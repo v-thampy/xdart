@@ -26,8 +26,10 @@ from .shell_values import (
     BrowserProjection,
     BrowserScan,
     FrameNavigationProjection,
+    PinnedTraceProjection,
     ScientificPlotOptions,
     ScientificProjection,
+    SlicePin,
 )
 from .scientific_axes import (
     heavy_projection,
@@ -53,6 +55,7 @@ class ScientificPreferences:
     slice_enabled: bool = False
     slice_center: float = 0.0
     slice_width: float = 10.0
+    slice_pins: tuple[SlicePin, ...] = ()
     q_range: tuple[float, float] = (0.0, 10.0)
     chi_range: tuple[float, float] = (-180.0, 180.0)
     plot_options: ScientificPlotOptions = ScientificPlotOptions()
@@ -183,6 +186,14 @@ def build_scientific_projection(
     eligible_ids = set(selected_ids)
     if current_id is not None:
         eligible_ids.add(current_id)
+    owned_pins = tuple(
+        pin
+        for pin in preferences.slice_pins
+        if type(pin) is SlicePin
+        and frame_by_id.get(id(pin.frame)) is pin.frame
+    )
+    pin_frame_ids = {id(pin.frame) for pin in owned_pins}
+    projectable_ids = eligible_ids | pin_frame_ids
     accepted_items: list[StandardDisplayPayload] = []
     payload_by_id: dict[int, StandardDisplayPayload] = {}
     for payload in payloads:
@@ -193,7 +204,7 @@ def build_scientific_projection(
         if (
             type(frame) is not DisplayFrameKey
             or frame_by_id.get(frame_id) is not frame
-            or frame_id not in eligible_ids
+            or frame_id not in projectable_ids
         ):
             continue
         try:
@@ -207,8 +218,11 @@ def build_scientific_projection(
             valid = False
         if not valid:
             continue
-        accepted_items.append(payload)
         payload_by_id.setdefault(frame_id, payload)
+        if frame_id in eligible_ids:
+            # Pin-only hydration may feed the recipe lookup below, but never
+            # becomes current/selected identity, title, or live membership.
+            accepted_items.append(payload)
     accepted = tuple(accepted_items)
     current_payload = (
         None
@@ -281,10 +295,40 @@ def build_scientific_projection(
             navigation.selected,
         )
     )
+    pins = tuple(
+        pin
+        for pin in owned_pins
+        if pin.plot_axis == requested_plot_axis
+    )
+    pinned_trace_rows: list[PinnedTraceProjection] = []
+    for pin in pins:
+        payload = payload_by_id.get(id(pin.frame))
+        if payload is None:
+            continue
+        trace = trace_projection(
+            payload,
+            requested_axis=pin.plot_axis,
+            allow_cake=processing_mode != "Int 1D",
+            slice_enabled=True,
+            slice_center=pin.center,
+            slice_width=pin.width,
+            norm_channel=effective_channel,
+        )
+        if trace is not None:
+            pinned_trace_rows.append(PinnedTraceProjection(pin, trace))
+    pinned_traces = tuple(pinned_trace_rows)
+    absorbed_frame_ids = {
+        id(pinned.pin.frame)
+        for pinned in pinned_traces
+        if preferences.slice_enabled
+        and pinned.pin.center == preferences.slice_center
+        and pinned.pin.width == preferences.slice_width
+    }
     traces = tuple(
         trace
         for payload in accepted
         if id(payload.frame_key) in selected_ids
+        if id(payload.frame_key) not in absorbed_frame_ids
         if (trace := trace_projection(
             payload,
             requested_axis=requested_plot_axis,
@@ -296,7 +340,10 @@ def build_scientific_projection(
         )) is not None
     )
     rendered_plot_axis = plot_axis_choice(
-        traces,
+        (
+            *traces,
+            *(pinned.trace for pinned in pinned_traces),
+        ),
         requested_plot_axis,
     )
     title = "Current"
@@ -333,6 +380,8 @@ def build_scientific_projection(
         slice_enabled=preferences.slice_enabled,
         slice_center=preferences.slice_center,
         slice_width=preferences.slice_width,
+        slice_pins=pins,
+        pinned_traces=pinned_traces,
         q_range=preferences.q_range,
         chi_range=preferences.chi_range,
         plot_options=preferences.plot_options,

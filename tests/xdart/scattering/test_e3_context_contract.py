@@ -39,6 +39,11 @@ from xdart.gui.tabs.scattering.events import (
     PreflightAccepted,
     RunIdentity,
 )
+from xdart.gui.tabs.scattering.shell_projection import (
+    ScientificPreferences,
+    build_scientific_projection,
+)
+from xdart.gui.tabs.scattering.shell_values import SlicePin
 from xdart.modules.display_context import (
     AcquisitionContext,
     BrowseContext,
@@ -742,6 +747,78 @@ def test_projection_rejects_stale_source_epoch_until_exact_readoption():
     # The context's run-level store is still the exact same owner; a new
     # member/artifact becomes projectable when its catalog entry arrives.
     assert controller.acquisition_context is acquisition
+
+
+def test_pin_axis_reseed_projects_the_exact_unselected_owned_frame() -> None:
+    controller, _, _, _, acquisition = _running_controller()
+    display = acquisition.publication_store
+    first = _current_key(controller)
+    first_payload = controller.project(first)
+    assert type(first_payload) is StandardDisplayPayload
+    display.put_payload(replace(first_payload, wavelength_m=1.0e-10))
+    initial_pin = SlicePin(first, "Q", 0.5, 1.0)
+    initial_preferences = ScientificPreferences(
+        plot_axis="Q",
+        plot_mode="Overlay",
+        slice_enabled=True,
+        slice_center=0.5,
+        slice_width=1.0,
+        slice_pins=(initial_pin,),
+    )
+    initial_payloads = controller.project_navigation(
+        preferences=initial_preferences,
+    )
+    assert tuple(payload.frame_key for payload in initial_payloads) == (
+        first,
+    )
+    assert controller.commit_navigation_projection((first,))
+
+    second_delta = display.append_navigation(
+        "run.a",
+        "/out/a.nxs",
+        2,
+    )
+    second = second_delta.appended
+    second_view = _view(2, 2.0)
+    display.put_payload(StandardDisplayPayload(
+        0,
+        second,
+        "Standard · run.a · frame 2",
+        second_view,
+        wavelength_m=1.0e-10,
+    ))
+    assert controller.accept_navigation(
+        second_delta,
+        plot_mode="Overlay",
+        follow_latest=True,
+    )
+    assert controller.select_navigation(second, (second,))
+
+    retargeted = replace(initial_pin, plot_axis="2theta")
+    preferences = replace(
+        initial_preferences,
+        plot_axis="2theta",
+        slice_pins=(retargeted,),
+    )
+    payloads = controller.project_navigation(preferences=preferences)
+    assert tuple(payload.frame_key for payload in payloads) == (
+        second,
+        first,
+    )
+
+    projection = build_scientific_projection(
+        payloads,
+        controller.navigation,
+        controller.resident_frame_keys,
+        preferences,
+        "",
+    )
+    assert projection.title == "scan_2.tif"
+    assert len(projection.pinned_traces) == 1
+    pinned = projection.pinned_traces[0]
+    assert pinned.pin is retargeted
+    assert pinned.pin.plot_axis == "2theta"
+    assert pinned.trace.frame is first
 
 
 def test_duplicate_context_ready_adoption_keeps_exact_display_generation():

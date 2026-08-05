@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from pyqtgraph.Qt import QtCore, QtGui, QtTest, QtWidgets
 
+from xdart.modules.display_context import ContextKind
 from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_projection import (
@@ -17,10 +18,12 @@ from xdart.gui.tabs.scattering.shell_values import (
     FrameNavigationProjection,
     ShellCommand,
     ShellCommandKind,
+    SlicePin,
 )
 from xdart.gui.tabs.scattering.workspace_shell import (
     ScatteringWorkspaceShell,
 )
+from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xrd_tools.core import Axis, FrameView, TwoDKind
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
@@ -104,7 +107,7 @@ def _send_key(
     "plot_mode",
     ("Overlay", "Waterfall"),
 )
-def test_accumulating_click_moves_anchor_without_mutating_trace_membership(
+def test_accumulating_click_carries_exact_toggle_membership(
     qapp: QtWidgets.QApplication,
     plot_mode: str,
 ) -> None:
@@ -125,7 +128,10 @@ def test_accumulating_click_moves_anchor_without_mutating_trace_membership(
         assert _selected_browser_rows(shell) == (0, 2)
         assert len(commands) == 1
         assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
-        assert commands[0].frames == state.navigation.selected
+        assert commands[0].frames == (
+            state.navigation.frames[0],
+            state.navigation.frames[2],
+        )
         assert commands[0].frame is state.navigation.frames[2]
 
         commands.clear()
@@ -133,7 +139,7 @@ def test_accumulating_click_moves_anchor_without_mutating_trace_membership(
 
         assert _selected_browser_rows(shell) == (0,)
         assert len(commands) == 1
-        assert commands[0].frames == state.navigation.selected
+        assert commands[0].frames == (state.navigation.frames[0],)
         assert commands[0].frame is state.navigation.frames[2]
         assert (
             shell.browser.frames.currentIndex().data(
@@ -141,6 +147,80 @@ def test_accumulating_click_moves_anchor_without_mutating_trace_membership(
             )
             is state.navigation.frames[2]
         )
+    finally:
+        shell.close()
+
+
+@pytest.mark.parametrize(
+    "plot_mode",
+    ("Overlay", "Waterfall"),
+)
+def test_idle_accumulating_selection_carries_exact_highlighted_rows(
+    qapp: QtWidgets.QApplication,
+    plot_mode: str,
+) -> None:
+    """Historical Browse selection is operator-owned once the run is idle."""
+
+    state = make_shell_projection(plot_mode=plot_mode)
+    first = state.navigation.frames[0]
+    state = replace(
+        state,
+        navigation=replace(
+            state.navigation,
+            current=first,
+            selected=(first,),
+        ),
+    )
+    shell = ScatteringWorkspaceShell()
+    commands = []
+    shell.commandRequested.connect(commands.append)
+    shell.resize(1200, 800)
+    shell.show()
+    try:
+        shell.apply_state(state)
+        qapp.processEvents()
+        commands.clear()
+
+        _click_frame(qapp, shell, 2)
+
+        assert _selected_browser_rows(shell) == (0, 2)
+        assert len(commands) == 1
+        assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
+        assert commands[0].frame is state.navigation.frames[2]
+        assert commands[0].frames == (
+            state.navigation.frames[0],
+            state.navigation.frames[2],
+        )
+    finally:
+        shell.close()
+
+
+@pytest.mark.parametrize("plot_mode", ("Overlay", "Waterfall"))
+def test_accumulating_sole_row_toggle_preserves_visible_membership(
+    qapp: QtWidgets.QApplication,
+    plot_mode: str,
+) -> None:
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode=plot_mode,
+    )
+    shell = ScatteringWorkspaceShell()
+    commands = []
+    shell.commandRequested.connect(commands.append)
+    shell.resize(1200, 800)
+    shell.show()
+    try:
+        shell.apply_state(state)
+        qapp.processEvents()
+        commands.clear()
+
+        _click_frame(qapp, shell, 0)
+
+        assert len(commands) == 1
+        assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
+        assert commands[0].frame is state.navigation.frames[0]
+        assert commands[0].frames == (state.navigation.frames[0],)
     finally:
         shell.close()
 
@@ -329,7 +409,7 @@ def test_held_arrow_is_one_gesture_with_no_intermediate_command(
         shell.close()
 
 
-def test_held_overlay_arrow_moves_anchor_without_mutating_membership(
+def test_held_overlay_arrow_carries_exact_new_ui_membership(
     qapp: QtWidgets.QApplication,
 ) -> None:
     base = make_shell_projection(plot_mode="Overlay")
@@ -384,7 +464,7 @@ def test_held_overlay_arrow_moves_anchor_without_mutating_membership(
 
         assert len(commands) == 1
         assert commands[0].frame is state.navigation.frames[3]
-        assert commands[0].frames == state.navigation.selected
+        assert commands[0].frames == (state.navigation.frames[3],)
     finally:
         shell.close()
 
@@ -876,6 +956,306 @@ def test_page_preserves_explicit_single_multiselection_but_mode_entry_collapses(
         (frames[-1], (frames[-1],)),
     ]
     assert events == ["cancel", "select"]
+
+
+def test_active_acquisition_overlay_visit_preserves_arrival_membership() -> None:
+    state = make_shell_projection(plot_mode="Overlay")
+    frames = state.navigation.frames
+    arrival_membership = frames[:2]
+    calls: list[tuple[object, tuple[object, ...]]] = []
+
+    class Controller:
+        navigation = FrameNavigationProjection(
+            frames,
+            frames[1],
+            arrival_membership,
+        )
+        selection = SimpleNamespace(kind=ContextKind.ACQUISITION)
+
+        @staticmethod
+        def owns_frame(frame: object) -> bool:
+            return any(frame is candidate for candidate in frames)
+
+        @staticmethod
+        def select_navigation(current, selected) -> bool:
+            calls.append((current, selected))
+            return True
+
+    owner = SimpleNamespace(
+        _context_controller=Controller(),
+        _preferences=ScientificPreferences(plot_mode="Overlay"),
+        _lifecycle=SimpleNamespace(phase=RunPhase.RUNNING),
+        _auto_last=True,
+        _refresh_shell=lambda: None,
+        _ensure_timer=lambda: None,
+    )
+    ScatteringWorkspace._select_frames(
+        owner,
+        ShellCommand(
+            ShellCommandKind.SELECT_BROWSER_FRAMES,
+            frame=frames[3],
+            frames=(frames[0], frames[3]),
+        ),
+    )
+
+    assert calls == [(frames[3], arrival_membership)]
+
+
+@pytest.mark.parametrize(
+    ("selection_kind", "phase"),
+    (
+        (ContextKind.ACQUISITION, RunPhase.IDLE),
+        (ContextKind.BROWSE, RunPhase.RUNNING),
+        (ContextKind.BROWSE, RunPhase.PAUSED),
+    ),
+)
+def test_nonactive_or_browse_overlay_adopts_exact_ui_membership(
+    selection_kind: ContextKind,
+    phase: RunPhase,
+) -> None:
+    state = make_shell_projection(plot_mode="Overlay")
+    frames = state.navigation.frames
+    requested = (frames[0], frames[3])
+    calls: list[tuple[object, tuple[object, ...]]] = []
+
+    class Controller:
+        navigation = FrameNavigationProjection(
+            frames,
+            frames[1],
+            frames[:2],
+        )
+        selection = SimpleNamespace(kind=selection_kind)
+
+        @staticmethod
+        def owns_frame(frame: object) -> bool:
+            return any(frame is candidate for candidate in frames)
+
+        @staticmethod
+        def select_navigation(current, selected) -> bool:
+            calls.append((current, selected))
+            return True
+
+    owner = SimpleNamespace(
+        _context_controller=Controller(),
+        _preferences=ScientificPreferences(plot_mode="Overlay"),
+        _lifecycle=SimpleNamespace(phase=phase),
+        _auto_last=True,
+        _refresh_shell=lambda: None,
+        _ensure_timer=lambda: None,
+    )
+    ScatteringWorkspace._select_frames(
+        owner,
+        ShellCommand(
+            ShellCommandKind.SELECT_BROWSER_FRAMES,
+            frame=frames[3],
+            frames=requested,
+        ),
+    )
+
+    assert calls == [(frames[3], requested)]
+
+
+def test_pin_slice_command_is_owned_instead_of_silently_dropped() -> None:
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Overlay",
+    )
+    scientific = replace(
+        state.scientific,
+        slice_enabled=True,
+        slice_center=0.0,
+        slice_width=5.0,
+    )
+    owner = SimpleNamespace(
+        _preferences=ScientificPreferences(
+            plot_mode="Overlay",
+            slice_enabled=True,
+            slice_center=0.0,
+            slice_width=5.0,
+        ),
+        _last_scientific_projection=scientific,
+        _context_controller=SimpleNamespace(
+            navigation=state.navigation,
+            owns_frame=lambda frame: frame is state.navigation.current,
+        ),
+    )
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.PIN_SLICE),
+    )
+    assert len(owner._preferences.slice_pins) == 1
+    assert not ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.PIN_SLICE),
+    )
+
+
+def test_pin_slice_uses_only_the_singular_accepted_heavy_frame() -> None:
+    state = make_shell_projection(
+        frame_count=4,
+        selected_index=3,
+        heavy_indices=(3,),
+        plot_mode="Overlay",
+    )
+    navigation = replace(
+        state.navigation,
+        selected=state.navigation.frames,
+    )
+    scientific = replace(
+        state.scientific,
+        slice_enabled=True,
+        slice_center=0.5,
+        slice_width=2.0,
+    )
+    assert scientific.heavy is not None
+    assert scientific.heavy.frame is navigation.current
+    owner = SimpleNamespace(
+        _preferences=ScientificPreferences(
+            plot_mode="Overlay",
+            slice_enabled=True,
+            slice_center=0.5,
+            slice_width=2.0,
+        ),
+        _last_scientific_projection=scientific,
+        _context_controller=SimpleNamespace(
+            navigation=navigation,
+            owns_frame=lambda frame: any(
+                frame is candidate for candidate in navigation.frames
+            ),
+        ),
+    )
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.PIN_SLICE),
+    )
+    assert len(owner._preferences.slice_pins) == 1
+    assert (
+        owner._preferences.slice_pins[0].frame
+        is scientific.heavy.frame
+    )
+
+
+def test_slice_pins_survive_accumulating_mode_switch_and_clear_together() -> None:
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Overlay",
+    )
+    frame = state.navigation.frames[0]
+    pin = SlicePin(frame, "Q", 0.0, 5.0)
+    selected: list[tuple[object, tuple[object, ...]]] = []
+    owner = SimpleNamespace(
+        _preferences=ScientificPreferences(
+            plot_mode="Overlay",
+            slice_enabled=True,
+            slice_pins=(pin,),
+        ),
+        _shell=SimpleNamespace(
+            browser=SimpleNamespace(
+                cancel_pending_frame_selection=lambda: None,
+            )
+        ),
+        _context_controller=SimpleNamespace(
+            navigation=state.navigation,
+            select_navigation=lambda current, frames: selected.append(
+                (current, frames)
+            ),
+        ),
+    )
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Waterfall"),
+    )
+    assert owner._preferences.slice_pins == (pin,)
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.CLEAR_1D),
+    )
+    assert owner._preferences.slice_pins == ()
+    assert selected == [(frame, (frame,))]
+
+
+def test_direct_plot_axis_change_retargets_compatible_pins_and_clears_others() -> None:
+    state = make_shell_projection(frame_count=1, heavy_indices=(0,))
+    pin = SlicePin(state.navigation.frames[0], "Q", 0.5, 2.0)
+    owner = SimpleNamespace(
+        _preferences=ScientificPreferences(
+            plot_axis="Q",
+            plot_mode="Overlay",
+            slice_pins=(pin,),
+        )
+    )
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "2theta"),
+    )
+    assert len(owner._preferences.slice_pins) == 1
+    retargeted = owner._preferences.slice_pins[0]
+    assert retargeted.frame is pin.frame
+    assert retargeted.plot_axis == "2theta"
+    assert (retargeted.center, retargeted.width) == (0.5, 2.0)
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "chi"),
+    )
+    assert owner._preferences.slice_pins == ()
+
+
+def test_shared_image_axis_changes_apply_the_same_slice_pin_policy() -> None:
+    state = make_shell_projection(frame_count=1, heavy_indices=(0,))
+    pin = SlicePin(state.navigation.frames[0], "Q", 0.5, 2.0)
+    owner = SimpleNamespace(
+        _preferences=ScientificPreferences(
+            image_axis="Q-Chi",
+            plot_axis="Q",
+            plot_mode="Overlay",
+            share_axis=True,
+            slice_pins=(pin,),
+        )
+    )
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.SET_IMAGE_AXIS, "2Th-Chi"),
+    )
+    assert owner._preferences.plot_axis == "2theta"
+    assert len(owner._preferences.slice_pins) == 1
+    assert owner._preferences.slice_pins[0].plot_axis == "2theta"
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.SET_IMAGE_AXIS, "qip_qoop"),
+    )
+    assert owner._preferences.plot_axis == "q_ip"
+    assert owner._preferences.slice_pins == ()
+
+
+def test_enabling_share_axis_retargets_compatible_slice_pins() -> None:
+    state = make_shell_projection(frame_count=1, heavy_indices=(0,))
+    pin = SlicePin(state.navigation.frames[0], "Q", 0.5, 2.0)
+    owner = SimpleNamespace(
+        _preferences=ScientificPreferences(
+            image_axis="2Th-Chi",
+            plot_axis="Q",
+            plot_mode="Overlay",
+            slice_pins=(pin,),
+        )
+    )
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        owner,
+        ShellCommand(ShellCommandKind.SET_SHARE_AXIS, True),
+    )
+    assert owner._preferences.share_axis
+    assert owner._preferences.plot_axis == "2theta"
+    assert len(owner._preferences.slice_pins) == 1
+    assert owner._preferences.slice_pins[0].plot_axis == "2theta"
 
 
 def test_explicit_footer_selection_cancels_older_browser_debounce() -> None:

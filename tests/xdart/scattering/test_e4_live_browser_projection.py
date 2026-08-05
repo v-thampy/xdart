@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
+from threading import Event, Thread
 import time
 from types import SimpleNamespace
 
@@ -11,8 +13,10 @@ from xdart.gui.tabs.scattering.adapters.source import (
     FilesystemSourceAdapter,
 )
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+from xdart.gui.tabs.scattering import browser_catalog as browser_catalog_module
 from xdart.gui.tabs.scattering.browser_catalog import (
     BrowserCatalogEntry,
+    DirectoryModifiedCache,
     enumerate_processed_artifacts,
 )
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
@@ -132,6 +136,98 @@ def test_browser_time_sort_interleaves_directories_and_artifacts() -> None:
         "old-file.nxs",
         "old-dir/",
     )
+
+
+def test_browser_time_sort_derives_directory_time_from_immediate_children(
+    tmp_path: Path,
+) -> None:
+    """Date order follows scan contents, not directory inode churn."""
+
+    root = tmp_path / "processed"
+    root.mkdir()
+    inode_newer = root / "inode-newer"
+    content_newer = root / "content-newer"
+    inode_newer.mkdir()
+    content_newer.mkdir()
+    old_child = inode_newer / "old.nexus"
+    new_child = content_newer / "new.nexus"
+    old_child.touch()
+    new_child.touch()
+    nested = inode_newer / "nested"
+    nested.mkdir()
+    grandchild = nested / "must-not-count.nexus"
+    grandchild.touch()
+
+    os.utime(old_child, ns=(100, 100))
+    os.utime(new_child, ns=(300, 300))
+    os.utime(grandchild, ns=(900, 900))
+    os.utime(nested, ns=(50, 50))
+    # Deliberately contradict the content order at the inode layer.
+    os.utime(inode_newer, ns=(800, 800))
+    os.utime(content_newer, ns=(200, 200))
+
+    catalog = enumerate_processed_artifacts(
+        str(root),
+        inspect_directory_contents=True,
+    )
+    by_label = {entry.label: entry for entry in catalog}
+
+    assert by_label["inode-newer/"].modified_ns == 100
+    assert by_label["content-newer/"].modified_ns == 300
+    projected = build_browser_projection(
+        contexts=(),
+        selection=None,
+        navigation=FrameNavigationProjection(),
+        browser_directory=str(root),
+        date_sorted=True,
+        auto_last=False,
+        catalog=catalog,
+    )
+    assert tuple(scan.label for scan in projected.scans[:3]) == (
+        "..",
+        "content-newer/",
+        "inode-newer/",
+    )
+
+
+def test_directory_time_cache_clear_during_scan_cannot_repopulate_stale_value(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    directory = tmp_path / "scan"
+    directory.mkdir()
+    entered = Event()
+    release = Event()
+    calls: list[int] = []
+
+    def blocked_scan(_directory: Path, _own_mtime_ns: int):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(timeout=2.0)
+        return 100 + len(calls), True
+
+    monkeypatch.setattr(
+        browser_catalog_module,
+        "_directory_modified_ns",
+        blocked_scan,
+    )
+    cache = DirectoryModifiedCache(ttl_s=60.0)
+    results: list[int] = []
+    worker = Thread(
+        target=lambda: results.append(cache.modified_ns(directory, 1)),
+    )
+    worker.start()
+    assert entered.wait(timeout=2.0)
+    cache.clear()
+    release.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert results == [101]
+    assert cache.modified_ns(directory, 1) == 102
+    assert cache.modified_ns(directory, 1) == 102
+    assert calls == [1, 2]
 
 
 def _keys() -> tuple[DisplayFrameKey, ...]:
@@ -552,6 +648,68 @@ def test_open_folder_and_refresh_publish_processed_catalog(
     finally:
         page.close_workspace()
         assert not page._browser_catalog_timer.isActive()
+        page.deleteLater()
+        app.processEvents()
+
+
+def test_page_time_sort_and_refresh_use_immediate_child_mtime(
+    tmp_path: Path,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    first = processed / "first"
+    second = processed / "second"
+    first.mkdir()
+    second.mkdir()
+    first_child = first / "frame.nexus"
+    second_child = second / "frame.nexus"
+    first_child.touch()
+    second_child.touch()
+    base = time.time_ns() - 10_000_000_000
+    os.utime(first_child, ns=(base + 300, base + 300))
+    os.utime(second_child, ns=(base + 100, base + 100))
+    # Contradict the content order at the folder-inode layer.
+    os.utime(first, ns=(base + 100, base + 100))
+    os.utime(second, ns=(base + 300, base + 300))
+
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(save_path=str(processed))),
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    shell = page.findChild(ScatteringWorkspaceShell)
+    assert shell is not None
+
+    def labels() -> tuple[str, ...]:
+        return tuple(
+            shell.browser.scans.item(index).text()
+            for index in range(shell.browser.scans.count())
+        )
+
+    def wait_for(predicate) -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if predicate():
+                return
+            time.sleep(0.005)
+        raise AssertionError("page Time-sort catalog did not settle")
+
+    try:
+        wait_for(lambda: shell.browser.scans.count() == 3)
+        # Keep the finite row attributable to the two explicit commands. A
+        # later 1.5 s poll must not hide a missing Refresh-cache invalidation
+        # after the two-second TTL expires.
+        page._browser_catalog_timer.stop()
+        shell.browser.date_sort.click()
+        wait_for(lambda: labels() == ("..", "first/", "second/"))
+
+        os.utime(second_child, ns=(base + 500, base + 500))
+        shell.browser.refresh.click()
+        wait_for(lambda: labels() == ("..", "second/", "first/"))
+    finally:
+        page.close_workspace()
         page.deleteLater()
         app.processEvents()
 

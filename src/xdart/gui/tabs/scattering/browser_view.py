@@ -614,19 +614,22 @@ class BrowserView(QtWidgets.QFrame):
         )
 
         selected_frames = ui_selected_frames
-        if self._plot_mode in _VISIT_ACCUMULATING_PLOT_MODES:
-            selected_frames = (
-                self._committed_selected
-                if self._committed_selected
-                else (() if current is None else (current,))
-            )
+        if (
+            self._plot_mode in _VISIT_ACCUMULATING_PLOT_MODES
+            and not selected_frames
+            and current is not None
+        ):
+            # Reconcile already keeps the current row visibly selected.  Carry
+            # that same minimum membership to the owner so a sole-row toggle
+            # cannot produce a visually selected frame with a blank 1-D plot.
+            selected_frames = (current,)
 
         self._pending_frame_command = ShellCommand(
             ShellCommandKind.SELECT_BROWSER_FRAMES,
             frame=current,
             frames=selected_frames,
         )
-        self._selected_frames = ui_selected_frames
+        self._selected_frames = selected_frames
         if not self._frame_gesture_active:
             self._frame_selection_coalescer.trigger()
 

@@ -39,7 +39,7 @@ from .scientific_axes import (
     resolve_norm_presentation,
     trace_normalization_scope,
 )
-from .shell_values import FrameNavigationProjection
+from .shell_values import FrameNavigationProjection, SlicePin
 
 
 @dataclass(frozen=True, slots=True)
@@ -777,6 +777,23 @@ class _ContextRuntime:
                 selected,
             )
             frames = list(planned)
+            if reseed:
+                # A semantic reseed must rebuild retained pin recipes even
+                # after their source frame leaves selected/current.  This is
+                # deliberately absent from the steady suffix cadence path.
+                owned_by_id = self._selected_frame_by_id()
+                planned_ids = {id(frame) for frame in frames}
+                for pin in getattr(preferences, "slice_pins", ()):
+                    if type(pin) is not SlicePin:
+                        continue
+                    frame = pin.frame
+                    frame_id = id(frame)
+                    if (
+                        owned_by_id.get(frame_id) is frame
+                        and frame_id not in planned_ids
+                    ):
+                        frames.append(frame)
+                        planned_ids.add(frame_id)
         else:
             if preferences is not None:
                 # Leaving an accumulating mode invalidates its projection
@@ -1102,6 +1119,10 @@ class _ContextRuntime:
             getattr(preferences, "slice_enabled", None),
             getattr(preferences, "slice_center", None),
             getattr(preferences, "slice_width", None),
+            tuple(
+                pin.projection_id
+                for pin in getattr(preferences, "slice_pins", ())
+            ),
             *trace_normalization_scope(
                 norm_identity,
                 effective_channel,

@@ -18,7 +18,10 @@ from xrd_tools.session.display_logic import (
 )
 
 from .display_values import DisplayFrameKey
-from .scientific_axes import trace_normalization_scope
+from .scientific_axes import (
+    slice_region_orientation,
+    trace_normalization_scope,
+)
 from .scientific_plot_options import (
     PLOT_OPTION_COMMAND_PATHS,
     PlotOptionsDialog,
@@ -225,7 +228,11 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_selection_keys: tuple[DisplayFrameKey, ...] = ()
         self._trace_history_keys: tuple[DisplayFrameKey, ...] = ()
         self._trace_history_by_identity: dict[int, TraceProjection] = {}
-        self._rendered_trace_keys: tuple[DisplayFrameKey, ...] = ()
+        self._pinned_trace_scope: tuple[object, ...] | None = None
+        self._pinned_trace_by_id: dict[
+            tuple[object, ...], TraceProjection
+        ] = {}
+        self._rendered_trace_keys: tuple[tuple[object, ...], ...] = ()
         self._rendered_plot_mode = ""
         self._rendered_plot_options: ScientificPlotOptions | None = None
         self._rendered_overlay_step: float | None = None
@@ -233,12 +240,17 @@ class ScientificView(QtWidgets.QFrame):
         self._waterfall_y_values: tuple[float, ...] = ()
         self._waterfall_y_label = "Frame #"
         self._waterfall_last_draw = 0.0
-        self._waterfall_source_keys: tuple[DisplayFrameKey, ...] = ()
+        self._waterfall_source_keys: tuple[tuple[object, ...], ...] = ()
         self._waterfall_render_contract: tuple[object, ...] | None = None
         self._processing_mode = ""
         self._rendered_image_axis: str | None = None
         self._rendered_cake_axis_key: str | None = None
+        self._rendered_cake_x_axis: AxisProjection | None = None
+        self._rendered_cake_y_axis: AxisProjection | None = None
         self._rendered_trace_axis_key: str | None = None
+        self._slice_extent_lines: tuple[pg.InfiniteLine, ...] = ()
+        self._slice_extent_scope: tuple[object, ...] | None = None
+        self._rendered_slice_contract: tuple[object, ...] | None = None
         self._share_link_on = False
         self._share_axis_syncing = False
         self._cake_x_pinned_by_share = False
@@ -530,6 +542,17 @@ class ScientificView(QtWidgets.QFrame):
         total: int,
         detail: str,
     ) -> None:
+        slice_contract = (
+            state.plot_axis,
+            state.slice_enabled,
+            state.slice_center,
+            state.slice_width,
+            tuple(pin.projection_id for pin in state.slice_pins),
+        )
+        slice_contract_changed = (
+            self._rendered_slice_contract is not None
+            and slice_contract != self._rendered_slice_contract
+        )
         widgets = (
             self.norm,
             self.color_map,
@@ -615,10 +638,14 @@ class ScientificView(QtWidgets.QFrame):
                     self._rendered_cake_axis_key = self._axis_key(
                         state.heavy.cake_x
                     )
+                    self._rendered_cake_x_axis = state.heavy.cake_x
+                    self._rendered_cake_y_axis = state.heavy.cake_y
                     self._rendered_image_axis = state.image_axis
                 else:
                     self.cake.clear()
                     self._rendered_cake_axis_key = None
+                    self._rendered_cake_x_axis = None
+                    self._rendered_cake_y_axis = None
                     self._rendered_image_axis = None
             elif state.retain_display:
                 # A qualified hydration is pending.  Keep the last accepted
@@ -630,6 +657,8 @@ class ScientificView(QtWidgets.QFrame):
                 self.raw.clear()
                 self.cake.clear()
                 self._rendered_cake_axis_key = None
+                self._rendered_cake_x_axis = None
+                self._rendered_cake_y_axis = None
                 self._rendered_image_axis = None
             if replace_presentation:
                 self._render_traces(
@@ -639,10 +668,126 @@ class ScientificView(QtWidgets.QFrame):
                 )
         finally:
             self._share_axis_syncing = prior_syncing
+        if replace_presentation:
+            self._reconcile_slice_extent(state)
+        pin_available = (
+            state.heavy is not None
+            and state.plot_mode in {"Overlay", "Waterfall"}
+            and state.slice_enabled
+            and slice_region_orientation(
+                state.plot_axis,
+                self._rendered_cake_x_axis,
+                self._rendered_cake_y_axis,
+            ) is not None
+        )
+        self.pin.setEnabled(pin_available)
+        self.pin.setToolTip(
+            "Pin the current slice cut into the accumulating plot."
+            if pin_available
+            else (
+                "Pin is available for an accepted 2-D slice in Overlay "
+                "or Waterfall."
+            )
+        )
         self._apply_share_axis_state(state.share_axis)
+        if (
+            replace_presentation
+            and slice_contract_changed
+            and state.slice_enabled
+            and self.curve.listDataItems()
+        ):
+            self._autorange_slice_projection(self._share_link_on)
+        if replace_presentation:
+            self._rendered_slice_contract = slice_contract
         self.status.setText(state.status or detail)
         self.progress.setText(f"{completed}/{total}")
         del blockers
+
+    def _reconcile_slice_extent(self, state: ScientificProjection) -> None:
+        orientation = (
+            slice_region_orientation(
+                state.plot_axis,
+                self._rendered_cake_x_axis,
+                self._rendered_cake_y_axis,
+            )
+            if state.slice_enabled
+            else None
+        )
+        slice_axis = (
+            self._rendered_cake_y_axis
+            if orientation == "horizontal"
+            else self._rendered_cake_x_axis
+            if orientation == "vertical"
+            else None
+        )
+        extent: tuple[float, float] | None = None
+        if slice_axis is not None:
+            finite = np.asarray(slice_axis.values, dtype=float)
+            finite = finite[np.isfinite(finite)]
+            if finite.size:
+                lower = max(
+                    float(np.min(finite)),
+                    float(state.slice_center - state.slice_width),
+                )
+                upper = min(
+                    float(np.max(finite)),
+                    float(state.slice_center + state.slice_width),
+                )
+                if lower <= upper:
+                    extent = (lower, upper)
+        scope = (
+            orientation,
+            extent,
+            None if slice_axis is None else id(slice_axis.values),
+        )
+        if scope == self._slice_extent_scope:
+            return
+        self._clear_slice_extent()
+        self._slice_extent_scope = scope
+        if orientation is None or extent is None:
+            return
+        angle = 0.0 if orientation == "horizontal" else 90.0
+        pen = pg.mkPen((255, 255, 255, 225), width=1.5)
+        lines = tuple(
+            pg.InfiniteLine(
+                pos=value,
+                angle=angle,
+                movable=False,
+                pen=pen,
+            )
+            for value in extent
+        )
+        for line in lines:
+            self.cake.canvas.imageViewBox.addItem(
+                line,
+                ignoreBounds=True,
+            )
+        self._slice_extent_lines = lines
+
+    def _clear_slice_extent(self) -> None:
+        for line in self._slice_extent_lines:
+            try:
+                self.cake.canvas.imageViewBox.removeItem(line)
+            except (RuntimeError, ValueError):
+                pass
+        self._slice_extent_lines = ()
+
+    def _autorange_slice_projection(self, share_axis: bool) -> None:
+        """Immediately fit a changed slice and retain continuous tracking."""
+
+        view = self.curve.getPlotItem().getViewBox()
+        if share_axis:
+            view.enableAutoRange(
+                axis=pg.ViewBox.XAxis,
+                enable=False,
+            )
+            view.enableAutoRange(
+                axis=pg.ViewBox.YAxis,
+                enable=True,
+            )
+            return
+        self.curve.autoRange()
+        self.curve.enableAutoRange()
 
     def _rebuild_frames(
         self,
@@ -701,28 +846,39 @@ class ScientificView(QtWidgets.QFrame):
         *,
         live_update: bool,
     ) -> None:
-        traces = self._merge_trace_history(state, navigation)
+        live_traces = self._merge_trace_history(state, navigation)
+        pinned = self._merge_pinned_trace_history(state)
+        rows = (
+            *((("pin", *pin_id), trace) for pin_id, trace in pinned),
+            *((("live", id(trace.frame)), trace) for trace in live_traces),
+        )
+        presented_by_id = {
+            id(trace.frame): trace.frame
+            for _row_key, trace in rows
+        }
+        self._trace_history_keys = tuple(
+            frame
+            for frame in navigation.selected
+            if presented_by_id.get(id(frame)) is frame
+        )
         self._bottom_waterfall_active = waterfall_should_be_active(
             state.plot_mode,
-            len(traces),
+            len(rows),
             was_active=self._bottom_waterfall_active,
         )
-        waterfall_scope = traces
+        waterfall_scope = rows
         stacked_selection = (
             state.plot_mode in {"Overlay", "Waterfall"}
-            or (state.plot_mode == "Single" and len(traces) > 1)
+            or (state.plot_mode == "Single" and len(rows) > 1)
         )
-        if (
-            stacked_selection
-            or self._bottom_waterfall_active
-        ):
+        if stacked_selection or self._bottom_waterfall_active:
             start_index = state.plot_options.waterfall_start - 1
             stop_index = state.plot_options.waterfall_stop or None
-            traces = traces[
+            rows = rows[
                 start_index:stop_index:state.plot_options.waterfall_step
             ]
         if self._bottom_waterfall_active:
-            source_keys = tuple(trace.frame for trace in traces)
+            source_keys = tuple(row_key for row_key, _trace in rows)
             render_contract = (
                 self._trace_history_scope,
                 state.plot_options,
@@ -739,20 +895,26 @@ class ScientificView(QtWidgets.QFrame):
                 if self._share_link_on:
                     self._schedule_curve_under_cake()
                 return
-            traces = self._bounded_waterfall_traces(traces)
-        traces = tuple(
-            replace(
-                trace,
-                intensity=_scaled_intensity(
-                    trace.intensity,
-                    state.plot_options.intensity_scale,
+            rows = self._bounded_waterfall_rows(rows)
+        rows = tuple(
+            (
+                row_key,
+                replace(
+                    trace,
+                    intensity=_scaled_intensity(
+                        trace.intensity,
+                        state.plot_options.intensity_scale,
+                    ),
                 ),
             )
-            for trace in traces
+            for row_key, trace in rows
         )
+        keys = tuple(row_key for row_key, _trace in rows)
+        traces = tuple(trace for _row_key, trace in rows)
         if state.plot_mode in {"Average", "Sum"}:
+            source_keys = keys
             traces = aggregate_traces(traces, state.plot_mode)
-        keys = tuple(trace.frame for trace in traces)
+            keys = (("aggregate", state.plot_mode, *source_keys),)
         axis_keys = {
             self._axis_key(trace.axis)
             for trace in traces
@@ -774,10 +936,11 @@ class ScientificView(QtWidgets.QFrame):
         )
         if self._bottom_waterfall_active and self._render_waterfall(
             traces,
+            row_keys=keys,
             waterfall_scope=waterfall_scope,
-            position_by_frame={
-                id(trace.frame): float(index + 1)
-                for index, trace in enumerate(waterfall_scope)
+            position_by_key={
+                row_key: float(index + 1)
+                for index, (row_key, _trace) in enumerate(waterfall_scope)
             },
             y_axis_choice=state.plot_options.waterfall_y_axis,
             color_map=state.color_map,
@@ -808,7 +971,7 @@ class ScientificView(QtWidgets.QFrame):
             and self._rendered_overlay_step == overlay_step
             and len(keys) >= len(self._rendered_trace_keys)
             and all(
-                key is self._rendered_trace_keys[index]
+                key == self._rendered_trace_keys[index]
                 for index, key in enumerate(self._rendered_trace_keys)
             )
         )
@@ -883,6 +1046,7 @@ class ScientificView(QtWidgets.QFrame):
             state.slice_enabled,
             state.slice_center,
             state.slice_width,
+            tuple(pin.projection_id for pin in state.slice_pins),
             # Aggregate revision remains visible provenance but does not
             # change an earlier trace's per-frame metadata divisor.  Only the
             # semantic normalization regime reseeds detached history.
@@ -893,7 +1057,8 @@ class ScientificView(QtWidgets.QFrame):
         )
         selected = navigation.selected
         prefix = (
-            scope == self._trace_history_scope
+            (state.retain_display or bool(state.traces))
+            and scope == self._trace_history_scope
             and len(selected) >= len(self._trace_selection_keys)
             and all(
                 frame is selected[index]
@@ -932,9 +1097,47 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_history_keys = tuple(trace.frame for trace in traces)
         return traces
 
+    def _merge_pinned_trace_history(
+        self,
+        state: ScientificProjection,
+    ) -> tuple[tuple[tuple[object, ...], TraceProjection], ...]:
+        pin_ids = tuple(pin.projection_id for pin in state.slice_pins)
+        scope = (
+            state.processing_mode,
+            state.plot_axis,
+            pin_ids,
+            state.norm_identity,
+            state.norm_channel,
+        )
+        if (
+            scope != self._pinned_trace_scope
+            or (
+                not state.retain_display
+                and not state.pinned_traces
+                and not state.slice_pins
+            )
+        ):
+            self._pinned_trace_by_id.clear()
+        desired = set(pin_ids)
+        for pinned in state.pinned_traces:
+            pin_id = pinned.pin.projection_id
+            if pin_id in desired:
+                self._pinned_trace_by_id[pin_id] = pinned.trace
+        self._pinned_trace_by_id = {
+            pin_id: trace
+            for pin_id, trace in self._pinned_trace_by_id.items()
+            if pin_id in desired
+        }
+        self._pinned_trace_scope = scope
+        return tuple(
+            (pin_id, self._pinned_trace_by_id[pin_id])
+            for pin_id in pin_ids
+            if pin_id in self._pinned_trace_by_id
+        )
+
     def _skip_live_waterfall(
         self,
-        source_keys: tuple[DisplayFrameKey, ...],
+        source_keys: tuple[tuple[object, ...], ...],
         render_contract: tuple[object, ...],
         *,
         live_update: bool,
@@ -948,35 +1151,38 @@ class ScientificView(QtWidgets.QFrame):
             or render_contract != self._waterfall_render_contract
             or len(source_keys) < len(self._waterfall_source_keys)
             or not all(
-                frame is source_keys[index]
-                for index, frame in enumerate(self._waterfall_source_keys)
+                key == source_keys[index]
+                for index, key in enumerate(self._waterfall_source_keys)
             )
         ):
             return False
         return time.monotonic() - self._waterfall_last_draw < 0.5
 
     @staticmethod
-    def _bounded_waterfall_traces(
-        traces: tuple[TraceProjection, ...],
-    ) -> tuple[TraceProjection, ...]:
+    def _bounded_waterfall_rows(
+        rows: tuple[tuple[tuple[object, ...], TraceProjection], ...],
+    ) -> tuple[tuple[tuple[object, ...], TraceProjection], ...]:
         """Choose one display-only row set before any numeric transforms."""
 
-        if len(traces) <= MAX_WATERFALL_DISPLAY_ROWS:
-            return traces
-        empty_rows = np.empty((len(traces), 0), dtype=float)
-        _rows, selected, _indices = waterfall_display_rows(
+        if len(rows) <= MAX_WATERFALL_DISPLAY_ROWS:
+            return rows
+        empty_rows = np.empty((len(rows), 0), dtype=float)
+        _display, _keys, indices = waterfall_display_rows(
             empty_rows,
-            traces,
+            tuple(row_key for row_key, _trace in rows),
             MAX_WATERFALL_DISPLAY_ROWS,
         )
-        return tuple(selected)
+        if indices is None:
+            return rows
+        return tuple(rows[int(index)] for index in indices)
 
     def _render_waterfall(
         self,
         traces,
         *,
+        row_keys,
         waterfall_scope,
-        position_by_frame: dict[int, float],
+        position_by_key: dict[tuple[object, ...], float],
         y_axis_choice: str,
         color_map: str,
     ) -> bool:
@@ -995,7 +1201,8 @@ class ScientificView(QtWidgets.QFrame):
         y_values, y_label = self._waterfall_axis(
             waterfall_scope,
             traces,
-            position_by_frame,
+            row_keys,
+            position_by_key,
             y_axis_choice,
         )
         if y_values.shape != (rows.shape[0],):
@@ -1010,7 +1217,10 @@ class ScientificView(QtWidgets.QFrame):
             y_axis=AxisProjection(y_values, y_label),
             color_map=color_map,
             level_scan_token=(
-                tuple((id(trace.frame), id(trace.intensity)) for trace in traces),
+                tuple(
+                    (row_key, id(trace.intensity))
+                    for row_key, trace in zip(row_keys, traces, strict=True)
+                ),
                 y_axis_choice,
             ),
         )
@@ -1023,24 +1233,25 @@ class ScientificView(QtWidgets.QFrame):
     def _waterfall_axis(
         waterfall_scope,
         traces,
-        position_by_frame: dict[int, float],
+        row_keys,
+        position_by_key: dict[tuple[object, ...], float],
         y_axis_choice: str,
     ) -> tuple[np.ndarray, str]:
         positions = np.asarray(
-            [position_by_frame[id(trace.frame)] for trace in traces],
+            [position_by_key[row_key] for row_key in row_keys],
             dtype=float,
         )
         if y_axis_choice == "Frame #":
             return positions, y_axis_choice
         epochs = {
-            id(trace.frame): trace.epoch
-            for trace in waterfall_scope
+            row_key: trace.epoch
+            for row_key, trace in waterfall_scope
         }
         if not epochs or any(value is None for value in epochs.values()):
             return positions, "Frame #"
         baseline = min(float(value) for value in epochs.values())
         values = np.asarray(
-            [float(epochs[id(trace.frame)]) - baseline for trace in traces],
+            [float(epochs[row_key]) - baseline for row_key in row_keys],
             dtype=float,
         )
         if y_axis_choice == "Time (minutes)":

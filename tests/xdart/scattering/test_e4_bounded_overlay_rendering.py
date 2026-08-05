@@ -276,7 +276,11 @@ def test_3621_runtime_projection_is_two_phase_and_prefix_delta_only(
 
     requested = []
 
-    def record_request(_projection, request):
+    def record_request(
+        _projection,
+        request,
+        _browse_hydration_owner=None,
+    ):
         requested.append(request.frame)
         return None
 

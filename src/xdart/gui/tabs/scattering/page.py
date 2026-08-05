@@ -11,6 +11,7 @@ import weakref
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from xdart.modules.display_context import ContextKind
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.session.intent_store import (
@@ -28,6 +29,7 @@ from .advanced_editor import AdvancedSettingsDialog
 from .adapters.browse_loader import BrowseLoader
 from .browser_catalog import (
     BrowserCatalogEntry,
+    DirectoryModifiedCache,
     enumerate_processed_artifacts,
     processed_directory,
 )
@@ -90,10 +92,15 @@ from .shell_projection import (
     ScientificPreferences,
     share_plot_axis_for_image,
 )
+from .scientific_axes import (
+    slice_recipe_axes_compatible,
+    slice_region_orientation,
+)
 from .shell_values import (
     ProgressProjection,
     ShellCommand,
     ShellCommandKind,
+    SlicePin,
 )
 from .shell_widgets import (
     experiment_header_projection,
@@ -121,6 +128,23 @@ _NO_DELIBERATE_MANUAL = object()
 _NO_AUTOMATIC_GI_MOTOR = object()
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
+
+
+def _slice_pins_for_plot_axis(
+    pins: tuple[SlicePin, ...],
+    prior_axis: str,
+    requested_axis: str,
+) -> tuple[SlicePin, ...]:
+    """Retarget compatible slice recipes and retire incompatible ones."""
+
+    if requested_axis == prior_axis:
+        return pins
+    if not slice_recipe_axes_compatible(prior_axis, requested_axis):
+        return ()
+    return tuple(
+        replace(pin, plot_axis=requested_axis)
+        for pin in pins
+    )
 
 
 def _source_selection_path(source: object) -> str:
@@ -235,6 +259,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ) = None
         self._browser_catalog_token = 0
         self._browser_catalog: tuple[BrowserCatalogEntry, ...] = ()
+        self._browser_directory_time_cache = DirectoryModifiedCache()
         self._browser_follow_identity: RunIdentity | None = None
         self._browser_seen_artifacts: set[str] = set()
         self._browser_transient_frame: DisplayFrameKey | None = None
@@ -282,6 +307,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         self._shell_revision = 0
         self._preferences = ScientificPreferences()
+        self._last_scientific_projection = None
         self._rendered_image_axis = self._preferences.image_axis
         self._detector_summary_key: tuple[str, str] | None = None
         self._detector_summary_text = "not configured"
@@ -609,6 +635,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._choose_browser_directory()
             return
         if kind is ShellCommandKind.REFRESH_BROWSER:
+            self._browser_directory_time_cache.clear()
             self._request_browser_catalog()
             return
         if kind is ShellCommandKind.SELECT_SCAN:
@@ -1066,6 +1093,27 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             for candidate in frames
         ):
             return
+        selection = getattr(self._context_controller, "selection", None)
+        if (
+            command.kind is ShellCommandKind.SELECT_BROWSER_FRAMES
+            and self._preferences.plot_mode in {"Overlay", "Waterfall"}
+            and selection is not None
+            and selection.kind is ContextKind.ACQUISITION
+            and self._lifecycle.phase in {
+                RunPhase.PREPARING,
+                RunPhase.STARTING,
+                RunPhase.RUNNING,
+                RunPhase.PAUSING,
+                RunPhase.PAUSED,
+                RunPhase.RESUMING,
+                RunPhase.STOPPING,
+                RunPhase.FINALIZING,
+            }
+        ):
+            # A live acquisition owns arrival membership. Browser visits move
+            # only the heavy-frame anchor until the run is terminal; an idle
+            # or Browse selection adopts the exact highlighted rows below.
+            frames = self._context_controller.navigation.selected
         if not self._context_controller.select_navigation(
             frame, frames
         ):
@@ -1288,6 +1336,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         controls = self._project_controls(snapshot)
         permitted, blocker = self._start_permitted()
         navigation = self._context_controller.navigation
+        if self._preferences.slice_pins:
+            retained_pins = tuple(
+                pin
+                for pin in self._preferences.slice_pins
+                if self._context_controller.owns_frame(pin.frame)
+            )
+            if retained_pins != self._preferences.slice_pins:
+                self._preferences = replace(
+                    self._preferences,
+                    slice_pins=retained_pins,
+                )
         live_update = self._lifecycle.phase in {
             RunPhase.STARTING,
             RunPhase.RUNNING,
@@ -1371,6 +1430,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 f"{detached_exception_strings(error)[2]}"
             )
             return
+        self._last_scientific_projection = projection.scientific
         self._context_controller.commit_navigation_projection(
             self._shell.scientific.trace_history_keys
         )
@@ -1511,8 +1571,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     updates["share_axis"] = False
                 else:
                     updates["plot_axis"] = matching_plot_axis
+                    updates["slice_pins"] = _slice_pins_for_plot_axis(
+                        self._preferences.slice_pins,
+                        self._preferences.plot_axis,
+                        matching_plot_axis,
+                    )
         elif kind is ShellCommandKind.SET_PLOT_AXIS:
-            updates["plot_axis"] = str(value)
+            requested_axis = str(value)
+            updates["plot_axis"] = requested_axis
+            updates["slice_pins"] = _slice_pins_for_plot_axis(
+                self._preferences.slice_pins,
+                self._preferences.plot_axis,
+                requested_axis,
+            )
         elif kind is ShellCommandKind.SET_PLOT_MODE:
             if type(value) is not str or value not in {
                 "Single",
@@ -1524,6 +1595,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return False
             prior_mode = self._preferences.plot_mode
             updates["plot_mode"] = value
+            if value not in {"Overlay", "Waterfall"}:
+                updates["slice_pins"] = ()
             if value == "Single" and prior_mode != "Single":
                 self._shell.browser.cancel_pending_frame_selection()
                 current = self._context_controller.navigation.current
@@ -1547,12 +1620,51 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if value:
                 if matching_plot_axis is not None:
                     updates["plot_axis"] = matching_plot_axis
+                    updates["slice_pins"] = _slice_pins_for_plot_axis(
+                        self._preferences.slice_pins,
+                        self._preferences.plot_axis,
+                        matching_plot_axis,
+                    )
         elif kind is ShellCommandKind.SET_SLICE_ENABLED:
             updates["slice_enabled"] = bool(value)
         elif kind is ShellCommandKind.SET_SLICE_CENTER:
             updates["slice_center"] = float(value)
         elif kind is ShellCommandKind.SET_SLICE_WIDTH:
             updates["slice_width"] = float(value)
+        elif kind is ShellCommandKind.PIN_SLICE:
+            state = self._last_scientific_projection
+            navigation = self._context_controller.navigation
+            heavy = None if state is None else state.heavy
+            if (
+                state is None
+                or state.plot_mode not in {"Overlay", "Waterfall"}
+                or not state.slice_enabled
+                or heavy is None
+                or heavy.cake is None
+                or slice_region_orientation(
+                    state.plot_axis,
+                    heavy.cake_x,
+                    heavy.cake_y,
+                ) is None
+            ):
+                return False
+            frame = heavy.frame
+            if (
+                navigation.current is not frame
+                or not self._context_controller.owns_frame(frame)
+            ):
+                return False
+            existing = self._preferences.slice_pins
+            existing_ids = {pin.projection_id for pin in existing}
+            pin = SlicePin(
+                frame,
+                state.plot_axis,
+                float(state.slice_center),
+                float(state.slice_width),
+            )
+            if pin.projection_id in existing_ids:
+                return False
+            updates["slice_pins"] = (*existing, pin)
         elif kind is ShellCommandKind.SET_RANGE:
             if type(value) not in {int, float}:
                 return False
@@ -1620,7 +1732,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 not self._preferences.background_set
             )
         elif kind is ShellCommandKind.SET_DATE_SORT:
-            self._date_sorted = bool(value)
+            requested = bool(value)
+            changed = requested != self._date_sorted
+            self._date_sorted = requested
+            if changed and requested:
+                self._request_browser_catalog()
             return True
         elif kind is ShellCommandKind.SET_AUTO_LAST:
             self._auto_last = bool(value)
@@ -1635,6 +1751,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._context_controller.select_navigation(
                 current, () if current is None else (current,)
             )
+            if self._preferences.slice_pins:
+                self._preferences = replace(
+                    self._preferences,
+                    slice_pins=(),
+                )
             return True
         else:
             return False
@@ -2255,6 +2376,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         future = pool.submit(
             enumerate_processed_artifacts,
             directory,
+            inspect_directory_contents=self._date_sorted,
+            directory_time_cache=self._browser_directory_time_cache,
         )
         operation = _BrowserCatalogOperation(
             self._browser_catalog_token,

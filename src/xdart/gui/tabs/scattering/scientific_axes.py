@@ -278,7 +278,6 @@ def _cake_trace_values(
         or y_axis.values.shape != (intensity.shape[0],)
     ):
         return False, None, None
-    requested_key = _PLOT_AXIS_KEYS.get(requested_axis, requested_axis)
     x_projection = AxisProjection(
         x_axis.values,
         x_axis.label,
@@ -289,16 +288,12 @@ def _cake_trace_values(
         y_axis.label,
         y_axis.unit,
     )
-    x_key = _axis_key(x_projection)
-    y_key = _axis_key(y_projection)
-    x_matches = (
-        x_key == requested_key
-        or {
-            x_key,
-            requested_key,
-        } <= _CONVERTIBLE_RADIAL_AXIS_KEYS
+    orientation = slice_region_orientation(
+        requested_axis,
+        x_projection,
+        y_projection,
     )
-    if x_matches:
+    if orientation == "horizontal":
         selected_axis = _present_radial_axis(
             x_projection,
             requested_axis=requested_axis,
@@ -314,7 +309,7 @@ def _cake_trace_values(
             reduced = nanmean_slice(intensity[selected, :], 0)
         else:
             reduced = nanmean_slice(intensity, 0)
-    elif y_key == requested_key:
+    elif orientation == "vertical":
         selected_axis = y_projection
         slice_axis = x_projection
         if slice_enabled:
@@ -335,6 +330,47 @@ def _cake_trace_values(
     ):
         return True, None, slice_axis
     return True, (selected_axis, reduced), slice_axis
+
+
+def slice_region_orientation(
+    requested_axis: str,
+    cake_x: AxisProjection | None,
+    cake_y: AxisProjection | None,
+) -> str | None:
+    """Return the cake marker orientation for one 1-D slice projection.
+
+    A projected cake-X trace integrates over cake Y and therefore draws a
+    horizontal band. A projected cake-Y trace integrates over cake X and draws
+    a vertical band. Radial Q/2theta compatibility is identical to the numeric
+    projection above, keeping the marker and the reduced values inseparable.
+    """
+
+    if cake_x is None or cake_y is None:
+        return None
+    requested_key = _PLOT_AXIS_KEYS.get(requested_axis, requested_axis)
+    x_key = _axis_key(cake_x)
+    y_key = _axis_key(cake_y)
+    if (
+        x_key == requested_key
+        or {x_key, requested_key} <= _CONVERTIBLE_RADIAL_AXIS_KEYS
+    ):
+        return "horizontal"
+    if y_key == requested_key:
+        return "vertical"
+    return None
+
+
+def slice_recipe_axes_compatible(first: str, second: str) -> bool:
+    """Whether one slice recipe can survive a 1-D axis presentation change."""
+
+    if type(first) is not str or type(second) is not str:
+        return False
+    first_key = _PLOT_AXIS_KEYS.get(first, first)
+    second_key = _PLOT_AXIS_KEYS.get(second, second)
+    return (
+        first_key == second_key
+        or {first_key, second_key} <= _CONVERTIBLE_RADIAL_AXIS_KEYS
+    )
 
 
 def _legend_axis_label(axis: AxisProjection) -> str:
@@ -602,6 +638,8 @@ __all__ = [
     "requested_image_axis",
     "resolve_norm_presentation",
     "share_plot_axis_for_image",
+    "slice_recipe_axes_compatible",
+    "slice_region_orientation",
     "trace_normalization_scope",
     "trace_projection",
 ]

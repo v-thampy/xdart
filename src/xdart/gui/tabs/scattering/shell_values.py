@@ -206,6 +206,52 @@ class TraceProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class SlicePin:
+    """One scan-qualified immutable slice recipe owned by the page."""
+
+    frame: DisplayFrameKey
+    plot_axis: str
+    center: float
+    width: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.frame) is not DisplayFrameKey
+            or type(self.plot_axis) is not str
+            or not self.plot_axis
+            or type(self.center) is not float
+            or not np.isfinite(self.center)
+            or type(self.width) is not float
+            or not np.isfinite(self.width)
+            or self.width < 0.0
+        ):
+            raise TypeError("slice pin is invalid")
+
+    @property
+    def projection_id(self) -> tuple[object, ...]:
+        return (
+            id(self.frame),
+            self.plot_axis,
+            self.center,
+            self.width,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedTraceProjection:
+    pin: SlicePin
+    trace: TraceProjection
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.pin) is not SlicePin
+            or type(self.trace) is not TraceProjection
+            or self.trace.frame is not self.pin.frame
+        ):
+            raise TypeError("pinned trace projection is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class HeavyProjection:
     frame: DisplayFrameKey
     raw: np.ndarray | None = None
@@ -285,6 +331,8 @@ class ScientificProjection:
     slice_enabled: bool = False
     slice_center: float = 0.0
     slice_width: float = 10.0
+    slice_pins: tuple[SlicePin, ...] = ()
+    pinned_traces: tuple[PinnedTraceProjection, ...] = ()
     q_range: tuple[float, float] = (0.0, 10.0)
     chi_range: tuple[float, float] = (-180.0, 180.0)
     plot_options: ScientificPlotOptions = ScientificPlotOptions()
@@ -357,9 +405,11 @@ __all__ = [
     "FrameNavigationProjection",
     "HeavyProjection",
     "ProgressProjection",
+    "PinnedTraceProjection",
     "RunStripProjection",
     "ScientificPlotOptions",
     "ScientificProjection",
+    "SlicePin",
     "ShellCommand",
     "ShellCommandKind",
     "ShellPhase",

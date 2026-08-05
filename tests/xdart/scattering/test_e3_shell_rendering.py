@@ -7,7 +7,7 @@ import pytest
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xrd_tools.core import FrameView
+from xrd_tools.core import Axis, FrameView, TwoDKind
 from xdart.gui.tabs.scattering.display_values import (
     StandardDisplayPayload,
     display_payload_is_valid,
@@ -18,7 +18,10 @@ from xdart.gui.tabs.scattering.shell_projection import (
 )
 from xdart.gui.tabs.scattering.shell_values import (
     AxisProjection,
+    FrameNavigationProjection,
     HeavyProjection,
+    PinnedTraceProjection,
+    SlicePin,
 )
 from xdart.gui.tabs.scattering.workspace_shell import (
     ScatteringWorkspaceShell,
@@ -72,6 +75,460 @@ def test_e3_ui2_renders_raw_cake_axes_and_all_retained_overlay_rows(
             shell.scientific.frame_selector.itemText(index)
             for index in range(shell.scientific.frame_selector.count())
         ] == ["1", "2", "3", "4", "5"]
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_slice_projection_draws_exact_cake_extent_boundaries(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    state = replace(
+        state,
+        scientific=replace(
+            state.scientific,
+            slice_enabled=True,
+            slice_center=12.0,
+            slice_width=3.0,
+        ),
+    )
+    try:
+        shell.apply_state(state)
+        qapp.processEvents()
+
+        lines = shell.scientific._slice_extent_lines
+        assert len(lines) == 2
+        assert tuple(line.value() for line in lines) == pytest.approx(
+            (9.0, 15.0)
+        )
+        assert tuple(float(line.angle) for line in lines) == (0.0, 0.0)
+
+        shell.apply_state(
+            replace(
+                state,
+                revision=state.revision + 1,
+                scientific=replace(
+                    state.scientific,
+                    slice_enabled=False,
+                ),
+            )
+        )
+        assert shell.scientific._slice_extent_lines == ()
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize(
+    ("measurement_mode", "plot_axis", "cake_x", "cake_y", "angle"),
+    (
+        (
+            "Standard",
+            "chi",
+            AxisProjection(np.linspace(0.0, 4.0, 32), "Q", "Å⁻¹"),
+            AxisProjection(np.linspace(-90.0, 90.0, 24), "χ", "°"),
+            90.0,
+        ),
+        (
+            "GI",
+            "q_ip",
+            AxisProjection(np.linspace(-2.0, 2.0, 32), "Qip", "Å⁻¹"),
+            AxisProjection(np.linspace(0.0, 4.0, 24), "Qoop", "Å⁻¹"),
+            0.0,
+        ),
+    ),
+)
+def test_slice_extent_orientation_matches_standard_and_gi_projection(
+    qapp: QtWidgets.QApplication,
+    measurement_mode: str,
+    plot_axis: str,
+    cake_x: AxisProjection,
+    cake_y: AxisProjection,
+    angle: float,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    assert state.scientific.heavy is not None
+    scientific = replace(
+        state.scientific,
+        measurement_mode=measurement_mode,
+        plot_axis=plot_axis,
+        slice_enabled=True,
+        slice_center=1.0,
+        slice_width=0.25,
+        heavy=replace(
+            state.scientific.heavy,
+            cake_x=cake_x,
+            cake_y=cake_y,
+        ),
+    )
+    try:
+        shell.apply_state(replace(state, scientific=scientific))
+
+        lines = shell.scientific._slice_extent_lines
+        assert len(lines) == 2
+        assert tuple(line.value() for line in lines) == pytest.approx(
+            (0.75, 1.25)
+        )
+        assert tuple(float(line.angle) for line in lines) == (angle, angle)
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_slice_projection_change_refits_and_rearms_one_d_autoscale(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    state = replace(
+        state,
+        scientific=replace(
+            state.scientific,
+            slice_enabled=True,
+            slice_center=0.0,
+            slice_width=2.0,
+        ),
+    )
+    try:
+        shell.apply_state(state)
+        qapp.processEvents()
+        view = shell.scientific.curve.getPlotItem().getViewBox()
+        view.setYRange(5000.0, 6000.0, padding=0.0)
+        assert view.autoRangeEnabled()[1] is False
+
+        shell.apply_state(
+            replace(
+                state,
+                revision=state.revision + 1,
+                scientific=replace(
+                    state.scientific,
+                    slice_center=10.0,
+                ),
+            )
+        )
+        qapp.processEvents()
+
+        y_range = view.viewRange()[1]
+        assert view.autoRangeEnabled()[1] is not False
+        assert y_range[0] < 10.0 and y_range[1] < 100.0
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_retained_hydration_keeps_coherent_slice_marker_and_range(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Overlay",
+    )
+    scientific = replace(
+        state.scientific,
+        slice_enabled=True,
+        slice_center=0.0,
+        slice_width=2.0,
+    )
+    try:
+        shell.apply_state(replace(state, scientific=scientific))
+        view = shell.scientific.curve.getPlotItem().getViewBox()
+        view.setYRange(5000.0, 6000.0, padding=0.0)
+        prior_lines = shell.scientific._slice_extent_lines
+        prior_values = tuple(line.value() for line in prior_lines)
+        prior_contract = shell.scientific._rendered_slice_contract
+
+        shell.apply_state(replace(
+            state,
+            revision=state.revision + 1,
+            scientific=replace(
+                scientific,
+                heavy=None,
+                traces=(),
+                slice_center=20.0,
+                retain_display=True,
+            ),
+        ))
+
+        assert shell.scientific._slice_extent_lines == prior_lines
+        assert tuple(line.value() for line in prior_lines) == prior_values
+        assert shell.scientific._rendered_slice_contract == prior_contract
+        assert view.viewRange()[1] == pytest.approx((5000.0, 6000.0))
+        assert not shell.scientific.pin.isEnabled()
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_slice_autorange_preserves_effective_shared_x_range(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    scientific = replace(
+        state.scientific,
+        image_axis="Q-Chi",
+        plot_axis="Q",
+        share_axis=True,
+        slice_enabled=True,
+        slice_center=0.0,
+        slice_width=2.0,
+    )
+    try:
+        shell.apply_state(replace(state, scientific=scientific))
+        qapp.processEvents()
+        assert shell.scientific._share_link_on
+        view = shell.scientific.curve.getPlotItem().getViewBox()
+        view.setXRange(0.75, 1.25, padding=0.0)
+        qapp.processEvents()
+        before = tuple(view.viewRange()[0])
+
+        shell.apply_state(replace(
+            state,
+            revision=state.revision + 1,
+            scientific=replace(scientific, slice_center=10.0),
+        ))
+        qapp.processEvents()
+
+        assert tuple(view.viewRange()[0]) == pytest.approx(before)
+        assert view.autoRangeEnabled()[0] is False
+        assert view.autoRangeEnabled()[1] is not False
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_overlay_pin_retains_old_slice_and_absorbs_matching_live_cut(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Overlay",
+    )
+    frame = state.navigation.current
+    assert frame is not None
+    q = np.linspace(0.1, 1.0, 4)
+    chi = np.array([-10.0, -5.0, 0.0, 5.0, 10.0])
+    cake = np.repeat(np.arange(1.0, 6.0)[:, None], q.size, axis=1)
+    payload = StandardDisplayPayload(
+        0,
+        frame,
+        "slice pin",
+        FrameView(
+            frame.local_frame_label,
+            axis_1d=Axis("Q", "q_A^-1", values=q),
+            intensity_1d=np.full(q.shape, 99.0),
+            axis_2d_x=Axis("Q", "q_A^-1", values=q),
+            axis_2d_y=Axis("chi", "chi_deg", values=chi),
+            intensity_2d=cake,
+            two_d_kind=TwoDKind.Q_CHI,
+        ),
+    )
+    old_pin = SlicePin(frame, "Q", -5.0, 0.1)
+    old_preferences = ScientificPreferences(
+        plot_mode="Overlay",
+        plot_axis="Q",
+        slice_enabled=True,
+        slice_center=-5.0,
+        slice_width=0.1,
+        slice_pins=(old_pin,),
+    )
+    old_projection = build_scientific_projection(
+        (payload,),
+        state.navigation,
+        frozenset({frame}),
+        old_preferences,
+        "",
+    )
+    assert old_projection.traces == ()
+    assert len(old_projection.pinned_traces) == 1
+    np.testing.assert_array_equal(
+        old_projection.pinned_traces[0].trace.intensity,
+        np.full(q.shape, 2.0),
+    )
+
+    moved_preferences = replace(
+        old_preferences,
+        slice_center=5.0,
+    )
+    moved_projection = build_scientific_projection(
+        (payload,),
+        state.navigation,
+        frozenset({frame}),
+        moved_preferences,
+        "",
+    )
+    assert len(moved_projection.traces) == 1
+    assert len(moved_projection.pinned_traces) == 1
+    np.testing.assert_array_equal(
+        moved_projection.traces[0].intensity,
+        np.full(q.shape, 4.0),
+    )
+
+    new_pin = SlicePin(frame, "Q", 5.0, 0.1)
+    absorbed_projection = build_scientific_projection(
+        (payload,),
+        state.navigation,
+        frozenset({frame}),
+        replace(moved_preferences, slice_pins=(old_pin, new_pin)),
+        "",
+    )
+    assert absorbed_projection.traces == ()
+    assert tuple(
+        pinned.pin.projection_id
+        for pinned in absorbed_projection.pinned_traces
+    ) == (old_pin.projection_id, new_pin.projection_id)
+
+    try:
+        shell.apply_state(replace(state, scientific=old_projection))
+        assert len(shell.scientific.curve.listDataItems()) == 1
+        shell.apply_state(replace(
+            state,
+            revision=state.revision + 1,
+            scientific=moved_projection,
+        ))
+        assert len(shell.scientific.curve.listDataItems()) == 2
+        shell.apply_state(replace(
+            state,
+            revision=state.revision + 2,
+            scientific=absorbed_projection,
+        ))
+        assert len(shell.scientific.curve.listDataItems()) == 2
+        assert len(set(shell.scientific._rendered_trace_keys)) == 2
+        assert shell.scientific.trace_history_keys == (frame,)
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_retained_pin_keeps_live_suffix_projection_incremental(
+    qapp: QtWidgets.QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    full = make_shell_projection(
+        frame_count=3,
+        heavy_indices=(0,),
+        plot_mode="Overlay",
+    )
+    frames = full.navigation.frames
+    base = full.scientific.traces[0].intensity
+    pinned_trace = replace(full.scientific.traces[0], intensity=base)
+    second_trace = replace(full.scientific.traces[1], intensity=base)
+    third_trace = replace(full.scientific.traces[2], intensity=base)
+    pin = SlicePin(frames[0], "Q", 0.0, 1.0)
+    initial = replace(
+        full,
+        navigation=FrameNavigationProjection(
+            frames[:2],
+            frames[1],
+            frames[:2],
+        ),
+        scientific=replace(
+            full.scientific,
+            traces=(second_trace,),
+            slice_enabled=True,
+            slice_center=0.0,
+            slice_width=1.0,
+            slice_pins=(pin,),
+            pinned_traces=(PinnedTraceProjection(pin, pinned_trace),),
+        ),
+    )
+    try:
+        shell.apply_state(initial)
+        assert len(shell.scientific.curve.listDataItems()) == 2
+
+        calls = {"clear": 0, "plot": 0}
+        original_clear = shell.scientific.curve.clear
+        original_plot = shell.scientific.curve.plot
+
+        def counted_clear(*args, **kwargs):
+            calls["clear"] += 1
+            return original_clear(*args, **kwargs)
+
+        def counted_plot(*args, **kwargs):
+            calls["plot"] += 1
+            return original_plot(*args, **kwargs)
+
+        monkeypatch.setattr(shell.scientific.curve, "clear", counted_clear)
+        monkeypatch.setattr(shell.scientific.curve, "plot", counted_plot)
+        shell.apply_state(replace(
+            full,
+            revision=full.revision + 1,
+            scientific=replace(
+                initial.scientific,
+                traces=(third_trace,),
+                pinned_traces=(),
+            ),
+        ))
+
+        assert calls == {"clear": 0, "plot": 1}
+        assert len(shell.scientific.curve.listDataItems()) == 3
+        assert shell.scientific.trace_history_keys == frames
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize("plot_mode", ("Overlay", "Waterfall"))
+def test_slice_pin_preserves_bounded_waterfall_rendering(
+    qapp: QtWidgets.QApplication,
+    plot_mode: str,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=17,
+        heavy_indices=(0,),
+        plot_mode=plot_mode,
+    )
+    frame = state.navigation.frames[0]
+    pin = SlicePin(frame, "Q", 0.0, 1.0)
+    scientific = replace(
+        state.scientific,
+        traces=state.scientific.traces[1:],
+        slice_enabled=True,
+        slice_pins=(pin,),
+        pinned_traces=(
+            PinnedTraceProjection(pin, state.scientific.traces[0]),
+        ),
+    )
+    try:
+        shell.apply_state(replace(state, scientific=scientific))
+
+        assert shell.scientific.bottom_stack.currentWidget() \
+            is shell.scientific.waterfall
+        assert shell.scientific.waterfall.image.image.shape == (64, 17)
+        assert len(shell.scientific._rendered_trace_keys) == 17
     finally:
         shell.close()
         shell.deleteLater()
