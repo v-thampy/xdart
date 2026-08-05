@@ -389,6 +389,8 @@ def reduce_control_edit(
     snapshot: RunIntentSnapshot,
     path: tuple[str, ...],
     value: object,
+    *,
+    reset_auto_gi_motor: bool = False,
 ) -> EditResult:
     """Validate one presentation edit before changing an independent candidate."""
 
@@ -397,7 +399,12 @@ def reduce_control_edit(
     if path in INT_PATHS:
         return _reduce_integration_edit(snapshot, path, value)
     if path in SOURCE_EDIT_PATHS:
-        return _reduce_source_edit(snapshot, path, value)
+        return _reduce_source_edit(
+            snapshot,
+            path,
+            value,
+            reset_auto_gi_motor=reset_auto_gi_motor,
+        )
     intent = snapshot.thaw()
     parsed = _control_value(intent, path, value)
     if isinstance(parsed, EditRefusal):
@@ -769,6 +776,8 @@ def _reduce_source_edit(
     snapshot: RunIntentSnapshot,
     path: tuple[str, ...],
     value: object,
+    *,
+    reset_auto_gi_motor: bool = False,
 ) -> EditResult:
     candidate = snapshot.thaw()
     source = candidate.source_spec
@@ -787,7 +796,10 @@ def _reduce_source_edit(
                 generation=source.generation + 1,
                 metadata_format=metadata_format,
             )
-            return candidate
+            return _finish_source_edit(
+                candidate,
+                reset_auto_gi_motor=reset_auto_gi_motor,
+            )
         if type(source) is SourceSpec:
             options = dict(source.options)
             current = options.get("metadata_format", "auto")
@@ -801,7 +813,10 @@ def _reduce_source_edit(
                 entry=source.entry,
                 options=options,
             )
-            return candidate
+            return _finish_source_edit(
+                candidate,
+                reset_auto_gi_motor=reset_auto_gi_motor,
+            )
         return EditRefusal("Choose an image source before editing Meta Type.")
     if type(source) is not DirectorySourceSpec:
         return EditRefusal(
@@ -848,6 +863,28 @@ def _reduce_source_edit(
         generation=source.generation + 1,
         metadata_format=source.metadata_format,
     )
+    return _finish_source_edit(
+        candidate,
+        reset_auto_gi_motor=reset_auto_gi_motor,
+    )
+
+
+def _finish_source_edit(
+    candidate: RunIntent,
+    *,
+    reset_auto_gi_motor: bool,
+) -> RunIntent:
+    """Keep a page-owned automatic motor pick scoped to its source.
+
+    The page supplies ``reset_auto_gi_motor`` only when its provenance marker
+    proves that the current motor was selected automatically for the source
+    being replaced.  Explicit user selections therefore remain sticky, while
+    an automatic pick is reset in the SAME source-edit candidate and cannot
+    leak into a new source revision.
+    """
+
+    if reset_auto_gi_motor:
+        candidate.gi.incidence_motor = "Manual"
     return candidate
 
 
@@ -865,6 +902,8 @@ def _metadata_format_value(value: object) -> str | None | EditRefusal:
 def reduce_source_selection(
     snapshot: RunIntentSnapshot,
     source: SourceSelection,
+    *,
+    reset_auto_gi_motor: bool = False,
 ) -> EditResult:
     """Replace the complete selected source in one candidate value."""
 
@@ -874,7 +913,10 @@ def reduce_source_selection(
     if candidate.source_spec == source:
         return EditNoChange()
     candidate.source_spec = source
-    return candidate
+    return _finish_source_edit(
+        candidate,
+        reset_auto_gi_motor=reset_auto_gi_motor,
+    )
 
 
 def _control_value(

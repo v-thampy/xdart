@@ -13,8 +13,6 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.gi_motor import pick_default_gi_motor
-
-_NO_DELIBERATE_MANUAL = object()
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
     IntentRecaptureRequired,
@@ -25,7 +23,6 @@ from xrd_tools.sources.selection import (
     DirectorySourceSpec,
     is_single_image_spec,
 )
-
 from .advanced_editor import AdvancedSettingsDialog
 from .adapters.browse_loader import BrowseLoader
 from .browser_catalog import (
@@ -47,6 +44,7 @@ from .contracts import (
 )
 from .context_controller import ContextController
 from .context_projection import ContextProjection
+from .controls_inventory import SOURCE_EDIT_PATHS
 from .controls_projection import (
     AdvancedSettingsValues,
     EditNoChange,
@@ -118,6 +116,8 @@ from .state_machine import RunPhase
 from .workspace_shell import ScatteringWorkspaceShell
 
 
+_NO_DELIBERATE_MANUAL = object()
+_NO_AUTOMATIC_GI_MOTOR = object()
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 
@@ -211,6 +211,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         # Manual": a source_spec can itself be None, and the default state
         # must never compare equal to it.
         self._gi_manual_source = _NO_DELIBERATE_MANUAL
+        # An automatic metadata pick is source-scoped.  Keep its provenance
+        # outside RunIntent so a later source edit can reset only OUR pick,
+        # without erasing an explicit real-motor selection by the user.
+        self._gi_auto_motor: object = _NO_AUTOMATIC_GI_MOTOR
         self._observation_token = 0
         self._browser_catalog_pool: ThreadPoolExecutor | None = (
             ThreadPoolExecutor(max_workers=1)
@@ -346,7 +350,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if self._closing or self._closed:
             return
         snapshot = self._intents.snapshot()
-        reduced = reduce_source_selection(snapshot, source)
+        reduced = reduce_source_selection(
+            snapshot,
+            source,
+            reset_auto_gi_motor=self._auto_gi_motor_matches(snapshot),
+        )
         if isinstance(reduced, EditRefusal):
             self._notice(reduced.reason)
             self._refresh_shell()
@@ -696,7 +704,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if edit is None:
             return True
         snapshot = self._intents.snapshot()
-        reduced = reduce_control_edit(snapshot, edit.path, edit.value)
+        reduced = reduce_control_edit(
+            snapshot,
+            edit.path,
+            edit.value,
+            reset_auto_gi_motor=(
+                edit.path in SOURCE_EDIT_PATHS
+                and self._auto_gi_motor_matches(snapshot)
+            ),
+        )
         if isinstance(reduced, EditRefusal):
             self._notice(reduced.reason)
             self._refresh_shell()
@@ -980,6 +996,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._admission_state = state
             if not self._closing and not self._closed:
                 self._ensure_timer()
+        self._retry_deferred_gi_motor_default()
         return released
 
     def _stop_run(self) -> None:
@@ -991,6 +1008,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refuse_preparing(token)
             if released.cleanup_status is not CleanupStatus.CLEANED:
                 self._notice("Output cleanup remains pending.")
+            self._retry_deferred_gi_motor_default()
             self._refresh_shell()
             return
         try:
@@ -1162,6 +1180,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         self._batch_latest_frame
                     )
                 self._accept_terminal_event(event)
+                self._retry_deferred_gi_motor_default()
                 # The writer publishes its atomic final path before emitting
                 # the terminal event.  Re-enumerate here so a non-batch run
                 # whose FRAME_READY preceded that rename becomes visible.
@@ -1617,6 +1636,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(outcome.detail or outcome.reason.value)
         else:
             self._notice("Standard run was not started.")
+        self._retry_deferred_gi_motor_default()
         self._refresh_shell()
 
     def closeEvent(self, event: QtCore.QEvent) -> None:
@@ -1727,6 +1747,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         choices = getattr(observation, "gi_motor_choices", None)
         if not choices:
             return
+        # Observation delivery and Run click are serialized on the GUI
+        # thread.  Once start owns PREPARING/admission, an automatic CAS would
+        # invalidate the exact captured revision and refuse the user's click.
+        # Keep the captured displayed value for this run; the retained
+        # observation is reconsidered after a clean terminal transition.
+        if (
+            self._admission is not None
+            or self._lifecycle.phase is not RunPhase.IDLE
+        ):
+            return
         intent = self._intents.snapshot().thaw()
         if intent.gi.incidence_motor != "Manual":
             return
@@ -1736,10 +1766,29 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         preferred = pick_default_gi_motor(choices)
         if preferred == "Manual":
             return
-        self._on_field_value(GI_MOTOR, preferred)
+        self._on_field_value(GI_MOTOR, preferred, automatic=True)
+
+    def _retry_deferred_gi_motor_default(self) -> None:
+        observation = self._source_observation
+        if observation is not None:
+            self._maybe_default_gi_motor(observation)
+
+    def _auto_gi_motor_matches(
+        self,
+        snapshot: RunIntentSnapshot,
+    ) -> bool:
+        marker = self._gi_auto_motor
+        if marker is _NO_AUTOMATIC_GI_MOTOR:
+            return False
+        intent = snapshot.thaw()
+        return marker == (intent.source_spec, intent.gi.incidence_motor)
 
     def _on_field_value(
-        self, path: object, value: object
+        self,
+        path: object,
+        value: object,
+        *,
+        automatic: bool = False,
     ) -> None:
         if self._closing or self._closed:
             return
@@ -1756,14 +1805,33 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         snapshot = self._intents.snapshot()
         reduced = reduce_control_edit(
-            snapshot, path, value  # type: ignore[arg-type]
+            snapshot,
+            path,
+            value,  # type: ignore[arg-type]
+            reset_auto_gi_motor=(
+                type(path) is tuple
+                and path in SOURCE_EDIT_PATHS
+                and self._auto_gi_motor_matches(snapshot)
+            ),
         )
         if isinstance(reduced, EditRefusal):
-            self._notice(reduced.reason)
+            if not automatic:
+                self._notice(reduced.reason)
             self._refresh_shell()
             return
         if isinstance(reduced, EditNoChange):
-            self._notice("")
+            if path == GI_MOTOR and not automatic:
+                # A same-value activation is still an operator claim over an
+                # earlier automatic pick.  No intent revision is needed, but
+                # provenance must stop treating that value as disposable on
+                # the next source change.
+                self._gi_manual_source = (
+                    snapshot.thaw().source_spec
+                    if value == "Manual" else _NO_DELIBERATE_MANUAL
+                )
+                self._gi_auto_motor = _NO_AUTOMATIC_GI_MOTOR
+            if not automatic:
+                self._notice("")
             self._refresh_shell()
             return
         result = self._intents.commit(
@@ -1777,10 +1845,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     snapshot.thaw().source_spec
                     if value == "Manual" else _NO_DELIBERATE_MANUAL
                 )
-            self._notice("")
+                self._gi_auto_motor = (
+                    (snapshot.thaw().source_spec, value)
+                    if automatic
+                    else _NO_AUTOMATIC_GI_MOTOR
+                )
+            if not automatic:
+                self._notice("")
             self._reconcile_snapshot(snapshot, result.snapshot)
         elif type(result) is IntentRecaptureRequired:
-            self._notice("Edit superseded; review current value.")
+            if not automatic:
+                self._notice("Edit superseded; review current value.")
             self._reconcile_snapshot(snapshot, result.snapshot)
 
     def _request_observation(
@@ -1947,9 +2022,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_browser_catalog()
         self._refresh_shell()
         if prior_source != current_source:
+            self._gi_auto_motor = _NO_AUTOMATIC_GI_MOTOR
             self._source_observation = None
             self._cancel_observation()
             self._request_observation(current)
+        self._retry_deferred_gi_motor_default()
 
     def _choose_directory_dialog(self, current: str) -> str | None:
         chosen = QtWidgets.QFileDialog.getExistingDirectory(
@@ -2050,6 +2127,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._source_history[source_mode(current)] = current
         candidate = snapshot.thaw()
         candidate.source_spec = self._source_history.get(desired_mode)
+        if self._auto_gi_motor_matches(snapshot):
+            candidate.gi.incidence_motor = "Manual"
         result = self._intents.commit(
             candidate,
             expected_revision=snapshot.revision,

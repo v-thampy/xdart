@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pyqtgraph.Qt import QtWidgets
@@ -16,6 +17,7 @@ from xdart.gui.tabs.scattering.contracts import (
 from xdart.gui.tabs.scattering.controls_inventory import (
     INT_1D_POINTS,
     INT_2D_RADIAL_POINTS,
+    SOURCE_DIRECTORY,
 )
 from xdart.gui.tabs.scattering.controls_inventory import integration_values
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
@@ -30,7 +32,10 @@ from xrd_tools.session.intent_store import (
     RunIntentStore,
 )
 from xrd_tools.session.run_configuration import RunIntent
-from xrd_tools.sources.selection import image_series_spec
+from xrd_tools.sources.selection import (
+    DirectorySourceSpec,
+    image_series_spec,
+)
 
 
 @pytest.fixture
@@ -259,6 +264,47 @@ def test_focused_edit_cas_recapture_visibly_refuses_without_capture(
         )
         assert "superseded" in page._shell.scientific.status.text()
         assert "Run not started" in page._shell.scientific.status.text()
+    finally:
+        _close(page)
+
+
+def test_run_cas_resets_an_automatic_motor_with_the_focused_source_edit(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, store = _page(tmp_path)
+    captures = []
+    try:
+        source = DirectorySourceSpec(
+            tmp_path / "raw",
+            suffixes=(".nxs",),
+        )
+        page.select_source(source)
+        page._maybe_default_gi_motor(
+            SimpleNamespace(gi_motor_choices=("exposure", "halpha"))
+        )
+        assert store.snapshot().thaw().gi.incidence_motor == "halpha"
+
+        row = _row(page, SOURCE_DIRECTORY)
+        _focus(page, row.editor, qapp)
+        replacement = str(tmp_path / "replacement")
+        row.editor.setText(replacement)
+        # QLineEdit.setText is deliberately not user intent.  Emit the native
+        # user-edit signal so the basename-only path row marks this focused
+        # value dirty and action-time capture sees the full typed path.
+        row.editor.textEdited.emit(replacement)
+        qapp.processEvents()
+        store.commit_calls = 0
+        monkeypatch.setattr(page, "_begin_admission", captures.append)
+
+        _run(page)
+
+        assert store.commit_calls == 1
+        assert len(captures) == 1
+        captured = captures[0].intent_snapshot.thaw()
+        assert captured.source_spec.root == tmp_path / "replacement"
+        assert captured.gi.incidence_motor == "Manual"
     finally:
         _close(page)
 

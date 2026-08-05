@@ -12,6 +12,7 @@ from xdart.gui.tabs.scattering.controls_projection import (
     GI_ORIENTATION,
     GI_THETA,
     GI_TILT,
+    SOURCE_DIRECTORY,
     project_controls,
     reduce_control_edit,
 )
@@ -758,7 +759,7 @@ def test_production_projection_mounts_full_processing_subsections() -> None:
 # LV-UI-5b — metadata-preferred incidence motor (F3 sticky Manual)
 # ---------------------------------------------------------------------------
 
-def _motor_page():
+def _motor_page(intent: RunIntent | None = None):
     from pyqtgraph.Qt import QtWidgets
     from xrd_tools.session.intent_store import RunIntentStore
     from xdart.gui.tabs.scattering.adapters.run_executor import (
@@ -772,7 +773,9 @@ def _motor_page():
 
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     return ScatteringWorkspace(
-        intents=RunIntentStore(RunIntent(output_mode="Overwrite")),
+        intents=RunIntentStore(
+            intent or RunIntent(output_mode="Overwrite")
+        ),
         lifecycle=ScatteringCoordinator(),
         sources=FilesystemSourceAdapter(),
         executor=StandardRunExecutor(),
@@ -797,6 +800,20 @@ def test_metadata_motor_default_pick_adopts_the_preferred_motor():
         page.deleteLater()
 
 
+def test_metadata_motor_default_preserves_the_operator_notice():
+    page = _motor_page()
+    try:
+        page._notice("Standard run stopped.")
+
+        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+
+        assert page._intents.snapshot().thaw().gi.incidence_motor == "th"
+        assert page._notice_text == "Standard run stopped."
+    finally:
+        page.close_workspace()
+        page.deleteLater()
+
+
 def test_metadata_motor_default_pick_respects_a_deliberate_manual():
     from xdart.gui.tabs.scattering.controls_inventory import GI_MOTOR
 
@@ -810,6 +827,108 @@ def test_metadata_motor_default_pick_respects_a_deliberate_manual():
         # ...and a re-observation must NOT flip it back (F3 sticky rule).
         page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
         assert page._intents.snapshot().thaw().gi.incidence_motor == "Manual"
+    finally:
+        page.close_workspace()
+        page.deleteLater()
+
+
+def test_metadata_motor_default_never_invalidates_an_owned_start_capture():
+    page = _motor_page()
+    try:
+        started = page._lifecycle.begin_start()
+        assert started.phase is RunPhase.PREPARING
+        before = page._intents.snapshot()
+
+        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+
+        after = page._intents.snapshot()
+        assert after.revision == before.revision
+        assert after.thaw().gi.incidence_motor == "Manual"
+    finally:
+        page.close_workspace()
+        page.deleteLater()
+
+
+def test_deferred_metadata_motor_default_retries_after_preflight_refusal():
+    from xdart.gui.tabs.scattering.contracts import (
+        SourceObservation,
+        SourceObservationStatus,
+    )
+    from xdart.gui.tabs.scattering.events import PreflightRefused
+    from xdart.gui.tabs.scattering.start_outcomes import (
+        StartRefusal,
+        StartRefused,
+    )
+
+    page = _motor_page(_intent())
+    try:
+        source = page._intents.snapshot().thaw().source_spec
+        observation = SourceObservation(
+            1,
+            0,
+            source,
+            SourceObservationStatus.AVAILABLE,
+            "eiger",
+            True,
+            True,
+            direct_child_count=1,
+            gi_motor_choices=("exposure", "chi", "th"),
+        )
+        page._source_observation = observation
+        started = page._lifecycle.begin_start()
+        assert started.phase is RunPhase.PREPARING
+        page._maybe_default_gi_motor(observation)
+        assert page._intents.snapshot().thaw().gi.incidence_motor == "Manual"
+
+        refused = page._lifecycle.preflight_refused(
+            PreflightRefused(started.request_id)
+        )
+        page._render_start_outcome(StartRefused(
+            started.request_id,
+            StartRefusal.OUTPUT_PREFLIGHT,
+            refused,
+            detail="Output admission refused.",
+        ))
+
+        assert page._lifecycle.phase is RunPhase.IDLE
+        assert page._intents.snapshot().thaw().gi.incidence_motor == "th"
+        assert page._notice_text == "Output admission refused."
+    finally:
+        page.close_workspace()
+        page.deleteLater()
+
+
+def test_explicit_real_motor_survives_source_replacement():
+    from xdart.gui.tabs.scattering.controls_inventory import GI_MOTOR
+
+    page = _motor_page()
+    try:
+        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+        # A same-value user activation claims the automatic value without an
+        # unnecessary intent revision.
+        page._on_field_value(GI_MOTOR, "th")
+        replacement = DirectorySourceSpec(Path("/raw/replacement"))
+
+        page.select_source(replacement)
+
+        intent = page._intents.snapshot().thaw()
+        assert intent.source_spec == replacement
+        assert intent.gi.incidence_motor == "th"
+    finally:
+        page.close_workspace()
+        page.deleteLater()
+
+
+def test_automatic_motor_resets_in_the_same_directory_source_edit():
+    page = _motor_page(_intent())
+    try:
+        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+
+        page._on_field_value(SOURCE_DIRECTORY, "/raw/replacement")
+
+        intent = page._intents.snapshot().thaw()
+        assert intent.source_spec.root == Path("/raw/replacement")
+        assert intent.gi.incidence_motor == "Manual"
     finally:
         page.close_workspace()
         page.deleteLater()

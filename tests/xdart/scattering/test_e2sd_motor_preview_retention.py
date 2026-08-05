@@ -162,6 +162,7 @@ def test_source_change_synchronously_drops_prior_motor_knowledge(
         page.select_source(second)
         assert _choices(page) == ("Manual",)
         assert _visible_choices(page) == ("Manual",)
+        assert page._intents.snapshot().thaw().gi.incidence_motor == "Manual"
     finally:
         page.close_workspace()
 
