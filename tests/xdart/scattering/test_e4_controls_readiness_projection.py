@@ -167,11 +167,17 @@ def test_explicit_single_image_is_not_reclassified_from_member_count(
     )
 
 
-def test_explicit_container_reports_its_one_bounded_probe_frame_count(
+@pytest.mark.parametrize(
+    ("suffix", "kind"),
+    ((".h5", SourceKind.EIGER_MASTER), (".nxs", SourceKind.NEXUS_STACK)),
+)
+def test_container_directory_counts_files_while_explicit_series_counts_frames(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    kind: SourceKind,
 ) -> None:
-    path = tmp_path / "scan_master.h5"
+    path = tmp_path / f"scan_master{suffix}"
     path.write_bytes(b"container")
 
     class _Owner:
@@ -186,23 +192,44 @@ def test_explicit_container_reports_its_one_bounded_probe_frame_count(
     monkeypatch.setattr(
         source_adapter_module, "candidate_owner", lambda candidate: _Owner()
     )
-    source = SourceSpec(str(path), SourceKind.EIGER_MASTER)
-    observed = FilesystemSourceAdapter().observe(
-        SourceObservationRequest(1, 0, source)
+    adapter = FilesystemSourceAdapter()
+    directory = DirectorySourceSpec(
+        tmp_path,
+        recursive=False,
+        suffixes=(suffix,),
+    )
+    source = SourceSpec(str(path), kind)
+    directory_observed = adapter.observe(
+        SourceObservationRequest(1, 0, directory)
+    )
+    series_observed = adapter.observe(
+        SourceObservationRequest(2, 0, source)
     )
 
-    assert observed.direct_child_count == 651
-    assert source_header_projection(observed).text == (
+    assert directory_observed.direct_child_count == 1
+    assert source_header_projection(directory_observed).text == (
+        "1 file · Image Directory"
+    )
+    assert series_observed.direct_child_count == 651
+    assert source_header_projection(series_observed).text == (
         "651 frames · Image Series"
     )
 
 
-def test_container_directory_counts_files_without_probing_contents(
+@pytest.mark.parametrize("suffix", (".h5", ".nxs"))
+def test_recursive_container_count_includes_only_immediate_subfolders_without_probing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
 ) -> None:
-    (tmp_path / "first.h5").write_bytes(b"one")
-    (tmp_path / "second.h5").write_bytes(b"two")
+    (tmp_path / f"direct{suffix}").write_bytes(b"one")
+    immediate = tmp_path / "immediate"
+    deeper = immediate / "deeper"
+    immediate.mkdir()
+    deeper.mkdir()
+    (immediate / f"nested{suffix.upper()}").write_bytes(b"two")
+    (deeper / f"too_deep{suffix}").write_bytes(b"three")
+    (immediate / "ignore.txt").write_bytes(b"sidecar")
     monkeypatch.setattr(
         source_adapter_module,
         "candidate_owner",
@@ -211,15 +238,29 @@ def test_container_directory_counts_files_without_probing_contents(
     source = DirectorySourceSpec(
         tmp_path,
         recursive=True,
-        suffixes=(".h5",),
+        suffixes=(suffix,),
     )
     observed = FilesystemSourceAdapter().observe(
         SourceObservationRequest(1, 0, source)
     )
+    direct = FilesystemSourceAdapter().observe(
+        SourceObservationRequest(
+            2,
+            0,
+            DirectorySourceSpec(tmp_path, recursive=False, suffixes=(suffix,)),
+        )
+    )
 
-    assert observed.direct_child_count == 2
+    assert observed.direct_child_count == 1
+    assert observed.one_level_file_count == 2
+    assert observed.observed_file_count == 2
+    assert (
+        observed.file_count_scope
+        is SourceCountScope.SELECTED_PLUS_IMMEDIATE
+    )
+    assert observed.candidate_fingerprint == direct.candidate_fingerprint
     assert source_header_projection(observed).text == (
-        "2 files · Image Directory"
+        "2 files (folder + 1 level) · Image Directory"
     )
 
 

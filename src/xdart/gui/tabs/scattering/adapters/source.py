@@ -631,7 +631,7 @@ class FilesystemSourceAdapter:
             )
         one_level_file_count = None
         fingerprint_facts = tuple(facts)
-        if source.recursive and self._is_tiff_directory(source):
+        if source.recursive:
             try:
                 shallow_facts = list(facts)
                 for child in children:
@@ -654,7 +654,14 @@ class FilesystemSourceAdapter:
                                 SourceFileState.capture(member)
                             )
                 one_level_file_count = len(shallow_facts)
-                fingerprint_facts = tuple(shallow_facts)
+                # Recursive TIFF motor preview owns the same bounded shallow
+                # universe, so its generation fingerprint must cover it too.
+                # Container motor preview retains the established direct-only
+                # fallback when a recursive tree exceeds its content-probe
+                # cap; widening that fingerprint would make the fallback
+                # reject an otherwise unchanged direct catalog.
+                if self._is_tiff_directory(source):
+                    fingerprint_facts = tuple(shallow_facts)
             except (OSError, ValueError):
                 # The direct observation and its fingerprint remain truthful.
                 # An incomplete shallow walk is never displayed as a count.

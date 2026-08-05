@@ -668,9 +668,11 @@ class SourceObservation:
         """Return the bounded count intended for passive display only.
 
         Direct observations qualify the direct-child fingerprint.  Recursive
-        TIFF observations qualify a fingerprint covering the selected
-        directory plus exactly one immediate subdirectory level, matching
-        their displayed count, without opening image or sidecar content.
+        directory observations may display a bounded selected-folder plus
+        one-level count without opening file content.  Recursive TIFF also
+        widens its fingerprint to that shallow universe because its bounded
+        motor preview consumes the same members; container preview retains
+        its established direct-only fingerprint fallback.
         """
 
         return (
