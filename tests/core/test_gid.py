@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
+import pickle
 
 import numpy as np
 import pytest
 
-from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.containers import (
+    IntegrationResult1D,
+    IntegrationResult2D,
+    PONI,
+)
 from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     freeze_common_axes_2d,
@@ -73,6 +79,116 @@ def test_create_fiber_integrator_radians(poni_fixture):
 
     assert hasattr(fi, "_gi_incident_angle")
     np.testing.assert_allclose(fi._gi_incident_angle, 0.005, rtol=1e-10, atol=1e-12)
+
+
+def test_project_fiber_resets_engines_without_eager_global_gc(
+    poni_fixture,
+    monkeypatch,
+):
+    """Geometry changes stay exact but never serialize workers through GC."""
+
+    from pyFAI.integrator import common as pyfai_common
+
+    collections = []
+    monkeypatch.setattr(
+        pyfai_common.gc,
+        "collect",
+        lambda: collections.append("collected"),
+    )
+
+    fi = create_fiber_integrator(poni_fixture, incident_angle=0.15)
+    assert collections == []
+
+    class SentinelEngine:
+        reset_count = 0
+
+        def reset(self):
+            self.reset_count += 1
+
+    engine = SentinelEngine()
+    fi.engines["sentinel"] = engine
+    fi.reset_integrator(np.deg2rad(0.25), 0.0, 1)
+
+    assert engine.reset_count == 1
+    assert fi.engines == {}
+    assert fi.incident_angle == pytest.approx(np.deg2rad(0.25))
+    assert collections == []
+
+    # The production worker provider deep-copies the owner integrator.  The
+    # project reset policy and its bounded empty engine cache must survive.
+    worker = copy.deepcopy(fi)
+    worker_engine = SentinelEngine()
+    worker.engines["worker-sentinel"] = worker_engine
+    worker.reset_integrator(np.deg2rad(0.30), 0.0, 1)
+    assert worker_engine.reset_count == 1
+    assert worker.engines == {}
+    assert collections == []
+
+    # create_fiber_integrator is public and its historical pyFAI result was
+    # pickleable.  The lazy project policy must retain that compatibility.
+    restored = pickle.loads(pickle.dumps(fi))
+    restored_engine = SentinelEngine()
+    restored.engines["restored-sentinel"] = restored_engine
+    restored.reset_integrator(np.deg2rad(0.35), 0.0, 1)
+    assert restored_engine.reset_count == 1
+    assert restored.engines == {}
+    assert collections == []
+
+
+@pytest.mark.slow
+def test_variable_incidence_a_b_a_matches_fresh_fiber_integrators():
+    """Skipping eager GC must not retain geometry arrays across GI angles."""
+
+    shape = (195, 487)
+    poni = PONI(
+        dist=0.2,
+        poni1=shape[0] * 172e-6 / 2.0,
+        poni2=shape[1] * 172e-6 / 2.0,
+        rot1=0.0,
+        rot2=0.0,
+        rot3=0.0,
+        wavelength=1.0e-10,
+        detector="Pilatus100k",
+    )
+    image = (
+        np.arange(shape[0] * shape[1], dtype=np.float64).reshape(shape)
+        % 97.0
+    ) + 1.0
+
+    def _integrate(fi, angle):
+        return integrate_gi_2d(
+            image,
+            fi,
+            npt_rad=32,
+            npt_azim=24,
+            incident_angle=angle,
+        )
+
+    reused = create_fiber_integrator(poni, incident_angle=0.15)
+    first_a = _integrate(reused, 0.15)
+    result_b = _integrate(reused, 0.25)
+    second_a = _integrate(reused, 0.15)
+    fresh_a = _integrate(
+        create_fiber_integrator(poni, incident_angle=0.15),
+        0.15,
+    )
+    fresh_b = _integrate(
+        create_fiber_integrator(poni, incident_angle=0.25),
+        0.25,
+    )
+
+    for actual, expected in (
+        (first_a, fresh_a),
+        (second_a, fresh_a),
+        (result_b, fresh_b),
+    ):
+        np.testing.assert_allclose(actual.radial, expected.radial)
+        np.testing.assert_allclose(actual.azimuthal, expected.azimuthal)
+        np.testing.assert_allclose(
+            actual.intensity,
+            expected.intensity,
+            equal_nan=True,
+        )
 
 
 @pytest.mark.slow

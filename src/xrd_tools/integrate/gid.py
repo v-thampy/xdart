@@ -66,6 +66,25 @@ def _deg2rad_or_pass(value: float, angle_unit: str) -> float:
     return float(np.deg2rad(value)) if angle_unit == "deg" else float(value)
 
 
+def _xrd_fiber_integrator_type() -> type[Any]:
+    """Lazily build the project FiberIntegrator reset policy.
+
+    pyFAI correctly invalidates all geometry arrays and integration engines
+    when a GI angle changes, but its default reset also forces a process-wide
+    ``gc.collect()``.  A metadata-driven scan can change angle every frame and
+    serialize otherwise independent reduction workers in that global sweep.
+    Keep the complete reset and bounded engine eviction while leaving object
+    reclamation to Python's normal garbage collector.
+
+    The import remains lazy because importing pyFAI can select a Qt binding;
+    importing this headless-first module must not do that.
+    """
+
+    from xrd_tools.integrate._fiber import _XrdToolsFiberIntegrator
+
+    return _XrdToolsFiberIntegrator
+
+
 def _effective_gi_params(
     fi: FiberIntegrator,
     incident_angle: float | None,
@@ -184,7 +203,7 @@ def create_fiber_integrator(
     """
     ai = poni_to_integrator(poni)
     try:
-        fi = ai.promote("FiberIntegrator")
+        fi = ai.promote(_xrd_fiber_integrator_type())
     except (AttributeError, Exception) as exc:
         raise ImportError(
             "FiberIntegrator requires pyFAI >= 2025.01. "
