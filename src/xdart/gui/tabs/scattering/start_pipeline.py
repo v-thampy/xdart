@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from xrd_tools.session.intent_store import RunIntentSnapshot, RunIntentStore
+from xrd_tools.session.intent_store import (IntentRecaptureRequired,
+                                            RunIntentSnapshot, RunIntentStore)
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
 
 from .contracts import (AdmissionReceipt, AdmissionToken, RunExecutorPort,
                         SourceCapture, SourcePort, admitted_capture)
-from .controls_editing import commit_canonical_threshold
+from .controls_editing import (commit_canonical_threshold,
+                               commit_canonical_threshold_once)
 from .coordinator import ScatteringCoordinator
 from .events import (CleanupStatus, ExecutorAccepted, ExecutorClosed, ExecutorStartFailed, LifecycleError,
                      LifecycleResult, LifecycleStatus, OwnersClosed, PreflightAccepted,
@@ -350,23 +352,20 @@ class StartPipeline:
             # routes through the shared canonicalizer.  The operator
             # candidate commits first (the store commit is the only seam
             # that may receive a raw intent); the ACCEPTED snapshot is then
-            # canonicalized through the same store loop, so the replacement
-            # capture still uses an exact store-accepted identity, never a
-            # later re-read.  Already-canonical candidates take no extra
-            # revision.
+            # canonicalized SINGLE-SHOT — this path owns one specific
+            # accepted revision, so an intervening edit is a COMMIT_RACE to
+            # surface with the exact current snapshot, never a revision to
+            # consume into a replacement capture or a source recapture
+            # (bounded rework, 2026-08-04).  Already-canonical candidates
+            # take no extra revision.
             try:
-                canonical = self._canonical_threshold_snapshot(result.snapshot)
+                canonical = commit_canonical_threshold_once(self._intents, result.snapshot)
             except Exception as error:
                 return self._closed_invariant(error)
-            if canonical is None:
-                return self._refuse(
-                    capture.request_id,
-                    StartRefusal.FREEZE_VALIDATION,
-                    detail=(
-                        "threshold canonicalization lost three consecutive "
-                        "intent revisions; retry the start"
-                    ),
-                )
+            if type(canonical) is IntentRecaptureRequired:
+                if not recapture_result_is_valid(canonical, result.snapshot.revision):
+                    return self._closed_invariant(TypeError("RunIntentStore.commit() returned an invalid result"))
+                return self._recapture_required(capture, StartRecaptureCause.COMMIT_RACE, canonical.snapshot)
             if not snapshot_is_valid(canonical):
                 return self._closed_invariant(TypeError("threshold canonicalization returned an invalid snapshot"))
             if canonical.thaw().source_spec == capture.source_capture.source:

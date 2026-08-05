@@ -9,6 +9,7 @@ from pathlib import Path
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
+    IntentRecaptureRequired,
     RunIntentSnapshot,
     RunIntentStore,
 )
@@ -491,29 +492,52 @@ def canonicalize_threshold_intent(intent: RunIntent) -> bool:
     return changed
 
 
-def commit_canonical_threshold(
+def commit_canonical_threshold_once(
     store: RunIntentStore, snapshot: RunIntentSnapshot
-) -> RunIntentSnapshot | None:
-    """Run the shared canonicalizer THROUGH the revisioned store and return
-    the canonical snapshot (``snapshot`` itself when already canonical).
+) -> RunIntentSnapshot | IntentRecaptureRequired:
+    """Single-shot canonicalize-through-the-store.
+
+    Returns ``snapshot`` itself when it is already canonical, the accepted
+    canonical snapshot when the store accepted OUR revision, or the store's
+    conflict ticket UNTOUCHED when an intervening edit landed first.  This
+    function NEVER consumes another writer's revision: the post-operator
+    canonicalization path must surface a COMMIT_RACE carrying the exact
+    current snapshot, not silently adopt an unrelated edit into a
+    replacement capture (Codex bounded rework, 2026-08-04).
 
     Hosted HERE rather than in the start pipeline because candidate
     mutation belongs to the editing module: callers hand in a snapshot and
-    receive a snapshot back, so no raw thawed ``RunIntent`` ever crosses a
-    kernel-module boundary (the semantic architecture guard permits a raw
-    intent outside the reducer only as the direct candidate of a store
-    ``commit``).  The bounded retry re-runs only on a genuine concurrent-
-    revision race; exhaustion returns ``None`` and the caller must refuse
-    with a typed outcome — a raw non-canonical capture is never produced.
+    receive a snapshot (or the store's own ticket) back, so no raw thawed
+    ``RunIntent`` ever crosses a kernel-module boundary (the semantic
+    architecture guard permits a raw intent outside the reducer only as
+    the direct candidate of a store ``commit``).
+    """
+    intent = snapshot.thaw()
+    if not canonicalize_threshold_intent(intent):
+        return snapshot
+    result = store.commit(intent, expected_revision=snapshot.revision)
+    if isinstance(result, IntentCommitAccepted):
+        return result.snapshot
+    return result
+
+
+def commit_canonical_threshold(
+    store: RunIntentStore, snapshot: RunIntentSnapshot
+) -> RunIntentSnapshot | None:
+    """Retrying canonicalize-through-the-store for the INITIAL capture path
+    only, where no capture identity exists yet: the capture must describe
+    whatever the store currently holds, so consuming a newer revision and
+    canonicalizing THAT is exactly right there — unlike the post-operator
+    path, which owns a specific accepted revision and must surface a
+    conflict instead (see :func:`commit_canonical_threshold_once`).
+    Exhaustion returns ``None`` and the caller must refuse with a typed
+    outcome — a raw non-canonical capture is never produced.
     """
     for _ in range(3):
-        intent = snapshot.thaw()
-        if not canonicalize_threshold_intent(intent):
-            return snapshot
-        result = store.commit(intent, expected_revision=snapshot.revision)
-        if isinstance(result, IntentCommitAccepted):
-            return result.snapshot
-        snapshot = result.snapshot
+        outcome = commit_canonical_threshold_once(store, snapshot)
+        if isinstance(outcome, RunIntentSnapshot):
+            return outcome
+        snapshot = outcome.snapshot
     return None
 
 

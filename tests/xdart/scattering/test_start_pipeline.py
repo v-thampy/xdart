@@ -7,7 +7,7 @@ from typing import get_type_hints
 import pytest
 
 from xrd_tools.core.scan import SourceKind, SourceSpec
-from xrd_tools.session.intent_store import RunIntentStore
+from xrd_tools.session.intent_store import IntentCommitAccepted, RunIntentStore
 from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xdart.gui.tabs.scattering.contracts import AdmissionReceipt, SourceCapture
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
@@ -240,6 +240,58 @@ def test_commit_race_preserves_intervening_edit_and_returns_canonical_recapture_
     assert lifecycle.phase is RunPhase.PREPARING
     assert store.snapshot().thaw().generation == 0
     assert executor.calls == []
+
+
+def test_operator_canonicalization_conflict_surfaces_the_race_without_adopting():
+    """Bounded rework 2026-08-04: an unrelated edit landing BETWEEN the
+    accepted operator commit (r1) and its canonicalization commit must
+    surface a COMMIT_RACE carrying the exact current snapshot — never be
+    consumed into a canonical r3 replacement capture or a source
+    recapture (the no-silent-adoption contract)."""
+
+    class InterleavingStore(RunIntentStore):
+        # A REAL store whose next accepted commit is immediately followed
+        # by an unrelated writer's commit — the exact single-threaded
+        # window between apply_operator_decision's operator commit and
+        # the canonicalization commit.
+        def arm(self) -> None:
+            self._armed = True
+
+        def commit(self, candidate, *, expected_revision):
+            result = super().commit(candidate, expected_revision=expected_revision)
+            if getattr(self, "_armed", False) and isinstance(result, IntentCommitAccepted):
+                self._armed = False
+                unrelated = super().snapshot().thaw()
+                unrelated.processing_mode = "Int 1D"
+                injected = super().commit(
+                    unrelated, expected_revision=result.snapshot.revision
+                )
+                assert isinstance(injected, IntentCommitAccepted)
+            return result
+
+    pipeline, store, lifecycle, source, executor = _pipeline(
+        store=InterleavingStore(_intent())
+    )
+    capture = pipeline.begin()
+    assert isinstance(capture, StartCapture)
+    candidate = capture.intent_snapshot.thaw()
+    candidate.threshold.apply_threshold = True
+    candidate.threshold.mask_saturation = True  # degenerate: canonicalization must commit
+    store.arm()
+
+    result = pipeline.apply_operator_decision(capture, candidate)
+
+    assert isinstance(result, StartRecaptureRequired)
+    assert result.cause is StartRecaptureCause.COMMIT_RACE
+    # The ticket carries the EXACT current snapshot: the unrelated
+    # writer's r2, not a canonicalized r3.
+    assert result.current_snapshot.revision == 2
+    assert store.revision == 2
+    assert result.current_snapshot.thaw().processing_mode == "Int 1D"
+    # No replacement capture and no source recapture were created.
+    assert len(source.captures) == 1
+    assert executor.calls == []
+    assert lifecycle.phase is RunPhase.PREPARING
 
 
 def test_freeze_race_uses_ticket_snapshot_revision_and_requires_explicit_recapture():
