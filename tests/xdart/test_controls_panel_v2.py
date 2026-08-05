@@ -5142,7 +5142,7 @@ def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
     intent = RunIntent()
     intent.threshold.apply_threshold = True
     intent.threshold.mask_saturation = False
-    intent.threshold.threshold_min = 12.25
+    intent.threshold.threshold_min = 12.0
     intent.threshold.threshold_max = 4294967295.0
     panel = ControlsPanelV2()
     generic = RangeRow(
@@ -5157,7 +5157,7 @@ def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
         row = _threshold_row(panel)
         assert row._low.text() == "12"
         assert row._high.text() == "4294967295"
-        assert (("Mask", "min"), "12.25") in row.current_edits()
+        assert (("Mask", "min"), "12.0") in row.current_edits()
         assert (
             (("Mask", "max"), "4294967295.0") in row.current_edits()
         )
@@ -5167,7 +5167,7 @@ def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
             lambda path, value: emitted.append((tuple(path), value))
         )
         row._low.editingFinished.emit()
-        assert emitted[-1] == (("Mask", "min"), "12.25")
+        assert emitted[-1] == (("Mask", "min"), "12.0")
 
         _user_types(qapp, panel, row._low, "12")
         focused = panel.focused_form_edit()
@@ -5187,26 +5187,35 @@ def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
         ))
         row = _threshold_row(panel)
         assert row._low.text() == "12"
-        assert (("Mask", "min"), "12.25") in row.current_edits()
+        assert (("Mask", "min"), "12.0") in row.current_edits()
         row._low.setFocus()
         qapp.processEvents()
         focused = panel.focused_form_edit()
-        assert focused is not None and focused.value == "12.25"
+        assert focused is not None and focused.value == "12.0"
+        row._low.clearFocus()
+        qapp.processEvents()
+
+        # A deliberately non-integral draft remains truthful after its
+        # accepted commit and blur; zero-decimal formatting must never render
+        # 1.5 as a different executed value such as 2.
+        _user_types(qapp, panel, row._low, "1.5")
+        row._low.editingFinished.emit()
+        assert emitted[-1] == (("Mask", "min"), "1.5")
         row._low.clearFocus()
         qapp.processEvents()
 
         updated = RunIntent()
         updated.threshold.apply_threshold = True
         updated.threshold.mask_saturation = False
-        updated.threshold.threshold_min = 8.75
+        updated.threshold.threshold_min = 1.5
         updated.threshold.threshold_max = 100.75
         assert panel.apply_state_update(project_controls(
             RunIntentStore(updated).snapshot(), None, RunPhase.IDLE
         ))
         row = _threshold_row(panel)
-        assert row._low.text() == "9"
-        assert row._high.text() == "101"
-        assert (("Mask", "min"), "8.75") in row.current_edits()
+        assert row._low.text() == "1.5"
+        assert row._high.text() == "100.75"
+        assert (("Mask", "min"), "1.5") in row.current_edits()
         assert (("Mask", "max"), "100.75") in row.current_edits()
 
         # Other numeric ranges keep their existing precision.

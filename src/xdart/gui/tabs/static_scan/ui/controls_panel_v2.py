@@ -942,7 +942,10 @@ class RangeRow(QtWidgets.QWidget):
         if self._display_decimals is None or not text:
             return text
         try:
-            return format(float(value), f".{self._display_decimals}f")
+            numeric = float(value)
+            if self._display_decimals == 0 and not numeric.is_integer():
+                return text
+            return format(numeric, f".{self._display_decimals}f")
         except (TypeError, ValueError):
             return text
 
