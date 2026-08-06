@@ -134,10 +134,11 @@ def _field_tooltip(path, reason: str = "") -> str:
 _SOURCE_ENERGY_PATH = ("Source", "energy_preference")
 _SOURCE_ENERGY_OPTIONS = (("PONI", "poni"), ("Metadata", "metadata"))
 # Maintainer policy (2026-08-04, exception-based — supersedes the old
-# enumerated allowlist): ONLY the project folder displays its full path (it
-# anchors the whole session); every other browse-backed path field displays
-# its basename / final directory component, with the full path in the
-# tooltip and the committed model value.
+# enumerated allowlist): ONLY the project folder displays its full path while
+# idle (it anchors the whole session).  Every other browse-backed path field
+# displays its basename / final directory component while idle, expands to its
+# exact full model value while focused for direct editing, and retains that
+# full value in the tooltip and committed model throughout.
 _FULL_PATH_DISPLAY_PATHS = {
     ("Project", "project_folder"),
 }
@@ -729,6 +730,8 @@ class FormRow(QtWidgets.QWidget):
 
         self.editor = editor
         self.editor.setEnabled(self._enabled)
+        if self._file_name_only:
+            self.editor.installEventFilter(self)
         # Path/browse fields should show the root of long paths by default; the
         # full value is still available on hover via the row tooltip.
         if browse and isinstance(self.editor, QtWidgets.QLineEdit):
@@ -811,14 +814,22 @@ class FormRow(QtWidgets.QWidget):
                     idx = self.editor.findText(value)
                     if idx >= 0:
                         self.editor.setCurrentIndex(idx)
-            elif not self.editor.hasFocus():
-                shown = self._line_display_value(value)
-                if self.editor.text() != shown:
-                    self.editor.setText(shown)
-                self._model_value = value
-                self._editor_dirty = False
-                if field.browse:
-                    self.editor.setCursorPosition(0)
+            else:
+                focused = self.editor.hasFocus()
+                if not focused:
+                    shown = self._line_display_value(value)
+                    if self.editor.text() != shown:
+                        self.editor.setText(shown)
+                    if field.browse:
+                        self.editor.setCursorPosition(0)
+                # Once editingFinished has emitted, an immediate synchronous
+                # owner projection is authoritative even though QLineEdit is
+                # still completing its FocusOut event.  A rejected edit can
+                # therefore restore the prior exact path before the deferred
+                # basename collapse; an actively typed draft remains intact.
+                if not focused or not self._editor_dirty:
+                    self._model_value = value
+                    self._editor_dirty = False
         finally:
             self.editor.blockSignals(was_blocked)
 
@@ -837,12 +848,54 @@ class FormRow(QtWidgets.QWidget):
             return PurePath(text).name
         return text
 
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.editor and self._file_name_only:
+            event_type = event.type()
+            if event_type == QtCore.QEvent.Type.FocusIn:
+                # Presentation-only expansion: programmatic setText must not
+                # manufacture a draft or commit.  The exact model value, not
+                # the idle basename, is the starting point for direct edits.
+                if not self._editor_dirty:
+                    blocked = self.editor.blockSignals(True)
+                    try:
+                        self.editor.setText(self._model_value)
+                    finally:
+                        self.editor.blockSignals(blocked)
+            elif event_type == QtCore.QEvent.Type.FocusOut:
+                # QLineEdit emits editingFinished from its own focus-out
+                # handler.  Collapse on the next turn so the full typed value
+                # is committed first and never replaced by its basename.
+                QtCore.QTimer.singleShot(0, self._collapse_path_editor)
+        return super().eventFilter(watched, event)
+
+    def _collapse_path_editor(self) -> None:
+        if not self._file_name_only or self.editor.hasFocus():
+            return
+        blocked = self.editor.blockSignals(True)
+        try:
+            self.editor.setText(self._line_display_value(self._model_value))
+            self.editor.setCursorPosition(0)
+        finally:
+            self.editor.blockSignals(blocked)
+
     def _draft_edited(self, text: str) -> None:
         self._editor_dirty = True
         self.draftChanged.emit(self._path, text)
 
     def _emit_editor_edit(self) -> None:
-        self._emit_edit(self.current_value())
+        value = self.current_value()
+        if self._file_name_only:
+            # A focused Return commit can precede any owner reconciliation,
+            # while a focus-out commit must collapse immediately afterwards.
+            # Promote the exact edited value locally so neither path can fall
+            # back to the old model value.  The normal projection may still
+            # reconcile an authoritative replacement once focus is released.
+            self._model_value = "" if value is None else str(value)
+            self._editor_dirty = False
+            if self._model_value:
+                for widget in (self, self.editor, self.label):
+                    widget.setToolTip(self._model_value)
+        self._emit_edit(value)
 
     def _emit_edit(self, value) -> None:
         edit = ControlFormEdit(path=self._path, value=value)

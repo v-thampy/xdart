@@ -154,6 +154,28 @@ def test_unknown_headerless_raw_shape_is_not_guessed(tmp_path):
     assert infer_raw_detector_shape(path) is None
 
 
+def test_image_adapter_probes_only_known_headerless_raw_geometry(tmp_path):
+    import xrd_tools.sources.registry  # noqa: F401
+    from xrd_tools.sources.adapters import candidate_owner
+    from xrd_tools.sources.probe import ProbeState
+
+    known = tmp_path / "known_0001.raw"
+    np.ones((195, 487), dtype=np.int32).tofile(known)
+    owner = candidate_owner(known)
+    assert owner is not None
+    ready = owner.probe(known)
+    assert ready.state is ProbeState.READY
+    assert ready.reason == "RAW image file readable"
+
+    unknown = tmp_path / "unknown_0001.raw"
+    np.ones((17, 19), dtype=np.int32).tofile(unknown)
+    owner = candidate_owner(unknown)
+    assert owner is not None
+    pending = owner.probe(unknown)
+    assert pending.state is ProbeState.IN_PROGRESS
+    assert "does not yet match" in pending.reason
+
+
 def test_tiff_series_from_directory_uses_natural_order_and_pattern(tmp_path):
     from xrd_tools.sources import TiffSeriesSource
 

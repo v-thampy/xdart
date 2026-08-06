@@ -602,8 +602,12 @@ class ScientificView(QtWidgets.QFrame):
         self._single_mode = state.plot_mode == "Single"
         self._selected_keys = navigation.selected
         footer_frames = (
-            navigation.frames
-            if self._single_mode or navigation.selected
+            tuple(
+                frame
+                for frame in navigation.frames
+                if frame.artifact == navigation.current.artifact
+            )
+            if navigation.current is not None
             else ()
         )
         self._rebuild_frames(footer_frames, navigation.current)
@@ -823,10 +827,7 @@ class ScientificView(QtWidgets.QFrame):
             self.frame_selector.add_frame(
                 frame_caption(frame, repeated, position=index),
                 frame,
-                (
-                    f"{frame.source_scan}:{frame.local_frame_label} "
-                    f"[{frame.work_ordinal}]"
-                ),
+                f"{frame.source_scan}:{frame.local_frame_label}",
             )
             indices.append(index)
             self._selector_operations += 1

@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 pytest.importorskip("pyqtgraph")
-from pyqtgraph import QtWidgets
+from pyqtgraph import QtCore, QtWidgets
 from pyqtgraph.Qt import QtTest
 
 
@@ -4462,6 +4462,130 @@ def test_controls_panel_v2_path_fields_show_full_path_tooltip(qapp, monkeypatch)
     finally:
         widget.close()
         widget.deleteLater()
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        (("Signal", "File"), "/data/raw/scan_0001.nxs"),
+        (("Signal", "img_dir"), "/data/raw/images"),
+        (("Signal", "poni_file"), "/data/calibration/cal.poni"),
+        (("Signal", "mask_file"), "/data/calibration/mask.edf"),
+        (("Project", "h5_dir"), "/data/processed/results"),
+    ),
+)
+def test_compact_path_expands_for_direct_edit_then_collapses(
+    qapp, path, value,
+):
+    row = FormRow(
+        label="Path",
+        path=path,
+        value=value,
+        browse=True,
+    )
+    row.show()
+    qapp.processEvents()
+    row.editor.clearFocus()
+    qapp.processEvents()
+    qapp.processEvents()
+    edits = []
+    drafts = []
+    row.valueChanged.connect(lambda changed, text: edits.append((changed, text)))
+    row.draftChanged.connect(lambda changed, text: drafts.append((changed, text)))
+    try:
+        assert row.editor.text() == Path(value).name
+        assert row.current_value() == value
+
+        row.editor.setFocus()
+        qapp.processEvents()
+        assert row.editor.text() == value
+        assert row.current_value() == value
+        assert edits == []
+        assert drafts == []
+
+        replacement = "/edited/directly/new-source.nxs"
+        row.editor.selectAll()
+        QtTest.QTest.keyClicks(row.editor, replacement)
+        qapp.processEvents()
+        assert row.current_value() == replacement
+        assert drafts and drafts[-1] == (path, replacement)
+
+        row.editor.clearFocus()
+        qapp.processEvents()
+        qapp.processEvents()
+        assert edits[-1] == (path, replacement)
+        assert row.current_value() == replacement
+        assert row.editor.text() == Path(replacement).name
+        assert row.editor.toolTip() == replacement
+    finally:
+        row.close()
+        row.deleteLater()
+
+
+def test_project_folder_remains_full_path_while_focused(qapp):
+    value = "/data/very/long/project"
+    row = FormRow(
+        label="Folder",
+        path=("Project", "project_folder"),
+        value=value,
+        browse=True,
+    )
+    row.show()
+    qapp.processEvents()
+    try:
+        assert row.editor.text() == value
+        row.editor.setFocus()
+        qapp.processEvents()
+        assert row.editor.text() == value
+        row.editor.clearFocus()
+        qapp.processEvents()
+        assert row.editor.text() == value
+    finally:
+        row.close()
+        row.deleteLater()
+
+
+def test_rejected_compact_path_edit_restores_authoritative_path(qapp):
+    path = ("Signal", "File")
+    original = "/data/raw/scan_0001.nxs"
+    row = FormRow(
+        label="Image File",
+        path=path,
+        value=original,
+        browse=True,
+    )
+    authoritative = ControlFormField(
+        SectionId.SOURCE,
+        "Image File",
+        path,
+        original,
+        browse=True,
+    )
+    row.valueChanged.connect(
+        lambda _path, _value: row.apply_field(authoritative)
+    )
+    row.show()
+    qapp.processEvents()
+    try:
+        row.editor.setFocus()
+        qapp.processEvents()
+        row.editor.selectAll()
+        QtTest.QTest.keyClicks(row.editor, "/rejected/missing.nxs")
+        QtTest.QTest.keyClick(
+            row.editor, QtCore.Qt.Key.Key_Return
+        )
+        qapp.processEvents()
+        assert row.current_value() == original
+
+        row.editor.clearFocus()
+        qapp.processEvents()
+        qapp.processEvents()
+        assert row.current_value() == original
+        assert row.editor.text() == Path(original).name
+        assert row.editor.toolTip() == original
+    finally:
+        row.close()
+        row.deleteLater()
 
 
 def test_integrator_gi_motor_autoselects_preferred_over_manual(qapp, monkeypatch):

@@ -83,13 +83,12 @@ def test_construct_loop_adopts_two_artifacts_as_one_atomic_current_scope(
             closed_sources.append(self)
 
     class Session:
-        frames_completed = 0
-
         def __init__(self, *_args, **_kwargs):
-            pass
+            self.frames_completed = 0
+            self._completed = None
 
-        def on_frame_completed(self, _callback):
-            pass
+        def on_frame_completed(self, callback):
+            self._completed = callback
 
         def start(self):
             pass
@@ -98,6 +97,9 @@ def test_construct_loop_adopts_two_artifacts_as_one_atomic_current_scope(
             return True
 
         def finish(self, **_kwargs):
+            self.frames_completed = 1
+            assert self._completed is not None
+            self._completed(SimpleNamespace(frame_index=1))
             return SimpleNamespace(
                 failed=False, cancelled=False, n_processed=1
             )
@@ -123,6 +125,15 @@ def test_construct_loop_adopts_two_artifacts_as_one_atomic_current_scope(
     monkeypatch.setattr(executor_module, "ScanSession", Session)
 
     executor = StandardRunExecutor()
+    monkeypatch.setattr(
+        executor,
+        "_frame_ready_owned",
+        lambda owned_run, _event, _image, _session: setattr(
+            owned_run,
+            "current_published",
+            owned_run.current_published + 1,
+        ),
+    )
     executor._construct(run, item=items[0])
     context = run.context_runtime.context
     scan_a = scans[0]

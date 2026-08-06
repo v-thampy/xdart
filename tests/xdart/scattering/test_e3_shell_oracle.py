@@ -10,6 +10,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.shell_values import (
+    ArtifactProgress,
     ProgressProjection,
     ShellCommandKind,
     ShellPhase,
@@ -110,11 +111,15 @@ def test_e3_ui3_selector_append_is_constant_work_with_new_duplicates(
         assert shell.scientific.frame_selector.count() == 6
         assert shell.scientific._selector_operations - before == 1
         assert shell.scientific.frame_selector.itemData(5) is appended
+        assert shell.scientific.frame_selector.itemData(
+            5,
+            QtCore.Qt.ItemDataRole.ToolTipRole,
+        ) == f"scan-c:{appended.local_frame_label}"
     finally:
         _dispose(shell, qapp)
 
 
-def test_e3_ui3_terminal_progress_does_not_follow_historical_selection(
+def test_e3_ui3_terminal_footer_follows_current_scan_selection(
     qapp: QtWidgets.QApplication,
 ) -> None:
     shell = ScatteringWorkspaceShell()
@@ -128,8 +133,153 @@ def test_e3_ui3_terminal_progress_does_not_follow_historical_selection(
         assert shell.scientific.frame_selector.currentData() is (
             state.navigation.frames[0]
         )
-        assert shell.scientific.progress.text() == "25/25"
+        assert shell.scientific.progress.text() == "1/25"
         assert shell.scientific.status.text() == "Ready"
+    finally:
+        _dispose(shell, qapp)
+
+
+def test_e3_ui3_footer_uses_typed_current_scan_progress(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(frame_count=52, selected_index=51)
+    current = state.navigation.current
+    assert current is not None
+    state = replace(
+        state,
+        progress=ProgressProjection(
+            52,
+            2961,
+            "Running",
+            (ArtifactProgress(current.artifact, 52, 1000),),
+        ),
+    )
+    try:
+        shell.apply_state(state)
+        assert shell.scientific.progress.text() == "52/1000"
+        assert shell.scientific.frame_selector.count() == 52
+    finally:
+        _dispose(shell, qapp)
+
+
+@pytest.mark.parametrize("label_start", [0, 1])
+def test_e3_ui3_footer_keeps_published_prefix_position_when_durable_ahead(
+    qapp: QtWidgets.QApplication,
+    label_start: int,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=10,
+        selected_index=0,
+        heavy_indices=(),
+        plot_mode="Single",
+    )
+    frames = tuple(
+        replace(frame, local_frame_label=label_start + index)
+        for index, frame in enumerate(state.navigation.frames)
+    )
+    artifact = frames[0].artifact
+    state = replace(
+        state,
+        browser=replace(state.browser, frames=frames),
+        scientific=replace(
+            state.scientific,
+            traces=tuple(
+                replace(trace, frame=frames[index])
+                for index, trace in enumerate(state.scientific.traces)
+            ),
+            heavy_available=frozenset(),
+            heavy=None,
+        ),
+        navigation=replace(
+            state.navigation,
+            frames=frames,
+            current=frames[0],
+            selected=(frames[0],),
+        ),
+        progress=ProgressProjection(
+            1000,
+            1000,
+            "Display projection failed",
+            (ArtifactProgress(artifact, 1000, 1000, published=10),),
+            terminal=True,
+        ),
+    )
+    try:
+        shell.apply_state(state)
+        assert shell.scientific.progress.text() == "1/1000"
+
+        shell.apply_state(replace(
+            state,
+            revision=2,
+            navigation=replace(
+                state.navigation,
+                current=frames[-1],
+                selected=(frames[-1],),
+            ),
+        ))
+        assert shell.scientific.progress.text() == "10/1000"
+
+        retained = frames[2:]
+        shell.apply_state(replace(
+            state,
+            revision=3,
+            navigation=replace(
+                state.navigation,
+                frames=retained,
+                current=retained[0],
+                selected=(retained[0],),
+            ),
+        ))
+        assert shell.scientific.progress.text() == "3/1000"
+    finally:
+        _dispose(shell, qapp)
+
+
+def test_e3_ui3_footer_keeps_absolute_scan_position_after_catalog_eviction(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=5,
+        selected_index=2,
+        plot_mode="Single",
+    )
+    retained = state.navigation.frames[2:]
+    artifact = retained[0].artifact
+    progress = ProgressProjection(
+        5,
+        5,
+        "Finished",
+        (ArtifactProgress(artifact, 5, 5),),
+    )
+    try:
+        shell.apply_state(replace(
+            state,
+            navigation=replace(
+                state.navigation,
+                frames=retained,
+                current=retained[0],
+                selected=(retained[0],),
+            ),
+            progress=progress,
+        ))
+        assert shell.scientific.frame_selector.count() == 3
+        assert shell.scientific.progress.text() == "3/5"
+
+        shell.apply_state(replace(
+            state,
+            revision=2,
+            navigation=replace(
+                state.navigation,
+                frames=retained,
+                current=retained[-1],
+                selected=(retained[-1],),
+            ),
+            progress=progress,
+        ))
+        assert shell.scientific.progress.text() == "5/5"
     finally:
         _dispose(shell, qapp)
 
@@ -138,7 +288,9 @@ def test_e3_ui3_terminal_progress_does_not_follow_historical_selection(
     ("phase", "button_text", "run_enabled", "stop_enabled"),
     [
         (ShellPhase.IDLE, "Run", True, False),
-        (ShellPhase.PREPARING, "Run", False, True),
+        # The pending Run has already been consumed.  PREPARING previews the
+        # eventual Pause affordance but keeps it disabled until acceptance.
+        (ShellPhase.PREPARING, "Pause", False, True),
         (ShellPhase.RUNNING, "Pause", False, True),
         (ShellPhase.PAUSED, "Resume", False, True),
         (ShellPhase.STOPPING, "Run", False, True),
@@ -190,7 +342,7 @@ def test_e3_ui3_browsed_and_finished_presentations_keep_same_shell(
         )
         shell.apply_state(finished)
         assert shell.scientific.status.text() == "Finished"
-        assert shell.scientific.progress.text() == "5/5"
+        assert shell.scientific.progress.text() == "1/5"
         assert shell.splitter.count() == 3
     finally:
         _dispose(shell, qapp)

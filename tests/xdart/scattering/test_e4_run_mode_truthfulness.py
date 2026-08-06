@@ -13,6 +13,10 @@ from xdart.gui.tabs.scattering.shell_projection import (
     build_run_strip_projection,
 )
 from xdart.gui.tabs.scattering.state_machine import RunPhase
+from xdart.gui.tabs.scattering.shell_values import (
+    DirectoryFileProgress,
+    ProgressProjection,
+)
 from xdart.gui.tabs.scattering.workspace_shell import (
     ScatteringWorkspaceShell,
 )
@@ -161,6 +165,54 @@ def test_projection_owns_modes_and_refuses_run_readiness_for_unowned_mode() -> N
     assert unsupported.readiness == dict(UNOWNED_RUN_MODE_REASONS)[
         "Int 1D (XYE)"
     ]
+
+
+def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:
+    base = make_shell_projection(plot_mode="Single")
+
+    def project(phase: RunPhase, progress: ProgressProjection):
+        return ContextProjection().build_shell(
+            revision=1,
+            controls=base.controls,
+            controls_readiness=base.controls_readiness,
+            phase=phase,
+            intent=_configured_intent("Int 2D"),
+            contexts=(),
+            selection=None,
+            navigation=base.navigation,
+            payloads=(),
+            resident_frames=frozenset(),
+            progress=progress,
+            preferences=ScientificPreferences(plot_mode="Single"),
+            browser_directory="",
+            date_sorted=False,
+            auto_last=True,
+            executor_available=True,
+            start_permitted=False,
+            start_blocker="",
+            notice="",
+        )
+
+    files = DirectoryFileProgress(2, 1, 3, 6)
+    paused = project(
+        RunPhase.PAUSED,
+        ProgressProjection(directory_files=files),
+    )
+    failed = project(
+        RunPhase.FAILED,
+        ProgressProjection(
+            detail="reader failed",
+            directory_files=files,
+            terminal=True,
+        ),
+    )
+
+    assert paused.run.readiness == (
+        "Paused · 2 processed · 1 skipped · 3 pending · 6 discovered"
+    )
+    assert failed.run.readiness == (
+        "Failed · 2 processed · 1 skipped · 3 pending · 6 discovered"
+    )
 
 
 def test_native_processing_mode_immediately_owns_mounted_center_layout() -> None:

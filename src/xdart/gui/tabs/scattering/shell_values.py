@@ -366,10 +366,77 @@ class RunStripProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactProgress:
+    artifact: str
+    completed: int
+    total: int
+    # Exact prefix represented by navigation events. ``None`` keeps detached
+    # callers that only know durable progress on the legacy suffix fallback.
+    published: int | None = None
+
+    def __post_init__(self) -> None:
+        if not (
+            type(self.artifact) is str
+            and self.artifact
+            and type(self.completed) is int
+            and type(self.total) is int
+            and 0 <= self.completed <= self.total
+            and (
+                self.published is None
+                or type(self.published) is int
+                and 0 <= self.published <= self.completed
+            )
+        ):
+            raise ValueError("artifact progress is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryFileProgress:
+    processed: int
+    skipped: int
+    pending: int
+    discovered: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.processed,
+            self.skipped,
+            self.pending,
+            self.discovered,
+        )
+        if not (
+            all(type(value) is int and value >= 0 for value in values)
+            and self.processed + self.skipped + self.pending
+            == self.discovered
+        ):
+            raise ValueError("directory file progress is invalid")
+
+    def text(self, state: str) -> str:
+        return (
+            f"{state} · {self.processed} processed · "
+            f"{self.skipped} skipped · {self.pending} pending · "
+            f"{self.discovered} discovered"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ProgressProjection:
     completed: int = 0
     total: int = 0
     detail: str = ""
+    artifacts: tuple[ArtifactProgress, ...] = ()
+    directory_files: DirectoryFileProgress | None = None
+    terminal: bool = False
+
+    def for_artifact(self, artifact: str) -> ArtifactProgress | None:
+        return next(
+            (
+                value
+                for value in self.artifacts
+                if value.artifact == artifact
+            ),
+            None,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,8 +466,10 @@ def _scalar_is_valid(value: object) -> bool:
 
 
 __all__ = [
+    "ArtifactProgress",
     "AxisProjection",
     "BrowserProjection",
+    "DirectoryFileProgress",
     "BrowserScan",
     "FrameNavigationProjection",
     "HeavyProjection",

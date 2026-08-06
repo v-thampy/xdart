@@ -241,7 +241,7 @@ def test_executor_constructs_and_releases_each_standard_owner_once(monkeypatch, 
 
     class Scan:
         name = "Standard"
-        frames = (SimpleNamespace(index=1),)
+        frames = (SimpleNamespace(index=1, image=None),)
 
         def __len__(self) -> int:
             return 1
@@ -268,10 +268,11 @@ def test_executor_constructs_and_releases_each_standard_owner_once(monkeypatch, 
         def __init__(self, _plan, _scan, sink, **_kwargs) -> None:
             counted("session")
             self._sink = sink
-            self.frames_completed = 1
+            self.frames_completed = 0
+            self._completed = None
 
-        def on_frame_completed(self, _callback) -> None:
-            return None
+        def on_frame_completed(self, callback) -> None:
+            self._completed = callback
 
         def start(self) -> None:
             counted("session.start")
@@ -283,6 +284,9 @@ def test_executor_constructs_and_releases_each_standard_owner_once(monkeypatch, 
         def finish(self, **_kwargs):
             counted("session.finish")
             self._sink.finish(None)
+            self.frames_completed = 1
+            assert self._completed is not None
+            self._completed(SimpleNamespace(frame_index=1))
             return SimpleNamespace(failed=False, cancelled=False, n_processed=1)
 
     opened = Opened()
@@ -298,6 +302,15 @@ def test_executor_constructs_and_releases_each_standard_owner_once(monkeypatch, 
     monkeypatch.setattr(executor_module, "ScanSession", Session)
 
     executor = StandardRunExecutor()
+    monkeypatch.setattr(
+        executor,
+        "_frame_ready_owned",
+        lambda owned_run, _event, _image, _session: setattr(
+            owned_run,
+            "current_published",
+            owned_run.current_published + 1,
+        ),
+    )
     run = _StandardRun(
         configuration, identity, None, None, None, None, Path(configuration.save_path),
         capture=SourceCapture(RequestId(1), 1, source),

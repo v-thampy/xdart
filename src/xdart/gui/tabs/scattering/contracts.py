@@ -187,6 +187,7 @@ class SourceExecutionStamp:
     first_label: int
     members: tuple[SourceFileState, ...] = ()
     external_members: tuple[ExternalSourceState, ...] = ()
+    dependency_files: tuple[SourceFileState, ...] = ()
     admitted_motor_values: tuple[AdmittedMotorValue, ...] = ()
     metadata_sources: tuple[AdmittedMetadataSource, ...] = ()
 
@@ -205,6 +206,13 @@ class SourceExecutionStamp:
                 type(value) is ExternalSourceState
                 for value in self.external_members
             )
+            or type(self.dependency_files) is not tuple
+            or not all(
+                type(value) is SourceFileState
+                for value in self.dependency_files
+            )
+            or len({value.path for value in self.dependency_files})
+            != len(self.dependency_files)
             or type(self.admitted_motor_values) is not tuple
             or not all(
                 type(value) is AdmittedMotorValue
@@ -270,6 +278,9 @@ class SourceExecutionStamp:
             "external_members": [
                 value.as_dict() for value in self.external_members
             ],
+            "dependency_files": [
+                value.as_dict() for value in self.dependency_files
+            ],
             "admitted_motor_values": [
                 value.as_dict() for value in self.admitted_motor_values
             ],
@@ -326,6 +337,11 @@ class PlannedOutput:
             Path(value.file.path)
             for value in self.source_stamp.external_members
         )
+        members += tuple(
+            Path(value.path)
+            for value in self.source_stamp.dependency_files
+        )
+        members = tuple(dict.fromkeys(members))
         options = dict(self.source_spec.options)
         key = str(
             options.get("scan_name")
@@ -526,9 +542,15 @@ class AdmissionReceipt:
     display_retirement: DisplayRetirementReceipt = (
         NO_DISPLAY_RETIREMENT
     )
+    deferred_directory: object | None = None
+    directory_discovered_file_count: int = 0
+    directory_discovered_paths: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
-        from .output_preflight import OutputCandidate
+        from .output_preflight import (
+            DeferredDirectoryPlan,
+            OutputCandidate,
+        )
 
         choices = self.gi_motor_choices
         valid = (type(self.request_id) is RequestId and type(self.revision) is int
@@ -537,6 +559,24 @@ class AdmissionReceipt:
                  and type(self.candidate) is OutputCandidate and type(self.outputs) is tuple
                  and all(type(item) is AdmittedOutput for item in self.outputs)
                  and type(self.scientific_assets) is AcceptedScientificAssets
+                 and (
+                     self.deferred_directory is None
+                     or type(self.deferred_directory)
+                     is DeferredDirectoryPlan
+                 )
+                 and not (self.outputs and self.deferred_directory is not None)
+                 and type(self.directory_discovered_file_count) is int
+                 and self.directory_discovered_file_count >= 0
+                 and type(self.directory_discovered_paths) is tuple
+                 and all(
+                     isinstance(value, Path)
+                     and value.is_absolute()
+                     for value in self.directory_discovered_paths
+                 )
+                 and len(set(self.directory_discovered_paths))
+                 == len(self.directory_discovered_paths)
+                 and self.directory_discovered_file_count
+                 == len(self.directory_discovered_paths)
                  and (choices is None or type(choices) is tuple
                       and all(type(value) is str for value in choices))
                  and type(self.display_retirement)

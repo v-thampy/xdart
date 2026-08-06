@@ -406,6 +406,59 @@ def test_source_form_is_the_only_picker_and_browse_replaces_complete_source(
         page.close()
 
 
+@pytest.mark.parametrize("mode", ["Image Series", "Single Image"])
+def test_source_file_direct_edit_rebuilds_complete_source(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    old = tmp_path / "old_0001.tif"
+    old.write_bytes(b"old")
+    replacement = tuple(
+        tmp_path / f"replacement_{index:04d}.tif"
+        for index in range(1, 3)
+    )
+    for member in replacement:
+        member.write_bytes(b"replacement")
+    current = (
+        image_series_spec(old, metadata_format="spec")
+        if mode == "Image Series"
+        else single_image_spec(old, metadata_format="spec")
+    )
+    store = RunIntentStore(RunIntent(
+        source_spec=current,
+        output_mode="Overwrite",
+    ))
+    page = ScatteringWorkspace(
+        intents=store,
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    try:
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.CONTROL_EDIT,
+            str(replacement[1]),
+            path=SOURCE_FILE,
+        ))
+
+        selected = store.snapshot().thaw().source_spec
+        assert type(selected) is SourceSpec
+        assert source_mode(selected) == mode
+        assert selected.options["metadata_format"] == "spec"
+        assert store.revision == 1
+        if mode == "Image Series":
+            assert selected.options["files"] == tuple(
+                str(member) for member in replacement
+            )
+            assert selected.options["selected_file"] == str(replacement[1])
+        else:
+            assert selected.options["files"] == (str(replacement[1]),)
+            assert is_single_image_spec(selected)
+    finally:
+        page.close_workspace()
+        page.close()
+
+
 def test_source_mode_switch_is_value_only_and_restores_each_mode(
     qapp: QtWidgets.QApplication,
 ) -> None:

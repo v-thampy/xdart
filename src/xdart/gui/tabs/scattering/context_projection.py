@@ -165,6 +165,32 @@ class ContextProjection:
                 source_count_includes_immediate
             ),
         )
+        progress_detail = progress.detail
+        if progress.directory_files is not None and (
+            not progress.terminal or phase is RunPhase.FAILED
+        ):
+            progress_detail = progress.directory_files.text(
+                "Failed"
+                if progress.terminal
+                else {
+                    RunPhase.PREPARING: "Starting",
+                    RunPhase.STARTING: "Starting",
+                    RunPhase.RUNNING: "Running",
+                    RunPhase.PAUSING: "Pausing",
+                    RunPhase.PAUSED: "Paused",
+                    RunPhase.RESUMING: "Resuming",
+                    RunPhase.STOPPING: "Stopping",
+                    RunPhase.FINALIZING: "Finalizing",
+                }.get(phase, "Running")
+            )
+        if (
+            (
+                phase not in {RunPhase.IDLE, RunPhase.FAILED, RunPhase.CLOSED}
+                or progress.terminal
+            )
+            and progress_detail
+        ):
+            run = replace(run, readiness=progress_detail)
         controls = replace(
             controls,
             profile=replace(

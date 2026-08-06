@@ -242,11 +242,56 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                 # pending intent.  The one trailing typed command reconciles
                 # both surfaces together.
                 if not self.browser.frame_selection_pending:
+                    current = state.navigation.current
+                    local_frames = (
+                        tuple(
+                            frame
+                            for frame in state.navigation.frames
+                            if frame.artifact == current.artifact
+                        )
+                        if current is not None
+                        else ()
+                    )
+                    artifact_progress = (
+                        None
+                        if current is None
+                        else state.progress.for_artifact(current.artifact)
+                    )
+                    retained_index = next(
+                        (
+                            index
+                            for index, frame in enumerate(local_frames, 1)
+                            if frame is current
+                        ),
+                        0,
+                    )
+                    local_completed = (
+                        max(
+                            0,
+                            min(
+                                artifact_progress.total,
+                                (
+                                    artifact_progress.completed
+                                    if artifact_progress.published is None
+                                    else artifact_progress.published
+                                )
+                                - len(local_frames)
+                                + retained_index,
+                            ),
+                        )
+                        if artifact_progress is not None
+                        else retained_index
+                    )
+                    local_total = (
+                        artifact_progress.total
+                        if artifact_progress is not None
+                        else len(local_frames)
+                    )
                     self.scientific.reconcile(
                         state.scientific,
                         state.navigation,
-                        completed=state.progress.completed,
-                        total=state.progress.total,
+                        completed=local_completed,
+                        total=local_total,
                         detail=state.progress.detail,
                     )
             controls = _shell_controls(state.controls)

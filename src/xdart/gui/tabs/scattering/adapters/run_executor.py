@@ -48,7 +48,8 @@ from ..events import (
     ExecutorStartFailed, RunIdentity, detach_exception,
 )
 from ..output_preflight import (
-    OutputDisposition, PlannedOutput, execution_plan_values,
+    DeferredDirectoryPlan, OutputDisposition, PlannedOutput,
+    execution_plan_values, materialize_deferred_output,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
 )
@@ -95,6 +96,14 @@ class _StandardRun:
     artifacts: list[Path] = field(default_factory=list)
     completed: int = 0
     total: int = 0
+    current_total: int = 0
+    current_completed: int = 0
+    current_published: int = 0
+    files_discovered: int = 0
+    files_processed: int = 0
+    files_skipped: int = 0
+    current_file_total: int = 0
+    current_files_incremental: bool = False
     resources: RunResources | None = None
     display: RunDisplayState = field(init=False)
     context_runtime: AcquisitionRuntime | None = None
@@ -121,6 +130,182 @@ def _perf_add(run: _StandardRun, key: str, elapsed: float) -> None:
         run.perf_values[key] = run.perf_values.get(key, 0.0) + max(
             0.0, float(elapsed)
         )
+
+
+def _directory_status(
+    run: _StandardRun,
+    *,
+    state: str = "Running",
+    in_flight_processed: int = 0,
+) -> str:
+    processed, skipped, pending, discovered = _directory_counts(
+        run,
+        in_flight_processed=in_flight_processed,
+    )
+    return (
+        f"{state} · {processed} processed · {skipped} skipped · "
+        f"{pending} pending · {discovered} discovered"
+    )
+
+
+def _directory_counts(
+    run: _StandardRun,
+    *,
+    in_flight_processed: int = 0,
+) -> tuple[int, int, int, int]:
+    discovered = max(0, int(run.files_discovered))
+    processed = max(
+        0,
+        min(discovered, int(run.files_processed) + in_flight_processed),
+    )
+    skipped = max(
+        0,
+        min(discovered - processed, int(run.files_skipped)),
+    )
+    pending = max(0, discovered - processed - skipped)
+    return processed, skipped, pending, discovered
+
+
+def _directory_event_fields(
+    run: _StandardRun,
+    *,
+    in_flight_processed: int = 0,
+) -> dict[str, int]:
+    processed, skipped, pending, discovered = _directory_counts(
+        run,
+        in_flight_processed=in_flight_processed,
+    )
+    return {
+        "files_processed": processed,
+        "files_skipped": skipped,
+        "files_pending": pending,
+        "files_discovered": discovered,
+    }
+
+
+def _terminal_in_flight_files(run: _StandardRun) -> int:
+    """Physical files durably completed by the current unfinished fold."""
+
+    if run.current_file_total <= 0:
+        return 0
+    if run.current_files_incremental:
+        return min(run.current_file_total, run.current_completed)
+    return (
+        run.current_file_total
+        if run.current_total > 0
+        and run.current_completed >= run.current_total
+        else 0
+    )
+
+
+def _planned_physical_file_count(item: PlannedOutput) -> int:
+    """Physical source files consumed by one planned output."""
+
+    if item.source_spec.kind is SourceKind.TIFF_SERIES:
+        return max(1, len(item.source_stamp.members))
+    return 1 + len({
+        value.file.path for value in item.source_stamp.external_members
+    })
+
+
+def _physical_file_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _planned_primary_paths(item: PlannedOutput) -> tuple[Path, ...]:
+    """Physical candidates that own their own directory counter slots."""
+
+    members = tuple(
+        Path(value.path) for value in item.source_stamp.members
+    )
+    return members or (item.source_path,)
+
+
+def _candidate_file_owners(
+    primary_groups: tuple[tuple[Path, ...], ...],
+) -> dict[str, int]:
+    """Bind every discovered candidate to exactly one planned output."""
+
+    owners: dict[str, int] = {}
+    for output_index, paths in enumerate(primary_groups):
+        for path in paths:
+            key = _physical_file_key(path)
+            previous = owners.setdefault(key, output_index)
+            if previous != output_index:
+                raise ValueError(
+                    "physical directory candidate belongs to multiple outputs: "
+                    f"{path}"
+                )
+    return owners
+
+
+def _claim_physical_files(
+    member_paths: tuple[Path, ...],
+    discovered_paths: tuple[Path, ...],
+    claimed: set[Path],
+    *,
+    candidate_owners: dict[str, int],
+    output_index: int,
+) -> int:
+    """Claim one output's candidates and otherwise-unowned sidecars."""
+
+    member_keys = {
+        _physical_file_key(path) for path in member_paths
+    }
+    selected = tuple(
+        path
+        for path in discovered_paths
+        if path not in claimed
+        and (key := _physical_file_key(path)) in member_keys
+        and candidate_owners.get(key, output_index) == output_index
+    )
+    claimed.update(selected)
+    return len(selected)
+
+
+def _claim_output_physical_files(
+    item: PlannedOutput,
+    discovered_paths: tuple[Path, ...],
+    claimed: set[Path],
+    *,
+    candidate_owners: dict[str, int],
+    output_index: int,
+) -> int:
+    return _claim_physical_files(
+        item.group.member_paths,
+        discovered_paths,
+        claimed,
+        candidate_owners=candidate_owners,
+        output_index=output_index,
+    )
+
+
+def _eager_directory_file_counts(
+    outputs: tuple[AdmittedOutput, ...],
+    discovered_paths: tuple[Path, ...],
+) -> tuple[tuple[int, ...], int]:
+    """Assign each physical directory entry to at most one eager output."""
+
+    if not discovered_paths:
+        counts = tuple(
+            _planned_physical_file_count(output.item) for output in outputs
+        )
+        return counts, 0
+    candidate_owners = _candidate_file_owners(tuple(
+        _planned_primary_paths(output.item) for output in outputs
+    ))
+    claimed: set[Path] = set()
+    counts = tuple(
+        _claim_output_physical_files(
+            output.item,
+            discovered_paths,
+            claimed,
+            candidate_owners=candidate_owners,
+            output_index=output_index,
+        )
+        for output_index, output in enumerate(outputs)
+    )
+    return counts, len(discovered_paths) - len(claimed)
 
 
 class StandardRunExecutor:
@@ -471,9 +656,11 @@ class StandardRunExecutor:
                     try:
                         if item is _DISPLAY_PROJECTION_END:
                             return
-                        event, image = item
+                        event, image, session = item
                         started = monotonic()
-                        self._frame_ready_owned(run, event, image)
+                        self._frame_ready_owned(
+                            run, event, image, session
+                        )
                         _perf_add(
                             run,
                             "display_projection",
@@ -528,11 +715,14 @@ class StandardRunExecutor:
         if source_spec is None or not configuration.poni_file or (not configuration.save_path):
             raise ValueError('Standard execution requires source, PONI, and output paths')
         artifact = item.target if item is not None else Path(configuration.save_path)
+        # Establish the item identity before validation/open.  A failure at any
+        # later construction seam must be reported against this artifact, not
+        # the previously completed one.
+        run.artifact = artifact
         if configuration.output_mode != 'Overwrite':
             raise ValueError(APPEND_UNAVAILABLE)
         if item is not None:
             validate_planned_source(item)
-        run.artifact = artifact
         if item is not None and item.candidate is not None and (item.descriptor is not None) and (item.descriptor.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
             cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
             try:
@@ -552,6 +742,16 @@ class StandardRunExecutor:
         if labels is not None:
             wanted = set(labels)
             run.scan.frames = [frame for frame in run.scan.frames if int(frame.index) in wanted]
+        run.current_total = (
+            item.source_stamp.frame_count
+            if item is not None
+            else len(run.scan.frames)
+        )
+        run.current_completed = max(
+            0,
+            run.current_total - len(run.scan.frames),
+        )
+        run.current_published = run.current_completed
         args_1d, args_2d, values = execution_plan_values(configuration, None if assets is None else assets.mask)
         plan = build_native_int_reduction_plan_from_args(args_1d, args_2d, **values)
         try:
@@ -729,6 +929,9 @@ class StandardRunExecutor:
             raise
         if run.stop_requested:
             return True
+        deferred = receipt.deferred_directory
+        if type(deferred) is DeferredDirectoryPlan:
+            return self._execute_deferred_directory(run, receipt, deferred)
         try:
             npt = int(run.configuration.bai_1d_args.get("npt", 0))
         except (TypeError, ValueError):
@@ -747,19 +950,223 @@ class StandardRunExecutor:
             frame_bytes=frame_bytes or None,
         )
         run.total = sum(output.item.source_stamp.frame_count for output in outputs)
-        self._events.put(StandardRunEvent(run.identity, StandardEventKind.DISCOVERY, total=run.total, detail=f"{('GI' if run.configuration.gi.enabled else 'Standard')} · {len(outputs)} admitted candidates"))
+        run.files_discovered = receipt.directory_discovered_file_count
+        output_file_counts, unowned_files = _eager_directory_file_counts(
+            outputs,
+            getattr(receipt, "directory_discovered_paths", ()),
+        )
+        if run.files_discovered:
+            run.files_skipped = unowned_files
+        self._events.put(StandardRunEvent(
+            run.identity,
+            StandardEventKind.DISCOVERY,
+            total=run.total,
+            detail=(
+                _directory_status(run)
+                if run.files_discovered
+                else f"{('GI' if run.configuration.gi.enabled else 'Standard')} · {len(outputs)} admitted candidates"
+            ),
+            **_directory_event_fields(run),
+        ))
         stopped = False
-        for decision in outputs:
+        for decision, output_file_count in zip(
+            outputs, output_file_counts, strict=True
+        ):
             item = decision.item
             if run.stop_requested:
                 stopped = True
                 break
             if not target_state_matches(decision):
                 raise RuntimeError(f'output target changed after admission: {item.target}')
+            run.artifact = item.target
+            run.current_total = item.source_stamp.frame_count
             run.completed += item.source_stamp.frame_count - len(decision.labels)
+            run.current_completed = (
+                run.current_total - len(decision.labels)
+            )
+            run.current_published = run.current_completed
+            run.current_file_total = (
+                output_file_count
+                if run.files_discovered
+                else 0
+            )
+            run.current_files_incremental = (
+                bool(run.current_file_total)
+                and item.source_spec.kind is SourceKind.TIFF_SERIES
+            )
             self._construct(run, item=item, labels=decision.labels, decision=decision)
             stopped = self._execute_current(run, construct=False) or stopped
-            run.artifacts.append(item.target)
+            if run.current_files_incremental:
+                run.files_processed += min(
+                    run.current_file_total,
+                    run.current_completed,
+                )
+            elif (
+                run.current_file_total
+                and run.current_completed >= run.current_total
+            ):
+                run.files_processed += run.current_file_total
+            run.current_file_total = 0
+            run.current_files_incremental = False
+            if run.files_discovered:
+                self._events.put(StandardRunEvent(
+                    run.identity,
+                    StandardEventKind.DISCOVERY,
+                    completed=run.completed,
+                    total=run.total,
+                    artifact=str(item.target),
+                    detail=_directory_status(run),
+                    artifact_completed=run.current_published,
+                    artifact_total=run.current_total,
+                    **_directory_event_fields(run),
+                ))
+        return stopped
+
+    def _execute_deferred_directory(
+        self,
+        run: _StandardRun,
+        receipt: AdmissionReceipt,
+        deferred: DeferredDirectoryPlan,
+    ) -> bool:
+        resources = run.resources
+        session = None if resources is None else resources.directory_session
+        if session is None:
+            raise RuntimeError("deferred directory run lost its index session")
+        try:
+            npt = int(run.configuration.bai_1d_args.get("npt", 0))
+        except (TypeError, ValueError):
+            npt = 0
+        run.display.configure(
+            partition_count=len(deferred.entries),
+            npt=npt,
+            frame_bytes=None,
+        )
+        run.files_discovered = deferred.discovered_file_count
+        run.files_skipped = 0
+        claimed_files: set[Path] = set()
+        candidate_owners = _candidate_file_owners(tuple(
+            entry.physical_paths for entry in deferred.entries
+        ))
+        self._events.put(StandardRunEvent(
+            run.identity,
+            StandardEventKind.DISCOVERY,
+            completed=run.completed,
+            total=run.total,
+            detail=_directory_status(run),
+            **_directory_event_fields(run),
+        ))
+        stopped = False
+        for output_index, entry in enumerate(deferred.entries):
+            if run.stop_requested:
+                stopped = True
+                break
+            try:
+                decision, _ready_files, skipped_files = (
+                    materialize_deferred_output(
+                        receipt,
+                        session,
+                        entry,
+                        cancelled=lambda: run.stop_requested,
+                    )
+                )
+            except RuntimeError as error:
+                if (
+                    run.stop_requested
+                    and error.args == ("admission cancelled",)
+                ):
+                    stopped = True
+                    break
+                raise
+            if decision is None:
+                skipped_claims = _claim_physical_files(
+                    tuple(
+                        Path(state.path)
+                        for state in entry.protected_states
+                    ),
+                    deferred.discovered_paths,
+                    claimed_files,
+                    candidate_owners=candidate_owners,
+                    output_index=output_index,
+                )
+                run.files_skipped += max(skipped_files, skipped_claims)
+                self._events.put(StandardRunEvent(
+                    run.identity,
+                    StandardEventKind.DISCOVERY,
+                    completed=run.completed,
+                    total=run.total,
+                    detail=_directory_status(run),
+                    **_directory_event_fields(run),
+                ))
+                continue
+            run.files_skipped += skipped_files
+            item = decision.item
+            if not target_state_matches(decision):
+                raise RuntimeError(
+                    f"output target changed after admission: {item.target}"
+                )
+            run.artifact = item.target
+            run.current_total = item.source_stamp.frame_count
+            run.total += run.current_total
+            run.completed += run.current_total - len(decision.labels)
+            run.current_completed = (
+                run.current_total - len(decision.labels)
+            )
+            run.current_published = run.current_completed
+            run.current_file_total = _claim_output_physical_files(
+                item,
+                deferred.discovered_paths,
+                claimed_files,
+                candidate_owners=candidate_owners,
+                output_index=output_index,
+            )
+            run.current_files_incremental = (
+                item.source_spec.kind is SourceKind.TIFF_SERIES
+            )
+            self._events.put(StandardRunEvent(
+                run.identity,
+                StandardEventKind.DISCOVERY,
+                completed=run.completed,
+                total=run.total,
+                artifact=str(item.target),
+                detail=_directory_status(run),
+                artifact_completed=run.current_published,
+                artifact_total=run.current_total,
+                **_directory_event_fields(run),
+            ))
+            self._construct(
+                run,
+                item=item,
+                labels=decision.labels,
+                decision=decision,
+            )
+            stopped = self._execute_current(run, construct=False) or stopped
+            if run.current_files_incremental:
+                run.files_processed += min(
+                    run.current_file_total,
+                    run.current_completed,
+                )
+            elif run.current_completed >= run.current_total:
+                run.files_processed += run.current_file_total
+            run.current_file_total = 0
+            run.current_files_incremental = False
+            self._events.put(StandardRunEvent(
+                run.identity,
+                StandardEventKind.DISCOVERY,
+                completed=run.completed,
+                total=run.total,
+                artifact=str(item.target),
+                detail=_directory_status(run),
+                artifact_completed=run.current_published,
+                artifact_total=run.current_total,
+                **_directory_event_fields(run),
+            ))
+            if stopped:
+                break
+        if not stopped:
+            run.files_skipped = max(
+                run.files_skipped,
+                run.files_discovered - run.files_processed,
+            )
         return stopped
 
     def _execute_current(self, run: _StandardRun, *, construct: bool=True) -> bool:
@@ -798,6 +1205,18 @@ class StandardRunExecutor:
             result = self._finish_session(run)
         except BaseException as error:
             session_error = error
+        if result is not None:
+            processed = int(getattr(result, 'n_processed', 0) or 0)
+            run.completed += processed
+            run.current_completed = min(
+                run.current_total,
+                run.current_completed + processed,
+            )
+            if not result.failed and run.artifact not in run.artifacts:
+                # ``ScanSession.finish`` has returned after the sink's durable
+                # finish boundary.  Preserve that artifact even if the
+                # asynchronous display projection subsequently fails.
+                run.artifacts.append(run.artifact)
         try:
             self._finish_display_projection(run)
         except BaseException as error:
@@ -814,9 +1233,14 @@ class StandardRunExecutor:
             if callable(snapshot):
                 for key, elapsed in snapshot().items():
                     _perf_add(run, key, elapsed)
-        run.completed += int(getattr(result, 'n_processed', 0) or 0)
         if result.failed:
             raise RuntimeError(result.error or 'scattering reduction failed')
+        if run.current_published != run.current_completed:
+            raise RuntimeError(
+                "display projection lost a durable frame: "
+                f"published={run.current_published}, "
+                f"processed={run.current_completed}"
+            )
         close = getattr(run.source, 'close', None)
         if callable(close):
             close()
@@ -942,14 +1366,21 @@ class StandardRunExecutor:
         started = monotonic()
         try:
             pending = run.display_projection_queue
+            # ``ScanSession.finish`` can detach ``run.session`` before this
+            # bounded projection queue is drained.  Carry the exact session
+            # owner with every completion so trailing durable frames retain
+            # their saturation policy and navigation publication.
+            session = run.session
             frame = run.frames_by_label.get(int(event.frame_index))
             image = None if frame is None else frame.image
-            if pending is not None:
+            if pending is not None and session is not None:
                 while True:
                     if run.display_projection_errors:
                         return
                     try:
-                        pending.put((event, image), timeout=0.05)
+                        pending.put(
+                            (event, image, session), timeout=0.05
+                        )
                         break
                     except Full:
                         continue
@@ -957,10 +1388,14 @@ class StandardRunExecutor:
             _perf_add(run, "display_callback", monotonic() - started)
 
     def _frame_ready_owned(
-        self, run: _StandardRun, event: Any, image: np.ndarray | None
+        self,
+        run: _StandardRun,
+        event: Any,
+        image: np.ndarray | None,
+        session: ScanSession,
     ) -> None:
-        records, scan, session = (run.records, run.scan, run.session)
-        if records is None or scan is None or session is None:
+        records, scan = (run.records, run.scan)
+        if records is None or scan is None:
             return
         label = int(event.frame_index)
         record = records.get(label)
@@ -1003,6 +1438,10 @@ class StandardRunExecutor:
             owner.source_scan,
             str(owner.artifact),
             label,
+        )
+        run.current_published = min(
+            run.current_total,
+            run.current_published + 1,
         )
         key = navigation.appended
         source_identity = (
@@ -1063,14 +1502,34 @@ class StandardRunExecutor:
             if self._active is not run or run.closed:
                 return
             run.display.put_payload(payload)
+        artifact_completed = run.current_published
+        in_flight_files = (
+            min(run.current_file_total, artifact_completed)
+            if run.current_files_incremental
+            else 0
+        )
         self._events.put(StandardRunEvent(
             run.identity,
             StandardEventKind.FRAME_READY,
             completed=completed,
             total=total,
             artifact=key.artifact,
+            detail=(
+                _directory_status(
+                    run,
+                    in_flight_processed=in_flight_files,
+                )
+                if run.files_discovered
+                else payload.status
+            ),
             frame_key=key,
             navigation_delta=navigation,
+            artifact_completed=artifact_completed,
+            artifact_total=run.current_total,
+            **_directory_event_fields(
+                run,
+                in_flight_processed=in_flight_files,
+            ),
         ))
 
     def _cleanup(self, run: _StandardRun, primary: DetachedDiagnostic | None=None) -> ExecutorClosed:
@@ -1161,8 +1620,47 @@ class StandardRunExecutor:
             if run.terminal_emitted:
                 return
             run.terminal_emitted = True
-        detail = receipt.primary.message if receipt.primary is not None else receipt.cleanup_failures[0].message if receipt.cleanup_failures else next(reversed(run.display.payloads.values())).measurement_mode if run.display.payloads else 'Standard'
-        self._events.put(StandardRunEvent(run.identity, kind, completed=completed, total=total, artifact=str(run.artifact), detail=detail, cleanup_status=receipt.cleanup_status, primary=receipt.primary, cleanup_failures=receipt.cleanup_failures, artifacts=tuple((str(item) for item in run.artifacts))))
+        detail = (
+            receipt.primary.message
+            if receipt.primary is not None
+            else receipt.cleanup_failures[0].message
+            if receipt.cleanup_failures
+            else _directory_status(
+                run,
+                state=(
+                    "Stopped"
+                    if kind is StandardEventKind.STOPPED
+                    else "Failed"
+                    if kind is StandardEventKind.FAILED
+                    else "Complete"
+                ),
+                in_flight_processed=_terminal_in_flight_files(run),
+            )
+            if run.files_discovered
+            else next(
+                reversed(run.display.payloads.values())
+            ).measurement_mode
+            if run.display.payloads
+            else "Standard"
+        )
+        self._events.put(StandardRunEvent(
+            run.identity,
+            kind,
+            completed=completed,
+            total=total,
+            artifact=str(run.artifact),
+            detail=detail,
+            cleanup_status=receipt.cleanup_status,
+            primary=receipt.primary,
+            cleanup_failures=receipt.cleanup_failures,
+            artifacts=tuple(str(item) for item in run.artifacts),
+            artifact_completed=run.current_completed,
+            artifact_total=run.current_total,
+            **_directory_event_fields(
+                run,
+                in_flight_processed=_terminal_in_flight_files(run),
+            ),
+        ))
         throughput = completed / elapsed if completed and elapsed > 0.0 else 0.0
         logger.info("Total Frames Processed: %d", completed)
         logger.info("Total Time: %.2fs", elapsed)

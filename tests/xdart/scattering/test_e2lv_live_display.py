@@ -719,7 +719,7 @@ def test_product_retention_uses_ram_aware_tiers_not_delivery_limits(
         qapp.processEvents()
 
 
-def test_historical_selection_does_not_rewind_terminal_progress(
+def test_historical_selection_moves_within_current_scan_footer(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -755,7 +755,7 @@ def test_historical_selection_does_not_rewind_terminal_progress(
             ),
         )
 
-        assert shell.scientific.progress.text() == "5/5"
+        assert shell.scientific.progress.text() == "4/5"
     finally:
         page.close_workspace()
         page.deleteLater()

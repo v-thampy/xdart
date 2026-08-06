@@ -22,7 +22,9 @@ from xrd_tools.session.intent_store import (
 )
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
+    image_series_spec,
     is_single_image_spec,
+    single_image_spec,
 )
 from xdart.utils.browse import browse_start_dir, remember_browse_path
 from .advanced_editor import AdvancedSettingsDialog
@@ -52,6 +54,7 @@ from .controls_projection import (
     AdvancedSettingsValues,
     EditNoChange,
     EditRefusal,
+    EditResult,
     OUTPUT_MODE,
     SOURCE_DIRECTORY,
     SOURCE_FILE,
@@ -97,6 +100,8 @@ from .scientific_axes import (
     slice_region_orientation,
 )
 from .shell_values import (
+    ArtifactProgress,
+    DirectoryFileProgress,
     ProgressProjection,
     ShellCommand,
     ShellCommandKind,
@@ -155,6 +160,49 @@ def _source_selection_path(source: object) -> str:
         return ""
     selected = source.options.get("selected_file")
     return str(selected or source.uri)
+
+
+def _typed_file_source(
+    current: object,
+    mode: str,
+    value: object,
+) -> SourceSelection | EditRefusal:
+    """Build one complete image-source value from a committed path edit."""
+
+    if type(value) is not str or not value.strip():
+        return EditRefusal("Choose an image file.")
+    metadata_format: str | None = "auto"
+    if type(current) is SourceSpec:
+        candidate = current.options.get("metadata_format", "auto")
+        if candidate is None or type(candidate) is str:
+            metadata_format = candidate
+    try:
+        if mode == "Image Series":
+            return image_series_spec(
+                value,
+                metadata_format=metadata_format,
+            )
+        if mode == "Single Image":
+            return single_image_spec(
+                value,
+                metadata_format=metadata_format,
+            )
+    except (OSError, ValueError) as error:
+        return EditRefusal(str(error))
+    return EditRefusal("Choose an image source before editing its file.")
+
+
+def _directory_file_progress(
+    event: StandardRunEvent,
+) -> DirectoryFileProgress | None:
+    if event.files_discovered <= 0:
+        return None
+    return DirectoryFileProgress(
+        event.files_processed,
+        event.files_skipped,
+        event.files_pending,
+        event.files_discovered,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +364,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._experiment_readiness_key: tuple[bool, str] | None = None
         self._experiment_readiness = SectionHeaderProjection("")
         self._controls_readiness = ControlsReadinessProjection()
+        self._artifact_progress: dict[str, ArtifactProgress] = {}
         self._progress = ProgressProjection()
         self._notice_text = ""
         self._date_sorted = False
@@ -742,14 +791,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if edit is None:
             return True
         snapshot = self._intents.snapshot()
-        reduced = reduce_control_edit(
-            snapshot,
-            edit.path,
-            edit.value,
-            reset_auto_gi_motor=(
-                edit.path in SOURCE_EDIT_PATHS
-                and self._auto_gi_motor_matches(snapshot)
-            ),
+        reduced = self._reduce_page_control_edit(
+            snapshot, edit.path, edit.value
         )
         if isinstance(reduced, EditRefusal):
             self._notice(reduced.reason)
@@ -775,6 +818,39 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._reconcile_snapshot(snapshot, result.snapshot)
         return False
+
+    def _reduce_page_control_edit(
+        self,
+        snapshot: RunIntentSnapshot,
+        path: object,
+        value: object,
+    ) -> EditResult:
+        """Reduce controls whose complete value is owned by the page."""
+
+        reset_auto_gi_motor = (
+            type(path) is tuple
+            and (path in SOURCE_EDIT_PATHS or path == SOURCE_FILE)
+            and self._auto_gi_motor_matches(snapshot)
+        )
+        if path == SOURCE_FILE:
+            source = _typed_file_source(
+                snapshot.thaw().source_spec,
+                self._source_mode,
+                value,
+            )
+            if isinstance(source, EditRefusal):
+                return source
+            return reduce_source_selection(
+                snapshot,
+                source,
+                reset_auto_gi_motor=reset_auto_gi_motor,
+            )
+        return reduce_control_edit(
+            snapshot,
+            path,  # type: ignore[arg-type]
+            value,
+            reset_auto_gi_motor=reset_auto_gi_motor,
+        )
 
     def _begin_run(self) -> None:
         pipeline = self._pipeline
@@ -944,6 +1020,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._batch_latest_frame = None
             self._browser_transient_frame = None
             self._browser_transient_clear_token = None
+            self._artifact_progress.clear()
             self._progress = ProgressProjection(
                 detail="Run started"
             )
@@ -1177,9 +1254,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 continue
             if event.kind is StandardEventKind.DISCOVERY:
+                self._record_artifact_progress(event)
                 self._progress = ProgressProjection(
-                    0, event.total, event.detail
+                    event.completed,
+                    event.total,
+                    event.detail,
+                    tuple(self._artifact_progress.values()),
+                    _directory_file_progress(event),
                 )
+                changed = True
                 continue
             if event.kind is StandardEventKind.CONTEXT_READY:
                 try:
@@ -1205,14 +1288,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._run_frame_seen = True
                     self._batch_latest_frame = frame
                     self._browser_transient_frame = frame
+                    self._record_artifact_progress(event)
                     self._progress = ProgressProjection(
                         event.completed,
                         event.total,
                         event.detail,
+                        tuple(self._artifact_progress.values()),
+                        _directory_file_progress(event),
                     )
+                    changed = True
                     if not self._active_batch_mode:
                         self._follow_processed_artifact(frame)
-                        changed = True
                 continue
             if event.kind is StandardEventKind.DISPLAY_READY:
                 if (
@@ -1265,10 +1351,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         stop_was_requested = (
             self._lifecycle.phase is RunPhase.STOPPING
         )
+        self._record_artifact_progress(event)
         self._progress = ProgressProjection(
             event.completed,
             event.total,
             event.detail,
+            tuple(self._artifact_progress.values()),
+            _directory_file_progress(event),
+            terminal=True,
         )
         failed = event.kind is StandardEventKind.FAILED
         if failed or event.cleanup_status is not CleanupStatus.CLEANED:
@@ -1300,6 +1390,37 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or stop_was_requested
             )
             else ""
+        )
+
+    def _record_artifact_progress(self, event: StandardRunEvent) -> None:
+        artifact = event.artifact
+        if not artifact or event.artifact_total <= 0:
+            return
+        prior = self._artifact_progress.get(artifact)
+        completed = event.artifact_completed
+        published = 0
+        if prior is not None:
+            completed = max(completed, prior.completed)
+            published = (
+                prior.completed
+                if prior.published is None
+                else prior.published
+            )
+        if event.kind not in {
+            StandardEventKind.FINISHED,
+            StandardEventKind.STOPPED,
+            StandardEventKind.FAILED,
+        }:
+            # FRAME_READY and the non-terminal directory folds report the
+            # exact displayed prefix.  A terminal event may instead advance
+            # durable completion after projection failed; do not mislabel
+            # that unwitnessed suffix as navigable.
+            published = max(published, event.artifact_completed)
+        self._artifact_progress[artifact] = ArtifactProgress(
+            artifact,
+            min(completed, event.artifact_total),
+            event.artifact_total,
+            min(published, completed, event.artifact_total),
         )
 
     def _polling_needed(self) -> bool:
@@ -1809,6 +1930,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> None:
         if self._closing or self._closed:
             return
+        if path == SOURCE_FILE:
+            self._notice(
+                "Choose an image file."
+                if type(value) is not str or not value.strip()
+                else ""
+            )
+            self._refresh_shell()
+            return
         reduced = reduce_control_edit(
             self._intents.snapshot(), path, value  # type: ignore[arg-type]
         )
@@ -1949,16 +2078,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._switch_source_mode(value)
             return
         snapshot = self._intents.snapshot()
-        reduced = reduce_control_edit(
-            snapshot,
-            path,
-            value,  # type: ignore[arg-type]
-            reset_auto_gi_motor=(
-                type(path) is tuple
-                and path in SOURCE_EDIT_PATHS
-                and self._auto_gi_motor_matches(snapshot)
-            ),
-        )
+        reduced = self._reduce_page_control_edit(snapshot, path, value)
         if isinstance(reduced, EditRefusal):
             if not automatic:
                 self._notice(reduced.reason)
@@ -1997,7 +2117,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             if not automatic:
                 self._notice("")
-            self._reconcile_snapshot(snapshot, result.snapshot)
+            self._reconcile_snapshot(
+                snapshot,
+                result.snapshot,
+                preserve_terminal=automatic,
+            )
         elif type(result) is IntentRecaptureRequired:
             if not automatic:
                 self._notice("Edit superseded; review current value.")
@@ -2093,6 +2217,29 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if snapshot.thaw().source_spec != request.source:
             return
+        prior_observation = self._source_observation
+        if (
+            self._progress.terminal
+            and prior_observation is not None
+            and (
+                prior_observation.candidate_fingerprint,
+                prior_observation.status,
+                prior_observation.exists,
+                prior_observation.observed_file_count,
+            )
+            != (
+                observation.candidate_fingerprint,
+                observation.status,
+                observation.exists,
+                observation.observed_file_count,
+            )
+        ):
+            self._progress = replace(
+                self._progress,
+                detail="",
+                directory_files=None,
+                terminal=False,
+            )
         self._source_observation = observation
         self._maybe_default_gi_motor(observation)
         if operation.preview:
@@ -2143,7 +2290,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self,
         prior: RunIntentSnapshot,
         current: RunIntentSnapshot,
+        *,
+        preserve_terminal: bool = False,
     ) -> None:
+        if (
+            current.revision != prior.revision
+            and self._progress.terminal
+            and not preserve_terminal
+        ):
+            self._progress = replace(
+                self._progress,
+                detail="",
+                directory_files=None,
+                terminal=False,
+            )
         token = self._admission
         if token is not None and current.revision != prior.revision:
             self._release_admission(token)

@@ -1,20 +1,27 @@
 from __future__ import annotations
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path
 from typing import Any, Callable
 import numpy as np
+from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration import load_poni
 from xrd_tools.io import load_mask
 from xrd_tools.io.output_path import OVERWRITE_MODE, resolve_output_target
-from xrd_tools.io.output_safety import check_output_not_source
+from xrd_tools.io.output_safety import (
+    OutputCollisionError,
+    check_output_not_source,
+)
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
 from xrd_tools.sources.adapters import candidate_owner, get_adapter
 from xrd_tools.sources.descriptor import ContainerDescriptor
+from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.run_plan import RunCandidatePlan
@@ -98,6 +105,88 @@ class OutputCandidate:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DeferredDirectoryEntry:
+    """One name/stat-qualified output group awaiting content admission."""
+
+    candidates: tuple[Candidate, ...]
+    target: Path
+    fact: OutputFact
+    physical_paths: tuple[Path, ...]
+    protected_states: tuple[SourceFileState, ...]
+    skip_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not (
+            type(self.candidates) is tuple
+            and self.candidates
+            and all(type(value) is Candidate for value in self.candidates)
+            and isinstance(self.target, Path)
+            and type(self.fact) is OutputFact
+            and type(self.physical_paths) is tuple
+            and self.physical_paths
+            and all(
+                isinstance(value, Path) and value.is_absolute()
+                for value in self.physical_paths
+            )
+            and len(set(self.physical_paths)) == len(self.physical_paths)
+            and type(self.protected_states) is tuple
+            and all(
+                type(value) is SourceFileState
+                for value in self.protected_states
+            )
+            and len({value.path for value in self.protected_states})
+            == len(self.protected_states)
+            and type(self.skip_reason) is str
+        ):
+            raise TypeError("deferred directory entry is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredDirectoryPlan:
+    """Frozen directory names/targets consumed one output group at a time."""
+
+    candidates: RunCandidatePlan
+    entries: tuple[DeferredDirectoryEntry, ...]
+    discovered_paths: tuple[Path, ...]
+
+    def __post_init__(self) -> None:
+        flattened = tuple(
+            candidate
+            for entry in self.entries
+            for candidate in entry.candidates
+        )
+        physical = tuple(
+            path for entry in self.entries for path in entry.physical_paths
+        )
+        if not (
+            type(self.candidates) is RunCandidatePlan
+            and type(self.entries) is tuple
+            and self.entries
+            and all(type(value) is DeferredDirectoryEntry for value in self.entries)
+            and type(self.discovered_paths) is tuple
+            and all(
+                isinstance(value, Path) and value.is_absolute()
+                for value in self.discovered_paths
+            )
+            and len(set(self.discovered_paths)) == len(self.discovered_paths)
+            and len(set(physical)) == len(physical)
+            and set(physical).issubset(self.discovered_paths)
+            and len({candidate.path for candidate in flattened})
+            == len(flattened)
+            and set(flattened) == set(self.candidates.candidates)
+        ):
+            raise TypeError("deferred directory plan is invalid")
+
+    @property
+    def discovered_file_count(self) -> int:
+        return len(self.discovered_paths)
+
+    @property
+    def targets(self) -> tuple[Path, ...]:
+        return tuple(entry.target for entry in self.entries)
+
+
 def _validate_exact_tiff_gi_motor(
     intent: RunIntent,
     items: tuple[PlannedOutput, ...],
@@ -130,6 +219,38 @@ def _validate_exact_tiff_gi_motor(
                 "fixed angle across the whole run, or choose a "
                 "frame-complete metadata motor."
             )
+
+
+def _directory_matching_paths(
+    source: DirectorySourceSpec,
+    *,
+    cancelled: Callable[[], bool],
+) -> tuple[Path, ...]:
+    """Freeze the physical suffix/filter universe shown by Run counters."""
+
+    root = Path(source.root).expanduser().absolute()
+    suffixes = tuple(str(value).casefold() for value in source.suffixes)
+    name_ok = compile_filter(source.name_filter)
+    iterator = root.rglob("*") if source.recursive else root.iterdir()
+    paths: list[Path] = []
+    for path in iterator:
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        if not path.is_file():
+            continue
+        low = path.name.casefold()
+        suffix = next(
+            (value for value in suffixes if low.endswith(value)),
+            "",
+        )
+        if suffixes and not suffix:
+            continue
+        stem = path.name[:-len(suffix)] if suffix else path.name
+        if name_ok(stem):
+            paths.append(path.absolute())
+    return tuple(sorted(dict.fromkeys(paths)))
+
+
 def prepare_output(
     capture: StartCapture, *, cancelled: Callable[[], bool],
     session_owner: Callable[[DirectoryIndexSession | None], None],
@@ -141,9 +262,11 @@ def prepare_output(
     ):
         raise TypeError("admission requires typed StartCapture")
     snapshot = capture.intent_snapshot
-    assets = _load_scientific_assets(snapshot.thaw())
+    intent = snapshot.thaw()
+    assets = _load_scientific_assets(intent)
     candidate = OutputCandidate.from_start_capture(capture, assets)
-    source, choices = candidate.source, None
+    source, choices, deferred = candidate.source, None, None
+    directory_discovered_paths: tuple[Path, ...] = ()
     if cancelled():
         raise RuntimeError("admission cancelled")
     if type(source) is DirectorySourceSpec:
@@ -154,16 +277,36 @@ def prepare_output(
             name_filter=source.name_filter, suffixes=source.suffixes,
         )
         observation = session.observe(refresh=True)
-        session.enable_probes(exclude=())
-        while observation.unprobed_count:
-            if cancelled():
-                raise RuntimeError("admission cancelled")
-            observation = session.observe(refresh=False)
-        plan = RunCandidatePlan.from_observation(observation)
-        items = _directory_items(candidate, plan, cancelled=cancelled)
-        _validate_exact_tiff_gi_motor(snapshot.thaw(), items)
-        choices = _motor_choices(items)
-        candidate = OutputCandidate.from_start_capture(capture, assets, choices)
+        discovered = observation.discovered_snapshot
+        if not intent.live_mode:
+            directory_discovered_paths = _directory_matching_paths(
+                source,
+                cancelled=cancelled,
+            )
+        if (
+            not intent.gi.enabled
+            and not intent.live_mode
+        ):
+            deferred = _deferred_directory_plan(
+                candidate,
+                RunCandidatePlan.from_snapshot(discovered),
+                directory_discovered_paths,
+                cancelled=cancelled,
+            )
+            items = ()
+        else:
+            session.enable_probes(exclude=())
+            while observation.unprobed_count:
+                if cancelled():
+                    raise RuntimeError("admission cancelled")
+                observation = session.observe(refresh=False)
+            plan = RunCandidatePlan.from_observation(observation)
+            items = _directory_items(candidate, plan, cancelled=cancelled)
+            _validate_exact_tiff_gi_motor(intent, items)
+            choices = _motor_choices(items)
+            candidate = OutputCandidate.from_start_capture(
+                capture, assets, choices
+            )
     else:
         items = (_series_item(candidate, source, cancelled=cancelled),)
         _validate_exact_tiff_gi_motor(snapshot.thaw(), items)
@@ -172,11 +315,16 @@ def prepare_output(
             candidate = OutputCandidate.from_start_capture(
                 capture, assets, choices
             )
-    _validate_targets(candidate, source, items)
+    if deferred is None:
+        _validate_targets(candidate, source, items)
     if targets_owner is not None:
-        targets_owner(tuple(dict.fromkeys(item.target for item in items)))
+        targets_owner(
+            deferred.targets
+            if deferred is not None
+            else tuple(dict.fromkeys(item.target for item in items))
+        )
     outputs = tuple(inspect_output(item, candidate) for item in items)
-    if cancelled() or not outputs:
+    if cancelled() or not outputs and deferred is None:
         raise RuntimeError(
             "admission cancelled" if cancelled()
             else "source has no READY candidates"
@@ -184,6 +332,9 @@ def prepare_output(
     return AdmissionReceipt(
         capture.request_id, snapshot.revision, capture.source_capture,
         candidate, outputs, assets, choices,
+        deferred_directory=deferred,
+        directory_discovered_file_count=len(directory_discovered_paths),
+        directory_discovered_paths=directory_discovered_paths,
     )
 def inspect_output(
     item: PlannedOutput,
@@ -195,6 +346,1285 @@ def inspect_output(
     return AdmittedOutput(
         item, OutputDisposition.WRITE, tuple(range(start, start + count)), accepted
     )
+
+
+def _directory_candidate_groups(
+    plan: RunCandidatePlan,
+) -> tuple[tuple[Candidate, ...], ...]:
+    groups: list[tuple[Candidate, ...]] = []
+    consumed: set[Path] = set()
+    for candidate in plan.candidates:
+        if candidate.path in consumed:
+            continue
+        adapter = get_adapter(candidate.adapter_id)
+        if adapter is None:
+            raise ValueError(
+                f"directory candidate lost adapter {candidate.adapter_id!r}"
+            )
+        if SourceKind.IMAGE_FILE in adapter.kinds:
+            name = adapter.scan_name(candidate.path)
+            members = tuple(
+                value
+                for value in plan.candidates
+                if (
+                    value.adapter_id == candidate.adapter_id
+                    and value.path.parent == candidate.path.parent
+                    and adapter.scan_name(value.path) == name
+                )
+            )
+        else:
+            members = (candidate,)
+        consumed.update(value.path for value in members)
+        groups.append(members)
+    return tuple(groups)
+
+
+def _directory_target(
+    configuration: FrozenRunConfiguration | OutputCandidate,
+    plan: RunCandidatePlan,
+    candidate: Candidate,
+    name: str,
+) -> Path:
+    output_root = Path(configuration.save_path)
+    output_request = configuration.save_path
+    if not output_root.suffix:
+        try:
+            relative_parent = candidate.path.parent.relative_to(plan.root)
+        except ValueError as error:
+            raise ValueError(
+                "directory candidate escaped admitted root: "
+                f"{candidate.path}"
+            ) from error
+        output_directory = output_root / relative_parent
+        try:
+            resolved_root = output_root.resolve(strict=False)
+            resolved_output = output_directory.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                f"directory output could not be resolved: {output_directory}"
+            ) from error
+        if not resolved_output.is_relative_to(resolved_root):
+            raise ValueError(
+                "directory output escaped selected root: "
+                f"{output_directory}"
+            )
+        output_request = str(output_directory)
+    return _resolved_generated_target(output_request, name)
+
+
+def _candidate_still_exact(candidate: Candidate) -> bool:
+    try:
+        stat = candidate.path.stat()
+    except OSError:
+        return False
+    owner = candidate_owner(candidate.path)
+    return (
+        owner is not None
+        and owner.id == candidate.adapter_id
+        and (int(stat.st_size), int(stat.st_mtime_ns))
+        == candidate.version_stamp
+    )
+
+
+def _source_state_key(path: str | Path) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _same_source_revision(
+    left: SourceFileState,
+    right: SourceFileState,
+) -> bool:
+    return (
+        _source_state_key(left.path) == _source_state_key(right.path)
+        and (
+            left.size,
+            left.mtime_ns,
+            left.ctime_ns,
+            left.device,
+            left.inode,
+        )
+        == (
+            right.size,
+            right.mtime_ns,
+            right.ctime_ns,
+            right.device,
+            right.inode,
+        )
+    )
+
+
+def _remember_source_state(
+    path: Path,
+    states: dict[str, SourceFileState],
+) -> SourceFileState:
+    current = SourceFileState.capture(path)
+    key = _source_state_key(current.path)
+    accepted = states.get(key)
+    if accepted is not None and not _same_source_revision(accepted, current):
+        raise ValueError(
+            f"HDF5 dependency changed during admission: {current.path}"
+        )
+    states.setdefault(key, current)
+    return current
+
+
+def _verify_source_states(
+    states: dict[str, SourceFileState],
+) -> None:
+    for state in states.values():
+        if not state.matches_disk():
+            raise ValueError(
+                f"HDF5 dependency changed during admission: {state.path}"
+            )
+
+
+@contextmanager
+def _open_stable_hdf5_dependency(
+    path: Path,
+    states: dict[str, SourceFileState],
+):
+    """Open one HDF5 file only while its strong source state stays exact."""
+
+    import h5py
+
+    selected = Path(path).resolve(strict=False)
+    try:
+        before = _remember_source_state(selected, states)
+    except FileNotFoundError:
+        yield None
+        return
+    try:
+        handle = h5py.File(selected, "r")
+    except OSError as error:
+        raise ValueError(
+            f"HDF5 dependency could not be inspected: {selected}: {error}"
+        ) from error
+    try:
+        with handle:
+            yield handle
+    finally:
+        try:
+            after = SourceFileState.capture(selected)
+        except OSError as error:
+            raise ValueError(
+                f"HDF5 dependency changed during admission: {selected}"
+            ) from error
+        if not _same_source_revision(after, before):
+            raise ValueError(
+                f"HDF5 dependency changed during admission: {selected}"
+            )
+
+
+def _hdf5_link_file(parent: object, filename: object) -> Path:
+    """Resolve one HDF5 dependency relative to its declaring file."""
+
+    base = Path(os.fsdecode(parent.file.filename)).parent
+    return (base / os.fsdecode(filename)).resolve(strict=False)
+
+
+def _hdf5_object_path(value: object) -> str:
+    raw = os.fsdecode(value)
+    return "/" + posixpath.normpath("/" + raw.lstrip("/")).lstrip("/")
+
+
+def _trace_hdf5_object_dependencies(
+    file_path: Path,
+    object_path: str,
+    *,
+    paths: list[Path],
+    seen: set[tuple[str, str]],
+    cancelled: Callable[[], bool] | None,
+    required: bool,
+    states: dict[str, SourceFileState],
+) -> None:
+    """Close ExternalLink/soft-link/VDS chains for one HDF5 object path."""
+
+    import h5py
+
+    selected_file = Path(file_path).resolve(strict=False)
+    selected_object = _hdf5_object_path(object_path)
+    identity = (
+        os.path.normcase(os.path.realpath(selected_file)),
+        selected_object,
+    )
+    if identity in seen:
+        return
+    seen.add(identity)
+    if cancelled is not None and cancelled():
+        raise RuntimeError("admission cancelled")
+    with _open_stable_hdf5_dependency(selected_file, states) as handle:
+        if handle is None:
+            # The declaring link/VDS source path is already in ``paths``.  The
+            # caller freezes it and emits the finite-landing refusal.
+            return
+        value: object = handle
+        components = tuple(
+            component
+            for component in selected_object.strip("/").split("/")
+            if component
+        )
+        for offset, component in enumerate(components):
+            if cancelled is not None and cancelled():
+                raise RuntimeError("admission cancelled")
+            if not isinstance(value, h5py.Group):
+                if required:
+                    raise ValueError(
+                        "selected HDF5 dependency path is incomplete: "
+                        f"{selected_file}:{selected_object}"
+                    )
+                return
+            try:
+                link = value.get(component, getlink=True)
+            except (KeyError, OSError, RuntimeError):
+                if required:
+                    raise ValueError(
+                        "selected HDF5 dependency path is unavailable: "
+                        f"{selected_file}:{selected_object}"
+                    )
+                return
+            remainder = components[offset + 1 :]
+            if isinstance(link, h5py.ExternalLink):
+                dependency = _hdf5_link_file(value, link.filename)
+                paths.append(dependency)
+                target = _hdf5_object_path(link.path)
+                if remainder:
+                    target = _hdf5_object_path(
+                        posixpath.join(target, *remainder)
+                    )
+                _trace_hdf5_object_dependencies(
+                    dependency,
+                    target,
+                    paths=paths,
+                    seen=seen,
+                    cancelled=cancelled,
+                    required=required,
+                    states=states,
+                )
+                return
+            if isinstance(link, h5py.SoftLink):
+                target = os.fsdecode(link.path)
+                if not target.startswith("/"):
+                    target = posixpath.join(value.name, target)
+                if remainder:
+                    target = posixpath.join(target, *remainder)
+                _trace_hdf5_object_dependencies(
+                    Path(os.fsdecode(value.file.filename)),
+                    _hdf5_object_path(target),
+                    paths=paths,
+                    seen=seen,
+                    cancelled=cancelled,
+                    required=required,
+                    states=states,
+                )
+                return
+            try:
+                next_value = value.get(component)
+            except (KeyError, OSError, RuntimeError):
+                if required:
+                    raise ValueError(
+                        "selected HDF5 dependency path is unavailable: "
+                        f"{selected_file}:{selected_object}"
+                    )
+                return
+            if next_value is None:
+                if required:
+                    raise ValueError(
+                        "selected HDF5 dependency path is unavailable: "
+                        f"{selected_file}:{selected_object}"
+                    )
+                return
+            value = next_value
+        if isinstance(value, h5py.Dataset):
+            _extend_hdf5_dataset_dependency_paths(
+                value,
+                paths=paths,
+                seen=seen,
+                cancelled=cancelled,
+                required=required,
+                states=states,
+            )
+        elif required:
+            raise ValueError(
+                "selected HDF5 dependency is not a dataset: "
+                f"{selected_file}:{selected_object}"
+            )
+
+
+def _extend_hdf5_dataset_dependency_paths(
+    dataset: object,
+    *,
+    paths: list[Path],
+    seen: set[tuple[str, str]],
+    cancelled: Callable[[], bool] | None,
+    required: bool,
+    states: dict[str, SourceFileState],
+) -> None:
+    """Add external-storage and recursively closed VDS dependencies."""
+
+    current_file = Path(os.fsdecode(dataset.file.filename)).resolve(
+        strict=False
+    )
+    base = current_file.parent
+    for value in dataset.external or ():
+        paths.append(
+            (base / os.fsdecode(value[0])).resolve(strict=False)
+        )
+    if not bool(dataset.is_virtual):
+        return
+    for source in dataset.virtual_sources():
+        if cancelled is not None and cancelled():
+            raise RuntimeError("admission cancelled")
+        filename = os.fsdecode(source.file_name)
+        dependency = (
+            current_file
+            if filename in {"", "."}
+            else (base / filename).resolve(strict=False)
+        )
+        if dependency != current_file:
+            paths.append(dependency)
+        _trace_hdf5_object_dependencies(
+            dependency,
+            os.fsdecode(source.dset_name),
+            paths=paths,
+            seen=seen,
+            cancelled=cancelled,
+            required=required,
+            states=states,
+        )
+
+
+def _hdf5_dataset_dependency_paths(
+    dataset: object,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    required: bool = False,
+    states: dict[str, SourceFileState] | None = None,
+) -> tuple[Path, ...]:
+    """Return the full external-storage/VDS closure for one dataset."""
+
+    current_file = Path(os.fsdecode(dataset.file.filename)).resolve(
+        strict=False
+    )
+    seen = {
+        (
+            os.path.normcase(os.path.realpath(current_file)),
+            _hdf5_object_path(dataset.name),
+        )
+    }
+    paths: list[Path] = []
+    accepted_states = {} if states is None else states
+    _extend_hdf5_dataset_dependency_paths(
+        dataset,
+        paths=paths,
+        seen=seen,
+        cancelled=cancelled,
+        required=required,
+        states=accepted_states,
+    )
+    return tuple(dict.fromkeys(paths))
+
+
+def _scan_all_external_links(
+    root: object,
+    *,
+    cancelled: Callable[[], bool],
+    states: dict[str, SourceFileState],
+) -> tuple[Path, ...]:
+    """Walk hard-linked groups and collect links without opening datasets."""
+
+    import h5py
+
+    external: list[Path] = []
+    seen: set[tuple[str, int]] = set()
+    traced: set[tuple[str, str]] = set()
+
+    def visit(group: object) -> None:
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        try:
+            address = int(h5py.h5o.get_info(group.id).addr)
+        except Exception:
+            address = hash(group.id)
+        file_name = os.path.normcase(os.path.realpath(group.file.filename))
+        identity = (file_name, address)
+        if identity in seen:
+            return
+        seen.add(identity)
+        for raw_name in group:
+            if cancelled():
+                raise RuntimeError("admission cancelled")
+            name = str(raw_name)
+            link = group.get(name, getlink=True)
+            if isinstance(link, h5py.ExternalLink):
+                dependency = _hdf5_link_file(group, link.filename)
+                external.append(dependency)
+                _trace_hdf5_object_dependencies(
+                    dependency,
+                    os.fsdecode(link.path),
+                    paths=external,
+                    seen=traced,
+                    cancelled=cancelled,
+                    required=False,
+                    states=states,
+                )
+                value = group.get(name)
+                if isinstance(value, h5py.Group):
+                    visit(value)
+                elif isinstance(value, h5py.Dataset):
+                    external.extend(
+                        _hdf5_dataset_dependency_paths(
+                            value,
+                            cancelled=cancelled,
+                            states=states,
+                        )
+                    )
+                continue
+            if isinstance(link, h5py.SoftLink):
+                target = os.fsdecode(link.path)
+                if not target.startswith("/"):
+                    target = posixpath.join(group.name, target)
+                _trace_hdf5_object_dependencies(
+                    Path(os.fsdecode(group.file.filename)),
+                    target,
+                    paths=external,
+                    seen=traced,
+                    cancelled=cancelled,
+                    required=False,
+                    states=states,
+                )
+                try:
+                    value = group.get(name)
+                except (KeyError, OSError, RuntimeError):
+                    value = None
+                if isinstance(value, h5py.Group):
+                    visit(value)
+                elif isinstance(value, h5py.Dataset):
+                    external.extend(
+                        _hdf5_dataset_dependency_paths(
+                            value,
+                            cancelled=cancelled,
+                            states=states,
+                        )
+                    )
+                continue
+            try:
+                kind = group.get(name, getclass=True)
+            except (KeyError, OSError, RuntimeError):
+                continue
+            if kind is h5py.Group:
+                child = group.get(name)
+                if child is not None:
+                    visit(child)
+            elif kind is h5py.Dataset:
+                dataset = group.get(name)
+                if dataset is not None:
+                    external.extend(
+                        _hdf5_dataset_dependency_paths(
+                            dataset,
+                            cancelled=cancelled,
+                            states=states,
+                        )
+                    )
+
+    visit(root)
+    return tuple(dict.fromkeys(external))
+
+
+def _external_link_inventory(
+    candidate: Candidate,
+    *,
+    cancelled: Callable[[], bool],
+) -> tuple[tuple[Path, ...], tuple[SourceFileState, ...], str]:
+    """Inventory pre-write HDF5 dependencies without eager frame counting.
+
+    A canonical 3-D detector dataset or Eiger link wins before the reader's
+    recursive fallbacks, so its direct link neighborhood is a complete and
+    cheap proof.  A non-canonical layout may be resolved by a recursive
+    detector marker, NXdata/NXdetector group, or largest-dataset fallback; only
+    those uncommon files receive a complete link-only tree walk.  Dataset
+    pixels and frame counts remain just-in-time in both cases.
+
+    This split preserves global output safety: a generated target is checked
+    against every ExternalLink that the eventual resolver could consume before
+    any earlier output is written.  Soft-linked canonical paths deliberately
+    take the complete-walk branch because their final link target cannot be
+    proved from the canonical leaf alone.
+    """
+
+    adapter = get_adapter(candidate.adapter_id)
+    if adapter is None:
+        raise ValueError(f"candidate {candidate.path} lost its adapter")
+    if not any(
+        kind in {
+            SourceKind.NEXUS_STACK,
+            SourceKind.EIGER_MASTER,
+            SourceKind.PROCESSED_NEXUS,
+        }
+        for kind in adapter.kinds
+    ):
+        return (), (), ""
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    states: dict[str, SourceFileState] = {}
+    try:
+        import h5py
+        _remember_source_state(candidate.path, states)
+        is_hdf5 = bool(h5py.is_hdf5(candidate.path))
+        _verify_source_states(states)
+    except Exception as error:
+        raise ValueError(
+            "source dependency type could not be established: "
+            f"{candidate.path}: {type(error).__name__}: {error}"
+        ) from error
+    if not is_hdf5:
+        if not _candidate_still_exact(candidate):
+            raise ValueError(
+                f"source candidate changed during admission: {candidate.path}"
+            )
+        return (
+            (),
+            tuple(states.values()),
+            "not a readable HDF5 container",
+        )
+
+    external: list[Path] = []
+    traced: set[tuple[str, str]] = set()
+
+    def record_external(
+        parent: object,
+        link: object,
+        *,
+        required: bool = False,
+    ) -> None:
+        if not isinstance(link, h5py.ExternalLink):
+            return
+        dependency = _hdf5_link_file(parent, link.filename)
+        external.append(dependency)
+        _trace_hdf5_object_dependencies(
+            dependency,
+            os.fsdecode(link.path),
+            paths=external,
+            seen=traced,
+            cancelled=cancelled,
+            required=required,
+            states=states,
+        )
+
+    def trace_indirect_link(
+        parent: object,
+        link: object,
+        *,
+        required: bool = False,
+        selected_paths: list[Path] | None = None,
+        selected_seen: set[tuple[str, str]] | None = None,
+        selected_states: dict[str, SourceFileState] | None = None,
+    ) -> None:
+        """Freeze an indirect child before any caller dereferences it."""
+
+        accepted_paths = external if selected_paths is None else selected_paths
+        accepted_seen = traced if selected_seen is None else selected_seen
+        accepted_states = states if selected_states is None else selected_states
+        if isinstance(link, h5py.ExternalLink):
+            dependency = _hdf5_link_file(parent, link.filename)
+            accepted_paths.append(dependency)
+            _trace_hdf5_object_dependencies(
+                dependency,
+                os.fsdecode(link.path),
+                paths=accepted_paths,
+                seen=accepted_seen,
+                cancelled=cancelled,
+                required=required,
+                states=accepted_states,
+            )
+        elif isinstance(link, h5py.SoftLink):
+            target = os.fsdecode(link.path)
+            if not target.startswith("/"):
+                target = posixpath.join(parent.name, target)
+            _trace_hdf5_object_dependencies(
+                Path(os.fsdecode(parent.file.filename)),
+                target,
+                paths=accepted_paths,
+                seen=accepted_seen,
+                cancelled=cancelled,
+                required=required,
+                states=accepted_states,
+            )
+
+    def direct_3d_dataset(group: object, name: str) -> bool:
+        """Whether one non-soft canonical leaf resolves to a 3-D dataset."""
+
+        link = group.get(name, getlink=True)
+        if isinstance(link, h5py.SoftLink):
+            return False
+        record_external(group, link, required=True)
+        try:
+            value = group.get(name)
+        except (KeyError, OSError, RuntimeError):
+            return False
+        if not isinstance(value, h5py.Dataset) or value.ndim != 3:
+            return False
+        external.extend(
+            _hdf5_dataset_dependency_paths(
+                value,
+                cancelled=cancelled,
+                required=True,
+                states=states,
+            )
+        )
+        return True
+
+    def has_apstools_flat_contract(entry: object | None) -> bool:
+        if entry is None:
+            return False
+        from xrd_tools.sources.descriptor import (
+            _apstools_flat_nxdata_contract,
+            _apstools_flat_stack_paths,
+        )
+
+        trial_paths: list[Path] = []
+        trial_seen = set(traced)
+        trial_states = dict(states)
+        entry_file = Path(os.fsdecode(entry.file.filename))
+        selectors: tuple[str, ...] = ()
+        with _open_stable_hdf5_dependency(
+            entry_file,
+            trial_states,
+        ) as trial_handle:
+            if trial_handle is None:
+                return False
+            try:
+                trial_entry = trial_handle.get(entry.name)
+            except (KeyError, OSError, RuntimeError):
+                trial_entry = None
+            if not isinstance(trial_entry, h5py.Group):
+                return False
+            for selector in (
+                posixpath.join(trial_entry.name, "data"),
+                posixpath.join(
+                    trial_entry.name, "instrument", "bluesky"
+                ),
+            ):
+                _trace_hdf5_object_dependencies(
+                    entry_file,
+                    selector,
+                    paths=trial_paths,
+                    seen=trial_seen,
+                    cancelled=cancelled,
+                    required=False,
+                    states=trial_states,
+                )
+            if not _apstools_flat_nxdata_contract(
+                trial_handle,
+                trial_entry,
+            ):
+                return False
+            data_group = trial_entry.get("data")
+            child_dependencies: dict[str, list[Path]] = {}
+            inspection_states = dict(trial_states)
+            if isinstance(data_group, h5py.Group):
+                for raw_name in data_group:
+                    name = str(raw_name)
+                    try:
+                        link = data_group.get(name, getlink=True)
+                    except (KeyError, OSError, RuntimeError):
+                        continue
+                    if not isinstance(
+                        link,
+                        (h5py.ExternalLink, h5py.SoftLink),
+                    ):
+                        continue
+                    child_paths: list[Path] = []
+                    child_seen = set(trial_seen)
+                    trace_indirect_link(
+                        data_group,
+                        link,
+                        selected_paths=child_paths,
+                        selected_seen=child_seen,
+                        selected_states=inspection_states,
+                    )
+                    child_dependencies[
+                        _hdf5_object_path(
+                            posixpath.join(data_group.name, name)
+                        )
+                    ] = child_paths
+            selectors = tuple(_apstools_flat_stack_paths(trial_entry))
+            for selector in selectors:
+                child = child_dependencies.get(
+                    _hdf5_object_path(selector)
+                )
+                if child is not None:
+                    trial_paths.extend(child)
+                    for path in child:
+                        key = _source_state_key(path)
+                        child_state = inspection_states.get(key)
+                        if child_state is not None:
+                            trial_states.setdefault(key, child_state)
+                _trace_hdf5_object_dependencies(
+                    entry_file,
+                    selector,
+                    paths=trial_paths,
+                    seen=trial_seen,
+                    cancelled=cancelled,
+                    required=True,
+                    states=trial_states,
+                )
+        _verify_source_states(trial_states)
+        external.extend(trial_paths)
+        traced.clear()
+        traced.update(trial_seen)
+        states.clear()
+        states.update(trial_states)
+        return True
+
+    def has_decisive_detector(entry: object | None) -> bool:
+        """Match only resolver arms that precede every recursive fallback."""
+
+        if entry is None:
+            return False
+        try:
+            from xrd_tools.io.processed_scan_id import is_processed_xdart_file
+            entry_name = entry.name.strip("/").split("/")[-1]
+            if is_processed_xdart_file(entry.file, entry_name):
+                return True
+        except Exception:
+            pass
+        if has_apstools_flat_contract(entry):
+            return True
+        try:
+            data_link = entry.get("data", getlink=True)
+        except (KeyError, OSError, RuntimeError):
+            data_link = None
+        trace_indirect_link(entry, data_link)
+        try:
+            data = entry.get("data")
+        except (KeyError, OSError, RuntimeError):
+            data = None
+        if not isinstance(data_link, h5py.SoftLink) and isinstance(
+            data, h5py.Group
+        ):
+            # The descriptor treats every direct ExternalLink in entry/data as
+            # an Eiger segment and gives that set absolute precedence.
+            eiger_links = False
+            for name in data:
+                link = data.get(str(name), getlink=True)
+                if isinstance(link, h5py.ExternalLink):
+                    record_external(data, link, required=True)
+                    eiger_links = True
+                    value = data.get(str(name))
+                    if isinstance(value, h5py.Dataset):
+                        external.extend(
+                            _hdf5_dataset_dependency_paths(
+                                value,
+                                cancelled=cancelled,
+                                required=True,
+                                states=states,
+                            )
+                        )
+            if eiger_links:
+                return True
+            if direct_3d_dataset(data, "data"):
+                return True
+
+        try:
+            instrument_link = entry.get("instrument", getlink=True)
+        except (KeyError, OSError, RuntimeError):
+            instrument_link = None
+        trace_indirect_link(entry, instrument_link)
+        try:
+            instrument = entry.get("instrument")
+        except (KeyError, OSError, RuntimeError):
+            instrument = None
+        if isinstance(instrument_link, h5py.SoftLink) or not isinstance(
+            instrument, h5py.Group
+        ):
+            return False
+        try:
+            detector_link = instrument.get("detector", getlink=True)
+        except (KeyError, OSError, RuntimeError):
+            detector_link = None
+        trace_indirect_link(instrument, detector_link)
+        try:
+            detector = instrument.get("detector")
+        except (KeyError, OSError, RuntimeError):
+            detector = None
+        if (
+            not isinstance(detector_link, h5py.SoftLink)
+            and isinstance(detector, h5py.Group)
+            and direct_3d_dataset(detector, "data")
+        ):
+            return True
+        for name in instrument:
+            link = instrument.get(str(name), getlink=True)
+            if isinstance(link, (h5py.SoftLink, h5py.ExternalLink)):
+                record_external(instrument, link)
+                # Resolver precedence follows instrument child order.  Once
+                # an indirect child is encountered, a later local child cannot
+                # prove which landed detector wins without following the full
+                # dependency tree.
+                return False
+            try:
+                group = instrument.get(str(name))
+            except (KeyError, OSError, RuntimeError):
+                continue
+            if isinstance(group, h5py.Group) and direct_3d_dataset(
+                group, "data"
+            ):
+                return True
+        return False
+
+    try:
+        with _open_stable_hdf5_dependency(
+            candidate.path,
+            states,
+        ) as handle:
+            if handle is None:
+                raise ValueError(
+                    f"source candidate disappeared during admission: "
+                    f"{candidate.path}"
+                )
+            root_names = tuple(str(raw_name) for raw_name in handle)
+            inspected: dict[
+                str,
+                tuple[
+                    bool,
+                    str,
+                    list[Path],
+                    set[tuple[str, str]],
+                    dict[str, SourceFileState],
+                ],
+            ] = {}
+
+            def root_group_facts(value: object) -> tuple[bool, str]:
+                if not isinstance(value, h5py.Group):
+                    return False, ""
+                raw_class = value.attrs.get("NX_class", "")
+                if isinstance(raw_class, bytes):
+                    return True, raw_class.decode(
+                        "utf-8", errors="replace"
+                    )
+                if isinstance(raw_class, np.ndarray):
+                    first = raw_class.ravel()[0] if raw_class.size else ""
+                    return True, (
+                        first.decode("utf-8", errors="replace")
+                        if isinstance(first, bytes)
+                        else str(first)
+                    )
+                return True, str(raw_class or "")
+
+            def inspect_root_group(name: str) -> tuple[
+                bool,
+                str,
+                list[Path],
+                set[tuple[str, str]],
+                dict[str, SourceFileState],
+            ]:
+                cached = inspected.get(name)
+                if cached is not None:
+                    return cached
+                trial_paths: list[Path] = []
+                trial_seen = set(traced)
+                trial_states = dict(states)
+                is_group = False
+                nx_class = ""
+                try:
+                    root_link = handle.get(name, getlink=True)
+                except (KeyError, OSError, RuntimeError):
+                    root_link = None
+                if not isinstance(
+                    root_link,
+                    (h5py.ExternalLink, h5py.SoftLink),
+                ):
+                    # A hard-linked root object belongs wholly to the already
+                    # frozen master.  Inspect it in-place so the common layout
+                    # still costs only one HDF5 open per candidate.
+                    try:
+                        value = handle.get(name)
+                    except (KeyError, OSError, RuntimeError):
+                        value = None
+                    is_group, nx_class = root_group_facts(value)
+                    result = (
+                        is_group,
+                        nx_class,
+                        trial_paths,
+                        trial_seen,
+                        trial_states,
+                    )
+                    inspected[name] = result
+                    return result
+                with _open_stable_hdf5_dependency(
+                    candidate.path,
+                    trial_states,
+                ) as trial_root:
+                    if trial_root is not None:
+                        try:
+                            link = trial_root.get(name, getlink=True)
+                        except (KeyError, OSError, RuntimeError):
+                            link = None
+                        trace_indirect_link(
+                            trial_root,
+                            link,
+                            selected_paths=trial_paths,
+                            selected_seen=trial_seen,
+                            selected_states=trial_states,
+                        )
+                        try:
+                            value = trial_root.get(name)
+                        except (KeyError, OSError, RuntimeError):
+                            value = None
+                        is_group, nx_class = root_group_facts(value)
+                _verify_source_states(trial_states)
+                result = (
+                    is_group,
+                    nx_class,
+                    trial_paths,
+                    trial_seen,
+                    trial_states,
+                )
+                inspected[name] = result
+                return result
+
+            selected_root = None
+            hint = inspect_root_group("entry")
+            if hint[0] and hint[1] in {"NXentry", ""}:
+                selected_root = "entry"
+            else:
+                for name in root_names:
+                    value = inspect_root_group(name)
+                    if value[0] and value[1] == "NXentry":
+                        selected_root = name
+                        break
+                if selected_root is None and hint[0]:
+                    selected_root = "entry"
+
+            selected_entry = None
+            if selected_root is not None:
+                _, _, selected_paths, selected_seen, selected_states = (
+                    inspect_root_group(selected_root)
+                )
+                external.extend(selected_paths)
+                traced.clear()
+                traced.update(selected_seen)
+                states.clear()
+                states.update(selected_states)
+                try:
+                    value = handle.get(selected_root)
+                except (KeyError, OSError, RuntimeError):
+                    value = None
+                if isinstance(value, h5py.Group):
+                    selected_entry = value
+            if not has_decisive_detector(selected_entry):
+                external.extend(_scan_all_external_links(
+                    handle,
+                    cancelled=cancelled,
+                    states=states,
+                ))
+    except RuntimeError as error:
+        if error.args == ("admission cancelled",):
+            raise
+        raise ValueError(
+            "source dependency inventory could not be established: "
+            f"{candidate.path}: {type(error).__name__}: {error}"
+        ) from error
+    except Exception as error:
+        raise ValueError(
+            "source dependency inventory could not be established: "
+            f"{candidate.path}: {type(error).__name__}: {error}"
+        ) from error
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    if not _candidate_still_exact(candidate):
+        raise ValueError(
+            f"source candidate changed during admission: {candidate.path}"
+        )
+    _verify_source_states(states)
+    return (
+        tuple(dict.fromkeys(external)),
+        tuple(states.values()),
+        "",
+    )
+
+
+def _deferred_directory_plan(
+    configuration: OutputCandidate,
+    plan: RunCandidatePlan,
+    discovered_paths: tuple[Path, ...],
+    *,
+    cancelled: Callable[[], bool],
+) -> DeferredDirectoryPlan:
+    if not plan.candidates:
+        raise RuntimeError("source has no matching candidates")
+    staged: list[
+        tuple[
+            tuple[Candidate, ...],
+            Path,
+            tuple[Path, ...],
+            tuple[SourceFileState, ...],
+            str,
+        ]
+    ] = []
+    for group in _directory_candidate_groups(plan):
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        representative = group[0]
+        adapter = get_adapter(representative.adapter_id)
+        if adapter is None:
+            raise ValueError(
+                f"candidate {representative.path} lost its adapter"
+            )
+        name = adapter.scan_name(representative.path)
+        target = _directory_target(configuration, plan, representative, name)
+        external_paths, inventory_states, skip_reason = _external_link_inventory(
+            representative,
+            cancelled=cancelled,
+        )
+        staged.append(
+            (group, target, external_paths, inventory_states, skip_reason)
+        )
+
+    _validate_deferred_targets(
+        configuration,
+        plan,
+        tuple(
+            target
+            for _group, target, _external, _states, _reason in staged
+        ),
+        tuple(
+            path
+            for _group, _target, paths, _states, _reason in staged
+            for path in paths
+        ),
+    )
+    entries: list[DeferredDirectoryEntry] = []
+    for (
+        group,
+        target,
+        external_paths,
+        inventory_states,
+        skip_reason,
+    ) in staged:
+        keys = {
+            os.path.normcase(os.path.abspath(path))
+            for path in (candidate.path for candidate in group)
+        }
+        physical = tuple(
+            path
+            for path in discovered_paths
+            if os.path.normcase(os.path.abspath(path)) in keys
+        )
+        if not physical:
+            raise ValueError(
+                f"directory candidate escaped physical file census: {group[0].path}"
+            )
+        protected: list[SourceFileState] = []
+        frozen = {
+            _source_state_key(value.path): value
+            for value in inventory_states
+        }
+        reason = skip_reason
+        for source_candidate in group:
+            key = _source_state_key(source_candidate.path)
+            try:
+                state = frozen.get(key) or SourceFileState.capture(
+                    source_candidate.path
+                )
+            except OSError as error:
+                raise ValueError(
+                    "source candidate changed during finite admission: "
+                    f"{source_candidate.path}"
+                ) from error
+            if not state.matches_disk():
+                raise ValueError(
+                    "source candidate changed during finite admission: "
+                    f"{source_candidate.path}"
+                )
+            protected.append(state)
+        for path in external_paths:
+            key = _source_state_key(path)
+            if any(_source_state_key(value.path) == key for value in protected):
+                continue
+            try:
+                state = frozen.get(key) or SourceFileState.capture(path)
+            except FileNotFoundError as error:
+                raise ValueError(
+                    "source dependency is still landing; finite Standard "
+                    f"admission cannot safely start: {path}"
+                ) from error
+            except OSError as error:
+                raise ValueError(
+                    f"source dependency could not be frozen: {path}: {error}"
+                ) from error
+            if not state.matches_disk():
+                raise ValueError(
+                    f"source dependency changed during admission: {state.path}"
+                )
+            protected.append(state)
+        entries.append(DeferredDirectoryEntry(
+            group,
+            target,
+            OutputFact(_path_state(target)),
+            physical,
+            tuple(protected),
+            reason,
+        ))
+    return DeferredDirectoryPlan(
+        plan,
+        tuple(entries),
+        discovered_paths,
+    )
+
+
+def _validate_deferred_targets(
+    configuration: OutputCandidate,
+    plan: RunCandidatePlan,
+    targets: tuple[Path, ...],
+    external_paths: tuple[Path, ...],
+) -> None:
+    source = configuration.source
+    if type(source) is not DirectorySourceSpec:
+        raise TypeError("deferred targets require a directory source")
+    raw_paths = (
+        tuple(candidate.path for candidate in plan.candidates)
+        + external_paths
+    )
+    raw_norms = {
+        os.path.normcase(os.path.realpath(path)) for path in raw_paths
+    }
+    raw_inodes: set[tuple[int, int]] = set()
+    for path in raw_paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        raw_inodes.add((int(stat.st_dev), int(stat.st_ino)))
+    protected = tuple(
+        Path(value)
+        for value in (configuration.poni_file, configuration.mask_file)
+        if value
+    )
+    seen: set[str] = set()
+    for target in targets:
+        normalized = os.path.normcase(os.path.realpath(target))
+        if normalized in seen:
+            raise ValueError(f"duplicate output target {target}")
+        seen.add(normalized)
+        target_inode = None
+        try:
+            stat = target.stat()
+        except OSError:
+            pass
+        else:
+            target_inode = (int(stat.st_dev), int(stat.st_ino))
+        if normalized in raw_norms or (
+            target_inode is not None and target_inode in raw_inodes
+        ):
+            raise OutputCollisionError(
+                f"Reduction output '{target}' is the same file as a raw "
+                "directory input; choose a separate Save Path."
+            )
+        check_output_not_source(
+            target,
+            input_files=protected,
+            watched_dirs=(source.root,),
+            recursive=source.recursive,
+            container_directory_mode=True,
+        )
+
+
+def materialize_deferred_output(
+    receipt: AdmissionReceipt,
+    session: DirectoryIndexSession,
+    entry: DeferredDirectoryEntry,
+    *,
+    cancelled: Callable[[], bool],
+) -> tuple[AdmittedOutput | None, int, int]:
+    deferred = receipt.deferred_directory
+    if (
+        type(deferred) is not DeferredDirectoryPlan
+        or type(entry) is not DeferredDirectoryEntry
+        or not any(value is entry for value in deferred.entries)
+    ):
+        raise TypeError("deferred output is not owned by this receipt")
+    _validate_deferred_entry_states(entry)
+    if entry.skip_reason:
+        return None, 0, len(entry.physical_paths)
+
+    ready: list[Candidate] = []
+    descriptors: list[ContainerDescriptor | None] = []
+    skipped = 0
+    for candidate in entry.candidates:
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        # ``validate_admitted_receipt`` refreshes and reconciles the complete
+        # name/stat snapshot once before execution.  Refreshing again here
+        # would rescan the whole directory for every member (O(N^2)); the
+        # exact-one probe itself revalidates this candidate after opening it.
+        observed = session.probe_candidate(candidate, refresh=False)
+        descriptor = observed.descriptor
+        if observed.result.state is ProbeState.READY and (
+            descriptor is not None
+            or observed.result.kind is SourceKind.IMAGE_FILE
+        ):
+            ready.append(observed.candidate)
+            descriptors.append(descriptor)
+        else:
+            skipped += 1
+    if not ready:
+        return None, 0, len(entry.physical_paths)
+    plan = deferred.candidates
+    subset = RunCandidatePlan(
+        plan.generation,
+        tuple(ready),
+        plan.root,
+        plan.recursive,
+        plan.name_filter,
+        tuple(descriptors),
+    )
+    items = _directory_items(
+        receipt.candidate,
+        subset,
+        cancelled=cancelled,
+    )
+    if len(items) != 1:
+        raise ValueError("deferred source group did not produce one output")
+    item = items[0]
+    if item.target != entry.target:
+        raise ValueError("deferred source target changed during materialization")
+    _validate_deferred_entry_states(entry, item=item)
+    _validate_targets(receipt.candidate, receipt.candidate.source, (item,))
+    decision = inspect_output(item, receipt.candidate, entry.fact)
+    if item.source_spec.kind is SourceKind.TIFF_SERIES:
+        return decision, len(ready), skipped
+    return decision, len(entry.physical_paths), 0
+
+
+def _validate_deferred_entry_states(
+    entry: DeferredDirectoryEntry,
+    *,
+    item: PlannedOutput | None = None,
+) -> None:
+    """Require one deferred cursor to remain inside its admitted revision."""
+
+    frozen = {value.path: value for value in entry.protected_states}
+    for state in entry.protected_states:
+        if not state.matches_disk():
+            raise ValueError(
+                f"source dependency changed after admission: {state.path}"
+            )
+    if item is None:
+        return
+    stamp = item.source_stamp
+    selected = tuple(stamp.members or (stamp.file,)) + tuple(
+        value.file for value in stamp.external_members
+    ) + stamp.dependency_files
+    for state in selected:
+        accepted = frozen.get(state.path)
+        if accepted is None or accepted != state:
+            raise ValueError(
+                "source dependency escaped admitted revision: "
+                f"{state.path}"
+            )
+
+
 def validate_admitted_receipt(
     receipt: AdmissionReceipt,
     session: DirectoryIndexSession | None,
@@ -205,6 +1635,28 @@ def validate_admitted_receipt(
     if is_cancelled():
         raise RuntimeError("admission cancelled")
     outputs = receipt.outputs
+    deferred = receipt.deferred_directory
+    if deferred is not None:
+        if (
+            type(deferred) is not DeferredDirectoryPlan
+            or session is None
+        ):
+            raise RuntimeError("deferred directory admission lost its session")
+        observation = session.observe(refresh=True)
+        reconciliation = deferred.candidates.reconcile(
+            observation.discovered_snapshot
+        )
+        if not reconciliation.baseline_current:
+            raise ValueError("source group changed after admission")
+        for entry in deferred.entries:
+            if is_cancelled():
+                raise RuntimeError("admission cancelled")
+            _validate_deferred_entry_states(entry)
+            if _path_state(entry.target) != entry.fact.target_state:
+                raise RuntimeError(
+                    f"output target changed after admission: {entry.target}"
+                )
+        return
     if session is None:
         source = receipt.candidate.source
         if type(source) is SourceSpec and source.kind is SourceKind.TIFF_SERIES:
@@ -549,14 +2001,22 @@ def _container_item(
     )
     name = descriptor.scan_name or path.stem.removesuffix("_master")
     target = _resolved_generated_target(configuration.save_path, name)
+    external_members = _external_members(
+        path,
+        descriptor,
+        cancelled=cancelled,
+    )
     stamp = SourceExecutionStamp(
         state,
         owner.id,
         descriptor.frame_count,
         0,
-        external_members=_external_members(
+        external_members=external_members,
+        dependency_files=_selected_dependency_files(
             path,
+            state,
             descriptor,
+            external_members,
             cancelled=cancelled,
         ),
     )
@@ -566,6 +2026,19 @@ def _container_item(
         target,
         stamp,
         descriptor=descriptor,
+    )
+
+
+def _uses_eager_directory_descriptors(
+    configuration: FrozenRunConfiguration | OutputCandidate,
+) -> bool:
+    if type(configuration) is FrozenRunConfiguration:
+        return bool(configuration.gi.enabled or configuration.live_mode)
+    values = configuration.processing_mapping()
+    gi = values.get("gi", {})
+    return bool(
+        values.get("live_mode")
+        or (type(gi) is dict and gi.get("enabled"))
     )
 
 
@@ -650,6 +2123,32 @@ def _directory_items(
             )
         else:
             consumed.add(candidate.path)
+            if _uses_eager_directory_descriptors(configuration):
+                state = _capture_source_states(
+                    (candidate.path,),
+                    cancelled,
+                )[0]
+                adapter = get_adapter(candidate.adapter_id)
+                if adapter is None:
+                    raise ValueError(
+                        f"candidate {candidate.path} lost its adapter"
+                    )
+                refreshed = adapter.probe(candidate.path)
+                if (
+                    not state.matches_disk()
+                    or refreshed.state is not ProbeState.READY
+                    or refreshed.descriptor is None
+                ):
+                    raise ValueError(
+                        "container changed during eager admission: "
+                        f"{candidate.path}"
+                    )
+                descriptor = refreshed.descriptor
+            else:
+                state = _capture_source_states(
+                    (candidate.path,),
+                    cancelled,
+                )[0]
             if descriptor.kind is SourceKind.PROCESSED_NEXUS:
                 raise ValueError("processed output cannot be raw input")
             if descriptor.frame_count < 1:
@@ -659,10 +2158,16 @@ def _directory_items(
                 candidate.path, descriptor.kind,
                 entry=descriptor.resolved_entry or descriptor.requested_entry,
             )
-            state = _capture_source_states((candidate.path,), cancelled)[0]
             external_members = _external_members(
                 candidate.path,
                 descriptor,
+                cancelled=cancelled,
+            )
+            dependency_files = _selected_dependency_files(
+                candidate.path,
+                state,
+                descriptor,
+                external_members,
                 cancelled=cancelled,
             )
             if cancelled():
@@ -671,6 +2176,7 @@ def _directory_items(
                 state,
                 candidate.adapter_id, descriptor.frame_count, 0,
                 external_members=external_members,
+                dependency_files=dependency_files,
             )
         output_request = configuration.save_path
         if not output_root.suffix:
@@ -756,6 +2262,13 @@ def validate_planned_source(
                 )
         if is_cancelled():
             raise RuntimeError("admission cancelled")
+    for dependency in item.source_stamp.dependency_files:
+        if is_cancelled():
+            raise RuntimeError("admission cancelled")
+        if not dependency.matches_disk():
+            raise ValueError(
+                f"source dependency changed before open: {dependency.path}"
+            )
 def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
     stamp = item.source_stamp
     if stamp.members:
@@ -798,6 +2311,14 @@ def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
             "frame_count": external.stop - external.first,
             "dataset_path": external.dataset,
             "self_contained": True,
+        }
+    for dependency in stamp.dependency_files:
+        values[dependency.path] = {
+            "adapter_id": "hdf5_dependency",
+            **dependency.as_dict(),
+            "frame_count": 0,
+            "self_contained": True,
+            "source_role": "detector_dependency",
         }
     return values
 def execution_plan_values(
@@ -852,6 +2373,10 @@ def _validate_targets(
         Path(external.file.path)
         for item in items
         for external in item.source_stamp.external_members
+    ) + tuple(
+        Path(dependency.path)
+        for item in items
+        for dependency in item.source_stamp.dependency_files
     ) + tuple(
         Path(metadata.metadata_file.path)
         for item in items
@@ -926,12 +2451,44 @@ def _external_members(
         for epoch, segment in enumerate(segments):
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            link = handle.get(segment, getlink=True)
+            components = tuple(
+                value
+                for value in segment.strip("/").split("/")
+                if value
+            )
+            parent: object = handle
+            for component in components[:-1]:
+                if not isinstance(parent, h5py.Group):
+                    return ()
+                parent = parent.get(component)
+            if not components or not isinstance(parent, h5py.Group):
+                return ()
+            link = parent.get(components[-1], getlink=True)
             if not isinstance(link, h5py.ExternalLink):
-                raise ValueError("external container lost its exact link")
-            path = (master.parent / link.filename).resolve(strict=True)
-            with h5py.File(path, "r") as member:
-                stop = first + int(member[link.path].shape[0])
+                # A soft link or an ExternalLink in an ancestor still yields a
+                # valid external detector, but it is not a direct Eiger segment
+                # with a member-qualified range.  The exact dependency closure
+                # below freezes that chain instead.
+                return ()
+            path = _hdf5_link_file(parent, link.filename).resolve(strict=True)
+            dataset = parent.get(components[-1])
+            if not isinstance(dataset, h5py.Dataset):
+                raise ValueError("external container lost its exact dataset")
+            count = 1 if dataset.ndim == 2 else int(dataset.shape[0])
+            frame_shape = (
+                tuple(int(value) for value in dataset.shape)
+                if dataset.ndim == 2
+                else tuple(int(value) for value in dataset.shape[1:])
+            )
+            if (
+                frame_shape != descriptor.frame_shape
+                or np.dtype(dataset.dtype) != descriptor.dtype
+            ):
+                raise ValueError(
+                    "external detector layout changed during admission: "
+                    f"{path}:{link.path}"
+                )
+            stop = first + count
             values.append(
                 ExternalSourceState(
                     SourceFileState.capture(path),
@@ -944,7 +2501,113 @@ def _external_members(
             first = stop
             if cancelled():
                 raise RuntimeError("admission cancelled")
+    if values and first != descriptor.frame_count:
+        raise ValueError(
+            "external detector frame count changed during admission: "
+            f"descriptor={descriptor.frame_count}, members={first}"
+        )
     return tuple(values)
+
+
+def _selected_dependency_files(
+    master: Path,
+    master_state: SourceFileState,
+    descriptor: ContainerDescriptor,
+    external_members: tuple[ExternalSourceState, ...],
+    *,
+    cancelled: Callable[[], bool] = _not_cancelled,
+) -> tuple[SourceFileState, ...]:
+    """Freeze non-leaf-link and dataset-storage files actually selected."""
+
+    selectors = descriptor.segment_paths or (
+        (descriptor.dataset_path,) if descriptor.dataset_path else ()
+    )
+    if not selectors:
+        return ()
+    import h5py
+
+    paths: list[Path] = []
+    seen: set[tuple[str, str]] = set()
+    states = {_source_state_key(master_state.path): master_state}
+    for external in external_members:
+        key = _source_state_key(external.file.path)
+        accepted = states.get(key)
+        if accepted is not None and not _same_source_revision(
+            accepted,
+            external.file,
+        ):
+            raise ValueError(
+                "external detector member changed during admission: "
+                f"{external.file.path}"
+            )
+        states.setdefault(key, external.file)
+    for selector in selectors:
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        _trace_hdf5_object_dependencies(
+            master,
+            selector,
+            paths=paths,
+            seen=seen,
+            cancelled=cancelled,
+            required=True,
+            states=states,
+        )
+    frame_count = 0
+    with _open_stable_hdf5_dependency(master, states) as handle:
+        if handle is None:
+            raise ValueError(
+                f"selected detector disappeared during admission: {master}"
+            )
+        for selector in selectors:
+            value = handle.get(selector)
+            if not isinstance(value, h5py.Dataset) or value.ndim not in {2, 3}:
+                raise ValueError(
+                    f"selected detector dependency is unavailable: "
+                    f"{master}:{selector}"
+                )
+            count = 1 if value.ndim == 2 else int(value.shape[0])
+            shape = (
+                tuple(int(item) for item in value.shape)
+                if value.ndim == 2
+                else tuple(int(item) for item in value.shape[1:])
+            )
+            if (
+                shape != descriptor.frame_shape
+                or np.dtype(value.dtype) != descriptor.dtype
+            ):
+                raise ValueError(
+                    "selected detector layout changed during admission: "
+                    f"{master}:{selector}"
+                )
+            frame_count += count
+    if frame_count != descriptor.frame_count:
+        raise ValueError(
+            "selected detector frame count changed during admission: "
+            f"descriptor={descriptor.frame_count}, selected={frame_count}"
+        )
+    excluded = {
+        _source_state_key(master),
+        *(
+            _source_state_key(value.file.path)
+            for value in external_members
+        ),
+    }
+    selected: list[SourceFileState] = []
+    for path in dict.fromkeys(paths):
+        key = _source_state_key(path)
+        if key in excluded or any(
+            _source_state_key(value.path) == key for value in selected
+        ):
+            continue
+        state = states.get(key)
+        if state is None:
+            state = _remember_source_state(path, states)
+        selected.append(state)
+    _verify_source_states(states)
+    return tuple(selected)
+
+
 def _path_state(path: Path) -> tuple[int, int, int, int, int] | bool:
     try:
         stat = path.stat()
@@ -955,8 +2618,9 @@ def _path_state(path: Path) -> tuple[int, int, int, int, int] | bool:
         int(stat.st_dev), int(stat.st_ino),
     )
 __all__ = [
-    "OutputCandidate", "execution_plan_values",
-    "inspect_output", "OutputFact", "prepare_output", "source_snapshots",
+    "DeferredDirectoryEntry", "DeferredDirectoryPlan", "OutputCandidate",
+    "execution_plan_values", "inspect_output", "materialize_deferred_output",
+    "OutputFact", "prepare_output", "source_snapshots",
     "target_state_matches", "validate_admitted_receipt",
     "validate_planned_source",
 ]

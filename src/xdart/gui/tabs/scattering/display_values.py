@@ -98,6 +98,12 @@ class StandardRunEvent:
     frame_key: DisplayFrameKey | None = None
     selection_generation: int = 0
     navigation_delta: DisplayNavigationDelta | None = None
+    artifact_completed: int = 0
+    artifact_total: int = 0
+    files_processed: int = 0
+    files_skipped: int = 0
+    files_pending: int = 0
+    files_discovered: int = 0
 
 @dataclass(frozen=True, slots=True)
 class StandardDisplayPayload:
@@ -136,7 +142,18 @@ def standard_event_is_valid(value: object, identity: RunIdentity) -> bool:
                     and value.navigation_delta.appended is value.frame_key
                     and value.navigation_delta.appended.run_identity is identity
                 )
-                and _nonnegative_int(value.selection_generation))
+                and _nonnegative_int(value.selection_generation)
+                and _nonnegative_int(value.artifact_completed)
+                and _nonnegative_int(value.artifact_total)
+                and value.artifact_completed <= value.artifact_total
+                and _nonnegative_int(value.files_processed)
+                and _nonnegative_int(value.files_skipped)
+                and _nonnegative_int(value.files_pending)
+                and _nonnegative_int(value.files_discovered)
+                and value.files_processed
+                + value.files_skipped
+                + value.files_pending
+                == value.files_discovered)
     except Exception:
         return False
 

@@ -287,6 +287,45 @@ def _image_scan_name(path: Path) -> str:
 
 def _image_probe(path: Path) -> Any:
     from xrd_tools.sources.probe import ProbeResult, ProbeState
+    if path.suffix.lower() == ".raw":
+        from xrd_tools.io.image import (
+            infer_raw_detector_shape,
+            read_image,
+        )
+
+        shape = infer_raw_detector_shape(path)
+        if shape is None:
+            # A headerless RAW file may still be landing.  Keep an unknown
+            # payload size provisional so the DirectoryIndex retry window can
+            # observe a later exact known-detector size; never guess geometry.
+            return ProbeResult(
+                ProbeState.IN_PROGRESS,
+                reason="RAW payload does not yet match one known detector",
+                kind=SourceKind.IMAGE_FILE,
+            )
+        try:
+            image = read_image(
+                path,
+                detector_shape=shape,
+                preserve_dtype=True,
+            )
+        except Exception as exc:
+            return ProbeResult(
+                ProbeState.IN_PROGRESS,
+                reason=f"RAW image is not yet readable: {exc}",
+                kind=SourceKind.IMAGE_FILE,
+            )
+        if image.ndim != 2 or tuple(image.shape) != tuple(shape):
+            return ProbeResult(
+                ProbeState.INVALID,
+                reason="RAW image shape did not match inferred detector",
+                kind=SourceKind.IMAGE_FILE,
+            )
+        return ProbeResult(
+            ProbeState.READY,
+            reason="RAW image file readable",
+            kind=SourceKind.IMAGE_FILE,
+        )
     import fabio
     try:
         with fabio.open(str(path)) as f:

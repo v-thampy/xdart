@@ -104,11 +104,20 @@ def test_two_independent_tiff_series_keep_distinct_group_identity(
 
     receipt, session = admit_with_session(start)
     try:
-        groups = tuple(output.item.group for output in receipt.outputs)
-        assert len(groups) == 2
-        assert all(group is not None for group in groups)
-        assert groups[0] != groups[1]
-        assert {len(group.member_paths) for group in groups} == {2}
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        assert len(deferred.entries) == 2
+        assert {
+            tuple(candidate.path.name for candidate in entry.candidates)
+            for entry in deferred.entries
+        } == {
+            ("alpha_0001.tif", "alpha_0002.tif"),
+            ("beta_0001.tif", "beta_0002.tif"),
+        }
+        assert {entry.target.name for entry in deferred.entries} == {
+            "alpha.nexus",
+            "beta.nexus",
+        }
     finally:
         session.close()
 

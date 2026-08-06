@@ -205,6 +205,32 @@ class DirectoryIndexSession:
     def observe(self, *, refresh: bool = True) -> DirectoryObservation:
         return self.observe_async(refresh=refresh).result()
 
+    def probe_candidate(
+        self,
+        candidate: Candidate,
+        *,
+        refresh: bool = True,
+    ) -> CandidateObservation:
+        """Probe exactly one frozen candidate on the serialized owner.
+
+        Large Standard directory runs use this cursor-shaped operation so
+        content readiness and container frame counts are learned only when
+        that candidate reaches execution.  The optional refresh revalidates
+        its cheap ``(path, adapter, size, mtime)`` identity first; no sibling
+        candidate is probed as a side effect.
+        """
+
+        if type(candidate) is not Candidate:
+            raise TypeError("candidate probe requires an exact Candidate")
+        generation, config = self._request()
+        return self._executor.submit(
+            self._probe_candidate_on_owner,
+            generation,
+            config,
+            candidate,
+            bool(refresh),
+        ).result()
+
     def enable_probes(self, *, exclude: tuple[Candidate, ...] = ()) -> None:
         with self._lock:
             if self._closed:
@@ -394,6 +420,36 @@ class DirectoryIndexSession:
             elapsed_s=time.perf_counter() - started,
             unprobed_count=unprobed_count,
         )
+
+    def _probe_candidate_on_owner(
+        self,
+        generation: int,
+        config: DirectorySessionConfig,
+        candidate: Candidate,
+        refresh: bool,
+    ) -> CandidateObservation:
+        # A lazy session is configured with probing disabled.  Reuse the same
+        # owner to refresh name/stat identity, then call the index for exactly
+        # the requested candidate rather than draining the directory queue.
+        observation = self._observe_on_owner(
+            generation,
+            config,
+            refresh,
+        )
+        current = observation.discovered_snapshot.by_path().get(candidate.path)
+        if current != candidate:
+            raise StaleCandidateError(
+                f"{candidate.path} changed before its deferred probe"
+            )
+        stored = self._results.get(candidate.path)
+        if stored is not None and stored[0] == current:
+            return CandidateObservation(current, stored[1])
+        index = self._index
+        if index is None:  # pragma: no cover - owner construction invariant
+            raise RuntimeError("directory index session has no active index")
+        result = index.probe_candidate(current)
+        self._results[current.path] = (current, result)
+        return CandidateObservation(current, result)
 
     def close(self) -> None:
         with self._lock:
