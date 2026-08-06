@@ -20,10 +20,12 @@ from xrd_tools.session.scan_session import ScanSession
 from xrd_tools.sources import open_source
 from xrd_tools.sources.cursor import open_container_cursor
 from xrd_tools.sources.nexus import NexusStackSource
+from xrd_tools.sources.probe import ProbeState
 from ..contracts import (
     AdmittedOutput, AdmissionFailure, AdmissionReceipt, AdmissionReleased,
     AdmissionToken,
-    SourceCapture, StartCapture, executor_start_inputs_are_valid,
+    SourceCapture, SourceExecutionIdentityV1, StartCapture,
+    executor_start_inputs_are_valid,
 )
 from ..acquisition_runtime import AcquisitionRuntime
 from ..display_values import (
@@ -48,8 +50,10 @@ from ..events import (
     ExecutorStartFailed, RunIdentity, detach_exception,
 )
 from ..output_preflight import (
-    DeferredDirectoryPlan, OutputDisposition, PlannedOutput,
+    DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
+    OutputDisposition, PlannedOutput, SourceRevisionChanged,
     execution_plan_values, materialize_deferred_output,
+    live_directory_groups, materialize_live_directory_group,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
 )
@@ -57,6 +61,7 @@ from ..output_values import APPEND_UNAVAILABLE
 from .target_reservation import (
     AdmissionOperation as _AdmissionOperation,
     RunResources,
+    TargetLease,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +73,7 @@ _LIVE_SINK_FLUSH_EVERY = 8
 _CONTAINER_READ_CHUNK_FRAMES = 8
 _SOURCE_PREFETCH_FRAMES = 4
 _DISPLAY_PROJECTION_FRAMES = 8
+_LIVE_DIRECTORY_POLL_S = 0.1
 
 _SOURCE_SUBMISSION_END = object()
 _DISPLAY_PROJECTION_END = object()
@@ -86,6 +92,7 @@ class _StandardRun:
     sink: NexusSink | None = None
     worker: Thread | None = None
     stop_requested: bool = False
+    stop_signal: Event = field(default_factory=Event)
     sink_requires_abort: bool = False
     closed: bool = False
     cleanup_status: CleanupStatus = CleanupStatus.CLEANUP_PENDING
@@ -102,6 +109,13 @@ class _StandardRun:
     files_discovered: int = 0
     files_processed: int = 0
     files_skipped: int = 0
+    processed_live_revisions: dict[str, LiveDirectoryAttempt] = field(
+        default_factory=dict
+    )
+    deferred_live_revisions: dict[str, LiveDirectoryAttempt] = field(
+        default_factory=dict
+    )
+    live_revision_lock: Lock = field(default_factory=Lock)
     current_file_total: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
@@ -142,10 +156,16 @@ def _directory_status(
         run,
         in_flight_processed=in_flight_processed,
     )
-    return (
+    status = (
         f"{state} · {processed} processed · {skipped} skipped · "
         f"{pending} pending · {discovered} discovered"
     )
+    with run.live_revision_lock:
+        deferred = len(run.deferred_live_revisions)
+    if deferred:
+        noun = "revision" if deferred == 1 else "revisions"
+        status += f" · {deferred} source {noun} deferred"
+    return status
 
 
 def _directory_counts(
@@ -544,6 +564,7 @@ class StandardRunExecutor:
         if run is None or run.closed:
             return
         run.stop_requested = True
+        run.stop_signal.set()
         session = run.session
         if session is not None:
             runtime = run.context_runtime
@@ -702,6 +723,30 @@ class StandardRunExecutor:
         with self._lock:
             return run.display.catalog_snapshot()
 
+    def processed_live_revisions(
+        self,
+        run_identity: RunIdentity,
+    ) -> tuple[LiveDirectoryAttempt, ...]:
+        """Exact latest processed source attempt per physical Live target."""
+
+        run = self._exact_run(run_identity)
+        if run is None:
+            return ()
+        with run.live_revision_lock:
+            return tuple(run.processed_live_revisions.values())
+
+    def deferred_live_revisions(
+        self,
+        run_identity: RunIdentity,
+    ) -> tuple[LiveDirectoryAttempt, ...]:
+        """Exact latest same-target source attempt awaiting P1 composition."""
+
+        run = self._exact_run(run_identity)
+        if run is None:
+            return ()
+        with run.live_revision_lock:
+            return tuple(run.deferred_live_revisions.values())
+
     def acquisition_context(self, run_identity: RunIdentity):
         run = self._exact_run(run_identity)
         runtime = None if run is None else run.context_runtime
@@ -721,23 +766,57 @@ class StandardRunExecutor:
         run.artifact = artifact
         if configuration.output_mode != 'Overwrite':
             raise ValueError(APPEND_UNAVAILABLE)
-        if item is not None:
-            validate_planned_source(item)
-        if item is not None and item.candidate is not None and (item.descriptor is not None) and (item.descriptor.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
-            cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
-            try:
-                run.source = NexusStackSource(item.source_path, entry=item.source_spec.entry or 'entry', cursor=cursor)
-            except Exception:
-                cursor.close()
+        cancelled = lambda: run.stop_requested
+
+        def discard_source() -> None:
+            source_owner = run.source
+            if source_owner is not None:
+                close = getattr(source_owner, 'close', None)
+                if callable(close):
+                    close()
+            run.source = None
+            run.scan = None
+
+        try:
+            if item is not None:
+                validate_planned_source(item, cancelled=cancelled)
+            if item is not None and item.candidate is not None and (item.descriptor is not None) and (item.descriptor.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
+                cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
+                try:
+                    run.source = NexusStackSource(item.source_path, entry=item.source_spec.entry or 'entry', cursor=cursor)
+                except Exception:
+                    cursor.close()
+                    raise
+            else:
+                run.source = open_source(source_spec)
+            admission = None if run.resources is None else run.resources.admission
+            assets = None if admission is None else admission.scientific_assets
+            poni = assets.poni if assets is not None else load_poni(configuration.poni_file)
+            if poni is None:
+                raise ValueError('accepted PONI asset is unavailable')
+            run.scan = run.source.to_scan(poni=poni, integrator=poni_to_integrator(poni), output_path=artifact)
+        except SourceRevisionChanged:
+            discard_source()
+            raise
+        except Exception as error:
+            if (
+                isinstance(error, RuntimeError)
+                and error.args == ('admission cancelled',)
+            ):
+                discard_source()
                 raise
-        else:
-            run.source = open_source(source_spec)
-        admission = None if run.resources is None else run.resources.admission
-        assets = None if admission is None else admission.scientific_assets
-        poni = assets.poni if assets is not None else load_poni(configuration.poni_file)
-        if poni is None:
-            raise ValueError('accepted PONI asset is unavailable')
-        run.scan = run.source.to_scan(poni=poni, integrator=poni_to_integrator(poni), output_path=artifact)
+            if item is not None:
+                try:
+                    validate_planned_source(item, cancelled=cancelled)
+                except SourceRevisionChanged as drift:
+                    discard_source()
+                    raise drift from error
+                except RuntimeError as cancellation:
+                    if cancellation.args == ('admission cancelled',):
+                        discard_source()
+                        raise cancellation from error
+                    raise
+            raise
         run.scan.gi_config = configuration.gi.scan_config().copy()
         if labels is not None:
             wanted = set(labels)
@@ -880,7 +959,14 @@ class StandardRunExecutor:
             else:
                 stopped = self._execute_admitted(run)
         except Exception as error:
-            primary = detach_exception(error)
+            if (
+                run.stop_requested
+                and isinstance(error, RuntimeError)
+                and error.args == ('admission cancelled',)
+            ):
+                stopped = True
+            else:
+                primary = detach_exception(error)
         work_elapsed = max(0.0, monotonic() - started_at)
         completed, total = standard_progress(run)
         cleanup_started_at = monotonic()
@@ -931,6 +1017,8 @@ class StandardRunExecutor:
             return True
         deferred = receipt.deferred_directory
         if type(deferred) is DeferredDirectoryPlan:
+            if deferred.live:
+                return self._execute_live_directory(run, receipt, deferred)
             return self._execute_deferred_directory(run, receipt, deferred)
         try:
             npt = int(run.configuration.bai_1d_args.get("npt", 0))
@@ -1021,6 +1109,280 @@ class StandardRunExecutor:
                     **_directory_event_fields(run),
                 ))
         return stopped
+
+    def _execute_live_directory(
+        self,
+        run: _StandardRun,
+        receipt: AdmissionReceipt,
+        deferred: DeferredDirectoryPlan,
+    ) -> bool:
+        """Watch one admitted directory until Stop and JIT-run stable groups.
+
+        P-1 deliberately does not reopen an output target already committed by
+        this run.  A later source revision for that target remains visible as a
+        truthful deferred revision until the shared H23 epoch seam is composed.
+        """
+
+        resources = run.resources
+        session = None if resources is None else resources.directory_session
+        configuration = run.configuration
+        if (
+            session is None
+            or type(configuration) is not FrozenRunConfiguration
+            or not deferred.live
+        ):
+            raise RuntimeError("live directory run lost its source owner")
+
+        settled_revisions: dict[
+            str,
+            tuple[tuple[object, ...], SourceExecutionIdentityV1 | None],
+        ] = {}
+        retry_revisions: dict[str, tuple[object, ...]] = {}
+        owned_targets: set[str] = set()
+        discovered_paths: set[Path] = set(deferred.discovered_paths)
+        processed_paths: set[Path] = set()
+        skipped_paths: set[Path] = set()
+        last_projection: tuple[int, int, int, int, int] | None = None
+
+        def publish(*, force: bool = False) -> None:
+            nonlocal last_projection
+            run.files_discovered = len(discovered_paths)
+            run.files_processed = len(processed_paths)
+            run.files_skipped = len(skipped_paths - processed_paths)
+            with run.live_revision_lock:
+                deferred_count = len(run.deferred_live_revisions)
+            projection = (
+                run.files_processed,
+                run.files_skipped,
+                max(
+                    0,
+                    run.files_discovered
+                    - run.files_processed
+                    - run.files_skipped,
+                ),
+                run.files_discovered,
+                deferred_count,
+            )
+            if not force and projection == last_projection:
+                return
+            last_projection = projection
+            self._events.put(StandardRunEvent(
+                run.identity,
+                StandardEventKind.DISCOVERY,
+                completed=run.completed,
+                total=run.total,
+                artifact=str(run.artifact),
+                detail=_directory_status(run, state="Watching"),
+                artifact_completed=run.current_published,
+                artifact_total=run.current_total,
+                **_directory_event_fields(run),
+            ))
+
+        publish(force=True)
+        while not run.stop_requested:
+            observation = session.observe(refresh=True)
+            groups = live_directory_groups(receipt, observation)
+            for group in groups:
+                discovered_paths.update(group.physical_paths)
+            publish()
+
+            for group in groups:
+                if run.stop_requested:
+                    return True
+                revision = tuple(group.revision)
+                target_key = _physical_file_key(group.target)
+                with run.live_revision_lock:
+                    pending = run.deferred_live_revisions.get(target_key)
+                settled = settled_revisions.get(target_key)
+                if settled is not None and settled[0] == revision:
+                    settled_identity = settled[1]
+                    if settled_identity is None:
+                        continue
+                    with run.live_revision_lock:
+                        retained = run.processed_live_revisions.get(target_key)
+                    if (
+                        retained is None
+                        or retained.decision is None
+                        or retained.decision.item.source_stamp.execution_identity_v1
+                        != settled_identity
+                    ):
+                        raise RuntimeError(
+                            "settled Live source identity lost its exact attempt"
+                        )
+                    try:
+                        validate_planned_source(
+                            retained.decision.item,
+                            cancelled=lambda: run.stop_requested,
+                        )
+                    except SourceRevisionChanged:
+                        settled_revisions.pop(target_key, None)
+                    else:
+                        continue
+                if (
+                    pending is not None
+                    and tuple(pending.group.revision) == revision
+                ):
+                    pending_decision = pending.decision
+                    if pending_decision is None:
+                        raise RuntimeError(
+                            "deferred Live source identity lost its decision"
+                        )
+                    try:
+                        validate_planned_source(
+                            pending_decision.item,
+                            cancelled=lambda: run.stop_requested,
+                        )
+                    except SourceRevisionChanged:
+                        with run.live_revision_lock:
+                            if run.deferred_live_revisions.get(target_key) is pending:
+                                del run.deferred_live_revisions[target_key]
+                        pending = None
+                        publish(force=True)
+                    else:
+                        # This explicit projection is the P-1 pending identity;
+                        # legacy SourceExecutionStamp equality is not a valid
+                        # substitute for the resolved alias topology.
+                        _ = pending_decision.item.source_stamp.execution_identity_v1
+                        continue
+                reprobe = retry_revisions.pop(target_key, None) == revision
+                try:
+                    attempt = materialize_live_directory_group(
+                        receipt,
+                        configuration,
+                        session,
+                        group,
+                        cancelled=lambda: run.stop_requested,
+                        reprobe=reprobe,
+                    )
+                except RuntimeError as error:
+                    if (
+                        run.stop_requested
+                        and error.args == ("admission cancelled",)
+                    ):
+                        return True
+                    raise
+                if attempt.state is ProbeState.IN_PROGRESS:
+                    if attempt.revision_changed:
+                        retry_revisions[target_key] = revision
+                    continue
+                if attempt.state is not ProbeState.READY:
+                    settled_revisions[target_key] = (revision, None)
+                    skipped_paths.update(group.physical_paths)
+                    publish()
+                    continue
+
+                decision = attempt.decision
+                if decision is None:  # pragma: no cover - typed invariant
+                    raise RuntimeError("READY Live attempt lost its output")
+                if target_key != _physical_file_key(decision.item.target):
+                    raise RuntimeError("Live output target changed after JIT")
+                if target_key in owned_targets:
+                    # Reopening a committed target belongs to H23.  Preserve
+                    # the exact accepted source revision as deferred instead of
+                    # pretending that overwriting it is same-run Append.
+                    current_identity = (
+                        decision.item.source_stamp.execution_identity_v1
+                    )
+                    with run.live_revision_lock:
+                        existing = run.deferred_live_revisions.get(target_key)
+                        existing_identity = (
+                            None
+                            if existing is None or existing.decision is None
+                            else existing.decision.item.source_stamp.execution_identity_v1
+                        )
+                        if existing_identity != current_identity:
+                            run.deferred_live_revisions[target_key] = attempt
+                    publish()
+                    continue
+                if resources.target_lease is not None:
+                    raise RuntimeError("live output target lease was not released")
+                resources.target_lease = TargetLease.acquire(
+                    (decision.item.target,)
+                )
+                if not target_state_matches(decision):
+                    raise RuntimeError(
+                        "output target changed after Live admission: "
+                        f"{decision.item.target}"
+                    )
+
+                item = decision.item
+                run.artifact = item.target
+                run.current_file_total = len(group.physical_paths)
+                run.current_files_incremental = (
+                    item.source_spec.kind is SourceKind.TIFF_SERIES
+                )
+                artifact_count = len(run.display.artifacts)
+                if artifact_count:
+                    run.display.admit_additional_partition()
+                try:
+                    self._construct(
+                        run,
+                        item=item,
+                        labels=decision.labels,
+                        decision=decision,
+                    )
+                except SourceRevisionChanged:
+                    if (
+                        len(run.display.artifacts) != artifact_count
+                        or run.session is not None
+                        or run.sink is not None
+                    ):
+                        raise RuntimeError(
+                            "source changed after Live output construction began"
+                        )
+                    source_owner = run.source
+                    if source_owner is not None:
+                        close = getattr(source_owner, "close", None)
+                        if callable(close):
+                            close()
+                    run.source = None
+                    run.scan = None
+                    run.records = None
+                    run.frames_by_label.clear()
+                    lease = resources.target_lease
+                    if lease is not None:
+                        lease.release()
+                        resources.target_lease = None
+                    run.current_total = 0
+                    run.current_completed = 0
+                    run.current_published = 0
+                    run.current_file_total = 0
+                    run.current_files_incremental = False
+                    retry_revisions[target_key] = revision
+                    publish(force=True)
+                    continue
+                run.total += run.current_total
+                run.completed += run.current_completed
+                publish(force=True)
+                stopped = self._execute_current(run, construct=False)
+                if run.current_files_incremental:
+                    processed_paths.update(
+                        group.physical_paths[:run.current_completed]
+                    )
+                elif run.current_completed >= run.current_total:
+                    processed_paths.update(group.physical_paths)
+                skipped_paths.difference_update(processed_paths)
+                if not stopped and run.current_completed >= run.current_total:
+                    owned_targets.add(target_key)
+                    with run.live_revision_lock:
+                        run.processed_live_revisions[target_key] = attempt
+                    settled_revisions[target_key] = (
+                        revision,
+                        decision.item.source_stamp.execution_identity_v1,
+                    )
+
+                lease = resources.target_lease
+                if lease is not None:
+                    lease.release()
+                    resources.target_lease = None
+                run.current_file_total = 0
+                run.current_files_incremental = False
+                publish(force=True)
+                if stopped or run.stop_requested:
+                    return True
+
+            run.stop_signal.wait(_LIVE_DIRECTORY_POLL_S)
+        return True
 
     def _execute_deferred_directory(
         self,

@@ -168,7 +168,7 @@ def test_disabled_threshold_does_not_reach_reduction_plan(monkeypatch, tmp_path)
 
     class Opened:
         def to_scan(self, **_kwargs):
-            return type("Scan", (), {"gi_config": None})()
+            return type("Scan", (), {"gi_config": None, "frames": ()})()
 
         def close(self) -> None:
             return None

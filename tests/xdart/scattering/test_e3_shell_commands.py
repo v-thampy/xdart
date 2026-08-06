@@ -103,13 +103,19 @@ def test_e3_ui2_browser_multi_selection_carries_exact_frame_keys_once(
     assert len(commands) == 1
     assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
     # Overlay decouples focus from membership: the browser reports the newly
-    # focused key plus the committed membership, each as the exact catalog
-    # object.  Accumulating those into a new membership is the page's job.
+    # focused key plus the literal highlighted membership, each as the exact
+    # catalog object.  Accumulating visits into plot membership is the page's
+    # job.
     assert commands[0].frame is catalog[1]
+    highlighted = tuple(
+        index.data(QtCore.Qt.ItemDataRole.UserRole)
+        for index in selection.selectedRows()
+    )
+    assert len(commands[0].frames) == len(highlighted)
     assert all(
         actual is expected
         for actual, expected in zip(
-            commands[0].frames, catalog, strict=True
+            commands[0].frames, highlighted, strict=True
         )
     )
 

@@ -447,6 +447,27 @@ class DirectoryIndex:
         ``None`` here even though its verdict is still sticky."""
         return self._retries.get(Path(path))
 
+    def discard_probe_resolution(self, candidate: Candidate) -> None:
+        """Forget one exact candidate's cached probe verdict.
+
+        This is the narrow Live revision-race seam: the caller has already
+        proved that a dependency changed after a READY observation and needs
+        one fresh probe even when the primary candidate's cheap stamp did not
+        move.  Identity is revalidated before either cache is changed; a stale
+        caller cannot invalidate the current owner or any sibling candidate.
+        """
+
+        if type(candidate) is not Candidate:
+            raise TypeError("probe invalidation requires an exact Candidate")
+        current = self._snapshot.by_path().get(candidate.path)
+        if current != candidate:
+            raise StaleCandidateError(
+                f"stale candidate {candidate.path} cannot invalidate the "
+                "current probe resolution"
+            )
+        self._retries.pop(candidate.path, None)
+        self._terminal.pop(candidate.path, None)
+
     def probe_candidate(self, candidate: Candidate, *,
                         retry_deadline: float | None = None) -> ProbeResult:
         """Explicitly probe ONE candidate through its owning adapter and

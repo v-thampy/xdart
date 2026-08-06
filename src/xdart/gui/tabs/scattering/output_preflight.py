@@ -1,6 +1,6 @@
 from __future__ import annotations
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -22,6 +22,7 @@ from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunInten
 from xrd_tools.sources.adapters import candidate_owner, get_adapter
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.discover import Candidate
+from xrd_tools.sources.directory_index import StaleCandidateError
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.run_plan import RunCandidatePlan
@@ -38,6 +39,98 @@ from .source_metadata import (
     ordered_motor_intersection,
     read_image_motor_metadata,
 )
+
+
+class SourceRevisionChanged(ValueError):
+    """Exact source bytes/dependencies drifted during one admitted attempt."""
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedSourceAliases:
+    """Immutable result of the immediate two-sweep source proof."""
+
+    identity: object
+    targets: tuple[object, ...]
+
+
+def _raw_source_path(path: str | Path) -> str:
+    return os.path.abspath(os.path.expanduser(os.fsdecode(path)))
+
+
+def _raw_source_key(path: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(_raw_source_path(path)))
+
+
+def _resolved_source_key(path: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(_raw_source_path(path)))
+
+
+def _resolve_source_alias(path: str) -> str:
+    return str(Path(path).resolve(strict=True))
+
+
+def _capture_canonical_source_target(path: str) -> SourceFileState:
+    return SourceFileState.capture(Path(path))
+
+
+def _candidate_owner_id(path: str) -> str | None:
+    owner = candidate_owner(Path(path))
+    return None if owner is None else owner.id
+
+
+def validate_source_aliases(
+    stamp: SourceExecutionStamp,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> ValidatedSourceAliases:
+    """Prove every raw alias and target twice in deterministic order."""
+
+    if type(stamp) is not SourceExecutionStamp:
+        raise TypeError("source alias validation requires an execution stamp")
+    is_cancelled = _not_cancelled if cancelled is None else cancelled
+    targets = stamp.canonical_targets
+    for sweep in range(2):
+        for binding in stamp.source_aliases:
+            if is_cancelled():
+                raise RuntimeError("admission cancelled")
+            try:
+                resolved = _resolve_source_alias(binding.raw_path)
+            except (OSError, RuntimeError) as error:
+                raise SourceRevisionChanged(
+                    f"source alias is unavailable: {binding.raw_path}"
+                ) from error
+            if _resolved_source_key(resolved) != _resolved_source_key(
+                binding.resolved_path
+            ):
+                raise SourceRevisionChanged(
+                    (
+                        "source candidate changed after admission: "
+                        if binding.candidate_owner_id is not None
+                        else "source alias retargeted after admission: "
+                    )
+                    + binding.raw_path
+                )
+            expected = targets[binding.target_id]
+            try:
+                current = _capture_canonical_source_target(resolved)
+            except OSError as error:
+                raise SourceRevisionChanged(
+                    f"source target is unavailable: {binding.resolved_path}"
+                ) from error
+            if current != expected.state:
+                raise SourceRevisionChanged(
+                    "source target changed after admission: "
+                    f"{binding.resolved_path}"
+                )
+            if sweep == 0 and binding.candidate_owner_id is not None:
+                if _candidate_owner_id(binding.raw_path) != binding.candidate_owner_id:
+                    raise SourceRevisionChanged(
+                        "source candidate owner changed after admission: "
+                        f"{binding.raw_path}"
+                    )
+    return ValidatedSourceAliases(stamp.execution_identity_v1, targets)
+
+
 @dataclass(frozen=True, slots=True)
 class OutputCandidate:
     source: SourceSpec | DirectorySourceSpec
@@ -149,6 +242,7 @@ class DeferredDirectoryPlan:
     candidates: RunCandidatePlan
     entries: tuple[DeferredDirectoryEntry, ...]
     discovered_paths: tuple[Path, ...]
+    live: bool = False
 
     def __post_init__(self) -> None:
         flattened = tuple(
@@ -159,10 +253,9 @@ class DeferredDirectoryPlan:
         physical = tuple(
             path for entry in self.entries for path in entry.physical_paths
         )
-        if not (
+        common = (
             type(self.candidates) is RunCandidatePlan
             and type(self.entries) is tuple
-            and self.entries
             and all(type(value) is DeferredDirectoryEntry for value in self.entries)
             and type(self.discovered_paths) is tuple
             and all(
@@ -170,12 +263,21 @@ class DeferredDirectoryPlan:
                 for value in self.discovered_paths
             )
             and len(set(self.discovered_paths)) == len(self.discovered_paths)
+            and type(self.live) is bool
+        )
+        finite = (
+            bool(self.entries)
             and len(set(physical)) == len(physical)
             and set(physical).issubset(self.discovered_paths)
             and len({candidate.path for candidate in flattened})
             == len(flattened)
             and set(flattened) == set(self.candidates.candidates)
-        ):
+        )
+        watching = (
+            not self.entries
+            and set(self.candidates.paths) == set(self.discovered_paths)
+        )
+        if not (common and (watching if self.live else finite)):
             raise TypeError("deferred directory plan is invalid")
 
     @property
@@ -185,6 +287,61 @@ class DeferredDirectoryPlan:
     @property
     def targets(self) -> tuple[Path, ...]:
         return tuple(entry.target for entry in self.entries)
+
+
+@dataclass(frozen=True, slots=True)
+class LiveDirectoryGroup:
+    """One exact name/stat revision observed by a directory Live owner."""
+
+    plan: RunCandidatePlan
+    target: Path
+    physical_paths: tuple[Path, ...]
+
+    def __post_init__(self) -> None:
+        if not (
+            type(self.plan) is RunCandidatePlan
+            and bool(self.plan.candidates)
+            and isinstance(self.target, Path)
+            and type(self.physical_paths) is tuple
+            and self.physical_paths
+            and self.physical_paths == self.plan.paths
+            and all(path.is_absolute() for path in self.physical_paths)
+        ):
+            raise TypeError("live directory group is invalid")
+
+    @property
+    def revision(self) -> tuple[Candidate, ...]:
+        return self.plan.candidates
+
+
+@dataclass(frozen=True, slots=True)
+class LiveDirectoryAttempt:
+    """Typed result of one exact, Stop-aware Live group probe."""
+
+    group: LiveDirectoryGroup
+    state: ProbeState
+    decision: AdmittedOutput | None = None
+    reason: str = ""
+    revision_changed: bool = False
+
+    def __post_init__(self) -> None:
+        if not (
+            type(self.group) is LiveDirectoryGroup
+            and type(self.state) is ProbeState
+            and (
+                self.decision is None
+                or type(self.decision) is AdmittedOutput
+            )
+            and (self.state is ProbeState.READY)
+            == (self.decision is not None)
+            and type(self.reason) is str
+            and type(self.revision_changed) is bool
+            and (
+                not self.revision_changed
+                or self.state is ProbeState.IN_PROGRESS
+            )
+        ):
+            raise TypeError("live directory attempt is invalid")
 
 
 def _validate_exact_tiff_gi_motor(
@@ -270,7 +427,10 @@ def prepare_output(
     if cancelled():
         raise RuntimeError("admission cancelled")
     if type(source) is DirectorySourceSpec:
-        session = DirectoryIndexSession(probe_candidates=False)
+        session = DirectoryIndexSession(
+            retry_deadline=(float("inf") if intent.live_mode else None),
+            probe_candidates=False,
+        )
         session_owner(session)
         session.configure(
             source.root, recursive=source.recursive,
@@ -278,7 +438,19 @@ def prepare_output(
         )
         observation = session.observe(refresh=True)
         discovered = observation.discovered_snapshot
-        if not intent.live_mode:
+        if intent.live_mode:
+            directory_discovered_paths = tuple(
+                candidate.path.absolute()
+                for candidate in discovered.candidates
+            )
+            deferred = DeferredDirectoryPlan(
+                RunCandidatePlan.from_snapshot(discovered),
+                (),
+                directory_discovered_paths,
+                live=True,
+            )
+            items = ()
+        else:
             directory_discovered_paths = _directory_matching_paths(
                 source,
                 cancelled=cancelled,
@@ -294,7 +466,7 @@ def prepare_output(
                 cancelled=cancelled,
             )
             items = ()
-        else:
+        elif not intent.live_mode:
             session.enable_probes(exclude=())
             while observation.unprobed_count:
                 if cancelled():
@@ -316,13 +488,20 @@ def prepare_output(
                 capture, assets, choices
             )
     if deferred is None:
-        _validate_targets(candidate, source, items)
+        _validate_targets(
+            candidate,
+            source,
+            items,
+            cancelled=cancelled,
+        )
     if targets_owner is not None:
-        targets_owner(
+        targets = (
             deferred.targets
             if deferred is not None
             else tuple(dict.fromkeys(item.target for item in items))
         )
+        if targets:
+            targets_owner(targets)
     outputs = tuple(inspect_output(item, candidate) for item in items)
     if cancelled() or not outputs and deferred is None:
         raise RuntimeError(
@@ -426,8 +605,72 @@ def _candidate_still_exact(candidate: Candidate) -> bool:
     )
 
 
+def _validate_exact_candidate_state(
+    candidate: Candidate,
+    state: SourceFileState,
+    *,
+    require_current: bool = True,
+) -> None:
+    """Bind one cheap Candidate to one still-current strong file state."""
+
+    owner = candidate_owner(candidate.path)
+    if (
+        _source_state_key(state.path)
+        != _source_state_key(candidate.path)
+        or owner is None
+        or owner.id != candidate.adapter_id
+        or (state.size, state.mtime_ns) != candidate.version_stamp
+        or (require_current and not state.matches_disk())
+    ):
+        raise SourceRevisionChanged(
+            f"source candidate changed during admission: {candidate.path}"
+        )
+
+
+def _capture_exact_candidate_state(
+    candidate: Candidate,
+) -> SourceFileState:
+    try:
+        state = SourceFileState.capture(candidate.path)
+    except OSError as error:
+        raise SourceRevisionChanged(
+            f"source candidate disappeared during admission: {candidate.path}"
+        ) from error
+    # This is the one strong capture required by the binding operation.  The
+    # caller owns the immediate Stop boundary before any later current-state
+    # revalidation is allowed to perform an equality-equivalent recapture.
+    _validate_exact_candidate_state(
+        candidate,
+        state,
+        require_current=False,
+    )
+    return state
+
+
+def _classify_inventory_failure(
+    candidate: Candidate,
+    states: dict[str, SourceFileState],
+    error: BaseException,
+) -> None:
+    """Upgrade a failed HDF5 inspection only when exact drift is proven."""
+
+    try:
+        accepted = states.get(_source_state_key(candidate.path))
+        if accepted is None:
+            if not _candidate_still_exact(candidate):
+                raise SourceRevisionChanged(
+                    "source candidate changed during admission: "
+                    f"{candidate.path}"
+                )
+        else:
+            _validate_exact_candidate_state(candidate, accepted)
+        _verify_source_states(states)
+    except SourceRevisionChanged as drift:
+        raise drift from error
+
+
 def _source_state_key(path: str | Path) -> str:
-    return os.path.normcase(os.path.realpath(path))
+    return _raw_source_key(path)
 
 
 def _same_source_revision(
@@ -435,7 +678,7 @@ def _same_source_revision(
     right: SourceFileState,
 ) -> bool:
     return (
-        _source_state_key(left.path) == _source_state_key(right.path)
+        _raw_source_key(left.path) == _raw_source_key(right.path)
         and (
             left.size,
             left.mtime_ns,
@@ -461,7 +704,7 @@ def _remember_source_state(
     key = _source_state_key(current.path)
     accepted = states.get(key)
     if accepted is not None and not _same_source_revision(accepted, current):
-        raise ValueError(
+        raise SourceRevisionChanged(
             f"HDF5 dependency changed during admission: {current.path}"
         )
     states.setdefault(key, current)
@@ -473,7 +716,7 @@ def _verify_source_states(
 ) -> None:
     for state in states.values():
         if not state.matches_disk():
-            raise ValueError(
+            raise SourceRevisionChanged(
                 f"HDF5 dependency changed during admission: {state.path}"
             )
 
@@ -487,7 +730,7 @@ def _open_stable_hdf5_dependency(
 
     import h5py
 
-    selected = Path(path).resolve(strict=False)
+    selected = Path(_raw_source_path(path))
     try:
         before = _remember_source_state(selected, states)
     except FileNotFoundError:
@@ -496,6 +739,10 @@ def _open_stable_hdf5_dependency(
     try:
         handle = h5py.File(selected, "r")
     except OSError as error:
+        try:
+            _verify_source_states(states)
+        except SourceRevisionChanged as drift:
+            raise drift from error
         raise ValueError(
             f"HDF5 dependency could not be inspected: {selected}: {error}"
         ) from error
@@ -506,20 +753,20 @@ def _open_stable_hdf5_dependency(
         try:
             after = SourceFileState.capture(selected)
         except OSError as error:
-            raise ValueError(
+            raise SourceRevisionChanged(
                 f"HDF5 dependency changed during admission: {selected}"
             ) from error
         if not _same_source_revision(after, before):
-            raise ValueError(
+            raise SourceRevisionChanged(
                 f"HDF5 dependency changed during admission: {selected}"
             )
 
 
 def _hdf5_link_file(parent: object, filename: object) -> Path:
-    """Resolve one HDF5 dependency relative to its declaring file."""
+    """Return the absolute lexical dependency named by its declaring file."""
 
     base = Path(os.fsdecode(parent.file.filename)).parent
-    return (base / os.fsdecode(filename)).resolve(strict=False)
+    return Path(_raw_source_path(base / os.fsdecode(filename)))
 
 
 def _hdf5_object_path(value: object) -> str:
@@ -541,7 +788,7 @@ def _trace_hdf5_object_dependencies(
 
     import h5py
 
-    selected_file = Path(file_path).resolve(strict=False)
+    selected_file = Path(_raw_source_path(file_path))
     selected_object = _hdf5_object_path(object_path)
     identity = (
         os.path.normcase(os.path.realpath(selected_file)),
@@ -661,14 +908,10 @@ def _extend_hdf5_dataset_dependency_paths(
 ) -> None:
     """Add external-storage and recursively closed VDS dependencies."""
 
-    current_file = Path(os.fsdecode(dataset.file.filename)).resolve(
-        strict=False
-    )
+    current_file = Path(_raw_source_path(dataset.file.filename))
     base = current_file.parent
     for value in dataset.external or ():
-        paths.append(
-            (base / os.fsdecode(value[0])).resolve(strict=False)
-        )
+        paths.append(Path(_raw_source_path(base / os.fsdecode(value[0]))))
     if not bool(dataset.is_virtual):
         return
     for source in dataset.virtual_sources():
@@ -678,7 +921,7 @@ def _extend_hdf5_dataset_dependency_paths(
         dependency = (
             current_file
             if filename in {"", "."}
-            else (base / filename).resolve(strict=False)
+            else Path(_raw_source_path(base / filename))
         )
         if dependency != current_file:
             paths.append(dependency)
@@ -702,9 +945,7 @@ def _hdf5_dataset_dependency_paths(
 ) -> tuple[Path, ...]:
     """Return the full external-storage/VDS closure for one dataset."""
 
-    current_file = Path(os.fsdecode(dataset.file.filename)).resolve(
-        strict=False
-    )
+    current_file = Path(_raw_source_path(dataset.file.filename))
     seen = {
         (
             os.path.normcase(os.path.realpath(current_file)),
@@ -833,6 +1074,7 @@ def _scan_all_external_links(
 def _external_link_inventory(
     candidate: Candidate,
     *,
+    candidate_states: tuple[SourceFileState, ...],
     cancelled: Callable[[], bool],
 ) -> tuple[tuple[Path, ...], tuple[SourceFileState, ...], str]:
     """Inventory pre-write HDF5 dependencies without eager frame counting.
@@ -851,6 +1093,14 @@ def _external_link_inventory(
     proved from the canonical leaf alone.
     """
 
+    states = {
+        _source_state_key(state.path): state
+        for state in candidate_states
+    }
+    accepted_candidate = states.get(_source_state_key(candidate.path))
+    if accepted_candidate is None:
+        raise TypeError("HDF5 inventory lost its exact candidate capture")
+    _validate_exact_candidate_state(candidate, accepted_candidate)
     adapter = get_adapter(candidate.adapter_id)
     if adapter is None:
         raise ValueError(f"candidate {candidate.path} lost its adapter")
@@ -865,20 +1115,22 @@ def _external_link_inventory(
         return (), (), ""
     if cancelled():
         raise RuntimeError("admission cancelled")
-    states: dict[str, SourceFileState] = {}
     try:
         import h5py
         _remember_source_state(candidate.path, states)
         is_hdf5 = bool(h5py.is_hdf5(candidate.path))
         _verify_source_states(states)
+    except SourceRevisionChanged:
+        raise
     except Exception as error:
+        _classify_inventory_failure(candidate, states, error)
         raise ValueError(
             "source dependency type could not be established: "
             f"{candidate.path}: {type(error).__name__}: {error}"
         ) from error
     if not is_hdf5:
         if not _candidate_still_exact(candidate):
-            raise ValueError(
+            raise SourceRevisionChanged(
                 f"source candidate changed during admission: {candidate.path}"
             )
         return (
@@ -1178,7 +1430,7 @@ def _external_link_inventory(
             states,
         ) as handle:
             if handle is None:
-                raise ValueError(
+                raise SourceRevisionChanged(
                     f"source candidate disappeared during admission: "
                     f"{candidate.path}"
                 )
@@ -1321,21 +1573,22 @@ def _external_link_inventory(
     except RuntimeError as error:
         if error.args == ("admission cancelled",):
             raise
+        _classify_inventory_failure(candidate, states, error)
         raise ValueError(
             "source dependency inventory could not be established: "
             f"{candidate.path}: {type(error).__name__}: {error}"
         ) from error
+    except SourceRevisionChanged:
+        raise
     except Exception as error:
+        _classify_inventory_failure(candidate, states, error)
         raise ValueError(
             "source dependency inventory could not be established: "
             f"{candidate.path}: {type(error).__name__}: {error}"
         ) from error
     if cancelled():
         raise RuntimeError("admission cancelled")
-    if not _candidate_still_exact(candidate):
-        raise ValueError(
-            f"source candidate changed during admission: {candidate.path}"
-        )
+    _validate_exact_candidate_state(candidate, accepted_candidate)
     _verify_source_states(states)
     return (
         tuple(dict.fromkeys(external)),
@@ -1356,6 +1609,7 @@ def _deferred_directory_plan(
     staged: list[
         tuple[
             tuple[Candidate, ...],
+            tuple[SourceFileState, ...],
             Path,
             tuple[Path, ...],
             tuple[SourceFileState, ...],
@@ -1365,6 +1619,16 @@ def _deferred_directory_plan(
     for group in _directory_candidate_groups(plan):
         if cancelled():
             raise RuntimeError("admission cancelled")
+        captured_states: list[SourceFileState] = []
+        for source_candidate in group:
+            if cancelled():
+                raise RuntimeError("admission cancelled")
+            captured_states.append(
+                _capture_exact_candidate_state(source_candidate)
+            )
+            if cancelled():
+                raise RuntimeError("admission cancelled")
+        candidate_states = tuple(captured_states)
         representative = group[0]
         adapter = get_adapter(representative.adapter_id)
         if adapter is None:
@@ -1375,10 +1639,18 @@ def _deferred_directory_plan(
         target = _directory_target(configuration, plan, representative, name)
         external_paths, inventory_states, skip_reason = _external_link_inventory(
             representative,
+            candidate_states=candidate_states,
             cancelled=cancelled,
         )
         staged.append(
-            (group, target, external_paths, inventory_states, skip_reason)
+            (
+                group,
+                candidate_states,
+                target,
+                external_paths,
+                inventory_states,
+                skip_reason,
+            )
         )
 
     _validate_deferred_targets(
@@ -1386,17 +1658,32 @@ def _deferred_directory_plan(
         plan,
         tuple(
             target
-            for _group, target, _external, _states, _reason in staged
+            for (
+                _group,
+                _candidate_states,
+                target,
+                _external,
+                _states,
+                _reason,
+            ) in staged
         ),
         tuple(
             path
-            for _group, _target, paths, _states, _reason in staged
+            for (
+                _group,
+                _candidate_states,
+                _target,
+                paths,
+                _states,
+                _reason,
+            ) in staged
             for path in paths
         ),
     )
     entries: list[DeferredDirectoryEntry] = []
     for (
         group,
+        candidate_states,
         target,
         external_paths,
         inventory_states,
@@ -1421,31 +1708,27 @@ def _deferred_directory_plan(
             for value in inventory_states
         }
         reason = skip_reason
-        for source_candidate in group:
-            key = _source_state_key(source_candidate.path)
-            try:
-                state = frozen.get(key) or SourceFileState.capture(
-                    source_candidate.path
-                )
-            except OSError as error:
-                raise ValueError(
-                    "source candidate changed during finite admission: "
-                    f"{source_candidate.path}"
-                ) from error
-            if not state.matches_disk():
-                raise ValueError(
-                    "source candidate changed during finite admission: "
-                    f"{source_candidate.path}"
-                )
+        for source_candidate, state in zip(
+            group,
+            candidate_states,
+            strict=True,
+        ):
+            if cancelled():
+                raise RuntimeError("admission cancelled")
+            _validate_exact_candidate_state(source_candidate, state)
+            if cancelled():
+                raise RuntimeError("admission cancelled")
             protected.append(state)
         for path in external_paths:
+            if cancelled():
+                raise RuntimeError("admission cancelled")
             key = _source_state_key(path)
             if any(_source_state_key(value.path) == key for value in protected):
                 continue
             try:
                 state = frozen.get(key) or SourceFileState.capture(path)
             except FileNotFoundError as error:
-                raise ValueError(
+                raise SourceRevisionChanged(
                     "source dependency is still landing; finite Standard "
                     f"admission cannot safely start: {path}"
                 ) from error
@@ -1453,8 +1736,10 @@ def _deferred_directory_plan(
                 raise ValueError(
                     f"source dependency could not be frozen: {path}: {error}"
                 ) from error
+            if cancelled():
+                raise RuntimeError("admission cancelled")
             if not state.matches_disk():
-                raise ValueError(
+                raise SourceRevisionChanged(
                     f"source dependency changed during admission: {state.path}"
                 )
             protected.append(state)
@@ -1530,6 +1815,150 @@ def _validate_deferred_targets(
         )
 
 
+def live_directory_groups(
+    receipt: AdmissionReceipt,
+    observation: object,
+) -> tuple[LiveDirectoryGroup, ...]:
+    """Project current name/stat revisions into output-shaped Live groups.
+
+    This step opens no candidate content.  Exact content readiness remains a
+    separate, Stop-aware JIT operation in
+    :func:`materialize_live_directory_group`.
+    """
+
+    deferred = receipt.deferred_directory
+    discovered = getattr(observation, "discovered_snapshot", None)
+    if (
+        type(deferred) is not DeferredDirectoryPlan
+        or not deferred.live
+        or discovered is None
+        or not deferred.candidates.matches_config(discovered)
+    ):
+        raise TypeError("live directory observation lost its admitted owner")
+    current = RunCandidatePlan.from_snapshot(discovered)
+    groups: list[LiveDirectoryGroup] = []
+    for candidates in _directory_candidate_groups(current):
+        adapter = get_adapter(candidates[0].adapter_id)
+        if adapter is None:
+            raise ValueError(
+                f"candidate {candidates[0].path} lost its adapter"
+            )
+        subset = RunCandidatePlan(
+            current.generation,
+            candidates,
+            current.root,
+            current.recursive,
+            current.name_filter,
+        )
+        groups.append(LiveDirectoryGroup(
+            subset,
+            _directory_target(
+                receipt.candidate,
+                current,
+                candidates[0],
+                adapter.scan_name(candidates[0].path),
+            ),
+            subset.paths,
+        ))
+    return tuple(groups)
+
+
+def materialize_live_directory_group(
+    receipt: AdmissionReceipt,
+    configuration: FrozenRunConfiguration,
+    session: DirectoryIndexSession,
+    group: LiveDirectoryGroup,
+    *,
+    cancelled: Callable[[], bool],
+    reprobe: bool = False,
+) -> LiveDirectoryAttempt:
+    """Probe and JIT-admit one exact Live group revision.
+
+    Provisional or concurrently changing bytes produce a typed retry-later
+    result.  Output collision/configuration failures remain hard failures.
+    """
+
+    observations = []
+    for candidate in group.plan.candidates:
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        try:
+            observed = (
+                session.reprobe_candidate(candidate, refresh=False)
+                if reprobe
+                else session.probe_candidate(candidate, refresh=False)
+            )
+        except StaleCandidateError as error:
+            return LiveDirectoryAttempt(
+                group,
+                ProbeState.IN_PROGRESS,
+                reason=str(error),
+            )
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        observations.append(observed)
+        if observed.result.state is not ProbeState.READY:
+            return LiveDirectoryAttempt(
+                group,
+                observed.result.state,
+                reason=observed.result.reason,
+            )
+
+    ready = RunCandidatePlan(
+        group.plan.generation,
+        tuple(value.candidate for value in observations),
+        group.plan.root,
+        group.plan.recursive,
+        group.plan.name_filter,
+        tuple(value.descriptor for value in observations),
+    )
+    try:
+        deferred = _deferred_directory_plan(
+            receipt.candidate,
+            ready,
+            group.physical_paths,
+            cancelled=cancelled,
+        )
+        transient = replace(
+            receipt,
+            deferred_directory=deferred,
+            directory_discovered_file_count=len(group.physical_paths),
+            directory_discovered_paths=group.physical_paths,
+        )
+        decision, _ready_files, _skipped_files = materialize_deferred_output(
+            transient,
+            session,
+            deferred.entries[0],
+            cancelled=cancelled,
+        )
+    except RuntimeError as error:
+        if error.args == ("admission cancelled",):
+            raise
+        raise
+    except SourceRevisionChanged as error:
+        return LiveDirectoryAttempt(
+            group,
+            ProbeState.IN_PROGRESS,
+            reason=str(error),
+            revision_changed=True,
+        )
+    if decision is None:
+        return LiveDirectoryAttempt(
+            group,
+            ProbeState.INVALID,
+            reason="source revision has no READY detector frames",
+        )
+    _validate_exact_tiff_gi_motor(
+        RunIntent.from_frozen(configuration),
+        (decision.item,),
+    )
+    return LiveDirectoryAttempt(
+        group,
+        ProbeState.READY,
+        decision=decision,
+    )
+
+
 def materialize_deferred_output(
     receipt: AdmissionReceipt,
     session: DirectoryIndexSession,
@@ -1544,7 +1973,7 @@ def materialize_deferred_output(
         or not any(value is entry for value in deferred.entries)
     ):
         raise TypeError("deferred output is not owned by this receipt")
-    _validate_deferred_entry_states(entry)
+    _validate_deferred_entry_states(entry, cancelled=cancelled)
     if entry.skip_reason:
         return None, 0, len(entry.physical_paths)
 
@@ -1579,18 +2008,35 @@ def materialize_deferred_output(
         plan.name_filter,
         tuple(descriptors),
     )
-    items = _directory_items(
-        receipt.candidate,
-        subset,
-        cancelled=cancelled,
-    )
+    try:
+        items = _directory_items(
+            receipt.candidate,
+            subset,
+            cancelled=cancelled,
+        )
+    except (ValueError, OSError):
+        # A semantic/schema failure remains terminal when every admitted
+        # source state is still exact.  If the same failure followed a real
+        # byte/dependency drift, this exact revalidation raises the typed Live
+        # retry signal instead.
+        _validate_deferred_entry_states(entry, cancelled=cancelled)
+        raise
     if len(items) != 1:
         raise ValueError("deferred source group did not produce one output")
     item = items[0]
     if item.target != entry.target:
         raise ValueError("deferred source target changed during materialization")
-    _validate_deferred_entry_states(entry, item=item)
-    _validate_targets(receipt.candidate, receipt.candidate.source, (item,))
+    _validate_deferred_entry_states(
+        entry,
+        item=item,
+        cancelled=cancelled,
+    )
+    _validate_targets(
+        receipt.candidate,
+        receipt.candidate.source,
+        (item,),
+        cancelled=cancelled,
+    )
     decision = inspect_output(item, receipt.candidate, entry.fact)
     if item.source_spec.kind is SourceKind.TIFF_SERIES:
         return decision, len(ready), skipped
@@ -1601,27 +2047,108 @@ def _validate_deferred_entry_states(
     entry: DeferredDirectoryEntry,
     *,
     item: PlannedOutput | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> None:
     """Require one deferred cursor to remain inside its admitted revision."""
 
-    frozen = {value.path: value for value in entry.protected_states}
+    is_cancelled = _not_cancelled if cancelled is None else cancelled
+    if item is not None:
+        # The complete JIT stamp is the first owner capable of proving every
+        # raw alias binding.  Run that proof before the older deferred-state
+        # fences so no alias drift can be classified without its frozen
+        # raw-to-resolved identity reaching the central validator.
+        validate_source_aliases(item.source_stamp, cancelled=is_cancelled)
+        _validate_tiff_metadata_selection(item, cancelled=is_cancelled)
+    frozen = {
+        _source_state_key(value.path): value
+        for value in entry.protected_states
+    }
     for state in entry.protected_states:
+        if is_cancelled():
+            raise RuntimeError("admission cancelled")
         if not state.matches_disk():
-            raise ValueError(
+            raise SourceRevisionChanged(
                 f"source dependency changed after admission: {state.path}"
             )
     if item is None:
         return
     stamp = item.source_stamp
-    selected = tuple(stamp.members or (stamp.file,)) + tuple(
-        value.file for value in stamp.external_members
-    ) + stamp.dependency_files
-    for state in selected:
-        accepted = frozen.get(state.path)
-        if accepted is None or accepted != state:
-            raise ValueError(
+    occurrences = (
+        ((stamp.file, "source_file"),)
+        + tuple((value, "source_member") for value in stamp.members)
+        + tuple(
+            (value.file, "external_member")
+            for value in stamp.external_members
+        )
+        + tuple(
+            (value, "detector_dependency")
+            for value in stamp.dependency_files
+        )
+        + tuple(
+            (value.metadata_file, "image_metadata")
+            for value in stamp.metadata_sources
+            if value.metadata_file is not None
+        )
+    )
+    for state, role in occurrences:
+        if is_cancelled():
+            raise RuntimeError("admission cancelled")
+        accepted = frozen.get(_source_state_key(state.path))
+        if accepted is None:
+            # TIFF sidecars are discovered and guarded JIT while the source
+            # group is materialized, so they are not present in the cheap
+            # candidate/dependency freeze.  They are valid only if the exact
+            # revision captured by metadata admission is still current here.
+            if role == "image_metadata" and state.matches_disk():
+                continue
+            raise SourceRevisionChanged(
                 "source dependency escaped admitted revision: "
                 f"{state.path}"
+            )
+        if not _same_source_revision(accepted, state):
+            raise SourceRevisionChanged(
+                "source dependency escaped admitted revision: "
+                f"{state.path}"
+            )
+
+
+def _validate_tiff_metadata_selection(
+    item: PlannedOutput,
+    *,
+    cancelled: Callable[[], bool],
+) -> None:
+    """Keep nullable/selected TIFF metadata authoritative until decision."""
+
+    stamp = item.source_stamp
+    if not stamp.metadata_sources:
+        return
+    options = dict(item.source_spec.options)
+    metadata_format = options.get("metadata_format", "auto")
+    meta_dir = options.get("meta_dir")
+    for metadata in stamp.metadata_sources:
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        observed = read_image_motor_metadata(
+            metadata.source_path,
+            metadata_format,
+            meta_dir=meta_dir,
+        )
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        current = observed.source_path
+        expected = metadata.metadata_file
+        if (
+            (expected is None) != (current is None)
+            or (
+                expected is not None
+                and current is not None
+                and _raw_source_key(expected.path)
+                != _raw_source_key(current)
+            )
+        ):
+            raise SourceRevisionChanged(
+                "TIFF metadata source changed before output decision: "
+                f"{metadata.source_path}"
             )
 
 
@@ -1642,6 +2169,12 @@ def validate_admitted_receipt(
             or session is None
         ):
             raise RuntimeError("deferred directory admission lost its session")
+        if deferred.live:
+            # Directory Live owns a persistent source session.  Its baseline is
+            # intentionally allowed to gain or revise candidates between the
+            # Start click and worker launch; the worker exact-probes the current
+            # Candidate revision before every JIT materialization.
+            return
         observation = session.observe(refresh=True)
         reconciliation = deferred.candidates.reconcile(
             observation.discovered_snapshot
@@ -1651,7 +2184,10 @@ def validate_admitted_receipt(
         for entry in deferred.entries:
             if is_cancelled():
                 raise RuntimeError("admission cancelled")
-            _validate_deferred_entry_states(entry)
+            _validate_deferred_entry_states(
+                entry,
+                cancelled=is_cancelled,
+            )
             if _path_state(entry.target) != entry.fact.target_state:
                 raise RuntimeError(
                     f"output target changed after admission: {entry.target}"
@@ -1796,7 +2332,12 @@ def _capture_source_states(
     for path in paths:
         if cancelled():
             raise RuntimeError("admission cancelled")
-        state = SourceFileState.capture(path)
+        try:
+            state = SourceFileState.capture(path)
+        except FileNotFoundError as error:
+            raise SourceRevisionChanged(
+                f"source candidate disappeared during admission: {path}"
+            ) from error
         if cancelled():
             raise RuntimeError("admission cancelled")
         states.append(state)
@@ -1860,7 +2401,7 @@ def _tiff_motor_knowledge(
                 != Path(observed_path).resolve(strict=False)
             )
         ):
-            raise ValueError(
+            raise SourceRevisionChanged(
                 f"TIFF metadata source changed during admission: {member}"
             )
         metadata_file = (
@@ -1871,7 +2412,7 @@ def _tiff_motor_knowledge(
         if cancelled():
             raise RuntimeError("admission cancelled")
         if before != metadata_file:
-            raise ValueError(
+            raise SourceRevisionChanged(
                 f"TIFF metadata source changed during admission: {member}"
             )
         metadata.append(dict(observed.values))
@@ -1984,7 +2525,9 @@ def _container_item(
         or current_owner is None
         or current_owner.id != owner.id
     ):
-        raise ValueError(f"source candidate changed during admission: {path}")
+        raise SourceRevisionChanged(
+            f"source candidate changed during admission: {path}"
+        )
     descriptor = result.descriptor
     if (
         result.state is not ProbeState.READY
@@ -2134,14 +2677,18 @@ def _directory_items(
                         f"candidate {candidate.path} lost its adapter"
                     )
                 refreshed = adapter.probe(candidate.path)
+                if not state.matches_disk():
+                    raise SourceRevisionChanged(
+                        "container changed during eager admission: "
+                        f"{candidate.path}"
+                    )
                 if (
-                    not state.matches_disk()
-                    or refreshed.state is not ProbeState.READY
+                    refreshed.state is not ProbeState.READY
                     or refreshed.descriptor is None
                 ):
                     raise ValueError(
-                        "container changed during eager admission: "
-                        f"{candidate.path}"
+                        "container lost READY descriptor during eager "
+                        f"admission: {candidate.path}"
                     )
                 descriptor = refreshed.descriptor
             else:
@@ -2158,11 +2705,21 @@ def _directory_items(
                 candidate.path, descriptor.kind,
                 entry=descriptor.resolved_entry or descriptor.requested_entry,
             )
-            external_members = _external_members(
-                candidate.path,
-                descriptor,
-                cancelled=cancelled,
-            )
+            try:
+                external_members = _external_members(
+                    candidate.path,
+                    descriptor,
+                    cancelled=cancelled,
+                )
+            except OSError as error:
+                # Deferred materialization owns the accepted strong-state set.
+                # Preserve this as a hard read failure here; its outer
+                # classifier upgrades it to SourceRevisionChanged only when
+                # exact master/member revalidation proves drift.
+                raise ValueError(
+                    "external source members could not be inspected: "
+                    f"{candidate.path}: {error}"
+                ) from error
             dependency_files = _selected_dependency_files(
                 candidate.path,
                 state,
@@ -2223,52 +2780,34 @@ def validate_planned_source(
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
     is_cancelled = _not_cancelled if cancelled is None else cancelled
-    owners = {item.source_stamp.adapter_id}
-    if "tiff_series" in owners:
-        owners.add("image_file")
-    states = item.source_stamp.members or (item.source_stamp.file,)
-    for state in states:
-        if is_cancelled():
-            raise RuntimeError("admission cancelled")
-        path = Path(state.path)
-        owner = candidate_owner(path)
-        if (
-            not state.matches_disk()
-            or owner is None or owner.id not in owners
-        ):
-            raise ValueError(f"source candidate changed before open: {path}")
-    for metadata in item.source_stamp.metadata_sources:
-        if is_cancelled():
-            raise RuntimeError("admission cancelled")
-        state = metadata.metadata_file
-        if state is not None and not state.matches_disk():
-            raise ValueError(
-                "TIFF metadata source changed before open: "
-                f"{state.path}"
-            )
+    validate_source_aliases(item.source_stamp, cancelled=is_cancelled)
+    _validate_tiff_metadata_selection(item, cancelled=is_cancelled)
     import h5py
     for external in item.source_stamp.external_members:
         if is_cancelled():
             raise RuntimeError("admission cancelled")
-        path = Path(external.file.path)
-        if not external.file.matches_disk():
-            raise ValueError(
-                f"external source member changed before open: {path}"
-            )
-        with h5py.File(path, "r") as handle:
-            if external.dataset not in handle:
-                raise ValueError(
-                    f"external source dataset changed: {path}:{external.dataset}"
+        state = external.file
+        path = Path(state.path)
+        try:
+            with h5py.File(path, "r") as handle:
+                if external.dataset not in handle:
+                    raise ValueError(
+                        "external source dataset changed: "
+                        f"{path}:{external.dataset}"
+                    )
+        except SourceRevisionChanged:
+            raise
+        except OSError as error:
+            try:
+                validate_source_aliases(
+                    item.source_stamp,
+                    cancelled=is_cancelled,
                 )
+            except SourceRevisionChanged as drift:
+                raise drift from error
+            raise
         if is_cancelled():
             raise RuntimeError("admission cancelled")
-    for dependency in item.source_stamp.dependency_files:
-        if is_cancelled():
-            raise RuntimeError("admission cancelled")
-        if not dependency.matches_disk():
-            raise ValueError(
-                f"source dependency changed before open: {dependency.path}"
-            )
 def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
     stamp = item.source_stamp
     if stamp.members:
@@ -2283,16 +2822,16 @@ def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
         }
         for metadata in stamp.metadata_sources:
             state = metadata.metadata_file
-            if state is None:
-                continue
-            values[state.path] = {
-                "adapter_id": "image_metadata",
-                **state.as_dict(),
-                "frame_count": 0,
-                "self_contained": True,
-                "source_role": "image_metadata",
-            }
+            if state is not None:
+                values[state.path] = {
+                    "adapter_id": "image_metadata",
+                    **state.as_dict(),
+                    "frame_count": 0,
+                    "self_contained": True,
+                    "source_role": "image_metadata",
+                }
         return values
+
     value: dict[str, Any] = {
         "adapter_id": stamp.adapter_id,
         **stamp.file.as_dict(),
@@ -2305,17 +2844,18 @@ def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
         )
     values = {str(item.source_path): value}
     for external in stamp.external_members:
-        values[external.file.path] = {
+        state = external.file
+        values[state.path] = {
             "adapter_id": stamp.adapter_id,
-            **external.file.as_dict(),
+            **state.as_dict(),
             "frame_count": external.stop - external.first,
             "dataset_path": external.dataset,
             "self_contained": True,
         }
-    for dependency in stamp.dependency_files:
-        values[dependency.path] = {
+    for state in stamp.dependency_files:
+        values[state.path] = {
             "adapter_id": "hdf5_dependency",
-            **dependency.as_dict(),
+            **state.as_dict(),
             "frame_count": 0,
             "self_contained": True,
             "source_role": "detector_dependency",
@@ -2364,25 +2904,17 @@ def _validate_targets(
     configuration: FrozenRunConfiguration | OutputCandidate,
     source: SourceSpec | DirectorySourceSpec,
     items: tuple[PlannedOutput, ...],
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> None:
-    raw = tuple(
-        Path(member.path) if item.source_stamp.members else item.source_path
-        for item in items
-        for member in item.source_stamp.members or (item.source_stamp.file,)
-    ) + tuple(
-        Path(external.file.path)
-        for item in items
-        for external in item.source_stamp.external_members
-    ) + tuple(
-        Path(dependency.path)
-        for item in items
-        for dependency in item.source_stamp.dependency_files
-    ) + tuple(
-        Path(metadata.metadata_file.path)
-        for item in items
-        for metadata in item.source_stamp.metadata_sources
-        if metadata.metadata_file is not None
-    )
+    raw: tuple[Path, ...] = ()
+    for item in items:
+        identity = validate_source_aliases(
+            item.source_stamp,
+            cancelled=cancelled,
+        )
+        raw += tuple(Path(binding.raw_path) for binding in identity.identity.aliases)
+        raw += tuple(Path(target.resolved_path) for target in identity.targets)
     protected = tuple(
         Path(value) for value in (
             configuration.poni_file, configuration.mask_file,
@@ -2470,10 +3002,22 @@ def _external_members(
                 # with a member-qualified range.  The exact dependency closure
                 # below freezes that chain instead.
                 return ()
-            path = _hdf5_link_file(parent, link.filename).resolve(strict=True)
+            try:
+                path = _hdf5_link_file(
+                    parent,
+                    link.filename,
+                )
+                path.resolve(strict=True)
+            except FileNotFoundError as error:
+                raise ValueError(
+                    "external detector member disappeared during admission: "
+                    f"{link.filename}"
+                ) from error
             dataset = parent.get(components[-1])
             if not isinstance(dataset, h5py.Dataset):
-                raise ValueError("external container lost its exact dataset")
+                raise ValueError(
+                    "external container lost its exact dataset"
+                )
             count = 1 if dataset.ndim == 2 else int(dataset.shape[0])
             frame_shape = (
                 tuple(int(value) for value in dataset.shape)
@@ -2536,7 +3080,7 @@ def _selected_dependency_files(
             accepted,
             external.file,
         ):
-            raise ValueError(
+            raise SourceRevisionChanged(
                 "external detector member changed during admission: "
                 f"{external.file.path}"
             )
@@ -2618,9 +3162,12 @@ def _path_state(path: Path) -> tuple[int, int, int, int, int] | bool:
         int(stat.st_dev), int(stat.st_ino),
     )
 __all__ = [
-    "DeferredDirectoryEntry", "DeferredDirectoryPlan", "OutputCandidate",
+    "DeferredDirectoryEntry", "DeferredDirectoryPlan", "LiveDirectoryAttempt",
+    "LiveDirectoryGroup", "OutputCandidate", "SourceRevisionChanged",
+    "ValidatedSourceAliases",
     "execution_plan_values", "inspect_output", "materialize_deferred_output",
+    "live_directory_groups", "materialize_live_directory_group",
     "OutputFact", "prepare_output", "source_snapshots",
     "target_state_matches", "validate_admitted_receipt",
-    "validate_planned_source",
+    "validate_planned_source", "validate_source_aliases",
 ]

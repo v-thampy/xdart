@@ -351,7 +351,18 @@ def test_page_polls_cancelled_c_refreshes_blocker_and_only_then_allows_next_run(
         assert rig.controller.browse_pending is True
         assert rig.page._run_timer.isActive()
         assert not rig.shell.run_controls.startButton.isEnabled()
-        assert "cleanup" in rig.shell.run_controls.readinessLabel.text().lower()
+        # A retained terminal progress summary cannot hide the semantic reason
+        # why the next Run is disabled once the lifecycle is idle again.
+        readiness = rig.shell.run_controls.readinessLabel
+        assert readiness.full_text() == "Browse cleanup remains pending"
+        assert readiness.toolTip() == "Browse cleanup remains pending"
+        assert rig.page._start_permitted() == (
+            False,
+            "Browse cleanup remains pending",
+        )
+        assert rig.shell.controls._profile.run_blockers == (
+            "Browse cleanup remains pending",
+        )
 
         attempts_before_release = len(release_attempts)
         allow_release.set()

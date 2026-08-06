@@ -229,6 +229,32 @@ class DirectoryIndexSession:
             config,
             candidate,
             bool(refresh),
+            False,
+        ).result()
+
+    def reprobe_candidate(
+        self,
+        candidate: Candidate,
+        *,
+        refresh: bool = True,
+    ) -> CandidateObservation:
+        """Reprobe one still-exact candidate after proven dependency drift.
+
+        Only that candidate's terminal/result cache is discarded, on the
+        serialized session owner, after its current generation, cheap stamp,
+        and adapter identity have all been revalidated.
+        """
+
+        if type(candidate) is not Candidate:
+            raise TypeError("candidate reprobe requires an exact Candidate")
+        generation, config = self._request()
+        return self._executor.submit(
+            self._probe_candidate_on_owner,
+            generation,
+            config,
+            candidate,
+            bool(refresh),
+            True,
         ).result()
 
     def enable_probes(self, *, exclude: tuple[Candidate, ...] = ()) -> None:
@@ -427,6 +453,7 @@ class DirectoryIndexSession:
         config: DirectorySessionConfig,
         candidate: Candidate,
         refresh: bool,
+        force_reprobe: bool,
     ) -> CandidateObservation:
         # A lazy session is configured with probing disabled.  Reuse the same
         # owner to refresh name/stat identity, then call the index for exactly
@@ -441,12 +468,16 @@ class DirectoryIndexSession:
             raise StaleCandidateError(
                 f"{candidate.path} changed before its deferred probe"
             )
-        stored = self._results.get(candidate.path)
-        if stored is not None and stored[0] == current:
-            return CandidateObservation(current, stored[1])
         index = self._index
         if index is None:  # pragma: no cover - owner construction invariant
             raise RuntimeError("directory index session has no active index")
+        if force_reprobe:
+            index.discard_probe_resolution(current)
+            self._results.pop(current.path, None)
+        stored = self._results.get(candidate.path)
+        retrying = index.retry_state(candidate.path) is not None
+        if stored is not None and stored[0] == current and not retrying:
+            return CandidateObservation(current, stored[1])
         result = index.probe_candidate(current)
         self._results[current.path] = (current, result)
         return CandidateObservation(current, result)

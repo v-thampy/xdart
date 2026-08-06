@@ -1407,9 +1407,13 @@ def test_dependency_graph_state_cannot_rebaseline_after_inventory(
     original_inventory = output_preflight._external_link_inventory
     mutated = False
 
-    def racing_inventory(candidate, *, cancelled):
+    def racing_inventory(candidate, *, cancelled, **kwargs):
         nonlocal mutated
-        result = original_inventory(candidate, cancelled=cancelled)
+        result = original_inventory(
+            candidate,
+            cancelled=cancelled,
+            **kwargs,
+        )
         if candidate.path == master and not mutated:
             mutated = True
             write_sidecar(second)
@@ -3028,7 +3032,10 @@ def test_same_stat_motor_rewrite_invalidates_admission(tmp_path: Path) -> None:
         )
         assert after.st_ctime_ns != before.st_ctime_ns
 
-        with pytest.raises(ValueError, match="source"):
+        with pytest.raises(
+            ValueError,
+            match="authoritative motor knowledge changed after admission",
+        ):
             validate_admitted_receipt(receipt, session)
     finally:
         session.close()

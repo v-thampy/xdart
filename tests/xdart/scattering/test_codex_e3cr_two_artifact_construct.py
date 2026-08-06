@@ -104,9 +104,11 @@ def test_construct_loop_adopts_two_artifacts_as_one_atomic_current_scope(
                 failed=False, cancelled=False, n_processed=1
             )
 
-    monkeypatch.setattr(
-        executor_module, "validate_planned_source", lambda _item: None
-    )
+        monkeypatch.setattr(
+            executor_module,
+            "validate_planned_source",
+            lambda _item, **_kwargs: None,
+        )
     monkeypatch.setattr(executor_module, "open_source", Source)
     monkeypatch.setattr(executor_module, "load_poni", lambda _path: object())
     monkeypatch.setattr(

@@ -76,19 +76,12 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
         assert commands[0].kind is (
             ShellCommandKind.SELECT_BROWSER_FRAMES
         )
-        # Accepted split: a user clear reports the still-current frame and
-        # the committed membership.  The browser no longer synthesises an
-        # empty membership — the page owns accumulation and projects the
-        # empty total below.
+        # Visit-accumulating modes preserve the focused row as their minimum
+        # membership when Qt reports an empty selection; the browser still
+        # must not substitute the run-global navigation catalog.
         assert commands[0].frame is state.navigation.current
-        assert all(
-            actual is expected
-            for actual, expected in zip(
-                commands[0].frames,
-                state.navigation.selected,
-                strict=True,
-            )
-        )
+        assert len(commands[0].frames) == 1
+        assert commands[0].frames[0] is state.navigation.current
         assert browser_commands == commands
 
         empty = replace(
@@ -101,7 +94,10 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
             replace(state, revision=2, navigation=empty)
         )
         assert commands == []
-        assert _browser_selected(shell) == ()
+        # Browser/history retains accumulated run membership, while the
+        # scan-local footer below is empty without a current scan.
+        assert _browser_selected(shell) == (state.navigation.current,)
+        assert _browser_selected(shell)[0] is state.navigation.current
         assert not shell.browser.frames.currentIndex().isValid()
         assert shell.scientific.frame_selector.count() == 0
         assert shell.scientific.frame_selector.currentIndex() == -1
@@ -113,23 +109,21 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
         assert commands == []
 
         shell.apply_state(replace(state, revision=4))
-        # The WHOLE membership tuple is exactly the retained frame: proving
-        # only element 0 would let a mutant append the newly focused frame.
-        assert _browser_selected(shell) == (state.navigation.current,)
-        assert len(_browser_selected(shell)) == 1
-        assert _browser_selected(shell)[0] is state.navigation.current
+        # The explicit clear is retained across projection refresh, while the
+        # run-global Browser catalog itself remains available.
+        assert _browser_selected(shell) == ()
+        assert shell.browser.frame_model.rowCount() == len(
+            state.navigation.frames
+        )
         commands.clear()
         browser_commands.clear()
         shell.apply_state(
             replace(state, revision=5, navigation=empty)
         )
-        # An empty projection retracts focus but not an accumulated visit:
-        # membership is retired by the user or by a new catalog, never by a
-        # projection alone.  Assert the WHOLE tuple, not just element 0, so a
-        # transient append of the newly focused frame cannot escape.
-        assert _browser_selected(shell) == (state.navigation.current,)
-        assert len(_browser_selected(shell)) == 1
-        assert _browser_selected(shell)[0] is state.navigation.current
+        assert _browser_selected(shell) == ()
+        assert shell.browser.frame_model.rowCount() == len(
+            state.navigation.frames
+        )
         assert not shell.browser.frames.currentIndex().isValid()
         assert shell.scientific.frame_selector.count() == 0
         assert commands == []
@@ -179,7 +173,9 @@ def test_e3_ui61_empty_single_catalog_has_no_implicit_current(
         assert commands == []
         assert _browser_selected(shell) == ()
         assert not shell.browser.frames.currentIndex().isValid()
-        assert shell.scientific.frame_selector.count() == 5
+        # The run-global catalog remains in Browser/history, while the footer
+        # is scan-local and therefore empty when there is no current scan.
+        assert shell.scientific.frame_selector.count() == 0
         assert shell.scientific.frame_selector.currentIndex() == -1
         assert shell.scientific.frame_selector.currentData() is None
         assert shell.scientific.title.text() == "No current frame"

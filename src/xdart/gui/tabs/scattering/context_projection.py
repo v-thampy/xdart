@@ -188,6 +188,10 @@ class ContextProjection:
                 phase not in {RunPhase.IDLE, RunPhase.FAILED, RunPhase.CLOSED}
                 or progress.terminal
             )
+            and not (
+                phase in {RunPhase.IDLE, RunPhase.FAILED}
+                and not start_permitted
+            )
             and progress_detail
         ):
             run = replace(run, readiness=progress_detail)

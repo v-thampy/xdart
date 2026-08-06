@@ -7,9 +7,14 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pytest
 
 from xrd_tools.core.scan import SourceKind
-from xrd_tools.sources.directory_index import DirectoryIndex
+from xrd_tools.sources.directory_index import (
+    DirectoryIndex,
+    StaleCandidateError,
+)
+from xrd_tools.sources import directory_session as directory_session_module
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeResult, ProbeState
 
@@ -242,6 +247,145 @@ def test_real_nascent_nexus_shell_becomes_ready_after_detector_arrives(tmp_path)
         assert [item.path for item in ready.delta.changed] == [source]
         assert ready.ready_snapshot.candidates[0].path == source
         assert ready.result_for(source).state is ProbeState.READY
+    finally:
+        session.close()
+
+
+def test_exact_probe_retries_unchanged_master_when_external_data_lands(
+    tmp_path,
+):
+    """A Live JIT probe must retry a provisional master whose own stat is
+    unchanged while its external detector member lands later.
+    """
+
+    master = tmp_path / "scan_master.h5"
+    target = tmp_path / "scan_data_000001.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data["data_000001"] = h5py.ExternalLink(
+            str(target),
+            "/entry/data/data",
+        )
+    master_stamp = master.stat().st_mtime_ns
+
+    session = DirectoryIndexSession(probe_candidates=False)
+    try:
+        session.configure(tmp_path, suffixes=("_master.h5",))
+        discovered = session.observe()
+        candidate = discovered.discovered_snapshot.candidates[0]
+        provisional = session.probe_candidate(candidate, refresh=False)
+        assert provisional.result.state is ProbeState.IN_PROGRESS
+
+        with h5py.File(target, "w") as handle:
+            handle.create_dataset(
+                "entry/data/data",
+                data=np.ones((2, 3, 4), dtype=np.uint16),
+            )
+        assert master.stat().st_mtime_ns == master_stamp
+
+        ready = session.probe_candidate(candidate, refresh=False)
+        assert ready.result.state is ProbeState.READY
+        assert ready.descriptor is not None
+        assert ready.descriptor.frame_count == 2
+    finally:
+        session.close()
+
+
+def test_nonexpiring_session_keeps_unchanged_master_pending_past_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    clock = [0.0]
+    real_index = DirectoryIndex
+
+    def clocked_index(*args, **kwargs):
+        kwargs["clock"] = lambda: clock[0]
+        return real_index(*args, **kwargs)
+
+    monkeypatch.setattr(
+        directory_session_module,
+        "DirectoryIndex",
+        clocked_index,
+    )
+    master = tmp_path / "late_master.h5"
+    target = tmp_path / "late_data_000001.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data["data_000001"] = h5py.ExternalLink(
+            str(target),
+            "/entry/data/data",
+        )
+
+    session = DirectoryIndexSession(
+        retry_deadline=float("inf"),
+        probe_candidates=False,
+    )
+    try:
+        session.configure(tmp_path, suffixes=("_master.h5",))
+        candidate = session.observe().discovered_snapshot.candidates[0]
+        first = session.probe_candidate(candidate, refresh=False)
+        assert first.result.state is ProbeState.IN_PROGRESS
+
+        clock[0] = 3_600.0
+        overdue = session.probe_candidate(candidate, refresh=False)
+        assert overdue.result.state is ProbeState.IN_PROGRESS
+
+        with h5py.File(target, "w") as handle:
+            handle.create_dataset(
+                "entry/data/data",
+                data=np.ones((2, 3, 4), dtype=np.uint16),
+            )
+        ready = session.probe_candidate(candidate, refresh=False)
+        assert ready.result.state is ProbeState.READY
+        assert ready.descriptor is not None
+        assert ready.descriptor.frame_count == 2
+    finally:
+        session.close()
+
+
+def test_exact_reprobe_invalidates_only_current_candidate_and_no_sibling(
+    tmp_path,
+    monkeypatch,
+):
+    first = _write(tmp_path / "first.nxs")
+    second = _write(tmp_path / "second.nxs")
+    calls = {first: 0, second: 0}
+
+    def probe(index, candidate):
+        calls[candidate.path] += 1
+        return index.record_probe(
+            candidate,
+            ProbeResult(ProbeState.READY, kind=SourceKind.NEXUS_STACK),
+        )
+
+    monkeypatch.setattr(DirectoryIndex, "probe_candidate", probe)
+    session = DirectoryIndexSession(probe_candidates=False)
+    try:
+        session.configure(tmp_path, suffixes=(".nxs",))
+        candidates = session.observe().discovered_snapshot.candidates
+        by_name = {value.path.name: value for value in candidates}
+        first_candidate = by_name["first.nxs"]
+        second_candidate = by_name["second.nxs"]
+
+        session.probe_candidate(first_candidate, refresh=False)
+        session.probe_candidate(second_candidate, refresh=False)
+        session.probe_candidate(first_candidate, refresh=False)
+        assert calls == {first: 1, second: 1}
+
+        session.reprobe_candidate(first_candidate, refresh=False)
+        session.probe_candidate(second_candidate, refresh=False)
+        assert calls == {first: 2, second: 1}
+
+        first.write_bytes(b"changed")
+        with pytest.raises(StaleCandidateError):
+            session.reprobe_candidate(first_candidate, refresh=True)
+        assert calls == {first: 2, second: 1}
     finally:
         session.close()
 

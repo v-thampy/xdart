@@ -460,7 +460,9 @@ def test_batch_run_defers_frame_paints_and_follows_latest_at_terminal(
         page._drain_executor()
 
         assert followed == []
-        assert refreshes == []
+        # Batch FRAME_READY refreshes scan-local progress while preserving the
+        # outgoing scientific paint; follow/paint remains terminal-owned.
+        assert refreshes == [None]
         assert lifecycle.phase is RunPhase.RUNNING
 
         executor.events.append(
@@ -476,7 +478,7 @@ def test_batch_run_defers_frame_paints_and_follows_latest_at_terminal(
         page._drain_executor()
 
         assert followed == [frame]
-        assert refreshes == [None]
+        assert refreshes == [None, None]
         assert lifecycle.phase is RunPhase.IDLE
         assert page._active_batch_mode is False
     finally:
@@ -518,12 +520,12 @@ def test_batch_frame_survives_unrelated_refresh_until_terminal(
             navigation_delta=DisplayNavigationDelta(frame),
         ))
         page._drain_executor()
-        assert applied == []
+        assert applied == [True]
 
         # A readiness/browser callback may refresh controls while the batch is
         # running; it must not expose the deferred frame or clear old paint.
         page._refresh_shell()
-        assert applied == [True]
+        assert applied == [True, True]
 
         executor.events.append(StandardRunEvent(
             identity,

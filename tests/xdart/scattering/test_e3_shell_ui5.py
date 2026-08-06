@@ -268,8 +268,8 @@ def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
         assert browser_commands[0].kind is (
             ShellCommandKind.SELECT_BROWSER_FRAMES
         )
-        assert browser_commands[0].frames == frames
-        assert browser_commands[0].frames[3] is frames[3]
+        assert len(browser_commands[0].frames) == 1
+        assert browser_commands[0].frames[0] is frames[3]
         assert browser_commands[0].frame is frames[3]
 
         shell.scientific.frame_selector.setCurrentIndex(3)

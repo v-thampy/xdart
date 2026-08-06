@@ -301,6 +301,26 @@ class RunDisplayState:
         self._partition_index += 1
         return owner
 
+    def admit_additional_partition(self) -> None:
+        """Monotonically admit one next Live artifact partition.
+
+        A directory Live run cannot know its final artifact count at Start.
+        Extending only the partition ceiling preserves the existing catalog,
+        residency owner, and per-artifact stores.  The operation is idempotent
+        until the newly admitted slot is consumed, so a proven source drift
+        before ``add_artifact`` can retry without inflating the ceiling.
+        """
+
+        with self._lock:
+            if not self._configured or self._partition_index < 1:
+                raise RuntimeError(
+                    "additional display partition requires one admitted artifact"
+                )
+            self._partition_count = max(
+                self._partition_count,
+                self._partition_index + 1,
+            )
+
     def append_navigation(
         self,
         source_scan: str,
