@@ -716,7 +716,7 @@ class CompositeSink:
             raise errors[0]
         return self._terminal_result(values)
 
-    def abort(self, result: ReductionResult) -> NexusTerminalResult | None:
+    def abort(self, result: ReductionResult | None) -> NexusTerminalResult | None:
         errors: list[BaseException] = []
         values: list[object] = []
         for sink in self.sinks:
@@ -1611,6 +1611,12 @@ class NexusSink:
         writer = self._writer
         if writer is None:
             raise RuntimeError("NexusSink finish has no transaction writer")
+        if (writer.phase.value == "finished"
+                and self._transaction.snapshot().phase is TransactionPhase.EPOCH_COMMITTED
+                and self._pending_append_decision is None):
+            self._scan = None
+            self._plan = None
+            return self._abort_composed()
         if getattr(result, "cancelled", False) and not writer.written_labels:
             self._scan = None
             self._plan = None
@@ -1660,7 +1666,7 @@ class NexusSink:
         self._plan = None
         return self._typed_terminal(snapshot)
 
-    def abort(self, result: ReductionResult) -> NexusTerminalResult:
+    def abort(self, result: ReductionResult | None) -> NexusTerminalResult:
         if self._terminal_result is not None:
             return self._terminal_result
         self._scan = None
@@ -1987,6 +1993,31 @@ class ReductionSession:
                 self._failure,
             )
 
+    @property
+    def sink_terminal_safe(self) -> bool:
+        """Whether no timed-out writer can still invoke the sink."""
+        return self._writer_thread is None or not self._writer_thread.is_alive()
+
+    def _shutdown_worker(self, *, wait: bool = True) -> None:
+        if self._owns_worker and self._worker is not None:
+            _admission_trace("pool_shutdown_enter", wait=wait, owned=True)
+            self._worker.shutdown(wait=wait, cancel_futures=True)
+            _admission_trace("pool_shutdown_exit", owned=True)
+        self._worker = None
+
+    def _rollback_construction(self, primary: BaseException) -> None:
+        self._record_failure(primary)
+        try:
+            if self._started:
+                if self._stream_started:
+                    self.finish(raise_on_failure=False)
+                else:
+                    abort = getattr(self._sink, "abort", None)
+                    (abort if callable(abort) else self._sink.finish)(None)
+        finally:
+            self._shutdown_worker()
+            self._finished = True
+
     def __post_init__(self) -> None:
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {self.chunk_size}")
@@ -2037,13 +2068,19 @@ class ReductionSession:
             raise ValueError(
                 f"execution must be 'chunked' or 'streaming'; got {self.execution!r}"
             )
-        self._worker, self._owns_worker = _coerce_executor(self.executor)
-        self._sink.begin(self.scan, self.plan)
-        self._started = True
-        _emit(self.progress_cb, self.scan.name, "start", None, 0, len(self.scan))
-
-        if self.execution == "streaming":
-            self._init_streaming()
+        try:
+            self._worker, self._owns_worker = _coerce_executor(self.executor)
+            self._sink.begin(self.scan, self.plan)
+            self._started = True
+            _emit(self.progress_cb, self.scan.name, "start", None, 0, len(self.scan))
+            if self.execution == "streaming":
+                self._init_streaming()
+        except BaseException as primary:
+            try:
+                self._rollback_construction(primary)
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
 
     def __enter__(self) -> ReductionSession:
         return self
@@ -2743,20 +2780,9 @@ class ReductionSession:
         try:
             if self._started:
                 if _writer_timed_out:
-                    # T0-5: the writer thread is STILL ALIVE (a stalled worker
-                    # holds it in future.result()) and may yet call
-                    # sink.write() on its h5 handle.  Tearing the sink down
-                    # here would (a) race h5.close() against an in-flight
-                    # write — h5py handles are not thread-safe — and (b) in
-                    # atomic-mode NexusSink, abort() used to unlink the tmp
-                    # file holding every frame written so far.  Leave the sink
-                    # untouched; the recorded TimeoutError (raised below) is
-                    # the loud signal, and the on-disk file keeps whatever was
-                    # written.
-                    # Name the actual on-disk location: an atomic-mode
-                    # NexusSink writes into a hidden tmp file that never gets
-                    # promoted on this path — without naming it, "left as-is"
-                    # reads as total loss for a new output file.
+                    # T0-5: a live writer may still call sink.write(); closing
+                    # its HDF5 handle would race that write.  Leave the exact
+                    # sink untouched and report its unfinalized data location.
                     data_loc = (getattr(self._sink, "_tmp_path", None)
                                 or getattr(self._sink, "_active_path", None)
                                 or getattr(self._sink, "path", None))
@@ -2784,15 +2810,8 @@ class ReductionSession:
                         self._sink.finish(self.result)
                         _admission_trace("sink_finish_end", on_failure=True)
         finally:
-            if self._owns_worker and self._worker is not None:
-                # If the writer join timed out, the pool has stalled futures —
-                # shut down without waiting (don't re-hang here).
-                wait_for_pool = not _writer_timed_out
-                _admission_trace("pool_shutdown_enter", wait=wait_for_pool,
-                                 owned=True)
-                self._worker.shutdown(wait=wait_for_pool, cancel_futures=True)
-                _admission_trace("pool_shutdown_exit", owned=True)
-            self._worker = None
+            # A timed-out writer can own stalled futures; never re-hang here.
+            self._shutdown_worker(wait=not _writer_timed_out)
             self._finished = True
 
         _emit(

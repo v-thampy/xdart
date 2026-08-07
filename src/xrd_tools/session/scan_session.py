@@ -484,17 +484,16 @@ class ScanSession:
         self._dynamic_settled_epoch_anchor = None
         self._dynamic_epoch_notified = False
         self._terminal_result: NexusTerminalResult | None = None
+        self._dynamic_graph_terminal_settled = False
         self._dynamic_terminal_settled = False
         self._terminal_state_emitted = False
         self._dynamic_extend_live = None
         self._dynamic_extension_owner = None
         self._dynamic_current_intent = None
-        if dynamic_accounting is not None:
-            self._dynamic_boundary.bind_live_session(
-                self, self._dynamic_owner_token,
-            )
-            if self._dynamic_nexus_sink is not None:
-                self._dynamic_nexus_sink._defer_publication_drop_settlement = True
+        prior_facade = (
+            None if self._dynamic_nexus_sink is None
+            else self._dynamic_nexus_sink._session_facade
+        )
         if hasattr(sink, "bind_session"):
             sink.bind_session(
                 self._dynamic_boundary
@@ -502,8 +501,7 @@ class ScanSession:
                 else _StageBoundaryFacade(self)
             )
         event_sink = _EventSink(
-            sink, self._on_completed,
-            defer_terminal=dynamic_accounting is not None,
+            sink, self._on_completed, defer_terminal=False,
         )
         # Streaming + retain_products=False: per-frame results are delivered via
         # events (and persisted by a durable sink), so the session does not also
@@ -549,46 +547,44 @@ class ScanSession:
                 ),
             )
         except BaseException as primary:
-            if dynamic_accounting is not None:
-                try:
-                    self._dynamic_boundary.epoch_aborted(
-                        self, self._dynamic_owner_token,
-                        f"dynamic sink begin failed: {primary}",
-                    )
-                except BaseException as cleanup:
-                    raise primary from cleanup
+            try:
+                nexus = self._dynamic_nexus_sink
+                if nexus is not None and (
+                    nexus._writer is None or type(nexus._terminal_result) is NexusTerminalResult
+                ):
+                    nexus.bind_session(prior_facade)
+            except BaseException as cleanup:
+                raise primary from cleanup
             raise
         self._event_sink = event_sink
-        if (
-            dynamic_accounting is not None
-            and self._dynamic_nexus_sink is not None
-            and type(self._dynamic_nexus_sink.same_run_intent) is AppendIntent
-        ):
+        try:
+            if (dynamic_accounting is not None
+                    and self._dynamic_nexus_sink is not None
+                    and type(self._dynamic_nexus_sink.same_run_intent) is AppendIntent):
+                self._dynamic_extend_live = self._dynamic_nexus_sink.extend_live
+                self._dynamic_extension_owner = self._dynamic_nexus_sink.extension_owner
+                self._dynamic_current_intent = self._dynamic_nexus_sink.same_run_intent
+            if dynamic_accounting is not None:
+                self._dynamic_boundary.bind_live_session(
+                    self, self._dynamic_owner_token,
+                )
+        except BaseException as primary:
             try:
-                extend_live = self._dynamic_nexus_sink.extend_live
-                extension_owner = self._dynamic_nexus_sink.extension_owner
-            except BaseException as primary:
-                try:
-                    self._session._record_failure(primary)
-                    failed_result = self._session.finish(raise_on_failure=False)
-                    terminal = self._user_sink.abort(failed_result)
-                    if (
-                        type(terminal) is not NexusTerminalResult
-                        or terminal.disposition is not NexusTerminalDisposition.ABORTED
-                    ):
-                        raise RuntimeError(
-                            "same-run capture cleanup did not abort the Nexus graph"
-                        )
-                    self._dynamic_boundary.epoch_aborted(
-                        self, self._dynamic_owner_token,
-                        f"same-run capability capture failed: {primary}",
-                    )
-                except BaseException as cleanup:
-                    raise primary from cleanup
-                raise
-            self._dynamic_extend_live = extend_live
-            self._dynamic_extension_owner = extension_owner
-            self._dynamic_current_intent = self._dynamic_nexus_sink.same_run_intent
+                self._session._rollback_construction(primary)
+                nexus = self._dynamic_nexus_sink
+                if nexus is not None:
+                    terminal = nexus._terminal_result
+                    if (type(terminal) is not NexusTerminalResult
+                            or terminal.disposition is not NexusTerminalDisposition.ABORTED):
+                        raise RuntimeError("construction cleanup did not abort Nexus")
+                    nexus.bind_session(prior_facade)
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
+        if dynamic_accounting is not None:
+            event_sink._defer_terminal = True
+            if self._dynamic_nexus_sink is not None:
+                self._dynamic_nexus_sink._defer_publication_drop_settlement = True
 
     # -- context manager ---------------------------------------------------
     def __enter__(self) -> "ScanSession":
@@ -790,10 +786,34 @@ class ScanSession:
             self._dynamic_frozen_result = result
         return result
 
+    def _settle_dynamic_graph(self, result, *, failed):
+        if self._dynamic_graph_terminal_settled:
+            return self._terminal_result
+        sink = self._user_sink
+        if sink is None:
+            value = None
+        elif failed:
+            abort = getattr(sink, "abort", None)
+            value = (abort if callable(abort) else sink.finish)(result)
+        else:
+            value = sink.finish(result)
+        if self._dynamic_nexus_sink is not None:
+            if type(value) is not NexusTerminalResult:
+                raise RuntimeError("dynamic Nexus graph returned no typed terminal")
+            self._terminal_result = value
+        elif value is not None:
+            raise RuntimeError("dynamic Memory graph returned Nexus terminal truth")
+        self._dynamic_graph_terminal_settled = True
+        return self._terminal_result
+
     def _finish_dynamic(
         self, *, raise_on_failure: bool, join_timeout: float | None,
     ) -> ReductionResult:
         result = self._freeze_dynamic_result(join_timeout)
+        if not self._session.sink_terminal_safe:
+            raise self._dynamic_primary_error or RuntimeError(
+                "dynamic writer remains able to call the sink"
+            )
         if self._dynamic_terminal_settled:
             if raise_on_failure and result.failed:
                 error = self._dynamic_primary_error
@@ -816,12 +836,7 @@ class ScanSession:
                 failed = True
 
         if failed:
-            if self._dynamic_nexus_sink is not None and self._terminal_result is None:
-                value = self._user_sink.abort(result)
-                if type(value) is not NexusTerminalResult:
-                    raise RuntimeError("dynamic Nexus abort returned no typed terminal")
-                self._terminal_result = value
-            value = self._terminal_result
+            value = self._settle_dynamic_graph(result, failed=True)
             if value is not None and value.disposition is NexusTerminalDisposition.COMMITTED:
                 if self._dynamic_finish_seal is None:
                     raise RuntimeError("committed dynamic failure has no finish seal")
@@ -837,12 +852,7 @@ class ScanSession:
                 )
             self._dynamic_terminal_settled = True
         else:
-            if self._dynamic_nexus_sink is not None and self._terminal_result is None:
-                value = self._user_sink.finish(result)
-                if type(value) is not NexusTerminalResult:
-                    raise RuntimeError("dynamic Nexus finish returned no typed terminal")
-                self._terminal_result = value
-            value = self._terminal_result
+            value = self._settle_dynamic_graph(result, failed=False)
             if value is None:
                 if stopped:
                     boundary.session_stopped(
