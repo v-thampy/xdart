@@ -837,6 +837,7 @@ class Light1DRetentionLease:
         self._cleanup_step = 0
         self._cleanup_reason: str | None = None
         self._cleanup_hooks: Light1DCleanupHooks | None = None
+        self._cleanup_callback_call = None
         self._retired_payload_groups: deque[tuple[bytes, ...]] = deque()
         self._cleanup_receipt: Light1DCleanupReceipt | None = None
         self._release_receipt: Light1DReleaseReceipt | None = None
@@ -1375,6 +1376,18 @@ class Light1DRetentionLease:
         with self._lock:
             return tuple(self._records)
 
+    def retire(
+        self, row_identity: Hashable, *, grant_id: str, generation: int,
+    ) -> bool:
+        """Retire one active row without classifying it as capacity eviction."""
+        row_identity = _freeze_light_identity(row_identity, "retire row")
+        with self._lock:
+            self._check_generation(grant_id, generation)
+            if row_identity not in self._records:
+                return False
+            self._remove(row_identity)
+            return True
+
     def get(self, row_identity: Hashable) -> Light1DBorrow | None:
         return self.borrow(row_identity)
 
@@ -1523,6 +1536,26 @@ class Light1DRetentionLease:
         if hook is not None:
             hook()
 
+    def _assert_cleanup_callback(
+        self, hooks: Light1DCleanupHooks, step_name: str,
+        callback: Callable[[], None], expected_step: int,
+    ) -> None:
+        with self._lock:
+            if (
+                self._cleanup_hooks is not hooks
+                or getattr(hooks, step_name) is not callback
+                or self._cleanup_token is None
+                or self._cleanup_step != expected_step
+                or self._state not in {
+                    Light1DLeaseState.FENCED,
+                    Light1DLeaseState.CLEANUP_PENDING,
+                }
+                or self._cleanup_callback_call != (
+                    threading.get_ident(), step_name, callback,
+                )
+            ):
+                raise RuntimeError("light-1D cleanup callback lacks exact authority")
+
     def _clear_owned_buffers(self) -> None:
         """Retire every canonical payload without laundering live aliases."""
         for key in tuple(self._records):
@@ -1567,7 +1600,17 @@ class Light1DRetentionLease:
                 name = names[step]
                 # Hooks may join workers that need the state lock to observe
                 # the generation fence, so no external call runs under it.
-                self._call(hook_by_name[name])
+                callback = hook_by_name[name]
+                if callback is not None:
+                    armed = (threading.get_ident(), name, callback)
+                    with self._lock:
+                        self._cleanup_callback_call = armed
+                    try:
+                        callback()
+                    finally:
+                        with self._lock:
+                            if self._cleanup_callback_call == armed:
+                                self._cleanup_callback_call = None
                 with self._lock:
                     if name == "clear":
                         if self._hydration_tokens or self._hydration_rows:

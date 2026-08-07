@@ -2986,13 +2986,19 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
         )
 
     first = store.publish_light_1d(record(0), source_identity="scan.nxs#0")
+    assert not hasattr(first, "borrow")
+    assert store.get_light_1d_shell(0) is first
+    assert store.get(0) is None
+    assert all(type(item).__name__ == "FramePublication"
+               for item in store._items.values())
     canonical = lease.borrow(0)
-    try:
-        assert first.borrow.modes["raw"].coordinate is canonical.modes["raw"].coordinate
-        assert first.borrow.modes["raw"].intensity is canonical.modes["raw"].intensity
-        assert first.borrow.modes["bg"].intensity is canonical.modes["bg"].intensity
-    finally:
-        canonical.close()
+    assert canonical is not None
+    assert canonical.modes["raw"].coordinate is not axis
+    assert canonical.modes["raw"].intensity.flags.writeable is False
+    canonical.close()
+    # Closing the separately tracked client borrow cannot unpin the store's
+    # private eviction guard.
+    assert lease.active_borrow_count == 1
     census = store.ndarray_owner_census()
     assert census["lease"] == lease.owned_buffer_ids
     assert census["publication"] == frozenset()
@@ -3013,17 +3019,24 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
         del store._hidden_publication_copy
 
     second = store.publish_light_1d(record(1), source_identity="scan.nxs#1")
-    assert store.labels() == (1,)
+    assert store.labels() == ()
+    assert store.get_light_1d_shell(0) is None
+    assert store.get_light_1d_shell(1) is second
     assert lease.keys() == (1,)
-    assert first.borrow.closed is True
     with pytest.raises(Light1DStaleGeneration):
         store.publish_light_1d(record(2, generation=6), source_identity="stale")
-    assert store.labels() == (1,)
+    assert store.get_light_1d_shell(1) is second
 
     del first, second
+    hooks = store.light_1d_cleanup_hooks(lease)
     store.clear()
+    assert store.allocation is allocation
+    assert store._light_1d is lease
+    assert lease.keys() == ()
     gc.collect()
-    lease.release(reason="terminal", hooks=Light1DCleanupHooks())
+    lease.release(reason="terminal", hooks=hooks)
+    assert store.allocation is None
+    assert store._light_1d is None
     assert authority.snapshot().reserved_bytes == allocation.assigned_bytes
     assert authority.snapshot().categories.get("light_1d", 0) == 0
     assert store.ndarray_owner_census() == {

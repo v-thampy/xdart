@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
+import gc
 import logging
+import threading
 
 import numpy as np
 import pytest
 import h5py
 
 from xrd_tools.core import (
+    Axis,
+    FrameRecord,
+    FrameView,
     IntegrationResult1D,
     IntegrationResult2D,
     TwoDKind,
+    assert_framerecord_equivalent,
     assert_frameview_equivalent,
 )
 from xrd_tools.io.nexus import write_integrated_stack
 
 from xdart.modules.frame_publication import (
+    FramePublication,
     PublicationStore,
     publication_error_details,
     publication_from_nexus_frame,
@@ -61,6 +69,194 @@ class DuckFrame:
 
     def _get_incident_angle(self):
         return float(self.scan_info["th"])
+
+
+def _bound_gui_light_graph(*, rows=3, shared_coordinate=False, dtype=np.float64):
+    """Build the exact fixed GUI layout and its bound store without Qt."""
+    from xrd_tools.session import (
+        Light1DBufferLayout,
+        Light1DLayout,
+        Light1DModeData,
+        Light1DModeLayout,
+        Light1DRecord,
+        SessionResourceAuthority,
+        SessionResourceRequirements,
+        acquire_light_1d_retention,
+        resolve_session_policy,
+    )
+
+    dtype = np.dtype(dtype)
+    requirements = SessionResourceRequirements(
+        height=4,
+        width=4,
+        native_itemsize=2,
+        modes_1d=2,
+        npt_1d=4,
+        sigma_1d=1,
+        modes_2d=1,
+        npt_rad=3,
+        npt_azim=2,
+    )
+    allocation = resolve_session_policy(
+        requirements,
+        envelope_bytes=4 * 1024 ** 3,
+        requests={"publication_items": rows, "record_items": rows},
+        env={},
+    ).allocation
+    layout = Light1DLayout(
+        modes=(
+            Light1DModeLayout(
+                "raw",
+                Light1DBufferLayout(
+                    4, dtype.itemsize, "raw-q", dtype.str,
+                    shared=shared_coordinate,
+                ),
+                Light1DBufferLayout(4, dtype.itemsize, "raw-i", dtype.str),
+                Light1DBufferLayout(4, dtype.itemsize, "raw-s", dtype.str),
+            ),
+            Light1DModeLayout(
+                "bg",
+                Light1DBufferLayout(
+                    4, dtype.itemsize, "bg-q", dtype.str,
+                    shared=shared_coordinate,
+                ),
+                Light1DBufferLayout(4, dtype.itemsize, "bg-i", dtype.str),
+            ),
+        ),
+        active_mode="bg",
+    )
+    authority = SessionResourceAuthority.from_allocation(allocation)
+    lease = acquire_light_1d_retention(
+        authority,
+        owner="c2p6-gui",
+        generation=7,
+        layout=layout,
+        requested_rows=rows,
+        compatibility_byte_ceiling=(
+            layout.shared_bytes + rows * layout.per_row_unique_ndarray_bytes
+        ),
+        gui_thread_id=threading.get_ident(),
+    )
+    store = PublicationStore()
+    store.bind_allocation(allocation)
+    store.bind_light_1d(lease)
+
+    def build(
+        label,
+        *,
+        source="scan.nxs#source",
+        scan="scan-owner",
+        publication_source=None,
+        publication_scan=None,
+        publication_generation=None,
+        light_generation=None,
+        array_dtype=None,
+        array_length=4,
+        light_active="bg",
+        publication_active="bg",
+        drop_light_mode=None,
+        omit_raw_uncertainty=False,
+        add_bg_uncertainty=False,
+        raw_ref=None,
+        heavy=True,
+    ):
+        use_dtype = np.dtype(array_dtype or dtype)
+        mode_arrays = {
+            "raw": (
+                np.linspace(0.1, 0.4, array_length, dtype=use_dtype),
+                np.full(array_length, float(label) + 1.0, dtype=use_dtype),
+                None if omit_raw_uncertainty else np.full(
+                    array_length, 0.5, dtype=use_dtype),
+            ),
+            "bg": (
+                np.linspace(0.2, 0.5, array_length, dtype=use_dtype),
+                np.full(array_length, float(label) + 2.0, dtype=use_dtype),
+                (np.full(array_length, 0.25, dtype=use_dtype)
+                 if add_bg_uncertainty else None),
+            ),
+        }
+        mode_views = {
+            mode: FrameView(
+                label=label,
+                axis_1d=Axis("Q", "q_A^-1", values=coordinate),
+                intensity_1d=intensity,
+                sigma_1d=uncertainty,
+                metadata_raw={"sample": "LaB6"},
+                metadata_numeric={"monitor": 100.0},
+                source_path="raw_0001.tif",
+                source_frame_index=int(label),
+            )
+            for mode, (coordinate, intensity, uncertainty) in mode_arrays.items()
+        }
+        active_view = mode_views[publication_active]
+        results_2d = {}
+        if heavy:
+            active_view = replace(
+                active_view,
+                axis_2d_x=Axis("Q", "q_A^-1", values=np.arange(3.0)),
+                axis_2d_y=Axis("chi", "chi_deg", values=np.arange(2.0)),
+                intensity_2d=np.full((2, 3), float(label) + 3.0),
+                raw=np.full((4, 4), float(label) + 4.0),
+                thumbnail=np.full((2, 2), float(label) + 5.0),
+                mask_baked=True,
+            )
+            results_2d = {"cake": active_view}
+        publication = FramePublication(
+            view=active_view,
+            record=FrameRecord(
+                label=label,
+                results_1d=mode_views,
+                results_2d=results_2d,
+                active_mode_1d=publication_active,
+                active_mode_2d="cake" if results_2d else "default",
+            ),
+            source_identity=(
+                source if publication_source is None else publication_source
+            ),
+            generation=(
+                store.generation
+                if publication_generation is None else publication_generation
+            ),
+            raw_ref=raw_ref,
+            raw_status="ready" if heavy else "1d-only",
+            scan_key=scan if publication_scan is None else publication_scan,
+        )
+        light_modes = {
+            mode: Light1DModeData(*values)
+            for mode, values in mode_arrays.items()
+            if mode != drop_light_mode
+        }
+        light_record = Light1DRecord(
+            row_identity=label,
+            generation=(
+                lease.generation if light_generation is None else light_generation
+            ),
+            active_mode=light_active,
+            modes=light_modes,
+            provenance={"source_identity": source, "scan_key": scan},
+        )
+        return publication, light_record
+
+    return store, lease, allocation, authority, build
+
+
+def _without_1d(publication):
+    view = replace(
+        publication.view,
+        axis_1d=None,
+        intensity_1d=None,
+        sigma_1d=None,
+    )
+    return replace(
+        publication,
+        view=view,
+        record=FrameRecord(
+            label=publication.label,
+            results_2d=publication.record.results_2d,
+            active_mode_2d=publication.record.active_mode_2d,
+        ),
+        raw_ref=None,
+    )
 
 
 def test_publication_from_live_frame_keeps_raw_lazy_by_default():
@@ -2359,3 +2555,468 @@ def test_scan_owner_preserved_through_hydration_replacement():
     assert hydrated is not None
     assert hydrated.view.intensity_1d is not None    # payload restored
     assert hydrated.scan_key == "run_a"              # owner survived
+
+
+def test_gui_light_1d_pair_is_frame_equivalent_with_one_zero_copy_owner():
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph()
+    publication, light_record = build(0)
+
+    composed = store.publish_gui_light_1d(publication, light_record)
+    assert type(composed) is FramePublication
+    assert type(store._items[0]) is FramePublication
+    assert not store._items[0].view.has_1d
+    assert all(
+        mode_view.axis_1d is None
+        and mode_view.intensity_1d is None
+        and mode_view.sigma_1d is None
+        for mode_view in store._items[0].record.results_1d.values()
+    )
+    assert_frameview_equivalent(composed.view, publication.view)
+    assert_framerecord_equivalent(composed.record, publication.record)
+
+    canonical = lease.borrow(0)
+    assert canonical is not None
+    try:
+        assert composed.view.axis_1d.values is canonical.modes["bg"].coordinate
+        assert composed.view.intensity_1d is canonical.modes["bg"].intensity
+        assert composed.view.sigma_1d is canonical.modes["bg"].uncertainty
+        assert (composed.record.results_1d["raw"].axis_1d.values
+                is canonical.modes["raw"].coordinate)
+        assert (composed.record.results_1d["raw"].intensity_1d
+                is canonical.modes["raw"].intensity)
+        assert (composed.record.results_1d["raw"].sigma_1d
+                is canonical.modes["raw"].uncertainty)
+    finally:
+        canonical.close()
+    census = store.ndarray_owner_census()
+    expected_heavy = frozenset(
+        id(store._ndarray_root(value))
+        for value in (
+            store._items[0].view.intensity_2d,
+            store._items[0].view.raw,
+            store._items[0].view.thumbnail,
+        )
+    )
+    assert expected_heavy <= census["publication"]
+    assert census["publication"].isdisjoint(census["lease"])
+
+
+def test_gui_light_1d_pair_refuses_identity_authority_mismatches_atomically():
+    from xrd_tools.session import Light1DStaleGeneration
+
+    store, lease, allocation, _authority, build = _bound_gui_light_graph()
+    publication, light_record = build(0)
+    store.publish_gui_light_1d(publication, light_record)
+    prior_base = store._items[0]
+    prior_pair = store._light_1d_items[0]
+    prior_keys = lease.keys()
+    prior_generation = store.generation
+
+    candidates = []
+    publication_1, light_1 = build(1)
+    candidates.append((publication_1, replace(light_1, row_identity=99)))
+    candidates.append(build(1, publication_source="foreign-source"))
+    candidates.append(build(1, publication_scan="foreign-scan"))
+    candidates.append(build(1, publication_generation=store.generation + 1))
+    candidates.append(build(1, light_generation=lease.generation + 1))
+    for candidate_publication, candidate_record in candidates:
+        with pytest.raises((ValueError, Light1DStaleGeneration)):
+            store.publish_gui_light_1d(candidate_publication, candidate_record)
+        assert store._items[0] is prior_base
+        assert store._light_1d_items[0] is prior_pair
+        assert lease.keys() == prior_keys
+        assert store.generation == prior_generation
+
+    store.allocation = object()
+    try:
+        with pytest.raises(ValueError, match="allocation"):
+            store.publish_gui_light_1d(*build(1))
+        assert store._items[0] is prior_base
+        assert store._light_1d_items[0] is prior_pair
+        assert lease.keys() == prior_keys
+        assert store.generation == prior_generation
+    finally:
+        store.allocation = allocation
+
+
+def test_gui_light_1d_pair_refuses_unsupported_layouts_atomically():
+    graph_cases = (
+        _bound_gui_light_graph(dtype=np.float32),
+        _bound_gui_light_graph(dtype=np.dtype(">f8")),
+        _bound_gui_light_graph(shared_coordinate=True),
+    )
+    for store, lease, _allocation, _authority, build in graph_cases:
+        with pytest.raises(ValueError):
+            store.publish_gui_light_1d(*build(0))
+        assert store._items == {}
+        assert store._light_1d_items == {}
+        assert lease.keys() == ()
+
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph()
+    invalid = (
+        build(0, array_length=3),
+        build(0, drop_light_mode="raw"),
+        build(0, light_active="raw"),
+        build(0, omit_raw_uncertainty=True),
+        build(0, add_bg_uncertainty=True),
+        build(0, raw_ref=object()),
+    )
+    for publication, light_record in invalid:
+        with pytest.raises(ValueError):
+            store.publish_gui_light_1d(publication, light_record)
+        assert store._items == {}
+        assert store._light_1d_items == {}
+        assert lease.keys() == ()
+
+
+def test_bound_upsert_refuses_1d_and_allows_raw_2d_only():
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph()
+    publication, _light_record = build(0)
+
+    with pytest.raises(ValueError, match="1-D"):
+        store.upsert(publication)
+    assert store._items == {}
+    assert lease.keys() == ()
+
+    array_free = _without_1d(publication)
+    stored = store.upsert(array_free)
+    assert stored is store._items[0]
+    assert not stored.view.has_1d
+    assert stored.view.has_2d
+    assert stored.view.raw is publication.view.raw
+
+
+def test_bound_refresh_preserves_qualified_pair_and_retires_foreign_pair():
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph()
+    publication, light_record = build(0)
+    store.publish_gui_light_1d(publication, light_record)
+    pair = store._light_1d_items[0]
+    canonical = lease.borrow(0)
+    assert canonical is not None
+    canonical_intensity = canonical.modes["bg"].intensity
+    canonical.close()
+
+    refresh, _unused = build(0)
+    refreshed = store.upsert(_without_1d(refresh))
+    assert store._light_1d_items[0] is pair
+    assert lease.keys() == (0,)
+    assert refreshed.view.intensity_1d is canonical_intensity
+    assert refreshed.view.has_2d
+
+    for mismatch in ("source", "scan", "generation"):
+        other_store, other_lease, _a, _r, other_build = _bound_gui_light_graph()
+        original, original_light = other_build(0)
+        other_store.publish_gui_light_1d(original, original_light)
+        options = {
+            "source": {"publication_source": "foreign-source"},
+            "scan": {"publication_scan": "foreign-scan"},
+            "generation": {"publication_generation": other_store.generation + 1},
+        }[mismatch]
+        foreign, _unused = other_build(0, **options)
+        replaced_publication = other_store.upsert(_without_1d(foreign))
+        assert not replaced_publication.view.has_1d
+        assert 0 not in other_store._light_1d_items
+        assert other_lease.keys() == ()
+
+
+def test_bound_reads_compose_frame_publications_without_shell_leakage():
+    from xdart.modules.frame_publication import Light1DPublicationShell
+
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph()
+    publication, light_record = build(0)
+    shell = store.publish_gui_light_1d(publication, light_record)
+    assert type(shell) is FramePublication
+
+    canonical = lease.borrow(0)
+    assert canonical is not None
+    try:
+        values = (
+            store.get(0),
+            store.get_many((0,))[0],
+            store.snapshot()[0],
+            store.get_1d_many_or_hydrate((0,))[0],
+        )
+        for value in values:
+            assert type(value) is FramePublication
+            assert not isinstance(value, Light1DPublicationShell)
+            assert value.view.intensity_1d is canonical.modes["bg"].intensity
+            assert (value.record.results_1d["raw"].axis_1d.values
+                    is canonical.modes["raw"].coordinate)
+    finally:
+        canonical.close()
+    public_shell = store.get_light_1d_shell(0)
+    assert public_shell is not None
+    assert not hasattr(public_shell, "borrow")
+
+
+def test_bound_heavy_and_thumbnail_demotion_preserve_light_pair():
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph()
+    publication, light_record = build(0)
+    store.publish_gui_light_1d(publication, light_record)
+    pair = store._light_1d_items[0]
+
+    assert store.evict_heavy(0)
+    semilight = store.get(0)
+    assert store._light_1d_items[0] is pair
+    assert lease.keys() == (0,)
+    assert semilight.view.has_1d
+    assert semilight.view.intensity_2d is None
+    assert semilight.view.thumbnail is not None
+
+    assert store.evict_thumbnail(0)
+    light = store.get(0)
+    assert store._light_1d_items[0] is pair
+    assert lease.keys() == (0,)
+    assert light.view.has_1d
+    assert light.view.thumbnail is None
+
+
+def test_bound_terminal_removals_close_exact_light_pairs(monkeypatch):
+    from xrd_tools.session import (
+        Light1DBorrow,
+        Light1DCleanupHooks,
+        Light1DCleanupPending,
+        Light1DCleanupToken,
+        Light1DLeaseState,
+        Light1DRetentionLease,
+        Light1DUnavailable,
+    )
+
+    def published(*, rows=3, labels=(0,)):
+        graph = _bound_gui_light_graph(rows=rows)
+        local_store, local_lease, _allocation, _authority, build = graph
+        for label in labels:
+            local_store.publish_gui_light_1d(*build(label))
+        return graph
+
+    store, lease, _a, _r, _build = published(labels=(0, 1))
+    store.invalidate((0,))
+    assert lease.keys() == (1,)
+    assert 0 not in store._light_1d_items and store.get(0) is None
+    assert store.discard(1)
+    assert lease.keys() == ()
+
+    store, lease, _a, _r, build = published(rows=1)
+    store.publish_gui_light_1d(*build(1))
+    assert lease.keys() == (1,)
+    assert 0 not in store._light_1d_items
+    assert store.get(0) is None
+
+    store, lease, _a, _r, _build = published(labels=(0,))
+    client = lease.borrow(0)
+    prior_base = store._items[0]
+    with pytest.raises(Light1DUnavailable):
+        store.discard(0)
+    assert store._items[0] is prior_base
+    assert 0 in store._light_1d_items
+    assert lease.keys() == (0,)
+    assert client is not None
+    client.close()
+    assert store.discard(0)
+
+    store, lease, allocation, _r, _build = published(labels=(0, 1, 2))
+    client = lease.borrow(1)
+    with pytest.raises(Light1DUnavailable):
+        store.clear()
+    assert lease.keys() == (1, 2)
+    assert store.get(0) is None
+    assert store.get(1) is not None and store.get(2) is not None
+    assert store.allocation is allocation and store._light_1d is lease
+    assert client is not None
+    client.close()
+    store.clear()
+    assert lease.keys() == ()
+    assert store._items == {} and store._light_1d_items == {}
+    assert store.allocation is allocation and store._light_1d is lease
+
+    store, lease, allocation, _r, _build = published(labels=(0,))
+    hooks = store.light_1d_cleanup_hooks(lease)
+    before = (store._items.copy(), store._light_1d_items.copy(), lease.keys())
+    with pytest.raises(RuntimeError):
+        hooks.clear()
+    assert (store._items, store._light_1d_items, lease.keys()) == before
+    failures = []
+    thread = threading.Thread(
+        target=lambda: failures.append(pytest.raises(RuntimeError, hooks.clear)),
+    )
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive() and len(failures) == 1
+
+    # Each private callback authority fact is independently observable while
+    # the other facts are qualified.
+    store, lease, _a, _r, _build = published(labels=(0,))
+    frozen = store.light_1d_cleanup_hooks(lease)
+    foreign = store.light_1d_cleanup_hooks(lease)
+    rogue = Light1DCleanupHooks(
+        clear=foreign.clear,
+        detach=foreign.detach,
+    )
+    with pytest.raises(Light1DCleanupPending) as pending:
+        lease.release(reason="foreign-hooks", hooks=rogue)
+    assert pending.value.receipt.failed_step == "clear"
+    assert lease.keys() == (0,) and 0 in store._light_1d_items
+
+    store, lease, _a, _r, _build = published(labels=(0,))
+    hooks = None
+
+    def erase_cleanup_token():
+        lease._cleanup_token = None
+
+    hooks = store.light_1d_cleanup_hooks(lease, drain=erase_cleanup_token)
+    with pytest.raises(Light1DCleanupPending) as pending:
+        lease.release(reason="missing-token", hooks=hooks)
+    assert pending.value.receipt.failed_step == "clear"
+    assert lease.keys() == (0,) and 0 in store._light_1d_items
+
+    store, lease, _a, _r, _build = published(labels=(0,))
+    hooks = store.light_1d_cleanup_hooks(lease)
+    with lease._lock:
+        lease._cleanup_hooks = hooks
+        lease._cleanup_token = Light1DCleanupToken(
+            lease.grant_id, lease.generation, 1,
+        )
+        lease._cleanup_step = 2
+        lease._state = Light1DLeaseState.FENCED
+        lease._cleanup_callback_call = (
+            threading.get_ident(), "clear", hooks.clear,
+        )
+    cross_thread_failures = []
+    thread = threading.Thread(target=lambda: cross_thread_failures.append(
+        pytest.raises(RuntimeError, hooks.clear),
+    ))
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive() and len(cross_thread_failures) == 1
+    assert lease.keys() == (0,) and 0 in store._light_1d_items
+    with lease._lock:
+        lease._cleanup_step = 1
+    with pytest.raises(RuntimeError):
+        hooks.clear()
+    assert lease.keys() == (0,) and 0 in store._light_1d_items
+    with lease._lock:
+        lease._cleanup_step = 2
+        lease._state = Light1DLeaseState.ACTIVE
+    with pytest.raises(RuntimeError):
+        hooks.clear()
+    assert lease.keys() == (0,) and 0 in store._light_1d_items
+
+    retire_calls = []
+    original_retire = Light1DRetentionLease.retire
+
+    def record_retire(owner, *args, **kwargs):
+        retire_calls.append((owner, args, kwargs))
+        return original_retire(owner, *args, **kwargs)
+
+    monkeypatch.setattr(Light1DRetentionLease, "retire", record_retire)
+    receipt = lease.release(reason="terminal", hooks=hooks)
+    assert receipt.released_bytes == lease.reserved_ndarray_bytes
+    assert retire_calls == []
+    assert lease.state is Light1DLeaseState.RELEASED
+    assert store.allocation is None and store._light_1d is None
+    assert store._items == {} and store._light_1d_items == {}
+    with pytest.raises(RuntimeError):
+        hooks.detach()
+
+    # A cursor-2 guard-close failure keeps that pair for the exact retry; the
+    # lease-owned canonical clear and cursor-3 detach then run once.
+    store, lease, _a, _r, _build = published(labels=(0, 1))
+    hooks = store.light_1d_cleanup_hooks(lease)
+    target_guard = store._light_1d_items[1].guard
+    original_close = Light1DBorrow.close
+    fail_once = [True]
+
+    def flaky_close(owner):
+        if owner is target_guard and fail_once:
+            fail_once.pop()
+            raise RuntimeError("injected guard close")
+        return original_close(owner)
+
+    monkeypatch.setattr(Light1DBorrow, "close", flaky_close)
+    with pytest.raises(Light1DCleanupPending) as pending:
+        lease.release(reason="terminal", hooks=hooks)
+    assert pending.value.receipt.failed_step == "clear"
+    assert 0 not in store._light_1d_items
+    assert 1 in store._light_1d_items
+    assert lease.keys() == (0, 1)
+    monkeypatch.setattr(Light1DBorrow, "close", original_close)
+    lease.retry_cleanup(pending.value.token, hooks=hooks)
+    assert lease.state is Light1DLeaseState.RELEASED
+    assert store.allocation is None and store._light_1d is None
+
+    # A hidden 1-D base is a pre-mutation cursor-3 refusal. Qualified raw/2-D
+    # bases are admitted and consumed by the retry.
+    store, lease, allocation, _r, build = _bound_gui_light_graph()
+    hidden, _hidden_light = build(0)
+    store._items[0] = hidden
+    hooks = store.light_1d_cleanup_hooks(lease)
+    with pytest.raises(Light1DCleanupPending) as pending:
+        lease.release(reason="terminal", hooks=hooks)
+    assert pending.value.receipt.failed_step == "detach"
+    assert store._items[0] is hidden
+    assert store.allocation is allocation and store._light_1d is lease
+    store._items[0] = _without_1d(hidden)
+    lease.retry_cleanup(pending.value.token, hooks=hooks)
+    assert store._items == {}
+    assert store.allocation is None and store._light_1d is None
+
+    # A pair whose public retirement falsely reports an absent key is never
+    # allowed to diverge from the lease map or public base.
+    store, lease, _a, _r, _build = published(labels=(0,))
+    prior_base = store._items[0]
+    prior_retire = Light1DRetentionLease.retire
+    monkeypatch.setattr(Light1DRetentionLease, "retire", lambda *_a, **_k: False)
+    with pytest.raises(RuntimeError, match="inconsistent"):
+        store.discard(0)
+    assert store._items[0] is prior_base
+    assert 0 in store._light_1d_items and lease.keys() == (0,)
+    monkeypatch.setattr(Light1DRetentionLease, "retire", prior_retire)
+
+
+def test_gui_light_1d_escaped_alias_reconciles_without_regrant_then_retries():
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph(rows=1)
+    store.publish_gui_light_1d(*build(0))
+    shown = store.get(0)
+    alias = shown.view.intensity_1d
+    owned_before = lease.unique_owned_ndarray_bytes
+
+    missed = store.publish_gui_light_1d(*build(1))
+    assert not missed.view.has_1d
+    assert store.get(0) is None
+    assert 0 not in store._light_1d_items
+    assert 1 not in store._light_1d_items
+    assert lease.keys() == ()
+    assert lease.unique_owned_ndarray_bytes == owned_before
+
+    del alias, shown, missed
+    gc.collect()
+    retried = store.publish_gui_light_1d(*build(1))
+    assert retried.view.has_1d
+    assert lease.keys() == (1,)
+    assert tuple(store._light_1d_items) == (1,)
+
+
+def test_bound_reintegrate_refuses_before_any_mutation():
+    store, lease, allocation, _authority, build = _bound_gui_light_graph()
+    store.publish_gui_light_1d(*build(0))
+    prior = (
+        store.generation,
+        store._items.copy(),
+        store._light_1d_items.copy(),
+        store._carryover.copy(),
+        lease.keys(),
+        store.allocation,
+        store._light_1d,
+    )
+
+    with pytest.raises(RuntimeError, match="reintegrat"):
+        store.begin_reintegrate()
+    assert (
+        store.generation,
+        store._items,
+        store._light_1d_items,
+        store._carryover,
+        lease.keys(),
+        store.allocation,
+        store._light_1d,
+    ) == prior

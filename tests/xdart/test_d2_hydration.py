@@ -13,12 +13,16 @@ from collections import deque
 from types import SimpleNamespace, MethodType
 
 import numpy as np
+import pytest
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
 from xdart.gui.tabs.static_scan.display_logic import ConsumerKind
 from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
-from xdart.modules.frame_publication import PublicationStore
+from xdart.modules.frame_publication import (
+    PublicationStore,
+    publication_from_live_frame,
+)
 
 
 class _DuckFrame:
@@ -64,6 +68,84 @@ def _hydrator_holder(disk_frame, store=None):
     h._rehydrate_publication = MethodType(
         DisplayDataMixin._rehydrate_publication, h)
     return h
+
+
+def _bound_d2_light_graph():
+    from xrd_tools.session import (
+        Light1DBufferLayout,
+        Light1DLayout,
+        Light1DModeData,
+        Light1DModeLayout,
+        Light1DRecord,
+        SessionResourceAuthority,
+        SessionResourceRequirements,
+        acquire_light_1d_retention,
+        resolve_session_policy,
+    )
+
+    requirements = SessionResourceRequirements(
+        height=4,
+        width=4,
+        native_itemsize=2,
+        modes_1d=1,
+        npt_1d=6,
+        sigma_1d=1,
+        modes_2d=1,
+        npt_rad=4,
+        npt_azim=3,
+    )
+    allocation = resolve_session_policy(
+        requirements,
+        envelope_bytes=4 * 1024 ** 3,
+        requests={"publication_items": 2, "record_items": 2},
+        env={},
+    ).allocation
+    layout = Light1DLayout((Light1DModeLayout(
+        "default",
+        Light1DBufferLayout(6, 8, "q", np.dtype(np.float64).str),
+        Light1DBufferLayout(6, 8, "i", np.dtype(np.float64).str),
+        Light1DBufferLayout(6, 8, "s", np.dtype(np.float64).str),
+    ),), "default")
+    authority = SessionResourceAuthority.from_allocation(allocation)
+    lease = acquire_light_1d_retention(
+        authority,
+        owner="c2p6-d2",
+        generation=9,
+        layout=layout,
+        requested_rows=2,
+        compatibility_byte_ceiling=2 * layout.per_row_unique_ndarray_bytes,
+        gui_thread_id=threading.get_ident(),
+    )
+    store = PublicationStore()
+    store.bind_allocation(allocation)
+    store.bind_light_1d(lease)
+
+    def pair(frame, *, include_2d=False, include_thumbnail=False):
+        publication = publication_from_live_frame(
+            frame,
+            generation=store.generation,
+            source_identity="scan.nxs#source",
+            include_2d=include_2d,
+            include_thumbnail=include_thumbnail,
+            retain_raw_ref=False,
+            scan_key="scan-owner",
+        )
+        result = frame.int_1d
+        light_record = Light1DRecord(
+            frame.idx,
+            lease.generation,
+            "default",
+            {"default": Light1DModeData(
+                result.radial, result.intensity, result.sigma,
+            )},
+            provenance={
+                "source_identity": "scan.nxs#source",
+                "scan_key": "scan-owner",
+            },
+        )
+        return publication, light_record
+
+    return store, lease, pair
 
 
 def test_rehydrate_publication_builds_heavy_from_disk():
@@ -771,3 +853,63 @@ def test_succeeded_frame_not_re_requested_after_eviction_rl1_show_all():
     h.display_generation = 4
     h._request_frame_hydration(LABEL, purpose="1d")
     assert calls[-1] == (LABEL, 4, "1d")
+
+
+def test_bound_full_hydration_preserves_pair_without_duplicate_1d():
+    store, lease, pair = _bound_d2_light_graph()
+    initial_frame = _DuckFrame(idx=0)
+    initial, light_record = pair(initial_frame)
+    store.publish_gui_light_1d(initial, light_record)
+    canonical = lease.borrow(0)
+    assert canonical is not None
+    canonical_intensity = canonical.modes["default"].intensity
+    canonical.close()
+
+    calls = []
+
+    def hydrate(label):
+        calls.append(label)
+        fresh, _unused = pair(
+            _DuckFrame(idx=label), include_2d=True, include_thumbnail=True,
+        )
+        return fresh
+
+    store.set_hydrator(hydrate)
+    hydrated = store.get_or_hydrate(0)
+
+    assert calls == [0]
+    assert hydrated.view.has_1d and hydrated.view.has_2d
+    assert hydrated.view.intensity_1d is canonical_intensity
+    assert store._items[0].view.intensity_1d is None
+    assert all(
+        view.axis_1d is None
+        and view.intensity_1d is None
+        and view.sigma_1d is None
+        for view in store._items[0].record.results_1d.values()
+    )
+    assert store._light_1d_items[0].guard.closed is False
+    assert lease.keys() == (0,)
+
+
+def test_bound_missing_1d_refuses_before_legacy_hydrator():
+    store, lease, _pair = _bound_d2_light_graph()
+    frame = _DuckFrame(idx=1)
+    frame.int_1d = None
+    base = publication_from_live_frame(
+        frame,
+        generation=store.generation,
+        source_identity="scan.nxs#source",
+        retain_raw_ref=False,
+        scan_key="scan-owner",
+    )
+    store.upsert(base)
+    calls = []
+    store.set_1d_hydrator(lambda labels: calls.append(labels))
+    prior = (store._items.copy(), store.generation, lease.keys())
+
+    with pytest.raises(RuntimeError, match="worker|token|bound"):
+        store.get_1d_many_or_hydrate((1,))
+    assert calls == []
+    assert store._items == prior[0]
+    assert store.generation == prior[1]
+    assert lease.keys() == prior[2]

@@ -20,6 +20,7 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 from xrd_tools.core import (
+    Axis,
     FrameRecord,
     FrameView,
     TwoDKind,
@@ -142,12 +143,29 @@ class FramePublication:
 
 @dataclass(frozen=True, slots=True)
 class Light1DPublicationShell:
-    """Array-free publication identity holding one tracked lease borrow."""
+    """Array-free scalar receipt for one privately guarded lease row."""
 
     label: int | str
     generation: int
     source_identity: str
-    borrow: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _Light1DModeTemplate:
+    mode: Any
+    axis_label: str
+    axis_unit: str
+    axis_log: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Light1DPair:
+    shell: Light1DPublicationShell
+    store_generation: int
+    scan_key: str | None
+    active_mode: Any
+    modes: tuple[_Light1DModeTemplate, ...]
+    guard: Any
 
 
 def validate_publication(
@@ -535,6 +553,50 @@ def _lightweight_publication(publication: FramePublication) -> FramePublication:
     )
 
 
+def _publication_has_1d_arrays(publication: FramePublication) -> bool:
+    def view_has_1d_array(view: FrameView) -> bool:
+        axis = view.axis_1d
+        return any(value is not None for value in (
+            None if axis is None else axis.values,
+            view.intensity_1d,
+            view.sigma_1d,
+        ))
+
+    return view_has_1d_array(publication.view) or any(
+        view_has_1d_array(view)
+        for view in publication.record.results_1d.values()
+    )
+
+
+def _without_1d_arrays(publication: FramePublication) -> FramePublication:
+    view = replace(
+        publication.view,
+        axis_1d=None,
+        intensity_1d=None,
+        sigma_1d=None,
+    )
+    return replace(
+        publication,
+        view=view,
+        record=FrameRecord(
+            label=publication.label,
+            results_1d={
+                mode: replace(
+                    mode_view,
+                    axis_1d=None,
+                    intensity_1d=None,
+                    sigma_1d=None,
+                )
+                for mode, mode_view in publication.record.results_1d.items()
+            },
+            results_2d=publication.record.results_2d,
+            active_mode_1d=publication.record.active_mode_1d,
+            active_mode_2d=publication.record.active_mode_2d,
+        ),
+        raw_ref=None,
+    )
+
+
 def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
     """Accumulate the incoming record's modes into the existing one (ADR-0003
     fork B): the store keeps ONE FrameRecord per frame that grows as GI modes
@@ -659,6 +721,7 @@ class PublicationStore:
         self.allocation: Any = None
         self._light_1d = None
         self._items: dict[int | str, FramePublication] = {}
+        self._light_1d_items: dict[int | str, _Light1DPair] = {}
         self._heavy_labels: list[int | str] = []
         self._thumb_labels: list[int | str] = []
         # D2: optional rehydration source (label -> FramePublication|None).
@@ -720,7 +783,7 @@ class PublicationStore:
             self._light_1d = lease
 
     def publish_light_1d(self, record, *, source_identity: str):
-        """Retain through the lease and store only its tracked shell borrow."""
+        """Retain a heterogeneous row behind an array-free scalar shell."""
         from xrd_tools.session import Light1DStaleGeneration
 
         with self._lock:
@@ -730,20 +793,17 @@ class PublicationStore:
             if int(record.generation) != int(lease.generation):
                 raise Light1DStaleGeneration("light-1D publication generation is stale")
             label = record.row_identity
-            prior = self._items.get(label)
-            if isinstance(prior, Light1DPublicationShell):
-                prior.borrow.close()
-                self._items.pop(label, None)
+            if label in self._light_1d_items:
+                self._retire_light_pair_locked(label)
             if label not in lease.keys() and len(lease.keys()) >= lease.row_cap:
                 oldest = lease.keys()[0]
-                shell = self._items.pop(oldest, None)
-                if shell is not None and hasattr(shell, "borrow"):
-                    shell.borrow.close()
-                else:
+                if oldest not in self._light_1d_items:
                     raise RuntimeError(
                         "light-1D lease residency lost its publication shell: "
-                        f"oldest={oldest!r}, publications={tuple(self._items)!r}"
+                        f"oldest={oldest!r}, publications="
+                        f"{tuple(self._light_1d_items)!r}"
                     )
+                self._retire_light_pair_locked(oldest)
             lease.retain(
                 record,
                 grant_id=lease.grant_id,
@@ -753,10 +813,343 @@ class PublicationStore:
                 label=label,
                 generation=lease.generation,
                 source_identity=str(source_identity),
-                borrow=lease.borrow(label),
             )
-            self._items[label] = shell
+            guard = lease.borrow(label)
+            if guard is None:
+                raise RuntimeError("retained light-1D row has no private guard")
+            self._light_1d_items[label] = _Light1DPair(
+                shell, self._generation, None, record.active_mode, (), guard,
+            )
             return shell
+
+    def get_light_1d_shell(self, label: int | str):
+        with self._lock:
+            pair = self._light_1d_items.get(label)
+            return None if pair is None else pair.shell
+
+    def _retire_light_pair_locked(self, label: int | str) -> bool:
+        pair = self._light_1d_items.get(label)
+        if pair is None:
+            return False
+        lease = self._light_1d
+        if lease is None:
+            raise RuntimeError("light-1D pair has no bound lease")
+        pair.guard.close()
+        try:
+            retired = lease.retire(
+                label, grant_id=lease.grant_id, generation=lease.generation,
+            )
+        except BaseException:
+            guard = lease.borrow(label)
+            if guard is None:
+                raise RuntimeError("light-1D private guard restoration failed")
+            self._light_1d_items[label] = replace(pair, guard=guard)
+            raise
+        if not retired:
+            guard = lease.borrow(label)
+            if guard is None:
+                raise RuntimeError("retired light-1D pair is inconsistent")
+            self._light_1d_items[label] = replace(pair, guard=guard)
+            raise RuntimeError("light-1D pair and lease key are inconsistent")
+        self._light_1d_items.pop(label, None)
+        return True
+
+    def _compose_locked(
+        self, label: int | str, publication: FramePublication | None,
+    ) -> FramePublication | None:
+        pair = self._light_1d_items.get(label)
+        if publication is None or pair is None or not pair.modes:
+            return publication
+        views = {}
+        for template in pair.modes:
+            values = pair.guard.modes[template.mode]
+            mode_base = publication.record.results_1d.get(
+                template.mode, publication.view,
+            )
+            views[template.mode] = replace(
+                mode_base,
+                axis_1d=Axis(
+                    template.axis_label,
+                    template.axis_unit,
+                    template.axis_log,
+                    values.coordinate,
+                ),
+                intensity_1d=values.intensity,
+                sigma_1d=values.uncertainty,
+            )
+        active = views[pair.active_mode]
+        return replace(
+            publication,
+            view=replace(
+                publication.view,
+                axis_1d=active.axis_1d,
+                intensity_1d=active.intensity_1d,
+                sigma_1d=active.sigma_1d,
+            ),
+            record=FrameRecord(
+                label=publication.label,
+                results_1d=views,
+                results_2d=publication.record.results_2d,
+                active_mode_1d=pair.active_mode,
+                active_mode_2d=publication.record.active_mode_2d,
+            ),
+        )
+
+    @staticmethod
+    def _exact_gui_array(array, spec, role: str) -> None:
+        dtype = getattr(array, "dtype", None)
+        if (
+            type(array) is not np.ndarray
+            or array.ndim != 1
+            or array.shape != (spec.length,)
+            or dtype != np.dtype(np.float64)
+            or not dtype.isnative
+            or spec.itemsize != np.dtype(np.float64).itemsize
+            or np.dtype(spec.dtype) != np.dtype(np.float64)
+            or spec.shared
+        ):
+            raise ValueError(f"unsupported GUI light-1D layout for {role}")
+
+    def _validate_gui_light_1d_locked(self, publication, record):
+        from xrd_tools.session import (
+            Light1DLeaseState, Light1DRecord, Light1DStaleGeneration,
+        )
+
+        lease = self._light_1d
+        if type(publication) is not FramePublication or type(record) is not Light1DRecord:
+            raise TypeError("GUI light-1D publication requires exact values")
+        if self.allocation is None or lease is None:
+            raise RuntimeError("GUI light-1D publication requires exact bindings")
+        if lease.authority.parent_allocation is not self.allocation:
+            raise ValueError("GUI light-1D allocation authority is foreign")
+        if lease.state is not Light1DLeaseState.ACTIVE:
+            raise Light1DStaleGeneration("GUI light-1D lease is not active")
+        if publication.generation != self._generation:
+            raise Light1DStaleGeneration("GUI publication store generation is stale")
+        if record.generation != lease.generation:
+            raise Light1DStaleGeneration("GUI light-1D lease generation is stale")
+        if publication.label != record.row_identity or publication.record.label != record.row_identity:
+            raise ValueError("GUI light-1D label identity mismatch")
+        source = record.provenance.get("source_identity")
+        scan_key = record.provenance.get("scan_key")
+        if (
+            type(publication.source_identity) is not str
+            or not publication.source_identity
+            or source != publication.source_identity
+        ):
+            raise ValueError("GUI light-1D source identity mismatch")
+        if (
+            type(publication.scan_key) is not str
+            or not publication.scan_key
+            or scan_key != publication.scan_key
+        ):
+            raise ValueError("GUI light-1D scan identity mismatch")
+        if publication.raw_ref is not None:
+            raise ValueError("GUI light-1D publication cannot retain raw_ref")
+        expected = tuple(mode.mode for mode in lease.layout.modes)
+        if (
+            tuple(record.modes) != expected
+            or record.active_mode != lease.layout.active_mode
+            or tuple(publication.record.results_1d) != expected
+            or publication.record.active_mode_1d != lease.layout.active_mode
+        ):
+            raise ValueError("GUI light-1D mode topology mismatch")
+        templates = []
+        for mode_layout in lease.layout.modes:
+            mode = mode_layout.mode
+            values = record.modes[mode]
+            view = publication.record.results_1d[mode]
+            if view.axis_1d is None or view.axis_1d.values is None:
+                raise ValueError("GUI light-1D mode has no coordinate")
+            triples = (
+                (values.coordinate, view.axis_1d.values,
+                 mode_layout.coordinate, "coordinate"),
+                (values.intensity, view.intensity_1d,
+                 mode_layout.intensity, "intensity"),
+                (values.uncertainty, view.sigma_1d,
+                 mode_layout.uncertainty, "uncertainty"),
+            )
+            for supplied, displayed, spec, role in triples:
+                if spec is None:
+                    if supplied is not None or displayed is not None:
+                        raise ValueError("GUI light-1D uncertainty topology mismatch")
+                    continue
+                if supplied is None or displayed is None:
+                    raise ValueError("GUI light-1D uncertainty topology mismatch")
+                self._exact_gui_array(supplied, spec, f"{mode!r}.{role}")
+                self._exact_gui_array(displayed, spec, f"display {mode!r}.{role}")
+                if not np.array_equal(supplied, displayed, equal_nan=True):
+                    raise ValueError("GUI light-1D view and record disagree")
+            templates.append(_Light1DModeTemplate(
+                mode, view.axis_1d.label, view.axis_1d.unit, view.axis_1d.log,
+            ))
+        active = publication.record.results_1d[lease.layout.active_mode]
+        if not (
+            np.array_equal(publication.view.axis_1d.values,
+                           active.axis_1d.values, equal_nan=True)
+            and np.array_equal(publication.view.intensity_1d,
+                               active.intensity_1d, equal_nan=True)
+            and (
+                publication.view.sigma_1d is active.sigma_1d
+                or np.array_equal(publication.view.sigma_1d,
+                                  active.sigma_1d, equal_nan=True)
+            )
+        ):
+            raise ValueError("GUI light-1D active projection disagrees")
+        return tuple(templates)
+
+    @staticmethod
+    def _pair_values_match(pair: _Light1DPair, record) -> bool:
+        try:
+            return all(
+                np.array_equal(left, right, equal_nan=True)
+                for mode, values in record.modes.items()
+                for left, right in (
+                    (pair.guard.modes[mode].coordinate, values.coordinate),
+                    (pair.guard.modes[mode].intensity, values.intensity),
+                    (pair.guard.modes[mode].uncertainty, values.uncertainty),
+                )
+                if left is not None or right is not None
+            )
+        except (KeyError, ValueError, TypeError):
+            return False
+
+    def _install_base_locked(self, publication: FramePublication) -> None:
+        label = publication.label
+        self._items.pop(label, None)
+        self._drop_heavy_label_locked(label)
+        self._drop_thumb_label_locked(label)
+        self._items[label] = publication
+        if _publication_has_heavy_payload(publication):
+            self._heavy_labels.append(label)
+        if publication.view.thumbnail is not None:
+            self._thumb_labels.append(label)
+        self._enforce_bounds_locked()
+
+    def publish_gui_light_1d(self, publication, light_record):
+        from xrd_tools.session import Light1DUnavailable
+
+        with self._lock:
+            templates = self._validate_gui_light_1d_locked(
+                publication, light_record,
+            )
+            lease = self._light_1d
+            label = publication.label
+            base = _without_1d_arrays(publication)
+            prior = self._light_1d_items.get(label)
+            if prior is not None:
+                identity = (
+                    prior.store_generation == self._generation
+                    and prior.shell.source_identity == publication.source_identity
+                    and prior.scan_key == publication.scan_key
+                    and prior.active_mode == light_record.active_mode
+                    and prior.modes == templates
+                )
+                if identity and self._pair_values_match(prior, light_record):
+                    self._install_base_locked(base)
+                    return self._compose_locked(label, base)
+                if identity:
+                    self._retire_light_pair_locked(label)
+                else:
+                    raise ValueError("GUI light-1D pair identity changed")
+            keys = lease.keys()
+            if label not in keys and keys and len(keys) >= lease.row_cap:
+                victim = keys[0]
+                if victim not in self._light_1d_items:
+                    raise RuntimeError("light-1D victim has no store pair")
+                self._retire_light_pair_locked(victim)
+                self._items.pop(victim, None)
+                self._drop_heavy_label_locked(victim)
+                self._drop_thumb_label_locked(victim)
+            try:
+                lease.retain(
+                    light_record,
+                    grant_id=lease.grant_id,
+                    generation=lease.generation,
+                )
+            except Light1DUnavailable:
+                self._install_base_locked(base)
+                return base
+            guard = lease.borrow(label)
+            if guard is None:
+                lease.retire(
+                    label, grant_id=lease.grant_id, generation=lease.generation,
+                )
+                raise RuntimeError("retained GUI light-1D row has no guard")
+            shell = Light1DPublicationShell(
+                label, lease.generation, publication.source_identity,
+            )
+            self._light_1d_items[label] = _Light1DPair(
+                shell, self._generation, publication.scan_key,
+                light_record.active_mode, templates, guard,
+            )
+            self._install_base_locked(base)
+            return self._compose_locked(label, self._items.get(label))
+
+    def light_1d_cleanup_hooks(
+        self, exact_lease, *, cancel=None, drain=None, verify=None, release=None,
+    ):
+        from xrd_tools.session import (
+            Light1DCleanupHooks, Light1DLeaseState, Light1DRetentionLease,
+        )
+
+        if type(exact_lease) is not Light1DRetentionLease:
+            raise TypeError("cleanup hooks require an exact light-1D lease")
+        with self._lock:
+            if (
+                self._light_1d is not exact_lease
+                or self.allocation is None
+                or exact_lease.authority.parent_allocation is not self.allocation
+                or exact_lease.state is not Light1DLeaseState.ACTIVE
+            ):
+                raise RuntimeError("cleanup hooks require the exact active binding")
+
+        hooks = None
+
+        def clear_pairs():
+            exact_lease._assert_cleanup_callback(hooks, "clear", clear_pairs, 2)
+            with self._lock:
+                if self._light_1d is not exact_lease:
+                    raise RuntimeError("cleanup clear has a foreign store binding")
+                for label in tuple(self._light_1d_items):
+                    pair = self._light_1d_items[label]
+                    pair.guard.close()
+                    self._light_1d_items.pop(label)
+
+        def detach_store():
+            exact_lease._assert_cleanup_callback(hooks, "detach", detach_store, 3)
+            with self._lock:
+                if (
+                    self._light_1d is not exact_lease
+                    or self.allocation is None
+                    or exact_lease.authority.parent_allocation is not self.allocation
+                ):
+                    raise RuntimeError("cleanup detach has a foreign store binding")
+                if (
+                    self._light_1d_items
+                    or exact_lease.keys()
+                    or exact_lease.pending_hydration_count
+                    or any(_publication_has_1d_arrays(item)
+                           for item in self._items.values())
+                ):
+                    raise RuntimeError("cleanup detach found retained light-1D state")
+                self._items.clear()
+                self._heavy_labels.clear()
+                self._thumb_labels.clear()
+                self._carryover.clear()
+                self._generation += 1
+                self.allocation = None
+                self._light_1d = None
+
+        hooks = Light1DCleanupHooks(
+            cancel=cancel,
+            drain=drain,
+            clear=clear_pairs,
+            detach=detach_store,
+            verify=verify,
+            release=release,
+        )
+        return hooks
 
     def ndarray_owner_census(self):
         """Public split census derived from the store's actual owned state."""
@@ -816,17 +1209,27 @@ class PublicationStore:
 
     def clear(self) -> None:
         """Full reset (a scan boundary): empty everything + bump generation."""
+        from xrd_tools.session import Light1DLeaseState
+
         with self._lock:
-            for publication in self._items.values():
-                if isinstance(publication, Light1DPublicationShell):
-                    publication.borrow.close()
+            lease = self._light_1d
+            if lease is not None and lease.state is not Light1DLeaseState.ACTIVE:
+                raise RuntimeError("non-active bound PublicationStore cannot clear")
+            for label in tuple(self._items):
+                self._retire_light_pair_locked(label)
+                self._items.pop(label, None)
+                self._drop_heavy_label_locked(label)
+                self._drop_thumb_label_locked(label)
+                self._carryover.pop(label, None)
+            for label in tuple(self._light_1d_items):
+                self._retire_light_pair_locked(label)
             self._generation += 1
-            self.allocation = None
-            self._light_1d = None
             self._items.clear()
             self._heavy_labels.clear()
             self._thumb_labels.clear()
             self._carryover.clear()
+            if lease is None:
+                self.allocation = None
 
     def begin_reintegrate(self) -> None:
         """Reset for a SAME-SCAN reintegrate pass (Step 6).
@@ -840,6 +1243,10 @@ class PublicationStore:
         Eviction is respected: an evicted frame carries a thinned record, so its
         dropped modes are not resurrected (they rehydrate from disk)."""
         with self._lock:
+            if self._light_1d is not None:
+                raise RuntimeError(
+                    "bound light-1D reintegration requires a new generation"
+                )
             self._carryover = {
                 # X1 3c: carry the scan owner alongside the record so the
                 # reintegrate republish keeps the stamp.
@@ -891,7 +1298,8 @@ class PublicationStore:
         with self._lock:
             changed = False
             for label in labels:
-                if self._items.pop(label, None) is not None:
+                pair_removed = self._retire_light_pair_locked(label)
+                if self._items.pop(label, None) is not None or pair_removed:
                     self._drop_heavy_label_locked(label)
                     self._drop_thumb_label_locked(label)
                     self._carryover.pop(label, None)
@@ -927,7 +1335,7 @@ class PublicationStore:
         linearizes cleanly and the payload is inserted NOWHERE.  Without a gate
         the behaviour is unchanged — that is the idle/legacy path."""
         with self._lock:
-            publication = self._items.get(label)
+            publication = self._compose_locked(label, self._items.get(label))
             hydrator = self._hydrator
         # Rehydrate when the payload is GONE (tier-1 thumbnail-only or tier-2
         # evicted), keyed on real DATA arrays — NOT _publication_has_heavy_payload,
@@ -955,6 +1363,9 @@ class PublicationStore:
             return publication
         if fresh is None:
             return publication
+        with self._lock:
+            if self._light_1d is not None:
+                fresh = _without_1d_arrays(fresh)
         if commit_gate is None:
             return self.upsert(fresh)
         if not commit_gate.enter(commit_epoch):
@@ -980,6 +1391,20 @@ class PublicationStore:
         if not requested:
             return {}
         with self._lock:
+            if self._light_1d is not None:
+                missing = tuple(
+                    label for label in requested
+                    if label not in self._light_1d_items
+                    or label not in self._items
+                )
+                if missing:
+                    raise RuntimeError(
+                        "bound light-1D misses require worker hydration tokens"
+                    )
+                return {
+                    label: self._compose_locked(label, self._items[label])
+                    for label in requested
+                }
             missing = []
             for label in requested:
                 publication = self._items.get(label)
@@ -1009,10 +1434,28 @@ class PublicationStore:
         return self.get_many(requested)
 
     def upsert(self, publication: FramePublication) -> FramePublication:
+        from xrd_tools.session import Light1DLeaseState
+
         with self._lock:
             incoming_generation = publication.generation
             label = publication.label
             existing = self._items.get(label)
+            foreign_pair = False
+            if self._light_1d is not None:
+                if self._light_1d.state is not Light1DLeaseState.ACTIVE:
+                    raise RuntimeError("non-active bound PublicationStore cannot upsert")
+                if _publication_has_1d_arrays(publication):
+                    raise ValueError(
+                        "bound PublicationStore generic upsert refuses 1-D arrays"
+                    )
+                pair = self._light_1d_items.get(label)
+                if pair is not None and not (
+                    incoming_generation == self._generation
+                    and publication.source_identity == pair.shell.source_identity
+                    and publication.scan_key == pair.scan_key
+                ):
+                    self._retire_light_pair_locked(label)
+                    foreign_pair = True
             # A STALE incoming (queued before a clear()/generation bump) for a
             # frame ALREADY present is from a superseded epoch — DROP it and keep
             # the current entry, so old-scan data can neither replace nor splice
@@ -1020,7 +1463,11 @@ class PublicationStore:
             # the CURRENT store generation (display_data._rehydrate_publication),
             # so it is never seen as stale.  A stale incoming for a NEW label is
             # still stored below, for legacy/sessionless callers.
-            if existing is not None and incoming_generation != self._generation:
+            if (
+                existing is not None
+                and incoming_generation != self._generation
+                and not foreign_pair
+            ):
                 return existing
             if incoming_generation != self._generation:
                 publication = replace(publication, generation=self._generation)
@@ -1082,7 +1529,9 @@ class PublicationStore:
             if publication.view.thumbnail is not None:
                 self._thumb_labels.append(label)
             self._enforce_bounds_locked()
-            return publication
+            if self._light_1d is None:
+                return publication
+            return self._compose_locked(label, self._items.get(label)) or publication
 
     def extend(self, publications: Iterable[FramePublication]) -> tuple[FramePublication, ...]:
         with self._lock:
@@ -1090,7 +1539,7 @@ class PublicationStore:
 
     def get(self, label: int | str) -> FramePublication | None:
         with self._lock:
-            return self._items.get(label)
+            return self._compose_locked(label, self._items.get(label))
 
     def has_heavy_payload(self, label: int | str) -> bool:
         with self._lock:
@@ -1142,6 +1591,7 @@ class PublicationStore:
         with self._lock:
             if label not in self._items or not self._label_evictable_locked(label):
                 return False
+            self._retire_light_pair_locked(label)
             self._items.pop(label, None)
             self._drop_heavy_label_locked(label)
             self._drop_thumb_label_locked(label)
@@ -1159,7 +1609,7 @@ class PublicationStore:
         """
         with self._lock:
             return {
-                label: publication
+                label: self._compose_locked(label, publication)
                 for label in labels
                 if (publication := self._items.get(label)) is not None
             }
@@ -1170,7 +1620,10 @@ class PublicationStore:
 
     def snapshot(self) -> Mapping[int | str, FramePublication]:
         with self._lock:
-            return MappingProxyType(dict(self._items))
+            return MappingProxyType({
+                label: self._compose_locked(label, publication)
+                for label, publication in self._items.items()
+            })
 
     def __len__(self) -> int:
         with self._lock:
@@ -1213,6 +1666,7 @@ class PublicationStore:
             if probe is None:
                 while len(self._items) > self._max_items:
                     label = next(iter(self._items))
+                    self._retire_light_pair_locked(label)
                     self._items.pop(label, None)
                     self._drop_heavy_label_locked(label)
                     self._drop_thumb_label_locked(label)
@@ -1232,6 +1686,7 @@ class PublicationStore:
                                 continue
                         except Exception:
                             continue
+                        self._retire_light_pair_locked(label)
                         self._items.pop(label, None)
                         self._drop_heavy_label_locked(label)
                         self._drop_thumb_label_locked(label)
