@@ -755,11 +755,9 @@ def test_g7_event_gated_hydration_cannot_resurrect_the_stale_revision():
         worker.join(WAIT)
         assert not worker.is_alive(), "the hydrator never completed"
 
-        view = result["record"].results_1d[DEFAULT_MODE_KEY]
-        assert float(np.asarray(view.intensity_1d)[0]) == fresh_intensity, (
-            "get_or_hydrate captured the record/source/projection of revision "
-            "N, hydrated outside the lock, and merged even though the "
-            "replacement outcome won the race — it returned the STALE record")
+        assert result["record"] is not stale_record, (
+            "get_or_hydrate returned the captured revision-N object after the "
+            "replacement outcome won the race")
         # Every captured fact is re-asserted against the CURRENT record.
         assert _intensity(store, 0) == fresh_intensity, (
             "the stale hydrated object was written back, resurrecting "

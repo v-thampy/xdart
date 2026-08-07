@@ -309,6 +309,92 @@ def test_get_or_hydrate_requires_exact_returned_revision_authority(
     assert not store.has_heavy_payload(1)
 
 
+def test_get_or_hydrate_requires_the_exact_request_object_not_equal_replay():
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, source="/data/a.tif"), persisted=True)
+    assert store.release_heavy(1)
+
+    def hydrate(request):
+        return FrameHydrationResult(
+            replace(request),
+            _record(label=1, source="/data/a.tif", scale=9.0),
+        )
+
+    store.set_hydrator(hydrate, revision_qualified=True)
+    returned = store.get_or_hydrate(1)
+    assert returned is store.get(1)
+    assert not store.has_heavy_payload(1)
+
+
+def test_certified_source_less_result_cannot_inherit_qualified_source():
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, source="/data/a.tif"), persisted=True)
+    assert store.release_heavy(1)
+
+    def hydrate(request):
+        return FrameHydrationResult(
+            request,
+            _record(label=1, source=None, source_frame=None, scale=9.0),
+        )
+
+    store.set_hydrator(hydrate, revision_qualified=True)
+    returned = store.get_or_hydrate(1)
+    assert returned is store.get(1)
+    assert store.source_identity(1) == "/data/a.tif#0"
+    assert not store.has_heavy_payload(1)
+
+
+def test_hydration_rechecks_projected_membership_not_only_projection_sets():
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, source="/data/a.tif"), persisted=True)
+    assert store.release_heavy(1)
+    mode = ("1d", "q_total")
+
+    def hydrate(request):
+        store.replace_projection(1, hydratable=(mode,))
+        return FrameHydrationResult(
+            request,
+            _record(label=1, source="/data/a.tif", scale=9.0),
+        )
+
+    store.set_hydrator(hydrate, revision_qualified=True)
+    returned = store.get_or_hydrate(1)
+    assert returned is store.get(1)
+    assert not store.has_heavy_payload(1)
+
+
+def test_hydration_request_cannot_replay_across_commit_epoch_aba():
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, source="/data/a.tif"), persisted=True)
+    assert store.release_heavy(1)
+    captured = []
+
+    def capture(request):
+        captured.append(request)
+        return None
+
+    class Gate:
+        def enter(self, _epoch):
+            return True
+
+        def leave(self):
+            pass
+
+    gate = Gate()
+    store.set_hydrator(capture, revision_qualified=True)
+    store.get_or_hydrate(1, commit_gate=gate, commit_epoch=1)
+    assert len(captured) == 1
+    store.set_hydrator(
+        lambda _request: FrameHydrationResult(
+            captured[0], _record(label=1, source="/data/a.tif", scale=9.0),
+        ),
+        revision_qualified=True,
+    )
+    returned = store.get_or_hydrate(1, commit_gate=gate, commit_epoch=2)
+    assert returned is store.get(1)
+    assert not store.has_heavy_payload(1)
+
+
 def test_snapshot_is_read_only_copy():
     store = FrameRecordStore(max_heavy_items=None)
     store.upsert(_record(label=1))

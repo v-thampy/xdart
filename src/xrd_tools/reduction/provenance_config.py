@@ -313,14 +313,14 @@ def _copy_optional(out: dict[str, Any], key: str, value: Any) -> None:
 
 
 def _jsonable_range(value: Any) -> Any:
-    """One JSON-native range projection, shared with the run-configuration owner.
+    """One JSON-native range projection owned by reduction provenance.
 
     O-1a-W1R (review §39.2 W1R-P1-7): this pair used to be the only bounded
-    recursive normalization in the tree, so the run-configuration provenance
-    owner generalized it rather than adding a second writer schema authority.
-    Both paths now go through :func:`xrd_tools.session.run_configuration.
-    jsonable_run_value`; the numeric coercion below is kept because a reduction
-    range is numeric by contract.
+    recursive normalization in the tree, so reduction provenance generalized
+    it rather than adding a second writer schema authority.  The session module
+    re-exports :func:`jsonable_run_value` as a compatibility name; it does not
+    own another implementation.  The numeric coercion below is kept because a
+    reduction range is numeric by contract.
     """
     if value is None:
         return None

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
 import json
+from numbers import Integral
 import os
 from pathlib import Path
 import shutil
@@ -105,6 +106,37 @@ class RecordWrite:
     replace_existing: bool = False
 
     def __post_init__(self) -> None:
+        def exact_bool(value: Any, name: str) -> bool:
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"{name} must be an exact boolean")
+            return bool(value)
+
+        def exact_nonnegative_int(value: Any, name: str) -> int:
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+                raise TypeError(f"{name} must be an exact integer")
+            normalized = int(value)
+            if normalized < 0:
+                raise ValueError(f"{name} must be non-negative")
+            return normalized
+
+        object.__setattr__(self, "label", exact_nonnegative_int(self.label, "label"))
+        object.__setattr__(
+            self, "source_frame_index",
+            exact_nonnegative_int(self.source_frame_index, "source_frame_index"),
+        )
+        object.__setattr__(
+            self, "thumbnail_mask_baked",
+            exact_bool(self.thumbnail_mask_baked, "thumbnail_mask_baked"),
+        )
+        object.__setattr__(self, "mask_baked", exact_bool(self.mask_baked, "mask_baked"))
+        object.__setattr__(
+            self, "write_frame_record",
+            exact_bool(self.write_frame_record, "write_frame_record"),
+        )
+        object.__setattr__(
+            self, "replace_existing",
+            exact_bool(self.replace_existing, "replace_existing"),
+        )
         allowed_snapshot = {
             "adapter_id", "size", "mtime_ns", "frame_count",
             "dataset_path", "self_contained",
@@ -115,15 +147,9 @@ class RecordWrite:
             if key not in allowed_snapshot:
                 raise ValueError(f"unknown source snapshot field {key!r}")
             if key in {"size", "mtime_ns", "frame_count"}:
-                if isinstance(value, bool):
-                    raise ValueError(f"source snapshot {key} must be an integer")
-                value = int(value)
-                if value < 0:
-                    raise ValueError(f"source snapshot {key} must be non-negative")
+                value = exact_nonnegative_int(value, f"source snapshot {key}")
             elif key == "self_contained":
-                if not isinstance(value, (bool, np.bool_)):
-                    raise ValueError("source snapshot self_contained must be boolean")
-                value = bool(value)
+                value = exact_bool(value, "source snapshot self_contained")
             elif value is None:
                 raise ValueError(f"source snapshot {key} may not be null")
             else:
@@ -133,10 +159,11 @@ class RecordWrite:
             snapshot[key] = value
         if snapshot and self.source_path is None:
             raise ValueError("source snapshot requires source_path")
+        if self.source_path is None and self.source_frame_index != 0:
+            raise ValueError(
+                "absent source_path requires source_frame_index to be exactly 0"
+            )
         object.__setattr__(self, "source_snapshot", MappingProxyType(snapshot))
-        object.__setattr__(self, "thumbnail_mask_baked", bool(self.thumbnail_mask_baked))
-        object.__setattr__(self, "mask_baked", bool(self.mask_baked))
-        object.__setattr__(self, "replace_existing", bool(self.replace_existing))
         if self.thumbnail_mask is not None:
             incoming_mask = np.asarray(self.thumbnail_mask)
             if incoming_mask.dtype != np.dtype(bool):
@@ -633,6 +660,52 @@ class NexusRecordWriter:
         if not self.complete_record:
             return
         self._dirty_frames[int(record.label)] = self._expected_frame_row(record)
+
+    def _verify_supplied_source_identity(self, record: RecordWrite) -> None:
+        """Validate source facts on a mode-only write without rewriting its row."""
+        if record.source_path is None:
+            return
+        label = int(record.label)
+        frame = self._entry_group().get(f"frames/frame_{label:04d}")
+        source = frame.get("source") if isinstance(frame, h5py.Group) else None
+        if not isinstance(source, h5py.Group):
+            raise WriterStateError(
+                f"existing frame {label} has no authoritative source identity"
+            )
+        expected_path = relative_source_path(record.source_path, self.source_base)
+        if self._text_value(source["path"][()]) != expected_path:
+            raise WriterStateError(
+                f"existing frame {label} source path does not match supplied path"
+            )
+        if int(source["frame_index"][()]) != int(record.source_frame_index):
+            raise WriterStateError(
+                f"existing frame {label} source selector does not match supplied index"
+            )
+        attr_names = {
+            "adapter_id": "adapter_id",
+            "size": "file_size",
+            "mtime_ns": "file_mtime_ns",
+            "frame_count": "frame_count",
+            "dataset_path": "dataset_path",
+            "self_contained": "self_contained",
+        }
+        for key, expected in record.source_snapshot.items():
+            attr_name = attr_names[key]
+            if attr_name not in source.attrs:
+                raise WriterStateError(
+                    f"existing frame {label} source snapshot lacks {key}"
+                )
+            observed = source.attrs[attr_name]
+            if key in {"size", "mtime_ns", "frame_count"}:
+                matches = int(observed) == int(expected)
+            elif key == "self_contained":
+                matches = bool(observed) is bool(expected)
+            else:
+                matches = self._text_value(observed) == str(expected)
+            if not matches:
+                raise WriterStateError(
+                    f"existing frame {label} source snapshot {key} does not match"
+                )
 
     def _remember_written_rows(self, records: tuple[RecordWrite, ...]) -> None:
         for record in records:
@@ -1545,6 +1618,16 @@ class NexusRecordWriter:
             if record.source_path is not None:
                 relative_source_path(record.source_path, self.source_base)
             frame = entry.get(f"frames/frame_{int(record.label):04d}")
+            if record.replace_existing and not isinstance(frame, h5py.Group):
+                raise WriterStateError(
+                    f"explicit replacement requires existing frame label "
+                    f"{int(record.label)}"
+                )
+            if not record.write_frame_record and not isinstance(frame, h5py.Group):
+                raise WriterStateError(
+                    f"mode-only write requires existing frame label "
+                    f"{int(record.label)}"
+                )
             if (isinstance(frame, h5py.Group) and record.write_frame_record
                     and not record.replace_existing):
                 # Existing-row replacement is an exact provenance identity
@@ -1553,6 +1636,8 @@ class NexusRecordWriter:
                 self._verify_frame_row(
                     _EvidenceBuilder(), self._expected_frame_row(record),
                 )
+            elif isinstance(frame, h5py.Group) and not record.write_frame_record:
+                self._verify_supplied_source_identity(record)
             if existing_columns is not None:
                 unexpected = set(map(str, record.metadata)) - existing_columns
                 if unexpected:

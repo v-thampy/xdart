@@ -87,7 +87,8 @@ pre-migration reference signature.  Two additive notes:
   incidence scans, a `gi_config` group with the mode + frozen-range diagnostic).
   This block is **additive** and did not exist in the earliest pre-6a writer, so
   a strict byte-for-byte diff against a pre-6a capture would show it; the
-  committed `v2_record_signature_pre6a.json` fixture was re-pinned to include it.
+  committed `v2_record_signature_normalized_legacy.json` fixture was re-pinned
+  to include it.
   Reload is unaffected (readers that don't know the block ignore it), and CF-3's
   target-config read + the data-derived units depend on it — so it is disclosed,
   not removed.  `test_v2_record_gi_scan_writes_gi_provenance` exercises the GI

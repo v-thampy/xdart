@@ -173,11 +173,17 @@ def test_probe_rejects_file_changed_after_descriptor_inspection(
 
 def test_invalid_via_real_corrupt_image_file(tmp_path):
     _image_corrupt(tmp_path / "broken.tif")
-    index = DirectoryIndex(tmp_path, clock=_FakeClock())
+    clock = _FakeClock()
+    index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=5.0)
     index.poll()
+    candidate = _candidate_for(tmp_path, "broken.tif")
 
-    result = index.probe_candidate(_candidate_for(tmp_path, "broken.tif"))
-    assert result.state is ProbeState.INVALID
+    first = index.probe_candidate(candidate)
+    assert first.state is ProbeState.IN_PROGRESS
+    clock.advance(6.0)
+    final = index.probe_candidate(candidate)
+    assert final.state is ProbeState.INVALID
+    assert "retry window" in final.reason
 
 
 def test_invalid_via_nexus_retry_exhaustion_on_a_corrupt_file(tmp_path):

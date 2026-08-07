@@ -20,7 +20,9 @@ from xrd_tools.core import (
     view_to_result_1d,
 )
 from xrd_tools.io import read_frame_view, write_integrated_stack
-from xrd_tools.session import FrameRecordStore
+from xrd_tools.session import (
+    FrameHydrationRequest, FrameHydrationResult, FrameRecordStore,
+)
 
 _DIRECT = Qt.QtCore.Qt.ConnectionType.DirectConnection
 
@@ -470,3 +472,69 @@ def test_record_store_hydrator_reads_immediately_when_writer_idle(monkeypatch):
 
     assert entered.is_set()
     assert isinstance(result, FrameRecord)
+
+
+def test_record_store_hydrator_qualified_call_preserves_exact_request(monkeypatch):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    import xrd_tools.io as xrd_io
+
+    store = FrameRecordStore(max_heavy_items=1)
+    host = SimpleNamespace(
+        file_lock=threading.Lock(),
+        _on_qt_gui_thread=lambda: False,
+    )
+    scan = SimpleNamespace(data_file="/tmp/live_scan.nxs")
+    monkeypatch.setattr(
+        xrd_io, "read_frame_view",
+        lambda _path, label, **_kwargs: _view(label),
+    )
+    hydrate = imageThread._record_store_hydrator(host, scan, store)
+    request = FrameHydrationRequest(
+        label=2, source_identity="/tmp/raw.tif#2", revision=3, generation=4,
+    )
+
+    result = hydrate(request)
+
+    assert isinstance(result, FrameHydrationResult)
+    assert result.request is request
+    assert isinstance(result.record, FrameRecord)
+    assert result.record.label == 2
+
+
+def test_record_store_hydrator_refuses_gui_thread_without_disk_io(monkeypatch):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    import xrd_tools.io as xrd_io
+
+    called = []
+    monkeypatch.setattr(
+        xrd_io, "read_frame_view",
+        lambda *_args, **_kwargs: called.append(True),
+    )
+    host = SimpleNamespace(
+        file_lock=threading.Lock(),
+        _on_qt_gui_thread=lambda: True,
+    )
+    scan = SimpleNamespace(data_file="/tmp/live_scan.nxs")
+    hydrate = imageThread._record_store_hydrator(
+        host, scan, FrameRecordStore(max_heavy_items=1),
+    )
+
+    assert hydrate(2) is None
+    assert called == []
+
+
+def test_scan_session_adapter_forwards_both_hydrator_call_forms():
+    from xdart.gui.tabs.static_scan.wranglers.scan_session import ScanSessionAdapter
+
+    calls = []
+
+    class Store:
+        def set_hydrator(self, hydrator, *, revision_qualified=False):
+            calls.append((hydrator, revision_qualified))
+
+    session = SimpleNamespace(record_store=Store())
+    adapter = ScanSessionAdapter(None, None, session, None)
+    hydrator = object()
+    adapter.set_hydrator(hydrator)
+    adapter.set_hydrator(hydrator, revision_qualified=True)
+    assert calls == [(hydrator, False), (hydrator, True)]

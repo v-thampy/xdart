@@ -509,7 +509,9 @@ def test_ordinary_existing_row_write_requires_complete_provenance_identity(
     before = target.read_bytes()
     changed = dict(base)
     if mutation == "source_absent":
-        changed.update(source_path=None, source_snapshot={})
+        changed.update(
+            source_path=None, source_frame_index=0, source_snapshot={},
+        )
     elif mutation == "source_path":
         changed["source_path"] = tmp_path / "other.h5"
     elif mutation == "source_index":
@@ -546,8 +548,116 @@ def test_record_provenance_rejects_malformed_values_before_writer_mutation(
     writer.begin()
     writer._h5.flush()
     before = target.read_bytes()
-    with pytest.raises(ValueError):
+    with pytest.raises((TypeError, ValueError)):
         writer.write(rw.RecordWrite(label=0, result_1d=_r1(1), **kwargs))
+    writer._h5.flush()
+    assert target.read_bytes() == before
+    writer.abort()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("replace_existing", "yes"),
+        ("write_frame_record", 1),
+        ("mask_baked", "false"),
+        ("thumbnail_mask_baked", 0),
+    ),
+)
+def test_record_write_boolean_schema_refuses_truthiness(field, value):
+    rw = _api()
+    with pytest.raises((TypeError, ValueError)):
+        rw.RecordWrite(label=0, result_1d=_r1(1), **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("label", 0.0),
+        ("label", True),
+        ("source_frame_index", 1.0),
+        ("source_frame_index", 1.5),
+        ("source_frame_index", True),
+        ("source_snapshot", {"size": 1.0}),
+        ("source_snapshot", {"mtime_ns": True}),
+        ("source_snapshot", {"frame_count": "1"}),
+        ("source_snapshot", {"self_contained": "false"}),
+    ),
+)
+def test_record_write_integral_and_snapshot_schema_refuses_coercion(
+    tmp_path, field, value,
+):
+    rw = _api()
+    kwargs = {"label": 0, "result_1d": _r1(1), "source_path": tmp_path / "raw.h5"}
+    kwargs[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        rw.RecordWrite(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"source_frame_index": 1},
+        {"source_frame_index": -1},
+        {"source_frame_index": 0.5},
+        {"source_frame_index": True},
+        {"source_snapshot": {"size": 1}},
+    ),
+)
+def test_absent_source_accepts_only_the_canonical_default_selector(kwargs):
+    rw = _api()
+    with pytest.raises((TypeError, ValueError)):
+        rw.RecordWrite(label=0, result_1d=_r1(1), **kwargs)
+
+
+def test_mode_only_write_cannot_bypass_authoritative_source_identity(tmp_path):
+    rw = _api()
+    target = tmp_path / "mode-only-source.nexus"
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"source")
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1), source_path=source, source_frame_index=2,
+    ))
+    writer.flush(force=True)
+    before = target.read_bytes()
+    with pytest.raises(rw.WriterStateError):
+        writer.write(rw.RecordWrite(
+            label=0, result_1d=_r1(2), write_frame_record=False,
+            source_path=tmp_path / "foreign.h5", source_frame_index=9,
+        ))
+    assert target.read_bytes() == before
+    writer.abort()
+
+
+def test_explicit_replace_requires_an_existing_frame_label(tmp_path):
+    rw = _api()
+    target = tmp_path / "replace-absent.nexus"
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer._h5.flush()
+    before = target.read_bytes()
+    with pytest.raises(rw.WriterStateError):
+        writer.write(rw.RecordWrite(
+            label=4, result_1d=_r1(1), replace_existing=True,
+        ))
+    writer._h5.flush()
+    assert target.read_bytes() == before
+    writer.abort()
+
+
+def test_mode_only_write_requires_an_existing_frame_label(tmp_path):
+    rw = _api()
+    target = tmp_path / "mode-only-absent.nexus"
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer._h5.flush()
+    before = target.read_bytes()
+    with pytest.raises(rw.WriterStateError):
+        writer.write(rw.RecordWrite(
+            label=4, result_1d=_r1(1), write_frame_record=False,
+        ))
     writer._h5.flush()
     assert target.read_bytes() == before
     writer.abort()

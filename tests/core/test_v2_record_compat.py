@@ -22,6 +22,13 @@ FIXTURE = (
 )
 
 
+def test_migration_names_the_truthful_normalized_legacy_fixture():
+    migration = Path(__file__).parents[2] / "MIGRATION.md"
+    text = migration.read_text(encoding="utf-8")
+    assert "v2_record_signature_pre6a.json" not in text
+    assert "v2_record_signature_normalized_legacy.json" in text
+
+
 def test_v2_reference_fixture_is_headless_and_xdart_independent(tmp_path):
     """The frozen core fixture must neither name nor import GUI-side owners."""
     fixture_module = Path(__file__).parent / "_v2_record_fixture.py"

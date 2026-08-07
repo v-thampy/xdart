@@ -334,8 +334,8 @@ def _image_probe(path: Path) -> Any:
             pixels = np.asarray(f.data)
     except Exception as exc:
         return ProbeResult(
-            ProbeState.INVALID,
-            reason=f"unreadable image file: {exc}",
+            ProbeState.IN_PROGRESS,
+            reason=f"image decoder has no complete payload yet: {exc}",
             kind=SourceKind.IMAGE_FILE,
         )
     if n <= 0:

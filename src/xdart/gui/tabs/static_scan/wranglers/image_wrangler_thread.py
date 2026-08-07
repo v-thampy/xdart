@@ -2885,9 +2885,13 @@ class imageThread(wranglerThread):
         """
         initial_path = getattr(scan, "data_file", None)
 
-        def hydrate(request):
-            from xrd_tools.session import FrameHydrationResult
-            label = request.label
+        def hydrate(request_or_label):
+            from xrd_tools.session import (
+                FrameHydrationRequest, FrameHydrationResult,
+            )
+            qualified = isinstance(request_or_label, FrameHydrationRequest)
+            request = request_or_label if qualified else None
+            label = request.label if qualified else request_or_label
             thread_check = getattr(self, "_on_qt_gui_thread", None)
             on_gui_thread = (
                 thread_check()
@@ -2940,12 +2944,10 @@ class imageThread(wranglerThread):
                 logger.debug("record-store hydrate failed for %s", label,
                              exc_info=True)
                 return None
-            return FrameHydrationResult(
-                request,
-                FrameRecord.from_view(
-                    view, mode_1d=mode_1d, mode_2d=mode_2d,
-                ),
+            record = FrameRecord.from_view(
+                view, mode_1d=mode_1d, mode_2d=mode_2d,
             )
+            return FrameHydrationResult(request, record) if qualified else record
 
         return hydrate
 

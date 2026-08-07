@@ -112,16 +112,64 @@ class OutputSinkKindProvider(Protocol):
     def output_sink_kinds(self) -> frozenset[OutputSinkKind]: ...
 
 
+@runtime_checkable
+class OutputSinkChildrenProvider(Protocol):
+    """Public immutable delegation edge for a composite/proxy sink graph."""
+
+    @property
+    def output_sink_children(self) -> tuple[object, ...]: ...
+
+
+class UnclassifiedOutputSinkGraph(TypeError):
+    """A sink graph has no complete public output-family classification."""
+
+
+def classify_output_sink_graph(value: object) -> frozenset[OutputSinkKind]:
+    """Recursively classify the actual public sink graph at admission time."""
+    active: set[int] = set()
+
+    def visit(node: object) -> set[OutputSinkKind]:
+        if node is None:
+            return set()
+        identity = id(node)
+        if identity in active:
+            raise UnclassifiedOutputSinkGraph("output sink graph contains a cycle")
+        active.add(identity)
+        try:
+            if isinstance(node, OutputSinkChildrenProvider):
+                children = node.output_sink_children
+                if type(children) is not tuple:
+                    raise UnclassifiedOutputSinkGraph(
+                        "output_sink_children must be an immutable tuple"
+                    )
+                kinds: set[OutputSinkKind] = set()
+                for child in children:
+                    kinds.update(visit(child))
+                return kinds
+            if not isinstance(node, OutputSinkKindProvider):
+                raise UnclassifiedOutputSinkGraph(
+                    f"sink {type(node).__name__} has no public output requirement"
+                )
+            kinds = node.output_sink_kinds
+            if (not isinstance(kinds, frozenset)
+                    or not all(isinstance(item, OutputSinkKind) for item in kinds)):
+                raise UnclassifiedOutputSinkGraph(
+                    "output_sink_kinds must be a typed frozenset"
+                )
+            return set(kinds)
+        finally:
+            active.remove(identity)
+
+    return frozenset(visit(value))
+
+
 def requires_active_xye_output(value: object) -> bool:
     """Return whether a public sink graph contains an active XYE writer."""
-    if not isinstance(value, OutputSinkKindProvider):
+    try:
+        kinds = classify_output_sink_graph(value)
+    except UnclassifiedOutputSinkGraph:
         return False
-    kinds = value.output_sink_kinds
-    return (
-        isinstance(kinds, frozenset)
-        and all(isinstance(item, OutputSinkKind) for item in kinds)
-        and OutputSinkKind.XYE in kinds
-    )
+    return OutputSinkKind.XYE in kinds
 
 # H10 §14.3 admission-lifecycle trace: OFF unless ``XDART_H10_ADMISSION_TRACE``
 # names a file to append to (no default location, so an unset gate writes
@@ -522,6 +570,9 @@ class MemorySink:
     """In-memory sink for notebooks, tests, and xdart display handoff."""
 
     frames: dict[int, FrameReduction] = field(default_factory=dict)
+    output_sink_kinds: frozenset[OutputSinkKind] = field(
+        default=frozenset(), init=False,
+    )
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         self.frames.clear()
@@ -533,7 +584,7 @@ class MemorySink:
         return None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class CompositeSink:
     """Fan out reduction products to multiple sinks."""
 
@@ -545,6 +596,10 @@ class CompositeSink:
     output_sink_kinds: frozenset[OutputSinkKind] = field(
         default_factory=frozenset, init=False,
     )
+
+    @property
+    def output_sink_children(self) -> tuple[object, ...]:
+        return self.sinks
 
     def __post_init__(self) -> None:
         capabilities: set[OutputReceiptCapability] = set()
@@ -560,8 +615,10 @@ class CompositeSink:
                     and all(isinstance(item, OutputSinkKind)
                             for item in provided_kinds)):
                 kinds.update(provided_kinds)
-        self.output_receipt_capabilities = frozenset(capabilities)
-        self.output_sink_kinds = frozenset(kinds)
+        object.__setattr__(
+            self, "output_receipt_capabilities", frozenset(capabilities),
+        )
+        object.__setattr__(self, "output_sink_kinds", frozenset(kinds))
         workers = tuple(
             hook for sink in self.sinks
             if callable(hook := getattr(sink, "worker_process", None))
@@ -570,7 +627,7 @@ class CompositeSink:
             def process(frame, reduction):
                 for hook in workers:
                     hook(frame, reduction)
-            self.worker_process = process
+            object.__setattr__(self, "worker_process", process)
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         for sink in self.sinks:

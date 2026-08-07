@@ -280,19 +280,6 @@ def _stack_is_self_contained(h5f: Any, paths: list[str]) -> bool | None:
         return None
 
 
-def _stack_is_extendible(h5f: Any, paths: list[str]) -> bool:
-    """Whether a detector stack can still grow along its frame axis."""
-    for path in paths:
-        try:
-            dataset = h5f[path]
-            maxshape = dataset.maxshape
-            if dataset.ndim == 3 and maxshape and maxshape[0] is None:
-                return True
-        except Exception:
-            return True
-    return False
-
-
 def _apstools_flat_nxdata_contract(h5f: Any, entry_grp: Any) -> bool:
     """Whether this file declares the flat apstools ``NXWriter`` layout.
 
@@ -556,14 +543,9 @@ def describe_container_from_open(
         except Exception:
             wavelength = None
 
-    extendible_unfinalized = bool(
-        not has_end and _stack_is_extendible(h5f, paths)
-    )
-    if extendible_unfinalized:
-        common["finalized"] = False
-    if (is_bluesky and not has_end) or extendible_unfinalized:
+    if is_bluesky and not has_end:
         state, reason = ProbeState.IN_PROGRESS, (
-            "extendible detector run not yet finalized (no end_time)"
+            "NXWriter run not yet finalized (no end_time)"
         )
     elif facts["frame_count"] <= 0:
         state, reason = ProbeState.IMAGELESS, "zero-frame detector dataset"

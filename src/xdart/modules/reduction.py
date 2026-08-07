@@ -44,7 +44,8 @@ from xrd_tools.reduction import (
     Scan,
     StrictPolicy,
     NexusSink,
-    requires_active_xye_output,
+    OutputSinkKind,
+    classify_output_sink_graph,
     run_reduction,
     supports_durable_xye_receipts,
 )
@@ -1246,8 +1247,19 @@ def open_live_scan_session(
     """
     from xrd_tools.session import DynamicRunAccounting, ScanSession
 
-    if type(accounting) is DynamicRunAccounting:
-        active_xye = bool(xye_target) or requires_active_xye_output(sink)
+    if accounting is not None:
+        if not isinstance(accounting, DynamicRunAccounting):
+            raise TypeError(
+                "non-None live accounting must be DynamicRunAccounting authority"
+            )
+        try:
+            sink_kinds = classify_output_sink_graph(sink)
+        except TypeError as error:
+            raise DynamicXyeReceiptBoundaryRequired(
+                "dynamic output sink graph must expose complete public "
+                "requirements or immutable delegation children"
+            ) from error
+        active_xye = bool(xye_target) or OutputSinkKind.XYE in sink_kinds
         if active_xye:
             raise DynamicXyeReceiptBoundaryRequired(
                 "dynamic XYE output is dormant until P1 and must be refused "

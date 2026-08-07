@@ -20,12 +20,17 @@ from xrd_tools.core import FrameRecord, FrameView
 _ModeKey = tuple[str, str]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class FrameHydrationRequest:
     label: int | str
     source_identity: str
     revision: int
     generation: int
+    persisted_modes: frozenset[_ModeKey] = frozenset()
+    durable_modes: frozenset[_ModeKey] = frozenset()
+    dropped_modes: frozenset[_ModeKey] = frozenset()
+    projected: bool = False
+    commit_epoch: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,13 +467,18 @@ class FrameRecordStore:
             source_identity=captured[1],
             revision=captured[2],
             generation=captured[3],
+            persisted_modes=captured[4],
+            durable_modes=captured[5],
+            dropped_modes=captured[6],
+            projected=captured[7],
+            commit_epoch=commit_epoch,
         )
         returned = hydrator(request if self._hydrator_revision_qualified else label)
         if returned is None:
             return record
         certified_return = isinstance(returned, FrameHydrationResult)
         if certified_return:
-            if returned.request != request:
+            if returned.request is not request:
                 return record
             fresh = returned.record
         else:
@@ -484,12 +494,18 @@ class FrameRecordStore:
             return record
         captured_source_identity = captured[1]
         fresh_source_identity = _source_identity_from_record(fresh)
-        if fresh_source_identity:
-            if not _same_source_id(captured_source_identity, fresh_source_identity):
-                return record
-        elif not certified_return and captured_source_identity:
+        if captured_source_identity and not fresh_source_identity:
             return record
-        if commit_gate is not None and not commit_gate.enter(commit_epoch):
+        if fresh_source_identity and not _same_source_id(
+                captured_source_identity, fresh_source_identity):
+            return record
+        with self._lock:
+            current = self._records.get(label)
+            if current is None or self._capture_locked(
+                    label, current, self._persisted_modes.get(label, set())
+            ) != captured:
+                return current
+        if commit_gate is not None and not commit_gate.enter(request.commit_epoch):
             return record
         try:
             with self._lock:
@@ -523,7 +539,8 @@ class FrameRecordStore:
                 self._revisions.get(label, 0), self._generation,
                 frozenset(persisted),
                 frozenset(self._durable_modes.get(label, set())),
-                frozenset(self._dropped_modes.get(label, set())))
+                frozenset(self._dropped_modes.get(label, set())),
+                label in self._projected)
 
     def is_persisted(self, label: int | str) -> bool:
         with self._lock:

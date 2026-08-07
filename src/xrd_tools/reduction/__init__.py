@@ -29,6 +29,7 @@ __all__ = [
     "MemorySink",
     "NexusSink",
     "OutputSinkKind",
+    "OutputSinkChildrenProvider",
     "OutputSinkKindProvider",
     "PrepareDiagnostics",
     "ReductionPlan",
@@ -41,6 +42,7 @@ __all__ = [
     "prepare_gi_freeze",
     "run_reduction",
     "requires_active_xye_output",
+    "classify_output_sink_graph",
     "supports_durable_xye_receipts",
     "StrictPolicy",
     "StrictnessError",
@@ -66,6 +68,7 @@ _CORE_EXPORTS = {
     "MemorySink",
     "NexusSink",
     "OutputSinkKind",
+    "OutputSinkChildrenProvider",
     "OutputSinkKindProvider",
     "PrepareDiagnostics",
     "ReductionPlan",
@@ -78,6 +81,7 @@ _CORE_EXPORTS = {
     "prepare_gi_freeze",
     "run_reduction",
     "requires_active_xye_output",
+    "classify_output_sink_graph",
     "supports_durable_xye_receipts",
 }
 

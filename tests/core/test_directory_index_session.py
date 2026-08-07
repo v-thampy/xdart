@@ -318,18 +318,24 @@ def test_public_observe_probe_and_read_real_extendible_nexus(tmp_path):
         session.configure(tmp_path, suffixes=(".nxs",))
         candidate = session.observe().discovered_snapshot.candidates[0]
         assert session.probe_candidate(candidate, refresh=False).result.state \
-            is ProbeState.IN_PROGRESS
+            is ProbeState.READY
+        from xrd_tools.sources import open_source
+        initial = open_source(source_path)
+        try:
+            assert np.array_equal(
+                initial.load_frame(0), np.ones((3, 4), dtype=np.uint16),
+            )
+        finally:
+            close = getattr(initial, "close", None)
+            if callable(close):
+                close()
         with h5py.File(source_path, "a") as handle:
             data = handle["entry/instrument/detector/data"]
             data.resize((2, 3, 4))
             data[1] = np.full((3, 4), 7, dtype=np.uint16)
-            handle["entry"].create_dataset(
-                "end_time", data=np.bytes_("2026-08-07T00:00:00"),
-            )
         changed = session.observe().discovered_snapshot.candidates[0]
         ready = session.probe_candidate(changed, refresh=False)
         assert ready.result.state is ProbeState.READY
-        from xrd_tools.sources import open_source
         opened = open_source(source_path)
         try:
             assert np.array_equal(
