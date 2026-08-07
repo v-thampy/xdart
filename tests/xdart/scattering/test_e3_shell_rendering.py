@@ -70,11 +70,22 @@ def test_e3_ui2_renders_raw_cake_axes_and_all_retained_overlay_rows(
                 == "χ"
         )
         assert len(shell.scientific.curve.listDataItems()) == 5
-        assert shell.scientific.frame_selector.count() == 5
+        current = state.navigation.current
+        assert current is not None
+        footer = tuple(
+            frame
+            for frame in state.navigation.frames
+            if frame.source_scan == current.source_scan
+        )
+        assert shell.browser.frame_model.frames is state.navigation.frames
+        assert tuple(
+            shell.scientific.frame_selector.itemData(index)
+            for index in range(shell.scientific.frame_selector.count())
+        ) == footer
         assert [
             shell.scientific.frame_selector.itemText(index)
             for index in range(shell.scientific.frame_selector.count())
-        ] == ["1", "2", "3", "4", "5"]
+        ] == [str(frame.local_frame_label) for frame in footer]
     finally:
         shell.close()
         shell.deleteLater()

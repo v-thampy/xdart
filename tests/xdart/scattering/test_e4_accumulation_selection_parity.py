@@ -544,6 +544,7 @@ def test_overlay_footer_moves_anchor_without_mutating_membership(
         selected_index=0,
         heavy_indices=(0, 2),
         plot_mode="Overlay",
+        source_scan="scan-a",
     )
     frames = base.navigation.frames
     state = replace(

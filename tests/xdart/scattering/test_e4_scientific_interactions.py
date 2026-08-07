@@ -65,6 +65,7 @@ def test_overlay_footer_moves_anchor_without_mutating_accumulator() -> None:
         frame_count=3,
         heavy_indices=(0, 1, 2),
         plot_mode="Overlay",
+        source_scan="scan-a",
     )
     frames = projection.navigation.frames
     commands = []

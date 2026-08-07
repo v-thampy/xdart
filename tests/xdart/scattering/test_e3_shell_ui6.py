@@ -60,6 +60,16 @@ def _selected_browser_keys(
     )
 
 
+def _footer_frames(navigation) -> tuple[DisplayFrameKey, ...]:
+    current = navigation.current
+    assert current is not None
+    return tuple(
+        frame
+        for frame in navigation.frames
+        if frame.source_scan == current.source_scan
+    )
+
+
 def test_e3_ui6_override_inventory_is_anchored_to_exact_ui5_tip() -> None:
     accepted = json.loads(_OVERRIDES.read_text(encoding="utf-8"))
 
@@ -271,13 +281,16 @@ def test_e3_ui6_single_footer_catalog_replaces_singleton_selection(
     shell.commandRequested.connect(commands.append)
     try:
         shell.apply_state(state)
-        assert shell.scientific.frame_selector.count() == len(
-            navigation.frames
-        )
+        footer = _footer_frames(state.navigation)
+        assert tuple(
+            shell.scientific.frame_selector.itemData(index)
+            for index in range(shell.scientific.frame_selector.count())
+        ) == footer
+        assert shell.browser.frame_model.frames is navigation.frames
         assert _selected_browser_keys(shell) == selected
         assert len(shell.scientific.curve.listDataItems()) == 3
 
-        shell.scientific.frame_selector.setCurrentIndex(3)
+        shell.scientific.frame_selector.setCurrentIndex(1)
         assert len(commands) == 1
         assert commands[0].frame is navigation.frames[3]
         assert commands[0].frames == (navigation.frames[3],)
@@ -328,10 +341,12 @@ def test_e3_ui6_multi_mode_footer_preserves_membership_and_mirrors_focus(
     shell.commandRequested.connect(commands.append)
     try:
         shell.apply_state(state)
+        footer = _footer_frames(navigation)
         assert tuple(
             shell.scientific.frame_selector.itemData(index)
             for index in range(shell.scientific.frame_selector.count())
-        ) == navigation.frames
+        ) == footer
+        assert shell.browser.frame_model.frames is navigation.frames
         expected_browser_selection = (
             (selected[1],)
             if mode in {"Overlay", "Waterfall"}
@@ -342,7 +357,7 @@ def test_e3_ui6_multi_mode_footer_preserves_membership_and_mirrors_focus(
             QtCore.Qt.ItemDataRole.UserRole
         ) is selected[1]
 
-        shell.scientific.frame_selector.setCurrentIndex(2)
+        shell.scientific.frame_selector.setCurrentIndex(0)
         assert len(commands) == 1
         assert commands[0].frame is navigation.frames[2]
         expected_membership = (
@@ -412,7 +427,7 @@ def test_e3_ui6_prefix_append_and_retirement_update_both_widgets_atomically(
         assert tuple(
             shell.scientific.frame_selector.itemData(index)
             for index in range(shell.scientific.frame_selector.count())
-        ) == appended_frames
+        ) == (appended,)
 
         retired_frames = appended_frames[1:]
         retired_navigation = type(navigation)(
@@ -435,7 +450,7 @@ def test_e3_ui6_prefix_append_and_retirement_update_both_widgets_atomically(
         assert tuple(
             shell.scientific.frame_selector.itemData(index)
             for index in range(shell.scientific.frame_selector.count())
-        ) == retired_frames
+        ) == (appended,)
         assert shell.browser.frames.currentIndex().data(
             QtCore.Qt.ItemDataRole.UserRole
         ) is appended

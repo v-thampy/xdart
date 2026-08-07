@@ -42,12 +42,17 @@ def make_shell_projection(
     selected_index: int = 0,
     heavy_indices: tuple[int, ...] = (0, 4),
     plot_mode: str = "Overlay",
+    source_scan: str | None = None,
 ) -> ShellProjection:
     identity = RunIdentity(7, "e3-shell")
     frames = tuple(
         DisplayFrameKey(
             identity,
-            "scan-a" if index < max(1, frame_count // 2) else "scan-b",
+            source_scan or (
+                "scan-a"
+                if index < max(1, frame_count // 2)
+                else "scan-b"
+            ),
             "result.nxs",
             index % 3 + 1,
             index + 1,

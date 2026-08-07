@@ -289,10 +289,23 @@ def test_e3_ui6_compact_shell_continuity_at_review_viewports(
         navigation = state.navigation
         browser_model = shell.browser.frame_model
         assert browser_model.frames is navigation.frames
+        current = navigation.current
+        assert current is not None
+        footer = tuple(
+            frame
+            for frame in navigation.frames
+            if frame.source_scan == current.source_scan
+        )
         assert tuple(
             shell.scientific.frame_selector.itemData(index)
             for index in range(shell.scientific.frame_selector.count())
-        ) == navigation.selected
+        ) == footer
+        assert tuple(
+            browser_model.index(index, 0).data(
+                QtCore.Qt.ItemDataRole.UserRole
+            )
+            for index in range(browser_model.rowCount())
+        ) == navigation.frames
         assert shell.browser.frames.currentIndex().data(
             QtCore.Qt.ItemDataRole.UserRole
         ) is navigation.current
