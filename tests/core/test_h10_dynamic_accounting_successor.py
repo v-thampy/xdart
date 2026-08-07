@@ -379,7 +379,7 @@ def test_stop_freezes_frontier_without_laundering_incomplete_work(boundary):
         accounting.record_persisted((receipt,))
 
     stopped = accounting.stop()
-    assert stopped.state.value == "stopped"
+    assert stopped.state.value == "active"
     assert stopped.durable == frozenset()
     assert key in stopped.accepted
     assert key in stopped.retry_owned or key in stopped.in_flight
@@ -656,6 +656,7 @@ def test_unaccepted_retry_owner_is_visible_before_stop_and_settled_at_boundary()
     token = accounting.begin_attempt(key, source_revision=1)
     accounting.record_failed(token, error="partial source", retryable=True)
     stopped = accounting.stop()
+    assert stopped.state.value == "active"
     assert stopped.retry_owned == frozenset((key,))
     owner, owner_token = _BOUND_OWNERS[id(accounting)]
     seal = accounting.writer_boundary.prepare_session_finish(
@@ -667,6 +668,40 @@ def test_unaccepted_retry_owner_is_visible_before_stop_and_settled_at_boundary()
     terminal = accounting.snapshot()
     assert terminal.retry_owned == terminal.in_flight == frozenset()
     assert terminal.attempt_states[token].value == "failed"
+
+
+def test_stop_freeze_keeps_terminal_unlatched_and_disposes_distinct_remainders():
+    ledger, accounting = _accounting()
+    accepted_key = _discover(accounting, "stop-two-phase", 0)
+    accepted = accounting.begin_attempt(accepted_key, source_revision=1)
+    accounting.record_accepted(accepted)
+    retry_key = _discover(accounting, "stop-two-phase", 1)
+    retry = accounting.begin_attempt(retry_key, source_revision=1)
+    accounting.record_failed(retry, error="partial", retryable=True)
+
+    frozen = accounting.stop()
+    assert frozen.state is _api()[4].ACTIVE
+    assert frozen.in_flight == frozenset((accepted_key,))
+    assert frozen.retry_owned == frozenset((retry_key,))
+    owner, owner_token = _BOUND_OWNERS[id(accounting)]
+    seal = accounting.writer_boundary.prepare_session_finish(
+        owner, owner_token, stopped=False,
+    )
+    assert accounting.snapshot().state is _api()[4].ACTIVE
+    accounting.writer_boundary.session_stopped(
+        owner, owner_token, seal, "operator Stop",
+    )
+
+    terminal = accounting.snapshot()
+    assert terminal.state is _api()[4].STOPPED
+    assert terminal.attempt_states[accepted] is _api()[1].CANCELLED
+    assert terminal.attempt_states[retry] is _api()[1].FAILED
+    assert ledger.snapshot().dispositions[0] is ItemDisposition.CANCELLED_BEFORE_COMPLETION
+    assert 1 not in ledger.snapshot().dispositions
+    with pytest.raises(RuntimeError):
+        accounting.writer_boundary.session_stopped(
+            owner, owner_token, seal, "double disposition",
+        )
 
 
 def test_live_attempt_must_be_settled_before_retry_and_superseded_positive_is_atomic():

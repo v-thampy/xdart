@@ -99,6 +99,30 @@ def supports_durable_xye_receipts(value: object) -> bool:
         and OutputReceiptCapability.DURABLE_XYE in capabilities
     )
 
+
+class OutputSinkKind(str, Enum):
+    """Typed description of output families present in a sink graph."""
+
+    XYE = "xye"
+
+
+@runtime_checkable
+class OutputSinkKindProvider(Protocol):
+    @property
+    def output_sink_kinds(self) -> frozenset[OutputSinkKind]: ...
+
+
+def requires_active_xye_output(value: object) -> bool:
+    """Return whether a public sink graph contains an active XYE writer."""
+    if not isinstance(value, OutputSinkKindProvider):
+        return False
+    kinds = value.output_sink_kinds
+    return (
+        isinstance(kinds, frozenset)
+        and all(isinstance(item, OutputSinkKind) for item in kinds)
+        and OutputSinkKind.XYE in kinds
+    )
+
 # H10 §14.3 admission-lifecycle trace: OFF unless ``XDART_H10_ADMISSION_TRACE``
 # names a file to append to (no default location, so an unset gate writes
 # nowhere).  One tab-separated ``monotonic  thread  event  k=v`` line per event
@@ -518,16 +542,26 @@ class CompositeSink:
     output_receipt_capabilities: frozenset[OutputReceiptCapability] = field(
         default_factory=frozenset, init=False,
     )
+    output_sink_kinds: frozenset[OutputSinkKind] = field(
+        default_factory=frozenset, init=False,
+    )
 
     def __post_init__(self) -> None:
         capabilities: set[OutputReceiptCapability] = set()
+        kinds: set[OutputSinkKind] = set()
         for sink in self.sinks:
             provided = getattr(sink, "output_receipt_capabilities", frozenset())
             if (isinstance(provided, frozenset)
                     and all(isinstance(item, OutputReceiptCapability)
                             for item in provided)):
                 capabilities.update(provided)
+            provided_kinds = getattr(sink, "output_sink_kinds", frozenset())
+            if (isinstance(provided_kinds, frozenset)
+                    and all(isinstance(item, OutputSinkKind)
+                            for item in provided_kinds)):
+                kinds.update(provided_kinds)
         self.output_receipt_capabilities = frozenset(capabilities)
+        self.output_sink_kinds = frozenset(kinds)
         workers = tuple(
             hook for sink in self.sinks
             if callable(hook := getattr(sink, "worker_process", None))
@@ -630,6 +664,9 @@ class XYESink:
     _pending: Any = field(default=None, init=False, repr=False)
     _worker: Any = field(default=None, init=False, repr=False)
     _errors: list[BaseException] = field(default_factory=list, init=False, repr=False)
+    output_sink_kinds: frozenset[OutputSinkKind] = field(
+        default=frozenset({OutputSinkKind.XYE}), init=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.directory, Path):
@@ -1124,6 +1161,11 @@ class NexusSink:
         return decision
 
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
+        return self._write_or_replace(frame, reduction, replace_existing=False)
+
+    def _write_or_replace(
+        self, frame: Frame, reduction: FrameReduction, *, replace_existing: bool,
+    ) -> None:
         writer = self._writer
         if writer is None:
             raise RuntimeError("NexusSink.write called before begin().")
@@ -1150,11 +1192,15 @@ class NexusSink:
         )
         with self._prepared_thumbnails_lock:
             prepared = self._prepared_thumbnails.pop(id(reduction), None)
-        writer.write(self._write_frame_record(
-            frame,
-            reduction,
-            prepared=prepared,
-        ))
+        if replace_existing:
+            record = self._write_frame_record(
+                frame, reduction, prepared=prepared, replace_existing=True,
+            )
+        else:
+            record = self._write_frame_record(
+                frame, reduction, prepared=prepared,
+            )
+        writer.write(record)
         if drop_1d:
             writer.drop_publication(int(frame.index), ResultMode.one_d(mode_1d))
         if drop_2d:
@@ -1231,6 +1277,7 @@ class NexusSink:
         reduction: FrameReduction,
         *,
         prepared: tuple[np.ndarray | None, bool] | None = None,
+        replace_existing: bool = False,
     ) -> RecordWrite:
         thumb, mask_baked = (
             prepared if prepared is not None else self._prepare_frame_thumbnail(frame)
@@ -1281,10 +1328,11 @@ class NexusSink:
                 or {}
             ),
             write_frame_record=bool(getattr(reduction, "write_frame_record", True)),
+            replace_existing=replace_existing,
         )
 
     def replace(self, frame: Frame, reduction: FrameReduction):
-        return self.write(frame, reduction)
+        return self._write_or_replace(frame, reduction, replace_existing=True)
 
     def flush(self, *, force: bool = False) -> None:
         if self._writer is None:

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import ast
 import gc
+import inspect
 import threading
 
 import h5py
@@ -48,20 +50,47 @@ def _write_ready_nexus(target: Path, frames: int = 1) -> None:
 
 
 @pytest.mark.parametrize(
-    ("filename", "initial"),
-    (
-        ("growing.nxs", b"nexus-shell"),
-        ("growing.h5", b"hdf-shell"),
-        ("armed_master.h5", b"missing-external-link-member"),
-    ),
+    "filename", ("growing.nxs", "growing.h5", "armed_master.h5"),
 )
 def test_growing_container_retries_same_key_and_extends_one_live_owner(
     tmp_path,
     filename,
-    initial,
 ):
+    from xrd_tools.sources import ProbeState, open_source
+    from xrd_tools.sources.directory_session import DirectoryIndexSession
+
     source = tmp_path / filename
-    source.write_bytes(initial)
+    linked = tmp_path / "armed_data_000001.h5"
+    if filename == "armed_master.h5":
+        with h5py.File(source, "w") as handle:
+            entry = handle.create_group("entry")
+            entry.attrs["NX_class"] = "NXentry"
+            data = entry.create_group("data")
+            data.attrs["NX_class"] = "NXdata"
+            data["data_000001"] = h5py.ExternalLink(
+                str(linked), "/entry/data/data",
+            )
+        suffixes = ("_master.h5",)
+    else:
+        with h5py.File(source, "w") as handle:
+            entry = handle.create_group("entry")
+            detector = entry.create_group("instrument/detector")
+            detector.create_dataset(
+                "data", data=np.ones((1, 3, 4), dtype=np.uint16),
+                maxshape=(None, 3, 4), chunks=(1, 3, 4),
+            )
+        suffixes = (Path(filename).suffix,)
+    source_owner = DirectoryIndexSession(probe_candidates=False)
+    source_owner.configure(tmp_path, suffixes=suffixes)
+    discovered = source_owner.observe()
+    candidate = next(
+        item for item in discovered.discovered_snapshot.candidates
+        if item.path == source
+    )
+    provisional = source_owner.probe_candidate(candidate, refresh=False)
+    assert provisional.result.state is ProbeState.IN_PROGRESS
+    assert provisional.result.descriptor is not None
+    assert provisional.result.descriptor.state is ProbeState.IN_PROGRESS
     first_fact = observe_source_fact(tmp_path, filename, logical_identity=0)
     target = tmp_path / f"{Path(filename).stem}-processed.nexus"
     _ledger, accounting, mode, target_name = accounting_for(target)
@@ -70,7 +99,36 @@ def test_growing_container_retries_same_key_and_extends_one_live_owner(
         accounting, key0, first_fact.source_revision, "transient source revision",
     )
 
-    source.write_bytes(initial + b"-stable")
+    if filename == "armed_master.h5":
+        with h5py.File(linked, "w") as handle:
+            handle.create_dataset(
+                "entry/data/data",
+                data=np.arange(24, dtype=np.uint16).reshape(2, 3, 4),
+            )
+        with h5py.File(source, "a") as handle:
+            handle["entry"].create_dataset(
+                "end_time", data=np.bytes_("2026-08-07T00:00:00"),
+            )
+    else:
+        with h5py.File(source, "a") as handle:
+            data = handle["entry/instrument/detector/data"]
+            data.resize((2, 3, 4))
+            data[1] = np.full((3, 4), 7, dtype=np.uint16)
+            handle["entry"].create_dataset(
+                "end_time", data=np.bytes_("2026-08-07T00:00:00"),
+            )
+    current = source_owner.observe().discovered_snapshot.candidates
+    candidate = next(item for item in current if item.path == source)
+    ready = source_owner.probe_candidate(candidate, refresh=False)
+    assert ready.result.state is ProbeState.READY
+    opened = open_source(source)
+    try:
+        assert np.asarray(opened.load_frame(0)).shape == (3, 4)
+        assert np.asarray(opened.load_frame(1)).shape == (3, 4)
+    finally:
+        close = getattr(opened, "close", None)
+        if callable(close):
+            close()
     retry_fact = observe_source_fact(tmp_path, filename, logical_identity=0)
     successor = successful_attempt(
         accounting,
@@ -112,11 +170,26 @@ def test_growing_container_retries_same_key_and_extends_one_live_owner(
     assert snapshot.durable_attempts[(key1, mode, target_name)] is second
     assert _rows(target) == (0, 1)
     assert session not in accounting.owner_census()
+    source_owner.close()
 
 
 def test_partial_tiff_retry_has_no_receipt_then_same_key_succeeds(tmp_path):
+    from xrd_tools.sources import ProbeState, open_source
+    from xrd_tools.sources.directory_session import DirectoryIndexSession
+
     source = tmp_path / "frame_0001.tif"
-    source.write_bytes(b"II\x2a\x00partial")
+    tifffile = pytest.importorskip("tifffile")
+    image = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    complete = tmp_path / "complete.tif"
+    tifffile.imwrite(complete, image)
+    complete_bytes = complete.read_bytes()
+    complete.unlink()
+    source.write_bytes(complete_bytes[: max(8, len(complete_bytes) // 3)])
+    source_owner = DirectoryIndexSession(probe_candidates=False)
+    source_owner.configure(tmp_path, suffixes=(".tif",))
+    candidate = source_owner.observe().discovered_snapshot.candidates[0]
+    assert source_owner.probe_candidate(candidate, refresh=False).result.state \
+        is not ProbeState.READY
     partial = observe_source_fact(tmp_path, source.name, logical_identity=0)
     target = tmp_path / "partial-tiff.nexus"
     ledger, accounting, mode, target_name = accounting_for(target)
@@ -124,7 +197,12 @@ def test_partial_tiff_retry_has_no_receipt_then_same_key_succeeds(tmp_path):
     failed = retryable_attempt(accounting, key, partial.source_revision, "partial TIFF")
     assert ledger.snapshot().persisted == ledger.snapshot().durable == frozenset()
 
-    source.write_bytes(b"II\x2a\x00complete-image-payload")
+    source.write_bytes(complete_bytes)
+    candidate = source_owner.observe().discovered_snapshot.candidates[0]
+    ready = source_owner.probe_candidate(candidate, refresh=False)
+    assert ready.result.state is ProbeState.READY
+    opened = open_source(source)
+    assert np.array_equal(opened.load_frame(0), image)
     completed = observe_source_fact(tmp_path, source.name, logical_identity=0)
     successor = successful_attempt(
         accounting,
@@ -145,6 +223,7 @@ def test_partial_tiff_retry_has_no_receipt_then_same_key_succeeds(tmp_path):
     assert snapshot.attempts[key] == (failed, successor)
     assert snapshot.durable_attempts[(key, mode, target_name)] is successor
     assert _rows(target) == (0,)
+    source_owner.close()
 
 
 def test_ready_to_open_drift_is_retry_owned_and_opens_no_h23_session(tmp_path):
@@ -355,7 +434,7 @@ def test_stop_is_preterminal_and_commits_only_preaccepted_ready_prefix(tmp_path)
     ))
 
     stopped = accounting.stop()
-    assert stopped.state.value == "stopped"
+    assert stopped.state.value == "active"
     with pytest.raises(RuntimeError, match="frontier"):
         discover(accounting, facts[2], group="late", ordinal=0, label=99)
     accounting.record_completed(attempt1, produced=(mode,))
@@ -397,6 +476,42 @@ def test_event_sink_exposes_worker_process_only_for_callable_inner_hook():
     assert callable(getattr(worker, "worker_process", None))
     worker.worker_process("frame", "reduction")
     assert worker_inner.seen == ("frame", "reduction")
+
+
+def test_c2_has_exactly_the_h10_and_bounded_xye_stage_queues():
+    import xrd_tools.reduction.core as core
+
+    tree = ast.parse(inspect.getsource(core))
+    queues = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "queue"
+        and node.func.attr == "Queue"
+    ]
+    assert len(queues) == 2
+    assert sorted(
+        ast.unparse(node) for node in queues
+    ) == ["queue.Queue()", "queue.Queue(maxsize=16)"]
+    xye = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "XYESink"
+    )
+    names = {node.id for node in ast.walk(xye) if isinstance(node, ast.Name)}
+    attrs = {node.attr for node in ast.walk(xye) if isinstance(node, ast.Attribute)}
+    assert {
+        "_StreamPublication", "_InFlightWindow", "record_accepted",
+        "record_written", "record_durable",
+    }.isdisjoint(names | attrs)
+    assert not hasattr(core.XYESink(Path("unused")), "output_receipt_capabilities")
+
+
+def test_session_normalizer_is_the_exact_canonical_reexport():
+    from xrd_tools.reduction.provenance_config import jsonable_run_value as canonical
+    from xrd_tools.session import jsonable_run_value as compatibility
+
+    assert compatibility is canonical
 
 
 def test_source_snapshot_and_mask_provenance_are_durable_and_conflict_atomic(
@@ -492,6 +607,38 @@ def test_source_snapshot_and_mask_provenance_are_durable_and_conflict_atomic(
     writer.finish()
 
 
+def test_close_revalidates_compact_frame_proof_after_checkpoint_corruption(
+    tmp_path,
+):
+    source = tmp_path / "proof-source.nxs"
+    source.write_bytes(b"source")
+    fact = observe_source_fact(tmp_path, source.name, logical_identity=0)
+    target = tmp_path / "proof-output.nexus"
+    _ledger, accounting, mode, _target = accounting_for(target)
+    key = discover(accounting, fact, group="proof", ordinal=0, label=0)
+    successful_attempt(accounting, key, fact.source_revision, mode)
+    intent = append_intent(
+        tmp_path, extent=1, labels=(0,), generation=0,
+        source_identity=fact.source_identity,
+    )
+    session = open_session(live_scan(target, intent, (0,)), accounting)
+    session.flush(force=True)
+
+    writer = session.sink._writer
+    assert writer._transaction_binding is not None
+    assert writer._dirty_frames == {}
+    assert writer._durable_frame_proofs
+    proof = writer._durable_frame_proofs[0]
+    assert writer._frame_row_digest(0)[0] == proof.digest
+    frame_group = writer._h5["entry/frames/frame_0000"]
+    frame_group.attrs["mask_baked"] = not bool(frame_group.attrs["mask_baked"])
+    writer._h5.flush()
+    assert writer._frame_row_digest(0)[0] != proof.digest
+    with pytest.raises(Exception, match="frame proof changed"):
+        writer._close_handle()
+    session.abort()
+
+
 def test_one_shot_refuses_a_second_owner_during_live_cadence(tmp_path):
     from xdart.modules.reduction import write_live_scan_to_nexus
 
@@ -521,6 +668,62 @@ def test_one_shot_refuses_a_second_owner_during_live_cadence(tmp_path):
     assert target.read_bytes() == before
     assert accounting.owner_census() == before_census
     session.finish(finalize=True)
+
+
+def test_real_reduction_session_refeed_uses_explicit_atomic_replace(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.reduction.core as reduction_core
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.reduction import Frame, NexusSink, ReductionPlan, Scan
+    from xrd_tools.session import ResultMode, ScanSession
+
+    monkeypatch.setattr(
+        reduction_core, "integrate_1d",
+        lambda image, _integrator, **_kwargs: IntegrationResult1D(
+            radial=np.array([0.0, 1.0]),
+            intensity=np.full(2, float(np.sum(image))),
+            sigma=None, unit="q_A^-1",
+        ),
+    )
+    target = tmp_path / "explicit-refeed.nexus"
+    old = Frame(
+        0, image=np.ones((2, 2)), source_path=tmp_path / "old.tif",
+        source_frame_index=1,
+    )
+    new = Frame(
+        0, image=np.full((2, 2), 3.0), source_path=tmp_path / "new.tif",
+        source_frame_index=8,
+    )
+    mode = ResultMode.one_d()
+    target_name = f"nexus:{target}"
+    session = ScanSession(
+        ReductionPlan(integration_2d=None),
+        Scan("replace", [old], integrator=object()),
+        sink=NexusSink(target, overwrite=True, atomic=False, flush_every=None),
+        executor=1, targets_by_mode={mode: (target_name,)},
+    )
+    assert session.submit(old)
+    assert session.pause(timeout=5)
+    session.flush(force=True)
+    stale = session.accounting.receipt(0, mode, target_name)
+    session.accounting.record_durable((stale,))
+    session.resume()
+    assert session.submit(new)
+    assert session.pause(timeout=5)
+    session.flush(force=True)
+    fresh = session.accounting.receipt(0, mode, target_name)
+    assert fresh.revision == stale.revision + 1
+    assert session.frames_submitted == session.frames_completed == 1
+    session.accounting.record_durable((stale,))
+    assert (0, mode, target_name) in session.accounting_snapshot().durable
+    assert session.accounting.receipt(0, mode, target_name) == fresh
+    session.resume()
+    session.finish()
+    with h5py.File(target, "r") as handle:
+        frame = handle["entry/frames/frame_0000"]
+        assert int(frame["source/frame_index"][()]) == 8
+        assert frame["source/path"].asstr()[()] == str(tmp_path / "new.tif")
 
 
 def test_public_durable_xye_capability_is_typed_and_composite_aggregated():
@@ -599,6 +802,67 @@ def test_dynamic_bare_xye_refuses_before_any_positive_fact_or_target_mutation(
     assert ledger.snapshot() == before_stage
     assert not xye.exists()
     assert accounting.owner_census() == before_census
+
+
+def test_dynamic_nested_actual_xye_cannot_be_laundered_by_receipt_capability(
+    tmp_path,
+):
+    from xdart.modules.reduction import (
+        DynamicXyeReceiptBoundaryRequired,
+        open_live_scan_session,
+    )
+    from xrd_tools.io import OutputReceiptCapability
+    from xrd_tools.reduction import CompositeSink, ReductionPlan, XYESink
+    from xrd_tools.session import (
+        DynamicAccountingLimits, DynamicRunAccounting, ResultMode, StageLedger,
+    )
+
+    class UnrelatedReceiptOwner:
+        output_receipt_capabilities = frozenset({
+            OutputReceiptCapability.DURABLE_XYE,
+        })
+
+        def begin(self, *_args):
+            raise AssertionError("sink graph mutated before XYE refusal")
+
+    directory = tmp_path / "must-not-exist"
+    nested = CompositeSink((
+        CompositeSink((UnrelatedReceiptOwner(), XYESink(directory))),
+    ))
+    mode = ResultMode.one_d()
+    ledger = StageLedger(
+        required_modes=(mode,), targets_by_mode={mode: ("nexus:unused",)},
+    )
+    accounting = DynamicRunAccounting(
+        ledger, run_generation=1,
+        limits=DynamicAccountingLimits(1, 2, 1),
+    )
+    live = SimpleNamespace(
+        idx=0, map_raw=np.ones((2, 2)), bg_raw=None, scan_info={},
+        source_file=str(tmp_path / "raw.tif"), source_frame_idx=0,
+        mask=None, poni=None, integrator=object(),
+    )
+    before_dynamic = accounting.snapshot()
+    before_stage = ledger.snapshot()
+    before_census = accounting.owner_census()
+    with pytest.raises(DynamicXyeReceiptBoundaryRequired):
+        open_live_scan_session(
+            (live,), ReductionPlan(integration_2d=None), sink=nested,
+            accounting=accounting, xye_receipt_boundary=UnrelatedReceiptOwner(),
+        )
+    assert accounting.snapshot() == before_dynamic
+    assert ledger.snapshot() == before_stage
+    assert accounting.owner_census() == before_census
+    assert not directory.exists()
+
+
+def test_standalone_xye_sink_remains_available_outside_dynamic_runs(tmp_path):
+    from xrd_tools.reduction import ReductionPlan, Scan, XYESink
+
+    sink = XYESink(tmp_path / "standalone")
+    sink.begin(Scan("standalone", []), ReductionPlan(integration_2d=None))
+    sink.finish(SimpleNamespace())
+    assert (tmp_path / "standalone").is_dir()
 
 
 def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
@@ -703,6 +967,15 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
     assert lease.unique_owned_ndarray_bytes == lease.reserved_ndarray_bytes
     assert authority.snapshot().categories["light_1d"] == lease.reserved_ndarray_bytes
 
+    hidden_copy = np.arange(4, dtype=np.float64)
+    store._hidden_publication_copy = hidden_copy
+    try:
+        mutated = store.ndarray_owner_census()
+        assert mutated["publication"] == frozenset((id(hidden_copy),))
+        assert mutated["publication"].isdisjoint(mutated["lease"])
+    finally:
+        del store._hidden_publication_copy
+
     second = store.publish_light_1d(record(1), source_identity="scan.nxs#1")
     assert store.labels() == (1,)
     assert lease.keys() == (1,)
@@ -716,6 +989,7 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
     gc.collect()
     lease.release(reason="terminal", hooks=Light1DCleanupHooks())
     assert authority.snapshot().reserved_bytes == allocation.assigned_bytes
+    assert authority.snapshot().categories.get("light_1d", 0) == 0
     assert store.ndarray_owner_census() == {
         "lease": frozenset(),
         "publication": frozenset(),

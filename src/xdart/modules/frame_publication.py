@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import posixpath
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from threading import RLock
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
@@ -759,15 +759,60 @@ class PublicationStore:
             return shell
 
     def ndarray_owner_census(self):
-        """Public split census: the store owns no ndarray root after binding."""
+        """Public split census derived from the store's actual owned state."""
         with self._lock:
             lease = self._light_1d
             return {
                 "lease": (
                     frozenset() if lease is None else lease.owned_buffer_ids
                 ),
-                "publication": frozenset(),
+                "publication": self._publication_ndarray_roots_locked(),
             }
+
+    @staticmethod
+    def _ndarray_root(value: np.ndarray) -> np.ndarray:
+        root = value
+        while isinstance(root.base, np.ndarray):
+            root = root.base
+        return root
+
+    def _publication_ndarray_roots_locked(self) -> frozenset[int]:
+        roots: set[int] = set()
+        seen: set[int] = set()
+
+        def visit(value) -> None:
+            identity = id(value)
+            if identity in seen:
+                return
+            seen.add(identity)
+            if isinstance(value, np.ndarray):
+                roots.add(id(self._ndarray_root(value)))
+                return
+            if isinstance(value, Light1DPublicationShell):
+                # The borrow is a non-owning projection into the lease.  Its
+                # arrays belong exclusively to the lease side of the census.
+                return
+            if isinstance(value, Mapping):
+                for key, item in value.items():
+                    visit(key)
+                    visit(item)
+                return
+            if isinstance(value, (tuple, list, set, frozenset)):
+                for item in value:
+                    visit(item)
+                return
+            if is_dataclass(value) and not isinstance(value, type):
+                for descriptor in fields(value):
+                    visit(getattr(value, descriptor.name))
+
+        excluded = {
+            "_lock", "_light_1d", "allocation", "_hydrator",
+            "_hydrator_1d_many", "_evictable",
+        }
+        for name, value in self.__dict__.items():
+            if name not in excluded:
+                visit(value)
+        return frozenset(roots)
 
     def clear(self) -> None:
         """Full reset (a scan boundary): empty everything + bump generation."""

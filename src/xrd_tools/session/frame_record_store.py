@@ -11,13 +11,27 @@ one risky step.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from threading import RLock
 from types import MappingProxyType
 
 from xrd_tools.core import FrameRecord, FrameView
 
 _ModeKey = tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class FrameHydrationRequest:
+    label: int | str
+    source_identity: str
+    revision: int
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class FrameHydrationResult:
+    request: FrameHydrationRequest
+    record: FrameRecord
 
 
 def _record_views(record: FrameRecord) -> tuple[FrameView, ...]:
@@ -182,6 +196,8 @@ class FrameRecordStore:
         self._lock = RLock()
         self._records: dict[int | str, FrameRecord] = {}
         self._source_ids: dict[int | str, str] = {}
+        self._revisions: dict[int | str, int] = {}
+        self._generation = 0
         # ``_projected`` = labels a ScanSession owns; else the pre-C2-A rule.
         self._persisted_modes: dict[int | str, set[_ModeKey]] = {}
         self._durable_modes: dict[int | str, set[_ModeKey]] = {}
@@ -192,11 +208,14 @@ class FrameRecordStore:
         self._max_heavy_items = max_heavy_items
         self._require_persisted_for_eviction = bool(require_persisted_for_eviction)
         self._hydrator: Callable[[int | str], FrameRecord | None] | None = None
+        self._hydrator_revision_qualified = False
 
     def clear(self) -> None:
         with self._lock:
             self._records.clear()
             self._source_ids.clear()
+            self._revisions.clear()
+            self._generation += 1
             self._persisted_modes.clear()
             self._durable_modes.clear()
             self._dropped_modes.clear()
@@ -204,7 +223,7 @@ class FrameRecordStore:
             self._heavy_labels.clear()
 
     def set_hydrator(
-        self, hydrator: Callable[[int | str], FrameRecord | None] | None
+        self, hydrator: Callable | None, *, revision_qualified: bool = False,
     ) -> None:
         """Register a synchronous hydrator for thinned records.
 
@@ -215,6 +234,7 @@ class FrameRecordStore:
         """
         with self._lock:
             self._hydrator = hydrator
+            self._hydrator_revision_qualified = bool(revision_qualified)
 
     def upsert(
         self,
@@ -251,6 +271,7 @@ class FrameRecordStore:
             self._drop_heavy_label_locked(label)
             self._records[label] = record
             self._source_ids[label] = source_id
+            self._revisions[label] = self._revisions.get(label, 0) + 1
             # Per-mode persistence (``persisted_modes``) takes precedence over the
             # blanket ``persisted`` flag: ``get_or_hydrate`` uses it so a hydrator
             # that returns an EXTRA freshly-computed (unsaved) mode does NOT get
@@ -436,8 +457,37 @@ class FrameRecordStore:
                 return record
         if hydrator is None:
             return record
-        fresh = hydrator(label)
-        if fresh is None:
+        request = FrameHydrationRequest(
+            label=label,
+            source_identity=captured[1],
+            revision=captured[2],
+            generation=captured[3],
+        )
+        returned = hydrator(request if self._hydrator_revision_qualified else label)
+        if returned is None:
+            return record
+        certified_return = isinstance(returned, FrameHydrationResult)
+        if certified_return:
+            if returned.request != request:
+                return record
+            fresh = returned.record
+        else:
+            # Documented compatibility only for an unqualified legacy row.
+            # It can never certify a source-qualified stored revision.
+            if captured[1] or self._hydrator_revision_qualified:
+                return record
+            fresh = returned
+        # Hydration is a read of the exact captured logical row.  A hydrator
+        # may fill payloads, but it may not redirect that read to a different
+        # label or source identity.
+        if fresh.label != label:
+            return record
+        captured_source_identity = captured[1]
+        fresh_source_identity = _source_identity_from_record(fresh)
+        if fresh_source_identity:
+            if not _same_source_id(captured_source_identity, fresh_source_identity):
+                return record
+        elif not certified_return and captured_source_identity:
             return record
         if commit_gate is not None and not commit_gate.enter(commit_epoch):
             return record
@@ -448,19 +498,12 @@ class FrameRecordStore:
                         label, current, self._persisted_modes.get(label, set())
                 ) != captured:
                     return current
-                current_source_identity = self._source_ids.get(label, "")
-                fresh_source_identity = _source_identity_from_record(fresh)
-                source_identity = (
-                    current_source_identity
-                    if current_source_identity and not fresh_source_identity
-                    else None
-                )
                 durable = set(self._durable_modes.get(label, set()))
                 dropped = set(self._dropped_modes.get(label, set()))
                 projected = label in self._projected
                 merged = self.upsert(
                     fresh,
-                    source_identity=source_identity,
+                    source_identity=captured_source_identity,
                     persisted_modes=prev_persisted,
                 )
                 # Hydration RE-ARMS an existing revision: restore its projection.
@@ -477,6 +520,7 @@ class FrameRecordStore:
     def _capture_locked(self, label: int | str, record: FrameRecord,
                         persisted: set[_ModeKey]) -> tuple:
         return (id(record), self._source_ids.get(label, ""),
+                self._revisions.get(label, 0), self._generation,
                 frozenset(persisted),
                 frozenset(self._durable_modes.get(label, set())),
                 frozenset(self._dropped_modes.get(label, set())))

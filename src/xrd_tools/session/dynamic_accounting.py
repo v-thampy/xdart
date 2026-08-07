@@ -281,6 +281,7 @@ class DynamicRunAccounting:
         self._limits = limits
         self._lock = threading.RLock()
         self._state = DynamicRunState.ACTIVE
+        self._stop_requested = False
         self._frames: dict[DynamicFrameIdentity, _FrameRegistration] = {}
         self._logical_enqueued: set[DynamicFrameIdentity] = set()
         self._ordinals: dict[Hashable, dict[int, DynamicFrameIdentity]] = {}
@@ -353,7 +354,7 @@ class DynamicRunAccounting:
         return self._writer_boundary
 
     def _require_open_frontier(self) -> None:
-        if self._state is not DynamicRunState.ACTIVE:
+        if self._state is not DynamicRunState.ACTIVE or self._stop_requested:
             raise RuntimeError("dynamic accepted frontier is frozen")
 
     def _require_preterminal(self) -> None:
@@ -907,7 +908,7 @@ class DynamicRunAccounting:
             if self._active_seal is not None:
                 raise RuntimeError("dynamic lineage epoch already has an active seal")
             self._validate_pending_current()
-            if kind == "finish" and self._state is DynamicRunState.STOPPED:
+            if kind == "finish" and self._stop_requested:
                 terminal_state = DynamicRunState.STOPPED
             self._validate_epoch_terminality(terminal_state=terminal_state)
             self._seal_ordinal += 1
@@ -1061,8 +1062,12 @@ class DynamicRunAccounting:
     def stop(self) -> DynamicRunSnapshot:
         with self._lock:
             self._require_unsealed()
-            if self._state is DynamicRunState.ACTIVE:
-                self._state = DynamicRunState.STOPPED
+            if self._state is not DynamicRunState.ACTIVE:
+                raise RuntimeError("dynamic accepted frontier is frozen")
+            # Phase one only freezes new discovery/attempt admission.  STOPPED
+            # is latched by the exact bound terminal callback after the writer
+            # drains the accepted-ready prefix and disposes the remainder.
+            self._stop_requested = True
             return self.snapshot()
 
     def bind_light_1d(self, lease, *, cleanup_hooks) -> None:
@@ -1077,7 +1082,7 @@ class DynamicRunAccounting:
                 raise TypeError("dynamic run requires the exact light-1D lease")
             if hooks_type is None or type(cleanup_hooks) is not hooks_type:
                 raise TypeError("dynamic run requires exact light-1D cleanup hooks")
-            if self._state is not DynamicRunState.ACTIVE:
+            if self._state is not DynamicRunState.ACTIVE or self._stop_requested:
                 raise RuntimeError("a non-active dynamic run cannot bind light-1D")
             if getattr(getattr(lease, "state", None), "value", None) != "active":
                 raise RuntimeError("dynamic run requires an active light-1D lease")

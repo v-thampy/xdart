@@ -6,7 +6,9 @@ flip.  They lock the store invariants before xdart projects onto it.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import numpy as np
+import pytest
 
 from xrd_tools.core import (
     Axis,
@@ -16,7 +18,15 @@ from xrd_tools.core import (
     assert_framerecord_equivalent,
     axis_from_unit,
 )
-from xrd_tools.session import FrameRecordStore
+from xrd_tools.session import FrameHydrationResult, FrameRecordStore
+
+
+def _set_certified_hydrator(store, hydrate):
+    def certified(request):
+        record = hydrate(request.label)
+        return None if record is None else FrameHydrationResult(request, record)
+
+    store.set_hydrator(certified, revision_qualified=True)
 
 
 def _view(label=0, *, source: "str | None" = "/data/scan_0001.tif",
@@ -201,7 +211,7 @@ def test_get_or_hydrate_restores_thinned_record():
         calls.append(label)
         return _record(label=label, scale=5.0)
 
-    store.set_hydrator(hydrate)
+    _set_certified_hydrator(store, hydrate)
     rec = store.get_or_hydrate(1)
 
     assert calls == [1]
@@ -225,7 +235,9 @@ def test_get_or_hydrate_restores_every_written_mode_from_nexus(tmp_path):
     store.upsert(records[1], persisted=True)
     assert not store.has_heavy_payload(0)
 
-    store.set_hydrator(lambda label: read_frame_record(path, int(label)))
+    _set_certified_hydrator(
+        store, lambda label: read_frame_record(path, int(label)),
+    )
     hydrated = store.get_or_hydrate(0)
 
     assert hydrated is not None
@@ -236,7 +248,7 @@ def test_get_or_hydrate_restores_every_written_mode_from_nexus(tmp_path):
     assert_framerecord_equivalent(records[0], hydrated)
 
 
-def test_get_or_hydrate_learns_source_identity_when_thinned_record_had_none():
+def test_get_or_hydrate_refuses_source_identity_when_captured_row_had_none():
     store = FrameRecordStore(max_heavy_items=0, require_persisted_for_eviction=False)
     store.upsert(_record(label=1, source=None, source_frame=None))
     assert store.source_identity(1) == ""
@@ -245,14 +257,15 @@ def test_get_or_hydrate_learns_source_identity_when_thinned_record_had_none():
     def hydrate(label):
         return _record(label=label, source="/data/scan_0001.tif", source_frame=12)
 
-    store.set_hydrator(hydrate)
+    _set_certified_hydrator(store, hydrate)
     rec = store.get_or_hydrate(1)
 
     assert rec is not None
-    assert store.source_identity(1) == "/data/scan_0001.tif#12"
+    assert store.source_identity(1) == ""
+    assert not store.has_heavy_payload(1)
 
 
-def test_get_or_hydrate_replaces_when_hydrator_returns_conflicting_source():
+def test_get_or_hydrate_refuses_conflicting_source_without_replacement():
     store = FrameRecordStore(max_heavy_items=0, require_persisted_for_eviction=False)
     store.upsert(_record(label=1, mode="q_total", source="/data/a.tif"))
     assert store.source_identity(1) == "/data/a.tif#0"
@@ -260,12 +273,40 @@ def test_get_or_hydrate_replaces_when_hydrator_returns_conflicting_source():
     def hydrate(label):
         return _record(label=label, mode="q_ip", source="/data/b.tif", scale=4.0)
 
-    store.set_hydrator(hydrate)
+    _set_certified_hydrator(store, hydrate)
     rec = store.get_or_hydrate(1)
 
     assert rec is not None
-    assert rec.modes_1d == ("q_ip",)
-    assert store.source_identity(1) == "/data/b.tif#0"
+    assert rec.modes_1d == ("q_total",)
+    assert store.source_identity(1) == "/data/a.tif#0"
+
+
+@pytest.mark.parametrize("authority_mutation", ("label", "source", "revision", "generation"))
+def test_get_or_hydrate_requires_exact_returned_revision_authority(
+    authority_mutation,
+):
+    from xrd_tools.session import FrameHydrationResult
+
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, source="/data/a.tif"), persisted=True)
+    assert store.release_heavy(1)
+
+    def hydrate(request):
+        changes = {
+            "label": {"label": 2},
+            "source": {"source_identity": "/data/b.tif#0"},
+            "revision": {"revision": request.revision + 1},
+            "generation": {"generation": request.generation + 1},
+        }[authority_mutation]
+        foreign = replace(request, **changes)
+        return FrameHydrationResult(
+            foreign, _record(label=1, source="/data/a.tif", scale=9.0),
+        )
+
+    store.set_hydrator(hydrate, revision_qualified=True)
+    returned = store.get_or_hydrate(1)
+    assert returned is store.get(1)
+    assert not store.has_heavy_payload(1)
 
 
 def test_snapshot_is_read_only_copy():
@@ -294,7 +335,7 @@ def test_get_or_hydrate_does_not_persist_extra_unsaved_mode():
         rec = FrameRecord.from_view(_view(label), mode_1d="q_total")  # on-disk mode
         return rec.with_result_1d("q_ip", _view(label, scale=2.0))   # extra unsaved
 
-    store.set_hydrator(hydrate)
+    _set_certified_hydrator(store, hydrate)
     rec = store.get_or_hydrate(1)
     assert set(rec.modes_1d) == {"q_total", "q_ip"}
     assert not store.is_persisted(1)                 # q_ip unsaved -> not fully persisted
@@ -329,7 +370,9 @@ def test_concurrent_upsert_mark_hydrate_is_thread_safe():
     import threading
 
     store = FrameRecordStore(max_heavy_items=8, max_items=20)
-    store.set_hydrator(lambda label: _record(label=label, scale=3.0))
+    _set_certified_hydrator(
+        store, lambda label: _record(label=label, scale=3.0),
+    )
     errors: list[BaseException] = []
 
     def worker(base):
@@ -500,7 +543,7 @@ def test_live_store_set_hydrator_rehydrates_an_evicted_record_on_access():
         calls.append(label)
         return _record(label=label, source=f"/d/{label}.tif", scale=5.0)
 
-    store.set_hydrator(hydrate)
+    _set_certified_hydrator(store, hydrate)
     rec = store.get_or_hydrate(thinned)
 
     assert calls == [thinned]                          # hydrator called once

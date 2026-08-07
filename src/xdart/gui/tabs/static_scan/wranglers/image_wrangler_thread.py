@@ -2885,7 +2885,9 @@ class imageThread(wranglerThread):
         """
         initial_path = getattr(scan, "data_file", None)
 
-        def hydrate(label):
+        def hydrate(request):
+            from xrd_tools.session import FrameHydrationResult
+            label = request.label
             thread_check = getattr(self, "_on_qt_gui_thread", None)
             on_gui_thread = (
                 thread_check()
@@ -2938,8 +2940,12 @@ class imageThread(wranglerThread):
                 logger.debug("record-store hydrate failed for %s", label,
                              exc_info=True)
                 return None
-            return FrameRecord.from_view(
-                view, mode_1d=mode_1d, mode_2d=mode_2d)
+            return FrameHydrationResult(
+                request,
+                FrameRecord.from_view(
+                    view, mode_1d=mode_1d, mode_2d=mode_2d,
+                ),
+            )
 
         return hydrate
 
@@ -3119,7 +3125,9 @@ class imageThread(wranglerThread):
         from .scan_session import ScanSessionAdapter
         self._scan_session_adapter = ScanSessionAdapter(self, scan, session, sink)
         self._scan_session_adapter.set_hydrator(
-            imageThread._record_store_hydrator(self, scan, record_store))
+            imageThread._record_store_hydrator(self, scan, record_store),
+            revision_qualified=True,
+        )
         return session, sink
 
     def _process_one(self, frozen, scan, img_file, img_number, img_data, img_meta,
@@ -6121,4 +6129,3 @@ class imageThread(wranglerThread):
         return bg
 
     # ``save_1d`` moved to wranglerThread (the base class).
-

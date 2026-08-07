@@ -30,6 +30,8 @@ _EXPORTS = {
     "FrameEvent": "xrd_tools.session.scan_session",
     "FrameProjection": "xrd_tools.session.frame_projection",
     "FrameRecordStore": "xrd_tools.session.frame_record_store",
+    "FrameHydrationRequest": "xrd_tools.session.frame_record_store",
+    "FrameHydrationResult": "xrd_tools.session.frame_record_store",
     "FrozenGIConfiguration": "xrd_tools.session.run_configuration",
     "FrozenRunConfiguration": "xrd_tools.session.run_configuration",
     "FrozenSourceSpec": "xrd_tools.session.run_configuration",

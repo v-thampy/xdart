@@ -1,9 +1,9 @@
-"""6a gate: the refactored writer preserves the frozen v2 record contract.
+"""6a gate: the refactored writer preserves the normalized v2 record contract.
 
-The committed fixture is the content signature of a deterministic scan
-written by the PRE-6a (all-xdart) writer.  Every scientific/storage fact stays
-identical; the test separately and positively asserts the three intentional
-shared-writer metadata ownership deltas.
+The committed fixture is a normalized legacy signature rematerialized by the
+headless fixture builder.  It is not claimed to be a byte-identical historical
+artifact.  Every normalized scientific/storage fact stays identical; the test
+separately asserts the intentional shared-writer metadata ownership deltas.
 """
 import ast
 import copy
@@ -16,7 +16,10 @@ import textwrap
 
 import pytest
 
-FIXTURE = Path(__file__).parent / "fixtures" / "v2_record_signature_pre6a.json"
+FIXTURE = (
+    Path(__file__).parent / "fixtures" /
+    "v2_record_signature_normalized_legacy.json"
+)
 
 
 def test_v2_reference_fixture_is_headless_and_xdart_independent(tmp_path):
@@ -76,7 +79,7 @@ def test_v2_reference_fixture_is_headless_and_xdart_independent(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def test_v2_record_content_identical_to_pre6a(tmp_path):
+def test_v2_record_content_matches_normalized_legacy_signature(tmp_path):
     import h5py
 
     from tests.core._v2_record_fixture import write_reference_scan
@@ -93,7 +96,7 @@ def test_v2_record_content_identical_to_pre6a(tmp_path):
     # Preserve every frozen root provenance key, but name the actual shared
     # writer instead of impersonating nexusformat.  Assert that one truthful
     # identity delta plus the additive schema/program stamps positively, then
-    # compare every remaining pre-6a fact as one immutable signature.
+    # compare every remaining normalized legacy fact as one immutable signature.
     with h5py.File(out, "r") as h5:
         assert set(h5.attrs) == {
             "HDF5_Version", "creator", "creator_version", "file_name",

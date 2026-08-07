@@ -290,6 +290,81 @@ def test_exact_probe_retries_unchanged_master_when_external_data_lands(
         assert ready.result.state is ProbeState.READY
         assert ready.descriptor is not None
         assert ready.descriptor.frame_count == 2
+        from xrd_tools.sources import open_source
+        source = open_source(master)
+        try:
+            assert np.array_equal(
+                source.load_frame(1), np.ones((3, 4), dtype=np.uint16),
+            )
+        finally:
+            close = getattr(source, "close", None)
+            if callable(close):
+                close()
+    finally:
+        session.close()
+
+
+def test_public_observe_probe_and_read_real_extendible_nexus(tmp_path):
+    source_path = tmp_path / "growing.nxs"
+    with h5py.File(source_path, "w") as handle:
+        entry = handle.create_group("entry")
+        detector = entry.create_group("instrument/detector")
+        detector.create_dataset(
+            "data", data=np.ones((1, 3, 4), dtype=np.uint16),
+            maxshape=(None, 3, 4), chunks=(1, 3, 4),
+        )
+    session = DirectoryIndexSession(probe_candidates=False)
+    try:
+        session.configure(tmp_path, suffixes=(".nxs",))
+        candidate = session.observe().discovered_snapshot.candidates[0]
+        assert session.probe_candidate(candidate, refresh=False).result.state \
+            is ProbeState.IN_PROGRESS
+        with h5py.File(source_path, "a") as handle:
+            data = handle["entry/instrument/detector/data"]
+            data.resize((2, 3, 4))
+            data[1] = np.full((3, 4), 7, dtype=np.uint16)
+            handle["entry"].create_dataset(
+                "end_time", data=np.bytes_("2026-08-07T00:00:00"),
+            )
+        changed = session.observe().discovered_snapshot.candidates[0]
+        ready = session.probe_candidate(changed, refresh=False)
+        assert ready.result.state is ProbeState.READY
+        from xrd_tools.sources import open_source
+        opened = open_source(source_path)
+        try:
+            assert np.array_equal(
+                opened.load_frame(1), np.full((3, 4), 7, dtype=np.uint16),
+            )
+        finally:
+            close = getattr(opened, "close", None)
+            if callable(close):
+                close()
+    finally:
+        session.close()
+
+
+def test_public_probe_rejects_real_truncated_tiff_then_reads_complete(tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    complete = tmp_path / "complete.tif"
+    image = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    tifffile.imwrite(complete, image)
+    full_bytes = complete.read_bytes()
+    complete.unlink()
+    path = tmp_path / "frame.tif"
+    path.write_bytes(full_bytes[: max(8, len(full_bytes) // 3)])
+    session = DirectoryIndexSession(probe_candidates=False)
+    try:
+        session.configure(tmp_path, suffixes=(".tif",))
+        partial = session.observe().discovered_snapshot.candidates[0]
+        assert session.probe_candidate(partial, refresh=False).result.state \
+            is not ProbeState.READY
+        path.write_bytes(full_bytes)
+        current = session.observe().discovered_snapshot.candidates[0]
+        ready = session.probe_candidate(current, refresh=False)
+        assert ready.result.state is ProbeState.READY
+        from xrd_tools.sources import open_source
+        opened = open_source(path)
+        assert np.array_equal(opened.load_frame(0), image)
     finally:
         session.close()
 

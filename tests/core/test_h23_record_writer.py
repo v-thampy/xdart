@@ -465,7 +465,7 @@ def test_dirty_replacement_updates_exact_source_record_and_transposes_2d_once(tm
         source_path=tmp_path / "new.h5", source_frame_index=8,
         metadata={"timestamp": "new"},
     )
-    sink.write(new_frame, type("Reduction", (), {
+    sink.replace(new_frame, type("Reduction", (), {
         "frame_index": 2, "result_1d": None, "result_2d": replacement,
         "mode_1d": "default", "mode_2d": "default", "metadata": {},
     })())
@@ -476,6 +476,98 @@ def test_dirty_replacement_updates_exact_source_record_and_transposes_2d_once(tm
         assert frame["timestamp"][()].decode() == "new"
         assert frame["source/frame_index"][()] == 8
         assert frame["source/path"].asstr()[()] == str(tmp_path / "new.h5")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("source_absent", "source_path", "source_index", "snapshot",
+     "mask_flag", "mask_content"),
+)
+def test_ordinary_existing_row_write_requires_complete_provenance_identity(
+    tmp_path, mutation,
+):
+    rw = _api()
+    target = tmp_path / f"identity-{mutation}.nexus"
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"source")
+    snapshot = {
+        "adapter_id": "nexus_hdf5", "size": source.stat().st_size,
+        "mtime_ns": source.stat().st_mtime_ns, "frame_count": 1,
+        "dataset_path": "/entry/data/data", "self_contained": True,
+    }
+    base = dict(
+        label=0, result_1d=_r1(1), source_path=source,
+        source_frame_index=3, source_snapshot=snapshot,
+        thumbnail=np.array([[1.0, np.nan], [2.0, 3.0]], dtype=np.float32),
+        thumbnail_mask=np.array([[False, True], [False, False]], dtype=bool),
+        thumbnail_mask_baked=False, mask_baked=False,
+    )
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write(rw.RecordWrite(**base))
+    writer.flush(force=True)
+    before = target.read_bytes()
+    changed = dict(base)
+    if mutation == "source_absent":
+        changed.update(source_path=None, source_snapshot={})
+    elif mutation == "source_path":
+        changed["source_path"] = tmp_path / "other.h5"
+    elif mutation == "source_index":
+        changed["source_frame_index"] = 4
+    elif mutation == "snapshot":
+        changed["source_snapshot"] = {**snapshot, "frame_count": 2}
+    elif mutation == "mask_flag":
+        changed["mask_baked"] = True
+    else:
+        changed["thumbnail_mask"] = np.array(
+            [[True, True], [False, False]], dtype=bool,
+        )
+    with pytest.raises(rw.WriterStateError):
+        writer.write(rw.RecordWrite(**changed))
+    assert target.read_bytes() == before
+    writer.abort()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"source_path": "raw.h5", "source_snapshot": {"size": -1}},
+        {"source_path": "raw.h5", "source_snapshot": {"unknown": "x"}},
+        {"source_path": "raw.h5", "source_snapshot": {"self_contained": 1}},
+        {"thumbnail_mask": np.ones((2, 2), dtype=np.uint8)},
+    ),
+)
+def test_record_provenance_rejects_malformed_values_before_writer_mutation(
+    tmp_path, kwargs,
+):
+    rw = _api()
+    target = tmp_path / "malformed.nexus"
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer._h5.flush()
+    before = target.read_bytes()
+    with pytest.raises(ValueError):
+        writer.write(rw.RecordWrite(label=0, result_1d=_r1(1), **kwargs))
+    writer._h5.flush()
+    assert target.read_bytes() == before
+    writer.abort()
+
+
+def test_frame_provenance_corruption_is_read_back_before_durability(tmp_path):
+    rw = _api()
+    target = tmp_path / "pre-durable-corruption.nexus"
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1),
+        thumbnail=np.array([[1.0, np.nan], [2.0, 3.0]], dtype=np.float32),
+        thumbnail_mask=np.array([[False, True], [False, False]], dtype=bool),
+    ))
+    mask = writer._h5["entry/frames/frame_0000/thumbnail_mask"]
+    mask[0, 0] = True
+    with pytest.raises(rw.WriterIncomplete, match="durability readback"):
+        writer.flush(force=True)
+    writer.abort()
 
 
 def test_finish_replace_failure_preserves_typed_partial_artifact(monkeypatch, tmp_path):

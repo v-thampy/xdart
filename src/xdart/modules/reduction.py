@@ -44,6 +44,7 @@ from xrd_tools.reduction import (
     Scan,
     StrictPolicy,
     NexusSink,
+    requires_active_xye_output,
     run_reduction,
     supports_durable_xye_receipts,
 )
@@ -1246,10 +1247,11 @@ def open_live_scan_session(
     from xrd_tools.session import DynamicRunAccounting, ScanSession
 
     if type(accounting) is DynamicRunAccounting:
-        if xye_target and xye_receipt_boundary is None:
+        active_xye = bool(xye_target) or requires_active_xye_output(sink)
+        if active_xye:
             raise DynamicXyeReceiptBoundaryRequired(
-                "dynamic XYE requires a transaction-qualified durable "
-                "receipt boundary before session mutation"
+                "dynamic XYE output is dormant until P1 and must be refused "
+                "before session mutation"
             )
         if (xye_receipt_boundary is not None
                 and not supports_durable_xye_receipts(xye_receipt_boundary)):

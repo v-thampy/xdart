@@ -28,6 +28,8 @@ __all__ = [
     "MaskSpec",
     "MemorySink",
     "NexusSink",
+    "OutputSinkKind",
+    "OutputSinkKindProvider",
     "PrepareDiagnostics",
     "ReductionPlan",
     "ReductionProgress",
@@ -38,6 +40,7 @@ __all__ = [
     "XYESink",
     "prepare_gi_freeze",
     "run_reduction",
+    "requires_active_xye_output",
     "supports_durable_xye_receipts",
     "StrictPolicy",
     "StrictnessError",
@@ -62,6 +65,8 @@ _CORE_EXPORTS = {
     "MaskSpec",
     "MemorySink",
     "NexusSink",
+    "OutputSinkKind",
+    "OutputSinkKindProvider",
     "PrepareDiagnostics",
     "ReductionPlan",
     "ReductionProgress",
@@ -72,6 +77,7 @@ _CORE_EXPORTS = {
     "XYESink",
     "prepare_gi_freeze",
     "run_reduction",
+    "requires_active_xye_output",
     "supports_durable_xye_receipts",
 }
 

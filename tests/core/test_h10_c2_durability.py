@@ -720,12 +720,16 @@ def test_g7_event_gated_hydration_cannot_resurrect_the_stale_revision():
             f"revision N's captured projection is exact: persisted "
             f"{stale_persisted}, dropped 2-D, resident heavy {stale_heavy}")
 
-        def _hydrator(label):
+        from xrd_tools.session import FrameHydrationResult
+
+        def _hydrator(request):
             entered.set()
             assert release.wait(WAIT), "hydrator gate never released"
-            return stale_record          # what revision N had on disk
+            return FrameHydrationResult(
+                request, stale_record,
+            )                            # what revision N had on disk
 
-        store.set_hydrator(_hydrator)
+        store.set_hydrator(_hydrator, revision_qualified=True)
         stale_hydratable = set(store.hydratable_modes(0))
         assert stale_hydratable == {K1}, "revision N is store-hydratable"
         worker = threading.Thread(
@@ -913,8 +917,14 @@ def test_g14_final_sweep_runs_once_after_the_terminal_boundary():
     assert not store.has_heavy_payload(0), (
         "ONE post-terminal sweep releases current durable heavy data (18)")
     hydrations: list[int] = []
+    from xrd_tools.session import FrameHydrationResult
     store.set_hydrator(
-        lambda label: (hydrations.append(int(label)), heavy)[1])
+        lambda request: (
+            hydrations.append(int(request.label)),
+            FrameHydrationResult(request, heavy),
+        )[1],
+        revision_qualified=True,
+    )
     store.get_or_hydrate(0)                 # same certified revision, re-armed
     assert hydrations == [0]
     assert store.has_heavy_payload(0), "the re-armed payload is resident"

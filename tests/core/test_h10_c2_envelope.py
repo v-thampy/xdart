@@ -168,7 +168,7 @@ def test_g10_simultaneous_hydration_and_staging_hold_distinct_arrays():
     so records must be charged as their own partition beside staging."""
     import numpy as np
     from xrd_tools.core import Axis, FrameRecord, FrameView, TwoDKind
-    from xrd_tools.session import FrameRecordStore
+    from xrd_tools.session import FrameHydrationResult, FrameRecordStore
 
     def _heavy(label):
         return FrameRecord.from_view(
@@ -186,7 +186,12 @@ def test_g10_simultaneous_hydration_and_staging_hold_distinct_arrays():
 
     store = FrameRecordStore(max_items=8, max_heavy_items=1,
                              require_persisted_for_eviction=False)
-    store.set_hydrator(_heavy)
+    store.set_hydrator(
+        lambda request: FrameHydrationResult(
+            request, _heavy(request.label),
+        ),
+        revision_qualified=True,
+    )
     staged = _heavy(0)
     store.upsert(staged)
     store.upsert(_heavy(1))          # heavy pressure thins label 0

@@ -102,23 +102,46 @@ class RecordWrite:
     thumbnail_mask: Any | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     write_frame_record: bool = True
+    replace_existing: bool = False
 
     def __post_init__(self) -> None:
+        allowed_snapshot = {
+            "adapter_id", "size", "mtime_ns", "frame_count",
+            "dataset_path", "self_contained",
+        }
         snapshot = {}
         for key, value in dict(self.source_snapshot or {}).items():
             key = str(key)
+            if key not in allowed_snapshot:
+                raise ValueError(f"unknown source snapshot field {key!r}")
             if key in {"size", "mtime_ns", "frame_count"}:
+                if isinstance(value, bool):
+                    raise ValueError(f"source snapshot {key} must be an integer")
                 value = int(value)
+                if value < 0:
+                    raise ValueError(f"source snapshot {key} must be non-negative")
             elif key == "self_contained":
+                if not isinstance(value, (bool, np.bool_)):
+                    raise ValueError("source snapshot self_contained must be boolean")
                 value = bool(value)
-            elif value is not None:
+            elif value is None:
+                raise ValueError(f"source snapshot {key} may not be null")
+            else:
                 value = str(value)
+                if not value:
+                    raise ValueError(f"source snapshot {key} may not be empty")
             snapshot[key] = value
+        if snapshot and self.source_path is None:
+            raise ValueError("source snapshot requires source_path")
         object.__setattr__(self, "source_snapshot", MappingProxyType(snapshot))
         object.__setattr__(self, "thumbnail_mask_baked", bool(self.thumbnail_mask_baked))
         object.__setattr__(self, "mask_baked", bool(self.mask_baked))
+        object.__setattr__(self, "replace_existing", bool(self.replace_existing))
         if self.thumbnail_mask is not None:
-            mask = np.array(self.thumbnail_mask, dtype=bool, copy=True)
+            incoming_mask = np.asarray(self.thumbnail_mask)
+            if incoming_mask.dtype != np.dtype(bool):
+                raise ValueError("record thumbnail_mask dtype must be bool")
+            mask = np.array(incoming_mask, copy=True)
             if mask.ndim != 2:
                 raise ValueError("record thumbnail_mask must be exactly 2-D")
             mask.setflags(write=False)
@@ -222,6 +245,14 @@ class _DurableAbsenceProof:
 
     group_name: str
     label: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DurableFrameProof:
+    """Compact digest of a complete frame provenance row."""
+
+    label: int
+    digest: str
 
 
 class _EvidenceBuilder:
@@ -408,12 +439,14 @@ class NexusRecordWriter:
         self._checkpoint_rows = 0
         self._checkpoint_read_bytes = 0
         self._stream_close_attempt = None
+        self._close_verification_descriptor = None
         self._durable_mode_proofs: dict[
             tuple[str, int], _DurableModeProof
         ] = {}
         self._durable_absence_proofs: dict[
             tuple[str, int], _DurableAbsenceProof
         ] = {}
+        self._durable_frame_proofs: dict[int, _DurableFrameProof] = {}
 
     @property
     def active_path(self) -> Path | None:
@@ -561,9 +594,7 @@ class NexusRecordWriter:
         self._dirty_absent_modes.discard((group_name, label))
         self._durable_absence_proofs.pop((group_name, label), None)
 
-    def _remember_frame_row(self, record: RecordWrite) -> None:
-        if not self.complete_record:
-            return
+    def _expected_frame_row(self, record: RecordWrite) -> _ExpectedFrameRow:
         thumbnail = None
         lut = None
         if record.thumbnail is not None:
@@ -585,7 +616,7 @@ class NexusRecordWriter:
             )
             if not thumbnail_mask.any() and record.thumbnail_mask is None:
                 thumbnail_mask = None
-        self._dirty_frames[int(record.label)] = _ExpectedFrameRow(
+        return _ExpectedFrameRow(
             int(record.label),
             thumbnail,
             lut,
@@ -597,6 +628,11 @@ class NexusRecordWriter:
             tuple(sorted(record.source_snapshot.items())),
             timestamp,
         )
+
+    def _remember_frame_row(self, record: RecordWrite) -> None:
+        if not self.complete_record:
+            return
+        self._dirty_frames[int(record.label)] = self._expected_frame_row(record)
 
     def _remember_written_rows(self, records: tuple[RecordWrite, ...]) -> None:
         for record in records:
@@ -820,6 +856,17 @@ class NexusRecordWriter:
                 "dataset_path": "dataset_path",
                 "self_contained": "self_contained",
             }
+            expected_attr_names = {
+                attr_names[key]
+                for key, value in expected.source_snapshot
+                if value is not None
+            }
+            observed_attr_names = set(source.attrs) - {"NX_class"}
+            evidence.text(
+                f"{role}/source@fields",
+                json.dumps(sorted(expected_attr_names)),
+                json.dumps(sorted(observed_attr_names)),
+            )
             for key, value in expected.source_snapshot:
                 attr_name = attr_names.get(key)
                 if attr_name is None or value is None:
@@ -851,6 +898,62 @@ class NexusRecordWriter:
                 expected.timestamp,
                 self._text_value(frame["timestamp"][()]),
             )
+
+    def _frame_row_digest(self, label: int) -> tuple[str, int]:
+        """Digest the complete persisted provenance row without retaining data."""
+        frame = self._entry_group().get(f"frames/frame_{int(label):04d}")
+        if not isinstance(frame, h5py.Group):
+            raise WriterStateError(f"durable frame proof lost label {label}")
+        digest = hashlib.sha256(b"xrd-tools-frame-row-v1\0")
+        read_bytes = 0
+
+        def update(role: str, payload: bytes) -> None:
+            digest.update(len(role).to_bytes(8, "big"))
+            digest.update(role.encode("utf-8"))
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+
+        def scalar(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="strict")
+            if isinstance(value, np.generic):
+                return value.item()
+            return value
+
+        def walk(group: h5py.Group, prefix: str) -> None:
+            nonlocal read_bytes
+            for name in sorted(group.attrs):
+                value = scalar(group.attrs[name])
+                update(f"{prefix}@{name}", repr(value).encode("utf-8"))
+            for name in sorted(group):
+                child = group[name]
+                role = f"{prefix}/{name}"
+                if isinstance(child, h5py.Group):
+                    update(role, b"group")
+                    walk(child, role)
+                    continue
+                if not isinstance(child, h5py.Dataset):
+                    raise WriterStateError(f"unsupported frame proof node {role}")
+                observed = np.asarray(child[()])
+                facts = json.dumps(
+                    [observed.dtype.str, list(observed.shape)],
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if observed.dtype.kind in {"O", "S", "U"}:
+                    values = [self._text_value(item) for item in observed.ravel()]
+                    payload = json.dumps(values, separators=(",", ":")).encode("utf-8")
+                else:
+                    payload = observed.tobytes(order="C")
+                update(role, facts + payload)
+                read_bytes += len(payload)
+                for attr_name in sorted(child.attrs):
+                    value = scalar(child.attrs[attr_name])
+                    update(
+                        f"{role}@{attr_name}", repr(value).encode("utf-8"),
+                    )
+
+        walk(frame, frame.name)
+        return digest.hexdigest(), read_bytes
 
     def _verify_indexed_row(
         self,
@@ -943,10 +1046,12 @@ class NexusRecordWriter:
         int,
         int,
         dict[tuple[str, int], _DurableModeProof],
+        dict[int, _DurableFrameProof],
     ]:
         aggregate = _EvidenceBuilder()
         read_bytes = 0
         mode_proofs: dict[tuple[str, int], _DurableModeProof] = {}
+        frame_proofs: dict[int, _DurableFrameProof] = {}
 
         def absorb(role: str, evidence: _EvidenceBuilder) -> None:
             nonlocal read_bytes
@@ -967,6 +1072,9 @@ class NexusRecordWriter:
             evidence = _EvidenceBuilder()
             self._verify_frame_row(evidence, self._dirty_frames[label])
             absorb(f"frame:{label}", evidence)
+            frame_digest, frame_bytes = self._frame_row_digest(label)
+            frame_proofs[label] = _DurableFrameProof(label, frame_digest)
+            read_bytes += frame_bytes
         for key in sorted(self._dirty_indexed):
             evidence = _EvidenceBuilder()
             self._verify_indexed_row(evidence, self._dirty_indexed[key])
@@ -981,7 +1089,7 @@ class NexusRecordWriter:
             + len(self._dirty_frames)
             + len(self._dirty_indexed)
         )
-        return aggregate.hexdigest(), read_bytes, rows, mode_proofs
+        return aggregate.hexdigest(), read_bytes, rows, mode_proofs, frame_proofs
 
     def _reverify_durable_mode_proof(
         self,
@@ -1060,18 +1168,45 @@ class NexusRecordWriter:
             int(observed.st_ctime_ns),
         )
 
-    def _seal_verified_stream_close(self, binding) -> None:
-        if not self._durable_mode_proofs and not self._durable_absence_proofs:
+    def _seal_verified_stream_close(
+        self, binding, verification_path=None, verification_descriptor=None,
+        *, seal_transaction: bool = True,
+    ) -> None:
+        if (not self._durable_mode_proofs
+                and not self._durable_absence_proofs
+                and not self._durable_frame_proofs):
             raise WriterStateError(
                 "durable close has no retained mode-row or absence proof"
             )
         previous = self._h5
+        if verification_descriptor is None:
+            verification_descriptor = self._close_verification_descriptor
         aggregate = _EvidenceBuilder()
         read_bytes = 0
+        verification_stream = None
         try:
-            with h5py.File(self.target, "r") as handle:
+            if verification_descriptor is not None:
+                # Reopen the exact duplicated live inode/handle, not a pathname
+                # that an atomic transaction may already have replaced.  A
+                # file-object VFD is portable across POSIX and Windows; the
+                # duplicated descriptor itself remains the stat/seal authority.
+                verification_stream = os.fdopen(
+                    verification_descriptor, "rb", closefd=False,
+                )
+                verification_source = verification_stream
+            else:
+                verification_source = (
+                    Path(verification_path)
+                    if verification_path is not None
+                    else (self._active_path or self.target)
+                )
+            with h5py.File(verification_source, "r") as handle:
                 self._h5 = handle
-                descriptor = self._vfd_descriptor()
+                descriptor = (
+                    verification_descriptor
+                    if verification_descriptor is not None
+                    else self._vfd_descriptor()
+                )
                 before = self._descriptor_stat_tuple(descriptor)
                 for key in sorted(self._durable_mode_proofs):
                     proof = self._durable_mode_proofs[key]
@@ -1096,29 +1231,45 @@ class NexusRecordWriter:
                         digest,
                     )
                     read_bytes += evidence.read_bytes
+                for label in sorted(self._durable_frame_proofs):
+                    proof = self._durable_frame_proofs[label]
+                    observed, observed_bytes = self._frame_row_digest(label)
+                    if observed != proof.digest:
+                        raise WriterStateError(
+                            f"durable frame proof changed for label {label}"
+                        )
+                    aggregate.text(f"frame:{label}", proof.digest, observed)
+                    read_bytes += observed_bytes
                 after = self._descriptor_stat_tuple(descriptor)
                 if after != before:
                     raise WriterStateError(
                         "durable rows changed during post-close verification"
                     )
-                binding.transaction.seal_stream_close(
+                if seal_transaction:
+                    binding.transaction.seal_stream_close(
+                        binding.attempt,
+                        self._stream_close_attempt,
+                        lease=binding.lease,
+                        descriptor=descriptor,
+                        expected_stat=after,
+                        evidence_digest=aggregate.hexdigest(),
+                        evidence_bytes=read_bytes,
+                    )
+        except BaseException:
+            if seal_transaction:
+                binding.transaction.hold_stream_close(
                     binding.attempt,
                     self._stream_close_attempt,
                     lease=binding.lease,
-                    descriptor=descriptor,
-                    expected_stat=after,
-                    evidence_digest=aggregate.hexdigest(),
-                    evidence_bytes=read_bytes,
                 )
-        except BaseException:
-            binding.transaction.hold_stream_close(
-                binding.attempt,
-                self._stream_close_attempt,
-                lease=binding.lease,
-            )
             raise
         finally:
             self._h5 = previous
+            if verification_stream is not None:
+                verification_stream.close()
+            if verification_descriptor is not None:
+                os.close(verification_descriptor)
+                self._close_verification_descriptor = None
 
     def _clear_dirty_evidence(self) -> None:
         self._dirty_modes.clear()
@@ -1394,44 +1545,14 @@ class NexusRecordWriter:
             if record.source_path is not None:
                 relative_source_path(record.source_path, self.source_base)
             frame = entry.get(f"frames/frame_{int(record.label):04d}")
-            if isinstance(frame, h5py.Group) and record.source_snapshot:
-                source = frame.get("source")
-                if not isinstance(source, h5py.Group):
-                    raise WriterStateError(
-                        "existing frame has no source provenance to compare"
-                    )
-                attr_names = {
-                    "adapter_id": "adapter_id",
-                    "size": "file_size",
-                    "mtime_ns": "file_mtime_ns",
-                    "frame_count": "frame_count",
-                    "dataset_path": "dataset_path",
-                    "self_contained": "self_contained",
-                }
-                for key, expected in record.source_snapshot.items():
-                    if key not in attr_names or expected is None:
-                        continue
-                    attr_name = attr_names[key]
-                    if attr_name not in source.attrs:
-                        raise WriterStateError(
-                            f"existing source provenance lacks {attr_name!r}"
-                        )
-                    observed = source.attrs[attr_name]
-                    if isinstance(observed, bytes):
-                        observed = observed.decode("utf-8", errors="strict")
-                    elif isinstance(observed, np.generic):
-                        observed = observed.item()
-                    if key in {"size", "mtime_ns", "frame_count"}:
-                        observed = int(observed)
-                    elif key == "self_contained":
-                        observed = bool(observed)
-                    else:
-                        observed = str(observed)
-                    if observed != expected:
-                        raise WriterStateError(
-                            "existing source provenance conflicts for "
-                            f"{key!r}: {observed!r} != {expected!r}"
-                        )
+            if (isinstance(frame, h5py.Group) and record.write_frame_record
+                    and not record.replace_existing):
+                # Existing-row replacement is an exact provenance identity
+                # assertion, including child presence/absence, source selector,
+                # snapshot fields, thumbnail mask flags, shape, dtype and bytes.
+                self._verify_frame_row(
+                    _EvidenceBuilder(), self._expected_frame_row(record),
+                )
             if existing_columns is not None:
                 unexpected = set(map(str, record.metadata)) - existing_columns
                 if unexpected:
@@ -1683,7 +1804,8 @@ class NexusRecordWriter:
     def _seal_checkpoint_and_receipts(self, *, publish_receipts: bool = True) -> None:
         batch = self._current_receipts() if publish_receipts else ()
         dropped = self._current_publication_drops() if publish_receipts else ()
-        digest, read_bytes, rows, mode_proofs = self._verify_dirty_evidence()
+        (digest, read_bytes, rows, mode_proofs,
+         frame_proofs) = self._verify_dirty_evidence()
         binding = self._transaction_binding
         # A dynamic same-run lineage facade cannot publish additive H10
         # durability until H23 has committed that rollback-capable epoch.  It
@@ -1704,6 +1826,7 @@ class NexusRecordWriter:
             )
             if batch:
                 self._durable_mode_proofs.update(mode_proofs)
+            self._durable_frame_proofs.update(frame_proofs)
             if dropped:
                 for label, mode, _revision in dropped:
                     group_name = self._mode_cursor_name(mode.kind, mode.key)
@@ -1733,6 +1856,20 @@ class NexusRecordWriter:
     def _close_handle(self) -> None:
         allow_unverified = self._pending_owner == "abort"
         binding = self._transaction_binding
+        verification_path = (
+            Path(self._h5.filename)
+            if self._h5 is not None and binding is not None
+            and hasattr(self._h5, "filename")
+            else None
+        )
+        verification_descriptor = None
+        if (
+            self._h5 is not None
+            and binding is not None
+            and self._durable_frame_proofs
+        ):
+            verification_descriptor = os.dup(self._vfd_descriptor())
+            self._close_verification_descriptor = verification_descriptor
         if self._h5 is not None and binding is not None:
             if self._stream_close_attempt is None:
                 try:
@@ -1743,6 +1880,10 @@ class NexusRecordWriter:
                         )
                     )
                 except OutputTransactionError:
+                    if verification_descriptor is not None:
+                        os.close(verification_descriptor)
+                        verification_descriptor = None
+                        self._close_verification_descriptor = None
                     if not allow_unverified:
                         raise
                     # Release the HDF5 handle even when an earlier unsealed
@@ -1752,12 +1893,29 @@ class NexusRecordWriter:
                     self._h5 = None
                     return
         if self._h5 is not None:
-            self._h5.close()
+            try:
+                self._h5.close()
+            except BaseException:
+                if verification_descriptor is not None:
+                    os.close(verification_descriptor)
+                    verification_descriptor = None
+                    self._close_verification_descriptor = None
+                raise
             self._h5 = None
-        if binding is not None and self._stream_close_attempt is not None:
-            if allow_unverified:
-                self._seal_verified_stream_close(binding)
-            else:
+        if binding is not None:
+            retained_proofs = bool(
+                self._durable_mode_proofs or self._durable_absence_proofs
+                or self._durable_frame_proofs
+            )
+            if retained_proofs:
+                if self._stream_close_attempt is not None:
+                    self._seal_verified_stream_close(binding)
+                else:
+                    self._seal_verified_stream_close(
+                        binding, verification_path, verification_descriptor,
+                        seal_transaction=False,
+                    )
+            elif self._stream_close_attempt is not None:
                 binding.transaction.seal_stream_close(
                     binding.attempt,
                     self._stream_close_attempt,

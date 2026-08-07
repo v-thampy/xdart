@@ -330,10 +330,22 @@ def _image_probe(path: Path) -> Any:
     try:
         with fabio.open(str(path)) as f:
             n = int(getattr(f, "nframes", 1) or 0)
+            import numpy as np
+            pixels = np.asarray(f.data)
     except Exception as exc:
-        return ProbeResult(ProbeState.INVALID, reason=f"unreadable image file: {exc}")
+        return ProbeResult(
+            ProbeState.INVALID,
+            reason=f"unreadable image file: {exc}",
+            kind=SourceKind.IMAGE_FILE,
+        )
     if n <= 0:
         return ProbeResult(ProbeState.IMAGELESS, reason="zero frames")
+    if pixels.ndim != 2 or pixels.size == 0:
+        return ProbeResult(
+            ProbeState.IN_PROGRESS,
+            reason="image file has no complete 2-D pixel payload",
+            kind=SourceKind.IMAGE_FILE,
+        )
     return ProbeResult(
         ProbeState.READY, reason="image file readable", kind=SourceKind.IMAGE_FILE)
 

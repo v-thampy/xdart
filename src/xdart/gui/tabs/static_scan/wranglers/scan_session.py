@@ -141,10 +141,12 @@ class ScanSessionAdapter:
         the public session API."""
         self._session.flush(force=True)
 
-    def set_hydrator(self, hydrator) -> None:
+    def set_hydrator(self, hydrator, *, revision_qualified: bool = False) -> None:
         store = self.record_store
         if store is not None:
-            store.set_hydrator(hydrator)
+            store.set_hydrator(
+                hydrator, revision_qualified=revision_qualified,
+            )
 
     def resume(self) -> None:
         """Re-allow submit() after a pause (delegates to
