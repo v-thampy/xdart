@@ -1092,6 +1092,17 @@ class Light1DRetentionLease:
             reverse[id(root)] = owner_key
         return roots, tuple(supplied)
 
+    def _preflight_store_record(self, record=None, retiring=()) -> None:
+        with self._lock:
+            self._check_generation(self.grant_id, self.generation)
+            if record is not None:
+                self._validate_record(record)
+            for row, guard in retiring:
+                if [handle for key, handle in self._borrows.values()
+                    if key == row] != [guard]:
+                    raise Light1DUnavailable(
+                        "tracked light-1D shell borrow must close before eviction")
+
     @staticmethod
     def _same_array_values(left, right) -> bool:
         try:

@@ -834,6 +834,7 @@ class PublicationStore:
         lease = self._light_1d
         if lease is None:
             raise RuntimeError("light-1D pair has no bound lease")
+        lease._preflight_store_record(retiring=((label, pair.guard),))
         pair.guard.close()
         try:
             retired = lease.retire(
@@ -1036,6 +1037,7 @@ class PublicationStore:
             lease = self._light_1d
             label = publication.label
             base = _without_1d_arrays(publication)
+            lease._preflight_store_record(light_record)
             prior = self._light_1d_items.get(label)
             if prior is not None:
                 identity = (
@@ -1068,7 +1070,13 @@ class PublicationStore:
                     generation=lease.generation,
                 )
             except Light1DUnavailable:
-                self._install_base_locked(base)
+                try:
+                    self._install_base_locked(base)
+                except BaseException:
+                    self._items.pop(label, None)
+                    self._drop_heavy_label_locked(label)
+                    self._drop_thumb_label_locked(label)
+                    raise
                 return base
             guard = lease.borrow(label)
             if guard is None:
@@ -1083,7 +1091,14 @@ class PublicationStore:
                 shell, self._generation, publication.scan_key,
                 light_record.active_mode, templates, guard,
             )
-            self._install_base_locked(base)
+            try:
+                self._install_base_locked(base)
+            except BaseException:
+                self._retire_light_pair_locked(label)
+                self._items.pop(label, None)
+                self._drop_heavy_label_locked(label)
+                self._drop_thumb_label_locked(label)
+                raise
             return self._compose_locked(label, self._items.get(label))
 
     def light_1d_cleanup_hooks(
@@ -1129,7 +1144,8 @@ class PublicationStore:
                     self._light_1d_items
                     or exact_lease.keys()
                     or exact_lease.pending_hydration_count
-                    or any(_publication_has_1d_arrays(item)
+                    or any(item.raw_ref is not None
+                           or _publication_has_1d_arrays(item)
                            for item in self._items.values())
                 ):
                     raise RuntimeError("cleanup detach found retained light-1D state")
@@ -1444,6 +1460,8 @@ class PublicationStore:
             if self._light_1d is not None:
                 if self._light_1d.state is not Light1DLeaseState.ACTIVE:
                     raise RuntimeError("non-active bound PublicationStore cannot upsert")
+                if publication.raw_ref is not None:
+                    raise ValueError("bound PublicationStore refuses raw_ref")
                 if _publication_has_1d_arrays(publication):
                     raise ValueError(
                         "bound PublicationStore generic upsert refuses 1-D arrays"

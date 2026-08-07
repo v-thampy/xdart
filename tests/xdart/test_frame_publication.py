@@ -2609,8 +2609,12 @@ def test_gui_light_1d_pair_refuses_identity_authority_mismatches_atomically():
     store.publish_gui_light_1d(publication, light_record)
     prior_base = store._items[0]
     prior_pair = store._light_1d_items[0]
+    prior_guard = prior_pair.guard
     prior_keys = lease.keys()
     prior_generation = store.generation
+    prior_labels = store.labels()
+    prior_heavy = tuple(store._heavy_labels)
+    prior_thumbs = tuple(store._thumb_labels)
 
     candidates = []
     publication_1, light_1 = build(1)
@@ -2624,6 +2628,7 @@ def test_gui_light_1d_pair_refuses_identity_authority_mismatches_atomically():
             store.publish_gui_light_1d(candidate_publication, candidate_record)
         assert store._items[0] is prior_base
         assert store._light_1d_items[0] is prior_pair
+        assert prior_pair.guard is prior_guard and not prior_guard.closed
         assert lease.keys() == prior_keys
         assert store.generation == prior_generation
 
@@ -2637,6 +2642,69 @@ def test_gui_light_1d_pair_refuses_identity_authority_mismatches_atomically():
         assert store.generation == prior_generation
     finally:
         store.allocation = allocation
+
+    def deep_invalid(label):
+        candidate, light = build(label)
+        coordinate = np.arange(4.0)
+        raw_view = candidate.record.results_1d["raw"]
+        raw_view = replace(
+            raw_view,
+            axis_1d=replace(raw_view.axis_1d, values=coordinate),
+            intensity_1d=coordinate,
+        )
+        return (
+            replace(candidate, record=replace(
+                candidate.record,
+                results_1d={**candidate.record.results_1d, "raw": raw_view},
+            )),
+            replace(light, modes={
+                **light.modes,
+                "raw": replace(
+                    light.modes["raw"],
+                    coordinate=coordinate,
+                    intensity=coordinate,
+                ),
+            }),
+        )
+
+    with pytest.raises(ValueError):
+        store.publish_gui_light_1d(*deep_invalid(0))
+    assert store.labels() == prior_labels
+    assert store._items[0] is prior_base
+    assert store._light_1d_items[0] is prior_pair
+    assert prior_pair.guard is prior_guard and not prior_guard.closed
+    assert lease.keys() == prior_keys
+    assert store.generation == prior_generation
+    assert tuple(store._heavy_labels) == prior_heavy
+    assert tuple(store._thumb_labels) == prior_thumbs
+
+    full_store, full_lease, _a, _r, full_build = _bound_gui_light_graph(rows=1)
+    full_store.publish_gui_light_1d(*full_build(0))
+    victim_base = full_store._items[0]
+    victim_pair = full_store._light_1d_items[0]
+    victim_guard = victim_pair.guard
+    bad, bad_light = full_build(1)
+    shared = np.arange(4.0)
+    bad_raw = replace(
+        bad.record.results_1d["raw"],
+        axis_1d=replace(bad.record.results_1d["raw"].axis_1d, values=shared),
+        intensity_1d=shared,
+    )
+    bad = replace(bad, record=replace(
+        bad.record, results_1d={**bad.record.results_1d, "raw": bad_raw},
+    ))
+    bad_light = replace(bad_light, modes={
+        **bad_light.modes,
+        "raw": replace(bad_light.modes["raw"],
+                       coordinate=shared, intensity=shared),
+    })
+    with pytest.raises(ValueError):
+        full_store.publish_gui_light_1d(bad, bad_light)
+    assert full_store.labels() == (0,)
+    assert full_store._items[0] is victim_base
+    assert full_store._light_1d_items[0] is victim_pair
+    assert victim_pair.guard is victim_guard and not victim_guard.closed
+    assert full_lease.keys() == (0,)
 
 
 def test_gui_light_1d_pair_refuses_unsupported_layouts_atomically():
@@ -2679,6 +2747,13 @@ def test_bound_upsert_refuses_1d_and_allows_raw_2d_only():
     assert lease.keys() == ()
 
     array_free = _without_1d(publication)
+    hidden_raw = replace(array_free, raw_ref=DuckFrame(idx=0))
+    with pytest.raises(ValueError, match="raw_ref"):
+        store.upsert(hidden_raw)
+    assert store._items == {}
+    assert store._light_1d_items == {}
+    assert lease.keys() == ()
+
     stored = store.upsert(array_free)
     assert stored is store._items[0]
     assert not stored.view.has_1d
@@ -2779,6 +2854,7 @@ def test_bound_terminal_removals_close_exact_light_pairs(monkeypatch):
         Light1DCleanupToken,
         Light1DLeaseState,
         Light1DRetentionLease,
+        Light1DStaleGeneration,
         Light1DUnavailable,
     )
 
@@ -2828,6 +2904,49 @@ def test_bound_terminal_removals_close_exact_light_pairs(monkeypatch):
     assert lease.keys() == ()
     assert store._items == {} and store._light_1d_items == {}
     assert store.allocation is allocation and store._light_1d is lease
+
+    for state in ("fenced", "cleanup-pending"):
+        for operation in ("invalidate", "discard", "total-bound", "foreign"):
+            store, lease, _a, _r, build = published(labels=(0,))
+            if operation == "total-bound":
+                store._max_items = 0
+            if state == "fenced":
+                lease.fence()
+            else:
+                def fail_cancel():
+                    raise RuntimeError("injected cancel refusal")
+
+                hooks = store.light_1d_cleanup_hooks(
+                    lease, cancel=fail_cancel,
+                )
+                with pytest.raises(Light1DCleanupPending):
+                    lease.release(reason="pending-before-clear", hooks=hooks)
+            base = store._items[0]
+            pair = store._light_1d_items[0]
+            guard = pair.guard
+            before = (
+                store.labels(), lease.keys(), store.generation,
+                tuple(store._heavy_labels), tuple(store._thumb_labels),
+            )
+            actions = {
+                "invalidate": lambda: store.invalidate((0,)),
+                "discard": lambda: store.discard(0),
+                "total-bound": store._enforce_bounds_locked,
+                "foreign": lambda: store.upsert(_without_1d(
+                    build(0, publication_source="foreign-source")[0]
+                )),
+            }
+            with pytest.raises((
+                RuntimeError, Light1DStaleGeneration, Light1DUnavailable,
+            )):
+                actions[operation]()
+            assert store._items[0] is base
+            assert store._light_1d_items[0] is pair
+            assert pair.guard is guard and not guard.closed
+            assert (
+                store.labels(), lease.keys(), store.generation,
+                tuple(store._heavy_labels), tuple(store._thumb_labels),
+            ) == before
 
     store, lease, allocation, _r, _build = published(labels=(0,))
     hooks = store.light_1d_cleanup_hooks(lease)
@@ -2955,8 +3074,15 @@ def test_bound_terminal_removals_close_exact_light_pairs(monkeypatch):
     assert pending.value.receipt.failed_step == "detach"
     assert store._items[0] is hidden
     assert store.allocation is allocation and store._light_1d is lease
+    hidden_raw = replace(_without_1d(hidden), raw_ref=DuckFrame(idx=0))
+    store._items[0] = hidden_raw
+    with pytest.raises(Light1DCleanupPending) as raw_pending:
+        lease.retry_cleanup(pending.value.token, hooks=hooks)
+    assert raw_pending.value.receipt.failed_step == "detach"
+    assert store._items[0] is hidden_raw
+    assert store.allocation is allocation and store._light_1d is lease
     store._items[0] = _without_1d(hidden)
-    lease.retry_cleanup(pending.value.token, hooks=hooks)
+    lease.retry_cleanup(raw_pending.value.token, hooks=hooks)
     assert store._items == {}
     assert store.allocation is None and store._light_1d is None
 
@@ -2969,11 +3095,13 @@ def test_bound_terminal_removals_close_exact_light_pairs(monkeypatch):
     with pytest.raises(RuntimeError, match="inconsistent"):
         store.discard(0)
     assert store._items[0] is prior_base
-    assert 0 in store._light_1d_items and lease.keys() == (0,)
+    assert 0 in store._light_1d_items and lease.keys() == (0,) and not store._light_1d_items[0].guard.closed
     monkeypatch.setattr(Light1DRetentionLease, "retire", prior_retire)
 
 
 def test_gui_light_1d_escaped_alias_reconciles_without_regrant_then_retries():
+    from xrd_tools.session import Light1DUnavailable
+
     store, lease, _allocation, _authority, build = _bound_gui_light_graph(rows=1)
     store.publish_gui_light_1d(*build(0))
     shown = store.get(0)
@@ -2994,6 +3122,30 @@ def test_gui_light_1d_escaped_alias_reconciles_without_regrant_then_retries():
     assert retried.view.has_1d
     assert lease.keys() == (1,)
     assert tuple(store._light_1d_items) == (1,)
+
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph(rows=2)
+    store.publish_gui_light_1d(*build(0))
+    store.upsert(_without_1d(build(2)[0]))
+    client = lease.borrow(0)
+    before_pair = store._light_1d_items[0]
+    before = (
+        store.labels(), tuple(map(id, store._items.values())), before_pair,
+        before_pair.guard, lease.keys(), store.generation,
+        tuple(store._heavy_labels), tuple(store._thumb_labels),
+    )
+    with pytest.raises(Light1DUnavailable):
+        store.publish_gui_light_1d(*build(1))
+    assert tuple(store._light_1d_items) == (0,)
+    assert (
+        store.labels(), tuple(map(id, store._items.values())),
+        store._light_1d_items[0], store._light_1d_items[0].guard,
+        lease.keys(), store.generation,
+        tuple(store._heavy_labels), tuple(store._thumb_labels),
+    ) == before
+    assert not before_pair.guard.closed
+    assert 1 not in store._items and 1 not in store._light_1d_items
+    assert client is not None
+    client.close()
 
 
 def test_bound_reintegrate_refuses_before_any_mutation():
