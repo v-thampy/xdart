@@ -167,14 +167,14 @@ def _control_path_chooser(widget):
         SOURCE_DIRECTORY,
     )
 
-    def choose(path, current):
+    def choose(path, current, start_directory):
         if path in {PROJECT_ROOT, SOURCE_DIRECTORY}:
             selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose folder", current)
+                widget, "Choose folder", start_directory)
             return selected or None
         if path == SAVE_PATH:
             selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose processed-data folder", current)
+                widget, "Choose processed-data folder", start_directory)
             return selected or None
         title, file_filter = (
             ("Choose PONI calibration", "PONI files (*.poni);;All files (*)")
@@ -185,7 +185,7 @@ def _control_path_chooser(widget):
             )
         )
         selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            widget, title, current, file_filter)
+            widget, title, start_directory, file_filter)
         return selected or None
 
     return choose
@@ -215,7 +215,7 @@ def _source_selection_chooser(widget):
                 options.get("metadata_format", "auto"))
         return "auto"
 
-    def choose(current, desired_mode=None):
+    def choose(current, desired_mode, start_directory):
         mode = desired_mode or (
             "Image Directory"
             if type(current) is DirectorySourceSpec
@@ -236,7 +236,7 @@ def _source_selection_chooser(widget):
                 )
             )
             selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose image directory", str(prior.root))
+                widget, "Choose image directory", start_directory)
             if not selected:
                 return None
             return DirectorySourceSpec(
@@ -247,10 +247,6 @@ def _source_selection_chooser(widget):
                 generation=prior.generation + 1,
                 metadata_format=prior.metadata_format,
             )
-        current_file = ""
-        if type(current) is SourceSpec:
-            current_file = str(
-                current.options.get("selected_file") or current.uri)
         selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
             widget,
             (
@@ -258,7 +254,7 @@ def _source_selection_chooser(widget):
                 if mode == "Single Image"
                 else "Choose an image-series member"
             ),
-            current_file,
+            start_directory,
             (
                 "Detector image files (*.tif *.tiff *.cbf *.edf *.img "
                 "*.mar3450 *.raw)"

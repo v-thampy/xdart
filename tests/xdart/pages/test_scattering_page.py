@@ -321,6 +321,201 @@ class SimpleNamespaceStatus:
         self.messages.append(text)
 
 
+class _ExactProvider:
+    def __init__(self, value):
+        self.value = value
+
+    def store_for(self, _key):
+        return self.value
+
+    def executor_for(self, _key):
+        return self.value
+
+    def source_port_for(self, _key):
+        return self.value
+
+
+def _build_mounted_workspace(store, status):
+    from xdart.gui.pages.scattering_workspace import (
+        SCATTERING_PAGE_KEY,
+        build_scattering_workspace,
+    )
+    from xdart.gui.pages.services import (
+        DiagnosticIdentity,
+        ExecutionProfile,
+        HostServices,
+    )
+
+    services = HostServices(
+        status=status,
+        run_intents=_ExactProvider(store),
+        execution=_ExactProvider(None),
+        sources=_ExactProvider(None),
+        execution_profile=ExecutionProfile.TEST,
+        diagnostics=DiagnosticIdentity("tests.scattering.mounted-chooser"),
+    ).for_page(SCATTERING_PAGE_KEY)
+    return build_scattering_workspace(services, None)
+
+
+def test_mounted_control_path_chooser_uses_page_start_and_commits(
+        qapp, isolated_settings, tmp_path, monkeypatch):
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_projection import PONI_FILE
+    from xdart.utils.browse import remember_browse_path
+
+    current_directory = tmp_path / "current-control"
+    dialog_start = tmp_path / "last-browse"
+    selected_directory = tmp_path / "selected-control"
+    for directory in (current_directory, dialog_start, selected_directory):
+        directory.mkdir()
+    current = current_directory / "current.poni"
+    selected = selected_directory / "selected.poni"
+    current.touch()
+    selected.touch()
+    remember_browse_path(dialog_start)
+
+    starts = []
+
+    def choose_file(_parent, _title, start_directory, _file_filter):
+        starts.append(start_directory)
+        return str(selected), "PONI files (*.poni)"
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog, "getOpenFileName", choose_file)
+    store = RunIntentStore(RunIntent(
+        project_root=str(current_directory),
+        poni_file=str(current),
+        output_mode="Overwrite",
+    ))
+    status = SimpleNamespaceStatus()
+    handle = _build_mounted_workspace(store, status)
+    try:
+        handle.widget._choose_control_path(PONI_FILE)
+
+        assert starts == [str(dialog_start)]
+        assert store.snapshot().thaw().poni_file == str(selected)
+        assert not any("Browse failed" in message for message in status.messages)
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_mounted_source_chooser_uses_page_start_and_preserves_policy(
+        qapp, isolated_settings, tmp_path, monkeypatch):
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xrd_tools.sources.selection import DirectorySourceSpec
+    from xdart.utils.browse import remember_browse_path
+
+    prior_root = tmp_path / "prior-source"
+    dialog_start = tmp_path / "last-browse"
+    selected_root = tmp_path / "selected-source"
+    for directory in (prior_root, dialog_start, selected_root):
+        directory.mkdir()
+    remember_browse_path(dialog_start)
+    prior = DirectorySourceSpec(
+        prior_root,
+        recursive=True,
+        suffixes=(".h5", ".nxs"),
+        name_filter="scan*",
+        generation=7,
+        metadata_format=None,
+    )
+    starts = []
+
+    def choose_directory(_parent, _title, start_directory):
+        starts.append(start_directory)
+        return str(selected_root)
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog, "getExistingDirectory", choose_directory)
+    store = RunIntentStore(RunIntent(
+        source_spec=prior,
+        project_root=str(tmp_path),
+        output_mode="Overwrite",
+    ))
+    status = SimpleNamespaceStatus()
+    handle = _build_mounted_workspace(store, status)
+    try:
+        handle.widget._choose_source_selection("Image Directory")
+
+        selected = store.snapshot().thaw().source_spec
+        assert starts == [str(dialog_start)]
+        assert type(selected) is DirectorySourceSpec
+        assert selected.root == selected_root
+        assert selected.recursive is prior.recursive
+        assert selected.suffixes == prior.suffixes
+        assert selected.name_filter == prior.name_filter
+        assert selected.metadata_format == prior.metadata_format
+        assert selected.generation == prior.generation + 1
+        assert not any(
+            "Choose source failed" in message for message in status.messages
+        )
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_mounted_chooser_cancel_does_not_mutate_or_emit_error(
+        qapp, isolated_settings, tmp_path, monkeypatch):
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xrd_tools.sources.selection import DirectorySourceSpec
+    from xdart.gui.tabs.scattering.controls_projection import PONI_FILE
+
+    source_root = tmp_path / "source"
+    project_root = tmp_path / "project"
+    source_root.mkdir()
+    project_root.mkdir()
+    poni = project_root / "current.poni"
+    poni.touch()
+    prior = DirectorySourceSpec(
+        source_root,
+        recursive=True,
+        suffixes=(".nxs",),
+        name_filter="sample*",
+        generation=4,
+        metadata_format="auto",
+    )
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileName",
+        lambda *_args: ("", ""),
+    )
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getExistingDirectory",
+        lambda *_args: "",
+    )
+    store = RunIntentStore(RunIntent(
+        source_spec=prior,
+        project_root=str(project_root),
+        poni_file=str(poni),
+        output_mode="Overwrite",
+    ))
+    before = store.snapshot()
+    revision = store.revision
+    status = SimpleNamespaceStatus()
+    handle = _build_mounted_workspace(store, status)
+    try:
+        handle.widget._choose_control_path(PONI_FILE)
+        handle.widget._choose_source_selection("Image Directory")
+
+        assert store.snapshot() == before
+        assert store.revision == revision
+        assert not any(
+            "Browse failed" in message or "Choose source failed" in message
+            for message in status.messages
+        )
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
 def test_default_fallback_seeds_an_admittable_overwrite_intent(
         qapp, isolated_settings):
     from xdart.gui.pages.services import empty_host_services
