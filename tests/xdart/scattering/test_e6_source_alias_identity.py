@@ -1072,7 +1072,7 @@ def test_stable_semantic_and_schema_failures_are_terminal_not_pending(
                 "/entry/data/missing",
                 paths=[],
                 seen=set(),
-                cancelled=None,
+                cancelled=lambda: False,
                 required=True,
                 states={},
             )

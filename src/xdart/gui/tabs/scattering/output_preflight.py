@@ -1,6 +1,6 @@
 from __future__ import annotations
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -51,6 +51,48 @@ class ValidatedSourceAliases:
 
     identity: object
     targets: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedSourceTopology:
+    """Private pre-stamp owner of one lexical source binding."""
+
+    raw_path: str
+    resolved_path: str
+    followed_state: SourceFileState
+    candidate_owner_id: str | None = None
+
+    def __post_init__(self) -> None:
+        captured = (
+            self.followed_state._resolved_path_at_capture
+            if type(self.followed_state) is SourceFileState
+            else None
+        )
+        if (
+            type(self.raw_path) is not str
+            or not os.path.isabs(self.raw_path)
+            or type(self.resolved_path) is not str
+            or not os.path.isabs(self.resolved_path)
+            or type(self.followed_state) is not SourceFileState
+            or _raw_source_key(self.raw_path)
+            != _raw_source_key(self.followed_state.path)
+            or type(captured) is not str
+            or _resolved_source_key(self.resolved_path)
+            != _resolved_source_key(captured)
+            or (
+                self.candidate_owner_id is not None
+                and (
+                    type(self.candidate_owner_id) is not str
+                    or not self.candidate_owner_id
+                )
+            )
+        ):
+            raise TypeError("captured source topology is invalid")
+
+    def matches_disk(self) -> bool:
+        """Retain the legacy internal-map diagnostic without rebaselining."""
+
+        return self.followed_state.matches_disk()
 
 
 def _raw_source_path(path: str | Path) -> str:
@@ -208,6 +250,11 @@ class DeferredDirectoryEntry:
     physical_paths: tuple[Path, ...]
     protected_states: tuple[SourceFileState, ...]
     skip_reason: str = ""
+    _protected_topology: tuple[_CapturedSourceTopology, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not (
@@ -231,6 +278,18 @@ class DeferredDirectoryEntry:
             and len({value.path for value in self.protected_states})
             == len(self.protected_states)
             and type(self.skip_reason) is str
+            and type(self._protected_topology) is tuple
+            and all(
+                type(value) is _CapturedSourceTopology
+                for value in self._protected_topology
+            )
+            and (
+                not self._protected_topology
+                or tuple(
+                    value.followed_state
+                    for value in self._protected_topology
+                ) == self.protected_states
+            )
         ):
             raise TypeError("deferred directory entry is invalid")
 
@@ -649,22 +708,24 @@ def _capture_exact_candidate_state(
 
 def _classify_inventory_failure(
     candidate: Candidate,
-    states: dict[str, SourceFileState],
+    states: dict[str, _CapturedSourceTopology],
     error: BaseException,
+    *,
+    cancelled: Callable[[], bool],
 ) -> None:
     """Upgrade a failed HDF5 inspection only when exact drift is proven."""
 
     try:
         accepted = states.get(_source_state_key(candidate.path))
-        if accepted is None:
-            if not _candidate_still_exact(candidate):
-                raise SourceRevisionChanged(
-                    "source candidate changed during admission: "
-                    f"{candidate.path}"
-                )
-        else:
-            _validate_exact_candidate_state(candidate, accepted)
-        _verify_source_states(states)
+        if (
+            accepted is None
+            or accepted.candidate_owner_id != candidate.adapter_id
+        ):
+            raise SourceRevisionChanged(
+                "source candidate lost its captured topology during admission: "
+                f"{candidate.path}"
+            )
+        _verify_source_states(states, cancelled=cancelled)
     except SourceRevisionChanged as drift:
         raise drift from error
 
@@ -696,35 +757,169 @@ def _same_source_revision(
     )
 
 
+def _same_followed_source_revision(
+    left: SourceFileState,
+    right: SourceFileState,
+) -> bool:
+    return (
+        left.size,
+        left.mtime_ns,
+        left.ctime_ns,
+        left.device,
+        left.inode,
+    ) == (
+        right.size,
+        right.mtime_ns,
+        right.ctime_ns,
+        right.device,
+        right.inode,
+    )
+
+
+def _topology_from_captured_state(
+    state: SourceFileState,
+    *,
+    candidate_owner_id: str | None = None,
+) -> _CapturedSourceTopology:
+    """Lift an actual capture without consulting the filesystem again."""
+
+    captured = state._resolved_path_at_capture
+    if type(captured) is not str:
+        raise SourceRevisionChanged(
+            "source state has no captured resolved topology: "
+            f"{state.path}"
+        )
+    return _CapturedSourceTopology(
+        _raw_source_path(state.path),
+        _raw_source_path(captured),
+        state,
+        candidate_owner_id,
+    )
+
+
+def _capture_source_topology(
+    path: Path,
+    *,
+    cancelled: Callable[[], bool],
+    candidate_owner_id: str | None = None,
+) -> _CapturedSourceTopology:
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    selected = Path(_raw_source_path(path))
+    return _topology_from_captured_state(
+        SourceFileState.capture(selected),
+        candidate_owner_id=candidate_owner_id,
+    )
+
+
 def _remember_source_state(
     path: Path,
-    states: dict[str, SourceFileState],
-) -> SourceFileState:
-    current = SourceFileState.capture(path)
-    key = _source_state_key(current.path)
+    states: dict[str, _CapturedSourceTopology],
+    *,
+    cancelled: Callable[[], bool],
+    candidate_owner_id: str | None = None,
+) -> _CapturedSourceTopology:
+    current = _capture_source_topology(
+        path,
+        cancelled=cancelled,
+        candidate_owner_id=candidate_owner_id,
+    )
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    key = _source_state_key(current.raw_path)
     accepted = states.get(key)
-    if accepted is not None and not _same_source_revision(accepted, current):
-        raise SourceRevisionChanged(
-            f"HDF5 dependency changed during admission: {current.path}"
-        )
-    states.setdefault(key, current)
+    if accepted is not None:
+        if (
+            _resolved_source_key(accepted.resolved_path)
+            != _resolved_source_key(current.resolved_path)
+            or not _same_followed_source_revision(
+                accepted.followed_state,
+                current.followed_state,
+            )
+            or (
+                candidate_owner_id is not None
+                and accepted.candidate_owner_id not in {
+                    None,
+                    candidate_owner_id,
+                }
+            )
+        ):
+            raise SourceRevisionChanged(
+                "HDF5 dependency changed during admission: "
+                f"{current.raw_path}"
+            )
+        if (
+            accepted.candidate_owner_id is None
+            and candidate_owner_id is not None
+        ):
+            accepted = replace(
+                accepted,
+                candidate_owner_id=candidate_owner_id,
+            )
+            states[key] = accepted
+        return accepted
+    states[key] = current
     return current
 
 
 def _verify_source_states(
-    states: dict[str, SourceFileState],
+    states: dict[str, _CapturedSourceTopology],
+    *,
+    cancelled: Callable[[], bool],
 ) -> None:
-    for state in states.values():
-        if not state.matches_disk():
-            raise SourceRevisionChanged(
-                f"HDF5 dependency changed during admission: {state.path}"
-            )
+    """Prove every captured raw binding twice without rebasing its topology."""
+
+    for sweep in range(2):
+        for topology in states.values():
+            if cancelled():
+                raise RuntimeError("admission cancelled")
+            try:
+                resolved = _resolve_source_alias(topology.raw_path)
+            except (OSError, RuntimeError) as error:
+                raise SourceRevisionChanged(
+                    f"source alias is unavailable: {topology.raw_path}"
+                ) from error
+            if _resolved_source_key(resolved) != _resolved_source_key(
+                topology.resolved_path
+            ):
+                raise SourceRevisionChanged(
+                    "source alias retargeted during admission: "
+                    f"{topology.raw_path}"
+                )
+            try:
+                current = _capture_canonical_source_target(resolved)
+            except OSError as error:
+                raise SourceRevisionChanged(
+                    "source target is unavailable: "
+                    f"{topology.resolved_path}"
+                ) from error
+            if not _same_followed_source_revision(
+                topology.followed_state,
+                current,
+            ):
+                raise SourceRevisionChanged(
+                    "HDF5 dependency changed during admission: "
+                    f"{topology.raw_path}"
+                )
+            if sweep == 0 and topology.candidate_owner_id is not None:
+                if (
+                    _candidate_owner_id(topology.raw_path)
+                    != topology.candidate_owner_id
+                ):
+                    raise SourceRevisionChanged(
+                        "source candidate owner changed during admission: "
+                        f"{topology.raw_path}"
+                    )
+    if cancelled():
+        raise RuntimeError("admission cancelled")
 
 
 @contextmanager
 def _open_stable_hdf5_dependency(
     path: Path,
-    states: dict[str, SourceFileState],
+    states: dict[str, _CapturedSourceTopology],
+    *,
+    cancelled: Callable[[], bool],
 ):
     """Open one HDF5 file only while its strong source state stays exact."""
 
@@ -732,34 +927,131 @@ def _open_stable_hdf5_dependency(
 
     selected = Path(_raw_source_path(path))
     try:
-        before = _remember_source_state(selected, states)
+        before = _remember_source_state(
+            selected,
+            states,
+            cancelled=cancelled,
+        )
     except FileNotFoundError:
+        if cancelled():
+            raise RuntimeError("admission cancelled")
         yield None
         return
     try:
         handle = h5py.File(selected, "r")
     except OSError as error:
+        if cancelled():
+            raise RuntimeError("admission cancelled") from error
         try:
-            _verify_source_states(states)
+            _verify_source_states(states, cancelled=cancelled)
         except SourceRevisionChanged as drift:
             raise drift from error
+        if cancelled():
+            raise RuntimeError("admission cancelled") from error
         raise ValueError(
             f"HDF5 dependency could not be inspected: {selected}: {error}"
         ) from error
+    body_failure: BaseException | None = None
+    body_traceback = None
     try:
-        with handle:
-            yield handle
-    finally:
-        try:
-            after = SourceFileState.capture(selected)
-        except OSError as error:
-            raise SourceRevisionChanged(
-                f"HDF5 dependency changed during admission: {selected}"
-            ) from error
-        if not _same_source_revision(after, before):
-            raise SourceRevisionChanged(
-                f"HDF5 dependency changed during admission: {selected}"
+        yield handle
+    except BaseException as error:
+        body_failure = error
+        body_traceback = error.__traceback__
+
+    close_failure: BaseException | None = None
+    close_traceback = None
+    try:
+        handle.close()
+    except BaseException as error:
+        close_failure = error
+        close_traceback = error.__traceback__
+
+    if body_failure is not None and close_failure is not None:
+        if (
+            body_failure.__cause__ is None
+            and close_failure.__context__ is body_failure
+        ):
+            close_failure.__context__ = None
+        pending = [close_failure]
+        seen: set[int] = set()
+        close_reaches_body = False
+        while pending:
+            linked = pending.pop()
+            if linked is body_failure:
+                close_reaches_body = True
+                break
+            marker = id(linked)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if linked.__cause__ is not None:
+                pending.append(linked.__cause__)
+            if linked.__context__ is not None:
+                pending.append(linked.__context__)
+        if body_failure.__cause__ is None and not close_reaches_body:
+            body_failure.__cause__ = close_failure
+            body_failure.__suppress_context__ = True
+        else:
+            note = (
+                "secondary HDF5 close failure: "
+                f"{type(close_failure).__name__}: {close_failure}"
             )
+            if note not in getattr(body_failure, "__notes__", ()):
+                body_failure.add_note(note)
+
+    if body_failure is not None and not isinstance(body_failure, Exception):
+        raise body_failure.with_traceback(body_traceback)
+    if (
+        isinstance(body_failure, SourceRevisionChanged)
+    ):
+        raise body_failure.with_traceback(body_traceback)
+    if (
+        isinstance(body_failure, RuntimeError)
+        and body_failure.args == ("admission cancelled",)
+    ):
+        raise body_failure.with_traceback(body_traceback)
+    primary_failure = (
+        body_failure if body_failure is not None else close_failure
+    )
+    if cancelled():
+        raise RuntimeError("admission cancelled") from primary_failure
+    try:
+        after = _capture_source_topology(
+            selected,
+            cancelled=cancelled,
+        )
+    except RuntimeError as error:
+        if error.args != ("admission cancelled",):
+            raise
+        if primary_failure is not None:
+            raise error from primary_failure
+        raise
+    except OSError as error:
+        cause = primary_failure if primary_failure is not None else error
+        raise SourceRevisionChanged(
+            f"HDF5 dependency changed during admission: {selected}"
+        ) from cause
+    if (
+        _resolved_source_key(after.resolved_path)
+        != _resolved_source_key(before.resolved_path)
+        or not _same_followed_source_revision(
+            after.followed_state,
+            before.followed_state,
+        )
+    ):
+        drift = SourceRevisionChanged(
+            f"HDF5 dependency changed during admission: {selected}"
+        )
+        if primary_failure is not None:
+            raise drift from primary_failure
+        raise drift
+    if cancelled():
+        raise RuntimeError("admission cancelled") from primary_failure
+    if body_failure is not None:
+        raise body_failure.with_traceback(body_traceback)
+    if close_failure is not None:
+        raise close_failure.with_traceback(close_traceback)
 
 
 def _hdf5_link_file(parent: object, filename: object) -> Path:
@@ -780,9 +1072,9 @@ def _trace_hdf5_object_dependencies(
     *,
     paths: list[Path],
     seen: set[tuple[str, str]],
-    cancelled: Callable[[], bool] | None,
+    cancelled: Callable[[], bool],
     required: bool,
-    states: dict[str, SourceFileState],
+    states: dict[str, _CapturedSourceTopology],
 ) -> None:
     """Close ExternalLink/soft-link/VDS chains for one HDF5 object path."""
 
@@ -790,16 +1082,38 @@ def _trace_hdf5_object_dependencies(
 
     selected_file = Path(_raw_source_path(file_path))
     selected_object = _hdf5_object_path(object_path)
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    try:
+        topology = _remember_source_state(
+            selected_file,
+            states,
+            cancelled=cancelled,
+        )
+    except FileNotFoundError:
+        # The declaring link/VDS caller already retained this lexical path.
+        # Let target-collision adjudication see it before the deferred freeze
+        # turns a genuinely missing required dependency into typed pending.
+        return
+    except OSError as error:
+        if required:
+            raise SourceRevisionChanged(
+                "required HDF5 dependency capture is unverifiable: "
+                f"{selected_file}"
+            ) from error
+        raise
     identity = (
-        os.path.normcase(os.path.realpath(selected_file)),
+        _resolved_source_key(topology.resolved_path),
         selected_object,
     )
     if identity in seen:
         return
     seen.add(identity)
-    if cancelled is not None and cancelled():
-        raise RuntimeError("admission cancelled")
-    with _open_stable_hdf5_dependency(selected_file, states) as handle:
+    with _open_stable_hdf5_dependency(
+        selected_file,
+        states,
+        cancelled=cancelled,
+    ) as handle:
         if handle is None:
             # The declaring link/VDS source path is already in ``paths``.  The
             # caller freezes it and emits the finite-landing refusal.
@@ -811,7 +1125,7 @@ def _trace_hdf5_object_dependencies(
             if component
         )
         for offset, component in enumerate(components):
-            if cancelled is not None and cancelled():
+            if cancelled():
                 raise RuntimeError("admission cancelled")
             if not isinstance(value, h5py.Group):
                 if required:
@@ -902,20 +1216,43 @@ def _extend_hdf5_dataset_dependency_paths(
     *,
     paths: list[Path],
     seen: set[tuple[str, str]],
-    cancelled: Callable[[], bool] | None,
+    cancelled: Callable[[], bool],
     required: bool,
-    states: dict[str, SourceFileState],
+    states: dict[str, _CapturedSourceTopology],
 ) -> None:
     """Add external-storage and recursively closed VDS dependencies."""
 
     current_file = Path(_raw_source_path(dataset.file.filename))
     base = current_file.parent
     for value in dataset.external or ():
-        paths.append(Path(_raw_source_path(base / os.fsdecode(value[0]))))
+        if cancelled():
+            raise RuntimeError("admission cancelled")
+        dependency = Path(
+            _raw_source_path(base / os.fsdecode(value[0]))
+        )
+        try:
+            _remember_source_state(
+                dependency,
+                states,
+                cancelled=cancelled,
+            )
+        except FileNotFoundError as error:
+            raise SourceRevisionChanged(
+                "external HDF5 storage is still landing: "
+                f"{dependency}"
+            ) from error
+        except OSError as error:
+            if required:
+                raise SourceRevisionChanged(
+                    "external HDF5 storage capture is unverifiable: "
+                    f"{dependency}"
+                ) from error
+            raise
+        paths.append(dependency)
     if not bool(dataset.is_virtual):
         return
     for source in dataset.virtual_sources():
-        if cancelled is not None and cancelled():
+        if cancelled():
             raise RuntimeError("admission cancelled")
         filename = os.fsdecode(source.file_name)
         dependency = (
@@ -939,9 +1276,9 @@ def _extend_hdf5_dataset_dependency_paths(
 def _hdf5_dataset_dependency_paths(
     dataset: object,
     *,
-    cancelled: Callable[[], bool] | None = None,
+    cancelled: Callable[[], bool],
     required: bool = False,
-    states: dict[str, SourceFileState] | None = None,
+    states: dict[str, _CapturedSourceTopology] | None = None,
 ) -> tuple[Path, ...]:
     """Return the full external-storage/VDS closure for one dataset."""
 
@@ -969,7 +1306,7 @@ def _scan_all_external_links(
     root: object,
     *,
     cancelled: Callable[[], bool],
-    states: dict[str, SourceFileState],
+    states: dict[str, _CapturedSourceTopology],
 ) -> tuple[Path, ...]:
     """Walk hard-linked groups and collect links without opening datasets."""
 
@@ -1074,9 +1411,13 @@ def _scan_all_external_links(
 def _external_link_inventory(
     candidate: Candidate,
     *,
-    candidate_states: tuple[SourceFileState, ...],
+    candidate_states: tuple[_CapturedSourceTopology, ...],
     cancelled: Callable[[], bool],
-) -> tuple[tuple[Path, ...], tuple[SourceFileState, ...], str]:
+) -> tuple[
+    tuple[Path, ...],
+    tuple[_CapturedSourceTopology, ...],
+    str,
+]:
     """Inventory pre-write HDF5 dependencies without eager frame counting.
 
     A canonical 3-D detector dataset or Eiger link wins before the reader's
@@ -1094,13 +1435,16 @@ def _external_link_inventory(
     """
 
     states = {
-        _source_state_key(state.path): state
-        for state in candidate_states
+        _source_state_key(topology.raw_path): topology
+        for topology in candidate_states
     }
     accepted_candidate = states.get(_source_state_key(candidate.path))
     if accepted_candidate is None:
         raise TypeError("HDF5 inventory lost its exact candidate capture")
-    _validate_exact_candidate_state(candidate, accepted_candidate)
+    _validate_exact_candidate_state(
+        candidate,
+        accepted_candidate.followed_state,
+    )
     adapter = get_adapter(candidate.adapter_id)
     if adapter is None:
         raise ValueError(f"candidate {candidate.path} lost its adapter")
@@ -1117,13 +1461,23 @@ def _external_link_inventory(
         raise RuntimeError("admission cancelled")
     try:
         import h5py
-        _remember_source_state(candidate.path, states)
+        _remember_source_state(
+            candidate.path,
+            states,
+            cancelled=cancelled,
+            candidate_owner_id=candidate.adapter_id,
+        )
         is_hdf5 = bool(h5py.is_hdf5(candidate.path))
-        _verify_source_states(states)
+        _verify_source_states(states, cancelled=cancelled)
     except SourceRevisionChanged:
         raise
     except Exception as error:
-        _classify_inventory_failure(candidate, states, error)
+        _classify_inventory_failure(
+            candidate,
+            states,
+            error,
+            cancelled=cancelled,
+        )
         raise ValueError(
             "source dependency type could not be established: "
             f"{candidate.path}: {type(error).__name__}: {error}"
@@ -1169,7 +1523,7 @@ def _external_link_inventory(
         required: bool = False,
         selected_paths: list[Path] | None = None,
         selected_seen: set[tuple[str, str]] | None = None,
-        selected_states: dict[str, SourceFileState] | None = None,
+        selected_states: dict[str, _CapturedSourceTopology] | None = None,
     ) -> None:
         """Freeze an indirect child before any caller dereferences it."""
 
@@ -1241,6 +1595,7 @@ def _external_link_inventory(
         with _open_stable_hdf5_dependency(
             entry_file,
             trial_states,
+            cancelled=cancelled,
         ) as trial_handle:
             if trial_handle is None:
                 return False
@@ -1320,7 +1675,7 @@ def _external_link_inventory(
                     required=True,
                     states=trial_states,
                 )
-        _verify_source_states(trial_states)
+        _verify_source_states(trial_states, cancelled=cancelled)
         external.extend(trial_paths)
         traced.clear()
         traced.update(trial_seen)
@@ -1428,6 +1783,7 @@ def _external_link_inventory(
         with _open_stable_hdf5_dependency(
             candidate.path,
             states,
+            cancelled=cancelled,
         ) as handle:
             if handle is None:
                 raise SourceRevisionChanged(
@@ -1442,7 +1798,7 @@ def _external_link_inventory(
                     str,
                     list[Path],
                     set[tuple[str, str]],
-                    dict[str, SourceFileState],
+                    dict[str, _CapturedSourceTopology],
                 ],
             ] = {}
 
@@ -1468,7 +1824,7 @@ def _external_link_inventory(
                 str,
                 list[Path],
                 set[tuple[str, str]],
-                dict[str, SourceFileState],
+                dict[str, _CapturedSourceTopology],
             ]:
                 cached = inspected.get(name)
                 if cached is not None:
@@ -1506,6 +1862,7 @@ def _external_link_inventory(
                 with _open_stable_hdf5_dependency(
                     candidate.path,
                     trial_states,
+                    cancelled=cancelled,
                 ) as trial_root:
                     if trial_root is not None:
                         try:
@@ -1524,7 +1881,10 @@ def _external_link_inventory(
                         except (KeyError, OSError, RuntimeError):
                             value = None
                         is_group, nx_class = root_group_facts(value)
-                _verify_source_states(trial_states)
+                _verify_source_states(
+                    trial_states,
+                    cancelled=cancelled,
+                )
                 result = (
                     is_group,
                     nx_class,
@@ -1573,7 +1933,12 @@ def _external_link_inventory(
     except RuntimeError as error:
         if error.args == ("admission cancelled",):
             raise
-        _classify_inventory_failure(candidate, states, error)
+        _classify_inventory_failure(
+            candidate,
+            states,
+            error,
+            cancelled=cancelled,
+        )
         raise ValueError(
             "source dependency inventory could not be established: "
             f"{candidate.path}: {type(error).__name__}: {error}"
@@ -1581,15 +1946,23 @@ def _external_link_inventory(
     except SourceRevisionChanged:
         raise
     except Exception as error:
-        _classify_inventory_failure(candidate, states, error)
+        _classify_inventory_failure(
+            candidate,
+            states,
+            error,
+            cancelled=cancelled,
+        )
         raise ValueError(
             "source dependency inventory could not be established: "
             f"{candidate.path}: {type(error).__name__}: {error}"
         ) from error
     if cancelled():
         raise RuntimeError("admission cancelled")
-    _validate_exact_candidate_state(candidate, accepted_candidate)
-    _verify_source_states(states)
+    _validate_exact_candidate_state(
+        candidate,
+        accepted_candidate.followed_state,
+    )
+    _verify_source_states(states, cancelled=cancelled)
     return (
         tuple(dict.fromkeys(external)),
         tuple(states.values()),
@@ -1609,26 +1982,29 @@ def _deferred_directory_plan(
     staged: list[
         tuple[
             tuple[Candidate, ...],
-            tuple[SourceFileState, ...],
+            tuple[_CapturedSourceTopology, ...],
             Path,
             tuple[Path, ...],
-            tuple[SourceFileState, ...],
+            tuple[_CapturedSourceTopology, ...],
             str,
         ]
     ] = []
     for group in _directory_candidate_groups(plan):
         if cancelled():
             raise RuntimeError("admission cancelled")
-        captured_states: list[SourceFileState] = []
+        captured_topologies: list[_CapturedSourceTopology] = []
         for source_candidate in group:
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            captured_states.append(
-                _capture_exact_candidate_state(source_candidate)
+            captured_topologies.append(
+                _topology_from_captured_state(
+                    _capture_exact_candidate_state(source_candidate),
+                    candidate_owner_id=source_candidate.adapter_id,
+                )
             )
             if cancelled():
                 raise RuntimeError("admission cancelled")
-        candidate_states = tuple(captured_states)
+        candidate_states = tuple(captured_topologies)
         representative = group[0]
         adapter = get_adapter(representative.adapter_id)
         if adapter is None:
@@ -1702,31 +2078,40 @@ def _deferred_directory_plan(
             raise ValueError(
                 f"directory candidate escaped physical file census: {group[0].path}"
             )
-        protected: list[SourceFileState] = []
+        protected: list[_CapturedSourceTopology] = []
         frozen = {
-            _source_state_key(value.path): value
+            _source_state_key(value.raw_path): value
             for value in inventory_states
         }
         reason = skip_reason
-        for source_candidate, state in zip(
+        for source_candidate, topology in zip(
             group,
             candidate_states,
             strict=True,
         ):
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            _validate_exact_candidate_state(source_candidate, state)
+            _validate_exact_candidate_state(
+                source_candidate,
+                topology.followed_state,
+            )
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            protected.append(state)
+            protected.append(topology)
         for path in external_paths:
             if cancelled():
                 raise RuntimeError("admission cancelled")
             key = _source_state_key(path)
-            if any(_source_state_key(value.path) == key for value in protected):
+            if any(
+                _source_state_key(value.raw_path) == key
+                for value in protected
+            ):
                 continue
             try:
-                state = frozen.get(key) or SourceFileState.capture(path)
+                topology = frozen.get(key) or _capture_source_topology(
+                    path,
+                    cancelled=cancelled,
+                )
             except FileNotFoundError as error:
                 raise SourceRevisionChanged(
                     "source dependency is still landing; finite Standard "
@@ -1738,18 +2123,20 @@ def _deferred_directory_plan(
                 ) from error
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            if not state.matches_disk():
-                raise SourceRevisionChanged(
-                    f"source dependency changed during admission: {state.path}"
-                )
-            protected.append(state)
+            protected.append(topology)
+        protected_map = {
+            _source_state_key(value.raw_path): value
+            for value in protected
+        }
+        _verify_source_states(protected_map, cancelled=cancelled)
         entries.append(DeferredDirectoryEntry(
             group,
             target,
             OutputFact(_path_state(target)),
             physical,
-            tuple(protected),
+            tuple(value.followed_state for value in protected),
             reason,
+            _protected_topology=tuple(protected),
         ))
     return DeferredDirectoryPlan(
         plan,
@@ -2059,17 +2446,19 @@ def _validate_deferred_entry_states(
         # raw-to-resolved identity reaching the central validator.
         validate_source_aliases(item.source_stamp, cancelled=is_cancelled)
         _validate_tiff_metadata_selection(item, cancelled=is_cancelled)
-    frozen = {
-        _source_state_key(value.path): value
+    topologies = entry._protected_topology or tuple(
+        _topology_from_captured_state(value)
         for value in entry.protected_states
+    )
+    topology_map = {
+        _source_state_key(value.raw_path): value
+        for value in topologies
     }
-    for state in entry.protected_states:
-        if is_cancelled():
-            raise RuntimeError("admission cancelled")
-        if not state.matches_disk():
-            raise SourceRevisionChanged(
-                f"source dependency changed after admission: {state.path}"
-            )
+    _verify_source_states(topology_map, cancelled=is_cancelled)
+    frozen = {
+        _source_state_key(value.raw_path): value.followed_state
+        for value in topologies
+    }
     if item is None:
         return
     stamp = item.source_stamp
@@ -2546,6 +2935,7 @@ def _container_item(
     target = _resolved_generated_target(configuration.save_path, name)
     external_members = _external_members(
         path,
+        state,
         descriptor,
         cancelled=cancelled,
     )
@@ -2708,6 +3098,7 @@ def _directory_items(
             try:
                 external_members = _external_members(
                     candidate.path,
+                    state,
                     descriptor,
                     cancelled=cancelled,
                 )
@@ -2966,7 +3357,9 @@ def _load_stable_asset(
         raise ValueError(f"scientific asset changed while admitted: {path}")
     return value, hashlib.sha256(before).hexdigest()
 def _external_members(
-    master: Path, descriptor: ContainerDescriptor,
+    master: Path,
+    master_state: SourceFileState,
+    descriptor: ContainerDescriptor,
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
 ) -> tuple[ExternalSourceState, ...]:
@@ -2978,78 +3371,123 @@ def _external_members(
     if not segments:
         raise ValueError("external container has no member-qualified proof")
     import h5py
-    values, first = [], 0
-    with h5py.File(master, "r") as handle:
-        for epoch, segment in enumerate(segments):
-            if cancelled():
-                raise RuntimeError("admission cancelled")
-            components = tuple(
-                value
-                for value in segment.strip("/").split("/")
-                if value
+    master_topology = _topology_from_captured_state(master_state)
+    states = {
+        _source_state_key(master_topology.raw_path): master_topology
+    }
+    values: list[ExternalSourceState] = []
+    first = 0
+    member_qualified = True
+    try:
+        with _open_stable_hdf5_dependency(
+            master,
+            states,
+            cancelled=cancelled,
+        ) as handle:
+            if handle is None:
+                raise SourceRevisionChanged(
+                    f"external container disappeared during admission: {master}"
+                )
+            for epoch, segment in enumerate(segments):
+                if cancelled():
+                    raise RuntimeError("admission cancelled")
+                components = tuple(
+                    value
+                    for value in segment.strip("/").split("/")
+                    if value
+                )
+                parent: object = handle
+                for component in components[:-1]:
+                    if not isinstance(parent, h5py.Group):
+                        member_qualified = False
+                        break
+                    parent = parent.get(component)
+                if (
+                    not member_qualified
+                    or not components
+                    or not isinstance(parent, h5py.Group)
+                ):
+                    member_qualified = False
+                    break
+                link = parent.get(components[-1], getlink=True)
+                if not isinstance(link, h5py.ExternalLink):
+                    # SoftLink, ancestor-ExternalLink and VDS layouts are
+                    # frozen by the selected dependency closure below.
+                    member_qualified = False
+                    break
+                path = _hdf5_link_file(parent, link.filename)
+                try:
+                    topology = _remember_source_state(
+                        path,
+                        states,
+                        cancelled=cancelled,
+                    )
+                except FileNotFoundError as error:
+                    raise SourceRevisionChanged(
+                        "external detector member disappeared during "
+                        f"admission: {path}"
+                    ) from error
+                except OSError as error:
+                    raise SourceRevisionChanged(
+                        "external detector member capture is unverifiable: "
+                        f"{path}"
+                    ) from error
+                dataset = parent.get(components[-1])
+                if not isinstance(dataset, h5py.Dataset):
+                    raise ValueError(
+                        "external container lost its exact dataset"
+                    )
+                count = 1 if dataset.ndim == 2 else int(dataset.shape[0])
+                frame_shape = (
+                    tuple(int(value) for value in dataset.shape)
+                    if dataset.ndim == 2
+                    else tuple(int(value) for value in dataset.shape[1:])
+                )
+                if (
+                    frame_shape != descriptor.frame_shape
+                    or np.dtype(dataset.dtype) != descriptor.dtype
+                ):
+                    raise ValueError(
+                        "external detector layout changed during admission: "
+                        f"{path}:{link.path}"
+                    )
+                stop = first + count
+                values.append(
+                    ExternalSourceState(
+                        topology.followed_state,
+                        link.path,
+                        first,
+                        stop,
+                        epoch,
+                    )
+                )
+                first = stop
+                if cancelled():
+                    raise RuntimeError("admission cancelled")
+        if values and first != descriptor.frame_count:
+            raise ValueError(
+                "external detector frame count changed during admission: "
+                f"descriptor={descriptor.frame_count}, members={first}"
             )
-            parent: object = handle
-            for component in components[:-1]:
-                if not isinstance(parent, h5py.Group):
-                    return ()
-                parent = parent.get(component)
-            if not components or not isinstance(parent, h5py.Group):
-                return ()
-            link = parent.get(components[-1], getlink=True)
-            if not isinstance(link, h5py.ExternalLink):
-                # A soft link or an ExternalLink in an ancestor still yields a
-                # valid external detector, but it is not a direct Eiger segment
-                # with a member-qualified range.  The exact dependency closure
-                # below freezes that chain instead.
-                return ()
-            try:
-                path = _hdf5_link_file(
-                    parent,
-                    link.filename,
-                )
-                path.resolve(strict=True)
-            except FileNotFoundError as error:
-                raise ValueError(
-                    "external detector member disappeared during admission: "
-                    f"{link.filename}"
-                ) from error
-            dataset = parent.get(components[-1])
-            if not isinstance(dataset, h5py.Dataset):
-                raise ValueError(
-                    "external container lost its exact dataset"
-                )
-            count = 1 if dataset.ndim == 2 else int(dataset.shape[0])
-            frame_shape = (
-                tuple(int(value) for value in dataset.shape)
-                if dataset.ndim == 2
-                else tuple(int(value) for value in dataset.shape[1:])
-            )
-            if (
-                frame_shape != descriptor.frame_shape
-                or np.dtype(dataset.dtype) != descriptor.dtype
-            ):
-                raise ValueError(
-                    "external detector layout changed during admission: "
-                    f"{path}:{link.path}"
-                )
-            stop = first + count
-            values.append(
-                ExternalSourceState(
-                    SourceFileState.capture(path),
-                    link.path,
-                    first,
-                    stop,
-                    epoch,
-                )
-            )
-            first = stop
-            if cancelled():
-                raise RuntimeError("admission cancelled")
-    if values and first != descriptor.frame_count:
-        raise ValueError(
-            "external detector frame count changed during admission: "
-            f"descriptor={descriptor.frame_count}, members={first}"
-        )
+    except SourceRevisionChanged:
+        raise
+    except RuntimeError as error:
+        if error.args == ("admission cancelled",):
+            raise
+        try:
+            _verify_source_states(states, cancelled=cancelled)
+        except SourceRevisionChanged as drift:
+            raise drift from error
+        raise
+    except (OSError, ValueError) as error:
+        try:
+            _verify_source_states(states, cancelled=cancelled)
+        except SourceRevisionChanged as drift:
+            raise drift from error
+        raise
+    _verify_source_states(states, cancelled=cancelled)
+    if not member_qualified:
+        return ()
     return tuple(values)
 
 
@@ -3059,7 +3497,7 @@ def _selected_dependency_files(
     descriptor: ContainerDescriptor,
     external_members: tuple[ExternalSourceState, ...],
     *,
-    cancelled: Callable[[], bool] = _not_cancelled,
+    cancelled: Callable[[], bool],
 ) -> tuple[SourceFileState, ...]:
     """Freeze non-leaf-link and dataset-storage files actually selected."""
 
@@ -3072,64 +3510,133 @@ def _selected_dependency_files(
 
     paths: list[Path] = []
     seen: set[tuple[str, str]] = set()
-    states = {_source_state_key(master_state.path): master_state}
+    master_topology = _topology_from_captured_state(master_state)
+    states = {
+        _source_state_key(master_topology.raw_path): master_topology
+    }
     for external in external_members:
         key = _source_state_key(external.file.path)
         accepted = states.get(key)
         if accepted is not None and not _same_source_revision(
-            accepted,
+            accepted.followed_state,
             external.file,
         ):
             raise SourceRevisionChanged(
                 "external detector member changed during admission: "
                 f"{external.file.path}"
             )
-        states.setdefault(key, external.file)
-    for selector in selectors:
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        _trace_hdf5_object_dependencies(
-            master,
-            selector,
-            paths=paths,
-            seen=seen,
-            cancelled=cancelled,
-            required=True,
-            states=states,
+        states.setdefault(
+            key,
+            _topology_from_captured_state(external.file),
         )
-    frame_count = 0
-    with _open_stable_hdf5_dependency(master, states) as handle:
-        if handle is None:
-            raise ValueError(
-                f"selected detector disappeared during admission: {master}"
-            )
+    try:
         for selector in selectors:
-            value = handle.get(selector)
-            if not isinstance(value, h5py.Dataset) or value.ndim not in {2, 3}:
-                raise ValueError(
-                    f"selected detector dependency is unavailable: "
-                    f"{master}:{selector}"
-                )
-            count = 1 if value.ndim == 2 else int(value.shape[0])
-            shape = (
-                tuple(int(item) for item in value.shape)
-                if value.ndim == 2
-                else tuple(int(item) for item in value.shape[1:])
+            if cancelled():
+                raise RuntimeError("admission cancelled")
+            _trace_hdf5_object_dependencies(
+                master,
+                selector,
+                paths=paths,
+                seen=seen,
+                cancelled=cancelled,
+                required=True,
+                states=states,
             )
-            if (
-                shape != descriptor.frame_shape
-                or np.dtype(value.dtype) != descriptor.dtype
-            ):
-                raise ValueError(
-                    "selected detector layout changed during admission: "
-                    f"{master}:{selector}"
+    except SourceRevisionChanged:
+        raise
+    except RuntimeError as error:
+        if error.args == ("admission cancelled",):
+            raise
+        try:
+            _verify_source_states(states, cancelled=cancelled)
+        except SourceRevisionChanged as drift:
+            raise drift from error
+        raise
+    except (OSError, ValueError) as error:
+        try:
+            _verify_source_states(states, cancelled=cancelled)
+        except SourceRevisionChanged as drift:
+            raise drift from error
+        raise
+
+    for path in dict.fromkeys(paths):
+        key = _source_state_key(path)
+        if key in states:
+            continue
+        try:
+            _remember_source_state(
+                path,
+                states,
+                cancelled=cancelled,
+            )
+        except FileNotFoundError as error:
+            raise SourceRevisionChanged(
+                f"required HDF5 dependency is still landing: {path}"
+            ) from error
+        except OSError as error:
+            raise SourceRevisionChanged(
+                "required HDF5 dependency capture is unverifiable: "
+                f"{path}"
+            ) from error
+
+    frame_count = 0
+    try:
+        with _open_stable_hdf5_dependency(
+            master,
+            states,
+            cancelled=cancelled,
+        ) as handle:
+            if handle is None:
+                raise SourceRevisionChanged(
+                    f"selected detector disappeared during admission: {master}"
                 )
-            frame_count += count
-    if frame_count != descriptor.frame_count:
-        raise ValueError(
-            "selected detector frame count changed during admission: "
-            f"descriptor={descriptor.frame_count}, selected={frame_count}"
-        )
+            for selector in selectors:
+                value = handle.get(selector)
+                if (
+                    not isinstance(value, h5py.Dataset)
+                    or value.ndim not in {2, 3}
+                ):
+                    raise ValueError(
+                        f"selected detector dependency is unavailable: "
+                        f"{master}:{selector}"
+                    )
+                count = 1 if value.ndim == 2 else int(value.shape[0])
+                shape = (
+                    tuple(int(item) for item in value.shape)
+                    if value.ndim == 2
+                    else tuple(int(item) for item in value.shape[1:])
+                )
+                if (
+                    shape != descriptor.frame_shape
+                    or np.dtype(value.dtype) != descriptor.dtype
+                ):
+                    raise ValueError(
+                        "selected detector layout changed during admission: "
+                        f"{master}:{selector}"
+                    )
+                frame_count += count
+        if frame_count != descriptor.frame_count:
+            raise ValueError(
+                "selected detector frame count changed during admission: "
+                f"descriptor={descriptor.frame_count}, "
+                f"selected={frame_count}"
+            )
+    except SourceRevisionChanged:
+        raise
+    except RuntimeError as error:
+        if error.args == ("admission cancelled",):
+            raise
+        try:
+            _verify_source_states(states, cancelled=cancelled)
+        except SourceRevisionChanged as drift:
+            raise drift from error
+        raise
+    except (OSError, ValueError) as error:
+        try:
+            _verify_source_states(states, cancelled=cancelled)
+        except SourceRevisionChanged as drift:
+            raise drift from error
+        raise
     excluded = {
         _source_state_key(master),
         *(
@@ -3145,10 +3652,12 @@ def _selected_dependency_files(
         ):
             continue
         state = states.get(key)
-        if state is None:
-            state = _remember_source_state(path, states)
-        selected.append(state)
-    _verify_source_states(states)
+        if state is None:  # pragma: no cover - pre-freeze owns every path
+            raise SourceRevisionChanged(
+                f"required HDF5 dependency escaped its freeze: {path}"
+            )
+        selected.append(state.followed_state)
+    _verify_source_states(states, cancelled=cancelled)
     return tuple(selected)
 
 

@@ -899,7 +899,7 @@ def test_stable_malformed_hdf5_path_is_not_source_revision_drift(
             "/entry/data/missing",
             paths=[],
             seen=set(),
-            cancelled=None,
+            cancelled=lambda: False,
             required=True,
             states=states,
         )
