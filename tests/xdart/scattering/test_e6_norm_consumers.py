@@ -86,6 +86,7 @@ from xdart.modules.display_context import (
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core import Axis, FrameRecord, FrameView
 from xrd_tools.core.metadata import resolve_monitor_norm
+from xrd_tools.io.output_path import READABLE_OUTPUT_SUFFIXES
 from xrd_tools.session.display_logic import nanmean_slice
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.run_configuration import RunIntent
@@ -1598,6 +1599,17 @@ def _browse_load(path: Path, generation: int):
     return context, request
 
 
+def _readable_output_candidates(root: Path) -> tuple[Path, ...]:
+    return tuple(sorted(
+        (
+            path
+            for suffix in READABLE_OUTPUT_SUFFIXES
+            for path in root.rglob(f"*{suffix}")
+        ),
+        key=lambda path: path.as_posix(),
+    ))
+
+
 @pytest.mark.skipif(
     not os.environ.get("XDART_TEST_DATA"),
     reason=(
@@ -1611,8 +1623,8 @@ def test_real_browse_reload_aggregate_fold_parity():
     # Standard/GI consumer traces — that claim belongs to
     # test_real_standard_gi_browse_reload_consumer_trace_parity below.
     root = Path(os.environ["XDART_TEST_DATA"])
-    candidates = sorted(root.rglob("*.nxs"))
-    assert candidates, f"no .nxs artifact under {root}"
+    candidates = _readable_output_candidates(root)
+    assert candidates, f"no readable processed artifact under {root}"
 
     context = None
     for candidate in candidates:
@@ -1656,8 +1668,8 @@ def test_real_standard_gi_browse_reload_consumer_trace_parity():
     # normalized trace against an independent kernel division of the same
     # real records.
     root = Path(os.environ["XDART_TEST_DATA"])
-    candidates = sorted(root.rglob("*.nxs"))
-    assert candidates, f"no .nxs artifact under {root}"
+    candidates = _readable_output_candidates(root)
+    assert candidates, f"no readable processed artifact under {root}"
 
     def _usable_channel(context):
         aggregate = context.norm_aggregate

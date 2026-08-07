@@ -810,9 +810,7 @@ def frame_caption(
     *,
     position: int | None = None,
 ) -> str:
-    del repeated
-    if position is not None:
-        return str(position + 1)
+    del repeated, position
     return str(frame.local_frame_label)
 
 

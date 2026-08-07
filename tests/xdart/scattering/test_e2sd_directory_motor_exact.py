@@ -35,6 +35,7 @@ from xdart.gui.tabs.scattering.controls_projection import GI_MOTOR, PROJECT_ROOT
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.events import RequestId
 from xdart.gui.tabs.scattering.output_preflight import (
+    SourceRevisionChanged,
     materialize_deferred_output,
     prepare_output,
     validate_admitted_receipt,
@@ -319,8 +320,8 @@ def test_deferred_unreadable_container_revalidates_before_skip(
         landing.write_bytes(b"new revision")
 
         with pytest.raises(
-            ValueError,
-            match="source dependency changed after admission",
+            SourceRevisionChanged,
+            match="HDF5 dependency changed during admission: ",
         ):
             materialize_deferred_output(
                 receipt,
@@ -3067,7 +3068,10 @@ def test_same_stat_eiger_member_rewrite_invalidates_admission(
         )
         assert after.st_ctime_ns != before.st_ctime_ns
 
-        with pytest.raises(ValueError, match="source dependency changed"):
+        with pytest.raises(
+            SourceRevisionChanged,
+            match="HDF5 dependency changed during admission: ",
+        ):
             validate_admitted_receipt(receipt, session)
     finally:
         session.close()
@@ -3103,7 +3107,10 @@ def test_deferred_cursor_rechecks_dependency_after_start_validation(
 
         deferred = receipt.deferred_directory
         assert deferred is not None
-        with pytest.raises(ValueError, match="source dependency changed"):
+        with pytest.raises(
+            SourceRevisionChanged,
+            match="HDF5 dependency changed during admission: ",
+        ):
             materialize_deferred_output(
                 receipt,
                 session,

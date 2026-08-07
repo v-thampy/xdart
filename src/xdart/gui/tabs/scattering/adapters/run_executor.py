@@ -580,7 +580,14 @@ class StandardRunExecutor:
         runtime = run.context_runtime
         if runtime is None:
             raise RuntimeError("acquisition context is not ready")
-        return runtime.pause(run.session, run_identity, self._join_timeout)
+        return runtime.pause(
+            run.session,
+            run_identity,
+            self._join_timeout,
+            drain_projection=lambda timeout: self._drain_display_projection(
+                run, timeout
+            ),
+        )
 
     def resume(self, run_identity: RunIdentity) -> None:
         run = self._exact_run(run_identity)
@@ -671,26 +678,31 @@ class StandardRunExecutor:
         run.display_projection_errors.clear()
 
         def project_pending() -> None:
-            try:
-                while True:
-                    item = pending.get()
-                    try:
-                        if item is _DISPLAY_PROJECTION_END:
-                            return
-                        event, image, session = item
-                        started = monotonic()
-                        self._frame_ready_owned(
-                            run, event, image, session
-                        )
-                        _perf_add(
-                            run,
-                            "display_projection",
-                            monotonic() - started,
-                        )
-                    finally:
-                        pending.task_done()
-            except BaseException as error:
-                run.display_projection_errors.append(error)
+            while True:
+                item = pending.get()
+                failed = False
+                try:
+                    if item is _DISPLAY_PROJECTION_END:
+                        return
+                    event, image, session = item
+                    started = monotonic()
+                    self._frame_ready_owned(
+                        run, event, image, session
+                    )
+                    _perf_add(
+                        run,
+                        "display_projection",
+                        monotonic() - started,
+                    )
+                except BaseException as error:
+                    # Publish the exact projection failure before task_done()
+                    # wakes any bounded Pause waiter.
+                    run.display_projection_errors.append(error)
+                    failed = True
+                finally:
+                    pending.task_done()
+                if failed:
+                    return
 
         worker = Thread(
             target=project_pending,
@@ -699,6 +711,32 @@ class StandardRunExecutor:
         )
         run.display_projection_worker = worker
         worker.start()
+
+    @staticmethod
+    def _drain_display_projection(
+        run: _StandardRun,
+        timeout: float,
+    ) -> bool:
+        """Wait for already-accepted projection work without retiring it."""
+
+        pending = run.display_projection_queue
+        worker = run.display_projection_worker
+        if pending is None or worker is None:
+            if run.display_projection_errors:
+                raise run.display_projection_errors[0]
+            return True
+        deadline = monotonic() + max(0.0, float(timeout))
+        with pending.all_tasks_done:
+            while pending.unfinished_tasks:
+                if run.display_projection_errors:
+                    raise run.display_projection_errors[0]
+                remaining = deadline - monotonic()
+                if remaining <= 0.0:
+                    return False
+                pending.all_tasks_done.wait(timeout=min(remaining, 0.01))
+            if run.display_projection_errors:
+                raise run.display_projection_errors[0]
+        return True
 
     @staticmethod
     def _finish_display_projection(run: _StandardRun) -> None:

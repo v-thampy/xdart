@@ -13,7 +13,10 @@ from tests.xdart.scattering.test_e3_context_correction_boundaries import (
     _wait_for,
 )
 from xdart.gui.tabs.scattering import adapters
-from xdart.gui.tabs.scattering.acquisition_runtime import AcquisitionRuntime
+from xdart.gui.tabs.scattering.acquisition_runtime import (
+    AcquisitionRuntime,
+    CommandCompensationFailure,
+)
 from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.modules.display_context import (
     AcquisitionContext,
@@ -138,6 +141,40 @@ def test_pause_compensation_failure_does_not_reopen_submission_gate():
     with pytest.raises(RuntimeError, match="pause failed after stopping"):
         runtime.pause(Session(), object(), 0.01)
 
+    assert runtime._gate.is_set() is False
+
+
+def test_projection_pause_and_failed_compensation_retain_both_exact_causes():
+    runtime = AcquisitionRuntime()
+    primary = RuntimeError("queued projection failed")
+    recovery = RuntimeError("resume after projection failed")
+
+    class Session:
+        def pause(self, *, timeout):
+            return True
+
+        def resume(self):
+            raise recovery
+
+    def fail_projection(_timeout: float) -> bool:
+        raise primary
+
+    with pytest.raises(CommandCompensationFailure) as captured:
+        runtime.pause(
+            Session(),
+            object(),
+            0.01,
+            drain_projection=fail_projection,
+        )
+
+    assert tuple(item.message for item in captured.value.diagnostics) == (
+        "queued projection failed",
+        "resume after projection failed",
+    )
+    assert tuple(item.operation for item in captured.value.diagnostics) == (
+        "context.pause",
+        "context.pause.compensation",
+    )
     assert runtime._gate.is_set() is False
 
 

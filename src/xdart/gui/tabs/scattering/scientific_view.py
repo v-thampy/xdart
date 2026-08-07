@@ -605,7 +605,7 @@ class ScientificView(QtWidgets.QFrame):
             tuple(
                 frame
                 for frame in navigation.frames
-                if frame.artifact == navigation.current.artifact
+                if frame.source_scan == navigation.current.source_scan
             )
             if navigation.current is not None
             else ()
@@ -811,21 +811,8 @@ class ScientificView(QtWidgets.QFrame):
         for index, frame in enumerate(frames[start:], start):
             label = frame.local_frame_label
             indices = self._label_indices.setdefault(label, [])
-            if len(indices) == 1:
-                prior_index = indices[0]
-                prior_frame = frames[prior_index]
-                self.frame_selector.setItemText(
-                    prior_index,
-                    frame_caption(
-                        prior_frame,
-                        frozenset({label}),
-                        position=prior_index,
-                    ),
-                )
-                self._selector_operations += 1
-            repeated = frozenset({label}) if indices else frozenset()
             self.frame_selector.add_frame(
-                frame_caption(frame, repeated, position=index),
+                frame_caption(frame, frozenset(), position=index),
                 frame,
                 f"{frame.source_scan}:{frame.local_frame_label}",
             )

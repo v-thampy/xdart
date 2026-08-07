@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -234,7 +235,12 @@ def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
     shell.scientific.commandRequested.connect(scientific_commands.append)
     try:
         shell.apply_state(state)
-        expected = [str(index + 1) for index in range(len(frames))]
+        expected = [str(frame.local_frame_label) for frame in frames]
+        footer = tuple(
+            frame
+            for frame in frames
+            if frame.source_scan == state.navigation.current.source_scan
+        )
         model = shell.browser.frames.model()
         assert [
             model.index(index, 0).data(QtCore.Qt.ItemDataRole.DisplayRole)
@@ -248,10 +254,10 @@ def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
         assert [
             shell.scientific.frame_selector.itemText(index)
             for index in range(shell.scientific.frame_selector.count())
-        ] == expected
+        ] == [str(frame.local_frame_label) for frame in footer]
         assert all(
             shell.scientific.frame_selector.itemData(index)
-            is frames[index]
+            is footer[index]
             for index in range(shell.scientific.frame_selector.count())
         )
 
@@ -272,7 +278,17 @@ def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
         assert browser_commands[0].frames[0] is frames[3]
         assert browser_commands[0].frame is frames[3]
 
-        shell.scientific.frame_selector.setCurrentIndex(3)
+        shell.apply_state(
+            replace(
+                state,
+                revision=2,
+                navigation=replace(
+                    state.navigation,
+                    current=frames[2],
+                ),
+            )
+        )
+        shell.scientific.frame_selector.setCurrentIndex(1)
         assert len(scientific_commands) == 1
         assert scientific_commands[0].kind is ShellCommandKind.HYDRATE_FRAME
         assert scientific_commands[0].frame is frames[3]
@@ -281,7 +297,7 @@ def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
             frames[3].local_frame_label
         ) == 1
         assert expected[0] == "1"
-        assert expected[3] == "4"
+        assert expected[3] == "1"
     finally:
         _dispose(shell, qapp)
 

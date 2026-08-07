@@ -12,7 +12,6 @@ from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.shell_values import (
     ArtifactProgress,
     ProgressProjection,
-    ShellCommandKind,
     ShellPhase,
     TraceProjection,
 )
@@ -52,16 +51,29 @@ def test_e3_ui3_navigation_is_full_history_not_heavy_window(
     shell.commandRequested.connect(commands.append)
     try:
         shell.apply_state(state)
-        assert shell.scientific.frame_selector.count() == frame_count
+        current = state.navigation.current
+        assert current is not None
+        local_frames = tuple(
+            frame
+            for frame in state.navigation.frames
+            if frame.source_scan == current.source_scan
+        )
+        assert shell.browser.frame_model.rowCount() == frame_count
+        assert all(
+            shell.browser.frame_model.index(index, 0).data(
+                QtCore.Qt.ItemDataRole.UserRole
+            ) is state.navigation.frames[index]
+            for index in range(frame_count)
+        )
+        assert shell.scientific.frame_selector.count() == len(local_frames)
         assert len(shell.scientific._heavy_available) == 2
         assert all(
             shell.scientific.frame_selector.itemData(index)
-            is state.navigation.frames[index]
-            for index in range(frame_count)
+            is local_frames[index]
+            for index in range(len(local_frames))
         )
-        shell.scientific.frame_selector.setCurrentIndex(frame_count - 1)
-        assert commands[-1].kind is ShellCommandKind.SELECT_FRAME
-        assert commands[-1].frame is state.navigation.frames[-1]
+        shell.scientific.frame_selector.setCurrentIndex(len(local_frames) - 1)
+        assert commands[-1].frame is local_frames[-1]
     finally:
         _dispose(shell, qapp)
 
@@ -77,7 +89,7 @@ def test_e3_ui3_selector_append_is_constant_work_with_new_duplicates(
         frames = state.navigation.frames
         appended = DisplayFrameKey(
             frames[0].run_identity,
-            "scan-c",
+            frames[0].source_scan,
             "result.nxs",
             frames[0].local_frame_label,
             6,
@@ -108,13 +120,13 @@ def test_e3_ui3_selector_append_is_constant_work_with_new_duplicates(
             )
         )
 
-        assert shell.scientific.frame_selector.count() == 6
+        assert shell.scientific.frame_selector.count() == 3
         assert shell.scientific._selector_operations - before == 1
-        assert shell.scientific.frame_selector.itemData(5) is appended
+        assert shell.scientific.frame_selector.itemData(2) is appended
         assert shell.scientific.frame_selector.itemData(
-            5,
+            2,
             QtCore.Qt.ItemDataRole.ToolTipRole,
-        ) == f"scan-c:{appended.local_frame_label}"
+        ) == f"{appended.source_scan}:{appended.local_frame_label}"
     finally:
         _dispose(shell, qapp)
 
@@ -133,7 +145,7 @@ def test_e3_ui3_terminal_footer_follows_current_scan_selection(
         assert shell.scientific.frame_selector.currentData() is (
             state.navigation.frames[0]
         )
-        assert shell.scientific.progress.text() == "1/25"
+        assert shell.scientific.progress.text() == "1/12"
         assert shell.scientific.status.text() == "Ready"
     finally:
         _dispose(shell, qapp)
@@ -157,8 +169,17 @@ def test_e3_ui3_footer_uses_typed_current_scan_progress(
     )
     try:
         shell.apply_state(state)
-        assert shell.scientific.progress.text() == "52/1000"
-        assert shell.scientific.frame_selector.count() == 52
+        # Two logical source scans deliberately share this retained artifact.
+        # Artifact-only progress is ambiguous, so the scientific footer stays
+        # on the exact current scan's published catalog rather than combining
+        # both scans into an apparent 52/1000 denominator.
+        assert shell.scientific.progress.text() == "26/26"
+        assert shell.scientific.frame_selector.count() == 26
+        assert all(
+            shell.scientific.frame_selector.itemData(index).source_scan
+            == current.source_scan
+            for index in range(shell.scientific.frame_selector.count())
+        )
     finally:
         _dispose(shell, qapp)
 
@@ -176,7 +197,11 @@ def test_e3_ui3_footer_keeps_published_prefix_position_when_durable_ahead(
         plot_mode="Single",
     )
     frames = tuple(
-        replace(frame, local_frame_label=label_start + index)
+        replace(
+            frame,
+            source_scan="scan-a",
+            local_frame_label=label_start + index,
+        )
         for index, frame in enumerate(state.navigation.frames)
     )
     artifact = frames[0].artifact
@@ -342,7 +367,7 @@ def test_e3_ui3_browsed_and_finished_presentations_keep_same_shell(
         )
         shell.apply_state(finished)
         assert shell.scientific.status.text() == "Finished"
-        assert shell.scientific.progress.text() == "1/5"
+        assert shell.scientific.progress.text() == "1/2"
         assert shell.splitter.count() == 3
     finally:
         _dispose(shell, qapp)
@@ -415,7 +440,7 @@ def test_e3_ui3_651_reconciliation_preserves_gui_heartbeat(
         assert len(ticks) >= 5
         assert float(gaps.max(initial=0.0)) < 0.25
         assert shell.scientific._selector_operations == operations
-        assert shell.scientific.frame_selector.count() == 651
+        assert shell.scientific.frame_selector.count() == 325
     finally:
         timer.stop()
         _dispose(shell, qapp)

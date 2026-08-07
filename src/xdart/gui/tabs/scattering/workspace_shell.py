@@ -247,14 +247,22 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                         tuple(
                             frame
                             for frame in state.navigation.frames
-                            if frame.artifact == current.artifact
+                            if frame.source_scan == current.source_scan
                         )
                         if current is not None
                         else ()
                     )
+                    artifact_is_shared = bool(
+                        current is not None
+                        and any(
+                            frame.artifact == current.artifact
+                            and frame.source_scan != current.source_scan
+                            for frame in state.navigation.frames
+                        )
+                    )
                     artifact_progress = (
                         None
-                        if current is None
+                        if current is None or artifact_is_shared
                         else state.progress.for_artifact(current.artifact)
                     )
                     retained_index = next(

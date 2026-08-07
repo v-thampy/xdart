@@ -86,10 +86,11 @@ def canonical_browse_scan_key(source_path: str) -> str:
         return ""
     # Importing registry installs the built-in immutable format descriptors.
     from xrd_tools.sources import registry as _registry  # noqa: F401
-    from xrd_tools.sources.adapters import candidate_owner
+    from xrd_tools.core.scan import SourceKind
+    from xrd_tools.sources.adapters import explicit_source_owner
 
     path = Path(source_path)
-    owner = candidate_owner(path)
+    owner = explicit_source_owner(path, SourceKind.PROCESSED_NEXUS)
     return "" if owner is None else str(owner.scan_name(path) or "")
 
 

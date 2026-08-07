@@ -176,6 +176,33 @@ def candidate_owner(path: Path) -> SourceFormatAdapter | None:
     return best.adapter if best is not None else None
 
 
+def explicit_source_owner(
+    path: Path,
+    kind: SourceKind | str,
+) -> SourceFormatAdapter | None:
+    """Resolve one explicitly selected typed source through the registry.
+
+    Explicit processed outputs deliberately do not reuse name-only raw
+    discovery: ``.nexus`` is Browse-readable but is not a raw directory
+    candidate.  The requested kind and the registered output capability are
+    therefore the authority at this seam.
+    """
+
+    source_path = Path(path)
+    source_kind = coerce_source_kind(kind)
+    owner = adapter_for_kind(source_kind)
+    if owner is None:
+        return None
+    if source_kind is SourceKind.PROCESSED_NEXUS:
+        from xrd_tools.io.output_path import is_readable_output_path
+
+        if not owner.is_output_format or not is_readable_output_path(
+            source_path
+        ):
+            return None
+    return owner
+
+
 def all_adapters() -> tuple[SourceFormatAdapter, ...]:
     """All registered adapters, in first-registration order."""
     return tuple(e.adapter for e in _ADAPTERS.values())
@@ -192,6 +219,7 @@ __all__ = [
     "adapter_for_kind",
     "all_adapters",
     "candidate_owner",
+    "explicit_source_owner",
     "get_adapter",
     "register_adapter",
 ]

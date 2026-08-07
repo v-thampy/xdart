@@ -17,6 +17,7 @@ from xdart.gui.tabs.scattering.adapters.run_executor import (
     _claim_output_physical_files,
     _eager_directory_file_counts,
 )
+from xdart.gui.tabs.scattering.acquisition_runtime import AcquisitionRuntime
 from xdart.gui.tabs.scattering.display_values import (
     StandardEventKind,
     StandardRunEvent,
@@ -618,3 +619,138 @@ def test_display_projection_leaves_hdf5_completion_thread(
     assert worker_names == ["scattering-display-projection"]
     release.set()
     executor._finish_display_projection(run)
+
+
+class _PauseSession:
+    def __init__(self) -> None:
+        self.pause_calls: list[float] = []
+        self.resumes = 0
+        self.submits = 0
+
+    def pause(self, *, timeout: float) -> bool:
+        self.pause_calls.append(timeout)
+        return True
+
+    def resume(self) -> None:
+        self.resumes += 1
+
+    def submit(self, _frame) -> bool:
+        self.submits += 1
+        return True
+
+
+def _projection_pause_run(
+    executor: StandardRunExecutor,
+) -> tuple[_StandardRun, _PauseSession]:
+    configuration = RunIntent().freeze()
+    identity = RunIdentity.from_configuration(configuration)
+    session = _PauseSession()
+    run = _StandardRun(
+        configuration,
+        identity,
+        None,
+        None,
+        session,
+        None,
+        Path("pause-projection.nexus"),
+        context_runtime=AcquisitionRuntime(),
+    )
+    executor._active = run
+    executor._start_display_projection(run)
+    return run, session
+
+
+def test_durable_pause_waits_for_accepted_display_projection_without_retiring_worker(
+    monkeypatch,
+) -> None:
+    executor = StandardRunExecutor(join_timeout=0.5)
+    run, session = _projection_pause_run(executor)
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    published: list[object] = []
+    result: list[object] = []
+    worker = run.display_projection_worker
+
+    def blocked_projection(_run, event, _image, _session) -> None:
+        entered.set()
+        assert release.wait(timeout=2.0)
+        published.append(event)
+
+    monkeypatch.setattr(executor, "_frame_ready_owned", blocked_projection)
+    event = SimpleNamespace(frame_index=1)
+    executor._frame_ready(run, event)
+    assert entered.wait(timeout=1.0)
+
+    def pause() -> None:
+        result.append(executor.pause(run.identity))
+        returned.set()
+
+    command = threading.Thread(target=pause, name="pause-command")
+    command.start()
+    assert not returned.wait(timeout=0.05)
+    assert published == []
+    assert run.display_projection_worker is worker
+    assert worker is not None and worker.is_alive()
+
+    release.set()
+    command.join(timeout=1.0)
+    assert not command.is_alive()
+    assert returned.is_set()
+    assert result[0].run_identity is run.identity
+    assert published == [event]
+    frozen = tuple(published)
+    assert returned.wait(timeout=0.02)
+    assert tuple(published) == frozen
+    assert run.display_projection_worker is worker
+    assert worker is not None and worker.is_alive()
+
+    run.context_runtime.resume(session)
+    executor._finish_display_projection(run)
+
+
+@pytest.mark.parametrize("failure", ("timeout", "projection-error"))
+def test_projection_pause_failure_compensates_and_reopens_submit_gate(
+    monkeypatch,
+    failure: str,
+) -> None:
+    executor = StandardRunExecutor(join_timeout=0.02)
+    run, session = _projection_pause_run(executor)
+    entered = threading.Event()
+    release = threading.Event()
+    projection_error = RuntimeError("queued display projection failed")
+
+    def project(_run, _event, _image, _session) -> None:
+        entered.set()
+        if failure == "timeout":
+            assert release.wait(timeout=2.0)
+        else:
+            raise projection_error
+
+    monkeypatch.setattr(executor, "_frame_ready_owned", project)
+    executor._frame_ready(run, SimpleNamespace(frame_index=1))
+    assert entered.wait(timeout=1.0)
+
+    if failure == "timeout":
+        expected = pytest.raises(
+            TimeoutError,
+            match="display projection did not reach durable pause",
+        )
+    else:
+        expected = pytest.raises(RuntimeError, match=str(projection_error))
+    with expected as captured:
+        executor.pause(run.identity)
+    if failure == "projection-error":
+        assert captured.value is projection_error
+    assert session.resumes == 1
+    assert run.context_runtime.submit(session, object()) is True
+    assert session.submits == 1
+    assert run.display_projection_worker is not None
+
+    release.set()
+    if failure == "projection-error":
+        with pytest.raises(RuntimeError) as terminal:
+            executor._finish_display_projection(run)
+        assert terminal.value is projection_error
+    else:
+        executor._finish_display_projection(run)

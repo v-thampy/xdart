@@ -33,6 +33,7 @@ from xrd_tools.reduction import Integration1DPlan, ReductionPlan
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
+from xrd_tools.sources.discover import enumerate_candidates
 from xrd_tools.io import ProcessedScan, iter_frame_records
 
 from tests.xdart.scattering._admission import await_admission
@@ -158,6 +159,59 @@ def test_real_browse_load_is_off_thread_exact_and_independently_owned(
     loader.release_context(context)
     assert context.released is True
     assert len(context.record_store) == 0
+    loader.close()
+
+
+def test_explicit_processed_nexus_browse_does_not_enter_raw_discovery() -> None:
+    path = Path(
+        "/Users/vthampy/repos/test_data/eiger/xdart_processed_data/"
+        "Combi4_Angledependence_samz_4p9_03271005.nexus"
+    )
+    if not path.is_file():
+        pytest.skip(
+            "processed .nexus Browse capability unavailable: missing "
+            f"{path}"
+        )
+
+    discovered = enumerate_candidates(path.parent)
+    assert path not in {candidate.path for candidate in discovered}
+
+    loader = BrowseLoader(max_items=32)
+    request = BrowseLoadRequest(
+        new_context_token(ContextKind.BROWSE),
+        1,
+        str(path),
+    )
+    assert loader.begin(request) is request
+    outcome = _wait_outcome(loader, request)
+    assert outcome.status is BrowseLoadStatus.READY
+    context = loader.consume(outcome)
+    assert context is not None
+    assert context.requested_path == str(path)
+    assert context.scan_key == path.stem
+    assert path not in {
+        candidate.path for candidate in enumerate_candidates(path.parent)
+    }
+    loader.release_context(context)
+    loader.close()
+
+
+def test_explicit_malformed_nexus_browse_fails_truthfully(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "malformed.nexus"
+    path.write_bytes(b"not a processed NeXus file")
+    loader = BrowseLoader()
+    request = BrowseLoadRequest(
+        new_context_token(ContextKind.BROWSE),
+        1,
+        str(path),
+    )
+    loader.begin(request)
+    outcome = _wait_outcome(loader, request)
+    assert outcome.status is BrowseLoadStatus.FAILED
+    assert outcome.detail
+    assert loader.consume(outcome) is None
     loader.close()
 
 

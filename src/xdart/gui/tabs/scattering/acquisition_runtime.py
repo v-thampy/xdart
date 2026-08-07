@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from threading import Event, Lock
+from time import monotonic
 
 from xdart.modules.display_context import (
     AcquisitionContext, ContextKind, new_context_token,
@@ -88,17 +90,38 @@ class AcquisitionRuntime:
                     return bool(session.submit(frame))
                 return bool(session.submit(frame, image))
 
-    def pause(self, session, run_identity: RunIdentity,
-              timeout: float) -> DurablePaused:
+    def pause(
+        self,
+        session,
+        run_identity: RunIdentity,
+        timeout: float,
+        *,
+        drain_projection: Callable[[float], bool] | None = None,
+    ) -> DurablePaused:
+        deadline = monotonic() + max(0.0, float(timeout))
         self._gate.clear()
         try:
             with self._command_lock:
-                drained = bool(session.pause(timeout=timeout))
+                drained = bool(session.pause(timeout=max(
+                    0.0, deadline - monotonic()
+                )))
         except BaseException as primary:
             self._resume_after_pause_failure(session, primary)
         if not drained:
             primary = TimeoutError("acquisition did not reach durable pause")
             self._resume_after_pause_failure(session, primary)
+        if drain_projection is not None:
+            try:
+                projected = bool(drain_projection(max(
+                    0.0, deadline - monotonic()
+                )))
+            except BaseException as primary:
+                self._resume_after_pause_failure(session, primary)
+            if not projected:
+                primary = TimeoutError(
+                    "display projection did not reach durable pause"
+                )
+                self._resume_after_pause_failure(session, primary)
         self._durable_generation += 1
         return DurablePaused(run_identity, self._durable_generation)
 

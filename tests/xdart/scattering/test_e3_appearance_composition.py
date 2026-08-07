@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -25,8 +26,8 @@ def qapp() -> QtWidgets.QApplication:
 class _MenuHost(QtWidgets.QWidget):
     """Small host for the production ``Main`` Config-menu owner."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
         self.h5viewer = SimpleNamespace(
             paramMenu=QtWidgets.QMenu(self),
             helpMenu=QtWidgets.QMenu(self),
@@ -36,24 +37,58 @@ class _MenuHost(QtWidgets.QWidget):
             middleFrame=QtWidgets.QFrame(self),
             rightFrame=QtWidgets.QFrame(self),
         )
+        self.displayframe = SimpleNamespace(_processing_active=False)
 
     def enable_async_hydration(self) -> None:
+        pass
+
+    def shortcut_load_settings(self) -> None:
+        pass
+
+    def shortcut_save_settings(self) -> None:
+        pass
+
+    def shortcut_run_pause(self) -> None:
+        pass
+
+    def shortcut_stop(self) -> None:
+        pass
+
+    def shortcut_toggle_write_mode(self) -> None:
+        pass
+
+    def shortcut_pin_slice_cut(self) -> None:
         pass
 
 
 def _main_window(monkeypatch):
     from xdart import _gui_main
+    from xdart.gui.pages.catalog import LEGACY_STATIC_PAGE
+    from xdart.gui.pages.legacy_static import build_legacy_static
 
-    monkeypatch.setattr(
-        _gui_main.tabs.static_scan,
-        "staticWidget",
-        _MenuHost,
+    del monkeypatch
+
+    def build(services, parent):
+        return build_legacy_static(
+            services,
+            parent,
+            _widget_factory=_MenuHost,
+        )
+
+    descriptor = replace(
+        LEGACY_STATIC_PAGE,
+        build=build,
     )
-    return _gui_main.Main()
+    return _gui_main.Main(
+        page_descriptors=(descriptor,),
+        selected_page_key=descriptor.key,
+    )
 
 
 def _trigger(window, submenu_title: str, label: str) -> None:
-    for owner in window.main_widget.h5viewer.paramMenu.actions():
+    menu = window._attached_config_menu
+    assert menu is not None
+    for owner in menu.actions():
         submenu = owner.menu()
         if submenu is None or submenu.title() != submenu_title:
             continue

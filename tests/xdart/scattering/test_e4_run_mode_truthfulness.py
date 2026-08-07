@@ -170,7 +170,13 @@ def test_projection_owns_modes_and_refuses_run_readiness_for_unowned_mode() -> N
 def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:
     base = make_shell_projection(plot_mode="Single")
 
-    def project(phase: RunPhase, progress: ProgressProjection):
+    def project(
+        phase: RunPhase,
+        progress: ProgressProjection,
+        *,
+        start_permitted: bool = True,
+        start_blocker: str = "",
+    ):
         return ContextProjection().build_shell(
             revision=1,
             controls=base.controls,
@@ -188,8 +194,8 @@ def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:
             date_sorted=False,
             auto_last=True,
             executor_available=True,
-            start_permitted=False,
-            start_blocker="",
+            start_permitted=start_permitted,
+            start_blocker=start_blocker,
             notice="",
         )
 
@@ -206,6 +212,16 @@ def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:
             terminal=True,
         ),
     )
+    cleanup_blocked = project(
+        RunPhase.FAILED,
+        ProgressProjection(
+            detail="reader failed",
+            directory_files=files,
+            terminal=True,
+        ),
+        start_permitted=False,
+        start_blocker="Cleanup remains pending",
+    )
 
     assert paused.run.readiness == (
         "Paused · 2 processed · 1 skipped · 3 pending · 6 discovered"
@@ -213,6 +229,7 @@ def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:
     assert failed.run.readiness == (
         "Failed · 2 processed · 1 skipped · 3 pending · 6 discovered"
     )
+    assert cleanup_blocked.run.readiness == "Cleanup remains pending"
 
 
 def test_native_processing_mode_immediately_owns_mounted_center_layout() -> None:

@@ -187,9 +187,14 @@ def test_e3_ui5_maintainer_controls_are_exact_at_review_viewports(
             for _path, button in row._pills
         ] == ["Mask Saturated", "Average Scan"]
 
-        expected_frames = [
+        expected_browser_frames = [
             str(frame.local_frame_label)
             for frame in state.navigation.frames
+        ]
+        expected_footer = [
+            frame
+            for frame in state.navigation.frames
+            if frame.source_scan == state.navigation.current.source_scan
         ]
         browser_model = shell.browser.frames.model()
         assert [
@@ -197,11 +202,22 @@ def test_e3_ui5_maintainer_controls_are_exact_at_review_viewports(
                 QtCore.Qt.ItemDataRole.DisplayRole
             )
             for index in range(browser_model.rowCount())
-        ] == expected_frames
+        ] == expected_browser_frames
+        assert all(
+            browser_model.index(index, 0).data(
+                QtCore.Qt.ItemDataRole.UserRole
+            ) is state.navigation.frames[index]
+            for index in range(browser_model.rowCount())
+        )
         assert [
             shell.scientific.frame_selector.itemText(index)
             for index in range(shell.scientific.frame_selector.count())
-        ] == expected_frames
+        ] == [str(frame.local_frame_label) for frame in expected_footer]
+        assert all(
+            shell.scientific.frame_selector.itemData(index)
+            is expected_footer[index]
+            for index in range(shell.scientific.frame_selector.count())
+        )
         assert type(shell.browser.metadata) is QtWidgets.QPushButton
         assert shell.browser.metadata.menu() is None
     finally:
