@@ -122,6 +122,7 @@ SOURCE_FORMAT_SUFFIXES = {
     "cxi": (".cxi",),
     "cbf": (".cbf",),
     "edf": (".edf",),
+    "raw": (".raw",),
 }
 
 

@@ -663,6 +663,30 @@ def test_unrepresentable_suffix_tuple_is_exact_and_not_editable() -> None:
     assert snapshot.thaw().source_spec == intent.source_spec
 
 
+def test_raw_directory_format_projects_and_replaces_one_complete_source() -> None:
+    snapshot = RunIntentStore(_intent()).snapshot()
+    state = project_controls(snapshot, None, RunPhase.IDLE)
+    assert state.bound_controls is not None
+    fields = {field.path: field for field in state.bound_controls.fields}
+    assert "raw" in fields[("Signal", "img_ext")].choices
+
+    changed = reduce_control_edit(
+        snapshot,
+        ("Signal", "img_ext"),
+        "raw",
+    )
+
+    assert type(changed) is RunIntent
+    assert changed.source_spec == DirectorySourceSpec(
+        Path("/raw/eiger"),
+        recursive=True,
+        suffixes=(".raw",),
+        name_filter="scan",
+        generation=1,
+    )
+    assert snapshot.thaw().source_spec == _intent().source_spec
+
+
 def test_invalid_integration_edits_leave_snapshot_exact() -> None:
     snapshot = RunIntentStore(_intent()).snapshot()
     before = snapshot.thaw()
