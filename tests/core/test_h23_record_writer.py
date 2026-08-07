@@ -642,6 +642,270 @@ def _complete_source_snapshot(source: Path) -> dict[str, object]:
     }
 
 
+_MALFORMED_PERSISTED_SOURCE_FACTS = (
+    pytest.param(
+        "path", np.int64(123), {"source_name": "123"},
+        id="path-non-text-scalar",
+    ),
+    pytest.param(
+        "path", np.array([b"123"]), {"source_name": "[b'123']"},
+        id="path-non-scalar",
+    ),
+    pytest.param(
+        "path", b"\xff", {}, id="path-invalid-utf8",
+    ),
+    pytest.param("frame_index", 1.0, {}, id="frame-index-float"),
+    pytest.param("frame_index", "1", {}, id="frame-index-string"),
+    pytest.param("frame_index", True, {}, id="frame-index-bool"),
+    pytest.param(
+        "frame_index", np.array([1]), {}, id="frame-index-non-scalar",
+    ),
+    pytest.param(
+        "adapter_id", np.int64(123), {"adapter_id": "123"},
+        id="adapter-id-non-text",
+    ),
+    pytest.param("file_size", 1.0, {}, id="file-size-float"),
+    pytest.param("file_size", "1", {}, id="file-size-string"),
+    pytest.param("file_size", True, {}, id="file-size-bool"),
+    pytest.param("file_mtime_ns", 1.0, {}, id="file-mtime-ns-float"),
+    pytest.param("file_mtime_ns", "1", {}, id="file-mtime-ns-string"),
+    pytest.param("file_mtime_ns", True, {}, id="file-mtime-ns-bool"),
+    pytest.param("frame_count", 1.0, {}, id="frame-count-float"),
+    pytest.param("frame_count", "1", {}, id="frame-count-string"),
+    pytest.param("frame_count", True, {}, id="frame-count-bool"),
+    pytest.param(
+        "dataset_path", np.int64(456), {"dataset_path": "456"},
+        id="dataset-path-non-text",
+    ),
+    pytest.param(
+        "self_contained", "false", {}, id="self-contained-string",
+    ),
+    pytest.param(
+        "self_contained", 1, {}, id="self-contained-integer",
+    ),
+)
+
+
+def _corrupt_persisted_source_fact(source_group, field, malformed) -> None:
+    if field in {"path", "frame_index"}:
+        del source_group[field]
+        source_group.create_dataset(field, data=malformed)
+        return
+    del source_group.attrs[field]
+    source_group.attrs[field] = malformed
+
+
+def _persisted_result_state(writer) -> tuple[tuple[object, ...], ...]:
+    entry = writer._entry_group()
+    state = []
+    for group_name in ("integrated_1d", "integrated_2d"):
+        group = entry.get(group_name)
+        if not isinstance(group, h5py.Group):
+            state.append((group_name, "absent"))
+            continue
+        for name in sorted(group):
+            child = group[name]
+            if not isinstance(child, h5py.Dataset):
+                continue
+            observed = np.asarray(child[()])
+            state.append((
+                group_name, name, observed.dtype.str, tuple(observed.shape),
+                hashlib.sha256(observed.tobytes(order="C")).hexdigest(),
+            ))
+    return tuple(state)
+
+
+def _raw_hdf5_group_state(group) -> tuple[tuple[object, ...], ...]:
+    def value_state(value) -> tuple[object, ...]:
+        observed = np.asarray(value)
+        facts = (observed.dtype.str, tuple(observed.shape))
+        if observed.dtype.kind not in "OSU":
+            return facts + (observed.tobytes(order="C"),)
+        items = []
+        for item in observed.ravel():
+            if isinstance(item, (bytes, np.bytes_)):
+                items.append(("bytes", bytes(item)))
+            elif isinstance(item, (str, np.str_)):
+                items.append(("text", str(item)))
+            else:
+                items.append((type(item).__name__, repr(item)))
+        return facts + (tuple(items),)
+
+    state = []
+
+    def walk(current, prefix) -> None:
+        for name in sorted(current.attrs):
+            state.append((f"{prefix}@{name}",) + value_state(current.attrs[name]))
+        for name in sorted(current):
+            child = current[name]
+            role = f"{prefix}/{name}"
+            if isinstance(child, h5py.Group):
+                state.append((role, "group"))
+                walk(child, role)
+            else:
+                state.append((role,) + value_state(child[()]))
+
+    walk(group, group.name)
+    return tuple(state)
+
+
+@pytest.mark.parametrize("route", ("mode-only", "existing-row"))
+@pytest.mark.parametrize(
+    ("field", "malformed", "expected_overrides"),
+    _MALFORMED_PERSISTED_SOURCE_FACTS,
+)
+def test_malformed_persisted_source_fact_refuses_atomically(
+    tmp_path, route, field, malformed, expected_overrides,
+):
+    rw = _api()
+    target = tmp_path / "malformed-persisted-source.nexus"
+    source = tmp_path / expected_overrides.get("source_name", "source.h5")
+    source.write_bytes(b"x")
+    snapshot = {
+        "adapter_id": expected_overrides.get("adapter_id", "nexus_hdf5"),
+        "size": 1,
+        "mtime_ns": 1,
+        "frame_count": 1,
+        "dataset_path": expected_overrides.get(
+            "dataset_path", "/entry/instrument/detector/data",
+        ),
+        "self_contained": True,
+    }
+    facade = _Facade(target)
+    one_d = ResultMode.one_d("default")
+    two_d = ResultMode.two_d("default")
+    facade.set_revision(0, one_d, 1)
+    facade.set_revision(9, one_d, 1)
+    facade.set_revision(0, two_d, 1)
+    writer = rw.NexusRecordWriter(
+        target, atomic=False, flush_every=None, source_base=tmp_path,
+    )
+    writer.bind_session(facade)
+    writer.begin()
+    writer.write_batch((
+        rw.RecordWrite(
+            label=0, result_1d=_r1(1), source_path=source,
+            source_frame_index=1, source_snapshot=snapshot,
+        ),
+        rw.RecordWrite(label=9, result_1d=_r1(9)),
+    ))
+    writer.flush(force=True)
+    source_group = writer._entry_group()["frames/frame_0000/source"]
+    _corrupt_persisted_source_fact(source_group, field, malformed)
+    writer._h5.flush()
+    writer.reset_operation_vector()
+    before_target = target.read_bytes()
+    before_results = _persisted_result_state(writer)
+    before_source = _raw_hdf5_group_state(source_group)
+    before_unrelated = writer._frame_row_digest(9)
+    before_vector = writer.operation_vector()
+    before_pending = dict(writer._pending)
+    before_receipts = tuple(facade.durable)
+    incoming = {
+        "label": 0,
+        "result_2d": _r2(2),
+        "source_path": source,
+        "source_frame_index": 1,
+        "source_snapshot": snapshot,
+    }
+    if route == "mode-only":
+        incoming["write_frame_record"] = False
+    else:
+        incoming["result_1d"] = _r1(1)
+    try:
+        with pytest.raises(rw.WriterStateError):
+            writer.write(rw.RecordWrite(**incoming))
+        writer._h5.flush()
+        assert target.read_bytes() == before_target
+        assert _persisted_result_state(writer) == before_results
+        assert _raw_hdf5_group_state(
+            writer._entry_group()["frames/frame_0000/source"]
+        ) == before_source
+        assert writer._frame_row_digest(9) == before_unrelated
+        assert writer.operation_vector() == before_vector
+        assert writer._pending == before_pending
+        assert tuple(facade.durable) == before_receipts
+    finally:
+        writer.abort()
+
+
+@pytest.mark.parametrize("source_kind", ("complete", "partial", "source-less"))
+def test_exact_persisted_source_fact_allows_mode_only_siblings(
+    tmp_path, source_kind,
+):
+    rw = _api()
+    target = tmp_path / f"exact-{source_kind}.nexus"
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"source")
+    if source_kind == "complete":
+        source_kwargs = {
+            "source_path": source,
+            "source_frame_index": 2,
+            "source_snapshot": _complete_source_snapshot(source),
+        }
+    elif source_kind == "partial":
+        source_kwargs = {
+            "source_path": source,
+            "source_frame_index": 2,
+            "source_snapshot": {"size": source.stat().st_size},
+        }
+    else:
+        source_kwargs = {}
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write(rw.RecordWrite(label=0, result_1d=_r1(1), **source_kwargs))
+    writer.flush(force=True)
+    before_digest = writer._frame_row_digest(0)
+    writer.reset_operation_vector()
+    writer.write(rw.RecordWrite(
+        label=0, result_2d=_r2(2), write_frame_record=False, **source_kwargs,
+    ))
+    writer.flush(force=True)
+    assert writer._frame_row_digest(0) == before_digest
+    assert writer.operation_vector().source_record_rows == 0
+    writer.finish()
+
+
+def test_exact_existing_row_is_idempotent_and_explicit_replacement_is_authorized(
+    tmp_path,
+):
+    rw = _api()
+    target = tmp_path / "existing-idempotence-and-replacement.nexus"
+    first_source = tmp_path / "first.h5"
+    second_source = tmp_path / "second.h5"
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    first_snapshot = _complete_source_snapshot(first_source)
+    second_snapshot = _complete_source_snapshot(second_source)
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1), source_path=first_source,
+        source_frame_index=2, source_snapshot=first_snapshot,
+    ))
+    writer.flush(force=True)
+    first_digest = writer._frame_row_digest(0)
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1), result_2d=_r2(2),
+        source_path=first_source, source_frame_index=2,
+        source_snapshot=first_snapshot,
+    ))
+    writer.flush(force=True)
+    assert writer._frame_row_digest(0) == first_digest
+
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1), result_2d=_r2(3),
+        source_path=second_source, source_frame_index=7,
+        source_snapshot=second_snapshot, replace_existing=True,
+    ))
+    writer.flush(force=True)
+    observed = writer._authoritative_source_fact(0)
+    assert observed.path == str(second_source)
+    assert observed.frame_index == 7
+    assert dict(observed.snapshot) == second_snapshot
+    writer.finish()
+
+
 def test_d1_mode_only_source_omission_is_an_atomic_mismatch(tmp_path):
     rw = _api()
     target = tmp_path / "mode-only-omitted-source.nexus"

@@ -681,6 +681,12 @@ class NexusRecordWriter:
 
     def _expected_source_fact(self, record: RecordWrite) -> _PersistedSourceFact:
         expected = self._expected_frame_row(record)
+        return self._source_fact_for_expected_frame(expected)
+
+    @staticmethod
+    def _source_fact_for_expected_frame(
+        expected: _ExpectedFrameRow,
+    ) -> _PersistedSourceFact:
         if expected.source_path is None:
             return _PersistedSourceFact(False, None, None, ())
         supplied = dict(expected.source_snapshot)
@@ -694,6 +700,51 @@ class NexusRecordWriter:
             ),
         )
 
+    @staticmethod
+    def _decode_persisted_source_scalar(
+        value: Any,
+        *,
+        kind: str,
+        role: str,
+    ) -> str | int | bool:
+        if kind == "text":
+            if type(value) in (str, np.str_):
+                decoded = str(value)
+            elif type(value) in (bytes, np.bytes_):
+                try:
+                    decoded = bytes(value).decode("utf-8", errors="strict")
+                except UnicodeDecodeError as error:
+                    raise WriterStateError(
+                        f"{role} must be a valid UTF-8 text scalar"
+                    ) from error
+            else:
+                raise WriterStateError(
+                    f"{role} must be a text scalar, got {type(value).__name__}"
+                )
+            if not decoded:
+                raise WriterStateError(f"{role} must not be empty")
+            return decoded
+        if kind == "integer":
+            if isinstance(value, (bool, np.bool_)) or not isinstance(
+                value, Integral,
+            ):
+                raise WriterStateError(
+                    f"{role} must be a non-negative integer scalar, "
+                    f"got {type(value).__name__}"
+                )
+            decoded = int(value)
+            if decoded < 0:
+                raise WriterStateError(f"{role} must be non-negative")
+            return decoded
+        if kind == "boolean":
+            if type(value) not in (bool, np.bool_):
+                raise WriterStateError(
+                    f"{role} must be a boolean scalar, "
+                    f"got {type(value).__name__}"
+                )
+            return bool(value)
+        raise AssertionError(f"unknown persisted source scalar kind {kind!r}")
+
     def _authoritative_source_fact(self, label: int) -> _PersistedSourceFact:
         label = int(label)
         frame = self._entry_group().get(f"frames/frame_{label:04d}")
@@ -703,12 +754,22 @@ class NexusRecordWriter:
         if not isinstance(source, h5py.Group):
             raise WriterStateError(f"existing frame {label} source is not a group")
         try:
-            path = self._text_value(source["path"][()])
-            frame_index = int(source["frame_index"][()])
-        except (KeyError, TypeError, ValueError) as error:
+            stored_path = source["path"][()]
+            stored_frame_index = source["frame_index"][()]
+        except (KeyError, TypeError, ValueError, OSError) as error:
             raise WriterStateError(
                 f"existing frame {label} has malformed source identity"
             ) from error
+        path = self._decode_persisted_source_scalar(
+            stored_path,
+            kind="text",
+            role=f"existing frame {label} source/path",
+        )
+        frame_index = self._decode_persisted_source_scalar(
+            stored_frame_index,
+            kind="integer",
+            role=f"existing frame {label} source/frame_index",
+        )
         snapshot = []
         for key, attr_name in _SOURCE_SNAPSHOT_ATTRIBUTES:
             if attr_name not in source.attrs:
@@ -716,11 +777,16 @@ class NexusRecordWriter:
             else:
                 observed = source.attrs[attr_name]
                 if key in {"size", "mtime_ns", "frame_count"}:
-                    value = int(observed)
+                    kind = "integer"
                 elif key == "self_contained":
-                    value = bool(observed)
+                    kind = "boolean"
                 else:
-                    value = self._text_value(observed)
+                    kind = "text"
+                value = self._decode_persisted_source_scalar(
+                    observed,
+                    kind=kind,
+                    role=f"existing frame {label} source@{attr_name}",
+                )
             snapshot.append((key, value))
         return _PersistedSourceFact(True, path, frame_index, tuple(snapshot))
 
@@ -866,6 +932,12 @@ class NexusRecordWriter:
         frame = self._entry_group().get(f"frames/frame_{expected.label:04d}")
         if not isinstance(frame, h5py.Group):
             raise WriterStateError(f"durability readback missing {role}")
+        expected_source_fact = self._source_fact_for_expected_frame(expected)
+        observed_source_fact = self._authoritative_source_fact(expected.label)
+        if observed_source_fact != expected_source_fact:
+            raise WriterStateError(
+                f"durability readback mismatch for {role}/source complete fact"
+            )
         expected_children = set()
         if expected.thumbnail is not None:
             expected_children.add("thumbnail")
@@ -940,22 +1012,14 @@ class NexusRecordWriter:
             evidence.text(
                 f"{role}/source/path",
                 expected.source_path,
-                self._text_value(source["path"][()]),
+                observed_source_fact.path,
             )
-            source_index = source["frame_index"]
-            evidence.array(
+            evidence.text(
                 f"{role}/source/frame_index",
-                np.asarray(expected.source_frame_index, dtype=source_index.dtype),
-                np.asarray(source_index[()]),
+                expected.source_frame_index,
+                observed_source_fact.frame_index,
             )
-            attr_names = {
-                "adapter_id": "adapter_id",
-                "size": "file_size",
-                "mtime_ns": "file_mtime_ns",
-                "frame_count": "frame_count",
-                "dataset_path": "dataset_path",
-                "self_contained": "self_contained",
-            }
+            attr_names = dict(_SOURCE_SNAPSHOT_ATTRIBUTES)
             expected_attr_names = {
                 attr_names[key]
                 for key, value in expected.source_snapshot
@@ -967,29 +1031,16 @@ class NexusRecordWriter:
                 json.dumps(sorted(expected_attr_names)),
                 json.dumps(sorted(observed_attr_names)),
             )
+            observed_snapshot = dict(observed_source_fact.snapshot)
             for key, value in expected.source_snapshot:
                 attr_name = attr_names.get(key)
                 if attr_name is None or value is None:
                     continue
-                observed = source.attrs.get(attr_name)
-                if key in {"size", "mtime_ns", "frame_count"}:
-                    evidence.array(
-                        f"{role}/source@{attr_name}",
-                        np.asarray(value, dtype=np.asarray(observed).dtype),
-                        np.asarray(observed),
-                    )
-                elif key == "self_contained":
-                    evidence.text(
-                        f"{role}/source@{attr_name}",
-                        str(bool(value)),
-                        str(bool(observed)),
-                    )
-                else:
-                    evidence.text(
-                        f"{role}/source@{attr_name}",
-                        value,
-                        self._text_value(observed),
-                    )
+                evidence.text(
+                    f"{role}/source@{attr_name}",
+                    value,
+                    observed_snapshot[key],
+                )
         if expected.timestamp is None:
             evidence.absent(f"{role}/timestamp", "timestamp" not in frame)
         else:
