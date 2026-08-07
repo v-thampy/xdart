@@ -15,8 +15,8 @@ import numpy as np
 from xdart.utils.h5pool import H5FilePool
 
 
-def _make_file(tmp_path):
-    p = tmp_path / "pool.h5"
+def _make_file(tmp_path, name="pool.h5"):
+    p = tmp_path / name
     with h5py.File(p, "w") as f:
         f.create_dataset("x", data=np.arange(4))
     return str(p)
@@ -57,4 +57,22 @@ def test_unbalanced_resume_is_safe(tmp_path):
     assert pool.get(path) is None         # one pause still blocks
     pool.resume(path)
     assert pool.get(path) is not None
+    pool.close_all()
+
+
+def test_lru_eviction_and_stale_handle_reopen(tmp_path):
+    pool = H5FilePool(max_open=2)
+    first = _make_file(tmp_path, "first.h5")
+    second = _make_file(tmp_path, "second.h5")
+    third = _make_file(tmp_path, "third.h5")
+
+    first_handle = pool.get(first)
+    second_handle = pool.get(second)
+    assert pool.get(first) is first_handle  # make first the most recent
+    pool.get(third)
+    assert first_handle.id.valid and not second_handle.id.valid
+
+    first_handle.close()  # stale cached handle must be replaced on demand
+    reopened = pool.get(first)
+    assert reopened is not first_handle and reopened.id.valid
     pool.close_all()
