@@ -1270,13 +1270,14 @@ def _armed_submission(accounting, *, label=0, revision=1, logical=None):
 
 
 def _open_final_session(tmp_path, name, sink, accounting, live, plan, *, store=None,
-                        nexus_target=None, executor=1):
+                        nexus_target=None, executor=1, policy=None):
     from xdart.modules.reduction import open_live_scan_session
 
     return open_live_scan_session(
         (live,), plan, sink=sink, accounting=accounting, executor=executor,
         record_store=store,
         nexus_target=nexus_target or f"nexus:{tmp_path / (name + '.nexus')}",
+        policy=policy,
     )
 
 
@@ -1287,11 +1288,34 @@ def test_c2_dynamic_genuine_frame_reaches_exact_written_then_typed_commit(
     from xrd_tools.reduction import (
         CompositeSink, MemorySink, NexusSink, NexusTerminalDisposition,
     )
+    from xrd_tools.session import (
+        FlushPolicy,
+        SessionPolicy,
+        SessionResourceAllocation,
+        SessionResourceRequirements,
+        resolve_session_policy,
+    )
 
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, f"final-{composite}")
     mode = accounting.ledger.required_modes[0]
     target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
     key, token = _armed_submission(accounting)
+    flush = FlushPolicy(interval=8, cap=64, margin=8)
+    policy = resolve_session_policy(
+        SessionResourceRequirements(
+            height=2,
+            width=2,
+            native_itemsize=8,
+            modes_1d=1,
+            npt_1d=8,
+        ),
+        envelope_bytes=64 * 1024 ** 3,
+        flush=flush,
+        env={},
+    )
+    assert type(policy) is SessionPolicy
+    assert type(policy.allocation) is SessionResourceAllocation
+    assert policy.flush is flush
     memory = MemorySink()
     nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
     sink = CompositeSink((memory, nexus)) if composite else nexus
@@ -1326,7 +1350,9 @@ def test_c2_dynamic_genuine_frame_reaches_exact_written_then_typed_commit(
     session = _open_final_session(
         tmp_path, f"final-{composite}", sink, accounting, live, plan,
         nexus_target=target_name,
+        policy=policy,
     )
+    assert session.policy is policy
     events = []
     session.on_frame_completed(events.append)
     assert session.submit(session.scan.frames[0], attempt_token=token) is True

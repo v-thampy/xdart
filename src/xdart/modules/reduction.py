@@ -24,7 +24,7 @@ class DynamicXyeReceiptBoundaryRequired(TypeError):
 from dataclasses import fields as _dc_fields
 
 if TYPE_CHECKING:
-    from xrd_tools.session import FrameRecordStore
+    from xrd_tools.session import FrameRecordStore, SessionPolicy
 
 from xrd_tools.core.metadata import (
     IncidenceAngleUnresolved,
@@ -1233,6 +1233,7 @@ def open_live_scan_session(
     record_store_persisted_on_write: bool = False,
     nexus_target: str | None = None,
     xye_target: str | None = None,
+    policy: SessionPolicy | None = None,
     accounting=None,
     xye_receipt_boundary=None,
 ):
@@ -1312,6 +1313,7 @@ def open_live_scan_session(
         record_store_persisted_on_write=record_store_persisted_on_write,
         targets_by_mode=targets_by_mode,
         store_targets_by_mode=store_targets_by_mode,
+        policy=policy,
         accounting=accounting,
         dynamic_accounting=dynamic_accounting,
         # GUI never aborts a save (loud is the headless default).  Without this, the
