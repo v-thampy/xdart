@@ -490,10 +490,8 @@ class ScanSession:
         self._dynamic_extend_live = None
         self._dynamic_extension_owner = None
         self._dynamic_current_intent = None
-        prior_facade = (
-            None if self._dynamic_nexus_sink is None
-            else self._dynamic_nexus_sink._session_facade
-        )
+        nexus = self._dynamic_nexus_sink
+        prior_facade = None if nexus is None else nexus._session_facade
         if hasattr(sink, "bind_session"):
             sink.bind_session(
                 self._dynamic_boundary
@@ -548,10 +546,7 @@ class ScanSession:
             )
         except BaseException as primary:
             try:
-                nexus = self._dynamic_nexus_sink
-                if nexus is not None and (
-                    nexus._writer is None or type(nexus._terminal_result) is NexusTerminalResult
-                ):
+                if nexus is not None:
                     nexus.bind_session(prior_facade)
             except BaseException as cleanup:
                 raise primary from cleanup
@@ -570,14 +565,16 @@ class ScanSession:
                 )
         except BaseException as primary:
             try:
-                self._session._rollback_construction(primary)
-                nexus = self._dynamic_nexus_sink
+                try:
+                    self._session._rollback_construction(primary)
+                finally:
+                    if nexus is not None:
+                        nexus.bind_session(prior_facade)
                 if nexus is not None:
                     terminal = nexus._terminal_result
                     if (type(terminal) is not NexusTerminalResult
                             or terminal.disposition is not NexusTerminalDisposition.ABORTED):
                         raise RuntimeError("construction cleanup did not abort Nexus")
-                    nexus.bind_session(prior_facade)
             except BaseException as cleanup:
                 raise primary from cleanup
             raise

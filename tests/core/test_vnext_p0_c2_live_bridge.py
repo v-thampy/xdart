@@ -2751,3 +2751,316 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
         "publication": frozenset(),
     }
     assert independent_publication_arrays(store, lease) == {}
+
+
+def _c2_retry_graph(memory_count, nexus):
+    """Return an admitted exact graph with Memory before the Nexus branch."""
+    from xrd_tools.reduction import CompositeSink, MemorySink
+
+    memories = [MemorySink() for _ in range(memory_count)]
+    if memory_count == 1:
+        return CompositeSink((memories[0], nexus)), memories
+    inner = CompositeSink((memories[1], nexus))
+    return CompositeSink((memories[0], inner)), memories
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "flat-finish",
+        "flat-abort",
+        "flat-constructor-replay",
+        "nested-finish",
+        "nested-abort",
+    ),
+)
+def test_c2_exact_composite_retry_settles_nexus_before_memory(
+    tmp_path, monkeypatch, case,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.reduction import (
+        CompositeSink, MemorySink, NexusSink, NexusTerminalDisposition,
+        NexusTerminalResult, ReductionResult,
+    )
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, case)
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    _key, token = _armed_submission(accounting)
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    graph, memories = _c2_retry_graph(
+        2 if case.startswith("nested") else 1, nexus,
+    )
+    memory_calls = {id(memory): [] for memory in memories}
+    nexus_calls = []
+    original_memory_finish = MemorySink.finish
+    original_nexus_finish = NexusSink.finish
+    original_nexus_abort = NexusSink.abort
+
+    def count_memory(owner, result):
+        if id(owner) in memory_calls:
+            memory_calls[id(owner)].append(result)
+        return original_memory_finish(owner, result)
+
+    def count_nexus_finish(owner, result):
+        if owner is nexus:
+            nexus_calls.append(result)
+        return original_nexus_finish(owner, result)
+
+    def count_nexus_abort(owner, result):
+        if owner is nexus:
+            nexus_calls.append(result)
+        return original_nexus_abort(owner, result)
+
+    monkeypatch.setattr(MemorySink, "finish", count_memory)
+    monkeypatch.setattr(NexusSink, "finish", count_nexus_finish)
+    monkeypatch.setattr(NexusSink, "abort", count_nexus_abort)
+    original_release = OutputTransaction.release_lease_owner
+    failures = [OSError("forced H23 terminal cleanup failure")]
+
+    def fail_release_once(owner, *args, **kwargs):
+        if owner is nexus._transaction and failures:
+            raise failures.pop()
+        return original_release(owner, *args, **kwargs)
+
+    monkeypatch.setattr(OutputTransaction, "release_lease_owner", fail_release_once)
+
+    if case == "flat-constructor-replay":
+        original_start = threading.Thread.start
+        start_failures = [RuntimeError("forced reduction writer start failure")]
+
+        def fail_writer_start(owner):
+            if owner.name.startswith("reduction-writer-") and start_failures:
+                raise start_failures.pop()
+            return original_start(owner)
+
+        monkeypatch.setattr(threading.Thread, "start", fail_writer_start)
+        with pytest.raises(
+            RuntimeError, match="forced reduction writer start failure",
+        ) as caught:
+            open_live_scan_session(
+                (live,), plan, sink=graph, accounting=accounting, executor=1,
+                nexus_target=target_name,
+            )
+        assert isinstance(caught.value.__cause__, OSError)
+        assert len(nexus_calls) == 1
+        assert type(nexus_calls[0]) is ReductionResult
+        assert nexus_calls[0].failed is True
+        assert all(calls == [] for calls in memory_calls.values())
+        terminal = graph.abort(None)
+        assert nexus_calls == [nexus_calls[0], None]
+        assert type(terminal) is NexusTerminalResult
+        assert terminal.disposition is NexusTerminalDisposition.ABORTED
+    else:
+        session = open_live_scan_session(
+            (live,), plan, sink=graph, accounting=accounting, executor=1,
+            nexus_target=target_name,
+        )
+        if case.endswith("abort"):
+            original_write = NexusSink.write
+
+            def fail_write(owner, frame, reduction):
+                if owner is nexus:
+                    raise OSError("forced Nexus write failure")
+                return original_write(owner, frame, reduction)
+
+            monkeypatch.setattr(NexusSink, "write", fail_write)
+        assert session.submit(session.scan.frames[0], attempt_token=token)
+        with pytest.raises(OSError, match="forced H23 terminal cleanup failure"):
+            session.finish(raise_on_failure=not case.endswith("abort"))
+        assert len(nexus_calls) == 1
+        assert all(calls == [] for calls in memory_calls.values())
+        result = session.finish(raise_on_failure=False)
+        terminal = session.terminal_result
+        assert result.failed is case.endswith("abort")
+        assert type(terminal) is NexusTerminalResult
+        assert terminal.disposition is (
+            NexusTerminalDisposition.ABORTED
+            if case.endswith("abort") else NexusTerminalDisposition.COMMITTED
+        )
+        assert len(nexus_calls) == 2
+
+    assert all(len(calls) == 1 for calls in memory_calls.values())
+
+
+def _c2_bind_light_owner(accounting, name):
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DCleanupHooks, Light1DLayout,
+        Light1DModeLayout, SessionResourceAuthority,
+        acquire_light_1d_retention,
+    )
+
+    coordinate = Light1DBufferLayout(4, 8, f"{name}-q", "<f8", shared=True)
+    intensity = Light1DBufferLayout(4, 8, f"{name}-i", "<f8")
+    layout = Light1DLayout((Light1DModeLayout(
+        "default", coordinate, intensity,
+    ),), "default")
+    authority = SessionResourceAuthority(capacity_bytes=4096)
+    lease = acquire_light_1d_retention(
+        authority, owner=name, generation=1, layout=layout, requested_rows=1,
+        compatibility_byte_ceiling=(
+            layout.shared_bytes + layout.per_row_unique_ndarray_bytes
+        ),
+        gui_thread_id=threading.get_ident(),
+    )
+    accounting.bind_light_1d(lease, cleanup_hooks=Light1DCleanupHooks())
+    return authority
+
+
+@pytest.mark.parametrize(
+    "failure_kind,composite",
+    (
+        ("writer-start", False),
+        ("writer-start", True),
+        ("final-bind", False),
+        ("final-bind", True),
+    ),
+    ids=("writer-direct", "writer-composite", "bind-direct", "bind-composite"),
+)
+def test_c2_failed_constructor_restores_borrowed_facade_before_replay(
+    tmp_path, monkeypatch, failure_kind, composite,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.reduction import (
+        CompositeSink, MemorySink, NexusSink, NexusTerminalDisposition,
+    )
+
+    name = f"facade-{failure_kind}-{composite}"
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, name)
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    authority = _c2_bind_light_owner(accounting, name)
+    reserved = authority.snapshot().reserved_bytes
+    existing = None
+    if failure_kind == "final-bind":
+        existing = open_live_scan_session(
+            (live,), plan, sink=MemorySink(), accounting=accounting, executor=1,
+            nexus_target=target_name,
+        )
+        token = None
+    else:
+        _key, token = _armed_submission(accounting)
+    before = accounting.snapshot()
+    owners_before = accounting.owner_census()
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    prior_facade = object()
+    prior_defer = True
+    nexus.bind_session(prior_facade)
+    nexus._defer_publication_drop_settlement = prior_defer
+    graph = CompositeSink((MemorySink(), nexus)) if composite else nexus
+    original_release = OutputTransaction.release_lease_owner
+    cleanup_failures = [OSError("forced construction H23 cleanup failure")]
+
+    def fail_cleanup_once(owner, *args, **kwargs):
+        if owner is nexus._transaction and cleanup_failures:
+            raise cleanup_failures.pop()
+        return original_release(owner, *args, **kwargs)
+
+    monkeypatch.setattr(OutputTransaction, "release_lease_owner", fail_cleanup_once)
+    if failure_kind == "writer-start":
+        original_start = threading.Thread.start
+        start_failures = [RuntimeError("forced reduction writer start failure")]
+
+        def fail_writer_start(owner):
+            if owner.name.startswith("reduction-writer-") and start_failures:
+                raise start_failures.pop()
+            return original_start(owner)
+
+        monkeypatch.setattr(threading.Thread, "start", fail_writer_start)
+        expected = "forced reduction writer start failure"
+    else:
+        expected = "dynamic accounting already has a bound live session"
+
+    with pytest.raises(RuntimeError, match=expected) as caught:
+        open_live_scan_session(
+            (live,), plan, sink=graph, accounting=accounting, executor=1,
+            nexus_target=target_name,
+        )
+    assert isinstance(caught.value.__cause__, OSError)
+    assert nexus._session_facade is prior_facade
+    assert nexus._defer_publication_drop_settlement is prior_defer
+    assert accounting.snapshot() == before
+    assert accounting.owner_census() == owners_before
+    assert authority.snapshot().reserved_bytes == reserved
+    terminal = graph.abort(None)
+    assert terminal.disposition is NexusTerminalDisposition.ABORTED
+    assert nexus._session_facade is prior_facade
+    assert nexus._defer_publication_drop_settlement is prior_defer
+
+    if existing is None:
+        fresh = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+        session = open_live_scan_session(
+            (live,), plan, sink=fresh, accounting=accounting, executor=1,
+            nexus_target=target_name,
+        )
+        assert session.submit(session.scan.frames[0], attempt_token=token)
+        assert session.finish().failed is False
+    else:
+        assert accounting.owner_census().count(existing) == 1
+        existing.stop()
+        assert existing.finish(raise_on_failure=False).cancelled is True
+    assert authority.snapshot().reserved_bytes == 0
+
+
+@pytest.mark.parametrize("nested", (False, True), ids=("flat", "nested"))
+def test_c2_exact_composite_begin_runs_nexus_branch_before_memory(
+    tmp_path, monkeypatch, nested,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.io import NexusRecordWriter
+    from xrd_tools.reduction import (
+        CompositeSink, MemorySink, NexusSink, NexusTerminalDisposition,
+    )
+
+    target, accounting, live, plan = _dynamic_sink_case(
+        tmp_path, f"begin-order-{nested}",
+    )
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    graph, memories = _c2_retry_graph(2 if nested else 1, nexus)
+    sentinels = {id(memory): object() for memory in memories}
+    for memory in memories:
+        memory.frames[99] = sentinels[id(memory)]
+    begin_calls = {id(memory): 0 for memory in memories}
+    finish_calls = {id(memory): 0 for memory in memories}
+    original_memory_begin = MemorySink.begin
+    original_memory_finish = MemorySink.finish
+    original_writer_begin = NexusRecordWriter.begin
+
+    def count_memory_begin(owner, scan, reduction_plan):
+        if id(owner) in begin_calls:
+            begin_calls[id(owner)] += 1
+        return original_memory_begin(owner, scan, reduction_plan)
+
+    def count_memory_finish(owner, result):
+        if id(owner) in finish_calls:
+            finish_calls[id(owner)] += 1
+        return original_memory_finish(owner, result)
+
+    def fail_nexus_begin(owner, *args, **kwargs):
+        if owner.target == target:
+            raise RuntimeError("forced Nexus writer begin failure")
+        return original_writer_begin(owner, *args, **kwargs)
+
+    monkeypatch.setattr(MemorySink, "begin", count_memory_begin)
+    monkeypatch.setattr(MemorySink, "finish", count_memory_finish)
+    monkeypatch.setattr(NexusRecordWriter, "begin", fail_nexus_begin)
+    with pytest.raises(RuntimeError, match="forced Nexus writer begin failure"):
+        open_live_scan_session(
+            (live,), plan, sink=graph, accounting=accounting, executor=1,
+            nexus_target=target_name,
+        )
+    assert all(count == 0 for count in begin_calls.values())
+    assert all(count == 0 for count in finish_calls.values())
+    assert all(
+        memory.frames == {99: sentinels[id(memory)]} for memory in memories
+    )
+    assert nexus._terminal_result.disposition is NexusTerminalDisposition.ABORTED
+    assert nexus._writer is None or nexus._writer.phase.value not in {"active", "partial"}
+    assert nexus._transaction_owners is None

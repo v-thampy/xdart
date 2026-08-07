@@ -668,8 +668,14 @@ class CompositeSink:
             object.__setattr__(self, "worker_process", process)
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
-        for sink in self.sinks:
-            sink.begin(scan, plan)
+        self._begin(scan, plan, self._p0_order()[1])
+
+    def _begin(self, scan, plan, p0) -> None:
+        for sink in self._p0_order()[0] if p0 else self.sinks:
+            if type(sink) is CompositeSink:
+                sink._begin(scan, plan, p0)
+            else:
+                sink.begin(scan, plan)
 
     def bind_session(self, facade: Any) -> None:
         for sink in self.sinks:
@@ -692,45 +698,49 @@ class CompositeSink:
             _emit_sink_replace(sink, frame, reduction)
 
     @staticmethod
-    def _terminal_result(values: list[object]) -> NexusTerminalResult | None:
-        terminals = [
-            value for value in values if type(value) is NexusTerminalResult
-        ]
-        if not terminals:
-            return None
-        if len(terminals) != 1:
-            raise RuntimeError(
-                "CompositeSink terminal requires exactly one Nexus owner"
-            )
-        return terminals[0]
+    def _p0_nexus_count(sink):
+        kind = type(sink)
+        if kind is not CompositeSink:
+            return 0 if kind is MemorySink else 1 if kind is NexusSink else None
+        counts = tuple(map(CompositeSink._p0_nexus_count, sink.sinks))
+        return None if None in counts else sum(counts)
+
+    def _p0_order(self):
+        counts = tuple(map(self._p0_nexus_count, self.sinks))
+        if type(self) is not CompositeSink or None in counts or sum(counts) != 1:
+            return self.sinks, False
+        owner = counts.index(1)
+        return (self.sinks[owner], *self.sinks[:owner], *self.sinks[owner + 1:]), True
+
+    def _terminal(self, result, *, failed, p0) -> NexusTerminalResult | None:
+        values, error = [], None
+        sinks, nexus_first = self._p0_order() if p0 else (self.sinks, False)
+        for position, sink in enumerate(sinks):
+            hook = getattr(sink, "abort", None) if failed else sink.finish
+            try:
+                value = (sink._terminal(result, failed=failed, p0=p0)
+                         if type(sink) is CompositeSink else
+                         (hook if callable(hook) else sink.finish)(result))
+            except BaseException as exc:  # pragma: no cover - defensive fan-out
+                if nexus_first and position == 0:
+                    raise
+                error = exc if error is None else error
+            else:
+                if nexus_first and position == 0 and type(value) is not NexusTerminalResult:
+                    raise RuntimeError("CompositeSink Nexus branch did not settle")
+                values.append(value)
+        if error is not None:
+            raise error
+        terminals = [value for value in values if type(value) is NexusTerminalResult]
+        if len(terminals) > 1:
+            raise RuntimeError("CompositeSink terminal requires exactly one Nexus owner")
+        return terminals[0] if terminals else None
 
     def finish(self, result: ReductionResult) -> NexusTerminalResult | None:
-        errors: list[BaseException] = []
-        values: list[object] = []
-        for sink in self.sinks:
-            try:
-                values.append(sink.finish(result))
-            except BaseException as exc:  # pragma: no cover - defensive fan-out
-                errors.append(exc)
-        if errors:
-            raise errors[0]
-        return self._terminal_result(values)
+        return self._terminal(result, failed=False, p0=self._p0_order()[1])
 
     def abort(self, result: ReductionResult | None) -> NexusTerminalResult | None:
-        errors: list[BaseException] = []
-        values: list[object] = []
-        for sink in self.sinks:
-            abort = getattr(sink, "abort", None)
-            try:
-                if callable(abort):
-                    values.append(abort(result))
-                else:
-                    values.append(sink.finish(result))
-            except BaseException as exc:  # pragma: no cover - defensive fan-out
-                errors.append(exc)
-        if errors:
-            raise errors[0]
-        return self._terminal_result(values)
+        return self._terminal(result, failed=True, p0=self._p0_order()[1])
 
     def flush(self, *, force: bool = False) -> None:
         for sink in self.sinks:
@@ -2009,11 +2019,7 @@ class ReductionSession:
         self._record_failure(primary)
         try:
             if self._started:
-                if self._stream_started:
-                    self.finish(raise_on_failure=False)
-                else:
-                    abort = getattr(self._sink, "abort", None)
-                    (abort if callable(abort) else self._sink.finish)(None)
+                self.finish(raise_on_failure=False)
         finally:
             self._shutdown_worker()
             self._finished = True

@@ -915,3 +915,60 @@ def test_submit_returns_bool_and_drops_cleanly_on_cancel(monkeypatch):
     assert len(s.scan.frames) == inventory_after_accept
     assert 99 not in s.scan._frame_by_index
     s.finish(raise_on_failure=False)
+
+
+@pytest.mark.parametrize("terminal_hook", ("abort", "finish"))
+def test_constructor_rollback_passes_failed_zero_frame_result(
+    monkeypatch, terminal_hook,
+):
+    from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
+    from xrd_tools.reduction import ReductionResult
+
+    shutdowns = []
+
+    class TrackingExecutor(RealThreadPoolExecutor):
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            shutdowns.append((bool(wait), bool(cancel_futures)))
+            return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    class StrictResultSink:
+        def __init__(self):
+            self.open = False
+            self.values = []
+
+        def begin(self, _scan, _plan):
+            self.open = True
+
+        def write(self, _frame, _reduction):
+            return None
+
+        def finish(self, result):
+            self.values.append(result)
+            assert type(result) is ReductionResult
+            assert result.failed is True
+            assert result.n_processed == 0
+            assert result.frames == {}
+            assert result.error == "forced post-begin construction failure"
+            self.open = False
+
+        if terminal_hook == "abort":
+            def abort(self, result):
+                self.finish(result)
+
+    def fail_after_begin(_owner):
+        raise RuntimeError("forced post-begin construction failure")
+
+    monkeypatch.setattr(reduction_core, "ThreadPoolExecutor", TrackingExecutor)
+    monkeypatch.setattr(ReductionSession, "_init_streaming", fail_after_begin)
+    sink = StrictResultSink()
+    with pytest.raises(
+        RuntimeError, match="forced post-begin construction failure",
+    ) as caught:
+        ReductionSession(
+            _plan(), Scan("strict", _frames(1), integrator=object()), sink=sink,
+            execution="streaming", executor=1,
+        )
+    assert caught.value.__cause__ is None
+    assert sink.open is False
+    assert len(sink.values) == 1
+    assert shutdowns == [(True, True)]
