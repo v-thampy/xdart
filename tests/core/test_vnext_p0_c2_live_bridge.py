@@ -1281,6 +1281,260 @@ def _open_final_session(tmp_path, name, sink, accounting, live, plan, *, store=N
     )
 
 
+class _ObservedLiveFrames:
+    def __init__(self, frame, effects):
+        self._frame = frame
+        self._effects = effects
+
+    def __iter__(self):
+        self._effects["source_iterations"] += 1
+        return iter((self._frame,))
+
+
+def _install_policy_effect_spies(monkeypatch):
+    import xdart.modules.reduction as reduction_module
+    import xrd_tools.session as session_module
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import DynamicRunAccounting
+
+    active = {"accounting": None, "effects": None}
+    original_binder = reduction_module.bind_dynamic_output_sink
+    original_ledger = DynamicRunAccounting.ledger.fget
+    original_bind = NexusSink.bind_session
+    original_begin = NexusSink.begin
+
+    def mark(name):
+        effects = active["effects"]
+        if effects is not None:
+            effects[name] += 1
+
+    def observed_binder(sink):
+        mark("sink_classifications")
+        return original_binder(sink)
+
+    def observed_ledger(owner):
+        if owner is active["accounting"]:
+            mark("accounting_observations")
+        return original_ledger(owner)
+
+    def observed_session(*_args, **_kwargs):
+        mark("session_constructions")
+        raise RuntimeError("ScanSession construction reached")
+
+    def observed_bind(owner, facade):
+        mark("sink_binds")
+        return original_bind(owner, facade)
+
+    def observed_begin(owner, scan, plan):
+        mark("sink_begins")
+        return original_begin(owner, scan, plan)
+
+    monkeypatch.setattr(
+        reduction_module, "bind_dynamic_output_sink", observed_binder,
+    )
+    monkeypatch.setattr(
+        DynamicRunAccounting, "ledger", property(observed_ledger),
+    )
+    monkeypatch.setattr(session_module, "ScanSession", observed_session)
+    monkeypatch.setattr(NexusSink, "bind_session", observed_bind)
+    monkeypatch.setattr(NexusSink, "begin", observed_begin)
+    return active
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    ("foreign-policy", "policy-subclass", "missing-or-foreign-allocation"),
+    ids=("foreign-policy", "policy-subclass", "missing-or-foreign-allocation"),
+)
+def test_live_scan_facade_refuses_invalid_policy_before_source_or_sink_effect(
+    tmp_path, monkeypatch, invalid_kind,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    from xrd_tools.session import (
+        FlushPolicy,
+        SessionPolicy,
+        SessionResourceRequirements,
+        resolve_session_policy,
+    )
+
+    class PolicySubclass(SessionPolicy):
+        pass
+
+    if invalid_kind == "foreign-policy":
+        invalid_policies = (object(),)
+        expected = "policy must be an exact SessionPolicy or None"
+    elif invalid_kind == "policy-subclass":
+        base_policy = resolve_session_policy(
+            SessionResourceRequirements(
+                height=2,
+                width=2,
+                native_itemsize=8,
+                modes_1d=1,
+                npt_1d=1000,
+            ),
+            envelope_bytes=64 * 1024 ** 3,
+            flush=FlushPolicy(interval=8, cap=64, margin=8),
+            env={},
+        )
+        invalid_policies = (
+            PolicySubclass(
+                flush=base_policy.flush,
+                allocation=base_policy.allocation,
+            ),
+        )
+        expected = "policy must be an exact SessionPolicy or None"
+    else:
+        invalid_policies = (
+            SessionPolicy(),
+            SessionPolicy(allocation=object()),
+        )
+        expected = "policy must carry an exact SessionResourceAllocation"
+
+    active = _install_policy_effect_spies(monkeypatch)
+    observations = []
+    for ordinal, invalid_policy in enumerate(invalid_policies):
+        name = f"{invalid_kind}-{ordinal}"
+        target = tmp_path / name / "result.nexus"
+        _ledger, accounting, _mode, target_name = accounting_for(target)
+        effects = {
+            "source_iterations": 0,
+            "sink_classifications": 0,
+            "accounting_observations": 0,
+            "session_constructions": 0,
+            "sink_binds": 0,
+            "sink_begins": 0,
+        }
+        live = SimpleNamespace(
+            idx=0,
+            map_raw=np.ones((2, 2), dtype=np.float64),
+            bg_raw=None,
+            scan_info={},
+            source_file=str(tmp_path / f"{name}.tif"),
+            source_frame_idx=0,
+            mask=None,
+            poni=None,
+            integrator=DeterministicIntegrator(),
+        )
+        prior_output = tmp_path / f"{name}-prior.nexus"
+        prior_output.write_bytes(b"prior-output-bytes")
+        before = accounting.snapshot()
+        active["accounting"] = accounting
+        active["effects"] = effects
+        error = None
+        try:
+            open_live_scan_session(
+                _ObservedLiveFrames(live, effects),
+                ReductionPlan(integration_2d=None),
+                sink=NexusSink(
+                    target, overwrite=True, atomic=False, flush_every=None,
+                ),
+                accounting=accounting,
+                nexus_target=target_name,
+                policy=invalid_policy,
+            )
+        except BaseException as caught:
+            error = caught
+        active["accounting"] = None
+        active["effects"] = None
+        observations.append((effects, error, before, accounting.snapshot()))
+        assert not target.parent.exists()
+        assert not target.exists()
+        assert prior_output.read_bytes() == b"prior-output-bytes"
+
+    for effects, error, before, after in observations:
+        assert effects == {
+            "source_iterations": 0,
+            "sink_classifications": 0,
+            "accounting_observations": 0,
+            "session_constructions": 0,
+            "sink_binds": 0,
+            "sink_begins": 0,
+        }
+        assert after == before
+        assert type(error) is TypeError
+        assert str(error) == expected
+
+
+def test_live_scan_facade_refuses_policy_for_other_requirements_before_sink_or_target(
+    tmp_path, monkeypatch,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    from xrd_tools.session import (
+        FlushPolicy,
+        SessionResourceRequirements,
+        resolve_session_policy,
+    )
+
+    target = tmp_path / "mismatch" / "result.nexus"
+    _ledger, accounting, _mode, target_name = accounting_for(target)
+    effects = {
+        "source_iterations": 0,
+        "sink_classifications": 0,
+        "accounting_observations": 0,
+        "session_constructions": 0,
+        "sink_binds": 0,
+        "sink_begins": 0,
+    }
+    live = SimpleNamespace(
+        idx=0,
+        map_raw=np.ones((2, 2), dtype=np.float64),
+        bg_raw=None,
+        scan_info={},
+        source_file=str(tmp_path / "mismatch.tif"),
+        source_frame_idx=0,
+        mask=None,
+        poni=None,
+        integrator=DeterministicIntegrator(),
+    )
+    policy = resolve_session_policy(
+        SessionResourceRequirements(
+            height=3,
+            width=4,
+            native_itemsize=8,
+            modes_1d=1,
+            npt_1d=8,
+        ),
+        envelope_bytes=64 * 1024 ** 3,
+        flush=FlushPolicy(interval=8, cap=64, margin=8),
+        env={},
+    )
+    prior_output = tmp_path / "mismatch-prior.nexus"
+    prior_output.write_bytes(b"prior-output-bytes")
+    before = accounting.snapshot()
+    active = _install_policy_effect_spies(monkeypatch)
+    active["accounting"] = accounting
+    active["effects"] = effects
+    error = None
+    try:
+        open_live_scan_session(
+            _ObservedLiveFrames(live, effects),
+            ReductionPlan(integration_2d=None),
+            sink=NexusSink(
+                target, overwrite=True, atomic=False, flush_every=None,
+            ),
+            accounting=accounting,
+            nexus_target=target_name,
+            policy=policy,
+        )
+    except BaseException as caught:
+        error = caught
+    active["accounting"] = None
+    active["effects"] = None
+
+    assert effects["source_iterations"] == 1
+    assert effects["session_constructions"] == 0
+    assert effects["sink_binds"] == 0
+    assert effects["sink_begins"] == 0
+    assert accounting.snapshot() == before
+    assert not target.parent.exists()
+    assert not target.exists()
+    assert prior_output.read_bytes() == b"prior-output-bytes"
+    assert type(error) is ValueError
+    assert str(error) == "explicit allocation was built for other requirements"
+
+
 @pytest.mark.parametrize("composite", (False, True), ids=("direct", "memory-nexus"))
 def test_c2_dynamic_genuine_frame_reaches_exact_written_then_typed_commit(
     tmp_path, monkeypatch, composite,
@@ -1307,7 +1561,7 @@ def test_c2_dynamic_genuine_frame_reaches_exact_written_then_typed_commit(
             width=2,
             native_itemsize=8,
             modes_1d=1,
-            npt_1d=8,
+            npt_1d=1000,
         ),
         envelope_bytes=64 * 1024 ** 3,
         flush=flush,

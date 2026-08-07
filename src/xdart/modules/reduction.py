@@ -1246,7 +1246,25 @@ def open_live_scan_session(
     ``ReductionSession``.  Streaming-only — the GUI live/batch write path.
     ``clear_frame_images=True`` preserves xdart's PERF-3 raw-nulling.
     """
-    from xrd_tools.session import DynamicRunAccounting, ScanSession
+    from types import SimpleNamespace
+    from xrd_tools.session import (
+        DynamicRunAccounting,
+        ScanSession,
+        SessionPolicy,
+        SessionResourceAllocation,
+        resolve_session_policy,
+    )
+    from xrd_tools.session.policy import requirements_from
+
+    if policy is not None and type(policy) is not SessionPolicy:
+        raise TypeError("policy must be an exact SessionPolicy or None")
+    if (
+        policy is not None
+        and type(policy.allocation) is not SessionResourceAllocation
+    ):
+        raise TypeError(
+            "policy must carry an exact SessionResourceAllocation"
+        )
 
     dynamic_accounting = None
     if accounting is not None:
@@ -1298,6 +1316,22 @@ def open_live_scan_session(
     scan, plan, _n = _build_live_scan_and_plan(
         live_frames, plan, scan_name=scan_name, global_mask=global_mask,
         integrator=integrator, poni=poni)
+    if policy is not None:
+        image = scan.frames[0].image
+        descriptor = SimpleNamespace(
+            frame_shape=tuple(getattr(image, "shape", ())),
+            dtype=getattr(image, "dtype", None),
+        )
+        actual_requirements = requirements_from(descriptor, plan)
+        if resolve_session_policy(
+            actual_requirements,
+            allocation=policy.allocation,
+            flush=policy.flush,
+            env={},
+        ).allocation is not policy.allocation:
+            raise RuntimeError(
+                "explicit allocation validator replaced allocation identity"
+            )
     targets_by_mode, store_targets_by_mode = live_target_maps(
         plan, nexus_target=nexus_target, xye_target=xye_target)
     return ScanSession(
