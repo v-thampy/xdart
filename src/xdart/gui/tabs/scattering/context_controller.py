@@ -7,7 +7,10 @@ from xdart.modules.display_context import (
     new_context_token,
 )
 
-from .acquisition_runtime import CommandCompensationFailure
+from .acquisition_runtime import (
+    CommandCompensationFailure,
+    TerminalPauseFailure,
+)
 from .browse_hydration import _BrowseHydrationOwner
 from .browse_preview import (
     browse_preview_polling_needed,
@@ -571,23 +574,26 @@ class ContextController:
             if type(error) is CommandCompensationFailure
             else None
         )
+        terminal = type(error) is TerminalPauseFailure
         failed = event_type(
             identity,
             (
                 compensation[0]
                 if compensation is not None
+                else error.diagnostic
+                if terminal
                 else detach_exception(error, f"context.{operation}")
             ),
             None if compensation is None else compensation[1],
         )
         result = (
             self._lifecycle.fatal(FatalExecution(identity))
-            if compensation is not None
+            if compensation is not None or terminal
             else recover(failed)
         )
         expected = (
             RunPhase.FAILED
-            if compensation is not None
+            if compensation is not None or terminal
             else recovered_phase
         )
         if result.phase is not expected:

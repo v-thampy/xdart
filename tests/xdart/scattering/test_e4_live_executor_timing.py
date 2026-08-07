@@ -25,9 +25,15 @@ from xdart.gui.tabs.scattering.display_values import (
 from xdart.gui.tabs.scattering.events import (
     CleanupStatus,
     ExecutorClosed,
+    PauseFailed,
     RunIdentity,
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+from tests.xdart.scattering.test_e3_context_contract import (
+    _running_controller,
+)
 
 
 def test_linked_candidate_keeps_its_own_directory_counter_slot(
@@ -626,6 +632,7 @@ class _PauseSession:
         self.pause_calls: list[float] = []
         self.resumes = 0
         self.submits = 0
+        self.stops = 0
 
     def pause(self, *, timeout: float) -> bool:
         self.pause_calls.append(timeout)
@@ -638,12 +645,21 @@ class _PauseSession:
         self.submits += 1
         return True
 
+    def stop(self) -> None:
+        self.stops += 1
+
+    def finish(self, *, raise_on_failure: bool = False):
+        assert raise_on_failure is False
+        return SimpleNamespace(failed=False, n_processed=0)
+
 
 def _projection_pause_run(
     executor: StandardRunExecutor,
+    *,
+    identity: RunIdentity | None = None,
 ) -> tuple[_StandardRun, _PauseSession]:
     configuration = RunIntent().freeze()
-    identity = RunIdentity.from_configuration(configuration)
+    identity = identity or RunIdentity.from_configuration(configuration)
     session = _PauseSession()
     run = _StandardRun(
         configuration,
@@ -709,48 +725,119 @@ def test_durable_pause_waits_for_accepted_display_projection_without_retiring_wo
     executor._finish_display_projection(run)
 
 
-@pytest.mark.parametrize("failure", ("timeout", "projection-error"))
-def test_projection_pause_failure_compensates_and_reopens_submit_gate(
+def test_projection_pause_timeout_compensates_with_live_worker_and_no_duplicate_keys(
     monkeypatch,
-    failure: str,
 ) -> None:
     executor = StandardRunExecutor(join_timeout=0.02)
     run, session = _projection_pause_run(executor)
     entered = threading.Event()
     release = threading.Event()
-    projection_error = RuntimeError("queued display projection failed")
+    projected: list[int] = []
 
-    def project(_run, _event, _image, _session) -> None:
+    def project(_run, event, _image, _session) -> None:
         entered.set()
-        if failure == "timeout":
+        if int(event.frame_index) == 1:
             assert release.wait(timeout=2.0)
-        else:
-            raise projection_error
+        projected.append(int(event.frame_index))
 
     monkeypatch.setattr(executor, "_frame_ready_owned", project)
     executor._frame_ready(run, SimpleNamespace(frame_index=1))
     assert entered.wait(timeout=1.0)
 
-    if failure == "timeout":
-        expected = pytest.raises(
-            TimeoutError,
-            match="display projection did not reach durable pause",
-        )
-    else:
-        expected = pytest.raises(RuntimeError, match=str(projection_error))
-    with expected as captured:
+    with pytest.raises(
+        TimeoutError,
+        match="display projection did not reach durable pause",
+    ):
         executor.pause(run.identity)
-    if failure == "projection-error":
-        assert captured.value is projection_error
     assert session.resumes == 1
     assert run.context_runtime.submit(session, object()) is True
     assert session.submits == 1
-    assert run.display_projection_worker is not None
+    worker = run.display_projection_worker
+    assert worker is not None and worker.is_alive()
 
     release.set()
-    if failure == "projection-error":
-        with pytest.raises(RuntimeError) as terminal:
-            executor._finish_display_projection(run)
-        assert terminal.value is projection_error
-    else:
-        executor._finish_display_projection(run)
+    executor._frame_ready(run, SimpleNamespace(frame_index=2))
+    assert executor._drain_display_projection(run, 1.0) is True
+    assert projected == [1, 2]
+    assert len(projected) == len(set(projected))
+    assert run.display_projection_worker is worker
+    assert worker.is_alive()
+    executor._finish_display_projection(run)
+
+
+def test_projection_exception_is_terminal_failed_and_cleanup_is_visible(
+    monkeypatch,
+) -> None:
+    controller, lifecycle, mounted, _, _ = _running_controller()
+    executor = StandardRunExecutor(join_timeout=0.1)
+    run, session = _projection_pause_run(
+        executor,
+        identity=mounted.identity,
+    )
+    controller._executor = executor
+    entered = threading.Event()
+    primary = RuntimeError("queued display projection failed")
+
+    def fail_projection(_run, _event, _image, _session) -> None:
+        entered.set()
+        raise primary
+
+    monkeypatch.setattr(executor, "_frame_ready_owned", fail_projection)
+    executor._frame_ready(run, SimpleNamespace(frame_index=1))
+    assert entered.wait(timeout=1.0)
+
+    failed = controller.pause()
+    assert type(failed) is PauseFailed
+    assert failed.diagnostic.message == str(primary)
+    assert failed.diagnostic.operation == "context.pause"
+    assert lifecycle.phase is RunPhase.FAILED
+    assert session.resumes == 0
+    assert session.stops == 1
+    assert run.context_runtime is not None
+    assert run.context_runtime._gate.is_set() is False
+    assert run.closed is True
+    assert run.display_projection_worker is None
+    terminal = executor.drain_events()
+    assert len(terminal) == 1
+    assert terminal[0].kind is StandardEventKind.FAILED
+    assert terminal[0].primary is not None
+    assert terminal[0].primary.message == str(primary)
+    assert terminal[0].cleanup_status is CleanupStatus.CLEANED
+
+
+def test_dead_projection_worker_without_error_is_terminal_failed(
+    monkeypatch,
+) -> None:
+    controller, lifecycle, mounted, _, _ = _running_controller()
+    executor = StandardRunExecutor(join_timeout=0.1)
+    run, session = _projection_pause_run(
+        executor,
+        identity=mounted.identity,
+    )
+    controller._executor = executor
+    pending = run.display_projection_queue
+    worker = run.display_projection_worker
+    assert pending is not None and worker is not None
+    pending.put(executor_module._DISPLAY_PROJECTION_END)
+    worker.join(timeout=1.0)
+    assert worker.is_alive() is False
+    assert run.display_projection_errors == []
+
+    failed = controller.pause()
+    assert type(failed) is PauseFailed
+    assert failed.diagnostic.message == (
+        "display projection worker stopped before durable pause"
+    )
+    assert lifecycle.phase is RunPhase.FAILED
+    assert session.resumes == 0
+    assert session.stops == 1
+    assert run.context_runtime is not None
+    assert run.context_runtime._gate.is_set() is False
+    assert run.closed is True
+    assert run.display_projection_worker is None
+    terminal = executor.drain_events()
+    assert len(terminal) == 1
+    assert terminal[0].kind is StandardEventKind.FAILED
+    assert terminal[0].primary is not None
+    assert terminal[0].primary.message == failed.diagnostic.message
+    assert terminal[0].cleanup_status is CleanupStatus.CLEANED

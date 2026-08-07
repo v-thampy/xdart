@@ -91,8 +91,20 @@ def _qualified_symbol_owners(
 ) -> set[str]:
     """Return definition/import owners, excluding harmless local names."""
 
-    owners: set[str] = set()
     relative = str(path.relative_to(ROOT))
+    return _qualified_symbol_owners_from_source(
+        path.read_text(), relative, token
+    )
+
+
+def _qualified_symbol_owners_from_source(
+    source: str,
+    relative: str,
+    token: str,
+) -> set[str]:
+    """Return semantic owners from one source mutation discriminator."""
+
+    owners: set[str] = set()
 
     class Visitor(ast.NodeVisitor):
         def __init__(self) -> None:
@@ -133,24 +145,107 @@ def _qualified_symbol_owners(
                     owners.add(self._owner(f"import:{token}"))
 
         def visit_Assign(self, node: ast.Assign) -> None:
-            if self.function_depth == 0 and any(
-                isinstance(target, ast.Name) and target.id == token
-                for target in node.targets
-            ):
-                owners.add(self._owner(f"assignment:{token}"))
+            for target in node.targets:
+                self._record_assignment(target)
             self.generic_visit(node)
 
         def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-            if (
-                self.function_depth == 0
-                and isinstance(node.target, ast.Name)
-                and node.target.id == token
-            ):
-                owners.add(self._owner(f"assignment:{token}"))
+            self._record_assignment(node.target)
             self.generic_visit(node)
 
-    Visitor().visit(ast.parse(path.read_text()))
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self._record_assignment(node.target)
+            self.generic_visit(node)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            self._record_assignment(node.target)
+            self.generic_visit(node)
+
+        def _record_assignment(self, target: ast.expr) -> None:
+            if (
+                isinstance(target, ast.Name)
+                and target.id == token
+                and self.function_depth == 0
+            ):
+                owners.add(self._owner(f"assignment:{token}"))
+            elif (
+                isinstance(target, ast.Attribute)
+                and target.attr == token
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                owners.add(self._owner(f"assignment:self.{token}"))
+            elif isinstance(target, (ast.List, ast.Tuple)):
+                for item in target.elts:
+                    self._record_assignment(item)
+            elif isinstance(target, ast.Starred):
+                self._record_assignment(target.value)
+
+    Visitor().visit(ast.parse(source))
     return owners
+
+
+def test_owner_census_mutation_rejects_instance_store() -> None:
+    owners = _qualified_symbol_owners_from_source(
+        "class Page:\n"
+        "    def bind(self):\n"
+        "        self._display_target = object()\n",
+        "mutated.py",
+        "_display_target",
+    )
+    assert owners == {
+        "mutated.py.Page.bind.assignment:self._display_target"
+    }
+
+
+def test_owner_census_mutation_rejects_module_and_class_assignments() -> None:
+    owners = _qualified_symbol_owners_from_source(
+        "_display_target = object()\n"
+        "class Page:\n"
+        "    _display_target: object = object()\n",
+        "mutated.py",
+        "_display_target",
+    )
+    assert owners == {
+        "mutated.py.assignment:_display_target",
+        "mutated.py.Page.assignment:_display_target",
+    }
+
+
+def test_owner_census_mutation_rejects_definition_and_import() -> None:
+    owners = _qualified_symbol_owners_from_source(
+        "from legacy import owner as _display_target\n"
+        "def _display_target():\n"
+        "    return None\n",
+        "mutated.py",
+        "_display_target",
+    )
+    assert owners == {
+        "mutated.py.import:_display_target",
+        "mutated.py._display_target",
+    }
+
+
+def test_owner_census_mutation_allows_harmless_local_frame_label() -> None:
+    owners = _qualified_symbol_owners_from_source(
+        "def caption():\n"
+        "    frame_label = 7\n"
+        "    return frame_label\n",
+        "mutated.py",
+        "frame_label",
+    )
+    assert owners == set()
+
+
+def test_owner_census_preserves_exact_artifact_progress_owner() -> None:
+    owners = _qualified_symbol_owners(
+        ROOT / "src/xdart/gui/tabs/scattering/shell_values.py",
+        "for_artifact",
+    )
+    assert owners == {
+        "src/xdart/gui/tabs/scattering/shell_values.py."
+        "ProgressProjection.for_artifact"
+    }
 
 
 def test_j2_merge_keyed_scalar_route_census_is_zero() -> None:

@@ -27,7 +27,7 @@ from ..contracts import (
     SourceCapture, SourceExecutionIdentityV1, StartCapture,
     executor_start_inputs_are_valid,
 )
-from ..acquisition_runtime import AcquisitionRuntime
+from ..acquisition_runtime import AcquisitionRuntime, TerminalPauseFailure
 from ..display_values import (
     DisplayFrameCatalog,
     DisplayFrameKey,
@@ -128,6 +128,7 @@ class _StandardRun:
     display_projection_queue: Queue[object] | None = None
     display_projection_worker: Thread | None = None
     display_projection_errors: list[BaseException] = field(default_factory=list)
+    command_failure: DetachedDiagnostic | None = None
 
     def __post_init__(self) -> None:
         self.perf_enabled = bool(os.environ.get("XDART_PERF"))
@@ -580,14 +581,20 @@ class StandardRunExecutor:
         runtime = run.context_runtime
         if runtime is None:
             raise RuntimeError("acquisition context is not ready")
-        return runtime.pause(
-            run.session,
-            run_identity,
-            self._join_timeout,
-            drain_projection=lambda timeout: self._drain_display_projection(
-                run, timeout
-            ),
-        )
+        try:
+            return runtime.pause(
+                run.session,
+                run_identity,
+                self._join_timeout,
+                drain_projection=lambda timeout: self._drain_display_projection(
+                    run, timeout
+                ),
+            )
+        except TerminalPauseFailure as failure:
+            failure.cleanup_receipt = self._terminate_projection_failure(
+                run, failure.diagnostic
+            )
+            raise
 
     def resume(self, run_identity: RunIdentity) -> None:
         run = self._exact_run(run_identity)
@@ -723,19 +730,115 @@ class StandardRunExecutor:
         worker = run.display_projection_worker
         if pending is None or worker is None:
             if run.display_projection_errors:
-                raise run.display_projection_errors[0]
+                raise TerminalPauseFailure(
+                    run.display_projection_errors[0]
+                )
             return True
         deadline = monotonic() + max(0.0, float(timeout))
         with pending.all_tasks_done:
             while pending.unfinished_tasks:
                 if run.display_projection_errors:
-                    raise run.display_projection_errors[0]
+                    raise TerminalPauseFailure(
+                        run.display_projection_errors[0]
+                    )
+                if not worker.is_alive():
+                    raise TerminalPauseFailure(RuntimeError(
+                        "display projection worker stopped before durable pause"
+                    ))
                 remaining = deadline - monotonic()
                 if remaining <= 0.0:
                     return False
                 pending.all_tasks_done.wait(timeout=min(remaining, 0.01))
             if run.display_projection_errors:
-                raise run.display_projection_errors[0]
+                raise TerminalPauseFailure(
+                    run.display_projection_errors[0]
+                )
+            if not worker.is_alive():
+                raise TerminalPauseFailure(RuntimeError(
+                    "display projection worker stopped before durable pause"
+                ))
+        return True
+
+    def _terminate_projection_failure(
+        self,
+        run: _StandardRun,
+        diagnostic: DetachedDiagnostic,
+    ) -> ExecutorClosed:
+        """Fail one exact active run and retire its non-retryable owners."""
+
+        with run.cleanup_lock:
+            if run.command_failure is None:
+                run.command_failure = diagnostic
+            if run.primary is None:
+                run.primary = diagnostic
+        run.stop_requested = True
+        run.stop_signal.set()
+        session = run.session
+        runtime = run.context_runtime
+        if session is not None:
+            try:
+                if runtime is None:
+                    session.stop()
+                else:
+                    runtime.terminal_stop(session)
+            except BaseException as error:
+                with run.cleanup_lock:
+                    run.cleanup_failures.append(detach_exception(
+                        error, "session.stop"
+                    ))
+        projection_retired = self._retire_failed_display_projection(run)
+        worker = run.worker
+        if (
+            worker is not None
+            and worker is not current_thread()
+            and worker.ident is not None
+        ):
+            worker.join(timeout=self._join_timeout)
+        if projection_retired and (worker is None or not worker.is_alive()):
+            receipt = self._cleanup(run, diagnostic)
+        else:
+            run.cleanup_status = CleanupStatus.CLEANUP_PENDING
+            receipt = self._receipt(run)
+        completed, total = standard_progress(run)
+        self._terminal_event(
+            run,
+            StandardEventKind.FAILED,
+            receipt,
+            completed,
+            total,
+        )
+        return receipt
+
+    def _retire_failed_display_projection(self, run: _StandardRun) -> bool:
+        """Discard non-retryable queued work and release the failed worker."""
+
+        pending = run.display_projection_queue
+        worker = run.display_projection_worker
+        if (
+            worker is not None
+            and worker is not current_thread()
+            and worker.ident is not None
+            and worker.is_alive()
+        ):
+            worker.join(timeout=self._join_timeout)
+        if worker is not None and worker.is_alive():
+            with run.cleanup_lock:
+                run.cleanup_failures.append(detach_exception(
+                    TimeoutError("display projection worker did not retire"),
+                    "display_projection.retire",
+                ))
+            return False
+        if pending is not None:
+            while True:
+                try:
+                    pending.get_nowait()
+                except Empty:
+                    break
+                else:
+                    pending.task_done()
+        run.display_projection_queue = None
+        run.display_projection_worker = None
+        run.display_projection_errors.clear()
         return True
 
     @staticmethod
@@ -1005,6 +1108,8 @@ class StandardRunExecutor:
                 stopped = True
             else:
                 primary = detach_exception(error)
+        if run.command_failure is not None:
+            primary = run.command_failure
         work_elapsed = max(0.0, monotonic() - started_at)
         completed, total = standard_progress(run)
         cleanup_started_at = monotonic()

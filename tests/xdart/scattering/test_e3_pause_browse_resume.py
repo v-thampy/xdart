@@ -52,6 +52,14 @@ from tests.xdart.scattering.test_e3_context_contract import (
 _B_SHA256 = (
     "6110bedb3bb14c1c30978f84b43716339ff099856ab55f96e4ca7f2d9c56a3c6"
 )
+_EXPLICIT_NEXUS_RELATIVE = Path(
+    "eiger/xdart_processed_data/"
+    "Combi4_Angledependence_samz_4p9_03271005.nexus"
+)
+_EXPLICIT_NEXUS_SIZE = 10_449_060
+_EXPLICIT_NEXUS_SHA256 = (
+    "f41fcbdc0f341ded301987662a508427ed14981ee05134a71ee9a86b6a59a4b9"
+)
 
 
 def _browse_fixture() -> Path:
@@ -162,37 +170,55 @@ def test_real_browse_load_is_off_thread_exact_and_independently_owned(
     loader.close()
 
 
-def test_explicit_processed_nexus_browse_does_not_enter_raw_discovery() -> None:
-    path = Path(
-        "/Users/vthampy/repos/test_data/eiger/xdart_processed_data/"
-        "Combi4_Angledependence_samz_4p9_03271005.nexus"
-    )
+def test_explicit_processed_nexus_browse_reload_does_not_enter_raw_discovery(
+) -> None:
+    data_root = os.environ.get("XDART_TEST_DATA")
+    if not data_root:
+        pytest.skip(
+            "processed .nexus Browse capability unavailable: "
+            "XDART_TEST_DATA is unset; expected relative path "
+            f"{_EXPLICIT_NEXUS_RELATIVE} with sha256 "
+            f"{_EXPLICIT_NEXUS_SHA256}"
+        )
+    path = Path(data_root) / _EXPLICIT_NEXUS_RELATIVE
     if not path.is_file():
         pytest.skip(
             "processed .nexus Browse capability unavailable: missing "
-            f"{path}"
+            f"{path}; expected size {_EXPLICIT_NEXUS_SIZE} and sha256 "
+            f"{_EXPLICIT_NEXUS_SHA256}"
         )
+    assert path.stat().st_size == _EXPLICIT_NEXUS_SIZE
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+        _EXPLICIT_NEXUS_SHA256
+    )
 
     discovered = enumerate_candidates(path.parent)
     assert path not in {candidate.path for candidate in discovered}
 
     loader = BrowseLoader(max_items=32)
-    request = BrowseLoadRequest(
-        new_context_token(ContextKind.BROWSE),
-        1,
-        str(path),
-    )
-    assert loader.begin(request) is request
-    outcome = _wait_outcome(loader, request)
-    assert outcome.status is BrowseLoadStatus.READY
-    context = loader.consume(outcome)
-    assert context is not None
-    assert context.requested_path == str(path)
-    assert context.scan_key == path.stem
-    assert path not in {
-        candidate.path for candidate in enumerate_candidates(path.parent)
-    }
-    loader.release_context(context)
+    contexts = []
+    for generation in (1, 2):
+        request = BrowseLoadRequest(
+            new_context_token(ContextKind.BROWSE),
+            generation,
+            str(path),
+        )
+        assert loader.begin(request) is request
+        outcome = _wait_outcome(loader, request)
+        assert outcome.status is BrowseLoadStatus.READY
+        context = loader.consume(outcome)
+        assert context is not None
+        contexts.append(context)
+        assert context.load_generation == generation
+        assert context.requested_path == str(path)
+        assert context.scan_key == path.stem
+        assert path not in {
+            candidate.path
+            for candidate in enumerate_candidates(path.parent)
+        }
+        loader.release_context(context)
+        assert context.released is True
+    assert contexts[0] is not contexts[1]
     loader.close()
 
 

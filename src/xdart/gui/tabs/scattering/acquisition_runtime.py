@@ -27,6 +27,16 @@ class CommandCompensationFailure(RuntimeError, KeyboardInterrupt):
         super().__init__(self.diagnostics[0].message)
 
 
+class TerminalPauseFailure(RuntimeError):
+    """A Pause boundary that cannot truthfully recover to Running."""
+
+    def __init__(self, primary: BaseException) -> None:
+        self.primary = primary
+        self.diagnostic = detach_exception(primary, "context.pause")
+        self.cleanup_receipt = None
+        super().__init__(self.diagnostic.message)
+
+
 def _pause_compensation(session, timeout: float) -> bool:
     try:
         pause = object.__getattribute__(session, "pause")
@@ -115,6 +125,10 @@ class AcquisitionRuntime:
                 projected = bool(drain_projection(max(
                     0.0, deadline - monotonic()
                 )))
+            except TerminalPauseFailure:
+                # Projection mutation is not proven atomic.  Its exact owner
+                # must terminate the run instead of compensating to Running.
+                raise
             except BaseException as primary:
                 self._resume_after_pause_failure(session, primary)
             if not projected:
@@ -158,10 +172,21 @@ class AcquisitionRuntime:
         with self._command_lock:
             session.stop()
 
+    def terminal_stop(self, session) -> None:
+        """Stop one failed session without reopening frame submission."""
+
+        self._gate.clear()
+        with self._command_lock:
+            session.stop()
+
     def retire(self) -> None:
         self._gate.set()
         if self.context is not None:
             self.context.retire()
 
 
-__all__ = ["AcquisitionRuntime", "CommandCompensationFailure"]
+__all__ = [
+    "AcquisitionRuntime",
+    "CommandCompensationFailure",
+    "TerminalPauseFailure",
+]
