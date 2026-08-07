@@ -3093,7 +3093,7 @@ def test_xye_nonterminal_retry_freezes_epoch_then_allows_later_terminal_epoch(
     assert attempts == [(0,), (0,), (1,)]
 
 
-def test_kernel_is_qt_free_and_mounted_only_at_c3_composition_boundaries() -> None:
+def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
     api = _api()
     module_path = Path(api.__file__).resolve()
     source_root = module_path.parents[2]
@@ -3132,12 +3132,11 @@ def test_kernel_is_qt_free_and_mounted_only_at_c3_composition_boundaries() -> No
         "xrd_tools/io/append.py",
         "xrd_tools/io/record_writer.py",
         "xrd_tools/reduction/core.py",
-        "xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py",
     ])
 
 
 def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
-    """C2 sub-oracle; the canonical wrangler_widget mount remains C3-owned."""
+    """C2 sub-oracle; the GUI transaction mount remains deferred to P1 XYE."""
     api = _api()
     module_path = Path(api.__file__).resolve()
     source_root = module_path.parents[2]

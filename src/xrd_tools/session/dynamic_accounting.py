@@ -15,7 +15,7 @@ import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Hashable, Iterable, Mapping
+from typing import Callable, Hashable, Iterable, Mapping
 
 from ._closed_values import freeze_identity
 from .stage_accounting import ItemDisposition, ResultMode, StageReceipt
@@ -294,6 +294,9 @@ class DynamicRunAccounting:
         self._receipt_suppliers: dict[
             tuple[int, ResultMode, int], DynamicAttemptToken
         ] = {}
+        self._ledger_attempt_tokens: dict[
+            tuple[int, int], DynamicAttemptToken
+        ] = {}
         self._epoch_tokens: list[DynamicAttemptToken] = []
         self._pending_persisted: dict[
             tuple[DynamicFrameIdentity, ResultMode, str],
@@ -410,12 +413,16 @@ class DynamicRunAccounting:
         durable = self._durable if durable is None else durable
         dropped = self._dropped if dropped is None else dropped
         modes = tuple(self._ledger.required_modes)
-        if not modes or any(not self._ledger.targets_by_mode.get(mode) for mode in modes):
+        if not modes:
             return False
         for mode in modes:
             current = self._current_result_supplier(key, mode)
             if current is None:
                 return False
+            if not self._ledger.targets_by_mode.get(mode):
+                if mode not in self._records[current].written:
+                    return False
+                continue
             if dropped.get((key, mode)) is current:
                 continue
             if not self._mode_has_one_supplier(
@@ -568,12 +575,43 @@ class DynamicRunAccounting:
             record.enqueued = True
             record.state = DynamicAttemptState.ENQUEUED
 
-    def record_accepted(self, token: DynamicAttemptToken) -> int:
+    def validate_submission(
+        self, token: DynamicAttemptToken, output_label: int,
+    ) -> None:
+        """Validate one exact single-call submit capability without mutation."""
+        if isinstance(output_label, bool) or int(output_label) != output_label:
+            raise ValueError("dynamic submission output label must be an integer")
+        output_label = int(output_label)
+        with self._lock:
+            self._require_unsealed()
+            self._require_open_frontier()
+            record = self._record(token)
+            attempts = self._attempts[token.key]
+            if not attempts or attempts[-1] is not token:
+                raise ValueError("stale dynamic attempt token")
+            if self._frames[token.key].output_label != output_label:
+                raise ValueError("dynamic attempt token has the wrong output label")
+            if record.accepted or record.state is DynamicAttemptState.ACCEPTED:
+                raise ValueError("pre-accepted dynamic attempt cannot be submitted")
+            if record.state is not DynamicAttemptState.ENQUEUED:
+                raise ValueError(
+                    "dynamic submission requires the latest enqueued attempt token"
+                )
+
+    def record_accepted(
+        self,
+        token: DynamicAttemptToken,
+        *,
+        publish_acceptance: Callable[[int], None] | None = None,
+    ) -> int:
         with self._lock:
             self._require_unsealed()
             record = self._record(token)
             if record.accepted:
-                return int(record.ledger_attempt)
+                ledger_attempt = int(record.ledger_attempt)
+                if publish_acceptance is not None:
+                    publish_acceptance(ledger_attempt)
+                return ledger_attempt
             self._require_latest_positive(token)
             self._require_open_frontier()
             if record.state not in {
@@ -582,12 +620,51 @@ class DynamicRunAccounting:
             }:
                 raise ValueError("only a live provisional attempt can be accepted")
             label = self._frames[token.key].output_label
-            ledger_attempt = self._ledger.record_accepted(label)
-            record.ledger_attempt = int(ledger_attempt)
-            record.accepted = True
-            record.state = DynamicAttemptState.ACCEPTED
-            self._epoch_tokens.append(token)
+
+            def publish(ledger_attempt: int) -> None:
+                ledger_attempt = int(ledger_attempt)
+                key = (label, ledger_attempt)
+                prior = self._ledger_attempt_tokens.get(key)
+                if prior not in {None, token}:
+                    raise RuntimeError(
+                        "ledger attempt is already bound to another dynamic token"
+                    )
+                if record.ledger_attempt not in {None, ledger_attempt}:
+                    raise RuntimeError("dynamic acceptance replay changed its attempt")
+                if not record.accepted:
+                    record.ledger_attempt = ledger_attempt
+                    record.accepted = True
+                    record.state = DynamicAttemptState.ACCEPTED
+                    self._ledger_attempt_tokens[key] = token
+                    self._epoch_tokens.append(token)
+                if publish_acceptance is not None:
+                    publish_acceptance(ledger_attempt)
+
+            ledger_attempt = self._ledger.record_accepted(
+                label, publish_acceptance=publish,
+            )
+            if not record.accepted or record.ledger_attempt != int(ledger_attempt):
+                raise RuntimeError("dynamic acceptance was not published atomically")
             return int(ledger_attempt)
+
+    def token_for_ledger_attempt(
+        self, output_label: int, ledger_attempt: int,
+    ) -> DynamicAttemptToken:
+        if isinstance(output_label, bool) or int(output_label) != output_label:
+            raise ValueError("output label must be an integer")
+        if (
+            isinstance(ledger_attempt, bool)
+            or int(ledger_attempt) != ledger_attempt
+            or int(ledger_attempt) <= 0
+        ):
+            raise ValueError("ledger attempt must be a positive integer")
+        with self._lock:
+            token = self._ledger_attempt_tokens.get(
+                (int(output_label), int(ledger_attempt)),
+            )
+            if token is None:
+                raise ValueError("foreign ledger attempt has no dynamic token")
+            return token
 
     def record_completed(self, token: DynamicAttemptToken, *,
                          produced: Iterable[ResultMode]) -> None:

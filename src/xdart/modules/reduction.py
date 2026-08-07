@@ -1247,8 +1247,9 @@ def open_live_scan_session(
     """
     from xrd_tools.session import DynamicRunAccounting, ScanSession
 
+    dynamic_accounting = None
     if accounting is not None:
-        if not isinstance(accounting, DynamicRunAccounting):
+        if type(accounting) is not DynamicRunAccounting:
             raise TypeError(
                 "non-None live accounting must be DynamicRunAccounting authority"
             )
@@ -1270,6 +1271,26 @@ def open_live_scan_session(
                 "dynamic XYE receipt boundary must be the exact shared "
                 "durable receipt owner"
             )
+        pre_targets, _pre_store_targets = live_target_maps(
+            plan, nexus_target=nexus_target, xye_target=xye_target,
+        )
+        nexus = sink_binding.nexus_sink
+        if nexus is not None:
+            if nexus.allow_unbound_same_run and nexus.same_run_intent is None:
+                raise ValueError(
+                    "dynamic ScanSession refuses unbound same-run adoption"
+                )
+            if nexus.flush_every is not None:
+                raise ValueError("dynamic Nexus sink requires flush_every=None")
+            expected = frozenset((f"nexus:{nexus.path}",))
+            if pre_targets is None or any(
+                frozenset(pre_targets.get(mode, ())) != expected
+                for mode in accounting.ledger.required_modes
+            ):
+                raise ValueError(
+                    "dynamic Nexus target must exactly match every required mode"
+                )
+        dynamic_accounting = accounting
         accounting = accounting.ledger
         sink = sink_binding.sink
 
@@ -1292,6 +1313,7 @@ def open_live_scan_session(
         targets_by_mode=targets_by_mode,
         store_targets_by_mode=store_targets_by_mode,
         accounting=accounting,
+        dynamic_accounting=dynamic_accounting,
         # GUI never aborts a save (loud is the headless default).  Without this, the
         # streaming live/batch write path ran loud and a single degraded frame
         # (dead monitor / all-dummy 2D) aborted the whole-scan save (B-1 regression).

@@ -63,6 +63,7 @@ from xrd_tools.io.record_writer import (
     WriterTransactionBinding,
 )
 from xrd_tools.io.append import (
+    AppendDecision,
     AppendDisposition,
     AppendIntent,
     AppendPreflight,
@@ -78,6 +79,9 @@ from xrd_tools.io.output_transaction import (
     OutputReceiptCapability,
     OutputReceiptCapabilityProvider,
     OwnerToken,
+    StreamTerminal,
+    TransactionPhase,
+    TransactionSnapshot,
     get_output_transaction_coordinator,
 )
 logger = logging.getLogger(__name__)
@@ -106,6 +110,37 @@ class OutputSinkKind(str, Enum):
     MEMORY = "memory"
     NEXUS = "nexus"
     XYE = "xye"
+
+
+class NexusTerminalDisposition(str, Enum):
+    COMMITTED = "committed"
+    ABORTED = "aborted"
+
+
+@dataclass(frozen=True, slots=True)
+class NexusTerminalResult:
+    """Detached, validated H23 terminal truth returned by a Nexus sink."""
+
+    disposition: NexusTerminalDisposition
+    transaction: TransactionSnapshot
+    commit_identity: StreamTerminal | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.transaction) is not TransactionSnapshot:
+            raise TypeError("Nexus terminal result requires a TransactionSnapshot")
+        if self.disposition is NexusTerminalDisposition.COMMITTED:
+            if self.transaction.phase is not TransactionPhase.COMMITTED:
+                raise ValueError("committed Nexus result requires COMMITTED transaction")
+            if type(self.commit_identity) is not StreamTerminal:
+                raise ValueError("committed Nexus result requires exact StreamTerminal")
+            return
+        if self.disposition is NexusTerminalDisposition.ABORTED:
+            if self.transaction.phase is not TransactionPhase.ABORTED:
+                raise ValueError("aborted Nexus result requires ABORTED transaction")
+            if self.commit_identity is not None:
+                raise ValueError("aborted Nexus result cannot carry commit identity")
+            return
+        raise ValueError("unknown Nexus terminal disposition")
 
 
 @runtime_checkable
@@ -636,6 +671,12 @@ class CompositeSink:
         for sink in self.sinks:
             sink.begin(scan, plan)
 
+    def bind_session(self, facade: Any) -> None:
+        for sink in self.sinks:
+            bind = getattr(sink, "bind_session", None)
+            if callable(bind):
+                bind(facade)
+
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         for sink in self.sinks:
             sink.write(frame, reduction)
@@ -650,35 +691,60 @@ class CompositeSink:
         for sink in self.sinks:
             _emit_sink_replace(sink, frame, reduction)
 
-    def finish(self, result: ReductionResult) -> None:
+    @staticmethod
+    def _terminal_result(values: list[object]) -> NexusTerminalResult | None:
+        terminals = [
+            value for value in values if type(value) is NexusTerminalResult
+        ]
+        if not terminals:
+            return None
+        if len(terminals) != 1:
+            raise RuntimeError(
+                "CompositeSink terminal requires exactly one Nexus owner"
+            )
+        return terminals[0]
+
+    def finish(self, result: ReductionResult) -> NexusTerminalResult | None:
         errors: list[BaseException] = []
+        values: list[object] = []
         for sink in self.sinks:
             try:
-                sink.finish(result)
+                values.append(sink.finish(result))
             except BaseException as exc:  # pragma: no cover - defensive fan-out
                 errors.append(exc)
         if errors:
             raise errors[0]
+        return self._terminal_result(values)
 
-    def abort(self, result: ReductionResult) -> None:
+    def abort(self, result: ReductionResult) -> NexusTerminalResult | None:
         errors: list[BaseException] = []
+        values: list[object] = []
         for sink in self.sinks:
             abort = getattr(sink, "abort", None)
             try:
                 if callable(abort):
-                    abort(result)
+                    values.append(abort(result))
                 else:
-                    sink.finish(result)
+                    values.append(sink.finish(result))
             except BaseException as exc:  # pragma: no cover - defensive fan-out
                 errors.append(exc)
         if errors:
             raise errors[0]
+        return self._terminal_result(values)
 
     def flush(self, *, force: bool = False) -> None:
         for sink in self.sinks:
             flush = getattr(sink, "flush", None)
             if callable(flush):
                 flush(force=force)
+
+    def _settle_deferred_publication_drops(
+        self, frame: Frame, reduction: FrameReduction,
+    ) -> None:
+        for sink in self.sinks:
+            settle = getattr(sink, "_settle_deferred_publication_drops", None)
+            if callable(settle):
+                settle(frame, reduction)
 
     def perf_snapshot(self) -> dict[str, float]:
         values: dict[str, float] = {}
@@ -870,6 +936,15 @@ class NexusSink:
     _source_execution: dict[str, Any] | None = field(
         default=None, init=False, repr=False,
     )
+    _terminal_result: NexusTerminalResult | None = field(
+        default=None, init=False, repr=False,
+    )
+    _deferred_publication_drops: dict[int, tuple[ResultMode, ...]] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _defer_publication_drop_settlement: bool = field(
+        default=False, init=False, repr=False,
+    )
 
     @property
     def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
@@ -957,7 +1032,35 @@ class NexusSink:
         self._transaction.abandon(self._lease)
         self._release_terminal_lease()
 
-    def _abort_composed(self) -> None:
+    def _typed_terminal(
+        self, snapshot: TransactionSnapshot,
+    ) -> NexusTerminalResult:
+        if snapshot.phase is TransactionPhase.COMMITTED:
+            writer = self._writer
+            if writer is None:
+                raise RuntimeError("committed Nexus transaction lost its writer")
+            outcome = writer.finish()
+            result = NexusTerminalResult(
+                NexusTerminalDisposition.COMMITTED,
+                snapshot,
+                outcome.stream_terminal,
+            )
+        elif snapshot.phase is TransactionPhase.ABORTED:
+            result = NexusTerminalResult(
+                NexusTerminalDisposition.ABORTED, snapshot, None,
+            )
+        else:
+            raise RuntimeError(
+                f"Nexus transaction is not terminal: {snapshot.phase.value}"
+            )
+        if self._terminal_result is not None and result != self._terminal_result:
+            raise RuntimeError("Nexus terminal retry changed its exact result")
+        self._terminal_result = self._terminal_result or result
+        return self._terminal_result
+
+    def _abort_composed(self) -> NexusTerminalResult:
+        if self._terminal_result is not None:
+            return self._terminal_result
         writer = self._writer
         phase = self._transaction.snapshot().phase.value
         if writer is not None and writer.phase.value == "finished" and phase == "cleanup-pending":
@@ -989,6 +1092,7 @@ class NexusSink:
                 else AppendPreflightState.ABORTED
             )
             self.append_preflight._terminal(state)
+        return self._typed_terminal(self._transaction.snapshot())
 
     def _prepare_transaction(self):
         if self.append_preflight is not None:
@@ -1089,6 +1193,8 @@ class NexusSink:
             self._prepared_thumbnails.clear()
         self._writer = None
         self._attempt = None
+        self._terminal_result = None
+        self._deferred_publication_drops.clear()
         self._primary_mode_1d, self._primary_mode_2d = _plan_mode_keys(plan)
         append_decision = self._prepare_transaction()
         try:
@@ -1266,16 +1372,28 @@ class NexusSink:
                 frame, reduction, prepared=prepared,
             )
         writer.write(record)
-        if drop_1d:
-            writer.drop_publication(int(frame.index), ResultMode.one_d(mode_1d))
-        if drop_2d:
-            writer.drop_publication(int(frame.index), ResultMode.two_d(mode_2d))
-        return frozenset(
+        dropped = tuple(
             mode for mode, dropped in (
                 (ResultMode.one_d(mode_1d), drop_1d),
                 (ResultMode.two_d(mode_2d), drop_2d),
             ) if dropped
         )
+        if self._defer_publication_drop_settlement:
+            self._deferred_publication_drops[id(reduction)] = dropped
+        else:
+            for mode in dropped:
+                writer.drop_publication(int(frame.index), mode)
+        return frozenset(dropped)
+
+    def _settle_deferred_publication_drops(
+        self, frame: Frame, reduction: FrameReduction,
+    ) -> None:
+        modes = self._deferred_publication_drops.pop(id(reduction), ())
+        writer = self._writer
+        if writer is None and modes:
+            raise RuntimeError("deferred publication drop lost its writer")
+        for mode in modes:
+            writer.drop_publication(int(frame.index), mode)
 
     def worker_process(self, frame: Frame, reduction: FrameReduction) -> None:
         """Prepare the persisted thumbnail on the parallel reduction worker."""
@@ -1486,18 +1604,20 @@ class NexusSink:
             self.append_preflight._commit_epoch(anchor)
         return anchor
 
-    def finish(self, result: ReductionResult) -> None:
+    def finish(self, result: ReductionResult) -> NexusTerminalResult:
+        if self._terminal_result is not None:
+            return self._terminal_result
         self._apply_pending_extension()
         writer = self._writer
         if writer is None:
-            return
+            raise RuntimeError("NexusSink finish has no transaction writer")
         if getattr(result, "cancelled", False) and not writer.written_labels:
             self._scan = None
             self._plan = None
-            self._abort_composed()
+            terminal = self._abort_composed()
             if self.append_preflight is not None:
                 self.append_preflight._terminal(AppendPreflightState.ABORTED)
-            return
+            return terminal
         if getattr(result, "cancelled", False):
             self.truncate_epoch(writer.written_labels)
             self._apply_pending_extension()
@@ -1507,18 +1627,20 @@ class NexusSink:
                 and self._transaction_owners is None):
             self._scan = None
             self._plan = None
-            return
+            return self._typed_terminal(self._transaction.snapshot())
         # A retry resumes the writer's frozen finite state machine; rebuilding
         # provenance/metadata here would create a second authority for it.
         if writer.phase.value != "active":
             writer.finish()
-            self._transaction.commit_stream(self._attempt, lease=self._lease)
+            snapshot = self._transaction.commit_stream(
+                self._attempt, lease=self._lease,
+            )
             self._release_terminal_lease()
             if self.append_preflight is not None:
                 self.append_preflight._terminal(AppendPreflightState.COMMITTED)
             self._scan = None
             self._plan = None
-            return
+            return self._typed_terminal(snapshot)
         try:
             finalization = self._writer_finalization(writer)
         except BaseException as primary:
@@ -1528,24 +1650,32 @@ class NexusSink:
                 raise primary from cleanup
             raise
         writer.finish(finalization)
-        self._transaction.commit_stream(self._attempt, lease=self._lease)
+        snapshot = self._transaction.commit_stream(
+            self._attempt, lease=self._lease,
+        )
         self._release_terminal_lease()
         if self.append_preflight is not None:
             self.append_preflight._terminal(AppendPreflightState.COMMITTED)
         self._scan = None
         self._plan = None
+        return self._typed_terminal(snapshot)
 
-    def abort(self, result: ReductionResult) -> None:
+    def abort(self, result: ReductionResult) -> NexusTerminalResult:
+        if self._terminal_result is not None:
+            return self._terminal_result
         self._scan = None
         self._plan = None
         if self._transaction is not None and self._transaction_owners is not None:
             try:
-                self._abort_composed()
+                return self._abort_composed()
             except BaseException:
                 if self.append_preflight is not None:
                     self.append_preflight._terminal(
                         self.append_preflight._cleanup_failure_state())
                 raise
+        if self._transaction is None:
+            raise RuntimeError("NexusSink abort has no transaction")
+        return self._typed_terminal(self._transaction.snapshot())
 
 
 @dataclass(frozen=True, slots=True)
@@ -1554,12 +1684,15 @@ class BoundOutputSinkGraph:
 
     sink: ReductionSink | None
     families: frozenset[OutputSinkKind]
+    nexus_sink: NexusSink | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.families, frozenset)
                 or not all(isinstance(item, OutputSinkKind)
                            for item in self.families)):
             raise TypeError("bound sink families must be a typed frozenset")
+        if self.nexus_sink is not None and type(self.nexus_sink) is not NexusSink:
+            raise TypeError("bound Nexus owner must be an exact NexusSink")
 
 
 def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
@@ -1573,7 +1706,7 @@ def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
 
     def bind(node: object) -> BoundOutputSinkGraph:
         if node is None:
-            return BoundOutputSinkGraph(None, frozenset())
+            return BoundOutputSinkGraph(None, frozenset(), None)
         node_type = type(node)
         direct = {
             MemorySink: OutputSinkKind.MEMORY,
@@ -1583,6 +1716,7 @@ def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
         if node_type in direct:
             return BoundOutputSinkGraph(
                 node, frozenset({direct[node_type]}),
+                node if node_type is NexusSink else None,
             )
         if node_type is not CompositeSink:
             raise UnclassifiedOutputSinkGraph(
@@ -1608,9 +1742,18 @@ def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
         executable = CompositeSink(tuple(
             child.sink for child in bound_children
         ))
+        nexus_children = tuple(
+            child.nexus_sink for child in bound_children
+            if child.nexus_sink is not None
+        )
+        if len(nexus_children) > 1:
+            raise UnclassifiedOutputSinkGraph(
+                "dynamic CompositeSink has multiple Nexus transaction owners"
+            )
         return BoundOutputSinkGraph(
             executable,
             frozenset().union(*(child.families for child in bound_children)),
+            nexus_children[0] if nexus_children else None,
         )
 
     return bind(value)
@@ -1747,6 +1890,10 @@ class ReductionSession:
     # single optional callable, streaming-mode only, exceptions caught+logged
     # so a listener can never kill the writer (T0-7/S1 discipline).
     outcome_cb: Callable[[FrameOutcomeReceipt], None] | None = None
+    # Package-owned dynamic authorities.  Unlike observers, failures are sticky
+    # and stop the write/publication path.
+    outcome_authority_cb: Callable[[FrameOutcomeReceipt], None] | None = None
+    written_authority_cb: Callable[[Frame, FrameReduction, int | None], None] | None = None
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -2267,9 +2414,6 @@ class ReductionSession:
         """Deliver one :class:`FrameOutcomeReceipt` to ``outcome_cb`` (writer
         thread).  A listener exception is caught + logged — it must never
         escape the writer loop (T0-7/S1)."""
-        cb = self.outcome_cb
-        if cb is None:
-            return
         receipt = FrameOutcomeReceipt(
             frame_index=int(frame_index),
             outcome=outcome,
@@ -2279,6 +2423,12 @@ class ReductionSession:
             error=error,
             attempt=attempt,
         )
+        authority = self.outcome_authority_cb
+        if authority is not None:
+            authority(receipt)
+        cb = self.outcome_cb
+        if cb is None:
+            return
         try:
             cb(receipt)
         except Exception:
@@ -2322,19 +2472,26 @@ class ReductionSession:
                     # The exact attempt-keyed drop identity (§13.2.3): this
                     # queue item is the thing that was dropped in flight.
                     self._dropped_attempts += 1
-                    self._emit_outcome(
-                        idx, FrameOutcome.CANCELLED_BEFORE_COMPLETION,
-                        replacing=replacing, attempt=attempt)
+                    try:
+                        self._emit_outcome(
+                            idx, FrameOutcome.CANCELLED_BEFORE_COMPLETION,
+                            replacing=replacing, attempt=attempt)
+                    except BaseException as exc:
+                        self._record_failure(exc)
                     self._mark_cancelled()
                     if self.clear_frame_images:
                         frame.image = None
                         frame.background = None
                     continue
                 except BaseException as exc:  # integration failure for one frame
-                    self._emit_outcome(
-                        idx, FrameOutcome.FAILED,
-                        replacing=replacing, error=f"{type(exc).__name__}: {exc}",
-                        attempt=attempt)
+                    try:
+                        self._emit_outcome(
+                            idx, FrameOutcome.FAILED,
+                            replacing=replacing,
+                            error=f"{type(exc).__name__}: {exc}",
+                            attempt=attempt)
+                    except BaseException as authority_error:
+                        self._record_failure(authority_error)
                     self._record_failure(exc)
                     if self.clear_frame_images:
                         frame.image = None
@@ -2342,9 +2499,16 @@ class ReductionSession:
                     continue
                 # Compute success is observed BEFORE the sink write: a failed
                 # write must stay distinguishable from a failed compute.
-                self._emit_outcome(
-                    idx, FrameOutcome.COMPLETED,
-                    replacing=replacing, reduction=reduction, attempt=attempt)
+                try:
+                    self._emit_outcome(
+                        idx, FrameOutcome.COMPLETED,
+                        replacing=replacing, reduction=reduction, attempt=attempt)
+                except BaseException as exc:
+                    self._record_failure(exc)
+                    if self.clear_frame_images:
+                        frame.image = None
+                        frame.background = None
+                    continue
                 if prep_error is not None:
                     # The typed result is real and already reported; the sink's
                     # pool-side worker_process prep is what failed.  Record it
@@ -2363,11 +2527,21 @@ class ReductionSession:
                         _emit_sink_replace(self._sink, frame, reduction)
                     else:
                         self._sink.write(frame, reduction)
+                    if self.written_authority_cb is not None:
+                        self.written_authority_cb(frame, reduction, attempt)
+                    settle = getattr(
+                        self._sink, "_settle_deferred_publication_drops", None,
+                    )
+                    if callable(settle):
+                        settle(frame, reduction)
                     # The top-level sink hook returned: record the DISTINCT
                     # label identity (§4.1), never an increment — plus the
                     # attempt-axis write fact for the cancellation diagnostic.
                     self._written_labels.add(idx)
                     self._written_attempts += 1
+                    post_write = getattr(self._sink, "_post_write", None)
+                    if callable(post_write):
+                        post_write(frame, reduction)
                 except BaseException as exc:
                     self._record_failure(exc)
                 else:

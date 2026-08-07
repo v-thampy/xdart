@@ -829,6 +829,70 @@ def test_malformed_persisted_source_fact_refuses_atomically(
         writer.abort()
 
 
+@pytest.mark.parametrize("route", ("mode-only", "existing-row"))
+@pytest.mark.parametrize("field", ("adapter_id", "dataset_path"))
+def test_surrogate_persisted_source_text_refuses_before_any_mutation(
+    tmp_path, route, field,
+):
+    """h5py can decode malformed UTF-8 vlen text to a surrogate-containing str."""
+    rw = _api()
+    target = tmp_path / f"surrogate-{route}-{field}.nexus"
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"x")
+    snapshot = _complete_source_snapshot(source)
+    facade = _Facade(target)
+    one_d = ResultMode.one_d("default")
+    two_d = ResultMode.two_d("default")
+    facade.set_revision(0, one_d, 1)
+    facade.set_revision(0, two_d, 1)
+    writer = rw.NexusRecordWriter(
+        target, atomic=False, flush_every=None, source_base=tmp_path,
+    )
+    writer.bind_session(facade)
+    writer.begin()
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1), source_path=source,
+        source_frame_index=1, source_snapshot=snapshot,
+    ))
+    writer.flush(force=True)
+    source_group = writer._entry_group()["frames/frame_0000/source"]
+    del source_group.attrs[field]
+    source_group.attrs.create(
+        field, b"\xff", dtype=h5py.string_dtype(encoding="utf-8"),
+    )
+    observed = source_group.attrs[field]
+    assert type(observed) is str and observed == "\udcff"
+    writer._h5.flush()
+    before_target = target.read_bytes()
+    before_results = _persisted_result_state(writer)
+    before_source = _raw_hdf5_group_state(source_group)
+    before_vector = writer.operation_vector()
+    before_pending = dict(writer._pending)
+    before_receipts = tuple(facade.durable)
+    incoming_snapshot = dict(snapshot)
+    incoming_snapshot[field] = "\udcff"
+    incoming = dict(
+        label=0, result_2d=_r2(2), source_path=source,
+        source_frame_index=1, source_snapshot=incoming_snapshot,
+    )
+    if route == "mode-only":
+        incoming["write_frame_record"] = False
+    else:
+        incoming["result_1d"] = _r1(1)
+    try:
+        with pytest.raises(rw.WriterStateError, match="valid UTF-8"):
+            writer.write(rw.RecordWrite(**incoming))
+        writer._h5.flush()
+        assert target.read_bytes() == before_target
+        assert _persisted_result_state(writer) == before_results
+        assert _raw_hdf5_group_state(source_group) == before_source
+        assert writer.operation_vector() == before_vector
+        assert writer._pending == before_pending
+        assert tuple(facade.durable) == before_receipts
+    finally:
+        writer.abort()
+
+
 @pytest.mark.parametrize("source_kind", ("complete", "partial", "source-less"))
 def test_exact_persisted_source_fact_allows_mode_only_siblings(
     tmp_path, source_kind,

@@ -23,6 +23,24 @@ class SourceFact:
     source_revision: int
 
 
+class DeterministicIntegrator:
+    """Small real ``integrate1d`` provider for the Qt-free bridge oracle."""
+
+    detector = None
+
+    def __init__(self, *, all_nan: bool = False) -> None:
+        self.all_nan = bool(all_nan)
+
+    def integrate1d(self, image, npt, *, unit="q_A^-1", **_kwargs):
+        value = np.nan if self.all_nan else float(np.asarray(image).sum())
+        return SimpleNamespace(
+            radial=np.linspace(0.0, 1.0, int(npt)),
+            intensity=np.full(int(npt), value),
+            sigma=None,
+            unit=unit,
+        )
+
+
 def observe_source_fact(
     root: Path,
     filename: str,
@@ -108,6 +126,12 @@ def successful_attempt(accounting, key, source_revision: int, mode):
     accounting.record_accepted(attempt)
     accounting.record_completed(attempt, produced=(mode,))
     accounting.record_written(attempt, modes=(mode,))
+    return attempt
+
+
+def submission_attempt(accounting, key, source_revision: int):
+    attempt = accounting.begin_attempt(key, source_revision=int(source_revision))
+    accounting.record_enqueued(attempt)
     return attempt
 
 

@@ -51,7 +51,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
@@ -59,14 +59,24 @@ import numpy as np
 
 from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord, FrameView
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.io import AppendDecision, AppendIntent
 from xrd_tools.reduction import (
     Frame,
     FrameOutcome,
     FrameOutcomeReceipt,
+    NexusTerminalDisposition,
+    NexusTerminalResult,
+    OutputSinkKind,
     ReductionPlan,
     ReductionResult,
     ReductionSession,
     StrictPolicy,
+    bind_dynamic_output_sink,
+)
+from .dynamic_accounting import (
+    DynamicAttemptState,
+    DynamicRunAccounting,
+    DynamicRunState,
 )
 from .frame_record_store import FrameRecordStore
 from .policy import (SessionPolicy, _int, requirements_from,
@@ -76,6 +86,7 @@ from .stage_accounting import (
     freeze_target_map)
 
 logger = logging.getLogger(__name__)
+_ATTEMPT_MISSING = object()
 
 
 class _StageBoundaryFacade:
@@ -143,9 +154,11 @@ class _EventSink:
     inner sink only when the inner sink actually provides it.
     """
 
-    def __init__(self, inner, on_completed: Callable[[Frame, Any], None]) -> None:
+    def __init__(self, inner, on_completed: Callable[[Frame, Any], None], *,
+                 defer_terminal: bool = False) -> None:
         self._inner = inner
         self._on_completed = on_completed
+        self._defer_terminal = bool(defer_terminal)
         worker_process = getattr(inner, "worker_process", None)
         if callable(worker_process):
             self.worker_process = worker_process
@@ -162,7 +175,6 @@ class _EventSink:
     def write(self, frame, reduction) -> None:
         if self._inner is not None:
             self._inner.write(frame, reduction)
-        self._on_completed(frame, reduction)
 
     def replace(self, frame, reduction) -> None:
         inner_replace = getattr(self._inner, "replace", None)
@@ -171,16 +183,29 @@ class _EventSink:
         elif self._inner is not None:
             # No replace hook → the engine would have called write(); match it.
             self._inner.write(frame, reduction)
+
+    def _post_write(self, frame, reduction) -> None:
         self._on_completed(frame, reduction)
 
-    def finish(self, result) -> None:
-        if self._inner is not None:
-            self._inner.finish(result)
+    def _settle_deferred_publication_drops(self, frame, reduction) -> None:
+        settle = getattr(self._inner, "_settle_deferred_publication_drops", None)
+        if callable(settle):
+            settle(frame, reduction)
 
-    def abort(self, result) -> None:
+    def finish(self, result):
+        if self._defer_terminal or self._inner is None:
+            return None
+        return self._inner.finish(result)
+
+    def abort(self, result):
+        if self._defer_terminal:
+            return None
         inner_abort = getattr(self._inner, "abort", None)
         if callable(inner_abort):
-            inner_abort(result)
+            return inner_abort(result)
+        if self._inner is not None:
+            return self._inner.finish(result)
+        return None
 
     def flush(self, *, force: bool = False) -> None:
         f = getattr(self._inner, "flush", None)
@@ -331,6 +356,7 @@ class ScanSession:
         store_targets_by_mode: Mapping[ResultMode, Iterable[str]] | None = None,
         write_targets_by_mode: Mapping[ResultMode, Iterable[str]] | None = None,
         accounting: StageLedger | None = None,
+        dynamic_accounting: DynamicRunAccounting | None = None,
         policy: SessionPolicy | None = None,
         envelope_bytes: int | None = None,
         executor_workers: int | None = None,
@@ -343,6 +369,18 @@ class ScanSession:
         self._generation = 0
         self._mode_key = _mode_key_from_plan(plan)
         required = _required_modes_from_plan(plan, self._mode_key)
+        if (
+            dynamic_accounting is not None
+            and type(dynamic_accounting) is not DynamicRunAccounting
+        ):
+            raise TypeError("dynamic_accounting must be an exact DynamicRunAccounting")
+        self._dynamic_accounting = dynamic_accounting
+        if dynamic_accounting is not None:
+            if accounting is not None and accounting is not dynamic_accounting.ledger:
+                raise ValueError(
+                    "dynamic accounting must borrow the exact supplied StageLedger"
+                )
+            accounting = dynamic_accounting.ledger
         if accounting is None:
             self._accounting = StageLedger(
                 required_modes=required,
@@ -371,6 +409,29 @@ class ScanSession:
             self._accounting = accounting
         if _accounting_only:
             return
+        self._dynamic_nexus_sink = None
+        if dynamic_accounting is not None:
+            binding = bind_dynamic_output_sink(sink)
+            if OutputSinkKind.XYE in binding.families:
+                raise TypeError("dynamic XYE output remains outside the C2 envelope")
+            nexus = binding.nexus_sink
+            if nexus is not None:
+                if nexus.allow_unbound_same_run and nexus.same_run_intent is None:
+                    raise ValueError(
+                        "dynamic ScanSession refuses unbound same-run adoption"
+                    )
+                if nexus.flush_every is not None:
+                    raise ValueError("dynamic Nexus sink requires flush_every=None")
+                expected = f"nexus:{nexus.path}"
+                if any(
+                    self._accounting.targets_by_mode.get(mode) != frozenset((expected,))
+                    for mode in required
+                ):
+                    raise ValueError(
+                        "dynamic Nexus target must exactly match every required mode"
+                    )
+            sink = binding.sink
+            self._dynamic_nexus_sink = nexus
         applicable = self._accounting.targets_by_mode
         self._store_targets = (
             applicable if store_targets_by_mode is None else
@@ -409,42 +470,125 @@ class ScanSession:
             if executor is None or isinstance(executor, int):
                 executor = allocation.workers
         self._user_sink = sink
+        self._dynamic_boundary = (
+            None if dynamic_accounting is None else dynamic_accounting.writer_boundary
+        )
+        self._dynamic_owner_token = object() if dynamic_accounting is not None else None
+        self._dynamic_submit_token = None
+        self._dynamic_stop_requested = False
+        self._dynamic_frozen_result: ReductionResult | None = None
+        self._dynamic_primary_error: BaseException | None = None
+        self._dynamic_finish_seal = None
+        self._dynamic_epoch_seal = None
+        self._dynamic_epoch_anchor = None
+        self._dynamic_settled_epoch_anchor = None
+        self._dynamic_epoch_notified = False
+        self._terminal_result: NexusTerminalResult | None = None
+        self._dynamic_terminal_settled = False
+        self._terminal_state_emitted = False
+        self._dynamic_extend_live = None
+        self._dynamic_extension_owner = None
+        self._dynamic_current_intent = None
+        if dynamic_accounting is not None:
+            self._dynamic_boundary.bind_live_session(
+                self, self._dynamic_owner_token,
+            )
+            if self._dynamic_nexus_sink is not None:
+                self._dynamic_nexus_sink._defer_publication_drop_settlement = True
         if hasattr(sink, "bind_session"):
-            sink.bind_session(_StageBoundaryFacade(self))
-        event_sink = _EventSink(sink, self._on_completed)
+            sink.bind_session(
+                self._dynamic_boundary
+                if dynamic_accounting is not None
+                else _StageBoundaryFacade(self)
+            )
+        event_sink = _EventSink(
+            sink, self._on_completed,
+            defer_terminal=dynamic_accounting is not None,
+        )
         # Streaming + retain_products=False: per-frame results are delivered via
         # events (and persisted by a durable sink), so the session does not also
         # hoard every FrameReduction (the S2 ~14 GB-on-10k-frames trap).
-        self._session = ReductionSession(
-            plan,
-            source,
-            event_sink,
-            execution="streaming",
-            executor=executor,
-            inflight_max=inflight_max,
-            gi_freeze_mode=gi_freeze_mode,
-            cancel_token=cancel_token,
-            # Strictness policy (default loud, matching ReductionSession).  The GUI
-            # write path (open_live_scan_session) passes graceful() so a per-frame
-            # degradation skips-and-defers instead of aborting the whole-scan save —
-            # the streaming path's per-frame contract (B-1 regression fix).
-            strict=strict if strict is not None else StrictPolicy.loud(),
-            retain_products=False,
-            # The writer nulls frame.image after each write so the source-array
-            # reference doesn't pin ~18 MB/frame for the session's life (xdart's
-            # PERF-3); a later consumer reloads via Frame.load_image.  Default
-            # off — a notebook caller keeping the source frames opts in.
-            clear_frame_images=clear_frame_images,
-            # H10-C1: acceptance is admitted synchronously inside submit(), as
-            # the last fallible step before ACCEPTED opens the worker and
-            # writer (so `accepted` is never behind a completion), and per-item
-            # compute outcomes
-            # (success/failure/cancellation) feed the stage ledger from the
-            # writer loop — never inferred from accepted-minus-written counts.
-            accept_cb=self._on_accepted,
-            outcome_cb=self._on_outcome,
-        )
+        try:
+            self._session = ReductionSession(
+                plan,
+                source,
+                event_sink,
+                execution="streaming",
+                executor=executor,
+                inflight_max=inflight_max,
+                gi_freeze_mode=gi_freeze_mode,
+                cancel_token=cancel_token,
+                # Strictness policy (default loud, matching ReductionSession).  The GUI
+                # write path (open_live_scan_session) passes graceful() so a per-frame
+                # degradation skips-and-defers instead of aborting the whole-scan save —
+                # the streaming path's per-frame contract (B-1 regression fix).
+                strict=strict if strict is not None else StrictPolicy.loud(),
+                retain_products=False,
+                # The writer nulls frame.image after each write so the source-array
+                # reference doesn't pin ~18 MB/frame for the session's life (xdart's
+                # PERF-3); a later consumer reloads via Frame.load_image.  Default
+                # off — a notebook caller keeping the source frames opts in.
+                clear_frame_images=clear_frame_images,
+                # H10-C1: acceptance is admitted synchronously inside submit(), as
+                # the last fallible step before ACCEPTED opens the worker and
+                # writer (so `accepted` is never behind a completion), and per-item
+                # compute outcomes
+                # (success/failure/cancellation) feed the stage ledger from the
+                # writer loop — never inferred from accepted-minus-written counts.
+                accept_cb=self._on_accepted,
+                outcome_cb=(
+                    None if dynamic_accounting is not None else self._on_outcome
+                ),
+                outcome_authority_cb=(
+                    self._on_dynamic_outcome
+                    if dynamic_accounting is not None else None
+                ),
+                written_authority_cb=(
+                    self._on_dynamic_written
+                    if dynamic_accounting is not None else None
+                ),
+            )
+        except BaseException as primary:
+            if dynamic_accounting is not None:
+                try:
+                    self._dynamic_boundary.epoch_aborted(
+                        self, self._dynamic_owner_token,
+                        f"dynamic sink begin failed: {primary}",
+                    )
+                except BaseException as cleanup:
+                    raise primary from cleanup
+            raise
         self._event_sink = event_sink
+        if (
+            dynamic_accounting is not None
+            and self._dynamic_nexus_sink is not None
+            and type(self._dynamic_nexus_sink.same_run_intent) is AppendIntent
+        ):
+            try:
+                extend_live = self._dynamic_nexus_sink.extend_live
+                extension_owner = self._dynamic_nexus_sink.extension_owner
+            except BaseException as primary:
+                try:
+                    self._session._record_failure(primary)
+                    failed_result = self._session.finish(raise_on_failure=False)
+                    terminal = self._user_sink.abort(failed_result)
+                    if (
+                        type(terminal) is not NexusTerminalResult
+                        or terminal.disposition is not NexusTerminalDisposition.ABORTED
+                    ):
+                        raise RuntimeError(
+                            "same-run capture cleanup did not abort the Nexus graph"
+                        )
+                    self._dynamic_boundary.epoch_aborted(
+                        self, self._dynamic_owner_token,
+                        f"same-run capability capture failed: {primary}",
+                    )
+                except BaseException as cleanup:
+                    raise primary from cleanup
+                raise
+            self._dynamic_extend_live = extend_live
+            self._dynamic_extension_owner = extension_owner
+            self._dynamic_current_intent = self._dynamic_nexus_sink.same_run_intent
 
     # -- context manager ---------------------------------------------------
     def __enter__(self) -> "ScanSession":
@@ -524,7 +668,13 @@ class ScanSession:
         running state once."""
         self._emit_state()
 
-    def submit(self, frame: Frame, image: np.ndarray | None = None) -> bool:
+    def submit(
+        self,
+        frame: Frame,
+        image: np.ndarray | None = None,
+        *,
+        attempt_token: object = _ATTEMPT_MISSING,
+    ) -> bool:
         """Feed one frame.
 
         Returns True when accepted, False when DROPPED (cancelled / writer-dead
@@ -552,11 +702,27 @@ class ScanSession:
         :meth:`resume`.  A streaming ``executor`` must be asynchronous (its
         ``submit()`` returns before the submitted callable needs its admission
         decision); its Future need expose only a blocking ``result()``."""
-        accepted = self._session.submit(frame, image)
+        dynamic = self._dynamic_accounting
+        if dynamic is None:
+            if attempt_token is not _ATTEMPT_MISSING:
+                raise ValueError("static ScanSession rejects an attempt_token")
+        else:
+            if attempt_token is _ATTEMPT_MISSING:
+                raise TypeError("dynamic ScanSession submit is missing attempt_token")
+            dynamic.validate_submission(attempt_token, int(frame.index))
+            if self._dynamic_submit_token is not None:
+                raise RuntimeError("dynamic submit capability is already in use")
+            self._dynamic_submit_token = attempt_token
+        try:
+            accepted = self._session.submit(frame, image)
+        finally:
+            if dynamic is not None:
+                self._dynamic_submit_token = None
         if accepted:
             self._emit_progress()
         else:
-            self._accounting.record_refused(int(frame.index))
+            if dynamic is None:
+                self._accounting.record_refused(int(frame.index))
         return accepted
 
     def pause(self, timeout: float | None = None) -> bool:
@@ -573,6 +739,9 @@ class ScanSession:
     def stop(self) -> None:
         """Cooperative cancel (sets the cancel token); the writer stops at the
         next boundary.  Call :meth:`finish` to drain + finalize."""
+        if self._dynamic_accounting is not None and not self._dynamic_stop_requested:
+            self._dynamic_accounting.stop()
+            self._dynamic_stop_requested = True
         self._session.cancel_token.cancel()
         self._emit_state()
 
@@ -582,15 +751,235 @@ class ScanSession:
         a second finish() returns the same result and does NOT re-emit a
         state-change event (so a bridge that tears down on the running→finished
         transition can't double-fire)."""
-        was_running = self.is_running
-        try:
-            result = self._session.finish(
-                raise_on_failure=raise_on_failure, join_timeout=join_timeout)
-        finally:
-            self._final_sweep()   # ONE sweep, AFTER the terminal boundary
-        if was_running:          # only on the real running -> finished transition
-            self._emit_state()
+        if self._dynamic_accounting is None:
+            was_running = self.is_running
+            try:
+                result = self._session.finish(
+                    raise_on_failure=raise_on_failure, join_timeout=join_timeout)
+            finally:
+                self._final_sweep()
+            if was_running:
+                self._emit_state()
+            return result
+        return self._finish_dynamic(
+            raise_on_failure=raise_on_failure, join_timeout=join_timeout,
+        )
+
+    @property
+    def terminal_result(self) -> NexusTerminalResult | None:
+        return self._terminal_result
+
+    def _freeze_dynamic_result(
+        self, join_timeout: float | None,
+    ) -> ReductionResult:
+        if self._dynamic_frozen_result is None:
+            self._dynamic_frozen_result = self._session.finish(
+                raise_on_failure=False, join_timeout=join_timeout,
+            )
+            self._dynamic_primary_error = self._session._current_failure()
+        return self._dynamic_frozen_result
+
+    def _mark_dynamic_failure(self, error: BaseException) -> ReductionResult:
+        if self._dynamic_primary_error is None:
+            self._dynamic_primary_error = error
+        result = self._dynamic_frozen_result
+        if result is None:
+            raise RuntimeError("dynamic terminal result was not frozen")
+        if not result.failed:
+            result = replace(result, failed=True, error=str(error))
+            self._dynamic_frozen_result = result
         return result
+
+    def _finish_dynamic(
+        self, *, raise_on_failure: bool, join_timeout: float | None,
+    ) -> ReductionResult:
+        result = self._freeze_dynamic_result(join_timeout)
+        if self._dynamic_terminal_settled:
+            if raise_on_failure and result.failed:
+                error = self._dynamic_primary_error
+                if error is not None:
+                    raise error
+            return result
+        boundary = self._dynamic_boundary
+        owner = self._dynamic_owner_token
+        failed = bool(result.failed)
+        stopped = bool(self._dynamic_stop_requested or result.cancelled)
+
+        if not failed and self._dynamic_finish_seal is None:
+            try:
+                self._event_sink.flush(force=True)
+                self._dynamic_finish_seal = boundary.prepare_session_finish(
+                    self, owner, stopped=stopped,
+                )
+            except BaseException as error:
+                result = self._mark_dynamic_failure(error)
+                failed = True
+
+        if failed:
+            if self._dynamic_nexus_sink is not None and self._terminal_result is None:
+                value = self._user_sink.abort(result)
+                if type(value) is not NexusTerminalResult:
+                    raise RuntimeError("dynamic Nexus abort returned no typed terminal")
+                self._terminal_result = value
+            value = self._terminal_result
+            if value is not None and value.disposition is NexusTerminalDisposition.COMMITTED:
+                if self._dynamic_finish_seal is None:
+                    raise RuntimeError("committed dynamic failure has no finish seal")
+                boundary.session_finished(
+                    self, owner, self._dynamic_finish_seal, value.commit_identity,
+                )
+            else:
+                if value is not None and value.disposition is not NexusTerminalDisposition.ABORTED:
+                    raise RuntimeError("dynamic abort returned contradictory terminal truth")
+                boundary.epoch_aborted(
+                    self, owner,
+                    str(self._dynamic_primary_error or "dynamic run aborted"),
+                )
+            self._dynamic_terminal_settled = True
+        else:
+            if self._dynamic_nexus_sink is not None and self._terminal_result is None:
+                value = self._user_sink.finish(result)
+                if type(value) is not NexusTerminalResult:
+                    raise RuntimeError("dynamic Nexus finish returned no typed terminal")
+                self._terminal_result = value
+            value = self._terminal_result
+            if value is None:
+                if stopped:
+                    boundary.session_stopped(
+                        self, owner, self._dynamic_finish_seal,
+                        "dynamic session stopped without a Nexus transaction",
+                    )
+                else:
+                    boundary.session_finished(
+                        self, owner, self._dynamic_finish_seal, owner,
+                    )
+            elif value.disposition is NexusTerminalDisposition.COMMITTED:
+                boundary.session_finished(
+                    self, owner, self._dynamic_finish_seal, value.commit_identity,
+                )
+            elif stopped and value.disposition is NexusTerminalDisposition.ABORTED:
+                boundary.session_stopped(
+                    self, owner, self._dynamic_finish_seal,
+                    "dynamic session stopped before a canonical prefix",
+                )
+            else:
+                error = RuntimeError("dynamic finish resolved to ABORTED")
+                self._mark_dynamic_failure(error)
+                boundary.epoch_aborted(self, owner, str(error))
+            self._dynamic_terminal_settled = True
+
+        if self._record_store is not None:
+            with self._projection_lock:
+                self._reconcile_locked(self._record_store.labels())
+        self._final_sweep()
+        if not self._terminal_state_emitted:
+            self._terminal_state_emitted = True
+            self._emit_state()
+        result = self._dynamic_frozen_result
+        if raise_on_failure and result.failed:
+            error = self._dynamic_primary_error
+            if error is not None:
+                raise error
+        return result
+
+    def commit_epoch(self):
+        """Commit one dynamic H23 epoch while retaining this exact session."""
+        if self._dynamic_accounting is None or self._dynamic_nexus_sink is None:
+            raise RuntimeError("commit_epoch requires one dynamic Nexus owner")
+        if self._dynamic_frozen_result is not None or self._dynamic_stop_requested:
+            raise RuntimeError("terminal dynamic session cannot commit another epoch")
+        if self._dynamic_epoch_notified:
+            return self._dynamic_settled_epoch_anchor
+        if self._dynamic_epoch_seal is None:
+            if not self._session.drain():
+                raise RuntimeError("dynamic epoch writer did not drain")
+            failure = self._session._current_failure()
+            if failure is not None:
+                raise failure
+            self._event_sink.flush(force=True)
+            self._dynamic_epoch_seal = self._dynamic_boundary.prepare_epoch_commit(
+                self, self._dynamic_owner_token,
+            )
+        if self._dynamic_epoch_anchor is None:
+            current = ReductionResult(
+                self.scan.name, {}, self._session._completed,
+            )
+            self._dynamic_epoch_anchor = self._dynamic_nexus_sink.commit_epoch(current)
+        anchor = self._dynamic_epoch_anchor
+        self._dynamic_boundary.epoch_committed(
+            self, self._dynamic_owner_token, self._dynamic_epoch_seal, anchor,
+        )
+        self._dynamic_settled_epoch_anchor = anchor
+        self._dynamic_epoch_seal = None
+        self._dynamic_epoch_anchor = None
+        self._dynamic_epoch_notified = True
+        if self._record_store is not None:
+            with self._projection_lock:
+                self._reconcile_locked(self._record_store.labels())
+        return anchor
+
+    def extend_live(self, intent: AppendIntent) -> AppendDecision:
+        """Continue this exact committed same-run output lineage."""
+        if type(intent) is not AppendIntent:
+            raise TypeError("extend_live requires an exact AppendIntent")
+        extend_live = self._dynamic_extend_live
+        owner = self._dynamic_extension_owner
+        current_intent = self._dynamic_current_intent
+        if extend_live is None or owner is None or current_intent is None:
+            raise RuntimeError(
+                "session has no captured same-run continuation capability"
+            )
+        if self._dynamic_settled_epoch_anchor is None:
+            raise RuntimeError(
+                "same-run continuation requires one settled committed epoch"
+            )
+        if (
+            self._dynamic_epoch_seal is not None
+            or self._dynamic_finish_seal is not None
+            or self._dynamic_frozen_result is not None
+            or self._dynamic_terminal_settled
+            or self._dynamic_primary_error is not None
+        ):
+            raise RuntimeError("same-run continuation has pending terminal work")
+        if self._dynamic_submit_token is not None:
+            raise RuntimeError("same-run continuation cannot overlap submission")
+        if (
+            self._dynamic_stop_requested
+            or self._session.cancel_token.cancelled
+            or self._session.is_paused
+            or not self._session.is_running
+        ):
+            raise RuntimeError("same-run continuation requires an active session")
+        if self._session._current_failure() is not None:
+            raise RuntimeError("same-run continuation refuses a failed session")
+        if not self._session.drain(timeout=0.0):
+            raise RuntimeError("same-run continuation requires a drained writer")
+        snapshot = self._dynamic_accounting.snapshot()
+        latest_states = tuple(
+            snapshot.attempt_states[tokens[-1]]
+            for tokens in snapshot.attempts.values() if tokens
+        )
+        if (
+            snapshot.state is not DynamicRunState.ACTIVE
+            or snapshot.in_flight
+            or snapshot.retry_owned
+            or any(state in {
+                DynamicAttemptState.FAILED,
+                DynamicAttemptState.FAILED_RETRYABLE,
+                DynamicAttemptState.CANCELLED,
+            } for state in latest_states)
+        ):
+            raise RuntimeError("same-run continuation refuses a dirty epoch")
+        replay = intent == current_intent
+        if not replay and not self._dynamic_epoch_notified:
+            raise RuntimeError(
+                "a different successor requires a newly committed epoch"
+            )
+        decision = extend_live(owner, intent)
+        if not replay:
+            self._dynamic_current_intent = intent
+            self._dynamic_epoch_notified = False
+        return decision
 
     def _final_sweep(self) -> None:
         store = self._record_store
@@ -699,16 +1088,39 @@ class ScanSession:
         the new attempt's accepted/PENDING state is ledger-visible before any
         outcome, sink write or public completion callback for it can run.
         """
-        return self._accounting.record_accepted(
-            int(frame.index), publish_acceptance=publish_acceptance)
+        dynamic = self._dynamic_accounting
+        subject = int(frame.index)
+        publisher = publish_acceptance
+        if dynamic is not None:
+            token = self._dynamic_submit_token
+            if token is None:
+                raise RuntimeError("dynamic acceptance lost its exact submit token")
+            def publish_dynamic(ledger_attempt: int) -> None:
+                self._dynamic_epoch_anchor = None
+                self._dynamic_epoch_notified = False
+                publish_acceptance(ledger_attempt)
+            subject = token
+            publisher = publish_dynamic
+        authority = dynamic if dynamic is not None else self._accounting
+        return authority.record_accepted(
+            subject, publish_acceptance=publisher,
+        )
 
     def record_persisted(self, receipts: Iterable[StageReceipt]) -> None:
+        if self._dynamic_accounting is not None:
+            raise RuntimeError(
+                "dynamic persisted truth is owned only by the writer boundary"
+            )
         batch = tuple(receipts)
         with self._projection_lock:
             self._accounting.record_persisted(batch)
             self._reconcile_locked({int(r.label) for r in batch})
 
     def record_durable(self, receipts: Iterable[StageReceipt]) -> None:
+        if self._dynamic_accounting is not None:
+            raise RuntimeError(
+                "dynamic durable truth is owned only by the writer boundary"
+            )
         batch = tuple(receipts)
         with self._projection_lock:
             self._accounting.record_durable(batch)
@@ -716,6 +1128,10 @@ class ScanSession:
 
     def record_publication_dropped(self, label: int, mode: ResultMode, *,
                                    expected_revision: int) -> None:
+        if self._dynamic_accounting is not None:
+            raise RuntimeError(
+                "dynamic publication drop is owned only by the writer boundary"
+            )
         with self._projection_lock:
             self._accounting.record_publication_dropped(
                 label, mode, expected_revision=expected_revision)
@@ -812,6 +1228,59 @@ class ScanSession:
                         self._blocked.pop(label, None)
                 self._reconcile_locked((label,))
 
+    def _produced_modes(self, receipt: FrameOutcomeReceipt) -> tuple[ResultMode, ...]:
+        mode_1d, mode_2d = _dimension_modes(self._mode_key)
+        modes = []
+        if receipt.produced_1d:
+            modes.append(ResultMode.one_d(mode_1d))
+        if receipt.produced_2d:
+            modes.append(ResultMode.two_d(mode_2d))
+        return tuple(modes)
+
+    def _on_dynamic_outcome(self, receipt: FrameOutcomeReceipt) -> None:
+        dynamic = self._dynamic_accounting
+        if dynamic is None or receipt.attempt is None:
+            raise RuntimeError("dynamic outcome has no exact ledger attempt")
+        token = dynamic.token_for_ledger_attempt(
+            int(receipt.frame_index), receipt.attempt,
+        )
+        produced = self._produced_modes(receipt)
+        label = int(receipt.frame_index)
+        with self._projection_lock:
+            affected = produced or tuple(
+                mode for mode in self._accounting.required_modes
+                if self._accounting.current_revision(label, mode) >= 1
+            )
+            self._clear_projection_locked(label, affected)
+            if receipt.outcome is FrameOutcome.COMPLETED:
+                dynamic.record_completed(token, produced=produced)
+                if produced:
+                    self._pending.setdefault(label, set()).update(produced)
+            elif receipt.outcome is FrameOutcome.FAILED:
+                dynamic.record_failed(
+                    token, error=receipt.error or "dynamic reduction failed",
+                    retryable=not self._dynamic_stop_requested,
+                )
+            else:
+                dynamic.record_cancelled(
+                    token, reason=receipt.error or "dynamic reduction cancelled",
+                )
+
+    def _on_dynamic_written(
+        self, frame: Frame, reduction: Any, ledger_attempt: int | None,
+    ) -> None:
+        dynamic = self._dynamic_accounting
+        if dynamic is None or ledger_attempt is None:
+            raise RuntimeError("dynamic write has no exact ledger attempt")
+        token = dynamic.token_for_ledger_attempt(int(frame.index), ledger_attempt)
+        mode_1d, mode_2d = _dimension_modes(self._mode_key)
+        modes = []
+        if getattr(reduction, "result_1d", None) is not None:
+            modes.append(ResultMode.one_d(mode_1d))
+        if getattr(reduction, "result_2d", None) is not None:
+            modes.append(ResultMode.two_d(mode_2d))
+        dynamic.record_written(token, modes=modes)
+
     def _record_written(self, event: FrameEvent) -> None:
         """The TOP-LEVEL sink hook returned successfully for this event.
 
@@ -851,7 +1320,8 @@ class ScanSession:
             generation=generation,
             timestamp=time.time(),
         )
-        self._record_written(event)
+        if self._dynamic_accounting is None:
+            self._record_written(event)
         started = time.perf_counter() if self._perf_enabled else 0.0
         self._upsert_record_store(frame, event)
         self._perf_add("session_record_upsert", started)

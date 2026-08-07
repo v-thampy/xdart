@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from tests.core._vnext_p0_c2_bridge_support import (
+    DeterministicIntegrator,
     accounting_for,
     append_intent,
     discover,
@@ -27,6 +28,7 @@ from tests.core._vnext_p0_c2_bridge_support import (
     open_session,
     retryable_attempt,
     successful_attempt,
+    submission_attempt,
 )
 
 
@@ -961,7 +963,7 @@ def _dynamic_sink_case(tmp_path, name):
     live = SimpleNamespace(
         idx=0, map_raw=np.ones((2, 2)), bg_raw=None, scan_info={},
         source_file=str(tmp_path / f"{name}.tif"), source_frame_idx=0,
-        mask=None, poni=None, integrator=object(),
+        mask=None, poni=None, integrator=DeterministicIntegrator(),
     )
     return target, accounting, live, ReductionPlan(integration_2d=None)
 
@@ -973,7 +975,7 @@ def test_d1_direct_nexus_dynamic_graph_is_bound_and_admitted(tmp_path):
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "direct-nexus")
     session = open_live_scan_session(
         (live,), plan,
-        sink=NexusSink(target, overwrite=True, atomic=False),
+        sink=NexusSink(target, overwrite=True, atomic=False, flush_every=None),
         accounting=accounting,
         nexus_target=f"nexus:{target}",
     )
@@ -989,7 +991,9 @@ def test_d1_nexus_memory_dynamic_composite_is_bound_and_admitted(tmp_path):
     session = open_live_scan_session(
         (live,), plan,
         sink=CompositeSink((
-            MemorySink(), NexusSink(target, overwrite=True, atomic=False),
+            MemorySink(), NexusSink(
+                target, overwrite=True, atomic=False, flush_every=None,
+            ),
         )),
         accounting=accounting,
         nexus_target=f"nexus:{target}",
@@ -1054,10 +1058,8 @@ def test_d1_original_composite_mutation_cannot_change_bound_execution(tmp_path):
     assert not marker.exists()
 
 
-def test_dynamic_accounting_subclass_cannot_skip_xye_safety(tmp_path):
-    from xdart.modules.reduction import (
-        DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
-    )
+def test_dynamic_accounting_subclass_refuses_before_xye_safety(tmp_path):
+    from xdart.modules.reduction import open_live_scan_session
     from xrd_tools.reduction import XYESink
     from xrd_tools.session import (
         DynamicAccountingLimits, DynamicRunAccounting, ResultMode, StageLedger,
@@ -1078,13 +1080,51 @@ def test_dynamic_accounting_subclass_cannot_skip_xye_safety(tmp_path):
     )
     directory = tmp_path / "subclass-xye"
     before = derived.snapshot()
-    with pytest.raises(DynamicXyeReceiptBoundaryRequired):
+    with pytest.raises(TypeError, match="DynamicRunAccounting"):
         open_live_scan_session(
             (live,), plan, sink=XYESink(directory), accounting=derived,
             nexus_target=f"nexus:{target}",
         )
     assert derived.snapshot() == before
     assert not directory.exists()
+    assert not target.exists()
+
+
+def test_dynamic_accounting_subclass_refuses_before_direct_source_materialization(
+    tmp_path,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    from xrd_tools.session import (
+        DynamicAccountingLimits, DynamicRunAccounting, ResultMode, StageLedger,
+    )
+
+    class DerivedDynamicAccounting(DynamicRunAccounting):
+        pass
+
+    class MustNotMaterialize:
+        def __iter__(self):
+            raise AssertionError("dynamic subclass admission touched the source")
+
+    target = tmp_path / "subclass-direct.nexus"
+    mode, target_name = ResultMode.one_d(), f"nexus:{target}"
+    ledger = StageLedger(
+        required_modes=(mode,), targets_by_mode={mode: (target_name,)},
+    )
+    accounting = DerivedDynamicAccounting(
+        ledger, run_generation=1,
+        limits=DynamicAccountingLimits(1, 2, 1),
+    )
+    before = accounting.snapshot()
+    with pytest.raises(TypeError, match="DynamicRunAccounting"):
+        open_live_scan_session(
+            MustNotMaterialize(), ReductionPlan(integration_2d=None),
+            sink=NexusSink(
+                target, overwrite=True, atomic=False, flush_every=None,
+            ),
+            accounting=accounting, nexus_target=target_name,
+        )
+    assert accounting.snapshot() == before
     assert not target.exists()
 
 
@@ -1195,6 +1235,1003 @@ def test_standalone_xye_sink_remains_available_outside_dynamic_runs(tmp_path):
     sink.begin(Scan("standalone", []), ReductionPlan(integration_2d=None))
     sink.finish(SimpleNamespace())
     assert (tmp_path / "standalone").is_dir()
+
+
+def test_static_composite_ignores_legacy_child_terminal_sentinel():
+    from xrd_tools.reduction import CompositeSink, ReductionResult
+
+    sentinel = object()
+
+    class LegacySink:
+        def finish(self, _result):
+            return sentinel
+
+        def abort(self, _result):
+            return sentinel
+
+    sink = CompositeSink((LegacySink(),))
+    result = ReductionResult("legacy-static", {}, 0)
+    assert sink.finish(result) is None
+    assert sink.abort(result) is None
+
+
+# ---------------------------------------------------------------------------
+# C2 final-foundation: exact dynamic token -> engine -> H23 terminal bridge
+# ---------------------------------------------------------------------------
+
+
+def _armed_submission(accounting, *, label=0, revision=1, logical=None):
+    from xrd_tools.session import DynamicFrameIdentity
+
+    key = DynamicFrameIdentity("c2-final-source", label if logical is None else logical)
+    accounting.discover(key, group="scan", ordinal=int(label), output_label=int(label))
+    return key, submission_attempt(accounting, key, revision)
+
+
+def _open_final_session(tmp_path, name, sink, accounting, live, plan, *, store=None,
+                        nexus_target=None, executor=1):
+    from xdart.modules.reduction import open_live_scan_session
+
+    return open_live_scan_session(
+        (live,), plan, sink=sink, accounting=accounting, executor=executor,
+        record_store=store,
+        nexus_target=nexus_target or f"nexus:{tmp_path / (name + '.nexus')}",
+    )
+
+
+@pytest.mark.parametrize("composite", (False, True), ids=("direct", "memory-nexus"))
+def test_c2_dynamic_genuine_frame_reaches_exact_written_then_typed_commit(
+    tmp_path, monkeypatch, composite,
+):
+    from xrd_tools.reduction import (
+        CompositeSink, MemorySink, NexusSink, NexusTerminalDisposition,
+    )
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, f"final-{composite}")
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    key, token = _armed_submission(accounting)
+    memory = MemorySink()
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    sink = CompositeSink((memory, nexus)) if composite else nexus
+    facades = []
+    original_bind = NexusSink.bind_session
+
+    def bind_nexus(owner, facade):
+        if owner is nexus:
+            facades.append(facade)
+        return original_bind(owner, facade)
+
+    def bind_memory(owner, facade):
+        if owner is memory:
+            facades.append(facade)
+
+    monkeypatch.setattr(NexusSink, "bind_session", bind_nexus)
+    monkeypatch.setattr(MemorySink, "bind_session", bind_memory, raising=False)
+    session = _open_final_session(
+        tmp_path, f"final-{composite}", sink, accounting, live, plan,
+        nexus_target=target_name,
+    )
+    events = []
+    session.on_frame_completed(events.append)
+    assert session.submit(session.scan.frames[0], attempt_token=token) is True
+    assert session.pause(timeout=5.0) is True
+    session.flush(force=True)
+
+    staged = accounting.snapshot()
+    assert staged.completed_attempts[key] is token
+    assert staged.written_attempts[(key, mode)] is token
+    assert staged.pending_durable == frozenset(((key, mode, target_name),))
+    assert staged.durable == frozenset()
+    assert _rows(target) == (0,)
+    assert [event.frame_index for event in events] == [0]
+    if composite:
+        assert 0 in memory.frames
+        assert facades == [accounting.writer_boundary, accounting.writer_boundary]
+        assert facades[0] is facades[1]
+    else:
+        assert facades == [accounting.writer_boundary]
+
+    result = session.finish()
+    assert result.failed is False
+    assert session.terminal_result.disposition is NexusTerminalDisposition.COMMITTED
+    assert session.terminal_result.commit_identity is not None
+    settled = accounting.snapshot()
+    assert settled.durable_attempts[(key, mode, target_name)] is token
+    assert settled.state.value == "finished"
+
+
+def test_c2_dynamic_submit_refuses_every_invalid_capability_before_engine(tmp_path):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import Frame, NexusSink
+    from xrd_tools.session import (
+        DynamicAccountingLimits, DynamicAttemptToken, DynamicFrameIdentity,
+        DynamicRunAccounting, StageLedger,
+    )
+
+    class MustNotSubmit:
+        _max_workers = 1
+
+        def submit(self, *_args, **_kwargs):
+            raise AssertionError("invalid dynamic token reached executor.submit")
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "invalid-token")
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    keys = []
+    tokens = []
+    for label in range(5):
+        key = DynamicFrameIdentity("invalid-source", label)
+        accounting.discover(key, group="scan", ordinal=label, output_label=label)
+        keys.append(key)
+        tokens.append(submission_attempt(accounting, key, 1))
+    stale = tokens[2]
+    accounting.record_failed(stale, error="retry", retryable=True)
+    submission_attempt(accounting, keys[2], 2)
+    preaccepted = tokens[3]
+    accounting.record_accepted(preaccepted)
+    foreign_ledger = StageLedger(
+        required_modes=(mode,), targets_by_mode={mode: (target_name,)},
+    )
+    foreign = DynamicRunAccounting(
+        foreign_ledger, run_generation=accounting.snapshot().run_generation,
+        limits=DynamicAccountingLimits(1, 2, 1),
+    )
+    foreign_key = DynamicFrameIdentity("foreign-source", 0)
+    foreign.discover(foreign_key, group="foreign", ordinal=0, output_label=0)
+    foreign_token = submission_attempt(foreign, foreign_key, 1)
+    wrong_generation = DynamicAttemptToken(keys[1], 999, 1, 1)
+    session = open_live_scan_session(
+        (live,), plan,
+        sink=NexusSink(target, overwrite=True, atomic=False, flush_every=None),
+        accounting=accounting, executor=MustNotSubmit(), nexus_target=target_name,
+    )
+    base_frame = session.scan.frames[0]
+    cases = (
+        (base_frame, None, "missing"),
+        (base_frame, foreign_token, "foreign"),
+        (base_frame, wrong_generation, "generation"),
+        (Frame(2, image=np.ones((2, 2))), stale, "stale"),
+        (Frame(3, image=np.ones((2, 2))), preaccepted, "accepted"),
+        (Frame(99, image=np.ones((2, 2))), tokens[4], "label"),
+    )
+    for frame, token, match in cases:
+        before = accounting.snapshot()
+        before_inventory = tuple(session.scan.frame_indices)
+        kwargs = {} if token is None else {"attempt_token": token}
+        with pytest.raises((TypeError, ValueError), match=match):
+            session.submit(frame, **kwargs)
+        assert accounting.snapshot() == before
+        assert tuple(session.scan.frame_indices) == before_inventory
+    session.stop()
+    session.finish(raise_on_failure=False)
+
+    static = open_live_scan_session(
+        (live,), plan, sink=None, executor=MustNotSubmit(),
+    )
+    with pytest.raises(ValueError, match="static"):
+        static.submit(static.scan.frames[0], attempt_token=tokens[0])
+    static.stop()
+    static.finish(raise_on_failure=False)
+
+
+def test_c2_attempt_integer_bijection_is_exact_across_same_label_retry(tmp_path):
+    target = tmp_path / "bijection.nexus"
+    _ledger, accounting, _mode, _target = accounting_for(target)
+    key, first = _armed_submission(accounting)
+    first_published = []
+    first_revision = accounting.record_accepted(
+        first, publish_acceptance=first_published.append,
+    )
+    accounting.record_failed(first, error="retry", retryable=True)
+    second = submission_attempt(accounting, key, 2)
+    second_published = []
+    second_revision = accounting.record_accepted(
+        second, publish_acceptance=second_published.append,
+    )
+
+    assert (first_revision, second_revision) == (1, 2)
+    assert first_published == [1]
+    assert second_published == [2]
+    assert accounting.token_for_ledger_attempt(0, 1) is first
+    assert accounting.token_for_ledger_attempt(0, 2) is second
+    replay = []
+    assert accounting.record_accepted(
+        second, publish_acceptance=replay.append,
+    ) == 2
+    assert replay == [2]
+    assert accounting.ledger.current_attempt(0) == 2
+
+
+@pytest.mark.parametrize("composite", (False, True), ids=("direct", "memory-nexus"))
+def test_scan_session_commit_epoch_then_extend_live_reuses_exact_capability(
+    tmp_path, monkeypatch, composite,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.io import AppendRefused, get_output_transaction_coordinator
+    import xrd_tools.io.append as append_module
+    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.reduction import CompositeSink, Frame, MemorySink, NexusSink
+    from xrd_tools.session import DynamicFrameIdentity
+
+    target, accounting, live, plan = _dynamic_sink_case(
+        tmp_path, f"same-run-public-{composite}",
+    )
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    source_identity = "c2-public-same-run"
+    first_intent = append_intent(
+        tmp_path, extent=1, labels=(0,), generation=0,
+        source_identity=source_identity,
+    )
+    key0, token0 = _armed_submission(accounting)
+    memory = MemorySink()
+    nexus = NexusSink(
+        target, overwrite=True, atomic=False, flush_every=None,
+        same_run_intent=first_intent,
+    )
+    sink = CompositeSink((memory, nexus)) if composite else nexus
+
+    coordinator = get_output_transaction_coordinator()
+    admissions, leases, qualifications = [], [], []
+    original_admit = coordinator.admit
+    original_acquire = OutputTransaction.acquire_lease
+    original_qualify = append_module.qualify_append
+
+    def count_admit(*args, **kwargs):
+        admissions.append(args[0])
+        return original_admit(*args, **kwargs)
+
+    def count_acquire(owner, *args, **kwargs):
+        leases.append(owner.admission.target)
+        return original_acquire(owner, *args, **kwargs)
+
+    def count_qualify(*args, **kwargs):
+        qualifications.append(args[0])
+        return original_qualify(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator, "admit", count_admit)
+    monkeypatch.setattr(OutputTransaction, "acquire_lease", count_acquire)
+    monkeypatch.setattr(append_module, "qualify_append", count_qualify)
+
+    session = open_live_scan_session(
+        (live,), plan, sink=sink, accounting=accounting, executor=1,
+        nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token0)
+    anchor_a = session.commit_epoch()
+    epoch_a = target.read_bytes()
+    assert accounting.snapshot().durable_attempts[(key0, mode, target_name)] is token0
+
+    second_intent = append_intent(
+        tmp_path, extent=2, labels=(0, 1), generation=1,
+        source_identity=source_identity,
+    )
+    decision_b = session.extend_live(second_intent)
+    assert session.extend_live(second_intent) is decision_b
+    third_intent = append_intent(
+        tmp_path, extent=3, labels=(0, 1, 2), generation=2,
+        source_identity=source_identity,
+    )
+    with pytest.raises(RuntimeError, match="different successor"):
+        session.extend_live(third_intent)
+
+    key1 = DynamicFrameIdentity("c2-final-source", 1)
+    accounting.discover(key1, group="scan", ordinal=1, output_label=1)
+    token1 = submission_attempt(accounting, key1, 2)
+    frame1 = Frame(1, image=np.full((2, 2), 2.0))
+    assert session.submit(frame1, attempt_token=token1)
+    with pytest.raises(RuntimeError, match="drained writer|dirty epoch"):
+        session.extend_live(second_intent)
+    anchor_b = session.commit_epoch()
+    assert anchor_b is not anchor_a
+
+    regressed = append_intent(
+        tmp_path, extent=3, labels=(0, 1, 2), generation=1,
+        source_identity=source_identity,
+    )
+    before_refusal = accounting.snapshot()
+    before_bytes = target.read_bytes()
+    with pytest.raises(AppendRefused):
+        session.extend_live(regressed)
+    assert accounting.snapshot() == before_refusal
+    assert target.read_bytes() == before_bytes
+
+    session.finish()
+    with pytest.raises(RuntimeError, match="terminal|active"):
+        session.extend_live(third_intent)
+    snapshot = accounting.snapshot()
+    assert _rows(target) == (0, 1)
+    assert snapshot.ledger_attempts[token0] == 1
+    assert snapshot.ledger_attempts[token1] == 1
+    assert snapshot.durable_attempts[(key0, mode, target_name)] is token0
+    assert snapshot.durable_attempts[(key1, mode, target_name)] is token1
+    if composite:
+        assert tuple(memory.frames) == (0, 1)
+    assert admissions == [target]
+    assert leases == [str(target)]
+    assert qualifications == []
+    assert epoch_a != target.read_bytes()
+
+
+def test_scan_session_extend_live_refusals_and_stop_preserve_committed_epoch(
+    tmp_path, monkeypatch,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import NexusSink
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "same-run-stop")
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    source_identity = "c2-public-stop"
+    first_intent = append_intent(
+        tmp_path, extent=1, labels=(0,), generation=0,
+        source_identity=source_identity,
+    )
+    second_intent = append_intent(
+        tmp_path, extent=2, labels=(0, 1), generation=1,
+        source_identity=source_identity,
+    )
+    third_intent = append_intent(
+        tmp_path, extent=3, labels=(0, 1, 2), generation=2,
+        source_identity=source_identity,
+    )
+    _key0, token0 = _armed_submission(accounting)
+    nexus = NexusSink(
+        target, overwrite=True, atomic=False, flush_every=None,
+        same_run_intent=first_intent,
+    )
+    calls = []
+    original_extend = NexusSink.extend_live
+
+    def count_extend(owner, capability, intent):
+        if owner is nexus:
+            calls.append((capability, intent))
+        return original_extend(owner, capability, intent)
+
+    monkeypatch.setattr(NexusSink, "extend_live", count_extend)
+    session = open_live_scan_session(
+        (live,), plan, sink=nexus, accounting=accounting, executor=1,
+        nexus_target=target_name,
+    )
+    before = accounting.snapshot()
+    with pytest.raises(RuntimeError, match="settled committed epoch"):
+        session.extend_live(second_intent)
+    assert calls == []
+    assert accounting.snapshot() == before
+
+    assert session.submit(session.scan.frames[0], attempt_token=token0)
+    session.commit_epoch()
+    epoch_a = target.read_bytes()
+    assert session.pause(timeout=5.0)
+    with pytest.raises(RuntimeError, match="active session"):
+        session.extend_live(second_intent)
+    assert calls == []
+    session.resume()
+
+    decision = session.extend_live(second_intent)
+    assert session.extend_live(second_intent) is decision
+    with pytest.raises(RuntimeError, match="different successor"):
+        session.extend_live(third_intent)
+    assert len(calls) == 2
+    session.stop()
+    with pytest.raises(RuntimeError, match="active session|terminal"):
+        session.extend_live(second_intent)
+    assert len(calls) == 2
+    session.finish(raise_on_failure=False)
+    assert target.read_bytes() == epoch_a
+    assert _rows(target) == (0,)
+    assert accounting.snapshot().state.value == "stopped"
+    assert session not in accounting.owner_census()
+
+
+def test_scan_session_capture_fault_aborts_graph_and_releases_dynamic_light_owner(
+    tmp_path, monkeypatch,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DCleanupHooks, Light1DLayout,
+        Light1DModeLayout, SessionResourceAuthority,
+        acquire_light_1d_retention,
+    )
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "capture-fault")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    intent = append_intent(
+        tmp_path, extent=1, labels=(0,), generation=0,
+        source_identity="c2-capture-fault",
+    )
+    coordinate = Light1DBufferLayout(4, 8, "capture-q", "<f8", shared=True)
+    intensity = Light1DBufferLayout(4, 8, "capture-i", "<f8")
+    layout = Light1DLayout(
+        modes=(Light1DModeLayout("default", coordinate, intensity),),
+        active_mode="default",
+    )
+    authority = SessionResourceAuthority(capacity_bytes=4096)
+    lease = acquire_light_1d_retention(
+        authority, owner="capture-fault", generation=1, layout=layout,
+        requested_rows=1,
+        compatibility_byte_ceiling=(layout.shared_bytes
+                                    + layout.per_row_unique_ndarray_bytes),
+        gui_thread_id=threading.get_ident(),
+    )
+    accounting.bind_light_1d(lease, cleanup_hooks=Light1DCleanupHooks())
+    baseline_owners = accounting.owner_census()
+
+    def fail_capture(_owner):
+        raise RuntimeError("forced continuation capture fault")
+
+    monkeypatch.setattr(NexusSink, "extension_owner", property(fail_capture))
+    with pytest.raises(RuntimeError, match="forced continuation capture fault"):
+        open_live_scan_session(
+            (live,), plan,
+            sink=NexusSink(
+                target, overwrite=True, atomic=False, flush_every=None,
+                same_run_intent=intent,
+            ),
+            accounting=accounting, executor=1, nexus_target=target_name,
+        )
+    snapshot = accounting.snapshot()
+    assert snapshot.state.value == "aborted"
+    assert snapshot.cleanup_receipt.complete is True
+    assert authority.snapshot().reserved_bytes == 0
+    assert len(accounting.owner_census()) < len(baseline_owners)
+    assert not target.exists()
+
+
+def test_scan_session_begin_fault_releases_bound_dynamic_light_owner(
+    tmp_path, monkeypatch,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    import xrd_tools.reduction.core as reduction_core
+    from xrd_tools.io import WriterIncomplete
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DCleanupHooks, Light1DLayout,
+        Light1DModeLayout, SessionResourceAuthority,
+        acquire_light_1d_retention,
+    )
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "begin-fault")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    coordinate = Light1DBufferLayout(4, 8, "begin-q", "<f8", shared=True)
+    intensity = Light1DBufferLayout(4, 8, "begin-i", "<f8")
+    layout = Light1DLayout(
+        modes=(Light1DModeLayout("default", coordinate, intensity),),
+        active_mode="default",
+    )
+    authority = SessionResourceAuthority(capacity_bytes=4096)
+    lease = acquire_light_1d_retention(
+        authority, owner="begin-fault", generation=1, layout=layout,
+        requested_rows=1,
+        compatibility_byte_ceiling=(layout.shared_bytes
+                                    + layout.per_row_unique_ndarray_bytes),
+        gui_thread_id=threading.get_ident(),
+    )
+    accounting.bind_light_1d(lease, cleanup_hooks=Light1DCleanupHooks())
+    baseline_owners = accounting.owner_census()
+
+    def fail_open(*_args, **_kwargs):
+        raise OSError("forced sink begin fault")
+
+    monkeypatch.setattr(reduction_core, "open_nexus_writer", fail_open)
+    with pytest.raises(WriterIncomplete, match="forced sink begin fault"):
+        open_live_scan_session(
+            (live,), plan,
+            sink=NexusSink(
+                target, overwrite=True, atomic=False, flush_every=None,
+            ),
+            accounting=accounting, executor=1, nexus_target=target_name,
+        )
+    snapshot = accounting.snapshot()
+    assert snapshot.state.value == "aborted"
+    assert snapshot.cleanup_receipt.complete is True
+    assert authority.snapshot().reserved_bytes == 0
+    assert len(accounting.owner_census()) < len(baseline_owners)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("sink_kind", ("none", "memory"))
+def test_dynamic_targetless_graph_finishes_written_without_false_durable(
+    tmp_path, sink_kind,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import MemorySink, ReductionPlan
+    from xrd_tools.session import (
+        DynamicAccountingLimits, DynamicFrameIdentity, DynamicRunAccounting,
+        ResultMode, StageLedger,
+    )
+
+    mode = ResultMode.one_d()
+    ledger = StageLedger(required_modes=(mode,))
+    accounting = DynamicRunAccounting(
+        ledger, run_generation=1,
+        limits=DynamicAccountingLimits(1, 2, 1),
+    )
+    key = DynamicFrameIdentity(f"targetless-{sink_kind}", 0)
+    accounting.discover(key, group="scan", ordinal=0, output_label=0)
+    token = submission_attempt(accounting, key, 1)
+    live = SimpleNamespace(
+        idx=0, map_raw=np.ones((2, 2)), bg_raw=None, scan_info={},
+        source_file=str(tmp_path / f"targetless-{sink_kind}.tif"),
+        source_frame_idx=0, mask=None, poni=None,
+        integrator=DeterministicIntegrator(),
+    )
+    sink = None if sink_kind == "none" else MemorySink()
+    session = open_live_scan_session(
+        (live,), ReductionPlan(integration_2d=None), sink=sink,
+        accounting=accounting, executor=1,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    result = session.finish()
+    snapshot = accounting.snapshot()
+    assert result.failed is False
+    assert snapshot.state.value == "finished"
+    assert snapshot.accepted == snapshot.completed == snapshot.written == {key}
+    assert snapshot.written_attempts[(key, mode)] is token
+    assert snapshot.persisted == snapshot.durable == frozenset()
+    assert snapshot.publication_dropped == frozenset()
+    assert session.terminal_result is None
+    if sink is not None:
+        assert tuple(sink.frames) == (0,)
+
+
+def test_dynamic_targetless_completion_without_written_cannot_finish(tmp_path):
+    from xrd_tools.session import (
+        DynamicAccountingLimits, DynamicFrameIdentity, DynamicRunAccounting,
+        ResultMode, StageLedger,
+    )
+
+    class LiveOwner:
+        pass
+
+    mode = ResultMode.one_d()
+    accounting = DynamicRunAccounting(
+        StageLedger(required_modes=(mode,)), run_generation=1,
+        limits=DynamicAccountingLimits(1, 2, 1),
+    )
+    key = DynamicFrameIdentity("targetless-unwritten", 0)
+    accounting.discover(key, group="scan", ordinal=0, output_label=0)
+    token = submission_attempt(accounting, key, 1)
+    accounting.record_accepted(token)
+    accounting.record_completed(token, produced=(mode,))
+    session, owner = LiveOwner(), object()
+    boundary = accounting.writer_boundary
+    boundary.bind_live_session(session, owner)
+    with pytest.raises(RuntimeError, match="unresolved dynamic work"):
+        boundary.prepare_session_finish(session, owner)
+    assert (key, mode) not in accounting.snapshot().written_attempts
+    boundary.epoch_aborted(session, owner, "negative targetless oracle")
+
+
+def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monkeypatch):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import Frame, NexusSink
+    from xrd_tools.session import DynamicFrameIdentity
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "extend-failure")
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    source_identity = "c2-public-failure"
+    first_intent = append_intent(
+        tmp_path, extent=1, labels=(0,), generation=0,
+        source_identity=source_identity,
+    )
+    second_intent = append_intent(
+        tmp_path, extent=2, labels=(0, 1), generation=1,
+        source_identity=source_identity,
+    )
+    _key0, token0 = _armed_submission(accounting)
+    nexus = NexusSink(
+        target, overwrite=True, atomic=False, flush_every=None,
+        same_run_intent=first_intent,
+    )
+    session = open_live_scan_session(
+        (live,), plan, sink=nexus, accounting=accounting, executor=1,
+        nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token0)
+    session.commit_epoch()
+    epoch_a = target.read_bytes()
+    session.extend_live(second_intent)
+
+    key1 = DynamicFrameIdentity("c2-final-source", 1)
+    accounting.discover(key1, group="scan", ordinal=1, output_label=1)
+    token1 = submission_attempt(accounting, key1, 2)
+    original_write = NexusSink.write
+
+    def write_then_fail(owner, frame, reduction):
+        value = original_write(owner, frame, reduction)
+        if owner is nexus and int(frame.index) == 1:
+            raise OSError("recorded same-run write failure")
+        return value
+
+    monkeypatch.setattr(NexusSink, "write", write_then_fail)
+    assert session.submit(Frame(1, image=np.ones((2, 2))), attempt_token=token1)
+    assert session.pause(timeout=5.0)
+    session.resume()
+    before = accounting.snapshot()
+    with pytest.raises(RuntimeError, match="failed session"):
+        session.extend_live(second_intent)
+    assert accounting.snapshot() == before
+    result = session.finish(raise_on_failure=False)
+    assert result.failed is True
+    assert target.read_bytes() == epoch_a
+    assert _rows(target) == (0,)
+    assert accounting.snapshot().state.value == "aborted"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("automatic-flush", "target-mismatch", "multi-nexus", "unbound-same-run"),
+)
+def test_c2_dynamic_nexus_admission_refuses_pre_effect(tmp_path, case):
+    from xdart.modules.reduction import (
+        DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
+    )
+    from xrd_tools.reduction import CompositeSink, NexusSink
+
+    actual = tmp_path / f"{case}.nexus"
+    declared = actual if case != "target-mismatch" else tmp_path / "declared.nexus"
+    _ledger, accounting, _mode, target_name = accounting_for(declared)
+    if case == "automatic-flush":
+        sink = NexusSink(actual, overwrite=True, atomic=False, flush_every=1)
+    elif case == "target-mismatch":
+        sink = NexusSink(actual, overwrite=True, atomic=False, flush_every=None)
+    elif case == "unbound-same-run":
+        sink = NexusSink(
+            actual, overwrite=True, atomic=False, flush_every=None,
+            allow_unbound_same_run=True,
+        )
+    else:
+        sink = CompositeSink((
+            NexusSink(actual, overwrite=True, atomic=False, flush_every=None),
+            NexusSink(tmp_path / "second.nexus", overwrite=True, atomic=False,
+                      flush_every=None),
+        ))
+
+    class MustNotMaterialize:
+        def __iter__(self):
+            raise AssertionError("invalid sink admission touched the source")
+
+    before = accounting.snapshot()
+    with pytest.raises((ValueError, DynamicXyeReceiptBoundaryRequired)):
+        open_live_scan_session(
+            MustNotMaterialize(),
+            __import__("xrd_tools.reduction", fromlist=["ReductionPlan"]).ReductionPlan(
+                integration_2d=None,
+            ),
+            sink=sink, accounting=accounting, nexus_target=target_name,
+        )
+    assert accounting.snapshot() == before
+    assert not actual.exists()
+    assert not (tmp_path / "second.nexus").exists()
+
+
+def test_c2_all_nan_is_written_before_pending_drop_and_committed_canonical(tmp_path):
+    from xrd_tools.reduction import NexusSink
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "all-nan-final")
+    live.integrator = DeterministicIntegrator(all_nan=True)
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    key, token = _armed_submission(accounting)
+    session = _open_final_session(
+        tmp_path, "all-nan-final",
+        NexusSink(target, overwrite=True, atomic=False, flush_every=None),
+        accounting, live, plan, nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    assert session.pause(timeout=5.0)
+    session.flush(force=True)
+    pending = accounting.snapshot()
+    assert pending.written_attempts[(key, mode)] is token
+    assert pending.pending_publication_dropped == frozenset(((key, mode),))
+    assert pending.publication_dropped == frozenset()
+    session.finish()
+    final = accounting.snapshot()
+    assert final.publication_dropped_attempts[(key, mode)] is token
+    assert final.durable == frozenset()
+
+
+@pytest.mark.parametrize("failure_owner", ("sink", "accounting"))
+def test_c2_authority_and_sink_failures_never_publish_false_write(
+    tmp_path, monkeypatch, failure_owner,
+):
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import DynamicRunState
+
+    target, accounting, live, plan = _dynamic_sink_case(
+        tmp_path, f"failure-{failure_owner}",
+    )
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    key, token = _armed_submission(accounting)
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    writes = []
+    original_write = NexusSink.write
+    if failure_owner == "sink":
+        def fail_write(owner, frame, reduction):
+            if owner is nexus:
+                raise OSError("sink write fault")
+            return original_write(owner, frame, reduction)
+
+        monkeypatch.setattr(NexusSink, "write", fail_write)
+    else:
+        def count_write(owner, frame, reduction):
+            if owner is nexus:
+                writes.append(int(frame.index))
+            return original_write(owner, frame, reduction)
+
+        monkeypatch.setattr(NexusSink, "write", count_write)
+        owner_type = type(accounting)
+        original = owner_type.record_completed
+
+        def fail_outcome(owner, *args, **kwargs):
+            if owner is accounting:
+                raise RuntimeError("accounting authority fault")
+            return original(owner, *args, **kwargs)
+
+        monkeypatch.setattr(owner_type, "record_completed", fail_outcome)
+    session = _open_final_session(
+        tmp_path, f"failure-{failure_owner}", nexus, accounting, live, plan,
+        nexus_target=target_name,
+    )
+    events = []
+    session.on_frame_completed(events.append)
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    result = session.finish(raise_on_failure=False)
+    snap = accounting.snapshot()
+    assert result.failed is True
+    assert (key, mode) not in snap.written_attempts
+    assert snap.durable == frozenset()
+    assert events == []
+    assert snap.state is DynamicRunState.ABORTED
+    if failure_owner == "sink":
+        assert snap.completed_attempts[key] is token
+    else:
+        assert writes == []
+
+
+def test_c2_raise_on_failure_false_preserves_failed_terminal_disposition(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.reduction import NexusSink, NexusTerminalDisposition
+    import xrd_tools.session.scan_session as scan_module
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "false-failure")
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    key, token = _armed_submission(accounting)
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+
+    original_post_write = scan_module._EventSink._post_write
+
+    def fail_after_written(owner, *args):
+        original_post_write(owner, *args)
+        raise RuntimeError("post-written run failure")
+
+    monkeypatch.setattr(scan_module._EventSink, "_post_write", fail_after_written)
+    session = _open_final_session(
+        tmp_path, "false-failure", nexus, accounting, live, plan,
+        nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    result = session.finish(raise_on_failure=False)
+    snapshot = accounting.snapshot()
+    assert result.failed is True
+    assert snapshot.written_attempts[(key, mode)] is token
+    assert snapshot.durable == frozenset()
+    assert snapshot.state.value == "aborted"
+    assert session.terminal_result.disposition is NexusTerminalDisposition.ABORTED
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("written_prefix", (False, True), ids=("empty", "prefix"))
+def test_c2_stop_terminal_disposition_is_exact(tmp_path, written_prefix):
+    from xrd_tools.reduction import NexusSink, NexusTerminalDisposition
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, f"stop-{written_prefix}")
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    key, token = _armed_submission(accounting)
+    session = _open_final_session(
+        tmp_path, f"stop-{written_prefix}",
+        NexusSink(target, overwrite=True, atomic=False, flush_every=None),
+        accounting, live, plan, nexus_target=target_name,
+    )
+    if written_prefix:
+        assert session.submit(session.scan.frames[0], attempt_token=token)
+        assert session.pause(timeout=5.0)
+    session.stop()
+    result = session.finish(raise_on_failure=False)
+    assert result.cancelled is True
+    assert accounting.snapshot().state.value == "stopped"
+    expected = (
+        NexusTerminalDisposition.COMMITTED
+        if written_prefix else NexusTerminalDisposition.ABORTED
+    )
+    assert session.terminal_result.disposition is expected
+    if written_prefix:
+        assert accounting.snapshot().durable_attempts[(key, mode, target_name)] is token
+    else:
+        assert accounting.snapshot().durable == frozenset()
+
+
+def test_c2_finish_retry_preserves_seal_and_terminal_identity(tmp_path, monkeypatch):
+    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.reduction import NexusSink
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "finish-retry-final")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    _key, token = _armed_submission(accounting)
+    session = _open_final_session(
+        tmp_path, "finish-retry-final",
+        NexusSink(target, overwrite=True, atomic=False, flush_every=None),
+        accounting, live, plan, nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    original = OutputTransaction.release_lease_owner
+    failures = [OSError("terminal lease cleanup fault")]
+
+    def fail_once(owner, *args, **kwargs):
+        if failures:
+            raise failures.pop()
+        return original(owner, *args, **kwargs)
+
+    monkeypatch.setattr(OutputTransaction, "release_lease_owner", fail_once)
+    with pytest.raises(OSError, match="terminal lease cleanup fault"):
+        session.finish()
+    assert accounting.snapshot().epoch_revision == 0
+    result = session.finish()
+    identity = session.terminal_result.commit_identity
+    assert result.failed is False
+    assert identity is not None
+    assert session.finish().failed is False
+    assert session.terminal_result.commit_identity is identity
+    assert accounting.snapshot().epoch_revision == 1
+
+
+def test_c2_abort_retry_notifies_only_after_exact_aborted(tmp_path, monkeypatch):
+    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.reduction import NexusSink
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "abort-retry-final")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    _key, token = _armed_submission(accounting)
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    original_write = NexusSink.write
+
+    def fail_write(owner, frame, reduction):
+        if owner is nexus:
+            raise OSError("writer failure")
+        return original_write(owner, frame, reduction)
+
+    monkeypatch.setattr(NexusSink, "write", fail_write)
+    session = _open_final_session(
+        tmp_path, "abort-retry-final", nexus, accounting, live, plan,
+        nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    original_release = OutputTransaction.release_lease_owner
+    failures = [OSError("abort cleanup fault")]
+
+    def fail_release(owner, *args, **kwargs):
+        if failures:
+            raise failures.pop()
+        return original_release(owner, *args, **kwargs)
+
+    monkeypatch.setattr(OutputTransaction, "release_lease_owner", fail_release)
+    with pytest.raises(OSError, match="abort cleanup fault"):
+        session.finish(raise_on_failure=False)
+    assert accounting.snapshot().state.value == "active"
+    result = session.finish(raise_on_failure=False)
+    assert result.failed is True
+    assert accounting.snapshot().state.value == "aborted"
+
+
+def test_c2_post_commit_accounting_retry_does_not_rerun_h23(tmp_path, monkeypatch):
+    from xrd_tools.reduction import NexusSink
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "light-retry-final")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    _key, token = _armed_submission(accounting)
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    session = _open_final_session(
+        tmp_path, "light-retry-final", nexus, accounting, live, plan,
+        nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    finish_calls = []
+    original_finish = NexusSink.finish
+
+    def count_finish(owner, result):
+        if owner is nexus:
+            finish_calls.append(result)
+        return original_finish(owner, result)
+
+    monkeypatch.setattr(NexusSink, "finish", count_finish)
+    boundary_type = type(accounting.writer_boundary)
+    original_notify = boundary_type.session_finished
+    failures = [RuntimeError("light cleanup fault")]
+
+    def fail_once(owner, *args, **kwargs):
+        if owner is accounting.writer_boundary and failures:
+            raise failures.pop()
+        return original_notify(owner, *args, **kwargs)
+
+    monkeypatch.setattr(boundary_type, "session_finished", fail_once)
+    with pytest.raises(RuntimeError, match="light cleanup fault"):
+        session.finish()
+    committed = session.terminal_result
+    assert committed.commit_identity is not None
+    assert len(finish_calls) == 1
+    session.finish()
+    assert session.terminal_result is committed
+    assert len(finish_calls) == 1
+    assert accounting.snapshot().state.value == "finished"
+
+
+def test_c2_final_sweep_and_terminal_event_wait_for_settlement(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import FrameRecordStore
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "sweep-final")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    _key, token = _armed_submission(accounting)
+    store = FrameRecordStore()
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    session = _open_final_session(
+        tmp_path, "sweep-final", nexus, accounting, live, plan,
+        store=store, nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    states = []
+    session.on_state_change(states.append)
+    released = []
+    original_release = FrameRecordStore.release_heavy
+
+    def record_release(owner, label):
+        if owner is store:
+            released.append(int(label))
+        return original_release(owner, label)
+
+    monkeypatch.setattr(FrameRecordStore, "release_heavy", record_release)
+    boundary_type = type(accounting.writer_boundary)
+    original_notify = boundary_type.session_finished
+    failures = [RuntimeError("terminal notification fault")]
+
+    def fail_once(owner, *args, **kwargs):
+        if owner is accounting.writer_boundary and failures:
+            raise failures.pop()
+        return original_notify(owner, *args, **kwargs)
+
+    monkeypatch.setattr(boundary_type, "session_finished", fail_once)
+    with pytest.raises(RuntimeError, match="terminal notification fault"):
+        session.finish()
+    assert released == []
+    assert states == []
+    session.finish()
+    assert released == [0]
+    assert len(states) == 1
+    session.finish()
+    assert released == [0]
+    assert len(states) == 1
 
 
 def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():

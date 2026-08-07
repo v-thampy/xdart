@@ -49,6 +49,7 @@ from xrd_tools.io.output_transaction import (
     OutputTransaction,
     OutputTransactionError,
     StreamAttempt,
+    StreamTerminal,
     TargetLease,
 )
 from xrd_tools.io.read import relative_source_path
@@ -202,6 +203,7 @@ class WriterOutcome:
     partial_path: Path | None
     pending_owner: str | None
     operation_vector: WriterOperationVector
+    stream_terminal: StreamTerminal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +486,7 @@ class NexusRecordWriter:
         self._checkpoint_rows = 0
         self._checkpoint_read_bytes = 0
         self._stream_close_attempt = None
+        self._stream_terminal: StreamTerminal | None = None
         self._close_verification_descriptor = None
         self._durable_mode_proofs: dict[
             tuple[str, int], _DurableModeProof
@@ -723,6 +726,12 @@ class NexusRecordWriter:
                 )
             if not decoded:
                 raise WriterStateError(f"{role} must not be empty")
+            try:
+                decoded.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as error:
+                raise WriterStateError(
+                    f"{role} must be a valid UTF-8 text scalar"
+                ) from error
             return decoded
         if kind == "integer":
             if isinstance(value, (bool, np.bool_)) or not isinstance(
@@ -2566,15 +2575,26 @@ class NexusRecordWriter:
                     )
                 else:
                     binding = self._transaction_binding
+
+                    def seal_terminal() -> None:
+                        terminal = binding.transaction.seal_stream_terminal(
+                            binding.attempt, lease=binding.lease,
+                        )
+                        if (
+                            self._stream_terminal is not None
+                            and terminal != self._stream_terminal
+                        ):
+                            raise WriterStateError(
+                                "retry changed the exact stream terminal identity"
+                            )
+                        self._stream_terminal = terminal
+
                     steps = (
                         ("metadata", lambda: self._write_finalization(self._finalization)),
                         ("flush", self._flush_handle),
                         ("checkpoint", self._seal_checkpoint_and_receipts),
                         ("close", self._close_handle),
-                        ("terminal", lambda: binding.transaction.seal_stream_terminal(
-                            binding.attempt,
-                            lease=binding.lease,
-                        )),
+                        ("terminal", seal_terminal),
                     )
                 while self._finish_step < len(steps):
                     owner, action = steps[self._finish_step]
@@ -2640,6 +2660,7 @@ class NexusRecordWriter:
             phase=self.phase, target=self.target, partial_path=partial,
             pending_owner=self._pending_owner,
             operation_vector=self.operation_vector(),
+            stream_terminal=self._stream_terminal,
         )
 
 
