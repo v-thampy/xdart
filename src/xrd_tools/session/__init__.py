@@ -1,179 +1,117 @@
-# -*- coding: utf-8 -*-
-"""``xrd_tools.session`` - the headless scan-session layer.
-
-The public session classes are loaded lazily so importing a lightweight
-submodule such as ``xrd_tools.session.readiness`` does not pull in reduction
-writers or image-reader dependencies.
-"""
+"""Lazy public router for the complete headless session surface."""
 
 from __future__ import annotations
 
 from importlib import import_module
 from typing import Any
 
-__all__ = [
-    "ScanSession",
-    "FrameEvent",
-    "FrameRecordStore",
-    "ProgressEvent",
-    "StateChangeEvent",
-    # X1 store/provider read-authority projections (headless):
-    "MetadataRow",
-    "Capability",
-    "CapabilityState",
-    "CapabilityDisposition",
-    "DisplayCapabilities",
-    "WavelengthEvidence",
-    "WavelengthStatus",
-    "FrameProjection",
-    "MetadataConflictError",
-    "metadata_row_from_view",
-    "metadata_row_from_provider",
-    "metadata_row_from_record",
-    "normalization_channels",
-    "normalization_value",
-    "wavelength_evidence",
-    "display_capabilities",
-    "project_frame",
-    # Immutable run-boundary configuration values (headless):
-    "GIIntent",
-    "ThresholdIntent",
-    "RunIntent",
-    "FrozenGIConfiguration",
-    "FrozenThresholdPolicy",
-    "FrozenSourceSpec",
-    "FrozenRunConfiguration",
-    "RunConfigurationRefused",
-    "admit_run_configuration",
-    "require_run_configuration",
-    "jsonable_run_value",
-    # Canonical revisioned RunIntent owner (headless):
-    "RunIntentSnapshot",
-    "IntentCommitAccepted",
-    "IntentFreezeAccepted",
-    "IntentRecaptureRequired",
-    "RunIntentStore",
-    # GI theta-motor policy (Qt-free, single source of truth).  `resolve_gi_motor`
-    # is THE motor-resolution decision (raw selection + choice knowledge ->
-    # effective motor); `pick_default_gi_motor` is the default-pick it delegates
-    # to.  GUI owners import the resolver rather than re-deriving the rule.
-    "GI_MOTOR_PREFERENCE",
-    "pick_default_gi_motor",
-    "resolve_gi_motor",
-    # Slice-5 whole-scan normalization aggregate (headless value):
-    "ScanNormAggregate",
-    "accepts_norm_aggregate",
-    "channel_is_partial",
-    "empty_norm_aggregate",
-    "fold_norm_metadata",
-    "next_norm_revision",
-    # Revision-qualified hydration request/completion values (headless):
-    "HydrationPurpose",
-    "HydrationOutcome",
-    "HydrationScope",
-    "HydrationReadKey",
-    "HydrationToken",
-    "HydrationCompletion",
-    "normalize_hydration_purpose",
-]
-
-_SCAN_SESSION_EXPORTS = {
-    "ScanSession",
-    "FrameEvent",
-    "ProgressEvent",
-    "StateChangeEvent",
+_EXPORTS = {
+    "accepts_norm_aggregate": "xrd_tools.session.scan_norm",
+    "acquire_light_1d_retention": "xrd_tools.session.light_1d_retention",
+    "admit_run_configuration": "xrd_tools.session.run_configuration",
+    "Capability": "xrd_tools.session.frame_projection",
+    "CapabilityDisposition": "xrd_tools.session.frame_projection",
+    "CapabilityState": "xrd_tools.session.frame_projection",
+    "channel_is_partial": "xrd_tools.session.scan_norm",
+    "display_capabilities": "xrd_tools.session.frame_projection",
+    "DisplayCapabilities": "xrd_tools.session.frame_projection",
+    "DynamicAccountingLimits": "xrd_tools.session.dynamic_accounting",
+    "DynamicAttemptState": "xrd_tools.session.dynamic_accounting",
+    "DynamicAttemptToken": "xrd_tools.session.dynamic_accounting",
+    "DynamicCleanupReceipt": "xrd_tools.session.dynamic_accounting",
+    "DynamicFrameIdentity": "xrd_tools.session.dynamic_accounting",
+    "DynamicGroupHighWater": "xrd_tools.session.dynamic_accounting",
+    "DynamicRunAccounting": "xrd_tools.session.dynamic_accounting",
+    "DynamicRunSnapshot": "xrd_tools.session.dynamic_accounting",
+    "DynamicRunState": "xrd_tools.session.dynamic_accounting",
+    "empty_norm_aggregate": "xrd_tools.session.scan_norm",
+    "FlushPolicy": "xrd_tools.session.policy",
+    "fold_norm_metadata": "xrd_tools.session.scan_norm",
+    "FrameEvent": "xrd_tools.session.scan_session",
+    "FrameProjection": "xrd_tools.session.frame_projection",
+    "FrameRecordStore": "xrd_tools.session.frame_record_store",
+    "FrozenGIConfiguration": "xrd_tools.session.run_configuration",
+    "FrozenRunConfiguration": "xrd_tools.session.run_configuration",
+    "FrozenSourceSpec": "xrd_tools.session.run_configuration",
+    "FrozenThresholdPolicy": "xrd_tools.session.run_configuration",
+    "get_pool": "xrd_tools.session.io_coordination",
+    "GI_MOTOR_PREFERENCE": "xrd_tools.session.gi_motor",
+    "GIIntent": "xrd_tools.session.run_configuration",
+    "GUIThreadHydrationRefused": "xrd_tools.session.light_1d_retention",
+    "H5FilePool": "xrd_tools.session.io_coordination",
+    "HydrationCompletion": "xrd_tools.session.hydration",
+    "HydrationOutcome": "xrd_tools.session.hydration",
+    "HydrationPurpose": "xrd_tools.session.hydration",
+    "HydrationReadKey": "xrd_tools.session.hydration",
+    "HydrationScope": "xrd_tools.session.hydration",
+    "HydrationToken": "xrd_tools.session.hydration",
+    "IntentCommitAccepted": "xrd_tools.session.intent_store",
+    "IntentFreezeAccepted": "xrd_tools.session.intent_store",
+    "IntentRecaptureRequired": "xrd_tools.session.intent_store",
+    "ItemDisposition": "xrd_tools.session.stage_accounting",
+    "jsonable_run_value": "xrd_tools.session.run_configuration",
+    "Light1DBorrow": "xrd_tools.session.light_1d_retention",
+    "Light1DBufferLayout": "xrd_tools.session.light_1d_retention",
+    "Light1DCleanupHooks": "xrd_tools.session.light_1d_retention",
+    "Light1DCleanupPending": "xrd_tools.session.light_1d_retention",
+    "Light1DCleanupReceipt": "xrd_tools.session.light_1d_retention",
+    "Light1DCleanupToken": "xrd_tools.session.light_1d_retention",
+    "Light1DHydrationToken": "xrd_tools.session.light_1d_retention",
+    "Light1DLayout": "xrd_tools.session.light_1d_retention",
+    "Light1DLeaseState": "xrd_tools.session.light_1d_retention",
+    "Light1DModeData": "xrd_tools.session.light_1d_retention",
+    "Light1DModeLayout": "xrd_tools.session.light_1d_retention",
+    "Light1DRecord": "xrd_tools.session.light_1d_retention",
+    "Light1DReleaseReceipt": "xrd_tools.session.light_1d_retention",
+    "Light1DRetentionLease": "xrd_tools.session.light_1d_retention",
+    "Light1DStaleGeneration": "xrd_tools.session.light_1d_retention",
+    "Light1DUnavailable": "xrd_tools.session.light_1d_retention",
+    "metadata_row_from_provider": "xrd_tools.session.frame_projection",
+    "metadata_row_from_record": "xrd_tools.session.frame_projection",
+    "metadata_row_from_view": "xrd_tools.session.frame_projection",
+    "MetadataConflictError": "xrd_tools.session.frame_projection",
+    "MetadataRow": "xrd_tools.session.frame_projection",
+    "next_norm_revision": "xrd_tools.session.scan_norm",
+    "normalization_channels": "xrd_tools.session.frame_projection",
+    "normalization_value": "xrd_tools.session.frame_projection",
+    "normalize_hydration_purpose": "xrd_tools.session.hydration",
+    "pick_default_gi_motor": "xrd_tools.session.gi_motor",
+    "ProgressEvent": "xrd_tools.session.scan_session",
+    "project_frame": "xrd_tools.session.frame_projection",
+    "require_run_configuration": "xrd_tools.session.run_configuration",
+    "required_result_modes": "xrd_tools.session.scan_session",
+    "resolve_gi_motor": "xrd_tools.session.run_configuration",
+    "resolve_session_policy": "xrd_tools.session.policy",
+    "ResultMode": "xrd_tools.session.stage_accounting",
+    "RunConfigurationRefused": "xrd_tools.session.run_configuration",
+    "RunIntent": "xrd_tools.session.run_configuration",
+    "RunIntentSnapshot": "xrd_tools.session.intent_store",
+    "RunIntentStore": "xrd_tools.session.intent_store",
+    "ScanNormAggregate": "xrd_tools.session.scan_norm",
+    "ScanSession": "xrd_tools.session.scan_session",
+    "SessionEnvelopeError": "xrd_tools.session.policy",
+    "SessionPolicy": "xrd_tools.session.policy",
+    "SessionResourceAllocation": "xrd_tools.session.policy",
+    "SessionResourceAuthority": "xrd_tools.session.light_1d_retention",
+    "SessionResourceAuthoritySnapshot": "xrd_tools.session.light_1d_retention",
+    "SessionResourceRequirements": "xrd_tools.session.policy",
+    "StageLedger": "xrd_tools.session.stage_accounting",
+    "StageReceipt": "xrd_tools.session.stage_accounting",
+    "StageSnapshot": "xrd_tools.session.stage_accounting",
+    "StateChangeEvent": "xrd_tools.session.scan_session",
+    "ThresholdIntent": "xrd_tools.session.run_configuration",
+    "wavelength_evidence": "xrd_tools.session.frame_projection",
+    "WavelengthEvidence": "xrd_tools.session.frame_projection",
+    "WavelengthStatus": "xrd_tools.session.frame_projection",
 }
 
-_FRAME_PROJECTION_EXPORTS = {
-    "MetadataRow",
-    "Capability",
-    "CapabilityState",
-    "CapabilityDisposition",
-    "DisplayCapabilities",
-    "WavelengthEvidence",
-    "WavelengthStatus",
-    "FrameProjection",
-    "MetadataConflictError",
-    "metadata_row_from_view",
-    "metadata_row_from_provider",
-    "metadata_row_from_record",
-    "normalization_channels",
-    "normalization_value",
-    "wavelength_evidence",
-    "display_capabilities",
-    "project_frame",
-}
-
-_RUN_CONFIGURATION_EXPORTS = {
-    "GIIntent",
-    "ThresholdIntent",
-    "RunIntent",
-    "FrozenGIConfiguration",
-    "FrozenThresholdPolicy",
-    "FrozenSourceSpec",
-    "FrozenRunConfiguration",
-    "RunConfigurationRefused",
-    "admit_run_configuration",
-    "require_run_configuration",
-    "jsonable_run_value",
-    "resolve_gi_motor",
-}
-
-
-_INTENT_STORE_EXPORTS = {
-    "RunIntentSnapshot",
-    "IntentCommitAccepted",
-    "IntentFreezeAccepted",
-    "IntentRecaptureRequired",
-    "RunIntentStore",
-}
-
-
-_GI_MOTOR_EXPORTS = {
-    "GI_MOTOR_PREFERENCE",
-    "pick_default_gi_motor",
-}
-
-
-_SCAN_NORM_EXPORTS = {
-    "ScanNormAggregate",
-    "accepts_norm_aggregate",
-    "channel_is_partial",
-    "empty_norm_aggregate",
-    "fold_norm_metadata",
-    "next_norm_revision",
-}
-
-
-_HYDRATION_EXPORTS = {
-    "HydrationPurpose",
-    "HydrationOutcome",
-    "HydrationScope",
-    "HydrationReadKey",
-    "HydrationToken",
-    "HydrationCompletion",
-    "normalize_hydration_purpose",
-}
-
+__all__ = sorted(_EXPORTS)
 
 def __getattr__(name: str) -> Any:
-    if name == "FrameRecordStore":
-        value = getattr(import_module("xrd_tools.session.frame_record_store"), name)
-    elif name in _GI_MOTOR_EXPORTS:
-        value = getattr(import_module("xrd_tools.session.gi_motor"), name)
-    elif name in _SCAN_SESSION_EXPORTS:
-        value = getattr(import_module("xrd_tools.session.scan_session"), name)
-    elif name in _FRAME_PROJECTION_EXPORTS:
-        value = getattr(import_module("xrd_tools.session.frame_projection"), name)
-    elif name in _RUN_CONFIGURATION_EXPORTS:
-        value = getattr(import_module("xrd_tools.session.run_configuration"), name)
-    elif name in _INTENT_STORE_EXPORTS:
-        value = getattr(import_module("xrd_tools.session.intent_store"), name)
-    elif name in _HYDRATION_EXPORTS:
-        value = getattr(import_module("xrd_tools.session.hydration"), name)
-    elif name in _SCAN_NORM_EXPORTS:
-        value = getattr(import_module("xrd_tools.session.scan_norm"), name)
-    else:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    try:
+        module_name = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from error
+    value = getattr(import_module(module_name), name)
     globals()[name] = value
     return value

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -646,22 +647,22 @@ def test_nexus_sink_compression_default_honors_env(tmp_path, monkeypatch):
 
 
 def test_nexus_sink_abort_preserves_partial(tmp_path):
-    """T0-6/S7: in atomic mode every frame written so far lives in the tmp
-    file; abort() must preserve it as <output>.partial, never unlink it."""
+    """T0-6/S7: abort preserves every written frame as <output>.partial."""
     from xrd_tools.reduction import NexusSink
 
     out = tmp_path / "run.nxs"
     sink = NexusSink(out, overwrite=True)
-    sink.begin(Scan("s", _frames(1), integrator=object()), _plan())
-    assert sink._tmp_path is not None and sink._tmp_path.exists()
-    tmp = sink._tmp_path
+    frames = _frames(1)
+    sink.begin(Scan("s", frames, integrator=object()), _plan())
+    sink.write(frames[0], reduction_core.FrameReduction(
+        frame_index=0, result_1d=_r1d(1.0)))
+    assert out.exists()
 
     with pytest.warns(RuntimeWarning, match="partial"):
         sink.abort(result=None)
 
-    partial = tmp_path / "run.nxs.partial"
+    partial = Path(sink._transaction.snapshot().partial_path)
     assert partial.exists(), "aborted run's data must be preserved"
-    assert not tmp.exists()
     assert not out.exists()                   # never half-promoted
 
 
@@ -673,8 +674,11 @@ def test_nexus_sink_finish_failure_preserves_partial(tmp_path, monkeypatch):
 
     out = tmp_path / "run2.nxs"
     sink = NexusSink(out, overwrite=True)
-    scan = _Scan("s", _frames(1), integrator=object())
+    frames = _frames(1)
+    scan = _Scan("s", frames, integrator=object())
     sink.begin(scan, _plan())
+    sink.write(frames[0], reduction_core.FrameReduction(
+        frame_index=0, result_1d=_r1d(1.0)))
 
     def boom(self):
         raise RuntimeError("scan_data upsert failed")
@@ -684,7 +688,8 @@ def test_nexus_sink_finish_failure_preserves_partial(tmp_path, monkeypatch):
         with pytest.warns(RuntimeWarning, match="partial"):
             sink.finish(result=None)
 
-    assert (tmp_path / "run2.nxs.partial").exists()
+    partial = Path(sink._transaction.snapshot().partial_path)
+    assert partial.exists()
     assert not out.exists()
 
 
@@ -738,12 +743,13 @@ def test_submit_detects_dead_writer(monkeypatch):
     session.submit(frames[0])
     assert session.drain(timeout=5)
 
-    # Simulate a dead writer + a full in-flight window.
+    # Simulate a dead writer + a full sole-owner in-flight window.
     dead = threading.Thread(target=lambda: None)
     dead.start(); dead.join()
     session._writer_thread = dead
-    while session._semaphore.acquire(blocking=False):
-        pass
+    holders = [object() for _ in range(session.inflight_max)]
+    for holder in holders:
+        assert session._inflight.try_acquire(holder, 0) is True
 
     t0 = time.monotonic()
     session.submit(frames[1])                 # returns; previously spun forever
@@ -751,6 +757,8 @@ def test_submit_detects_dead_writer(monkeypatch):
     assert session._cancelled
     assert isinstance(session._failure, RuntimeError)
     assert "writer thread died" in str(session._failure)
+    for holder in holders:
+        session._inflight.release(holder)
 
 
 # ---------------------------------------------------------------------------

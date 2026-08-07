@@ -9,6 +9,12 @@ paused until every pause is matched.
 
 from __future__ import annotations
 
+import ast
+import importlib
+from pathlib import Path
+import subprocess
+import sys
+
 import h5py
 import numpy as np
 
@@ -58,6 +64,70 @@ def test_unbalanced_resume_is_safe(tmp_path):
     pool.resume(path)
     assert pool.get(path) is not None
     pool.close_all()
+
+
+def test_c3_headless_contract_owns_pool_and_compatibility_is_adapter():
+    import xrd_tools.session as session
+
+    getter = getattr(session, "get_pool", None)
+    assert callable(getter)
+    pool_type = getattr(session, "H5FilePool", None)
+    assert isinstance(pool_type, type)
+    assert pool_type.__module__ == "xrd_tools.session.io_coordination"
+
+    adapter = importlib.import_module("xdart.utils.h5pool")
+    utils = importlib.import_module("xdart.utils")
+    assert adapter.H5FilePool is pool_type
+    assert utils.H5FilePool is pool_type
+    assert adapter.get_pool is getter
+    assert adapter.get_pool() is getter() is getter()
+
+    adapter_tree = ast.parse(Path(adapter.__file__).read_text(encoding="utf-8"))
+    definitions = [node for node in adapter_tree.body
+                   if isinstance(node, (ast.ClassDef, ast.FunctionDef))]
+    assignments = {
+        target.id
+        for node in adapter_tree.body if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Name)
+    }
+    assert definitions == []
+    assert not ({"_pool", "_pool_key"} & assignments)
+
+    utils_tree = ast.parse(
+        (Path(adapter.__file__).parent / "__init__.py").read_text(encoding="utf-8"))
+    assert any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "xrd_tools.session"
+        and any(alias.name == "H5FilePool" for alias in node.names)
+        for node in utils_tree.body
+    )
+
+
+def test_c3_lazy_qt_free_concurrent_first_access_has_one_singleton():
+    probe = (
+        "import concurrent.futures, sys, threading\n"
+        "import xrd_tools.session as session\n"
+        "io_name='xrd_tools.session.io_coordination'\n"
+        "assert io_name not in sys.modules, 'plain session import was not light'\n"
+        "barrier=threading.Barrier(12)\n"
+        "def first(_):\n"
+        " barrier.wait()\n"
+        " getter=getattr(session, 'get_pool', None)\n"
+        " assert callable(getter), 'H10-C3 callable session.get_pool is absent'\n"
+        " return id(getter())\n"
+        "with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:\n"
+        " identities=list(ex.map(first, range(12)))\n"
+        "assert len(set(identities)) == 1, identities\n"
+        "assert io_name in sys.modules\n"
+        "forbidden=('PySide6','PyQt5','PyQt6','qtpy','pyqtgraph','xdart')\n"
+        "leaked=sorted(m for m in sys.modules if m.split('.')[0] in forbidden)\n"
+        "assert not leaked, leaked\n"
+        "print('c3-singleton-ok')\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert "c3-singleton-ok" in proc.stdout
 
 
 def test_lru_eviction_and_stale_handle_reopen(tmp_path):

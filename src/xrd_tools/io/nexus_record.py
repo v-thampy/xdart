@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+import uuid
 
 import h5py
 import numpy as np
@@ -339,16 +340,8 @@ def quantize_thumbnail(arr, dtype: str = "uint8"):
 # @source_base (N1 portability root)
 # ---------------------------------------------------------------------------
 
-def stamp_source_base(entry_grp: h5py.Group, source_base) -> str | None:
-    """Normalize + stamp the project root on ``entry/@source_base``.
-
-    ONE scan-level root governs ALL frames' relative source paths: appending
-    to a file written under a DIFFERENT root would silently rebase the
-    earlier frames' pointers, so a mismatch raises rather than corrupting
-    resolution.  Returns the normalized absolute base (native separators)
-    for use with :func:`write_frame_source_ref`, or ``None`` when no base
-    was given (absolute-path back-compat mode).
-    """
+def validate_source_base(entry_grp: h5py.Group, source_base) -> str | None:
+    """Normalize and validate the project root without mutating the entry."""
     if not source_base:
         return None
     base = os.path.abspath(os.path.expanduser(str(source_base)))
@@ -362,9 +355,26 @@ def stamp_source_base(entry_grp: h5py.Group, source_base) -> str | None:
                 f"cannot append to {os.fspath(entry_grp.file.filename)!r}: its "
                 f"Project Folder (@source_base={str(existing)!r}) differs from "
                 f"the current ({posix_base!r}).  Earlier frames' relative source "
-                f"paths are stored against the old root; start a NEW output "
-                f"file for the new Project Folder."
+                "paths are stored against the old root; start a NEW output "
+                "file for the new Project Folder."
             )
+    return base
+
+
+def stamp_source_base(entry_grp: h5py.Group, source_base) -> str | None:
+    """Normalize + stamp the project root on ``entry/@source_base``.
+
+    ONE scan-level root governs ALL frames' relative source paths: appending
+    to a file written under a DIFFERENT root would silently rebase the
+    earlier frames' pointers, so a mismatch raises rather than corrupting
+    resolution.  Returns the normalized absolute base (native separators)
+    for use with :func:`write_frame_source_ref`, or ``None`` when no base
+    was given (absolute-path back-compat mode).
+    """
+    base = validate_source_base(entry_grp, source_base)
+    if base is None:
+        return None
+    posix_base = Path(base).as_posix()
     try:
         entry_grp.attrs[SOURCE_BASE_ATTR] = posix_base
     except Exception as exc:
@@ -398,6 +408,7 @@ def write_thumbnail(
     dtype: str = "uint8",
     *,
     mask_baked: bool = True,
+    thumbnail_mask=None,
 ) -> None:
     """Quantize + store ``thumbnail`` with its inversion LUT attributes."""
     source = np.asarray(thumbnail)
@@ -406,8 +417,14 @@ def write_thumbnail(
     for key, value in zip(THUMBNAIL_LUT_ATTRS, lut):
         ds.attrs[key] = value
     ds.attrs["mask_baked"] = bool(mask_baked)
-    invalid = ~np.isfinite(source)
-    if invalid.any():
+    invalid = (
+        np.asarray(thumbnail_mask, dtype=bool)
+        if thumbnail_mask is not None
+        else ~np.isfinite(source)
+    )
+    if thumbnail_mask is not None and invalid.shape != source.shape:
+        raise ValueError("thumbnail_mask shape must equal thumbnail shape")
+    if invalid.any() or thumbnail_mask is not None:
         frame_grp.create_dataset(
             "thumbnail_mask",
             data=invalid,
@@ -469,6 +486,7 @@ def write_frame_source_ref(
 def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                        thumbnail=None, thumbnail_dtype: str = "uint8",
                        thumbnail_mask_baked: bool = True,
+                       mask_baked: bool = True, thumbnail_mask=None,
                        source_path=None, source_frame_index: int = 0,
                        timestamp=None, source_base=None,
                        source_snapshot=None) -> h5py.Group:
@@ -479,12 +497,14 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
     here; don't bring that back).
     """
     fg = _nxcollection(frames_grp, frame_key)
+    fg.attrs["mask_baked"] = bool(mask_baked)
     if thumbnail is not None and "thumbnail" not in fg:
         write_thumbnail(
             fg,
             thumbnail,
             dtype=thumbnail_dtype,
             mask_baked=thumbnail_mask_baked,
+            thumbnail_mask=thumbnail_mask,
         )
     if source_path and "source" not in fg:
         write_frame_source_ref(fg, source_path, source_frame_index,
@@ -493,6 +513,61 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
     if timestamp is not None and "timestamp" not in fg:
         fg["timestamp"] = str(timestamp)
     return fg
+
+
+def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
+                         thumbnail=None, thumbnail_dtype: str = "uint8",
+                         thumbnail_mask_baked: bool = True,
+                         mask_baked: bool = True, thumbnail_mask=None,
+                         source_path=None, source_frame_index: int = 0,
+                         timestamp=None, source_base=None,
+                         source_snapshot=None) -> h5py.Group:
+    """Replace one direct per-frame record through an atomic sibling stage."""
+    if not frame_key or "/" in frame_key:
+        raise ValueError(
+            f"frame_key must be one direct child name; got {frame_key!r}"
+        )
+    token = uuid.uuid4().hex
+    staged = f".{frame_key}.{token}.pending"
+    backup = f".{frame_key}.{token}.prior"
+    installed = False
+    prior_moved = False
+    try:
+        write_frame_record(
+            frames_grp,
+            staged,
+            thumbnail=thumbnail,
+            thumbnail_dtype=thumbnail_dtype,
+            thumbnail_mask_baked=thumbnail_mask_baked,
+            mask_baked=mask_baked,
+            thumbnail_mask=thumbnail_mask,
+            source_path=source_path,
+            source_frame_index=source_frame_index,
+            timestamp=timestamp,
+            source_base=source_base,
+            source_snapshot=source_snapshot,
+        )
+        if frame_key in frames_grp:
+            frames_grp.move(frame_key, backup)
+            prior_moved = True
+        frames_grp.move(staged, frame_key)
+        installed = True
+        if prior_moved:
+            del frames_grp[backup]
+        return frames_grp[frame_key]
+    except BaseException:
+        if (
+            installed
+            and frame_key in frames_grp
+            and prior_moved
+            and backup in frames_grp
+        ):
+            del frames_grp[frame_key]
+        if prior_moved and backup in frames_grp and frame_key not in frames_grp:
+            frames_grp.move(backup, frame_key)
+        if staged in frames_grp:
+            del frames_grp[staged]
+        raise
 
 
 def frame_record_key(scan_label, frame_index: int) -> str:

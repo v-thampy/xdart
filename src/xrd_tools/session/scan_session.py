@@ -3,10 +3,9 @@
 
 ``ScanSession`` wraps a streaming ``ReductionSession`` and a ``ReductionSink``.
 The user's sink is wrapped in an internal event-emitting decorator
-(:class:`_EventSink`) that forwards its hooks
-(``begin``/``write``/``replace``/``finish``/``abort``/``flush``), exposes
-``worker_process`` only when the wrapped sink owns that optional hook, and
-after each ``write``/``replace`` fires ``on_frame_completed``
+(:class:`_EventSink`) that forwards every hook the engine probes
+(``begin``/``write``/``replace``/``finish``/``abort``/``worker_process``/
+``flush``) and, after each ``write``/``replace``, fires ``on_frame_completed``
 on the session's single writer thread — preserving the HDF5 single-writer
 invariant (ADR-0004 §1).
 
@@ -24,6 +23,27 @@ buffering sink marks its records persisted from ``flush`` (see :class:`ScanSessi
 Only the Qt/file-handle flush *action* and the ``FlushPolicy`` *timing* remain
 xdart-adapter concerns; the session exposes ``flush`` as a contract pass-through to
 the sink.
+
+H10-C1: the session composes a :class:`~xrd_tools.session.stage_accounting.
+StageLedger` — the typed stage-accounting authority (accepted / completed /
+written / persisted / durable as identity sets, §4.1 of the H10 handoff).
+Acceptance is admitted from INSIDE the engine's ``submit`` (the narrow
+``accept_cb`` seam), the instant acceptance becomes irreversible and before
+its ACCEPTED decision opens worker and writer, so no write or completion can
+ever publish work the ledger has not yet accepted; the ledger mints that
+submission's per-label ``attempt_revision`` there.  Typed compute outcomes
+arrive through the engine's per-item
+:class:`~xrd_tools.reduction.FrameOutcomeReceipt` carrying the same attempt
+identity (so a failed sink write stays distinguishable from a failed compute,
+and an older overlapping attempt cannot overwrite a newer one's state), and
+``written`` is recorded when the top-level sink hook returns.  Persistence /
+durability advance only on explicit target-qualified receipts delivered to
+:attr:`ScanSession.accounting` by the flush-boundary owner.
+``frames_submitted``/``frames_completed`` are DERIVED compatibility
+projections of the ledger's identity facts — distinct accepted labels and
+distinct labels ever successfully written — never independent counters.
+``FrameEvent.generation`` stays a render-staleness stamp, excluded from every
+accounting identity.
 """
 from __future__ import annotations
 
@@ -33,7 +53,7 @@ import threading
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -41,14 +61,39 @@ from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord, FrameView
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.reduction import (
     Frame,
+    FrameOutcome,
+    FrameOutcomeReceipt,
     ReductionPlan,
     ReductionResult,
     ReductionSession,
     StrictPolicy,
 )
 from .frame_record_store import FrameRecordStore
+from .policy import (SessionPolicy, _int, requirements_from,
+                     resolve_session_policy)
+from .stage_accounting import (
+    ItemDisposition, ResultMode, StageLedger, StageReceipt, StageSnapshot,
+    freeze_target_map)
 
 logger = logging.getLogger(__name__)
+
+
+class _StageBoundaryFacade:
+    """The PRIVATE stage boundary a sink binds to; the session stays sole owner."""
+    __slots__ = ("_session",)
+    def __init__(self, session: "ScanSession") -> None:
+        self._session = session
+    def targets_for(self, mode: ResultMode) -> frozenset[str]:
+        return self._session.accounting.targets_by_mode.get(mode, frozenset())
+    def capture_receipt(self, label: int, mode: ResultMode,
+                        target: str) -> StageReceipt:
+        return self._session.accounting.receipt(label, mode, target)
+    def commit_durable(self, receipts: Iterable[StageReceipt]) -> None:
+        self._session.record_durable(receipts)
+    def commit_publication_drop(self, label: int, mode: ResultMode,
+                                expected_revision: int) -> None:
+        self._session.record_publication_dropped(
+            label, mode, expected_revision=expected_revision)
 
 
 # ── immutable events ────────────────────────────────────────────────────────
@@ -91,11 +136,11 @@ class _EventSink:
     """Wrap the user's sink: forward every probed hook, and after each
     ``write``/``replace`` fire the completion callback on the writer thread.
 
-    Forwarding the optional hooks and the internal run-mask binding is
-    essential. In particular, ``worker_process`` is attached to this instance
-    only when the inner sink owns it: the reduction engine uses callable
-    presence to decide whether to build a full corrected-image work product.
-    A plain sink must not pay for an image that this wrapper would discard.
+    Forwarding the *optional* hooks (``replace``/``abort``/``worker_process``/
+    ``flush``) is essential — defining them unconditionally would otherwise make
+    the engine treat a plain sink as replace/abort-capable, or (if omitted)
+    disable the parallel ``worker_process`` thumbnail path.  Each forwards to the
+    inner sink only when the inner sink actually provides it.
     """
 
     def __init__(self, inner, on_completed: Callable[[Frame, Any], None]) -> None:
@@ -167,6 +212,52 @@ def _dimension_modes(mode_key: Any) -> tuple[str, str]:
     return DEFAULT_MODE_KEY, DEFAULT_MODE_KEY
 
 
+def _required_modes_from_plan(plan: ReductionPlan, mode_key: Any) -> tuple[ResultMode, ...]:
+    """The run's frozen required result modes: one per integration dimension
+    the plan declares, under the plan's (GI) mode keys."""
+    mode_1d, mode_2d = _dimension_modes(mode_key)
+    modes: list[ResultMode] = []
+    if getattr(plan, "integration_1d", None) is not None:
+        modes.append(ResultMode.one_d(mode_1d))
+    if getattr(plan, "integration_2d", None) is not None:
+        modes.append(ResultMode.two_d(mode_2d))
+    return tuple(modes)
+
+
+def _executor_request(executor, executor_workers) -> tuple[int | None, bool]:
+    """``(requested_workers, is_caller_pool)``.  An integer ``executor=N`` is a
+    positive worker REQUEST; a caller pool must PROVE a positive capacity, fit
+    the grant exactly, is never shut down, and two spellings must agree."""
+    if executor_workers is not None:
+        _int("executor_workers", executor_workers, low=1)
+    if executor is None:
+        return (None if executor_workers is None
+                else int(executor_workers)), False
+    if isinstance(executor, (int, float)):
+        _int("executor", executor, low=1)
+        if executor_workers is not None and int(executor_workers) != executor:
+            raise ValueError(f"executor={executor} and executor_workers="
+                             f"{executor_workers} must agree")
+        return int(executor), False
+    declared = getattr(executor, "_max_workers", None)
+    if declared is not None and executor_workers is not None:
+        _int("_max_workers", declared, low=1)
+        if int(declared) != int(executor_workers):
+            raise ValueError(f"_max_workers={declared} and executor_workers="
+                             f"{executor_workers} must agree")
+    if declared is None:
+        declared = executor_workers
+    if declared is None:
+        raise ValueError(
+            "a descriptor-managed source needs an external executor exposing a "
+            "positive _max_workers, or an explicit executor_workers")
+    return _int("caller pool capacity", declared, low=1), True
+
+
+def required_result_modes(plan: ReductionPlan) -> tuple[ResultMode, ...]:
+    return _required_modes_from_plan(plan, _mode_key_from_plan(plan))
+
+
 def _freeze_result_arrays(result):
     """Mark a result's ndarray fields read-only IN PLACE (zero-copy) so a
     FrameEvent listener cannot retroactively corrupt the shared, already-written
@@ -207,7 +298,19 @@ class ScanSession:
     persisted-on-write there would let heavy arrays be evicted before they are
     written (persist-before-evict violation).  Such a caller must instead call
     ``record_store.mark_persisted(labels)`` from its flush completion.
+
+    ``obligations`` (H10-C1) declares the run's frozen output obligation /
+    target identities (e.g. ``("nexus:/data/run42.nxs",)``) for the composed
+    :attr:`accounting` ledger.  Persisted/durable state advances only on
+    explicit :class:`~xrd_tools.session.stage_accounting.StageReceipt`\\ s for
+    those targets; with no declared obligation nothing is ever reported
+    durable (no vacuous recoverability claim).
     """
+
+    @classmethod
+    def new_accounting(cls, plan, targets_by_mode):
+        return cls(plan, None, targets_by_mode=targets_by_mode,
+                   _accounting_only=True).accounting
 
     def __init__(
         self,
@@ -223,20 +326,91 @@ class ScanSession:
         record_store: FrameRecordStore | None = None,
         record_store_persisted_on_write: bool = False,
         strict: StrictPolicy | None = None,
+        obligations: Iterable[str] = (),
+        targets_by_mode: Mapping[ResultMode, Iterable[str]] | None = None,
+        store_targets_by_mode: Mapping[ResultMode, Iterable[str]] | None = None,
+        write_targets_by_mode: Mapping[ResultMode, Iterable[str]] | None = None,
+        accounting: StageLedger | None = None,
+        policy: SessionPolicy | None = None,
+        envelope_bytes: int | None = None,
+        executor_workers: int | None = None,
+        _accounting_only: bool = False,
     ) -> None:
         self._lock = threading.RLock()
         self._frame_cbs: list[Callable[[FrameEvent], None]] = []
         self._progress_cbs: list[Callable[[ProgressEvent], None]] = []
         self._state_cbs: list[Callable[[StateChangeEvent], None]] = []
-        self._submitted = 0
-        self._completed = 0
         self._generation = 0
         self._mode_key = _mode_key_from_plan(plan)
-        self._record_store = record_store
+        required = _required_modes_from_plan(plan, self._mode_key)
+        if accounting is None:
+            self._accounting = StageLedger(
+                required_modes=required,
+                obligations=obligations,
+                targets_by_mode=targets_by_mode,
+            )
+        else:
+            if not isinstance(accounting, StageLedger):
+                raise TypeError("accounting must be a StageLedger")
+            if tuple(accounting.required_modes) != tuple(required):
+                raise ValueError(
+                    "accounting required modes must exactly match the plan")
+            if targets_by_mode is None:
+                declared = frozenset(str(target) for target in obligations)
+                expected_targets = {mode: declared for mode in required}
+            else:
+                if tuple(obligations):
+                    raise ValueError(
+                        "a non-empty global obligations set cannot be combined "
+                        "with an explicit targets_by_mode map")
+                expected_targets = freeze_target_map(
+                    "targets_by_mode", targets_by_mode, required)
+            if dict(accounting.targets_by_mode) != dict(expected_targets):
+                raise ValueError(
+                    "accounting target map must exactly match the session")
+            self._accounting = accounting
+        if _accounting_only:
+            return
+        applicable = self._accounting.targets_by_mode
+        self._store_targets = (
+            applicable if store_targets_by_mode is None else
+            freeze_target_map("store_targets_by_mode", store_targets_by_mode,
+                              required, allow_empty=True, within=applicable))
         self._record_store_persisted_on_write = bool(record_store_persisted_on_write)
+        if write_targets_by_mode is None:
+            if self._record_store_persisted_on_write:
+                raise ValueError(
+                    "record_store_persisted_on_write=True must declare exactly one "
+                    "applicable target per mode via write_targets_by_mode")
+            self._write_targets: Mapping[ResultMode, frozenset[str]] = MappingProxyType({})
+        elif not self._record_store_persisted_on_write:
+            raise ValueError(
+                "write_targets_by_mode is meaningless without "
+                "record_store_persisted_on_write=True")
+        else:
+            self._write_targets = freeze_target_map(
+                "write_targets_by_mode", write_targets_by_mode, required,
+                allow_empty=False, exactly_one=True, within=applicable)
+        # One projection lock; fixed order session -> ledger -> store.
+        self._projection_lock = threading.RLock()
+        self._blocked: dict[int, set[ResultMode]] = {}
+        self._pending: dict[int, set[ResultMode]] = {}
+        self._swept = False
+        self._record_store = record_store
         self._perf_enabled = bool(os.environ.get("XDART_PERF"))
         self._perf_values: dict[str, float] = {}
+        self._policy = policy
+        allocation = self._resolve_resource_envelope(
+            source, plan, executor, executor_workers, envelope_bytes,
+            inflight_max)
+        if allocation is not None:
+            # The grants are the ACTUAL owned configuration, not report fields.
+            inflight_max = allocation.reduction_inflight
+            if executor is None or isinstance(executor, int):
+                executor = allocation.workers
         self._user_sink = sink
+        if hasattr(sink, "bind_session"):
+            sink.bind_session(_StageBoundaryFacade(self))
         event_sink = _EventSink(sink, self._on_completed)
         # Streaming + retain_products=False: per-frame results are delivered via
         # events (and persisted by a durable sink), so the session does not also
@@ -261,6 +435,14 @@ class ScanSession:
             # PERF-3); a later consumer reloads via Frame.load_image.  Default
             # off — a notebook caller keeping the source frames opts in.
             clear_frame_images=clear_frame_images,
+            # H10-C1: acceptance is admitted synchronously inside submit(), as
+            # the last fallible step before ACCEPTED opens the worker and
+            # writer (so `accepted` is never behind a completion), and per-item
+            # compute outcomes
+            # (success/failure/cancellation) feed the stage ledger from the
+            # writer loop — never inferred from accepted-minus-written counts.
+            accept_cb=self._on_accepted,
+            outcome_cb=self._on_outcome,
         )
         self._event_sink = event_sink
 
@@ -274,9 +456,67 @@ class ScanSession:
         # exception unwind; surface the run failure only on a clean exit.
         self.finish(raise_on_failure=exc_type is None)
 
+    def _resolve_resource_envelope(self, source, plan, executor,
+                                   executor_workers, envelope_bytes,
+                                   inflight_max):
+        """The coordinated descriptor-backed path: descriptor -> requirements ->
+        one policy -> bind the exact allocation, all BEFORE the sink hook, the
+        ``ReductionSession`` or any read.  A materialized C1 ``Scan`` is not
+        descriptor-managed, so its minimal duck is untouched."""
+        bind = getattr(source, "bind_allocation", None)
+        if not callable(bind):
+            return None
+        declared, caller_pool = _executor_request(executor, executor_workers)
+        if inflight_max is not None:
+            _int("inflight_max", inflight_max, low=1)
+        requirements = requirements_from(source.container_descriptor(), plan)
+        prior = self._policy
+        # A cadence-only SessionPolicy(allocation=None) is NOT explicit.
+        explicit = None if prior is None else prior.allocation
+        policy = resolve_session_policy(
+            requirements, envelope_bytes=envelope_bytes,
+            requested_workers=declared,
+            requests=(None if inflight_max is None
+                      else {"reduction_inflight": int(inflight_max)}),
+            flush=None if prior is None else prior.flush, allocation=explicit)
+        alloc = policy.allocation
+        if caller_pool and declared != alloc.workers:
+            raise ValueError(f"caller pool declares {declared} workers but the "
+                             f"allocation grants {alloc.workers} exactly")
+        if explicit is not None:
+            if declared is not None and not caller_pool and declared < alloc.workers:
+                raise ValueError(f"owned worker request {declared} is below the "
+                                 f"explicit grant {alloc.workers}")
+            if inflight_max is not None and int(inflight_max) != alloc.reduction_inflight:
+                raise ValueError(f"inflight_max {int(inflight_max)} != explicit "
+                                 f"grant {alloc.reduction_inflight}")
+        self._policy = policy
+        bind(alloc)
+        return alloc
+    def bind_session_policy(self, policy: SessionPolicy) -> None:
+        """Associate the ONE run policy the image/source owner already resolved;
+        a second, different policy object is rejected."""
+        if self._policy is not None and self._policy is not policy:
+            raise ValueError("a different session policy is already bound")
+        self._policy = policy
+    @property
+    def policy(self) -> SessionPolicy | None:
+        """The run's one immutable policy, or ``None`` when cadence-only."""
+        return self._policy
+
     @property
     def record_store(self) -> FrameRecordStore | None:
         return self._record_store
+
+    @property
+    def accounting(self) -> StageLedger:
+        """The composed stage-accounting authority (H10-C1).  Flush-boundary
+        owners deliver persisted/durable :class:`StageReceipt`\\ s here."""
+        return self._accounting
+
+    def accounting_snapshot(self) -> StageSnapshot:
+        """The public typed accounting snapshot (§4.1 exposure contract)."""
+        return self._accounting.snapshot()
 
     # -- commands in -------------------------------------------------------
     def start(self) -> None:
@@ -292,12 +532,31 @@ class ScanSession:
         RAISE rather than return False (mirroring ``ReductionSession.submit``):
         calling submit() after :meth:`finish`, or while paused, raises
         ``RuntimeError`` — these are misuse, kept loud on purpose, not a normal
-        "dropped" outcome.  Advances submitted-progress only when accepted."""
+        "dropped" outcome.  An accounting-authority exception also RAISES loudly.
+        Before publishing an acceptance proof, the engine rejects the ticket,
+        undoes its staged facts, and leaves no ledger fact, scan inventory, queue,
+        reduction, sink, outcome, or completion.  Once the authority publishes the attempt,
+        acceptance is irreversible even if it then raises: the item remains
+        inventoried and ledger-visible, the session sticky-fails and cancels, and the
+        accepted writer path completes it.  Advances submitted-progress only
+        when accepted; a call that does not return (an
+        operator interrupt in the engine's acceptance tail) emits no submit-side
+        event, and the totals it already advanced surface on the next one.
+
+        Acceptance itself is recorded by :meth:`_on_accepted`, which the engine
+        invokes from inside its own ``submit`` at the exact point acceptance
+        becomes irreversible — never here, after the writer may already have
+        completed the frame.
+
+        Called from one orchestrating thread, as are :meth:`pause`/
+        :meth:`resume`.  A streaming ``executor`` must be asynchronous (its
+        ``submit()`` returns before the submitted callable needs its admission
+        decision); its Future need expose only a blocking ``result()``."""
         accepted = self._session.submit(frame, image)
         if accepted:
-            with self._lock:
-                self._submitted += 1
             self._emit_progress()
+        else:
+            self._accounting.record_refused(int(frame.index))
         return accepted
 
     def pause(self, timeout: float | None = None) -> bool:
@@ -328,20 +587,31 @@ class ScanSession:
             result = self._session.finish(
                 raise_on_failure=raise_on_failure, join_timeout=join_timeout)
         finally:
-            # A buffering sink can make its final short block durable inside
-            # finish().  Consume those one-shot receipts even when a later
-            # finalization step raises, so eviction truth matches the artifact
-            # that was actually persisted.
-            self._mark_sink_persisted()
+            self._final_sweep()   # ONE sweep, AFTER the terminal boundary
         if was_running:          # only on the real running -> finished transition
             self._emit_state()
         return result
 
+    def _final_sweep(self) -> None:
+        store = self._record_store
+        with self._projection_lock:
+            if self._swept:
+                return
+            self._swept = True
+            if store is None:
+                return
+            for label in store.labels():
+                try:
+                    if self._fenced_locked(int(label)):
+                        continue        # a blocked pair keeps its heavy data
+                    store.release_heavy(label)
+                except Exception:
+                    logger.exception(
+                        "ScanSession final sweep failed for label %r", label)
     def flush(self, *, force: bool = False) -> None:
         """Contract pass-through to the sink's optional ``flush`` hook (ADR-0004
         §4).  No-op for a sink without one."""
         self._event_sink.flush(force=force)
-        self._mark_sink_persisted()
 
     def set_generation(self, generation: int) -> None:
         """Set the stale-render stamp put on subsequent events (ADR-0004 §2).
@@ -361,13 +631,17 @@ class ScanSession:
 
     @property
     def frames_submitted(self) -> int:
-        with self._lock:
-            return self._submitted
+        """DERIVED (§4.1): the number of DISTINCT accepted label identities.
+        A re-feed of a known label cannot increase it."""
+        return self._accounting.accepted_label_count()
 
     @property
     def frames_completed(self) -> int:
-        with self._lock:
-            return self._completed
+        """DERIVED (§4.1): the number of DISTINCT labels whose top-level sink
+        hook returned successfully at least once during the run.  Monotonic —
+        a later replacement whose write fails cannot decrement it — and a
+        re-feed cannot inflate it."""
+        return self._accounting.written_label_count()
 
     @property
     def saturation_mask_seeded(self) -> bool:
@@ -409,12 +683,159 @@ class ScanSession:
         return _unsubscribe
 
     # -- internals ---------------------------------------------------------
+    _OUTCOME_DISPOSITIONS = {
+        FrameOutcome.COMPLETED: ItemDisposition.COMPLETED,
+        FrameOutcome.FAILED: ItemDisposition.FAILED,
+        FrameOutcome.CANCELLED_BEFORE_COMPLETION:
+            ItemDisposition.CANCELLED_BEFORE_COMPLETION,
+    }
+
+    def _on_accepted(self, frame: Frame, publish_acceptance: Callable[[int], None]) -> int:
+        """Caller-thread acceptance admission (the engine's ``accept_cb``).
+
+        Invoked inside ``ReductionSession.submit`` in publication order — Future
+        bound, the same undecided ticket queued, inventory staged, THEN this
+        authority runs, ACCEPTED opens the worker and writer — so
+        the new attempt's accepted/PENDING state is ledger-visible before any
+        outcome, sink write or public completion callback for it can run.
+        """
+        return self._accounting.record_accepted(
+            int(frame.index), publish_acceptance=publish_acceptance)
+
+    def record_persisted(self, receipts: Iterable[StageReceipt]) -> None:
+        batch = tuple(receipts)
+        with self._projection_lock:
+            self._accounting.record_persisted(batch)
+            self._reconcile_locked({int(r.label) for r in batch})
+
+    def record_durable(self, receipts: Iterable[StageReceipt]) -> None:
+        batch = tuple(receipts)
+        with self._projection_lock:
+            self._accounting.record_durable(batch)
+            self._reconcile_locked({int(r.label) for r in batch})
+
+    def record_publication_dropped(self, label: int, mode: ResultMode, *,
+                                   expected_revision: int) -> None:
+        with self._projection_lock:
+            self._accounting.record_publication_dropped(
+                label, mode, expected_revision=expected_revision)
+            self._reconcile_locked({int(label)})
+
+    def _fenced_locked(self, label: int) -> set[ResultMode]:
+        return (self._blocked.get(label, set()) | self._pending.get(label, set()))
+
+    def _reconcile_locked(self, labels: Iterable[int]) -> None:
+        """Publish each label's COMPLETE projection in ONE atomic replacement."""
+        store = self._record_store
+        if store is None:
+            return
+        snapshot = self._accounting.snapshot()
+        for label in labels:
+            fenced = self._fenced_locked(label)
+            hydratable: list[tuple[str, str]] = []
+            durable: list[tuple[str, str]] = []
+            dropped: list[tuple[str, str]] = []
+            for mode in self._accounting.required_modes:
+                if mode in fenced:
+                    continue
+                key = (mode.kind, mode.key)
+                if (label, mode) in snapshot.publication_dropped:
+                    dropped.append(key)
+                    continue
+                applies = snapshot.targets_by_mode.get(mode, frozenset())
+                if any((label, mode, target) in snapshot.persisted
+                       for target in self._store_targets.get(mode, applies)):
+                    hydratable.append(key)          # this store can recover it
+                if applies and all((label, mode, target) in snapshot.durable
+                                   for target in applies):
+                    durable.append(key)             # EVERY applicable target
+            try:
+                store.replace_projection(label, hydratable=hydratable,
+                                         durable=durable, dropped=dropped)
+            except Exception:
+                # Fail toward retention: re-fence what we could not publish.
+                logger.exception("ScanSession store projection publish failed")
+                self._blocked.setdefault(label, set()).update(
+                    self._accounting.required_modes)
+    def _clear_projection_locked(self, label: int,
+                                 modes: Iterable[ResultMode]) -> None:
+        modes = tuple(modes)
+        if not modes:
+            return
+        self._blocked.setdefault(label, set()).update(modes)
+        self._reconcile_locked((label,))
+    def _settle_locked(self, label: int) -> None:
+        settled = self._pending.pop(label, set())
+        blocked = self._blocked.get(label)
+        if blocked is not None:
+            blocked -= settled
+            if not blocked:
+                self._blocked.pop(label, None)
+    def _on_outcome(self, receipt: FrameOutcomeReceipt) -> None:
+        """Writer-thread per-item compute outcome → the stage ledger.  A
+        COMPLETED outcome mints new result revisions for exactly the produced
+        modes; FAILED/CANCELLED_BEFORE_COMPLETION are typed terminal
+        dispositions with no revision (prior durable state stays truthful)."""
+        mode_1d, mode_2d = _dimension_modes(self._mode_key)
+        produced: list[ResultMode] = []
+        if receipt.outcome is FrameOutcome.COMPLETED:
+            if receipt.produced_1d:
+                produced.append(ResultMode.one_d(mode_1d))
+            if receipt.produced_2d:
+                produced.append(ResultMode.two_d(mode_2d))
+        label = int(receipt.frame_index)
+        with self._projection_lock:
+            affected = tuple(produced) or tuple(
+                mode for mode in self._accounting.required_modes
+                if self._accounting.current_revision(label, mode) >= 1)
+            before = {mode: self._accounting.current_revision(label, mode)
+                      for mode in affected}
+            self._clear_projection_locked(label, affected)
+            self._accounting.record_outcome(
+                label,
+                self._OUTCOME_DISPOSITIONS[receipt.outcome],
+                produced=produced,
+                error=receipt.error,
+                attempt=receipt.attempt,
+            )
+            minted = {mode for mode in affected
+                      if self._accounting.current_revision(label, mode)
+                      != before[mode]}
+            if minted:
+                self._pending.setdefault(label, set()).update(minted)
+            unchanged = set(affected) - minted
+            if unchanged:
+                blocked = self._blocked.get(label)
+                if blocked is not None:
+                    blocked -= unchanged
+                    if not blocked:
+                        self._blocked.pop(label, None)
+                self._reconcile_locked((label,))
+
+    def _record_written(self, event: FrameEvent) -> None:
+        """The TOP-LEVEL sink hook returned successfully for this event.
+
+        Certifies the event's exact modes and records the label in the
+        historical write identity behind ``frames_completed`` — so it runs even
+        for a result with no modes.  Guarded like the record-store upsert: an
+        accounting error is logged, never allowed to turn a successful write
+        into a run failure."""
+        mode_1d, mode_2d = _dimension_modes(event.mode_key)
+        modes: list[ResultMode] = []
+        if event.result_1d is not None:
+            modes.append(ResultMode.one_d(mode_1d))
+        if event.result_2d is not None:
+            modes.append(ResultMode.two_d(mode_2d))
+        try:
+            self._accounting.record_written(event.frame_index, modes)
+        except Exception:
+            logger.exception("ScanSession stage-accounting record_written failed")
+
     def _on_completed(self, frame: Frame, reduction: Any) -> None:
         """Writer-thread completion hook (called by _EventSink after the sink
         write).  Builds the immutable FrameEvent + advances completion progress.
         A listener exception is caught — it must never escape the writer loop."""
         with self._lock:
-            self._completed += 1
             generation = self._generation
             cbs = tuple(self._frame_cbs)
         event = FrameEvent(
@@ -430,12 +851,9 @@ class ScanSession:
             generation=generation,
             timestamp=time.time(),
         )
+        self._record_written(event)
         started = time.perf_counter() if self._perf_enabled else 0.0
         self._upsert_record_store(frame, event)
-        # NexusSink flushes at the end of its write() for a full batch.  Drain
-        # receipts only after this frame's record has been inserted, ensuring
-        # every durable label in that batch is present before mark_persisted().
-        self._mark_sink_persisted()
         self._perf_add("session_record_upsert", started)
         started = time.perf_counter() if self._perf_enabled else 0.0
         for cb in cbs:
@@ -456,14 +874,23 @@ class ScanSession:
         )
 
     def perf_snapshot(self) -> dict[str, float]:
-        """Return terminal writer-side timings without exposing mutable state."""
-
+        """Return writer-side timings without exposing mutable state."""
         values = dict(self._perf_values)
         snapshot = getattr(self._user_sink, "perf_snapshot", None)
         if callable(snapshot):
             values.update(snapshot())
         return values
 
+    def _mint_write_receipts_locked(self, label: int) -> None:
+        """The write IS the durability boundary: EXACTLY one declared target/mode."""
+        if not self._record_store_persisted_on_write:
+            return
+        receipts = [self._accounting.receipt(label, mode, target)
+                    for mode, targets in self._write_targets.items()
+                    for target in targets
+                    if self._accounting.current_revision(label, mode) >= 1]
+        if receipts:
+            self._accounting.record_durable(receipts)
     def _upsert_record_store(self, frame: Frame, event: FrameEvent) -> None:
         if self._record_store is None:
             return
@@ -479,33 +906,33 @@ class ScanSession:
                 source_path=getattr(frame, "source_path", None),
                 source_frame_index=getattr(frame, "source_frame_index", None),
             )
-            self._record_store.upsert(
-                FrameRecord.from_view(view, mode_1d=mode_1d, mode_2d=mode_2d),
-                source_identity=getattr(frame, "source_identity", None),
-                persisted=self._record_store_persisted_on_write,
-            )
+            record = FrameRecord.from_view(view, mode_1d=mode_1d, mode_2d=mode_2d)
         except Exception:
-            logger.exception("ScanSession record_store upsert failed")
-
-    def _mark_sink_persisted(self) -> None:
-        if self._record_store is None:
+            logger.exception("ScanSession record_store view build failed")
             return
-        take = getattr(self._user_sink, "take_persisted_labels", None)
-        if not callable(take):
-            return
-        try:
-            labels = tuple(take())
-            if labels:
-                self._record_store.mark_persisted(labels)
-        except Exception:
-            # A receipt failure must not turn a completed science write into a
-            # writer failure.  Fail closed for eviction: the affected records
-            # remain resident and visibly unpersisted.
-            logger.exception("ScanSession persisted receipt handling failed")
+        label = int(event.frame_index)
+        with self._projection_lock:
+            try:
+                self._record_store.upsert(
+                    record,
+                    source_identity=getattr(frame, "source_identity", None),
+                )
+            except Exception:
+                logger.exception("ScanSession record_store upsert failed")
+                return
+            self._settle_locked(label)
+            try:
+                self._mint_write_receipts_locked(label)
+            except Exception:
+                logger.exception("ScanSession write-boundary receipts failed")
+            self._reconcile_locked((label,))
 
     def _emit_progress(self) -> None:
+        # Both totals are DERIVED identity projections (§4.1), read straight
+        # from the ledger: absolute, monotonic, and immune to re-feed inflation.
+        submitted = self._accounting.accepted_label_count()
+        completed = self._accounting.written_label_count()
         with self._lock:
-            submitted, completed = self._submitted, self._completed
             cbs = tuple(self._progress_cbs)
         try:
             total = len(self._session.scan)

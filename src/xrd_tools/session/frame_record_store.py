@@ -182,7 +182,11 @@ class FrameRecordStore:
         self._lock = RLock()
         self._records: dict[int | str, FrameRecord] = {}
         self._source_ids: dict[int | str, str] = {}
+        # ``_projected`` = labels a ScanSession owns; else the pre-C2-A rule.
         self._persisted_modes: dict[int | str, set[_ModeKey]] = {}
+        self._durable_modes: dict[int | str, set[_ModeKey]] = {}
+        self._dropped_modes: dict[int | str, set[_ModeKey]] = {}
+        self._projected: set[int | str] = set()
         self._heavy_labels: list[int | str] = []
         self._max_items = max_items
         self._max_heavy_items = max_heavy_items
@@ -194,6 +198,9 @@ class FrameRecordStore:
             self._records.clear()
             self._source_ids.clear()
             self._persisted_modes.clear()
+            self._durable_modes.clear()
+            self._dropped_modes.clear()
+            self._projected.clear()
             self._heavy_labels.clear()
 
     def set_hydrator(
@@ -230,8 +237,15 @@ class FrameRecordStore:
                 record = _merge_records(existing, record)
                 persisted_set = set(self._persisted_modes.get(label, set()))
                 persisted_set.difference_update(incoming_mode_keys)
+                for registry in (self._durable_modes, self._dropped_modes):
+                    stale = registry.get(label)
+                    if stale is not None:
+                        self._assign_locked(registry, label,
+                                            stale - incoming_mode_keys)
             else:
                 persisted_set = set()
+                self._durable_modes.pop(label, None)
+                self._dropped_modes.pop(label, None)
 
             self._records.pop(label, None)
             self._drop_heavy_label_locked(label)
@@ -318,11 +332,73 @@ class FrameRecordStore:
                 record = self._records.get(label)
                 if record is None:
                     continue
+                self._dropped_modes.setdefault(label, set()).update(requested)
                 thinned = _thin_modes(record, requested)
                 self._records[label] = thinned
                 if not _has_heavy_payload(thinned):
                     self._drop_heavy_label_locked(label)
             self._enforce_bounds_locked()
+
+    def replace_projection(
+        self,
+        label: int | str,
+        *,
+        hydratable: Iterable[_ModeKey] = (),
+        durable: Iterable[_ModeKey] = (),
+        dropped: Iterable[_ModeKey] = (),
+    ) -> None:
+        """Publish this label's COMPLETE projection in ONE atomic swap: no
+        half-published mixture, and no stale mark survives a replacement."""
+        with self._lock:
+            record = self._records.get(label)
+            if record is None:
+                return
+            valid = _record_mode_keys(record)
+            hydratable_set = _normalize_mode_keys(hydratable) & valid
+            durable_set = _normalize_mode_keys(durable) & valid
+            dropped_set = _normalize_mode_keys(dropped) & valid
+            self._projected.add(label)
+            self._assign_locked(self._persisted_modes, label, hydratable_set)
+            self._assign_locked(self._durable_modes, label, durable_set)
+            self._assign_locked(self._dropped_modes, label, dropped_set)
+            if dropped_set:
+                thinned = _thin_modes(record, dropped_set)
+                self._records[label] = thinned
+                if not _has_heavy_payload(thinned):
+                    self._drop_heavy_label_locked(label)
+            self._enforce_bounds_locked()
+
+    @staticmethod
+    def _assign_locked(registry: dict, label, value: set[_ModeKey]) -> None:
+        if value:
+            registry[label] = value
+        else:
+            registry.pop(label, None)
+
+    def release_heavy(self, label: int | str) -> bool:
+        """Release only the heavy arrays this label is licensed to drop."""
+        with self._lock:
+            record = self._records.get(label)
+            if record is None:
+                return False
+            releasable = (self._releasable_modes_locked(label)
+                          & _heavy_mode_keys(record))
+            if not releasable:
+                return False
+            thinned = _thin_modes(record, releasable)
+            self._records[label] = thinned
+            if not _has_heavy_payload(thinned):
+                self._drop_heavy_label_locked(label)
+            return True
+
+    def durable_modes(self, label: int | str) -> frozenset[_ModeKey]:
+        """Modes durable on EVERY applicable target; the only releasable ones."""
+        with self._lock:
+            return frozenset(self._durable_modes.get(label, set()))
+
+    def dropped_modes(self, label: int | str) -> frozenset[_ModeKey]:
+        with self._lock:
+            return frozenset(self._dropped_modes.get(label, set()))
 
     def get(self, label: int | str) -> FrameRecord | None:
         with self._lock:
@@ -338,17 +414,10 @@ class FrameRecordStore:
 
     def get_or_hydrate(self, label: int | str, *, commit_gate=None,
                        commit_epoch=None) -> FrameRecord | None:
-        """Return the record, rehydrating an evicted heavy payload.
+        """Hydrate outside locks, then commit only through the live exact gate.
 
-        ``commit_gate`` is the REQUESTING owner's commit authority (X1 O-3).
-        The hydrator's read stays outside both this store's lock and the gate —
-        it is a disk read on a background thread — and the gate is taken only
-        around the final source-qualified upsert.  A cancelled or stale gate
-        inserts NOTHING: it does not fall back to an ungated upsert, and it
-        leaves the persisted-mode and source-identity bookkeeping untouched.
-
-        Without a gate the behaviour is exactly as before, which is the idle
-        and legacy path.
+        The captured record/source/projection facts are rechecked after the
+        read and after gate entry.  Losing either authority inserts nothing.
         """
         with self._lock:
             record = self._records.get(label)
@@ -361,31 +430,56 @@ class FrameRecordStore:
             # must NOT inherit persisted status — else it could be thinned before
             # it is written (persist-before-evict, the 748fcac bug).
             prev_persisted = set(self._persisted_modes.get(label, set()))
+            # Stale-read fence: merge back only if every captured fact is current.
+            captured = self._capture_locked(label, record, prev_persisted)
+            if label in self._projected and not prev_persisted:
+                return record
         if hydrator is None:
             return record
         fresh = hydrator(label)
         if fresh is None:
             return record
         if commit_gate is not None and not commit_gate.enter(commit_epoch):
-            # The requesting owner lost its commit authority while the read was
-            # in flight.  Nothing is inserted and no bookkeeping moves.
             return record
         try:
-            current_source_identity = self.source_identity(label)
-            fresh_source_identity = _source_identity_from_record(fresh)
-            source_identity = (
-                current_source_identity
-                if current_source_identity and not fresh_source_identity
-                else None
-            )
-            return self.upsert(
-                fresh,
-                source_identity=source_identity,
-                persisted_modes=prev_persisted,
-            )
+            with self._lock:
+                current = self._records.get(label)
+                if current is None or self._capture_locked(
+                        label, current, self._persisted_modes.get(label, set())
+                ) != captured:
+                    return current
+                current_source_identity = self._source_ids.get(label, "")
+                fresh_source_identity = _source_identity_from_record(fresh)
+                source_identity = (
+                    current_source_identity
+                    if current_source_identity and not fresh_source_identity
+                    else None
+                )
+                durable = set(self._durable_modes.get(label, set()))
+                dropped = set(self._dropped_modes.get(label, set()))
+                projected = label in self._projected
+                merged = self.upsert(
+                    fresh,
+                    source_identity=source_identity,
+                    persisted_modes=prev_persisted,
+                )
+                # Hydration RE-ARMS an existing revision: restore its projection.
+                valid = _record_mode_keys(merged)
+                self._assign_locked(self._durable_modes, label, durable & valid)
+                self._assign_locked(self._dropped_modes, label, dropped & valid)
+                if projected:
+                    self._projected.add(label)
+                return merged
         finally:
             if commit_gate is not None:
                 commit_gate.leave()
+
+    def _capture_locked(self, label: int | str, record: FrameRecord,
+                        persisted: set[_ModeKey]) -> tuple:
+        return (id(record), self._source_ids.get(label, ""),
+                frozenset(persisted),
+                frozenset(self._durable_modes.get(label, set())),
+                frozenset(self._dropped_modes.get(label, set())))
 
     def is_persisted(self, label: int | str) -> bool:
         with self._lock:
@@ -413,37 +507,6 @@ class FrameRecordStore:
         with self._lock:
             record = self._records.get(label)
             return bool(record is not None and _has_heavy_payload(record))
-
-    def evict_heavy(self, label: int | str) -> bool:
-        """Thin one exact persisted record without changing its identity."""
-        with self._lock:
-            record = self._records.get(label)
-            if (
-                record is None
-                or not _has_heavy_payload(record)
-                or (
-                    self._require_persisted_for_eviction
-                    and not self._label_heavy_payload_persisted_locked(label)
-                )
-            ):
-                return False
-            self._records[label] = _thin_record(record)
-            self._drop_heavy_label_locked(label)
-            return True
-
-    def discard(self, label: int | str) -> bool:
-        """Remove one exact persisted record from the resident lookup tier."""
-        with self._lock:
-            if label not in self._records or (
-                self._require_persisted_for_eviction
-                and not self._label_persisted_locked(label)
-            ):
-                return False
-            self._records.pop(label, None)
-            self._source_ids.pop(label, None)
-            self._persisted_modes.pop(label, None)
-            self._drop_heavy_label_locked(label)
-            return True
 
     def source_identity(self, label: int | str) -> str:
         with self._lock:
@@ -476,6 +539,12 @@ class FrameRecordStore:
                 return label
         return None
 
+    def _releasable_modes_locked(self, label: int | str) -> set[_ModeKey]:
+        """Under a projection exactly the DURABLE set; persistence never evicts."""
+        if label in self._projected:
+            return set(self._durable_modes.get(label, set()))
+        return set(self._persisted_modes.get(label, set()))
+
     def _label_persisted_locked(self, label: int | str) -> bool:
         record = self._records.get(label)
         if record is None:
@@ -485,13 +554,25 @@ class FrameRecordStore:
             self._persisted_modes.get(label, set())
         )
 
+    def _label_deletable_locked(self, label: int | str) -> bool:
+        """NON-DROPPED modes recoverable here, non-empty, none awaiting durability."""
+        record = self._records.get(label)
+        if record is None:
+            return False
+        remaining = _record_mode_keys(record) - self._dropped_modes.get(label, set())
+        if not remaining or not remaining.issubset(
+                self._persisted_modes.get(label, set())):
+            return False
+        return _heavy_mode_keys(record).issubset(
+            self._releasable_modes_locked(label))
+
     def _label_heavy_payload_persisted_locked(self, label: int | str) -> bool:
         record = self._records.get(label)
         if record is None:
             return False
         heavy_keys = _heavy_mode_keys(record)
         return bool(heavy_keys) and heavy_keys.issubset(
-            self._persisted_modes.get(label, set())
+            self._releasable_modes_locked(label)
         )
 
     def _enforce_bounds_locked(self) -> None:
@@ -512,16 +593,22 @@ class FrameRecordStore:
                         candidate
                         for candidate in self._records
                         if not self._require_persisted_for_eviction
-                        or self._label_persisted_locked(candidate)
+                        or self._label_deletable_locked(candidate)
                     ),
                     None,
                 )
                 if label is None:
                     break
-                self._records.pop(label, None)
-                self._source_ids.pop(label, None)
-                self._persisted_modes.pop(label, None)
-                self._drop_heavy_label_locked(label)
+                self._forget_label_locked(label)
+
+    def _forget_label_locked(self, label: int | str) -> None:
+        self._records.pop(label, None)
+        self._source_ids.pop(label, None)
+        self._persisted_modes.pop(label, None)
+        self._durable_modes.pop(label, None)
+        self._dropped_modes.pop(label, None)
+        self._projected.discard(label)
+        self._drop_heavy_label_locked(label)
 
 
 __all__ = ["FrameRecordStore"]

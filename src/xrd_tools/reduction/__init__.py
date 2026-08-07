@@ -17,6 +17,8 @@ __all__ = [
     "Frame",
     "FrameSource",
     "FrameReduction",
+    "FrameOutcome",
+    "FrameOutcomeReceipt",
     "GI1DMode",
     "GI2DMode",
     "GIFreezeError",
@@ -36,6 +38,7 @@ __all__ = [
     "XYESink",
     "prepare_gi_freeze",
     "run_reduction",
+    "supports_durable_xye_receipts",
     "StrictPolicy",
     "StrictnessError",
     "MissingNormalizationError",
@@ -48,6 +51,8 @@ _CORE_EXPORTS = {
     "Frame",
     "FrameSource",
     "FrameReduction",
+    "FrameOutcome",
+    "FrameOutcomeReceipt",
     "GI1DMode",
     "GI2DMode",
     "GIFreezeError",
@@ -67,6 +72,7 @@ _CORE_EXPORTS = {
     "XYESink",
     "prepare_gi_freeze",
     "run_reduction",
+    "supports_durable_xye_receipts",
 }
 
 _STRICTNESS_EXPORTS = {

@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple, Sequence
 
@@ -78,6 +79,23 @@ from xrd_tools.transforms import energy_to_wavelength
 logger = logging.getLogger(__name__)
 
 _UTF8_DTYPE = h5py.string_dtype(encoding="utf-8")
+
+
+def _stamp_root_writer_provenance(handle, path=None) -> None:
+    """Retain the frozen root provenance under this writer's true identity."""
+    from xrd_tools import __version__ as xrd_tools_version
+
+    values = {
+        "HDF5_Version": ".".join(str(x) for x in h5py.h5.get_libversion()),
+        "creator": "xrd_tools",
+        "creator_version": str(xrd_tools_version),
+        "file_name": str(Path(path or handle.filename).resolve()),
+        "file_time": datetime.now(timezone.utc).isoformat(),
+        "h5py_version": str(h5py.__version__),
+    }
+    for name, value in values.items():
+        if name not in handle.attrs:
+            handle.attrs[name] = value
 
 
 def warn_if_newer_schema(entry_grp, path="") -> None:
@@ -168,40 +186,6 @@ def read_nexus(
             f[entry], scan_id=p.stem,
             motor_names=motor_names, counter_names=counter_names,
         )
-
-
-def _read_scan_metadata_from_entry(
-    entry_grp: h5py.Group,
-    *,
-    scan_id: str,
-    motor_names: list[str] | None = None,
-    counter_names: list[str] | None = None,
-) -> ScanMetadata:
-    """Extract :class:`ScanMetadata` from an ALREADY-OPEN entry group.
-
-    The one shared body of :func:`read_nexus`, split out for callers that hold
-    the container open already (O-3N.R.3, handoff §19.1: the strict execution
-    opener reads raw stack and scan metadata on ONE held handle, so a pathname
-    replacement cannot hand one run pixels from the accepted inode and motor
-    angles from another).  Everything returned is detached — plain Python
-    values and materialized numpy arrays — so it survives the file's close.
-    """
-    energy = _read_energy(entry_grp)
-    wavelength = _read_wavelength(entry_grp, energy)
-    ub_matrix = _read_ub_matrix(entry_grp)
-    sample_name = _read_sample_name(entry_grp)
-    angles, counters = _read_data_group(entry_grp, motor_names, counter_names)
-    return ScanMetadata(
-        scan_id=scan_id,
-        energy=energy,
-        wavelength=wavelength,
-        angles=angles,
-        counters=counters,
-        ub_matrix=ub_matrix,
-        sample_name=sample_name,
-        source="nexus",
-        h5_path=Path(entry_grp.file.filename),
-    )
 
 
 class UnresolvedSourceLinkError(KeyError):
@@ -621,6 +605,39 @@ class NexusImageStack:
         return np.concatenate(chunks, axis=0)
 
 
+def _read_scan_metadata_from_entry(
+    entry_grp: h5py.Group,
+    *,
+    scan_id: str,
+    motor_names: list[str] | None = None,
+    counter_names: list[str] | None = None,
+) -> ScanMetadata:
+    """Extract :class:`ScanMetadata` from an ALREADY-OPEN entry group.
+
+    The one shared body of :func:`read_nexus`, split out for callers that hold
+    the container open already (O-3N.R.3, handoff §19.1: the strict execution
+    opener reads raw stack and scan metadata on ONE held handle, so a pathname
+    replacement cannot hand one run pixels from the accepted inode and motor
+    angles from another).  Everything returned is detached — plain Python
+    values and materialized numpy arrays — so it survives the file's close.
+    """
+    energy = _read_energy(entry_grp)
+    wavelength = _read_wavelength(entry_grp, energy)
+    ub_matrix = _read_ub_matrix(entry_grp)
+    sample_name = _read_sample_name(entry_grp)
+    angles, counters = _read_data_group(entry_grp, motor_names, counter_names)
+    return ScanMetadata(
+        scan_id=scan_id,
+        energy=energy,
+        wavelength=wavelength,
+        angles=angles,
+        counters=counters,
+        ub_matrix=ub_matrix,
+        sample_name=sample_name,
+        source="nexus",
+        h5_path=Path(entry_grp.file.filename),
+    )
+
 def open_nexus_image_stack_exact(
     path: Path | str,
     entry: str,
@@ -679,7 +696,6 @@ def open_nexus_image_stack_exact(
         h5f.close()
         raise
 
-
 def _require_exact_entry_name(entry: str) -> str:
     name = str(entry or "").strip().strip("/")
     if not name:
@@ -688,7 +704,6 @@ def _require_exact_entry_name(entry: str) -> str:
             "safe group to guess"
         )
     return name
-
 
 def _exact_entry_stack_paths(
     h5f: h5py.File, p: Path, name: str
@@ -732,7 +747,6 @@ def _exact_entry_stack_paths(
         )
     return paths
 
-
 class NexusExecutionSource(NamedTuple):
     """One strictly-proved execution source: raw stack + detached metadata.
 
@@ -744,7 +758,6 @@ class NexusExecutionSource(NamedTuple):
 
     stack: NexusImageStack
     scan_metadata: "ScanMetadata | None"
-
 
 def open_nexus_execution_source(
     path: Path | str,
@@ -783,7 +796,6 @@ def open_nexus_execution_source(
     except BaseException:
         h5f.close()
         raise
-
 
 def open_nexus_image_stack(
     path: Path | str,
@@ -1085,6 +1097,7 @@ def write_nexus(
         _require_uniform_axes_2d([result for _, result in sorted_2d])
 
     with h5py.File(p, mode) as f:
+        _stamp_root_writer_provenance(f, p)
         grp = f.require_group(entry)
         grp.attrs["NX_class"] = "NXentry"
         _stamp_processed_schema(grp)
@@ -1222,6 +1235,7 @@ def open_nexus_writer(
     mode = "w" if overwrite else "a"
     f = h5py.File(p, mode, **file_kwargs)
     try:
+        _stamp_root_writer_provenance(f, p)
         return _open_nexus_writer_body(f, entry, metadata, compression)
     except BaseException:
         # Close-on-construction-failure (same guard as FrameViewReader /
@@ -1458,6 +1472,8 @@ def _write_metadata(
 # Private helpers — results
 # ---------------------------------------------------------------------------
 
+_ROW_LOOKUP_UNSET = object()
+
 def _append_stacked_1d(
     entry_grp: h5py.Group,
     frame_idx: int | str,
@@ -1465,6 +1481,7 @@ def _append_stacked_1d(
     comp_kwargs: dict[str, Any],
     *,
     group_name: str = "integrated_1d",
+    known_row: int | None | object = _ROW_LOOKUP_UNSET,
 ) -> None:
     """Append one IntegrationResult1D as a row of the stacked
     ``/{entry}/integrated_1d`` NXdata group.
@@ -1524,11 +1541,22 @@ def _append_stacked_1d(
     n = di.shape[0]
     monotonic = bool(g.attrs.get(MONOTONIC_ATTR, False))
     last_idx = int(fi[n - 1]) if n else None
-    match = (
-        np.empty(0, dtype=int)
-        if monotonic and (last_idx is None or idx > last_idx)
-        else np.where(np.asarray(fi[()]) == idx)[0]
-    )
+    if known_row is not _ROW_LOOKUP_UNSET:
+        if known_row is None:
+            match = np.empty(0, dtype=int)
+        else:
+            row = int(known_row)
+            if row < 0 or row >= n or int(fi[row]) != idx:
+                raise ValueError(
+                    f"{group_name} known row {row} does not contain frame {idx}"
+                )
+            match = np.asarray([row], dtype=int)
+    else:
+        match = (
+            np.empty(0, dtype=int)
+            if monotonic and (last_idx is None or idx > last_idx)
+            else np.where(np.asarray(fi[()]) == idx)[0]
+        )
     if match.size:
         pos = int(match[0])  # upsert: replace existing row for this label
         di[pos] = intensity
@@ -1621,6 +1649,7 @@ def _append_stacked_2d(
     comp_kwargs: dict[str, Any],
     *,
     group_name: str = "integrated_2d",
+    known_row: int | None | object = _ROW_LOOKUP_UNSET,
 ) -> None:
     """Append one IntegrationResult2D as a slice of the stacked
     ``/{entry}/integrated_2d`` NXdata group ``(n_frames, n_chi, n_q)``.
@@ -1675,11 +1704,22 @@ def _append_stacked_2d(
     n = di.shape[0]
     monotonic = bool(g.attrs.get(MONOTONIC_ATTR, False))
     last_idx = int(fi[n - 1]) if n else None
-    match = (
-        np.empty(0, dtype=int)
-        if monotonic and (last_idx is None or idx > last_idx)
-        else np.where(np.asarray(fi[()]) == idx)[0]
-    )
+    if known_row is not _ROW_LOOKUP_UNSET:
+        if known_row is None:
+            match = np.empty(0, dtype=int)
+        else:
+            row = int(known_row)
+            if row < 0 or row >= n or int(fi[row]) != idx:
+                raise ValueError(
+                    f"{group_name} known row {row} does not contain frame {idx}"
+                )
+            match = np.asarray([row], dtype=int)
+    else:
+        match = (
+            np.empty(0, dtype=int)
+            if monotonic and (last_idx is None or idx > last_idx)
+            else np.where(np.asarray(fi[()]) == idx)[0]
+        )
     if match.size:
         pos = int(match[0])  # upsert: replace existing row for this label
         di[pos] = intensity
@@ -1829,6 +1869,7 @@ def validate_integrated_stack_write(
     results_2d: Sequence[IntegrationResult2D] | None = None,
     group_name_1d: str = "integrated_1d",
     group_name_2d: str = "integrated_2d",
+    allow_rebuild: bool = True,
 ) -> list[int]:
     """Validate a stacked integrated write without mutating ``entry_grp``.
 
@@ -1849,6 +1890,11 @@ def validate_integrated_stack_write(
             g["intensity"].shape[1] != np.asarray(results_1d[0].intensity).shape[0]
             or not _axes_match_1d(g, results_1d[0])
         ):
+            if not allow_rebuild:
+                raise ValueError(
+                    f"{group_name_1d} axis or row shape differs from the "
+                    "open writer cursor; dirty writes cannot rebuild a stack"
+                )
             _require_batch_covers_existing(g, group_name_1d, fis)
 
     if results_2d is not None and len(results_2d):
@@ -1861,6 +1907,11 @@ def validate_integrated_stack_write(
             tuple(g["intensity"].shape[1:]) != new_2d_shape
             or not _axes_match_2d(g, results_2d[0])
         ):
+            if not allow_rebuild:
+                raise ValueError(
+                    f"{group_name_2d} axis or row shape differs from the "
+                    "open writer cursor; dirty writes cannot rebuild a stack"
+                )
             _require_batch_covers_existing(g, group_name_2d, fis)
 
     return fis
@@ -2016,6 +2067,10 @@ def write_integrated_stack(
     group_name_1d: str = "integrated_1d",
     group_name_2d: str = "integrated_2d",
     compression: str | None = None,
+    known_rows_1d: dict[int, int] | None = None,
+    known_rows_2d: dict[int, int] | None = None,
+    known_rows_extra_1d: Mapping[str, dict[int, int]] | None = None,
+    known_rows_extra_2d: Mapping[str, dict[int, int]] | None = None,
 ) -> None:
     """Write/extend the stacked ``integrated_1d`` / ``integrated_2d`` NXdata
     groups from aligned lists of IntegrationResult + their frame labels.
@@ -2157,9 +2212,19 @@ def write_integrated_stack(
             g = None
         if g is None:
             _bulk_create_1d(entry_grp, results_1d, fis, disk_name=group_name_1d)
+            if known_rows_1d is not None:
+                known_rows_1d.clear()
+                known_rows_1d.update({label: row for row, label in enumerate(fis)})
         else:
             for fi, r in zip(fis, results_1d):
-                _append_stacked_1d(entry_grp, fi, r, ck, group_name=group_name_1d)
+                prior_n = int(g["frame_index"].shape[0])
+                _append_stacked_1d(
+                    entry_grp, fi, r, ck, group_name=group_name_1d,
+                    known_row=(_ROW_LOOKUP_UNSET if known_rows_1d is None
+                               else known_rows_1d.get(fi)),
+                )
+                if known_rows_1d is not None and fi not in known_rows_1d:
+                    known_rows_1d[fi] = prior_n
 
     if results_2d is not None and len(results_2d):
         if len(results_2d) != len(fis):
@@ -2178,9 +2243,19 @@ def write_integrated_stack(
             g = None
         if g is None:
             _bulk_create_2d(entry_grp, results_2d, fis, disk_name=group_name_2d)
+            if known_rows_2d is not None:
+                known_rows_2d.clear()
+                known_rows_2d.update({label: row for row, label in enumerate(fis)})
         else:
             for fi, r in zip(fis, results_2d):
-                _append_stacked_2d(entry_grp, fi, r, ck, group_name=group_name_2d)
+                prior_n = int(g["frame_index"].shape[0])
+                _append_stacked_2d(
+                    entry_grp, fi, r, ck, group_name=group_name_2d,
+                    known_row=(_ROW_LOOKUP_UNSET if known_rows_2d is None
+                               else known_rows_2d.get(fi)),
+                )
+                if known_rows_2d is not None and fi not in known_rows_2d:
+                    known_rows_2d[fi] = prior_n
 
     def _mode_fis(mode_indices, mode_key, default_fis):
         fis_ = [int(x) for x in (
@@ -2195,6 +2270,10 @@ def write_integrated_stack(
 
     def _write_extra_1d(parent, mode_key, results, fis_):
         sub = mode_subgroup_name(mode_key)  # canonical; raises on default/unknown
+        known_rows = (
+            known_rows_extra_1d.get(mode_key)
+            if known_rows_extra_1d is not None else None
+        )
         if not results or len(results) != len(fis_):
             raise ValueError(
                 f"extra_modes_1d[{mode_key!r}] length must match its frame_indices"
@@ -2210,12 +2289,26 @@ def write_integrated_stack(
             g = None
         if g is None:
             _bulk_create_1d(parent, results, fis_, disk_name=sub)
+            if known_rows is not None:
+                known_rows.clear()
+                known_rows.update({label: row for row, label in enumerate(fis_)})
         else:
             for fi, r in zip(fis_, results):
-                _append_stacked_1d(parent, fi, r, ck, group_name=sub)
+                prior_n = int(g["frame_index"].shape[0])
+                _append_stacked_1d(
+                    parent, fi, r, ck, group_name=sub,
+                    known_row=(_ROW_LOOKUP_UNSET if known_rows is None
+                               else known_rows.get(fi)),
+                )
+                if known_rows is not None and fi not in known_rows:
+                    known_rows[fi] = prior_n
 
     def _write_extra_2d(parent, mode_key, results, fis_):
         sub = mode_subgroup_name(mode_key)
+        known_rows = (
+            known_rows_extra_2d.get(mode_key)
+            if known_rows_extra_2d is not None else None
+        )
         if not results or len(results) != len(fis_):
             raise ValueError(
                 f"extra_modes_2d[{mode_key!r}] length must match its frame_indices"
@@ -2232,9 +2325,19 @@ def write_integrated_stack(
             g = None
         if g is None:
             _bulk_create_2d(parent, results, fis_, disk_name=sub)
+            if known_rows is not None:
+                known_rows.clear()
+                known_rows.update({label: row for row, label in enumerate(fis_)})
         else:
             for fi, r in zip(fis_, results):
-                _append_stacked_2d(parent, fi, r, ck, group_name=sub)
+                prior_n = int(g["frame_index"].shape[0])
+                _append_stacked_2d(
+                    parent, fi, r, ck, group_name=sub,
+                    known_row=(_ROW_LOOKUP_UNSET if known_rows is None
+                               else known_rows.get(fi)),
+                )
+                if known_rows is not None and fi not in known_rows:
+                    known_rows[fi] = prior_n
 
     # ── nested per-mode GI subgroups (ADR-0003) ─────────────────────────────
     # Each non-primary mode is its own NXdata child of the top-level group,
@@ -2793,6 +2896,7 @@ def _upsert_indexed_group(
     *,
     frame_indices: Sequence[int],
     values: dict[str, np.ndarray],
+    known_rows: dict[int, int] | None = None,
 ) -> None:
     """Update or append rows in an indexed metadata group.
 
@@ -2831,11 +2935,17 @@ def _upsert_indexed_group(
             ds = group[col]
             ds.resize((n + len(fis),))
             ds[n:] = arr
+        if known_rows is not None:
+            known_rows.update({label: n + offset
+                               for offset, label in enumerate(fis)})
         return
-    labels = [int(x) for x in np.asarray(labels_ds[()]).ravel()]
-    if len(labels) != len(set(labels)):
-        raise ValueError(f"{group.name}/frame_index contains duplicate labels")
-    row_of = {label: row for row, label in enumerate(labels)}
+    if known_rows is None:
+        labels = [int(x) for x in np.asarray(labels_ds[()]).ravel()]
+        if len(labels) != len(set(labels)):
+            raise ValueError(f"{group.name}/frame_index contains duplicate labels")
+        row_of = {label: row for row, label in enumerate(labels)}
+    else:
+        row_of = known_rows
     for label_pos, label in enumerate(fis):
         row = row_of.get(label)
         if row is None:
@@ -2848,6 +2958,10 @@ def _upsert_indexed_group(
                 ds[row] = arr[label_pos]
             row_of[label] = row
         else:
+            if row < 0 or row >= labels_ds.shape[0] or int(labels_ds[row]) != label:
+                raise ValueError(
+                    f"{group.name} known row {row} does not contain frame {label}"
+                )
             for col, arr in values.items():
                 group[col][row] = arr[label_pos]
     group.attrs[MONOTONIC_ATTR] = bool(
@@ -2899,6 +3013,8 @@ def upsert_scan_metadata(
     entry_grp: h5py.Group,
     scan_data,
     frame_indices: Sequence[int],
+    *,
+    known_rows: dict[int, int] | None = None,
 ) -> None:
     """Incrementally append or replace rows in ``/entry/scan_data``."""
     if scan_data is None or len(scan_data) == 0:
@@ -2914,8 +3030,14 @@ def upsert_scan_metadata(
         return
     if "scan_data" not in entry_grp:
         write_scan_metadata(entry_grp, scan_data, fis)
+        if known_rows is not None:
+            known_rows.clear()
+            known_rows.update({label: row for row, label in enumerate(fis)})
         return
-    _upsert_indexed_group(entry_grp["scan_data"], frame_indices=fis, values=values)
+    _upsert_indexed_group(
+        entry_grp["scan_data"], frame_indices=fis, values=values,
+        known_rows=known_rows,
+    )
     for col, attrs in attrs_by_col.items():
         if col in entry_grp["scan_data"]:
             entry_grp["scan_data"][col].attrs.update(attrs)
@@ -2928,6 +3050,7 @@ def upsert_per_frame_geometry(
     geometry,
     *,
     allow_create: bool = True,
+    known_rows: dict[int, int] | None = None,
 ) -> None:
     """Incrementally append or replace derived geometry rows."""
     if geometry is None or scan_data is None or len(scan_data) == 0:
@@ -2948,9 +3071,13 @@ def upsert_per_frame_geometry(
         if not allow_create:
             raise ValueError("/entry/per_frame_geometry is missing; full replacement required")
         write_per_frame_geometry(entry_grp, scan_data, fis, geometry)
+        if known_rows is not None:
+            known_rows.clear()
+            known_rows.update({label: row for row, label in enumerate(fis)})
         return
     _upsert_indexed_group(
         entry_grp["per_frame_geometry"], frame_indices=fis, values=derived,
+        known_rows=known_rows,
     )
 
 

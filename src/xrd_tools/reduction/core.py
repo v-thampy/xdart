@@ -11,15 +11,14 @@ from __future__ import annotations
 
 import copy
 import logging
-import math
 import os
 import queue
 import threading
 import time
-import uuid
 import warnings
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
@@ -52,13 +51,35 @@ from xrd_tools.core.strictness import (
 from xrd_tools.io.export import write_xye
 from xrd_tools.io.image import read_image
 from xrd_tools.io.nexus import (
-    open_nexus_image_stack,
     open_nexus_writer,
+    open_nexus_image_stack,
     resolve_stack_compression,
-    upsert_scan_metadata,
-    write_nexus_frame,
 )
-
+from xrd_tools.io.record_writer import (
+    NexusRecordWriter,
+    RecordWrite,
+    ResultMode,
+    WriterFinalization,
+    WriterTransactionBinding,
+)
+from xrd_tools.io.append import (
+    AppendDisposition,
+    AppendIntent,
+    AppendPreflight,
+    AppendPreflightState,
+    AppendRefused,
+    begin_same_run_lineage,
+    extend_same_run_lineage,
+    seal_append_epoch,
+    truncate_append_epoch,
+)
+from xrd_tools.io.output_transaction import (
+    LeaseOwner,
+    OutputReceiptCapability,
+    OutputReceiptCapabilityProvider,
+    OwnerToken,
+    get_output_transaction_coordinator,
+)
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # C4 — tighter Scan.integrator type without forcing the import
@@ -67,33 +88,48 @@ if TYPE_CHECKING:  # C4 — tighter Scan.integrator type without forcing the imp
 ProgressCallback = Callable[["ReductionProgress"], None]
 
 
-def _copy_json_provenance(value: object) -> dict[str, Any]:
-    """Validate and detach the finite JSON-native run-provenance algebra."""
+def supports_durable_xye_receipts(value: object) -> bool:
+    """Probe the public, typed durable-XYE receipt capability contract."""
+    if not isinstance(value, OutputReceiptCapabilityProvider):
+        return False
+    capabilities = value.output_receipt_capabilities
+    return (
+        isinstance(capabilities, frozenset)
+        and all(isinstance(item, OutputReceiptCapability) for item in capabilities)
+        and OutputReceiptCapability.DURABLE_XYE in capabilities
+    )
 
-    def copy_value(item: object) -> Any:
-        if item is None or type(item) in (bool, int, str):
-            return item
-        if type(item) is float:
-            if not math.isfinite(item):
-                raise ValueError("run configuration provenance floats must be finite")
-            return item
-        if type(item) is list:
-            return [copy_value(child) for child in item]
-        if type(item) is dict:
-            copied: dict[str, Any] = {}
-            for key, child in item.items():
-                if type(key) is not str:
-                    raise ValueError("run configuration provenance keys must be strings")
-                copied[key] = copy_value(child)
-            return copied
-        raise ValueError("run configuration provenance must be JSON-native")
+# H10 §14.3 admission-lifecycle trace: OFF unless ``XDART_H10_ADMISSION_TRACE``
+# names a file to append to (no default location, so an unset gate writes
+# nowhere).  One tab-separated ``monotonic  thread  event  k=v`` line per event
+# makes the submit/publication/worker/writer/sink/pool order readable for one
+# frame identity.  Diagnostic only: no state, no owner, no public API.
+_ADMISSION_TRACE_ENV = "XDART_H10_ADMISSION_TRACE"
+_TRACE_UNREPRESENTABLE = "<unrepresentable>"
 
-    if type(value) is not dict:
-        raise ValueError("run configuration provenance must be a dict")
-    copied = copy_value(value)
-    if type(copied) is not dict:
-        raise ValueError("run configuration provenance must be a dict")
-    return copied
+
+def _admission_trace(event: str, **fields: Any) -> None:
+    """Append one diagnostic event line — fire-and-forget (§19.4).
+
+    A trace never raises because of the DATA it was given: each field is
+    formatted under its own guard and a value whose ``__repr__`` raises becomes
+    one stable marker, so hostile data can neither escape nor replace the
+    failure the caller must see.  The COMPLETE body then runs under ONE outer
+    ``BaseException`` guard, so an interrupt inside optional trace machinery
+    changes no lifecycle fact; outside it, interrupts behave normally."""
+    try:
+        if not (path := os.environ.get(_ADMISSION_TRACE_ENV)):
+            return
+        parts = [f"{time.monotonic():.6f}", f"thread={threading.get_ident()}", event]
+        for key, value in fields.items():
+            try:
+                parts.append(f"{key}={value!r}")
+            except BaseException:        # hostile field data, not a run failure
+                parts.append(f"{key}={_TRACE_UNREPRESENTABLE}")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("\t".join(parts) + "\n")
+    except BaseException:  # a diagnostic may never change a lifecycle fact
+        pass
 
 
 class GIFreezeError(ValueError):
@@ -291,7 +327,7 @@ class GIMode:
     incidence_motor: str | None = None
     tilt_angle: float = 0.0
     sample_orientation: int = 1
-    method: str = "cython"
+    method: str = "no"
     mode_1d: GI1DMode | str = GI1DMode.Q_TOTAL
     mode_2d: GI2DMode | str = GI2DMode.QIP_QOOP
     npt_oop: int | None = None
@@ -323,12 +359,12 @@ class ReductionPlan:
     threshold_min: float | None = None
     threshold_max: float | None = None
     # R3-C: opt-in detector-saturation masking in the HEADLESS reduction path.
-    # When True, the first naturally-read frame resolves one scan-stable value
-    # mask: negatives and the unambiguous uint32 dummy are excluded, and the
-    # dtype-derived detector ceiling (np.iinfo(dtype).max, e.g. uint16 65535)
-    # is fraction-guarded via xrd_tools.core.invalid.saturation_pixels.  The
-    # stable mask keeps pyFAI's mask/LUT identity fixed across the scan; explicit
-    # thresholds remain per-frame.  Default False is an exact no-op.
+    # When True, _reduce_frame excludes the dtype-derived saturation ceiling
+    # (np.iinfo(dtype).max, e.g. uint16 65535) using the same fraction-guarded
+    # policy as the GUI (xrd_tools.core.invalid.saturation_pixels): masked only
+    # when a whole module sits at the ceiling (>1e-4 of the frame), never a few
+    # genuinely-saturated Bragg pixels.  Default False is behavior-preserving;
+    # core never hardcodes 65535 (a float-dtype frame -> ceiling None -> no-op).
     mask_saturation: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -354,6 +390,8 @@ class FrameReduction:
         repr=False,
         compare=False,
     )
+    thumbnail: np.ndarray | None = field(default=None, repr=False, compare=False)
+    write_frame_record: bool = True
 
 
 def _plan_mode_keys(plan: ReductionPlan | None) -> tuple[str, str]:
@@ -393,6 +431,42 @@ class ReductionResult:
     error: str | None = None
 
 
+class FrameOutcome(str, Enum):
+    """Typed per-item compute outcome (H10-C1).  ``COMPLETED`` means the
+    reduction produced a typed result; the terminal outcomes are exactly the
+    paths that previously disappeared inside the writer loop."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED_BEFORE_COMPLETION = "cancelled_before_completion"
+
+
+@dataclass(frozen=True, slots=True)
+class FrameOutcomeReceipt:
+    """One per-item outcome from the streaming writer loop (H10-C1).
+
+    Emitted on the WRITER thread, once per drained item: ``COMPLETED`` fires
+    BEFORE the sink write hook (compute success is a distinct fact from a
+    successful write — an accounting owner must never infer it from
+    accepted-minus-written counts), ``FAILED``/``CANCELLED_BEFORE_COMPLETION``
+    fire where the writer loop records-and-continues.  ``replacing`` is True
+    for a re-fed index (a replace attempt, not a first completion).
+
+    ``attempt`` is the exact per-label acceptance revision minted by
+    ``accept_cb`` for the submission that produced this outcome, so an older
+    overlapping attempt can never be mistaken for the latest one.  It is
+    ``None`` when no acceptance hook is installed.
+    """
+
+    frame_index: int
+    outcome: FrameOutcome
+    replacing: bool
+    produced_1d: bool
+    produced_2d: bool
+    error: str | None = None
+    attempt: int | None = None
+
+
 class ReductionSink(Protocol):
     """Destination for frame reduction products.
 
@@ -428,7 +502,7 @@ class MemorySink:
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         self.frames.clear()
 
-    def write(self, frame: Frame, reduction: FrameReduction) -> None:
+    def write(self, frame: Frame, reduction: FrameReduction) -> frozenset[ResultMode]:
         self.frames[int(frame.index)] = reduction
 
     def finish(self, result: ReductionResult) -> None:
@@ -440,6 +514,29 @@ class CompositeSink:
     """Fan out reduction products to multiple sinks."""
 
     sinks: tuple[ReductionSink, ...]
+    worker_process: Any = field(default=None, init=False, repr=False)
+    output_receipt_capabilities: frozenset[OutputReceiptCapability] = field(
+        default_factory=frozenset, init=False,
+    )
+
+    def __post_init__(self) -> None:
+        capabilities: set[OutputReceiptCapability] = set()
+        for sink in self.sinks:
+            provided = getattr(sink, "output_receipt_capabilities", frozenset())
+            if (isinstance(provided, frozenset)
+                    and all(isinstance(item, OutputReceiptCapability)
+                            for item in provided)):
+                capabilities.update(provided)
+        self.output_receipt_capabilities = frozenset(capabilities)
+        workers = tuple(
+            hook for sink in self.sinks
+            if callable(hook := getattr(sink, "worker_process", None))
+        )
+        if workers:
+            def process(frame, reduction):
+                for hook in workers:
+                    hook(frame, reduction)
+            self.worker_process = process
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         for sink in self.sinks:
@@ -449,17 +546,7 @@ class CompositeSink:
         for sink in self.sinks:
             sink.write(frame, reduction)
 
-    def worker_process(
-        self, frame: Frame, reduction: FrameReduction
-    ) -> None:
-        """Fan out optional parallel preparation before the writer boundary."""
-
-        for sink in self.sinks:
-            prepare = getattr(sink, "worker_process", None)
-            if callable(prepare):
-                prepare(frame, reduction)
-
-    def _bind_run_saturation_mask(self, state: "_RunSaturationMask") -> None:
+    def _bind_run_saturation_mask(self, state) -> None:
         for sink in self.sinks:
             bind = getattr(sink, "_bind_run_saturation_mask", None)
             if callable(bind):
@@ -494,33 +581,18 @@ class CompositeSink:
             raise errors[0]
 
     def flush(self, *, force: bool = False) -> None:
-        """Flush every buffering child at the shared durability boundary."""
-
         for sink in self.sinks:
             flush = getattr(sink, "flush", None)
             if callable(flush):
                 flush(force=force)
 
-    def take_persisted_labels(self) -> tuple[int, ...]:
-        """Collect one-shot durability receipts from child sinks."""
-
-        labels: list[int] = []
-        for sink in self.sinks:
-            take = getattr(sink, "take_persisted_labels", None)
-            if callable(take):
-                labels.extend(int(label) for label in take())
-        return tuple(dict.fromkeys(labels))
-
     def perf_snapshot(self) -> dict[str, float]:
-        """Return merged, read-only performance counters from child sinks."""
-
         values: dict[str, float] = {}
         for sink in self.sinks:
             snapshot = getattr(sink, "perf_snapshot", None)
-            if not callable(snapshot):
-                continue
-            for key, elapsed in snapshot().items():
-                values[key] = values.get(key, 0.0) + float(elapsed)
+            if callable(snapshot):
+                for key, elapsed in snapshot().items():
+                    values[key] = values.get(key, 0.0) + float(elapsed)
         return values
 
 
@@ -590,13 +662,12 @@ class XYESink:
                 finally:
                     pending.task_done()
 
-        worker = threading.Thread(
+        self._worker = threading.Thread(
             target=write_pending,
             name="xrd-tools-xye-writer",
             daemon=True,
         )
-        self._worker = worker
-        worker.start()
+        self._worker.start()
 
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         result = reduction.result_1d
@@ -610,15 +681,7 @@ class XYESink:
         pending = self._pending
         if pending is None:
             raise RuntimeError("XYESink.write called before begin().")
-        # The result arrays are immutable session outputs.  A bounded queue
-        # keeps at most 16 frames alive while preserving writer order (including
-        # replacement writes) without serializing text I/O on the HDF5 owner.
-        pending.put((
-            path,
-            result.radial,
-            result.intensity,
-            result.sigma,
-        ))
+        pending.put((path, result.radial, result.intensity, result.sigma))
 
     def finish(self, result: ReductionResult) -> None:
         pending, worker = self._pending, self._worker
@@ -628,15 +691,11 @@ class XYESink:
         self._pending = None
         self._worker = None
         if self._errors:
-            # Surface the primary failure once, then permit the run owner's
-            # retryable cleanup pass to close the already-drained sink.
             error = self._errors[0]
             self._errors.clear()
             raise error
 
     def abort(self, result: ReductionResult) -> None:
-        # Completed per-frame exports remain useful beside a partial NeXus
-        # artifact.  Drain the bounded prefix and report any write failure.
         self.finish(result)
 
     def perf_snapshot(self) -> dict[str, float]:
@@ -644,27 +703,16 @@ class XYESink:
 
 
 @dataclass(slots=True)
-class _PendingNexusWrite:
-    frame: Frame
-    reduction: FrameReduction
-    mode_1d: str
-    mode_2d: str
-    prepared_thumbnail: tuple[np.ndarray | None, bool] | None
-
-
-@dataclass(slots=True)
 class NexusSink:
-    """Frame-by-frame NeXus sink backed by ``xrd_tools.io.nexus``.
+    """Headless value adapter for :class:`NexusRecordWriter`.
 
-    Writes the **complete v2 record** (6a): besides the integrated stacks
-    and scan metadata, every frame gets its per-frame record group
-    (raw-source pointer + optional thumbnail) via
-    :mod:`xrd_tools.io.nexus_record`, ``@source_base`` is stamped when a
-    project root is given, and per-frame geometry is derived at finish when
-    the scan carries a geometry mapping.  A purely headless run therefore
-    produces a file that ``get_raw_frame`` / ``read_frame_view`` resolve
-    exactly like a GUI-written one (N1-portable when ``source_base`` is
-    set).  Set ``complete_record=False`` for the minimal pre-6a output.
+    The shared writer owns the open handle, row cursors, H10 durability
+    receipts, flush cadence, partial-file preservation, and terminal state.
+    This adapter only converts reduction-domain values into ``RecordWrite`` and
+    ``WriterFinalization`` objects.  ``file_lock`` is optional and borrowed;
+    without one this retains the pre-cutover single-session serialization
+    contract rather than claiming cross-session exclusion.  H23-C3 supplies
+    the canonical GUI lock at its composition boundary.
     """
 
     path: Path | str
@@ -679,339 +727,455 @@ class NexusSink:
     source_base: Path | str | None = None
     write_thumbnails: bool = True
     thumbnail_max: int = 256
-    run_configuration_provenance: Mapping[str, Any] | None = field(default=None, repr=False)
-    source_execution_provenance: Mapping[str, Any] | None = field(default=None, repr=False)
+    run_configuration_provenance: Mapping[str, Any] | None = field(
+        default=None, repr=False,
+    )
+    source_execution_provenance: Mapping[str, Any] | None = field(
+        default=None, repr=False,
+    )
     source_snapshots_provenance: Mapping[str, Mapping[str, Any]] | None = None
-    expected_target_state: tuple[int, int, int, int, int] | bool | None = None
-    _norm_source_base: str | None = field(default=None, init=False, repr=False)
-    _h5: Any | None = field(default=None, init=False, repr=False)
-    _n_written: int = field(default=0, init=False, repr=False)
+    file_lock: Any | None = None
+    append_preflight: AppendPreflight | None = None
+    same_run_intent: AppendIntent | None = None
+    allow_unbound_same_run: bool = False
+    incremental_finalization: bool = False
+    _writer: NexusRecordWriter | None = field(default=None, init=False, repr=False)
+    _transaction: Any | None = field(default=None, init=False, repr=False)
+    _lease: Any | None = field(default=None, init=False, repr=False)
+    _attempt: Any | None = field(default=None, init=False, repr=False)
+    _transaction_owners: tuple[Any, Any, dict] | None = field(
+        default=None, init=False, repr=False,
+    )
     _scan: "Scan | None" = field(default=None, init=False, repr=False)
     _plan: "ReductionPlan | None" = field(default=None, init=False, repr=False)
     _run_saturation_mask: "_RunSaturationMask | None" = field(
         default=None, init=False, repr=False,
     )
-    _active_path: Path | None = field(default=None, init=False, repr=False)
-    _tmp_path: Path | None = field(default=None, init=False, repr=False)
+    _session_facade: Any | None = field(default=None, init=False, repr=False)
     _primary_mode_1d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
     _primary_mode_2d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
-    _run_configuration_provenance: dict[str, Any] | None = field(default=None, init=False, repr=False)
-    _source_execution_provenance: dict[str, Any] | None = field(default=None, init=False, repr=False)
-    _source_snapshots_provenance: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _extension_owner: Any | None = field(default=None, init=False, repr=False)
+    _pending_append_decision: Any | None = field(default=None, init=False, repr=False)
+    _epoch_decision: Any | None = field(default=None, init=False, repr=False)
     _prepared_thumbnails: dict[int, tuple[np.ndarray | None, bool]] = field(
         default_factory=dict, init=False, repr=False,
     )
     _prepared_thumbnails_lock: Any = field(
         default_factory=threading.Lock, init=False, repr=False,
     )
-    _perf_enabled: bool = field(default=False, init=False, repr=False)
-    _perf_values: dict[str, float] = field(
+    _source_snapshots: dict[str, dict[str, Any]] = field(
         default_factory=dict, init=False, repr=False,
     )
-    _pending: list[_PendingNexusWrite] = field(
-        default_factory=list, init=False, repr=False,
+    _run_configuration: dict[str, Any] | None = field(
+        default=None, init=False, repr=False,
     )
-    _awaiting_durable: list[int] = field(
-        default_factory=list, init=False, repr=False,
+    _source_execution: dict[str, Any] | None = field(
+        default=None, init=False, repr=False,
     )
-    _persisted_receipts: list[int] = field(
-        default_factory=list, init=False, repr=False,
-    )
-    _flush_failed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
             self.path = Path(self.path)
-        self._perf_enabled = bool(os.environ.get("XDART_PERF"))
-        value = self.run_configuration_provenance
+        if self.overwrite and self.append_preflight is not None:
+            raise ValueError("Overwrite cannot consume an Append preflight")
+        if self.same_run_intent is not None and self.append_preflight is not None:
+            raise ValueError("same-run creation and cross-run Append are distinct policies")
+        if self.allow_unbound_same_run and (
+            not self.overwrite
+            or self.append_preflight is not None
+            or self.same_run_intent is not None
+        ):
+            raise ValueError(
+                "unbound same-run adoption requires a fresh Overwrite owner"
+            )
+        from xrd_tools.reduction.provenance_config import jsonable_run_value
+
+        if self.run_configuration_provenance is not None:
+            self._run_configuration = jsonable_run_value(
+                self.run_configuration_provenance,
+                path="run_configuration",
+            )
+        if self.source_execution_provenance is not None:
+            self._source_execution = jsonable_run_value(
+                self.source_execution_provenance,
+                path="source_execution",
+            )
         self.run_configuration_provenance = None
-        if value is not None:
-            copied = _copy_json_provenance(value)
-            if (
-                type(copied.get("generation")) is not int
-                or copied["generation"] < 1
-                or not isinstance(copied.get("fingerprint"), str)
-                or not copied["fingerprint"]
-                or type(copied.get("schema_version")) is not int
-            ):
-                raise ValueError("run configuration provenance has an invalid identity")
-            self._run_configuration_provenance = copied
-        source_execution = self.source_execution_provenance
         self.source_execution_provenance = None
-        if source_execution is not None:
-            self._source_execution_provenance = _copy_json_provenance(source_execution)
-        source_snapshots = self.source_snapshots_provenance
+        snapshots = self.source_snapshots_provenance or {}
+        self._source_snapshots = {
+            str(path): jsonable_run_value(snapshot, path=f"source_snapshot[{path!r}]")
+            for path, snapshot in snapshots.items()
+        }
         self.source_snapshots_provenance = None
-        if source_snapshots is not None:
-            self._source_snapshots_provenance = {
-                str(path): _copy_json_provenance(snapshot)
-                for path, snapshot in source_snapshots.items()
-            }
+
+    @property
+    def _tmp_path(self) -> Path | None:
+        writer = self._writer
+        if writer is None or writer.phase.value not in {"active", "partial"}:
+            return None
+        active = writer.active_path
+        return active if active is not None and active != self.path else None
+
+    def bind_session(self, facade: Any) -> None:
+        if self._writer is not None and self._writer.phase.value in {"active", "partial"}:
+            raise RuntimeError("NexusSink session facade cannot change during a write")
+        self._session_facade = facade
+
+    def _release_terminal_lease(self) -> None:
+        if self._transaction_owners is None:
+            return
+        owners = self._transaction_owners[2]
+        try:
+            for role in tuple(owners):
+                self._transaction.release_lease_owner(
+                    self._lease, role, owners[role]
+                )
+                del owners[role]
+        except BaseException:
+            if self.append_preflight is not None:
+                self.append_preflight._terminal(
+                    self.append_preflight._cleanup_failure_state())
+            raise
+        if not owners:
+            self._transaction_owners = None
+            self._extension_owner = None
+            self._pending_append_decision = None
+            self._epoch_decision = None
+
+    def _settle_unstarted_transaction(self) -> None:
+        snapshot = self._transaction.snapshot()
+        if snapshot.phase.value == "aborted":
+            self._release_terminal_lease()
+            return
+        if snapshot.pending_actions:
+            if snapshot.cleanup_token is None:
+                raise RuntimeError("pending output cleanup has no exact owner")
+            self._transaction.retry_cleanup(snapshot.cleanup_token)
+        self._transaction.abandon(self._lease)
+        self._release_terminal_lease()
+
+    def _abort_composed(self) -> None:
+        writer = self._writer
+        phase = self._transaction.snapshot().phase.value
+        if writer is not None and writer.phase.value == "finished" and phase == "cleanup-pending":
+            snapshot = self._transaction.snapshot()
+            self._transaction.retry_cleanup(snapshot.cleanup_token)
+            phase = self._transaction.snapshot().phase.value
+        if (writer is not None and writer.phase.value == "finished"
+                and phase in {"epoch-committed", "committed"}):
+            if phase == "epoch-committed":
+                self._transaction.commit_stream(self._attempt, lease=self._lease)
+            self._release_terminal_lease()
+        else:
+            if writer is not None and writer.phase.value != "aborted":
+                writer.abort()
+            if self._attempt is None:
+                self._settle_unstarted_transaction()
+            else:
+                snapshot = self._transaction.abort_stream(
+                    self._attempt, lease=self._lease,
+                    retain_partial=bool(writer and writer.written_labels),
+                )
+                if snapshot.partial_path:
+                    warnings.warn(f"writer abort preserved non-final data at {snapshot.partial_path}", RuntimeWarning, stacklevel=2)
+                self._release_terminal_lease()
+        if self.append_preflight is not None:
+            state = (
+                AppendPreflightState.COMMITTED
+                if self._transaction.snapshot().phase.value == "committed"
+                else AppendPreflightState.ABORTED
+            )
+            self.append_preflight._terminal(state)
+
+    def _prepare_transaction(self):
+        if self.append_preflight is not None:
+            binding = self.append_preflight._consume(self.path)
+            self._transaction = binding.transaction
+            self._lease = binding.lease
+            self._transaction_owners = (
+                binding.transaction_owner,
+                binding.target_owner,
+                binding.owners,
+            )
+            try:
+                self._attempt = binding.transaction.begin_stream(
+                    admission=binding.transaction.admission,
+                    transaction_owner=binding.transaction_owner,
+                    target_owner=binding.target_owner,
+                    lease=binding.lease,
+                    file_lock=self.file_lock,
+                )
+            except BaseException as primary:
+                try:
+                    self._settle_unstarted_transaction()
+                except BaseException as cleanup:
+                    self.append_preflight._terminal(
+                        self.append_preflight._cleanup_failure_state())
+                    raise primary from cleanup
+                self.append_preflight._terminal(AppendPreflightState.ABORTED)
+                raise
+            return binding.decision
+        coordinator = get_output_transaction_coordinator()
+        transaction_owner = OwnerToken("nexus-sink-transaction")
+        target_owner = OwnerToken("nexus-sink-target")
+        owners = {role: OwnerToken(f"nexus-sink-{role.value}") for role in LeaseOwner}
+        with (nullcontext() if self.file_lock is None else self.file_lock):
+            transaction = coordinator.admit(
+                self.path,
+                transaction_owner=transaction_owner,
+                target_owner=target_owner,
+            )
+            lease = transaction.acquire_lease(
+                admission=transaction.admission,
+                transaction_owner=transaction_owner,
+                target_owner=target_owner,
+                owners=owners,
+            )
+        self._transaction = transaction
+        self._lease = lease
+        self._transaction_owners = (transaction_owner, target_owner, owners)
+        try:
+            if self.same_run_intent is not None:
+                if transaction.admission.snapshot.exists and not self.overwrite:
+                    raise ValueError(
+                        "existing target requires an exact Append preflight")
+                decision = begin_same_run_lineage(self.same_run_intent)
+            else:
+                decision = None
+        except BaseException as primary:
+            try:
+                self._settle_unstarted_transaction()
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
+        if decision is not None and decision.disposition is not AppendDisposition.WRITE:
+            transaction.abandon(lease)
+            self._release_terminal_lease()
+            raise AppendRefused(decision)
+        try:
+            self._attempt = transaction.begin_stream(
+                admission=transaction.admission,
+                transaction_owner=transaction_owner,
+                target_owner=target_owner,
+                lease=lease,
+                file_lock=self.file_lock,
+            )
+        except BaseException as primary:
+            try:
+                self._settle_unstarted_transaction()
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
+        return decision
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
-        if self.flush_every is not None and self.flush_every <= 0:
-            raise ValueError(f"flush_every must be > 0 or None; got {self.flush_every}")
-        self._n_written = 0
-        self._perf_values.clear()
-        self._pending.clear()
-        self._awaiting_durable.clear()
-        self._persisted_receipts.clear()
-        self._flush_failed = False
-        with self._prepared_thumbnails_lock:
-            self._prepared_thumbnails.clear()
-        if self.expected_target_state is None:
-            self.expected_target_state = _target_state(self.path)
-        # Stash the scan so finish() can persist its per-frame condition table
-        # (scan_data) alongside the integrated stacks (core provenance).
+        if self._writer is not None and self._writer.phase.value in {"active", "partial"}:
+            raise RuntimeError("NexusSink.begin called before the prior writer terminated")
         self._scan = scan
         self._plan = plan
+        if not self._source_snapshots:
+            snapshots = (scan.extra or {}).get("source_snapshots") or {}
+            from xrd_tools.reduction.provenance_config import jsonable_run_value
+            self._source_snapshots = {
+                str(path): jsonable_run_value(
+                    snapshot, path=f"source_snapshot[{path!r}]",
+                )
+                for path, snapshot in snapshots.items()
+            }
+        with self._prepared_thumbnails_lock:
+            self._prepared_thumbnails.clear()
+        self._writer = None
+        self._attempt = None
         self._primary_mode_1d, self._primary_mode_2d = _plan_mode_keys(plan)
-        use_atomic = (
-            bool(self.atomic)
-            if self.atomic is not None
-            else (self.overwrite or not self.path.exists())
-        )
-        self._tmp_path = None
-        self._active_path = self.path
-        if use_atomic:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._tmp_path = self.path.with_name(
-                f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        append_decision = self._prepare_transaction()
+        try:
+            writer = NexusRecordWriter(
+                self.path,
+                entry=self.entry,
+                compression=self.compression,
+                overwrite=self.overwrite,
+                atomic=False,
+                flush_every=self.flush_every,
+                complete_record=self.complete_record,
+                source_base=self.source_base,
+                file_lock=self.file_lock,
+                opener=open_nexus_writer,
+                transaction_binding=WriterTransactionBinding(
+                    self._transaction, self._attempt, self._lease,
+                ),
+                append_decision=append_decision,
             )
-            self._active_path = self._tmp_path
-        self._h5 = open_nexus_writer(
-            self._active_path,
-            metadata=scan.to_metadata(),
-            entry=self.entry,
-            compression=self.compression,
-            overwrite=True if use_atomic else self.overwrite,
-        )
-        self._norm_source_base = None
-        if self.complete_record and self.source_base:
-            from xrd_tools.io.nexus_record import stamp_source_base
-            self._norm_source_base = stamp_source_base(
-                self._h5[self.entry], self.source_base
+            self._writer = writer
+            if self._session_facade is not None:
+                writer.bind_session(self._session_facade)
+            writer.begin(
+                metadata=scan.to_metadata(),
+                primary_mode_1d=self._primary_mode_1d,
+                primary_mode_2d=self._primary_mode_2d,
             )
+            if self.append_preflight is not None:
+                self.append_preflight._set_consumer(self._queue_append_decision)
+            if self.same_run_intent is not None or self.allow_unbound_same_run:
+                self._extension_owner = OwnerToken("same-run-extension")
+        except BaseException as primary:
+            try:
+                self._abort_composed()
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
 
-    def _bind_run_saturation_mask(self, state: "_RunSaturationMask") -> None:
-        self._run_saturation_mask = state
+    @property
+    def extension_owner(self):
+        if self._extension_owner is None:
+            raise RuntimeError("sink has no active same-run extension owner")
+        return self._extension_owner
+
+    def _queue_append_decision(self, decision) -> None:
+        self._pending_append_decision = decision
+
+    def _apply_pending_extension(self) -> None:
+        decision = self._pending_append_decision
+        if decision is None:
+            return
+        if self._writer.phase.value == "finished":
+            self._open_owned_epoch(decision)
+        else:
+            self._writer.extend_append(decision)
+        if self._pending_append_decision is decision:
+            self._pending_append_decision = None
+
+    def _open_owned_epoch(self, decision) -> None:
+        transaction_owner, target_owner, _owners = self._transaction_owners
+        try:
+            self._attempt = self._transaction.begin_stream_epoch(
+                self._attempt,
+                admission=self._transaction.admission,
+                transaction_owner=transaction_owner,
+                target_owner=target_owner,
+                lease=self._lease,
+            )
+            self._writer = None
+            writer = NexusRecordWriter(
+                self.path,
+                entry=self.entry,
+                compression=self.compression,
+                overwrite=False,
+                atomic=False,
+                flush_every=self.flush_every,
+                complete_record=self.complete_record,
+                source_base=self.source_base,
+                file_lock=self.file_lock,
+                opener=open_nexus_writer,
+                transaction_binding=WriterTransactionBinding(
+                    self._transaction, self._attempt, self._lease,
+                ),
+                append_decision=decision,
+            )
+            self._writer = writer
+            if self._session_facade is not None:
+                writer.bind_session(self._session_facade)
+            writer.begin(
+                metadata=self._scan.to_metadata(),
+                primary_mode_1d=self._primary_mode_1d,
+                primary_mode_2d=self._primary_mode_2d,
+            )
+        except BaseException as primary:
+            try:
+                self._abort_composed()
+            except BaseException as cleanup:
+                if self.append_preflight is not None:
+                    self.append_preflight._terminal(
+                        self.append_preflight._cleanup_failure_state())
+                raise primary from cleanup
+            raise
+
+    def extend_live(self, owner, intent: AppendIntent):
+        if owner is not self._extension_owner:
+            raise RuntimeError("same-run extension requires the exact live owner")
+        prior = self.same_run_intent
+        writer = self._writer
+        if writer is None or writer.phase.value not in {
+            "active", "finished",
+        }:
+            raise RuntimeError("same-run extension requires one owned writer")
+        if prior is None:
+            if not self.allow_unbound_same_run:
+                raise RuntimeError("same-run extension has no bound source owner")
+            if writer.phase.value != "active":
+                raise RuntimeError(
+                    "first same-run lineage must bind before writer finalization"
+                )
+            decision = begin_same_run_lineage(intent)
+            if decision.disposition is not AppendDisposition.WRITE:
+                raise AppendRefused(decision)
+            writer.adopt_append(decision)
+            self.same_run_intent = intent
+            return decision
+        base = self._pending_append_decision or self._epoch_decision or writer.append_decision
+        decision = extend_same_run_lineage(
+            base, prior, intent)
+        if decision.disposition is AppendDisposition.REFUSE:
+            raise AppendRefused(decision)
+        if intent == prior:
+            return decision
+        self.same_run_intent = intent
+        self._queue_append_decision(decision)
+        return decision
 
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
-        if self._h5 is None:
+        writer = self._writer
+        if writer is None:
             raise RuntimeError("NexusSink.write called before begin().")
+        self._apply_pending_extension()
+        writer = self._writer
         mode_1d = str(getattr(reduction, "mode_1d", None)
                       or self._primary_mode_1d or DEFAULT_MODE_KEY)
         mode_2d = str(getattr(reduction, "mode_2d", None)
                       or self._primary_mode_2d or DEFAULT_MODE_KEY)
-        # A direct caller can feed the same label twice without going through
-        # ReductionSession.replace().  Keep a pending batch duplicate-free so
-        # the canonical stacked writer's upsert contract remains exact.
-        if any(int(item.frame.index) == int(frame.index) for item in self._pending):
-            self._flush_pending(force=True)
-
-        prepared = None
-        if self.complete_record:
-            with self._prepared_thumbnails_lock:
-                prepared = self._prepared_thumbnails.pop(id(reduction), None)
-            if prepared is None:
-                prepared = self._prepare_frame_thumbnail(frame)
-        self._pending.append(_PendingNexusWrite(
-            frame=frame,
-            reduction=reduction,
-            mode_1d=mode_1d,
-            mode_2d=mode_2d,
-            prepared_thumbnail=prepared,
-        ))
-        self._flush_pending(force=False)
-
-    def replace(self, frame: Frame, reduction: FrameReduction) -> None:
-        # Reintegrations are sparse and must not be reordered across an older
-        # live batch.  Flush the prefix, then persist the replacement now.
-        self._flush_pending(force=True)
-        self.write(frame, reduction)
-        self._flush_pending(force=True)
-
-    def flush(self, *, force: bool = False) -> None:
-        self._flush_pending(force=force)
-
-    def take_persisted_labels(self) -> tuple[int, ...]:
-        labels = tuple(self._persisted_receipts)
-        self._persisted_receipts.clear()
-        return labels
-
-    def _flush_pending(self, *, force: bool, sync: bool = True) -> None:
-        if self._h5 is None or not self._pending:
-            return
-        threshold = 1 if self.flush_every is None else int(self.flush_every)
-        if not force and len(self._pending) < threshold:
-            return
-        pending = tuple(self._pending)
-        try:
-            started = time.perf_counter() if self._perf_enabled else 0.0
-            try:
-                self._write_integrated_batch(pending)
-            finally:
-                self._perf_add("sink_nexus_integrated", started)
-            if self.complete_record:
-                started = time.perf_counter() if self._perf_enabled else 0.0
-                try:
-                    for item in pending:
-                        self._write_frame_record(
-                            item.frame,
-                            item.reduction,
-                            prepared=item.prepared_thumbnail,
-                        )
-                finally:
-                    self._perf_add("sink_nexus_frame_record", started)
-            self._n_written += len(pending)
-            self._awaiting_durable.extend(int(item.frame.index) for item in pending)
-            self._pending.clear()
-            if sync:
-                started = time.perf_counter() if self._perf_enabled else 0.0
-                try:
-                    self._h5.flush()
-                finally:
-                    self._perf_add("sink_nexus_h5_flush", started)
-                self._mark_pending_durable()
-        except BaseException:
-            self._flush_failed = True
-            raise
-
-    def _mark_pending_durable(self) -> None:
-        self._persisted_receipts.extend(self._awaiting_durable)
-        self._awaiting_durable.clear()
-
-    def _write_integrated_batch(
-        self, pending: tuple[_PendingNexusWrite, ...]
-    ) -> None:
-        from xrd_tools.io.nexus import write_integrated_stack
-
-        entry = self._h5[self.entry]
-
-        def write_dimension(dimension: str) -> None:
-            primary = (
-                self._primary_mode_1d if dimension == "1d"
-                else self._primary_mode_2d
-            )
-            mode_attr = "mode_1d" if dimension == "1d" else "mode_2d"
-            result_attr = "result_1d" if dimension == "1d" else "result_2d"
-            top = [
-                item for item in pending
-                if getattr(item.reduction, result_attr) is not None
-                and getattr(item, mode_attr) in (primary, DEFAULT_MODE_KEY)
-            ]
-            if top:
-                kwargs = {
-                    "frame_indices": [int(item.frame.index) for item in top],
-                    f"results_{dimension}": [
-                        getattr(item.reduction, result_attr) for item in top
-                    ],
-                    f"primary_mode_{dimension}": primary,
-                    "compression": self.compression,
-                }
-                write_integrated_stack(entry, **kwargs)
-
-            extras: dict[str, list[_PendingNexusWrite]] = {}
-            for item in pending:
-                result = getattr(item.reduction, result_attr)
-                mode = getattr(item, mode_attr)
-                if result is not None and mode not in (primary, DEFAULT_MODE_KEY):
-                    extras.setdefault(mode, []).append(item)
-            for mode, items in extras.items():
-                kwargs = {
-                    "frame_indices": [int(item.frame.index) for item in items],
-                    f"extra_modes_{dimension}": {
-                        mode: [getattr(item.reduction, result_attr) for item in items]
-                    },
-                    f"extra_mode_indices_{dimension}": {
-                        mode: [int(item.frame.index) for item in items]
-                    },
-                    f"primary_mode_{dimension}": primary,
-                    "compression": self.compression,
-                }
-                write_integrated_stack(entry, **kwargs)
-
-        write_dimension("1d")
-        write_dimension("2d")
-
-    def _perf_add(self, key: str, started: float) -> None:
-        if not self._perf_enabled:
-            return
-        self._perf_values[key] = self._perf_values.get(key, 0.0) + max(
-            0.0, time.perf_counter() - started,
-        )
-
-    def perf_snapshot(self) -> dict[str, float]:
-        return dict(self._perf_values)
-
-    def _write_named_modes(
-        self,
-        frame: Frame,
-        reduction: FrameReduction,
-        *,
-        mode_1d: str,
-        mode_2d: str,
-    ) -> None:
-        if mode_1d == DEFAULT_MODE_KEY and mode_2d == DEFAULT_MODE_KEY:
-            return
-        from xrd_tools.io.nexus import write_integrated_stack
-
         result_1d = reduction.result_1d
         result_2d = reduction.result_2d
-        top_1d = (
-            [result_1d]
-            if result_1d is not None and mode_1d == self._primary_mode_1d
-            else None
+        drop_1d = result_1d is not None and not np.isfinite(
+            np.asarray(result_1d.intensity, dtype=float)
+        ).any()
+        intensity_2d = (
+            None if result_2d is None
+            else np.asarray(result_2d.intensity, dtype=float)
         )
-        top_2d = (
-            [result_2d]
-            if result_2d is not None and mode_2d == self._primary_mode_2d
-            else None
-        )
-        extra_1d = (
-            {mode_1d: [result_1d]}
-            if result_1d is not None and mode_1d != self._primary_mode_1d
-            else None
-        )
-        extra_2d = (
-            {mode_2d: [result_2d]}
-            if result_2d is not None and mode_2d != self._primary_mode_2d
-            else None
-        )
-        if not any((top_1d, top_2d, extra_1d, extra_2d)):
-            return
-        write_integrated_stack(
-            self._h5[self.entry],
-            frame_indices=[int(frame.index)],
-            results_1d=top_1d,
-            results_2d=top_2d,
-            extra_modes_1d=extra_1d,
-            extra_modes_2d=extra_2d,
-            extra_mode_indices_1d=(
-                {mode_1d: [int(frame.index)]} if extra_1d else None
-            ),
-            extra_mode_indices_2d=(
-                {mode_2d: [int(frame.index)]} if extra_2d else None
-            ),
-            primary_mode_1d=self._primary_mode_1d,
-            primary_mode_2d=self._primary_mode_2d,
-            compression=self.compression,
-        )
-
-    def worker_process(
-        self, frame: Frame, reduction: FrameReduction
-    ) -> None:
-        """Prepare the persisted thumbnail on the parallel reduction worker."""
-
-        prepared = self._prepare_frame_thumbnail(
-            frame,
-            corrected_image=reduction.corrected_image,
+        drop_2d = result_2d is not None and (
+            not np.isfinite(intensity_2d).any()
+            or np.isclose(intensity_2d, -1.0, equal_nan=False).mean() >= 0.95
+            or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
+            or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
         )
         with self._prepared_thumbnails_lock:
-            # A Frame object may be re-fed while an earlier reduction for the
-            # same frame is still in flight.  Bind preparation to the exact
-            # result instead of the mutable/reusable Frame owner.
+            prepared = self._prepared_thumbnails.pop(id(reduction), None)
+        writer.write(self._write_frame_record(
+            frame,
+            reduction,
+            prepared=prepared,
+        ))
+        if drop_1d:
+            writer.drop_publication(int(frame.index), ResultMode.one_d(mode_1d))
+        if drop_2d:
+            writer.drop_publication(int(frame.index), ResultMode.two_d(mode_2d))
+        return frozenset(
+            mode for mode, dropped in (
+                (ResultMode.one_d(mode_1d), drop_1d),
+                (ResultMode.two_d(mode_2d), drop_2d),
+            ) if dropped
+        )
+
+    def worker_process(self, frame: Frame, reduction: FrameReduction) -> None:
+        """Prepare the persisted thumbnail on the parallel reduction worker."""
+        prepared = self._prepare_frame_thumbnail(
+            frame, corrected_image=reduction.corrected_image,
+        )
+        with self._prepared_thumbnails_lock:
             self._prepared_thumbnails[id(reduction)] = prepared
+
+    def _bind_run_saturation_mask(self, state: "_RunSaturationMask") -> None:
+        self._run_saturation_mask = state
 
     def _prepare_frame_thumbnail(
         self,
@@ -1025,21 +1189,19 @@ class NexusSink:
             return None, False
         raw = np.asarray(frame.image)
         if corrected_image is None:
-            img = np.asarray(raw, dtype=np.float32)
-            bg = frame.background
-            if bg is not None:
-                bg_arr = np.asarray(bg, dtype=np.float32)
-                if bg_arr.shape == () or bg_arr.shape == img.shape:
-                    img = img - bg_arr
+            image = np.asarray(raw, dtype=np.float32)
+            background = frame.background
+            if background is not None:
+                bg = np.asarray(background, dtype=np.float32)
+                if bg.shape == () or bg.shape == image.shape:
+                    image = image - bg
         else:
-            img = np.asarray(corrected_image, dtype=np.float32)
+            image = np.asarray(corrected_image, dtype=np.float32)
         plan = self._plan
         static_mask = None
         if plan is not None:
             static_mask = _as_bool_mask(
-                plan.mask,
-                "ReductionPlan.mask",
-                image_shape=raw.shape,
+                plan.mask, "ReductionPlan.mask", image_shape=raw.shape,
             )
             static_mask = _combined_mask(static_mask, frame.mask, raw.shape)
         run_mask = self._run_saturation_mask
@@ -1054,11 +1216,9 @@ class NexusSink:
         )
         return (
             make_thumbnail_array(
-                img,
+                image,
                 mask_flat=(
-                    None
-                    if resolved_mask is None
-                    else np.flatnonzero(resolved_mask)
+                    None if resolved_mask is None else np.flatnonzero(resolved_mask)
                 ),
                 max_size=self.thumbnail_max,
             ),
@@ -1071,183 +1231,212 @@ class NexusSink:
         reduction: FrameReduction,
         *,
         prepared: tuple[np.ndarray | None, bool] | None = None,
-    ) -> None:
-        """Per-frame source pointer + thumbnail (complete-record mode)."""
-        from xrd_tools.io.nexus_record import (
-            ensure_frames_container, write_frame_record,
-        )
-
+    ) -> RecordWrite:
         thumb, mask_baked = (
-            prepared
-            if prepared is not None
-            else self._prepare_frame_thumbnail(frame)
+            prepared if prepared is not None else self._prepare_frame_thumbnail(frame)
         )
-        write_frame_record(
-            ensure_frames_container(self._h5[self.entry]),
-            f"frame_{int(frame.index):04d}",
+        explicit_thumb = getattr(reduction, "thumbnail", None)
+        if explicit_thumb is not None:
+            thumb, mask_baked = explicit_thumb, False
+        path = getattr(frame, "source_path", None)
+        mode_1d = str(
+            getattr(reduction, "mode_1d", None)
+            or self._primary_mode_1d or DEFAULT_MODE_KEY
+        )
+        mode_2d = str(
+            getattr(reduction, "mode_2d", None)
+            or self._primary_mode_2d or DEFAULT_MODE_KEY
+        )
+        result_1d = reduction.result_1d
+        result_2d = reduction.result_2d
+        if result_1d is not None and not np.isfinite(
+            np.asarray(result_1d.intensity, dtype=float)
+        ).any():
+            result_1d = None
+        if result_2d is not None:
+            intensity = np.asarray(result_2d.intensity, dtype=float)
+            if (
+                not np.isfinite(intensity).any()
+                or np.isclose(intensity, -1.0, equal_nan=False).mean() >= 0.95
+                or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
+                or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
+            ):
+                result_2d = None
+        return RecordWrite(
+            label=int(frame.index),
+            result_1d=result_1d,
+            result_2d=result_2d,
+            mode_1d=mode_1d,
+            mode_2d=mode_2d,
             thumbnail=thumb,
             thumbnail_mask_baked=mask_baked,
-            source_path=(str(frame.source_path)
-                         if frame.source_path is not None else None),
-            source_frame_index=(int(frame.source_frame_index)
-                                if frame.source_frame_index is not None
-                                else 0),
-            timestamp=frame.metadata.get("timestamp"),
-            source_base=self._norm_source_base,
-            source_snapshot=self._source_snapshots_provenance.get(str(frame.source_path)),
+            mask_baked=mask_baked,
+            source_path=path,
+            source_frame_index=int(getattr(frame, "source_frame_index", None) or 0),
+            source_snapshot=self._source_snapshots.get(str(path), {}),
+            timestamp=(getattr(frame, "metadata", None) or {}).get("timestamp"),
+            metadata=dict(
+                getattr(reduction, "metadata", None)
+                or getattr(frame, "metadata", None)
+                or {}
+            ),
+            write_frame_record=bool(getattr(reduction, "write_frame_record", True)),
         )
 
-    def finish(self, result: ReductionResult) -> None:
-        if self._h5 is None:
-            return
-        tmp_path = self._tmp_path
-        try:
-            # Write the final short block without a redundant HDF5 sync; the
-            # metadata/provenance flush below is the one durable boundary.
-            self._flush_pending(force=True, sync=False)
-            # Persist the per-frame condition table (scan_data) after the final
-            # integrated frame, before close.  A finish-time single upsert is
-            # correct for a batch sink; only the GUI's SWMR live consumers would
-            # need scan_data mid-run (they'd require a per-write incremental
-            # upsert).  Any failure here propagates (after abort() below) so a
-            # lost condition table is surfaced, not silent — and abort()
-            # preserves the frames written so far (atomic mode keeps the tmp
-            # as <output>.partial instead of unlinking it, T0-6/S7).
-            scan = self._scan
-            if scan is not None:
-                scan_data = scan.to_scan_data()
-                if scan_data is not None and len(scan_data.columns):
-                    upsert_scan_metadata(
-                        self._h5[self.entry], scan_data, scan.frame_indices,
-                    )
-                if self.complete_record:
-                    geom = scan.geometry
-                    if geom is not None and scan_data is not None:
-                        from xrd_tools.io.nexus import write_per_frame_geometry
-                        write_per_frame_geometry(
-                            self._h5[self.entry], scan_data,
-                            list(scan.frame_indices), geom,
-                        )
-                    # Persist the canonical Diffractometer blob for offline
-                    # stitch/RSM — but ONLY when a complete object is present.
-                    # Today's Scan.geometry is a bare DiffractometerGeometry
-                    # (pyFAI half only, no xu axes / calibration), so persisting
-                    # it would be a misleading partial blob; the step-4 rewire
-                    # threads the full Diffractometer in and flips this on.
-                    from xrd_tools.core.geometry import Diffractometer
-                    if isinstance(geom, Diffractometer):
-                        from xrd_tools.io.nexus import write_diffractometer
-                        write_diffractometer(self._h5[self.entry], geom)
-                plan = self._plan
-                if plan is not None:
-                    from xrd_tools import __version__ as _xrd_tools_version
-                    from xrd_tools.core.provenance import write_provenance
-                    from xrd_tools.reduction.provenance_config import (
-                        build_reduction_config,
-                    )
+    def replace(self, frame: Frame, reduction: FrameReduction):
+        return self.write(frame, reduction)
 
-                    config, inputs = build_reduction_config((scan, plan))
-                    if self._run_configuration_provenance is not None:
-                        config["run_configuration"] = copy.deepcopy(
-                            self._run_configuration_provenance,
-                        )
-                    if self._source_execution_provenance is not None:
-                        config["source_execution"] = copy.deepcopy(
-                            self._source_execution_provenance,
-                        )
-                    write_provenance(
-                        self._h5,
-                        entry=self.entry,
-                        program="xrd-tools",
-                        program_version=_xrd_tools_version,
-                        config=config,
-                        inputs=inputs or None,
-                    )
-            self._h5.flush()
-            self._mark_pending_durable()
-            self._h5.close()
-            self._h5 = None
+    def flush(self, *, force: bool = False) -> None:
+        if self._writer is None:
+            return
+        self._apply_pending_extension()
+        if self._writer.phase.value == "finished":
+            return
+        self._writer.flush(force=force)
+
+    def _writer_finalization(self, writer: NexusRecordWriter) -> WriterFinalization:
+        scan = self._scan
+        plan = self._plan
+        if scan is None:
+            raise RuntimeError("NexusSink has no bound scan values")
+        from xrd_tools import __version__ as _xrd_tools_version
+        from xrd_tools.core.geometry import Diffractometer
+        from xrd_tools.reduction.provenance_config import build_reduction_config
+
+        scan_data = (
+            None
+            if self.incremental_finalization
+            else (scan.to_scan_data() if writer.fresh else None)
+        )
+        if plan is None:
+            config = inputs = None
+        else:
+            config, inputs = build_reduction_config(
+                (scan, plan), include_inputs=writer.fresh
+            )
+            if self._run_configuration is not None:
+                config["run_configuration"] = copy.deepcopy(
+                    self._run_configuration,
+                )
+            if self._source_execution is not None:
+                config["source_execution"] = copy.deepcopy(
+                    self._source_execution,
+                )
+        geometry = scan.geometry if self.complete_record else None
+        return WriterFinalization(
+            scan_data=scan_data,
+            frame_indices=(tuple(int(x) for x in scan.frame_indices)
+                           if scan_data is not None else ()),
+            geometry=geometry,
+            diffractometer=(geometry if isinstance(geometry, Diffractometer)
+                            else None),
+            provenance_config=config,
+            provenance_inputs=inputs,
+            program_version=_xrd_tools_version,
+            detector_calibration=(scan.extra or {}).get("detector_calibration"),
+            global_mask=(scan.extra or {}).get("global_mask"),
+            detector_shape=(scan.extra or {}).get("detector_shape"),
+            stitched_1d=(scan.extra or {}).get("stitched_1d"),
+            stitched_2d=(scan.extra or {}).get("stitched_2d"),
+            stitched_provenance=(scan.extra or {}).get("stitched_provenance"),
+        )
+
+    def truncate_epoch(self, written_labels) -> None:
+        writer = self._writer
+        if writer is None or writer.append_decision is None:
+            return
+        if self.append_preflight is not None:
+            self.append_preflight.truncate(written_labels)
+            return
+        if self.same_run_intent is None:
+            raise RuntimeError("pending lineage has no same-run source owner")
+        decision = self._pending_append_decision or writer.append_decision
+        decision, self.same_run_intent = truncate_append_epoch(
+            decision, self.same_run_intent, written_labels)
+        self._queue_append_decision(decision)
+
+    def commit_epoch(self, result: ReductionResult):
+        if getattr(result, "cancelled", False):
+            raise RuntimeError("a cancelled result cannot commit a live epoch")
+        if self._writer is None:
+            raise RuntimeError("epoch commit requires an owned Append-lineage writer")
+        self._apply_pending_extension()
+        writer = self._writer
+        if writer.phase.value == "active":
+            writer.finish(self._writer_finalization(writer))
+        else:
+            writer.finish()
+        anchor = seal_append_epoch(writer.append_decision)
+        self._transaction.commit_stream_epoch(self._attempt, lease=self._lease)
+        self._epoch_decision = anchor
+        if self.append_preflight is not None:
+            self.append_preflight._commit_epoch(anchor)
+        return anchor
+
+    def finish(self, result: ReductionResult) -> None:
+        self._apply_pending_extension()
+        writer = self._writer
+        if writer is None:
+            return
+        if getattr(result, "cancelled", False) and not writer.written_labels:
             self._scan = None
             self._plan = None
-            if tmp_path is not None:
-                if _target_state(self.path) != self.expected_target_state:
-                    raise RuntimeError("output target changed after writer admission")
-                tmp_path.replace(self.path)
-        except BaseException:
+            self._abort_composed()
+            if self.append_preflight is not None:
+                self.append_preflight._terminal(AppendPreflightState.ABORTED)
+            return
+        if getattr(result, "cancelled", False):
+            self.truncate_epoch(writer.written_labels)
+            self._apply_pending_extension()
+            writer = self._writer
+        if (writer.phase.value == "finished"
+                and self._transaction.snapshot().phase.value == "committed"
+                and self._transaction_owners is None):
+            self._scan = None
+            self._plan = None
+            return
+        # A retry resumes the writer's frozen finite state machine; rebuilding
+        # provenance/metadata here would create a second authority for it.
+        if writer.phase.value != "active":
+            writer.finish()
+            self._transaction.commit_stream(self._attempt, lease=self._lease)
+            self._release_terminal_lease()
+            if self.append_preflight is not None:
+                self.append_preflight._terminal(AppendPreflightState.COMMITTED)
+            self._scan = None
+            self._plan = None
+            return
+        try:
+            finalization = self._writer_finalization(writer)
+        except BaseException as primary:
             try:
-                self.abort(result)
-            finally:
-                raise
-        finally:
-            self._active_path = None
-            self._tmp_path = None
-            with self._prepared_thumbnails_lock:
-                self._prepared_thumbnails.clear()
-
-    def abort(self, result: ReductionResult) -> None:
-        """Failure teardown.  NEVER destroys written data (T0-6/S7): in atomic
-        mode the tmp file holds every frame written this run, so instead of
-        unlinking it (which converted a finish-time failure into deletion of
-        the whole run) it is preserved as ``<output>.partial`` and a warning
-        names it.  Non-atomic mode writes in place — nothing to move."""
-        h5 = self._h5
-        tmp_path = self._tmp_path
-        if h5 is not None and self._pending and not self._flush_failed:
-            try:
-                # Preserve successfully reduced frames in the partial artifact
-                # even when a different frame failed later in the run.
-                self._flush_pending(force=True, sync=False)
-            except Exception:
-                pass
-        self._h5 = None
+                self._abort_composed()
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
+        writer.finish(finalization)
+        self._transaction.commit_stream(self._attempt, lease=self._lease)
+        self._release_terminal_lease()
+        if self.append_preflight is not None:
+            self.append_preflight._terminal(AppendPreflightState.COMMITTED)
         self._scan = None
         self._plan = None
-        self._active_path = None
-        self._tmp_path = None
-        with self._prepared_thumbnails_lock:
-            self._prepared_thumbnails.clear()
-        self._pending.clear()
-        self._awaiting_durable.clear()
-        if h5 is not None:
-            try:
-                h5.close()
-            except Exception:  # pragma: no cover - best-effort cleanup
-                pass
-        if tmp_path is not None and tmp_path.exists():
-            partial = Path(str(self.path) + ".partial")
-            try:
-                tmp_path.replace(partial)
-                warnings.warn(
-                    f"NexusSink.abort: run failed — frames written so far are "
-                    f"preserved at {partial} (not a finalized scan file).",
-                    RuntimeWarning, stacklevel=2,
-                )
-            except Exception:  # pragma: no cover - best-effort preservation
-                # Could not even rename: leave the tmp where it is rather
-                # than deleting it.
-                warnings.warn(
-                    f"NexusSink.abort: run failed — could not rename the "
-                    f"partial output; data left at {tmp_path}.",
-                    RuntimeWarning, stacklevel=2,
-                )
 
-
-def _target_state(path: Path) -> tuple[int, int, int, int, int] | bool:
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return False
-    return (int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns),
-            int(stat.st_dev), int(stat.st_ino))
+    def abort(self, result: ReductionResult) -> None:
+        self._scan = None
+        self._plan = None
+        if self._transaction is not None and self._transaction_owners is not None:
+            try:
+                self._abort_composed()
+            except BaseException:
+                if self.append_preflight is not None:
+                    self.append_preflight._terminal(
+                        self.append_preflight._cleanup_failure_state())
+                raise
 
 
 class _RunSaturationMask:
-    """Session-owned, first-frame detector-value mask.
-
-    This state is deliberately outside :class:`ReductionPlan`: it is derived
-    runtime data, not frozen operator intent or provenance.  One lock protects
-    the first seed so pool workers can share one immutable bool array.
-    """
+    """Session-owned, immutable detector-value mask seeded by frame one."""
 
     __slots__ = ("enabled", "_seeded", "_mask", "_lock")
 
@@ -1316,7 +1505,15 @@ class ReductionSession:
     integrators, sink lifecycle, progress, and cancellation for the scan
     lifetime, so callers can feed chunks without rebuilding CSR-LUTs or
     reopening sinks every chunk.
-    """
+
+    Streaming callers drive ``submit``/``pause``/``resume`` from one
+    orchestrating thread; concurrent submitters are unsupported.  A streaming
+    ``executor`` must also be asynchronous — ``submit()`` has to return before
+    the submitted callable needs its decision — while its Future need expose
+    only a blocking, no-argument ``result()``.  That is not structurally
+    probeable, so an inline executor is unsupported for streaming (use chunked
+    execution or an async adapter), not rejected up front.  An ``accept_cb``
+    has shape ``(frame, publisher) -> int`` and publishes that exact attempt."""
 
     plan: ReductionPlan
     source: Scan | FrameSource
@@ -1353,6 +1550,22 @@ class ReductionSession:
     # RAISES on missing-normalization / GI-all-dummy instead of writing bad
     # data; the xdart GUI passes StrictPolicy.graceful() (never abort a save).
     strict: StrictPolicy = field(default_factory=StrictPolicy.loud)
+    # H10-C1: ONE narrow synchronous acceptance-admission hook, invoked on the
+    # CALLER thread inside submit() in publication order (§18.2) — Future bound,
+    # the same undecided ticket queued, inventory staged, THEN this authority runs
+    # and only its ACCEPTED opens the worker and writer — so an
+    # accounting owner's `accepted` state is visible before any outcome, write
+    # or public completion callback for that item can run.  It returns the
+    # per-label attempt revision, which travels with the queued item onto every
+    # FrameOutcomeReceipt.  Streaming-mode only; not an observer framework.
+    # AUTHORITATIVE: publish/return one exact-int attempt; pre-publication
+    # failure rejects, post-publication acceptance is final.
+    accept_cb: Callable[[Frame, Callable[[int], None]], int] | None = None
+    # H10-C1: ONE narrow per-item outcome receipt from the streaming writer
+    # loop (see FrameOutcomeReceipt).  Not a general callback framework: a
+    # single optional callable, streaming-mode only, exceptions caught+logged
+    # so a listener can never kill the writer (T0-7/S1 discipline).
+    outcome_cb: Callable[[FrameOutcomeReceipt], None] | None = None
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -1375,7 +1588,9 @@ class ReductionSession:
     )
     _products: dict[int, FrameReduction] = field(default_factory=dict, init=False, repr=False)
     _seen_idxs: set[int] = field(default_factory=set, init=False, repr=False)
-    _completed: int = field(default=0, init=False, repr=False)
+    # H10-C1 §4.1: the DISTINCT labels whose top-level sink hook returned
+    # successfully at least once — an identity set, not a post-sink counter.
+    _written_labels: set[int] = field(default_factory=set, init=False, repr=False)
     _cancelled: bool = field(default=False, init=False, repr=False)
     _failure: BaseException | None = field(default=None, init=False, repr=False)
     _started: bool = field(default=False, init=False, repr=False)
@@ -1388,11 +1603,19 @@ class ReductionSession:
         default_factory=dict, init=False, repr=False,
     )
     # Streaming-mode machinery (execution="streaming"); unused when chunked.
-    _semaphore: Any = field(default=None, init=False, repr=False)
+    _inflight: Any = field(default=None, init=False, repr=False)
     _write_queue: Any = field(default=None, init=False, repr=False)
     _writer_thread: Any = field(default=None, init=False, repr=False)
     _stream_started: bool = field(default=False, init=False, repr=False)
     _submitted: int = field(default=0, init=False, repr=False)
+    # §13.2.3: ATTEMPT-axis facts for the private cancellation diagnostic —
+    # `_written_attempts` counts queue items whose top-level sink hook returned
+    # successfully; `_dropped_attempts` counts queue items the writer recorded
+    # as cancelled-before-completion.  Same axis as `_submitted`, counted
+    # directly at their exact writer-loop branches — never derived by
+    # subtracting the distinct-label completion total from the attempt total.
+    _written_attempts: int = field(default=0, init=False, repr=False)
+    _dropped_attempts: int = field(default=0, init=False, repr=False)
     _writer_ident: int | None = field(default=None, init=False, repr=False)
     # Phase 4a: cooperative pause.  pause() quiesces the writer at a frame
     # boundary and rejects further submit()/process() until resume().
@@ -1402,6 +1625,15 @@ class ReductionSession:
     _state_lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False,
     )
+
+    @property
+    def _completed(self) -> int:
+        """DERIVED completed-progress (§4.1): the number of DISTINCT labels
+        whose top-level sink hook returned successfully at least once during
+        the run.  There is no independently incremented post-sink counter — a
+        re-fed label cannot inflate this and a later failed replacement cannot
+        decrement it."""
+        return len(self._written_labels)
 
     def _mark_cancelled(self) -> None:
         with self._state_lock:
@@ -1576,8 +1808,8 @@ class ReductionSession:
         """Set up the bounded in-flight window + single writer thread.
 
         Reuses the persistent pool (``self._worker``) and the per-thread
-        integrator provider; only adds a ``Semaphore`` (the in-flight bound), a
-        FIFO queue, and one consumer thread.  Called once from ``__post_init__``
+        integrator provider; only adds one identity-membership capacity owner,
+        a FIFO queue, and one consumer thread.  Called once from ``__post_init__``
         AFTER the executor + integrators + GI freeze are in place, so the freeze
         (which needs first+last frames) is fixed before any frame is submitted.
         """
@@ -1597,7 +1829,7 @@ class ReductionSession:
             else max(2, 2 * n_workers)
         )
         self.inflight_max = bound
-        self._semaphore = threading.Semaphore(bound)
+        self._inflight = _InFlightWindow(bound)
         self._write_queue = queue.Queue()
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
@@ -1626,8 +1858,24 @@ class ReductionSession:
         paths RETURN (never raise) so they don't escape the caller's ``run()``
         loop and tear the QThread down (the GIFreezeError trap); caller-contract
         violations (after ``finish()``, after a recorded failure, while paused)
-        still RAISE.
-        """
+        still RAISE.  An acceptance-admission failure (``accept_cb`` raising)
+        also RAISES loudly: pre-proof facts roll back; published acceptance is
+        final and wakes under cancellation.
+
+        One frame is ONE publication transaction owned by a single private
+        ticket (§18.2).  The work is dispatched first, but the ticket keeps it
+        — and the writer — gated until this call publishes the item's one
+        decision, and the authority runs only once a Future exists, the same
+        PENDING ticket is queued and the inventory is staged, so acceptance
+        stays exactly where §4.1 froze it.  Every failure before the authority
+        publishes rejects that ticket with no Future method or public effect;
+        inventory, submitted count and membership restore.  Afterwards an
+        interrupt fails/cancels and completes the SAME immutable receipt wake.
+        ``accept_cb(frame, publish_acceptance)`` must publish and return the
+        same positive exact int.  Called from one orchestrating thread
+        (as are ``pause``/``resume``); a streaming executor must be
+        asynchronous — ``submit()`` returns before the callable needs its
+        decision."""
         if self.execution != "streaming":
             raise RuntimeError("submit() requires execution='streaming'")
         if self._finished:
@@ -1642,64 +1890,150 @@ class ReductionSession:
         if self._is_cancelled():
             self._mark_cancelled()
             return False
-        # Bounded in-flight: blocks the reader so it can't outrun integration
-        # (flat peak memory).  Released by the writer thread per frame.  The
-        # permit is acquired BEFORE the frame is registered/dispatched, so a
-        # frame dropped while waiting on a full window (cancel / writer-death)
-        # never enters the scan inventory and is never counted as submitted.
-        # Timed-acquire loop: poll the cancel token so Stop/Pause can interrupt
-        # a full in-flight window without waiting for a worker slot to free.
-        # Returns cleanly (no raise) so the caller's stop-check handles it safely
-        # (raising here escapes through run() which has no except, tearing down
-        # the QThread — the same trap the GIFreezeError fix addressed).
-        while not self._semaphore.acquire(timeout=0.1):
+        label = int(frame.index)
+        ticket = _StreamPublication(frame)
+        try:
+            while not self._inflight.try_acquire(ticket, 0.1):
+                if self._is_cancelled():
+                    self._mark_cancelled()
+                    return False
+                if (self._writer_thread is not None
+                        and not self._writer_thread.is_alive()):
+                    self._record_failure(RuntimeError(
+                        "ReductionSession writer thread died; run cannot proceed"
+                    ))
+                    self._mark_cancelled()
+                    return False
             if self._is_cancelled():
                 self._mark_cancelled()
+                self._inflight.release(ticket)
                 return False
-            if (self._writer_thread is not None
-                    and not self._writer_thread.is_alive()):
-                # T0-7/S1 belt-and-suspenders: the writer died, so no slot
-                # will ever free.  Record the failure and return cleanly
-                # (matching the cancel path — raising here would escape the
-                # caller's run() and tear down the QThread); the NEXT submit
-                # raises the recorded failure at its fail-loud precheck.
-                self._record_failure(RuntimeError(
-                    "ReductionSession writer thread died; run cannot proceed"
-                ))
-                self._mark_cancelled()
-                return False
-        if self._is_cancelled():
-            self._mark_cancelled()
-            self._semaphore.release()
-            return False
-        # Permit held and not cancelled: NOW it is safe to register the frame in
-        # the scan inventory and dispatch it — every registered/counted frame
-        # from here on is genuinely in flight.
-        try:
+            _admission_trace("permit_acquired", label=label)
             image = self._prime_saturation_mask(frame, image)
-            self._register_process_frames([frame])
-            future = self._worker.submit(self._stream_reduce, frame, image)
+            ticket.future = self._worker.submit(
+                self._ticketed_stream_reduce, ticket, image)
+            _admission_trace("future_bound", label=label)
+            self._write_queue.put(ticket)
+            _admission_trace("queue_published", label=label)
+            self._stage_publication(ticket)
+            _admission_trace("inventory_staged", label=label)
+            self._emit_accepted(frame, ticket.store_accepted)
+            receipt = ticket.decision
+            if receipt is None or receipt[0] == _TICKET_REJECTED:
+                raise RuntimeError(
+                    "acceptance authority returned without an ACCEPTED receipt")
+            ticket.complete_wake()
         except BaseException as exc:
-            # Pool/interpreter-level dispatch failure: the in-flight permit
-            # acquired above must be returned, else later submits deadlock
-            # on a semaphore that can never refill.  Record fail-loud.
-            self._semaphore.release()
-            self._record_failure(exc)
-            self._mark_cancelled()
+            receipt = ticket.decision
+            if receipt is not None and receipt[0] == _TICKET_ACCEPTED:
+                self._record_failure(exc)
+                self._mark_cancelled()
+                self.cancel_token.cancel()
+                ticket.complete_wake()
+            else:
+                self._reject_publication(ticket, exc, label)
             raise
-        self._submitted += 1
-        self._write_queue.put((frame, future))
         return True
+
+    def _reject_publication(self, ticket: _StreamPublication,
+                            exc: BaseException, label: int) -> None:
+        """Undo one UNACCEPTED submission, invariant-first (§18.3).
+
+        Ordered so the run's lifecycle is consistent before anything that can
+        raise on its own: publish the shared REJECTED decision (waking a worker
+        or writer parked on it), restore the staged inventory/submitted facts
+        exactly, make the original the run's sticky failure and cancel, remove
+        capacity membership exactly once — and only THEN write the diagnostic.  Trace
+        I/O may therefore change WHICH exception reaches the caller (an
+        interrupt supersedes the stored original), not what the run recorded."""
+        ticket.reject_and_wake()
+        undo = ticket.take_rejection_undo()
+        if undo is not None:
+            undo()
+        self._record_failure(exc)
+        self._mark_cancelled()
+        self._inflight.release(ticket)
+        _admission_trace("submit_rejected", label=label, error=exc)
+
+    def _stage_publication(self, ticket: _StreamPublication) -> None:
+        """Stage this item's reversible facts — the private submitted-attempt
+        count and the scan inventory — arming the EXACT undo on the ticket
+        BEFORE any mutation, so even a staging failure landing mid-mutation
+        restores frame order, ``_frame_by_index``, the position map, prior
+        object identity and the submitted count.  Registration goes through the
+        same :meth:`_register_process_frames` the chunked path uses, so fresh
+        and replacement semantics cannot drift; only an out-of-order fresh
+        label (the one re-sorting case) pays an O(n) snapshot.  ``submit`` runs
+        on one orchestrating thread, so absolute restores are exact."""
+        frame = ticket.frame
+        frames = self.scan.frames
+        positions = self._scan_frame_positions
+        by_index = self.scan._frame_by_index
+        idx = int(frame.index)
+        pos = positions.get(idx)
+        prior_frame = frames[pos] if pos is not None else None
+        had_entry = idx in by_index
+        prior_entry = by_index.get(idx)
+        prior_submitted = self._submitted
+        resort = (list(frames), dict(positions)) if (
+            pos is None and frames and idx < int(frames[-1].index)) else None
+
+        def _undo() -> None:                    # armed BEFORE any mutation
+            self._submitted = prior_submitted
+            if resort is not None:              # staging rebuilt the ordering
+                frames[:] = resort[0]
+                positions.clear()
+                positions.update(resort[1])
+            elif pos is None:                   # appended in order
+                if frames and frames[-1] is frame:
+                    frames.pop()
+                positions.pop(idx, None)
+            else:                               # replaced in place
+                frames[pos] = prior_frame
+            if had_entry:
+                by_index[idx] = prior_entry
+            else:
+                by_index.pop(idx, None)
+
+        ticket.unstage = _undo
+        self._submitted += 1
+        self._register_process_frames([frame])
+
+    def _ticketed_stream_reduce(self, ticket: _StreamPublication,
+                                image: np.ndarray | None):
+        """The dispatched worker callable (§18.2): observe this item's ONE
+        publication decision, then run the unchanged :meth:`_stream_reduce`.
+        A REJECTED item exits here — before reduction, ``worker_process``
+        prep or any public effect — including when a hostile executor scheduled
+        it and then failed the caller's ``submit``."""
+        label = int(ticket.frame.index)
+        _admission_trace("submitted_callable_entered", label=label)
+        state, _attempt = ticket.await_decision()
+        if state == _TICKET_REJECTED:
+            _admission_trace("callable_unaccepted", label=label, state=state)
+            raise _ReductionCancelled(
+                f"frame {label} was never admitted; reduction not started"
+            )
+        _admission_trace("ticket_accepted", label=label)
+        return self._stream_reduce(ticket.frame, image)
 
     def _stream_reduce(self, frame: Frame, image: np.ndarray | None):
         """Worker-thread task: integrate, then run the sink's per-frame
         ``worker_process`` hook (if any) so expensive per-frame prep — e.g.
         xdart's thumbnail + raw-free — happens in PARALLEL across the pool
         rather than serially on the single writer thread.  The writer then only
-        does the index-addressed HDF5 write.  Cancellation/errors propagate
-        through the future to the writer loop unchanged.
+        does the index-addressed HDF5 write.  Cancellation/errors from the
+        REDUCTION propagate through the future to the writer loop unchanged.
+
+        Returns ``(reduction, prep_error)``.  A ``worker_process`` failure
+        happens AFTER a valid typed result exists, so it is carried back beside
+        that result instead of destroying it: the writer still reports the
+        typed COMPLETED outcome with its exact produced modes, then records the
+        prep failure on the fail-loud run path and writes nothing.
         """
+        label = int(frame.index)
         worker_process = getattr(self._sink, "worker_process", None)
+        _admission_trace("reduction_begin", label=label)
         reduction = _reduce_frame(
             frame, image, self.plan, self._integrators, self._plan_masks,
             self._frame_masks,
@@ -1708,12 +2042,66 @@ class ReductionSession:
             run_saturation_mask=self._run_saturation_mask,
             strict=self.strict,
         )
+        _admission_trace("reduction_end", label=label)
+        prep_error: BaseException | None = None
         try:
             if callable(worker_process):
+                _admission_trace("worker_process_begin", label=label)
                 worker_process(frame, reduction)
+                _admission_trace("worker_process_end", label=label)
+        except BaseException as exc:
+            prep_error = exc
         finally:
             reduction.corrected_image = None
-        return reduction
+        return reduction, prep_error
+
+    def _emit_accepted(self, frame: Frame, publish_acceptance:
+                       Callable[[int | None], None]) -> int | None:
+        """Run the two-argument authority: publish/return one positive exact
+        int; no callback is raw ``ACCEPTED(None)`` or retried."""
+        cb = self.accept_cb
+        if cb is None:
+            publish_acceptance(None)
+            return None
+        published: object = _MISSING
+
+        def _publish(attempt: int) -> None:
+            nonlocal published
+            _require_positive_exact_int(attempt, "published attempt")
+            publish_acceptance(attempt)
+            published = attempt
+
+        attempt = cb(frame, _publish)
+        _require_positive_exact_int(attempt, "returned attempt")
+        if published is _MISSING:
+            raise RuntimeError("acceptance authority returned without a receipt")
+        if attempt != published:
+            raise RuntimeError(f"published {published!r}, returned {attempt!r}")
+        return attempt
+
+    def _emit_outcome(self, frame_index: int, outcome: FrameOutcome, *,
+                      replacing: bool, reduction: FrameReduction | None = None,
+                      error: str | None = None,
+                      attempt: int | None = None) -> None:
+        """Deliver one :class:`FrameOutcomeReceipt` to ``outcome_cb`` (writer
+        thread).  A listener exception is caught + logged — it must never
+        escape the writer loop (T0-7/S1)."""
+        cb = self.outcome_cb
+        if cb is None:
+            return
+        receipt = FrameOutcomeReceipt(
+            frame_index=int(frame_index),
+            outcome=outcome,
+            replacing=bool(replacing),
+            produced_1d=getattr(reduction, "result_1d", None) is not None,
+            produced_2d=getattr(reduction, "result_2d", None) is not None,
+            error=error,
+            attempt=attempt,
+        )
+        try:
+            cb(receipt)
+        except Exception:
+            logger.exception("ReductionSession outcome_cb listener raised")
 
     def _writer_loop(self) -> None:
         """The single consumer thread: drain completed frames → sink by index.
@@ -1729,27 +2117,64 @@ class ReductionSession:
         while True:
             item = self._write_queue.get()
             if item is _STREAM_SENTINEL:
+                _admission_trace("writer_sentinel_exit")
                 self._write_queue.task_done()
                 break
-            frame, future = item
+            ticket = item
+            frame = ticket.frame
+            idx = int(frame.index)
+            # §18.2: the writer may dequeue a still-PENDING ticket.  It waits
+            # for the caller's one decision and NEVER decides for it; an
+            # exactly-REJECTED item is dropped without touching a Future or
+            # calling the sink — one ``task_done``, one release, no outcome.
+            state, attempt = ticket.await_decision()
+            if state == _TICKET_REJECTED:
+                _admission_trace("writer_dropped_unaccepted", label=idx)
+                self._complete_stream_publication(ticket)
+                continue
+            _admission_trace("writer_item_dequeued", label=idx, attempt=attempt)
+            replacing = idx in self._seen_idxs
             try:
                 try:
-                    reduction = future.result()
+                    reduction, prep_error = ticket.future.result()
                 except _ReductionCancelled:
+                    # The exact attempt-keyed drop identity (§13.2.3): this
+                    # queue item is the thing that was dropped in flight.
+                    self._dropped_attempts += 1
+                    self._emit_outcome(
+                        idx, FrameOutcome.CANCELLED_BEFORE_COMPLETION,
+                        replacing=replacing, attempt=attempt)
                     self._mark_cancelled()
                     if self.clear_frame_images:
                         frame.image = None
                         frame.background = None
                     continue
                 except BaseException as exc:  # integration failure for one frame
+                    self._emit_outcome(
+                        idx, FrameOutcome.FAILED,
+                        replacing=replacing, error=f"{type(exc).__name__}: {exc}",
+                        attempt=attempt)
                     self._record_failure(exc)
                     if self.clear_frame_images:
                         frame.image = None
                         frame.background = None
                     continue
+                # Compute success is observed BEFORE the sink write: a failed
+                # write must stay distinguishable from a failed compute.
+                self._emit_outcome(
+                    idx, FrameOutcome.COMPLETED,
+                    replacing=replacing, reduction=reduction, attempt=attempt)
+                if prep_error is not None:
+                    # The typed result is real and already reported; the sink's
+                    # pool-side worker_process prep is what failed.  Record it
+                    # on the fail-loud run path and do NOT write the frame — a
+                    # prep failure is neither a failed compute nor a write.
+                    self._record_failure(prep_error)
+                    if self.clear_frame_images:
+                        frame.image = None
+                        frame.background = None
+                    continue
                 try:
-                    idx = int(frame.index)
-                    replacing = idx in self._seen_idxs
                     self._seen_idxs.add(idx)
                     if self.retain_products:
                         self._products[idx] = reduction
@@ -1757,15 +2182,14 @@ class ReductionSession:
                         _emit_sink_replace(self._sink, frame, reduction)
                     else:
                         self._sink.write(frame, reduction)
-                        self._completed += 1
+                    # The top-level sink hook returned: record the DISTINCT
+                    # label identity (§4.1), never an increment — plus the
+                    # attempt-axis write fact for the cancellation diagnostic.
+                    self._written_labels.add(idx)
+                    self._written_attempts += 1
                 except BaseException as exc:
                     self._record_failure(exc)
                 else:
-                    # T0-7/S1: a progress-callback or image-clear exception
-                    # must be RECORDED, not allowed to escape — an escape
-                    # kills this thread, after which submit() blocks forever
-                    # on the in-flight semaphore and finish() join()s a dead
-                    # thread and reports SUCCESS with frames missing.
                     try:
                         _emit(self.progress_cb, self.scan.name, "write",
                               frame.index, self._completed, len(self.scan))
@@ -1776,8 +2200,16 @@ class ReductionSession:
                     except BaseException as exc:
                         self._record_failure(exc)
             finally:
-                self._semaphore.release()
-                self._write_queue.task_done()
+                self._complete_stream_publication(ticket)
+
+    def _complete_stream_publication(self, ticket: _StreamPublication) -> None:
+        try:
+            try:
+                self._inflight.release(ticket)
+            except BaseException as exc:
+                self._record_failure(exc)
+        finally:
+            self._write_queue.task_done()
 
     def drain(self, timeout: float | None = None, poll: float = 0.05) -> bool:
         """Block until every SUBMITTED frame has been written, WITHOUT closing
@@ -1899,7 +2331,10 @@ class ReductionSession:
             # join it so only completed frames are flushed (never a torn frame).
             self._write_queue.put(_STREAM_SENTINEL)
             if self._writer_thread is not None:
+                _admission_trace("writer_join_begin", timeout=join_timeout)
                 self._writer_thread.join(timeout=join_timeout)
+                _admission_trace("writer_join_end",
+                                 alive=self._writer_thread.is_alive())
                 if self._writer_thread.is_alive():
                     # Writer is still alive after the timeout (a stalled worker
                     # held the future.result() call and the sentinel hasn't been
@@ -1938,11 +2373,17 @@ class ReductionSession:
             failed=failure is not None,
             error=None if failure is None else str(failure),
         )
-        dropped = max(0, int(self._submitted) - int(self._completed))
+        # §13.2.3: the drop count is the DIRECT attempt-keyed tally from the
+        # writer loop's cancelled-before-completion branch — never derived by
+        # subtracting a distinct-label total from an attempt total (two
+        # successful writes of one label would fabricate a "dropped" item).
+        # All three logged quantities share the attempt axis.  Private
+        # diagnostic only; public projections stay distinct-label facts.
+        dropped = int(self._dropped_attempts)
         if cancelled and dropped:
             logger.info(
-                "cancelled: %d submitted, %d written, %d dropped in-flight",
-                self._submitted, self._completed, dropped,
+                "cancelled: %d attempts submitted, %d written, %d dropped in-flight",
+                self._submitted, self._written_attempts, dropped,
             )
         try:
             if self._started:
@@ -1974,19 +2415,28 @@ class ReductionSession:
                         RuntimeWarning, stacklevel=2,
                     )
                 elif failure is None:
+                    _admission_trace("sink_finish_begin")
                     self._sink.finish(self.result)
+                    _admission_trace("sink_finish_end")
                 else:
                     abort = getattr(self._sink, "abort", None)
                     if callable(abort):
+                        _admission_trace("sink_abort_begin")
                         abort(self.result)
+                        _admission_trace("sink_abort_end")
                     else:
+                        _admission_trace("sink_finish_begin", on_failure=True)
                         self._sink.finish(self.result)
+                        _admission_trace("sink_finish_end", on_failure=True)
         finally:
             if self._owns_worker and self._worker is not None:
                 # If the writer join timed out, the pool has stalled futures —
                 # shut down without waiting (don't re-hang here).
                 wait_for_pool = not _writer_timed_out
+                _admission_trace("pool_shutdown_enter", wait=wait_for_pool,
+                                 owned=True)
                 self._worker.shutdown(wait=wait_for_pool, cancel_futures=True)
+                _admission_trace("pool_shutdown_exit", owned=True)
             self._worker = None
             self._finished = True
 
@@ -2025,12 +2475,7 @@ class ReductionSession:
         frame: Frame,
         image: np.ndarray | None,
     ) -> np.ndarray | None:
-        """Seed from the first image already entering this session.
-
-        Source-fed streaming passes that array straight through.  A direct
-        frame submission loads at most once and returns the same array to the
-        worker, so first-frame seeding never introduces a second source open.
-        """
+        """Seed once from the first image already entering this session."""
         if self._run_saturation_mask.seeded:
             return image
         if not self._run_saturation_mask.enabled:
@@ -2211,7 +2656,11 @@ class ReductionSession:
                     _emit_sink_replace(self._sink, frame, reduction)
                 else:
                     self._sink.write(frame, reduction)
-                    self._completed += 1
+                # The top-level sink hook returned: record the DISTINCT label
+                # identity (§4.1) — a re-fed index never double-counts — plus
+                # the attempt-axis write fact (kept exact in both modes).
+                self._written_labels.add(idx)
+                self._written_attempts += 1
                 _emit(self.progress_cb, self.scan.name, "write", frame.index, self._completed, len(self.scan))
                 if self.clear_frame_images:
                     frame.image = None
@@ -2264,6 +2713,9 @@ def run_reduction(
 ) -> ReductionResult:
     """Run a headless reduction job over all frames in ``scan`` or a source.
 
+    This one-orchestrating-thread owner uses raw ``ACCEPTED(None)``; direct
+    sessions may supply ``accept_cb(frame, publish_acceptance)``.
+
     Parameters
     ----------
     plan
@@ -2293,7 +2745,10 @@ def run_reduction(
         Optional execution policy for per-frame work inside each chunk.  Pass
         an executor with ``submit()``, ``True`` for a default
         :class:`ThreadPoolExecutor`, or an integer worker count.  Sink writes
-        remain ordered on the caller thread.
+        remain ordered on the caller thread.  A returned Future need expose
+        only a blocking, no-argument ``result()``; a ``"streaming"`` executor
+        must also be asynchronous (``submit()`` returns before the submitted
+        callable needs its decision), driven from one orchestrating thread.
     gi_freeze_mode
         Optional grazing-incidence common-grid freeze policy.  ``"first_frame"``
         scouts the first frame; ``"scout_union"`` scouts first+last (or
@@ -2362,7 +2817,7 @@ def run_reduction(
             # ``submit(frame, image)`` as decoded numpy arrays — so no live h5py/
             # fabio handle ever crosses into a reduction worker and the public
             # ``open_source(...) -> run_reduction(...)`` path never reopens the
-            # file per frame.  ``submit``'s semaphore bounds in-flight memory, so
+            # file per frame.  The in-flight window bounds memory, so
             # the cursor cannot outrun the workers.  A plain ``Scan`` source
             # yields ``None`` images here and keeps its existing per-frame
             # (in-memory / lazy) load behavior unchanged.
@@ -2838,6 +3293,115 @@ def _coerce_executor(executor: Any | None):
 
 class _ReductionCancelled(Exception):
     """Internal sentinel used to stop queued worker tasks without failure."""
+
+
+# How often a parked worker or writer wakes to re-check its item's decision.
+# The orchestrating caller publishes microseconds later on EVERY path, failure
+# transactions included, and an expired wake is never an outcome (§19.4).
+_TICKET_DECISION_TIMEOUT = 60.0
+_TICKET_ACCEPTED, _TICKET_REJECTED = "ACCEPTED", "REJECTED"
+_MISSING = object()
+
+
+def _require_positive_exact_int(value: Any, name: str) -> None:
+    if type(value) is not int or value < 1:
+        raise TypeError(f"{name} must be a positive exact int; got {value!r}")
+
+
+class _InFlightWindow:
+    __slots__ = ("limit", "_members", "_changed")
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._members: dict[_StreamPublication, None] = {}
+        self._changed = threading.Event()
+
+    def try_acquire(self, ticket: _StreamPublication, timeout: float) -> bool:
+        if ticket in self._members:
+            return True
+        if len(self._members) < self.limit:
+            self._members[ticket] = None
+            return True
+        self._changed.wait(timeout)
+        self._changed.clear()
+        return False
+
+    def release(self, ticket: _StreamPublication) -> bool:
+        first: BaseException | None = None
+        try:
+            removed = self._members.pop(ticket, _MISSING) is not _MISSING
+        except BaseException as exc:
+            first = exc
+            try:
+                removed = self._members.pop(ticket, _MISSING) is not _MISSING
+            except BaseException:
+                raise first
+        if removed or first is not None:
+            try:
+                self._changed.set()
+            except BaseException as exc:
+                first = first or exc
+                try:
+                    self._changed.set()
+                except BaseException:
+                    raise first
+        if first is not None:
+            raise first
+        return removed
+
+
+class _StreamPublication:
+    __slots__ = ("frame", "future", "unstage", "_decision", "_decided")
+
+    def __init__(self, frame: Frame) -> None:
+        self.frame = frame
+        self.future: Any = None
+        self.unstage: Callable[[], None] | None = None
+        self._decision: tuple[str, int | None] | None = None
+        self._decided = threading.Event()
+
+    @property
+    def decision(self) -> tuple[str, int | None] | None:
+        return self._decision
+
+    def store_accepted(self, attempt: int | None) -> None:
+        if attempt is not None:
+            _require_positive_exact_int(attempt, "published attempt")
+        receipt = (_TICKET_ACCEPTED, attempt)
+        current = self._decision
+        if current is None:
+            self._decision = receipt
+        elif current != receipt:
+            raise RuntimeError("contradictory publication decision")
+
+    def reject_and_wake(self) -> None:
+        current = self._decision
+        if current is None:
+            self._decision = (_TICKET_REJECTED, None)
+        elif current[0] != _TICKET_REJECTED:
+            raise RuntimeError("accepted publication cannot be rejected")
+        self._decided.set()
+
+    def complete_wake(self) -> None:
+        if self._decision is None:
+            raise RuntimeError("cannot wake an undecided publication")
+        self._decided.set()
+
+    def take_rejection_undo(self) -> Callable[[], None] | None:
+        receipt = self._decision
+        if receipt is not None and receipt[0] == _TICKET_ACCEPTED:
+            return None
+        undo = self.unstage
+        self.unstage = None
+        return undo
+
+    def await_decision(self, timeout: float = _TICKET_DECISION_TIMEOUT
+                       ) -> tuple[str, int | None]:
+        while True:
+            self._decided.wait(timeout)
+            receipt = self._decision
+            if receipt is not None:
+                return receipt
 
 
 # Pushed onto a streaming session's write queue by ``finish`` to tell the
@@ -3377,7 +3941,20 @@ def _combined_mask(
         image_shape,
         frame_mask_cache,
     )
-    return combine_detector_masks(plan_mask, frame_mask, image_shape)
+    if plan_mask is not None and plan_mask.shape != image_shape:
+        raise ValueError(
+            f"ReductionPlan.mask shape {plan_mask.shape} does not match "
+            f"image shape {image_shape}"
+        )
+    if frame_mask is not None and frame_mask.shape != image_shape:
+        raise ValueError(
+            f"Frame.mask shape {frame_mask.shape} does not match image shape {image_shape}"
+        )
+    if plan_mask is None:
+        return frame_mask
+    if frame_mask is None:
+        return plan_mask
+    return plan_mask | frame_mask
 
 
 def _cached_frame_mask_for_shape(

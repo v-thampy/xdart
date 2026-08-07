@@ -35,6 +35,7 @@ from xrd_tools.session import (
     FrameEvent,
     FrameRecordStore,
     ProgressEvent,
+    ResultMode,
     ScanSession,
     StateChangeEvent,
 )
@@ -78,6 +79,71 @@ def _frame_record_store_array_nbytes(store: FrameRecordStore) -> int:
                 if values is not None:
                     total += np.asarray(values).nbytes
     return total
+
+
+def test_h10_c4_external_ledger_is_exact_identity_and_validated_pre_engine():
+    """C4 composes the already-created per-output ledger into ScanSession.
+    Mode/target mismatches are rejected before ``sink.begin`` or engine work;
+    callers that omit the seam retain the default one-ledger construction."""
+    import inspect
+
+    from xrd_tools.session import StageLedger
+
+    assert "accounting" in inspect.signature(ScanSession).parameters, (
+        "C4 owner missing: ScanSession must accept the one external StageLedger"
+    )
+    mode = ResultMode.one_d()
+    target_map = {mode: ("nexus:/tmp/c4.nxs",)}
+
+    class BeginSpy(MemorySink):
+        def __init__(self):
+            super().__init__()
+            self.begins = 0
+
+        def begin(self, scan, plan):
+            self.begins += 1
+            return super().begin(scan, plan)
+
+    def source():
+        return Scan("c4", _frames(1), integrator=object())
+
+    exact = StageLedger(required_modes=(mode,), targets_by_mode=target_map)
+    sink = BeginSpy()
+    session = ScanSession(
+        ReductionPlan(integration_2d=None), source(), sink=sink, executor=1,
+        accounting=exact, targets_by_mode=target_map)
+    assert session.accounting is exact
+    assert sink.begins == 1
+    session.finish(raise_on_failure=False)
+
+    wrong_target = StageLedger(
+        required_modes=(mode,),
+        targets_by_mode={mode: ("nexus:/tmp/other.nxs",)},
+    )
+    sink = BeginSpy()
+    with pytest.raises(ValueError, match="target map"):
+        ScanSession(
+            ReductionPlan(integration_2d=None), source(), sink=sink, executor=1,
+            accounting=wrong_target, targets_by_mode=target_map)
+    assert sink.begins == 0
+
+    wrong_mode = ResultMode.two_d()
+    wrong_modes = StageLedger(
+        required_modes=(wrong_mode,),
+        targets_by_mode={wrong_mode: ("nexus:/tmp/c4.nxs",)},
+    )
+    sink = BeginSpy()
+    with pytest.raises(ValueError, match="required modes"):
+        ScanSession(
+            ReductionPlan(integration_2d=None), source(), sink=sink, executor=1,
+            accounting=wrong_modes, targets_by_mode=target_map)
+    assert sink.begins == 0
+
+    default = ScanSession(
+        ReductionPlan(integration_2d=None), source(), sink=MemorySink(),
+        executor=1, targets_by_mode=target_map)
+    assert default.accounting is not exact
+    default.finish(raise_on_failure=False)
 
 
 @pytest.fixture(autouse=True)
@@ -286,30 +352,6 @@ def test_event_sink_wrapper_preserves_single_writer_contract():
     # injects worker_process, so the wrapper must still fan it to pool workers
     # even though MemorySink does not define it (expect_worker_process=True).
     assert_streaming_contract(spy, caller, n_frames=4, expect_worker_process=True)
-
-
-def test_event_sink_exposes_worker_process_only_when_inner_sink_owns_it():
-    """A plain sink must not make reduction build a discarded corrected image."""
-    from types import SimpleNamespace
-
-    from xrd_tools.session.scan_session import _EventSink
-
-    plain = _EventSink(SimpleNamespace(), lambda _frame, _reduction: None)
-    assert getattr(plain, "worker_process", None) is None
-
-    calls = []
-    hooked = _EventSink(
-        SimpleNamespace(
-            worker_process=lambda frame, reduction: calls.append(
-                (frame, reduction)
-            )
-        ),
-        lambda _frame, _reduction: None,
-    )
-    worker_process = getattr(hooked, "worker_process", None)
-    assert callable(worker_process)
-    worker_process("frame", "reduction")
-    assert calls == [("frame", "reduction")]
 
 
 # ── adversarial-audit hardening (the event contract must be tamper-evident +
@@ -579,65 +621,24 @@ def test_optional_record_store_can_mark_completed_writes_persisted_for_eviction(
         executor=2,
         record_store=store,
         record_store_persisted_on_write=True,
+        obligations=("nexus:s",),
+        write_targets_by_mode={ResultMode.one_d(): ("nexus:s",)},
     )
     for fr in frames:
         sess.submit(fr)
-    sess.finish()
+    assert sess.pause(timeout=20.0), "the writer did not drain"
 
+    # Bounded DURING the run: exactly the durable overflow is thinned.
     assert store.get(0) is not None and store.get(1) is not None
     assert not store.has_heavy_payload(0)
     assert store.has_heavy_payload(1)
 
-
-def test_buffered_sink_marks_records_only_after_durable_receipt():
-    class BufferedSink:
-        def __init__(self):
-            self.pending: list[int] = []
-            self.receipts: list[int] = []
-
-        def begin(self, scan, plan):
-            return None
-
-        def write(self, frame, reduction):
-            self.pending.append(int(frame.index))
-            if len(self.pending) == 2:
-                self.receipts.extend(self.pending)
-                self.pending.clear()
-
-        def take_persisted_labels(self):
-            labels = tuple(self.receipts)
-            self.receipts.clear()
-            return labels
-
-        def finish(self, result):
-            self.receipts.extend(self.pending)
-            self.pending.clear()
-
-    store = FrameRecordStore(max_heavy_items=None)
-    frames = _frames(3)
-    sink = BufferedSink()
-    sess = ScanSession(
-        ReductionPlan(integration_2d=None),
-        Scan("s", frames, integrator=object()),
-        sink=sink,
-        executor=1,
-        record_store=store,
-        record_store_persisted_on_write=False,
-    )
-    sess.submit(frames[0])
-    assert sess.pause(timeout=10)
-    assert not store.is_persisted(0)
-
     sess.resume()
-    sess.submit(frames[1])
-    assert sess.pause(timeout=10)
-    assert store.is_persisted(0)
-    assert store.is_persisted(1)
-
-    sess.resume()
-    sess.submit(frames[2])
     sess.finish()
-    assert store.is_persisted(2)
+    # H10-C2-A: the ONE post-terminal sweep then releases the remaining
+    # current-durable heavy data as well; the light records stay.
+    assert not store.has_heavy_payload(1)
+    assert store.get(0) is not None and store.get(1) is not None
 
 
 def test_live_store_config_wired_through_scan_session_evicts_persisted_completions():
@@ -658,14 +659,17 @@ def test_live_store_config_wired_through_scan_session_evicts_persisted_completio
         executor=2,
         record_store=store,
         record_store_persisted_on_write=True,
+        obligations=("nexus:s",),
+        write_targets_by_mode={ResultMode.one_d(): ("nexus:s",)},
     )
     for fr in frames:
         sess.submit(fr)
-    sess.finish()
+    assert sess.pause(timeout=20.0), "the writer did not drain"
 
     # Every completed frame is in the store...
     assert len(store) == cap + 3
-    # ...but heavy arrays are bounded at the cap: exactly the overflow is thinned.
+    # ...but heavy arrays are bounded at the cap DURING the run: exactly the
+    # durable overflow is thinned.
     heavy = sum(1 for fr in frames if store.has_heavy_payload(fr.index))
     assert heavy == cap
     thinned = sum(1 for fr in frames if not store.has_heavy_payload(fr.index))
@@ -675,6 +679,13 @@ def test_live_store_config_wired_through_scan_session_evicts_persisted_completio
     rec = store.get(a_thinned.index)
     assert rec is not None
     assert rec.view_1d().intensity_1d is None
+
+    sess.resume()
+    sess.finish()
+    # H10-C2-A: the post-terminal sweep releases the rest of the current-durable
+    # heavy data; every light record is retained.
+    assert len(store) == cap + 3
+    assert sum(1 for fr in frames if store.has_heavy_payload(fr.index)) == 0
 
 
 def test_long_live_scan_record_store_plateaus_under_item_bound():
@@ -696,6 +707,8 @@ def test_long_live_scan_record_store_plateaus_under_item_bound():
         executor=2,
         record_store=store,
         record_store_persisted_on_write=True,
+        obligations=("nexus:s",),
+        write_targets_by_mode={ResultMode.one_d(): ("nexus:s",)},
     )
     for frame in frames:
         sess.submit(frame)
@@ -707,3 +720,368 @@ def test_long_live_scan_record_store_plateaus_under_item_bound():
         _frame_record_store_array_nbytes(store) / 1024.0 / n_frames
     )
     assert retained_kb_per_frame < retained_kb_per_submitted_frame_budget
+
+
+# ── H10-C2-B: the coordinated session's resource envelope ────────────────────
+#
+# A materialized ``Scan`` is NOT descriptor-managed: the accepted C1 minimal
+# executor duck and every existing row above stay green.  A descriptor-managed
+# source opts into envelope resolution, early executor validation and the typed
+# pre-effect error.
+
+
+class _DescriptorManagedSource:
+    """The narrow descriptor-managed contract ScanSession coordinates."""
+
+    def __init__(self, n=4, *, height=2, width=2, itemsize=2):
+        self.frame_indices = range(n)
+        self.name = "descriptor-source"
+        self.integrator = object()
+        self.allocation = None
+        self.bind_calls = []
+        self.effects = []
+        self._height, self._width, self._itemsize = height, width, itemsize
+
+    def container_descriptor(self):
+        from xrd_tools.sources.descriptor import ContainerDescriptor
+        self.effects.append("descriptor")
+        return ContainerDescriptor(
+            path=Path("/data/descriptor-source.h5"),
+            dataset_path="/entry/data/data",
+            frame_count=len(self.frame_indices),
+            frame_shape=(self._height, self._width),
+            dtype=np.dtype(f"uint{self._itemsize * 8}"))
+
+    def bind_allocation(self, allocation):
+        if self.allocation is not None and self.allocation != allocation:
+            raise ValueError("a second, different allocation was bound")
+        self.bind_calls.append(allocation)
+        self.allocation = allocation
+
+    def to_scan(self, **kwargs):
+        """Real sources carry their reduction context through ``to_scan``; the
+        bare-duck path in ``_coerce_to_scan`` drops it."""
+        return Scan(self.name,
+                    [Frame(int(i), image=np.full((2, 2), i, dtype=float))
+                     for i in self.frame_indices],
+                    **kwargs)
+
+    def frame_for(self, index):
+        self.effects.append(("frame_for", index))
+        return Frame(int(index), image=np.full((2, 2), index, dtype=float))
+
+    def load_frame(self, index):
+        self.effects.append(("load_frame", index))
+        return np.full((2, 2), index, dtype=float)
+
+
+class _CallerPool:
+    """A caller-owned executor: ScanSession validates it, never shuts it down."""
+
+    def __init__(self, max_workers=None):
+        if max_workers is not None:
+            self._max_workers = max_workers
+        self.shutdown_calls = 0
+
+    def submit(self, fn, *a, **kw):
+        raise AssertionError("no work may be submitted before validation")
+
+    def shutdown(self, *a, **kw):
+        self.shutdown_calls += 1
+
+
+def _envelope_session(source, **kw):
+    kw.setdefault("envelope_bytes", 64 * 1024 ** 3)
+    return ScanSession(ReductionPlan(integration_2d=None), source,
+                       sink=MemorySink(), **kw)
+
+
+def test_c2b_materialized_scan_keeps_the_accepted_c1_minimal_duck():
+    """No descriptor, no envelope: the C1 contract is untouched."""
+    session = _standard_session(2)
+    try:
+        assert session.policy is None or session.policy.allocation is None
+    finally:
+        session.finish(raise_on_failure=False)
+
+
+def test_c2b_descriptor_managed_source_is_bound_before_any_frame_effect():
+    source = _DescriptorManagedSource()
+    session = _envelope_session(source, executor=1)
+    try:
+        assert len(source.bind_calls) == 1
+        assert source.effects[0] == "descriptor"
+        assert not any(isinstance(e, tuple) for e in source.effects)
+        assert session.policy.allocation is source.allocation
+    finally:
+        session.finish(raise_on_failure=False)
+
+
+def test_c2b_undersize_envelope_raises_before_any_bind_or_sink_effect():
+    from xrd_tools.session.policy import SessionEnvelopeError
+
+    source = _DescriptorManagedSource()
+    sink = MemorySink()
+    with pytest.raises(SessionEnvelopeError) as exc:
+        ScanSession(ReductionPlan(integration_2d=None), source, sink=sink,
+                    envelope_bytes=4096)
+    assert exc.value.available_bytes == 4096
+    assert exc.value.required_bytes > 4096
+    assert source.bind_calls == []
+    assert source.effects == ["descriptor"]
+    assert not getattr(sink, "results", None)
+
+
+def test_c2b_managed_external_executor_must_declare_positive_capacity():
+    source = _DescriptorManagedSource()
+    pool = _CallerPool(max_workers=None)          # cannot prove its bound
+    with pytest.raises(ValueError):
+        _envelope_session(source, executor=pool)
+    assert pool.shutdown_calls == 0, "a caller pool is never shut down"
+    assert source.bind_calls == []
+
+
+def test_c2b_managed_external_executor_capacity_may_be_declared_explicitly():
+    source = _DescriptorManagedSource()
+    pool = _CallerPool(max_workers=None)
+    session = _envelope_session(source, executor=pool, executor_workers=2)
+    try:
+        # the pool's declared capacity IS its request, and must equal the grant
+        assert source.allocation.workers == 2
+        assert pool.shutdown_calls == 0
+    finally:
+        session.finish(raise_on_failure=False)
+        assert pool.shutdown_calls == 0
+
+
+def test_c2b_managed_external_executor_beyond_the_grant_is_refused_early():
+    source = _DescriptorManagedSource()
+    pool = _CallerPool(max_workers=64)
+    with pytest.raises(ValueError):
+        _envelope_session(source, executor=pool,
+                          envelope_bytes=3 * 1024 ** 3)   # grants far fewer
+    assert pool.shutdown_calls == 0
+    assert source.bind_calls == []
+
+
+def test_c2b_an_explicit_policy_is_revalidated_not_trusted():
+    import dataclasses as _dc
+    from xrd_tools.session.policy import (
+        SessionResourceRequirements,
+        resolve_session_policy,
+    )
+
+    req = SessionResourceRequirements(height=2, width=2, native_itemsize=2,
+                                      modes_1d=1, npt_1d=1000)
+    good = resolve_session_policy(req, envelope_bytes=64 * 1024 ** 3, env={},
+                                  requests={"workers": 1,
+                                            "reduction_inflight": 1})
+    source = _DescriptorManagedSource()
+    session = _envelope_session(source, executor=1, policy=good)
+    try:
+        # the caller's EXACT object is bound, never an equal reconstruction
+        assert source.allocation is good.allocation
+    finally:
+        session.finish(raise_on_failure=False)
+
+    forged = _dc.replace(good, allocation=_dc.replace(
+        good.allocation, counts={**good.allocation.counts, "queue_depth": 999}))
+    with pytest.raises(ValueError):
+        _envelope_session(_DescriptorManagedSource(), executor=1, policy=forged)
+
+
+def test_c2b_integer_executor_is_a_worker_request_not_the_owned_count():
+    """For a descriptor-managed source an integer ``executor`` is a REQUEST;
+    the coordinator owns a pool sized to the granted ``allocation.workers``."""
+    source = _DescriptorManagedSource()
+    session = _envelope_session(source, executor=64)
+    try:
+        alloc = source.allocation
+        assert alloc.workers >= 1
+        assert alloc.workers <= 64
+        assert session.policy.allocation is alloc
+    finally:
+        session.finish(raise_on_failure=False)
+
+
+def test_c2b_the_granted_inflight_bound_is_actually_wired_not_just_reported():
+    """``allocation.reduction_inflight`` must become the real coordinated
+    inflight bound - never an unconsumed report field."""
+    from xrd_tools.session.policy import minimum_bytes, requirements_from
+
+    source = _DescriptorManagedSource()
+    plan = ReductionPlan(integration_2d=None)
+    # Pin the envelope to exactly ``M`` so every count is granted its MINIMUM:
+    # the granted inflight is then 1, while ReductionSession's own default is
+    # ``max(2, 2 * n_workers)`` = 2.  A grant that merely coincides with that
+    # default cannot discriminate, so the bound must be pinned apart from it.
+    envelope = minimum_bytes(requirements_from(source.container_descriptor(), plan))
+    session = _envelope_session(source, executor=1, envelope_bytes=envelope)
+    try:
+        alloc = source.allocation
+        assert (alloc.workers, alloc.reduction_inflight) == (1, 1)
+        assert session._session.inflight_max == alloc.reduction_inflight == 1
+    finally:
+        session.finish(raise_on_failure=False)
+
+
+def test_c2b_a_caller_inflight_request_must_match_an_explicit_policy():
+    """With an explicit policy a caller ``inflight_max`` is a request that must
+    agree with the granted bound, and disagreement rejects before effects."""
+    from xrd_tools.session.policy import (
+        SessionResourceRequirements,
+        resolve_session_policy,
+    )
+
+    req = SessionResourceRequirements(height=2, width=2, native_itemsize=2,
+                                      modes_1d=1, npt_1d=1000)
+    good = resolve_session_policy(req, envelope_bytes=64 * 1024 ** 3, env={},
+                                  requests={"workers": 1,
+                                            "reduction_inflight": 1})
+    source = _DescriptorManagedSource()
+    session = _envelope_session(
+        source, executor=1, policy=good,
+        inflight_max=good.allocation.reduction_inflight)
+    try:
+        assert source.allocation is good.allocation
+    finally:
+        session.finish(raise_on_failure=False)
+
+    conflicting = _DescriptorManagedSource()
+    with pytest.raises(ValueError):
+        _envelope_session(conflicting, executor=1, policy=good,
+                          inflight_max=good.allocation.reduction_inflight + 5)
+    assert conflicting.bind_calls == []
+
+
+# ── correction 1: the executor / inflight boundary, all before any effect ────
+
+def _alloc_for(source, plan=None, **kw):
+    from xrd_tools.session.policy import requirements_from, resolve_session_policy
+    plan = plan or ReductionPlan(integration_2d=None)
+    req = requirements_from(source.container_descriptor(), plan)
+    return resolve_session_policy(req, envelope_bytes=64 * 1024 ** 3, env={},
+                                  **kw)
+
+
+def test_c1_non_positive_or_malformed_integer_executor_rejects_before_bind():
+    for bad in (0, -1, 2.5):
+        source = _DescriptorManagedSource()
+        with pytest.raises(ValueError):
+            _envelope_session(source, executor=bad)
+        assert source.bind_calls == []
+        assert source.effects in ([], ["descriptor"])
+
+
+def test_c1_conflicting_executor_and_executor_workers_reject_before_bind():
+    source = _DescriptorManagedSource()
+    with pytest.raises(ValueError):
+        _envelope_session(source, executor=4, executor_workers=2)
+    assert source.bind_calls == []
+    # the same value twice is one unambiguous request
+    ok = _DescriptorManagedSource()
+    session = _envelope_session(ok, executor=2, executor_workers=2)
+    try:
+        assert len(ok.bind_calls) == 1
+    finally:
+        session.finish(raise_on_failure=False)
+
+
+def test_c1_non_positive_inflight_max_rejects_before_bind():
+    for bad in (0, -3, 1.5):
+        source = _DescriptorManagedSource()
+        with pytest.raises(ValueError):
+            _envelope_session(source, executor=1, inflight_max=bad)
+        assert source.bind_calls == []
+
+
+def test_c1_caller_pool_must_equal_the_grant_exactly():
+    """A pool SMALLER than the grant is as wrong as a larger one: the policy
+    would claim workers the pool cannot supply."""
+    explicit = _alloc_for(_DescriptorManagedSource(), requests={"workers": 2,
+                                                               "reduction_inflight": 2})
+    grant = explicit.allocation.workers
+    for capacity in (grant - 1, grant + 1):
+        source = _DescriptorManagedSource()
+        pool = _CallerPool(max_workers=capacity)
+        with pytest.raises(ValueError):
+            _envelope_session(source, executor=pool, policy=explicit)
+        assert source.bind_calls == []
+        assert pool.shutdown_calls == 0
+    exact = _DescriptorManagedSource()
+    pool = _CallerPool(max_workers=grant)
+    session = _envelope_session(exact, executor=pool, policy=explicit)
+    try:
+        assert exact.allocation is explicit.allocation
+        assert pool.shutdown_calls == 0
+    finally:
+        session.finish(raise_on_failure=False)
+        assert pool.shutdown_calls == 0
+
+
+def test_c1_caller_pool_max_workers_and_explicit_capacity_must_agree():
+    source = _DescriptorManagedSource()
+    pool = _CallerPool(max_workers=4)
+    with pytest.raises(ValueError):
+        _envelope_session(source, executor=pool, executor_workers=2)
+    assert source.bind_calls == [] and pool.shutdown_calls == 0
+
+
+def test_c1_explicit_grant_above_an_owned_worker_request_rejects_before_bind():
+    explicit = _alloc_for(_DescriptorManagedSource(),
+                          requests={"workers": 3, "reduction_inflight": 6})
+    assert explicit.allocation.workers == 3
+    source = _DescriptorManagedSource()
+    with pytest.raises(ValueError):
+        _envelope_session(source, executor=1, policy=explicit)   # owned req < grant
+    assert source.bind_calls == []
+
+
+def test_c1_explicit_inflight_max_must_equal_the_granted_bound():
+    explicit = _alloc_for(_DescriptorManagedSource(),
+                          requests={"workers": 2, "reduction_inflight": 4})
+    source = _DescriptorManagedSource()
+    with pytest.raises(ValueError):
+        _envelope_session(source, executor=2, policy=explicit,
+                          inflight_max=explicit.allocation.reduction_inflight + 1)
+    assert source.bind_calls == []
+
+
+def test_c1_a_cadence_only_prior_policy_still_resolves_and_clamps():
+    """``SessionPolicy(allocation=None)`` is NOT an explicit allocation: its
+    requests are clamped normally instead of being equality-checked."""
+    from xrd_tools.session.policy import FlushPolicy, SessionPolicy
+
+    cadence_only = SessionPolicy(flush=FlushPolicy(interval=3))
+    source = _DescriptorManagedSource()
+    session = _envelope_session(source, executor=2, inflight_max=3,
+                                policy=cadence_only)
+    try:
+        alloc = source.allocation
+        assert alloc is not None
+        assert alloc.reduction_inflight <= 3           # clamped, not rejected
+        assert session.policy.flush.interval == 3      # the cadence survives
+    finally:
+        session.finish(raise_on_failure=False)
+
+
+def test_event_sink_exposes_worker_process_only_when_inner_sink_owns_it():
+    """A plain sink must not make reduction build a discarded corrected image."""
+    from types import SimpleNamespace
+
+    from xrd_tools.session.scan_session import _EventSink
+
+    plain = _EventSink(SimpleNamespace(), lambda _frame, _reduction: None)
+    assert getattr(plain, "worker_process", None) is None
+
+    calls = []
+    hooked = _EventSink(
+        SimpleNamespace(
+            worker_process=lambda frame, reduction: calls.append((frame, reduction))
+        ),
+        lambda _frame, _reduction: None,
+    )
+    worker_process = getattr(hooked, "worker_process", None)
+    assert callable(worker_process)
+    worker_process("frame", "reduction")
+    assert calls == [("frame", "reduction")]

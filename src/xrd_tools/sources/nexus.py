@@ -52,6 +52,27 @@ class NexusStackSource(BaseFrameSource):
             ),
         )
 
+    #: H10-C2-B: the coordinator's exact allocation, bound before any read.
+    #: This source NEVER resolves one; the legacy route leaves it ``None``.
+    allocation = None
+
+    def container_descriptor(self):
+        """The pixel-free descriptor a coordinator derives requirements from."""
+        cursor = self._consumption_cursor
+        if cursor is not None:
+            return cursor.descriptor
+        with self.open_cursor() as cursor:
+            return cursor.descriptor
+
+    def bind_allocation(self, allocation) -> None:
+        """Adopt the coordinator's EXACT allocation before reading.  Rebinding
+        is IDENTITY-qualified: the same object is idempotent, an equal-but-
+        distinct one rejects - the contract is one shared identity, not a value."""
+        if self.allocation is not None and self.allocation is not allocation:
+            raise ValueError(
+                "NexusStackSource is already bound to a different allocation")
+        self.allocation = allocation
+
     def open_cursor(self):
         """A context-managed :class:`~xrd_tools.sources.cursor.ContainerCursor`
         for sustained consumption: one open handle supplies descriptor,
@@ -110,12 +131,16 @@ class NexusStackSource(BaseFrameSource):
                     "NexusStackSource cursor consumption requires contiguous "
                     "0-based frame labels")
         desc = cursor.descriptor
+        # Coordinated route: only the bound grant.  The compatibility budget is
+        # reached ONLY by the legacy uncoordinated ``run_reduction`` entry.
+        budget = (self.allocation.owner_block_bytes
+                  if self.allocation is not None else source_block_budget_bytes())
         read_plan = plan_reads(
             desc.frame_count,
             desc.frame_shape,
             desc.dtype,
             desc.chunks,
-            source_block_budget_bytes(),
+            budget,
             frame_interval=(0, len(labels)),
             requested_block_frames=chunk_size,
             two_d=desc.is_2d,

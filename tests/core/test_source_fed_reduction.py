@@ -13,10 +13,12 @@ NOT scale with the frame count, and no h5py handle crosses into a worker.
 
 from __future__ import annotations
 
+import inspect
 import os
 
 import h5py
 import numpy as np
+import pytest
 
 import xrd_tools.reduction.core as reduction_core
 from xrd_tools.core.containers import IntegrationResult1D, PONI
@@ -282,3 +284,141 @@ def test_public_submit_seam_receives_native_dtype_under_huge_chunk(
     assert result.n_processed == 5
     assert [index for index, _dtype in seen] == list(range(5))
     assert {dtype for _index, dtype in seen} == {np.dtype(np.uint16)}
+
+
+# ── H10-C2-B: the coordinated route binds one allocation before reading ──────
+
+class _SpySink:
+    """Records the order of the fallible boundaries C2-B must run behind."""
+
+    def __init__(self, order):
+        self.order = order
+
+    def begin(self, scan, plan):
+        self.order.append("sink.begin")
+
+    def write(self, frame, reduction):
+        self.order.append("sink.write")
+
+    def finish(self, result):
+        self.order.append("sink.finish")
+
+
+def _envelope_plan():
+    return ReductionPlan(integration_1d=Integration1DPlan(npt=4))
+
+
+def test_c2b_coordinated_scan_session_binds_the_registry_source_before_effects(
+        tmp_path, monkeypatch):
+    """``ScanSession(plan, open_source(...))`` is the coordinated public path:
+    it derives descriptor-backed requirements without reading pixels and binds
+    the exact allocation before the sink hook or any source read."""
+    from xrd_tools.session import ScanSession
+
+    monkeypatch.setattr(reduction_core, "integrate_1d_frame", _fake_1d,
+                        raising=False)
+    path = _write_stack(tmp_path / "m.h5", 4)
+    source = open_source(path)
+    source.integrator = object()
+    order = []
+
+    real_bind = source.bind_allocation
+    real_iter = source.iter_chunks
+
+    def spy_bind(allocation):
+        order.append("bind_allocation")
+        return real_bind(allocation)
+
+    def spy_iter(chunk_size):
+        order.append("iter_chunks")
+        return real_iter(chunk_size)
+
+    source.bind_allocation = spy_bind
+    source.iter_chunks = spy_iter
+
+    session = ScanSession(_envelope_plan(), source, sink=_SpySink(order),
+                          envelope_bytes=64 * 1024 ** 3, executor=1)
+    try:
+        assert order[0] == "bind_allocation", order
+        assert "iter_chunks" not in order[:1]
+        assert source.allocation is not None
+        # the descriptor's real detector facts, never a fallback
+        assert source.allocation.requirements.height == 8
+        assert source.allocation.requirements.width == 8
+        assert source.allocation.requirements.native_itemsize == 2
+        # ... and the session's ONE policy carries that same object
+        assert session.policy.allocation is source.allocation
+    finally:
+        session.finish(raise_on_failure=False)
+
+
+def test_c2b_nexus_source_never_self_resolves_an_allocation():
+    from xrd_tools.sources.nexus import NexusStackSource
+
+    assert not hasattr(NexusStackSource, "resolve_session_policy")
+    source_text = inspect.getsource(NexusStackSource)
+    assert "resolve_session_policy" not in source_text
+
+
+def test_c2b_a_second_conflicting_bind_is_rejected(tmp_path):
+    from xrd_tools.session.policy import (
+        SessionResourceRequirements,
+        resolve_session_policy,
+    )
+
+    path = _write_stack(tmp_path / "m.h5", 3)
+    source = open_source(path)
+    req = SessionResourceRequirements(height=8, width=8, native_itemsize=2,
+                                      modes_1d=1, npt_1d=4)
+    first = resolve_session_policy(req, envelope_bytes=64 * 1024 ** 3,
+                                   env={}).allocation
+    source.bind_allocation(first)
+    source.bind_allocation(first)                    # SAME object: idempotent
+    # rebinding is IDENTITY-qualified: an equal-but-distinct object rejects,
+    # because the contract is one shared allocation object, not one value.
+    twin = resolve_session_policy(req, envelope_bytes=64 * 1024 ** 3,
+                                  env={}).allocation
+    assert twin == first and twin is not first
+    with pytest.raises(ValueError):
+        source.bind_allocation(twin)
+    other = resolve_session_policy(req, envelope_bytes=64 * 1024 ** 3,
+                                   requests={"queue_depth": 2},
+                                   env={}).allocation
+    with pytest.raises(ValueError):
+        source.bind_allocation(other)
+    assert source.allocation is first
+
+
+def test_c2b_bound_source_reads_only_its_granted_owner_block(tmp_path):
+    from xrd_tools.session.policy import (
+        SessionResourceRequirements,
+        resolve_session_policy,
+    )
+
+    path = _write_stack(tmp_path / "m.h5", 8, chunks=(2, 8, 8))
+    source = open_source(path)
+    req = SessionResourceRequirements(height=8, width=8, native_itemsize=2,
+                                      modes_1d=1, npt_1d=4)
+    frame_bytes = 8 * 8 * 2
+    alloc = resolve_session_policy(
+        req, envelope_bytes=64 * 1024 ** 3,
+        requests={"owner_block_bytes": 2 * frame_bytes}, env={}).allocation
+    source.bind_allocation(alloc)
+    for block, labels in source.iter_chunks(64):
+        assert block.nbytes <= alloc.owner_block_bytes
+        assert len(labels) == block.shape[0]
+
+
+def test_c2b_legacy_uncoordinated_run_reduction_route_needs_no_allocation(
+        tmp_path, monkeypatch):
+    """``run_reduction(open_source(...))`` stays the named legacy uncoordinated
+    entry: unbound, it uses the compatibility source-block budget and claims no
+    SessionPolicy."""
+    monkeypatch.setattr(reduction_core, "integrate_1d_frame", _fake_1d,
+                        raising=False)
+    path = _write_stack(tmp_path / "m.h5", 4)
+    source = open_source(path)
+    assert source.allocation is None
+    blocks = [len(labels) for _block, labels in source.iter_chunks(2)]
+    assert sum(blocks) == 4
+    assert source.allocation is None, "the legacy route must not manufacture one"

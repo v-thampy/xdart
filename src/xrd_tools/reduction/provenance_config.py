@@ -8,6 +8,9 @@ without importing each other.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from enum import Enum
+import math
+from pathlib import Path
 from typing import Any
 
 
@@ -331,9 +334,45 @@ def _enum_value(value: Any) -> Any:
 
 
 def _jsonable(value: Any) -> Any:
-    from xrd_tools.session.run_configuration import jsonable_run_value
-
     return jsonable_run_value(value, path="reduction_config")
+
+
+def jsonable_run_value(value: Any, *, path: str = "provenance") -> Any:
+    """Return the one detached, deterministic, JSON-native value projection."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(
+                f"{path}: non-finite float {number!r} has no JSON form"
+            )
+        return number
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return jsonable_run_value(value.value, path=f"{path}.value")
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"{path}: JSON object keys must be str, got "
+                    f"{type(key).__module__}.{type(key).__qualname__}"
+                )
+            out[key] = jsonable_run_value(item, path=f"{path}.{key}")
+        return out
+    if isinstance(value, (list, tuple)):
+        return [
+            jsonable_run_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(
+        f"{path}: run provenance values must be JSON-native; unsupported "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
 
 
 def _first_truthy(*values: Any) -> Any:
@@ -343,4 +382,4 @@ def _first_truthy(*values: Any) -> Any:
     return None
 
 
-__all__ = ["build_reduction_config"]
+__all__ = ["build_reduction_config", "jsonable_run_value"]

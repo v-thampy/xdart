@@ -140,6 +140,16 @@ class FramePublication:
         return self.view.label
 
 
+@dataclass(frozen=True, slots=True)
+class Light1DPublicationShell:
+    """Array-free publication identity holding one tracked lease borrow."""
+
+    label: int | str
+    generation: int
+    source_identity: str
+    borrow: Any
+
+
 def validate_publication(
     publication: FramePublication,
     *,
@@ -646,6 +656,8 @@ class PublicationStore:
         self._max_items = max_items
         self._max_heavy_items = max_heavy_items
         self._max_thumbnail_items = max_thumbnail_items
+        self.allocation: Any = None
+        self._light_1d = None
         self._items: dict[int | str, FramePublication] = {}
         self._heavy_labels: list[int | str] = []
         self._thumb_labels: list[int | str] = []
@@ -678,10 +690,94 @@ class PublicationStore:
         with self._lock:
             return self._generation
 
+    def bind_allocation(self, allocation) -> None:
+        """Bind the exact H10 allocation before any publication exists."""
+        with self._lock:
+            if self.allocation is not None:
+                if self.allocation is not allocation:
+                    raise ValueError("PublicationStore is bound to another allocation")
+                return
+            if self._items:
+                raise ValueError("cannot bind an allocation to a populated store")
+            self.allocation = allocation
+            self._max_items = int(allocation.publication_items)
+            self._max_heavy_items = int(allocation.publication_heavy_items)
+            self._max_thumbnail_items = int(allocation.thumbnail_items)
+
+    def bind_light_1d(self, lease) -> None:
+        """Bind the allocation's sole byte-native light-1D lease."""
+        from xrd_tools.session import Light1DRetentionLease
+
+        if type(lease) is not Light1DRetentionLease:
+            raise TypeError("publication light-1D owner must be an exact lease")
+        with self._lock:
+            if self.allocation is None:
+                raise RuntimeError("light-1D publication requires allocation binding")
+            if lease.authority.parent_allocation is not self.allocation:
+                raise ValueError("light-1D lease belongs to another allocation")
+            if self._light_1d is not None and self._light_1d is not lease:
+                raise ValueError("PublicationStore already has a light-1D lease")
+            self._light_1d = lease
+
+    def publish_light_1d(self, record, *, source_identity: str):
+        """Retain through the lease and store only its tracked shell borrow."""
+        from xrd_tools.session import Light1DStaleGeneration
+
+        with self._lock:
+            lease = self._light_1d
+            if lease is None:
+                raise RuntimeError("PublicationStore has no light-1D lease")
+            if int(record.generation) != int(lease.generation):
+                raise Light1DStaleGeneration("light-1D publication generation is stale")
+            label = record.row_identity
+            prior = self._items.get(label)
+            if isinstance(prior, Light1DPublicationShell):
+                prior.borrow.close()
+                self._items.pop(label, None)
+            if label not in lease.keys() and len(lease.keys()) >= lease.row_cap:
+                oldest = lease.keys()[0]
+                shell = self._items.pop(oldest, None)
+                if shell is not None and hasattr(shell, "borrow"):
+                    shell.borrow.close()
+                else:
+                    raise RuntimeError(
+                        "light-1D lease residency lost its publication shell: "
+                        f"oldest={oldest!r}, publications={tuple(self._items)!r}"
+                    )
+            lease.retain(
+                record,
+                grant_id=lease.grant_id,
+                generation=lease.generation,
+            )
+            shell = Light1DPublicationShell(
+                label=label,
+                generation=lease.generation,
+                source_identity=str(source_identity),
+                borrow=lease.borrow(label),
+            )
+            self._items[label] = shell
+            return shell
+
+    def ndarray_owner_census(self):
+        """Public split census: the store owns no ndarray root after binding."""
+        with self._lock:
+            lease = self._light_1d
+            return {
+                "lease": (
+                    frozenset() if lease is None else lease.owned_buffer_ids
+                ),
+                "publication": frozenset(),
+            }
+
     def clear(self) -> None:
         """Full reset (a scan boundary): empty everything + bump generation."""
         with self._lock:
+            for publication in self._items.values():
+                if isinstance(publication, Light1DPublicationShell):
+                    publication.borrow.close()
             self._generation += 1
+            self.allocation = None
+            self._light_1d = None
             self._items.clear()
             self._heavy_labels.clear()
             self._thumb_labels.clear()
@@ -727,6 +823,13 @@ class PublicationStore:
         if max_heavy_items is not None and max_heavy_items < 0:
             raise ValueError("max_heavy_items must be non-negative or None")
         with self._lock:
+            if (
+                self.allocation is not None
+                and max_heavy_items != self.allocation.publication_heavy_items
+            ):
+                raise ValueError(
+                    "allocation-bound PublicationStore cap cannot diverge"
+                )
             self._max_heavy_items = max_heavy_items
             self._enforce_bounds_locked()
 

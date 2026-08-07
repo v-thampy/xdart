@@ -1,20 +1,84 @@
-"""Ratified v2 writer content and storage-layout gate.
+"""6a gate: the refactored writer preserves the frozen v2 record contract.
 
-The committed fixture began as the PRE-6a all-xdart signature. Intentional,
-backward-readable schema additions are folded into it only after explicit
-boundary review. Any unreviewed change to an identical scan still fails here.
+The committed fixture is the content signature of a deterministic scan
+written by the PRE-6a (all-xdart) writer.  Every scientific/storage fact stays
+identical; the test separately and positively asserts the three intentional
+shared-writer metadata ownership deltas.
 """
+import ast
+import copy
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
-pytest.importorskip("xdart", reason="gate exercises the GUI-side writer")
-
-FIXTURE = Path(__file__).parent / "fixtures" / "v2_record_signature.json"
+FIXTURE = Path(__file__).parent / "fixtures" / "v2_record_signature_pre6a.json"
 
 
-def test_v2_record_content_matches_ratified_signature(tmp_path):
+def test_v2_reference_fixture_is_headless_and_xdart_independent(tmp_path):
+    """The frozen core fixture must neither name nor import GUI-side owners."""
+    fixture_module = Path(__file__).parent / "_v2_record_fixture.py"
+    tree = ast.parse(fixture_module.read_text(encoding="utf-8"))
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+    forbidden = sorted(
+        name for name in imported
+        if name == "xdart" or name.startswith("xdart.")
+        or name == "tests.xdart" or name.startswith("tests.xdart.")
+    )
+    assert forbidden == []
+
+    script = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+
+        class RejectGuiImports(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if (fullname == "xdart" or fullname.startswith("xdart.")
+                        or fullname == "tests.xdart"
+                        or fullname.startswith("tests.xdart.")):
+                    raise RuntimeError(f"forbidden core-fixture import: {fullname}")
+                return None
+
+        sys.meta_path.insert(0, RejectGuiImports())
+        from tests.core._v2_record_fixture import write_reference_scan
+        write_reference_scan(sys.argv[1], sys.argv[2])
+        forbidden = sorted(
+            name for name in sys.modules
+            if name == "xdart" or name.startswith("xdart.")
+            or name == "tests.xdart" or name.startswith("tests.xdart.")
+        )
+        if forbidden:
+            raise RuntimeError(f"forbidden modules loaded: {forbidden}")
+        """
+    )
+    repo = Path(__file__).parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo / "src")
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "headless.nxs"),
+         str(tmp_path / "source")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_v2_record_content_identical_to_pre6a(tmp_path):
+    import h5py
+
     from tests.core._v2_record_fixture import write_reference_scan
     from tests.core.h5sig import h5_content_signature
 
@@ -23,15 +87,52 @@ def test_v2_record_content_matches_ratified_signature(tmp_path):
     now = h5_content_signature(out)
     ref = json.loads(FIXTURE.read_text())
 
-    missing = sorted(set(ref) - set(now))
-    added = sorted(set(now) - set(ref))
+    def _text(value):
+        return value.decode() if isinstance(value, bytes) else str(value)
+
+    # Preserve every frozen root provenance key, but name the actual shared
+    # writer instead of impersonating nexusformat.  Assert that one truthful
+    # identity delta plus the additive schema/program stamps positively, then
+    # compare every remaining pre-6a fact as one immutable signature.
+    with h5py.File(out, "r") as h5:
+        assert set(h5.attrs) == {
+            "HDF5_Version", "creator", "creator_version", "file_name",
+            "file_time", "h5py_version",
+        }
+        assert _text(h5.attrs["creator"]) == "xrd_tools"
+        assert _text(h5.attrs["creator_version"])
+        assert Path(_text(h5.attrs["file_name"])).resolve() == Path(out).resolve()
+        entry = h5["entry"]
+        assert _text(entry.attrs["default"]) == "integrated_1d"
+        assert _text(entry.attrs["ssrl_schema"]) == "xrd_tools.processed_scan"
+        assert int(entry.attrs["ssrl_schema_version"]) == 2
+        assert _text(h5["entry/reduction"].attrs["program"]) == "ssrl_xrd_tools"
+        for frame in h5["entry/frames"].values():
+            assert bool(frame.attrs["mask_baked"])
+            assert bool(frame["thumbnail"].attrs["mask_baked"])
+
+    comparable = copy.deepcopy(now)
+    assert set(comparable["/"]["attrs"]) == set(ref["/"]["attrs"])
+    assert comparable["/"]["attrs"]["creator"] != ref["/"]["attrs"]["creator"]
+    comparable["/"]["attrs"]["creator"] = ref["/"]["attrs"]["creator"]
+    del comparable["entry"]["attrs"]["ssrl_schema"]
+    del comparable["entry"]["attrs"]["ssrl_schema_version"]
+    del comparable["entry/reduction"]["attrs"]["program"]
+    for key, value in comparable.items():
+        if key.startswith("entry/frames/frame_"):
+            value["attrs"].pop("mask_baked", None)
+
+    missing = sorted(set(ref) - set(comparable))
+    added = sorted(set(comparable) - set(ref))
     assert not missing and not added, (
         f"tree changed: missing={missing[:6]} added={added[:6]}"
     )
-    diffs = [k for k in sorted(ref) if ref[k] != now[k]]
+    diffs = [k for k in sorted(ref) if ref[k] != comparable[k]]
     assert diffs == [], (
         "content changed at: " + ", ".join(diffs[:8]) + "\n"
-        + "\n".join(f"  {k}: ref={ref[k]} now={now[k]}" for k in diffs[:3])
+        + "\n".join(
+            f"  {k}: ref={ref[k]} now={comparable[k]}" for k in diffs[:3]
+        )
     )
 
 
@@ -73,31 +174,31 @@ def test_v2_record_storage_layout_frozen(tmp_path):
         assert lzf == [], f"raw lzf re-emitted (ARM64 bus-error risk): {lzf}"
 
 
-def test_v2_record_integrated_stacks_compress(tmp_path, monkeypatch):
+def test_v2_record_integrated_stacks_compress(tmp_path):
     """The integrated stacks honor the resolved codec: ``gzip`` yields a portable
     (stock-h5py-readable) file; the default compresses (lz4, or a gzip fallback
     when hdf5plugin is absent).  Both keep chunking + resizability; neither
-    re-emits raw lzf.  The GUI writer caches the resolved codec in the module
-    constant ``INTEGRATED_STACK_COMPRESSION`` (the env var is read only at
-    import), so we set THAT, not the env var."""
+    re-emits raw lzf.  The fixture passes the selected codec explicitly to the
+    shared writer, so this does not depend on GUI import-time state."""
     import h5py
-    import xdart.modules.ewald.nexus_writer as nw
     from xrd_tools.io.nexus import resolve_stack_compression
     from tests.core._v2_record_fixture import write_reference_scan
 
     stacks = ("entry/integrated_1d/intensity", "entry/integrated_1d/sigma",
               "entry/integrated_2d/intensity")
     # portable gzip
-    monkeypatch.setattr(nw, "INTEGRATED_STACK_COMPRESSION", "gzip")
-    out = write_reference_scan(str(tmp_path / "g.nxs"), str(tmp_path / "gp"))
+    out = write_reference_scan(
+        str(tmp_path / "g.nxs"), str(tmp_path / "gp"), compression="gzip"
+    )
     with h5py.File(out, "r") as f:
         for p in stacks:
             assert f[p].compression == "gzip", f"{p}: not portable gzip"
             assert f[p].chunks is not None and f[p].maxshape[0] is None
     # default: compressed (lz4, or gzip when hdf5plugin missing), never raw lzf
-    monkeypatch.setattr(nw, "INTEGRATED_STACK_COMPRESSION",
-                        resolve_stack_compression("lz4"))
-    out = write_reference_scan(str(tmp_path / "d.nxs"), str(tmp_path / "dp"))
+    out = write_reference_scan(
+        str(tmp_path / "d.nxs"), str(tmp_path / "dp"),
+        compression=resolve_stack_compression("lz4"),
+    )
     with h5py.File(out, "r") as f:
         for p in stacks:
             assert f[p].compression not in (None, "lzf"), f"{p}: lost default compression"
@@ -112,9 +213,10 @@ def test_v2_record_gi_scan_writes_gi_provenance(tmp_path):
     block is ADDITIVE provenance; reload stays compatible; MIGRATION discloses it).
     """
     import h5py
-    from tests.core._v2_record_fixture import write_reference_scan
-    from tests.xdart.test_nexus_writer_roundtrip import _DuckArch, _DuckSphere
-    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from tests.core._v2_record_fixture import (
+        write_gi_reference_scan,
+        write_reference_scan,
+    )
 
     def _gi_flag(f):
         # the flag is persisted as a string ("true"/"false"), not an h5 bool
@@ -123,12 +225,24 @@ def test_v2_record_gi_scan_writes_gi_provenance(tmp_path):
             v = v.decode()
         return str(v).strip().lower() in ("true", "1")
 
-    frames = [_DuckArch(idx=i, seed=7) for i in range(2)]
     out = str(tmp_path / "gi.nxs")
-    save_scan_to_nexus(_DuckSphere(frames, gi=True), out, mode="w", finalize=True)
+    write_gi_reference_scan(out, str(tmp_path / "gip"))
     with h5py.File(out, "r") as f:
         assert "entry/reduction/config/gi" in f, "GI scan lost /reduction/config/gi"
         assert _gi_flag(f) is True
+        assert set(f["entry/integrated_1d"].attrs["multi_result_modes"]) == {
+            "q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"
+        }
+        assert set(f["entry/integrated_2d"].attrs["multi_result_modes"]) == {
+            "qip_qoop", "q_chi", "exit_angles"
+        }
+        for mode in ("q_ip", "q_oop", "exit_angle", "chi_gi"):
+            assert f[f"entry/integrated_1d/{mode}/sigma"].shape == (3, 32)
+        for mode in ("q_chi", "exit_angles"):
+            assert f[f"entry/integrated_2d/{mode}/intensity"].shape == (3, 16, 32)
+        gi_config = json.loads(f["entry/reduction/config/gi_config"][()].decode())
+        assert gi_config["gi_mode_1d"] == "q_total"
+        assert gi_config["gi_mode_2d"] == "qip_qoop"
 
     # the non-GI reference records gi=False (present, not absent) -> a reader can
     # always tell GI from standard.

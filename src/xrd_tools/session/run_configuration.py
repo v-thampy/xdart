@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from xrd_tools.core.scan import SourceSpec
+from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
@@ -1388,57 +1389,6 @@ def admit_run_configuration(
 # --------------------------------------------------------------------------- #
 # Detached JSON-native provenance (review §39.2 W1R-P1-7).
 # --------------------------------------------------------------------------- #
-
-def jsonable_run_value(value: Any, *, path: str = "provenance") -> Any:
-    """Return a detached, deterministic, JSON-NATIVE copy of *value*.
-
-    O-1a-W1R (review §39.2 W1R-P1-7, §39.5 Phase 3 item 4).  ``_freeze_value``
-    accepts several value types that survive :meth:`FrozenRunConfiguration.thaw`
-    but are NOT JSON — most importantly the pyFAI method TUPLE — so
-    ``json.loads(json.dumps(provenance))`` differed from the mapping the writer
-    was handed.  This is the ONE normalizer for that conversion; it follows the
-    bounded rules the vNext provenance path already used
-    (``reduction.provenance_config._jsonable_range`` / ``_enum_value``), which
-    now delegates here so the tree keeps a single owner.
-
-    Unsupported or live values RAISE, before any output file is created: a
-    lossy ``default=str`` stringify at write time is what W-1 forbids.
-    """
-
-    if value is None or isinstance(value, (bool, str)):
-        return value
-    if isinstance(value, int):
-        return int(value)
-    if isinstance(value, float):
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError(
-                f"{path}: non-finite float {number!r} has no JSON form")
-        return number
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Enum):
-        return jsonable_run_value(value.value, path=f"{path}.value")
-    if isinstance(value, Mapping):
-        out: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(
-                    f"{path}: JSON object keys must be str, got "
-                    f"{type(key).__module__}.{type(key).__qualname__}"
-                )
-            out[key] = jsonable_run_value(item, path=f"{path}.{key}")
-        return out
-    if isinstance(value, (list, tuple)):
-        return [
-            jsonable_run_value(item, path=f"{path}[{index}]")
-            for index, item in enumerate(value)
-        ]
-    raise TypeError(
-        f"{path}: run provenance values must be JSON-native; unsupported "
-        f"{type(value).__module__}.{type(value).__qualname__}"
-    )
-
 
 __all__ = [
     "FrozenGIConfiguration",

@@ -76,8 +76,8 @@ def _coerce_scan_info(scan_info):
 class LiveScan:
     """Stateful xdart live scan in v2 NeXus-formatted HDF5 files.
 
-    Output file structure (xdart v2 schema, written by
-    :func:`xdart.modules.ewald.nexus_writer.save_scan_to_nexus`)::
+    Output file structure (xdart v2 schema, written by the shared
+    :class:`xrd_tools.reduction.NexusSink`)::
 
         scan.nxs
         └── entry/                       (NXentry)
@@ -182,7 +182,7 @@ class LiveScan:
                                           static=self.static, gi=self.gi)
         self.scan_data = scan_data
 
-        # ``mg_args`` retained: nexus_writer reads
+        # ``mg_args`` retained: the shared reduction adapter reads
         # ``mg_args["wavelength"]`` for the NXsource stamp.  The
         # ``_mg_integrators`` list that powered the deleted
         # ``multigeometry_integrate_*`` API is gone — stitching now
@@ -194,6 +194,7 @@ class LiveScan:
         self.reduction_config = {}
         self._display_reduction_config = {}
         self.scan_lock = Condition(_PyRLock())
+        self._nexus_accounting_facade = None
 
         # G2: ``overall_raw`` was a sum-of-raw-frames accumulator
         # consumed only by display_data.get_scan_map_raw (now
@@ -210,6 +211,9 @@ class LiveScan:
     def reset(self):
         """Resets all held data objects to blank state."""
         with self.scan_lock:
+            session = getattr(self, "_nexus_write_session", None)
+            if session is not None and not getattr(session, "_closed", False):
+                raise RuntimeError("cannot reset a scan with an active NeXus owner")
             self.scan_data = pd.DataFrame()
             self.frames = LiveFrameSeries(self.data_file, self.file_lock,
                                           static=self.static, gi=self.gi)
@@ -237,6 +241,7 @@ class LiveScan:
             self._cached_poni = None
             self._cached_fiber_integrator = None
             self._cached_data_mask = None
+            self._nexus_accounting_facade = None
 
     def _clear_persisted_wavelength(self):
         """Drop the wavelength restored from a previously loaded .nxs (G1).
@@ -539,8 +544,7 @@ class LiveScan:
                       replace_frame_indices=None) -> dict[str, list[int]]:
         """Save scan state into a v2 NeXus file.  Idempotent across calls.
 
-        Two modes — see :func:`nexus_writer.save_scan_to_nexus` for
-        the full contract:
+        The canonical shared writer supports two selection modes:
 
         * ``replace_frame_indices=None`` (default): append-only.  Stacked
           datasets grow by however many new frames have been added
@@ -549,51 +553,93 @@ class LiveScan:
           integrated_1d/2d rows over their existing on-disk positions.
           Used by GUI reintegration (``scan_threads.bai_1d_all``).
 
-        The writer owns its own file handle (with NFS-retry semantics)
-        so the caller only needs to hold ``self.file_lock``.
+        This general compatibility call is a bounded one-shot shared session;
+        it never leaves a hidden transaction open.
         """
-        mode = 'w' if replace else 'a'
-        with self.file_lock:
-            return self._save_to_nexus(
-                mode=mode, entry=entry, finalize=finalize,
+        from xdart.modules.reduction import write_live_scan_to_nexus
+        with self.scan_lock:
+            return write_live_scan_to_nexus(
+                self,
+                entry=entry,
+                finalize=finalize,
+                replace=replace,
                 replace_frame_indices=replace_frame_indices,
+                file_lock=self.file_lock,
+                append_preflight=getattr(self, "_append_preflight", None),
+                accounting=getattr(self, "_nexus_accounting_facade", None),
             )
+
+    def bind_nexus_accounting(self, facade) -> None:
+        """Install one serial NeXus accounting authority before writer begin."""
+        if facade is None:
+            raise ValueError("NeXus accounting facade is required")
+        with self.scan_lock:
+            current = self._nexus_accounting_facade
+            if current is facade:
+                return
+            if current is not None:
+                raise RuntimeError("NeXus accounting authority cannot change")
+            session = getattr(self, "_nexus_write_session", None)
+            if session is not None and not getattr(session, "_closed", False):
+                session.bind_accounting(facade)
+            self._nexus_accounting_facade = facade
 
     def _save_to_nexus(self, *, mode: str = "a", entry: str = "entry",
                        finalize: bool = False,
                        replace_frame_indices=None) -> dict[str, list[int]]:
-        """Inner v2 writer; delegates to ``nexus_writer.save_scan_to_nexus``.
-
-        Opens the file at ``self.data_file`` internally.  Callers must
-        NOT hold an open h5py.File on the same path during this call —
-        HDF5 single-writer semantics will reject the second open.
-        """
-        from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+        """Cadence seam reusing one shared session until explicit terminal."""
+        from xdart.modules.reduction import open_live_scan_nexus_session
         with self.scan_lock:
-            dropped = save_scan_to_nexus(
-                self, self.data_file, mode=mode,
-                entry=entry, finalize=finalize,
+            session = getattr(self, "_nexus_write_session", None)
+            if session is None or getattr(session, "_closed", False):
+                replace_on_open = bool(
+                    mode == "w" or getattr(self, "_nexus_replace_on_open", False))
+                session = open_live_scan_nexus_session(
+                    self,
+                    entry=entry,
+                    replace=replace_on_open,
+                    file_lock=self.file_lock,
+                    append_preflight=getattr(self, "_append_preflight", None),
+                    accounting=getattr(self, "_nexus_accounting_facade", None),
+                )
+                self._nexus_write_session = session
+                self._nexus_replace_on_open = False
+            result = session.flush(
                 replace_frame_indices=replace_frame_indices,
+                force=True,
             )
-            # Persist-before-evict (data-loss guard): frames written by this
-            # save may be evicted from the in-memory cache.  Until this mark,
-            # ``LiveFrameSeries.stash`` refuses to drop them (their
-            # int_1d/int_2d live only on the in-memory LiveFrame).  Only
-            # reached on a successful save — a raising writer leaves the frames
-            # unmarked (and therefore un-evictable).
-            # PF-1d: durability is PER RESULT MODE — a label the writer
-            # deferred as pending for ANY group (a resident frame whose mode
-            # result was not committed this save) must NOT be marked: a
-            # durable 1D row cannot authorize evicting a fresh, not-yet-
-            # durable 2D result.
-            mark = getattr(self.frames, "mark_persisted", None)
-            if callable(mark):
-                cursor = getattr(self, "_nexus_write_cursor", None)
-                pending: set[int] = set()
-                for labels in (getattr(cursor, "pending", None) or {}).values():
-                    pending.update(int(i) for i in labels)
-                mark([i for i in self.frames.index if int(i) not in pending])
-            return dropped
+            if finalize:
+                session.finish(finalize=True)
+                self._nexus_write_session = None
+                self._nexus_accounting_facade = None
+            return result
+
+    def finish_nexus_session(self, *, finalize: bool = True) -> None:
+        session = getattr(self, "_nexus_write_session", None)
+        if session is None:
+            preflight = getattr(self, "_append_preflight", None)
+            if preflight is not None and preflight.snapshot.state.value == "reserved":
+                if preflight.snapshot.disposition.value == "skip":
+                    preflight.complete_noop()
+                else:
+                    preflight.abort()
+            self._nexus_accounting_facade = None
+            return
+        session.finish(finalize=finalize)
+        self._nexus_write_session = None
+        self._nexus_accounting_facade = None
+
+    def abort_nexus_session(self) -> None:
+        session = getattr(self, "_nexus_write_session", None)
+        if session is not None:
+            session.abort()
+            self._nexus_write_session = None
+            self._nexus_accounting_facade = None
+            return
+        preflight = getattr(self, "_append_preflight", None)
+        if preflight is not None and preflight.snapshot.state.value == "reserved":
+            preflight.abort()
+        self._nexus_accounting_facade = None
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Load scan state from a v2 NeXus file.

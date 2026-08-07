@@ -17,6 +17,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+class DynamicXyeReceiptBoundaryRequired(TypeError):
+    """A dynamic XYE target lacks the accepted transaction receipt owner."""
+
 from dataclasses import fields as _dc_fields
 
 if TYPE_CHECKING:
@@ -29,15 +33,19 @@ from xrd_tools.core.metadata import (
 )
 from xrd_tools.reduction import (
     Frame,
+    FrameReduction,
     GIMode,
     Integration1DPlan,
     Integration2DPlan,
     MaskSpec,
     ReductionPlan,
+    ReductionResult,
     ReductionSession,
     Scan,
     StrictPolicy,
+    NexusSink,
     run_reduction,
+    supports_durable_xye_receipts,
 )
 from xrd_tools.reduction.masks import _flat_mask_as_bool, _mask_for_plan
 from xdart.modules.wavelength import wavelength_m_to_angstrom
@@ -90,18 +98,26 @@ def scan_from_live_scan(
     live_scan: Any,
     *,
     frame_indices: Iterable[int] | None = None,
+    pinned_frames: Iterable[Any] | None = None,
     include_images: bool = True,
     include_backgrounds: bool | None = None,
 ) -> Scan:
     """Build an ``xrd_tools.reduction.Scan`` from a ``LiveScan``."""
     if include_backgrounds is None:
         include_backgrounds = include_images
-    indices = list(frame_indices) if frame_indices is not None else list(live_scan.frames.index)
+    pins = None if pinned_frames is None else list(pinned_frames)
+    indices = (
+        [int(getattr(frame, "idx", 0) or 0) for frame in pins]
+        if pins is not None
+        else (list(frame_indices) if frame_indices is not None
+              else list(live_scan.frames.index))
+    )
     scan_data = getattr(live_scan, "scan_data", None)
     frames = []
-    for idx in indices:
+    for position, idx in enumerate(indices):
+        live_frame = pins[position] if pins is not None else live_scan.frames[int(idx)]
         frame = frame_from_live_frame(
-            live_scan.frames[int(idx)],
+            live_frame,
             include_image=include_images,
             include_background=include_backgrounds,
         )
@@ -113,7 +129,10 @@ def scan_from_live_scan(
             }
         )
         frames.append(frame)
-    first_frame = live_scan.frames[int(indices[0])] if indices else None
+    first_frame = (
+        pins[0] if pins
+        else (live_scan.frames[int(indices[0])] if indices else None)
+    )
     poni = getattr(first_frame, "poni", None) if first_frame is not None else None
     wavelength_A = wavelength_m_to_angstrom(
         getattr(live_scan, "_persisted_wavelength_m", None),
@@ -136,6 +155,35 @@ def scan_from_live_scan(
             except (TypeError, ValueError):
                 continue
 
+    calibration = {}
+    source_snapshots = {}
+    for live_frame in (
+        pins if pins is not None
+        else [live_scan.frames[int(index)] for index in indices]
+    ):
+        path = _source_path(live_frame)
+        snapshot = getattr(live_frame, "source_snapshot", None)
+        if path is not None and snapshot:
+            source_snapshots[str(path)] = dict(snapshot)
+    poni = getattr(first_frame, "poni", None) if first_frame is not None else None
+    if poni is None:
+        poni = getattr(live_scan, "_cached_poni", None)
+    if poni is not None:
+        for name in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3"):
+            value = getattr(poni, name, None)
+            if value is not None:
+                calibration[name] = value
+        detector_name = getattr(poni, "detector", None)
+        if detector_name:
+            calibration["detector_name"] = detector_name
+    integrator = getattr(live_scan, "_cached_integrator", None)
+    detector = getattr(integrator, "detector", None)
+    if detector is not None:
+        if getattr(detector, "pixel2", None) is not None:
+            calibration["x_pixel_size"] = detector.pixel2
+        if getattr(detector, "pixel1", None) is not None:
+            calibration["y_pixel_size"] = detector.pixel1
+
     return Scan(
         name=str(getattr(live_scan, "name", "scan")),
         frames=frames,
@@ -146,8 +194,511 @@ def scan_from_live_scan(
         geometry=getattr(live_scan, "geometry", None),
         motors=motors,
         output_path=getattr(live_scan, "data_file", None),
-        extra={"source": "xdart.LiveScan"},
+        extra={
+            "source": "xdart.LiveScan",
+            "detector_calibration": calibration,
+            "global_mask": getattr(live_scan, "global_mask", None),
+            "detector_shape": getattr(live_scan, "detector_shape", None),
+            "stitched_1d": getattr(live_scan, "stitched_1d", None),
+            "stitched_2d": getattr(live_scan, "stitched_2d", None),
+            "source_snapshots": source_snapshots,
+        },
     )
+
+
+class LiveScanNexusSession:
+    """One canonical writer/lease/cursor lifetime for one LiveScan output."""
+
+    def __copy__(self):
+        raise TypeError("LiveScan Nexus session authority cannot be copied")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("LiveScan Nexus session authority cannot be copied")
+
+    def __init__(
+        self,
+        live_scan: Any,
+        *,
+        entry: str = "entry",
+        replace: bool = False,
+        file_lock=None,
+        append_preflight=None,
+        accounting=None,
+    ) -> None:
+        self.live_scan = live_scan
+        self.plan = plan_from_live_scan(live_scan)
+        self.same_run_intent = getattr(live_scan, "_same_run_intent", None)
+        self.sink = NexusSink(
+            live_scan.data_file,
+            entry=str(entry),
+            overwrite=bool(replace),
+            flush_every=None,
+            atomic=False,
+            source_base=getattr(live_scan, "source_base", None),
+            file_lock=(file_lock if file_lock is not None
+                       else getattr(live_scan, "file_lock", None)),
+            append_preflight=append_preflight,
+            same_run_intent=(None if append_preflight is not None
+                             else self.same_run_intent),
+            allow_unbound_same_run=bool(
+                replace and append_preflight is None
+                and self.same_run_intent is None
+            ),
+            incremental_finalization=True,
+            run_configuration_provenance=getattr(
+                live_scan, "run_configuration_provenance", None,
+            ),
+            source_execution_provenance=getattr(
+                live_scan, "source_execution_provenance", None,
+            ),
+            source_snapshots_provenance=getattr(
+                live_scan, "source_snapshots_provenance", None,
+            ),
+        )
+        self._begun = False
+        self._closed = False
+        self._products: dict[int, FrameReduction] = {}
+        self._written: list[int] = []
+        self._accounting = None
+        self._accounting_owner_token = object()
+        self._terminal_accounting_identity = object()
+        self._accounting_epoch_seal = None
+        self._accounting_epoch_anchor = None
+        self._accounting_committed_epoch_anchor = None
+        self._accounting_epoch_dirty = False
+        self._accounting_finish_seal = None
+        self._accounting_finish_disposition = None
+        self._terminal_result = None
+        self._terminal_finalize = None
+        self._sink_finished = False
+        self._sink_aborted = False
+        if accounting is not None:
+            self.bind_accounting(accounting)
+
+    def bind_accounting(self, facade) -> None:
+        """Bind the one run ledger before the canonical writer begins.
+
+        Exact replay of the same facade is harmless. A different authority may
+        never replace it, and no first binding is accepted after ``begin()``.
+        """
+        if self._accounting is facade:
+            return
+        if self._accounting is not None:
+            raise RuntimeError("LiveScan Nexus accounting authority cannot change")
+        if self._begun:
+            raise RuntimeError("LiveScan Nexus accounting must bind before begin")
+        self.sink.bind_session(facade)
+        self._accounting = facade
+        bind_live = getattr(facade, "bind_live_session", None)
+        if callable(bind_live):
+            bind_live(self, self._accounting_owner_token)
+
+    def extend(self, intent):
+        """Extend this exact open owner; never re-admit or reopen the target."""
+        if (
+            self._accounting_epoch_seal is not None
+            or self._accounting_finish_seal is not None
+        ):
+            raise RuntimeError("sealed LiveScan lineage must retry or abort first")
+        if self.sink.append_preflight is not None:
+            decision = self.sink.append_preflight.extend(intent)
+            self.same_run_intent = self.live_scan._same_run_intent = intent
+            return decision
+        if not self._begun:
+            self.same_run_intent = self.sink.same_run_intent = intent
+            self.live_scan._same_run_intent = intent
+            return None
+        decision = self.sink.extend_live(self.sink.extension_owner, intent)
+        self.same_run_intent = self.live_scan._same_run_intent = intent
+        return decision
+
+    def _select(self, replace_frame_indices=None) -> list[int]:
+        all_labels = [int(value) for value in self.live_scan.frames.index]
+        if replace_frame_indices is not None:
+            selected = [int(value) for value in replace_frame_indices]
+        elif self.sink.overwrite and not self._begun:
+            selected = all_labels
+        else:
+            persisted = set(getattr(self.live_scan.frames, "_persisted", set()))
+            selected = [label for label in all_labels if label not in persisted]
+        if self.sink.append_preflight is not None:
+            allowed = set(self.sink.append_preflight.snapshot.write_labels)
+            selected = [label for label in selected if label in allowed]
+        return selected
+
+    def _terminal(self, live) -> bool:
+        if self.plan.integration_1d is not None and getattr(live, "int_1d", None) is None:
+            return False
+        if (self.plan.integration_2d is not None
+                and not getattr(self.live_scan, "skip_2d", False)
+                and getattr(live, "int_2d", None) is None):
+            return False
+        return all(
+            value is not None
+            for mapping in (
+                getattr(live, "gi_1d", None) or {},
+                getattr(live, "gi_2d", None) or {},
+            )
+            for value in mapping.values()
+        )
+
+    def flush(self, *, replace_frame_indices=None, force: bool = False):
+        if self._closed:
+            raise RuntimeError("LiveScan Nexus session is terminal")
+        if (
+            self._accounting_epoch_seal is not None
+            or self._accounting_finish_seal is not None
+        ):
+            raise RuntimeError(
+                "sealed LiveScan lineage must retry commit/finish or abort first"
+            )
+        intent = getattr(self.live_scan, "_same_run_intent", None)
+        if intent is not None and intent != self.same_run_intent:
+            self.extend(intent)
+        labels = self._select(replace_frame_indices)
+        if self.sink.append_preflight is not None or self.same_run_intent is not None:
+            labels = [label for label in labels
+                      if self._terminal(self.live_scan.frames[label])]
+        pins = [self.live_scan.frames[label] for label in labels]
+        if not pins:
+            if self._begun:
+                self.sink.flush(force=force)
+            elif (force and self.sink.overwrite
+                  and self.sink.append_preflight is None):
+                scan = scan_from_live_scan(
+                    self.live_scan,
+                    pinned_frames=(),
+                    include_images=False,
+                    include_backgrounds=False,
+                )
+                self.sink.begin(scan, self.plan)
+                self._begun = True
+                self.sink.flush(force=True)
+            return {}
+        scan = scan_from_live_scan(
+            self.live_scan,
+            pinned_frames=pins,
+            include_images=False,
+            include_backgrounds=False,
+        )
+        # From this point a public flush may mutate a new H23 epoch.  A prior
+        # accounting-confirmed anchor must no longer authorize an unsealed
+        # committed phase until commit_epoch() positively publishes the new
+        # exact seal.
+        self._accounting_epoch_dirty = True
+        if not self._begun:
+            self.sink.begin(scan, self.plan)
+            self._begun = True
+        else:
+            self.sink._scan.extra.update(scan.extra)
+        from xrd_tools.io.nexus_record import (
+            legacy_to_canonical_1d,
+            legacy_to_canonical_2d,
+        )
+
+        terminal = []
+        for frame, live in zip(scan.frames, pins):
+            metadata = dict(getattr(live, "scan_info", {}) or {})
+            reduction = FrameReduction(
+                frame_index=int(frame.index),
+                result_1d=getattr(live, "int_1d", None),
+                result_2d=getattr(live, "int_2d", None),
+                metadata=metadata,
+                thumbnail=getattr(live, "thumbnail", None),
+            )
+            self._products[int(frame.index)] = reduction
+            self.sink.write(frame, reduction)
+            for key, result in (getattr(live, "gi_1d", None) or {}).items():
+                if result is not reduction.result_1d:
+                    self.sink.write(frame, FrameReduction(
+                        int(frame.index), result_1d=result,
+                        mode_1d=legacy_to_canonical_1d(key),
+                        metadata=metadata,
+                        write_frame_record=False,
+                    ))
+            for key, result in (getattr(live, "gi_2d", None) or {}).items():
+                if result is not reduction.result_2d:
+                    self.sink.write(frame, FrameReduction(
+                        int(frame.index), result_2d=result,
+                        mode_2d=legacy_to_canonical_2d(key),
+                        metadata=metadata,
+                        write_frame_record=False,
+                    ))
+            if self._terminal(live):
+                terminal.append(int(frame.index))
+            if int(frame.index) not in self._written:
+                self._written.append(int(frame.index))
+        self.sink.flush(force=force)
+        mark = getattr(self.live_scan.frames, "mark_persisted", None)
+        if callable(mark):
+            mark(terminal)
+        return {}
+
+    def _prepare_accounting_epoch(self, *, finishing: bool, stopped: bool = False):
+        if self._accounting is None:
+            return None
+        name = "prepare_session_finish" if finishing else "prepare_epoch_commit"
+        prepare = getattr(self._accounting, name, None)
+        if not callable(prepare):
+            return None
+        if finishing:
+            return prepare(
+                self,
+                self._accounting_owner_token,
+                stopped=bool(stopped),
+            )
+        return prepare(self, self._accounting_owner_token)
+
+    def _transaction_phase(self):
+        transaction = getattr(self.sink, "_transaction", None)
+        if transaction is None:
+            return None
+        phase = transaction.snapshot().phase
+        return getattr(phase, "value", str(phase))
+
+    def _require_terminal_transaction_phase(self):
+        phase = self._transaction_phase()
+        if (
+            self._accounting is not None
+            and self._begun
+            and phase not in {"committed", "aborted"}
+        ):
+            raise RuntimeError(
+                "bound dynamic accounting requires an exact terminal "
+                f"transaction phase; got {phase!r}"
+            )
+        return phase
+
+    def _notify_accounting_finish(self) -> None:
+        seal = self._accounting_finish_seal
+        if seal is None:
+            return
+        if self._accounting_finish_disposition == "stopped-discard":
+            notify = getattr(self._accounting, "session_stopped", None)
+            if not callable(notify):
+                raise RuntimeError("stopped accounting boundary has no terminal callback")
+            notify(
+                self,
+                self._accounting_owner_token,
+                seal,
+                "LiveScan stopped before any canonical epoch was committed",
+            )
+        else:
+            notify = getattr(self._accounting, "session_finished", None)
+            if not callable(notify):
+                raise RuntimeError("finished accounting boundary has no terminal callback")
+            notify(
+                self,
+                self._accounting_owner_token,
+                seal,
+                self._terminal_accounting_identity,
+            )
+        self._accounting_finish_seal = None
+
+    def finish(self, *, finalize: bool = True, commit_empty: bool = False):
+        if self._closed:
+            return {}
+        if self._sink_finished:
+            self._notify_accounting_finish()
+            self._closed = True
+            return {}
+        if self._accounting_finish_seal is not None:
+            if (bool(finalize), bool(commit_empty)) != self._terminal_finalize:
+                raise RuntimeError("LiveScan finish retry changed frozen terminal values")
+            result = self._terminal_result
+            self.sink.finish(result)
+            phase = self._require_terminal_transaction_phase()
+            self._accounting_finish_disposition = (
+                "stopped-discard" if phase == "aborted" else "committed"
+            )
+            self._sink_finished = True
+            self._notify_accounting_finish()
+            self._closed = True
+            return {}
+        if not self._begun:
+            self._accounting_finish_seal = self._prepare_accounting_epoch(
+                finishing=True, stopped=not finalize,
+            )
+            self._terminal_finalize = (bool(finalize), bool(commit_empty))
+            if self.sink.append_preflight is not None:
+                if self.sink.append_preflight.snapshot.disposition.value == "skip":
+                    self.sink.append_preflight.complete_noop()
+                else:
+                    self.sink.append_preflight.abort()
+            self._sink_finished = True
+            self._accounting_finish_disposition = (
+                "stopped-discard" if not finalize else "committed"
+            )
+            self._notify_accounting_finish()
+            self._closed = True
+            return {}
+        self.flush(force=True)
+        if not finalize and self._written:
+            self.sink.truncate_epoch(tuple(self._written))
+        if not finalize and self.sink._scan is not None:
+            self.sink._scan.extra["stitched_1d"] = None
+            self.sink._scan.extra["stitched_2d"] = None
+        result = ReductionResult(
+            str(getattr(self.live_scan, "name", "scan")),
+            self._products,
+            len(self._products),
+            cancelled=bool(
+                not finalize
+                and not self._written
+                and not commit_empty
+                and self._transaction_phase() not in {
+                    "epoch-committed", "committed",
+                }
+            ),
+        )
+        self._accounting_finish_seal = self._prepare_accounting_epoch(
+            finishing=True, stopped=not finalize,
+        )
+        self._terminal_finalize = (bool(finalize), bool(commit_empty))
+        self._terminal_result = result
+        self.sink.finish(result)
+        phase = self._require_terminal_transaction_phase()
+        self._accounting_finish_disposition = (
+            "stopped-discard" if phase == "aborted" else "committed"
+        )
+        self._sink_finished = True
+        self._notify_accounting_finish()
+        self._closed = True
+        return {}
+
+    def commit_epoch(self):
+        """Finalize a durable lineage epoch without releasing this session."""
+        if self._closed or not self._begun:
+            raise RuntimeError("lineage epoch commit requires an active session")
+        if self._accounting_finish_seal is not None:
+            raise RuntimeError("terminal finish is already sealed")
+        if self._accounting_epoch_seal is None:
+            self.flush(force=True)
+            self._accounting_epoch_seal = self._prepare_accounting_epoch(
+                finishing=False,
+            )
+        if self._accounting_epoch_anchor is None:
+            result = ReductionResult(
+                str(getattr(self.live_scan, "name", "scan")),
+                self._products,
+                len(self._products),
+            )
+            self._accounting_epoch_anchor = self.sink.commit_epoch(result)
+        anchor = self._accounting_epoch_anchor
+        notify = getattr(self._accounting, "epoch_committed", None)
+        if callable(notify) and self._accounting_epoch_seal is not None:
+            notify(
+                self,
+                self._accounting_owner_token,
+                self._accounting_epoch_seal,
+                anchor,
+            )
+            self._accounting_committed_epoch_anchor = anchor
+            self._accounting_epoch_dirty = False
+        self._accounting_epoch_seal = None
+        self._accounting_epoch_anchor = None
+        self._written.clear()
+        return anchor
+
+    def abort(self):
+        if self._closed:
+            return
+        if self._sink_finished:
+            self._notify_accounting_finish()
+            self._closed = True
+            return
+        if not self._sink_aborted:
+            if self._begun:
+                self.sink.abort(ReductionResult(
+                    str(getattr(self.live_scan, "name", "scan")),
+                    self._products,
+                    len(self._products),
+                    failed=True,
+                ))
+            elif self.sink.append_preflight is not None:
+                self.sink.append_preflight.abort()
+            self._sink_aborted = True
+        phase = self._require_terminal_transaction_phase()
+        if self._accounting_finish_seal is not None and phase == "committed":
+            self._sink_finished = True
+            self._accounting_finish_disposition = "committed"
+            self._notify_accounting_finish()
+            self._closed = True
+            return
+        if self._accounting_epoch_seal is not None and phase == "committed":
+            anchor = self._accounting_epoch_anchor or getattr(
+                self.sink, "_epoch_decision", None,
+            )
+            if anchor is None:
+                raise RuntimeError("canonical H23 epoch has no lineage anchor")
+            committed = getattr(self._accounting, "epoch_committed", None)
+            if callable(committed):
+                committed(
+                    self,
+                    self._accounting_owner_token,
+                    self._accounting_epoch_seal,
+                    anchor,
+                )
+            self._accounting_epoch_seal = None
+            self._accounting_epoch_anchor = None
+        elif (
+            self._accounting is not None
+            and self._begun
+            and phase == "committed"
+            and (
+                self._accounting_epoch_dirty
+                or self._accounting_committed_epoch_anchor is None
+            )
+        ):
+            raise RuntimeError(
+                "committed dynamic transaction has no exact accounting seal"
+            )
+        notify = getattr(self._accounting, "epoch_aborted", None)
+        if callable(notify):
+            notify(
+                self,
+                self._accounting_owner_token,
+                "LiveScan Nexus session abort",
+            )
+        self._accounting_epoch_seal = None
+        self._accounting_epoch_anchor = None
+        self._accounting_finish_seal = None
+        self._closed = True
+
+
+def open_live_scan_nexus_session(live_scan: Any, **kwargs) -> LiveScanNexusSession:
+    return LiveScanNexusSession(live_scan, **kwargs)
+
+
+def write_live_scan_to_nexus(
+    live_scan: Any,
+    *,
+    entry: str = "entry",
+    replace: bool = False,
+    finalize: bool = False,
+    replace_frame_indices=None,
+    file_lock=None,
+    append_preflight=None,
+    accounting=None,
+) -> dict[str, list[int]]:
+    """One-shot compatibility call using the same bounded shared session."""
+    session = open_live_scan_nexus_session(
+        live_scan,
+        entry=entry,
+        replace=replace,
+        file_lock=file_lock,
+        append_preflight=append_preflight,
+        accounting=accounting,
+    )
+    try:
+        session.flush(replace_frame_indices=replace_frame_indices, force=True)
+        return session.finish(finalize=finalize, commit_empty=True)
+    except BaseException as primary:
+        try:
+            session.abort()
+        except BaseException as cleanup:
+            raise primary from cleanup
+        raise
 
 
 @dataclass
@@ -267,20 +818,7 @@ def compute_bad_pixel_mask(raw_image, *, mask_saturation: bool = True,
 
 
 def apply_frozen_run_configuration(live_scan: Any, run_configuration: Any) -> Any:
-    """Project one accepted run configuration onto the run's OWN ``LiveScan``.
-
-    O-1a-W1A: this is the single run-side projection owner.  It writes only
-    values the frozen configuration owns, attaches the EXACT accepted object
-    (identity, not a copy) plus its ``(generation, fingerprint)``, and attaches
-    the detached JSON-native writer projection -- all BEFORE the caller opens any
-    output, so the very first written file already carries the run identity.
-
-    The GUI's display projection (``staticWidget._controls_v2_apply_run_configuration_to_scan``)
-    is the DISPLAY-side counterpart: it writes the browser's shared scan in place
-    under ``scan_lock``.  Both derive from the same frozen object, so there is one
-    authority; only the target and the locking differ.
-    """
-
+    """Project one accepted immutable run configuration onto its LiveScan."""
     scan = live_scan
     scan.skip_2d = bool(run_configuration.skip_2d)
     scan.gi_config = run_configuration.gi.scan_config()
@@ -313,13 +851,6 @@ def plan_from_live_scan(
     Note: ``chunk_size`` and other execution-policy knobs live on
     :func:`run_reduction` (and on :func:`reduce_live_frame` by way of
     the single-frame call here), not on the plan itself.
-
-    O-1a-W1A: a scan produced by an ADMITTED processing run carries the exact
-    accepted ``FrozenRunConfiguration`` (``scan.run_configuration``), and that
-    object -- not the mutable scan projection -- is then the integration
-    authority.  A reloaded/reintegrated scan carries none by construction, so it
-    keeps reading its own restored settings; the run path never reaches here
-    without one, because the worker refuses first.
     """
     frozen = run_configuration
     if frozen is None:
@@ -329,7 +860,8 @@ def plan_from_live_scan(
     if integrate_2d is None:
         integrate_2d = not bool(
             frozen.skip_2d if frozen is not None
-            else getattr(live_scan, "skip_2d", False))
+            else getattr(live_scan, "skip_2d", False)
+        )
 
     if frozen is not None:
         args_1d = dict(frozen.bai_1d_args)
@@ -373,17 +905,20 @@ def plan_from_live_scan(
     _pop_first(args_1d, ("normalization_factor",), None)
     _pop_first(args_2d, ("normalization_factor",), None)
 
-    is_gi = bool(frozen.gi.enabled if frozen is not None
-                 else getattr(live_scan, "gi", False))
+    is_gi = bool(
+        frozen.gi.enabled if frozen is not None
+        else getattr(live_scan, "gi", False)
+    )
     # Reintegrate-on-reload: a .nxs-reloaded scan carries its GI geometry only in
     # ``scan.gi_config`` — a live run sets the direct attrs via
     # ``sync_live_scan_gi_settings``, but a reload restores only the dict.  Fall
     # back to it so reintegrate uses the SAME sample_orientation / tilt as live;
     # otherwise sample_orientation silently defaults to 1 and the GI out-of-plane
-    # (Q_oop) axis flips sign vs the live run.  An ADMITTED run has one authority
-    # instead: the accepted frozen GI configuration.
-    _gi_cfg = dict(frozen.gi.scan_config() if frozen is not None
-                   else (getattr(live_scan, "gi_config", {}) or {}))
+    # (Q_oop) axis flips sign vs the live run.
+    _gi_cfg = dict(
+        frozen.gi.scan_config() if frozen is not None
+        else (getattr(live_scan, "gi_config", {}) or {})
+    )
 
     def _gi_geom(attr, default):
         if frozen is not None:
@@ -408,8 +943,10 @@ def plan_from_live_scan(
         _strip_nonstandard_args(args_2d)
     if is_gi and gi_incident_angle is None:
         gi_incident_angle = getattr(live_scan, "_cached_fiber_integrator_angle", None)
-    incidence_motor = (frozen.gi.scan_incidence_motor if frozen is not None
-                       else getattr(live_scan, "incidence_motor", None))
+    incidence_motor = (
+        frozen.gi.scan_incidence_motor if frozen is not None
+        else getattr(live_scan, "incidence_motor", None)
+    )
     if is_gi and gi_incident_angle is None and incidence_motor is not None:
         try:
             gi_incident_angle = resolve_incident_angle({}, incidence_motor)
@@ -591,7 +1128,12 @@ def reduce_live_frames(
         result_frames = result.frames
         active_plan = plan
     else:
-        session.process(headless_frames)
+        if session.execution == "streaming":
+            for headless_frame in headless_frames:
+                session.submit(headless_frame)
+            session.drain()
+        else:
+            session.process(headless_frames)
         result_frames = session.frames
         active_plan = session.plan
     by_index = {int(frame.idx): frame for frame in frames}
@@ -656,6 +1198,21 @@ def _build_live_scan_and_plan(
     )
     return scan, plan, len(frames)
 
+def live_target_maps(plan, *, nexus_target=None, xye_target=None):
+    """Per-mode applicability; XYE-only gives 1-D {xye} with NO store target."""
+    from xrd_tools.session import required_result_modes
+    targets, store = {}, {}
+    for mode in required_result_modes(plan):
+        applicable = []
+        if nexus_target:
+            applicable.append(nexus_target)
+        if xye_target and mode.kind == "1d":
+            applicable.append(xye_target)
+        if not applicable:
+            return None, None
+        targets[mode] = tuple(applicable)
+        store[mode] = (nexus_target,) if nexus_target else ()
+    return (targets, store) if targets else (None, None)
 
 def open_live_scan_session(
     live_frames: Iterable[Any],
@@ -672,6 +1229,10 @@ def open_live_scan_session(
     inflight_max: int | None = None,
     record_store: FrameRecordStore | None = None,
     record_store_persisted_on_write: bool = False,
+    nexus_target: str | None = None,
+    xye_target: str | None = None,
+    accounting=None,
+    xye_receipt_boundary=None,
 ):
     """Open a public :class:`xrd_tools.session.ScanSession` over xdart live
     frames (4f-bridge).
@@ -682,11 +1243,27 @@ def open_live_scan_session(
     ``ReductionSession``.  Streaming-only — the GUI live/batch write path.
     ``clear_frame_images=True`` preserves xdart's PERF-3 raw-nulling.
     """
-    from xrd_tools.session import ScanSession
+    from xrd_tools.session import DynamicRunAccounting, ScanSession
+
+    if type(accounting) is DynamicRunAccounting:
+        if xye_target and xye_receipt_boundary is None:
+            raise DynamicXyeReceiptBoundaryRequired(
+                "dynamic XYE requires a transaction-qualified durable "
+                "receipt boundary before session mutation"
+            )
+        if (xye_receipt_boundary is not None
+                and not supports_durable_xye_receipts(xye_receipt_boundary)):
+            raise DynamicXyeReceiptBoundaryRequired(
+                "dynamic XYE receipt boundary must be the exact shared "
+                "durable receipt owner"
+            )
+        accounting = accounting.ledger
 
     scan, plan, _n = _build_live_scan_and_plan(
         live_frames, plan, scan_name=scan_name, global_mask=global_mask,
         integrator=integrator, poni=poni)
+    targets_by_mode, store_targets_by_mode = live_target_maps(
+        plan, nexus_target=nexus_target, xye_target=xye_target)
     return ScanSession(
         plan,
         scan,
@@ -698,6 +1275,9 @@ def open_live_scan_session(
         clear_frame_images=True,
         record_store=record_store,
         record_store_persisted_on_write=record_store_persisted_on_write,
+        targets_by_mode=targets_by_mode,
+        store_targets_by_mode=store_targets_by_mode,
+        accounting=accounting,
         # GUI never aborts a save (loud is the headless default).  Without this, the
         # streaming live/batch write path ran loud and a single degraded frame
         # (dead monitor / all-dummy 2D) aborted the whole-scan save (B-1 regression).
@@ -720,6 +1300,8 @@ def open_live_reduction_session(
     sink: Any = None,
     execution: str = "chunked",
     inflight_max: int | None = None,
+    accept_cb=None,
+    outcome_cb=None,
 ) -> ReductionSession:
     """Open a persistent headless reducer for xdart live-frame chunks.
 
@@ -744,6 +1326,8 @@ def open_live_reduction_session(
         gi_freeze_mode=gi_freeze_mode,
         execution=execution,
         inflight_max=inflight_max,
+        accept_cb=accept_cb,
+        outcome_cb=outcome_cb,
         strict=StrictPolicy.graceful(),   # GUI never aborts a save (loud is the
         # headless default; the GUI drops a bad frame per-frame and keeps going)
 
@@ -1193,14 +1777,23 @@ def _gi_2d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
 
 
 __all__ = [
+    "DynamicXyeReceiptBoundaryRequired",
+    "LiveScanNexusSession",
     "StandardPlanCache",
+    "ThresholdSaturationConfig",
+    "apply_threshold_saturation_to_plan",
+    "bad_pixel_counts",
+    "compute_bad_pixel_mask",
     "apply_frozen_run_configuration",
     "frame_from_live_frame",
     "scan_from_live_scan",
+    "write_live_scan_to_nexus",
     "plan_from_live_scan",
     "reduce_live_frame",
     "reduce_live_frames",
     "open_live_reduction_session",
+    "open_live_scan_nexus_session",
+    "live_target_maps",
     "open_live_scan_session",
     "freeze_live_scan_gi_ranges",
     "sync_live_scan_gi_settings",
