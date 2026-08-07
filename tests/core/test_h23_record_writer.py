@@ -631,6 +631,95 @@ def test_mode_only_write_cannot_bypass_authoritative_source_identity(tmp_path):
     writer.abort()
 
 
+def _complete_source_snapshot(source: Path) -> dict[str, object]:
+    return {
+        "adapter_id": "nexus_hdf5",
+        "size": source.stat().st_size,
+        "mtime_ns": source.stat().st_mtime_ns,
+        "frame_count": 2,
+        "dataset_path": "/entry/instrument/detector/data",
+        "self_contained": True,
+    }
+
+
+def test_d1_mode_only_source_omission_is_an_atomic_mismatch(tmp_path):
+    rw = _api()
+    target = tmp_path / "mode-only-omitted-source.nexus"
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"source")
+    snapshot = _complete_source_snapshot(source)
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1), source_path=source,
+        source_frame_index=2, source_snapshot=snapshot,
+    ))
+    writer.flush(force=True)
+    before = target.read_bytes()
+    before_vector = writer.operation_vector()
+    with pytest.raises(rw.WriterStateError):
+        writer.write(rw.RecordWrite(
+            label=0, result_2d=_r2(2), write_frame_record=False,
+        ))
+    writer._h5.flush()
+    assert target.read_bytes() == before
+    assert writer.operation_vector() == before_vector
+    writer.abort()
+
+
+def test_d1_mode_only_partial_snapshot_is_an_atomic_mismatch(tmp_path):
+    rw = _api()
+    target = tmp_path / "mode-only-partial-snapshot.nexus"
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"source")
+    snapshot = _complete_source_snapshot(source)
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1), source_path=source,
+        source_frame_index=2, source_snapshot=snapshot,
+    ))
+    writer.flush(force=True)
+    before = target.read_bytes()
+    before_vector = writer.operation_vector()
+    with pytest.raises(rw.WriterStateError):
+        writer.write(rw.RecordWrite(
+            label=0, result_2d=_r2(2), write_frame_record=False,
+            source_path=source, source_frame_index=2,
+            source_snapshot={"size": snapshot["size"]},
+        ))
+    writer._h5.flush()
+    assert target.read_bytes() == before
+    assert writer.operation_vector() == before_vector
+    writer.abort()
+
+
+def test_d1_complete_mode_only_sibling_preserves_frame_provenance(tmp_path):
+    rw = _api()
+    target = tmp_path / "mode-only-exact-sibling.nexus"
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"source")
+    snapshot = _complete_source_snapshot(source)
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write(rw.RecordWrite(
+        label=0, result_1d=_r1(1), source_path=source,
+        source_frame_index=2, source_snapshot=snapshot,
+    ))
+    writer.flush(force=True)
+    before_digest = writer._frame_row_digest(0)
+    writer.reset_operation_vector()
+    writer.write(rw.RecordWrite(
+        label=0, result_2d=_r2(2), write_frame_record=False,
+        source_path=source, source_frame_index=2, source_snapshot=snapshot,
+    ))
+    writer.flush(force=True)
+    assert writer._frame_row_digest(0) == before_digest
+    assert writer.operation_vector().source_record_rows == 0
+    assert tuple(writer._entry_group()["frames"]) == ("frame_0000",)
+    writer.finish()
+
+
 def test_explicit_replace_requires_an_existing_frame_label(tmp_path):
     rw = _api()
     target = tmp_path / "replace-absent.nexus"

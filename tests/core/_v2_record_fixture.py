@@ -200,6 +200,8 @@ def write_gi_reference_scan(out_path, source_base, *, compression="default"):
                         index, unit=_GI_1D_UNITS[mode], offset=offset
                     ),
                     mode_1d=mode,
+                    source_path=base[index].source_path,
+                    source_frame_index=base[index].source_frame_index,
                     write_frame_record=False,
                 )
                 for index in range(N_FRAMES)
@@ -217,6 +219,8 @@ def write_gi_reference_scan(out_path, source_base, *, compression="default"):
                         offset=offset,
                     ),
                     mode_2d=mode,
+                    source_path=base[index].source_path,
+                    source_frame_index=base[index].source_frame_index,
                     write_frame_record=False,
                 )
                 for index in range(N_FRAMES)

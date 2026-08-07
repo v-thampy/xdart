@@ -45,7 +45,7 @@ from xrd_tools.reduction import (
     StrictPolicy,
     NexusSink,
     OutputSinkKind,
-    classify_output_sink_graph,
+    bind_dynamic_output_sink,
     run_reduction,
     supports_durable_xye_receipts,
 )
@@ -1253,13 +1253,12 @@ def open_live_scan_session(
                 "non-None live accounting must be DynamicRunAccounting authority"
             )
         try:
-            sink_kinds = classify_output_sink_graph(sink)
+            sink_binding = bind_dynamic_output_sink(sink)
         except TypeError as error:
             raise DynamicXyeReceiptBoundaryRequired(
-                "dynamic output sink graph must expose complete public "
-                "requirements or immutable delegation children"
+                "dynamic output sink is outside the bound P0 supported envelope"
             ) from error
-        active_xye = bool(xye_target) or OutputSinkKind.XYE in sink_kinds
+        active_xye = bool(xye_target) or OutputSinkKind.XYE in sink_binding.families
         if active_xye:
             raise DynamicXyeReceiptBoundaryRequired(
                 "dynamic XYE output is dormant until P1 and must be refused "
@@ -1272,6 +1271,7 @@ def open_live_scan_session(
                 "durable receipt owner"
             )
         accounting = accounting.ledger
+        sink = sink_binding.sink
 
     scan, plan, _n = _build_live_scan_and_plan(
         live_frames, plan, scan_name=scan_name, global_mask=global_mask,

@@ -12,6 +12,7 @@ from typing import Any
 
 __all__ = [
     "CancelToken",
+    "BoundOutputSinkGraph",
     "CompositeSink",
     "FlushPolicy",
     "Frame",
@@ -40,6 +41,7 @@ __all__ = [
     "Scan",
     "XYESink",
     "prepare_gi_freeze",
+    "bind_dynamic_output_sink",
     "run_reduction",
     "requires_active_xye_output",
     "classify_output_sink_graph",
@@ -52,6 +54,7 @@ __all__ = [
 
 _CORE_EXPORTS = {
     "CancelToken",
+    "BoundOutputSinkGraph",
     "CompositeSink",
     "Frame",
     "FrameSource",
@@ -79,6 +82,7 @@ _CORE_EXPORTS = {
     "Scan",
     "XYESink",
     "prepare_gi_freeze",
+    "bind_dynamic_output_sink",
     "run_reduction",
     "requires_active_xye_output",
     "classify_output_sink_graph",

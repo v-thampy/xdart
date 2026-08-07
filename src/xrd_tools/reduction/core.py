@@ -103,6 +103,8 @@ def supports_durable_xye_receipts(value: object) -> bool:
 class OutputSinkKind(str, Enum):
     """Typed description of output families present in a sink graph."""
 
+    MEMORY = "memory"
+    NEXUS = "nexus"
     XYE = "xye"
 
 
@@ -570,9 +572,10 @@ class MemorySink:
     """In-memory sink for notebooks, tests, and xdart display handoff."""
 
     frames: dict[int, FrameReduction] = field(default_factory=dict)
-    output_sink_kinds: frozenset[OutputSinkKind] = field(
-        default=frozenset(), init=False,
-    )
+
+    @property
+    def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
+        return frozenset({OutputSinkKind.MEMORY})
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         self.frames.clear()
@@ -721,9 +724,10 @@ class XYESink:
     _pending: Any = field(default=None, init=False, repr=False)
     _worker: Any = field(default=None, init=False, repr=False)
     _errors: list[BaseException] = field(default_factory=list, init=False, repr=False)
-    output_sink_kinds: frozenset[OutputSinkKind] = field(
-        default=frozenset({OutputSinkKind.XYE}), init=False,
-    )
+
+    @property
+    def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
+        return frozenset({OutputSinkKind.XYE})
 
     def __post_init__(self) -> None:
         if not isinstance(self.directory, Path):
@@ -866,6 +870,10 @@ class NexusSink:
     _source_execution: dict[str, Any] | None = field(
         default=None, init=False, repr=False,
     )
+
+    @property
+    def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
+        return frozenset({OutputSinkKind.NEXUS})
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -1538,6 +1546,74 @@ class NexusSink:
                     self.append_preflight._terminal(
                         self.append_preflight._cleanup_failure_state())
                 raise
+
+
+@dataclass(frozen=True, slots=True)
+class BoundOutputSinkGraph:
+    """One immutable dynamic-admission graph and the exact sink it executes."""
+
+    sink: ReductionSink | None
+    families: frozenset[OutputSinkKind]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.families, frozenset)
+                or not all(isinstance(item, OutputSinkKind)
+                           for item in self.families)):
+            raise TypeError("bound sink families must be a typed frozenset")
+
+
+def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
+    """Bind the finite P0 dynamic-sink envelope to its executable snapshot.
+
+    Arbitrary providers and delegation proxies are deliberately unsupported:
+    only exact built-ins and recursively rebuilt exact ``CompositeSink`` values
+    can cross this admission boundary.
+    """
+    active: set[int] = set()
+
+    def bind(node: object) -> BoundOutputSinkGraph:
+        if node is None:
+            return BoundOutputSinkGraph(None, frozenset())
+        node_type = type(node)
+        direct = {
+            MemorySink: OutputSinkKind.MEMORY,
+            NexusSink: OutputSinkKind.NEXUS,
+            XYESink: OutputSinkKind.XYE,
+        }
+        if node_type in direct:
+            return BoundOutputSinkGraph(
+                node, frozenset({direct[node_type]}),
+            )
+        if node_type is not CompositeSink:
+            raise UnclassifiedOutputSinkGraph(
+                f"dynamic sink {node_type.__name__} is outside the supported envelope"
+            )
+        identity = id(node)
+        if identity in active:
+            raise UnclassifiedOutputSinkGraph("dynamic sink graph contains a cycle")
+        active.add(identity)
+        try:
+            children = node.sinks
+            if type(children) is not tuple:
+                raise UnclassifiedOutputSinkGraph(
+                    "CompositeSink children must be an immutable tuple"
+                )
+            bound_children = tuple(bind(child) for child in children)
+            if any(child.sink is None for child in bound_children):
+                raise UnclassifiedOutputSinkGraph(
+                    "CompositeSink children must be supported sink values"
+                )
+        finally:
+            active.remove(identity)
+        executable = CompositeSink(tuple(
+            child.sink for child in bound_children
+        ))
+        return BoundOutputSinkGraph(
+            executable,
+            frozenset().union(*(child.families for child in bound_children)),
+        )
+
+    return bind(value)
 
 
 class _RunSaturationMask:

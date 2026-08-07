@@ -243,6 +243,24 @@ class _ExpectedFrameRow:
 
 
 @dataclass(frozen=True, slots=True)
+class _PersistedSourceFact:
+    present: bool
+    path: str | None
+    frame_index: int | None
+    snapshot: tuple[tuple[str, Any | None], ...]
+
+
+_SOURCE_SNAPSHOT_ATTRIBUTES = (
+    ("adapter_id", "adapter_id"),
+    ("size", "file_size"),
+    ("mtime_ns", "file_mtime_ns"),
+    ("frame_count", "frame_count"),
+    ("dataset_path", "dataset_path"),
+    ("self_contained", "self_contained"),
+)
+
+
+@dataclass(frozen=True, slots=True)
 class _ExpectedIndexedRow:
     group_name: str
     label: int
@@ -661,51 +679,60 @@ class NexusRecordWriter:
             return
         self._dirty_frames[int(record.label)] = self._expected_frame_row(record)
 
-    def _verify_supplied_source_identity(self, record: RecordWrite) -> None:
-        """Validate source facts on a mode-only write without rewriting its row."""
-        if record.source_path is None:
-            return
-        label = int(record.label)
+    def _expected_source_fact(self, record: RecordWrite) -> _PersistedSourceFact:
+        expected = self._expected_frame_row(record)
+        if expected.source_path is None:
+            return _PersistedSourceFact(False, None, None, ())
+        supplied = dict(expected.source_snapshot)
+        return _PersistedSourceFact(
+            True,
+            expected.source_path,
+            expected.source_frame_index,
+            tuple(
+                (key, supplied.get(key))
+                for key, _attr_name in _SOURCE_SNAPSHOT_ATTRIBUTES
+            ),
+        )
+
+    def _authoritative_source_fact(self, label: int) -> _PersistedSourceFact:
+        label = int(label)
         frame = self._entry_group().get(f"frames/frame_{label:04d}")
         source = frame.get("source") if isinstance(frame, h5py.Group) else None
+        if source is None:
+            return _PersistedSourceFact(False, None, None, ())
         if not isinstance(source, h5py.Group):
+            raise WriterStateError(f"existing frame {label} source is not a group")
+        try:
+            path = self._text_value(source["path"][()])
+            frame_index = int(source["frame_index"][()])
+        except (KeyError, TypeError, ValueError) as error:
             raise WriterStateError(
-                f"existing frame {label} has no authoritative source identity"
-            )
-        expected_path = relative_source_path(record.source_path, self.source_base)
-        if self._text_value(source["path"][()]) != expected_path:
-            raise WriterStateError(
-                f"existing frame {label} source path does not match supplied path"
-            )
-        if int(source["frame_index"][()]) != int(record.source_frame_index):
-            raise WriterStateError(
-                f"existing frame {label} source selector does not match supplied index"
-            )
-        attr_names = {
-            "adapter_id": "adapter_id",
-            "size": "file_size",
-            "mtime_ns": "file_mtime_ns",
-            "frame_count": "frame_count",
-            "dataset_path": "dataset_path",
-            "self_contained": "self_contained",
-        }
-        for key, expected in record.source_snapshot.items():
-            attr_name = attr_names[key]
+                f"existing frame {label} has malformed source identity"
+            ) from error
+        snapshot = []
+        for key, attr_name in _SOURCE_SNAPSHOT_ATTRIBUTES:
             if attr_name not in source.attrs:
-                raise WriterStateError(
-                    f"existing frame {label} source snapshot lacks {key}"
-                )
-            observed = source.attrs[attr_name]
-            if key in {"size", "mtime_ns", "frame_count"}:
-                matches = int(observed) == int(expected)
-            elif key == "self_contained":
-                matches = bool(observed) is bool(expected)
+                value = None
             else:
-                matches = self._text_value(observed) == str(expected)
-            if not matches:
-                raise WriterStateError(
-                    f"existing frame {label} source snapshot {key} does not match"
-                )
+                observed = source.attrs[attr_name]
+                if key in {"size", "mtime_ns", "frame_count"}:
+                    value = int(observed)
+                elif key == "self_contained":
+                    value = bool(observed)
+                else:
+                    value = self._text_value(observed)
+            snapshot.append((key, value))
+        return _PersistedSourceFact(True, path, frame_index, tuple(snapshot))
+
+    def _verify_supplied_source_identity(self, record: RecordWrite) -> None:
+        """Require complete source-fact equality for a mode-only sibling."""
+        expected = self._expected_source_fact(record)
+        observed = self._authoritative_source_fact(int(record.label))
+        if observed != expected:
+            raise WriterStateError(
+                f"existing frame {int(record.label)} complete source fact "
+                "does not match the mode-only write"
+            )
 
     def _remember_written_rows(self, records: tuple[RecordWrite, ...]) -> None:
         for record in records:

@@ -966,6 +966,94 @@ def _dynamic_sink_case(tmp_path, name):
     return target, accounting, live, ReductionPlan(integration_2d=None)
 
 
+def test_d1_direct_nexus_dynamic_graph_is_bound_and_admitted(tmp_path):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import NexusSink
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "direct-nexus")
+    session = open_live_scan_session(
+        (live,), plan,
+        sink=NexusSink(target, overwrite=True, atomic=False),
+        accounting=accounting,
+        nexus_target=f"nexus:{target}",
+    )
+    session.finish(raise_on_failure=False)
+    assert target.exists()
+
+
+def test_d1_nexus_memory_dynamic_composite_is_bound_and_admitted(tmp_path):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import CompositeSink, MemorySink, NexusSink
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "nexus-memory")
+    session = open_live_scan_session(
+        (live,), plan,
+        sink=CompositeSink((
+            MemorySink(), NexusSink(target, overwrite=True, atomic=False),
+        )),
+        accounting=accounting,
+        nexus_target=f"nexus:{target}",
+    )
+    session.finish(raise_on_failure=False)
+    assert target.exists()
+
+
+def test_d1_swapping_delegation_proxy_refuses_before_begin_or_effect(tmp_path):
+    from xdart.modules.reduction import (
+        DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
+    )
+    from xrd_tools.reduction import MemorySink, XYESink
+
+    class SwappingProxy:
+        def __init__(self, child):
+            self.child = child
+            self.begun = False
+
+        @property
+        def output_sink_children(self):
+            return (self.child,)
+
+        def begin(self, scan, plan):
+            self.begun = True
+            self.child = XYESink(directory)
+            self.child.begin(scan, plan)
+            self.child.finish(SimpleNamespace())
+            raise DynamicXyeReceiptBoundaryRequired("proxy mutated during begin")
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "swapping")
+    directory = tmp_path / "swapped-xye"
+    proxy = SwappingProxy(MemorySink())
+    before = accounting.snapshot()
+    with pytest.raises(DynamicXyeReceiptBoundaryRequired):
+        open_live_scan_session(
+            (live,), plan, sink=proxy, accounting=accounting,
+            nexus_target=f"nexus:{target}",
+        )
+    assert proxy.begun is False
+    assert not directory.exists()
+    assert accounting.snapshot() == before
+
+
+def test_d1_original_composite_mutation_cannot_change_bound_execution(tmp_path):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import CompositeSink, MemorySink
+
+    class LateEffectSink:
+        def finish(self, _result):
+            marker.write_text("executed", encoding="utf-8")
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "bound-copy")
+    marker = tmp_path / "late-effect.txt"
+    original = CompositeSink((MemorySink(),))
+    session = open_live_scan_session(
+        (live,), plan, sink=original, accounting=accounting,
+        nexus_target=f"nexus:{target}",
+    )
+    object.__setattr__(original, "sinks", (LateEffectSink(),))
+    session.finish(raise_on_failure=False)
+    assert not marker.exists()
+
+
 def test_dynamic_accounting_subclass_cannot_skip_xye_safety(tmp_path):
     from xdart.modules.reduction import (
         DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
