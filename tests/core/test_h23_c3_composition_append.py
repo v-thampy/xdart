@@ -3504,7 +3504,10 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
     assert target.read_bytes() == before
     _assert_lease_available(target)
 
-    for mutation in ("bool-version", "float-label", "bool-member-ordinal"):
+    for mutation in (
+        "bool-version", "float-label", "bool-member-ordinal", "bool-digest",
+        "string-image-members", "null-image-member",
+    ):
         typed_target = tmp_path / f"typed-{mutation}.nxs"
         _commit_image_series_target(
             typed_target, _image_series_intent(tmp_path, 2, generation=0),
@@ -3517,10 +3520,16 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
                 typed_lineage["version"] = True
             elif mutation == "float-label":
                 typed_lineage["epochs"][0]["labels"][0] = 0.0
-            else:
+            elif mutation == "bool-member-ordinal":
                 typed_lineage["epochs"][0]["source"]["image_members"][0][
                     "ordinal"
                 ] = False
+            elif mutation == "bool-digest":
+                typed_lineage["epochs"][0]["source"]["digest"] = True
+            elif mutation == "string-image-members":
+                typed_lineage["epochs"][0]["source"]["image_members"] = "x"
+            else:
+                typed_lineage["epochs"][0]["source"]["image_members"] = [None]
             del handle["entry/reduction/config/append_lineage"]
             handle["entry/reduction/config"].create_dataset(
                 "append_lineage", data=json.dumps(
@@ -3529,9 +3538,9 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
             )
         typed_before = typed_target.read_bytes()
         with h5py.File(typed_target, "r") as handle:
-            with pytest.raises(ValueError, match="not committed|exact JSON integers"):
+            with pytest.raises(ValueError, match="not committed|exact JSON"):
                 decode_committed_append_prefix(handle)
-        with pytest.raises(AppendRefused, match="not committed|exact JSON integers"):
+        with pytest.raises(AppendRefused, match="not committed|exact JSON"):
             prepare_append_preflight(
                 typed_target, _image_series_intent(tmp_path, 3, generation=1),
                 committed_prefix=typed_prefix,

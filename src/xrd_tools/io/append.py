@@ -331,10 +331,8 @@ class AppendPreflight:
                 if self._committed_prefix is None:
                     decision = qualify_append(self._target, intent)
                 else:
-                    decision = qualify_append(
-                        self._target, intent,
-                        committed_prefix=self._committed_prefix,
-                    )
+                    decision = qualify_append(self._target, intent,
+                                              committed_prefix=self._committed_prefix)
         if decision.disposition is AppendDisposition.REFUSE:
             raise AppendRefused(decision)
         self._intent = intent
@@ -490,12 +488,18 @@ def _source_dict(source: AppendSource) -> dict[str, Any]:
 def _intent_identity(intent: AppendIntent) -> tuple[Any, ...]:
     return (intent.entry, intent.source_base, intent.source_identity, intent.science_fingerprint, intent.modes)
 def _source_from_dict(raw_source: Mapping[str, Any]) -> AppendSource:
-    numbers = [raw_source.get(key) for key in ("size", "mtime_ns", "extent", "generation")]
-    numbers.extend(member.get(key) for kind in ("image_members", "external_members")
-                   for member in raw_source.get(kind, ())
-                   for key in ("size", "mtime_ns", "source_start", "source_stop", "ordinal"))
-    if any(type(value) is not int for value in numbers):
-        raise ValueError("Append source/member integers require exact JSON integers")
+    source_types = {"path": (str,), "adapter_id": (str,), "size": (int,), "mtime_ns": (int,), "extent": (int,), "digest": (str, type(None)), "generation": (int,)}
+    image_types = {"path": (str,), "size": (int,), "mtime_ns": (int,), "source_start": (int,), "source_stop": (int,), "ordinal": (int,)}
+    external_types = {**image_types, "dataset_path": (str,)}
+    dataset_paths = raw_source.get("dataset_paths")
+    member_types = ((raw_source.get("image_members"), image_types), (raw_source.get("external_members"), external_types))
+    if (type(dataset_paths) is not list
+            or any(type(value) is not str for value in dataset_paths)
+            or any(type(raw_source.get(key)) not in types for key, types in source_types.items())
+            or any(type(members) is not list for members, _types in member_types)
+            or any(type(member) is not dict or any(type(member.get(key)) not in types for key, types in schema.items())
+                   for members, schema in member_types for member in members)):
+        raise ValueError("Append source/member values require exact JSON types")
     values = dict(raw_source)
     values["image_members"] = tuple(
         AppendImageMember(**item) for item in raw_source["image_members"])
@@ -803,11 +807,7 @@ def _lineage_labels(lineage: Mapping[str, Any]) -> tuple[int, ...]:
     _require_contiguous(values, "Append lineage labels")
     return values
 
-def decode_committed_append_prefix(
-    handle: h5py.File,
-    *,
-    entry: str = "entry",
-) -> AppendCommittedPrefix:
+def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -> AppendCommittedPrefix:
     if not isinstance(handle, h5py.File) or not handle.id.valid:
         raise TypeError("committed Append prefix requires an open h5py.File")
     group = handle.get(entry)
