@@ -31,7 +31,6 @@ from xrd_tools.session.run_configuration import (
     require_run_configuration,
 )
 from ..run_config_debug import run_config_debug_log
-from .qt_nexus_sink import _is_append_axis_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +164,9 @@ class _CommandCancelToken:
     @property
     def cancelled(self):
         return getattr(self._owner, 'command', None) == 'stop'
+
+    def cancel(self):
+        self._owner.command = 'stop'
 
 
 class GIMotorHydration(NamedTuple):
@@ -455,6 +457,47 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             logger.debug(
                 "[GI] hydration invalidation on close failed", exc_info=True)
         super().closeEvent(event)
+
+    def _adopt_retained_custody(self, generation, path):
+        self._viewer_preserve_token = (int(generation), os.path.normcase(os.path.abspath(path)), None)
+
+    def dynamic_session_running(self, **facts):
+        probe = getattr(getattr(self, "thread", None), "dynamic_session_running", None)
+        return bool(callable(probe) and probe(**facts))
+
+    def dynamic_cleanup_pending(self):
+        probe = getattr(getattr(self, "thread", None), "dynamic_cleanup_pending", None)
+        return bool(callable(probe) and probe())
+
+    def _viewer_transition(self, transition, **facts):
+        token = getattr(self, "_viewer_preserve_token", None)
+        operation = facts.get("operation")
+        if token is not None:
+            generation, path, accepted = token
+            incoming = facts.get("path")
+            exact = (facts.get("generation") == generation and incoming is not None
+                     and os.path.normcase(os.path.abspath(incoming)) == path)
+            if (transition == "set_file" and exact and facts.get("internal")
+                    and accepted is None and facts.get("accepted")):
+                self._viewer_preserve_token = (generation, path, operation)
+                return "preserve"
+            if transition == "run_end_browse" and exact and accepted is None:
+                return "preserve"
+            if transition == "data_reset" and exact and accepted is not None:
+                return "preserve"
+            if (transition == "set_file_failed" and accepted is not None
+                    and operation is accepted):
+                self._viewer_preserve_token = (generation, path, None)
+                return "preserve"
+            if (transition == "thread_finished" and accepted is not None
+                    and operation is accepted):
+                self._viewer_preserve_token = None
+                return "preserve"
+        release = getattr(getattr(self, "thread", None), "release_retained_custody", None)
+        if release is None or release():
+            self._viewer_preserve_token = None
+            return "released"
+        return "cleanup-pending"
 
     @staticmethod
     def _gi_hydration_state(motors, proved: bool):
@@ -1182,20 +1225,8 @@ class wranglerThread(Qt.QtCore.QThread):
         # wrangler_finished handler.
         self._reduction_session = None
         self._reduction_session_key = None
-        # Streaming (PERF-4b) session + its QtNexusSink, kept on dedicated slots
-        # because one persistent session spans the WHOLE scan (the chunked cache
-        # keys on per-chunk n_workers, which varies).  Finished at scan end by
-        # _close_reduction_session.
-        self._streaming_session = None
-        self._streaming_sink = None
-        self._streaming_scan_id = None
-        self._streaming_record_store = None
-        self._streaming_executor_workers = None
-        # 4c-1/4d: the streaming register/submit/pause seam (created in
-        # _get_streaming_session, dies in _close_reduction_session).  Initialised
-        # here so the `scan_session` property + GUI run-state reads never hit an
-        # AttributeError before the first streaming session opens.
         self._scan_session_adapter = None
+        self._retained_scan_session_adapter = None
         # BLOCKER 1: id of the scan whose whole-scan GI grid pre-pass has run, so
         # the freeze happens once per scan (not per chunk).  Reset on scan close.
         self._gi_prepass_scan_id = None
@@ -1243,117 +1274,239 @@ class wranglerThread(Qt.QtCore.QThread):
             id(plan),
         )
 
+    def release_retained_custody(self):
+        if self._scan_session_adapter is not None:
+            return False
+        retained = self._retained_scan_session_adapter
+        if retained is not None and not retained.release_retained_custody():
+            return False
+        self._retained_scan_session_adapter = None
+        return True
+
+    def _retain_dynamic_failure(self, error, status=None):
+        self._reduction_write_error = error
+        lock = getattr(self, "command_lock", None)
+        if lock is None:
+            self.command = "stop"
+        else:
+            with lock:
+                self.command = "stop"
+        if status:
+            try:
+                self.showLabel.emit(f"{status}: {error}")
+            except Exception:
+                logger.debug("showLabel emit failed for dynamic output", exc_info=True)
+
+    def _mount_dynamic_reduction_session(
+            self, key, *, frozen, scan, plan, pending_frame, output_path,
+            gui_thread_id):
+        from dataclasses import replace
+        from types import SimpleNamespace
+        from xdart.modules.frame_publication import PublicationStore
+        from xdart.modules.reduction import open_live_scan_session
+        from xrd_tools.core import (DEFAULT_MODE_KEY, browse_publication_max_items,
+                                    total_physical_ram_bytes)
+        from xrd_tools.reduction import NexusSink
+        import xrd_tools.session as session_api
+        from xrd_tools.session.policy import requirements_from
+        from .qt_nexus_sink import QtFrameObserver
+        from .scan_session import ScanSessionAdapter
+        normalized = os.path.abspath(os.fspath(output_path))
+        lineage = (int(frozen.generation), normalized)
+        if key != lineage:
+            raise ValueError("dynamic mount key does not match its exact lineage")
+        if frozen is not getattr(self, "_admitted_run_configuration", None):
+            raise ValueError("dynamic mount requires the admitted run configuration")
+        if self._scan_session_adapter is not None and not self._close_reduction_session():
+            raise RuntimeError("prior dynamic session cleanup remains pending")
+        if not self.release_retained_custody():
+            raise RuntimeError("prior light-1D custody cleanup remains pending")
+        store = getattr(self, "publication_store", None)
+        if type(store) is not PublicationStore:
+            raise TypeError("dynamic GUI mount requires the artifact PublicationStore")
+        intent = getattr(scan, "_same_run_intent", None)
+        if intent is None:
+            raise ValueError("dynamic GUI mount requires a frozen source lineage")
+        committed_prefix = getattr(scan, "_committed_append_prefix", None)
+        one_d = getattr(plan, "integration_1d", None)
+        npt = int(getattr(one_d, "npt", 0) or 0)
+        if one_d is None or npt <= 0:
+            raise TypeError("dynamic GUI mount requires a positive 1-D plan")
+        image = np.asarray(getattr(pending_frame, "map_raw", None))
+        if image.ndim != 2:
+            raise TypeError("dynamic GUI mount requires a 2-D detector frame")
+        background = int(getattr(getattr(pending_frame, "bg_raw", None), "nbytes", 0))
+        requirements = requirements_from(SimpleNamespace(
+            frame_shape=image.shape, dtype=image.dtype), plan, background_bytes=background)
+        policy = session_api.resolve_session_policy(
+            requirements, requested_workers=max(1, int(frozen.max_cores)))
+        allocation = policy.allocation
+        policy = replace(policy, flush=session_api.FlushPolicy(
+            interval=8 if plan.integration_2d is not None else 1000,
+            cap=int(allocation.staging_items), margin=8))
+        mode = (str(plan.gi.mode_1d.value) if getattr(plan, "gi", None)
+                is not None else DEFAULT_MODE_KEY)
+        dtype = np.dtype(np.float64)
+        def buffer(role):
+            return session_api.Light1DBufferLayout(npt, dtype.itemsize,
+                f"{mode}:{role}", dtype.str, shared=False)
+        layout = session_api.Light1DLayout((session_api.Light1DModeLayout(
+            mode, buffer("coordinate"), buffer("intensity"),
+            buffer("uncertainty") if one_d.error_model else None),), mode)
+        total = max(0, int(total_physical_ram_bytes() or 0))
+        rows = browse_publication_max_items(npt, total_ram_bytes=total)
+        ceiling = (min(1024 ** 3, int(0.05 * total)) if total else
+                   layout.shared_bytes + rows * layout.per_row_unique_ndarray_bytes)
+        overwrite = frozen.output_mode != "Append"
+        fresh_append = (not overwrite and not os.path.exists(normalized)
+                        and committed_prefix is None)
+        modes = session_api.required_result_modes(plan)
+        target = f"nexus:{normalized}"
+        adapter = None
+        try:
+            authority = session_api.SessionResourceAuthority.from_allocation(allocation)
+            ledger = session_api.StageLedger(
+                required_modes=modes, targets_by_mode={item: (target,) for item in modes})
+            accounting = session_api.DynamicRunAccounting(
+                ledger, run_generation=lineage[0],
+                limits=session_api.DynamicAccountingLimits(1, 32, 128))
+            lease = session_api.acquire_light_1d_retention(
+                authority, owner=f"dynamic-gui-light-1d:{lineage[0]}:{lineage[1]}",
+                generation=lineage[0], layout=layout,
+                requested_rows=rows, compatibility_byte_ceiling=ceiling,
+                gui_thread_id=gui_thread_id,
+                funding_mode=session_api.Light1DFundingMode.REPLACE_PUBLICATION_A1,
+                current_lineage_rows=None)
+            adapter = ScanSessionAdapter(
+                session=None, accounting=accounting, sink_graph=None,
+                observer=None, publication_store=store, policy=policy,
+                light_authority=authority, light_lease=lease,
+                light_hooks=None, light_slot=None, generation=lineage[0])
+            sink_values = dict(
+                overwrite=overwrite, flush_every=None, atomic=False,
+                source_base=getattr(scan, "source_base", None),
+                file_lock=self.file_lock, incremental_finalization=True,
+                run_configuration_provenance=frozen.as_provenance(),
+                source_execution_provenance=getattr(scan, "source_execution_provenance", None),
+                source_snapshots_provenance=getattr(scan, "source_snapshots_provenance", None))
+            if frozen.output_mode == "Append" and not fresh_append:
+                sink = NexusSink.for_existing_append(
+                    normalized, intent, committed_prefix=committed_prefix,
+                    **sink_values)
+            else:
+                sink = NexusSink(
+                    normalized, same_run_intent=intent, **sink_values)
+            adapter._sink_graph = sink
+            session = open_live_scan_session(
+                (pending_frame,), plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=getattr(self, "mask", None),
+                integrator=getattr(scan, "_cached_integrator", None),
+                poni=getattr(self, "poni", None), executor=allocation.workers,
+                cancel_token=self._cancel_token(), gi_freeze_mode=None,
+                sink=sink, inflight_max=allocation.reduction_inflight,
+                record_store=None, record_store_persisted_on_write=False,
+                nexus_target=target, policy=policy, accounting=accounting)
+            adapter._session = session
+            session.set_generation(lineage[0])
+            store.bind_allocation(allocation)
+            store.bind_light_1d(lease)
+            hooks = store.light_1d_cleanup_hooks(lease)
+            adapter._light_hooks = hooks
+            slot = session_api.Light1DCustodySlot(
+                grant_id=lease.grant_id, owner=lease.owner,
+                generation=lease.generation, cleanup_hooks=hooks)
+            observer = QtFrameObserver(
+                self, scan, store, lease, generation=lineage[0], active_mode_1d=mode,
+                mask=getattr(self, "mask", None), publish_display=not bool(frozen.batch_mode))
+            adapter._light_slot, adapter._observer = slot, observer
+            accounting.bind_light_1d(lease, cleanup_hooks=hooks, custody_slot=slot)
+            adapter._subscriptions = (session.on_frame_completed(observer.on_frame_completed),)
+            self._scan_session_adapter = adapter
+            return adapter
+        except BaseException as primary:
+            if adapter is None:
+                raise
+            try:
+                command = self.command; adapter.stop()
+                result = adapter.finish(join_timeout=60.0); self.command = command
+                if bool(getattr(result, "failed", False)):
+                    raise RuntimeError(str(getattr(
+                        result, "error", None) or "dynamic mount cleanup failed"))
+            except BaseException as cleanup:
+                self._scan_session_adapter = adapter
+                self._retain_dynamic_failure(cleanup)
+                raise primary from cleanup
+            raise
+
     def _close_reduction_session(self):
+        self._gi_prepass_scan_id = None
+        adapter = self._scan_session_adapter
+        if adapter is not None:
+            try:
+                if getattr(self, "command", None) == "stop":
+                    adapter.stop()
+                result = adapter.finish(join_timeout=60.0)
+            except BaseException as exc:
+                wranglerThread._retain_dynamic_failure(self, exc, "Output cleanup remains pending")
+                logger.error("dynamic reduction cleanup remains pending: %s", exc, exc_info=True)
+                return False
+            failed = bool(getattr(result, "failed", False))
+            if failed:
+                error = RuntimeError(str(getattr(result, "error", None) or "dynamic write failed"))
+                wranglerThread._retain_dynamic_failure(self, error, "Dynamic output failed")
+            self._scan_session_adapter = None
+            slot = adapter._light_slot
+            if slot is None:
+                self._frames_since_save = 0
+                return not failed
+            slot_state = getattr(slot.state, "value", None)
+            if slot_state == "retained":
+                self._retained_scan_session_adapter = adapter
+                signal = getattr(self, "sigRetainedCustody", None)
+                if signal is not None:
+                    signal.emit(int(adapter._publication_store.generation),
+                                os.path.normcase(os.path.abspath(adapter._sink_graph.path)))
+            elif slot_state not in {"cancelled", "released"}:
+                self._scan_session_adapter = adapter
+                error = RuntimeError(f"dynamic light-1D custody is {slot_state}")
+                wranglerThread._retain_dynamic_failure(self, error, "Output cleanup remains pending")
+                return False
+            self._frames_since_save = 0
+            return not failed
+
         session = self._reduction_session
+        if session is None:
+            return True
+        try:
+            session.finish(join_timeout=60.0)
+        except BaseException as exc:
+            wranglerThread._retain_dynamic_failure(self, exc, "Output cleanup remains pending")
+            logger.error("legacy reduction session close failed", exc_info=True)
+            return False
         self._reduction_session = None
         self._reduction_session_key = None
-        # The streaming session's finish() drains the writer thread + does the
-        # final QtNexusSink flush (save + XYE + end-of-run signal), so closing
-        # it here is the streaming batch's end-of-scan write.
-        streaming = self._streaming_session
-        self._streaming_session = None
-        self._streaming_sink = None
-        self._streaming_scan_id = None
-        self._streaming_record_store = None
-        self._streaming_executor_workers = None
-        self._scan_session_adapter = None        # 4c-1: adapter dies with the session
-        self._gi_prepass_scan_id = None      # next scan re-runs its own pre-pass
-        # BLOCKER 2: finish() is fail-loud — a streaming sink/write failure now
-        # RAISES instead of being silently swallowed (the user must not think a
-        # failed write succeeded).  Close BOTH sessions even if the first raises
-        # (wrap each individually + collect), then surface the failure loudly.
-        errors = []
+        return True
 
-        def _submitted_count(sess):
-            value = getattr(sess, "frames_submitted", None)
-            if value is None:
-                return None
-            try:
-                return int(value() if callable(value) else value)
-            except Exception:
-                return None
+    def dynamic_session_running(self, *, path=None, generation=None):
+        """Scalar healthy-run probe; the adapter never leaves the worker."""
+        adapter = self._scan_session_adapter
+        if (adapter is None or self._reduction_write_error is not None
+                or adapter._session is None or not adapter._session.is_running):
+            return False
+        if (generation is not None and
+                int(adapter._publication_store.generation) != int(generation)):
+            return False
+        if (path is not None and os.path.normcase(os.path.abspath(adapter._sink_graph.path))
+                != os.path.normcase(os.path.abspath(os.fspath(path)))):
+            return False
+        return True
 
-        def _report_result(sess, res):
-            if res is None:
-                return
-            submitted = _submitted_count(sess)
-            try:
-                written = int(getattr(res, "n_processed"))
-            except Exception:
-                written = None
-            if bool(getattr(res, "cancelled", False)) and written is not None:
-                logger.info("Total Files Processed (durable after cancel): %d",
-                            written)
-            if submitted is None or written is None or submitted == written:
-                return
-            unwritten = max(0, submitted - written)
-            msg = (
-                f"Stopped with {unwritten} frame(s) un-written "
-                f"(submitted={submitted}, written={written}) — source data "
-                "intact; re-run Append/batch to recover"
-            )
-            logger.warning(msg)
-            show = getattr(self, "showLabel", None)
-            if show is not None:
-                try:
-                    show.emit(msg)
-                except Exception:
-                    pass
-
-        for sess in (session, streaming):
-            if sess is not None:
-                try:
-                    # #4 (codex): bound the writer-thread join so a stalled
-                    # NFS/pyFAI worker can't wedge Stop/close indefinitely.
-                    # 60 s is a generous ceiling for beamline conditions.
-                    res = sess.finish(join_timeout=60.0)
-                    _report_result(sess, res)
-                except Exception as exc:
-                    errors.append(exc)
-                    if _is_append_axis_mismatch(exc):
-                        logger.debug(
-                            "append mismatch already reported by sink abort; "
-                            "suppressing duplicate traceback",
-                            exc_info=True,
-                        )
-                    else:
-                        logger.error(
-                            "reduction session WRITE FAILED on close: %s",
-                            exc,
-                            exc_info=True,
-                        )
-        if errors:
-            self._reduction_write_error = errors[0]
-            msg = (f"Save FAILED — output .nxs may be incomplete: {errors[0]}")
-            show = getattr(self, "showLabel", None)
-            if show is not None:
-                try:
-                    show.emit(msg)
-                except Exception:
-                    pass
-            # A failed write is serious — stop the run rather than process
-            # further scans onto a broken output.  Under command_lock so a
-            # concurrent GUI pause() can't overwrite this stop (RS-2).
-            # getattr: tests drive this on duck holders without the lock.
-            if getattr(self, "command", None) is not None:
-                _lock = getattr(self, "command_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        self.command = 'stop'
-                else:
-                    self.command = 'stop'
-
-    @property
-    def scan_session(self):
-        """The active streaming session seam (``ScanSessionAdapter``) or None.
-
-        4d: the single read-only accessor the GUI consults for run-state
-        (``is_running`` / ``is_paused``) instead of poking the private adapter
-        slot, and the seam 4f's public ``xrd_tools.session.ScanSession`` bridge
-        hangs off.  None when no streaming session is open (true-live watch and
-        the reintegrate-via-integratorThread path have no adapter — callers fall
-        back to their own run-state cache)."""
-        return self._scan_session_adapter
+    def dynamic_cleanup_pending(self):
+        """Scalar retained-owner probe, distinct from a healthy active run."""
+        retained = self._retained_scan_session_adapter
+        state = getattr(getattr(getattr(retained, "_light_slot", None), "state", None), "value", None)
+        return self._scan_session_adapter is not None or state == "cleanup-pending"
 
     def _resolve_frame_mask(self, frozen, scan, img_data):
         """Return a stable per-scan "bad pixel" mask cached on the scan.

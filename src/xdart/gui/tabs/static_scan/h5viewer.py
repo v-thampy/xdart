@@ -647,6 +647,13 @@ class H5Viewer(QWidget):
         self._displayed_list_count = 0
         self._displayed_last_label = None
         self._date_sort_dir_cache = {}
+        self._pre_transition_callback = None
+    def _set_pre_transition_callback(self, callback):
+        self._pre_transition_callback = callback
+
+    def _before_transition(self, transition, **facts):
+        callback = getattr(self, "_pre_transition_callback", None)
+        return "released" if callback is None else callback(transition, **facts)
 
     def _init_ui(self):
         """Set up the main UI form and default widget."""
@@ -1618,6 +1625,8 @@ class H5Viewer(QWidget):
         self.data_changed(show_all=True)
 
     def thread_finished(self, task):
+        if self._before_transition("thread_finished", operation=task) == "cleanup-pending":
+            return
         # O-2.1 (§61.4 B): the browse-load FINISH, emitted HERE — the existing
         # GUI-thread completion seam — rather than from the file worker.  It
         # echoes the exact operation minted at the start, so the pair shares one
@@ -2009,7 +2018,8 @@ class H5Viewer(QWidget):
         selected = self.ui.listScans.selectedItems()
         if not selected:
             return
-
+        if self._before_transition("_load_xye_files") == "cleanup-pending":
+            return
         with self.data_lock:
             self.viewer_rows_1d.clear()
             self.viewer_rows_2d.clear()
@@ -2095,6 +2105,8 @@ class H5Viewer(QWidget):
         """Inspect a NeXus/HDF5 file without loading large arrays."""
         from xrd_tools.io import inspect_nexus
 
+        if self._before_transition("_load_nexus_file", path=fpath) == "cleanup-pending":
+            return
         with self.data_lock:
             self.viewer_rows_1d.clear()
             self.viewer_rows_2d.clear()
@@ -2579,6 +2591,8 @@ class H5Viewer(QWidget):
         populate listData with frame indices.  For single-frame
         files, display the image directly.
         """
+        if self._before_transition("_load_image_file", path=fpath) == "cleanup-pending":
+            return
         with self.data_lock:
             self.viewer_rows_1d.clear()
             self.viewer_rows_2d.clear()
@@ -2900,6 +2914,19 @@ class H5Viewer(QWidget):
             if fname and fname == getattr(self.file_thread, 'fname', None):
                 return
         if fname != '':
+            operation = (new_display_context_operation(
+                kind=("internal_output_reload" if internal else "user_browse"),
+                requested_path=fname, load_generation=getattr(self, "_load_generation", None),
+                identity=getattr(self, "diagnostic_run_identity", None),
+                previous_scan=self.scan) if run_config_debug_enabled() else None)
+            task = FileTask(method="set_datafile", operation=operation)
+            transition = self._before_transition(
+                "set_file", path=fname, generation=getattr(self.publication_store, "generation", None),
+                internal=internal, operation=task, accepted=True,
+            )
+            if transition == "cleanup-pending":
+                return
+            queued = False
             try:
                 self.cancel_pending_loads()
                 # with self.file_lock:
@@ -2932,17 +2959,6 @@ class H5Viewer(QWidget):
                 # caught the load repointing the shared singleton rather than a
                 # browse-owned scan.  Guarded by the channel check so a disabled
                 # session evaluates none of these arguments and stores nothing.
-                operation = None
-                if run_config_debug_enabled():
-                    operation = new_display_context_operation(
-                        kind=("internal_output_reload" if internal
-                              else "user_browse"),
-                        requested_path=fname,
-                        load_generation=getattr(
-                            self, "_load_generation", None),
-                        identity=getattr(
-                            self, "diagnostic_run_identity", None),
-                        previous_scan=self.scan)
                 # O-2.2R (§65.3): the operation travels INSIDE the task, and the
                 # start is emitted only once that task has actually been
                 # accepted.  A refused enqueue therefore raises to the handler
@@ -2950,8 +2966,8 @@ class H5Viewer(QWidget):
                 # no parallel structure left to roll back, because there is no
                 # parallel structure.
                 self._ensure_file_thread_running()
-                self.file_thread.queue.put(
-                    FileTask(method="set_datafile", operation=operation))
+                self.file_thread.queue.put(task)
+                queued = True
                 if operation is not None:
                     display_context_transition_log(
                         logger, "browse_load_start",
@@ -2968,6 +2984,8 @@ class H5Viewer(QWidget):
                 self.ui.listData.itemSelectionChanged.connect(self.data_changed)
                 self.new_scan = True
             except Exception:
+                if transition == "preserve" and not queued:
+                    self._before_transition("set_file_failed", operation=task)
                 logger.exception("Failed to set file: %s", fname)
                 return
 
@@ -3647,6 +3665,13 @@ class H5Viewer(QWidget):
     def data_reset(self):
         """Resets data in memory (self.frames, self.frame_ids, self.data_..
         """
+        if self.live_run_active:
+            return
+        outcome = self._before_transition("data_reset",
+            path=getattr(self.file_thread, "fname", None),
+            generation=getattr(self.publication_store, "generation", None))
+        if outcome == "cleanup-pending":
+            return
         # During a live (non-batch) wrangler run the display is driven by
         # the in-memory per-frame hand-off in static_scan_widget.update_data.
         # This slot is wired to ``sigNewFile``, which the async file-thread
@@ -3655,8 +3680,6 @@ class H5Viewer(QWidget):
         # refresh can render them.  That is the multi-scan Eiger "plots
         # stay blank" bug.  new_scan() already does the controlled reset
         # the live path needs, so skip the wipe while a run is active.
-        if self.live_run_active:
-            return
         self.cancel_pending_loads()
         self._h5pool.close(self.scan.data_file)
         self.frames.clear()
@@ -3664,7 +3687,8 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.viewer_rows_1d.clear()
             self.viewer_rows_2d.clear()
-            _clear_publication_store_for(self)
+            if outcome != "preserve":
+                _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         # Re-arm the raw self-heal: frame indices restart per scan, so a
         # stale negative-cache entry from the previous file suppressed
@@ -3685,6 +3709,8 @@ class H5Viewer(QWidget):
             options=QFileDialog.ShowDirsOnly
         )
         if os.path.exists(dirname):
+            if self._before_transition("open_folder") == "cleanup-pending":
+                return
             remember_browse_path(dirname)
             self.dirname = dirname
             save_session({'data_dir': dirname})
@@ -4194,8 +4220,10 @@ class H5Viewer(QWidget):
             except Exception:
                 logger.debug("file_thread shutdown failed", exc_info=True)
 
-    def enter_viewer_mode_cleanup(self) -> None:
+    def enter_viewer_mode_cleanup(self) -> bool:
         """Clear scan-frame state before Image/XYE viewer data is loaded."""
+        if self._before_transition("enter_viewer_mode_cleanup") == "cleanup-pending":
+            return False
         self.cancel_pending_loads()
 
         with self.data_lock:
@@ -4230,6 +4258,7 @@ class H5Viewer(QWidget):
             scans.setCurrentRow(-1)
         finally:
             scans.blockSignals(was_blocked)
+        return True
 
     def _teardown_load_worker(self) -> None:
         """Stop + wait for the in-flight load worker/thread, THEN drop refs.

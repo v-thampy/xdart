@@ -140,7 +140,7 @@ def _drain_reader(t, limit=64):
 # F-NXS-1 — raw source overwrite
 # ---------------------------------------------------------------------------
 
-def test_raw_source_preserved_when_save_path_equals_source_dir(tmp_path):
+def test_raw_source_preserved_when_save_path_equals_source_dir(tmp_path, monkeypatch):
     """Save Path == the watched raw container directory: the run is refused and
     the raw acquisition's bytes, size and HDF5 tree are untouched."""
     src_dir = tmp_path / "raw"
@@ -157,9 +157,12 @@ def test_raw_source_preserved_when_save_path_equals_source_dir(tmp_path):
         t.initialize_scan()
 
     # And the real run body refuses BEFORE reading/writing anything.
+    monkeypatch.setattr(t, "get_next_image", lambda *_a: pytest.fail(
+        "source read preceded output-safety refusal"))
     t.command = "start"
     t.process_scan(t.run_configuration)
     assert t.command == "stop"
+    assert t._prefetch_thread is None and t._discovered_frame_count == 0
 
     after = _digest(raw)
     assert after == before, "raw source must be byte/size/tree-identical"

@@ -1,93 +1,51 @@
 # -*- coding: utf-8 -*-
-"""Phase 4b-3 — the serial and streaming save-cadence predicates now route
-through ONE headless FlushPolicy (the divergence is closed).
-
-Each predicate keeps its own inputs by design (serial owns the live unsaved
-count; the streaming sink tracks only its own counter), so the test proves
-each REPRODUCES the standalone policy on its inputs — not that they agree
-with each other on differing inputs.
-"""
+"""The one session cadence boundary table used by the C3 cutover."""
 from __future__ import annotations
 
-from types import SimpleNamespace
 
-import pytest
-
-from xrd_tools.reduction import FlushPolicy
-from tests.xdart._accepted_run import (  # noqa: E402
-    accepted_run,
-    threshold_intent,
-)
-from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-
-
-def _serial(frames_since, *, cap, interval, unsaved, xye_only=False):
-    """Drive the real imageThread._save_due on a duck wrangler/scan."""
-    frames = SimpleNamespace(
-        _in_memory_cap=cap,
-        unsaved_in_memory_count=(lambda: unsaved) if unsaved is not None else None,
+def test_session_bound_cadence_boundary(tmp_path, monkeypatch):
+    from tests.xdart.test_vnext_p0_c3_dynamic_gui_mount import (
+        _c3_real_source_case, _c3_run,
     )
-    scan = SimpleNamespace(frames=frames)
-    host = SimpleNamespace(run_configuration=accepted_run(
-                               run_options={"xye_only": xye_only}),
-                           _frames_since_save=frames_since,
-                           LIVE_SAVE_INTERVAL=interval)
-    return imageThread._save_due(host, host.run_configuration, scan), scan
 
-
-@pytest.mark.parametrize("frames_since", [0, 1, 7, 8, 55, 56, 57])
-@pytest.mark.parametrize("unsaved", [None, 3, 55, 56])
-@pytest.mark.parametrize("interval", [8, 1000])
-@pytest.mark.parametrize("force", [False, True])
-def test_serial_save_due_reproduces_flush_policy(frames_since, unsaved, interval, force):
-    frames = SimpleNamespace(
-        _in_memory_cap=64,
-        unsaved_in_memory_count=(lambda: unsaved) if unsaved is not None else None,
-    )
-    scan = SimpleNamespace(frames=frames)
-    host = SimpleNamespace(run_configuration=accepted_run(),
-                           _frames_since_save=frames_since,
-                           LIVE_SAVE_INTERVAL=interval)
-    got = imageThread._save_due(host, host.run_configuration, scan, force=force)
-    expected = FlushPolicy(interval=interval, cap=64).should_flush(
-        frames_since_flush=frames_since, unsaved_in_memory=unsaved, force=force)
-    assert got is expected
-
-
-def test_serial_save_due_xye_only_never_saves():
-    got, _ = _serial(999, cap=64, interval=8, unsaved=999, xye_only=True)
-    assert got is False
-
-
-def test_streaming_due_to_save_reproduces_flush_policy(tmp_path):
-    """The QtNexusSink streaming predicate reproduces FlushPolicy with
-    unsaved_in_memory=None (it tracks only its own counter) — batch uses the
-    cap pressure bound, live uses LIVE_SAVE_INTERVAL."""
-    from xdart.modules.ewald import LiveScan
-    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import (
-        QtNexusSink, _SAVE_BEFORE_EVICT_MARGIN,
-    )
-    from xrd_tools.reduction import ReductionPlan
-
-    cap = 12
-    for batch_mode, interval in ((True, cap), (False, 8)):
-        scan = LiveScan(data_file=str(tmp_path / f"c_{batch_mode}.nxs"))
-        scan.frames._in_memory_cap = cap
-        host = SimpleNamespace(
-            run_configuration=accepted_run(batch_mode=batch_mode),
-            LIVE_SAVE_INTERVAL=8)
-        host._admitted_run_configuration = host.run_configuration
-        sink = QtNexusSink(
-            host,
-            scan,
-            ReductionPlan(integration_2d=None),
-            run_configuration=host.run_configuration,
-            mask=None,
-        )
-        policy = FlushPolicy(interval=interval, cap=cap,
-                             margin=_SAVE_BEFORE_EVICT_MARGIN)
-        for since in (0, 1, 3, 4, 7, 8, 11, 12):
-            sink._since_save = since
-            got = sink._due_to_save()
-            expected = policy.should_flush(frames_since_flush=since)
-            assert got is expected, (batch_mode, since, got, expected)
+    for mode, interval in (("Int 2D", 8), ("Int 1D", 1000)):
+        with monkeypatch.context() as scoped:
+            adapter = None
+            case = _c3_real_source_case(
+                tmp_path / f"cadence-{interval}", "tiff", processing_mode=mode,
+            )
+            try:
+                _trace, adapters = _c3_run(case, scoped)
+                assert len(adapters) == 1
+                adapter = adapters[0]
+                policy = adapter._session.policy
+                assert policy is adapter._policy
+                assert policy.allocation is case.worker.publication_store.allocation
+                assert policy.flush.cap == policy.allocation.staging_items
+                assert policy.flush.margin == 8
+                assert policy.flush.interval == interval
+                threshold = policy.flush.hard_threshold()
+                cases = (
+                    (interval - 1, 0, False, False),
+                    (interval, 0, False, True),
+                    (1, threshold - 1, False, False),
+                    (1, threshold, False, True),
+                    (0, 0, True, False),
+                    (1, 1, True, True),
+                )
+                for frames, pressure, force, expected in cases:
+                    assert policy.should_flush(
+                        frames_since_flush=frames,
+                        unsaved_in_memory=pressure,
+                        force=force,
+                    ) is expected
+            finally:
+                case.worker.command = "start"
+                case.worker._close_reduction_session()
+                retained = getattr(
+                    case.worker, "_retained_scan_session_adapter", None,
+                )
+                if retained is not None:
+                    if adapter is not None:
+                        assert retained is adapter
+                    assert retained.release_retained_custody() is True

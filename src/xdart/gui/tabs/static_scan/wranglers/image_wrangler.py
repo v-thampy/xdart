@@ -733,7 +733,8 @@ class imageWrangler(wranglerWidget):
         # at Run-click and a MID-RUN settings change bypasses it.
         self.thread.sigAppendMismatch.connect(self._on_append_mismatch)
         self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
-        self.thread.finished.connect(self.finished.emit)
+        self.thread.sigRetainedCustody.connect(self._adopt_retained_custody)
+        self.thread.finished.connect(self._on_worker_thread_finished)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
         # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
@@ -756,10 +757,15 @@ class imageWrangler(wranglerWidget):
 
         self.setup()
         self._restore_from_session()
-        # Open the GI / Threshold / Background groups when their toggle is on
-        # (e.g. from a restored session) so the relevant controls are visible
-        # instead of folded; collapsed when off.
         self._expand_active_groups()
+
+    def _on_worker_thread_finished(self):
+        error = getattr(self.thread, "_reduction_write_error", None)
+        if self.thread.dynamic_cleanup_pending():
+            self._set_status_text("Output cleanup remains pending")
+        elif error is not None:
+            self._set_status_text(f"Dynamic output failed: {error}")
+        self.finished.emit()
 
     # UI-1 (#81): the GI / Intensity-Threshold groups carry a header CHECKBOX
     # as their on/off toggle, mapped to the hidden bool that is their source
@@ -1035,6 +1041,11 @@ class imageWrangler(wranglerWidget):
         is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
         is_file_viewer = mode_text in ('Image Viewer', 'XYE Viewer')
         is_xye = mode_text == 'Int 1D (XYE)'
+        viewer_mode = mode_text.partition(' ')[0].lower() if is_viewer else ''
+        gate = getattr(getattr(self, '_h19_host', None), '_preflight_processing_viewer_mode', None)
+        if (is_viewer and viewer_mode != getattr(self, '_prev_viewer_mode', '')
+                and callable(gate) and not gate(mode_text)):
+            return
 
         # Pre-process state overrides
         self.ui.liveCheckBox.blockSignals(True)
@@ -1107,14 +1118,8 @@ class imageWrangler(wranglerWidget):
         # stitch worker when this is set (viewer mode texts never contain it).
         self.stitch_mode = ('Stitch' in mode_text)
 
-        if mode_text == 'Image Viewer':
-            self.viewer_mode = 'image'
-            self.scan.skip_2d = False
-        elif mode_text == 'XYE Viewer':
-            self.viewer_mode = 'xye'
-            self.scan.skip_2d = False
-        elif mode_text == 'NeXus Viewer':
-            self.viewer_mode = 'nexus'
+        if is_viewer:
+            self.viewer_mode = viewer_mode
             self.scan.skip_2d = False
         else:
             self.viewer_mode = None
@@ -1989,6 +1994,12 @@ class imageWrangler(wranglerWidget):
         also covers integration/reintegration, stitch, and the host run latch.
         """
         owner = imageWrangler._active_run_owner(self)
+        if (owner == "output-cleanup" and imageWrangler._viewer_transition(
+                self, "successor") == "cleanup-pending"):
+            imageWrangler._safe_status_text(self, "Output cleanup remains pending")
+            return
+        if owner == "output-cleanup":
+            owner = imageWrangler._active_run_owner(self)
         if owner is not None:
             # T-3.1: `owner` is now non-None for an UNOBSERVABLE owner too, so
             # the refusal text distinguishes "still stopping" from "could not
@@ -2014,6 +2025,9 @@ class imageWrangler(wranglerWidget):
         # leaves the slot empty.
         try:
             if not self._inputs_valid(staged):
+                return
+            if imageWrangler._viewer_transition(self, "successor") == "cleanup-pending":
+                imageWrangler._safe_status_text(self, "Output cleanup remains pending")
                 return
             if getattr(self, 'stitch_mode', False):
                 # Stitch is a one-shot batch reduction of the already-loaded
@@ -2136,7 +2150,9 @@ class imageWrangler(wranglerWidget):
         self.command = 'stop'
         self.thread.command = 'stop'
         self.ui.stopButton.setEnabled(False)
-        imageWrangler._safe_status_text(self, '')
+        if not (getattr(self.thread, "_reduction_write_error", None)
+                or self.thread.dynamic_cleanup_pending()):
+            imageWrangler._safe_status_text(self, '')
         self._set_action_button('idle')       # morph back to green 'Start'
         # Keep the Live toggle in sync when stopped via the Stop button or
         # programmatically — uncheck it without re-entering stop().  Because

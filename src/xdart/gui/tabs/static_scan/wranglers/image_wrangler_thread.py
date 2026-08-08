@@ -19,7 +19,6 @@ import numpy as np
 from pathlib import Path
 from collections import Counter, deque
 from typing import NamedTuple
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
@@ -132,7 +131,8 @@ def _nexus_append_cursor(path, *, require_2d, entry="entry"):
         provenance[_APPEND_SOURCE_SNAPSHOT_KEY] = (
             _nexus_processed_source_snapshot(
                 h5, completed, entry=entry))
-    return completed, provenance
+        committed_prefix = decode_committed_append_prefix(h5, entry=entry)
+    return completed, provenance, committed_prefix
 
 
 def _nexus_integrated_frame_count(path, *, entry="entry"):
@@ -147,25 +147,17 @@ import h5py
 from pyqtgraph import Qt
 
 # Project imports
-from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
-from xrd_tools.core import (
-    DEFAULT_MODE_KEY,
-    FrameRecord,
-    live_record_store_max_items,
-)
-from xrd_tools.io import resolve_output_target
+from xdart.modules.live import LiveFrame, LiveScan
+from xrd_tools.io import AppendRefused, decode_committed_append_prefix, resolve_output_target
 from xrd_tools.core.provenance import read_provenance_from_handle
 from xrd_tools.integrate.gid import gi_1d_output_axis_key
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import (
-    FlushPolicy,
-    GIFreezeError,
     GIMode,
     Integration1DPlan,
     ReductionPlan,
     prepare_gi_freeze,
 )
-from xrd_tools.session import FrameRecordStore
 from xrd_tools.session.run_configuration import (
     RunConfigurationRefused,
     require_run_configuration,
@@ -175,60 +167,24 @@ from xrd_tools.session.readiness import (
     append_config_difference_lines,
     append_config_mismatch_check,
     processing_config_from_mapping,
-    processing_config_from_scan,
 )
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.io.image import read_image, count_frames
 from xrd_tools.io.export import write_xye
-from xrd_tools.io.output_safety import (
-    OutputCollisionError,
-    check_output_not_source,
-)
+from xrd_tools.io.output_safety import OutputCollisionError, check_output_not_source
 from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
 from xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
-from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
     apply_frozen_run_configuration as _apply_frozen_run_configuration,
     freeze_live_scan_gi_ranges,
-    frame_from_live_frame,
-    open_live_reduction_session,
-    open_live_scan_session,
     StandardPlanCache,
-    reduce_live_frames,
     sync_live_scan_gi_settings,
 )
-from .qt_nexus_sink import QtNexusSink
 from .wrangler_widget import (
     wranglerThread,
 )
-
-# Batch execution policy (PERF-4b/WS-X1).  Batch ALWAYS streams now: one
-# persistent ReductionSession + QtNexusSink (submit-per-frame, single writer
-# thread, thumbnail parallelized in the worker) — proven on the 651-frame Eiger
-# scan at 8 cores to be byte-identical to and >= the old chunked path (2D 32.6s
-# vs 38.8s, XYE 23.7s vs 25.4s, 1D ~equal).  4e retired the old read-chunk ->
-# integrate -> Phase-2-write "chunked" dispatcher and its XDART_BATCH_EXECUTION
-# escape hatch: there is one batch write path.
-
-# Live (non-batch) execution policy (PERF-4b/WS-X1 #3 — unify live onto the
-# streaming sink).  "streaming" (DEFAULT as of the WS-X1 flip) routes a non-batch
-# *reprocess* (Phase 1/2 collect loop) through the SAME persistent
-# ReductionSession + QtNexusSink as batch — batch + reprocess share this write
-# path (true-live keeps its serial one, below) — and the parallel pool
-# pipelines I/O+compute (651-frame 2D reprocess ~30s vs ~60-76s serial; 1D ~21 vs
-# ~27s; the live display is published GUI-side via _published_frames, see
-# QtNexusSink._publish_display).  "serial" is the legacy per-frame _process_one
-# reprocess path, kept one cycle as a fallback (XDART_LIVE_EXECUTION=serial).
-# NOTE: the true-live *watch* (Phase 3, detector-rate, in-order one-at-a-time)
-# always uses _process_one regardless of this flag — streaming's parallelism is
-# moot there, and it stays the proven path.
-_LIVE_EXECUTION = os.environ.get("XDART_LIVE_EXECUTION", "streaming").strip().lower()
-if _LIVE_EXECUTION not in ("serial", "streaming"):
-    logger.warning("XDART_LIVE_EXECUTION=%r is not 'serial' or 'streaming'; "
-                   "using 'streaming'.", _LIVE_EXECUTION)
-    _LIVE_EXECUTION = "streaming"
 
 # Live/network-share partial-write tolerance (get_next_image).  When the glob
 # picks up a detector image the instrument is still flushing to disk (esp. an
@@ -307,6 +263,24 @@ def _paths_with_suffix(root, suffix, *, recursive=False):
     )
 
 
+def _source_observation(path):
+    import xrd_tools.sources.registry  # noqa: F401
+    from xrd_tools.sources.adapters import candidate_owner
+    from xrd_tools.sources.discover import Candidate
+    path = Path(path)
+    stat = path.stat()
+    return Candidate(path, getattr(candidate_owner(path), "id", ""), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+class _SourceMetadata(dict):
+    """Legacy metadata mapping carrying immutable producer facts out-of-band."""
+    __slots__ = ("facts",)
+
+    def __init__(self, values, facts):
+        super().__init__(values)
+        self.facts = dict(facts)
+
+
 def _raw_lives_in_source(path):
     """Return True if the raw image for ``path`` is already embedded in the
     source file (Eiger master or any HDF5/NeXus container).
@@ -374,18 +348,6 @@ def _gi_2d_range_keys(args):
     return 'radial_range', 'azimuth_range'
 
 
-# The GI-scout cluster below (_padded_axis_range,
-# _result_intensity_all_dummy, _freeze_gi_2d_ranges_from_result,
-# _freeze_gi_1d_range_from_result, and the imageThread methods
-# _scout_pending_frames, _build_scout, _freeze_gi_1d_auto_range,
-# _freeze_gi_2d_auto_ranges) is LIVE PRODUCTION CODE: the streaming GI batch
-# prepass calls _freeze_gi_1d_auto_range/_freeze_gi_2d_auto_ranges in
-# _dispatch_batch_streaming to freeze the whole-scan common grid BEFORE
-# dispatch (do NOT delete it as dead).  ssrl's ReductionSession has its own
-# first-chunk freeze, which serves the serial/chunked paths; the streaming
-# prepass deliberately freezes earlier (whole pending set, not first chunk).
-# The GI live==batch==reload equivalence tests additionally bind these
-# methods via MethodType to validate the ssrl freeze against this scout.
 def _padded_axis_range(axis, pad_fraction=0.02):
     """Return a small coverage margin around an integrated axis' finite extent.
 
@@ -651,6 +613,7 @@ class imageThread(wranglerThread):
     # by the exact accepted configuration OBJECT before translating it onto the
     # existing GI hydration projection, and nothing here can alter the run.
     sigGISourceMotors = Qt.QtCore.Signal(object)
+    sigRetainedCustody = Qt.QtCore.Signal(int, str)
 
     def __init__(
             self,
@@ -796,6 +759,7 @@ class imageThread(wranglerThread):
         self._plan_cache = StandardPlanCache()
         self._append_skip_frames_by_scan = {}
         self._append_source_snapshot_by_scan = {}
+        self._append_committed_prefix_by_scan = {}
         # Stamp-qualified processed-output cursors survive Stop -> Run on this
         # wrangler thread.  Unchanged outputs can then be validated with one
         # stat instead of reopening hundreds of small NeXus products.  The
@@ -806,6 +770,7 @@ class imageThread(wranglerThread):
         self._append_config_mismatch = False
         self._discovered_frame_count = 0
         self._skip_reason_counts = Counter()
+        self.files_processed = self._last_files_processed = 0
         self.files_processed_by_output = {}
         self._last_files_processed_by_output = {}
 
@@ -872,11 +837,6 @@ class imageThread(wranglerThread):
             except Exception:
                 logger.debug("showLabel emit failed for refusal", exc_info=True)
             return
-        if (self.poni is None
-                or (self.img_file == ''
-                    and not self._directory_source_armed(frozen))):
-            return
-
         # This must be the FIRST stateful operation of a new Run.  A prior
         # generation can outlive the bounded Stop join while blocked in HDF5;
         # clearing any cursor/cache before deciding to refuse the restart would
@@ -891,10 +851,19 @@ class imageThread(wranglerThread):
                 logger.debug("showLabel emit failed for lingering reader",
                              exc_info=True)
             return
+        if (self._scan_session_adapter is not None
+                and not self._close_reduction_session()):
+            return
+        if not self.release_retained_custody():
+            return
+        self._reduction_write_error = None
         # A timed-out prior cleanup intentionally leaves its HDF5 handle open.
         # Once the reader is confirmed dead, close it before clearing/reusing
         # any detector state for this generation.
         self._eiger_close_master()
+        if (self.poni is None or (self.img_file == ''
+                and not self._directory_source_armed(frozen))):
+            return
         self._reset_xye_output_notifications()
 
         self.img_fnames.clear()
@@ -954,11 +923,13 @@ class imageThread(wranglerThread):
         self._prefetch_error = None
         self._append_skip_frames_by_scan = {}
         self._append_source_snapshot_by_scan = {}
+        self._append_committed_prefix_by_scan = {}
         self._source_snapshot_by_path.clear()
         self._append_skip_without_reading = 0
         self._append_config_mismatch = False
         self._discovered_frame_count = 0
         self._skip_reason_counts = Counter()
+        self.files_processed = self._last_files_processed = 0
         self.files_processed_by_output = {}
         self._last_files_processed_by_output = {}
         # Per-run perf accumulators -> [PERF-SUMMARY] at end of run.  Breaks the
@@ -1026,6 +997,8 @@ class imageThread(wranglerThread):
 
         try:
             self.process_scan(frozen)
+        except AppendRefused as exc:
+            self._retain_dynamic_failure(exc, "Append refused")
         except AppendConfigMismatchError as exc:
             # Backstop: process_scan handles this at its initialize_scan call
             # sites; nothing may escape run() as an unhandled QThread
@@ -1045,7 +1018,8 @@ class imageThread(wranglerThread):
             except Exception:
                 logger.debug("showLabel emit failed", exc_info=True)
         finally:
-            self._close_reduction_session()
+            if not self._close_reduction_session():
+                self.command = "stop"
             # Stop background prefetcher from the main thread BEFORE closing the
             # master handle.  _eiger_close_master() is called from inside the
             # prefetch worker when switching masters, so triggering a stop from
@@ -1291,8 +1265,13 @@ class imageThread(wranglerThread):
         if source_cache is None:
             source_cache = {}
             self._append_source_snapshot_by_scan = source_cache
+        prefix_cache = getattr(
+            self, "_append_committed_prefix_by_scan", None)
+        if prefix_cache is None:
+            prefix_cache = {}
+            self._append_committed_prefix_by_scan = prefix_cache
         key = str(scan_name)
-        if key in cache:
+        if key in cache and key in prefix_cache:
             return cache[key]
         if getattr(self, "command", None) == "stop":
             return set()
@@ -1301,6 +1280,7 @@ class imageThread(wranglerThread):
         if not os.path.exists(out_path):
             cache[key] = set()
             source_cache[key] = None
+            prefix_cache[key] = None
             return cache[key]
 
         require_2d = not bool(frozen.skip_2d)
@@ -1316,22 +1296,22 @@ class imageThread(wranglerThread):
                 int(stat.st_size),
                 int(stat.st_mtime_ns),
             )
-        except OSError:
+        except OSError as exc:
             memo.pop(memo_key, None)
-            cache[key] = set()
-            source_cache[key] = None
-            return cache[key]
+            self._warn_append_snapshot_failed(key, out_path, exc)
+            raise
 
         hit = memo.get(memo_key)
         try:
             if hit is not None and hit[0] == before_stamp:
                 existing = set(hit[1])
                 processed_config = hit[2]
-                source_snapshot = hit[3] if len(hit) > 3 else None
+                source_snapshot = hit[3]
+                committed_prefix = hit[4]
             else:
                 memo.pop(memo_key, None)
                 with self._optional_lock(getattr(self, "file_lock", None)):
-                    existing, provenance = _nexus_append_cursor(
+                    existing, provenance, committed_prefix = _nexus_append_cursor(
                         out_path,
                         require_2d=require_2d,
                     )
@@ -1357,6 +1337,7 @@ class imageThread(wranglerThread):
                         frozenset(existing),
                         processed_config,
                         source_snapshot,
+                        committed_prefix,
                     )
                     while len(memo) > _APPEND_CURSOR_MEMO_LIMIT:
                         memo.pop(next(iter(memo)))
@@ -1371,10 +1352,11 @@ class imageThread(wranglerThread):
             raise
         except Exception as exc:
             self._warn_append_snapshot_failed(key, out_path, exc)
-            existing = set()
-            source_snapshot = None
+            memo.pop(memo_key, None)
+            raise
         cache[key] = existing
         source_cache[key] = source_snapshot
+        prefix_cache[key] = committed_prefix
         return cache[key]
 
     def _prime_append_skip_snapshots_for_run(self, frozen):
@@ -1538,14 +1520,14 @@ class imageThread(wranglerThread):
                          exc_info=True)
 
     def process_scan(self, frozen):
-        """Batch-integrate all existing images, then optionally watch for new ones (live mode).
-
-        Phase 1 — Collect: drain the current directory glob into a pending list.
-        Phase 2 — Process: sequential with cached AzimuthalIntegrator (~0.35 s/frame).
-        Phase 3 — Watch (live mode only): poll every 2 s for new files; process each immediately.
-        """
-        series_average = frozen.run_options.get("series_average", False)
-        xye_only = frozen.run_options.get("xye_only", False)
+        if frozen.run_options.get("xye_only", False):
+            raise TypeError("dynamic XYE output is not mounted")
+        if frozen.run_options.get("series_average", False):
+            raise TypeError("dynamic series average is not mounted")
+        try:
+            check_output_not_source(self._append_output_path(frozen, self.scan_name), **self._output_safety_args(frozen))
+        except OutputCollisionError as exc:
+            self._handle_output_collision(exc); return
         scan = None
         files_processed = 0
         files_processed_by_output = Counter()
@@ -1562,353 +1544,66 @@ class imageThread(wranglerThread):
                     logger.debug("invalid processed output path: %r", output)
                 else:
                     files_processed_by_output[key] += count
+            self.files_processed = self._last_files_processed = files_processed
+            self.files_processed_by_output = dict(files_processed_by_output)
+            self._last_files_processed_by_output = dict(files_processed_by_output)
 
-        _cached_poni = None
-        # O-1a-W1R (review §39.2 W1R-P1-5): the source family comes from the
-        # accepted frozen source, not from the mutable current-file cursor.
-        is_eiger = imageThread._frozen_source_is_container(self, frozen)
-        # One-time visibility into which execution path this run takes (so the
-        # XDART_LIVE_EXECUTION flag is observable).  Batch always streams now.
-        # DEBUG: developer diagnostics, not run output.
-        logger.debug('Execution policy: batch_mode=%s  batch=streaming  live=%s',
-                     frozen.batch_mode, self._live_execution())
-        # MEM-1c: refuse a series-average Append run whose averaged output
-        # already exists (would silently skip everything and write nothing).
-        # Only this special case needs an eager all-scan cursor pass.  Ordinary
-        # Append runs load one tiny cursor lazily as each scan is reached.
-        if series_average:
-            self._prime_append_skip_snapshots_for_run(frozen)
-            _blocker = self._series_average_append_blocker(frozen)
-        else:
-            _blocker = None
-        if _blocker:
-            logger.error("run refused: %s", _blocker)
-            _emit = getattr(getattr(self, "showLabel", None), "emit", None)
-            if callable(_emit):
-                try:
-                    _emit(_blocker)
-                except Exception:
-                    logger.debug("showLabel emit failed for run blocker",
-                                 exc_info=True)
-            self.command = 'stop'
-            return
-
-        # ── Phase 1 & 2: collect then process all existing images ─────────────
-        pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
-        pending_avg_count = 0
-        # Per-flush read-time accumulator.  With the prefetcher this is mostly
-        # queue-wait time on the main thread, not raw h5py I/O.
-        _t_read_accum = 0.0
-
-        while True:
-            self._wait_if_paused(frozen)        # freeze here (before reading) if paused
-            if self.command == 'stop':
+        pending, poll_s = [], 0.1
+        container = imageThread._frozen_source_is_container(self, frozen)
+        while self.command != "stop":
+            self._wait_if_paused(frozen)
+            if self.command == "stop":
                 break
-
-            _t_r0 = time.time()
-            img_file, scan_name, img_number, img_data, img_meta = self.get_next_image(frozen)
-            _t_read_this = time.time() - _t_r0
-            _t_read_accum += _t_read_this
-            if img_data is None:
-                if not frozen.batch_mode and pending:
-                    logger.info('Collected %d image(s) in %.2fs',
-                                len(pending), _t_read_accum)
-                break  # initial glob exhausted — move on to processing
-            if img_file is not None:
-                fname = os.path.splitext(os.path.basename(img_file))[0]
-                # When the input is a multi-frame container (HDF5/NeXus/Eiger master),
-                # include the frame index so progress is visible.
-                _ext = Path(img_file).suffix.lower()
-                _multi = _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file)
-                # Full name, untruncated (maintainer, 2026-07-13): the status
-                # bar has the room, and QStatusBar/showMessage never forces
-                # window width.
-                _label = (f'Collecting {fname} [frame {img_number}]'
-                          if _multi else
-                          f'Collecting {fname}')
-                if frozen.batch_mode:
-                    # Batch: the label is the only progress feedback while the
-                    # whole pending set is read up front.
-                    self.showLabel.emit(_label)
-                else:
-                    # Live: frames dispatch as they arrive, so the completion
-                    # status (sink) supersedes this within ms -- showing it
-                    # just flickered.  Keep it greppable at DEBUG; a single
-                    # summary INFO is logged when collection finishes.
-                    logger.debug(_label)
-            else:
-                logger.warning('Invalid image file, skipping')
-                continue
-
-            img_number = 1 if img_number is None else img_number
-            self.scan_name = scan_name
-
-            # Flush and switch scan when scan name changes.
-            #
-            # Two save paths matter here, both needed to keep N-1
-            # .nxs files from ending up empty in multi-scan mode
-            # (the bug observed with Eiger Image-Directory + LaB6
-            # calibration scans, one frame per master):
-            #
-            # 1. ``force_save=True`` on the pending dispatch — covers
-            #    batch_mode runs where the partial pending tail at
-            #    scan boundary stayed in-memory because the serial
-            #    path only writes when ``_frames_since_save >=
-            #    LIVE_SAVE_INTERVAL``.
-            # 2. Explicit ``_save_to_nexus`` on the old scan — covers
-            #    non-batch (live-mode-style) runs where each frame
-            #    was already dispatched immediately by the line-529
-            #    cadence (``pending`` is empty by the time we get
-            #    here), but ``_frames_since_save`` accumulated without
-            #    hitting the save interval.  Without this, the old
-            #    scan's in-memory frames get dropped when
-            #    ``initialize_scan()`` reassigns the local variable.
-            #
-            # Only the end-of-loop final-flush passed ``force_save``
-            # before, which is why only the last scan's file ever
-            # got data.
-            if (scan is None) or (scan_name != scan.name):
-                if pending:
-                    dispatched = self._dispatch_batch(
-                        frozen, scan, pending, force_save=True,
-                    )
-                    record_processed(scan, dispatched)
-                    pending = []
-                    pending_avg_count = 0
-                # Catch the case where pending was already drained by
-                # the per-iteration dispatch cadence below: the old
-                # scan may have integrated-but-unsaved frames in
-                # memory whose save_to_nexus call never fired.
-                self._flush_outgoing_scan(frozen, scan)
-                try:
-                    scan = self.initialize_scan()
-                except OutputCollisionError as exc:
-                    # F-NXS-1: the derived output would overwrite / be
-                    # re-ingested as a raw source; the guard fired BEFORE any
-                    # write, so source + destination bytes are untouched.
-                    # `scan` is still the PREVIOUS (already-flushed) scan — stop
-                    # cleanly, like a user Stop.
-                    self._handle_output_collision(exc)
-                    break
-                except AppendConfigMismatchError as exc:
-                    # `scan` still refers to the PREVIOUS scan (already
-                    # flushed above); stop cleanly through the shared
-                    # end-of-run tail — same path as a user Stop.
-                    self._handle_append_config_mismatch(exc)
-                    break
-                except OSError as exc:
-                    # DIR-3: e.g. a Windows replace-save blocked by an
-                    # external handle (WinError 5) after the retry budget.
-                    # The destination file is untouched; stop cleanly
-                    # instead of killing the QThread.
-                    self._handle_initialize_scan_write_error(exc)
-                    break
-                self._active_scan = scan      # Pause: serial-flush handle
-                _cached_poni = None
-
-            # Rebuild cached AzimuthalIntegrator when poni identity changes
-            if self.poni is not _cached_poni:
-                self._install_run_integrator(scan)
-                _cached_poni = self.poni
-                self._cached_gi_incident_angle = None
-
-            output_img_number = 1 if series_average else img_number
-            if self._append_frame_complete(
-                    frozen, scan.name, output_img_number, scan):
-                self._record_skip_reason("already processed at dispatch")
-                if (frozen.source.source_kind == "image_file") and not is_eiger:
-                    self.sigUpdate.emit(img_number)
-                    break
-                continue
-
-            bg_raw = self.get_background(frozen, img_file, img_number, img_meta)
-            # Stash the per-frame read time on the tuple so the per-frame
-            # TIMING log can show it (otherwise it gets lumped into the
-            # batch [FLUSH] line and hides per-frame variance).
-            entry = (img_file, img_number, img_data, img_meta,
-                     bg_raw, _t_read_this)
-            if series_average:
-                pending_avg_count = imageThread._append_series_average_pending(
-                    self, pending, entry, pending_avg_count)
-            else:
-                pending.append(entry)
-
-            if (frozen.source.source_kind == "image_file") and not is_eiger:
-                break
-
-            # ── Submit cadence ──────────────────────────────────────────────
-            # Streaming batch owns its own in-flight bound and save cadence, so
-            # the old "read 64/256 frames before dispatch" buffer only destroyed
-            # read||reduce overlap.  Submit every frame as soon as it is read;
-            # QtNexusSink/FlushPolicy still batch persistence, and batch remains
-            # display-silent until the final sigUpdate(-1).
-            flush_size = 1
-            if pending and len(pending) >= flush_size and not series_average:
-                if frozen.batch_mode:
-                    self.showLabel.emit(
-                        f'Integrating {len(pending)} frame(s)...'
-                    )
-                _t_disp = time.time()
-                dispatched = self._dispatch_batch(frozen, scan, pending)
-                record_processed(scan, dispatched)
-                _disp_dt = time.time() - _t_disp
-                _perf = getattr(self, '_perf', None)
-                if _perf is not None:
-                    _perf['collect_read'] += _t_read_accum
-                    _perf['dispatch'] += _disp_dt
-                    _perf['dispatch_frames'] += dispatched
-                if _t_read_accum >= 0.5 or _disp_dt >= 0.5:
-                    logger.info(
-                        '[DISPATCH] %d frames  read=%.2fs  dispatch=%.2fs',
-                        len(pending), _t_read_accum, _disp_dt,
-                    )
-                pending = []
-                pending_avg_count = 0
-                _t_read_accum = 0.0
-
-        # Process whatever is left.  force_save=True so any remaining
-        # _frames_since_save tail in live mode is flushed to disk.
-        if pending and scan is not None and self.command != 'stop':
-            _t_disp = time.time()
-            dispatched = self._dispatch_batch(
-                frozen, scan, pending, force_save=True,
-            )
-            record_processed(scan, dispatched)
-            pending_avg_count = 0
-            _disp_dt = time.time() - _t_disp
-            _perf = getattr(self, '_perf', None)
-            if _perf is not None:
-                _perf['collect_read'] += _t_read_accum
-                _perf['dispatch'] += _disp_dt
-                _perf['dispatch_frames'] += dispatched
-            logger.info(
-                '[FLUSH-FINAL] %d frames  read=%.2fs  dispatch=%.2fs',
-                len(pending), _t_read_accum, _disp_dt,
-            )
-        elif (scan is not None and not xye_only
-              and self._frames_since_save > 0 and self.command != 'stop'):
-            # Pending was empty but the live-save batcher has unflushed frames
-            # (last batch hit the divisor exactly).  Force a save before leaving
-            # the collect loop.
-            self.flush_serial_tail(frozen, scan, force=True)
-
-        # ── Phase 3: live watching ────────────────────────────────────────────
-        # Rebind here: the collect loop binds series_average per frame, but a
-        # provisional single-file run (NXS-SF-2) can reach the watch with NO
-        # collected frame at all.
-        # scan is None normally ends the run (nothing was collected) — EXCEPT
-        # for a provisional single-file container (nascent NXWriter shell /
-        # unlanded links), which must keep watching so the SAME run processes
-        # frames that land later (NXS-SF-2).
-        if (frozen.live_mode and self.command != 'stop'
-                and (scan is not None
-                     or self._eiger_single_file_watchable(frozen)
-                     or self._h19_live_directory_armed(frozen))):
-            self.showLabel.emit('Watching for new files...')
-            # Adaptive backoff between filesystem polls.  Starts tight
-            # so first-frame latency is small (~100 ms vs the old fixed
-            # 2 s — matters a lot for fast detectors like Eiger 4M);
-            # doubles on each consecutive miss up to ``_POLL_MAX`` so
-            # an idle wait doesn't burn CPU.  Resets on any hit so a
-            # steady-state acquisition stays at the low end of the
-            # range.  No external watcher dep — works on every FS the
-            # beamline mounts (NFS, SMB, local).
-            _poll_min = 0.1
-            _poll_max = 2.0
-            _poll_growth = 2.0
-            poll_s = _poll_min
-            while self.command != 'stop':
-                self._wait_if_paused(frozen)    # pause/examine/resume a live acquisition
-                if self.command == 'stop':
-                    break                 # Pause -> Stop while watching
-                img_file, scan_name, img_number, img_data, img_meta = self.get_next_image(frozen)
+            if not pending:
+                started = time.time()
+                read = self.get_next_image(frozen)
+                img_file, scan_name, img_number, img_data, img_meta = read
+                facts, img_meta = getattr(img_meta, "facts", {}), dict(img_meta or {})
                 if img_data is None:
-                    # A live scan can be complete without a successor arriving
-                    # to trigger the scan-swap flush.  Make its serial tail
-                    # durable at the first idle observation so the final XYE
-                    # folder and processed rows appear while the run remains
-                    # armed.  The counter is reset by a successful flush, so
-                    # subsequent watch ticks stay cheap no-ops.
-                    if (scan is not None and not xye_only
-                            and self._frames_since_save > 0):
-                        _n_idle = self._frames_since_save
-                        if self.flush_serial_tail(frozen, scan, force=True):
-                            logger.info(
-                                '[SAVE-ON-IDLE] %d frame(s) made durable for %s',
-                                _n_idle, scan.name,
-                            )
-                    # Nothing new yet — show watching status and sleep.
-                    self.showLabel.emit('Watching for new files...')
+                    if not frozen.live_mode:
+                        break
+                    self.showLabel.emit("Watching for new files...")
                     time.sleep(poll_s)
-                    poll_s = min(poll_s * _poll_growth, _poll_max)
+                    poll_s = min(2.0, poll_s * 2.0)
                     continue
-                # Hit — reset the backoff so the next miss falls back
-                # to the snappy 100 ms baseline.
-                poll_s = _poll_min
-
-                img_number = 1 if img_number is None else img_number
+                poll_s = 0.1
+                img_number = 1 if img_number is None else int(img_number)
                 self.scan_name = scan_name
-
-                if (scan is None) or (scan_name != scan.name):
-                    # SAVE-ON-SWAP (F1): persist the OUTGOING scan's
-                    # integrated-but-unsaved serial tail before switching, so a
-                    # sub-LIVE_SAVE_INTERVAL live scan (A→B→C single-frame
-                    # masters) is not counted-as-processed yet shipped empty.
-                    # Symmetric with the initial-collection boundary above.
-                    self._flush_outgoing_scan(frozen, scan)
+                if scan is None or scan.name != scan_name:
+                    if scan is not None and not self._close_reduction_session():
+                        raise RuntimeError("outgoing dynamic scan did not settle")
+                    if self.command == "stop":
+                        break
                     try:
                         scan = self.initialize_scan()
                     except OutputCollisionError as exc:
-                        # F-NXS-1: unsafe Save Path caught before any write;
-                        # source + destination preserved.  Stop cleanly, like a
-                        # user Stop while watching.
                         self._handle_output_collision(exc)
                         break
                     except AppendConfigMismatchError as exc:
-                        # `scan` stays the previous scan; the final force
-                        # flush below persists its tail, exactly like a
-                        # user Stop while watching.
                         self._handle_append_config_mismatch(exc)
                         break
                     except OSError as exc:
-                        # DIR-3: locked destination after the replace-retry
-                        # budget — stop cleanly, never kill the QThread.
                         self._handle_initialize_scan_write_error(exc)
                         break
-                    self._active_scan = scan  # Pause: serial-flush handle
-                    _cached_poni = None
-
-                if self.poni is not _cached_poni:
+                    self._active_scan = scan
                     self._install_run_integrator(scan)
-                    _cached_poni = self.poni
-                    self._cached_gi_incident_angle = None
+                pending.append((img_file, img_number, img_data, img_meta,
+                    self.get_background(frozen, img_file, img_number, img_meta),
+                    time.time() - started, facts))
+            accepted = self._dispatch_batch(frozen, scan, pending)
+            if not accepted:
+                continue
+            facts = pending[0][6]
+            if facts.get("commit_path") is not None:
+                self._commit_frame(
+                    facts["commit_path"],
+                    count_discovery=not facts.get("discovery_counted", False),
+                )
+            record_processed(scan, accepted)
+            pending.clear()
+            if frozen.source.source_kind == "image_file" and not container:
+                break
 
-                output_img_number = 1 if series_average else img_number
-                if self._append_frame_complete(
-                        frozen, scan.name, output_img_number, scan):
-                    self._record_skip_reason("already processed at dispatch")
-                    continue
-
-                bg_raw = self.get_background(frozen, img_file, img_number, img_meta)
-                # Process immediately — single-threaded for low latency.
-                # _process_one uses add_frame(batch_save=True), so the
-                # disk save still rides on _frames_since_save below.
-                self._process_one(frozen, scan, img_file, img_number, img_data, img_meta, bg_raw)
-                record_processed(scan, 1)
-                self._frames_since_save += 1
-                if xye_only:
-                    # No .nxs save in this mode -- drain the XYE buffer per
-                    # frame so output appears as the watch processes files.
-                    self._flush_xye_buffer(scan)
-                self.flush_serial_tail(frozen, scan)
-
-        # Final flush on exit (live-watch tail or stop request) so the
-        # last few frames aren't lost.
-        if scan is not None and xye_only:
-            self._flush_xye_buffer(scan)
-        self.flush_serial_tail(frozen, scan, force=True)
-
-        # In batch mode, emit a single final signal so the GUI can refresh
         self.files_processed = files_processed
         self._last_files_processed = files_processed
         self.files_processed_by_output = dict(files_processed_by_output)
@@ -1920,106 +1615,146 @@ class imageThread(wranglerThread):
             report_skip_summary(frozen, files_processed)
         logger.info('Total Files Processed: %d', files_processed)
 
-    # ── Batch dispatch ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _average_numeric_metadata(current, incoming, old_count, new_count):
-        out = dict(current or {})
-        for key in list(out):
-            try:
-                out[key] = (
-                    float(out[key]) * old_count
-                    + float((incoming or {}).get(key, 0.0))
-                ) / new_count
-            except (TypeError, ValueError):
-                pass
-        return out
-
-    @staticmethod
-    def _average_payload(current, incoming, old_count, new_count):
-        if current is None:
-            return None
-        if incoming is None:
-            return current
-        try:
-            return (
-                np.asarray(current, dtype=float) * old_count
-                + np.asarray(incoming, dtype=float)
-            ) / new_count
-        except (TypeError, ValueError):
-            return current
-
-    @staticmethod
-    def _copy_average_payload(value):
-        if value is None:
-            return None
-        return np.asarray(value, dtype=float).copy()
-
-    def _append_series_average_pending(self, pending, entry, count):
-        """Fold one source frame into the pending Average Scan mean.
-
-        ``pending`` keeps the normal dispatcher tuple shape, but holds exactly
-        one running-mean entry.  This mirrors the old queue feeder without
-        retaining every detector image until the streaming session opens.
-        """
-
-        img_file, _img_number, img_data, img_meta, bg_raw, t_read = entry
-        if count <= 0 or not pending:
-            pending[:] = [(
-                img_file,
-                1,
-                imageThread._copy_average_payload(img_data),
-                dict(img_meta or {}),
-                imageThread._copy_average_payload(bg_raw),
-                float(t_read or 0.0),
-            )]
-            return 1
-
-        old_file, _old_number, old_data, old_meta, old_bg, old_t = pending[0]
-        new_count = count + 1
-        pending[0] = (
-            img_file or old_file,
-            1,
-            imageThread._average_payload(old_data, img_data, count, new_count),
-            imageThread._average_numeric_metadata(
-                old_meta, img_meta, count, new_count),
-            imageThread._average_payload(old_bg, bg_raw, count, new_count),
-            float(old_t or 0.0) + float(t_read or 0.0),
-        )
-        return new_count
-
-    def _series_average_pending(self, frozen, pending):
-        if not bool(frozen.run_options.get("series_average", False)) or len(pending) <= 1:
-            return list(pending)
-        averaged = []
-        count = 0
-        for entry in pending:
-            count = imageThread._append_series_average_pending(
-                self, averaged, entry, count)
-        return averaged
+    def _dynamic_append_intent(self, frozen, scan, label, facts):
+        cached = facts.get("intent")
+        if cached is not None:
+            return cached
+        from dataclasses import replace
+        import xrd_tools.io as io_api
+        from xrd_tools.session import required_result_modes
+        observation = facts["observation"]
+        prior = getattr(scan, "_same_run_intent", None)
+        if prior is None:
+            prefix = getattr(scan, "_committed_append_prefix", None)
+            prior = prefix.intent if prefix is not None else None
+        generation = int(prior.source.generation) + 1 if prior else int(frozen.generation)
+        label = int(label)
+        modes = tuple(f"{mode.kind}:{mode.key}"
+                      for mode in required_result_modes(facts["plan"]))
+        path = os.path.abspath(os.fspath(observation.path))
+        if facts["container"]:
+            accepted_extent = int(facts["source_frame_idx"]) + 1
+            if label != accepted_extent:
+                raise ValueError("container output labels must match their source prefix")
+            if prior is None and accepted_extent != 1:
+                raise ValueError("container output cannot fabricate a missing prefix")
+            if prior is not None and tuple(prior.labels) != tuple(range(1, accepted_extent)):
+                raise ValueError("container output requires an exact accepted prefix")
+            external = tuple(io_api.AppendExternalMember(
+                os.fspath(member.path), dataset_path, int(member.size), int(member.mtime_ns),
+                int(start), int(stop), int(ordinal))
+                for member, dataset_path, start, stop, ordinal in facts["external_members"])
+            source = io_api.AppendSource(
+                path=path, adapter_id=str(observation.adapter_id),
+                size=int(observation.size), mtime_ns=int(observation.mtime_ns),
+                extent=int(facts["extent"]), dataset_paths=facts["dataset_paths"], external_members=external,
+                generation=generation)
+            source = io_api.truncate_append_source(source, accepted_extent)
+        else:
+            members = () if prior is None else prior.source.image_members
+            existing = next((member for member in members
+                             if os.path.abspath(member.path) == path), None)
+            if existing is not None:
+                if ((existing.size, existing.mtime_ns) == observation.version_stamp
+                        and label in prior.labels):
+                    facts["intent"] = prior
+                    return prior
+                raise ValueError("an accepted TIFF member changed in place")
+            ordinal = len(members)
+            members = (*members, io_api.AppendImageMember(
+                path=path, size=int(observation.size), mtime_ns=int(observation.mtime_ns),
+                source_start=ordinal, source_stop=ordinal + 1, ordinal=ordinal))
+            source = (io_api.AppendSource(
+                path=path, adapter_id=str(observation.adapter_id),
+                size=int(observation.size), mtime_ns=int(observation.mtime_ns),
+                extent=1, image_members=members, generation=generation) if prior is None
+                else replace(prior.source, extent=len(members), image_members=members,
+                             generation=generation))
+        labels = (*prior.labels, label) if prior else (label,)
+        intent = io_api.AppendIntent(
+            "entry", str(getattr(scan, "source_base", None) or ""),
+            (str(prior.source_identity) if prior is not None else path),
+            io_api.science_fingerprint(frozen.processing_mapping()), modes, source, labels)
+        facts["intent"] = intent
+        return intent
 
     def _dispatch_batch(self, frozen, scan, pending, *, force_save=False):
-        """Process a list of pending images — parallel in batch mode, serial otherwise.
-
-        ``force_save`` only affects the serial path (live mode); the
-        parallel path always saves at end of batch by construction
-        (the whole point of batch mode is one big save per dispatch).
-        """
-        self._maybe_warn_live_gi_clip(frozen)
-        if frozen.batch_mode:
-            # 4e: batch is one write path — always the streaming session.
-            return self._dispatch_batch_streaming(frozen, scan, pending)
-        # Live (non-batch): #3 routes it through the SAME streaming session +
-        # QtNexusSink (which does the per-frame display publish for live), behind
-        # the live flag; the proven per-frame _process_one path is the default.
-        if self._live_execution() == "streaming":
-            return self._dispatch_batch_streaming(frozen, scan, pending)
-        return self._dispatch_batch_serial(frozen, scan, pending, force_save=force_save)
-
-    def _live_execution(self) -> str:
-        """Active live (non-batch) execution policy ('serial' | 'streaming').
-        Instance override (``self.live_execution``) wins over the module default."""
-        return getattr(self, "live_execution", None) or _LIVE_EXECUTION
+        if not pending:
+            return 0
+        img_file, label, data, meta, bg_raw, _read, facts = pending[0]
+        live = facts.get("live")
+        if live is None:
+            live = self._build_scout(frozen, scan, pending[0][:6])
+            live.source_file = os.path.abspath(os.fspath(img_file))
+            live.source_frame_idx = int(facts["source_frame_idx"])
+            live.skip_map_raw = scan.skip_2d or _raw_lives_in_source(img_file)
+            if (frozen.gi.enabled and self._scan_session_adapter is None
+                    and not self._gi_ranges_fully_pinned(frozen, scan)):
+                sync_live_scan_gi_settings(
+                    scan, incidence_motor=frozen.gi.scan_incidence_motor,
+                    sample_orientation=frozen.gi.sample_orientation, tilt_angle=frozen.gi.tilt_angle)
+                freeze_live_scan_gi_ranges(
+                    scan, (live,), scan_name=str(scan.name),
+                    global_mask=self.mask, integrator=scan._cached_integrator,
+                    poni=self.poni, integrate_2d=not scan.skip_2d, gi_freeze_mode="first_frame")
+            facts["live"] = live
+        plan = facts.get("plan")
+        if plan is None:
+            plan = facts["plan"] = self._plan_cache.get(
+                scan, integrate_2d=not scan.skip_2d)
+        intent = self._dynamic_append_intent(frozen, scan, label, facts)
+        adapter = self._scan_session_adapter
+        if adapter is None:
+            scan._same_run_intent = intent
+            path = os.path.abspath(os.fspath(scan.data_file))
+            try:
+                adapter = self._mount_dynamic_reduction_session(
+                    (int(frozen.generation), path), frozen=frozen, scan=scan,
+                    plan=plan, pending_frame=live, output_path=path, gui_thread_id=self.gui_thread_id)
+            except AppendRefused:
+                raise
+            except RuntimeError:
+                if self._scan_session_adapter is not None:
+                    raise
+                retries = int(facts.get("dispatch_retries", 0)) + 1
+                facts["dispatch_retries"] = retries
+                if retries >= 32:
+                    raise
+                return 0
+            self.sigUpdateFile.emit(
+                str(scan.name), path, bool(frozen.gi.enabled),
+                str(frozen.gi.scan_incidence_motor), frozen.source.source_kind == "image_file", False)
+        elif intent != getattr(scan, "_same_run_intent", None):
+            try:
+                adapter.extend_live(intent)
+            except RuntimeError as exc:
+                if str(exc) != "same-run continuation requires a drained writer":
+                    raise
+                started = facts.setdefault("extend_retry_started", time.monotonic())
+                if time.monotonic() - started >= self.PAUSE_DRAIN_TIMEOUT:
+                    raise
+                time.sleep(0.01)
+                return 0
+            facts.pop("extend_retry_started", None)
+            scan._same_run_intent = intent
+        from xrd_tools.session import DynamicFrameIdentity
+        key = facts.setdefault("key", DynamicFrameIdentity(
+            os.path.abspath(os.fspath(img_file)), int(facts["source_frame_idx"])))
+        if not facts.get("discovered", False):
+            adapter.discover(key, group=os.path.abspath(scan.data_file),
+                             ordinal=int(label), output_label=int(label))
+            facts["discovered"] = True
+        token = facts["token"] = adapter.begin_attempt(key, source_revision=int(facts["source_revision"]))
+        adapter.record_enqueued(token)
+        if not adapter.submit(live, attempt_token=token):
+            adapter.record_failed(token, retryable=True)
+            return 0
+        self._frames_since_save += 1
+        if adapter.should_flush(self._frames_since_save,
+                unsaved_in_memory=None, force=bool(force_save)):
+            adapter.commit_epoch()
+            self._frames_since_save = 0
+        return 1
 
     def _maybe_warn_live_gi_clip(self, frozen) -> None:
         """One-time advisory for live GI runs (#75).
@@ -2052,12 +1787,6 @@ class imageThread(wranglerThread):
     # in May 2026 — both imageThread and nexusThread inherit them now.
     # See xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py.
 
-    # GI-scout cluster: LIVE PRODUCTION CODE (see the authoritative cluster
-    # note near _padded_axis_range).  _freeze_gi_1d_auto_range /
-    # _freeze_gi_2d_auto_ranges run in the streaming batch prepass
-    # (_dispatch_batch_streaming); _scout_pending_frames / _build_scout are
-    # their selection/build helpers, also exercised directly by the
-    # GI-equivalence tests.
     def _scout_pending_frames(self, frozen, pending):
         """Return bounded representative pending entries for the GI freeze.
 
@@ -2094,12 +1823,12 @@ class imageThread(wranglerThread):
 
     def _build_scout(self, frozen, scan, entry):
         """Build a temporary ``LiveFrame`` for the headless freeze adapter."""
-        img_file, img_number, img_data, img_meta, bg_raw, _ = entry
+        img_file, img_number, img_data, img_meta, bg_raw, _ = entry[:6]
         img_data = self._apply_threshold_inline(frozen, img_data)
         frame_mask = self._resolve_frame_mask(frozen, scan, img_data)
         scratch = LiveFrame(
             img_number, img_data, poni=self.poni,
-            scan_info=img_meta, static=True, gi=True,
+            scan_info=img_meta, static=True, gi=frozen.gi.enabled,
             th_mtr=frozen.gi.scan_incidence_motor, bg_raw=bg_raw,
             sample_orientation=frozen.gi.sample_orientation,
             tilt_angle=frozen.gi.tilt_angle,
@@ -2113,7 +1842,8 @@ class imageThread(wranglerThread):
             scratch.source_frame_idx = int(img_number) - 1
         else:
             scratch.source_frame_idx = 0
-        scratch._get_incident_angle()
+        if frozen.gi.enabled:
+            scratch._get_incident_angle()
         return scratch
 
     def _freeze_gi_1d_auto_range(self, frozen, scan, pending) -> None:
@@ -2561,7 +2291,7 @@ class imageThread(wranglerThread):
         # adapter.submit() isn't rejected.  No-op without an adapter / when
         # not paused / finished; harmless on the stop path.
         adapter = getattr(self, '_scan_session_adapter', None)
-        if adapter is not None:
+        if self.command == "start" and adapter is not None:
             adapter.resume()
 
     #: Bound the pause drain so a hung pool worker (stalled IO / runaway pyFAI)
@@ -2569,783 +2299,96 @@ class imageThread(wranglerThread):
     PAUSE_DRAIN_TIMEOUT = 30.0
 
     def _enter_pause(self, frozen) -> None:
-        """Quiesce the writer at a frame boundary so a paused user can browse any
-        already-processed frame from disk, then signal the GUI to lift the guard.
-
-        Routing is keyed on the SERIAL tail first: ``_frames_since_save > 0`` is
-        the unambiguous signal that the serial path is the active writer (the
-        true-live watch loop uses ``_process_one`` and increments it; the
-        streaming path never does).  So during Phase-3 live watching — where the
-        Phase-2 streaming session is still open but DORMANT — the serial flush
-        correctly wins and the watch tail (incl. its XYE buffer) is persisted and
-        the counter reset.  Otherwise the streaming branch drains+flushes.
-
-        STRICT ordering: drain/flush MUST complete BEFORE ``sigPaused`` so the
-        writer is provably idle before the GUI reads disk (race-safe).  The drain
-        is bounded (:attr:`PAUSE_DRAIN_TIMEOUT`) + cancel-aware so a stuck worker
-        can't strand the pause or block Stop/close.
-        """
+        """Publish Paused only after the dynamic epoch is durably quiescent."""
         try:
-            adapter = getattr(self, '_scan_session_adapter', None)
-            session = getattr(self, '_streaming_session', None)
-            sink = getattr(self, '_streaming_sink', None)
-            scan = self._active_scan
-            timeout = getattr(self, 'PAUSE_DRAIN_TIMEOUT', 30.0)
-            # Quiesce any open streaming session first (a no-op when nothing
-            # is in-flight) so the writer is provably idle before we touch the
-            # file from THIS thread.  4c-1: route through the adapter, which
-            # delegates to ReductionSession.pause (sets is_paused + drains);
-            # _wait_if_paused calls adapter.resume() when the pause ends.
-            drained = True
+            adapter = self._scan_session_adapter
             if adapter is not None:
-                drained = adapter.quiesce(timeout=timeout)
-            elif session is not None:
-                # Defensive no-adapter fallback (unreachable on the streaming
-                # path — _get_streaming_session always builds the adapter).
-                # Prefer the ReductionSession drain(); a bare public ScanSession
-                # only exposes pause() (drain + flag).
-                quiesce = (getattr(session, 'drain', None)
-                           or getattr(session, 'pause', None))
-                drained = quiesce(timeout=timeout) if quiesce is not None else True
-            if not drained:
-                # RS-1: the writer is provably NOT idle (a stalled worker) — a
-                # save/flush from this thread would race the writer's own
-                # write()→flush() (single-writer invariant), and resetting the
-                # save counter without saving would break persist-before-evict.
-                # Pause still proceeds (submits have stopped); the tail flushes
-                # on resume/finish.
-                logger.warning("pause drain timed out (worker not idle); "
-                               "pausing without a flush")
-            elif scan is not None and self._frames_since_save > 0:
-                # Serial path is the active writer (watch loop / serial
-                # dispatch): flush the serial tail.
-                if frozen.run_options.get("xye_only", False):
-                    self._flush_xye_buffer(scan)      # no .nxs save in xye-only
+                if not adapter.quiesce(timeout=self.PAUSE_DRAIN_TIMEOUT):
+                    raise RuntimeError("pause drain timed out before durable commit")
+                if adapter.should_flush(
+                    self._frames_since_save, unsaved_in_memory=None, force=True,
+                ):
+                    adapter.commit_epoch()
                     self._frames_since_save = 0
-                else:
-                    self.flush_serial_tail(frozen, scan, force=True)
-            elif adapter is not None:
-                # Streaming path (batch / reprocess / live Phase 2): in-flight
-                # window drained (non-terminal — session stays open) + flush
-                # via the adapter (h5pool bracket stays in QtNexusSink.flush).
-                adapter.flush()
-            elif session is not None and sink is not None:
-                sink.flush(force=True)         # defensive (no adapter built)
-        except Exception:
-            # A drain/flush failure must not strand the run; log loudly and
-            # still signal the pause (we've stopped submitting, so the writer is
-            # idle and disk reads are safe even if the final flush lagged).
-            logger.error("error draining/flushing on pause", exc_info=True)
-        finally:
-            self.sigPaused.emit()
-
-    @contextmanager
-    def _h5pool_bracket(self, scan):
-        """Pause the shared h5 pool around a serial write to ``scan.data_file``,
-        resuming even if the wrapped body raises (the symmetric bracket the .nxs
-        single-writer path needs).  Shared by :meth:`flush_serial_tail` and
-        ``QtNexusSink.flush`` (the streaming write reuses ONLY this bracket,
-        keeping its own ``mode=`` + bookkeeping).
-
-        Callers enter this while holding ``file_lock``.  Readers also acquire
-        ``file_lock`` before borrowing from the pool, so pausing under that lock
-        closes only idle cached handles, never a handle in active use.
-        """
-        _get_h5pool().pause(scan.data_file)
-        try:
-            yield
-        finally:
-            _get_h5pool().resume(scan.data_file)
-
-    def _flush_outgoing_scan(self, frozen, scan) -> None:
-        """Force-save the OUTGOING scan's integrated-but-unsaved serial tail at a
-        scan-boundary swap, before it is replaced by ``initialize_scan()``.
-
-        Shared by BOTH scan-swap paths — the initial-collection loop and the
-        Phase-3 live-watch boundary — because that is exactly where data can
-        vanish: a sub-``LIVE_SAVE_INTERVAL`` scan (e.g. A→B→C single-frame
-        masters) is ``record_processed``-counted but its ``.nxs`` never
-        force-saves, so it ships empty while ``files_processed_by_output`` claims
-        its frames.  The bug recurred once already because the two boundaries had
-        DUPLICATED this flush and only one was fixed — keep it here, called from
-        both, so they can never diverge again.  No-op for ``scan is None`` /
-        ``xye_only`` (xye is drained per-frame, has no .nxs tail).
-        """
-        if (scan is not None
-                and not frozen.run_options.get("xye_only", False)
-                and self._frames_since_save > 0):
-            _n_swap = self._frames_since_save     # reset by the tail
-            if self.flush_serial_tail(frozen, scan, force=True):
-                logger.info(
-                    '[SAVE-ON-SWAP] %d frames flushed for %s',
-                    _n_swap, scan.name,
-                )
-
-    def flush_serial_tail(self, frozen, scan, *, force=False) -> bool:
-        """The serial save tail (the DRYed copy-paste idiom).
-
-        When a save is due (cadence / cap-pressure / ``force``), h5pool-bracket a
-        file-locked ``scan._save_to_nexus()``, drain the XYE buffer, and reset
-        the per-save counter.  Returns ``True`` iff it saved.
-
-        persist-before-evict: ``_save_to_nexus`` marks the written frames
-        persisted BEFORE ``_frames_since_save`` is reset (the counter that gates
-        the next save cycle), so an unsaved frame is never evicted.  ``force=True``
-        respects the per-site ``_frames_since_save > 0`` precondition because
-        ``_save_due(force=True)`` is False on an empty tail.  No-op in xye_only
-        mode (no .nxs target — ``_save_due`` returns False) and for ``scan is
-        None``.
-        """
-        if scan is None or not self._save_due(frozen, scan, force=force):
-            return False
-        with self.file_lock:
-            with self._h5pool_bracket(scan):
-                scan._save_to_nexus()
-        self._flush_xye_buffer(scan)
-        self._frames_since_save = 0
-        return True
-
-    def _save_due(self, frozen, scan, *, force=False):
-        """Whether a non-batch v2 save should fire now (persist-before-evict).
-
-        A save is due when forced (final flush), when ``LIVE_SAVE_INTERVAL``
-        frames have accumulated since the last save, OR when the *unsaved*
-        in-memory frame set is about to reach the frame-cache cap
-        (``LiveFrameSeries._in_memory_cap``).  The cap bound is the data-loss
-        fix: the writer reads int_1d/int_2d straight off the in-memory frames,
-        and ``stash`` refuses to evict unsaved ones — so we must save before
-        the unsaved set fills the cache, else it would grow unbounded.  Net:
-        ``LIVE_SAVE_INTERVAL`` is an UPPER bound on save spacing; the cap is a
-        HARD bound, so the high interval is safe even on scans longer than the
-        cap.  Never saves in xye_only mode (no .nxs target).
-        """
-        if frozen.run_options.get("xye_only", False):
-            return False
-        # Phase 4b-3: the same headless FlushPolicy the streaming sink uses
-        # (kills the predicate divergence).  Serial owns the LIVE unsaved
-        # count, so it passes it through; the cap−margin pressure bound (the
-        # data-loss fix) and the LIVE_SAVE_INTERVAL upper bound are both the
-        # policy's now.  margin defaults to 8 (the canonical value, == the
-        # sink's _SAVE_BEFORE_EVICT_MARGIN).
-        cap = getattr(scan.frames, "_in_memory_cap", 64)
-        counter = getattr(scan.frames, "unsaved_in_memory_count", None)
-        unsaved = counter() if callable(counter) else None
-        policy = FlushPolicy(interval=self.LIVE_SAVE_INTERVAL, cap=cap)
-        return policy.should_flush(frames_since_flush=self._frames_since_save,
-                                   unsaved_in_memory=unsaved, force=force)
-
-    def _dispatch_batch_serial(self, frozen, scan, pending, *, force_save=False):
-        """Sequential dispatch (live mode or single-image batches).
-
-        Each frame in ``pending`` gets integrated + GUI-updated
-        immediately (via ``_process_one``).  The v2 file save runs
-        *only* when at least :attr:`LIVE_SAVE_INTERVAL` frames have
-        accumulated since the last save, or when ``force_save=True``
-        (used by the final-flush path and by the live-watch tail).
-        That keeps per-frame stalls off the integration loop while
-        bounding scan-state loss on a crash to ~8 frames.
-        """
-        count = 0
-        for item in pending:
-            self._wait_if_paused(frozen)        # pause between frames (serial path)
-            if self.command == 'stop':
-                break
-            # item is (img_file, img_number, img_data, img_meta, bg_raw, t_read)
-            self._process_one(frozen, scan, *item)
-            count += 1
-
-        self._frames_since_save += count
-
-        _n_save = self._frames_since_save        # reset by the tail
-        _t_save0 = time.time()
-        if self.flush_serial_tail(frozen, scan, force=force_save):
-            logger.info(
-                '[SAVE] %d frames since last save  flush=%.3fs',
-                _n_save, time.time() - _t_save0,
-            )
-        elif frozen.run_options.get("xye_only", False):
-            # Int 1D (XYE) on the serial fallback: there is no .nxs save to
-            # ride on (_save_due is always False in this mode), so drain the
-            # XYE buffer per dispatch -- without this the serial path wrote
-            # ZERO output, silently.  (The default streaming path flushes
-            # via QtNexusSink.flush.)
-            self._flush_xye_buffer(scan)
-        return count
-
-    def _build_batch_frames(self, frozen, scan, pending):
-        """Build the LiveFrame shells for a batch chunk (shared by the chunked
-        and streaming dispatchers).  Stamps source refs + skip_map_raw."""
-        skip_2d = scan.skip_2d
-        gi = frozen.gi.enabled
-        th_mtr = frozen.gi.scan_incidence_motor
-        sample_orientation = frozen.gi.sample_orientation
-        tilt_angle = frozen.gi.tilt_angle
-        series_average = frozen.run_options.get("series_average", False)
-        frames = []
-        pending = imageThread._series_average_pending(self, frozen, pending)
-        for img_file, img_number, img_data, img_meta, bg_raw, _t_read in pending:
-            if self.command == 'stop':
-                break
-            img_data = self._apply_threshold_inline(frozen, img_data)
-            frame_mask = self._resolve_frame_mask(frozen, scan, img_data)
-            frame = LiveFrame(
-                img_number, img_data, poni=self.poni,
-                scan_info=img_meta, static=True, gi=gi,
-                th_mtr=th_mtr, bg_raw=bg_raw,
-                sample_orientation=sample_orientation,
-                tilt_angle=tilt_angle,
-                series_average=series_average,
-                integrator=scan._cached_integrator,
-                mask=frame_mask,
-            )
-            if img_file:
-                frame.source_file = os.path.abspath(str(img_file))
-            else:
-                frame.source_file = ""
-            if _raw_lives_in_source(img_file):
-                frame.source_frame_idx = int(img_number) - 1
-            else:
-                frame.source_frame_idx = 0
-            frame.source_snapshot = self._source_snapshot_for_frame(img_file)
-            frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
-            frames.append(frame)
-        return frames
-
-    def _dispatch_batch_streaming(self, frozen, scan, pending):
-        """Stream a batch chunk through a persistent ReductionSession +
-        QtNexusSink (PERF-4b/WS-X1).
-
-        One session spans the whole scan: it owns the worker pool + the single
-        writer thread, and ``QtNexusSink`` owns the .nxs/XYE write.  Each frame
-        is registered + submitted the instant it's built; the per-scan
-        ``_close_reduction_session`` ``finish()`` drains the writer and does the
-        final flush.  Behind the execution flag; chunked is the default.
-        """
-        pending = imageThread._series_average_pending(self, frozen, pending)
-        if getattr(scan, "_cached_integrator", None) is None:
-            logger.info('[STREAM] no cached integrator yet — first frame falls '
-                        'back to serial (streaming engages from the next frame)')
-            return self._dispatch_batch_serial(frozen, scan, pending)
-        if getattr(scan, '_cached_data_mask', None) is None and pending:
-            self._prewarm_frame_mask(frozen, scan, pending[0][2])
-        sync_live_scan_gi_settings(
-            scan,
-            incidence_motor=frozen.gi.scan_incidence_motor,
-            sample_orientation=frozen.gi.sample_orientation,
-            tilt_angle=frozen.gi.tilt_angle,
-        )
-        # BLOCKER 1: freeze the GI common grid from the WHOLE scan's incidence
-        # range before the session opens (no-op on chunks 2..N via the scan-id
-        # guard; no-op for non-GI / fixed-incidence sources).  T0-4 policy:
-        # an unverifiable/unestablishable range WARNS and proceeds on the
-        # first-chunk freeze (diagnostic persisted in provenance); only a
-        # freeze that actually errors aborts the run.
-        if not self._gi_freeze_whole_scan_prepass(frozen, scan):
-            return 0
-        frames = self._build_batch_frames(frozen, scan, pending)
-        if not frames:
-            return 0
-        session, sink = self._get_streaming_session(frozen, scan, frames)
-        if session is None:
-            return 0
-        adapter = self._scan_session_adapter
-        count = 0
-        for live in frames:
-            self._wait_if_paused(frozen)        # pause between frames (streaming path)
-            if self.command == 'stop':
-                break
-            # Per-frame status is emitted at COMPLETION by the sink
-            # (QtNexusSink._emit_frame_status) so the label tracks what the
-            # plots show -- emitting here at submit time raced frames ahead
-            # of the display in the parallel pipeline.
-            #
-            # 4c-1: register+submit + the stop-on-write-failure translation
-            # (which must NOT raise out of run(), or it tears down the
-            # QThread) live in the adapter; it returns False on failure
-            # after setting command='stop'.
-            if not adapter.submit(live):
-                break
-            count += 1
-        return count
-
-    def _on_qt_gui_thread(self) -> bool:
-        try:
-            app = Qt.QtWidgets.QApplication.instance()
-            return app is not None and Qt.QtCore.QThread.currentThread() is app.thread()
-        except Exception:
-            return False
-
-    def _record_store_hydrator(self, scan, record_store):
-        """Build the disk-backed ``FrameRecordStore`` hydrator.
-
-        This hydrator is registered on the session store but is intentionally
-        invoked by ``FrameHydrationWorker``.  Refusing the Qt GUI thread here
-        protects the live UI if a caller accidentally asks the store to hydrate
-        synchronously from a render path.
-        """
-        initial_path = getattr(scan, "data_file", None)
-
-        def hydrate(request_or_label):
-            from xrd_tools.session import (
-                FrameHydrationRequest, FrameHydrationResult,
-            )
-            qualified = isinstance(request_or_label, FrameHydrationRequest)
-            request = request_or_label if qualified else None
-            label = request.label if qualified else request_or_label
-            thread_check = getattr(self, "_on_qt_gui_thread", None)
-            on_gui_thread = (
-                thread_check()
-                if callable(thread_check)
-                else imageThread._on_qt_gui_thread(self)
-            )
-            if on_gui_thread:
-                logger.error(
-                    "FrameRecordStore hydrator refused GUI-thread disk read "
-                    "for frame %s", label)
-                return None
-            scan_file = getattr(scan, "data_file", None) or initial_path
-            if not scan_file:
-                return None
-            try:
-                frame_label = int(label)
-            except (TypeError, ValueError):
-                return None
-
-            existing = record_store.get(frame_label)
-            mode_1d = (
-                existing.active_mode_1d
-                if existing is not None and existing.results_1d
-                else DEFAULT_MODE_KEY
-            )
-            mode_2d = (
-                existing.active_mode_2d
-                if existing is not None and existing.results_2d
-                else DEFAULT_MODE_KEY
-            )
-            try:
-                from xrd_tools.io import read_frame_view
-                file_lock = (
-                    getattr(self, "file_lock", None)
-                    or getattr(scan, "file_lock", None)
-                )
-                if file_lock is None:
-                    view = read_frame_view(
-                        scan_file, frame_label,
-                        mode_1d=mode_1d, mode_2d=mode_2d)
-                else:
-                    # Same lock the serial and streaming writers hold around
-                    # _save_to_nexus, so background hydration can proceed during a
-                    # pause but cannot overlap the writer's HDF5 r+/w open.
-                    with file_lock:
-                        view = read_frame_view(
-                            scan_file, frame_label,
-                            mode_1d=mode_1d, mode_2d=mode_2d)
-            except Exception:
-                logger.debug("record-store hydrate failed for %s", label,
-                             exc_info=True)
-                return None
-            record = FrameRecord.from_view(
-                view, mode_1d=mode_1d, mode_2d=mode_2d,
-            )
-            return FrameHydrationResult(request, record) if qualified else record
-
-        return hydrate
-
-    def _heavy_staging_window(self, scan):
-        """MEM-2: the RAM-aware size for the live heavy caps.
-
-        One number, consumed by all three heavy caps (LiveFrameSeries staging,
-        FrameRecordStore + PublicationStore ``max_heavy_items``).  ~25% of TOTAL
-        physical RAM / the as-stored per-frame heavy cost (raw is float64-upcast
-        today → 8 B/px), clamped [16, 64]; env ``XDART_HEAVY_WINDOW`` pins it.
-        Computed at run start (detector shape known); cached but logged whenever
-        the run/session start path consults it.
-        """
-        frame_bytes = imageThread._heavy_window_frame_bytes(self)
-        shape = getattr(self, "detector_shape", None)
-        try:
-            shape_key = (
-                tuple(int(dim) for dim in shape[:2])
-                if shape and len(shape) >= 2 else None
-            )
-        except (TypeError, ValueError):
-            shape_key = None
-        cache_key = (shape_key, frame_bytes, os.environ.get("XDART_HEAVY_WINDOW"))
-        cached = getattr(self, "_heavy_window", None)
-        if cached is None or getattr(self, "_heavy_window_key", None) != cache_key:
-            from xrd_tools.core import heavy_window
-            cached = heavy_window(frame_bytes)
-            self._heavy_window = cached
-            self._heavy_window_key = cache_key
-        imageThread._log_heavy_staging_window(self, cached, frame_bytes)
-        return cached
-
-    def _heavy_window_frame_bytes(self):
-        shape = getattr(self, "detector_shape", None)
-        if shape and len(shape) >= 2:
-            try:
-                return int(shape[0]) * int(shape[1]) * 8   # float64 as-stored
-            except (TypeError, ValueError):
-                return None
-        return None
-
-    def _log_heavy_staging_window(self, window, frame_bytes=None):
-        from xrd_tools.core import heavy_window_log_line
-        logger.debug(heavy_window_log_line(
-            window, frame_bytes,
-            overridden=bool(os.environ.get("XDART_HEAVY_WINDOW"))))
-
-    def _live_record_store_max_items(self, plan=None):
-        integration_1d = getattr(plan, "integration_1d", None)
-        npt = getattr(integration_1d, "npt", None)
-        return live_record_store_max_items(npt)
-
-    def _resize_publication_store_heavy_window(self, window):
-        store = getattr(self, "publication_store", None)
-        resize = getattr(store, "set_max_heavy_items", None)
-        if callable(resize):
-            resize(window)
-
-    def _log_reduction_worker_cap(self, frozen, workers):
-        from xrd_tools.core import reduction_worker_cap_log_line
-        logger.info(reduction_worker_cap_log_line(
-            workers, requested=frozen.max_cores,
-            overridden=bool(os.environ.get("XDART_REDUCTION_WORKERS"))))
-
-    def _get_streaming_session(self, frozen, scan, frames):
-        """Build (once per scan) or return the persistent streaming session +
-        its ``QtNexusSink``.  Returns ``(None, None)`` if the GI freeze scout
-        fails (the batch is skipped with an advisory, as in the chunked path)."""
-        if (self._streaming_session is not None
-                and self._streaming_scan_id == id(scan)):
-            _hsw = getattr(self, "_heavy_staging_window", None)
-            if callable(_hsw):
-                window = _hsw(scan)
-                imageThread._resize_publication_store_heavy_window(self, window)
-            return self._streaming_session, self._streaming_sink
-        if self._streaming_session is not None:   # a different scan started
-            self._close_reduction_session()
-        standard_plan = self._plan_cache.get(scan, integrate_2d=not scan.skip_2d)
-        # MEM-3: map Cores honestly to the reduction pool, capped at the
-        # throughput knee (memory-aware) and NEVER to None — the old
-        # ``n_workers==1 -> None`` silently built a ~20-worker default pool
-        # (20 integrator deepcopies), the opposite of the requested serial run.
-        from xrd_tools.core import reduction_worker_cap
-        executor = reduction_worker_cap(frozen.max_cores)
-        self._streaming_executor_workers = executor
-        imageThread._log_reduction_worker_cap(self, frozen, executor)
-        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
-        # Batch brackets all frames (scout_union over first+last of the chunk);
-        # live has no last frame at session open, so it freezes from the first
-        # frame only (matches the legacy _process_one live path + the #75 advisory).
-        _default_freeze = ("scout_union" if frozen.batch_mode else "first_frame") \
-            if frozen.gi.enabled else None
-        gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
-        # MEM-2: RAM-aware heavy window feeds all three heavy caps.  Set the
-        # LiveFrameSeries staging cap here so the record store (which mirrors it)
-        # and the GUI's PublicationStore (which reads self._heavy_window) all
-        # take the same value.  Defensive getattr: reduction-session tests drive
-        # this through a minimal host double without the wrangler's method — fall
-        # back to the pure RAM-aware default (MEM-3 fix for a MEM-2 test gap).
-        _hsw = getattr(self, "_heavy_staging_window", None)
-        if callable(_hsw):
-            window = _hsw(scan)
-        else:
-            from xrd_tools.core import heavy_window
-            window = heavy_window()
-        frames_obj = getattr(scan, "frames", None)
-        if frames_obj is not None:
-            frames_obj._in_memory_cap = window
-        imageThread._resize_publication_store_heavy_window(self, window)
-        record_store_max_items = imageThread._live_record_store_max_items(
-            self, standard_plan)
-        record_store = FrameRecordStore(
-            max_items=record_store_max_items,
-            max_heavy_items=window,
-        )
-        # X1-GUI-R2: declare which scan this active-run store owns, matching how
-        # the display resolves its current scan key (overlay current_scan_key:
-        # visible name, else data file).  The projection adapter
-        # (frame_projection_adapter.STORE_SCAN_KEY_ATTR) then serves this store
-        # ONLY for its own scan, so a paused run cannot project into a browse of
-        # a different scan that reuses the same frame labels.
-        _store_scan_key = getattr(scan, "name", None)
-        if _store_scan_key in (None, "", "null_main"):
-            _store_scan_key = getattr(scan, "data_file", None) or None
-        record_store._xdart_scan_key = _store_scan_key
-        self._streaming_record_store = record_store
-        sink = QtNexusSink(
-            self,
-            scan,
-            standard_plan,
-            run_configuration=frozen,
-            mask=self.mask,
-            record_store=record_store,
-        )
-        try:
-            # 4f-bridge: drive the streaming write path through the PUBLIC
-            # xrd_tools.session.ScanSession (commands in / events out), not a raw
-            # ReductionSession — xdart is now thin over the headless session.
-            # It builds + arms its own streaming ReductionSession internally;
-            # clear_frame_images=True preserves the PERF-3 raw-nulling, and the
-            # QtNexusSink still drives the per-frame display publish (the session
-            # forwards every sink hook via its internal _EventSink).
-            session = open_live_scan_session(
-                frames,
-                standard_plan,
-                scan_name=str(getattr(scan, "name", "scan")),
-                global_mask=self.mask,
-                integrator=scan._cached_integrator,
-                poni=self.poni,
-                executor=executor,
-                cancel_token=cancel_token,
-                gi_freeze_mode=gi_freeze_mode,
-                sink=sink,
-                record_store=record_store,
-                record_store_persisted_on_write=False,
-            )
-        except GIFreezeError as exc:
-            self.showLabel.emit(
-                'GI 2D scout frame is blank or the grid is degenerate: set '
-                'Theta Motor to Manual and enter the incident angle, or check '
-                'the mask / threshold.'
-            )
-            logger.warning('GI freeze scout failed for streaming batch: %s', exc)
-            self._streaming_session = None
-            self._streaming_sink = None
-            self._streaming_scan_id = None
-            self._streaming_record_store = None
-            self._streaming_executor_workers = None
-            self._scan_session_adapter = None
-            return None, None
-        self._streaming_session = session
-        self._streaming_sink = sink
-        self._streaming_scan_id = id(scan)
-        # 4c-1: the per-frame submit + pause quiesce/flush route through one
-        # adapter (it owns the stop-on-write-failure translation + delegates
-        # quiesce to ReductionSession.pause).
-        from .scan_session import ScanSessionAdapter
-        self._scan_session_adapter = ScanSessionAdapter(self, scan, session, sink)
-        self._scan_session_adapter.set_hydrator(
-            imageThread._record_store_hydrator(self, scan, record_store),
-            revision_qualified=True,
-        )
-        return session, sink
-
-    def _process_one(self, frozen, scan, img_file, img_number, img_data, img_meta,
-                     bg_raw, t_read=0.0):
-        """Integrate one image sequentially and save. Includes timing instrumentation.
-
-        ``t_read`` is the per-frame wall-clock time spent reading the
-        image off disk (or off the prefetch queue) — measured by the
-        collect loop and threaded through so the [TIMING] line shows
-        per-frame variance.  Defaults to 0 for callers that don't
-        track it (the live-watch loop reads via a different path).
-        """
-        series_average = frozen.run_options.get("series_average", False)
-        fname = os.path.splitext(os.path.basename(img_file))[0]
-        # Multi-frame containers reuse a single master filename across
-        # frames; appending "[frame N]" to the status box so the user
-        # can see the frame index advancing during the scan.
-        _ext = Path(img_file).suffix.lower()
-        if _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file):
-            self.showLabel.emit(f'{fname} [frame {img_number}]')
-        else:
-            self.showLabel.emit(fname)
-
-        _t1 = time.time()
-        # Threshold via dummy sentinel + stable cached mask — see
-        # _apply_threshold_inline / _resolve_frame_mask docstrings for
-        # why this is fast even with per-frame threshold filtering on.
-        img_data = self._apply_threshold_inline(frozen, img_data)
-        frame_mask = self._resolve_frame_mask(frozen, scan, img_data)
-        frame = LiveFrame(
-            img_number, img_data, poni=self.poni,
-            scan_info=img_meta, static=True, gi=frozen.gi.enabled,
-            th_mtr=frozen.gi.scan_incidence_motor, bg_raw=bg_raw,
-            sample_orientation=frozen.gi.sample_orientation,
-            tilt_angle=frozen.gi.tilt_angle,
-            series_average=series_average,
-            integrator=scan._cached_integrator,
-            mask=frame_mask,
-        )
-        _t_frame = time.time() - _t1
-
-        if frozen.gi.enabled:
-            try:
-                frame._get_incident_angle()
-            except IncidenceAngleUnresolved as exc:
-                # Refuse to integrate GI at a degenerate 0°.  Surface the
-                # fix and skip the frame rather than emit a blank cake.
-                self.showLabel.emit(
-                    'GI needs an incidence angle: set Theta Motor to Manual '
-                    'and enter the angle.'
-                )
-                logger.warning('Skipping GI frame %s: %s', img_file, exc)
-                return
-
-        _t2 = time.time()
-        sync_live_scan_gi_settings(
-            scan,
-            incidence_motor=frozen.gi.scan_incidence_motor,
-            sample_orientation=frozen.gi.sample_orientation,
-            tilt_angle=frozen.gi.tilt_angle,
-        )
-
-        plan = self._plan_cache.get(scan, integrate_2d=not scan.skip_2d)
-        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
-
-        def _session_factory():
-            return open_live_reduction_session(
-                [frame],
-                plan,
-                scan_name=str(getattr(scan, "name", "scan")),
-                global_mask=self.mask,
-                integrator=scan._cached_integrator,
-                poni=self.poni,
-                cancel_token=cancel_token,
-                chunk_size=1,
-                gi_freeze_mode="first_frame" if frozen.gi.enabled else None,
-            )
-
-        session_getter = getattr(self, "_get_reduction_session", None)
-        close_session = not callable(session_getter)
-        try:
-            if close_session:
-                session = _session_factory()
-            else:
-                session = session_getter(
-                    self._reduction_session_key_for(scan, plan, 1),
-                    _session_factory,
-                )
-        except GIFreezeError as exc:
-            # Blank/degenerate GI scout (raised while building the session).
-            # Mirror the IncidenceAngleUnresolved guidance and skip the frame.
-            self.showLabel.emit(
-                'GI 2D scout frame is blank or the grid is degenerate: set '
-                'Theta Motor to Manual and enter the incident angle, or check '
-                'the mask / threshold.'
-            )
-            logger.warning('GI freeze scout failed for frame: %s', exc)
+        except BaseException as exc:
+            self._retain_dynamic_failure(exc, "Pause failed; run stopped")
+            logger.error("dynamic pause failed; run stopped", exc_info=True)
             return
-        try:
-            reduce_live_frames(
-                [frame],
-                plan,
-                scan_name=str(getattr(scan, "name", "scan")),
-                global_mask=self.mask,
-                integrator=scan._cached_integrator,
-                poni=self.poni,
-                session=session,
-                cancel_token=cancel_token,
-                chunk_size=1,
-                gi_freeze_mode="first_frame" if frozen.gi.enabled else None,
-            )
-        finally:
-            if close_session:
-                # Legacy serial live integration session (write is the separate
-                # _save_to_nexus) — preserve the non-raising close.
-                session.finish(raise_on_failure=False)
-        # Timing kept for parity with the legacy logging; the
-        # standard path now does both 1D + 2D in one call so we
-        # bundle the total under _t_1d.
-        _t_1d = time.time() - _t2
-        _t_2d = 0.0
-
-        # ── GUI data (skip in batch mode — no one is looking) ────────────
-        # Wave 5: live scan display is published through _published_frames and
-        # consumed by static_scan_widget.update_data into PublicationStore.
-        _t_h5_total = _t_h5_wait = _t_h5_write = 0.0
-
-        # ── In-memory accumulation (no disk I/O — batch flush handles that) ──
-        if not frozen.run_options.get("xye_only", False):
-            # Set source file as relative path from HDF5 dir for NeXus provenance
-            if img_file:
-                frame.source_file = os.path.abspath(str(img_file))
-            else:
-                frame.source_file = ""
-            # source_frame_idx: per-source-file 0-based frame offset.
-            # See the matching block in ``_build_batch_frames`` (the streaming
-            # dispatcher's frame-shell builder) for the full rationale.  Eiger /
-            # HDF5 masters get ``img_number - 1``; everything else stays at 0.
-            if _raw_lives_in_source(img_file):
-                frame.source_frame_idx = int(img_number) - 1
-            else:
-                frame.source_frame_idx = 0
-            frame.source_snapshot = self._source_snapshot_for_frame(img_file)
-            # For Eiger: raw frames already live in the master file — don't double-store them.
-            frame.skip_map_raw = scan.skip_2d or _raw_lives_in_source(img_file)
-            _t4 = time.time()
-            # batch_save=True → pure in-memory (stash + index + bai_*).
-            # The serial dispatcher calls scan._save_to_nexus once at
-            # end-of-batch, so we don't pay per-frame write cost here.
-            scan.add_frame(
-                frame=frame, calculate=False, update=True,
-                get_sd=True, set_mg=False, static=True, gi=frozen.gi.enabled,
-                th_mtr=frozen.gi.scan_incidence_motor, series_average=series_average,
-                batch_save=True,
-            )
-            _t_h5_total = time.time() - _t4
-            _t_h5_wait = 0.0
-            _t_h5_write = _t_h5_total
-
-            # NOTE: no PERF-3 raw-free here.  This live/non-batch path hands the
-            # frame to the GUI publication store; freeing map_raw before that
-            # hand-off would force thumbnail/raw rehydration on the hot path.
-            # Batch still frees raw in QtNexusSink.worker_process after its
-            # publication payload has been prepared.
-
-        # ── XYE buffer (flushed at end of batch by the dispatcher) ──────
-        _t5 = time.time()
-        with self._xye_lock:
-            self._xye_buffer.append((img_number, frame))
-        _t_csv = time.time() - _t5
-
-        _t_total = t_read + _t_frame + _t_1d + _t_2d + _t_h5_total + _t_csv
-        _perf = getattr(self, '_perf', None)
-        if _perf is not None:
-            _perf['frame'] += _t_frame
-            _perf['1d'] += _t_1d
-            _perf['2d'] += _t_2d
-            _perf['h5'] += _t_h5_total
-            _perf['csv'] += _t_csv
-            _perf['n'] += 1
-        # Merged per-frame line: timing + the user-facing "processed
-        # <file>" annotation.  3-decimal precision so sub-10ms
-        # components (in-memory add_frame, XYE buffer append) don't
-        # round to 0.00.  For multi-frame containers (.h5/.hdf5/.nxs)
-        # the label is "<master> frame N" — the frame number is
-        # already explicit there, so we drop the redundant
-        # "image_NNNN" prefix that we keep for per-file inputs.
-        _ext = Path(img_file).suffix.lower()
-        if _ext in ('.h5', '.hdf5', '.nxs'):
-            _label = f'{fname} frame {img_number}'
-        else:
-            _label = f'image_{img_number:04d} {fname}'
-        _sub = f' {self.sub_label}' if self.sub_label else ''
-        logger.info(
-            '[TIMING] %s: read=%.3fs frame_init=%.3fs '
-            'int_1d=%.3fs int_2d=%.3fs add_frame=%.3fs csv=%.3fs '
-            'total=%.3fs%s',
-            _label, t_read, _t_frame, _t_1d, _t_2d,
-            _t_h5_total, _t_csv, _t_total, _sub,
-        )
-        # In batch mode, suppress per-frame GUI signals — emit once at end
-        # via process_scan's final ``sigUpdate.emit(-1)``.  Batch mode
-        # exists precisely to skip GUI work during the run and let
-        # the wrangler focus on integration throughput.
-        if not frozen.batch_mode:
-            # Publish the freshly-integrated frame so the main thread can
-            # consume it without going back to disk.  See
-            # static_scan_widget.update_data for the consumer side.
-            self._published_frames[img_number] = frame
-            self.sigUpdate.emit(img_number)
+        self.sigPaused.emit()
 
     # ── Eiger HDF5 helpers ────────────────────────────────────────────────
 
     def _get_nframes(self, master_path):
         """Return frame count for a master file, 0 on failure."""
         return count_frames(master_path)
+
+    def _eiger_source_facts(self, frame_idx):
+        master = getattr(self, "_eiger_master_candidate", None)
+        current = _source_observation(self._eiger_master_path)
+        if (master is None or Path(master.path) != Path(
+                self._eiger_master_path) or current != master):
+            raise RuntimeError("Eiger master changed outside its retained cursor")
+        descriptor = self._eiger_descriptor
+        paths = tuple(getattr(descriptor, "segment_paths", ()) or ())
+        if not paths and getattr(descriptor, "dataset_path", None):
+            paths = (descriptor.dataset_path,)
+        members, start = [], 0
+        handle = (getattr(self._eiger_cursor, "_h5", None) or
+                  getattr(self._eiger_fabio_handle, "h5", None))
+        if handle is None:
+            raise OSError("Eiger source has no retained detector owner")
+        if not paths:
+            data = handle.get("entry/data")
+            if isinstance(data, h5py.Dataset):
+                paths = ("/entry/data",)
+            elif isinstance(data, h5py.Group):
+                paths = tuple(f"{data.name}/{name}" for name in sorted(data)
+                              if isinstance(data.get(name), h5py.Dataset))
+        if not paths:
+            entry = handle.get("entry")
+            if isinstance(entry, h5py.Group):
+                paths = tuple(f"{entry.name}/{name}" for name in sorted(entry)
+                              if name.startswith("data") and isinstance(entry.get(name), h5py.Dataset))
+        if not paths:
+            raise ValueError("unsupported Eiger detector topology: no detector dataset")
+        if handle is not None:
+            kinds = set()
+            for ordinal, selector in enumerate(paths):
+                owner = handle
+                parts = [part for part in str(selector).split("/") if part]
+                if not parts:
+                    raise ValueError("unsupported Eiger detector topology: empty path")
+                for part in parts[:-1]:
+                    link = owner.get(part, getlink=True)
+                    if not isinstance(link, h5py.HardLink):
+                        raise ValueError("unsupported Eiger detector topology: indirect ancestor")
+                    owner = owner.get(part)
+                    if not isinstance(owner, h5py.Group):
+                        raise ValueError("unsupported Eiger detector topology: non-group ancestor")
+                link = owner.get(parts[-1], getlink=True)
+                if not isinstance(link, (h5py.HardLink, h5py.ExternalLink)):
+                    raise ValueError("unsupported Eiger detector topology: indirect detector leaf")
+                dataset = handle.get(selector)
+                if (not isinstance(dataset, h5py.Dataset) or bool(dataset.is_virtual)
+                        or dataset.id.get_create_plist().get_external_count()):
+                    raise ValueError("unsupported Eiger detector topology: non-owned storage")
+                kind = "external" if isinstance(link, h5py.ExternalLink) else "hard"
+                kinds.add(kind)
+                shape = dataset.shape
+                stop = start + (1 if len(shape) == 2 else int(shape[0]))
+                if kind == "external":
+                    target = Path(link.filename)
+                    if not target.is_absolute():
+                        target = Path(self._eiger_master_path).parent / target
+                    observation = _source_observation(target)
+                    members.append((observation, str(link.path), start, stop, ordinal))
+                start = stop
+            if len(kinds) > 1:
+                raise ValueError("unsupported Eiger detector topology: mixed storage owners")
+        return dict(observation=master, source_revision=max(1, int(master.mtime_ns)),
+                    container=True, extent=int(self._eiger_nframes), dataset_paths=paths,
+                    external_members=tuple(members), source_frame_idx=int(frame_idx),
+                    commit_path=None)
 
     @staticmethod
     def _h19_cursor_is_self_contained(cursor, descriptor):
@@ -3519,6 +2562,8 @@ class imageThread(wranglerThread):
         if (queued_candidate is not None
                 and Path(queued_candidate.path) != Path(master_path)):
             queued_candidate = None
+        if queued_candidate is None:
+            queued_candidate = _source_observation(master_path)
         self._eiger_close_master()
         self._eiger_open_state = "opening"
         # Provisional-until-proven: recorded per open/outcome so the Phase-3
@@ -3533,6 +2578,11 @@ class imageThread(wranglerThread):
             try:
                 # Primary: fabio (handles all Eiger layouts)
                 self._eiger_fabio_handle = fabio.open(master_path)
+                if _source_observation(master_path) != queued_candidate:
+                    self._eiger_fabio_handle.close()
+                    self._eiger_fabio_handle = None
+                    raise OSError("Eiger master changed while fabio opened it")
+                self._eiger_master_candidate = queued_candidate
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
                 self._eiger_open_state = "ready"
                 # fabio counts only LANDED data files; zero frames on a live
@@ -3630,6 +2680,7 @@ class imageThread(wranglerThread):
                 self._eiger_nframes = 0
                 return
             self._eiger_bind_cursor(cursor)
+            self._eiger_master_candidate = queued_candidate
             self._eiger_open_state = "ready"
             # R4A-1(iii): this container is now JIT-CLASSIFIED and has a live
             # metadata provider, so it is the earliest honest moment to hand the
@@ -3819,7 +2870,9 @@ class imageThread(wranglerThread):
         old_cursor = self._eiger_cursor
         replacement = None
         try:
-            replacement = ContainerCursor(path, entry='entry').open()
+            candidate = _source_observation(path)
+            replacement = ContainerCursor(
+                path, entry='entry', candidate=candidate).open()
             if replacement.descriptor.dataset_path is None:
                 replacement.close()
                 return False
@@ -3832,6 +2885,7 @@ class imageThread(wranglerThread):
         # Swap the coherent binding first.  Only the successful replacement can
         # release the old source owner; this keeps transient failures retryable.
         self._eiger_install_cursor_binding(replacement, binding)
+        self._eiger_master_candidate = candidate
         if old_cursor is not None and old_cursor is not replacement:
             try:
                 old_cursor.close()
@@ -3876,7 +2930,7 @@ class imageThread(wranglerThread):
         # the source regardless.
         self._eiger_close_master()
         try:
-            if not self._eiger_reopen_cursor():
+            if not self._eiger_refresh_master_handle(raise_errors=True):
                 # Reopen succeeded but resolved no detector dataset: a
                 # definitive imageless container (a still-writing shell
                 # raises the typed not-ready error instead).
@@ -3957,6 +3011,7 @@ class imageThread(wranglerThread):
         self._eiger_read_plan = None
         self._eiger_provider = None
         self._eiger_descriptor = None
+        self._eiger_master_candidate = None
         if self._eiger_fabio_handle is not None:
             try:
                 self._eiger_fabio_handle.close()
@@ -4933,7 +3988,7 @@ class imageThread(wranglerThread):
                     owner = candidate_owner(path)
                     candidate = Candidate(
                         path=path,
-                        adapter_id=owner.id if owner is not None else "",
+                        adapter_id=owner.id,
                         size=int(stat.st_size),
                         mtime_ns=int(stat.st_mtime_ns),
                     )
@@ -4984,7 +4039,7 @@ class imageThread(wranglerThread):
         # prefetcher died or hasn't pushed an end-of-stream sentinel yet.
         while True:
             if self.command == 'stop':
-                return (None, None, 1, None, {})
+                return None, None, 1, None, {}
             try:
                 item = self._prefetch_queue.get(timeout=0.25)
             except queue.Empty:
@@ -5001,7 +4056,7 @@ class imageThread(wranglerThread):
                     if (not frozen.batch_mode) and self.command != 'stop':
                         self._prefetch_queue = None
                         self._prefetch_thread = None
-                    return (None, None, 1, None, {})
+                    return None, None, 1, None, {}
                 continue
             # O8: surface a worker-failure sentinel as a user-visible
             # status before propagating end-of-stream.  A clean end
@@ -5138,10 +4193,14 @@ class imageThread(wranglerThread):
                     for group_start, group_end in groups:
                         _t_blk = time.time()
                         try:
+                            source_before = self._eiger_source_facts(group_start)
                             # Native-dtype owner block via the sustained cursor.
                             block = np.asarray(
                                 self._eiger_cursor.read_block(
                                     group_start, group_end).array)
+                            source_after = self._eiger_source_facts(group_start)
+                            if source_after != source_before:
+                                raise RuntimeError("source changed during bulk read")
                         except Exception as e:
                             logger.warning(
                                 'Bulk read failed (start=%d end=%d): %s; '
@@ -5149,6 +4208,7 @@ class imageThread(wranglerThread):
                                 group_start, group_end, e,
                             )
                             self._eiger_frame_idx = group_start
+                            self._eiger_refresh_master_handle()
                             bulk_failed = True
                             break  # outer worker loop resumes with sync reader
                         _t_blk = time.time() - _t_blk
@@ -5187,8 +4247,9 @@ class imageThread(wranglerThread):
                                 # metadata overlaid with the Bluesky per-frame
                                 # motor + counter row (so each frame carries its
                                 # own hy/i0.. values, not a shared master dict).
-                                self._frame_scan_info(
+                                _SourceMetadata(self._frame_scan_info(
                                     frozen, self._eiger_master_path, frame_idx),
+                                    dict(source_after, source_frame_idx=frame_idx)),
                             )
                             if not self._push_frame_to_queue(
                                     item, prefetch_queue=prefetch_queue,
@@ -5291,10 +4352,7 @@ class imageThread(wranglerThread):
                     # indexes a row out of a single-exposure frame).
                     idx = 0 if self._eiger_cursor.is_2d else frame_idx
                     return np.asarray(self._eiger_cursor.read_frame(idx))
-                with fabio.open(self._eiger_master_path) as _img:
-                    _raw = (_img.data if frame_idx == 0
-                            else _img.get_frame(frame_idx).data)
-                return np.asarray(_raw)
+                raise OSError("Eiger frame read requires its retained source owner")
             except Exception as e:
                 if frozen.batch_mode or waited >= deadline:
                     logger.error('Error reading frame %d from %s: %s',
@@ -5306,7 +4364,7 @@ class imageThread(wranglerThread):
                 # Pick up data files written since the handle was opened.
                 self._eiger_refresh_master_handle()
 
-    def _eiger_refresh_master_handle(self):
+    def _eiger_refresh_master_handle(self, *, raise_errors=False):
         """Reopen/refresh the open Eiger handle so a subsequent read sees
         per-frame data files written since it was opened (the master is written
         up front; the data streams in after).  Best-effort -- a refresh failure
@@ -5314,23 +4372,34 @@ class imageThread(wranglerThread):
         try:
             if self._eiger_fabio_handle is not None:
                 self._eiger_fabio_handle.close()
-                self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
+                self._eiger_fabio_handle = None
+                candidate = _source_observation(self._eiger_master_path)
+                replacement = fabio.open(self._eiger_master_path)
+                if _source_observation(self._eiger_master_path) != candidate:
+                    replacement.close()
+                    raise OSError("Eiger master changed while fabio reopened it")
+                self._eiger_fabio_handle = replacement
+                self._eiger_master_candidate = candidate
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
+                return True
             elif self._eiger_cursor is not None:
                 # Growth-refresh analogue of the fabio reopen: reopen the cursor
                 # so a subsequent read sees frames written since it was opened
                 # (reopen-to-refresh, NOT a new SWMR policy).
-                self._eiger_reopen_cursor()
+                return self._eiger_reopen_cursor()
             elif getattr(self, '_eiger_master_path', None) is not None:
                 # No handle at all — a single-file source whose detector tree
                 # landed after a provisional (not-ready) open.  Build the real
                 # cursor binding now so the tolerant read proceeds on the h5py
                 # path instead of burning the deadline on the fabio fallback
                 # (NXS-SF-2).
-                self._eiger_reopen_cursor()
+                return self._eiger_reopen_cursor()
         except Exception as e:
             logger.debug("Failed to refresh Eiger handle for %s: %s",
                          getattr(self, "_eiger_master_path", None), e)
+            if raise_errors:
+                raise
+        return False
 
     def _get_next_eiger_frame_sync(self, frozen):
         """Return the next frame from Eiger HDF5 master file(s), one at a time.
@@ -5393,28 +4462,17 @@ class imageThread(wranglerThread):
                     return None, None, 1, None, {}
 
             # ── Current master exhausted?  Try to advance ────────────────────
-            if self._eiger_frame_idx >= self._eiger_nframes:
-                # Re-check frame count (file may still be growing in live mode)
-                if self._eiger_fabio_handle is not None:
-                    # Reopen fabio handle to pick up newly written data files
-                    try:
-                        self._eiger_fabio_handle.close()
-                        self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
-                        self._eiger_nframes = self._eiger_fabio_handle.nframes
-                    except (IOError, OSError) as e:
-                        logger.debug("Failed to reopen fabio handle for %s: %s", self._eiger_master_path, e)
-                        self._eiger_nframes = self._get_nframes(self._eiger_master_path)
-                elif self._eiger_cursor is not None:
-                    # Finalized-container cursor: a stable frame count (no SWMR
-                    # growth tracking).  Re-read defensively; fall back to a
-                    # fresh count only if the cursor is unexpectedly unusable.
-                    try:
-                        self._eiger_nframes = self._eiger_cursor.frame_count
-                    except Exception as e:
-                        logger.debug("Failed to read cursor frame count for %s: %s", self._eiger_master_path, e)
-                        self._eiger_nframes = self._get_nframes(self._eiger_master_path)
-                else:
-                    self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+            if (self._eiger_frame_idx >= self._eiger_nframes
+                    and frozen.live_mode and not frozen.batch_mode
+                    and frozen.source.family == "directory"):
+                path, candidate = self._eiger_master_path, self._eiger_master_candidate
+                if (not imageThread._eiger_open_count_is_authoritative(self, path) and not self._eiger_refresh_master_handle()):
+                    self._eiger_close_master()
+                    retry_s = max(0.01, float(getattr(
+                        self, "CONTAINER_READY_RETRY", _CONTAINER_READY_RETRY)))
+                    self._eiger_retry_after[path] = time.monotonic() + retry_s
+                    if not imageThread._h19_candidate_is_current(candidate): self._eiger_master_path = None; self._eiger_frame_idx = self._eiger_nframes = 0
+                    return None, None, 1, None, {}
 
             if self._eiger_frame_idx >= self._eiger_nframes:
                 if frozen.source.family == "directory":
@@ -5487,12 +4545,21 @@ class imageThread(wranglerThread):
             if self._should_skip_before_read(frozen, scan_name, img_number):
                 continue
 
+            try:
+                source_before = self._eiger_source_facts(frame_idx)
+            except (OSError, RuntimeError):
+                self._eiger_frame_idx = frame_idx
+                if not self._eiger_refresh_master_handle():
+                    if frozen.live_mode and not frozen.batch_mode:
+                        return None, None, 1, None, {}
+                    raise
+                continue
             img_data = self._read_eiger_frame_tolerant(frozen, frame_idx)
             if img_data is None:
                 stop_evt = getattr(self, '_prefetch_stop_evt', None)
                 if (getattr(self, 'command', None) == 'stop'
                         or (stop_evt is not None and stop_evt.is_set())):
-                    return None, None, 1, None, {}     # genuine stop -> end of stream
+                    return None, None, 1, None, {}  # genuine stop
                 # A frame the master DECLARES (nimages) but whose data file
                 # never became readable within the deadline (an aborted/dropped
                 # frame): skip just this one and read on.  Do NOT emit an
@@ -5502,9 +4569,19 @@ class imageThread(wranglerThread):
                 self._record_skip_reason("unreadable or empty image data")
                 continue
 
+            try:
+                source_after = self._eiger_source_facts(frame_idx)
+            except (OSError, RuntimeError):
+                source_after = None
+            if source_after != source_before:
+                self._eiger_frame_idx = frame_idx
+                self._eiger_refresh_master_handle()
+                continue
+
             meta = self._frame_scan_info(frozen, self._eiger_master_path, frame_idx)
 
-            return self._eiger_master_path, scan_name, img_number, img_data, meta
+            return (self._eiger_master_path, scan_name, img_number, img_data,
+                    _SourceMetadata(meta, source_after))
 
     # ── Image iteration ──────────────────────────────────────────────────
 
@@ -5536,7 +4613,7 @@ class imageThread(wranglerThread):
                 waited += delay
                 delay = min(delay * 1.5, 0.5)
 
-    def _commit_frame(self, fname):
+    def _commit_frame(self, fname, *, count_discovery=True):
         """Mark a frame consumed for this run: record it processed, drop it from
         the pending queue, count it discovered.  Deferred until a DECISIVE read
         outcome (read succeeded, or gave up past the deadline) so a still-writing
@@ -5545,7 +4622,8 @@ class imageThread(wranglerThread):
         if self.img_fnames and self.img_fnames[0] == fname:
             self.img_fnames.popleft()
         self._frame_read_clock_map().pop(fname, None)
-        self._record_discovered_frame()
+        if count_discovery:
+            self._record_discovered_frame()
 
     def _frame_read_clock_map(self):
         """The fname -> first-unreadable-time map, lazily created (some test
@@ -5620,11 +4698,18 @@ class imageThread(wranglerThread):
             if self._should_skip_before_read(frozen, scan_name, img_number):
                 self.sigUpdate.emit(self._append_output_number(frozen, img_number))
                 return None, scan_name, img_number, None, {}
+            before = _source_observation(self.img_file)
             img_data = self._read_frame_tolerant(self.img_file)
             if img_data is None:
                 return None, scan_name, img_number, None, {}
+            observation = _source_observation(self.img_file)
+            if observation.version_stamp != before.version_stamp:
+                return None, scan_name, img_number, None, {}
             meta = read_image_metadata(self.img_file, meta_format=meta_ext, meta_dir=self.meta_dir) if meta_ext else {}
-            return self.img_file, scan_name, img_number, img_data, meta
+            facts = dict(observation=observation, source_revision=max(1, observation.mtime_ns), container=False,
+                         source_frame_idx=0, commit_path=None)
+            return (self.img_file, scan_name, img_number, img_data,
+                    _SourceMetadata(meta, facts))
 
         if is_container:
             return self._get_next_eiger_frame(frozen)
@@ -5689,6 +4774,7 @@ class imageThread(wranglerThread):
                 self._commit_frame(fname)
                 continue
 
+            before = _source_observation(fname)
             data = self._read_frame_tolerant(fname)
             if data is None:
                 # File is present but not readable yet.  In LIVE mode it may
@@ -5702,8 +4788,11 @@ class imageThread(wranglerThread):
                 self._record_skip_reason("unreadable image (gave up after deadline)")
                 continue
 
-            self._commit_frame(fname)
+            observation = _source_observation(fname)
+            if observation.version_stamp != before.version_stamp:
+                return None, sname, snumber, None, {}
             if not np.isfinite(data).any():
+                self._commit_frame(fname)
                 self._record_skip_reason("unreadable or empty image data")
                 continue
 
@@ -5711,7 +4800,10 @@ class imageThread(wranglerThread):
             n += 1
 
             if (not series_average) or (snumber is None):
-                return fname, sname, snumber, data, meta
+                self._record_discovered_frame()
+                facts = dict(observation=observation, source_revision=max(1, observation.mtime_ns), container=False,
+                             source_frame_idx=0, commit_path=fname, discovery_counted=True)
+                return fname, sname, snumber, data, _SourceMetadata(meta, facts)
             else:
                 if n == 1:
                     img_data = data
@@ -5883,7 +4975,6 @@ class imageThread(wranglerThread):
         # <scan_name>/ subfolder and never replaces this .nxs (no collision).
         if not xye_only:
             check_output_not_source(fname, **self._output_safety_args(frozen))
-        Path(frozen.save_path).mkdir(parents=True, exist_ok=True)
         # Eiger master files are pre-processed with the trailing
         # ``_master`` suffix stripped from scan_name (see
         # _get_next_eiger_frame). Without this sync, the wrangler
@@ -5911,6 +5002,8 @@ class imageThread(wranglerThread):
         # N1: the project root -> entry/@source_base + relative raw source paths
         # in the writer (portable .nxs).  None -> absolute paths (back-compat).
         scan.source_base = getattr(self, "source_base", None)
+        scan._committed_append_prefix = getattr(
+            self, "_append_committed_prefix_by_scan", {}).get(str(scan.name))
         # v2 NeXus writer needs a Diffractometer to derive per-frame
         # rot1/rot2/rot3 + incidence-angle arrays from scan_data.  default_geometry()
         # picks the preset from what scan_data recorded: psic when nu/del are
@@ -5924,87 +5017,6 @@ class imageThread(wranglerThread):
         # other source; PONI geometry still wins (see _stamp_bluesky_wavelength).
         self._stamp_bluesky_wavelength(scan)
 
-        write_mode = frozen.output_mode
-        if not os.path.exists(fname):
-            write_mode = 'Overwrite'
-
-        # Int 1D (XYE) writes ONLY .xye files (via the XYE flush); it must not
-        # create or write the .nxs stack at all.  Skip all NeXus disk I/O here —
-        # the per-batch ``scan._save_to_nexus`` is already gated off for
-        # xye_only, so the scan object is used purely in-memory for integration.
-        if not xye_only:
-            if write_mode == 'Append':
-                # Usually populated before the raw read.  Keep direct entry
-                # paths safe too; when cached this performs no file I/O.
-                self._load_append_skip_snapshot(frozen, self.scan_name)
-            with self.file_lock:
-                with self._h5pool_bracket(scan):
-                    if write_mode == 'Append':
-                        # v2 NeXus loader (the only one we support now).
-                        scan.load_from_h5(replace=False, mode='r')
-                        # the PROCESSED target's own stored configuration (read
-                        # off the file just loaded into the per-run scan) versus
-                        # the ACCEPTED run -- never the display scan.
-                        processed_config = processing_config_from_scan(
-                            scan, prefer_stored=True)
-                        current_config = processing_config_from_mapping(
-                            frozen.processing_mapping())
-                        append_check = append_config_mismatch_check(
-                            write_mode, processed_config, current_config)
-                        if not append_check.ok:
-                            # TYPED so process_scan can stop the run cleanly
-                            # and surface a modal instead of letting a bare
-                            # RuntimeError escape the QThread (the v1.0.1
-                            # mid-run Int 1D -> Int 2D beamline crash).  The
-                            # Run-click mismatch modal (CF-2/CF-3) only fires
-                            # at Run-click, so a mid-run settings change (or a
-                            # later auto-discovered scan) lands HERE.
-                            raise self._append_config_mismatch_error(
-                                fname,
-                                append_check,
-                                processed_config,
-                                current_config,
-                            )
-                        # ``load_from_h5`` restored the TARGET file's stored
-                        # configuration onto the per-run scan.  Re-assert the
-                        # accepted run: the run integrates with what the operator
-                        # accepted at this click, not with what the file was
-                        # written with (the mismatch check above already refused
-                        # an incompatible target).
-                        _apply_frozen_run_configuration(scan, frozen)
-                        for (k, v) in frozen.scan_args().items():
-                            setattr(scan, k, v)
-                        self._remember_append_skip_snapshot(frozen, scan.name, scan=scan)
-                        existing_frames = list(scan.frames.index)
-                        if len(existing_frames) == 0:
-                            try:
-                                disk_frame_count = _nexus_integrated_frame_count(fname)
-                            except Exception as exc:
-                                raise RuntimeError(
-                                    "Append target could not be verified after "
-                                    "loading zero frames; existing file preserved: "
-                                    f"{fname}"
-                                ) from exc
-                            if disk_frame_count:
-                                raise RuntimeError(
-                                    "Append target load returned zero frames, but "
-                                    f"{disk_frame_count} integrated frame(s) are "
-                                    "already on disk; existing file preserved: "
-                                    f"{fname}"
-                                )
-                            scan.save_to_nexus(replace=True)
-                        else:
-                            mark = getattr(scan.frames, "mark_persisted", None)
-                            if callable(mark):
-                                mark(existing_frames)
-                    else:
-                        scan.save_to_nexus(replace=True)
-
-        self.sigUpdateFile.emit(
-            self.scan_name, fname,
-            bool(scan_kwargs["gi"]), scan_kwargs["incidence_motor"],
-            (frozen.source.source_kind == "image_file"), series_average
-        )
         logger.info('***** New Scan *****')
         if xye_only:
             logger.info('Output (XYE) folder: %s',

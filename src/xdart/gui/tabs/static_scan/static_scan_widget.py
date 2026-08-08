@@ -1871,21 +1871,8 @@ class staticWidget(QWidget):
         return active_1d, active_2d
 
     def _active_frame_record_store(self):
-        """The ACQUISITION per-scan session store, if the live path has one.
-
-        X1 O-3: this stays the acquisition record store's resolver — it is what
-        the eviction probe and the run's own store-first reads consult — and it
-        is also the single writer that hands the store to the acquisition
-        context once the streaming session creates it.  A browse never reaches
-        here; it serves from its own publication store (see
-        ``_display_selected_stores``).
-        """
-        thread = getattr(getattr(self, "wrangler", None), "thread", None)
-        store = getattr(thread, "_streaming_record_store", None)
-        if store is None:
-            store = getattr(self, "_frame_record_store", None)
-        else:
-            self._frame_record_store = store
+        """Return the legacy per-scan record store when one is active."""
+        store = getattr(self, "_frame_record_store", None)
         context = getattr(self, "_acquisition_context", None)
         if context is not None and context.record_store is not store:
             context.adopt_record_store(store)
@@ -2149,6 +2136,7 @@ class staticWidget(QWidget):
         # display clear + integration-control state) here, ONCE.
         from .ui.static_controls import StaticControls
         self.controls = StaticControls()
+        self._accepted_processing_mode = self.controls.modeCombo.currentText()
         self.ui.controlsLayout.setContentsMargins(0, 0, 0, 0)
         self.ui.controlsLayout.addWidget(self.controls)
         # Hug the controls' own (snug, uniform-padded) content height and fix it,
@@ -10523,6 +10511,14 @@ class staticWidget(QWidget):
         args:
             qint: Qt int, index of the new wrangler
         """
+        if self.h5viewer._before_transition("wrangler_swap") == "cleanup-pending":
+            stack = self.ui.wranglerStack
+            previous = stack.indexOf(getattr(self, "wrangler", None))
+            if previous >= 0:
+                blocked = stack.blockSignals(True)
+                stack.setCurrentIndex(previous)
+                stack.blockSignals(blocked)
+            return
         if 'wrangler' in self.__dict__:
             self.disconnect_wrangler()
 
@@ -10537,6 +10533,8 @@ class staticWidget(QWidget):
         self.wrangler.publication_store = self.publication_store
         if hasattr(self.wrangler, "thread"):
             self.wrangler.thread.publication_store = self.publication_store
+        self.h5viewer._set_pre_transition_callback(
+            getattr(self.wrangler, "_viewer_transition", None))
         self.wrangler.sigStart.connect(self.start_wrangler)
         if hasattr(self.wrangler, 'sigStitchRequested'):
             self.wrangler.sigStitchRequested.connect(self.start_stitch)
@@ -10631,6 +10629,7 @@ class staticWidget(QWidget):
             if _i >= 0:
                 _combo.setCurrentIndex(_i)
         _combo.blockSignals(False)
+        self._accepted_processing_mode = _combo.currentText()
         self.wrangler._on_mode_changed(_combo.currentText())
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             self.wrangler.sigViewerModeChanged.connect(self._on_viewer_mode_changed)
@@ -10786,6 +10785,22 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("detach_controls failed", exc_info=True)
 
+    def _preflight_processing_viewer_mode(self, mode_text):
+        viewer_mode = mode_text.partition(' ')[0].lower()
+        if not self.h5viewer.enter_viewer_mode_cleanup():
+            combo = self.controls.modeCombo
+            blocked = combo.blockSignals(True)
+            combo.setCurrentText(self._accepted_processing_mode)
+            combo.blockSignals(blocked)
+            return False
+        self._accepted_processing_mode = mode_text
+        self._accepted_viewer_mode_transition = viewer_mode
+        self._sync_processing_mode_to_scan(mode_text)
+        self._apply_integration_control_state()
+        self._fit_controls_height()
+        self._refresh_controls_v2_profile()
+        return True
+
     def _on_processing_mode_changed(self, mode_text):
         """staticWidget-level reaction to a processing-mode change.
 
@@ -10793,6 +10808,10 @@ class staticWidget(QWidget):
         so it survives wrangler swaps.  Per-mode integration-control state +
         forcing the display out of any stuck viewer mode for a non-viewer mode.
         """
+        if 'Viewer' in mode_text:
+            return
+        self._accepted_viewer_mode_transition = None
+        self._accepted_processing_mode = mode_text
         # This slot is connected before the active wrangler's mode handler.  Do
         # not let display geometry depend on the wrangler updating scan.skip_2d
         # first, or a fresh startup can briefly use the previous/default mode and
@@ -11209,10 +11228,6 @@ class staticWidget(QWidget):
         _t_mask = _t_build = _t_upsert = _t_scan = 0.0   # per-leg accumulators
 
         published = getattr(self.wrangler, "thread", None)
-        record_store = getattr(published, "_streaming_record_store", None) \
-            if published is not None else None
-        if record_store is not None:
-            self._frame_record_store = record_store
         global_mask = getattr(published, "mask", None) if published is not None else None
         if global_mask is not None:
             # Publish the detector gap mask ONCE per drain for the display.  We do
@@ -12294,6 +12309,10 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
+        # Stop/join before retained-output cleanup can veto page teardown.
+        staticWidget._stop_wrangler_thread_on_close(self)
+        if self.h5viewer._before_transition("page_close") == "cleanup-pending":
+            return
         # Block the analysis slots first: a worker signal queued just before we
         # stop + destroy must not touch the about-to-be-destroyed dialog.
         self._tearing_down = True
@@ -12314,12 +12333,6 @@ class staticWidget(QWidget):
             save_session(state)
         except Exception:
             logger.debug("integrator session save failed", exc_info=True)
-        # Pause/Resume (Phase B): a PAUSED run blocks the wrangler thread in its
-        # `while command == 'pause'` wait.  Closing the window must break that
-        # wait so run() returns and the QThread isn't "destroyed while running".
-        # Setting command='stop' (the universal run-end signal) exits the pause
-        # wait from any state; bound-wait the thread so teardown is clean.
-        self._stop_wrangler_thread_on_close()
         # The wrangler consumes this same serialized directory authority. Close
         # it only after processing has stopped so teardown cannot cancel an
         # observation future that the worker is currently reconciling.
@@ -12655,22 +12668,21 @@ class staticWidget(QWidget):
                 }:
                     button.setEnabled(False)
 
-    def _session_run_active(self):
-        """4d: True iff a streaming session is open AND reports it is running.
+    @staticmethod
+    def _dynamic_worker_probe(wrangler, name):
+        probe = getattr(wrangler, name, None)
+        if not callable(probe):
+            probe = getattr(getattr(wrangler, 'thread', None), name, None)
+        return probe if callable(probe) else None
 
-        Reads the wrangler's ``scan_session`` seam (the ``ScanSessionAdapter``),
-        never the private slot.  Returns False when no session is open (so the
-        OR with ``_run_active`` falls through to the cache) — robustly guarded so
-        a duck/partial wrangler in a test never raises here."""
+    def _session_run_active(self):
+        """True only while the worker reports a healthy running session."""
         wrangler = getattr(self, 'wrangler', None)
-        session = getattr(wrangler, 'scan_session', None) if wrangler else None
-        if session is None:
-            thread = getattr(wrangler, 'thread', None) if wrangler else None
-            session = getattr(thread, 'scan_session', None) if thread else None
-        if session is None:
+        probe = staticWidget._dynamic_worker_probe(wrangler, 'dynamic_session_running')
+        if probe is None:
             return False
         try:
-            return bool(session.is_running)
+            return bool(probe())
         except Exception:
             return False
 
@@ -12742,27 +12754,26 @@ class staticWidget(QWidget):
             return "unknown"
 
     def _controls_v2_session_activity(self) -> str:
-        """Observe the streaming session: ``'active'`` / ``'idle'`` / ``'unknown'``.
-
-        Deliberately SEPARATE from :meth:`_session_run_active`, whose boolean
-        contract many display/lock consumers depend on and which T-3.1 does not
-        change.  ``is_running`` is a PROPERTY, so a half-torn-down session raises
-        on attribute ACCESS — that is an unknown owner state, not an idle one.
-        No session open at all is ordinary idle.
-        """
+        """Observe the worker's scalar dynamic-session probe."""
         wrangler = getattr(self, 'wrangler', None)
-        session = getattr(wrangler, 'scan_session', None) if wrangler else None
-        if session is None:
-            thread = getattr(wrangler, 'thread', None) if wrangler else None
-            session = getattr(thread, 'scan_session', None) if thread else None
-        if session is None:
+        probe = staticWidget._dynamic_worker_probe(wrangler, 'dynamic_session_running')
+        cleanup = staticWidget._dynamic_worker_probe(wrangler, 'dynamic_cleanup_pending')
+        try:
+            if cleanup is not None and cleanup():
+                return "cleanup"
+        except Exception as exc:
+            staticWidget._controls_v2_report_owner_probe_error(
+                self, "output-cleanup",
+                f"dynamic cleanup probe raised {type(exc).__name__}: {exc}")
+            return "unknown"
+        if probe is None:
             return "idle"
         try:
-            return "active" if bool(session.is_running) else "idle"
+            return "active" if bool(probe()) else "idle"
         except Exception as exc:
             staticWidget._controls_v2_report_owner_probe_error(
                 self, "run-session",
-                f"is_running raised {type(exc).__name__}: {exc}")
+                f"dynamic session probe raised {type(exc).__name__}: {exc}")
             return "unknown"
 
     def _controls_v2_active_run_owner(self) -> str | None:
@@ -12799,6 +12810,7 @@ class staticWidget(QWidget):
         if bool(getattr(self, '_run_active', False)):
             return "run"
         session_state = self._controls_v2_session_activity()
+        cleanup_pending = session_state == "cleanup"
         if session_state == "active":
             return "run"
         if session_state == "unknown":
@@ -12825,7 +12837,7 @@ class staticWidget(QWidget):
                 return label
             if state == "unknown":
                 return label + suffix
-        return None
+        return "output-cleanup" if cleanup_pending else None
 
     def _wrangler_run_active(self) -> bool:
         """True when the wrangler is in an actual acquisition/reduction run.
@@ -14863,6 +14875,11 @@ class staticWidget(QWidget):
         _scan_info_rows alongside the index is required — otherwise a late new_scan
         (or this call) would strand the new scan's undrained frames.
         """
+        dynamic_rescope = bool(getattr(self.h5viewer, "live_run_active", False)
+            and getattr(self.publication_store, "allocation", None) is not None)
+        if (not dynamic_rescope and self.h5viewer._before_transition(
+                "display_rescope") == "cleanup-pending"):
+            return
         # O-2 diagnostics: emitted BEFORE the destructive clears, so the record
         # states which publication store (owner + generation + count) is about
         # to be discarded and under whose identity.  Emitted after the clear it
@@ -14929,7 +14946,16 @@ class staticWidget(QWidget):
         if _fname:
             try:
                 self._sync_h5viewer_save_dir(os.path.dirname(_fname), refresh=False)
-                self.h5viewer.set_file(_fname, internal=True)
+                if dynamic_rescope:
+                    file_thread = getattr(self.h5viewer, "file_thread", None)
+                    if file_thread is not None:
+                        file_thread.fname = _fname
+                    self.scan.data_file = _fname
+                    frames = getattr(self.scan, "frames", None)
+                    if hasattr(frames, "data_file"):
+                        frames.data_file = _fname
+                else:
+                    self.h5viewer.set_file(_fname, internal=True)
             except Exception:
                 logger.debug("scan-rescope viewer rewire failed", exc_info=True)
         # Stamp which scan the panel is now scoped to (retained for diagnostics).
@@ -14940,7 +14966,8 @@ class staticWidget(QWidget):
         # on the frame-driven boundary too. The next streaming session installs
         # its own store; serial/live without one falls back to publication_store.
         self._frame_record_store = None
-        self.publication_store.clear()
+        if not dynamic_rescope:
+            self.publication_store.clear()
         # Undrained stash + scan_data row cache from the previous scan.
         self._pending_frames = {}
         self._scan_info_rows = {}
@@ -15422,6 +15449,7 @@ class staticWidget(QWidget):
             widget=self,
             origin="start_wrangler",
         )
+        self.wrangler.thread.gui_thread_id = threading.get_ident()
         self.wrangler.thread.start()
 
     def _perf_heartbeat_tick(self):
@@ -15629,6 +15657,20 @@ class staticWidget(QWidget):
             self.wrangler,
             all_skipped_append=all_skipped_append,
         )
+        browse_success = getattr(thread, "_reduction_write_error", None) is None
+        cleanup_probe = getattr(self.wrangler, "dynamic_cleanup_pending", None)
+        if browse_success and callable(cleanup_probe):
+            try:
+                browse_success = not bool(cleanup_probe())
+            except Exception:
+                browse_success = False
+                logger.exception("run-end output cleanup probe failed")
+        def browse_ready(path):
+            gate = getattr(self.h5viewer, "_before_transition", None)
+            return browse_success and (not callable(gate) or gate(
+                "run_end_browse", path=path,
+                generation=getattr(getattr(self.h5viewer, "publication_store", None), "generation", None),
+                internal=True) != "cleanup-pending")
         browse_debug_log(
             logger,
             "runend_wrangler_counts",
@@ -15641,7 +15683,7 @@ class staticWidget(QWidget):
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
 
-        if (is_batch and not is_xye_only and not _reintegrate_running
+        if (browse_success and is_batch and not is_xye_only and not _reintegrate_running
                 and not (append_config_failed
                          and not getattr(self, '_run_saw_frame', True))):
             # Prefer the thread's fname — it's the source of truth for
@@ -15652,7 +15694,8 @@ class staticWidget(QWidget):
             # widget's fname ends with ``_master.nxs`` but the actual
             # scan output is ``<stem>.nxs``).
             generated_file = finished_file
-            if generated_file and os.path.exists(generated_file):
+            if (generated_file and os.path.exists(generated_file)
+                    and browse_ready(generated_file)):
                 # Update directory display to point at the generated folder natively
                 generated_dir = os.path.dirname(generated_file)
                 if self.h5viewer.dirname != generated_dir:
@@ -15680,11 +15723,12 @@ class staticWidget(QWidget):
         # live.  Load the existing scan file and auto-select its LAST frame so
         # the user gets visual confirmation the run actually ran.  Batch already
         # auto-loads + selects-last above; XYE-only has no .nxs to load.
-        if (not is_batch and not is_xye_only and not _reintegrate_running
+        if (browse_success and not is_batch and not is_xye_only and not _reintegrate_running
                 and not getattr(self, '_run_saw_frame', True)
                 and not append_config_failed):
             existing_file = finished_file
-            if existing_file and os.path.exists(existing_file):
+            if (existing_file and os.path.exists(existing_file)
+                    and browse_ready(existing_file)):
                 existing_dir = os.path.dirname(existing_file)
                 if self.h5viewer.dirname != existing_dir:
                     self.h5viewer.dirname = existing_dir
@@ -15709,11 +15753,12 @@ class staticWidget(QWidget):
         # Batch already gets this via its end-of-batch reload above.  Skip when a
         # reintegrate is still running (don't repoint frames mid-reintegrate) or
         # when the run saw 0 frames (the append-feedback branch already reloaded).
-        if (not is_batch and not is_xye_only and not _reintegrate_running
-                and getattr(self, '_run_saw_frame', True)):
-            worker_output = (getattr(self.wrangler.thread, 'fname', None)
-                             or getattr(self.wrangler, 'fname', None))
-            written = _last_processed_output_file(thread, worker_output)
+        worker_output = (getattr(self.wrangler.thread, 'fname', None)
+                         or getattr(self.wrangler, 'fname', None))
+        written = _last_processed_output_file(thread, worker_output)
+        if (browse_success and not is_batch and not is_xye_only and not _reintegrate_running
+                and getattr(self, '_run_saw_frame', True)
+                and browse_ready(written)):
             try:
                 restore_processed_output = (
                     written is not None
@@ -15817,7 +15862,7 @@ class staticWidget(QWidget):
             # with their own reload + select-last recovery, and arming there
             # would flip the end-of-run selection to all frames for runs that
             # never had a lagged live paint to catch up.
-            if (not is_batch and not is_xye_only
+            if (browse_success and not is_batch and not is_xye_only
                     and getattr(self, '_run_saw_frame', True)):
                 staticWidget._arm_runend_overlay_catchup(self)
         elif not _hold:
@@ -15857,15 +15902,16 @@ class staticWidget(QWidget):
         # generated iq_/itth_ files (written to <scan_dir>/<scan_name> by
         # save_1d) in XYE Viewer mode so the outputs are actually listed.
         # Done last so integrator_thread_finished()'s refresh doesn't undo it.
-        if is_batch and is_xye_only:
+        if browse_success and is_batch and is_xye_only:
             try:
                 xye_dir = os.path.join(
                     os.path.dirname(self.scan.data_file), self.scan.name)
-                if os.path.isdir(xye_dir):
+                if os.path.isdir(xye_dir) and browse_ready(xye_dir):
                     self.h5viewer.dirname = xye_dir
                     # Same path the XYE Viewer combo takes: set viewer_mode,
                     # panels, selection mode, and refresh listScans.
-                    self._on_viewer_mode_changed('xye')
+                    if not self._on_viewer_mode_changed('xye'):
+                        return
                     # Auto-select the most recently *written* file (by mtime),
                     # not the name-last one, so the final pattern from this run
                     # is shown without a manual click.
@@ -15912,6 +15958,11 @@ class staticWidget(QWidget):
         viewer_mode = viewer_mode_str or None  # '' → None
         is_viewer = viewer_mode is not None
         is_file_viewer = viewer_mode in ('image', 'xye')
+        accepted = getattr(self, '_accepted_viewer_mode_transition', None)
+        if accepted == viewer_mode:
+            self._accepted_viewer_mode_transition = None
+        elif is_viewer and not self.h5viewer.enter_viewer_mode_cleanup():
+            return False
         from PySide6.QtWidgets import QAbstractItemView
 
         scans = self.h5viewer.ui.listScans
@@ -15979,7 +16030,6 @@ class staticWidget(QWidget):
                 ))
                 if save_path and (not current_dir or current_dir == default_dir):
                     self._sync_h5viewer_save_dir(save_path, refresh=False)
-                self.h5viewer.enter_viewer_mode_cleanup()
             else:
                 self.h5viewer.cancel_pending_loads()
                 if hasattr(self, 'scan') and hasattr(self.scan, 'global_mask'):
@@ -15992,6 +16042,7 @@ class staticWidget(QWidget):
             scans.blockSignals(was_blocked)
         self._fit_controls_height()
         self._refresh_controls_v2_profile()
+        return True
 
     def latest_frame(self, checked=None, *, emit_update=True):
         """Advances to last frame in data list, updates displayframe, and
