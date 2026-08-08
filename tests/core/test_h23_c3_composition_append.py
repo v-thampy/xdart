@@ -33,6 +33,7 @@ from xrd_tools.session import (
 from xrd_tools.io.schema import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
+    PRIMARY_MODE_ATTR,
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
     SOURCE_BASE_ATTR,
@@ -3473,8 +3474,10 @@ def test_prefix_bound_preflight_refuses_disappeared_target_instead_of_first_run_
 
 
 def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
+    from dataclasses import replace
     from xrd_tools.io import (
-        AppendRefused, decode_committed_append_prefix, prepare_append_preflight,
+        AppendCommittedPrefix, AppendRefused, decode_committed_append_prefix,
+        prepare_append_preflight,
     )
 
     target = tmp_path / "divergent.nxs"
@@ -3554,8 +3557,14 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
         ("schema-version-nan", float("nan")),
         ("schema-version-bool", True),
         ("schema-version-text", str(PROCESSED_SCHEMA_VERSION)),
+        ("schema-version-array", np.asarray(
+            [PROCESSED_SCHEMA_VERSION], dtype=np.int64,
+        )),
         ("source-base-int", 7),
         ("schema-name-int", 7),
+        ("schema-name-array", np.asarray(
+            [PROCESSED_SCHEMA_NAME.encode("utf-8")],
+        )),
         ("lineage-scalar-int", 7),
     ):
         scalar_target = tmp_path / f"scalar-{mutation}.nxs"
@@ -3567,7 +3576,7 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
             entry = handle["entry"]
             if mutation == "source-base-int":
                 entry.attrs[SOURCE_BASE_ATTR] = value
-            elif mutation == "schema-name-int":
+            elif mutation.startswith("schema-name"):
                 entry.attrs[SCHEMA_NAME_ATTR] = value
             elif mutation == "lineage-scalar-int":
                 del entry["reduction/config/append_lineage"]
@@ -3587,6 +3596,40 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
             )
         assert scalar_target.read_bytes() == scalar_before
         _assert_lease_available(scalar_target)
+
+    primary_target = tmp_path / "primary-mode-int.nxs"
+    _commit_image_series_target(
+        primary_target, _image_series_intent(tmp_path, 2, generation=0),
+    )
+    original_prefix = _decode_image_series_prefix(primary_target)
+    primary_lineage = json.loads(original_prefix.lineage_json)
+    primary_lineage["modes"] = ["1d:7"]
+    primary_intent = replace(original_prefix.intent, modes=("1d:7",))
+    primary_prefix = AppendCommittedPrefix(
+        str(primary_target), primary_intent, json.dumps(
+            primary_lineage, sort_keys=True, separators=(",", ":"),
+        ),
+    )
+    with h5py.File(primary_target, "r+") as handle:
+        entry = handle["entry"]
+        entry["integrated_1d"].attrs[PRIMARY_MODE_ATTR] = 7
+        del entry["reduction/config/append_lineage"]
+        entry["reduction/config"].create_dataset(
+            "append_lineage", data=primary_prefix.lineage_json,
+        )
+    primary_before = primary_target.read_bytes()
+    with h5py.File(primary_target, "r") as handle:
+        with pytest.raises(ValueError, match="primary mode"):
+            decode_committed_append_prefix(handle)
+    successor = replace(
+        _image_series_intent(tmp_path, 3, generation=1), modes=("1d:7",),
+    )
+    with pytest.raises(AppendRefused, match="primary mode"):
+        prepare_append_preflight(
+            primary_target, successor, committed_prefix=primary_prefix,
+        )
+    assert primary_target.read_bytes() == primary_before
+    _assert_lease_available(primary_target)
 
 
 def test_prefix_bound_preflight_accepts_concurrent_exact_successor_as_noop(

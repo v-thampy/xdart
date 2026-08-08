@@ -176,8 +176,7 @@ class AppendCommittedPrefix:
         if (type(lineage.get("version")) is not int or lineage.get("version") != LINEAGE_VERSION
                 or lineage.get("state") != "committed"):
             raise ValueError("committed Append prefix lineage is not committed")
-        labels = _lineage_labels(lineage)
-        epochs = lineage.get("epochs") or ()
+        labels = _lineage_labels(lineage); epochs = lineage.get("epochs") or ()
         if labels != self.intent.labels or not epochs:
             raise ValueError("committed Append prefix labels are inconsistent")
         lineage_identity = (lineage.get("entry"), lineage.get("source_base"),
@@ -187,8 +186,7 @@ class AppendCommittedPrefix:
             raise ValueError("committed Append prefix identity is inconsistent")
         if _source_dict(_source_from_dict(epochs[-1]["source"])) != _source_dict(self.intent.source):
             raise ValueError("committed Append prefix source is inconsistent")
-        object.__setattr__(self, "target", _normalize(self.target))
-        object.__setattr__(self, "lineage_json", _json(lineage))
+        object.__setattr__(self, "target", _normalize(self.target)); object.__setattr__(self, "lineage_json", _json(lineage))
     @property
     def committed_labels(self) -> tuple[int, ...]:
         return self.intent.labels
@@ -541,9 +539,8 @@ def _require_contiguous(labels: tuple[int, ...], role: str) -> None:
         raise ValueError(f"{role} are gapped or unordered")
 
 def _decode(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="strict")
-    return value.item() if hasattr(value, "item") else value
+    if isinstance(value, np.generic): value = value.item()
+    return value.decode("utf-8", errors="strict") if isinstance(value, bytes) else value
 
 def _mode_group(entry: h5py.Group, mode: str) -> h5py.Group:
     try:
@@ -556,7 +553,8 @@ def _mode_group(entry: h5py.Group, mode: str) -> h5py.Group:
     top = entry.get(top_name)
     if not isinstance(top, h5py.Group):
         raise ValueError(f"missing {top_name} group")
-    primary = str(_decode(top.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)))
+    primary = _decode(top.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY))
+    if type(primary) is not str or (primary != DEFAULT_MODE_KEY and primary not in MODE_SUBGROUP_NAMES): raise ValueError("Append primary mode requires exact supported text")
     if mode_key == primary:
         return top
     try:
@@ -845,7 +843,6 @@ def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -
         lineage.get("science_fingerprint", ""), tuple(modes), source, labels,
     )
     return AppendCommittedPrefix(_normalize(handle.filename), intent, _json(lineage))
-
 def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix: AppendCommittedPrefix | None = None) -> AppendDecision:
     target = Path(target)
     try:
@@ -880,8 +877,7 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
                 raise ValueError("committed Append epochs diverged from observed prefix")
         if _intent_identity(current.intent) != _intent_identity(intent):
             raise ValueError("foreign Append identity")
-        labels = current.committed_labels
-        lineage = json.loads(current.lineage_json)
+        labels = current.committed_labels; lineage = json.loads(current.lineage_json)
         prior_source = _source_dict(current.intent.source)
         current_source = _source_dict(intent.source)
         _source_extends(prior_source, current_source)
