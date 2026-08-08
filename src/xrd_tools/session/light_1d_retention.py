@@ -26,6 +26,9 @@ __all__ = [
     "Light1DCleanupPending",
     "Light1DCleanupReceipt",
     "Light1DCleanupToken",
+    "Light1DCustodySlot",
+    "Light1DCustodyState",
+    "Light1DFundingMode",
     "Light1DHydrationToken",
     "Light1DLayout",
     "Light1DLeaseState",
@@ -33,6 +36,7 @@ __all__ = [
     "Light1DModeLayout",
     "Light1DRecord",
     "Light1DReleaseReceipt",
+    "Light1DRetainedCustodyReceipt",
     "Light1DRetentionLease",
     "Light1DStaleGeneration",
     "Light1DUnavailable",
@@ -186,6 +190,14 @@ class Light1DLayout:
         return len(self.modes)
 
 
+class Light1DFundingMode(str, Enum):
+    HEADROOM = "headroom"
+    REPLACE_PUBLICATION_A1 = "replace-publication-a1"
+
+
+_CURRENT_LINEAGE_ROWS_OMITTED = object()
+
+
 @dataclass(frozen=True, slots=True)
 class Light1DModeData:
     coordinate: object
@@ -253,6 +265,8 @@ class _ResourceReservation:
     category: str
     claim: object
     prior_generation: int | None
+    source_category: str | None = None
+    source_debit: int = 0
     claimed: bool = False
 
 
@@ -286,7 +300,7 @@ class SessionResourceAuthority:
         }
         if sum(committed.values()) > self.capacity_bytes:
             raise ValueError("committed parent bytes exceed authority capacity")
-        self._committed = MappingProxyType(committed)
+        self._committed = committed
         self._parent_allocation = parent_allocation
         self._lock = threading.Lock()
         self._next_grant = 1
@@ -381,6 +395,8 @@ class SessionResourceAuthority:
         layout: Light1DLayout,
         requested_rows: int,
         compatibility_byte_ceiling: int,
+        funding_mode: Light1DFundingMode,
+        replacement_byte_ceiling: int | None = None,
     ) -> tuple[str, int, int, object]:
         requested_rows = _nonnegative_int("requested_rows", requested_rows)
         ceiling = _nonnegative_int(
@@ -400,10 +416,19 @@ class SessionResourceAuthority:
                 raise ValueError(
                     "replacement light-1D generation must be strictly newer"
                 )
-            used = sum(self._committed.values()) + sum(
-                reservation.amount for reservation in self._reservations.values()
-            )
-            available = max(0, self.capacity_bytes - used)
+            if funding_mode is Light1DFundingMode.REPLACE_PUBLICATION_A1:
+                transferred = sum(
+                    reservation.source_debit
+                    for reservation in self._reservations.values()
+                    if reservation.source_category == "publication"
+                )
+                available = max(0, int(replacement_byte_ceiling) - transferred)
+            else:
+                used = sum(self._committed.values()) + sum(
+                    reservation.amount
+                    for reservation in self._reservations.values()
+                )
+                available = max(0, self.capacity_bytes - used)
             per_row = layout.per_row_unique_ndarray_bytes
             shared = layout.shared_bytes
             requested_bytes = (
@@ -419,8 +444,15 @@ class SessionResourceAuthority:
             grant_id = f"light-1d-{self._next_grant}"
             self._next_grant += 1
             claim = object()
+            source_category = None
+            if funding_mode is Light1DFundingMode.REPLACE_PUBLICATION_A1:
+                source_category = "publication"
+                if reserved > self._committed.get(source_category, 0):
+                    raise ValueError("publication A1 funding is unavailable")
+                self._committed[source_category] -= reserved
             self._reservations[grant_id] = _ResourceReservation(
                 reserved, owner, generation, "light_1d", claim, prior_generation,
+                source_category, reserved if source_category is not None else 0,
             )
             self._last_generation[owner] = generation
             return grant_id, row_cap, reserved, claim
@@ -457,6 +489,8 @@ class SessionResourceAuthority:
             ):
                 raise RuntimeError("cannot cancel a foreign light-1D reservation")
             del self._reservations[grant_id]
+            if reservation.source_category is not None:
+                self._committed[reservation.source_category] += reservation.source_debit
             if reservation.prior_generation is None:
                 self._last_generation.pop(owner, None)
             else:
@@ -472,6 +506,8 @@ class SessionResourceAuthority:
             if not reservation.claimed:
                 raise RuntimeError("resource release names an unclaimed reservation")
             del self._reservations[grant_id]
+            if reservation.source_category is not None:
+                self._committed[reservation.source_category] += reservation.source_debit
             return reservation.amount
 
     def snapshot(self) -> SessionResourceAuthoritySnapshot:
@@ -486,7 +522,7 @@ class SessionResourceAuthority:
                 capacity_bytes=self.capacity_bytes,
                 reserved_bytes=reserved,
                 available_bytes=self.capacity_bytes - reserved,
-                committed_bytes=self._committed,
+                committed_bytes=MappingProxyType(dict(self._committed)),
                 categories=MappingProxyType(categories),
                 reservation_count=len(self._reservations),
             )
@@ -496,6 +532,14 @@ class Light1DLeaseState(str, Enum):
     ACTIVE = "active"
     FENCED = "fenced"
     CLEANUP_PENDING = "cleanup-pending"
+    RELEASED = "released"
+
+
+class Light1DCustodyState(str, Enum):
+    PENDING = "pending"
+    RETAINED = "retained"
+    CLEANUP_PENDING = "cleanup-pending"
+    CANCELLED = "cancelled"
     RELEASED = "released"
 
 
@@ -593,6 +637,16 @@ class Light1DReleaseReceipt:
     released_bytes: int
     reason: str
     retry_token: Light1DCleanupToken
+
+
+@dataclass(frozen=True, slots=True)
+class Light1DRetainedCustodyReceipt:
+    grant_id: str
+    owner: str
+    generation: int
+    terminal: str
+    retained_rows: int
+    reserved_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1773,6 +1827,158 @@ class Light1DRetentionLease:
         return self.retry_cleanup(token, hooks=hooks)
 
 
+def _custody_terminal(terminal, *, adoption: bool):
+    dynamic_module = sys.modules.get("xrd_tools.session.dynamic_accounting")
+    terminal_type = getattr(dynamic_module, "DynamicRunState", None)
+    if terminal_type is None or type(terminal) is not terminal_type:
+        raise TypeError("custody terminal requires exact DynamicRunState")
+    allowed = {terminal_type.FINISHED, terminal_type.STOPPED}
+    if not adoption:
+        allowed.add(terminal_type.ABORTED)
+    if terminal not in allowed:
+        raise ValueError("custody terminal intent is not supported")
+    return terminal
+
+
+class Light1DCustodySlot:
+    __slots__ = (
+        "_grant_id", "_owner", "_generation", "_cleanup_hooks", "_state",
+        "_lease", "_terminal", "_custody_receipt", "_release_receipt",
+        "_retry_token", "_lock",
+    )
+
+    def __init__(self, *, grant_id, owner, generation, cleanup_hooks) -> None:
+        require_exact_string(grant_id, "custody grant_id")
+        require_exact_string(owner, "custody owner")
+        if isinstance(generation, bool) or int(generation) != generation:
+            raise ValueError("custody generation must be an integer")
+        if type(cleanup_hooks) is not Light1DCleanupHooks:
+            raise TypeError("custody requires exact light-1D cleanup hooks")
+        self._grant_id = grant_id
+        self._owner = owner
+        self._generation = int(generation)
+        self._cleanup_hooks = cleanup_hooks
+        self._state = Light1DCustodyState.PENDING
+        self._lease = None
+        self._terminal = None
+        self._custody_receipt = None
+        self._release_receipt = None
+        self._retry_token = None
+        self._lock = threading.RLock()
+
+    @property
+    def state(self) -> Light1DCustodyState:
+        return self._state
+
+    @property
+    def custody_receipt(self) -> Light1DRetainedCustodyReceipt | None:
+        return self._custody_receipt
+
+    def _validate_lease(self, lease, cleanup_hooks) -> None:
+        if type(lease) is not Light1DRetentionLease:
+            raise TypeError("custody adoption requires exact light-1D lease")
+        if cleanup_hooks is not self._cleanup_hooks:
+            raise RuntimeError("custody cleanup hooks are not the exact binding")
+        if lease.grant_id != self._grant_id:
+            raise ValueError("custody grant does not match the lease")
+        if lease.owner != self._owner:
+            raise ValueError("custody owner does not match the lease")
+        if lease.generation != self._generation:
+            raise ValueError("custody generation does not match the lease")
+        if lease.state is not Light1DLeaseState.ACTIVE:
+            raise RuntimeError("custody requires an active light-1D lease")
+
+    def _validate_binding(self, lease, cleanup_hooks) -> None:
+        with self._lock:
+            if self._state is not Light1DCustodyState.PENDING:
+                raise RuntimeError("custody binding requires a pending slot")
+            self._validate_lease(lease, cleanup_hooks)
+
+    def adopt(self, lease, *, cleanup_hooks, terminal):
+        terminal = _custody_terminal(terminal, adoption=True)
+        with self._lock:
+            if self._state is Light1DCustodyState.RETAINED:
+                self._validate_lease(lease, cleanup_hooks)
+                if terminal is not self._terminal:
+                    raise ValueError("custody adoption terminal cannot change")
+                return self._custody_receipt
+            if self._state is not Light1DCustodyState.PENDING:
+                raise RuntimeError("custody slot is no longer pending")
+            self._validate_lease(lease, cleanup_hooks)
+            receipt = Light1DRetainedCustodyReceipt(
+                lease.grant_id, lease.owner, lease.generation, terminal.value,
+                len(lease.keys()), lease.reserved_ndarray_bytes,
+            )
+            self._lease = lease
+            self._terminal = terminal
+            self._custody_receipt = receipt
+            self._state = Light1DCustodyState.RETAINED
+            return receipt
+
+    def _validate_cancel(self, terminal) -> None:
+        terminal = _custody_terminal(terminal, adoption=False)
+        with self._lock:
+            if self._state is Light1DCustodyState.CANCELLED:
+                if terminal is not self._terminal:
+                    raise ValueError("custody cancellation terminal cannot change")
+                return
+            if self._state is not Light1DCustodyState.PENDING or self._lease is not None:
+                raise RuntimeError("custody cancellation requires an empty pending slot")
+
+    def cancel(self, *, terminal) -> None:
+        terminal = _custody_terminal(terminal, adoption=False)
+        with self._lock:
+            self._validate_cancel(terminal)
+            if self._state is Light1DCustodyState.CANCELLED:
+                return
+            self._terminal = terminal
+            self._cleanup_hooks = None
+            self._state = Light1DCustodyState.CANCELLED
+
+    def _complete_release(self, receipt) -> None:
+        self._release_receipt = receipt
+        self._retry_token = receipt.retry_token
+        self._lease = None
+        self._cleanup_hooks = None
+        self._state = Light1DCustodyState.RELEASED
+
+    def release(self, *, reason):
+        reason = str(reason)
+        with self._lock:
+            if self._state is Light1DCustodyState.RELEASED:
+                if reason != self._release_receipt.reason:
+                    raise ValueError("custody release reason cannot change")
+                return self._release_receipt
+            if self._state is Light1DCustodyState.CLEANUP_PENDING:
+                raise RuntimeError("cleanup-pending custody requires its retry token")
+            if self._state is not Light1DCustodyState.RETAINED:
+                raise RuntimeError("custody slot has no retained lease")
+            try:
+                receipt = self._lease.release(
+                    reason=reason, hooks=self._cleanup_hooks,
+                )
+            except Light1DCleanupPending as error:
+                self._retry_token = error.token
+                self._state = Light1DCustodyState.CLEANUP_PENDING
+                raise
+            self._complete_release(receipt)
+            return receipt
+
+    def retry_cleanup(self, token):
+        with self._lock:
+            if token is not self._retry_token:
+                raise RuntimeError("custody cleanup requires the exact retry token")
+            if self._state is Light1DCustodyState.RELEASED:
+                return self._release_receipt
+            if self._state is not Light1DCustodyState.CLEANUP_PENDING:
+                raise RuntimeError("custody slot has no cleanup-pending work")
+            receipt = self._lease.retry_cleanup(
+                token, hooks=self._cleanup_hooks,
+            )
+            self._complete_release(receipt)
+            return receipt
+
+
 def acquire_light_1d_retention(
     authority: SessionResourceAuthority,
     *,
@@ -1782,6 +1988,8 @@ def acquire_light_1d_retention(
     requested_rows: int,
     compatibility_byte_ceiling: int,
     gui_thread_id: int,
+    funding_mode=Light1DFundingMode.HEADROOM,
+    current_lineage_rows=_CURRENT_LINEAGE_ROWS_OMITTED,
 ) -> Light1DRetentionLease:
     if type(authority) is not SessionResourceAuthority:
         raise TypeError(
@@ -1789,6 +1997,8 @@ def acquire_light_1d_retention(
         )
     if type(layout) is not Light1DLayout:
         raise TypeError("layout must be exact Light1DLayout")
+    if type(funding_mode) is not Light1DFundingMode:
+        raise TypeError("funding_mode must be exact Light1DFundingMode")
     requested_rows = _nonnegative_int("requested_rows", requested_rows)
     try:
         if isinstance(generation, bool) or int(generation) != generation:
@@ -1806,12 +2016,55 @@ def acquire_light_1d_retention(
         raise ValueError("light-1D owner must be a non-empty string")
     if layout.per_row_unique_ndarray_bytes <= 0:
         raise ValueError("light-1D layout must charge per-row owned buffers")
+    reservation_rows = requested_rows
+    replacement_byte_ceiling = None
+    if funding_mode is Light1DFundingMode.REPLACE_PUBLICATION_A1:
+        allocation_type = getattr(
+            sys.modules.get("xrd_tools.session.policy"),
+            "SessionResourceAllocation", None,
+        )
+        allocation = authority.parent_allocation
+        if allocation_type is None or type(allocation) is not allocation_type:
+            raise TypeError("replacement funding requires an allocation authority")
+        if current_lineage_rows is _CURRENT_LINEAGE_ROWS_OMITTED:
+            raise ValueError(
+                "current_lineage_rows is required for replacement funding"
+            )
+        lineage_bound = None
+        if current_lineage_rows is not None:
+            if type(current_lineage_rows) is not int or current_lineage_rows < 0:
+                raise ValueError(
+                    "current_lineage_rows must be None or an exact non-negative int"
+                )
+            lineage_bound = current_lineage_rows
+        bounds = [
+            requested_rows,
+            _nonnegative_int("allocation record_items", allocation.record_items),
+            _nonnegative_int(
+                "allocation publication_items", allocation.publication_items,
+            ),
+        ]
+        if lineage_bound is not None:
+            bounds.append(lineage_bound)
+        reservation_rows = min(bounds)
+        replacement_byte_ceiling = (
+            allocation.publication_items
+            * allocation.requirements.result_1d_bytes
+        )
+        layout_ceiling = (
+            0 if reservation_rows == 0 else layout.shared_bytes
+            + reservation_rows * layout.per_row_unique_ndarray_bytes
+        )
+        if layout_ceiling > replacement_byte_ceiling:
+            raise ValueError("light-1D layout exceeds publication A1 funding")
     grant_id, row_cap, reserved, reservation_claim = authority._reserve_light(
         owner=owner,
         generation=generation,
         layout=layout,
-        requested_rows=requested_rows,
+        requested_rows=reservation_rows,
         compatibility_byte_ceiling=compatibility_byte_ceiling,
+        funding_mode=funding_mode,
+        replacement_byte_ceiling=replacement_byte_ceiling,
     )
     try:
         return Light1DRetentionLease(

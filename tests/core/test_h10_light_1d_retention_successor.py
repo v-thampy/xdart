@@ -1949,3 +1949,297 @@ def test_non_ndarray_buffer_root_is_refused_as_unaccounted_owner():
             generation=3,
         )
     assert lease.keys() == ()
+
+
+def test_child_b_publication_a1_replacement_funds_fully_assigned_allocation():
+    from xrd_tools.session import (
+        Light1DCleanupHooks, Light1DFundingMode, SessionResourceAuthority,
+        SessionResourceRequirements, acquire_light_1d_retention,
+        resolve_session_policy,
+    )
+    import xrd_tools.session.policy as policy
+
+    requirements = SessionResourceRequirements(
+        height=4, width=4, native_itemsize=2,
+        modes_1d=2, npt_1d=4, sigma_1d=1,
+    )
+    allocation = resolve_session_policy(
+        requirements, envelope_bytes=policy.floor_bytes(requirements), env={},
+    ).allocation
+    authority = SessionResourceAuthority.from_allocation(allocation)
+    before = authority.snapshot()
+    assert before.available_bytes == 0
+    layout = _layout()
+    one_row = layout.shared_bytes + layout.per_row_unique_ndarray_bytes
+    lease = acquire_light_1d_retention(
+        authority, owner="child-b-full", generation=1, layout=layout,
+        requested_rows=4, compatibility_byte_ceiling=one_row,
+        gui_thread_id=threading.get_ident(),
+        funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+        current_lineage_rows=None,
+    )
+    after = authority.snapshot()
+    assert lease.row_cap == 1
+    assert after.available_bytes == 0
+    assert after.committed_bytes["records"] == before.committed_bytes["records"]
+    assert after.committed_bytes["publication"] == (
+        before.committed_bytes["publication"] - lease.reserved_ndarray_bytes
+    )
+    assert after.categories["light_1d"] == lease.reserved_ndarray_bytes
+    assert after.reserved_bytes == before.reserved_bytes
+    lease.release(reason="test", hooks=Light1DCleanupHooks())
+    assert authority.snapshot() == before
+
+
+def test_child_b_publication_a1_replacement_preserves_record_a1_and_lineage_cap():
+    from xrd_tools.session import (
+        Light1DCleanupHooks, Light1DFundingMode, SessionResourceAuthority,
+        SessionResourceRequirements, acquire_light_1d_retention,
+        resolve_session_policy,
+    )
+
+    requirements = SessionResourceRequirements(
+        height=4, width=4, native_itemsize=2,
+        modes_1d=2, npt_1d=4, sigma_1d=1,
+    )
+    requests = {"record_items": 4, "publication_items": 4}
+    draft = resolve_session_policy(
+        requirements, envelope_bytes=4 * 1024 ** 3,
+        requests=requests, env={},
+    ).allocation
+    allocation = resolve_session_policy(
+        requirements, envelope_bytes=draft.assigned_bytes,
+        requests=requests, env={},
+    ).allocation
+    assert allocation.record_items == allocation.publication_items == 4
+    authority = SessionResourceAuthority.from_allocation(allocation)
+    layout = _layout()
+    ceiling = layout.shared_bytes + 6 * layout.per_row_unique_ndarray_bytes
+    baseline = authority.snapshot()
+
+    with pytest.raises(ValueError, match="current_lineage_rows"):
+        acquire_light_1d_retention(
+            authority, owner="omitted", generation=1, layout=layout,
+            requested_rows=6, compatibility_byte_ceiling=ceiling,
+            gui_thread_id=threading.get_ident(),
+            funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+        )
+    assert authority.snapshot() == baseline
+    for invalid in (True, -1, 1.0):
+        with pytest.raises((TypeError, ValueError)):
+            acquire_light_1d_retention(
+                authority, owner=f"invalid-{invalid!r}", generation=1,
+                layout=layout, requested_rows=6,
+                compatibility_byte_ceiling=ceiling,
+                gui_thread_id=threading.get_ident(),
+                funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+                current_lineage_rows=invalid,
+            )
+        assert authority.snapshot() == baseline
+
+    open_live = acquire_light_1d_retention(
+        authority, owner="open-live", generation=1, layout=layout,
+        requested_rows=6, compatibility_byte_ceiling=ceiling,
+        gui_thread_id=threading.get_ident(),
+        funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+        current_lineage_rows=None,
+    )
+    assert open_live.row_cap == 4
+    assert authority.snapshot().committed_bytes["records"] == (
+        baseline.committed_bytes["records"]
+    )
+    open_live.release(reason="test", hooks=Light1DCleanupHooks())
+
+    finite = acquire_light_1d_retention(
+        authority, owner="finite", generation=1, layout=layout,
+        requested_rows=6, compatibility_byte_ceiling=ceiling,
+        gui_thread_id=threading.get_ident(),
+        funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+        current_lineage_rows=2,
+    )
+    assert finite.row_cap == 2
+    assert finite.reserved_ndarray_bytes <= (
+        allocation.publication_items * requirements.result_1d_bytes
+    )
+    assert authority.snapshot().committed_bytes["records"] == (
+        baseline.committed_bytes["records"]
+    )
+    finite.release(reason="test", hooks=Light1DCleanupHooks())
+    assert authority.snapshot() == baseline
+
+
+def test_child_b_publication_a1_replacement_refuses_layout_without_mutation():
+    from xrd_tools.session import (
+        Light1DFundingMode, SessionResourceAuthority,
+        SessionResourceRequirements, acquire_light_1d_retention,
+        resolve_session_policy,
+    )
+    import xrd_tools.session.policy as policy
+
+    requirements = SessionResourceRequirements(
+        height=1, width=1, native_itemsize=1, modes_1d=1, npt_1d=1,
+    )
+    allocation = resolve_session_policy(
+        requirements, envelope_bytes=policy.floor_bytes(requirements), env={},
+    ).allocation
+    authority = SessionResourceAuthority.from_allocation(allocation)
+    before = authority.snapshot()
+    with pytest.raises(ValueError, match="publication A1"):
+        acquire_light_1d_retention(
+            authority, owner="oversize", generation=1, layout=_layout(),
+            requested_rows=1, compatibility_byte_ceiling=10_000,
+            gui_thread_id=threading.get_ident(),
+            funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+            current_lineage_rows=1,
+        )
+    assert authority.snapshot() == before
+    with pytest.raises(TypeError, match="funding_mode"):
+        acquire_light_1d_retention(
+            authority, owner="wrong-mode", generation=1, layout=_layout(),
+            requested_rows=1, compatibility_byte_ceiling=10_000,
+            gui_thread_id=threading.get_ident(), funding_mode="replacement",
+            current_lineage_rows=1,
+        )
+    assert authority.snapshot() == before
+    ordinary = SessionResourceAuthority(capacity_bytes=10_000)
+    ordinary_before = ordinary.snapshot()
+    with pytest.raises(TypeError, match="allocation"):
+        acquire_light_1d_retention(
+            ordinary, owner="foreign", generation=1, layout=_layout(),
+            requested_rows=1, compatibility_byte_ceiling=10_000,
+            gui_thread_id=threading.get_ident(),
+            funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+            current_lineage_rows=1,
+        )
+    assert ordinary.snapshot() == ordinary_before
+
+
+def test_child_b_publication_a1_replacement_constructor_failure_restores_categories(
+    monkeypatch,
+):
+    from xrd_tools.session import (
+        Light1DCleanupHooks, Light1DFundingMode, SessionResourceAuthority,
+        SessionResourceRequirements, acquire_light_1d_retention,
+        resolve_session_policy,
+    )
+    import xrd_tools.session.light_1d_retention as retention
+    import xrd_tools.session.policy as policy
+
+    requirements = SessionResourceRequirements(
+        height=4, width=4, native_itemsize=2,
+        modes_1d=2, npt_1d=4, sigma_1d=1,
+    )
+    allocation = resolve_session_policy(
+        requirements, envelope_bytes=policy.floor_bytes(requirements), env={},
+    ).allocation
+    authority = SessionResourceAuthority.from_allocation(allocation)
+    before = authority.snapshot()
+    original = retention.Light1DRetentionLease
+
+    def fail_construction(*_args, **_kwargs):
+        raise RuntimeError("injected lease construction failure")
+
+    monkeypatch.setattr(retention, "Light1DRetentionLease", fail_construction)
+    with pytest.raises(RuntimeError, match="injected lease construction failure"):
+        acquire_light_1d_retention(
+            authority, owner="constructor", generation=1, layout=_layout(),
+            requested_rows=1, compatibility_byte_ceiling=10_000,
+            gui_thread_id=threading.get_ident(),
+            funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+            current_lineage_rows=1,
+        )
+    assert authority.snapshot() == before
+    monkeypatch.setattr(retention, "Light1DRetentionLease", original)
+    lease = acquire_light_1d_retention(
+        authority, owner="constructor", generation=1, layout=_layout(),
+        requested_rows=1, compatibility_byte_ceiling=10_000,
+        gui_thread_id=threading.get_ident(),
+        funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+        current_lineage_rows=1,
+    )
+    lease.release(reason="test", hooks=Light1DCleanupHooks())
+    assert authority.snapshot() == before
+
+
+def test_child_b_retained_custody_release_failure_retries_exactly_once():
+    from xrd_tools.session import (
+        DynamicRunState, Light1DCleanupHooks, Light1DCleanupPending,
+        Light1DCustodySlot, Light1DCustodyState,
+        Light1DRetainedCustodyReceipt,
+    )
+
+    authority, lease = _lease(rows=1, generation=3)
+    failures = [OSError("custody cleanup fault")]
+    calls = []
+
+    def verify():
+        calls.append("verify")
+        if failures:
+            raise failures.pop()
+
+    hooks = Light1DCleanupHooks(verify=verify)
+    slot = Light1DCustodySlot(
+        grant_id=lease.grant_id, owner=lease.owner,
+        generation=lease.generation, cleanup_hooks=hooks,
+    )
+    wrong_grant = Light1DCustodySlot(
+        grant_id="foreign", owner=lease.owner,
+        generation=lease.generation, cleanup_hooks=hooks,
+    )
+    wrong_owner = Light1DCustodySlot(
+        grant_id=lease.grant_id, owner="foreign",
+        generation=lease.generation, cleanup_hooks=hooks,
+    )
+    wrong_generation = Light1DCustodySlot(
+        grant_id=lease.grant_id, owner=lease.owner,
+        generation=lease.generation + 1, cleanup_hooks=hooks,
+    )
+    lease_before = (lease.state, lease.keys(), authority.snapshot())
+    refusals = (
+        (slot, object(), hooks, DynamicRunState.FINISHED, TypeError, "exact light-1D lease"),
+        (slot, lease, Light1DCleanupHooks(), DynamicRunState.FINISHED, RuntimeError, "cleanup hooks"),
+        (slot, lease, hooks, DynamicRunState.ABORTED, ValueError, "terminal"),
+        (wrong_grant, lease, hooks, DynamicRunState.FINISHED, ValueError, "grant"),
+        (wrong_owner, lease, hooks, DynamicRunState.FINISHED, ValueError, "owner"),
+        (wrong_generation, lease, hooks, DynamicRunState.FINISHED, ValueError, "generation"),
+    )
+    for target, candidate, candidate_hooks, terminal, error, match in refusals:
+        with pytest.raises(error, match=match):
+            target.adopt(
+                candidate, cleanup_hooks=candidate_hooks, terminal=terminal,
+            )
+        assert target.state is Light1DCustodyState.PENDING
+        assert target.custody_receipt is None
+        assert (lease.state, lease.keys(), authority.snapshot()) == lease_before
+
+    custody = slot.adopt(
+        lease, cleanup_hooks=hooks, terminal=DynamicRunState.FINISHED,
+    )
+    assert type(custody) is Light1DRetainedCustodyReceipt
+    assert slot.custody_receipt is custody
+    assert slot.state is Light1DCustodyState.RETAINED
+    assert (custody.grant_id, custody.owner, custody.generation) == (
+        lease.grant_id, lease.owner, lease.generation,
+    )
+    assert custody.terminal == "finished"
+    assert custody.retained_rows == len(lease.keys())
+    assert custody.reserved_bytes == lease.reserved_ndarray_bytes
+    assert slot.adopt(
+        lease, cleanup_hooks=hooks, terminal=DynamicRunState.FINISHED,
+    ) is custody
+
+    with pytest.raises(Light1DCleanupPending) as caught:
+        slot.release(reason="close")
+    token = caught.value.token
+    assert slot.state is Light1DCustodyState.CLEANUP_PENDING
+    assert token is lease.cleanup_receipt.retry_token
+    assert authority.snapshot().categories["light_1d"] == (
+        lease.reserved_ndarray_bytes
+    )
+    with pytest.raises(RuntimeError, match="exact retry token"):
+        slot.retry_cleanup(object())
+    released = slot.retry_cleanup(token)
+    assert slot.state is Light1DCustodyState.RELEASED
+    assert slot.retry_cleanup(token) is released
+    assert calls == ["verify", "verify"]
+    assert authority.snapshot().reserved_bytes == 0

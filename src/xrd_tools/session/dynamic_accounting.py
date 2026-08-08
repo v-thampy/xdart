@@ -329,6 +329,8 @@ class DynamicRunAccounting:
         self._live_owner_token = None
         self._light_lease = None
         self._light_cleanup_hooks = None
+        self._light_custody_slot = None
+        self._light_action = None
         self._light_retry_token = None
         self._cleanup_receipt: DynamicCleanupReceipt | None = None
         self._terminal_intent: DynamicRunState | None = None
@@ -1147,7 +1149,7 @@ class DynamicRunAccounting:
             self._stop_requested = True
             return self.snapshot()
 
-    def bind_light_1d(self, lease, *, cleanup_hooks) -> None:
+    def bind_light_1d(self, lease, *, cleanup_hooks, custody_slot=None) -> None:
         with self._lock:
             self._require_preterminal()
             light_module = sys.modules.get(
@@ -1155,6 +1157,7 @@ class DynamicRunAccounting:
             )
             lease_type = getattr(light_module, "Light1DRetentionLease", None)
             hooks_type = getattr(light_module, "Light1DCleanupHooks", None)
+            slot_type = getattr(light_module, "Light1DCustodySlot", None)
             if lease_type is None or type(lease) is not lease_type:
                 raise TypeError("dynamic run requires the exact light-1D lease")
             if hooks_type is None or type(cleanup_hooks) is not hooks_type:
@@ -1163,9 +1166,16 @@ class DynamicRunAccounting:
                 raise RuntimeError("a non-active dynamic run cannot bind light-1D")
             if getattr(getattr(lease, "state", None), "value", None) != "active":
                 raise RuntimeError("dynamic run requires an active light-1D lease")
+            if custody_slot is not None:
+                if slot_type is None or type(custody_slot) is not slot_type:
+                    raise TypeError("dynamic run requires an exact light-1D custody slot")
+                custody_slot._validate_binding(lease, cleanup_hooks)
             if self._light_lease is lease:
-                if cleanup_hooks is not self._light_cleanup_hooks:
-                    raise RuntimeError("light-1D cleanup hooks cannot change")
+                if (
+                    cleanup_hooks is not self._light_cleanup_hooks
+                    or custody_slot is not self._light_custody_slot
+                ):
+                    raise RuntimeError("light-1D binding cannot change")
                 return
             if self._light_lease is not None:
                 raise RuntimeError("dynamic run already owns a light-1D lease")
@@ -1173,12 +1183,18 @@ class DynamicRunAccounting:
                 raise ValueError("light-1D lease belongs to another generation")
             self._light_lease = lease
             self._light_cleanup_hooks = cleanup_hooks
+            self._light_custody_slot = custody_slot
 
-    def _release_light(self, terminal: DynamicRunState) -> None:
+    def _release_light(self, terminal: DynamicRunState, *, adopt=False) -> None:
         with self._lock:
             lease = self._light_lease
             retry_token = self._light_retry_token
             hooks = self._light_cleanup_hooks
+            slot = self._light_custody_slot
+            action = self._light_action
+            if lease is not None and action is None:
+                action = "adopt" if adopt and slot is not None else "release"
+                self._light_action = action
         if lease is None:
             with self._lock:
                 self._cleanup_receipt = DynamicCleanupReceipt(
@@ -1187,21 +1203,32 @@ class DynamicRunAccounting:
                 self._state = terminal
             return
         try:
-            if retry_token is None:
+            if action == "adopt":
+                receipt = slot.adopt(
+                    lease, cleanup_hooks=hooks, terminal=terminal,
+                )
+            elif retry_token is None:
+                if slot is not None:
+                    slot._validate_cancel(terminal)
                 receipt = lease.release(
                     reason=terminal.value, hooks=hooks,
                 )
             else:
+                if slot is not None:
+                    slot._validate_cancel(terminal)
                 receipt = lease.retry_cleanup(
                     retry_token, hooks=hooks,
                 )
+            if action == "release" and slot is not None:
+                slot.cancel(terminal=terminal)
         except BaseException as exc:
             token = getattr(exc, "token", None)
             pending = getattr(exc, "receipt", None)
             if token is None or pending is None:
-                raise
+                token = pending = None
             with self._lock:
-                self._light_retry_token = token
+                if token is not None:
+                    self._light_retry_token = token
                 self._cleanup_receipt = DynamicCleanupReceipt(
                     terminal, pending, token, False,
                 )
@@ -1218,6 +1245,8 @@ class DynamicRunAccounting:
         self._live_owner_token = None
         self._light_lease = None
         self._light_cleanup_hooks = None
+        self._light_custody_slot = None
+        self._light_action = None
         self._light_retry_token = None
         self._active_seal = None
         self._sealed_promoted = False
@@ -1238,7 +1267,12 @@ class DynamicRunAccounting:
                 self._sealed_promoted = True
             elif self._terminal_intent is not terminal:
                 raise RuntimeError("terminal cleanup retry changed its intent")
-        self._release_light(terminal)
+            adopt = (
+                self._light_action is None
+                and self._light_custody_slot is not None
+                and set(self._light_lease.keys()) <= self._ledger.snapshot().mode_complete
+            )
+        self._release_light(terminal, adopt=adopt)
         with self._lock:
             self._drop_terminal_owners()
 
@@ -1399,6 +1433,8 @@ class DynamicRunAccounting:
             values = [self._ledger, self._writer_boundary]
             if self._light_lease is not None:
                 values.append(self._light_lease)
+            if self._light_custody_slot is not None:
+                values.append(self._light_custody_slot)
             session = self._live_session_ref() if self._live_session_ref else None
             if session is not None:
                 values.append(session)

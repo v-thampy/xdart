@@ -3530,3 +3530,363 @@ def test_c2_exact_composite_begin_runs_nexus_branch_before_memory(
     assert nexus._terminal_result.disposition is NexusTerminalDisposition.ABORTED
     assert nexus._writer is None or nexus._writer.phase.value not in {"active", "partial"}
     assert nexus._transaction_owners is None
+
+
+def test_child_b_terminal_custody_matrix_is_exact(tmp_path, monkeypatch):
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DCleanupHooks, Light1DCleanupPending,
+        Light1DCustodySlot, Light1DCustodyState, Light1DLayout,
+        Light1DModeData, Light1DModeLayout, Light1DRecord,
+        SessionResourceAuthority, acquire_light_1d_retention,
+    )
+
+    finish_calls = {}
+    original_finish = NexusSink.finish
+
+    def count_finish(owner, result):
+        finish_calls[id(owner)] = finish_calls.get(id(owner), 0) + 1
+        return original_finish(owner, result)
+
+    monkeypatch.setattr(NexusSink, "finish", count_finish)
+
+    def bind_bank(accounting, name, rows, *, fail_release=False):
+        axis = Light1DBufferLayout(4, 8, f"{name}-q", "<f8", shared=True)
+        layout = Light1DLayout((Light1DModeLayout(
+            "default", axis,
+            Light1DBufferLayout(4, 8, f"{name}-i", "<f8"),
+        ),), "default")
+        authority = SessionResourceAuthority(capacity_bytes=4096)
+        lease = acquire_light_1d_retention(
+            authority, owner=name, generation=1, layout=layout,
+            requested_rows=2,
+            compatibility_byte_ceiling=(layout.shared_bytes + 2 *
+                                        layout.per_row_unique_ndarray_bytes),
+            gui_thread_id=threading.get_ident(),
+        )
+        coordinate = np.linspace(0.0, 1.0, 4)
+        for row in rows:
+            lease.retain(Light1DRecord(
+                row, 1, "default", {"default": Light1DModeData(
+                    coordinate, np.full(4, row + 1.0),
+                )},
+            ), grant_id=lease.grant_id, generation=1)
+        failures = [OSError("fallback cleanup fault")] if fail_release else []
+
+        def verify():
+            if failures:
+                raise failures.pop()
+
+        hooks = Light1DCleanupHooks(verify=verify if fail_release else None)
+        slot = Light1DCustodySlot(
+            grant_id=lease.grant_id, owner=lease.owner,
+            generation=lease.generation, cleanup_hooks=hooks,
+        )
+        accounting.bind_light_1d(
+            lease, cleanup_hooks=hooks, custody_slot=slot,
+        )
+        return authority, lease, slot
+
+    cases = (
+        ("finish", (0,), True, False, Light1DCustodyState.RETAINED),
+        ("committed-stop", (0,), True, True, Light1DCustodyState.RETAINED),
+        ("zero-stop", (0,), False, True, Light1DCustodyState.CANCELLED),
+        ("noncanonical-stop", (0, 99), True, True,
+         Light1DCustodyState.CANCELLED),
+    )
+    for name, rows, submit, stop, expected in cases:
+        target, accounting, live, plan = _dynamic_sink_case(tmp_path, name)
+        target_name = next(iter(accounting.ledger.targets_by_mode[
+            accounting.ledger.required_modes[0]
+        ]))
+        token = _armed_submission(accounting)[1] if submit else None
+        authority, lease, slot = bind_bank(
+            accounting, name, rows, fail_release=name == "noncanonical-stop",
+        )
+        nexus = NexusSink(
+            target, overwrite=True, atomic=False, flush_every=None,
+        )
+        session = _open_final_session(
+            tmp_path, name, nexus, accounting, live, plan,
+            nexus_target=target_name,
+        )
+        if submit:
+            assert session.submit(session.scan.frames[0], attempt_token=token)
+            if stop:
+                assert session.pause(timeout=5.0)
+        if stop:
+            session.stop()
+        if name == "noncanonical-stop":
+            with pytest.raises(Light1DCleanupPending):
+                session.finish(raise_on_failure=False)
+            pending = accounting.snapshot()
+            assert pending.state.value == "cleanup-pending"
+            assert pending.cleanup_receipt.complete is False
+            assert pending.cleanup_receipt.retry_token is lease.cleanup_receipt.retry_token
+            assert lease in accounting.owner_census()
+            assert slot in accounting.owner_census()
+        result = session.finish(raise_on_failure=False)
+        assert accounting.snapshot().state.value == (
+            "finished" if name == "finish" else "stopped"
+        )
+        assert result.cancelled is stop
+        assert slot.state is expected
+        if expected is Light1DCustodyState.RETAINED:
+            assert slot.custody_receipt.retained_rows == len(rows)
+            assert slot.custody_receipt.terminal == (
+                "finished" if name == "finish" else "stopped"
+            )
+            slot.release(reason="test-close")
+        else:
+            assert slot.custody_receipt is None
+            assert lease.state.value == "released"
+        if submit:
+            assert finish_calls[id(nexus)] == 1
+        assert authority.snapshot().reserved_bytes == 0
+
+
+def test_child_b_abort_releases_and_cancels_empty_slot(tmp_path, monkeypatch):
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import (
+        DynamicRunState, Light1DBufferLayout, Light1DCleanupHooks, Light1DCustodySlot,
+        Light1DCustodyState, Light1DLayout, Light1DModeLayout,
+        Light1DRetentionLease, SessionResourceAuthority,
+        acquire_light_1d_retention,
+    )
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "abort-custody")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    token = _armed_submission(accounting)[1]
+    axis = Light1DBufferLayout(4, 8, "abort-q", "<f8", shared=True)
+    layout = Light1DLayout((Light1DModeLayout(
+        "default", axis, Light1DBufferLayout(4, 8, "abort-i", "<f8"),
+    ),), "default")
+    authority = SessionResourceAuthority(capacity_bytes=4096)
+    lease = acquire_light_1d_retention(
+        authority, owner="abort", generation=1, layout=layout,
+        requested_rows=1, compatibility_byte_ceiling=64,
+        gui_thread_id=threading.get_ident(),
+    )
+    hooks = Light1DCleanupHooks()
+    slot = Light1DCustodySlot(
+        grant_id=lease.grant_id, owner=lease.owner,
+        generation=lease.generation, cleanup_hooks=hooks,
+    )
+    nonpending = Light1DCustodySlot(
+        grant_id=lease.grant_id, owner=lease.owner, generation=lease.generation, cleanup_hooks=hooks)
+    nonpending.cancel(terminal=DynamicRunState.ABORTED)
+    wrong_grant = Light1DCustodySlot(
+        grant_id="foreign", owner=lease.owner, generation=lease.generation, cleanup_hooks=hooks)
+    wrong_owner = Light1DCustodySlot(
+        grant_id=lease.grant_id, owner="foreign", generation=lease.generation, cleanup_hooks=hooks)
+    wrong_generation = Light1DCustodySlot(
+        grant_id=lease.grant_id, owner=lease.owner, generation=lease.generation + 1, cleanup_hooks=hooks)
+    bind_refusals = (
+        (object(), hooks, TypeError, "custody slot"),
+        (nonpending, hooks, RuntimeError, "pending"),
+        (wrong_grant, hooks, ValueError, "grant"),
+        (wrong_owner, hooks, ValueError, "owner"),
+        (wrong_generation, hooks, ValueError, "generation"),
+        (slot, Light1DCleanupHooks(), RuntimeError, "cleanup hooks"),
+    )
+    for candidate, candidate_hooks, error, match in bind_refusals:
+        owners_before = accounting.owner_census()
+        with pytest.raises(error, match=match):
+            accounting.bind_light_1d(lease, cleanup_hooks=candidate_hooks, custody_slot=candidate)
+        owners_after = accounting.owner_census()
+        assert owners_after == owners_before
+        assert lease not in owners_after and candidate not in owners_after
+    accounting.bind_light_1d(lease, cleanup_hooks=hooks, custody_slot=slot)
+    original_keys = Light1DRetentionLease.keys
+    original_write = NexusSink.write
+
+    def forbidden_subset(owner):
+        if owner is lease:
+            raise AssertionError("Abort consulted the custody subset")
+        return original_keys(owner)
+
+    def fail_write(owner, frame, reduction):
+        if owner is nexus:
+            raise OSError("forced abort")
+        return original_write(owner, frame, reduction)
+
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    monkeypatch.setattr(Light1DRetentionLease, "keys", forbidden_subset)
+    monkeypatch.setattr(NexusSink, "write", fail_write)
+    session = _open_final_session(
+        tmp_path, "abort-custody", nexus, accounting, live, plan,
+        nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    result = session.finish(raise_on_failure=False)
+    assert result.failed is True
+    assert accounting.snapshot().state.value == "aborted"
+    assert slot.state is Light1DCustodyState.CANCELLED
+    assert slot.custody_receipt is None
+    assert authority.snapshot().reserved_bytes == 0
+
+
+def test_child_b_adoption_failure_retries_without_rerunning_h23(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DCleanupHooks, Light1DCustodySlot,
+        Light1DCustodyState, Light1DLayout, Light1DModeLayout,
+        SessionResourceAuthority, acquire_light_1d_retention,
+    )
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "adopt-retry")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    token = _armed_submission(accounting)[1]
+    axis = Light1DBufferLayout(4, 8, "adopt-q", "<f8", shared=True)
+    layout = Light1DLayout((Light1DModeLayout(
+        "default", axis, Light1DBufferLayout(4, 8, "adopt-i", "<f8"),
+    ),), "default")
+    authority = SessionResourceAuthority(capacity_bytes=4096)
+    lease = acquire_light_1d_retention(
+        authority, owner="adopt", generation=1, layout=layout,
+        requested_rows=1, compatibility_byte_ceiling=64,
+        gui_thread_id=threading.get_ident(),
+    )
+    hooks = Light1DCleanupHooks()
+    slot = Light1DCustodySlot(
+        grant_id=lease.grant_id, owner=lease.owner,
+        generation=lease.generation, cleanup_hooks=hooks,
+    )
+    accounting.bind_light_1d(lease, cleanup_hooks=hooks, custody_slot=slot)
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    finish_calls, failures = [], [RuntimeError("adoption fault")]
+    original_finish = NexusSink.finish
+    original_adopt = Light1DCustodySlot.adopt
+
+    def count_finish(owner, result):
+        if owner is nexus:
+            finish_calls.append(result)
+        return original_finish(owner, result)
+
+    def fail_adopt_once(owner, *args, **kwargs):
+        if owner is slot and failures:
+            raise failures.pop()
+        return original_adopt(owner, *args, **kwargs)
+
+    monkeypatch.setattr(NexusSink, "finish", count_finish)
+    monkeypatch.setattr(Light1DCustodySlot, "adopt", fail_adopt_once)
+    session = _open_final_session(
+        tmp_path, "adopt-retry", nexus, accounting, live, plan,
+        nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    with pytest.raises(RuntimeError, match="adoption fault"):
+        session.finish()
+    pending = accounting.snapshot()
+    assert pending.state.value == "cleanup-pending"
+    assert pending.cleanup_receipt.complete is False
+    assert pending.cleanup_receipt.retry_token is None
+    assert slot.state is Light1DCustodyState.PENDING
+    assert lease in accounting.owner_census() and slot in accounting.owner_census()
+    assert authority.snapshot().reserved_bytes > 0
+    assert len(finish_calls) == 1
+    assert session.finish().failed is False
+    assert len(finish_calls) == 1
+    assert accounting.snapshot().state.value == "finished"
+    assert slot.state is Light1DCustodyState.RETAINED
+    slot.release(reason="test-close")
+    assert authority.snapshot().reserved_bytes == 0
+
+
+def test_child_b_no_target_dynamic_terminal_behavior_is_unchanged(tmp_path):
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import Light1DRetentionLease
+
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, "no-custody")
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    token = _armed_submission(accounting)[1]
+    authority = _c2_bind_light_owner(accounting, "no-custody")
+    session = _open_final_session(
+        tmp_path, "no-custody",
+        NexusSink(target, overwrite=True, atomic=False, flush_every=None),
+        accounting, live, plan, nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    assert session.finish().failed is False
+    assert accounting.snapshot().state.value == "finished"
+    assert authority.snapshot().reserved_bytes == 0
+    assert not any(type(owner) is Light1DRetentionLease
+                   for owner in accounting.owner_census())
+
+
+def test_child_b_handoff_owner_census_drops_record_a1_after_durability():
+    from xdart.modules.frame_publication import PublicationStore
+    from xrd_tools.core import Axis, FrameRecord, FrameView
+    from xrd_tools.session import (
+        FrameRecordStore, Light1DBufferLayout,
+        Light1DFundingMode, Light1DLayout, Light1DModeData,
+        Light1DModeLayout, Light1DRecord, SessionResourceAuthority,
+        SessionResourceRequirements, acquire_light_1d_retention,
+        resolve_session_policy,
+    )
+
+    requirements = SessionResourceRequirements(
+        height=2, width=2, native_itemsize=2, modes_1d=1, npt_1d=4,
+    )
+    allocation = resolve_session_policy(
+        requirements, envelope_bytes=2 * 1024 ** 3,
+        requests={"record_items": 1, "publication_items": 1}, env={},
+    ).allocation
+    authority = SessionResourceAuthority.from_allocation(allocation)
+    before = authority.snapshot()
+    layout = Light1DLayout((Light1DModeLayout(
+        "default", Light1DBufferLayout(4, 8, "handoff-q", "<f8"),
+        Light1DBufferLayout(4, 8, "handoff-i", "<f8"),
+    ),), "default")
+    lease = acquire_light_1d_retention(
+        authority, owner="handoff", generation=1, layout=layout,
+        requested_rows=1, compatibility_byte_ceiling=64,
+        gui_thread_id=threading.get_ident(),
+        funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+        current_lineage_rows=1,
+    )
+    publication = PublicationStore()
+    publication.bind_allocation(allocation)
+    publication.bind_light_1d(lease)
+    lease.retain(Light1DRecord(
+        0, 1, "default", {"default": Light1DModeData(
+            np.linspace(0.0, 1.0, 4), np.ones(4),
+        )},
+    ), grant_id=lease.grant_id, generation=1)
+    canonical_roots = lease.owned_buffer_ids
+    census = publication.ndarray_owner_census()
+    assert census["lease"] == lease.owned_buffer_ids == canonical_roots
+    assert census["publication"] == frozenset()
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(FrameRecord(
+        0, results_1d={"default": FrameView(
+            0, axis_1d=Axis("q"), intensity_1d=np.full(4, 2.0),
+        )},
+    ))
+    record_root = id(store.get(0).results_1d["default"].intensity_1d)
+    handoff_roots = frozenset((record_root,)) | census["lease"] | census["publication"]
+    assert len(handoff_roots) == len(canonical_roots) + 1
+    assert authority.snapshot().committed_bytes["records"] == (
+        before.committed_bytes["records"]
+    )
+    store.replace_projection(
+        0, hydratable=(("1d", "default"),),
+        durable=(("1d", "default"),),
+    )
+    assert store.release_heavy(0)
+    assert store.get(0).results_1d["default"].intensity_1d is None
+    census = publication.ndarray_owner_census()
+    assert census["lease"] == lease.owned_buffer_ids == canonical_roots
+    assert census["publication"] == frozenset()
+    assert lease.unique_owned_ndarray_bytes == lease.reserved_ndarray_bytes
+    lease.release(reason="test", hooks=publication.light_1d_cleanup_hooks(lease))
+    assert publication.ndarray_owner_census() == {"lease": frozenset(), "publication": frozenset()}
+    assert authority.snapshot() == before
