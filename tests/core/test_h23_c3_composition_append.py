@@ -3473,7 +3473,9 @@ def test_prefix_bound_preflight_refuses_disappeared_target_instead_of_first_run_
 
 
 def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
-    from xrd_tools.io import AppendRefused, prepare_append_preflight
+    from xrd_tools.io import (
+        AppendRefused, decode_committed_append_prefix, prepare_append_preflight,
+    )
 
     target = tmp_path / "divergent.nxs"
     _commit_image_series_target(
@@ -3501,6 +3503,41 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
         )
     assert target.read_bytes() == before
     _assert_lease_available(target)
+
+    for mutation in ("bool-version", "float-label", "bool-member-ordinal"):
+        typed_target = tmp_path / f"typed-{mutation}.nxs"
+        _commit_image_series_target(
+            typed_target, _image_series_intent(tmp_path, 2, generation=0),
+        )
+        typed_prefix = _decode_image_series_prefix(typed_target)
+        with h5py.File(typed_target, "r+") as handle:
+            dataset = handle["entry/reduction/config/append_lineage"]
+            typed_lineage = json.loads(dataset[()].decode())
+            if mutation == "bool-version":
+                typed_lineage["version"] = True
+            elif mutation == "float-label":
+                typed_lineage["epochs"][0]["labels"][0] = 0.0
+            else:
+                typed_lineage["epochs"][0]["source"]["image_members"][0][
+                    "ordinal"
+                ] = False
+            del handle["entry/reduction/config/append_lineage"]
+            handle["entry/reduction/config"].create_dataset(
+                "append_lineage", data=json.dumps(
+                    typed_lineage, sort_keys=True, separators=(",", ":"),
+                ),
+            )
+        typed_before = typed_target.read_bytes()
+        with h5py.File(typed_target, "r") as handle:
+            with pytest.raises(ValueError, match="not committed|exact JSON integers"):
+                decode_committed_append_prefix(handle)
+        with pytest.raises(AppendRefused, match="not committed|exact JSON integers"):
+            prepare_append_preflight(
+                typed_target, _image_series_intent(tmp_path, 3, generation=1),
+                committed_prefix=typed_prefix,
+            )
+        assert typed_target.read_bytes() == typed_before
+        _assert_lease_available(typed_target)
 
 
 def test_prefix_bound_preflight_accepts_concurrent_exact_successor_as_noop(

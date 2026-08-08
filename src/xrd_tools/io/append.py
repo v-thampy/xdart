@@ -173,32 +173,25 @@ class AppendCommittedPrefix:
         lineage = json.loads(str(self.lineage_json))
         if not isinstance(lineage, dict):
             raise ValueError("committed Append prefix lineage is not an object")
-        if (lineage.get("version") != LINEAGE_VERSION
+        if (type(lineage.get("version")) is not int or lineage.get("version") != LINEAGE_VERSION
                 or lineage.get("state") != "committed"):
             raise ValueError("committed Append prefix lineage is not committed")
         labels = _lineage_labels(lineage)
         epochs = lineage.get("epochs") or ()
-        expected = {
-            "entry": self.intent.entry,
-            "source_base": self.intent.source_base,
-            "source_identity": self.intent.source_identity,
-            "science_fingerprint": self.intent.science_fingerprint,
-            "modes": list(self.intent.modes),
-        }
         if labels != self.intent.labels or not epochs:
             raise ValueError("committed Append prefix labels are inconsistent")
-        if any(lineage.get(key) != value for key, value in expected.items()):
+        lineage_identity = (lineage.get("entry"), lineage.get("source_base"),
+                            lineage.get("source_identity"), lineage.get("science_fingerprint"),
+                            tuple(lineage.get("modes") or ()))
+        if lineage_identity != _intent_identity(self.intent):
             raise ValueError("committed Append prefix identity is inconsistent")
-        if _source_dict(_source_from_dict(epochs[-1]["source"])) != _source_dict(
-                self.intent.source):
+        if _source_dict(_source_from_dict(epochs[-1]["source"])) != _source_dict(self.intent.source):
             raise ValueError("committed Append prefix source is inconsistent")
         object.__setattr__(self, "target", _normalize(self.target))
         object.__setattr__(self, "lineage_json", _json(lineage))
-
     @property
     def committed_labels(self) -> tuple[int, ...]:
         return self.intent.labels
-
 @dataclass(frozen=True)
 class AppendDecision:
     disposition: AppendDisposition
@@ -494,14 +487,21 @@ def _source_dict(source: AppendSource) -> dict[str, Any]:
         "generation": int(source.generation),
     }
 
+def _intent_identity(intent: AppendIntent) -> tuple[Any, ...]:
+    return (intent.entry, intent.source_base, intent.source_identity, intent.science_fingerprint, intent.modes)
 def _source_from_dict(raw_source: Mapping[str, Any]) -> AppendSource:
+    numbers = [raw_source.get(key) for key in ("size", "mtime_ns", "extent", "generation")]
+    numbers.extend(member.get(key) for kind in ("image_members", "external_members")
+                   for member in raw_source.get(kind, ())
+                   for key in ("size", "mtime_ns", "source_start", "source_stop", "ordinal"))
+    if any(type(value) is not int for value in numbers):
+        raise ValueError("Append source/member integers require exact JSON integers")
     values = dict(raw_source)
     values["image_members"] = tuple(
         AppendImageMember(**item) for item in raw_source["image_members"])
     values["external_members"] = tuple(
         AppendExternalMember(**item) for item in raw_source["external_members"])
     return AppendSource(**values)
-
 def _base_lineage(intent: AppendIntent) -> dict[str, Any]:
     return {
         "version": LINEAGE_VERSION,
@@ -785,12 +785,16 @@ def _lineage_labels(lineage: Mapping[str, Any]) -> tuple[int, ...]:
             raise ValueError("Append epoch is malformed")
         raw_source = epoch["source"]
         source = _source_from_dict(raw_source)
-        if _source_dict(source) != raw_source:
+        if _json(_source_dict(source)) != _json(raw_source):
             raise ValueError("Append epoch source is not canonical")
         if prior_source is not None:
             _source_extends(_source_dict(prior_source), raw_source)
         prior_source = source
-        labels = tuple(int(label) for label in epoch.get("labels", ()))
+        raw_labels = epoch.get("labels")
+        if (not isinstance(raw_labels, list)
+                or any(type(label) is not int for label in raw_labels)):
+            raise ValueError("Append epoch labels require exact JSON integers")
+        labels = tuple(raw_labels)
         _require_contiguous(labels, "Append epoch labels")
         if flattened and labels and labels[0] != flattened[-1] + 1:
             raise ValueError("Append epochs are gapped or overlapping")
@@ -809,11 +813,9 @@ def decode_committed_append_prefix(
     group = handle.get(entry)
     if not isinstance(group, h5py.Group):
         raise ValueError(f"foreign or missing entry {entry!r}")
-    schema_name = str(_decode(group.attrs.get(SCHEMA_NAME_ATTR, "")))
-    schema_version = int(group.attrs.get(SCHEMA_VERSION_ATTR, -1))
-    if schema_name not in ACCEPTED_SCHEMA_NAMES:
+    if str(_decode(group.attrs.get(SCHEMA_NAME_ATTR, ""))) not in ACCEPTED_SCHEMA_NAMES:
         raise ValueError("foreign processed schema identity")
-    if schema_version != PROCESSED_SCHEMA_VERSION:
+    if int(group.attrs.get(SCHEMA_VERSION_ATTR, -1)) != PROCESSED_SCHEMA_VERSION:
         raise ValueError("foreign processed schema version")
     stored_base = _normalize_base(str(_decode(group.attrs.get(SOURCE_BASE_ATTR, ""))))
     lineage = _read_lineage(group)
@@ -853,10 +855,7 @@ def qualify_append(
             if committed_prefix.target != normalized:
                 raise ValueError("committed Append prefix names a different target")
             observed = committed_prefix.intent
-            immutable = ("entry", "source_base", "source_identity",
-                         "science_fingerprint", "modes")
-            if any(getattr(observed, key) != getattr(intent, key)
-                   for key in immutable):
+            if _intent_identity(observed) != _intent_identity(intent):
                 raise ValueError("committed Append prefix identity changed")
             if intent.labels[:len(observed.labels)] != observed.labels:
                 raise ValueError("requested labels remap the committed Append prefix")
@@ -875,13 +874,11 @@ def qualify_append(
             if current.committed_labels[:len(committed_prefix.committed_labels)] \
                     != committed_prefix.committed_labels:
                 raise ValueError("committed Append labels no longer retain observed prefix")
-            if current_lineage["epochs"][:len(observed_epochs)] != observed_epochs:
+            if _json({"epochs": current_lineage["epochs"][:len(observed_epochs)]}) \
+                    != _json({"epochs": observed_epochs}):
                 raise ValueError("committed Append epochs diverged from observed prefix")
-        immutable = ("entry", "source_base", "source_identity",
-                     "science_fingerprint", "modes")
-        for key in immutable:
-            if getattr(current.intent, key) != getattr(intent, key):
-                raise ValueError(f"foreign Append {key}")
+        if _intent_identity(current.intent) != _intent_identity(intent):
+            raise ValueError("foreign Append identity")
         labels = current.committed_labels
         lineage = json.loads(current.lineage_json)
         prior_source = _source_dict(current.intent.source)
