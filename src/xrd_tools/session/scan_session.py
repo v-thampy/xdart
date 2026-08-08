@@ -374,6 +374,10 @@ class ScanSession:
             and type(dynamic_accounting) is not DynamicRunAccounting
         ):
             raise TypeError("dynamic_accounting must be an exact DynamicRunAccounting")
+        if dynamic_accounting is not None and record_store_persisted_on_write:
+            raise RuntimeError(
+                "dynamic durable truth is owned only by the writer boundary"
+            )
         self._dynamic_accounting = dynamic_accounting
         if dynamic_accounting is not None:
             if accounting is not None and accounting is not dynamic_accounting.ledger:

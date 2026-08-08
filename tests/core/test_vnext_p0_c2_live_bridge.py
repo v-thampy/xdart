@@ -3890,3 +3890,67 @@ def test_child_b_handoff_owner_census_drops_record_a1_after_durability():
     lease.release(reason="test", hooks=publication.light_1d_cleanup_hooks(lease))
     assert publication.ndarray_owner_census() == {"lease": frozenset(), "publication": frozenset()}
     assert authority.snapshot() == before
+
+
+def test_dynamic_record_store_persisted_on_write_refuses_before_sink_effect(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.session.scan_session as scan_session_module
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import Frame, MemorySink, NexusSink, Scan
+    from xrd_tools.session import ResultMode, ScanSession
+
+    target, accounting, live, plan = _dynamic_sink_case(
+        tmp_path, "dynamic-durable-guard",
+    )
+    target_name = next(iter(accounting.ledger.targets_by_mode[
+        accounting.ledger.required_modes[0]
+    ]))
+    before = accounting.snapshot()
+    owners_before = accounting.owner_census()
+    constructor_classifications, begin_calls = [], []
+    original_begin = NexusSink.begin
+
+    def poison_constructor_classification(value):
+        constructor_classifications.append(value)
+        raise AssertionError("constructor reached dynamic sink classification")
+
+    def count_begin(owner, *args, **kwargs):
+        begin_calls.append(owner)
+        return original_begin(owner, *args, **kwargs)
+
+    monkeypatch.setattr(
+        scan_session_module, "bind_dynamic_output_sink",
+        poison_constructor_classification,
+    )
+    monkeypatch.setattr(NexusSink, "begin", count_begin)
+    nexus = NexusSink(
+        target, overwrite=True, atomic=False, flush_every=None,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="^dynamic durable truth is owned only by the writer boundary$",
+    ):
+        # The public facade's earlier pure classification remains unpoisoned.
+        open_live_scan_session(
+            (live,), plan, sink=nexus, accounting=accounting, executor=1,
+            nexus_target=target_name, record_store_persisted_on_write=True,
+        )
+    assert constructor_classifications == []
+    assert begin_calls == []
+    assert nexus._writer is None and not target.exists()
+    assert accounting.snapshot() == before
+    assert accounting.owner_census() == owners_before
+
+    mode = ResultMode.one_d()
+    static_target = "memory:static-durable-control"
+    static = ScanSession(
+        plan,
+        Scan("static-durable-control", [Frame(0, image=np.ones((2, 2)))],
+             integrator=DeterministicIntegrator()),
+        sink=MemorySink(), executor=1,
+        targets_by_mode={mode: (static_target,)},
+        write_targets_by_mode={mode: (static_target,)},
+        record_store_persisted_on_write=True,
+    )
+    assert static.finish(raise_on_failure=False).failed is False
