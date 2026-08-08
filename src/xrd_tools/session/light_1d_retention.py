@@ -743,11 +743,15 @@ def _freeze_array(array) -> None:
     try:
         setter(write=False)
     except BaseException as exc:
+        if isinstance(exc, MemoryError) or not isinstance(exc, Exception):
+            raise
         raise ValueError("light-1D array write fence failed") from exc
     try:
         flags = getattr(array, "flags", None)
         writeable = getattr(flags, "writeable", None)
     except BaseException as exc:
+        if isinstance(exc, MemoryError) or not isinstance(exc, Exception):
+            raise
         raise ValueError("light-1D array write fence cannot be observed") from exc
     if writeable is None or bool(writeable):
         raise ValueError("light-1D array write fence was not established")
@@ -1057,6 +1061,7 @@ class Light1DRetentionLease:
         if set(record.modes) != expected_modes or record.active_mode != self.layout.active_mode:
             raise ValueError("light-1D record mode layout does not match grant layout")
         roots: dict[str, object] = {}
+        source_values: dict[str, object] = {}
         supplied: list[object] = []
         for mode_layout in self.layout.modes:
             values = record.modes[mode_layout.mode]
@@ -1081,6 +1086,22 @@ class Light1DRetentionLease:
                     raise ValueError(
                         f"light-1D layout owner {spec.owner_key!r} is not aliased"
                     )
+                prior_source = source_values.get(spec.owner_key)
+                if prior_source is not None and not self._same_array_values(array, prior_source):
+                    raise ValueError(
+                        f"light-1D owner {spec.owner_key!r} has contradictory views"
+                    )
+                source_values.setdefault(spec.owner_key, array)
+                if spec.shared:
+                    view = self._shared_views.get(spec.owner_key)
+                    if (view is None) != (self._shared_roots.get(spec.owner_key) is None):
+                        raise RuntimeError(
+                            "light-1D shared view/root authority is incomplete"
+                        )
+                    if view is not None and not self._same_array_values(array, view):
+                        raise ValueError(
+                            f"light-1D shared owner {spec.owner_key!r} changed values"
+                        )
                 roots[spec.owner_key] = root
         reverse: dict[int, str] = {}
         for owner_key, root in roots.items():
@@ -1092,22 +1113,54 @@ class Light1DRetentionLease:
             reverse[id(root)] = owner_key
         return roots, tuple(supplied)
 
-    def _preflight_store_record(self, record=None, retiring=()) -> None:
+    def _preflight_store_record(self, record=None, retiring=(), commit=None, *, needs_retain=True):
         with self._lock:
             self._check_generation(self.grant_id, self.generation)
+            retiring = tuple(retiring)
             if record is not None:
+                if self.row_cap <= 0:
+                    raise Light1DUnavailable("light-1D byte grant holds zero rows")
+                if record.row_identity in self._hydration_rows:
+                    raise Light1DUnavailable("row has a pending hydration owner; complete its exact token")
+                initializing = any(
+                    token.may_create_shared for token in self._hydration_tokens.values()
+                )
+                if self.shared_bytes and not self._shared_roots and not self._shared_views and initializing:
+                    raise Light1DUnavailable("shared light-1D roots have an exact hydration initializer")
                 self._validate_record(record)
+            seen = set()
             for row, guard in retiring:
-                if [handle for key, handle in self._borrows.values()
-                    if key == row] != [guard]:
-                    raise Light1DUnavailable(
-                        "tracked light-1D shell borrow must close before eviction")
+                if row in seen or row not in self._records or row not in self._roots:
+                    raise RuntimeError("duplicate or incomplete light-1D pair retirement")
+                seen.add(row)
+                handles = tuple(handle for key, handle in self._borrows.values() if key == row)
+                if type(guard) is not Light1DBorrow or guard.closed or handles != (guard,):
+                    raise Light1DUnavailable("tracked light-1D shell borrow must close before eviction")
+            if commit is None:
+                return None
+            if record is None or not needs_retain: return commit(None)
+            active, retained = True, False
+            def retain_candidate():
+                nonlocal retained
+                if not active or retained or record is None:
+                    raise RuntimeError("light-1D retain candidate thunk is stale")
+                retained = True
+                if self._occupied_row_slots() >= self.row_cap:
+                    self._raise_slot_unavailable("light-1D byte grant has no retained slot")
+                self.retain(record, grant_id=self.grant_id, generation=self.generation)
+
+            try:
+                return commit(retain_candidate)
+            finally:
+                active = False
 
     @staticmethod
     def _same_array_values(left, right) -> bool:
         try:
             return left.tobytes(order="C") == right.tobytes(order="C")
         except BaseException as exc:
+            if isinstance(exc, MemoryError):
+                raise
             raise ValueError("light-1D canonical buffer comparison failed") from exc
 
     def _private_array_copy(
@@ -1126,6 +1179,8 @@ class Light1DRetentionLease:
                 memoryview(payload), dtype=spec.dtype, count=spec.length,
             )
         except BaseException as exc:
+            if isinstance(exc, MemoryError):
+                raise
             raise ValueError(
                 f"light-1D canonical copy failed for {role}"
             ) from exc
@@ -1147,7 +1202,6 @@ class Light1DRetentionLease:
         self._validate_record(record)
         canonical_views: dict[str, object] = {}
         canonical_roots: dict[str, object] = {}
-        source_values: dict[str, object] = {}
         modes = {}
         for mode_layout in self.layout.modes:
             values = record.modes[mode_layout.mode]
@@ -1160,23 +1214,11 @@ class Light1DRetentionLease:
                 if spec is None:
                     fields[role] = None
                     continue
-                prior_source = source_values.get(spec.owner_key)
-                if prior_source is not None and not self._same_array_values(
-                    array, prior_source,
-                ):
-                    raise ValueError(
-                        f"light-1D owner {spec.owner_key!r} has contradictory views"
-                    )
-                source_values.setdefault(spec.owner_key, array)
                 view = canonical_views.get(spec.owner_key)
                 root = canonical_roots.get(spec.owner_key)
                 if view is None and spec.shared:
                     view = self._shared_views.get(spec.owner_key)
                     root = self._shared_roots.get(spec.owner_key)
-                    if view is not None and not self._same_array_values(array, view):
-                        raise ValueError(
-                            f"light-1D shared owner {spec.owner_key!r} changed values"
-                        )
                     if (view is None) != (root is None):
                         raise RuntimeError(
                             "light-1D shared view/root authority is incomplete"

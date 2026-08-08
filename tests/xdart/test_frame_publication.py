@@ -71,7 +71,10 @@ class DuckFrame:
         return float(self.scan_info["th"])
 
 
-def _bound_gui_light_graph(*, rows=3, shared_coordinate=False, dtype=np.float64):
+def _bound_gui_light_graph(
+    *, rows=3, shared_coordinate=False, same_owner_coordinate=False,
+    dtype=np.float64,
+):
     """Build the exact fixed GUI layout and its bound store without Qt."""
     from xrd_tools.session import (
         Light1DBufferLayout,
@@ -108,7 +111,9 @@ def _bound_gui_light_graph(*, rows=3, shared_coordinate=False, dtype=np.float64)
             Light1DModeLayout(
                 "raw",
                 Light1DBufferLayout(
-                    4, dtype.itemsize, "raw-q", dtype.str,
+                    4, dtype.itemsize,
+                    "per-row-q" if same_owner_coordinate else "raw-q",
+                    dtype.str,
                     shared=shared_coordinate,
                 ),
                 Light1DBufferLayout(4, dtype.itemsize, "raw-i", dtype.str),
@@ -117,7 +122,9 @@ def _bound_gui_light_graph(*, rows=3, shared_coordinate=False, dtype=np.float64)
             Light1DModeLayout(
                 "bg",
                 Light1DBufferLayout(
-                    4, dtype.itemsize, "bg-q", dtype.str,
+                    4, dtype.itemsize,
+                    "per-row-q" if same_owner_coordinate else "bg-q",
+                    dtype.str,
                     shared=shared_coordinate,
                 ),
                 Light1DBufferLayout(4, dtype.itemsize, "bg-i", dtype.str),
@@ -159,17 +166,26 @@ def _bound_gui_light_graph(*, rows=3, shared_coordinate=False, dtype=np.float64)
         add_bg_uncertainty=False,
         raw_ref=None,
         heavy=True,
+        reverse_bg_coordinate=False,
     ):
         use_dtype = np.dtype(array_dtype or dtype)
+        raw_coordinate = np.linspace(
+            0.1, 0.4, array_length, dtype=use_dtype,
+        )
+        bg_coordinate = (
+            raw_coordinate[::-1] if reverse_bg_coordinate else raw_coordinate
+        ) if same_owner_coordinate else np.linspace(
+            0.2, 0.5, array_length, dtype=use_dtype,
+        )
         mode_arrays = {
             "raw": (
-                np.linspace(0.1, 0.4, array_length, dtype=use_dtype),
+                raw_coordinate,
                 np.full(array_length, float(label) + 1.0, dtype=use_dtype),
                 None if omit_raw_uncertainty else np.full(
                     array_length, 0.5, dtype=use_dtype),
             ),
             "bg": (
-                np.linspace(0.2, 0.5, array_length, dtype=use_dtype),
+                bg_coordinate,
                 np.full(array_length, float(label) + 2.0, dtype=use_dtype),
                 (np.full(array_length, 0.25, dtype=use_dtype)
                  if add_bg_uncertainty else None),
@@ -2643,68 +2659,69 @@ def test_gui_light_1d_pair_refuses_identity_authority_mismatches_atomically():
     finally:
         store.allocation = allocation
 
-    def deep_invalid(label):
-        candidate, light = build(label)
-        coordinate = np.arange(4.0)
-        raw_view = candidate.record.results_1d["raw"]
-        raw_view = replace(
-            raw_view,
-            axis_1d=replace(raw_view.axis_1d, values=coordinate),
-            intensity_1d=coordinate,
-        )
-        return (
-            replace(candidate, record=replace(
-                candidate.record,
-                results_1d={**candidate.record.results_1d, "raw": raw_view},
-            )),
-            replace(light, modes={
-                **light.modes,
-                "raw": replace(
-                    light.modes["raw"],
-                    coordinate=coordinate,
-                    intensity=coordinate,
-                ),
-            }),
-        )
-
-    with pytest.raises(ValueError):
-        store.publish_gui_light_1d(*deep_invalid(0))
-    assert store.labels() == prior_labels
-    assert store._items[0] is prior_base
-    assert store._light_1d_items[0] is prior_pair
-    assert prior_pair.guard is prior_guard and not prior_guard.closed
-    assert lease.keys() == prior_keys
-    assert store.generation == prior_generation
-    assert tuple(store._heavy_labels) == prior_heavy
-    assert tuple(store._thumb_labels) == prior_thumbs
-
-    full_store, full_lease, _a, _r, full_build = _bound_gui_light_graph(rows=1)
-    full_store.publish_gui_light_1d(*full_build(0))
-    victim_base = full_store._items[0]
-    victim_pair = full_store._light_1d_items[0]
-    victim_guard = victim_pair.guard
-    bad, bad_light = full_build(1)
-    shared = np.arange(4.0)
-    bad_raw = replace(
-        bad.record.results_1d["raw"],
-        axis_1d=replace(bad.record.results_1d["raw"].axis_1d, values=shared),
-        intensity_1d=shared,
-    )
-    bad = replace(bad, record=replace(
-        bad.record, results_1d={**bad.record.results_1d, "raw": bad_raw},
-    ))
-    bad_light = replace(bad_light, modes={
-        **bad_light.modes,
-        "raw": replace(bad_light.modes["raw"],
-                       coordinate=shared, intensity=shared),
-    })
-    with pytest.raises(ValueError):
-        full_store.publish_gui_light_1d(bad, bad_light)
-    assert full_store.labels() == (0,)
-    assert full_store._items[0] is victim_base
-    assert full_store._light_1d_items[0] is victim_pair
-    assert victim_pair.guard is victim_guard and not victim_guard.closed
-    assert full_lease.keys() == (0,)
+    failures = []
+    for same_owner in (False, True):
+        for candidate_label in (0, 1):
+            graph = _bound_gui_light_graph(
+                rows=1, same_owner_coordinate=same_owner,
+            )
+            case_store, case_lease, _a, case_authority, case_build = graph
+            case_store.publish_gui_light_1d(*case_build(0))
+            case_base = case_store._items[0]
+            case_pair = case_store._light_1d_items[0]
+            case_guard = case_pair.guard
+            before = (
+                case_store.labels(), case_lease.keys(), case_store.generation,
+                tuple(case_store._heavy_labels), tuple(case_store._thumb_labels),
+                case_lease.owned_buffer_ids,
+                case_lease.unique_owned_ndarray_bytes,
+                case_authority.snapshot(),
+            )
+            bad, bad_light = case_build(
+                candidate_label, reverse_bg_coordinate=same_owner,
+            )
+            if not same_owner:
+                shared = np.arange(4.0)
+                raw_view = replace(
+                    bad.record.results_1d["raw"],
+                    axis_1d=replace(
+                        bad.record.results_1d["raw"].axis_1d, values=shared,
+                    ),
+                    intensity_1d=shared,
+                )
+                bad = replace(bad, record=replace(
+                    bad.record,
+                    results_1d={**bad.record.results_1d, "raw": raw_view},
+                ))
+                bad_light = replace(bad_light, modes={
+                    **bad_light.modes,
+                    "raw": replace(
+                        bad_light.modes["raw"],
+                        coordinate=shared, intensity=shared,
+                    ),
+                })
+            try:
+                case_store.publish_gui_light_1d(bad, bad_light)
+            except ValueError:
+                pass
+            else:
+                failures.append((same_owner, candidate_label, "no refusal"))
+            after = (
+                case_store.labels(), case_lease.keys(), case_store.generation,
+                tuple(case_store._heavy_labels), tuple(case_store._thumb_labels),
+                case_lease.owned_buffer_ids,
+                case_lease.unique_owned_ndarray_bytes,
+                case_authority.snapshot(),
+            )
+            if not (
+                after == before
+                and case_store._items.get(0) is case_base
+                and case_store._light_1d_items.get(0) is case_pair
+                and case_pair.guard is case_guard
+                and not case_guard.closed
+            ):
+                failures.append((same_owner, candidate_label, "state changed"))
+    assert not failures, failures
 
 
 def test_gui_light_1d_pair_refuses_unsupported_layouts_atomically():
@@ -3099,53 +3116,277 @@ def test_bound_terminal_removals_close_exact_light_pairs(monkeypatch):
     monkeypatch.setattr(Light1DRetentionLease, "retire", prior_retire)
 
 
-def test_gui_light_1d_escaped_alias_reconciles_without_regrant_then_retries():
-    from xrd_tools.session import Light1DUnavailable
+def test_gui_light_1d_escaped_alias_reconciles_without_regrant_then_retries(
+    monkeypatch,
+):
+    from xrd_tools.session import Light1DRetentionLease, Light1DUnavailable
+    import xrd_tools.session.light_1d_retention as retention_module
+
+    failures = []
+
+    def caught(call):
+        try:
+            return None, call()
+        except BaseException as exc:
+            return exc, None
+
+    def state(store, lease):
+        return (
+            store.labels(), tuple(map(id, store._items.values())),
+            tuple((label, id(pair), id(pair.guard), pair.guard.closed)
+                  for label, pair in store._light_1d_items.items()),
+            lease.keys(), store.generation, tuple(store._heavy_labels),
+            tuple(store._thumb_labels), lease.owned_buffer_ids,
+            lease.unique_owned_ndarray_bytes,
+        )
+
+    def recording_probe(calls, accepted):
+        def probe(label):
+            calls.append(label)
+            return label in accepted
+        return probe
+
+    def tracked(calls, name, method):
+        def wrapper(owner, *args, **kwargs):
+            calls.append(name)
+            return method(owner, *args, **kwargs)
+        return wrapper
 
     store, lease, _allocation, _authority, build = _bound_gui_light_graph(rows=1)
     store.publish_gui_light_1d(*build(0))
     shown = store.get(0)
     alias = shown.view.intensity_1d
     owned_before = lease.unique_owned_ndarray_bytes
+    calls = []
+    with monkeypatch.context() as observed:
+        observed.setattr(
+            Light1DRetentionLease, "retain",
+            tracked(calls, "retain", Light1DRetentionLease.retain),
+        )
+        observed.setattr(
+            Light1DRetentionLease, "_canonicalize_record",
+            tracked(calls, "canonicalize", Light1DRetentionLease._canonicalize_record),
+        )
+        observed.setattr(
+            Light1DRetentionLease, "_private_array_copy",
+            tracked(calls, "copy", Light1DRetentionLease._private_array_copy),
+        )
+        missed = store.publish_gui_light_1d(*build(1))
+        before_retry = tuple(calls), lease.unique_owned_ndarray_bytes
+        del alias, shown
+        gc.collect()
+        retried = store.publish_gui_light_1d(*build(1))
+    if not (
+        not missed.view.has_1d
+        and store.get(0) is None
+        and 0 not in store._light_1d_items
+        and before_retry == ((), owned_before)
+        and calls.count("retain") == 1
+        and retried.view.has_1d
+        and lease.keys() == (1,)
+    ):
+        failures.append(("retired receipt admission", before_retry, calls))
 
-    missed = store.publish_gui_light_1d(*build(1))
-    assert not missed.view.has_1d
-    assert store.get(0) is None
-    assert 0 not in store._light_1d_items
-    assert 1 not in store._light_1d_items
-    assert lease.keys() == ()
-    assert lease.unique_owned_ndarray_bytes == owned_before
+    store, lease, _a, _r, build = _bound_gui_light_graph(rows=2)
+    probe_calls = []
+    store.set_evictable_probe(recording_probe(probe_calls, set()))
+    store.upsert(_without_1d(build(2)[0]))
+    store.publish_gui_light_1d(*build(0))
+    store.upsert(_without_1d(build(3)[0]))
+    client = lease.borrow(0)
+    before = state(store, lease)
+    probe_calls.clear()
+    store.set_evictable_probe(recording_probe(probe_calls, {2, 0}))
+    error, _ = caught(lambda: store.publish_gui_light_1d(*build(1)))
+    if not (
+        isinstance(error, Light1DUnavailable)
+        and state(store, lease) == before
+        and probe_calls == [2, 0]
+        and all(probe_calls.count(label) == 1 for label in set(probe_calls))
+    ):
+        failures.append(("unpaired then borrowed victim", probe_calls))
+    client.close()
 
-    del alias, shown, missed
-    gc.collect()
-    retried = store.publish_gui_light_1d(*build(1))
-    assert retried.view.has_1d
-    assert lease.keys() == (1,)
-    assert tuple(store._light_1d_items) == (1,)
+    store, lease, _a, _r, build = _bound_gui_light_graph(rows=3)
+    store.set_evictable_probe(lambda _label: False)
+    store.publish_gui_light_1d(*build(0))
+    store.publish_gui_light_1d(*build(1))
+    store.upsert(_without_1d(build(2)[0]))
+    store.upsert(_without_1d(build(3)[0]))
+    client = lease.borrow(1)
+    before = state(store, lease)
+    probe_calls = []
+    store.set_evictable_probe(recording_probe(probe_calls, {0, 1}))
+    error, _ = caught(lambda: store.publish_gui_light_1d(*build(4)))
+    if not (
+        isinstance(error, Light1DUnavailable)
+        and state(store, lease) == before
+        and probe_calls == [0, 1]
+    ):
+        failures.append(("multiple paired victims", probe_calls))
+    client.close()
 
-    store, lease, _allocation, _authority, build = _bound_gui_light_graph(rows=2)
+    store, lease, _a, _r, build = _bound_gui_light_graph(rows=3)
+    store.set_evictable_probe(lambda _label: False)
     store.publish_gui_light_1d(*build(0))
     store.upsert(_without_1d(build(2)[0]))
-    client = lease.borrow(0)
-    before_pair = store._light_1d_items[0]
-    before = (
-        store.labels(), tuple(map(id, store._items.values())), before_pair,
-        before_pair.guard, lease.keys(), store.generation,
-        tuple(store._heavy_labels), tuple(store._thumb_labels),
-    )
-    with pytest.raises(Light1DUnavailable):
-        store.publish_gui_light_1d(*build(1))
-    assert tuple(store._light_1d_items) == (0,)
-    assert (
-        store.labels(), tuple(map(id, store._items.values())),
-        store._light_1d_items[0], store._light_1d_items[0].guard,
-        lease.keys(), store.generation,
-        tuple(store._heavy_labels), tuple(store._thumb_labels),
-    ) == before
-    assert not before_pair.guard.closed
-    assert 1 not in store._items and 1 not in store._light_1d_items
-    assert client is not None
-    client.close()
+    store.upsert(_without_1d(build(3)[0]))
+    before = state(store, lease)
+    probe_calls = []
+    store.set_evictable_probe(recording_probe(probe_calls, {1}))
+    error, result = caught(lambda: store.publish_gui_light_1d(*build(1)))
+    if not (
+        isinstance(error, Light1DUnavailable)
+        and result is None and state(store, lease) == before
+        and probe_calls == [0, 2, 3, 1]
+        and 1 not in store._items and 1 not in store._light_1d_items
+    ):
+        failures.append(("incoming selected", probe_calls, error, result))
+
+    store, lease, _a, _r, build = _bound_gui_light_graph(rows=2)
+    store.publish_gui_light_1d(*build(0))
+    store.publish_gui_light_1d(*build(1))
+    preserved = store._light_1d_items[0]
+    probe_calls, preflights, retirements = [], [], []
+    original_preflight = Light1DRetentionLease._preflight_store_record
+    original_retire = Light1DRetentionLease.retire
+
+    def record_preflight(owner, *args, **kwargs):
+        preflights.append(tuple(row for row, _guard in kwargs.get("retiring", ())))
+        return original_preflight(owner, *args, **kwargs)
+
+    def record_retire(owner, row, **kwargs):
+        retirements.append(row)
+        return original_retire(owner, row, **kwargs)
+
+    store.set_evictable_probe(recording_probe(probe_calls, {1}))
+    with monkeypatch.context() as total:
+        total.setattr(Light1DRetentionLease, "_preflight_store_record", record_preflight)
+        total.setattr(Light1DRetentionLease, "retire", record_retire)
+        result = store.publish_gui_light_1d(*build(2))
+    if not (
+        result.view.has_1d and store.labels() == (0, 2)
+        and store._light_1d_items[0] is preserved
+        and probe_calls == [0, 1]
+        and sum(entry.count(1) for entry in preflights) == 1
+        and retirements == [1]
+    ):
+        failures.append(("total victim frees slot", probe_calls, preflights, retirements))
+
+    store, lease, _a, _r, build = _bound_gui_light_graph(rows=2)
+    store.set_evictable_probe(lambda _label: False)
+    store.publish_gui_light_1d(*build(0))
+    store.upsert(_without_1d(build(2)[0]))
+    store.upsert(_without_1d(build(3)[0]))
+    before = state(store, lease)
+    probe_calls = []
+    store.set_evictable_probe(recording_probe(probe_calls, {0}))
+    error, result = caught(lambda: store.publish_gui_light_1d(*build(0)))
+    if not (
+        isinstance(error, Light1DUnavailable) and result is None
+        and state(store, lease) == before and probe_calls == [2, 3, 0]
+    ):
+        failures.append(("reused incoming selected", probe_calls, error, result))
+
+    store, lease, _a, _r, build = _bound_gui_light_graph(rows=2)
+    store.set_evictable_probe(lambda _label: False)
+    store.publish_gui_light_1d(*build(0))
+    store.publish_gui_light_1d(*build(2))
+    store.upsert(_without_1d(build(3)[0]))
+    pair = store._light_1d_items[0]
+    probe_calls, calls, retirements = [], [], []
+    store.set_evictable_probe(recording_probe(probe_calls, {2}))
+    with monkeypatch.context() as reused:
+        reused.setattr(Light1DRetentionLease, "retain",
+                       tracked(calls, "retain", Light1DRetentionLease.retain))
+        reused.setattr(Light1DRetentionLease, "_canonicalize_record",
+                       tracked(calls, "canonicalize",
+                               Light1DRetentionLease._canonicalize_record))
+        reused.setattr(Light1DRetentionLease, "_private_array_copy",
+                       tracked(calls, "copy", Light1DRetentionLease._private_array_copy))
+        reused.setattr(Light1DRetentionLease, "retire", record_retire)
+        result = store.publish_gui_light_1d(*build(0))
+    if not (
+        result.view.has_1d and probe_calls == [2] and calls == []
+        and retirements == [2]
+        and store.labels() == (3, 0) and store._light_1d_items[0] is pair
+        and lease.keys() == (0,) and not pair.guard.closed
+    ):
+        failures.append(("reused total victim", probe_calls, calls, retirements, store.labels()))
+
+    store, lease, _a, _r, build = _bound_gui_light_graph(rows=2)
+    store.set_evictable_probe(lambda _label: False)
+    store.upsert(_without_1d(build(2)[0]))
+    store.publish_gui_light_1d(*build(0))
+    store.publish_gui_light_1d(*build(1))
+    store.upsert(_without_1d(build(3)[0]))
+    preserved = store._light_1d_items[1]
+    probe_calls, preflights, retirements = [], [], []
+    store.set_evictable_probe(recording_probe(probe_calls, {2, 0, 3}))
+    with monkeypatch.context() as deduplicated:
+        deduplicated.setattr(
+            Light1DRetentionLease, "_preflight_store_record", record_preflight,
+        )
+        deduplicated.setattr(Light1DRetentionLease, "retire", record_retire)
+        result = store.publish_gui_light_1d(*build(4))
+    if not (
+        result.view.has_1d and store._light_1d_items[1] is preserved
+        and probe_calls == [2, 0, 1, 3]
+        and sum(entry.count(0) for entry in preflights) == 1
+        and retirements.count(0) == 1
+    ):
+        failures.append(("deduplicated capacity victim", probe_calls,
+                         preflights, retirements))
+
+    store, lease, _a, _r, build = _bound_gui_light_graph(rows=1)
+    store.publish_gui_light_1d(*build(0))
+    markers = []
+    fatal = MemoryError("injected GUI canonical freeze fault")
+    original_publish = PublicationStore.publish_gui_light_1d
+    original_preflight = Light1DRetentionLease._preflight_store_record
+    original_freeze = retention_module._freeze_array
+
+    def mark_publish(owner, *args, **kwargs):
+        markers.append("store")
+        return original_publish(owner, *args, **kwargs)
+
+    def mark_preflight(owner, *args, **kwargs):
+        commit = kwargs.get("commit")
+        if commit is not None:
+            def marked_commit(retain_candidate):
+                def marked_retain_candidate():
+                    markers.append("retain_candidate")
+                    return retain_candidate()
+                return commit(marked_retain_candidate)
+            kwargs["commit"] = marked_commit
+        return original_preflight(owner, *args, **kwargs)
+
+    def fail_canonical_freeze(array):
+        original_freeze(array)
+        if type(array) is memoryview:
+            markers.append("freeze")
+            raise fatal
+
+    with monkeypatch.context() as seam:
+        seam.setattr(PublicationStore, "publish_gui_light_1d", mark_publish)
+        seam.setattr(Light1DRetentionLease, "_preflight_store_record", mark_preflight)
+        seam.setattr(Light1DRetentionLease, "retain",
+                     tracked(markers, "retain", Light1DRetentionLease.retain))
+        seam.setattr(Light1DRetentionLease, "_canonicalize_record",
+                     tracked(markers, "canonicalize",
+                             Light1DRetentionLease._canonicalize_record))
+        seam.setattr(Light1DRetentionLease, "_private_array_copy",
+                     tracked(markers, "copy",
+                             Light1DRetentionLease._private_array_copy))
+        seam.setattr(retention_module, "_freeze_array", fail_canonical_freeze)
+        error, _ = caught(lambda: store.publish_gui_light_1d(*build(1)))
+    expected = ("store", "retain_candidate", "retain", "canonicalize", "copy", "freeze")
+    if error is not fatal or tuple(markers[:len(expected)]) != expected:
+        failures.append(("GUI production seam", markers, error))
+    hooks = store.light_1d_cleanup_hooks(lease)
+    store.clear()
+    lease.release(reason="terminal", hooks=hooks)
+    assert not failures, failures
 
 
 def test_bound_reintegrate_refuses_before_any_mutation():

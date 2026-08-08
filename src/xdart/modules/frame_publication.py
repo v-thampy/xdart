@@ -784,7 +784,7 @@ class PublicationStore:
 
     def publish_light_1d(self, record, *, source_identity: str):
         """Retain a heterogeneous row behind an array-free scalar shell."""
-        from xrd_tools.session import Light1DStaleGeneration
+        from xrd_tools.session import Light1DStaleGeneration, Light1DUnavailable
 
         with self._lock:
             lease = self._light_1d
@@ -793,48 +793,52 @@ class PublicationStore:
             if int(record.generation) != int(lease.generation):
                 raise Light1DStaleGeneration("light-1D publication generation is stale")
             label = record.row_identity
-            if label in self._light_1d_items:
-                self._retire_light_pair_locked(label)
-            if label not in lease.keys() and len(lease.keys()) >= lease.row_cap:
-                oldest = lease.keys()[0]
+            keys = lease.keys()
+            victims = [label] if label in self._light_1d_items else []
+            if label not in keys and keys and len(keys) >= lease.row_cap:
+                oldest = keys[0]
                 if oldest not in self._light_1d_items:
-                    raise RuntimeError(
-                        "light-1D lease residency lost its publication shell: "
-                        f"oldest={oldest!r}, publications="
-                        f"{tuple(self._light_1d_items)!r}"
-                    )
-                self._retire_light_pair_locked(oldest)
-            lease.retain(
-                record,
-                grant_id=lease.grant_id,
-                generation=lease.generation,
-            )
-            shell = Light1DPublicationShell(
-                label=label,
-                generation=lease.generation,
-                source_identity=str(source_identity),
-            )
-            guard = lease.borrow(label)
-            if guard is None:
-                raise RuntimeError("retained light-1D row has no private guard")
-            self._light_1d_items[label] = _Light1DPair(
-                shell, self._generation, None, record.active_mode, (), guard,
-            )
-            return shell
+                    raise RuntimeError(f"light-1D resident {oldest!r} has no publication shell")
+                victims.append(oldest)
+            retiring = tuple((victim, self._light_1d_items[victim].guard)
+                             for victim in victims)
+
+            def commit(retain_candidate):
+                for victim, guard in retiring:
+                    self._retire_light_pair_locked(victim, qualified_guard=guard)
+                try:
+                    retain_candidate()
+                except Light1DUnavailable as exc:
+                    return exc
+                shell = Light1DPublicationShell(label, lease.generation, str(source_identity))
+                guard = lease.borrow(label)
+                if guard is None:
+                    raise RuntimeError("retained light-1D row has no private guard")
+                self._light_1d_items[label] = _Light1DPair(
+                    shell, self._generation, None, record.active_mode, (), guard,
+                )
+                return shell
+
+            outcome = lease._preflight_store_record(record=record, retiring=retiring, commit=commit)
+            if isinstance(outcome, Light1DUnavailable): raise outcome
+            return outcome
 
     def get_light_1d_shell(self, label: int | str):
         with self._lock:
             pair = self._light_1d_items.get(label)
             return None if pair is None else pair.shell
 
-    def _retire_light_pair_locked(self, label: int | str) -> bool:
+    def _retire_light_pair_locked(self, label: int | str, *, qualified_guard=None) -> bool:
         pair = self._light_1d_items.get(label)
         if pair is None:
             return False
         lease = self._light_1d
         if lease is None:
             raise RuntimeError("light-1D pair has no bound lease")
-        lease._preflight_store_record(retiring=((label, pair.guard),))
+        if qualified_guard is None:
+            lease._preflight_store_record(retiring=((label, pair.guard),))
+        elif pair.guard is not qualified_guard:
+            raise RuntimeError("qualified light-1D pair guard changed")
         pair.guard.close()
         try:
             retired = lease.retire(
@@ -1015,7 +1019,16 @@ class PublicationStore:
         except (KeyError, ValueError, TypeError):
             return False
 
-    def _install_base_locked(self, publication: FramePublication) -> None:
+    def _project_total_victims_locked(self, label: int | str) -> tuple:
+        order = tuple(key for key in self._items if key != label) + (label,)
+        over = 0 if self._max_items is None else max(0, len(order) - self._max_items)
+        victims = []
+        for candidate in order:
+            if len(victims) == over: break
+            if self._label_evictable_locked(candidate): victims.append(candidate)
+        return tuple(victims)
+
+    def _install_base_locked(self, publication: FramePublication, *, enforce_total=True) -> None:
         label = publication.label
         self._items.pop(label, None)
         self._drop_heavy_label_locked(label)
@@ -1025,7 +1038,7 @@ class PublicationStore:
             self._heavy_labels.append(label)
         if publication.view.thumbnail is not None:
             self._thumb_labels.append(label)
-        self._enforce_bounds_locked()
+        self._enforce_bounds_locked(enforce_total=enforce_total)
 
     def publish_gui_light_1d(self, publication, light_record):
         from xrd_tools.session import Light1DUnavailable
@@ -1037,8 +1050,8 @@ class PublicationStore:
             lease = self._light_1d
             label = publication.label
             base = _without_1d_arrays(publication)
-            lease._preflight_store_record(light_record)
             prior = self._light_1d_items.get(label)
+            reuse_pair = False
             if prior is not None:
                 identity = (
                     prior.store_generation == self._generation
@@ -1048,58 +1061,46 @@ class PublicationStore:
                     and prior.modes == templates
                 )
                 if identity and self._pair_values_match(prior, light_record):
-                    self._install_base_locked(base)
-                    return self._compose_locked(label, base)
-                if identity:
-                    self._retire_light_pair_locked(label)
-                else:
+                    reuse_pair = True
+                elif not identity:
                     raise ValueError("GUI light-1D pair identity changed")
+            total_victims = self._project_total_victims_locked(label)
+            if label in total_victims: raise Light1DUnavailable("incoming GUI publication is pinned")
             keys = lease.keys()
-            if label not in keys and keys and len(keys) >= lease.row_cap:
-                victim = keys[0]
-                if victim not in self._light_1d_items:
-                    raise RuntimeError("light-1D victim has no store pair")
-                self._retire_light_pair_locked(victim)
-                self._items.pop(victim, None)
-                self._drop_heavy_label_locked(victim)
-                self._drop_thumb_label_locked(victim)
-            try:
-                lease.retain(
-                    light_record,
-                    grant_id=lease.grant_id,
-                    generation=lease.generation,
-                )
-            except Light1DUnavailable:
-                try:
-                    self._install_base_locked(base)
-                except BaseException:
-                    self._items.pop(label, None)
-                    self._drop_heavy_label_locked(label)
-                    self._drop_thumb_label_locked(label)
-                    raise
-                return base
-            guard = lease.borrow(label)
-            if guard is None:
-                lease.retire(
-                    label, grant_id=lease.grant_id, generation=lease.generation,
-                )
-                raise RuntimeError("retained GUI light-1D row has no guard")
-            shell = Light1DPublicationShell(
-                label, lease.generation, publication.source_identity,
-            )
-            self._light_1d_items[label] = _Light1DPair(
-                shell, self._generation, publication.scan_key,
-                light_record.active_mode, templates, guard,
-            )
-            try:
-                self._install_base_locked(base)
-            except BaseException:
-                self._retire_light_pair_locked(label)
-                self._items.pop(label, None)
-                self._drop_heavy_label_locked(label)
-                self._drop_thumb_label_locked(label)
-                raise
-            return self._compose_locked(label, self._items.get(label))
+            victims = list(dict.fromkeys((() if reuse_pair else ((label,) if prior else ())) + total_victims))
+            if not reuse_pair and label not in keys and len(keys) >= lease.row_cap > 0 and not any(victim in keys for victim in victims):
+                victims.append(keys[0])
+            retiring = tuple((victim, getattr(self._light_1d_items.get(victim), "guard", None))
+                             for victim in victims if victim in keys or victim in self._light_1d_items)
+            def commit(retain_candidate):
+                for victim in victims:
+                    pair = self._light_1d_items.get(victim)
+                    if pair is not None:
+                        self._retire_light_pair_locked(victim, qualified_guard=pair.guard)
+                    if victim != label:
+                        self._items.pop(victim, None)
+                        self._drop_heavy_label_locked(victim)
+                        self._drop_thumb_label_locked(victim)
+                if not reuse_pair:
+                    try:
+                        retain_candidate()
+                    except Light1DUnavailable:
+                        pass
+                    else:
+                        guard = lease.borrow(label)
+                        if guard is None:
+                            lease.retire(label, grant_id=lease.grant_id, generation=lease.generation)
+                            raise RuntimeError("retained GUI light-1D row has no guard")
+                        self._light_1d_items[label] = _Light1DPair(
+                            Light1DPublicationShell(label, lease.generation,
+                                                    publication.source_identity),
+                            self._generation, publication.scan_key,
+                            light_record.active_mode, templates, guard,
+                        )
+                self._install_base_locked(base, enforce_total=False)
+                return self._compose_locked(label, self._items.get(label))
+
+            return lease._preflight_store_record(record=light_record, retiring=retiring, commit=commit, needs_retain=not reuse_pair)
 
     def light_1d_cleanup_hooks(
         self, exact_lease, *, cancel=None, drain=None, verify=None, release=None,
@@ -1678,8 +1679,8 @@ class PublicationStore:
         except Exception:
             return False
 
-    def _enforce_bounds_locked(self) -> None:
-        if self._max_items is not None:
+    def _enforce_bounds_locked(self, *, enforce_total=True) -> None:
+        if enforce_total and self._max_items is not None:
             probe = self._evictable
             if probe is None:
                 while len(self._items) > self._max_items:

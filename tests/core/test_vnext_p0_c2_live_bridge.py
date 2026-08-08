@@ -2859,7 +2859,9 @@ def test_c2_final_sweep_and_terminal_event_wait_for_settlement(
     assert len(states) == 1
 
 
-def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
+def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant(
+    monkeypatch,
+):
     from dataclasses import fields, is_dataclass
     from collections.abc import Mapping
     from xdart.modules.frame_publication import PublicationStore
@@ -2870,7 +2872,9 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
         Light1DModeData,
         Light1DModeLayout,
         Light1DRecord,
+        Light1DRetentionLease,
         Light1DStaleGeneration,
+        Light1DUnavailable,
         SessionResourceAuthority,
         SessionResourceRequirements,
         acquire_light_1d_retention,
@@ -2966,24 +2970,67 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
 
     axis = np.linspace(0.0, 1.0, 4, dtype=np.float64)
 
-    def record(label, generation=7):
+    def record(
+        label, generation=7, *, cross_owner_alias=False, changed_axis=False,
+    ):
+        coordinate = axis + 1.0 if changed_axis else axis
+        intensity = np.full(4, label + 1, dtype=np.float64)
         return Light1DRecord(
             row_identity=label,
             generation=generation,
             active_mode="bg",
             modes={
                 "raw": Light1DModeData(
-                    axis,
-                    np.full(4, label + 1, dtype=np.float64),
-                    np.full(4, label / 10, dtype=np.float64),
+                    coordinate,
+                    intensity,
+                    (intensity if cross_owner_alias else
+                     np.full(4, label / 10, dtype=np.float64)),
                 ),
                 "bg": Light1DModeData(
-                    axis,
+                    coordinate,
                     np.full(4, label + 2, dtype=np.float32),
                 ),
             },
             provenance={"source": "scan.nxs", "logical": label},
         )
+
+    failures = []
+
+    def caught(call):
+        try:
+            call()
+        except BaseException as exc:
+            return exc
+        return None
+
+    def worker_token(row):
+        tokens = []
+        worker = threading.Thread(target=lambda: tokens.append(
+            lease.issue_hydration_token(row)))
+        worker.start()
+        worker.join()
+        return tokens[0]
+
+    canonicalized = []
+    original_canonicalize = Light1DRetentionLease._canonicalize_record
+
+    def count_canonicalize(owner, candidate):
+        canonicalized.append(candidate.row_identity)
+        return original_canonicalize(owner, candidate)
+
+    monkeypatch.setattr(
+        Light1DRetentionLease, "_canonicalize_record", count_canonicalize,
+    )
+    initializer = worker_token("shared-initializer")
+    before_calls = len(canonicalized)
+    error = caught(lambda: store.publish_light_1d(
+        record(0), source_identity="scan.nxs#0",
+    ))
+    if not (isinstance(error, Light1DUnavailable)
+            and len(canonicalized) == before_calls
+            and store.get_light_1d_shell(0) is None and lease.keys() == ()):
+        failures.append("shared initializer was not a no-copy preflight refusal")
+    lease.abandon_hydration(initializer)
 
     first = store.publish_light_1d(record(0), source_identity="scan.nxs#0")
     assert not hasattr(first, "borrow")
@@ -3027,12 +3074,137 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
         store.publish_light_1d(record(2, generation=6), source_identity="stale")
     assert store.get_light_1d_shell(1) is second
 
-    del first, second
+    for name, candidate, alias, changed in (
+        ("same-row alias", 1, True, False),
+        ("capacity alias", 2, True, False),
+        ("same-row shared values", 1, False, True),
+        ("capacity shared values", 2, False, True),
+    ):
+        shell, pair = store.get_light_1d_shell(1), store._light_1d_items[1]
+        before = (shell, pair, pair.guard, pair.guard.closed, lease.keys(),
+                  lease.owned_buffer_ids, lease.unique_owned_ndarray_bytes,
+                  authority.snapshot())
+        before_calls = len(canonicalized)
+        error = caught(lambda: store.publish_light_1d(
+            record(candidate, cross_owner_alias=alias, changed_axis=changed),
+            source_identity=f"scan.nxs#{candidate}",
+        ))
+        after = (store.get_light_1d_shell(1), store._light_1d_items.get(1),
+                 pair.guard, pair.guard.closed, lease.keys(),
+                 lease.owned_buffer_ids, lease.unique_owned_ndarray_bytes,
+                 authority.snapshot())
+        if not (isinstance(error, ValueError) and after == before
+                and len(canonicalized) == before_calls):
+            failures.append(f"{name} changed the established row")
+        if store.get_light_1d_shell(1) is not shell:
+            store.publish_light_1d(record(1), source_identity="scan.nxs#1")
+
+    import xrd_tools.session.light_1d_retention as retention_module
+
+    markers = ["store"]
+    fatal = MemoryError("injected canonical freeze fault")
+    original_preflight = Light1DRetentionLease._preflight_store_record
+    original_freeze = retention_module._freeze_array
+
+    def marked(name, method):
+        def call(owner, *args, **kwargs):
+            markers.append(name)
+            return method(owner, *args, **kwargs)
+        return call
+
+    def mark_preflight(owner, *args, **kwargs):
+        commit = kwargs.get("commit")
+        if commit is not None:
+            def marked_commit(retain_candidate):
+                def marked_retain_candidate():
+                    markers.append("retain_candidate")
+                    return retain_candidate()
+                return commit(marked_retain_candidate)
+            kwargs["commit"] = marked_commit
+        return original_preflight(owner, *args, **kwargs)
+
+    def fail_canonical_freeze(array):
+        original_freeze(array)
+        if type(array) is memoryview:
+            markers.append("freeze")
+            raise fatal
+
+    with monkeypatch.context() as seam:
+        seam.setattr(Light1DRetentionLease, "_preflight_store_record", mark_preflight)
+        seam.setattr(Light1DRetentionLease, "retain",
+                     marked("retain", Light1DRetentionLease.retain))
+        seam.setattr(Light1DRetentionLease, "_canonicalize_record",
+                     marked("canonicalize", count_canonicalize))
+        seam.setattr(Light1DRetentionLease, "_private_array_copy",
+                     marked("copy", Light1DRetentionLease._private_array_copy))
+        seam.setattr(retention_module, "_freeze_array", fail_canonical_freeze)
+        error = caught(lambda: store.publish_light_1d(
+            record(2), source_identity="scan.nxs#2",
+        ))
+    expected = (
+        "store", "retain_candidate", "retain", "canonicalize", "copy", "freeze",
+    )
+    if error is not fatal or tuple(markers[:len(expected)]) != expected:
+        failures.append(("low-level production seam", markers, type(error)))
+
+    class FatalFence(BaseException):
+        pass
+
+    class Fence:
+        writeable = False
+
+        def __init__(self, stage, failure):
+            self.stage = stage
+            self.failure = failure
+
+        def setflags(self, *, write):
+            assert write is False
+            if self.stage == "setter":
+                raise self.failure
+
+        @property
+        def flags(self):
+            if self.stage == "flags":
+                raise self.failure
+            return self
+
+    for stage, fault, message, is_fatal in (
+        ("setter", MemoryError("setter fatal"),
+         "light-1D array write fence failed", True),
+        ("flags", FatalFence("flags fatal"),
+         "light-1D array write fence cannot be observed", True),
+        ("setter", RuntimeError("setter ordinary"),
+         "light-1D array write fence failed", False),
+        ("flags", RuntimeError("flags ordinary"),
+         "light-1D array write fence cannot be observed", False),
+    ):
+        observed = caught(lambda: original_freeze(Fence(stage, fault)))
+        valid = observed is fault if is_fatal else (
+            type(observed) is ValueError
+            and str(observed) == message
+            and observed.__cause__ is fault
+        )
+        if not valid:
+            failures.append(("freeze classification", stage, type(fault), observed))
+
+    fatal.__traceback__ = None
+    del first, second, shell, pair, before, after, fatal
     hooks = store.light_1d_cleanup_hooks(lease)
     store.clear()
     assert store.allocation is allocation
     assert store._light_1d is lease
     assert lease.keys() == ()
+    pending = worker_token(2)
+    before_calls = len(canonicalized)
+    error = caught(lambda: store.publish_light_1d(
+        record(2), source_identity="scan.nxs#2",
+    ))
+    if not (isinstance(error, Light1DUnavailable)
+            and len(canonicalized) == before_calls
+            and store.get_light_1d_shell(2) is None and lease.keys() == ()):
+        failures.append("pending candidate hydration was not a no-copy refusal")
+    error.__traceback__ = None
+    lease.abandon_hydration(pending)
     gc.collect()
     lease.release(reason="terminal", hooks=hooks)
     assert store.allocation is None
@@ -3044,6 +3216,7 @@ def test_publication_store_borrows_the_only_light_1d_arrays_and_obeys_grant():
         "publication": frozenset(),
     }
     assert independent_publication_arrays(store, lease) == {}
+    assert not failures, failures
 
 
 def _c2_retry_graph(memory_count, nexus):
