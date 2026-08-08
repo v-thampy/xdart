@@ -557,12 +557,14 @@ class ScanSession:
             raise
         self._event_sink = event_sink
         try:
-            if (dynamic_accounting is not None
-                    and self._dynamic_nexus_sink is not None
-                    and type(self._dynamic_nexus_sink.same_run_intent) is AppendIntent):
-                self._dynamic_extend_live = self._dynamic_nexus_sink.extend_live
-                self._dynamic_extension_owner = self._dynamic_nexus_sink.extension_owner
-                self._dynamic_current_intent = self._dynamic_nexus_sink.same_run_intent
+            if dynamic_accounting is not None and self._dynamic_nexus_sink is not None:
+                capability = self._dynamic_nexus_sink._live_extension_capability()
+                if capability is not None:
+                    (
+                        self._dynamic_extend_live,
+                        self._dynamic_extension_owner,
+                        self._dynamic_current_intent,
+                    ) = capability
             if dynamic_accounting is not None:
                 self._dynamic_boundary.bind_live_session(
                     self, self._dynamic_owner_token,

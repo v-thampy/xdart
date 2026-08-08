@@ -1742,6 +1742,196 @@ def test_c2_attempt_integer_bijection_is_exact_across_same_label_retry(tmp_path)
     assert accounting.ledger.current_attempt(0) == 2
 
 
+def test_dynamic_existing_target_append_extends_through_public_session_capability(
+    tmp_path, monkeypatch,
+):
+    import json
+
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.io import (
+        AppendDecision, AppendPreflight, AppendRefused,
+        get_output_transaction_coordinator, prepare_append_preflight,
+    )
+    import xrd_tools.io.append as append_module
+    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.reduction import (
+        Frame, FrameReduction, NexusSink, ReductionResult,
+    )
+    import xrd_tools.reduction.core as reduction_core
+
+    target, accounting, live, plan = _dynamic_sink_case(
+        tmp_path, "existing-target-public",
+    )
+    plan.integration_1d.npt = 8
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    source_identity = "c2-public-existing-target"
+    first_intent = append_intent(
+        tmp_path, extent=1, labels=(0,), generation=0,
+        source_identity=source_identity,
+    )
+    seed = NexusSink(
+        target, overwrite=True, atomic=False, flush_every=None,
+        source_base=tmp_path, same_run_intent=first_intent,
+    )
+    seed.begin(Scan("seed", []), plan)
+    seed_value = DeterministicIntegrator().integrate1d(
+        np.ones((2, 2)), plan.integration_1d.npt,
+    )
+    seed.write(
+        ScanFrame(0),
+        FrameReduction(0, result_1d=IntegrationResult1D(
+            seed_value.radial, seed_value.intensity, seed_value.sigma,
+            seed_value.unit,
+        )),
+    )
+    seed.finish(ReductionResult("seed", {}, 1))
+
+    second_intent = append_intent(
+        tmp_path, extent=2, labels=(0, 1), generation=0,
+        source_identity=source_identity,
+    )
+    preflight = prepare_append_preflight(target, second_intent)
+    live.idx = 1
+    key1, token1 = _armed_submission(
+        accounting, label=1, revision=1, logical=1,
+    )
+    nexus = NexusSink(
+        target, atomic=False, flush_every=None, source_base=tmp_path,
+        append_preflight=preflight,
+    )
+    session = open_live_scan_session(
+        (live,), plan, sink=nexus, accounting=accounting, executor=1,
+        nexus_target=target_name,
+    )
+    assert session.submit(session.scan.frames[0], attempt_token=token1)
+    session.commit_epoch()
+    assert _rows(target) == (0, 1)
+
+    effects = {
+        "prepare": 0, "qualify": 0, "admit": 0,
+        "lease": 0, "open": 0, "stat": 0,
+    }
+    extend_calls = []
+    coordinator = get_output_transaction_coordinator()
+    original_prepare = append_module.prepare_append_preflight
+    original_qualify = append_module.qualify_append
+    original_admit = coordinator.admit
+    original_acquire = OutputTransaction.acquire_lease
+    original_open = reduction_core.open_nexus_writer
+    original_stat = Path.stat
+    original_extend = AppendPreflight.extend
+
+    def counted(name, function):
+        def wrapper(*args, **kwargs):
+            effects[name] += 1
+            return function(*args, **kwargs)
+        return wrapper
+
+    def count_extend(owner, intent):
+        extend_calls.append(intent)
+        return original_extend(owner, intent)
+
+    monkeypatch.setattr(
+        append_module, "prepare_append_preflight",
+        counted("prepare", original_prepare),
+    )
+    monkeypatch.setattr(
+        append_module, "qualify_append", counted("qualify", original_qualify),
+    )
+    monkeypatch.setattr(coordinator, "admit", counted("admit", original_admit))
+    monkeypatch.setattr(
+        OutputTransaction, "acquire_lease", counted("lease", original_acquire),
+    )
+    monkeypatch.setattr(
+        reduction_core, "open_nexus_writer", counted("open", original_open),
+    )
+    monkeypatch.setattr(Path, "stat", counted("stat", original_stat))
+    monkeypatch.setattr(AppendPreflight, "extend", count_extend)
+
+    def extend_without_effects(intent, *, error=None):
+        before = dict(effects)
+        if error is None:
+            value = session.extend_live(intent)
+        else:
+            with pytest.raises(error):
+                session.extend_live(intent)
+            value = None
+        assert effects == before
+        return value
+
+    captured_extend = session._dynamic_extend_live
+    captured_owner = session._dynamic_extension_owner
+    captured_intent = session._dynamic_current_intent
+    current_decision = preflight._decision
+    replay = extend_without_effects(second_intent)
+    assert replay is current_decision
+    assert type(replay) is AppendDecision
+    assert extend_calls == []
+
+    regressed = append_intent(
+        tmp_path, extent=3, labels=(0, 1, 2), generation=0,
+        source_identity=source_identity,
+    )
+    before_snapshot = preflight.snapshot
+    before_bytes = target.read_bytes()
+    before_accounting = accounting.snapshot()
+    before_decision = preflight._decision
+    extend_without_effects(regressed, error=AppendRefused)
+    assert preflight.snapshot == before_snapshot
+    assert target.read_bytes() == before_bytes
+    assert accounting.snapshot() == before_accounting
+    assert preflight._decision is before_decision
+    assert session._dynamic_extend_live is captured_extend
+    assert session._dynamic_extension_owner is captured_owner
+    assert session._dynamic_current_intent is captured_intent
+
+    successor = append_intent(
+        tmp_path, extent=3, labels=(0, 1, 2), generation=1,
+        source_identity=source_identity,
+    )
+    decision = extend_without_effects(successor)
+    assert type(decision) is AppendDecision
+    assert extend_calls.count(successor) == 1
+    assert decision is preflight._decision
+    assert extend_without_effects(successor) is decision
+    assert extend_calls.count(successor) == 1
+    lineage = (
+        nexus, nexus._transaction, nexus._lease,
+        session._dynamic_extension_owner,
+    )
+    key2, token2 = _armed_submission(
+        accounting, label=2, revision=2, logical=2,
+    )
+    opens_before_successor = effects["open"]
+    assert session.submit(
+        Frame(2, image=np.full((2, 2), 2.0)), attempt_token=token2,
+    )
+    session.commit_epoch()
+    assert effects["open"] == opens_before_successor + 1
+    assert nexus is lineage[0]
+    assert nexus._transaction is lineage[1]
+    assert nexus._lease is lineage[2]
+    assert session._dynamic_extension_owner is lineage[3]
+    session.finish()
+
+    assert _rows(target) == (0, 1, 2)
+    assert accounting.snapshot().durable_attempts[(key1, mode, target_name)] is token1
+    assert accounting.snapshot().durable_attempts[(key2, mode, target_name)] is token2
+    with h5py.File(target, "r") as handle:
+        stored = json.loads(
+            handle["entry/reduction/config/append_lineage"][()].decode(),
+        )
+    assert tuple(epoch["source"]["generation"] for epoch in stored["epochs"]) \
+        == (0, 0, 1)
+    assert preflight.snapshot.state.value == "committed"
+    assert nexus._transaction_owners is None
+    assert nexus._extension_owner is None
+    assert nexus._live_extension_capability() is None
+
+
 @pytest.mark.parametrize("composite", (False, True), ids=("direct", "memory-nexus"))
 def test_scan_session_commit_epoch_then_extend_live_reuses_exact_capability(
     tmp_path, monkeypatch, composite,

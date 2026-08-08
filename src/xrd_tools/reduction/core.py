@@ -1234,7 +1234,9 @@ class NexusSink:
             )
             if self.append_preflight is not None:
                 self.append_preflight._set_consumer(self._queue_append_decision)
-            if self.same_run_intent is not None or self.allow_unbound_same_run:
+            if (self.append_preflight is not None
+                    or self.same_run_intent is not None
+                    or self.allow_unbound_same_run):
                 self._extension_owner = OwnerToken("same-run-extension")
         except BaseException as primary:
             try:
@@ -1248,6 +1250,27 @@ class NexusSink:
         if self._extension_owner is None:
             raise RuntimeError("sink has no active same-run extension owner")
         return self._extension_owner
+
+    def _live_extension_capability(self):
+        writer = self._writer
+        if (writer is None or self._transaction_owners is None
+                or self._extension_owner is None
+                or writer.phase.value not in {"active", "finished"}):
+            return None
+        preflight = self.append_preflight
+        if preflight is not None:
+            consumer = preflight._consumer
+            if (preflight._state is not AppendPreflightState.BOUND
+                    or getattr(consumer, "__self__", None) is not self
+                    or getattr(consumer, "__func__", None)
+                    is not type(self)._queue_append_decision):
+                return None
+            intent = preflight._intent
+        elif type(self.same_run_intent) is AppendIntent:
+            intent = self.same_run_intent
+        else:
+            return None
+        return self.extend_live, self.extension_owner, intent
 
     def _queue_append_decision(self, decision) -> None:
         self._pending_append_decision = decision
@@ -1311,12 +1334,23 @@ class NexusSink:
     def extend_live(self, owner, intent: AppendIntent):
         if owner is not self._extension_owner:
             raise RuntimeError("same-run extension requires the exact live owner")
-        prior = self.same_run_intent
+        preflight = self.append_preflight
+        prior = preflight._intent if preflight is not None else self.same_run_intent
         writer = self._writer
         if writer is None or writer.phase.value not in {
             "active", "finished",
         }:
             raise RuntimeError("same-run extension requires one owned writer")
+        if preflight is not None:
+            if intent == prior:
+                return preflight._decision
+            preflight.extend(intent)
+            decision = preflight._decision
+            if self._pending_append_decision is not decision:
+                raise RuntimeError(
+                    "bound Append preflight did not queue its exact decision"
+                )
+            return decision
         if prior is None:
             if not self.allow_unbound_same_run:
                 raise RuntimeError("same-run extension has no bound source owner")
