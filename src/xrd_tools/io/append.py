@@ -160,6 +160,45 @@ class AppendIntent:
             raise ValueError("Append requires a non-empty unique mode tuple")
         _require_contiguous(self.labels, "proposed Append labels")
 
+@dataclass(frozen=True, slots=True)
+class AppendCommittedPrefix:
+    target: str
+    intent: AppendIntent
+    lineage_json: str
+    def __post_init__(self) -> None:
+        if not str(self.target).strip():
+            raise ValueError("committed Append prefix target is required")
+        if type(self.intent) is not AppendIntent:
+            raise TypeError("committed Append prefix requires an exact AppendIntent")
+        lineage = json.loads(str(self.lineage_json))
+        if not isinstance(lineage, dict):
+            raise ValueError("committed Append prefix lineage is not an object")
+        if (lineage.get("version") != LINEAGE_VERSION
+                or lineage.get("state") != "committed"):
+            raise ValueError("committed Append prefix lineage is not committed")
+        labels = _lineage_labels(lineage)
+        epochs = lineage.get("epochs") or ()
+        expected = {
+            "entry": self.intent.entry,
+            "source_base": self.intent.source_base,
+            "source_identity": self.intent.source_identity,
+            "science_fingerprint": self.intent.science_fingerprint,
+            "modes": list(self.intent.modes),
+        }
+        if labels != self.intent.labels or not epochs:
+            raise ValueError("committed Append prefix labels are inconsistent")
+        if any(lineage.get(key) != value for key, value in expected.items()):
+            raise ValueError("committed Append prefix identity is inconsistent")
+        if _source_dict(_source_from_dict(epochs[-1]["source"])) != _source_dict(
+                self.intent.source):
+            raise ValueError("committed Append prefix source is inconsistent")
+        object.__setattr__(self, "target", _normalize(self.target))
+        object.__setattr__(self, "lineage_json", _json(lineage))
+
+    @property
+    def committed_labels(self) -> tuple[int, ...]:
+        return self.intent.labels
+
 @dataclass(frozen=True)
 class AppendDecision:
     disposition: AppendDisposition
@@ -199,8 +238,8 @@ class _AppendPreflightBinding:
 class AppendPreflight:
     __slots__ = (
         "_target", "_intent", "_transaction", "_lease", "_transaction_owner",
-        "_target_owner", "_owners", "_decision", "_file_lock", "_state",
-        "_consumer",
+        "_target_owner", "_owners", "_decision", "_committed_prefix",
+        "_file_lock", "_state", "_consumer",
     )
     def __init__(self, *args, **kwargs) -> None:
         if kwargs.pop("_factory", None) is not _PREFLIGHT_FACTORY:
@@ -208,7 +247,7 @@ class AppendPreflight:
         (
             self._target, self._intent, self._transaction, self._lease,
             self._transaction_owner, self._target_owner, self._owners,
-            self._decision, self._file_lock,
+            self._decision, self._committed_prefix, self._file_lock,
         ) = args
         self._state = AppendPreflightState.RESERVED
         self._consumer: Callable[[AppendDecision], None] | None = None
@@ -296,7 +335,13 @@ class AppendPreflight:
             raise AppendRefused(decision)
         if self._state is AppendPreflightState.RESERVED:
             with (nullcontext() if self._file_lock is None else self._file_lock):
-                decision = qualify_append(self._target, intent)
+                if self._committed_prefix is None:
+                    decision = qualify_append(self._target, intent)
+                else:
+                    decision = qualify_append(
+                        self._target, intent,
+                        committed_prefix=self._committed_prefix,
+                    )
         if decision.disposition is AppendDisposition.REFUSE:
             raise AppendRefused(decision)
         self._intent = intent
@@ -448,6 +493,14 @@ def _source_dict(source: AppendSource) -> dict[str, Any]:
         "external_members": [asdict(member) for member in source.external_members],
         "generation": int(source.generation),
     }
+
+def _source_from_dict(raw_source: Mapping[str, Any]) -> AppendSource:
+    values = dict(raw_source)
+    values["image_members"] = tuple(
+        AppendImageMember(**item) for item in raw_source["image_members"])
+    values["external_members"] = tuple(
+        AppendExternalMember(**item) for item in raw_source["external_members"])
+    return AppendSource(**values)
 
 def _base_lineage(intent: AppendIntent) -> dict[str, Any]:
     return {
@@ -731,12 +784,7 @@ def _lineage_labels(lineage: Mapping[str, Any]) -> tuple[int, ...]:
         if not isinstance(epoch, dict) or not isinstance(epoch.get("source"), dict):
             raise ValueError("Append epoch is malformed")
         raw_source = epoch["source"]
-        source_values = dict(raw_source)
-        source_values["image_members"] = tuple(
-            AppendImageMember(**item) for item in raw_source["image_members"])
-        source_values["external_members"] = tuple(
-            AppendExternalMember(**item) for item in raw_source["external_members"])
-        source = AppendSource(**source_values)
+        source = _source_from_dict(raw_source)
         if _source_dict(source) != raw_source:
             raise ValueError("Append epoch source is not canonical")
         if prior_source is not None:
@@ -751,50 +799,92 @@ def _lineage_labels(lineage: Mapping[str, Any]) -> tuple[int, ...]:
     _require_contiguous(values, "Append lineage labels")
     return values
 
-def qualify_append(target: str | Path, intent: AppendIntent) -> AppendDecision:
+def decode_committed_append_prefix(
+    handle: h5py.File,
+    *,
+    entry: str = "entry",
+) -> AppendCommittedPrefix:
+    if not isinstance(handle, h5py.File) or not handle.id.valid:
+        raise TypeError("committed Append prefix requires an open h5py.File")
+    group = handle.get(entry)
+    if not isinstance(group, h5py.Group):
+        raise ValueError(f"foreign or missing entry {entry!r}")
+    schema_name = str(_decode(group.attrs.get(SCHEMA_NAME_ATTR, "")))
+    schema_version = int(group.attrs.get(SCHEMA_VERSION_ATTR, -1))
+    if schema_name not in ACCEPTED_SCHEMA_NAMES:
+        raise ValueError("foreign processed schema identity")
+    if schema_version != PROCESSED_SCHEMA_VERSION:
+        raise ValueError("foreign processed schema version")
+    stored_base = _normalize_base(str(_decode(group.attrs.get(SOURCE_BASE_ATTR, ""))))
+    lineage = _read_lineage(group)
+    if lineage.get("entry") != entry:
+        raise ValueError("foreign Append entry")
+    if lineage.get("source_base") != stored_base:
+        raise ValueError("wrong source base")
+    modes = lineage.get("modes")
+    if (not isinstance(modes, list) or not modes
+            or any(not isinstance(mode, str) for mode in modes)):
+        raise ValueError("malformed Append modes")
+    epochs = lineage.get("epochs")
+    if not isinstance(epochs, list) or not epochs:
+        raise ValueError("existing target has no committed Append epoch")
+    labels = _lineage_labels(lineage)
+    if _disk_labels(group, tuple(modes)) != labels:
+        raise ValueError("disk rows do not match exact committed lineage")
+    source = _source_from_dict(epochs[-1]["source"])
+    intent = AppendIntent(
+        entry, stored_base, lineage.get("source_identity", ""),
+        lineage.get("science_fingerprint", ""), tuple(modes), source, labels,
+    )
+    return AppendCommittedPrefix(_normalize(handle.filename), intent, _json(lineage))
+
+def qualify_append(
+    target: str | Path,
+    intent: AppendIntent,
+    *,
+    committed_prefix: AppendCommittedPrefix | None = None,
+) -> AppendDecision:
     target = Path(target)
     try:
+        normalized = _normalize(target)
+        if committed_prefix is not None:
+            if type(committed_prefix) is not AppendCommittedPrefix:
+                raise TypeError("committed prefix must be an exact AppendCommittedPrefix")
+            if committed_prefix.target != normalized:
+                raise ValueError("committed Append prefix names a different target")
+            observed = committed_prefix.intent
+            immutable = ("entry", "source_base", "source_identity",
+                         "science_fingerprint", "modes")
+            if any(getattr(observed, key) != getattr(intent, key)
+                   for key in immutable):
+                raise ValueError("committed Append prefix identity changed")
+            if intent.labels[:len(observed.labels)] != observed.labels:
+                raise ValueError("requested labels remap the committed Append prefix")
+            _source_extends(_source_dict(observed.source), _source_dict(intent.source))
         if not target.exists():
+            if committed_prefix is not None:
+                raise ValueError("committed Append prefix target disappeared")
             return begin_same_run_lineage(intent)
 
         with h5py.File(target, "r") as handle:
-            entry = handle.get(intent.entry)
-            if not isinstance(entry, h5py.Group):
-                raise ValueError(f"foreign or missing entry {intent.entry!r}")
-            schema_name = str(_decode(entry.attrs.get(SCHEMA_NAME_ATTR, "")))
-            schema_version = int(entry.attrs.get(SCHEMA_VERSION_ATTR, -1))
-            if schema_name not in ACCEPTED_SCHEMA_NAMES:
-                raise ValueError("foreign processed schema identity")
-            if schema_version != PROCESSED_SCHEMA_VERSION:
-                raise ValueError("foreign processed schema version")
-            stored_base = _normalize_base(
-                str(_decode(entry.attrs.get(SOURCE_BASE_ATTR, ""))))
-            if stored_base != intent.source_base:
-                raise ValueError("wrong source base")
-            labels = _disk_labels(entry, intent.modes)
-            lineage = _read_lineage(entry)
-
-        if int(lineage.get("version", -1)) != LINEAGE_VERSION:
-            raise ValueError("unsupported Append lineage version")
-        if lineage.get("state") != "committed":
-            raise ValueError("pending lineage never authorizes Append")
-        expected = {
-            "entry": intent.entry,
-            "source_base": intent.source_base,
-            "source_identity": intent.source_identity,
-            "science_fingerprint": intent.science_fingerprint,
-            "modes": list(intent.modes),
-        }
-        for key, value in expected.items():
-            if lineage.get(key) != value:
+            current = decode_committed_append_prefix(handle, entry=intent.entry)
+        if committed_prefix is not None:
+            observed_lineage = json.loads(committed_prefix.lineage_json)
+            current_lineage = json.loads(current.lineage_json)
+            observed_epochs = observed_lineage["epochs"]
+            if current.committed_labels[:len(committed_prefix.committed_labels)] \
+                    != committed_prefix.committed_labels:
+                raise ValueError("committed Append labels no longer retain observed prefix")
+            if current_lineage["epochs"][:len(observed_epochs)] != observed_epochs:
+                raise ValueError("committed Append epochs diverged from observed prefix")
+        immutable = ("entry", "source_base", "source_identity",
+                     "science_fingerprint", "modes")
+        for key in immutable:
+            if getattr(current.intent, key) != getattr(intent, key):
                 raise ValueError(f"foreign Append {key}")
-        lineage_labels = _lineage_labels(lineage)
-        if lineage_labels != labels:
-            raise ValueError("disk rows do not match exact committed lineage")
-        epochs = lineage["epochs"]
-        if not epochs:
-            raise ValueError("existing target has no committed Append epoch")
-        prior_source = epochs[-1]["source"]
+        labels = current.committed_labels
+        lineage = json.loads(current.lineage_json)
+        prior_source = _source_dict(current.intent.source)
         current_source = _source_dict(intent.source)
         _source_extends(prior_source, current_source)
         prior_extent = int(prior_source.get("extent", -1))
@@ -840,6 +930,7 @@ def prepare_append_preflight(
     target: str | Path,
     intent: AppendIntent,
     *,
+    committed_prefix: AppendCommittedPrefix | None = None,
     file_lock=None,
     refusal_mapper: Callable[[str, AppendDecision], BaseException] | None = None,
 ) -> AppendPreflight:
@@ -872,7 +963,12 @@ def prepare_append_preflight(
                 target_owner=target_owner,
                 owners=owners,
             )
-            decision = qualify_append(normalized, intent)
+            if committed_prefix is None:
+                decision = qualify_append(normalized, intent)
+            else:
+                decision = qualify_append(
+                    normalized, intent, committed_prefix=committed_prefix,
+                )
             if decision.disposition is AppendDisposition.REFUSE:
                 error = AppendRefused(decision)
                 if refusal_mapper is not None:
@@ -901,7 +997,7 @@ def prepare_append_preflight(
                 )
             owner = AppendPreflight(
                 normalized, intent, transaction, lease, transaction_owner,
-                target_owner, owners, retained, file_lock,
+                target_owner, owners, retained, committed_prefix, file_lock,
                 _factory=_PREFLIGHT_FACTORY,
             )
             owner._state = owner._cleanup_failure_state()
@@ -916,6 +1012,7 @@ def prepare_append_preflight(
         target_owner,
         owners,
         decision,
+        committed_prefix,
         file_lock,
         _factory=_PREFLIGHT_FACTORY,
     )
@@ -980,6 +1077,7 @@ def science_fingerprint(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 __all__ = [
+    "AppendCommittedPrefix",
     "AppendDecision",
     "AppendDisposition",
     "AppendExternalMember",
@@ -996,6 +1094,7 @@ __all__ = [
     "LINEAGE_VERSION",
     "begin_same_run_lineage",
     "commit_append_lineage",
+    "decode_committed_append_prefix",
     "extend_same_run_lineage",
     "prepare_append_preflight",
     "qualify_append",

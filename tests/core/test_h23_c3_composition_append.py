@@ -3353,3 +3353,206 @@ def test_noop_preflight_rechecks_target_before_reporting_terminal(tmp_path):
     with pytest.raises(TargetChanged, match="changed before abandonment"):
         preflight.complete_noop()
     assert preflight.snapshot.state.value == "integrity_hold"
+
+
+def _image_series_intent(tmp_path, count, *, generation):
+    from xrd_tools.io import AppendImageMember, AppendIntent, AppendSource
+
+    members = []
+    for index in range(count):
+        path = tmp_path / f"series-{index:04d}.tif"
+        if not path.exists():
+            path.write_bytes(bytes((index + 1,)) * (index + 3))
+        stat = path.stat()
+        members.append(AppendImageMember(
+            path=str(path), size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+            source_start=index, source_stop=index + 1, ordinal=index,
+        ))
+    return AppendIntent(
+        entry="entry", source_base=str(tmp_path),
+        source_identity="image-series:scan-17", science_fingerprint="science-v1",
+        modes=("1d:default",),
+        source=AppendSource(
+            path=str(tmp_path / "series-0000.tif"),
+            adapter_id="image-series:.tif",
+            size=sum(member.size for member in members),
+            mtime_ns=max(member.mtime_ns for member in members),
+            extent=count, image_members=tuple(members), generation=generation,
+        ),
+        labels=tuple(range(count)),
+    )
+
+
+def _commit_image_series_target(target, intent):
+    module = importlib.import_module("xrd_tools.io.append")
+    decision = module.qualify_append(target, intent)
+    assert decision.disposition is module.AppendDisposition.WRITE
+    if not target.exists():
+        _seed_target(target, intent.labels, Path(intent.source_base))
+    else:
+        with h5py.File(target, "r+") as handle:
+            for name in ("integrated_1d", "integrated_2d"):
+                del handle[f"entry/{name}/frame_index"]
+                handle[f"entry/{name}"].create_dataset(
+                    "frame_index", data=np.asarray(intent.labels, dtype=np.int64),
+                )
+    with h5py.File(target, "r+") as handle:
+        module.commit_append_lineage(
+            handle["entry"], decision, written_labels=decision.write_labels,
+        )
+
+
+def _decode_image_series_prefix(target):
+    from xrd_tools.io import decode_committed_append_prefix
+
+    with h5py.File(target, "r") as handle:
+        return decode_committed_append_prefix(handle)
+
+
+def test_committed_prefix_decoder_returns_exact_cumulative_image_series_intent(
+    tmp_path,
+):
+    io_module = importlib.import_module("xrd_tools.io")
+    target = tmp_path / "decoder.nxs"
+    first = _image_series_intent(tmp_path, 2, generation=0)
+    final = _image_series_intent(tmp_path, 3, generation=1)
+    _commit_image_series_target(target, first)
+    _commit_image_series_target(target, final)
+
+    assert "AppendCommittedPrefix" in io_module.__all__
+    assert "decode_committed_append_prefix" in io_module.__all__
+    with h5py.File(target, "r") as handle:
+        handle_id = handle.id
+        prefix = io_module.decode_committed_append_prefix(handle)
+        assert handle.id is handle_id and handle.id.valid
+        assert "entry" in handle
+
+    assert type(prefix) is io_module.AppendCommittedPrefix
+    assert prefix.target == os.path.normcase(os.path.abspath(target))
+    assert prefix.committed_labels == (0, 1, 2)
+    assert prefix.intent.entry == "entry"
+    assert prefix.intent.source_base == os.path.normcase(os.path.abspath(tmp_path))
+    assert prefix.intent.source_identity == "image-series:scan-17"
+    assert prefix.intent.science_fingerprint == "science-v1"
+    assert prefix.intent.modes == ("1d:default",)
+    assert prefix.intent.source.generation == 1
+    assert tuple(member.path for member in prefix.intent.source.image_members) == tuple(
+        os.path.normcase(os.path.abspath(tmp_path / f"series-{index:04d}.tif"))
+        for index in range(3)
+    )
+    assert tuple(
+        (member.source_start, member.source_stop, member.ordinal)
+        for member in prefix.intent.source.image_members
+    ) == ((0, 1, 0), (1, 2, 1), (2, 3, 2))
+    assert prefix.lineage_json == json.dumps(
+        json.loads(prefix.lineage_json), sort_keys=True, separators=(",", ":"),
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        prefix.target = "different"
+
+
+def test_prefix_bound_preflight_refuses_disappeared_target_instead_of_first_run_write(
+    tmp_path,
+):
+    from xrd_tools.io import AppendRefused, prepare_append_preflight
+
+    target = tmp_path / "disappeared.nxs"
+    _commit_image_series_target(
+        target, _image_series_intent(tmp_path, 2, generation=0),
+    )
+    prefix = _decode_image_series_prefix(target)
+    target.unlink()
+
+    with pytest.raises(AppendRefused, match="committed Append prefix target disappeared"):
+        prepare_append_preflight(
+            target, _image_series_intent(tmp_path, 3, generation=1),
+            committed_prefix=prefix,
+        )
+    assert not target.exists()
+    _assert_lease_available(target)
+
+
+def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
+    from xrd_tools.io import AppendRefused, prepare_append_preflight
+
+    target = tmp_path / "divergent.nxs"
+    _commit_image_series_target(
+        target, _image_series_intent(tmp_path, 2, generation=0),
+    )
+    _commit_image_series_target(
+        target, _image_series_intent(tmp_path, 3, generation=1),
+    )
+    prefix = _decode_image_series_prefix(target)
+    with h5py.File(target, "r+") as handle:
+        dataset = handle["entry/reduction/config/append_lineage"]
+        lineage = json.loads(dataset[()].decode())
+        lineage["epochs"][0]["source"]["generation"] = 1
+        del handle["entry/reduction/config/append_lineage"]
+        handle["entry/reduction/config"].create_dataset(
+            "append_lineage",
+            data=json.dumps(lineage, sort_keys=True, separators=(",", ":")),
+        )
+    before = target.read_bytes()
+
+    with pytest.raises(AppendRefused, match="committed Append epochs diverged"):
+        prepare_append_preflight(
+            target, _image_series_intent(tmp_path, 4, generation=2),
+            committed_prefix=prefix,
+        )
+    assert target.read_bytes() == before
+    _assert_lease_available(target)
+
+
+def test_prefix_bound_preflight_accepts_concurrent_exact_successor_as_noop(
+    tmp_path,
+):
+    from xrd_tools.io import AppendDisposition, AppendPreflightState
+    from xrd_tools.io import prepare_append_preflight
+
+    target = tmp_path / "concurrent-successor.nxs"
+    _commit_image_series_target(
+        target, _image_series_intent(tmp_path, 2, generation=0),
+    )
+    prefix = _decode_image_series_prefix(target)
+    successor = _image_series_intent(tmp_path, 3, generation=1)
+    _commit_image_series_target(target, successor)
+    before = target.read_bytes()
+
+    preflight = prepare_append_preflight(
+        target, successor, committed_prefix=prefix,
+    )
+    assert preflight.snapshot.disposition is AppendDisposition.SKIP
+    assert preflight.snapshot.skip_labels == (0, 1, 2)
+    assert preflight.complete_noop().state is AppendPreflightState.NOOP
+    assert target.read_bytes() == before
+    _assert_lease_available(target)
+
+
+def test_reserved_prefix_bound_preflight_extend_retains_anchor(tmp_path, monkeypatch):
+    from xrd_tools.io import prepare_append_preflight
+
+    module = importlib.import_module("xrd_tools.io.append")
+    target = tmp_path / "reserved-anchor.nxs"
+    _commit_image_series_target(
+        target, _image_series_intent(tmp_path, 2, generation=0),
+    )
+    prefix = _decode_image_series_prefix(target)
+    preflight = prepare_append_preflight(
+        target, _image_series_intent(tmp_path, 3, generation=1),
+        committed_prefix=prefix,
+    )
+    before = target.read_bytes()
+    seen = []
+    real_qualify = module.qualify_append
+
+    def qualify(path, intent, *, committed_prefix=None):
+        seen.append(committed_prefix)
+        return real_qualify(path, intent, committed_prefix=committed_prefix)
+
+    monkeypatch.setattr(module, "qualify_append", qualify)
+    snapshot = preflight.extend(_image_series_intent(tmp_path, 4, generation=2))
+    assert seen == [prefix]
+    assert snapshot.skip_labels == (0, 1) and snapshot.write_labels == (2, 3)
+    preflight.abort()
+    assert target.read_bytes() == before
+    _assert_lease_available(target)
