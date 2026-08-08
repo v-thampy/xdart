@@ -16,6 +16,7 @@ import numpy as np
 from .schema import (
     ACCEPTED_SCHEMA_NAMES,
     DEFAULT_MODE_KEY,
+    GI_MODE_KEYS_1D, GI_MODE_KEYS_2D,
     MODE_SUBGROUP_NAMES,
     PRIMARY_MODE_ATTR,
     PROCESSED_SCHEMA_VERSION,
@@ -549,14 +550,16 @@ def _mode_group(entry: h5py.Group, mode: str) -> h5py.Group:
         raise ValueError(f"malformed Append mode {mode!r}") from exc
     if dimension not in {"1d", "2d"}:
         raise ValueError(f"unknown Append dimension {dimension!r}")
+    allowed = GI_MODE_KEYS_1D if dimension == "1d" else GI_MODE_KEYS_2D
     top_name = f"integrated_{dimension}"
     top = entry.get(top_name)
     if not isinstance(top, h5py.Group):
         raise ValueError(f"missing {top_name} group")
     primary = _decode(top.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY))
-    if type(primary) is not str or (primary != DEFAULT_MODE_KEY and primary not in MODE_SUBGROUP_NAMES): raise ValueError("Append primary mode requires exact supported text")
+    if type(primary) is not str or (primary != DEFAULT_MODE_KEY and primary not in allowed): raise ValueError("Append primary mode requires exact supported text")
     if mode_key == primary:
         return top
+    if primary == DEFAULT_MODE_KEY or mode_key not in allowed: raise ValueError(f"unknown {dimension} mode key {mode_key!r}")
     try:
         subgroup = MODE_SUBGROUP_NAMES[mode_key]
     except KeyError as exc:
@@ -816,17 +819,14 @@ def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -
         raise ValueError("foreign processed schema identity")
     if type(schema_version) is not int or schema_version != PROCESSED_SCHEMA_VERSION:
         raise ValueError("foreign processed schema version")
-    if type(source_base) is not str:
-        raise ValueError("processed source base requires exact decoded text")
+    if type(source_base) is not str: raise ValueError("processed source base requires exact decoded text")
     stored_base = _normalize_base(source_base)
     lineage = _read_lineage(group)
     string_fields = ("entry", "source_base", "source_identity", "science_fingerprint", "state")
     if any(type(lineage.get(key)) is not str for key in string_fields) or type(lineage.get("version")) is not int:
         raise ValueError("Append lineage scalars require exact JSON types")
-    if lineage.get("entry") != entry:
-        raise ValueError("foreign Append entry")
-    if lineage.get("source_base") != stored_base:
-        raise ValueError("wrong source base")
+    if lineage.get("entry") != entry: raise ValueError("foreign Append entry")
+    if lineage.get("source_base") != stored_base: raise ValueError("wrong source base")
     modes = lineage.get("modes")
     if (not isinstance(modes, list) or not modes
             or any(not isinstance(mode, str) for mode in modes)):

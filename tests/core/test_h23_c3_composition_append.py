@@ -3632,6 +3632,75 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
     _assert_lease_available(primary_target)
 
 
+@pytest.mark.parametrize(
+    "case,dimension,primary,modes,subgroup,error",
+    (
+        (
+            "primary-1d", "1d", "qip_qoop", ("1d:qip_qoop",), None,
+            "primary mode",
+        ),
+        (
+            "non-primary-1d", "1d", "q_total",
+            ("1d:q_total", "1d:qip_qoop"), "qip_qoop", "unknown 1d mode",
+        ),
+        (
+            "primary-2d", "2d", "q_total", ("2d:q_total",), None,
+            "primary mode",
+        ),
+        (
+            "non-primary-2d", "2d", "qip_qoop",
+            ("2d:qip_qoop", "2d:q_total"), "q_total", "unknown 2d mode",
+        ),
+    ),
+)
+def test_prefix_bound_preflight_refuses_dimension_incompatible_modes(
+    tmp_path, case, dimension, primary, modes, subgroup, error,
+):
+    from dataclasses import replace
+    from xrd_tools.io import (
+        AppendCommittedPrefix, AppendRefused, decode_committed_append_prefix,
+        prepare_append_preflight,
+    )
+
+    target = tmp_path / f"wrong-dimension-{case}.nxs"
+    _commit_image_series_target(
+        target, _image_series_intent(tmp_path, 2, generation=0),
+    )
+    original = _decode_image_series_prefix(target)
+    lineage = json.loads(original.lineage_json)
+    lineage["modes"] = list(modes)
+    intent = replace(original.intent, modes=modes)
+    prefix = AppendCommittedPrefix(
+        str(target), intent,
+        json.dumps(lineage, sort_keys=True, separators=(",", ":")),
+    )
+    with h5py.File(target, "r+") as handle:
+        entry = handle["entry"]
+        top = entry[f"integrated_{dimension}"]
+        top.attrs[PRIMARY_MODE_ATTR] = primary
+        if subgroup is not None:
+            group = top.create_group(subgroup)
+            group.create_dataset("frame_index", data=top["frame_index"][()])
+        del entry["reduction/config/append_lineage"]
+        entry["reduction/config"].create_dataset(
+            "append_lineage", data=prefix.lineage_json,
+        )
+    before = target.read_bytes()
+
+    with h5py.File(target, "r") as handle:
+        with pytest.raises(ValueError, match=error):
+            decode_committed_append_prefix(handle)
+    successor = replace(
+        _image_series_intent(tmp_path, 3, generation=1), modes=modes,
+    )
+    with pytest.raises(AppendRefused, match=error):
+        prepare_append_preflight(
+            target, successor, committed_prefix=prefix,
+        )
+    assert target.read_bytes() == before
+    _assert_lease_available(target)
+
+
 def test_prefix_bound_preflight_accepts_concurrent_exact_successor_as_noop(
     tmp_path,
 ):
