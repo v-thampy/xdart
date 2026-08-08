@@ -378,7 +378,7 @@ class AppendPreflight:
 
 _PREFLIGHT_FACTORY = object()
 
-def _truncate_source(source: AppendSource, extent: int) -> AppendSource:
+def truncate_append_source(source: AppendSource, extent: int) -> AppendSource:
     if extent < 0 or extent > int(source.extent):
         raise ValueError("truncated source extent is outside the observed epoch")
 
@@ -691,7 +691,7 @@ def truncate_append_epoch(
     committed = decision.skip_labels
     written = committed + labels
     extent = intent.source.extent if written == intent.labels else len(written)
-    source = _truncate_source(intent.source, extent)
+    source = truncate_append_source(intent.source, extent)
     lineage = dict(decision.lineage or {})
     epochs = list(lineage.get("epochs") or ())
     if not epochs:
@@ -1003,4 +1003,5 @@ __all__ = [
     "seal_append_epoch",
     "stage_append_lineage",
     "truncate_append_epoch",
+    "truncate_append_source",
 ]

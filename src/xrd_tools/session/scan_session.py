@@ -706,6 +706,9 @@ class ScanSession:
             if attempt_token is not _ATTEMPT_MISSING:
                 raise ValueError("static ScanSession rejects an attempt_token")
         else:
+            if self._dynamic_epoch_notified:
+                raise RuntimeError(
+                    "dynamic submit requires an advancing live intent after commit")
             if attempt_token is _ATTEMPT_MISSING:
                 raise TypeError("dynamic ScanSession submit is missing attempt_token")
             dynamic.validate_submission(attempt_token, int(frame.index))
@@ -932,7 +935,7 @@ class ScanSession:
         return anchor
 
     def extend_live(self, intent: AppendIntent) -> AppendDecision:
-        """Continue this exact committed same-run output lineage."""
+        """Continue this exact same-run output lineage."""
         if type(intent) is not AppendIntent:
             raise TypeError("extend_live requires an exact AppendIntent")
         extend_live = self._dynamic_extend_live
@@ -941,10 +944,6 @@ class ScanSession:
         if extend_live is None or owner is None or current_intent is None:
             raise RuntimeError(
                 "session has no captured same-run continuation capability"
-            )
-        if self._dynamic_settled_epoch_anchor is None:
-            raise RuntimeError(
-                "same-run continuation requires one settled committed epoch"
             )
         if (
             self._dynamic_epoch_seal is not None
@@ -972,9 +971,15 @@ class ScanSession:
             snapshot.attempt_states[tokens[-1]]
             for tokens in snapshot.attempts.values() if tokens
         )
+        dirty_in_flight = any(
+            key not in snapshot.written
+            or snapshot.attempt_states[snapshot.attempts[key][-1]]
+            is not DynamicAttemptState.COMPLETED
+            for key in snapshot.in_flight
+        )
         if (
             snapshot.state is not DynamicRunState.ACTIVE
-            or snapshot.in_flight
+            or dirty_in_flight
             or snapshot.retry_owned
             or any(state in {
                 DynamicAttemptState.FAILED,
@@ -984,10 +989,6 @@ class ScanSession:
         ):
             raise RuntimeError("same-run continuation refuses a dirty epoch")
         replay = intent == current_intent
-        if not replay and not self._dynamic_epoch_notified:
-            raise RuntimeError(
-                "a different successor requires a newly committed epoch"
-            )
         decision = extend_live(owner, intent)
         if not replay:
             self._dynamic_current_intent = intent

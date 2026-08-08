@@ -147,6 +147,7 @@ _EXPORTS = {
     "TransactionSnapshot": ("xrd_tools.io.output_transaction", "TransactionSnapshot"),
     "TransactionStateError": ("xrd_tools.io.output_transaction", "TransactionStateError"),
     "truncate_append_epoch": ("xrd_tools.io.append", "truncate_append_epoch"),
+    "truncate_append_source": ("xrd_tools.io.append", "truncate_append_source"),
     "upsert_per_frame_geometry": ("xrd_tools.io.nexus", "upsert_per_frame_geometry"),
     "upsert_positioners": ("xrd_tools.io.nexus", "upsert_positioners"),
     "upsert_scan_metadata": ("xrd_tools.io.nexus", "upsert_scan_metadata"),

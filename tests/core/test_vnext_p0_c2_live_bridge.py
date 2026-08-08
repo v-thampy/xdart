@@ -1932,6 +1932,231 @@ def test_dynamic_existing_target_append_extends_through_public_session_capabilit
     assert nexus._live_extension_capability() is None
 
 
+@pytest.mark.parametrize(
+    "existing_target", (False, True), ids=("fresh", "bound-preflight"),
+)
+def test_scan_session_active_epoch_extends_exact_prefix_until_policy_commit(
+    tmp_path, monkeypatch, existing_target,
+):
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.io import (
+        AppendExternalMember, AppendSource, get_output_transaction_coordinator,
+        prepare_append_preflight, truncate_append_source,
+    )
+    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.reduction import Frame, FrameReduction, NexusSink, ReductionResult
+    import xrd_tools.reduction.core as reduction_core
+
+    full_source = AppendSource(
+        path=str(tmp_path / "full-master.h5"),
+        adapter_id="nexus_hdf5",
+        size=500,
+        mtime_ns=900,
+        extent=5,
+        dataset_paths=("/entry/data/a", "/entry/data/b"),
+        external_members=(
+            AppendExternalMember(
+                str(tmp_path / "a.h5"), "/entry/data", 100, 700, 0, 2, 0,
+            ),
+            AppendExternalMember(
+                str(tmp_path / "b.h5"), "/entry/data", 200, 800, 2, 5, 1,
+            ),
+        ),
+        generation=4,
+    )
+    clipped_source = truncate_append_source(full_source, 3)
+    assert clipped_source.extent == 3
+    assert tuple(
+        (member.source_start, member.source_stop)
+        for member in clipped_source.external_members
+    ) == ((0, 2), (2, 3))
+    assert clipped_source.dataset_paths == full_source.dataset_paths
+    assert len(clipped_source.dataset_paths) == len(clipped_source.external_members)
+    assert full_source.extent == 5
+    assert full_source.external_members[-1].source_stop == 5
+
+    name = f"active-prefix-{existing_target}"
+    target, accounting, live, plan = _dynamic_sink_case(tmp_path, name)
+    mode = accounting.ledger.required_modes[0]
+    target_name = next(iter(accounting.ledger.targets_by_mode[mode]))
+    source_identity = f"c2-active-prefix-{existing_target}"
+    first_label = 1 if existing_target else 0
+    first_generation = 1 if existing_target else 0
+
+    if existing_target:
+        seed_intent = append_intent(
+            tmp_path, extent=1, labels=(0,), generation=0,
+            source_identity=source_identity,
+        )
+        seed = NexusSink(
+            target, overwrite=True, atomic=False, flush_every=None,
+            source_base=tmp_path, same_run_intent=seed_intent,
+        )
+        seed.begin(Scan("seed", []), plan)
+        seed_value = DeterministicIntegrator().integrate1d(
+            np.ones((2, 2)), plan.integration_1d.npt,
+        )
+        seed.write(
+            ScanFrame(0),
+            FrameReduction(0, result_1d=IntegrationResult1D(
+                seed_value.radial, seed_value.intensity, seed_value.sigma,
+                seed_value.unit,
+            )),
+        )
+        seed.finish(ReductionResult("seed", {}, 1))
+
+    admissions, leases, opens = [], [], []
+    coordinator = get_output_transaction_coordinator()
+    original_admit = coordinator.admit
+    original_acquire = OutputTransaction.acquire_lease
+    original_open = reduction_core.open_nexus_writer
+
+    def count_admit(*args, **kwargs):
+        admissions.append(str(args[0]))
+        return original_admit(*args, **kwargs)
+
+    def count_acquire(owner, *args, **kwargs):
+        leases.append(owner.admission.target)
+        return original_acquire(owner, *args, **kwargs)
+
+    def count_open(*args, **kwargs):
+        opens.append(args[0])
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator, "admit", count_admit)
+    monkeypatch.setattr(OutputTransaction, "acquire_lease", count_acquire)
+    monkeypatch.setattr(reduction_core, "open_nexus_writer", count_open)
+
+    initial_intent = append_intent(
+        tmp_path,
+        extent=first_label + 1,
+        labels=tuple(range(first_label + 1)),
+        generation=first_generation,
+        source_identity=source_identity,
+    )
+    if existing_target:
+        nexus = NexusSink(
+            target, atomic=False, flush_every=None, source_base=tmp_path,
+            append_preflight=prepare_append_preflight(target, initial_intent),
+        )
+    else:
+        nexus = NexusSink(
+            target, overwrite=True, atomic=False, flush_every=None,
+            same_run_intent=initial_intent,
+        )
+    live.idx = first_label
+    key0, token0 = _armed_submission(
+        accounting, label=first_label, revision=first_generation + 1,
+    )
+    session = _open_final_session(
+        tmp_path, name, nexus, accounting, live, plan,
+        nexus_target=target_name,
+    )
+    assert accounting.owner_census().count(session) == 1
+    lineage = (
+        nexus._transaction, nexus._lease, session._dynamic_extension_owner,
+    )
+    keys = [key0]
+    tokens = [token0]
+    current_intent = initial_intent
+
+    assert session.submit(session.scan.frames[0], attempt_token=token0)
+    assert session.pause(timeout=5.0)
+    session.resume()
+    for step, label in enumerate(
+        (first_label + 1, first_label + 2), start=1,
+    ):
+        current_intent = append_intent(
+            tmp_path,
+            extent=label + 1,
+            labels=tuple(range(label + 1)),
+            generation=first_generation + step,
+            source_identity=source_identity,
+        )
+        session.extend_live(current_intent)
+        key, token = _armed_submission(
+            accounting, label=label,
+            revision=first_generation + step + 1,
+        )
+        keys.append(key)
+        tokens.append(token)
+        assert session.submit(
+            Frame(label, image=np.full((2, 2), float(label + 1))),
+            attempt_token=token,
+        )
+        assert session.pause(timeout=5.0)
+        session.resume()
+
+    before_commit = accounting.snapshot()
+    assert all(
+        (key, mode, target_name) not in before_commit.durable_attempts
+        for key in keys
+    )
+    assert admissions == [str(target)]
+    assert leases == [str(target)]
+    assert (
+        nexus._transaction, nexus._lease, session._dynamic_extension_owner,
+    ) == lineage
+    assert len(opens) == 1
+
+    session.commit_epoch()
+    expected_committed = tuple(range(first_label + 3))
+    assert _rows(target) == expected_committed
+    committed = accounting.snapshot()
+    assert all(
+        committed.durable_attempts[(key, mode, target_name)] is token
+        for key, token in zip(keys, tokens, strict=True)
+    )
+
+    next_label = first_label + 3
+    replay_decision = session.extend_live(current_intent)
+    assert session.extend_live(current_intent) is replay_decision
+    before_refusal = accounting.snapshot()
+    before_bytes = target.read_bytes()
+    before_inventory = tuple(session.scan.frame_indices)
+    with pytest.raises(RuntimeError, match="advancing live intent"):
+        session.submit(
+            Frame(next_label, image=np.full((2, 2), float(next_label + 1))),
+        )
+    assert accounting.snapshot() == before_refusal
+    assert target.read_bytes() == before_bytes
+    assert tuple(session.scan.frame_indices) == before_inventory
+    assert len(opens) == 1
+
+    successor = append_intent(
+        tmp_path,
+        extent=next_label + 1,
+        labels=tuple(range(next_label + 1)),
+        generation=first_generation + 3,
+        source_identity=source_identity,
+    )
+    session.extend_live(successor)
+    next_key, next_token = _armed_submission(
+        accounting, label=next_label, revision=first_generation + 4,
+    )
+    assert session.submit(
+        Frame(next_label, image=np.full((2, 2), float(next_label + 1))),
+        attempt_token=next_token,
+    )
+    assert session.pause(timeout=5.0)
+    session.resume()
+    assert len(opens) == 2
+    assert (
+        nexus._transaction, nexus._lease, session._dynamic_extension_owner,
+    ) == lineage
+    assert accounting.owner_census().count(session) == 1
+    session.finish()
+
+    final = accounting.snapshot()
+    assert _rows(target) == tuple(range(next_label + 1))
+    assert final.durable_attempts[(next_key, mode, target_name)] is next_token
+    assert admissions == [str(target)]
+    assert leases == [str(target)]
+    assert len(opens) == 2
+    assert session not in accounting.owner_census()
+
+
 @pytest.mark.parametrize("composite", (False, True), ids=("direct", "memory-nexus"))
 def test_scan_session_commit_epoch_then_extend_live_reuses_exact_capability(
     tmp_path, monkeypatch, composite,
@@ -2002,8 +2227,6 @@ def test_scan_session_commit_epoch_then_extend_live_reuses_exact_capability(
         tmp_path, extent=3, labels=(0, 1, 2), generation=2,
         source_identity=source_identity,
     )
-    with pytest.raises(RuntimeError, match="different successor"):
-        session.extend_live(third_intent)
 
     key1 = DynamicFrameIdentity("c2-final-source", 1)
     accounting.discover(key1, group="scan", ordinal=1, output_label=1)
@@ -2061,10 +2284,6 @@ def test_scan_session_extend_live_refusals_and_stop_preserve_committed_epoch(
         tmp_path, extent=2, labels=(0, 1), generation=1,
         source_identity=source_identity,
     )
-    third_intent = append_intent(
-        tmp_path, extent=3, labels=(0, 1, 2), generation=2,
-        source_identity=source_identity,
-    )
     _key0, token0 = _armed_submission(accounting)
     nexus = NexusSink(
         target, overwrite=True, atomic=False, flush_every=None,
@@ -2084,8 +2303,8 @@ def test_scan_session_extend_live_refusals_and_stop_preserve_committed_epoch(
         nexus_target=target_name,
     )
     before = accounting.snapshot()
-    with pytest.raises(RuntimeError, match="settled committed epoch"):
-        session.extend_live(second_intent)
+    with pytest.raises(TypeError, match="exact AppendIntent"):
+        session.extend_live(object())
     assert calls == []
     assert accounting.snapshot() == before
 
@@ -2100,8 +2319,6 @@ def test_scan_session_extend_live_refusals_and_stop_preserve_committed_epoch(
 
     decision = session.extend_live(second_intent)
     assert session.extend_live(second_intent) is decision
-    with pytest.raises(RuntimeError, match="different successor"):
-        session.extend_live(third_intent)
     assert len(calls) == 2
     session.stop()
     with pytest.raises(RuntimeError, match="active session|terminal"):
