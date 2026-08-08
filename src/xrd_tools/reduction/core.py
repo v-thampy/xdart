@@ -63,14 +63,17 @@ from xrd_tools.io.record_writer import (
     WriterTransactionBinding,
 )
 from xrd_tools.io.append import (
+    AppendCommittedPrefix,
     AppendDecision,
     AppendDisposition,
     AppendIntent,
     AppendPreflight,
+    AppendPreflightCleanupError,
     AppendPreflightState,
     AppendRefused,
     begin_same_run_lineage,
     extend_same_run_lineage,
+    prepare_append_preflight,
     seal_append_epoch,
     truncate_append_epoch,
 )
@@ -955,6 +958,42 @@ class NexusSink:
     _defer_publication_drop_settlement: bool = field(
         default=False, init=False, repr=False,
     )
+    _existing_append_intent: AppendIntent | None = field(
+        default=None, init=False, repr=False,
+    )
+    _existing_append_prefix: AppendCommittedPrefix | None = field(
+        default=None, init=False, repr=False,
+    )
+    _existing_append_pending: bool = field(default=False, init=False, repr=False)
+
+    @classmethod
+    def for_existing_append(
+        cls,
+        path: Path | str,
+        intent: AppendIntent,
+        *,
+        committed_prefix: AppendCommittedPrefix | None = None,
+        **sink_values: Any,
+    ) -> "NexusSink":
+        """Build a sink that qualifies one existing target lazily at begin."""
+        if type(intent) is not AppendIntent:
+            raise TypeError("existing Append requires an exact AppendIntent")
+        if (committed_prefix is not None
+                and type(committed_prefix) is not AppendCommittedPrefix):
+            raise TypeError(
+                "existing Append prefix must be an exact AppendCommittedPrefix"
+            )
+        if any(name in sink_values for name in (
+            "append_preflight", "same_run_intent", "allow_unbound_same_run",
+        )):
+            raise ValueError("existing Append owns its admission policy")
+        sink = cls(path, **sink_values)
+        if sink.overwrite:
+            raise ValueError("existing Append cannot overwrite its target")
+        sink._existing_append_intent = intent
+        sink._existing_append_prefix = committed_prefix
+        sink._existing_append_pending = True
+        return sink
 
     @property
     def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
@@ -1105,6 +1144,20 @@ class NexusSink:
         return self._typed_terminal(self._transaction.snapshot())
 
     def _prepare_transaction(self):
+        if self._existing_append_intent is not None and self.append_preflight is None:
+            if not self._existing_append_pending:
+                raise RuntimeError("existing Append qualification already failed")
+            self._existing_append_pending = False
+            try:
+                self.append_preflight = prepare_append_preflight(
+                    self.path,
+                    self._existing_append_intent,
+                    committed_prefix=self._existing_append_prefix,
+                    file_lock=self.file_lock,
+                )
+            except AppendPreflightCleanupError as error:
+                self.append_preflight = error.owner
+                raise
         if self.append_preflight is not None:
             binding = self.append_preflight._consume(self.path)
             self._transaction = binding.transaction
@@ -1710,7 +1763,7 @@ class NexusSink:
         self._plan = None
         return self._typed_terminal(snapshot)
 
-    def abort(self, result: ReductionResult | None) -> NexusTerminalResult:
+    def abort(self, result: ReductionResult | None) -> NexusTerminalResult | None:
         if self._terminal_result is not None:
             return self._terminal_result
         self._scan = None
@@ -1724,7 +1777,23 @@ class NexusSink:
                         self.append_preflight._cleanup_failure_state())
                 raise
         if self._transaction is None:
-            raise RuntimeError("NexusSink abort has no transaction")
+            preflight = self.append_preflight
+            if preflight is None:
+                return None
+            state = preflight.snapshot.state
+            if state is AppendPreflightState.RESERVED:
+                state = preflight.abort().state
+            elif state is AppendPreflightState.RETRYABLE:
+                state = preflight.retry_cleanup().state
+            if state not in {
+                AppendPreflightState.NOOP,
+                AppendPreflightState.COMMITTED,
+                AppendPreflightState.ABORTED,
+            }:
+                raise RuntimeError(
+                    f"Append preflight cleanup remains unsettled: {state.value}"
+                )
+            return None
         return self._typed_terminal(self._transaction.snapshot())
 
 

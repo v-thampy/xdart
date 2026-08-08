@@ -3754,3 +3754,193 @@ def test_reserved_prefix_bound_preflight_extend_retains_anchor(tmp_path, monkeyp
     preflight.abort()
     assert target.read_bytes() == before
     _assert_lease_available(target)
+
+
+def _seed_existing_append_target(target, source_base, intent):
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.reduction import FrameReduction, NexusSink, ReductionPlan, ReductionResult
+
+    sink = NexusSink(
+        target, overwrite=True, atomic=False, flush_every=None,
+        source_base=source_base, same_run_intent=intent,
+    )
+    sink.begin(Scan("seed", []), ReductionPlan(integration_2d=None))
+    for label in intent.labels:
+        sink.write(
+            ScanFrame(label), FrameReduction(label, result_1d=_r1(label)),
+        )
+    sink.finish(ReductionResult("seed", {}, len(intent.labels)))
+
+
+def test_existing_append_sink_qualifies_once_and_reuses_owner_for_extension(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.io import AppendDisposition
+    from xrd_tools.reduction import FrameReduction, NexusSink, ReductionPlan, ReductionResult
+    import xrd_tools.reduction.core as reduction_core
+
+    target = tmp_path / "lazy-existing.nxs"
+    first = _intent(
+        tmp_path, extent=1, labels=(0,), modes=("1d:default",),
+    )
+    _seed_existing_append_target(target, tmp_path, first)
+    second = _intent(
+        tmp_path, extent=2, labels=(0, 1), modes=("1d:default",),
+    )
+    calls = []
+    real_prepare = reduction_core.prepare_append_preflight
+
+    def prepare(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(reduction_core, "prepare_append_preflight", prepare)
+    sink = NexusSink.for_existing_append(
+        target, second, atomic=False, flush_every=None, source_base=tmp_path,
+    )
+    assert calls == []
+    sink.begin(Scan("existing", []), ReductionPlan(integration_2d=None))
+    owner = (sink, sink._transaction, sink._lease, sink.extension_owner)
+    assert len(calls) == 1
+    sink.write(ScanFrame(1), FrameReduction(1, result_1d=_r1(1)))
+    sink.commit_epoch(ReductionResult("existing", {}, 1))
+    third = _intent(
+        tmp_path, extent=3, labels=(0, 1, 2), generation=1,
+        modes=("1d:default",),
+    )
+    assert sink.extend_live(sink.extension_owner, third).disposition is AppendDisposition.WRITE
+    sink.write(ScanFrame(2), FrameReduction(2, result_1d=_r1(2)))
+    sink.finish(ReductionResult("existing", {}, 2))
+
+    assert len(calls) == 1
+    assert sink is owner[0] and sink._transaction is owner[1]
+    assert sink._lease is owner[2] and owner[3] is not None
+    with h5py.File(target, "r") as handle:
+        assert tuple(handle["entry/integrated_1d/frame_index"][()]) == (0, 1, 2)
+
+
+def test_existing_append_refusal_is_typed_preserves_target_and_has_no_owner(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.io import AppendRefused
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    import xrd_tools.reduction.core as reduction_core
+
+    target = tmp_path / "lazy-refusal.nxs"
+    first = _intent(
+        tmp_path, extent=1, labels=(0,), modes=("1d:default",),
+    )
+    _seed_existing_append_target(target, tmp_path, first)
+    before = target.read_bytes()
+    refused = _intent(
+        tmp_path, extent=2, labels=(0, 1), science="different-science",
+        modes=("1d:default",),
+    )
+    calls = 0
+    real_prepare = reduction_core.prepare_append_preflight
+
+    def prepare(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(reduction_core, "prepare_append_preflight", prepare)
+    sink = NexusSink.for_existing_append(target, refused, source_base=tmp_path)
+    assert sink.abort(None) is None
+    with pytest.raises(AppendRefused, match="foreign Append identity"):
+        sink.begin(Scan("refused", []), ReductionPlan(integration_2d=None))
+    assert calls == 1 and sink.append_preflight is None
+    assert sink.abort(None) is None and sink.abort(None) is None
+    with pytest.raises(RuntimeError, match="qualification already failed"):
+        sink.begin(Scan("refused", []), ReductionPlan(integration_2d=None))
+    assert calls == 1 and target.read_bytes() == before
+    sink.abort(None)
+    _assert_lease_available(target)
+
+
+def test_existing_append_retryable_cleanup_stays_in_sink_and_abort_retries(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.io import AppendPreflightCleanupError, AppendPreflightState
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    import xrd_tools.io.append as append_module
+    import xrd_tools.io.output_transaction as transaction_module
+    import xrd_tools.reduction.core as reduction_core
+
+    target = tmp_path / "lazy-retryable.nxs"
+    intent = _intent(
+        tmp_path, extent=1, labels=(0,), modes=("1d:default",),
+    )
+    _seed_existing_append_target(target, tmp_path, intent)
+    real_abandon = transaction_module.OutputTransaction.abandon
+    attempts = {"prepare": 0, "abandon": 0, "open": 0}
+
+    def fail_qualification(*_args, **_kwargs):
+        raise OSError("qualification fault")
+
+    def fail_abandon_once(owner, lease):
+        attempts["abandon"] += 1
+        if attempts["abandon"] == 1:
+            raise OSError("cleanup fault")
+        return real_abandon(owner, lease)
+
+    real_prepare = reduction_core.prepare_append_preflight
+
+    def prepare(*args, **kwargs):
+        attempts["prepare"] += 1
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(append_module, "qualify_append", fail_qualification)
+    monkeypatch.setattr(transaction_module.OutputTransaction, "abandon", fail_abandon_once)
+    monkeypatch.setattr(reduction_core, "prepare_append_preflight", prepare)
+    monkeypatch.setattr(
+        reduction_core, "open_nexus_writer",
+        lambda *_a, **_k: attempts.__setitem__("open", attempts["open"] + 1),
+    )
+    sink = NexusSink.for_existing_append(target, intent, source_base=tmp_path)
+    with pytest.raises(AppendPreflightCleanupError) as excinfo:
+        sink.begin(Scan("retryable", []), ReductionPlan(integration_2d=None))
+    owner = excinfo.value.owner
+    assert sink.append_preflight is owner
+    assert owner.snapshot.state is AppendPreflightState.RETRYABLE
+    assert attempts == {"prepare": 1, "abandon": 1, "open": 0}
+    assert sink.abort(None) is None
+    assert owner.snapshot.state is AppendPreflightState.ABORTED
+    assert attempts == {"prepare": 1, "abandon": 2, "open": 0}
+    assert sink.abort(None) is None and sink.append_preflight is owner
+    _assert_lease_available(target)
+
+
+def test_existing_append_integrity_hold_abort_never_reports_settled(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.io import AppendPreflightCleanupError, AppendPreflightState
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    import xrd_tools.io.append as append_module
+
+    target = tmp_path / "lazy-integrity-hold.nxs"
+    intent = _intent(
+        tmp_path, extent=1, labels=(0,), modes=("1d:default",),
+    )
+    _seed_existing_append_target(target, tmp_path, intent)
+
+    def mutate_then_fail(path, *_args, **_kwargs):
+        Path(path).write_bytes(b"foreign replacement")
+        raise OSError("qualification fault")
+
+    monkeypatch.setattr(append_module, "qualify_append", mutate_then_fail)
+    sink = NexusSink.for_existing_append(target, intent, source_base=tmp_path)
+    with pytest.raises(AppendPreflightCleanupError) as excinfo:
+        sink.begin(Scan("integrity", []), ReductionPlan(integration_2d=None))
+    owner = excinfo.value.owner
+    assert sink.append_preflight is owner
+    assert owner.snapshot.state is AppendPreflightState.INTEGRITY_HOLD
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="cleanup remains unsettled: integrity_hold"):
+            sink.abort(None)
+        assert sink.append_preflight is owner
+        assert owner.snapshot.state is AppendPreflightState.INTEGRITY_HOLD
