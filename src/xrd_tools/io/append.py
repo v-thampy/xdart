@@ -331,8 +331,7 @@ class AppendPreflight:
                 if self._committed_prefix is None:
                     decision = qualify_append(self._target, intent)
                 else:
-                    decision = qualify_append(self._target, intent,
-                                              committed_prefix=self._committed_prefix)
+                    decision = qualify_append(self._target, intent, committed_prefix=self._committed_prefix)
         if decision.disposition is AppendDisposition.REFUSE:
             raise AppendRefused(decision)
         self._intent = intent
@@ -591,7 +590,8 @@ def _read_lineage(entry: h5py.Group) -> dict[str, Any]:
     if not isinstance(dataset, h5py.Dataset) or dataset.shape != ():
         raise ValueError("missing or malformed committed Append lineage")
     raw = _decode(dataset[()])
-    value = json.loads(str(raw))
+    if type(raw) is not str: raise ValueError("Append lineage scalar requires exact decoded text")
+    value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("Append lineage is not an object")
     return value
@@ -813,12 +813,18 @@ def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -
     group = handle.get(entry)
     if not isinstance(group, h5py.Group):
         raise ValueError(f"foreign or missing entry {entry!r}")
-    if str(_decode(group.attrs.get(SCHEMA_NAME_ATTR, ""))) not in ACCEPTED_SCHEMA_NAMES:
+    schema_name, schema_version, source_base = (_decode(group.attrs.get(key, default)) for key, default in ((SCHEMA_NAME_ATTR, ""), (SCHEMA_VERSION_ATTR, -1), (SOURCE_BASE_ATTR, "")))
+    if type(schema_name) is not str or schema_name not in ACCEPTED_SCHEMA_NAMES:
         raise ValueError("foreign processed schema identity")
-    if int(group.attrs.get(SCHEMA_VERSION_ATTR, -1)) != PROCESSED_SCHEMA_VERSION:
+    if type(schema_version) is not int or schema_version != PROCESSED_SCHEMA_VERSION:
         raise ValueError("foreign processed schema version")
-    stored_base = _normalize_base(str(_decode(group.attrs.get(SOURCE_BASE_ATTR, ""))))
+    if type(source_base) is not str:
+        raise ValueError("processed source base requires exact decoded text")
+    stored_base = _normalize_base(source_base)
     lineage = _read_lineage(group)
+    string_fields = ("entry", "source_base", "source_identity", "science_fingerprint", "state")
+    if any(type(lineage.get(key)) is not str for key in string_fields) or type(lineage.get("version")) is not int:
+        raise ValueError("Append lineage scalars require exact JSON types")
     if lineage.get("entry") != entry:
         raise ValueError("foreign Append entry")
     if lineage.get("source_base") != stored_base:
@@ -840,12 +846,7 @@ def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -
     )
     return AppendCommittedPrefix(_normalize(handle.filename), intent, _json(lineage))
 
-def qualify_append(
-    target: str | Path,
-    intent: AppendIntent,
-    *,
-    committed_prefix: AppendCommittedPrefix | None = None,
-) -> AppendDecision:
+def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix: AppendCommittedPrefix | None = None) -> AppendDecision:
     target = Path(target)
     try:
         normalized = _normalize(target)
@@ -963,9 +964,7 @@ def prepare_append_preflight(
             if committed_prefix is None:
                 decision = qualify_append(normalized, intent)
             else:
-                decision = qualify_append(
-                    normalized, intent, committed_prefix=committed_prefix,
-                )
+                decision = qualify_append(normalized, intent, committed_prefix=committed_prefix)
             if decision.disposition is AppendDisposition.REFUSE:
                 error = AppendRefused(decision)
                 if refusal_mapper is not None:

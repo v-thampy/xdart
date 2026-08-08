@@ -3548,6 +3548,46 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
         assert typed_target.read_bytes() == typed_before
         _assert_lease_available(typed_target)
 
+    for mutation, value in (
+        ("schema-version-float", 2.5),
+        ("schema-version-inf", float("inf")),
+        ("schema-version-nan", float("nan")),
+        ("schema-version-bool", True),
+        ("schema-version-text", str(PROCESSED_SCHEMA_VERSION)),
+        ("source-base-int", 7),
+        ("schema-name-int", 7),
+        ("lineage-scalar-int", 7),
+    ):
+        scalar_target = tmp_path / f"scalar-{mutation}.nxs"
+        _commit_image_series_target(
+            scalar_target, _image_series_intent(tmp_path, 2, generation=0),
+        )
+        scalar_prefix = _decode_image_series_prefix(scalar_target)
+        with h5py.File(scalar_target, "r+") as handle:
+            entry = handle["entry"]
+            if mutation == "source-base-int":
+                entry.attrs[SOURCE_BASE_ATTR] = value
+            elif mutation == "schema-name-int":
+                entry.attrs[SCHEMA_NAME_ATTR] = value
+            elif mutation == "lineage-scalar-int":
+                del entry["reduction/config/append_lineage"]
+                entry["reduction/config"].create_dataset(
+                    "append_lineage", data=value,
+                )
+            else:
+                entry.attrs[SCHEMA_VERSION_ATTR] = value
+        scalar_before = scalar_target.read_bytes()
+        with h5py.File(scalar_target, "r") as handle:
+            with pytest.raises(ValueError, match="schema|source base|lineage scalar"):
+                decode_committed_append_prefix(handle)
+        with pytest.raises(AppendRefused, match="schema|source base|lineage scalar"):
+            prepare_append_preflight(
+                scalar_target, _image_series_intent(tmp_path, 3, generation=1),
+                committed_prefix=scalar_prefix,
+            )
+        assert scalar_target.read_bytes() == scalar_before
+        _assert_lease_available(scalar_target)
+
 
 def test_prefix_bound_preflight_accepts_concurrent_exact_successor_as_noop(
     tmp_path,
