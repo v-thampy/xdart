@@ -44,10 +44,8 @@ from xrd_tools.reduction import (
     Scan,
     StrictPolicy,
     NexusSink,
-    OutputSinkKind,
     bind_dynamic_output_sink,
     run_reduction,
-    supports_durable_xye_receipts,
 )
 from xrd_tools.reduction.masks import _flat_mask_as_bool, _mask_for_plan
 from xdart.modules.wavelength import wavelength_m_to_angstrom
@@ -1278,17 +1276,22 @@ def open_live_scan_session(
             raise DynamicXyeReceiptBoundaryRequired(
                 "dynamic output sink is outside the bound P0 supported envelope"
             ) from error
-        active_xye = bool(xye_target) or OutputSinkKind.XYE in sink_binding.families
-        if active_xye:
+        transactional_xye = sink_binding.transactional_xye_sink
+        if transactional_xye is None:
+            if xye_target is not None or xye_receipt_boundary is not None:
+                raise DynamicXyeReceiptBoundaryRequired(
+                    "dynamic XYE target requires the exact transactional sink"
+                )
+        elif xye_target != transactional_xye.canonical_target:
             raise DynamicXyeReceiptBoundaryRequired(
-                "dynamic XYE output is dormant until P1 and must be refused "
-                "before session mutation"
+                "dynamic XYE target must exactly match its transaction owner"
             )
-        if (xye_receipt_boundary is not None
-                and not supports_durable_xye_receipts(xye_receipt_boundary)):
+        elif (
+            xye_receipt_boundary is not None
+            and xye_receipt_boundary is not transactional_xye
+        ):
             raise DynamicXyeReceiptBoundaryRequired(
-                "dynamic XYE receipt boundary must be the exact shared "
-                "durable receipt owner"
+                "dynamic XYE receipt boundary must be the exact bound sink"
             )
         pre_targets, _pre_store_targets = live_target_maps(
             plan, nexus_target=nexus_target, xye_target=xye_target,
@@ -1301,6 +1304,23 @@ def open_live_scan_session(
                 )
             if nexus.flush_every is not None:
                 raise ValueError("dynamic Nexus sink requires flush_every=None")
+            expected_nexus = f"nexus:{nexus.path}"
+            if nexus_target != expected_nexus:
+                raise ValueError(
+                    "dynamic Nexus target must exactly match every required mode"
+                )
+        if transactional_xye is not None:
+            declared = (
+                None if pre_targets is None else {
+                    mode: frozenset(pre_targets.get(mode, ()))
+                    for mode in accounting.ledger.required_modes
+                }
+            )
+            if declared != dict(accounting.ledger.targets_by_mode):
+                raise DynamicXyeReceiptBoundaryRequired(
+                    "dynamic XYE targets must exactly match the bound graph"
+                )
+        elif nexus is not None:
             expected = frozenset((f"nexus:{nexus.path}",))
             if pre_targets is None or any(
                 frozenset(pre_targets.get(mode, ())) != expected

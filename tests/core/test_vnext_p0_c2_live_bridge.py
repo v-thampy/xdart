@@ -3948,11 +3948,11 @@ def test_child_b_terminal_custody_matrix_is_exact(tmp_path, monkeypatch):
         SessionResourceAuthority, acquire_light_1d_retention,
     )
 
-    finish_calls = {}
+    finish_owners = []
     original_finish = NexusSink.finish
 
     def count_finish(owner, result):
-        finish_calls[id(owner)] = finish_calls.get(id(owner), 0) + 1
+        finish_owners.append(owner)
         return original_finish(owner, result)
 
     monkeypatch.setattr(NexusSink, "finish", count_finish)
@@ -4048,7 +4048,7 @@ def test_child_b_terminal_custody_matrix_is_exact(tmp_path, monkeypatch):
             assert slot.custody_receipt is None
             assert lease.state.value == "released"
         if submit:
-            assert finish_calls[id(nexus)] == 1
+            assert sum(candidate is nexus for candidate in finish_owners) == 1
         assert authority.snapshot().reserved_bytes == 0
 
 

@@ -66,7 +66,6 @@ from xrd_tools.reduction import (
     FrameOutcomeReceipt,
     NexusTerminalDisposition,
     NexusTerminalResult,
-    OutputSinkKind,
     ReductionPlan,
     ReductionResult,
     ReductionSession,
@@ -414,11 +413,12 @@ class ScanSession:
         if _accounting_only:
             return
         self._dynamic_nexus_sink = None
+        self._dynamic_transactional_xye_sink = None
+        self._dynamic_xye_only_continuation = False
         if dynamic_accounting is not None:
             binding = bind_dynamic_output_sink(sink)
-            if OutputSinkKind.XYE in binding.families:
-                raise TypeError("dynamic XYE output remains outside the C2 envelope")
             nexus = binding.nexus_sink
+            transactional_xye = binding.transactional_xye_sink
             if nexus is not None:
                 if nexus.allow_unbound_same_run and nexus.same_run_intent is None:
                     raise ValueError(
@@ -426,16 +426,32 @@ class ScanSession:
                     )
                 if nexus.flush_every is not None:
                     raise ValueError("dynamic Nexus sink requires flush_every=None")
-                expected = f"nexus:{nexus.path}"
-                if any(
-                    self._accounting.targets_by_mode.get(mode) != frozenset((expected,))
-                    for mode in required
-                ):
+            if transactional_xye is not None:
+                one_d = tuple(mode for mode in required if mode.kind == "1d")
+                if len(one_d) != 1:
                     raise ValueError(
-                        "dynamic Nexus target must exactly match every required mode"
+                        "dynamic transactional XYE requires exactly one 1-D mode"
                     )
+            expected_targets = {}
+            for mode in required:
+                targets = []
+                if nexus is not None:
+                    targets.append(f"nexus:{nexus.path}")
+                if transactional_xye is not None and mode.kind == "1d":
+                    targets.append(transactional_xye.canonical_target)
+                expected_targets[mode] = frozenset(targets)
+            if (nexus is not None or transactional_xye is not None) and dict(
+                self._accounting.targets_by_mode
+            ) != expected_targets:
+                raise ValueError(
+                    "dynamic output targets must exactly match the bound sink graph"
+                )
             sink = binding.sink
             self._dynamic_nexus_sink = nexus
+            self._dynamic_transactional_xye_sink = transactional_xye
+            self._dynamic_xye_only_continuation = (
+                transactional_xye is not None and nexus is None
+            )
         applicable = self._accounting.targets_by_mode
         self._store_targets = (
             applicable if store_targets_by_mode is None else
@@ -487,6 +503,12 @@ class ScanSession:
         self._dynamic_epoch_anchor = None
         self._dynamic_settled_epoch_anchor = None
         self._dynamic_epoch_notified = False
+        self._dynamic_epoch_nexus_promoted = False
+        self._dynamic_terminal_nexus_promoted = False
+        self._dynamic_epoch_drained = False
+        self._dynamic_epoch_xye_handoff = None
+        self._dynamic_finish_xye_handoff = None
+        self._dynamic_finish_callback_kind = None
         self._terminal_result: NexusTerminalResult | None = None
         self._dynamic_graph_terminal_settled = False
         self._dynamic_terminal_settled = False
@@ -661,6 +683,21 @@ class ScanSession:
         """The public typed accounting snapshot (§4.1 exposure contract)."""
         return self._accounting.snapshot()
 
+    def _dynamic_xye_epoch_pending(self) -> bool:
+        xye = self._dynamic_transactional_xye_sink
+        return bool(
+            xye is not None
+            and not self._dynamic_epoch_notified
+            and (
+                self._dynamic_epoch_drained
+                or self._dynamic_epoch_anchor is not None
+                or self._dynamic_epoch_seal is not None
+                or self._dynamic_epoch_nexus_promoted
+                or self._dynamic_epoch_xye_handoff is not None
+                or xye._transition_kind == "epoch"
+            )
+        )
+
     # -- commands in -------------------------------------------------------
     def start(self) -> None:
         """Idempotent: the writer is armed at construction; emit the initial
@@ -706,7 +743,15 @@ class ScanSession:
             if attempt_token is not _ATTEMPT_MISSING:
                 raise ValueError("static ScanSession rejects an attempt_token")
         else:
-            if self._dynamic_epoch_notified:
+            xye = self._dynamic_transactional_xye_sink
+            if xye is not None and (
+                xye._settlement_pending or self._dynamic_xye_epoch_pending()
+            ):
+                raise RuntimeError("dynamic submit has pending XYE settlement")
+            if (
+                self._dynamic_epoch_notified
+                and not self._dynamic_xye_only_continuation
+            ):
                 raise RuntimeError(
                     "dynamic submit requires an advancing live intent after commit")
             if attempt_token is _ATTEMPT_MISSING:
@@ -741,9 +786,16 @@ class ScanSession:
     def stop(self) -> None:
         """Cooperative cancel (sets the cancel token); the writer stops at the
         next boundary.  Call :meth:`finish` to drain + finalize."""
+        xye = getattr(self, "_dynamic_transactional_xye_sink", None)
+        if xye is not None and (
+            xye._settlement_pending or self._dynamic_xye_epoch_pending()
+        ):
+            raise RuntimeError("dynamic stop has pending XYE settlement")
         if self._dynamic_accounting is not None and not self._dynamic_stop_requested:
             self._dynamic_accounting.stop()
             self._dynamic_stop_requested = True
+        if xye is not None and not self._session.drain():
+            raise RuntimeError("dynamic Stop could not drain its accepted prefix")
         self._session.cancel_token.cancel()
         self._emit_state()
 
@@ -815,6 +867,11 @@ class ScanSession:
     def _finish_dynamic(
         self, *, raise_on_failure: bool, join_timeout: float | None,
     ) -> ReductionResult:
+        if self._dynamic_transactional_xye_sink is not None:
+            return self._finish_dynamic_xye(
+                raise_on_failure=raise_on_failure,
+                join_timeout=join_timeout,
+            )
         result = self._freeze_dynamic_result(join_timeout)
         if not self._session.sink_terminal_safe:
             raise self._dynamic_primary_error or RuntimeError(
@@ -898,8 +955,171 @@ class ScanSession:
                 raise error
         return result
 
+    def _dynamic_has_unresolved_attempt(self) -> bool:
+        snapshot = self._dynamic_accounting.snapshot()
+        return any(
+            snapshot.attempt_states[tokens[-1]] in {
+                DynamicAttemptState.PROVISIONAL,
+                DynamicAttemptState.ENQUEUED,
+                DynamicAttemptState.ACCEPTED,
+                DynamicAttemptState.FAILED_RETRYABLE,
+            }
+            for tokens in snapshot.attempts.values() if tokens
+        )
+
+    def _promote_dynamic_terminal_nexus(self, value) -> None:
+        nexus = self._dynamic_nexus_sink
+        if nexus is None:
+            if value is not None:
+                raise RuntimeError("XYE-only graph returned Nexus terminal truth")
+            return
+        if type(value) is not NexusTerminalResult:
+            raise RuntimeError("dynamic Nexus graph returned no typed terminal")
+        if value.disposition is NexusTerminalDisposition.ABORTED:
+            return
+        if value.disposition is not NexusTerminalDisposition.COMMITTED:
+            raise RuntimeError("dynamic Nexus graph returned contradictory truth")
+        if self._dynamic_terminal_nexus_promoted:
+            return
+        if self._dynamic_epoch_seal is None:
+            self._dynamic_epoch_seal = self._dynamic_boundary.prepare_epoch_commit(
+                self, self._dynamic_owner_token,
+            )
+        self._dynamic_boundary.epoch_committed(
+            self,
+            self._dynamic_owner_token,
+            self._dynamic_epoch_seal,
+            value.commit_identity,
+        )
+        self._dynamic_terminal_nexus_promoted = True
+        self._dynamic_epoch_seal = None
+
+    def _complete_dynamic_terminal(self, *, raise_on_failure: bool):
+        if self._record_store is not None:
+            with self._projection_lock:
+                self._reconcile_locked(self._record_store.labels())
+        self._final_sweep()
+        if not self._terminal_state_emitted:
+            self._terminal_state_emitted = True
+            self._emit_state()
+        result = self._dynamic_frozen_result
+        if raise_on_failure and result.failed:
+            error = self._dynamic_primary_error
+            if error is not None:
+                raise error
+        return result
+
+    def _finish_dynamic_xye(
+        self, *, raise_on_failure: bool, join_timeout: float | None,
+    ) -> ReductionResult:
+        xye = self._dynamic_transactional_xye_sink
+        if (
+            xye._transition_kind == "epoch"
+            or (
+                not self._dynamic_epoch_notified
+                and (
+                    self._dynamic_epoch_drained
+                    or self._dynamic_epoch_nexus_promoted
+                    or self._dynamic_epoch_anchor is not None
+                    or self._dynamic_epoch_xye_handoff is not None
+                    or self._dynamic_epoch_seal is not None
+                )
+            )
+        ):
+            raise RuntimeError(
+                "dynamic finish cannot replace a pending XYE epoch settlement"
+            )
+        result = self._freeze_dynamic_result(join_timeout)
+        if not self._session.sink_terminal_safe:
+            raise self._dynamic_primary_error or RuntimeError(
+                "dynamic writer remains able to call the sink"
+            )
+        if self._dynamic_terminal_settled:
+            return self._complete_dynamic_terminal(
+                raise_on_failure=raise_on_failure,
+            )
+
+        boundary = self._dynamic_boundary
+        owner = self._dynamic_owner_token
+        stopped = bool(self._dynamic_stop_requested or result.cancelled)
+        failed = bool(result.failed)
+        if not failed and not stopped and self._dynamic_has_unresolved_attempt():
+            result = self._mark_dynamic_failure(RuntimeError(
+                "session finish cannot abandon unresolved dynamic work"
+            ))
+            failed = True
+
+        if failed:
+            value = self._settle_dynamic_graph(result, failed=True)
+            self._promote_dynamic_terminal_nexus(value)
+            boundary.epoch_aborted(
+                self, owner,
+                str(self._dynamic_primary_error or "dynamic run aborted"),
+            )
+            self._dynamic_terminal_settled = True
+            return self._complete_dynamic_terminal(
+                raise_on_failure=raise_on_failure,
+            )
+
+        if not self._dynamic_graph_terminal_settled:
+            self._event_sink.flush(force=True)
+        value = self._settle_dynamic_graph(result, failed=False)
+        if (
+            value is not None
+            and value.disposition is NexusTerminalDisposition.ABORTED
+            and not stopped
+        ):
+            error = RuntimeError("dynamic finish resolved to ABORTED")
+            result = self._mark_dynamic_failure(error)
+            xye.abort(result)
+            boundary.epoch_aborted(self, owner, str(error))
+            self._dynamic_terminal_settled = True
+            return self._complete_dynamic_terminal(
+                raise_on_failure=raise_on_failure,
+            )
+        self._promote_dynamic_terminal_nexus(value)
+
+        if self._dynamic_finish_seal is None:
+            handoff = xye._settle_transition("finish", boundary)
+            if (
+                self._dynamic_finish_xye_handoff is not None
+                and self._dynamic_finish_xye_handoff is not handoff
+            ):
+                raise RuntimeError("dynamic XYE finish identity changed")
+            self._dynamic_finish_xye_handoff = handoff
+            canonical = (
+                value is not None
+                and value.disposition is NexusTerminalDisposition.COMMITTED
+            ) or xye._has_canonical_output
+            self._dynamic_finish_callback_kind = (
+                "stopped" if stopped and not canonical else "finished"
+            )
+            self._dynamic_finish_seal = boundary.prepare_session_finish(
+                self, owner, stopped=stopped,
+            )
+
+        handoff = self._dynamic_finish_xye_handoff
+        if self._dynamic_finish_callback_kind == "stopped":
+            boundary.session_stopped(
+                self,
+                owner,
+                self._dynamic_finish_seal,
+                "dynamic session stopped before a canonical prefix",
+            )
+        elif self._dynamic_finish_callback_kind == "finished":
+            boundary.session_finished(
+                self, owner, self._dynamic_finish_seal, handoff,
+            )
+        else:
+            raise RuntimeError("dynamic XYE finish lost its terminal callback")
+        xye._acknowledge_transition(handoff)
+        self._dynamic_terminal_settled = True
+        return self._complete_dynamic_terminal(raise_on_failure=raise_on_failure)
+
     def commit_epoch(self):
         """Commit one dynamic H23 epoch while retaining this exact session."""
+        if self._dynamic_transactional_xye_sink is not None:
+            return self._commit_dynamic_xye_epoch()
         if self._dynamic_accounting is None or self._dynamic_nexus_sink is None:
             raise RuntimeError("commit_epoch requires one dynamic Nexus owner")
         if self._dynamic_frozen_result is not None or self._dynamic_stop_requested:
@@ -934,10 +1154,85 @@ class ScanSession:
                 self._reconcile_locked(self._record_store.labels())
         return anchor
 
+    def _commit_dynamic_xye_epoch(self):
+        if self._dynamic_accounting is None:
+            raise RuntimeError("commit_epoch requires dynamic accounting")
+        if self._dynamic_frozen_result is not None or self._dynamic_stop_requested:
+            raise RuntimeError("terminal dynamic session cannot commit another epoch")
+        xye = self._dynamic_transactional_xye_sink
+        if xye._transition_kind == "finish":
+            raise RuntimeError("an XYE terminal transition remains unsettled")
+        if self._dynamic_epoch_notified:
+            return self._dynamic_settled_epoch_anchor
+        if not self._dynamic_epoch_drained:
+            if not self._session.drain():
+                raise RuntimeError("dynamic epoch writer did not drain")
+            failure = self._session._current_failure()
+            if failure is not None:
+                raise failure
+            self._event_sink.flush(force=True)
+            self._dynamic_epoch_drained = True
+
+        nexus = self._dynamic_nexus_sink
+        if nexus is not None and not self._dynamic_epoch_nexus_promoted:
+            if self._dynamic_epoch_anchor is None:
+                current = ReductionResult(
+                    self.scan.name, {}, self._session._completed,
+                )
+                self._dynamic_epoch_anchor = nexus.commit_epoch(current)
+            if self._dynamic_epoch_seal is None:
+                self._dynamic_epoch_seal = (
+                    self._dynamic_boundary.prepare_epoch_commit(
+                        self, self._dynamic_owner_token,
+                    )
+                )
+            self._dynamic_boundary.epoch_committed(
+                self,
+                self._dynamic_owner_token,
+                self._dynamic_epoch_seal,
+                self._dynamic_epoch_anchor,
+            )
+            self._dynamic_epoch_nexus_promoted = True
+            self._dynamic_epoch_seal = None
+
+        if self._dynamic_epoch_xye_handoff is None:
+            self._dynamic_epoch_xye_handoff = xye._settle_transition(
+                "epoch", self._dynamic_boundary,
+            )
+        handoff = self._dynamic_epoch_xye_handoff
+        if self._dynamic_epoch_seal is None:
+            self._dynamic_epoch_seal = self._dynamic_boundary.prepare_epoch_commit(
+                self, self._dynamic_owner_token,
+            )
+        self._dynamic_boundary.epoch_committed(
+            self,
+            self._dynamic_owner_token,
+            self._dynamic_epoch_seal,
+            handoff,
+        )
+        xye._acknowledge_transition(handoff)
+        settled = self._dynamic_epoch_anchor if nexus is not None else handoff
+        self._dynamic_settled_epoch_anchor = settled
+        self._dynamic_epoch_seal = None
+        self._dynamic_epoch_anchor = None
+        self._dynamic_epoch_xye_handoff = None
+        self._dynamic_epoch_nexus_promoted = False
+        self._dynamic_epoch_drained = False
+        self._dynamic_epoch_notified = True
+        if self._record_store is not None:
+            with self._projection_lock:
+                self._reconcile_locked(self._record_store.labels())
+        return settled
+
     def extend_live(self, intent: AppendIntent) -> AppendDecision:
         """Continue this exact same-run output lineage."""
         if type(intent) is not AppendIntent:
             raise TypeError("extend_live requires an exact AppendIntent")
+        xye = self._dynamic_transactional_xye_sink
+        if xye is not None and (
+            xye._settlement_pending or self._dynamic_xye_epoch_pending()
+        ):
+            raise RuntimeError("same-run continuation has pending XYE settlement")
         extend_live = self._dynamic_extend_live
         owner = self._dynamic_extension_owner
         current_intent = self._dynamic_current_intent
@@ -1111,6 +1406,11 @@ class ScanSession:
                 raise RuntimeError("dynamic acceptance lost its exact submit token")
             def publish_dynamic(ledger_attempt: int) -> None:
                 self._dynamic_epoch_anchor = None
+                self._dynamic_settled_epoch_anchor = None
+                self._dynamic_epoch_seal = None
+                self._dynamic_epoch_nexus_promoted = False
+                self._dynamic_epoch_drained = False
+                self._dynamic_epoch_xye_handoff = None
                 self._dynamic_epoch_notified = False
                 publish_acceptance(ledger_attempt)
             subject = token

@@ -85,6 +85,7 @@ from xrd_tools.io.output_transaction import (
     StreamTerminal,
     TransactionPhase,
     TransactionSnapshot,
+    XyeSnapshot,
     get_output_transaction_coordinator,
 )
 logger = logging.getLogger(__name__)
@@ -704,7 +705,10 @@ class CompositeSink:
     def _p0_nexus_count(sink):
         kind = type(sink)
         if kind is not CompositeSink:
-            return 0 if kind is MemorySink else 1 if kind is NexusSink else None
+            return (
+                0 if kind in {MemorySink, TransactionalXYESink}
+                else 1 if kind is NexusSink else None
+            )
         counts = tuple(map(CompositeSink._p0_nexus_count, sink.sinks))
         return None if None in counts else sum(counts)
 
@@ -877,6 +881,219 @@ class XYESink:
 
     def perf_snapshot(self) -> dict[str, float]:
         return {"sink_xye_write": self._perf_write}
+
+
+@dataclass(frozen=True, slots=True)
+class _TransactionalXYEHandoff:
+    identity: tuple[int, XyeSnapshot]
+    descriptors: tuple[tuple[int, ResultMode, str], ...]
+    kind: str
+
+
+@dataclass(slots=True)
+class TransactionalXYESink:
+    """Publish dynamic 1-D values through the shared H23 transaction owner."""
+
+    directory: Path | str
+    stale_paths: tuple[Path | str, ...] = field(default=(), kw_only=True)
+    pattern: str = field(default="{scan}_{frame:04d}.xye", kw_only=True)
+    _run_owner: OwnerToken = field(init=False, repr=False)
+    _transaction: Any = field(init=False, repr=False)
+    _canonical_directory: Path = field(init=False, repr=False)
+    _stale_paths: tuple[Path | str, ...] = field(init=False, repr=False)
+    _pattern: str = field(init=False, repr=False)
+    _canonical_target: str = field(init=False, repr=False)
+    _boundary: Any = field(default=None, init=False, repr=False)
+    _scan_name: str = field(default="", init=False, repr=False)
+    _mode: ResultMode | None = field(default=None, init=False, repr=False)
+    _transition_kind: str | None = field(default=None, init=False, repr=False)
+    _handoff: _TransactionalXYEHandoff | None = field(
+        default=None, init=False, repr=False,
+    )
+    _transition_ordinal: int = field(default=0, init=False, repr=False)
+    _published_any: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.pattern != "{scan}_{frame:04d}.xye":
+            raise ValueError(
+                "transactional XYE supports only the direct per-frame pattern"
+            )
+        self.stale_paths = tuple(self.stale_paths)
+        self._stale_paths = self.stale_paths
+        self._pattern = self.pattern
+        owner = OwnerToken(f"transactional-xye:{self.directory}")
+        transaction = get_output_transaction_coordinator().prepare_xye(
+            self.directory, run_owner=owner,
+        )
+        normalized = transaction.snapshot().directory
+        self.directory = Path(normalized)
+        self._canonical_directory = self.directory
+        self._run_owner = owner
+        self._transaction = transaction
+        self._canonical_target = f"xye:{normalized}"
+
+    @property
+    def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
+        return frozenset({OutputSinkKind.XYE})
+
+    @property
+    def output_receipt_capabilities(self) -> frozenset[OutputReceiptCapability]:
+        return frozenset({OutputReceiptCapability.DURABLE_XYE})
+
+    @property
+    def canonical_target(self) -> str:
+        return self._canonical_target
+
+    @property
+    def _settlement_pending(self) -> bool:
+        return self._transition_kind is not None
+
+    @property
+    def _has_canonical_output(self) -> bool:
+        return self._published_any
+
+    def bind_session(self, boundary: Any) -> None:
+        if getattr(boundary, "defer_epoch_durability", None) is not True:
+            raise TypeError(
+                "transactional XYE requires the deferred dynamic writer boundary"
+            )
+        if self._boundary is not None and self._boundary is not boundary:
+            raise RuntimeError("transactional XYE boundary identity changed")
+        self._boundary = boundary
+
+    def begin(self, scan: Scan, plan: ReductionPlan) -> None:
+        boundary = self._boundary
+        if boundary is None:
+            raise RuntimeError("transactional XYE has no bound writer boundary")
+        if plan.integration_1d is None:
+            raise ValueError("transactional XYE requires one 1-D result mode")
+        mode_1d, mode_2d = _plan_mode_keys(plan)
+        mode = ResultMode.one_d(mode_1d)
+        if self._canonical_target not in boundary.targets_for(mode):
+            raise ValueError("transactional XYE target does not match the 1-D mode")
+        if (
+            plan.integration_2d is not None
+            and self._canonical_target in boundary.targets_for(
+                ResultMode.two_d(mode_2d)
+            )
+        ):
+            raise ValueError("transactional XYE target cannot satisfy a 2-D mode")
+        self._scan_name = scan.name
+        self._mode = mode
+
+    def _path_for(self, frame: Frame) -> Path:
+        path = os.path.normcase(os.path.abspath(str(
+            self._canonical_directory / self._pattern.format(
+                scan=self._scan_name,
+                frame=int(frame.index),
+                label=frame.label,
+            )
+        )))
+        if os.path.dirname(path) != str(self._canonical_directory):
+            raise ValueError(
+                "transactional XYE output path must stay in its canonical directory"
+            )
+        return Path(path)
+
+    def write(self, frame: Frame, reduction: FrameReduction) -> None:
+        result = reduction.result_1d
+        if result is None:
+            return
+        mode = ResultMode.one_d(
+            str(reduction.mode_1d or DEFAULT_MODE_KEY)
+        )
+        if self._mode is None:
+            raise RuntimeError("TransactionalXYESink.write called before begin().")
+        if mode != self._mode:
+            raise ValueError("transactional XYE result mode changed during the run")
+        path = self._path_for(frame)
+        self._transaction.stage(
+            self._run_owner,
+            int(frame.index),
+            (path, mode, result.radial, result.intensity, result.sigma),
+        )
+
+    def replace(self, frame: Frame, reduction: FrameReduction) -> None:
+        self.write(frame, reduction)
+
+    def flush(self, *, force: bool = False) -> None:
+        return None
+
+    def finish(self, result: ReductionResult) -> None:
+        return None
+
+    def abort(self, result: ReductionResult | None) -> None:
+        if self._settlement_pending:
+            raise RuntimeError("attempted XYE publication requires exact retry")
+        self._transaction.abandon(run_owner=self._run_owner)
+
+    def _publish_values(self, values) -> tuple[tuple[int, ResultMode, str], ...]:
+        descriptors = []
+        for label, value in values:
+            path, mode, radial, intensity, sigma = value
+            write_xye(path, radial, intensity, sigma)
+            descriptors.append((int(label), mode, self._canonical_target))
+        return tuple(descriptors)
+
+    def _settle_transition(self, kind: str, boundary: Any):
+        if kind not in {"epoch", "finish"}:
+            raise ValueError("unknown transactional XYE transition")
+        if boundary is not self._boundary:
+            raise RuntimeError("transactional XYE settlement changed boundary")
+        if self._transition_kind not in {None, kind}:
+            raise RuntimeError("another XYE transition remains unsettled")
+        self._transition_kind = kind
+        handoff = self._handoff
+        if handoff is None:
+            published: list[tuple[int, ResultMode, str]] = []
+
+            def publisher(values) -> None:
+                published.extend(self._publish_values(values))
+
+            try:
+                snapshot = self._transaction.snapshot()
+                if snapshot.retryable:
+                    token = snapshot.cleanup_token
+                    if token is None:
+                        raise RuntimeError("retryable XYE transaction lost its token")
+                    snapshot = self._transaction.retry_publication(
+                        token, publisher=publisher,
+                    )
+                elif kind == "epoch":
+                    snapshot = self._transaction.publish_epoch(
+                        run_owner=self._run_owner,
+                        stale_paths=self._stale_paths,
+                        publisher=publisher,
+                    )
+                else:
+                    snapshot = self._transaction.publish(
+                        run_owner=self._run_owner,
+                        stale_paths=self._stale_paths,
+                        publisher=publisher,
+                    )
+            except BaseException:
+                if not self._transaction.snapshot().retryable:
+                    self._transition_kind = None
+                raise
+            self._transition_ordinal += 1
+            handoff = _TransactionalXYEHandoff(
+                (self._transition_ordinal, snapshot), tuple(published), kind,
+            )
+            self._handoff = handoff
+            self._published_any = self._published_any or bool(published)
+        receipts = tuple(
+            boundary.capture_receipt(label, mode, target)
+            for label, mode, target in handoff.descriptors
+        )
+        boundary.commit_durable(receipts)
+        return handoff.identity
+
+    def _acknowledge_transition(self, identity) -> None:
+        handoff = self._handoff
+        if handoff is None or identity is not handoff.identity:
+            raise RuntimeError("transactional XYE promotion identity changed")
+        self._handoff = None
+        self._transition_kind = None
 
 
 @dataclass(slots=True)
@@ -1804,6 +2021,7 @@ class BoundOutputSinkGraph:
     sink: ReductionSink | None
     families: frozenset[OutputSinkKind]
     nexus_sink: NexusSink | None = None
+    transactional_xye_sink: TransactionalXYESink | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.families, frozenset)
@@ -1812,6 +2030,13 @@ class BoundOutputSinkGraph:
             raise TypeError("bound sink families must be a typed frozenset")
         if self.nexus_sink is not None and type(self.nexus_sink) is not NexusSink:
             raise TypeError("bound Nexus owner must be an exact NexusSink")
+        if (
+            self.transactional_xye_sink is not None
+            and type(self.transactional_xye_sink) is not TransactionalXYESink
+        ):
+            raise TypeError(
+                "bound XYE owner must be an exact TransactionalXYESink"
+            )
 
 
 def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
@@ -1825,17 +2050,18 @@ def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
 
     def bind(node: object) -> BoundOutputSinkGraph:
         if node is None:
-            return BoundOutputSinkGraph(None, frozenset(), None)
+            return BoundOutputSinkGraph(None, frozenset(), None, None)
         node_type = type(node)
         direct = {
             MemorySink: OutputSinkKind.MEMORY,
             NexusSink: OutputSinkKind.NEXUS,
-            XYESink: OutputSinkKind.XYE,
+            TransactionalXYESink: OutputSinkKind.XYE,
         }
         if node_type in direct:
             return BoundOutputSinkGraph(
                 node, frozenset({direct[node_type]}),
                 node if node_type is NexusSink else None,
+                node if node_type is TransactionalXYESink else None,
             )
         if node_type is not CompositeSink:
             raise UnclassifiedOutputSinkGraph(
@@ -1869,10 +2095,19 @@ def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
             raise UnclassifiedOutputSinkGraph(
                 "dynamic CompositeSink has multiple Nexus transaction owners"
             )
+        xye_children = tuple(
+            child.transactional_xye_sink for child in bound_children
+            if child.transactional_xye_sink is not None
+        )
+        if len(xye_children) > 1:
+            raise UnclassifiedOutputSinkGraph(
+                "dynamic CompositeSink has multiple XYE transaction owners"
+            )
         return BoundOutputSinkGraph(
             executable,
             frozenset().union(*(child.families for child in bound_children)),
             nexus_children[0] if nexus_children else None,
+            xye_children[0] if xye_children else None,
         )
 
     return bind(value)
