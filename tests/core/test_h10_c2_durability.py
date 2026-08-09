@@ -1114,6 +1114,10 @@ def test_g15_three_cadence_consumers_share_one_policy_definition():
         assert {attr for attr, _recv, _where, _line in calls} == {
             "should_flush", "commit_epoch",
         }, f"{rel} must delegate the complete cadence decision; got {calls}"
+        foreign = [row for row in calls if row[1] != "adapter"]
+        assert foreign == [], (
+            f"{rel} must delegate cadence through ScanSessionAdapter; "
+            f"foreign receivers={foreign}")
 
     adapter_calls = _method_calls(
         src / _CADENCE_ADAPTER, {"should_flush", "commit_epoch"})
