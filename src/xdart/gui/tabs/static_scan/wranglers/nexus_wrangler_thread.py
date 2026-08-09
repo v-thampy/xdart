@@ -5,47 +5,17 @@ nexusThread — worker thread for NeXus/Tiled wrangler.
 Reads frames from a NeXus HDF5 file (Bluesky suitcase-nexus format)
 and integrates each one using the same LiveFrame pipeline as imageThread.
 
-Performance shape (post-P3A refactor 2026-05-13):
-
-* **Bulk HDF5 reads** — frames are read in ``_READ_CHUNK``-sized
-  slices (``ds[a:b]``), so HDF5 chunk decompression happens once per
-  N frames rather than N times for the same chunk.  Reads go through
-  :class:`xrd_tools.io.nexus.NexusImageStack`, which exposes a
-  single (N, H, W) logical view across either a single 3D dataset or
-  an Eiger master's sibling ``data_NNNNNN`` external links — chunked
-  reads cross file boundaries seamlessly.
-* **Parallel integration** — within each chunk, xdart builds frame shells and
-  delegates the worker pool to ``xrd_tools.reduction.run_reduction``.
-* **Periodic saves** — disk writes are batched every
-  ``_LIVE_SAVE_INTERVAL`` frames so the v2 NeXus writer's per-flush
-  cost amortises across the scan.  Skipped entirely under
-  ``xye_only`` mode (Int 1D (XYE)).
-* **Per-chunk XYE flush** — XYE files are buffered inside the worker
-  and flushed once per chunk by ``_flush_xye_buffer`` (inherited from
-  wranglerThread).  Buffering keeps the worker thread cheap and
-  groups disk traffic so it doesn't interleave with the next chunk's
-  integration.  Per-frame XYE export happens in **every** mode
-  (Int 1D + 2D, Int 1D, Int 1D (XYE)).
-* **GI mode safe** — incident-angle resolution and fiber-integrator ownership
-  live inside the headless reduction spine.
-* **1D-only mode** — set ``scan.skip_2d = True`` to bypass 2D
-  integration entirely (faster on large detectors).  Set
-  ``self.xye_only = True`` (in addition) to also bypass the .nxs
-  writer and produce XYE files only.
-
 @author: thampy
 """
 
 # Standard library imports
 import logging
 import os
-import threading
-import time
-from contextlib import nullcontext
-from enum import Enum
+from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple
 
+import h5py
 import numpy as np
 
 # Qt imports
@@ -54,34 +24,34 @@ from pyqtgraph import Qt
 # Project imports
 from xdart.modules.live import LiveFrame, LiveScan
 from xrd_tools.core.containers import PONI
-from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io.output_safety import (
     OutputCollisionError,
     check_output_not_source,
 )
-from xrd_tools.session.readiness import (
-    append_config_mismatch_check,
-    processing_config_from_mapping,
-)
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
-from xrd_tools.reduction import GIFreezeError
-from xrd_tools.io import resolve_output_target
+from xrd_tools.io import (
+    AppendDisposition, AppendExternalMember, AppendIntent, AppendRefused,
+    AppendSource, AppendSourceGraphRefused, decode_committed_append_prefix,
+    qualify_append, resolve_output_target, science_fingerprint,
+    truncate_append_source,
+)
 from xrd_tools.io.nexus import open_nexus_execution_source
 from xrd_tools.io.image import read_image
 from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
-from xrd_tools.io.export import write_xye
-from xdart.utils.h5pool import get_pool as _get_h5pool
+from xrd_tools.session import DynamicFrameIdentity, required_result_modes
 from xrd_tools.session.run_configuration import (
     RunConfigurationRefused,
     require_run_configuration,
 )
 from xdart.modules.reduction import (
     apply_frozen_run_configuration as _apply_frozen_run_configuration,
-    open_live_reduction_session,
+    freeze_live_scan_gi_ranges,
     StandardPlanCache,
-    reduce_live_frames,
     sync_live_scan_gi_settings,
 )
+from xrd_tools.sources.adapters import candidate_owner
+from xrd_tools.sources.discover import Candidate
+import xrd_tools.sources.registry  # noqa: F401
 from .wrangler_widget import (
     wranglerThread,
 )
@@ -92,11 +62,14 @@ logger = logging.getLogger(__name__)
 #: supplied candidate that happens to be ``None`` (which must still refuse).
 _CARRIER = object()
 
-#: Suffix of the run-owned staging copy an Overwrite replacement renames the
-#: prior target to.  It lives beside the target so the rename is atomic, and it
-#: is dropped on commit / restored on rollback (§17.5).
-_REPLACING_SUFFIX = ".xdart-replacing"
 
+def _source_candidate(path):
+    path = Path(path)
+    stat = path.stat()
+    owner = candidate_owner(path)
+    if owner is None:
+        raise ValueError(f"no source adapter owns {path}")
+    return Candidate(path, owner.id, int(stat.st_size), int(stat.st_mtime_ns))
 
 class FrozenSourceTarget(NamedTuple):
     """The whole NeXus execution target, from the accepted object.
@@ -140,169 +113,8 @@ class FrozenSourceTarget(NamedTuple):
         return PONI.from_dict(dict(self.poni_values))
 
 
-class OverwritePhase(str, Enum):
-    """Terminally meaningful phases of one accepted output transaction."""
-
-    READY = "ready"
-    CREATING_NO_PRIOR = "creating-no-prior"
-    PRIOR_STAGED = "prior-staged"
-    ROLLBACK_PENDING = "rollback-pending"
-    COMMITTED = "committed"
-    CLEANUP_PENDING = "cleanup-pending"
-
-
-class PreparedOverwriteTransaction:
-    """One exact Overwrite transaction, frozen to the accepted target.
-
-    The phase is assigned before every fallible filesystem transition.  A
-    failed cleanup therefore leaves a precise retry owner rather than a
-    collection of booleans whose relationship must be reconstructed from the
-    current filesystem.
-    """
-
-    __slots__ = (
-        "enabled",
-        "target",
-        "backup",
-        "phase",
-        "_resume_pool",
-    )
-
-    def __init__(self, mode: str, target: str):
-        self.enabled = str(mode) == "Overwrite"
-        self.target = Path(target)
-        self.backup = self.target.with_name(
-            self.target.name + _REPLACING_SUFFIX)
-        self.phase = OverwritePhase.READY
-        self._resume_pool = None
-
-    @property
-    def ready_for_retry(self) -> bool:
-        return self.phase is OverwritePhase.READY
-
-    @property
-    def committed(self) -> bool:
-        return self.phase in {
-            OverwritePhase.COMMITTED,
-            OverwritePhase.CLEANUP_PENDING,
-        }
-
-    def retain_pool_resume(self, pool) -> None:
-        self._resume_pool = pool
-
-    def finish_pool_cleanup(self) -> None:
-        """Complete an interrupted pool-resume before releasing this owner."""
-        pool = self._resume_pool
-        if pool is None:
-            return
-        pool.resume(str(self.target))
-        self._resume_pool = None
-
-    def finish_filesystem_cleanup(self) -> None:
-        """Complete the exact filesystem phase retained by this owner.
-
-        The caller holds both writer isolation boundaries.  A failure leaves
-        the phase and paths unchanged, so public envelope release can retry
-        the same cleanup rather than dropping a partially-created target or
-        the only durable prior-result backup.
-        """
-        if self.phase is OverwritePhase.ROLLBACK_PENDING:
-            if self.target.exists():
-                self.target.unlink()
-            if self.backup.exists():
-                os.replace(self.backup, self.target)
-            self.phase = OverwritePhase.READY
-            return
-        if self.phase is OverwritePhase.CLEANUP_PENDING:
-            try:
-                self.backup.unlink()
-            except FileNotFoundError:
-                pass
-            self.phase = OverwritePhase.COMMITTED
-
-
-class PreparedXyeOutput:
-    """Run-owned XYE entries and stale-tail cleanup state."""
-
-    __slots__ = ("lock", "staged", "ready", "tail_pending", "ready_dirs")
-
-    def __init__(self):
-        self.lock = threading.RLock()
-        self.staged: list[tuple[int, object]] = []
-        self.ready: list[tuple[int, object]] = []
-        # None = never discovered; [] = discovered and clean.
-        self.tail_pending: list[Path] | None = None
-        self.ready_dirs: set[str] = set()
-
-    @property
-    def entries(self) -> list[tuple[int, object]]:
-        """Detached inspection of every entry still owned by this run."""
-        with self.lock:
-            return list(self.ready) + list(self.staged)
-
-    def stage(self, idx: int, frame) -> None:
-        with self.lock:
-            self.staged.append((int(idx), frame))
-
-    def qualify(self, published_idxs) -> bool:
-        """Move successfully published staged entries into the ready set."""
-        with self.lock:
-            if published_idxs is None:
-                allowed = None
-            else:
-                allowed = {int(value) for value in published_idxs}
-            if allowed is None:
-                qualified = self.staged
-            else:
-                qualified = [
-                    item for item in self.staged if int(item[0]) in allowed]
-            self.staged = []
-            self.ready.extend(qualified)
-            return bool(self.ready)
-
-    def drain(self) -> list[tuple[int, object]]:
-        with self.lock:
-            entries = self.ready
-            self.ready = []
-            return entries
-
-    def retire(self) -> int:
-        with self.lock:
-            count = len(self.staged) + len(self.ready)
-            self.staged = []
-            self.ready = []
-            return count
-
-
 class PreparedNexusExecution:
-    """The ONE prepared execution envelope for a NeXus run (§17.8 item 1).
-
-    O-3N.R.2's design checkpoint.  The parent kept five parallel latches --
-    ``_prepared_for``, ``_prepared_stack``, ``_run_output_prepared``,
-    ``_run_target_replaced`` and ``_xye_tail_cleared`` -- and each of them
-    recorded "prepared / replaced / cleared" *before* the resource or
-    transaction it named had reached a successful terminal state.  That is one
-    root cause with six symptoms (§17.1-§17.6): a foreign object could be
-    prepared, a proved stack could leak, a refused Append could be retried into
-    silence, a failed replacement could burn its retry identity, and a swallowed
-    delete could strand a stale XYE tail forever.
-
-    So this object owns all of it, for exactly one run:
-
-    * ``frozen`` -- the EXACT admitted ``FrozenRunConfiguration``, held by
-      reference.  Every later decision compares against it by ``is``;
-    * ``target`` -- the one derived :class:`FrozenSourceTarget`;
-    * ``stack`` -- the strict exact-entry raw stack, closed exactly once;
-    * ``scan_metadata`` -- the detached per-frame counters/angles, read on the
-      SAME held handle as the stack (O-3N.R.3 §19.1: the body used to reopen
-      the accepted pathname with ``read_nexus()``, so a replacement inode could
-      supply motor angles for the accepted inode's pixels);
-    * ``scan`` -- this run's own ``LiveScan``;
-    * the output-transaction state, each fact consumed only AFTER the operation
-      it describes has reached its terminal state (§19.3/§19.4 complete this:
-      an UNRESOLVED rollback and a WITHHELD XYE tail are carried too, so a
-      retry can complete them instead of destroying or forgetting them).
-    """
+    """Retryable custody for one admitted source handle and detached metadata."""
 
     __slots__ = (
         "frozen",
@@ -311,27 +123,23 @@ class PreparedNexusExecution:
         "scan_metadata",
         "scan",
         "poni",
-        "append_qualified",
-        "overwrite",
-        "xye",
+        "master",
+        "source",
+        "observations",
         "_adopted",
         "_closed",
     )
 
-    def __init__(self, frozen, target, stack=None, scan_metadata=None):
+    def __init__(self, frozen, target, master, poni):
         self.frozen = frozen
         self.target = target
-        self.stack = stack
-        self.scan_metadata = scan_metadata
+        self.master = master
+        self.stack = None
+        self.scan_metadata = None
         self.scan = None
-        self.poni = target.poni() if target is not None else None
-        #: Append qualification finished successfully (never set on refusal).
-        self.append_qualified = False
-        self.overwrite = PreparedOverwriteTransaction(
-            getattr(frozen, "output_mode", "Append"),
-            target.output_path,
-        )
-        self.xye = PreparedXyeOutput()
+        self.poni = poni
+        self.source = None
+        self.observations = ()
         self._adopted = False
         self._closed = False
 
@@ -348,11 +156,7 @@ class PreparedNexusExecution:
         self._adopted = True
 
     def close(self) -> None:
-        """Close the raw stack exactly once, retaining failed cleanup.
-
-        §17.8 item 3: every success, typed refusal, exception, Stop and Close
-        path routes here, so the proved HDF5 handle cannot outlive the run.
-        """
+        """Close the raw stack exactly once, retaining a failed close."""
         if self._closed:
             return
         stack = self.stack
@@ -362,18 +166,8 @@ class PreparedNexusExecution:
         self._closed = True
 
 
-# How many frames to bulk-read from the source HDF5 per iteration.
-# HDF5 chunks for typical detectors hold a handful of frames each;
-# reading in 16-frame slices avoids paying per-chunk decompression
-# multiple times for the same chunk.
-_READ_CHUNK = 16
-
-# Save cadence inherited from wranglerThread.LIVE_SAVE_INTERVAL.
-# Subclass-level override would go here as ``LIVE_SAVE_INTERVAL = N``.
-
-# R4-G: the module-level `_DEFAULT_MAX_CORES` fallback is gone along with the
-# worker-cached core count it used to backstop.  The parallel-integration cap
-# is `frozen.max_cores` -- one owner, and no default that can drift from it.
+# The session policy resolves its worker grant from frozen.max_cores; no worker
+# fallback or cached duplicate remains.
 
 
 class nexusThread(wranglerThread):
@@ -387,6 +181,7 @@ class nexusThread(wranglerThread):
         showLabel: str, status text for the UI label
     """
     showLabel = Qt.QtCore.Signal(str)
+    sigRetainedCustody = Qt.QtCore.Signal(int, str)
 
     def __init__(
             self,
@@ -425,53 +220,16 @@ class nexusThread(wranglerThread):
 
         self.detector = None
         self.mask = None
-        # O-3N.R.2 §17.8 item 1: the ONE prepared execution envelope for the run
-        # in progress -- exact admitted object, derived target, proved raw
-        # stack, run scan and output-transaction state.  It replaces the five
-        # parallel latches whose early "prepared/replaced/cleared" writes were
-        # the §17 root cause; ``None`` means this worker is idle.
+        # The one prepared execution envelope for the run: exact admitted
+        # object, derived target, proved raw stack, source graph, and scan.
         self._execution = None
 
-        # NeXus processing is always batch-mode equivalent — surface the
-        # same flags the GUI's wrangler_finished handler checks so it
-        # auto-reloads the generated file and selects the last frame
-        # once processing is done. Without these, the display is left
-        # showing stale state from before the run.
         # Settable from outside (e.g. before .start()) when the GUI
         # eventually exposes a Cores spinbox for the NeXus wrangler.
         # C1: cached standard ReductionPlan, rebuilt only when scan
         # settings change.  Lives on the thread so it survives across
         # chunks within a single run.
         self._plan_cache = StandardPlanCache()
-
-    def _final_save_to_nexus(self, frozen, scan, files_processed):
-        """Persist the final NeXus tail with writer-lock-before-pool-pause."""
-        if files_processed <= 0 or frozen.run_options.get("xye_only", False):
-            return
-        is_finalize = (self.command != 'stop')
-        prepared = nexusThread._require_execution(self, frozen)
-
-        def write():
-            # O-3N.R §15.4 item 4: Overwrite replaces the target exactly once,
-            # at the first SUCCESSFUL writer action of this run, so every save
-            # inside the run appends into what this run created and the final
-            # save can never mix a previous identity's rows under the new
-            # provenance.  ``replace`` stays False here for exactly that reason.
-            scan.default_geometry()
-            scan.save_to_nexus(
-                replace=False, finalize=is_finalize,
-            )
-
-        # §16.4/§17.5: if no periodic save happened, THIS is the run's first
-        # writer action, so the atomic Overwrite replacement belongs here -- the
-        # same success-after-operation rule as every other save.
-        nexusThread._write_run_result(self, prepared, scan, write)
-        if not is_finalize:
-            logger.info(
-                '[NEXUS] Stop tail-flushed %d frames; .nxs is '
-                'a partial result (no finalize stamp).',
-                files_processed,
-            )
 
     # ── Main entry point ─────────────────────────────────────────────────
 
@@ -649,325 +407,6 @@ class nexusThread(wranglerThread):
             raise                                      # unreachable; refuse()
         return source
 
-    @staticmethod
-    def _append_identity(mapping):
-        """The stored (uri, entry, processing signature, fingerprint) identity.
-
-        O-3N.R.2 §17.4: the fingerprint is part of it.  Comparing only URI,
-        entry and the narrower processing mapping admitted a second Start on
-        the same container whose accepted PONI distance had changed -- a
-        different accepted CONTENT identity appending into the first run's rows.
-        """
-        config = (mapping or {}).get("config") or {}
-        run = config.get("run_configuration") or {}
-        source = run.get("source") or {}
-        return (str(source.get("uri") or ""), str(source.get("entry") or ""),
-                run.get("processing_mapping") or {
-                    "bai_1d_args": run.get("bai_1d_args"),
-                    "bai_2d_args": run.get("bai_2d_args"),
-                    "gi": run.get("gi"),
-                },
-                str(run.get("fingerprint") or ""))
-
-    def _prepare_output_for_run(self, prepared, scan):
-        """Own the output transaction for this run, before any writer action.
-
-        O-3N.R.1 §16.2/§16.4, closed by O-3N.R.2 §17.4.  Two modes, two
-        contracts:
-
-        * **Append** is PROVENANCE-QUALIFIED.  An existing target is inspected
-          before reduction or any writer mutation; only a target whose stored
-          source URI, exact entry, processing signature AND accepted content
-          fingerprint match this run is admitted.  Missing, malformed,
-          foreign-source, foreign-entry, science-incompatible or
-          foreign-content provenance is a visible typed refusal that leaves the
-          target byte-for-byte.
-        * **Overwrite** is NOT destructive here.  The prior result survives
-          until the raw stack is proved and a writer action COMMITS a
-          replacement, exactly once (see :meth:`_write_run_result`).
-
-        The envelope's ``append_qualified`` flag is set only after every proof
-        and the reapply have succeeded.  The parent assigned its equivalent
-        latch on entry, so one malformed or foreign target refused once and
-        then let an exact retry return early, bypassing qualification entirely.
-
-        XYE-only never touches the ``.nxs`` at all.
-        """
-        frozen = prepared.frozen
-        if frozen.run_options.get("xye_only", False):
-            return False
-        Path(os.path.dirname(scan.data_file)).mkdir(parents=True,
-                                                    exist_ok=True)
-        if prepared.append_qualified:
-            return False
-        if str(getattr(frozen, "output_mode", "Append")) == "Overwrite":
-            # §16.4: retain the old target.  The first successful writer action
-            # replaces it; nothing is destroyed during preparation.
-            return False
-
-        target = Path(scan.data_file)
-        if not target.exists():
-            prepared.append_qualified = True
-            return False
-
-        def refuse(detail):
-            raise RunConfigurationRefused(
-                "foreign", stage="nexus-append-qualification", detail=detail,
-                generation=int(getattr(frozen, "generation", 0) or 0))
-
-        try:
-            stored = read_provenance(str(target))
-        except Exception as exc:                       # noqa: BLE001
-            refuse(f"the Append target carries no readable provenance "
-                   f"({exc}); refusing rather than mixing rows under a new "
-                   "identity")
-        stored_uri, stored_entry, stored_processing, stored_fingerprint = (
-            nexusThread._append_identity(stored))
-        accepted = frozen.source
-        if not stored_uri:
-            refuse("the Append target names no source; it was not written by "
-                   "an admitted run")
-        if stored_uri != str(accepted.uri):
-            refuse(f"the Append target was written from {stored_uri!r}, not "
-                   f"{str(accepted.uri)!r}")
-        if stored_entry != str(accepted.entry or ""):
-            refuse(f"the Append target was written from entry "
-                   f"{stored_entry!r}, not {str(accepted.entry or '')!r}")
-        current = processing_config_from_mapping(frozen.processing_mapping())
-        check = append_config_mismatch_check(
-            "Append", processing_config_from_mapping(stored_processing),
-            current)
-        if not check.ok:
-            refuse(f"the Append target's processing configuration is "
-                   f"incompatible: {check.reason}")
-        # §17.4: the accepted CONTENT identity.  ``processing_mapping()`` is
-        # deliberately narrower than the frozen fingerprint -- the calibration
-        # lives outside it -- so this is the comparison that catches a changed
-        # accepted science value on an otherwise identical source/entry.
-        accepted_fingerprint = str(getattr(frozen, "fingerprint", "") or "")
-        if not stored_fingerprint:
-            refuse("the Append target records no content fingerprint; it was "
-                   "not written by an admitted run")
-        if stored_fingerprint != accepted_fingerprint:
-            refuse(f"the Append target carries content identity "
-                   f"{stored_fingerprint!r}, not this run's "
-                   f"{accepted_fingerprint!r}")
-        # Compatible: load the existing rows into THIS run's scan so new rows
-        # are added once and existing durability state is preserved honestly.
-        # The identity is committed only once this has SUCCEEDED.
-        loader = getattr(scan, "load_from_h5", None)
-        if callable(loader):
-            with self.file_lock:
-                loader(replace=False, mode='r')
-            _apply_frozen_run_configuration(scan, frozen)
-            for key, value in frozen.scan_args().items():
-                setattr(scan, key, value)
-        prepared.append_qualified = True
-        return True
-
-    def _emit_overwrite_refusal(self, message):
-        try:
-            self.showLabel.emit(f"Run refused: {message}")
-        except Exception:
-            logger.debug("showLabel emit failed for staging refusal",
-                         exc_info=True)
-
-    def _repair_overwrite_locked(self, transaction):
-        """Complete an exact pending rollback before another writer attempt."""
-        if transaction.phase is not OverwritePhase.ROLLBACK_PENDING:
-            return
-        target = transaction.target
-        backup = transaction.backup
-        try:
-            if target.exists():
-                target.unlink()
-            if backup.exists():
-                os.replace(backup, target)
-        except BaseException:
-            logger.error(
-                "[NEXUS] Overwrite rollback remains pending for %s",
-                target,
-                exc_info=True,
-            )
-            raise
-        transaction.phase = OverwritePhase.READY
-        logger.info("[NEXUS] completed pending Overwrite rollback for %s",
-                    target)
-
-    def _rollback_overwrite_locked(self, transaction):
-        """Restore a prior result, or remove a failed no-prior creation."""
-        target = transaction.target
-        backup = transaction.backup
-        had_prior = transaction.phase is OverwritePhase.PRIOR_STAGED
-        transaction.phase = OverwritePhase.ROLLBACK_PENDING
-        try:
-            if target.exists():
-                target.unlink()
-            if had_prior:
-                os.replace(backup, target)
-        except BaseException:
-            logger.error(
-                "[NEXUS] Overwrite rollback failed; exact cleanup remains "
-                "owned for %s",
-                target,
-                exc_info=True,
-            )
-            return
-        transaction.phase = OverwritePhase.READY
-
-    def _execute_overwrite_locked(self, transaction, write):
-        """Execute one writer while the caller owns lock and pool exclusion."""
-        if not transaction.enabled:
-            return write()
-
-        nexusThread._repair_overwrite_locked(self, transaction)
-        target = transaction.target
-        backup = transaction.backup
-
-        if transaction.phase is OverwritePhase.CLEANUP_PENDING:
-            try:
-                backup.unlink()
-            except FileNotFoundError:
-                transaction.phase = OverwritePhase.COMMITTED
-            except OSError:
-                logger.warning(
-                    "[NEXUS] superseded backup cleanup remains pending: %s",
-                    backup,
-                    exc_info=True,
-                )
-            else:
-                transaction.phase = OverwritePhase.COMMITTED
-
-        if transaction.committed:
-            return write()
-
-        # A suffix not owned by this transaction is always a durable prior.
-        # Check it before the absent-target branch.
-        if backup.exists():
-            message = (
-                f"an unresolved prior-result backup occupies {backup}; "
-                "refusing to destroy it to stage a new replacement — restore "
-                "or remove it first")
-            nexusThread._emit_overwrite_refusal(self, message)
-            raise OSError(message)
-
-        if target.exists():
-            transaction.phase = OverwritePhase.PRIOR_STAGED
-            try:
-                os.replace(target, backup)
-            except BaseException:
-                transaction.phase = (
-                    OverwritePhase.ROLLBACK_PENDING
-                    if backup.exists() else OverwritePhase.READY)
-                raise
-        else:
-            transaction.phase = OverwritePhase.CREATING_NO_PRIOR
-
-        try:
-            result = write()
-            if not target.exists():
-                raise OSError(
-                    f"the writer returned without creating accepted output "
-                    f"{target}")
-        except BaseException:
-            nexusThread._rollback_overwrite_locked(self, transaction)
-            raise
-
-        if transaction.phase is OverwritePhase.PRIOR_STAGED:
-            transaction.phase = OverwritePhase.CLEANUP_PENDING
-            try:
-                backup.unlink()
-            except OSError:
-                logger.warning(
-                    "[NEXUS] replaced prior cleanup remains pending: %s",
-                    backup,
-                    exc_info=True,
-                )
-            else:
-                transaction.phase = OverwritePhase.COMMITTED
-        else:
-            transaction.phase = OverwritePhase.COMMITTED
-        logger.info("[NEXUS] Overwrite committed %s", target)
-        return result
-
-    def _write_run_result(self, prepared, scan, write):
-        """Run one writer inside the exact accepted output transaction.
-
-        One outer reentrant ``file_lock`` and one refcounted HDF5-pool pause
-        span staging, the writer, rollback/commit, and backup disposition.
-        Readers can therefore never observe the canonical pathname between
-        transaction phases.
-        """
-        transaction = prepared.overwrite
-        actual = Path(scan.data_file)
-        if actual != transaction.target:
-            raise RunConfigurationRefused(
-                "foreign",
-                stage="nexus-output-transaction",
-                detail=(
-                    f"scan output {actual} is not the accepted output "
-                    f"{transaction.target}"),
-                generation=int(
-                    getattr(prepared.frozen, "generation", 0) or 0),
-            )
-
-        pool = _get_h5pool()
-        primary = None
-        result = None
-        with self.file_lock:
-            transaction.finish_pool_cleanup()
-            pool.pause(str(transaction.target))
-            try:
-                try:
-                    result = nexusThread._execute_overwrite_locked(
-                        self, transaction, write)
-                except BaseException as exc:
-                    primary = exc
-            finally:
-                try:
-                    pool.resume(str(transaction.target))
-                except BaseException as exc:
-                    transaction.retain_pool_resume(pool)
-                    if primary is None:
-                        raise
-                    raise primary.with_traceback(primary.__traceback__) from exc
-        if primary is not None:
-            raise primary.with_traceback(primary.__traceback__)
-        return result
-
-    def _finish_overwrite_cleanup(self, prepared):
-        """Retry the prepared transaction's exact terminal cleanup.
-
-        Cleanup runs under the same lock and refcounted pool exclusion as a
-        writer action.  Failure retains both the envelope and transaction
-        phase; a repeated public release retries only this owner.
-        """
-        transaction = prepared.overwrite
-        with self.file_lock:
-            transaction.finish_pool_cleanup()
-            if transaction.phase not in {
-                    OverwritePhase.ROLLBACK_PENDING,
-                    OverwritePhase.CLEANUP_PENDING}:
-                return
-            pool = _get_h5pool()
-            pool.pause(str(transaction.target))
-            primary = None
-            try:
-                transaction.finish_filesystem_cleanup()
-            except BaseException as exc:
-                primary = exc
-            finally:
-                try:
-                    pool.resume(str(transaction.target))
-                except BaseException as exc:
-                    transaction.retain_pool_resume(pool)
-                    if primary is None:
-                        raise
-                    raise primary.with_traceback(
-                        primary.__traceback__) from exc
-            if primary is not None:
-                raise primary.with_traceback(primary.__traceback__)
-
     def _adopt_frozen_source_target(self, prepared):
         """Initialize this worker's runtime cursors FROM the accepted values.
 
@@ -994,139 +433,6 @@ class nexusThread(wranglerThread):
         # mapping already refused inside ``_frozen_source_target``.
         self.poni = prepared.poni
         return target
-
-    def _save_to_disk(self, frozen, scan):
-        """The run's periodic writer action, inside the output transaction.
-
-        §16.4/§17.5: Overwrite is destructive exactly ONCE per run, and only
-        once a writer action has SUCCEEDED -- after the raw stack was proved
-        and a result exists.  Later saves in the same run append into what this
-        run created.  XYE-only never reaches the ``.nxs`` writer at all.
-        """
-        if frozen.run_options.get("xye_only", False):
-            return
-        prepared = nexusThread._require_execution(self, frozen)
-        return nexusThread._write_run_result(
-            self, prepared, scan,
-            lambda: scan._save_to_nexus())
-
-    def _flush_xye_buffer(self, scan, published_idxs=None):
-        """Qualify and flush this prepared run's owned XYE entries.
-
-        Reduced frames are merely staged.  Only indices whose publication
-        completed become eligible, and at least one eligible entry must exist
-        before an Overwrite run may discover/delete a prior tail.  Pending
-        cleanup retains those exact entries on the prepared envelope.
-        """
-        prepared = getattr(self, "_execution", None)
-        if prepared is None:
-            return
-        xye = prepared.xye
-        if not xye.qualify(published_idxs):
-            return
-        if not nexusThread._clear_stale_xye_tail(self, prepared, scan):
-            logger.warning(
-                '[NEXUS] Overwrite: stale-XYE cleanup is PENDING; '
-                'withholding this flush (%d owned entries kept)',
-                len(xye.entries),
-            )
-            return
-        entries = xye.drain()
-        return wranglerThread._write_xye_entries(
-            self,
-            scan,
-            entries,
-            ready_dirs=xye.ready_dirs,
-            ready_lock=xye.lock,
-        )
-
-    def _clear_stale_xye_tail(self, prepared, scan):
-        """All-or-pending stale-XYE deletion for an Overwrite run (§17.6).
-
-        Two parent defects, one owner:
-
-        * the policy was read off mutable ``self.run_configuration``, so
-          replacing that carrier after admission with a foreign Append object
-          suppressed cleanup entirely.  It now comes from the ENVELOPE'S
-          accepted output policy, which nothing can poison;
-        * the completion latch was consumed before unlinking and ``OSError``
-          was swallowed, so one transient delete failure stranded a stale
-          higher-frame file permanently.  Cleanup is now all-or-pending and
-          every later flush retries what is left.
-
-        The stale set is discovered ONCE, before this run has written anything,
-        so a retry can never sweep the run's own output.
-
-        Returns ``True`` when the tail is CLEAN (nothing pending) and ``False``
-        while any stale artifact remains — the load-bearing outcome §19.4
-        requires: publication may proceed only on ``True``.
-        """
-        if str(getattr(prepared.frozen, "output_mode", "Append")) != "Overwrite":
-            return True
-        xye = prepared.xye
-        if xye.tail_pending is None:
-            root = Path(os.path.dirname(scan.data_file)) / str(scan.name)
-            xye.tail_pending = (sorted(root.glob("*.xye"))
-                                if root.is_dir() else [])
-        remaining = []
-        for stale in xye.tail_pending:
-            try:
-                stale.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError:
-                remaining.append(stale)
-        xye.tail_pending = remaining
-        if remaining:
-            logger.warning(
-                '[NEXUS] Overwrite: %d stale XYE file(s) could not be removed; '
-                'cleanup stays PENDING and the next flush retries: %s',
-                len(remaining), [str(p) for p in remaining])
-            return False
-        return True
-
-    def _finish_xye_output(self, prepared, scan):
-        """The run's terminal XYE outcome: clean, or VISIBLY pending (§19.4).
-
-        A one-chunk run has no later flush for the promised retry, so this is
-        the only/final attempt: retry the stale tail once more and, if it
-        clears, publish the withheld buffer (exactly the landed frames the
-        envelope accumulated).  If any stale artifact still remains, the run
-        may not report clean completion — the withheld output stays withheld
-        (no mixed run) and the pending state is surfaced on the same visible
-        label every other terminal outcome uses.
-
-        Returns ``True`` when this run's XYE output is complete and clean.
-        """
-        # §16.4 applied to the XYE half (panel finding R3-F1): a run that
-        # published NOTHING has no XYE stake, and the destructive stale sweep
-        # may not run decoupled from publication.  A discovered tail means a
-        # publishing-loop flush already ran; withheld indices or a non-empty
-        # buffer mean this run has output to land.  Otherwise — Stop before
-        # the first chunk, a failed GI freeze scout — the prior run's XYE
-        # files stay untouched, exactly as the ``.nxs`` half already behaves
-        # (``_final_save_to_nexus`` no-ops on zero processed frames).
-        xye = prepared.xye
-        stake = xye.tail_pending is not None or bool(xye.entries)
-        if not stake:
-            return True
-        self._flush_xye_buffer(scan, published_idxs=None)
-        pending = list(xye.tail_pending or ())
-        if not pending:
-            return True
-        withheld = len(xye.entries)
-        message = (
-            f'Run INCOMPLETE — {len(pending)} stale XYE file(s) from a prior '
-            f'run could not be removed; {withheld} new XYE file(s) withheld '
-            f'(no mixed output). Remove the stale file(s) and run again.')
-        logger.error('[NEXUS] %s  pending: %s', message,
-                     [str(p) for p in pending])
-        try:
-            self.showLabel.emit(message)
-        except Exception:                              # noqa: BLE001
-            logger.debug("showLabel emit failed for pending XYE tail",
-                         exc_info=True)
-        return False
 
     def _prepare_execution(self, frozen):
         """THE worker execution-preparation owner (§16.7 R.1-1, §17.8 item 1).
@@ -1166,12 +472,21 @@ class nexusThread(wranglerThread):
         # A superseded envelope never lingers beside a new one.
         nexusThread._release_execution(self)
         prepared = None
-        source = None
         try:
             target = nexusThread._frozen_source_target(accepted)
-            source = nexusThread._preflight_execution_target(self, target)
+            try:
+                master = _source_candidate(target.uri)
+            except (OSError, ValueError) as exc:
+                raise AppendSourceGraphRefused(
+                    f"master observation failed: {exc}",
+                    source_generation=int(accepted.generation)) from exc
             prepared = PreparedNexusExecution(
-                accepted, target, source.stack, source.scan_metadata)
+                accepted, target, master, target.poni())
+            source = nexusThread._preflight_execution_target(self, target)
+            prepared.stack = source.stack
+            prepared.scan_metadata = source.scan_metadata
+            prepared.source, prepared.observations = nexusThread._source_graph(
+                prepared, accepted.generation)
             nexusThread._adopt_frozen_source_target(self, prepared)
             prepared.mark_adopted()
         except BaseException as primary:
@@ -1184,11 +499,6 @@ class nexusThread(wranglerThread):
                     # preparation attempt completes only this cleanup.
                     self._execution = prepared
                     raise cleanup from primary
-            elif source is not None:
-                try:
-                    source.stack.close()
-                except Exception:                      # noqa: BLE001
-                    logger.debug("stack close failed", exc_info=True)
             raise
         self._execution = prepared
         return prepared
@@ -1207,47 +517,25 @@ class nexusThread(wranglerThread):
         return prepared
 
     def _release_execution(self):
-        """Close and clear the prepared envelope exactly once (§17.8 item 3).
-
-        Every terminal path -- success, typed refusal, exception, Stop and
-        Close -- routes here, so a proved raw-stack handle cannot outlive its
-        run and the worker returns to idle.
-
-        Panel finding R3-F3: WITHHELD XYE entries die with their envelope.
-        Once the run that withheld them is over they can never publish under
-        their own identity -- a later run on the same worker would drain them
-        under ITS published-index filter, writing another run's data into its
-        filenames.  (They also pin their integration payloads for as long as
-        they sit in the buffer.)
-        """
+        """Close and clear the exact source envelope after graph cleanup."""
         prepared = getattr(self, "_execution", None)
         if prepared is not None:
-            xye = getattr(prepared, "xye", None)
-            dropped = xye.retire() if xye is not None else 0
-            if dropped:
-                logger.warning(
-                    '[NEXUS] dropped %d uncommitted XYE entrie(s) with their '
-                    'released run owner', dropped)
-            primary = None
-            if getattr(prepared, "overwrite", None) is not None:
-                try:
-                    nexusThread._finish_overwrite_cleanup(self, prepared)
-                except BaseException as exc:
-                    primary = exc
-            try:
-                prepared.close()
-            except BaseException as exc:
-                if primary is None:
-                    primary = exc
-                else:
-                    logger.error(
-                        "[NEXUS] source cleanup also failed while output "
-                        "cleanup remained pending",
-                        exc_info=True,
-                    )
-            if primary is not None:
-                raise primary.with_traceback(primary.__traceback__)
+            prepared.close()
             self._execution = None
+
+    def release_retained_custody(self):
+        if (self._scan_session_adapter is not None
+                and not self._close_reduction_session()):
+            return False
+        try:
+            nexusThread._release_execution(self)
+        except BaseException as exc:
+            self._retain_dynamic_failure(exc, "Output cleanup remains pending")
+            return False
+        return super().release_retained_custody()
+
+    def dynamic_cleanup_pending(self):
+        return self._execution is not None or super().dynamic_cleanup_pending()
 
     def _project_gi_modes_onto_display_scan(self, frozen):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
@@ -1263,30 +551,22 @@ class nexusThread(wranglerThread):
         self.scan.bai_2d_args['gi_mode_2d'] = frozen.gi.mode_2d
 
     def run(self):
-        """QThread entry: run the integration body.
-
-        O-3N.R.2 §17.2/§17.8 item 3: EVERY worker refusal is contained here --
-        not just one raised by the initial preparation call.  A
-        production-shaped incompatible Append refuses well after preparation,
-        and the parent let that escape the QThread entry while the prepared
-        stack stayed open.  A worker-boundary refusal is an expected typed
-        terminal outcome: it is surfaced visibly, the envelope is released, and
-        the lifecycle returns to idle.
-        """
-        # W-1.2 case 5 parity: refuse before any source read, output open or
-        # reduction session — a worker without the accepted configuration does
-        # nothing at all.
+        """Run one admitted fixed snapshot through the dynamic session."""
+        outcome = None
+        succeeded = False
         try:
             try:
                 frozen = nexusThread._require_run_configuration(
                     self, "nexus-worker-run")
-                # O-3N (§14.2 item 4): derive what this run opens and where it
-                # writes from the accepted object BEFORE any source read or
-                # output open, so no mirror can decide either.
-                nexusThread._prepare_execution(self, frozen)
-                self._reset_xye_output_notifications()
-                self._run_impl(frozen)
-            except RunConfigurationRefused as exc:
+                if frozen.run_options.get("xye_only", False):
+                    raise RunConfigurationRefused(
+                        "absent", stage="nexus-dynamic-output",
+                        detail="dynamic XYE output is not mounted",
+                        generation=int(frozen.generation))
+                self._reduction_write_error = None
+                outcome = self._run_impl(frozen)
+                succeeded = True
+            except (RunConfigurationRefused, AppendRefused) as exc:
                 logger.error("run refused: %s", exc)
                 self.command = 'stop'
                 try:
@@ -1295,328 +575,269 @@ class nexusThread(wranglerThread):
                     logger.debug("showLabel emit failed for refusal",
                                  exc_info=True)
         finally:
-            # The reduction session drains first (its finish() is the streaming
-            # batch's end-of-scan write), then the source stack is released.
-            try:
-                self._close_reduction_session()
-            finally:
-                nexusThread._release_execution(self)
+            clean = self._close_reduction_session()
+            if clean:
+                try:
+                    nexusThread._release_execution(self)
+                except BaseException as exc:
+                    clean = False
+                    self._retain_dynamic_failure(
+                        exc, "Output cleanup remains pending")
+            if (succeeded and clean and outcome != "skip"
+                    and self.command != "stop"):
+                self.showLabel.emit(
+                    f"Done — {int(outcome or 0)} frames processed")
 
     def _run_impl(self, frozen):
-        """Read frames from a NeXus file and integrate them in parallel."""
-        # O-3N.R.1 §16.7 R.1-1: ONE worker preparation owner, reached by both
-        # ``run()`` and a supported direct ``_run_impl()`` entry.  It is
-        # idempotent, admits the exact object first, and nothing that reads
-        # source content or touches output may precede it.
+        """Submit the retained NeXus stack through one dynamic session."""
         prepared = nexusThread._prepare_execution(self, frozen)
-        try:
-            return nexusThread._run_body(self, prepared)
-        finally:
-            # §17.2: the proved raw stack was opened during preparation but only
-            # entered a ``with`` block after detector/mask/scan/Append work.
-            # Anything failing in between leaked the open HDF5 handle; the
-            # release is unconditional, and idempotent.
-            nexusThread._release_execution(self)
+        return nexusThread._run_body(self, prepared)
+
+    @staticmethod
+    def _source_graph(prepared, generation):
+        stack, master = prepared.stack, prepared.master
+
+        def refuse(reason):
+            raise AppendSourceGraphRefused(
+                f"unsupported NeXus detector topology: {reason}",
+                source_generation=int(generation))
+
+        paths = tuple(stack._paths)
+        datasets = tuple(stack._dsets)
+        offsets = tuple(stack._offsets)
+        if (not paths or len(paths) != len(datasets)
+                or len(offsets) != len(paths) + 1):
+            refuse("incomplete retained stack")
+        members, observations, kinds = [], [master], set()
+        for ordinal, (selector, dataset) in enumerate(zip(paths, datasets)):
+            owner = stack._h5
+            parts = [part for part in str(selector).split("/") if part]
+            if not parts:
+                refuse("empty detector path")
+            for part in parts[:-1]:
+                link = owner.get(part, getlink=True)
+                if not isinstance(link, h5py.HardLink):
+                    refuse("indirect ancestor")
+                owner = owner.get(part)
+                if not isinstance(owner, h5py.Group):
+                    refuse("non-group ancestor")
+            link = owner.get(parts[-1], getlink=True)
+            if not isinstance(link, (h5py.HardLink, h5py.ExternalLink)):
+                refuse("indirect detector leaf")
+            if (not isinstance(dataset, h5py.Dataset)
+                    or dataset.ndim not in (2, 3) or dataset.is_virtual
+                    or dataset.id.get_create_plist().get_external_count()):
+                refuse("non-owned or invalid-rank storage")
+            kind = "external" if isinstance(link, h5py.ExternalLink) else "hard"
+            kinds.add(kind)
+            if kind == "hard":
+                if os.path.abspath(dataset.file.filename) != os.path.abspath(master.path):
+                    refuse("hard link escaped the master")
+                continue
+            member_path = Path(link.filename)
+            if not member_path.is_absolute():
+                member_path = Path(master.path).parent / member_path
+            member_path = Path(os.path.abspath(member_path))
+            if (os.path.abspath(dataset.file.filename) != os.path.abspath(member_path)
+                    or dataset.name != str(link.path)):
+                refuse("external link is not a direct leaf")
+            try:
+                observed = _source_candidate(member_path)
+            except (OSError, ValueError) as exc:
+                refuse(f"member observation failed: {exc}")
+            observations.append(observed)
+            members.append(AppendExternalMember(
+                str(member_path), str(link.path), observed.size,
+                observed.mtime_ns, int(offsets[ordinal]),
+                int(offsets[ordinal + 1]), ordinal))
+        if len(kinds) != 1:
+            refuse("mixed storage owners")
+        source = AppendSource(
+            os.path.abspath(master.path), master.adapter_id, master.size,
+            master.mtime_ns, int(stack.shape[0]), dataset_paths=paths,
+            external_members=tuple(members), generation=int(generation))
+        return source, tuple(observations)
+
+    @staticmethod
+    def _require_source_unchanged(observations, generation):
+        for observed in observations:
+            try:
+                current = _source_candidate(observed.path)
+            except (OSError, ValueError) as exc:
+                raise AppendSourceGraphRefused(
+                    f"source member disappeared: {exc}",
+                    source_generation=int(generation)) from exc
+            if current != observed:
+                raise AppendSourceGraphRefused(
+                    f"source changed before mount: {observed.path}",
+                    source_generation=int(generation))
+
+    @staticmethod
+    def _frontier_intent(full, extent, generation):
+        source = replace(full.source, generation=int(generation))
+        return replace(
+            full, source=truncate_append_source(source, int(extent)),
+            labels=tuple(range(int(extent))))
 
     def _run_body(self, prepared):
-        """The integration body, executing ONLY on the prepared envelope."""
-        frozen = prepared.frozen
-        target = prepared.target
-        ds_cm = prepared.stack
-        xye_only = frozen.run_options.get("xye_only", False)
-        t0 = time.time()
-        # §17.1: source, entry, output and calibration are the envelope's --
-        # preflight already refused an absent calibration or unreadable source,
-        # so there is no silent early return to fall through here.
+        """Submit one exact fixed source graph through one dynamic adapter."""
+        frozen, target, stack = prepared.frozen, prepared.target, prepared.stack
+        scan_meta, base_meta = prepared.scan_metadata, {}
+        try:
+            for values in (scan_meta.counters, scan_meta.angles):
+                for name, column in values.items():
+                    if len(column):
+                        base_meta[name] = float(column[0])
+        except Exception:
+            scan_meta, base_meta = None, {}
 
-        # Setup detector and global mask
+        scan = self._initialize_scan(target.scan_name)
+        provisional = self._plan_cache.get(
+            scan, integrate_2d=not frozen.skip_2d)
+        policy = self._resolve_dynamic_session_policy(
+            frozen=frozen, plan=provisional, frame_shape=stack.shape[1:],
+            dtype=stack.dtype)
+        modes = tuple(f"{mode.kind}:{mode.key}"
+                      for mode in required_result_modes(provisional))
+        full = AppendIntent(
+            target.entry, target.source_base, os.path.abspath(target.uri),
+            science_fingerprint(frozen.processing_mapping()), modes,
+            prepared.source, tuple(range(int(stack.shape[0]))))
+        observations = prepared.observations
+        nexusThread._require_source_unchanged(
+            observations, full.source.generation)
+
+        prefix, decision = None, None
+        if target.output_mode == "Append":
+            with self.file_lock:
+                if Path(target.output_path).exists():
+                    try:
+                        with h5py.File(target.output_path, "r") as handle:
+                            prefix = decode_committed_append_prefix(
+                                handle, entry=target.entry)
+                    except (OSError, ValueError, TypeError, KeyError):
+                        prefix = None
+                if prefix is not None:
+                    k0 = len(prefix.intent.labels)
+                    if prefix.intent.labels != tuple(range(k0)):
+                        raise AppendSourceGraphRefused(
+                            "committed Nexus labels are not a zero-based prefix",
+                            source_generation=int(frozen.generation))
+                    generation = max(
+                        int(frozen.generation),
+                        int(prefix.intent.source.generation) + 1)
+                    full = nexusThread._frontier_intent(
+                        full, stack.shape[0], generation)
+                decision = qualify_append(
+                    target.output_path, full, committed_prefix=prefix)
+            if decision.disposition is AppendDisposition.REFUSE:
+                raise AppendRefused(decision)
+            k0 = len(prefix.intent.labels) if prefix is not None else 0
+            scan._committed_append_prefix = prefix
+            if decision.disposition is AppendDisposition.SKIP:
+                self.files_processed = self._last_files_processed = 0
+                self.showLabel.emit("Already processed — exact source is committed")
+                return "skip"
+        else:
+            k0 = 0
+            scan._committed_append_prefix = None
+
         self.detector = (get_detector(self.poni.detector)
                          if self.poni.detector else None)
         det_mask = self.detector.mask if self.detector is not None else None
         if frozen.mask_file and os.path.exists(frozen.mask_file):
-            custom_mask = np.asarray(read_image(frozen.mask_file), dtype=bool)
-            det_mask = (det_mask | custom_mask if det_mask is not None
-                        else custom_mask)
+            custom = np.asarray(read_image(frozen.mask_file), dtype=bool)
+            det_mask = det_mask | custom if det_mask is not None else custom
         self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
-
         nexusThread._project_gi_modes_onto_display_scan(self, frozen)
-
-        # Scan-level metadata (counters/angles per-frame arrays) is the
-        # ENVELOPE's, detached during strict preparation on the SAME held
-        # handle as the raw stack (§19.1).  Re-resolving the pathname here is
-        # exactly the scientific TOCTOU O-3N.R.3 removed: a replacement file
-        # at the accepted path fed the run foreign motor angles for the
-        # accepted inode's pixels.  Per-frame slicing happens later.
-        scan_meta = prepared.scan_metadata
-        base_meta = {}
-        try:
-            for k, v in scan_meta.counters.items():
-                if len(v) > 0:
-                    base_meta[k] = float(v[0])
-            for k, v in scan_meta.angles.items():
-                if len(v) > 0:
-                    base_meta[k] = float(v[0])
-        except Exception:
-            # Advisory metadata: a malformed per-point value degrades to the
-            # empty base exactly as the pre-§19.1 path-based read did.
-            scan_meta = None
-            base_meta = {}
-
-        # O-3N: one derivation — the name comes from the accepted source, never
-        # a second stem computed off a mutable mirror.
-        scan_name = target.scan_name
-        scan = self._initialize_scan(scan_name)
         scan._cached_integrator = poni_to_integrator(self.poni)
         scan._cached_poni = self.poni
         scan._cached_fiber_integrator = None
-
-        # Notify the GUI that a new scan is being processed.
+        sync_live_scan_gi_settings(
+            scan, incidence_motor=frozen.gi.scan_incidence_motor,
+            sample_orientation=frozen.gi.sample_orientation,
+            tilt_angle=frozen.gi.tilt_angle)
+        width = min(policy.flush.interval, policy.flush.hard_threshold())
+        frontier = min(int(stack.shape[0]), k0 + width)
+        intent = nexusThread._frontier_intent(
+            full, frontier, full.source.generation)
+        first_data = np.asarray(stack[k0])
+        first = self._build_frame(
+            frozen, scan, k0, first_data,
+            self._frame_meta(scan_meta, base_meta, k0))
+        if frozen.gi.enabled:
+            freeze_live_scan_gi_ranges(
+                scan, (first,), scan_name=str(scan.name),
+                global_mask=self.mask, integrator=scan._cached_integrator,
+                poni=self.poni, integrate_2d=not frozen.skip_2d,
+                gi_freeze_mode="first_frame")
+        final_plan = self._plan_cache.get(
+            scan, integrate_2d=not frozen.skip_2d)
+        final_modes = tuple(f"{mode.kind}:{mode.key}"
+                            for mode in required_result_modes(final_plan))
+        if final_modes != modes:
+            raise AppendSourceGraphRefused(
+                "GI freeze changed the qualified result modes",
+                source_generation=int(intent.source.generation))
+        nexusThread._require_source_unchanged(
+            observations, intent.source.generation)
+        scan._same_run_intent = intent
+        adapter = self._mount_dynamic_reduction_session(
+            (int(frozen.generation), os.path.abspath(target.output_path)),
+            frozen=frozen, scan=scan, plan=final_plan, pending_frame=first,
+            output_path=os.path.abspath(target.output_path),
+            gui_thread_id=self.gui_thread_id, policy=policy)
         self.sigUpdateFile.emit(
-            scan_name, self.fname,
-            frozen.gi.enabled, frozen.gi.scan_incidence_motor,
-            False, False,  # single_img=False, series_average=False
-        )
+            str(scan.name), os.path.abspath(target.output_path),
+            bool(frozen.gi.enabled), str(frozen.gi.scan_incidence_motor),
+            False, False)
 
-        files_processed = 0
-        # The strict execution source transparently handles two layouts:
-        #   • single 3D dataset (e.g. /entry/instrument/detector/data)
-        #   • Eiger master with sibling external links
-        #     /entry/data/data_NNNNNN → individual _data_*.h5 files.
-        # The proxy exposes the full scan as one (N, H, W) slice-able
-        # object, so chunked reads can cross file boundaries.
-        # §16.4: the raw stack was PROVED by the preparation owner before any
-        # output ownership became destructive; this is that exact resource, not
-        # a second open.  A processed/frameless/dangling source refused there.
-        # The prepared envelope is the sole lifetime owner.  Scope the body
-        # without invoking the stack context manager's close; exact release
-        # happens once in ``_release_execution`` and remains retryable.
-        with nullcontext(ds_cm) as ds:
-            nframes = ds.shape[0]
-            n_segments = ds.n_segments
-            self.showLabel.emit(
-                f'Found {nframes} frames in {Path(self.nexus_file).name}'
-                + (f' ({n_segments} data files)' if n_segments > 1 else '')
-            )
-
-            # F3: prewarm the stable bad-pixel mask cache on the main
-            # thread before any worker runs.  Without this, the first
-            # N workers all race to compute and write
-            # scan._cached_data_mask (same value, but the invariant
-            # isn't enforced).  Cheap: one frame read + a flatten.
-            if getattr(scan, '_cached_data_mask', None) is None:
-                first_frame = np.asarray(ds[0], dtype=np.float32)
-                self._prewarm_frame_mask(frozen, scan, first_frame)
-
-            n_workers = min(frozen.max_cores, nframes)
-            # C1: cached per-scan plan — rebuilt only when scan
-            # integration settings or mask change between chunks.
-            sync_live_scan_gi_settings(
-                scan,
-                incidence_motor=frozen.gi.scan_incidence_motor,
-                sample_orientation=frozen.gi.sample_orientation,
-                tilt_angle=frozen.gi.tilt_angle,
-            )
-            standard_plan = self._plan_cache.get(
-                # O-1a-W1R (review §39.2 W1R-P1-6): this 2D-integration
-                # decision used to read ``skip_2d`` off the locally
-                # aliased DISPLAY scan, which the committed AST census
-                # could not see.  It now comes from frozen policy.
-                # O-3N: the name is ``frozen`` in this scope -- ``_frozen`` was
-                # a NameError that no NeXus run could reach while the O-3 source
-                # guard refused them all.  Making NeXus runs executable again
-                # makes this line reachable, so it is corrected here.
-                scan, integrate_2d=not frozen.skip_2d,
-            )
-            frames_since_save = 0
-            for chunk_start in range(0, nframes, _READ_CHUNK):
-                if self.command == 'stop':
+        accepted = 0
+        revision = max(1, *(int(item.mtime_ns) for item in observations))
+        for frame_idx in range(k0, int(stack.shape[0])):
+            if self.command == "stop":
+                break
+            live = first if frame_idx == k0 else self._build_frame(
+                frozen, scan, frame_idx, np.asarray(stack[frame_idx]),
+                self._frame_meta(scan_meta, base_meta, frame_idx))
+            key = DynamicFrameIdentity(
+                os.path.abspath(target.uri), int(frame_idx))
+            adapter.discover(
+                key, group=os.path.abspath(target.output_path),
+                ordinal=int(frame_idx), output_label=int(frame_idx))
+            submitted = False
+            for _attempt in range(32):
+                token = adapter.begin_attempt(key, source_revision=revision)
+                adapter.record_enqueued(token)
+                if adapter.submit(live, attempt_token=token):
+                    submitted = True
                     break
-                chunk_end = min(chunk_start + _READ_CHUNK, nframes)
-                chunk_size = chunk_end - chunk_start
-
-                # Bulk-read the chunk — one HDF5 decompression pass.
-                _t_read = time.time()
-                block = np.asarray(ds[chunk_start:chunk_end],
-                                   dtype=np.float32)
-                _t_read = time.time() - _t_read
-
-                # Build per-frame live shells.  The headless reducer owns the
-                # worker pool; xdart keeps source provenance and later GUI
-                # publication.
-                frames = []
-                for i, frame_idx in enumerate(range(chunk_start, chunk_end)):
-                    frames.append(self._build_frame(
-                        frozen, scan,
-                        frame_idx,
-                        block[i],
-                        self._frame_meta(scan_meta, base_meta, frame_idx),
-                    ))
-
-                # ── Headless parallel integration ───────────────────
-                self.showLabel.emit(
-                    f'Integrating frames {chunk_start+1}-{chunk_end}'
-                    f'/{nframes} ({n_workers} workers)'
-                )
-                _t_phase1 = time.time()
-                executor = n_workers if n_workers > 1 else None
-                try:
-                    session = self._get_reduction_session(
-                        self._reduction_session_key_for(scan, standard_plan, n_workers),
-                        lambda: open_live_reduction_session(
-                            frames,
-                            standard_plan,
-                            scan_name=str(getattr(scan, "name", "scan")),
-                            global_mask=self.mask,
-                            integrator=scan._cached_integrator,
-                            poni=self.poni,
-                            executor=executor,
-                            cancel_token=self._cancel_token(),
-                            chunk_size=len(frames) if frames else 1,
-                            gi_freeze_mode="scout_union" if frozen.gi.enabled else None,
-                        ),
-                    )
-                except GIFreezeError as exc:
-                    # GI freeze scout (run when the session is built) found a
-                    # blank/degenerate grid.  The whole scan shares the GI
-                    # geometry, so retrying later chunks won't help -- surface
-                    # the fix and stop.
-                    self.showLabel.emit(
-                        'GI 2D scout frame is blank or the grid is degenerate: '
-                        'set Theta Motor to Manual and enter the incident '
-                        'angle, or check the mask / threshold.'
-                    )
-                    logger.warning('GI freeze scout failed: %s', exc)
+                adapter.record_failed(token, retryable=True)
+                if (self.command == "stop"
+                        or not adapter.quiesce(timeout=60.0)):
                     break
-                frames = reduce_live_frames(
-                    frames,
-                    standard_plan,
-                    scan_name=str(getattr(scan, "name", "scan")),
-                    global_mask=self.mask,
-                    integrator=scan._cached_integrator,
-                    poni=self.poni,
-                    session=session,
-                    cancel_token=self._cancel_token(),
-                    chunk_size=len(frames) if frames else 1,
-                    gi_freeze_mode="scout_union" if frozen.gi.enabled else None,
-                )
-                _t_phase1 = time.time() - _t_phase1
-
-                for frame in frames:
-                    if frame is None:
-                        continue
-                    prepared.xye.stage(frame.idx, frame)
-
-                # ── Serial accumulation into the scan ─────────────
-                # scan.add_frame and the sigUpdate emit happen serially; scan
-                # isn't thread-safe for concurrent writes, and the GUI widgets
-                # it feeds aren't either.
-                published_idxs = set()
-                for frame in frames:
-                    if frame is None:
-                        continue
-                    self._publish(frozen, scan, frame)
-                    self.sigUpdate.emit(frame.idx)
-                    published_idxs.add(int(frame.idx))
-                    files_processed += 1
-                    frames_since_save += 1
-
-                # ── Per-chunk XYE flush ─────────────────────────────
-                # Drain the XYE buffer once per chunk — keeps disk I/O
-                # batched and prevents the buffer from growing without
-                # bound on long scans.  Inherited ``_flush_xye_buffer``
-                # is a no-op when the buffer is empty (e.g. on Int 2D
-                # mode would be — but we always populate it).
-                # P3: pass the set of frame.idx values that survived the
-                # headless reduction call so a Stop-aborted batch doesn't
-                # leave orphan XYE files for frames that never landed in .nxs.
-                _t_xye = time.time()
-                self._flush_xye_buffer(scan, published_idxs=published_idxs)
-                _t_xye = time.time() - _t_xye
-
-                logger.info(
-                    '[NEXUS-BATCH] frames %d-%d  read=%.3fs  '
-                    'integrate=%.3fs  xye=%.3fs  total=%.3fs',
-                    chunk_start, chunk_end - 1, _t_read, _t_phase1,
-                    _t_xye, _t_read + _t_phase1 + _t_xye,
-                )
-
-                # ── Periodic .nxs save ──────────────────────────────
-                # ``LIVE_SAVE_INTERVAL`` (inherited from
-                # wranglerThread) is checked at chunk boundaries —
-                # not frame boundaries; the v2 writer's per-flush
-                # cost is ~30 ms regardless, so the granularity is
-                # close enough.  Skipped entirely in xye_only mode
-                # (the inherited ``_save_to_disk`` is also a no-op
-                # under xye_only, but we short-circuit here too so
-                # the chunk loop reads clean).
-                _due = frames_since_save >= self.LIVE_SAVE_INTERVAL
-                if not _due and not xye_only and frames_since_save > 0:
-                    # Cap-aware bound (mirrors imageThread._save_due): the
-                    # 1D interval is 1000, but stash() cannot evict unsaved
-                    # frames -- without this, up to 1000 frames each pinning
-                    # an ~18 MB raw chunk view accumulated between saves.
-                    _cap = getattr(scan.frames, "_in_memory_cap", 64)
-                    _counter = getattr(scan.frames,
-                                       "unsaved_in_memory_count", None)
-                    _unsaved = (_counter() if callable(_counter)
-                                else frames_since_save)
-                    _due = _unsaved >= max(1, _cap - 8)
-                if not xye_only and _due:
-                    self._save_to_disk(frozen, scan)
-                    frames_since_save = 0
-
-        # Final save: write everything coherent + provenance + finalize.
-        #
-        # N4 — Stop tail flush.  Pre-N4 this was gated on
-        # ``self.command != 'stop'``, which meant that if the user
-        # hit Stop after some frames had been processed and
-        # published but before the next periodic save kicked in,
-        # those tail frames remained in memory only and were lost.
-        # Now we always do a non-finalize save on Stop so the
-        # processed prefix lands on disk — only ``finalize=True``
-        # (provenance + write-once items) is skipped on Stop, since
-        # the scan didn't actually complete and the file should be
-        # marked as a partial result.
-        #
-        # H30/RN-2: take the writer file_lock before pausing the pooled reader.
-        # ``scan.save_to_nexus`` also takes this same reentrant lock internally;
-        # the outer hold is the ordering guard that prevents pause/close from
-        # racing a load worker that borrowed a pooled read handle under file_lock.
-        self._final_save_to_nexus(frozen, scan, files_processed)
-
-        # §19.4: the terminal outcome is truthful.  The only/final XYE attempt
-        # runs here — a transiently blocked tail publishes the withheld files
-        # now; a persistent one leaves the run visibly PENDING, never 'Done'.
-        if not nexusThread._finish_xye_output(self, prepared, scan):
-            logger.info(
-                'NeXus run ended PENDING (stale XYE tail): %.2fs, %d frames',
-                time.time() - t0, files_processed)
-            return
-
-        self.showLabel.emit(f'Done — {files_processed} frames processed')
-        # Panel finding R3-F2, visibility half: a superseded backup the
-        # commits could not remove is surfaced NOW, on the visible label --
-        # not discovered at the next run's unexplained staging refusal.
-        transaction = prepared.overwrite
-        leftover = (transaction.backup
-                    if transaction.phase is OverwritePhase.CLEANUP_PENDING
-                    else None)
-        if leftover is not None and leftover.exists():
-            message = (f'Done, with one leftover: the superseded backup '
-                       f'{leftover.name} could not be removed and will block '
-                       f'the next Overwrite run — remove it by hand.')
-            logger.error('[NEXUS] %s (%s)', message, leftover)
-            try:
-                self.showLabel.emit(message)
-            except Exception:
-                logger.debug("showLabel emit failed for leftover backup",
-                             exc_info=True)
-        logger.info(
-            'NeXus total time: %.2fs, %d frames', time.time() - t0,
-            files_processed,
-        )
-        # Pool reclamation is handled by run()'s finally (covers normal AND
-        # exception-aborted runs).
+                adapter.resume()
+            if not submitted:
+                if self.command == "stop":
+                    break
+                self._retain_dynamic_failure(
+                    RuntimeError(f"dynamic submit refused frame {frame_idx}"),
+                    "Dynamic submit refused")
+                break
+            accepted += 1
+            self._frames_since_save += 1
+            if adapter.should_flush(
+                    self._frames_since_save, unsaved_in_memory=None):
+                adapter.commit_epoch()
+                self._frames_since_save = 0
+                if frontier < int(stack.shape[0]):
+                    frontier = min(int(stack.shape[0]), frontier + width)
+                    intent = nexusThread._frontier_intent(
+                        full, frontier, intent.source.generation + 1)
+                    adapter.extend_live(intent)
+                    scan._same_run_intent = intent
+        self.files_processed = self._last_files_processed = accepted
+        return accepted
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1647,8 +868,6 @@ class nexusThread(wranglerThread):
             scan_kwargs = frozen.scan_kwargs()
             scan = LiveScan(
                 scan_name,
-                # §15.1: the run owns its output BEFORE anything can write.
-                # Both saves and every XYE file resolve through ``data_file``.
                 data_file=target.output_path,
                 static=True,
                 gi=bool(scan_kwargs["gi"]),
@@ -1666,7 +885,6 @@ class nexusThread(wranglerThread):
             scan.source_base = target.source_base or None
             prepared.scan = scan
             self._active_scan = scan
-            nexusThread._prepare_output_for_run(self, prepared, scan)
         except BaseException:
             nexusThread._release_execution(self)
             raise
@@ -1676,8 +894,7 @@ class nexusThread(wranglerThread):
         """Build a per-frame metadata dict from scan-level arrays.
 
         Falls back to ``base_meta`` (frame 0's slice) when the scan
-        arrays are shorter than expected — keeps the call cheap and
-        avoids exceptions in the parallel section.
+        arrays are shorter than expected.
         """
         meta = dict(base_meta)
         if scan_meta is None:
@@ -1726,37 +943,3 @@ class nexusThread(wranglerThread):
         frame.skip_map_raw = True
 
         return frame
-
-    def _publish(self, frozen, scan, frame):
-        """Push the integrated frame into scan + the publish slot.
-
-        Runs on the main thread after the parallel section so
-        ``scan.add_frame`` is serialised — scan isn't thread-safe
-        for concurrent writes.
-
-        After D1 (unified handoff): we leave the frame in
-        ``self._published_frames[frame.idx]`` and emit ``sigUpdate``;
-        ``static_scan_widget.update_data`` publishes it into the shared store.
-        """
-        # In-memory accumulate only — the chunked flush at the end of
-        # the dispatch loop (and the final ``save_to_nexus(finalize=True)``
-        # at the bottom of ``run()``) handle persistence.
-        # xye_only: SKIP the series stash (mirrors imageThread).  Both saves
-        # are gated off in this mode, so mark_persisted never runs and
-        # stash() could never evict — every frame's raw (a view pinning the
-        # whole bulk read chunk) accumulated for the entire run.
-        if not frozen.run_options.get("xye_only", False):
-            scan.add_frame(
-                frame=frame, calculate=False, update=True,
-                get_sd=True, set_mg=False, static=True, gi=frozen.gi.enabled,
-                th_mtr=frozen.gi.scan_incidence_motor, series_average=False,
-                batch_save=True,
-            )
-        # Publish for the GUI's update_data slot to consume.  Single
-        # write site for the dict round-trip.
-        self._published_frames[frame.idx] = frame
-
-    # ``_save_to_disk`` is inherited from wranglerThread.  Called
-    # from the chunk loop every LIVE_SAVE_INTERVAL frames so the
-    # on-disk file stays close to in-memory state even if the user
-    # kills the process mid-scan.

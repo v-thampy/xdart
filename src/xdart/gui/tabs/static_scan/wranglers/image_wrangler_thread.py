@@ -171,7 +171,6 @@ from xrd_tools.session.readiness import (
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.io.image import read_image, count_frames
-from xrd_tools.io.export import write_xye
 from xrd_tools.io.output_safety import OutputCollisionError, check_output_not_source
 from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
 from xrd_tools.io.metadata import read_image_metadata
@@ -456,13 +455,6 @@ _INT_PATTERN = re.compile(r'(\d+)')
 _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 _FRAME_SUFFIX_PATTERN = re.compile(r'^(.*?)[_-](\d+)$')
 
-# How many integrated frames to accumulate between v2 _save_to_nexus
-# Live-save cadence and threshold-sentinel constants moved to the
-# wranglerThread base class (wrangler_widget.py) in May 2026 — refer
-# via ``self.LIVE_SAVE_INTERVAL`` / the base's module-level
-# ``_THRESHOLD_NAN`` (re-imported here for back-compat with old SPEC
-# wrangler scans that may pickle/unpickle constants by name).
-
 # Number of frames the background prefetch worker may read ahead of the main
 # collect loop (the prefetch queue's maxsize).  This is the read‖reduce OVERLAP
 # budget: the collect loop blocks on dispatch (reduce+write backpressure) for
@@ -677,11 +669,7 @@ class imageThread(wranglerThread):
         self.bg_norm_channel = bg_norm_channel
         self.gi_mode_1d = gi_mode_1d
         self.gi_mode_2d = gi_mode_2d
-        # batch_mode / xye_only / apply_threshold / threshold_min /
-        # threshold_max / sub_label / _xye_buffer / _xye_lock /
-        # _frames_since_save / _published_frames are all initialised
-        # by the wranglerThread base class — see wrangler_widget.py.
-        # imageThread only needs to set the spec-specific extras here.
+        # Shared cadence and publication state are initialized by the base.
         self.command = command
         # The mutable DISPLAY scan.  Retained ONLY as the target of the backward
         # GI-mode acquisition projection (``_project_gi_modes_onto_display_scan``);
@@ -864,8 +852,6 @@ class imageThread(wranglerThread):
         if (self.poni is None or (self.img_file == ''
                 and not self._directory_source_armed(frozen))):
             return
-        self._reset_xye_output_notifications()
-
         self.img_fnames.clear()
         self.processed.clear()
         self._frame_read_clocks.clear()
@@ -1063,11 +1049,7 @@ class imageThread(wranglerThread):
         # Trailing newline gives a visual gap before the next scan's
         # 'New Scan' banner (or before the next prompt if this was the
         # last scan in the session).
-        if frozen.run_options.get("xye_only", False):
-            # Int 1D (XYE) writes only .xye files (no .nxs) into <dir>/<scan>.
-            logger.info('Output (XYE) folder: %s\n',
-                        os.path.join(frozen.save_path, self.scan_name))
-        else:
+        if not frozen.run_options.get("xye_only", False):
             # THIS run's own output path (``initialize_scan`` set it).  The old
             # display-scan fallback is deleted: the browser's scan may point at a
             # completely different file by the time a run ends.
@@ -1782,11 +1764,6 @@ class imageThread(wranglerThread):
             logger.debug("showLabel emit failed for live-GI clip warning",
                          exc_info=True)
 
-    # ``_resolve_frame_mask``, ``_apply_threshold_inline``, and
-    # ``_flush_xye_buffer`` moved to wranglerThread (the base class)
-    # in May 2026 — both imageThread and nexusThread inherit them now.
-    # See xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py.
-
     def _scout_pending_frames(self, frozen, pending):
         """Return bounded representative pending entries for the GI freeze.
 
@@ -1914,7 +1891,7 @@ class imageThread(wranglerThread):
         Mirrors the self-skip conditions of :meth:`_freeze_gi_1d_auto_range`
         (the active 1D mode's output-axis range key is set) and
         :meth:`_freeze_gi_2d_auto_ranges` (both of the active 2D mode's range
-        keys are set; 2D irrelevant for XYE-only / skip_2d runs).  When all
+        keys are set; 2D is irrelevant for skip_2d runs).  When all
         relevant ranges are pinned there is no auto grid to freeze, so the
         whole-scan scout — and its fail-closed abort on unverifiable sources —
         is unnecessary.  Conservative: any non-dict args → False (let the
@@ -4971,8 +4948,7 @@ class imageThread(wranglerThread):
         # BEFORE mkdir/replace-save so both the raw source and any existing
         # destination keep their bytes.  Caught at the initialize_scan call sites
         # for a clean run stop (like the DIR-3 locked-destination handling).
-        # Skipped for Int-1D/XYE, which writes only .xye files into a
-        # <scan_name>/ subfolder and never replaces this .nxs (no collision).
+        # The dormant XYE selection has no .nxs target and is refused earlier.
         if not xye_only:
             check_output_not_source(fname, **self._output_safety_args(frozen))
         # Eiger master files are pre-processed with the trailing
@@ -5018,10 +4994,7 @@ class imageThread(wranglerThread):
         self._stamp_bluesky_wavelength(scan)
 
         logger.info('***** New Scan *****')
-        if xye_only:
-            logger.info('Output (XYE) folder: %s',
-                        os.path.join(frozen.save_path, self.scan_name))
-        else:
+        if not xye_only:
             logger.info('Output file: %s', fname)
 
         return scan
@@ -5141,5 +5114,3 @@ class imageThread(wranglerThread):
             self.sub_label = f'[Subtracted {bg_scale_label}{norm_label}{sname}]'
 
         return bg
-
-    # ``save_1d`` moved to wranglerThread (the base class).

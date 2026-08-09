@@ -121,6 +121,11 @@ def _c3_install_adapter_trace(monkeypatch, active):
             finally:
                 active.pop("adapter_call", None)
             if trace is not None: trace.append((f"adapter.{__name}.return", owner, result))
+            if (__name == "submit" and result
+                    and active.get("stop_after") is not None):
+                active["accepted_submits"] += 1
+                if active["accepted_submits"] == active["stop_after"]:
+                    active["worker"].command = "stop"
             return result
         monkeypatch.setattr(adapter_type, name, traced)
 
@@ -600,11 +605,659 @@ def test_image_controller_uses_one_worker_owned_dynamic_nexus_session(
     finally:
         case.worker._close_reduction_session()
 
-def test_nexus_controller_uses_the_same_dynamic_mount_without_legacy_output_owner():
+def test_nexus_controller_uses_the_same_dynamic_mount_without_legacy_output_owner(
+    tmp_path, monkeypatch,
+):
+    from tests.core._vnext_p0_c2_bridge_support import DeterministicIntegrator
+    from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
+    from tests.xdart._accepted_run import accepted_run, admitted_worker, gi_intent
+    from xdart.gui.tabs.static_scan.wranglers import nexus_wrangler as wrapper_mod
+    from xdart.gui.tabs.static_scan.wranglers import nexus_wrangler_thread as mod
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler
     from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import nexusThread
-    source = _source(nexusThread._run_body)
-    assert "_mount_dynamic_reduction_session" in source
-    assert "_get_reduction_session" not in source
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread, wranglerWidget
+    from xdart.modules.frame_publication import PublicationStore
+    from xdart.modules.live import LiveScan
+    from xdart.modules import reduction as reduction_mod
+    import xdart.gui.gui_utils  # noqa: F401
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.io.nexus import NexusImageStack
+    from xrd_tools.reduction import core as reduction_core
+    from xrd_tools.session.run_configuration import RunConfigurationRefused
+    source = tmp_path / "fixed.nxs"
+    member = tmp_path / "fixed-data.h5"
+    def write_source(nframes):
+        _write_bluesky_nxwriter(source, n=nframes)
+        with h5py.File(source, "r") as handle:
+            images = np.asarray(handle["entry/data/eiger_image"])
+        with h5py.File(member, "w") as handle:
+            handle.create_dataset("entry/data/data", data=images)
+        with h5py.File(source, "a") as handle:
+            del handle["entry/instrument/detectors/eiger/data"]
+            del handle["entry/data/eiger_image"]
+            handle["entry/data/data_000001"] = h5py.ExternalLink(
+                member.name, "/entry/data/data")
+        return source
+    write_source(9)
+    output = tmp_path / "out"
+    output.mkdir()
+    target = output / "fixed.nexus"
+    poni = PONI(dist=.2, poni1=.1, poni2=.1, wavelength=1e-10)
+    active = dict(
+        trace=None, reads=None, opened=None, mounts=None, freezes=None,
+        worker=None, stop_after=None, accepted_submits=0,
+        source_close_failures=0, candidate_calls=None,
+        revise_final_restat=False,
+    )
+    source_candidate = mod._source_candidate
+    def output_snapshot():
+        return tuple((str(path.relative_to(output)), path.read_bytes())
+                     for path in sorted(output.rglob("*")) if path.is_file())
+    @contextmanager
+    def source_graph_fixture(label, topology=None):
+        topology = topology or label
+        root = tmp_path / "source-graphs" / label
+        root.mkdir(parents=True)
+        master_path, member_path = root / "master.nxs", root / "member.h5"
+        data = np.ones((1, 2, 2), dtype=np.uint16)
+        selectors = (("/entry/data/hard", "/entry/data/external")
+                     if topology == "mixed" else ("/entry/data/data",))
+        if topology in {"external", "indirect", "mixed", "missing"}:
+            with h5py.File(member_path, "w") as member_handle:
+                member_handle.create_dataset("/entry/data/data", data=data)
+        with h5py.File(master_path, "w") as master:
+            if topology == "indirect":
+                master["entry"] = h5py.ExternalLink(member_path.name, "/entry")
+            else:
+                master.require_group("/entry/data")
+                if topology == "hard":
+                    master.create_dataset(selectors[0], data=data)
+                elif topology in {"external", "missing"}:
+                    master[selectors[0]] = h5py.ExternalLink(
+                        member_path.name, "/entry/data/data")
+                elif topology == "soft":
+                    master.create_dataset("/real", data=data)
+                    master[selectors[0]] = h5py.SoftLink("/real")
+                elif topology == "vds":
+                    master.create_dataset("/raw", data=data)
+                    layout = h5py.VirtualLayout(shape=data.shape, dtype=data.dtype)
+                    layout[:] = h5py.VirtualSource(
+                        str(master_path), "/raw", shape=data.shape)
+                    master.create_virtual_dataset(selectors[0], layout)
+                elif topology == "external-storage":
+                    master.create_dataset(
+                        selectors[0], shape=data.shape, dtype=data.dtype,
+                        external=[("payload.raw", 0, h5py.h5f.UNLIMITED)])
+                elif topology == "mixed":
+                    master.create_dataset(selectors[0], data=data)
+                    master[selectors[1]] = h5py.ExternalLink(
+                        member_path.name, "/entry/data/data")
+                elif topology == "invalid-rank":
+                    master.create_dataset(selectors[0], data=np.ones(2))
+        handle = h5py.File(master_path, "r")
+        datasets = []
+        try:
+            if topology == "invalid-rank":
+                datasets = [handle[path] for path in selectors]
+                stack = SimpleNamespace(
+                    _h5=handle, _paths=selectors, _dsets=datasets,
+                    _offsets=[0, 2], shape=(2, 2, 2))
+            else:
+                stack = NexusImageStack(handle, list(selectors))
+                datasets = list(stack._dsets)
+            yield SimpleNamespace(
+                stack=stack, master=source_candidate(master_path)
+            ), master_path, member_path
+        finally:
+            for dataset in datasets:
+                if dataset.id.valid:
+                    dataset.id.close()
+            handle.close()
+
+    topology_generation = 37
+    for topology in ("hard", "external"):
+        with source_graph_fixture(topology) as (prepared, master_path, member_path):
+            graph, observations = nexusThread._source_graph(
+                prepared, topology_generation)
+            assert (graph.dataset_paths, graph.extent, graph.generation) == (
+                tuple(prepared.stack._paths), prepared.stack.shape[0],
+                topology_generation)
+            if topology == "hard":
+                assert graph.external_members == ()
+                assert observations == (prepared.master,)
+            else:
+                assert observations[0] == prepared.master and tuple(item.path for item in observations) == (
+                    master_path, member_path)
+                assert len(graph.external_members) == 1
+                external = graph.external_members[0]
+                assert (Path(external.path), external.dataset_path,
+                        external.source_start, external.source_stop,
+                        external.ordinal) == (
+                    member_path, "/entry/data/data", 0, 1, 0)
+            nexusThread._require_source_unchanged(
+                observations, topology_generation)
+    negatives = {
+        "soft": "indirect detector leaf",
+        "indirect": "indirect ancestor",
+        "vds": "non-owned or invalid-rank storage",
+        "external-storage": "non-owned or invalid-rank storage",
+        "mixed": "mixed storage owners",
+        "invalid-rank": "non-owned or invalid-rank storage",
+        "missing": "member observation failed",
+    }
+    for topology, reason in negatives.items():
+        before_output, before_mounts = output_snapshot(), active["mounts"]
+        with source_graph_fixture(topology) as (prepared, _master, _member):
+            with monkeypatch.context() as scoped:
+                if topology == "missing":
+                    def missing_member_candidate(path):
+                        if Path(path) == _member:
+                            raise OSError("injected missing member")
+                        return source_candidate(path)
+                    scoped.setattr(mod, "_source_candidate", missing_member_candidate)
+                with pytest.raises(mod.AppendSourceGraphRefused) as caught:
+                    nexusThread._source_graph(prepared, topology_generation)
+        assert reason in str(caught.value)
+        assert caught.value.decision.source_generation == topology_generation
+        assert output_snapshot() == before_output and active["mounts"] is before_mounts
+    for label, ordinal, action, reason in (
+        ("changed-master", 0, "touch", "source changed before mount"),
+        ("changed-member", 1, "touch", "source changed before mount"),
+        ("disappeared-master", 0, "unlink", "source member disappeared"),
+        ("disappeared-member", 1, "unlink", "source member disappeared"),
+    ):
+        with source_graph_fixture(label, "external") as (prepared, _master, _member):
+            _graph, observations = nexusThread._source_graph(
+                prepared, topology_generation)
+        changed = Path(observations[ordinal].path)
+        if action == "touch":
+            with changed.open("ab") as stream:
+                stream.write(b"\0")
+        else:
+            changed.unlink()
+        before_output, before_mounts = output_snapshot(), active["mounts"]
+        with pytest.raises(mod.AppendSourceGraphRefused) as caught:
+            nexusThread._require_source_unchanged(
+                observations, topology_generation)
+        assert reason in str(caught.value)
+        assert output_snapshot() == before_output and active["mounts"] is before_mounts
+    class Integrator(DeterministicIntegrator):
+        def integrate2d(self, image, npt_rad, npt_azim, *, unit, **_kwargs):
+            intensity = np.full((npt_azim, npt_rad), np.asarray(image).sum())
+            return SimpleNamespace(radial=np.arange(npt_rad),
+                azimuthal=np.arange(npt_azim), intensity=intensity, sigma=None,
+                unit=unit, azimuthal_unit="chi_deg")
+    def gi_1d(image, _fiber, *, npt, unit="q_A^-1", **_kwargs):
+        axis = np.linspace(.1, 1., int(npt))
+        return SimpleNamespace(radial=axis,
+            intensity=np.full_like(axis, np.asarray(image).sum()), sigma=None,
+            unit=unit)
+    def gi_2d(image, _fiber, *, npt_rad, npt_azim,
+              unit="qip_A^-1", **_kwargs):
+        radial = np.linspace(.1, 1., int(npt_rad))
+        azimuthal = np.linspace(-1., 1., int(npt_azim))
+        intensity = np.full((len(radial), len(azimuthal)), np.asarray(image).sum())
+        return SimpleNamespace(radial=radial, azimuthal=azimuthal,
+            intensity=intensity, sigma=None, unit=unit,
+            azimuthal_unit="qoop_A^-1")
+    monkeypatch.setattr(mod, "poni_to_integrator", lambda _poni: Integrator())
+    monkeypatch.setattr(reduction_core, "poni_to_fiber_integrator",
+                        lambda *_a, **_k: object())
+    monkeypatch.setattr(reduction_core, "integrate_gi_polar_1d", gi_1d)
+    monkeypatch.setattr(reduction_core, "integrate_gi_2d", gi_2d)
+    _c3_install_adapter_trace(monkeypatch, active)
+    real_get, real_open = NexusImageStack.__getitem__, reduction_mod.open_live_scan_session
+    def traced_get(stack, key):
+        active["reads"].append(key)
+        return real_get(stack, key)
+    def traced_open(*args, **kwargs):
+        active["opened"].append(kwargs["sink"])
+        return real_open(*args, **kwargs)
+    def traced_candidate(path):
+        candidate = source_candidate(path)
+        if active["revise_final_restat"] and len(active["candidate_calls"]) == 5:
+            candidate = type(candidate)(candidate.path, candidate.adapter_id,
+                                        candidate.size + 1, candidate.mtime_ns)
+        active["candidate_calls"].append(candidate)
+        return candidate
+    real_freeze = reduction_mod.freeze_live_scan_gi_ranges
+    def traced_freeze(scan, frames, **kwargs):
+        values = tuple(frames)
+        assert active["worker"]._scan_session_adapter is None
+        active["freezes"].append(values)
+        return real_freeze(scan, values, **kwargs)
+    monkeypatch.setattr(NexusImageStack, "__getitem__", traced_get)
+    monkeypatch.setattr(reduction_mod, "open_live_scan_session", traced_open)
+    monkeypatch.setattr(mod, "_source_candidate", traced_candidate)
+    monkeypatch.setattr(mod, "freeze_live_scan_gi_ranges", traced_freeze,
+                        raising=False)
+    real_execution_close = mod.PreparedNexusExecution.close
+    def traced_execution_close(envelope):
+        active["trace"].append(("execution.close.enter", envelope))
+        if active["source_close_failures"]:
+            active["source_close_failures"] -= 1
+            raise OSError("injected retained source close")
+        result = real_execution_close(envelope)
+        active["trace"].append(("execution.close.return", envelope, result))
+        return result
+    monkeypatch.setattr(
+        mod.PreparedNexusExecution, "close", traced_execution_close)
+    def run(
+        mode="Int 1D + 2D", *, cleanup_pending=False, stop_after=None,
+        source_close_failures=0, revise_final_restat=False,
+    ):
+        active.update(
+            trace=[], reads=[], opened=[], mounts=[], freezes=[],
+            stop_after=stop_after, accepted_submits=0,
+            source_close_failures=source_close_failures, candidate_calls=[],
+            revise_final_restat=bool(revise_final_restat),
+        )
+        display = LiveScan("display", static=True)
+        worker = nexusThread(Queue(), RLock(), str(target), str(source), poni,
+            "q_total", "qip_qoop", "start", display)
+        active["worker"] = worker
+        frozen = accepted_run(
+            source_spec=SourceSpec(str(source), SourceKind.NEXUS_STACK, entry="entry"),
+            processing_mode=mode, output_mode="Append", save_path=str(output), run_options={"xye_only": mode == "Int 1D (XYE)"},
+            max_cores=1, poni_values=poni.to_dict(),
+            bai_1d_args={"npt": 8, "unit": "q_A^-1"},
+            bai_2d_args={"npt_rad": 4, "npt_azim": 4, "unit": "q_A^-1"},
+            gi=gi_intent(enabled=True, incidence_motor="Manual", th_val=.1),
+        )
+        admitted_worker(worker, frozen=frozen)
+        worker.publication_store = PublicationStore(max_items=16)
+        worker.gui_thread_id = worker._gui_thread_id = threading.get_ident()
+        statuses = []
+        worker.showLabel.connect(statuses.append)
+        real_mount = worker._mount_dynamic_reduction_session
+        def traced_mount(*args, **kwargs):
+            adapter = real_mount(*args, **kwargs)
+            intent = worker._active_scan._same_run_intent
+            active["mounts"].append((adapter, intent, kwargs.get("policy")))
+            return adapter
+        worker._mount_dynamic_reduction_session = traced_mount
+        if cleanup_pending:
+            worker._test_real_close = worker._close_reduction_session
+            worker._close_reduction_session = lambda: False
+        worker.run()
+        return worker, statuses
+
+    expected_candidate_paths = [os.path.abspath(source), os.path.abspath(member)] * 3
+    fresh, fresh_statuses = run()
+    fresh_candidates = tuple(active["candidate_calls"])
+    assert [os.path.abspath(item.path) for item in fresh_candidates] == expected_candidate_paths
+    assert fresh_candidates[0] == fresh_candidates[2] == fresh_candidates[4] and fresh_candidates[1] == fresh_candidates[3] == fresh_candidates[5]
+    trace = list(active["trace"])
+    fresh_freezes = list(active["freezes"])
+    mounts = active["mounts"]
+    opened = active["opened"]
+    enters = [row[0] for row in trace if row[0].endswith(".enter")]
+    assert len(mounts) == 1, "Nexus must mount one shared dynamic adapter"
+    assert len(opened) == 1, "Nexus must open one headless sink graph"
+    adapter, initial, policy = mounts[0]
+    assert adapter._sink_graph is opened[0]
+    assert adapter._sink_graph is not adapter._observer
+    assert policy is adapter._policy
+    final_plan = fresh._plan_cache.get(fresh._active_scan, integrate_2d=True)
+    provisional = copy.deepcopy(final_plan); provisional.integration_1d.npt += 1
+    bad_policy = fresh._resolve_dynamic_session_policy(frozen=fresh.run_configuration,
+        plan=provisional, frame_shape=(2, 2), dtype=np.uint16)
+    policy_effects = []
+    fresh._scan_session_adapter = object()
+    fresh._close_reduction_session = lambda: policy_effects.append("close") or True
+    fresh.release_retained_custody = lambda: policy_effects.append("release") or True
+    pending = SimpleNamespace(map_raw=np.ones((2, 2), dtype=np.uint16), bg_raw=None)
+    with pytest.raises(RunConfigurationRefused) as policy_refusal:
+        fresh._mount_dynamic_reduction_session((fresh.run_configuration.generation, os.path.abspath(target)),
+            frozen=fresh.run_configuration, scan=fresh._active_scan, plan=final_plan, pending_frame=pending,
+            output_path=target, gui_thread_id=fresh.gui_thread_id, policy=bad_policy)
+    assert (policy_refusal.value.stage, policy_refusal.value.generation, policy_effects) == (
+        "dynamic-policy", fresh.run_configuration.generation, [])
+    fresh._scan_session_adapter = None
+    width = min(policy.flush.interval, policy.flush.hard_threshold())
+    assert width == len(initial.labels) == 8
+    assert len(fresh_freezes) == 1
+    assert len(fresh_freezes[0]) == 1
+    assert fresh_freezes[0][0].idx == 0
+    submits = [row for row in trace if row[0] == "adapter.submit.enter"]
+    assert len(submits) == 9
+    assert all(row[1] is adapter for row in submits)
+    submit_tokens = [row[3]["attempt_token"] for row in submits]
+    begin_tokens = [row[2] for row in trace
+                    if row[0] == "adapter.begin_attempt.return"]
+    assert submit_tokens == begin_tokens
+    assert len({id(token) for token in submit_tokens}) == 9
+    attempt_events = {"adapter.discover.enter", "adapter.begin_attempt.enter",
+                      "adapter.record_enqueued.enter", "adapter.submit.enter"}
+    per_frame = [name for name in enters if name in attempt_events]
+    expected_attempt = ["adapter.discover.enter", "adapter.begin_attempt.enter",
+                        "adapter.record_enqueued.enter", "adapter.submit.enter"]
+    assert all(per_frame[pos:pos + 4] == expected_attempt
+               for pos in range(0, len(per_frame), 4))
+    commit_positions = [index for index, name in enumerate(enters)
+                        if name == "adapter.commit_epoch.enter"]
+    extend_positions = [index for index, name in enumerate(enters)
+                        if name == "adapter.extend_live.enter"]
+    submit_positions = [index for index, name in enumerate(enters)
+                        if name == "adapter.submit.enter"]
+    assert len(commit_positions) == 1
+    assert len(extend_positions) == 1
+    commit = commit_positions[0]
+    extend = extend_positions[0]
+    assert enters[:commit].count("adapter.submit.enter") == 8
+    assert commit < extend < submit_positions[8]
+    finish = enters.index("adapter.finish.enter")
+    source_close = enters.index("execution.close.enter")
+    assert submit_positions[8] < finish
+    assert finish < source_close
+    assert "adapter.stop.enter" not in enters
+    assert any("done" in text.lower() for text in fresh_statuses)
+    successor = next(row[2][0] for row in trace
+                     if row[0] == "adapter.extend_live.enter")
+    assert initial.labels == tuple(range(8))
+    assert initial.source.extent == 8
+    assert successor.labels == tuple(range(9))
+    assert successor.source.extent == 9
+    assert successor.source.generation == initial.source.generation + 1
+    assert successor.source.path == initial.source.path
+    assert successor.source.adapter_id == initial.source.adapter_id
+    assert successor.source.dataset_paths == initial.source.dataset_paths
+    assert successor.source.size == initial.source.size
+    assert successor.source.mtime_ns == initial.source.mtime_ns
+    assert successor.source.digest == initial.source.digest
+    assert successor.entry == initial.entry
+    assert successor.source_base == initial.source_base
+    assert successor.source_identity == initial.source_identity
+    assert successor.science_fingerprint == initial.science_fingerprint
+    assert successor.modes == initial.modes
+    assert len(initial.source.external_members) == 1
+    assert len(successor.source.external_members) == 1
+    initial_member = initial.source.external_members[0]
+    successor_member = successor.source.external_members[0]
+    assert (Path(initial_member.path), initial_member.dataset_path, initial_member.source_start, initial_member.source_stop, initial_member.ordinal) == (
+        member, "/entry/data/data", 0, 8, 0)
+    assert successor_member.path == initial_member.path
+    assert successor_member.dataset_path == initial_member.dataset_path
+    assert successor_member.size == initial_member.size
+    assert successor_member.mtime_ns == initial_member.mtime_ns
+    assert successor_member.source_start == initial_member.source_start
+    assert successor_member.ordinal == initial_member.ordinal
+    assert initial_member.source_stop == 8
+    assert successor_member.source_stop == 9
+    with h5py.File(target) as handle:
+        written_1d = tuple(map(int, handle["entry/integrated_1d/frame_index"][()]))
+        written_2d = tuple(map(int, handle["entry/integrated_2d/frame_index"][()]))
+    assert written_1d == written_2d == tuple(range(9))
+
+    write_source(10)
+    before_output = output_snapshot()
+    _refused, refused_statuses = run(revise_final_restat=True)
+    revised = tuple(active["candidate_calls"])
+    assert [os.path.abspath(item.path) for item in revised] == expected_candidate_paths
+    assert revised[0] == revised[2] == revised[4] and revised[1] == revised[3] and revised[-1].size == revised[1].size + 1
+    assert _refused.command == "stop" and active["mounts"] == active["opened"] == [] and output_snapshot() == before_output and any("changed before mount" in text for text in refused_statuses)
+    resumed, _ = run()
+    resumed_freezes = list(active["freezes"])
+    resumed_submits = [row for row in active["trace"]
+                       if row[0] == "adapter.submit.enter"]
+    resumed_discovers = [row for row in active["trace"]
+                         if row[0] == "adapter.discover.enter"]
+    assert len(active["mounts"]) == 1
+    assert len(active["opened"]) == 1
+    assert len(resumed_submits) == 1
+    assert len(resumed_discovers) == 1
+    assert resumed_discovers[0][3]["output_label"] == 9
+    assert active["mounts"][0][1].labels == tuple(range(10))
+    assert resumed._active_scan._committed_append_prefix.intent.labels \
+        == tuple(range(9))
+    assert len(resumed_freezes) == 1
+    assert len(resumed_freezes[0]) == 1
+    assert resumed_freezes[0][0].idx == 9
+    for key in active["reads"]:
+        first = int(key) if isinstance(key, (int, np.integer)) \
+            else int(key.start or 0)
+        assert first >= 9, f"committed detector pixel was reread: {key!r}"
+    fully_skipped, skipped_statuses = run()
+    assert active["reads"] == []
+    assert active["mounts"] == []
+    assert active["opened"] == []
+    assert not [
+        row for row in active["trace"]
+        if row[0] == "adapter.submit.enter"]
+    assert any("already processed" in text.lower()
+               for text in skipped_statuses)
+    assert int(fully_skipped.files_processed) == 0
+
+    with monkeypatch.context() as scoped:
+        xye_output = tmp_path / "xye-controller-output"
+        display = LiveScan("xye-controller-display", static=True)
+        controller = nexusWrangler(str(tmp_path / "unused.nexus"), RLock(), display)
+        controller.parameters.child("NeXus File").child("nexus_file").setValue(
+            str(source))
+        controller.parameters.child("Output").child("h5_dir").setValue(
+            str(xye_output))
+        controller.processingModeCombo.setCurrentText("Int 1D (XYE)")
+        controller_statuses = []
+        controller._set_status_text = controller_statuses.append
+        admissions, releases, starts, constructions, source_opens, effects = [], [], [], [], [], []
+        real_h5_file = h5py.File
+        def traced_h5_file(*args, **kwargs):
+            source_opens.append((args, dict(kwargs)))
+            return real_h5_file(*args, **kwargs)
+        controller.thread.release_retained_custody = (
+            lambda: releases.append(True) or True)
+        controller.sigStart.connect(lambda: (starts.append(True), effects.append(("start",))))
+        scoped.setattr(
+            wranglerWidget, "_admit_run_configuration",
+            staticmethod(lambda *_args, **_kwargs: (admissions.append(True), effects.append(("admit",)))))
+        scoped.setattr(
+            wrapper_mod, "nexusThread",
+            lambda *_args, **_kwargs: constructions.append(True))
+        scoped.setattr(h5py, "File", traced_h5_file)
+        state = lambda: (controller.thread, controller.fname, controller.scan.data_file,
+            controller.command, controller.run_configuration, controller._frozen_setup_pending,
+            controller.startButton.isEnabled(), controller.stopButton.isEnabled(),
+            getattr(controller.thread, "run_configuration", None))
+        baseline = state()
+        controller.start()
+        assert admissions == []
+        assert releases == []
+        assert starts == []
+        assert constructions == []
+        assert source_opens == []
+        assert state() == baseline
+        assert not xye_output.exists()
+        assert controller_statuses
+        assert "xye" in controller_statuses[-1].lower()
+        assert "refus" in controller_statuses[-1].lower()
+        controller.processingModeCombo.setCurrentText("Int 1D")
+        owners = []
+        def owner_probe(_owner):
+            value = owners.pop(0); effects.append(("probe", value)); return value
+        scoped.setattr(wranglerWidget, "_active_run_owner", owner_probe)
+        controller.thread.release_retained_custody = lambda: effects.append(("release",)) or False
+        owners[:] = [None]; effects.clear(); controller.start()
+        assert effects == [("probe", None), ("release",)] and state() == baseline
+        assert "cleanup" in controller_statuses[-1].lower() and admissions == starts == constructions == source_opens == []
+        owners[:] = ["wrangler"]; effects.clear(); controller.start()
+        assert effects == [("probe", "wrangler")] and state() == baseline
+        is_running = controller.thread.isRunning; controller.thread.isRunning = lambda: True
+        owners[:] = [None]; effects.clear(); controller.start()
+        assert effects == [("probe", None)] and state() == baseline
+        controller.thread.isRunning = is_running
+        controller.thread.release_retained_custody = lambda: effects.append(("release",)) or True
+        owners[:] = ["output-cleanup", None]; effects.clear(); controller.start()
+        assert effects == [("probe", "output-cleanup"), ("release",), ("probe", None), ("admit",), ("start",)]
+        assert admissions == starts == [True] and constructions == source_opens == []
+
+    xye_worker, xye_statuses = run("Int 1D (XYE)")
+    assert active["reads"] == []
+    assert active["mounts"] == []
+    assert active["opened"] == []
+    assert xye_worker.command == "stop"
+    assert any("xye" in text.lower() and "refus" in text.lower()
+               for text in xye_statuses)
+
+    write_source(11)
+    pending_worker, pending_statuses = run(cleanup_pending=True)
+    pending_trace = active["trace"]
+    assert pending_worker._scan_session_adapter is not None
+    assert pending_worker._execution is not None
+    assert pending_worker._execution.stack._h5.id.valid
+    assert "execution.close.enter" not in [row[0] for row in pending_trace]
+    assert not any("done" in text.lower() for text in pending_statuses)
+    assert pending_worker.dynamic_cleanup_pending() is True
+    statuses = []
+    finished = []
+    owner = SimpleNamespace(thread=pending_worker, _set_status_text=statuses.append,
+                            finished=SimpleNamespace(emit=lambda: finished.append(True)))
+    nexusWrangler._on_worker_thread_finished(owner)
+    assert statuses
+    assert "pending" in statuses[-1].lower()
+    assert finished == [True]
+    pending_worker._close_reduction_session = pending_worker._test_real_close
+    assert pending_worker.release_retained_custody() is True
+    assert pending_worker._execution is None
+    pending_names = [row[0] for row in pending_trace]
+    assert pending_names.index("adapter.finish.return") \
+        < pending_names.index("execution.close.enter")
+
+    write_source(14)
+    with monkeypatch.context() as scoped:
+        def stop_refusal(owner, frame, **kwargs):
+            active["trace"].append(("adapter.submit.stop-refusal", owner, frame, kwargs))
+            active["worker"].command = "stop"; return False
+        scoped.setattr(_adapter(), "submit", stop_refusal)
+        stopped_worker, stopped_statuses = run()
+    stopped_trace = active["trace"]
+    stopped_names = [row[0] for row in stopped_trace]
+    refusal = next(row for row in stopped_trace if row[0] == "adapter.submit.stop-refusal")
+    settlement = next(row for row in stopped_trace if row[0] == "adapter.record_failed.enter")
+    assert settlement[2][0] is refusal[3]["attempt_token"]
+    assert stopped_names.index("adapter.stop.enter") \
+        < stopped_names.index("adapter.finish.enter")
+    assert stopped_names.index("adapter.finish.return") \
+        < stopped_names.index("execution.close.enter")
+    assert stopped_worker._execution is None
+    assert stopped_worker._reduction_write_error is None
+    assert not any("dynamic submit refused" in text.lower() for text in stopped_statuses)
+    assert not any("done" in text.lower() for text in stopped_statuses)
+
+    # A source-close fault after graph success retains the exact envelope.
+    source_pending, source_pending_statuses = run(source_close_failures=1)
+    source_pending_trace = active["trace"]
+    source_pending_names = [row[0] for row in source_pending_trace]
+    retained_envelope = source_pending._execution
+    assert retained_envelope is not None
+    assert retained_envelope.stack._h5.id.valid
+    assert source_pending._scan_session_adapter is None
+    assert source_pending_names.index("adapter.finish.return") \
+        < source_pending_names.index("execution.close.enter")
+    assert source_pending.dynamic_cleanup_pending() is True
+    assert not any("done" in text.lower()
+                   for text in source_pending_statuses)
+    statuses = []
+    owner = SimpleNamespace(thread=source_pending,
+                            _set_status_text=statuses.append,
+                            finished=SimpleNamespace(emit=lambda: None))
+    nexusWrangler._on_worker_thread_finished(owner)
+    assert statuses
+    assert "pending" in statuses[-1].lower()
+
+    controller = nexusWrangler(str(target), RLock(),
+                               LiveScan("controller-display", static=True))
+    controller.parameters.child("NeXus File").child("nexus_file").setValue(str(source))
+    controller.parameters.child("Output").child("h5_dir").setValue(str(output))
+    controller.poni = poni
+    controller.publication_store = PublicationStore(max_items=16)
+    controller_gui_thread_id = controller._gui_thread_id
+    source_pending.gui_thread_id, source_pending._gui_thread_id = 41, -41
+    controller.thread = source_pending
+    real_public_release = source_pending.release_retained_custody
+    real_constructor = wrapper_mod.nexusThread
+    def public_release():
+        source_pending_trace.append(("worker.release.enter", source_pending))
+        result = real_public_release()
+        source_pending_trace.append(("worker.release.return", source_pending, result))
+        return result
+    def replacement_constructor(*args, **kwargs):
+        source_pending_trace.append(("replacement.construct",))
+        return real_constructor(*args, **kwargs)
+    source_pending.release_retained_custody = public_release
+    with monkeypatch.context() as scoped:
+        scoped.setattr(wrapper_mod, "nexusThread", replacement_constructor)
+        controller.setup()
+    replacement_names = [row[0] for row in source_pending_trace]
+    close_owners = [row[1] for row in source_pending_trace
+                    if row[0] == "execution.close.enter"]
+    assert close_owners == [retained_envelope, retained_envelope]
+    assert replacement_names.index("execution.close.return") \
+        < replacement_names.index("worker.release.return")
+    assert replacement_names.index("worker.release.return") \
+        < replacement_names.index("replacement.construct")
+    assert source_pending._execution is None
+    assert controller.thread is not source_pending
+    assert controller.thread.publication_store is controller.publication_store
+    assert controller.thread.gui_thread_id == controller_gui_thread_id != 41
+    assert "_gui_thread_id" not in controller.thread.__dict__
+    controller.thread.sigRetainedCustody.emit(41, str(target))
+    expected_custody = (41, os.path.normcase(os.path.abspath(target)))
+    assert controller._viewer_preserve_token[:2] == expected_custody
+
+    old = controller.thread
+    baseline = (controller.thread, controller.fname, controller.scan.data_file)
+    releases = []
+    old.release_retained_custody = lambda: releases.append(True) or False
+    controller.setup()
+    assert releases == [True]
+    assert (controller.thread, controller.fname, controller.scan.data_file) == baseline
+
+    body = _source(nexusThread._run_body)
+    legacy = (
+        "_get_reduction_session", "open_live_reduction_session",
+        "reduce_live_frames", "_publish(", "_save_to_disk",
+        "_flush_xye_buffer", "_final_save_to_nexus", "scan.add_frame",
+        "scan.save_to_nexus", "scan._save_to_nexus",
+        "PreparedOverwriteTransaction", "PreparedXyeOutput",
+    )
+    for name in legacy:
+        assert name not in body, f"legacy Nexus owner remains: {name}"
+    retired_module_owners = {
+        "OverwritePhase", "PreparedOverwriteTransaction", "PreparedXyeOutput",
+        "open_live_reduction_session", "reduce_live_frames", "write_xye",
+        "read_provenance", "_get_h5pool",
+    }
+    for name in retired_module_owners:
+        assert not hasattr(mod, name), f"retired Nexus module owner remains: {name}"
+    retired_nexus_methods = {
+        "_final_save_to_nexus", "_append_identity", "_prepare_output_for_run",
+        "_emit_overwrite_refusal", "_repair_overwrite_locked",
+        "_rollback_overwrite_locked", "_execute_overwrite_locked",
+        "_write_run_result", "_finish_overwrite_cleanup", "_save_to_disk",
+        "_flush_xye_buffer", "_clear_stale_xye_tail", "_finish_xye_output",
+        "_publish", "_get_reduction_session", "_reduction_session_key_for",
+    }
+    for name in retired_nexus_methods:
+        assert not hasattr(nexusThread, name), f"retired Nexus method remains: {name}"
+    retired_base_methods = {
+        "_get_reduction_session", "_reduction_session_key_for",
+        "_flush_xye_buffer", "_write_xye_entries",
+        "_reset_xye_output_notifications", "save_1d", "_save_to_disk",
+    }
+    for name in retired_base_methods:
+        assert not hasattr(wranglerThread, name), f"retired base owner remains: {name}"
+    retired_instance_state = {
+        "_reduction_session", "_reduction_session_key", "_xye_buffer",
+        "_xye_lock", "_xye_ready_dirs",
+    }
+    assert retired_instance_state.isdisjoint(fresh.__dict__)
+    retired_envelope_state = {"append_qualified", "overwrite", "xye"}
+    assert retired_envelope_state.isdisjoint(
+        set(mod.PreparedNexusExecution.__slots__))
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler_thread as image_mod
+    assert not hasattr(image_mod, "write_xye")
+    assert "_reset_xye_output_notifications" not in _source(image_mod.imageThread.run)
 
 def test_canonical_finish_and_prefix_stop_adopt_light_bank_for_browse(
     tmp_path, monkeypatch,
@@ -1212,7 +1865,7 @@ def test_cleanup_pending_retains_worker_owner_and_blocks_gui_success(
     monkeypatch.setattr(staticWidget, "_arm_runend_overlay_catchup", lambda _host: mutations.append("catchup"))
     for label, batch, xye, failed, retained in (("batch", True, False, False, True), ("xye", True, True, False, False),
               ("zero", False, False, False, False), ("error", True, False, True, False)):
-        tail_root = tmp_path / f"run-end-{label}"; tail_root.mkdir(); (tail_root / "scan").mkdir() if xye else None
+        tail_root = tmp_path / f"run-end-{label}"; tail_root.mkdir(); (tail_root / "scanA").mkdir() if xye else None
         tail, viewer, _nxs, loads = _finish_host(tail_root, batch=batch, saw_frame=label != "zero", xye_only=xye, write_mode="Append" if label == "zero" else "Overwrite", files_processed=0 if label == "zero" else None, append_skipped=1 if label == "zero" else 0, indexed_count=1 if label == "zero" else 0)
         tail.wrangler.dynamic_cleanup_pending = (lambda: False) if (failed or retained or label == "zero") else case.worker.dynamic_cleanup_pending
         if failed: tail.wrangler.thread._reduction_write_error = RuntimeError("writer failed")

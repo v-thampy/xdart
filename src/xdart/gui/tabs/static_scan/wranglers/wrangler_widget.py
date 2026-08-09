@@ -21,8 +21,6 @@ from pyqtgraph import Qt
 from pyqtgraph.parametertree import Parameter
 
 # This module imports
-from xdart.utils.h5pool import get_pool as _get_h5pool
-from xrd_tools.io.export import write_xye
 from xrd_tools.session.run_configuration import (
     FrozenRunConfiguration,
     FrozenSourceSpec,
@@ -137,23 +135,6 @@ class _BoundedFrameHandoff(dict):
 # without invalidating the mask CRC, so the per-frame threshold
 # filter survives without forcing a per-frame LUT rebuild.
 _THRESHOLD_NAN = np.float32(np.nan)
-
-# Default cadence: flush scan state to disk every N frames in batch
-# / live modes.  Subclasses can override per-instance via the
-# ``LIVE_SAVE_INTERVAL`` attribute if they want a different rhythm.
-_LIVE_SAVE_INTERVAL = 8
-# 1D-only .nxs writes are small and cheap, so flush far less often: it is the
-# fixed per-save overhead (not per-frame compute) that made long Int-1D scans
-# crawl as the frame count grew.  2D keeps the tight default so peak RAM stays
-# bounded.  (PERF-2)
-# This is now an UPPER bound on save spacing, not the effective cadence: the
-# persist-before-evict fix (LiveFrameSeries._persisted + mark_persisted, and the
-# _save_due cap bound in imageWranglerThread) guarantees a save fires before the
-# unsaved in-memory set reaches _in_memory_cap, so no frame's int_1d is ever
-# evicted before it's written — the high interval is safe on scans longer than
-# the cap.  Effective cadence is therefore min(this, cap-margin).
-_LIVE_SAVE_INTERVAL_1D = 1000
-
 
 class _CommandCancelToken:
     """Duck-typed ssrl CancelToken bound to a wrangler thread command."""
@@ -291,9 +272,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     # sigUpdateFrame = Qt.QtCore.Signal(dict)
     sigUpdateFile = Qt.QtCore.Signal(str, str, bool, str, bool, bool)
     sigUpdateGI = Qt.QtCore.Signal(bool)
-    # Emitted after the first XYE file in a scan directory is durable.  The
-    # static widget uses this to refresh the browser after save_1d creates the
-    # directory (sigUpdateFile necessarily fires before that directory exists).
+    # Reserved for the future XYE viewer handoff; C3 dynamic runs refuse XYE.
     sigXyeOutputReady = Qt.QtCore.Signal(str)
     # GI move (Stage B): hands the available SPEC incidence-motor columns to the
     # integrator panel's GI motor dropdown (the integrator owns the selection).
@@ -1144,23 +1123,6 @@ class wranglerThread(Qt.QtCore.QThread):
     sigUpdateGI = Qt.QtCore.Signal(bool)
     sigXyeOutputReady = Qt.QtCore.Signal(str)
 
-    # Save cadence (frames between disk flushes), mode-aware: a 1D-only run
-    # (``scan.skip_2d``) flushes every ``_LIVE_SAVE_INTERVAL_1D`` frames; a 2D
-    # run keeps the tight ``_LIVE_SAVE_INTERVAL`` for bounded RAM.  An instance
-    # may still pin a value (e.g. a test) by assigning ``LIVE_SAVE_INTERVAL``.
-    @property
-    def LIVE_SAVE_INTERVAL(self) -> int:
-        override = getattr(self, "_live_save_interval_override", None)
-        if override is not None:
-            return int(override)
-        if getattr(getattr(self, "scan", None), "skip_2d", False):
-            return _LIVE_SAVE_INTERVAL_1D
-        return _LIVE_SAVE_INTERVAL
-
-    @LIVE_SAVE_INTERVAL.setter
-    def LIVE_SAVE_INTERVAL(self, value: int) -> None:
-        self._live_save_interval_override = int(value)
-
     def __init__(self, command_queue, fname, file_lock, parent=None):
         """command_queue: mp.Queue, queue for commands sent from parent
         fname: str, path to data file.
@@ -1191,18 +1153,7 @@ class wranglerThread(Qt.QtCore.QThread):
         self._admitted_run_configuration = None
 
         # ── Shared batch-engine state ────────────────────────────────
-        # Subclasses can override any of these before .start() (or
-        # via their own __init__) — the defaults are the "no batch
-        # features active" zero state.
-
-        # XYE write buffer + lock.  Populated during integration in
-        # workers; drained at end of batch by _flush_xye_buffer.
-        self._xye_buffer: list = []
-        self._xye_lock = threading.Lock()
-        self._xye_ready_dirs: set[str] = set()
-
-        # Per-batch save cadence counter.  Wraps to zero each time
-        # _save_to_disk fires.
+        # Dynamic epoch cadence counter; reset after each committed flush.
         self._frames_since_save = 0
 
         # In-memory hand-off of just-integrated frames to the main
@@ -1223,8 +1174,6 @@ class wranglerThread(Qt.QtCore.QThread):
 
         # Mode flags read by the dispatch loops + the GUI's
         # wrangler_finished handler.
-        self._reduction_session = None
-        self._reduction_session_key = None
         self._scan_session_adapter = None
         self._retained_scan_session_adapter = None
         # BLOCKER 1: id of the scan whose whole-scan GI grid pre-pass has run, so
@@ -1242,37 +1191,6 @@ class wranglerThread(Qt.QtCore.QThread):
 
     def _cancel_token(self):
         return _CommandCancelToken(self)
-
-    def _get_reduction_session(self, key, factory):
-        """Return the persistent headless reduction session for *key*.
-
-        The session owns the executor and per-thread pyFAI integrators for the
-        scan/run lifetime.  The caller supplies a key that includes scan identity
-        and execution policy; changing either closes the old session and opens a
-        fresh one from the provided factory.
-        """
-        if self._reduction_session is not None and self._reduction_session_key == key:
-            return self._reduction_session
-
-        self._close_reduction_session()
-        self._reduction_session = factory()
-        self._reduction_session_key = key
-        return self._reduction_session
-
-    def _reduction_session_key_for(self, scan, plan, n_workers):
-        try:
-            n_workers = int(n_workers or 1)
-        except (TypeError, ValueError):
-            n_workers = 1
-        return (
-            id(scan),
-            str(getattr(scan, "name", "scan")),
-            str(getattr(scan, "data_file", "")),
-            max(1, n_workers),
-            bool(getattr(scan, "gi", False)),
-            bool(getattr(scan, "skip_2d", False)),
-            id(plan),
-        )
 
     def release_retained_custody(self):
         if self._scan_session_adapter is not None:
@@ -1297,18 +1215,58 @@ class wranglerThread(Qt.QtCore.QThread):
             except Exception:
                 logger.debug("showLabel emit failed for dynamic output", exc_info=True)
 
-    def _mount_dynamic_reduction_session(
-            self, key, *, frozen, scan, plan, pending_frame, output_path,
-            gui_thread_id):
+    @staticmethod
+    def _resolve_dynamic_session_policy(
+            *, frozen, plan, frame_shape, dtype, background_bytes=0,
+            policy=None):
         from dataclasses import replace
         from types import SimpleNamespace
+        import xrd_tools.session as session_api
+        from xrd_tools.session.policy import requirements_from
+        supplied = policy is not None
+        requested = max(1, int(frozen.max_cores))
+        requirements = requirements_from(
+            SimpleNamespace(frame_shape=tuple(frame_shape), dtype=np.dtype(dtype)),
+            plan, background_bytes=int(background_bytes))
+        interval = 8 if plan.integration_2d is not None else 1000
+        if policy is None:
+            policy = session_api.resolve_session_policy(
+                requirements, requested_workers=requested)
+            allocation = policy.allocation
+            policy = replace(policy, flush=session_api.FlushPolicy(
+                interval=interval, cap=int(allocation.staging_items), margin=8))
+        def invalid(detail, kind=ValueError):
+            if supplied:
+                raise RunConfigurationRefused(
+                    "foreign", stage="dynamic-policy", detail=detail,
+                    generation=int(frozen.generation))
+            raise kind(detail)
+        if type(policy) is not session_api.SessionPolicy:
+            invalid("dynamic mount requires an exact SessionPolicy", TypeError)
+        allocation = policy.allocation
+        if type(allocation) is not session_api.SessionResourceAllocation:
+            invalid("dynamic mount requires one exact allocation", TypeError)
+        if allocation.requirements.fingerprint != requirements.fingerprint:
+            invalid("dynamic policy requirement fingerprint changed")
+        if not 1 <= int(allocation.workers) <= requested:
+            invalid("dynamic policy worker grant is invalid")
+        if type(policy.flush) is not session_api.FlushPolicy:
+            invalid("dynamic mount requires an exact FlushPolicy", TypeError)
+        expected = (interval, int(allocation.staging_items), 8)
+        actual = (policy.flush.interval, policy.flush.cap, policy.flush.margin)
+        if actual != expected:
+            invalid("dynamic policy flush tuple changed")
+        return policy
+
+    def _mount_dynamic_reduction_session(
+            self, key, *, frozen, scan, plan, pending_frame, output_path,
+            gui_thread_id, policy=None):
         from xdart.modules.frame_publication import PublicationStore
         from xdart.modules.reduction import open_live_scan_session
         from xrd_tools.core import (DEFAULT_MODE_KEY, browse_publication_max_items,
                                     total_physical_ram_bytes)
         from xrd_tools.reduction import NexusSink
         import xrd_tools.session as session_api
-        from xrd_tools.session.policy import requirements_from
         from .qt_nexus_sink import QtFrameObserver
         from .scan_session import ScanSessionAdapter
         normalized = os.path.abspath(os.fspath(output_path))
@@ -1317,17 +1275,6 @@ class wranglerThread(Qt.QtCore.QThread):
             raise ValueError("dynamic mount key does not match its exact lineage")
         if frozen is not getattr(self, "_admitted_run_configuration", None):
             raise ValueError("dynamic mount requires the admitted run configuration")
-        if self._scan_session_adapter is not None and not self._close_reduction_session():
-            raise RuntimeError("prior dynamic session cleanup remains pending")
-        if not self.release_retained_custody():
-            raise RuntimeError("prior light-1D custody cleanup remains pending")
-        store = getattr(self, "publication_store", None)
-        if type(store) is not PublicationStore:
-            raise TypeError("dynamic GUI mount requires the artifact PublicationStore")
-        intent = getattr(scan, "_same_run_intent", None)
-        if intent is None:
-            raise ValueError("dynamic GUI mount requires a frozen source lineage")
-        committed_prefix = getattr(scan, "_committed_append_prefix", None)
         one_d = getattr(plan, "integration_1d", None)
         npt = int(getattr(one_d, "npt", 0) or 0)
         if one_d is None or npt <= 0:
@@ -1336,14 +1283,21 @@ class wranglerThread(Qt.QtCore.QThread):
         if image.ndim != 2:
             raise TypeError("dynamic GUI mount requires a 2-D detector frame")
         background = int(getattr(getattr(pending_frame, "bg_raw", None), "nbytes", 0))
-        requirements = requirements_from(SimpleNamespace(
-            frame_shape=image.shape, dtype=image.dtype), plan, background_bytes=background)
-        policy = session_api.resolve_session_policy(
-            requirements, requested_workers=max(1, int(frozen.max_cores)))
+        policy = self._resolve_dynamic_session_policy(
+            frozen=frozen, plan=plan, frame_shape=image.shape,
+            dtype=image.dtype, background_bytes=background, policy=policy)
+        if self._scan_session_adapter is not None and not self._close_reduction_session():
+            raise RuntimeError("prior dynamic session cleanup remains pending")
+        if not wranglerThread.release_retained_custody(self):
+            raise RuntimeError("prior light-1D custody cleanup remains pending")
+        store = getattr(self, "publication_store", None)
+        if type(store) is not PublicationStore:
+            raise TypeError("dynamic GUI mount requires the artifact PublicationStore")
+        intent = getattr(scan, "_same_run_intent", None)
+        if intent is None:
+            raise ValueError("dynamic GUI mount requires a frozen source lineage")
+        committed_prefix = getattr(scan, "_committed_append_prefix", None)
         allocation = policy.allocation
-        policy = replace(policy, flush=session_api.FlushPolicy(
-            interval=8 if plan.integration_2d is not None else 1000,
-            cap=int(allocation.staging_items), margin=8))
         mode = (str(plan.gi.mode_1d.value) if getattr(plan, "gi", None)
                 is not None else DEFAULT_MODE_KEY)
         dtype = np.dtype(np.float64)
@@ -1475,17 +1429,6 @@ class wranglerThread(Qt.QtCore.QThread):
             self._frames_since_save = 0
             return not failed
 
-        session = self._reduction_session
-        if session is None:
-            return True
-        try:
-            session.finish(join_timeout=60.0)
-        except BaseException as exc:
-            wranglerThread._retain_dynamic_failure(self, exc, "Output cleanup remains pending")
-            logger.error("legacy reduction session close failed", exc_info=True)
-            return False
-        self._reduction_session = None
-        self._reduction_session_key = None
         return True
 
     def dynamic_session_running(self, *, path=None, generation=None):
@@ -1635,142 +1578,3 @@ class wranglerThread(Qt.QtCore.QThread):
         bad = (img < frozen.threshold.threshold_min) | (img > frozen.threshold.threshold_max)
         img[bad] = _THRESHOLD_NAN
         return img
-
-    def _flush_xye_buffer(self, scan, published_idxs=None):
-        """Drain ``self._xye_buffer`` and write each pending XYE file.
-
-        Drains under :attr:`_xye_lock` so workers can keep appending
-        new entries while this batch's disk IO runs.  Per-file write
-        errors are logged but don't abort the batch — losing one XYE
-        file shouldn't kill an otherwise-valid scan.
-
-        P3: when ``published_idxs`` is provided, only buffer entries
-        whose ``img_number`` (a.k.a. ``frame.idx``) appears in the set
-        are written to disk; entries for frames that finished
-        integration but never got published to the .nxs are dropped.
-        This keeps the XYE directory and the .nxs frame set in sync
-        after a Stop mid-batch — without the filter, in-flight
-        workers that the parallel dispatcher abandoned could leave
-        orphan XYE files for frames that never landed in HDF5.
-        """
-        with self._xye_lock:
-            if not self._xye_buffer:
-                return
-            buf = self._xye_buffer
-            self._xye_buffer = []
-        return self._write_xye_entries(
-            scan,
-            buf,
-            published_idxs=published_idxs,
-            ready_dirs=self._xye_ready_dirs,
-            ready_lock=self._xye_lock,
-        )
-
-    def _write_xye_entries(
-        self,
-        scan,
-        entries,
-        *,
-        published_idxs=None,
-        ready_dirs=None,
-        ready_lock=None,
-    ):
-        """Write an already-owned batch of XYE entries.
-
-        The base/image worker drains its historical worker buffer before
-        calling this value operation.  NeXus supplies entries from its
-        run-owned prepared transaction instead, so no implementation needs to
-        transplant one run's buffer onto a reusable worker.
-        """
-        buf = list(entries)
-        if published_idxs is not None:
-            published_idxs = {int(i) for i in published_idxs}
-            dropped = [t for t in buf if int(t[0]) not in published_idxs]
-            buf = [t for t in buf if int(t[0]) in published_idxs]
-            if dropped:
-                logger.info(
-                    'XYE: dropped %d unpublished entries (Stop mid-batch)',
-                    len(dropped),
-                )
-        if not buf:
-            return
-        if ready_dirs is None:
-            ready_dirs = self._xye_ready_dirs
-        if ready_lock is None:
-            ready_lock = self._xye_lock
-        ready_outputs = []
-        for img_number, frame in buf:
-            try:
-                fname = self.save_1d(scan, frame, img_number)
-            except Exception as e:
-                logger.warning(
-                    'XYE write failed for frame %s: %s', img_number, e,
-                )
-                continue
-            if not fname:
-                continue
-            output_dir = os.path.dirname(os.path.abspath(fname))
-            output_key = os.path.normcase(output_dir)
-            with ready_lock:
-                if output_key in ready_dirs:
-                    continue
-                ready_dirs.add(output_key)
-            ready_outputs.append(output_dir)
-        for output_dir in ready_outputs:
-            try:
-                self.sigXyeOutputReady.emit(output_dir)
-            except Exception:
-                logger.debug(
-                    'XYE output-ready emit failed for %s', output_dir,
-                    exc_info=True,
-                )
-
-    def _reset_xye_output_notifications(self):
-        """Re-arm first-durable-file notifications for a new Run."""
-        with self._xye_lock:
-            self._xye_ready_dirs.clear()
-
-    @staticmethod
-    def save_1d(scan, frame, idx):
-        """Write a single-frame XYE next to the scan's .nxs file.
-
-        Static because it only depends on the scan + frame state —
-        not on per-wrangler attributes.  Filename layout matches the
-        prior imageWrangler convention so existing downstream tools
-        keep working: ``<scan_dir>/<scan_name>/iq_<scan>_NNNN.xye``
-        (or ``itth_...`` for 2θ units).
-        """
-        if frame.int_1d is None:
-            return
-        path = os.path.dirname(scan.data_file)
-        path = os.path.join(path, scan.name)
-        Path(path).mkdir(parents=True, exist_ok=True)
-        r1d = frame.int_1d
-        # Encode the actual 1D integration axis in the prefix so the XYE reader
-        # recovers the x-axis from the name.  The old `iq if q else itth` rule
-        # mislabeled every non-Q axis (GI Q_ip/Q_oop/exit) as 2θ.
-        from ..display_logic import xye_prefix_for_unit
-        prefix = xye_prefix_for_unit(r1d.unit)
-        fname = os.path.join(
-            path, f'{prefix}_{scan.name}_{str(idx).zfill(4)}.xye'
-        )
-        write_xye(fname, r1d.radial, r1d.intensity,
-                  np.sqrt(np.abs(r1d.intensity)))
-        return fname
-
-    def _save_to_disk(self, frozen, scan):
-        """Persist scan state to its .nxs file (intermediate save).
-
-        Honours the h5pool pause/resume protocol so the GUI's
-        h5viewer doesn't fight the writer for the file handle, and
-        the per-wrangler ``file_lock`` so reads stay quiescent
-        during the write.  No-op in xye_only mode (no .nxs target).
-        """
-        if frozen.run_options.get("xye_only", False):
-            return
-        with self.file_lock:
-            _get_h5pool().pause(scan.data_file)
-            try:
-                scan._save_to_nexus()
-            finally:
-                _get_h5pool().resume(scan.data_file)

@@ -13,6 +13,7 @@ master files) and a PONI calibration file.
 import logging
 import os
 from pathlib import Path
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,7 @@ class nexusWrangler(wranglerWidget):
 
     def __init__(self, fname, file_lock, scan, parent=None):
         super().__init__(fname, file_lock, parent)
+        self._gui_thread_id = threading.get_ident()
 
         self.poni = None
         self.command = None
@@ -175,13 +177,8 @@ class nexusWrangler(wranglerWidget):
         self.stopButton = QtWidgets.QPushButton('Stop')
         self.stopButton.setObjectName('stopButton')
 
-        # Processing-mode dropdown — same items as imageWrangler so the
-        # two paths feel interchangeable.  Selecting "Int 1D" or
-        # "Int 1D (XYE)" skips 2D integration (faster batches on big
-        # detectors).  "Int 1D (XYE)" also bypasses the HDF5 write
-        # entirely — useful when the user only wants per-frame XYE
-        # files (e.g. handing off to downstream tools that don't read
-        # our .nxs schema).
+        # Selecting Int 1D skips 2-D integration.  The XYE item remains visible
+        # for parity but Start refuses it until the dynamic XYE owner is mounted.
         self.modeLabel = QtWidgets.QLabel('Mode:')
         self.processingModeCombo = QtWidgets.QComboBox()
         self.processingModeCombo.addItems([
@@ -190,11 +187,8 @@ class nexusWrangler(wranglerWidget):
             'Int 1D (XYE)',
         ])
 
-        # Cores spinbox — controls how many worker threads the
-        # nexusThread spawns for parallel batch integration.  Same
-        # convention as imageWrangler.maxCoresSpinBox.  R4-G: its value
-        # reaches the worker as ``frozen.max_cores`` at admission, not as a
-        # ``self.thread.max_cores`` push-down (that slot is gone).
+        # This maximum reaches the session policy through frozen.max_cores;
+        # the dynamic session owns its resulting worker grant.
         # Default = min(CPU-1, 4) so we don't saturate a busy laptop.
         self.coresLabel = QtWidgets.QLabel('Cores:')
         self.maxCoresSpinBox = QtWidgets.QSpinBox()
@@ -291,14 +285,28 @@ class nexusWrangler(wranglerWidget):
             entry=self.entry,
             parent=self,
         )
-        self.thread.showLabel.connect(self._set_status_text)
-        self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
-        self.thread.finished.connect(self.finished.emit)
-        self.thread.sigUpdate.connect(self.sigUpdateData.emit)
-        self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
-        self.thread.sigXyeOutputReady.connect(self.sigXyeOutputReady.emit)
+        self._bind_worker(self.thread)
 
         self._restore_from_session()
+
+    def _bind_worker(self, thread):
+        thread.publication_store = getattr(self, "publication_store", None)
+        thread.gui_thread_id = int(self._gui_thread_id)
+        thread.showLabel.connect(self._set_status_text)
+        thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
+        thread.sigRetainedCustody.connect(self._adopt_retained_custody)
+        thread.finished.connect(self._on_worker_thread_finished)
+        thread.sigUpdate.connect(self.sigUpdateData.emit)
+        thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
+        thread.sigXyeOutputReady.connect(self.sigXyeOutputReady.emit)
+
+    def _on_worker_thread_finished(self):
+        error = getattr(self.thread, "_reduction_write_error", None)
+        if self.thread.dynamic_cleanup_pending():
+            self._set_status_text("Output cleanup remains pending")
+        elif error is not None:
+            self._set_status_text(f"Dynamic output failed: {error}")
+        self.finished.emit()
 
     # ── Session persistence ──────────────────────────────────────────
 
@@ -415,13 +423,8 @@ class nexusWrangler(wranglerWidget):
         viewer modes (the NeXus wrangler always runs the integration
         pipeline — it has no separate display-only viewer panel).
 
-        * ``Int 1D + 2D`` → 1D + 2D, save .nxs, write XYE every frame
-        * ``Int 1D``       → 1D only, save .nxs, write XYE every frame
-        * ``Int 1D (XYE)`` → 1D only, **no** .nxs save, XYE only
+        The XYE selection is projected for display but refused by Start.
         """
-        # ``'1D'`` is the spec-wrangler convention: any mode whose label
-        # contains '1D' (vs '2D') skips 2D integration.  Matches even
-        # if we add new label variants later (e.g. 'Int 1D (cake-XYE)').
         skip_2d = ('1D' in mode_text) and ('2D' not in mode_text)
         self.scan.skip_2d = skip_2d
         self.xye_only = (mode_text == 'Int 1D (XYE)')
@@ -611,6 +614,11 @@ class nexusWrangler(wranglerWidget):
 
     def setup(self):
         """Sync parameters to thread before starting."""
+        _old = getattr(self, "thread", None)
+        if (_old is not None and not _old.isRunning()
+                and not _old.release_retained_custody()):
+            self._set_status_text("Output cleanup remains pending")
+            return False
         # O-3N (§14.2 item 4): after admission, the source, entry and output are
         # the ACCEPTED ones.  Re-reading them from the Qt tree here is what let
         # a post-admission edit change what the replacement worker opened and
@@ -705,7 +713,6 @@ class nexusWrangler(wranglerWidget):
         # first: it is parented to this widget, so without deleteLater every
         # run start accumulated one dormant QThread (plus its signal
         # connections and _published_frames remnants) for the app's life.
-        _old = getattr(self, 'thread', None)
         if _old is not None and not (hasattr(_old, 'isRunning')
                                      and _old.isRunning()):
             try:
@@ -729,12 +736,7 @@ class nexusWrangler(wranglerWidget):
             entry=self.entry,
             parent=self,
         )
-        self.thread.showLabel.connect(self._set_status_text)
-        self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
-        self.thread.finished.connect(self.finished.emit)
-        self.thread.sigUpdate.connect(self.sigUpdateData.emit)
-        self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
-        self.thread.sigXyeOutputReady.connect(self.sigXyeOutputReady.emit)
+        self._bind_worker(self.thread)
         self.sigUpdateGI.emit(self.gi)
 
         self.thread.file_lock = self.file_lock
@@ -749,6 +751,7 @@ class nexusWrangler(wranglerWidget):
         # admitted by ``start()`` must be published onto the thread that will
         # actually run — otherwise the new worker starts with none and refuses.
         wranglerWidget._publish_run_configuration_to_thread(self, self.thread)
+        return True
 
     def controls_profile(self):
         """NeXus wrangler: no Live / Batch / Pause; its own 3 mode items.
@@ -811,6 +814,32 @@ class nexusWrangler(wranglerWidget):
         configuration at all.  Both refusals are zero-delta: nothing above has
         run yet when they return.
         """
+        if self.processingModeCombo.currentText() == "Int 1D (XYE)":
+            self._set_status_text(
+                "Run refused: dynamic XYE output is not mounted yet")
+            return
+        owner = wranglerWidget._active_run_owner(self)
+        if owner not in (None, "output-cleanup"):
+            wranglerWidget._safe_status_text(
+                self, _run_owner_refusal_status(owner))
+            return
+        predecessor = getattr(self, "thread", None)
+        running = getattr(predecessor, "isRunning", None)
+        if not callable(running):
+            wranglerWidget._safe_status_text(self, _run_owner_refusal_status("wrangler-probe-error"))
+            return
+        try:
+            if running():
+                wranglerWidget._safe_status_text(self, _run_owner_refusal_status("wrangler"))
+                return
+        except Exception:
+            wranglerWidget._safe_status_text(self, _run_owner_refusal_status("wrangler-probe-error"))
+            return
+        release = getattr(predecessor, "release_retained_custody", None)
+        if not callable(release) or not release():
+            wranglerWidget._safe_status_text(
+                self, "Output cleanup remains pending")
+            return
         owner = wranglerWidget._active_run_owner(self)
         if owner is not None:
             wranglerWidget._safe_status_text(
