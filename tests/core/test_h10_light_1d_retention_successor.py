@@ -1255,7 +1255,7 @@ def test_dynamic_light_binding_requires_exact_active_owner_and_hooks():
     hooks = api["Light1DCleanupHooks"]()
     owner.bind_light_1d(lease, cleanup_hooks=hooks)
     owner.bind_light_1d(lease, cleanup_hooks=hooks)
-    with pytest.raises(RuntimeError, match="hooks cannot change"):
+    with pytest.raises(RuntimeError, match=r"light-1D binding cannot change"):
         owner.bind_light_1d(lease, cleanup_hooks=api["Light1DCleanupHooks"]())
     with pytest.raises(TypeError, match="exact light-1D lease"):
         accounting(3).bind_light_1d(object(), cleanup_hooks=hooks)

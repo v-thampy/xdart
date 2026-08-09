@@ -1071,13 +1071,13 @@ def test_g15_one_ledger_construction_site_and_one_cadence_definition():
         "xrd_tools.reduction.cadence becomes a COMPATIBILITY RE-EXPORT")
 
 
-_CADENCE_CONSUMERS = (
+_CADENCE_CONTROLLERS = (
     "xdart/gui/tabs/static_scan/wranglers/image_wrangler_thread.py",
-    "xdart/gui/tabs/static_scan/wranglers/qt_nexus_sink.py",
     "xdart/gui/tabs/static_scan/wranglers/nexus_wrangler_thread.py",
 )
+_CADENCE_ADAPTER = "xdart/gui/tabs/static_scan/wranglers/scan_session.py"
+_CADENCE_OBSERVER = "xdart/gui/tabs/static_scan/wranglers/qt_nexus_sink.py"
 _POLICY_NAMES = {"FlushPolicy", "SessionPolicy"}
-_POLICY_OWNERS = ("xrd_tools.session", "xrd_tools.session.policy")
 _CADENCE_COUNTERS = {"_since_save", "_frames_since_save", "frames_since_save"}
 _CADENCE_THRESHOLDS = {"LIVE_SAVE_INTERVAL", "_LIVE_SAVE_INTERVAL",
                        "live_save_interval", "_flush_interval",
@@ -1085,46 +1085,51 @@ _CADENCE_THRESHOLDS = {"LIVE_SAVE_INTERVAL", "_LIVE_SAVE_INTERVAL",
 
 
 def test_g15_three_cadence_consumers_share_one_policy_definition():
-    """All three consumers import the ONE definition and call its decision on a
-    per-run object.  Constructing a policy in run setup (or injecting one) is
-    LEGAL; constructing one inside the decision itself, or keeping a
-    handwritten cadence comparison, is ratification mutation 19."""
+    """Controllers delegate cadence; the display observer owns none of it."""
     src = _src_root()
-    foreign: list[tuple] = []
-    silent: list[str] = []
-    per_decision: list[tuple] = []
-    handwritten: list[tuple] = []
-    for rel in _CADENCE_CONSUMERS:
+    authority: list[tuple] = []
+    for rel in (*_CADENCE_CONTROLLERS, _CADENCE_OBSERVER):
         path = src / rel
         tree = _tree(path)
-        modules = [node.module or "" for node in ast.walk(tree)
-                   if isinstance(node, ast.ImportFrom)
-                   and any(alias.name in _POLICY_NAMES for alias in node.names)]
-        foreign += [(rel, module) for module in modules
-                    if module not in _POLICY_OWNERS]
-        deciding = {where for _attr, _recv, where, _line
-                    in _method_calls(path, {"should_flush"})}
-        if not modules or not deciding:
-            silent.append(rel)
-        per_decision += [(rel, where, line) for _name, where, line
-                         in _constructor_calls(path, _POLICY_NAMES)
-                         if where in deciding]
-        handwritten += [(rel, node.lineno) for node in ast.walk(tree)
-                        if isinstance(node, ast.Compare)
-                        and _tokens(node) & _CADENCE_COUNTERS
-                        and _tokens(node) & _CADENCE_THRESHOLDS]
-    assert silent == [], (
-        "imageThread serial, QtNexusSink streaming and nexusWranglerThread "
-        f"batch all import the policy AND call its decision; {silent} do not")
-    assert foreign == [], (
-        "all three must consume the SAME definition through the session "
-        f"policy owner (a re-export path is a second import surface): {foreign}")
-    assert per_decision == [], (
-        "each run owns ONE immutable policy object; constructing one inside "
-        f"the decision is mutation 19.  Got {per_decision}")
-    assert handwritten == [], (
-        "a handwritten cadence comparison is a SECOND predicate even when a "
-        f"policy also exists (mutation 19).  Got {handwritten}")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and any(
+                    alias.name in _POLICY_NAMES for alias in node.names):
+                authority.append((rel, "import", node.lineno))
+            if isinstance(node, ast.Call):
+                tail = (node.func.id if isinstance(node.func, ast.Name)
+                        else node.func.attr if isinstance(node.func, ast.Attribute)
+                        else None)
+                if tail in _POLICY_NAMES:
+                    authority.append((rel, "construct", node.lineno))
+            if (isinstance(node, ast.Compare)
+                    and _tokens(node) & _CADENCE_COUNTERS
+                    and _tokens(node) & _CADENCE_THRESHOLDS):
+                authority.append((rel, "comparison", node.lineno))
+    assert authority == [], (
+        "controllers and QtFrameObserver may not import, construct or recreate "
+        f"the session cadence policy; found {authority}")
+
+    for rel in _CADENCE_CONTROLLERS:
+        calls = _method_calls(src / rel, {"should_flush", "commit_epoch"})
+        assert {attr for attr, _recv, _where, _line in calls} == {
+            "should_flush", "commit_epoch",
+        }, f"{rel} must delegate the complete cadence decision; got {calls}"
+
+    adapter_calls = _method_calls(
+        src / _CADENCE_ADAPTER, {"should_flush", "commit_epoch"})
+    assert [row[:3] for row in adapter_calls if row[0] == "should_flush"] == [
+        ("should_flush", "self._session.policy", "should_flush")
+    ], f"the adapter must delegate to the mounted session policy: {adapter_calls}"
+    assert [row[:3] for row in adapter_calls if row[0] == "commit_epoch"] == [
+        ("commit_epoch", "self._session", "commit_epoch")
+    ], f"the adapter must delegate the matching epoch commit: {adapter_calls}"
+
+    observer_calls = _method_calls(
+        src / _CADENCE_OBSERVER, {"should_flush", "commit_epoch"})
+    observer_tokens = _tokens(_tree(src / _CADENCE_OBSERVER))
+    assert observer_calls == [] and not (_CADENCE_COUNTERS & observer_tokens), (
+        "QtFrameObserver is display-only and may own no cadence state; "
+        f"calls={observer_calls}, counters={_CADENCE_COUNTERS & observer_tokens}")
 
 
 _PROJECTION_WRITES = {"mark_persisted", "mark_durable", "mark_dropped",
@@ -1193,8 +1198,7 @@ def test_g15_c2_headless_store_projection_owner_split():
     )
 
 
-def test_g15_sink_uses_the_private_facade_and_xrd_tools_stays_qt_free():
-    src = _src_root()
+def _assert_scan_session_bind_contract(src: pathlib.Path) -> None:
     cls = next(node for node in _tree(src / "xrd_tools/session/scan_session.py").body
                if isinstance(node, ast.ClassDef) and node.name == "ScanSession")
     init = next(node for node in cls.body
@@ -1202,30 +1206,43 @@ def test_g15_sink_uses_the_private_facade_and_xrd_tools_stays_qt_free():
     binds = [node for node in ast.walk(init) if isinstance(node, ast.Call)
              and isinstance(node.func, ast.Attribute)
              and node.func.attr == "bind_session"]
+    forward = [node for node in binds
+               if _chain(node.func.value) in {"sink", "self._user_sink"}]
+    restores = [node for node in binds if _chain(node.func.value) == "nexus"]
     writers = [node.lineno for node in ast.walk(init) if isinstance(node, ast.Call)
                and isinstance(node.func, ast.Name)
                and node.func.id == "ReductionSession"]
-    assert len(binds) == 1 and writers and binds[0].lineno < min(writers), (
-        "ScanSession itself must invoke the EXACT narrow bind_session(facade) "
-        "hook, and do it BEFORE constructing/starting the reduction writer; "
-        f"bind sites {[b.lineno for b in binds]}, writer construction {writers}")
-    bind = binds[0]
-    receiver = _chain(bind.func.value)
-    assert receiver in {"sink", "self._user_sink"}, (
-        f"the bind receiver is the selected sink, not an alias/owner: {receiver}")
+    assert len(forward) == 1 and writers and forward[0].lineno < min(writers), (
+        "ScanSession must bind one selected sink before constructing the writer; "
+        f"forward={[node.lineno for node in forward]}, writers={writers}")
+    bind = forward[0]
     assert len(bind.args) == 1 and not bind.keywords
-    argument = bind.args[0]
-    direct = (_chain(argument.func) if isinstance(argument, ast.Call) else None)
-    named = argument.id if isinstance(argument, ast.Name) else None
-    assert ((direct and "facade" in direct.lower())
-            or (named and "facade" in named.lower() and named != "self")), (
-        "bind_session receives the private narrow facade, never the full "
-        f"ScanSession/accounting/store owner; got {ast.unparse(argument)}")
+    assert ast.unparse(bind.args[0]) == (
+        "self._dynamic_boundary if dynamic_accounting is not None else "
+        "_StageBoundaryFacade(self)"
+    ), "the selected sink must receive only the exact writer boundary/facade"
+
+    boundary = [node for node in ast.walk(init) if isinstance(node, ast.Assign)
+                and any(_chain(target) == "self._dynamic_boundary"
+                        for target in node.targets)]
+    assert len(boundary) == 1 and ast.unparse(boundary[0].value) == (
+        "None if dynamic_accounting is None else dynamic_accounting.writer_boundary"
+    ), "the dynamic facade must be the accounting writer boundary"
+    assert len(restores) == 2 and all(
+        len(node.args) == 1 and not node.keywords
+        and ast.unparse(node.args[0]) == "prior_facade"
+        for node in restores
+    ), "both constructor-failure paths must restore the borrowed prior facade"
+
+
+def test_g15_sink_uses_the_private_facade_and_xrd_tools_stays_qt_free():
+    src = _src_root()
+    _assert_scan_session_bind_contract(src)
 
     tree = _tree(src / "xdart/gui/tabs/static_scan/wranglers/qt_nexus_sink.py")
-    assert "bind_session" in {node.name for node in ast.walk(tree)
-                              if isinstance(node, ast.FunctionDef)}, (
-        "QtNexusSink exposes exactly that private stage-boundary hook")
+    assert "bind_session" not in {node.name for node in ast.walk(tree)
+                                  if isinstance(node, ast.FunctionDef)}, (
+        "QtFrameObserver is display-only and exposes no session-binding hook")
     reads = sorted({chain for chain in (_chain(node) for node in ast.walk(tree)
                                         if isinstance(node, ast.Attribute))
                     if chain and "session" in chain
@@ -1253,30 +1270,9 @@ def test_g15_sink_uses_the_private_facade_and_xrd_tools_stays_qt_free():
 
 
 def test_g15_c2_private_facade_and_headless_import_purity_split():
-    """C2 sub-oracle; QtNexusSink's private read side remains a C3 residual."""
+    """The headless facade owner and import-purity split survive C3."""
     src = _src_root()
-    cls = next(node for node in _tree(src / "xrd_tools/session/scan_session.py").body
-               if isinstance(node, ast.ClassDef) and node.name == "ScanSession")
-    init = next(node for node in cls.body
-                if isinstance(node, ast.FunctionDef) and node.name == "__init__")
-    binds = [node for node in ast.walk(init) if isinstance(node, ast.Call)
-             and isinstance(node.func, ast.Attribute)
-             and node.func.attr == "bind_session"]
-    writers = [node.lineno for node in ast.walk(init) if isinstance(node, ast.Call)
-               and isinstance(node.func, ast.Name)
-               and node.func.id == "ReductionSession"]
-    assert len(binds) == 1 and writers and binds[0].lineno < min(writers)
-    bind = binds[0]
-    assert _chain(bind.func.value) in {"sink", "self._user_sink"}
-    assert len(bind.args) == 1 and not bind.keywords
-    argument = bind.args[0]
-    direct = _chain(argument.func) if isinstance(argument, ast.Call) else None
-    named = argument.id if isinstance(argument, ast.Name) else None
-    assert ((direct and "facade" in direct.lower())
-            or (named and "facade" in named.lower() and named != "self")), (
-        "bind_session must receive only the narrow private facade; got "
-        f"{ast.unparse(argument)}"
-    )
+    _assert_scan_session_bind_contract(src)
 
     offenders: list[tuple[str, str]] = []
     for rel, path in _py_files(src):

@@ -439,7 +439,7 @@ class GIMode:
     incidence_motor: str | None = None
     tilt_angle: float = 0.0
     sample_orientation: int = 1
-    method: str = "no"
+    method: str = "cython"
     mode_1d: GI1DMode | str = GI1DMode.Q_TOTAL
     mode_2d: GI2DMode | str = GI2DMode.QIP_QOOP
     npt_oop: int | None = None

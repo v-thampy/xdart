@@ -1319,8 +1319,8 @@ class wranglerThread(Qt.QtCore.QThread):
         adapter = None
         try:
             authority = session_api.SessionResourceAuthority.from_allocation(allocation)
-            ledger = session_api.StageLedger(
-                required_modes=modes, targets_by_mode={item: (target,) for item in modes})
+            ledger = session_api.ScanSession.new_accounting(
+                plan, {item: (target,) for item in modes})
             accounting = session_api.DynamicRunAccounting(
                 ledger, run_generation=lineage[0],
                 limits=session_api.DynamicAccountingLimits(1, 32, 128))
