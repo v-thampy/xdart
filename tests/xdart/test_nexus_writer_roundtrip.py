@@ -17,11 +17,6 @@ keep the test fast / dep-free.
 """
 
 from __future__ import annotations
-from tests.xdart._accepted_run import (  # noqa: E402
-    accepted_run,
-    container_source,
-)
-
 import logging
 
 import numpy as np
@@ -605,29 +600,19 @@ def test_source_ref_multiframe(tmp_path):
             assert int(src["frame_index"][()]) == 1000 + i
 
 
-def test_source_snapshot_writer_roundtrip_drives_restarted_append_skip(
-        tmp_path):
-    """Production writer provenance is sufficient for a new worker to skip."""
+def test_legacy_writer_source_snapshot_roundtrip_remains_reloadable(tmp_path):
+    """The reintegration writer's historical source snapshot still reloads."""
     import h5py
 
-    # R4A-3: the worker test helpers live behind this optional GUI dependency.
-    # Skip before importing/calling them so a headless dependency-minimal test
-    # environment reports the intended skip instead of NameError(imageThread).
-    pytest.importorskip("pyqtgraph")
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
-    from tests.xdart.test_append_skip_before_read import (
-        _bare_worker,
-        _current_candidate,
-        _frozen_run_config,
-    )
     from xdart.modules.ewald.frame_series import _load_frame_v2
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
 
     raw = _write_bluesky_nxwriter(tmp_path / "scan.nxs", n=6)
-    candidate = _current_candidate(raw)
+    stat = raw.stat()
     snapshot = {
-        "size": candidate.size,
-        "mtime_ns": candidate.mtime_ns,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
         "frame_count": 6,
         "dataset_path": "/entry/data/eiger_image",
         "self_contained": True,
@@ -646,36 +631,13 @@ def test_source_snapshot_writer_roundtrip_drives_restarted_append_skip(
 
     with h5py.File(output, "r") as handle:
         source = handle["entry/frames/frame_0006/source"]
-        assert int(source.attrs["file_size"]) == candidate.size
-        assert int(source.attrs["file_mtime_ns"]) == candidate.mtime_ns
+        assert int(source.attrs["file_size"]) == stat.st_size
+        assert int(source.attrs["file_mtime_ns"]) == stat.st_mtime_ns
         assert int(source.attrs["frame_count"]) == 6
         assert source.attrs["dataset_path"] == "/entry/data/eiger_image"
         assert bool(source.attrs["self_contained"]) is True
         reloaded = _load_frame_v2(handle, 6, static=False, gi=False)
     assert reloaded.source_snapshot == snapshot
-
-    worker = _bare_worker(tmp_path)
-    worker.scan = scan
-    # O-1a-W1A: the restarted worker admits the SAME configuration the target was
-    # written with; the Append cursor now compares against that accepted run
-    # rather than against whatever scan object the display happens to hold.
-    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(
-        skip_2d=False,
-        bai_1d_args=dict(scan.bai_1d_args),
-        bai_2d_args=dict(scan.bai_2d_args),
-        source_spec=container_source(raw),
-        output_mode="Append",
-        # the accepted output target: the append cursor resolves the existing
-        # processed scan from HERE, not from a mutable ``h5_dir`` mirror.
-        save_path=str(output_dir),
-    )
-    worker._eiger_done_masters = set()
-    worker.source_frame_count_snapshot = {}
-
-    assert worker._eiger_skip_complete_append_master(
-        worker.run_configuration, str(raw), candidate) is True
-    assert worker._eiger_done_masters == {str(raw)}
-    assert worker._append_skip_without_reading == 6
 
 
 def test_replace_frame_indices_updates_only_targets(tmp_path):

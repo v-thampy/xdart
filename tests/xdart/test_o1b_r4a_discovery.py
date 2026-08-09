@@ -8,7 +8,6 @@ halves of the same lazy-discovery contract.
 
 from __future__ import annotations
 
-import ast
 import os
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -16,47 +15,6 @@ from types import MethodType, SimpleNamespace
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-
-# --------------------------------------------------------------------------- #
-# R4A-3 — a helper defined behind an optional GUI dependency may only be
-# imported after this consumer has established that dependency.
-# --------------------------------------------------------------------------- #
-
-def test_nexus_roundtrip_worker_helper_import_is_guarded_without_pyqtgraph():
-    """The helper module's own pytest mark cannot protect a cross-import."""
-    target = Path(__file__).with_name("test_nexus_writer_roundtrip.py")
-    tree = ast.parse(target.read_text(encoding="utf-8"), filename=str(target))
-    function = next(
-        node for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name
-        == "test_source_snapshot_writer_roundtrip_drives_restarted_append_skip"
-    )
-    guard_lines = [
-        node.lineno
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "pytest"
-        and node.func.attr == "importorskip"
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and node.args[0].value == "pyqtgraph"
-    ]
-    helper_import_lines = [
-        node.lineno
-        for node in ast.walk(function)
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "tests.xdart.test_append_skip_before_read"
-        and any(alias.name == "_bare_worker" for alias in node.names)
-    ]
-    assert len(guard_lines) == 1
-    assert len(helper_import_lines) == 1
-    assert guard_lines[0] < helper_import_lines[0], (
-        "the pyqtgraph guard must execute before the guarded helper import"
-    )
 
 
 # --------------------------------------------------------------------------- #

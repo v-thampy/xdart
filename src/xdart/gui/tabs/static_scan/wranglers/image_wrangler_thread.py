@@ -178,6 +178,7 @@ from xdart.utils import get_series_avg
 from xdart.modules.reduction import (
     apply_frozen_run_configuration as _apply_frozen_run_configuration,
     freeze_live_scan_gi_ranges,
+    plan_from_live_scan,
     StandardPlanCache,
     sync_live_scan_gi_settings,
 )
@@ -1675,10 +1676,25 @@ class imageThread(wranglerThread):
                 sync_live_scan_gi_settings(
                     scan, incidence_motor=frozen.gi.scan_incidence_motor,
                     sample_orientation=frozen.gi.sample_orientation, tilt_angle=frozen.gi.tilt_angle)
-                freeze_live_scan_gi_ranges(
-                    scan, (live,), scan_name=str(scan.name),
-                    global_mask=self.mask, integrator=scan._cached_integrator,
-                    poni=self.poni, integrate_2d=not scan.skip_2d, gi_freeze_mode="first_frame")
+                if (frozen.batch_mode
+                        and not self._gi_freeze_whole_scan_prepass(
+                            frozen, scan, pending_live=live)):
+                    return 0
+                if not self._gi_ranges_fully_pinned(frozen, scan):
+                    freeze_live_scan_gi_ranges(
+                        scan, (live,), scan_name=str(scan.name),
+                        global_mask=self.mask, integrator=scan._cached_integrator,
+                        poni=self.poni, integrate_2d=not scan.skip_2d,
+                        gi_freeze_mode="first_frame")
+                    self._maybe_warn_live_gi_clip(frozen)
+                # GI ranges are derived after admission and intentionally do
+                # not mutate the immutable run configuration.  Build this
+                # scan's one final plan from the now-frozen scan values before
+                # intent/policy/mount; the ordinary cache builder prefers the
+                # admitted pre-freeze dictionaries.
+                facts["plan"] = plan_from_live_scan(
+                    scan, integrate_2d=not scan.skip_2d,
+                    run_configuration=False)
             facts["live"] = live
         plan = facts.get("plan")
         if plan is None:
@@ -1911,7 +1927,8 @@ class imageThread(wranglerThread):
                    for k in _gi_2d_range_keys(args_2d))
 
     # ── BLOCKER 1: whole-scan GI grid freeze (streaming batch) ──────────────
-    def _gi_freeze_whole_scan_prepass(self, frozen, scan) -> bool:
+    def _gi_freeze_whole_scan_prepass(
+            self, frozen, scan, pending_live=None) -> bool:
         """Freeze the GI common q/χ grid from the WHOLE scan's incidence range
         BEFORE the streaming session opens.
 
@@ -1919,13 +1936,11 @@ class imageThread(wranglerThread):
         ``scout_union`` would bracket chunk 1's incidence range and clip later,
         higher-incidence frames (BLOCKER 1).  Here a CHEAP metadata-only sweep
         finds the global lowest+highest-incidence frames, loads ONLY those two
-        images, and runs the existing whole-scan freeze
-        (:meth:`_freeze_gi_1d_auto_range` / :meth:`_freeze_gi_2d_auto_ranges`,
-        which delegate to ``freeze_live_scan_gi_ranges``) to write the UNION
-        ranges into ``scan.bai_*_args``.  The streaming session then rebuilds its
-        plan with those ranges (``StandardPlanCache`` keys on ``bai_*_args``) and
-        its own per-session freeze early-returns -> the whole batch shares the
-        union grid.  The two scouts are integrated only inside the throwaway
+        images, reusing the exact pending frame when selected, and runs one
+        ``freeze_live_scan_gi_ranges`` call to write the UNION ranges into
+        ``scan.bai_*_args``.  The dynamic session then receives a rebuilt plan
+        with those ranges, so the whole batch shares the union grid.  The two
+        scouts are integrated only inside the throwaway
         freeze session, never submitted to the streaming session -> no double
         processing.
 
@@ -1965,7 +1980,8 @@ class imageThread(wranglerThread):
             self._gi_prepass_scan_id = id(scan)   # latch: decided for this scan
             return True
         try:
-            status, scouts = self._gi_whole_scan_scout_entries(frozen, scan)
+            status, scouts = self._gi_whole_scan_scout_entries(
+                frozen, scan, pending_live=pending_live)
         except Exception as exc:
             # T0-4 warn-and-proceed: a scout failure means we lose the union
             # sweep, not correctness — the first-chunk freeze is acceptable.
@@ -2005,8 +2021,19 @@ class imageThread(wranglerThread):
             # produced a broken grid, not a narrow one) and must not escape
             # the worker thread (run() has no except).
             try:
-                self._freeze_gi_1d_auto_range(frozen, scan, scouts)
-                self._freeze_gi_2d_auto_ranges(frozen, scan, scouts)
+                live_scouts = tuple(
+                    scout if isinstance(scout, LiveFrame)
+                    else self._build_scout(frozen, scan, scout)
+                    for scout in scouts)
+                freeze_live_scan_gi_ranges(
+                    scan, live_scouts,
+                    scan_name=str(getattr(scan, "name", "scan")),
+                    global_mask=self.mask,
+                    integrator=getattr(scan, "_cached_integrator", None),
+                    poni=self.poni, integrate_1d=True,
+                    integrate_2d=(not scan.skip_2d and not
+                                  frozen.run_options.get("xye_only", False)),
+                    gi_freeze_mode="scout_union")
             except Exception as exc:
                 self._abort_gi_prepass(f"whole-scan grid freeze failed ({exc})")
                 return False
@@ -2122,7 +2149,8 @@ class imageThread(wranglerThread):
             ),
             metadata_format=meta_fmt, meta_dir=meta_dir)
 
-    def _gi_whole_scan_scout_entries(self, frozen, scan):
+    def _gi_whole_scan_scout_entries(
+            self, frozen, scan, pending_live=None):
         """Decide how to freeze the whole-scan GI grid and, when needed, gather
         the scout images.  Returns ``(status, entries)``:
 
@@ -2132,7 +2160,8 @@ class imageThread(wranglerThread):
         - ``("freeze", [lo_entry, hi_entry])`` — a varying-incidence per-file
           scan whose global incidence extremes were discovered by core; the
           ``entries`` are ``(img_file, img_number, img_data, img_meta, bg_raw,
-          0.0)`` for the lowest+highest incidence frames, images loaded.
+          0.0)`` for loaded extrema, or the exact pending ``LiveFrame`` when it
+          is an extreme.
         - ``("unverifiable", [])`` — a source that can't be cheaply swept up
           front (Image-Directory, or a possibly-multi-master Eiger): the caller
           warns and proceeds on the first-chunk freeze (T0-4 policy).
@@ -2198,7 +2227,19 @@ class imageThread(wranglerThread):
             frame = source.frame_for(int(idx))
             fname = str(frame.source_path) if frame.source_path else ""
             meta = dict(frame.metadata)
+            source_idx = int(frame.source_frame_index or 0)
+            pending_path = getattr(pending_live, "source_file", None)
+            pending_idx = getattr(pending_live, "source_frame_idx", None)
+            if (pending_path and pending_idx is not None
+                    and os.path.abspath(os.fspath(pending_path))
+                    == os.path.abspath(os.fspath(fname))
+                    and int(pending_idx) == source_idx):
+                entries.append(pending_live)
+                continue
+            before = _source_observation(fname)
             data = np.asarray(source.load_frame(int(idx)), dtype=float)
+            if _source_observation(fname) != before:
+                raise RuntimeError(f"GI scout source changed while reading: {fname}")
             _sname, img_number = _get_scan_info(fname)
             # bg is irrelevant to the frozen AXIS extent (geometry+incidence
             # driven), so a failing/missing background must NOT abort an
