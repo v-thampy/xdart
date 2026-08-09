@@ -200,7 +200,7 @@ class FilesystemSourceAdapter:
                     and 0 < direct_count <= self._MOTOR_PREVIEW_LIMIT
                 ):
                     return passive
-                # A large recursive tree remains owned by Run admission.  The
+                # Deeper recursive data remain outside Run admission.  The
                 # bounded preview may inspect only the already-observed direct
                 # children, provided their exact passive fingerprint still
                 # matches after reconfiguration.
@@ -262,9 +262,9 @@ class FilesystemSourceAdapter:
             choices = ordered_motor_intersection(catalogs)
             result = replace(
                 passive, gi_motor_choices=choices,
-                # The page qualifies this deep result against the passive
-                # direct-child observation that launched it.  Recursive
-                # admission independently walks and revalidates the full tree.
+                # The page qualifies this bounded result against the passive
+                # direct-child observation that launched it. Run admission
+                # independently revalidates the same root-plus-one scope.
                 candidate_fingerprint=fingerprint,
             )
             self.publish_motor_knowledge(result)
@@ -392,7 +392,7 @@ class FilesystemSourceAdapter:
         request: SourceObservationRequest,
         passive: SourceObservation,
     ) -> SourceObservation:
-        """Inspect at most one bounded TIFF level; exact Run owns deeper data."""
+        """Inspect one bounded TIFF level; deeper data remain unsupported."""
 
         source = request.source
         if type(source) is not DirectorySourceSpec:

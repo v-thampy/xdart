@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from threading import Event, Lock
 
 from xrd_tools.sources.directory_session import DirectoryIndexSession
@@ -20,45 +19,12 @@ from ..display_retirement import (
     NO_DISPLAY_RETIREMENT,
 )
 
-
-class TargetLease:
-    _lock = Lock()
-    _reserved: set[Path] = set()
-
-    def __init__(self, paths: tuple[Path, ...]) -> None:
-        self.paths = paths
-        self._released = False
-
-    @classmethod
-    def acquire(cls, paths: tuple[Path, ...]) -> "TargetLease":
-        paths = tuple(
-            dict.fromkeys(path.resolve(strict=False) for path in paths)
-        )
-        with cls._lock:
-            collisions = cls._reserved.intersection(paths)
-            if collisions:
-                raise RuntimeError(
-                    f"output target is already reserved: {min(collisions)}"
-                )
-            cls._reserved.update(paths)
-        return cls(paths)
-
-    def release(self) -> None:
-        with self._lock:
-            if not self._released:
-                self._released = True
-                self._reserved.difference_update(self.paths)
-
-
 @dataclass(slots=True)
 class RunResources:
     admission: AdmissionReceipt | None
     directory_session: DirectoryIndexSession | None
-    target_lease: TargetLease | None
 
-    def cleanup(
-        self, *, release_target: bool = True
-    ) -> tuple[tuple[str, Exception], ...]:
+    def cleanup(self) -> tuple[tuple[str, Exception], ...]:
         self.admission = None
         failures: list[tuple[str, Exception]] = []
         owner = self.directory_session
@@ -69,23 +35,11 @@ class RunResources:
                 failures.append(("directory_session.close", error))
             else:
                 self.directory_session = None
-        if release_target and self.directory_session is None:
-            lease = self.target_lease
-            if lease is not None:
-                try:
-                    lease.release()
-                except Exception as error:
-                    failures.append(("target_lease.release", error))
-                else:
-                    self.target_lease = None
         return tuple(failures)
 
     @property
     def cleaned(self) -> bool:
-        return (
-            self.directory_session is None
-            and self.target_lease is None
-        )
+        return self.directory_session is None
 
 
 @dataclass(slots=True)
@@ -95,7 +49,6 @@ class AdmissionOperation:
     cancelled: Event = field(default_factory=Event)
     directory_session: DirectoryIndexSession | None = None
     result: AdmissionReceipt | AdmissionFailure | None = None
-    target_lease: TargetLease | None = None
     cleanup_failures: list[DetachedDiagnostic] = field(default_factory=list)
     worker_done: bool = False
     cleanup_in_flight: bool = False
@@ -141,19 +94,6 @@ class AdmissionOperation:
             if self.cancelled.is_set() and self.cleanup_in_flight:
                 self.cleanup_requested = True
 
-    def reserve_targets(self, paths: tuple[Path, ...]) -> None:
-        lease = TargetLease.acquire(paths)
-        with self.lock:
-            if self.target_lease is not None:
-                lease.release()
-                raise RuntimeError("admission already owns target reservations")
-            self.target_lease = lease
-            cancelled = self.cancelled.is_set()
-            if cancelled and self.cleanup_in_flight:
-                self.cleanup_requested = True
-        if cancelled:
-            raise RuntimeError("admission cancelled")
-
     def finish_worker(
         self, result: AdmissionReceipt | AdmissionFailure | None
     ) -> None:
@@ -189,18 +129,6 @@ class AdmissionOperation:
                     if self.directory_session is session:
                         self.directory_session = None
         with self.lock:
-            lease_ready = self.worker_done and self.directory_session is None
-            lease = self.target_lease if lease_ready else None
-        if lease is not None:
-            try:
-                lease.release()
-            except Exception as error:
-                failures.append(("target_lease.release", error))
-            else:
-                with self.lock:
-                    if self.target_lease is lease:
-                        self.target_lease = None
-        with self.lock:
             self.cleanup_failures.extend(
                 detach_exception(error, context)
                 for context, error in failures
@@ -234,7 +162,6 @@ class AdmissionOperation:
             self.worker_done
             and not self.cleanup_in_flight
             and self.directory_session is None
-            and self.target_lease is None
         )
 
     def transfer(self, receipt: AdmissionReceipt) -> RunResources | None:
@@ -247,9 +174,8 @@ class AdmissionOperation:
             ):
                 return None
             resources = RunResources(
-                receipt, self.directory_session, self.target_lease
+                receipt, self.directory_session
             )
             self.result = None
             self.directory_session = None
-            self.target_lease = None
             return resources

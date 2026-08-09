@@ -85,7 +85,7 @@ class SourceStatusView(QtWidgets.QFrame):
         if count is not None:
             self._count.setText(f"{count} matching files")
         elif observation.subdirectories_deferred:
-            self._count.setText("Subfolders processed during Run")
+            self._count.setText("Immediate subfolders are the Run boundary")
         else:
             self._count.setText("")
         if (
@@ -93,12 +93,13 @@ class SourceStatusView(QtWidgets.QFrame):
             is SourceCountScope.SELECTED_PLUS_IMMEDIATE
         ):
             self._count.setText(
-                f"{count} matching files through immediate subfolders · "
-                "Deeper subfolders processed during Run"
+                f"{count} matching files · Only the selected folder and "
+                "immediate subfolders are processed · "
+                "Deeper subfolders are outside the supported Run scope"
             )
         elif observation.subdirectories_deferred and count is not None:
             self._count.setText(
-                f"{count} matching files · Subfolders processed during Run"
+                f"{count} matching files · Run is limited to one folder level"
             )
         self._set_header(source_header_projection(observation))
 

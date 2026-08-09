@@ -605,7 +605,7 @@ class ScientificView(QtWidgets.QFrame):
             tuple(
                 frame
                 for frame in navigation.frames
-                if frame.source_scan == navigation.current.source_scan
+                if frame.artifact == navigation.current.artifact
             )
             if navigation.current is not None
             else ()

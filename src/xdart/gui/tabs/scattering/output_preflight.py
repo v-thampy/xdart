@@ -11,7 +11,7 @@ import numpy as np
 from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration import load_poni
-from xrd_tools.io import load_mask
+from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
 from xrd_tools.io.output_path import OVERWRITE_MODE, resolve_output_target
 from xrd_tools.io.output_safety import (
     OutputCollisionError,
@@ -34,7 +34,6 @@ from .contracts import (
     SourceExecutionStamp, SourceFileState, StartCapture,
     threshold_pair_is_canonical,
 )
-from . import output_values
 from .source_metadata import (
     ordered_motor_intersection,
     read_image_motor_metadata,
@@ -181,6 +180,9 @@ class OutputCandidate:
     save_path: str
     processing_json: str
     fingerprint: str
+    _configuration: FrozenRunConfiguration | None = field(
+        default=None, repr=False, compare=False,
+    )
     def __post_init__(self) -> None:
         texts = (
             self.poni_file, self.mask_file, self.save_path,
@@ -206,8 +208,13 @@ class OutputCandidate:
                 "pair — refusing to sign a configuration that would not "
                 "describe its own execution"
             )
-        if str(intent.output_mode).strip().lower() != "overwrite":
-            raise ValueError(output_values.APPEND_UNAVAILABLE)
+        if (
+            str(intent.output_mode).strip().lower() == "append"
+            and intent.processing_mode == "Int 1D (XYE)"
+        ):
+            raise ValueError(
+                "XYE-only Append has no persisted lineage owner"
+            )
         source = intent.source_spec
         if type(source) not in {SourceSpec, DirectorySourceSpec}:
             raise ValueError("output admission requires a supported source")
@@ -228,13 +235,13 @@ class OutputCandidate:
                 allow_nan=False,
             ),
             frozen.fingerprint,
+            frozen,
         )
     def processing_mapping(self) -> dict[str, Any]:
         return json.loads(self.processing_json)
     def matches(self, configuration: FrozenRunConfiguration) -> bool:
         return (
             configuration.thaw_source_spec() == self.source
-            and configuration.output_mode == "Overwrite"
             and configuration.save_path == self.save_path
             and configuration.fingerprint == self.fingerprint
         )
@@ -454,6 +461,11 @@ def _directory_matching_paths(
             raise RuntimeError("admission cancelled")
         if not path.is_file():
             continue
+        try:
+            if len(path.absolute().relative_to(root).parts) > 2:
+                continue
+        except ValueError:
+            continue
         low = path.name.casefold()
         suffix = next(
             (value for value in suffixes if low.endswith(value)),
@@ -465,6 +477,28 @@ def _directory_matching_paths(
         if name_ok(stem):
             paths.append(path.absolute())
     return tuple(sorted(dict.fromkeys(paths)))
+
+
+def _bounded_directory_plan(plan: RunCandidatePlan) -> RunCandidatePlan:
+    """Keep matching files at the selected root plus one immediate level."""
+
+    aligned = tuple(
+        (candidate, descriptor)
+        for candidate, descriptor in zip(
+            plan.candidates, plan.descriptors, strict=True,
+        )
+        if len(candidate.path.absolute().relative_to(
+            plan.root.absolute()
+        ).parts) <= 2
+    )
+    return RunCandidatePlan(
+        plan.generation,
+        tuple(value[0] for value in aligned),
+        plan.root,
+        plan.recursive,
+        plan.name_filter,
+        tuple(value[1] for value in aligned),
+    )
 
 
 def prepare_output(
@@ -497,13 +531,20 @@ def prepare_output(
         )
         observation = session.observe(refresh=True)
         discovered = observation.discovered_snapshot
+        complete_plan = RunCandidatePlan.from_snapshot(discovered)
+        bounded_plan = _bounded_directory_plan(complete_plan)
+        excluded = tuple(
+            candidate
+            for candidate in complete_plan.candidates
+            if candidate not in bounded_plan.candidates
+        )
         if intent.live_mode:
             directory_discovered_paths = tuple(
                 candidate.path.absolute()
-                for candidate in discovered.candidates
+                for candidate in bounded_plan.candidates
             )
             deferred = DeferredDirectoryPlan(
-                RunCandidatePlan.from_snapshot(discovered),
+                bounded_plan,
                 (),
                 directory_discovered_paths,
                 live=True,
@@ -520,13 +561,13 @@ def prepare_output(
         ):
             deferred = _deferred_directory_plan(
                 candidate,
-                RunCandidatePlan.from_snapshot(discovered),
+                bounded_plan,
                 directory_discovered_paths,
                 cancelled=cancelled,
             )
             items = ()
         elif not intent.live_mode:
-            session.enable_probes(exclude=())
+            session.enable_probes(exclude=excluded)
             while observation.unprobed_count:
                 if cancelled():
                     raise RuntimeError("admission cancelled")
@@ -579,10 +620,35 @@ def inspect_output(
     configuration: FrozenRunConfiguration | OutputCandidate,
     fact: OutputFact | None = None,
 ) -> AdmittedOutput:
+    from .adapters.dynamic_output import _supported_lineage_frame_count
+
+    start = item.source_stamp.first_label
+    count = _supported_lineage_frame_count(item.source_stamp)
     accepted = fact if type(fact) is OutputFact else OutputFact(_path_state(item.target))
-    start, count = item.source_stamp.first_label, item.source_stamp.frame_count
+    labels = tuple(range(start, start + count))
+    frozen = (
+        configuration._configuration
+        if type(configuration) is OutputCandidate
+        else configuration
+    )
+    if frozen is not None and frozen.output_mode == "Append":
+        from .adapters.dynamic_output import preview_append_decision
+
+        if type(configuration) is not OutputCandidate:
+            raise TypeError(
+                "Append inspection requires the signed output candidate"
+            )
+        append = preview_append_decision(
+            frozen,
+            item,
+            configuration.processing_mapping(),
+        )
+        if append.disposition is AppendDisposition.REFUSE:
+            raise AppendRefused(append)
+        labels = tuple(append.write_labels)
     return AdmittedOutput(
-        item, OutputDisposition.WRITE, tuple(range(start, start + count)), accepted
+        item, OutputDisposition.WRITE, labels, accepted,
+        "" if frozen is None or frozen.output_mode != "Append" else append.reason,
     )
 
 
@@ -2013,11 +2079,11 @@ def _deferred_directory_plan(
             )
         name = adapter.scan_name(representative.path)
         target = _directory_target(configuration, plan, representative, name)
-        external_paths, inventory_states, skip_reason = _external_link_inventory(
-            representative,
-            candidate_states=candidate_states,
-            cancelled=cancelled,
-        )
+        # Directory admission remains name/stat-only. Exact container and
+        # external-dependency inspection belongs to the one JIT materializer.
+        external_paths = ()
+        inventory_states = candidate_states
+        skip_reason = ""
         staged.append(
             (
                 group,
@@ -2222,7 +2288,9 @@ def live_directory_groups(
         or not deferred.candidates.matches_config(discovered)
     ):
         raise TypeError("live directory observation lost its admitted owner")
-    current = RunCandidatePlan.from_snapshot(discovered)
+    current = _bounded_directory_plan(
+        RunCandidatePlan.from_snapshot(discovered)
+    )
     groups: list[LiveDirectoryGroup] = []
     for candidates in _directory_candidate_groups(current):
         adapter = get_adapter(candidates[0].adapter_id)
@@ -2484,11 +2552,15 @@ def _validate_deferred_entry_states(
             raise RuntimeError("admission cancelled")
         accepted = frozen.get(_source_state_key(state.path))
         if accepted is None:
-            # TIFF sidecars are discovered and guarded JIT while the source
-            # group is materialized, so they are not present in the cheap
-            # candidate/dependency freeze.  They are valid only if the exact
-            # revision captured by metadata admission is still current here.
-            if role == "image_metadata" and state.matches_disk():
+            # TIFF sidecars and selected HDF5 dependencies are discovered and
+            # guarded JIT while the source group is materialized, so they are
+            # not present in the cheap name/stat candidate freeze.  They are
+            # valid only while that exact JIT-captured revision remains current.
+            if role in {
+                "external_member",
+                "detector_dependency",
+                "image_metadata",
+            } and state.matches_disk():
                 continue
             raise SourceRevisionChanged(
                 "source dependency escaped admitted revision: "

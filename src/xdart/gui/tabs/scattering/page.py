@@ -90,7 +90,6 @@ from .events import (
     RunIdentity,
     detached_exception_strings,
 )
-from .output_values import APPEND_UNAVAILABLE
 from .shell_projection import (
     ScientificPreferences,
     share_plot_axis_for_image,
@@ -856,14 +855,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         pipeline = self._pipeline
         if self._closing or self._closed or pipeline is None:
             self._notice("Standard execution is unavailable.")
-            return
-        intent = self._intents.snapshot().thaw()
-        if (
-            type(intent.output_mode) is not str
-            or intent.output_mode.strip().lower() != "overwrite"
-        ):
-            self._notice(APPEND_UNAVAILABLE)
-            self._refresh_shell()
             return
         if self._admission is not None:
             released = self._release_admission(self._admission)

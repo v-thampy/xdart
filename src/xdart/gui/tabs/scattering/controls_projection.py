@@ -77,7 +77,6 @@ from .controls_inventory import (
     truthful_field,
 )
 from .detector_projection import detector_summary, poni_saturation_ceiling
-from .output_values import APPEND_UNAVAILABLE
 from .state_machine import RunPhase
 
 
@@ -128,19 +127,11 @@ def project_controls(
         tool=tool,
         controls_enabled=unlocked,
     )
-    output_choices = (
-        ("Overwrite", "Append")
-        if intent.output_mode == "Append"
-        else ("Overwrite",)
-    )
+    output_choices = ("Overwrite", "Append")
     output_reason = (
-        APPEND_UNAVAILABLE
-        if intent.output_mode == "Append"
-        else (
-            ""
-            if unlocked
-            else "Controls are locked during the active run."
-        )
+        ""
+        if unlocked
+        else "Controls are locked during the active run."
     )
     fields = list(projected.fields)
     gi_paths = {GI_MOTOR, GI_THETA, GI_ORIENTATION, GI_TILT}

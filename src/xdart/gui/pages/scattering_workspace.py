@@ -3,12 +3,11 @@
 Opt-in coexistence mount: the legacy static page remains registered and the
 product default. This factory constructs the real ``ScatteringWorkspace`` with
 its production services and returns a typed ``PageHandle`` whose ports map the
-page truthfully — Open/Run/Stop dispatch through the page's single command
-owner, run activity from the coordinator phase, application menus onto the
-page's own Config/Help hosts, and close through ``close_workspace()``'s
-cleanup receipt (CLEANED is authoritatively CLEAN). The write-mode port is
-PRESENT and returns the scattering owner's typed human-facing refusal —
-Append remains an H23 contract. Capabilities the page has no surface for
+page truthfully — Open/Run/Stop and write-mode changes dispatch through the
+page's single command owner, run activity comes from the coordinator phase,
+application menus mount onto the page's own Config/Help hosts, and close uses
+``close_workspace()``'s cleanup receipt (CLEANED is authoritatively CLEAN).
+Capabilities the page has no surface for
 (slice pin, settings I/O) are absent so the host disables those actions. The
 file-dialog choosers are ported unchanged from the live-verified opt-in
 launcher.
@@ -24,7 +23,6 @@ from .services import HostServices
 from .values import (
     ActionAccepted,
     ActionCompleted,
-    ActionRefused,
     CloseReceipt,
     PageCleanup,
     PageKey,
@@ -140,20 +138,14 @@ class _WorkspaceRunControl:
 
 
 @dataclass(frozen=True, slots=True)
-class _AppendHeldWriteMode:
-    """Present port, typed refusal: Append remains an H23 contract.
-
-    The reason is the scattering owner's human-facing constant — the host
-    presents ``outcome.reason`` directly, so a raw registry token here would
-    be a maintainer-visible contract violation.
-    """
+class _WorkspaceWriteMode:
+    widget: "ScatteringWorkspace"
 
     def toggle(self):
-        from xdart.gui.tabs.scattering.output_values import (
-            APPEND_UNAVAILABLE,
-        )
-
-        return ActionRefused(APPEND_UNAVAILABLE)
+        current = self.widget._intents.snapshot().thaw().output_mode
+        value = "Append" if current == "Overwrite" else "Overwrite"
+        _dispatch(self.widget, "SET_OUTPUT_POLICY", value)
+        return ActionCompleted(f"write-mode-{value.casefold()}")
 
 
 def _control_path_chooser(widget):
@@ -293,9 +285,6 @@ def build_scattering_workspace(
     key = SCATTERING_PAGE_KEY
     intents = services.run_intents.store_for(key)
     if intents is None:
-        # vNext admission is Overwrite-only while Append remains an H23
-        # contract; a default-Append seed would make every fresh mount start
-        # in a refused mode.
         intents = RunIntentStore(RunIntent(output_mode="Overwrite"))
     executor = services.execution.executor_for(key)
     if executor is None:
@@ -329,7 +318,7 @@ def build_scattering_workspace(
         close=_WorkspaceCloser(widget),
         open_folder=_WorkspaceOpenFolder(widget),
         run_control=_WorkspaceRunControl(widget),
-        write_mode=_AppendHeldWriteMode(),
+        write_mode=_WorkspaceWriteMode(widget),
         activity=_WorkspaceActivity(lifecycle),
         app_menus=_WorkspaceMenus(widget),
     )

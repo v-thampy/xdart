@@ -380,12 +380,12 @@ class RunDisplayState:
             owner.records.upsert(
                 record,
                 source_identity=source_identity,
-                persisted=True,
+                persisted=False,
             )
             owner.light_records.upsert(
                 light_record(record),
                 source_identity=source_identity,
-                persisted=True,
+                persisted=False,
             )
             owner.publications.upsert(publication)
             self._residency.observe(
@@ -396,6 +396,18 @@ class RunDisplayState:
             )
             self._residency.enforce()
             owner.norm_aggregate = next_norm_revision(draft)
+
+    def mark_durable(
+        self,
+        owner: DisplayArtifact,
+        labels: tuple[int, ...],
+    ) -> None:
+        """Project only exact writer-boundary durable labels as persisted."""
+
+        with self._lock:
+            owner.records.mark_persisted(labels)
+            owner.light_records.mark_persisted(labels)
+            self._residency.enforce()
 
     def frame_norm_aggregate(
         self, key: DisplayFrameKey

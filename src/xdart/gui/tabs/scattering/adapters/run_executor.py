@@ -11,12 +11,9 @@ import numpy as np
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.integrate.calibration import load_poni, poni_to_integrator
-from xrd_tools.reduction import CompositeSink, NexusSink, XYESink
-from xrd_tools.session.display_logic import xye_prefix_for_unit
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
-from xrd_tools.session.scan_session import ScanSession
 from xrd_tools.sources import open_source
 from xrd_tools.sources.cursor import open_container_cursor
 from xrd_tools.sources.nexus import NexusStackSource
@@ -34,7 +31,6 @@ from ..display_values import (
     StandardDisplayPayload,
     StandardEventKind,
     StandardRunEvent,
-    standard_progress,
 )
 from ..display_runtime import (
     DisplayArtifact,
@@ -57,19 +53,14 @@ from ..output_preflight import (
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
 )
-from ..output_values import APPEND_UNAVAILABLE
 from .target_reservation import (
     AdmissionOperation as _AdmissionOperation,
     RunResources,
-    TargetLease,
 )
+from .dynamic_output import DynamicOutputAdapter
 
 logger = logging.getLogger(__name__)
 
-# Match the established live writer cadence while keeping source reads bounded.
-# A per-frame HDF5 flush roughly doubled long Eiger runs, while requesting the
-# entire container as one chunk made Stop wait behind a large read.
-_LIVE_SINK_FLUSH_EVERY = 8
 _CONTAINER_READ_CHUNK_FRAMES = 8
 _SOURCE_PREFETCH_FRAMES = 4
 _DISPLAY_PROJECTION_FRAMES = 8
@@ -78,22 +69,27 @@ _LIVE_DIRECTORY_POLL_S = 0.1
 _SOURCE_SUBMISSION_END = object()
 _DISPLAY_PROJECTION_END = object()
 
+
+def _terminal_durable_progress(run) -> tuple[int, int]:
+    completed = max(0, int(run.completed))
+    return completed, max(int(run.total), completed)
+
 @dataclass(slots=True)
 class _StandardRun:
     configuration: FrozenRunConfiguration | None
     identity: RunIdentity
     scan: Any | None
     source: Any | None
-    session: ScanSession | None
+    session: Any | None
     records: FrameRecordStore | None
     artifact: Path
     max_display_items: int = 2
     capture: SourceCapture | None = None
-    sink: NexusSink | None = None
+    sink: Any | None = None
+    output: DynamicOutputAdapter | None = None
     worker: Thread | None = None
     stop_requested: bool = False
     stop_signal: Event = field(default_factory=Event)
-    sink_requires_abort: bool = False
     closed: bool = False
     cleanup_status: CleanupStatus = CleanupStatus.CLEANUP_PENDING
     primary: DetachedDiagnostic | None = None
@@ -106,13 +102,11 @@ class _StandardRun:
     current_total: int = 0
     current_completed: int = 0
     current_published: int = 0
+    current_epoch_published: int = 0
     files_discovered: int = 0
     files_processed: int = 0
     files_skipped: int = 0
     processed_live_revisions: dict[str, LiveDirectoryAttempt] = field(
-        default_factory=dict
-    )
-    deferred_live_revisions: dict[str, LiveDirectoryAttempt] = field(
         default_factory=dict
     )
     live_revision_lock: Lock = field(default_factory=Lock)
@@ -161,11 +155,6 @@ def _directory_status(
         f"{state} · {processed} processed · {skipped} skipped · "
         f"{pending} pending · {discovered} discovered"
     )
-    with run.live_revision_lock:
-        deferred = len(run.deferred_live_revisions)
-    if deferred:
-        noun = "revision" if deferred == 1 else "revisions"
-        status += f" · {deferred} source {noun} deferred"
     return status
 
 
@@ -428,11 +417,6 @@ class StandardRunExecutor:
             if owner is not None:
                 operation.retirement_receipt = owner.proof
             self._admission = operation
-        if capture.intent_snapshot.thaw().output_mode != 'Overwrite':
-            operation.finish_worker(
-                AdmissionFailure(token, APPEND_UNAVAILABLE)
-            )
-            return token
         worker = Thread(target=self._perform_admission, args=(operation,), name='scattering-admission', daemon=True)
         try:
             worker.start()
@@ -519,7 +503,6 @@ class StandardRunExecutor:
                         operation.capture,
                         cancelled=operation.cancelled.is_set,
                         session_owner=operation.register_directory_session,
-                        targets_owner=operation.reserve_targets,
                     ),
                     display_retirement=proof,
                 )
@@ -567,7 +550,14 @@ class StandardRunExecutor:
         run.stop_requested = True
         run.stop_signal.set()
         session = run.session
-        if session is not None:
+        output = run.output
+        if output is not None:
+            runtime = run.context_runtime
+            if runtime is None:
+                output.stop()
+            else:
+                runtime.request_stop(output)
+        elif session is not None:
             runtime = run.context_runtime
             if runtime is None:
                 session.stop()
@@ -656,6 +646,7 @@ class StandardRunExecutor:
                 for value in (
                     run.session,
                     run.sink,
+                    run.output,
                     run.source,
                     run.resources,
                 )
@@ -774,8 +765,20 @@ class StandardRunExecutor:
         run.stop_requested = True
         run.stop_signal.set()
         session = run.session
+        output = run.output
         runtime = run.context_runtime
-        if session is not None:
+        if output is not None:
+            try:
+                if runtime is None:
+                    output.stop()
+                else:
+                    runtime.request_stop(output)
+            except BaseException as error:
+                with run.cleanup_lock:
+                    run.cleanup_failures.append(detach_exception(
+                        error, "dynamic_output.stop"
+                    ))
+        elif session is not None:
             try:
                 if runtime is None:
                     session.stop()
@@ -799,7 +802,7 @@ class StandardRunExecutor:
         else:
             run.cleanup_status = CleanupStatus.CLEANUP_PENDING
             receipt = self._receipt(run)
-        completed, total = standard_progress(run)
+        completed, total = _terminal_durable_progress(run)
         self._terminal_event(
             run,
             StandardEventKind.FAILED,
@@ -847,9 +850,13 @@ class StandardRunExecutor:
         worker = run.display_projection_worker
         if pending is None or worker is None:
             return
-        if worker.is_alive():
-            pending.put(_DISPLAY_PROJECTION_END)
+        while worker.is_alive():
+            try:
+                pending.put(_DISPLAY_PROJECTION_END, timeout=0.05)
+            except Full:
+                continue
             worker.join()
+            break
         run.display_projection_queue = None
         run.display_projection_worker = None
         if run.display_projection_errors:
@@ -876,18 +883,6 @@ class StandardRunExecutor:
         with run.live_revision_lock:
             return tuple(run.processed_live_revisions.values())
 
-    def deferred_live_revisions(
-        self,
-        run_identity: RunIdentity,
-    ) -> tuple[LiveDirectoryAttempt, ...]:
-        """Exact latest same-target source attempt awaiting P1 composition."""
-
-        run = self._exact_run(run_identity)
-        if run is None:
-            return ()
-        with run.live_revision_lock:
-            return tuple(run.deferred_live_revisions.values())
-
     def acquisition_context(self, run_identity: RunIdentity):
         run = self._exact_run(run_identity)
         runtime = None if run is None else run.context_runtime
@@ -905,8 +900,6 @@ class StandardRunExecutor:
         # later construction seam must be reported against this artifact, not
         # the previously completed one.
         run.artifact = artifact
-        if configuration.output_mode != 'Overwrite':
-            raise ValueError(APPEND_UNAVAILABLE)
         cancelled = lambda: run.stop_requested
 
         def discard_source() -> None:
@@ -959,19 +952,11 @@ class StandardRunExecutor:
                     raise
             raise
         run.scan.gi_config = configuration.gi.scan_config().copy()
-        if labels is not None:
-            wanted = set(labels)
-            run.scan.frames = [frame for frame in run.scan.frames if int(frame.index) in wanted]
         run.current_total = (
             item.source_stamp.frame_count
             if item is not None
             else len(run.scan.frames)
         )
-        run.current_completed = max(
-            0,
-            run.current_total - len(run.scan.frames),
-        )
-        run.current_published = run.current_completed
         args_1d, args_2d, values = execution_plan_values(configuration, None if assets is None else assets.mask)
         plan = build_native_int_reduction_plan_from_args(args_1d, args_2d, **values)
         try:
@@ -1003,66 +988,80 @@ class StandardRunExecutor:
                 ),
             )
         mask = None if assets is None else assets.mask
-        owner = run.display.add_artifact(
-            artifact,
-            str(
-                getattr(run.scan, "name", "")
-                or Path(source_spec.uri).stem
-                or "scan"
-            ),
-            mask=mask,
-            mask_saturation=bool(
-                getattr(plan, "mask_saturation", False)
-            ),
-            measurement_mode=(
-                "GI" if configuration.gi.enabled else "Standard"
-            ),
-            gi_incidence_motor=(
-                configuration.gi.incidence_motor
-                if configuration.gi.enabled else ""
-            ),
-            gi_resolved_motor=(
-                configuration.gi.effective_motor
-                if configuration.gi.enabled else ""
-            ),
-            gi_mode_1d=(
-                configuration.gi.mode_1d if configuration.gi.enabled else ""
-            ),
-            gi_mode_2d=(
-                configuration.gi.mode_2d if configuration.gi.enabled else ""
-            ),
-            wavelength_m=(
-                float(poni.wavelength)
-                if getattr(poni, "wavelength", None)
-                and float(poni.wavelength) > 0.0
-                else None
-            ),
-        )
+        owner = run.display.artifacts.get(str(artifact))
+        if owner is None:
+            owner = run.display.add_artifact(
+                artifact,
+                str(
+                    getattr(run.scan, "name", "")
+                    or Path(source_spec.uri).stem
+                    or "scan"
+                ),
+                mask=mask,
+                mask_saturation=bool(
+                    getattr(plan, "mask_saturation", False)
+                ),
+                measurement_mode=(
+                    "GI" if configuration.gi.enabled else "Standard"
+                ),
+                gi_incidence_motor=(
+                    configuration.gi.incidence_motor
+                    if configuration.gi.enabled else ""
+                ),
+                gi_resolved_motor=(
+                    configuration.gi.effective_motor
+                    if configuration.gi.enabled else ""
+                ),
+                gi_mode_1d=(
+                    configuration.gi.mode_1d if configuration.gi.enabled else ""
+                ),
+                gi_mode_2d=(
+                    configuration.gi.mode_2d if configuration.gi.enabled else ""
+                ),
+                wavelength_m=(
+                    float(poni.wavelength)
+                    if getattr(poni, "wavelength", None)
+                    and float(poni.wavelength) > 0.0
+                    else None
+                ),
+            )
         run.records = owner.records
         run_provenance = configuration.as_provenance()
         if admission is not None:
             run_provenance['scientific_signature'] = admission.candidate.processing_mapping()
-        run.sink = NexusSink(artifact, overwrite=True, flush_every=_LIVE_SINK_FLUSH_EVERY, run_configuration_provenance=run_provenance, source_execution_provenance=item.source_stamp.as_dict() if item is not None else None, source_snapshots_provenance=source_snapshots(item) if item is not None else None, source_base=configuration.project_root or None, expected_target_state=decision.fact.target_state if decision is not None else None)
-        run.sink_requires_abort = True
-        session_sink = run.sink
-        integration_1d = getattr(plan, "integration_1d", None)
-        if integration_1d is not None:
-            xye_directory = artifact.parent / str(run.scan.name)
-            xye_pattern = (
-                f"{xye_prefix_for_unit(integration_1d.unit)}"
-                "_{scan}_{frame:04d}.xye"
-            )
-            session_sink = CompositeSink((
-                run.sink,
-                XYESink(xye_directory, pattern=xye_pattern),
-            ))
-        run.session = ScanSession(plan, run.scan, session_sink, executor=configuration.max_cores, inflight_max=max(1, configuration.max_cores), gi_freeze_mode='scout_union' if configuration.gi.enabled else None, clear_frame_images=True, record_store=run.records, record_store_persisted_on_write=False)
-        run.sink_requires_abort = False
-        self._start_display_projection(run)
-        run.session.on_frame_completed(lambda event: self._frame_ready(run, event))
-        self._adopt_acquisition_context(
-            run, owner, source_path=str(source_spec.uri)
+        if item is None or decision is None:
+            raise RuntimeError("dynamic output requires one admitted output")
+        if run.stop_requested:
+            discard_source()
+            raise RuntimeError("admission cancelled")
+        output = run.output
+        if output is None:
+            output = DynamicOutputAdapter(configuration)
+            run.output = output
+        run.session, created = output.activate(
+            run.scan,
+            plan,
+            item,
+            decision,
+            record_store=run.records,
+            run_provenance=run_provenance,
+            cancelled=cancelled,
         )
+        run.sink = output
+        write_labels = set(output.write_labels)
+        run.current_completed = max(0, run.current_total - len(write_labels))
+        run.current_published = run.current_completed
+        run.current_epoch_published = 0
+        if run.session is not None and run.display_projection_worker is None:
+            self._start_display_projection(run)
+        if created:
+            run.session.on_frame_completed(
+                lambda event: self._frame_ready(run, event)
+            )
+        if run.session is not None:
+            self._adopt_acquisition_context(
+                run, owner, source_path=str(source_spec.uri)
+            )
         return run
 
     def _adopt_acquisition_context(
@@ -1111,9 +1110,9 @@ class StandardRunExecutor:
         if run.command_failure is not None:
             primary = run.command_failure
         work_elapsed = max(0.0, monotonic() - started_at)
-        completed, total = standard_progress(run)
         cleanup_started_at = monotonic()
         receipt = self._cleanup(run, primary)
+        completed, total = _terminal_durable_progress(run)
         elapsed = max(0.0, monotonic() - started_at)
         cleanup_elapsed = max(
             0.0,
@@ -1207,15 +1206,13 @@ class StandardRunExecutor:
             if run.stop_requested:
                 stopped = True
                 break
-            if not target_state_matches(decision):
+            if (
+                run.configuration.output_mode == "Overwrite"
+                and not target_state_matches(decision)
+            ):
                 raise RuntimeError(f'output target changed after admission: {item.target}')
             run.artifact = item.target
             run.current_total = item.source_stamp.frame_count
-            run.completed += item.source_stamp.frame_count - len(decision.labels)
-            run.current_completed = (
-                run.current_total - len(decision.labels)
-            )
-            run.current_published = run.current_completed
             run.current_file_total = (
                 output_file_count
                 if run.files_discovered
@@ -1226,6 +1223,7 @@ class StandardRunExecutor:
                 and item.source_spec.kind is SourceKind.TIFF_SERIES
             )
             self._construct(run, item=item, labels=decision.labels, decision=decision)
+            run.completed += run.current_completed
             stopped = self._execute_current(run, construct=False) or stopped
             if run.current_files_incremental:
                 run.files_processed += min(
@@ -1259,12 +1257,7 @@ class StandardRunExecutor:
         receipt: AdmissionReceipt,
         deferred: DeferredDirectoryPlan,
     ) -> bool:
-        """Watch one admitted directory until Stop and JIT-run stable groups.
-
-        P-1 deliberately does not reopen an output target already committed by
-        this run.  A later source revision for that target remains visible as a
-        truthful deferred revision until the shared H23 epoch seam is composed.
-        """
+        """Watch one directory and extend each exact output lineage in place."""
 
         resources = run.resources
         session = None if resources is None else resources.directory_session
@@ -1281,7 +1274,6 @@ class StandardRunExecutor:
             tuple[tuple[object, ...], SourceExecutionIdentityV1 | None],
         ] = {}
         retry_revisions: dict[str, tuple[object, ...]] = {}
-        owned_targets: set[str] = set()
         discovered_paths: set[Path] = set(deferred.discovered_paths)
         processed_paths: set[Path] = set()
         skipped_paths: set[Path] = set()
@@ -1292,8 +1284,6 @@ class StandardRunExecutor:
             run.files_discovered = len(discovered_paths)
             run.files_processed = len(processed_paths)
             run.files_skipped = len(skipped_paths - processed_paths)
-            with run.live_revision_lock:
-                deferred_count = len(run.deferred_live_revisions)
             projection = (
                 run.files_processed,
                 run.files_skipped,
@@ -1304,7 +1294,6 @@ class StandardRunExecutor:
                     - run.files_skipped,
                 ),
                 run.files_discovered,
-                deferred_count,
             )
             if not force and projection == last_projection:
                 return
@@ -1334,8 +1323,6 @@ class StandardRunExecutor:
                     return True
                 revision = tuple(group.revision)
                 target_key = _physical_file_key(group.target)
-                with run.live_revision_lock:
-                    pending = run.deferred_live_revisions.get(target_key)
                 settled = settled_revisions.get(target_key)
                 if settled is not None and settled[0] == revision:
                     settled_identity = settled[1]
@@ -1360,32 +1347,6 @@ class StandardRunExecutor:
                     except SourceRevisionChanged:
                         settled_revisions.pop(target_key, None)
                     else:
-                        continue
-                if (
-                    pending is not None
-                    and tuple(pending.group.revision) == revision
-                ):
-                    pending_decision = pending.decision
-                    if pending_decision is None:
-                        raise RuntimeError(
-                            "deferred Live source identity lost its decision"
-                        )
-                    try:
-                        validate_planned_source(
-                            pending_decision.item,
-                            cancelled=lambda: run.stop_requested,
-                        )
-                    except SourceRevisionChanged:
-                        with run.live_revision_lock:
-                            if run.deferred_live_revisions.get(target_key) is pending:
-                                del run.deferred_live_revisions[target_key]
-                        pending = None
-                        publish(force=True)
-                    else:
-                        # This explicit projection is the P-1 pending identity;
-                        # legacy SourceExecutionStamp equality is not a valid
-                        # substitute for the resolved alias topology.
-                        _ = pending_decision.item.source_stamp.execution_identity_v1
                         continue
                 reprobe = retry_revisions.pop(target_key, None) == revision
                 try:
@@ -1419,30 +1380,10 @@ class StandardRunExecutor:
                     raise RuntimeError("READY Live attempt lost its output")
                 if target_key != _physical_file_key(decision.item.target):
                     raise RuntimeError("Live output target changed after JIT")
-                if target_key in owned_targets:
-                    # Reopening a committed target belongs to H23.  Preserve
-                    # the exact accepted source revision as deferred instead of
-                    # pretending that overwriting it is same-run Append.
-                    current_identity = (
-                        decision.item.source_stamp.execution_identity_v1
-                    )
-                    with run.live_revision_lock:
-                        existing = run.deferred_live_revisions.get(target_key)
-                        existing_identity = (
-                            None
-                            if existing is None or existing.decision is None
-                            else existing.decision.item.source_stamp.execution_identity_v1
-                        )
-                        if existing_identity != current_identity:
-                            run.deferred_live_revisions[target_key] = attempt
-                    publish()
-                    continue
-                if resources.target_lease is not None:
-                    raise RuntimeError("live output target lease was not released")
-                resources.target_lease = TargetLease.acquire(
-                    (decision.item.target,)
-                )
-                if not target_state_matches(decision):
+                if (
+                    configuration.output_mode == "Overwrite"
+                    and not target_state_matches(decision)
+                ):
                     raise RuntimeError(
                         "output target changed after Live admission: "
                         f"{decision.item.target}"
@@ -1454,8 +1395,8 @@ class StandardRunExecutor:
                 run.current_files_incremental = (
                     item.source_spec.kind is SourceKind.TIFF_SERIES
                 )
-                artifact_count = len(run.display.artifacts)
-                if artifact_count:
+                known_artifact = str(item.target) in run.display.artifacts
+                if run.display.artifacts and not known_artifact:
                     run.display.admit_additional_partition()
                 try:
                     self._construct(
@@ -1465,14 +1406,6 @@ class StandardRunExecutor:
                         decision=decision,
                     )
                 except SourceRevisionChanged:
-                    if (
-                        len(run.display.artifacts) != artifact_count
-                        or run.session is not None
-                        or run.sink is not None
-                    ):
-                        raise RuntimeError(
-                            "source changed after Live output construction began"
-                        )
                     source_owner = run.source
                     if source_owner is not None:
                         close = getattr(source_owner, "close", None)
@@ -1482,10 +1415,6 @@ class StandardRunExecutor:
                     run.scan = None
                     run.records = None
                     run.frames_by_label.clear()
-                    lease = resources.target_lease
-                    if lease is not None:
-                        lease.release()
-                        resources.target_lease = None
                     run.current_total = 0
                     run.current_completed = 0
                     run.current_published = 0
@@ -1494,10 +1423,14 @@ class StandardRunExecutor:
                     retry_revisions[target_key] = revision
                     publish(force=True)
                     continue
-                run.total += run.current_total
-                run.completed += run.current_completed
+                output = run.output
+                if output is None:
+                    raise RuntimeError("Live output graph was not constructed")
+                run.total += len(output.write_labels)
                 publish(force=True)
-                stopped = self._execute_current(run, construct=False)
+                stopped = self._execute_current(
+                    run, construct=False, retain_session=True,
+                )
                 if run.current_files_incremental:
                     processed_paths.update(
                         group.physical_paths[:run.current_completed]
@@ -1506,18 +1439,12 @@ class StandardRunExecutor:
                     processed_paths.update(group.physical_paths)
                 skipped_paths.difference_update(processed_paths)
                 if not stopped and run.current_completed >= run.current_total:
-                    owned_targets.add(target_key)
                     with run.live_revision_lock:
                         run.processed_live_revisions[target_key] = attempt
                     settled_revisions[target_key] = (
                         revision,
                         decision.item.source_stamp.execution_identity_v1,
                     )
-
-                lease = resources.target_lease
-                if lease is not None:
-                    lease.release()
-                    resources.target_lease = None
                 run.current_file_total = 0
                 run.current_files_incremental = False
                 publish(force=True)
@@ -1605,18 +1532,16 @@ class StandardRunExecutor:
                 continue
             run.files_skipped += skipped_files
             item = decision.item
-            if not target_state_matches(decision):
+            if (
+                run.configuration.output_mode == "Overwrite"
+                and not target_state_matches(decision)
+            ):
                 raise RuntimeError(
                     f"output target changed after admission: {item.target}"
                 )
             run.artifact = item.target
             run.current_total = item.source_stamp.frame_count
             run.total += run.current_total
-            run.completed += run.current_total - len(decision.labels)
-            run.current_completed = (
-                run.current_total - len(decision.labels)
-            )
-            run.current_published = run.current_completed
             run.current_file_total = _claim_output_physical_files(
                 item,
                 deferred.discovered_paths,
@@ -1627,6 +1552,13 @@ class StandardRunExecutor:
             run.current_files_incremental = (
                 item.source_spec.kind is SourceKind.TIFF_SERIES
             )
+            self._construct(
+                run,
+                item=item,
+                labels=decision.labels,
+                decision=decision,
+            )
+            run.completed += run.current_completed
             self._events.put(StandardRunEvent(
                 run.identity,
                 StandardEventKind.DISCOVERY,
@@ -1638,12 +1570,6 @@ class StandardRunExecutor:
                 artifact_total=run.current_total,
                 **_directory_event_fields(run),
             ))
-            self._construct(
-                run,
-                item=item,
-                labels=decision.labels,
-                decision=decision,
-            )
             stopped = self._execute_current(run, construct=False) or stopped
             if run.current_files_incremental:
                 run.files_processed += min(
@@ -1674,30 +1600,55 @@ class StandardRunExecutor:
             )
         return stopped
 
-    def _execute_current(self, run: _StandardRun, *, construct: bool=True) -> bool:
+    def _execute_current(
+        self,
+        run: _StandardRun,
+        *,
+        construct: bool = True,
+        retain_session: bool = False,
+    ) -> bool:
         if construct and run.session is None:
             self._construct(run)
-        scan, session = (run.scan, run.session)
-        if scan is None or session is None:
+        scan, session, output = (run.scan, run.session, run.output)
+        if (
+            scan is not None
+            and session is None
+            and output is not None
+            and not output.write_labels
+        ):
+            close = getattr(run.source, "close", None)
+            if callable(close):
+                close()
+            run.source = None
+            run.scan = None
+            run.records = None
+            run.frames_by_label.clear()
+            if run.artifact not in run.artifacts:
+                run.artifacts.append(run.artifact)
+            return bool(run.stop_requested)
+        if scan is None or session is None or output is None:
             raise RuntimeError('scattering executor lost its constructed owners')
+        write_labels = set(output.write_labels)
         run.frames_by_label = {
-            int(frame.index): frame for frame in scan.frames
+            int(frame.index): frame
+            for frame in scan.frames
+            if int(frame.index) in write_labels
         }
         session.start()
-        if run.stop_requested:
-            session.stop()
-        if isinstance(run.source, NexusStackSource):
-            self._submit_container_source(run, session)
+        if isinstance(run.source, NexusStackSource) and write_labels:
+            self._submit_container_source(run, output)
         else:
             for frame in scan.frames:
+                if int(frame.index) not in write_labels:
+                    continue
                 if run.stop_requested:
-                    session.stop()
+                    break
                 runtime = run.context_runtime
                 submit_started = monotonic()
                 if not (
-                    session.submit(frame)
+                    output.submit(frame)
                     if runtime is None
-                    else runtime.submit(session, frame)
+                    else runtime.submit(output, frame)
                 ):
                     _perf_add(run, "submit_wait", monotonic() - submit_started)
                     break
@@ -1707,30 +1658,29 @@ class StandardRunExecutor:
         projection_error: BaseException | None = None
         result = None
         try:
-            result = self._finish_session(run)
+            if retain_session and not run.stop_requested:
+                result = output.commit_epoch()
+            else:
+                result = output.finish_current()
         except BaseException as error:
             session_error = error
-        if result is not None:
-            processed = int(getattr(result, 'n_processed', 0) or 0)
-            run.completed += processed
-            run.current_completed = min(
-                run.current_total,
-                run.current_completed + processed,
-            )
-            if not result.failed and run.artifact not in run.artifacts:
-                # ``ScanSession.finish`` has returned after the sink's durable
-                # finish boundary.  Preserve that artifact even if the
-                # asynchronous display projection subsequently fails.
-                run.artifacts.append(run.artifact)
-        try:
-            self._finish_display_projection(run)
-        except BaseException as error:
-            projection_error = error
+        if session_error is None:
+            try:
+                self._finish_display_projection(run)
+            except BaseException as error:
+                projection_error = error
         _perf_add(run, "finish_wait", monotonic() - finish_started)
         if session_error is not None:
             raise session_error.with_traceback(session_error.__traceback__)
         if projection_error is not None:
+            try:
+                self.stop(run.identity)
+            except BaseException as error:
+                run.cleanup_failures.append(detach_exception(
+                    error, "dynamic_output.stop"
+                ))
             raise projection_error.with_traceback(projection_error.__traceback__)
+        self._project_new_durable(run, output)
         if result is None:  # pragma: no cover - defensive type narrowing
             raise RuntimeError("scattering session returned no terminal result")
         if run.perf_enabled:
@@ -1738,14 +1688,11 @@ class StandardRunExecutor:
             if callable(snapshot):
                 for key, elapsed in snapshot().items():
                     _perf_add(run, key, elapsed)
-        if result.failed:
+        if getattr(result, "failed", False):
             raise RuntimeError(result.error or 'scattering reduction failed')
-        if run.current_published != run.current_completed:
-            raise RuntimeError(
-                "display projection lost a durable frame: "
-                f"published={run.current_published}, "
-                f"processed={run.current_completed}"
-            )
+        run.current_published = max(
+            run.current_published, run.current_completed,
+        )
         close = getattr(run.source, 'close', None)
         if callable(close):
             close()
@@ -1753,10 +1700,33 @@ class StandardRunExecutor:
         run.scan = None
         run.records = None
         run.frames_by_label.clear()
-        return bool(result.cancelled or run.stop_requested)
+        return bool(getattr(result, "cancelled", False) or run.stop_requested)
 
     @staticmethod
-    def _submit_container_source(run: _StandardRun, session: ScanSession) -> None:
+    def _project_new_durable(run: _StandardRun, output) -> None:
+        def apply(artifact, durable_labels, new_labels):
+            owner = run.display.artifacts.get(artifact)
+            if owner is None:
+                raise RuntimeError(
+                    f"durable output lost display artifact {artifact}"
+                )
+            run.display.mark_durable(owner, durable_labels)
+            run.completed += len(new_labels)
+            path = Path(artifact)
+            if path == run.artifact:
+                run.current_completed = min(
+                    run.current_total,
+                    run.current_completed + len(new_labels),
+                )
+                run.current_published = max(
+                    run.current_published, run.current_completed,
+                )
+            if new_labels and path not in run.artifacts:
+                run.artifacts.append(path)
+        output.project_new_durable(apply)
+
+    @staticmethod
+    def _submit_container_source(run: _StandardRun, output: Any) -> None:
         """Overlap bounded container reads with reduction backpressure.
 
         The executor thread remains the sole HDF5/cursor owner.  One bounded
@@ -1769,6 +1739,23 @@ class StandardRunExecutor:
         source = run.source
         if not isinstance(source, NexusStackSource):
             raise TypeError("container submission requires NexusStackSource")
+
+        wanted = tuple(run.frames_by_label)
+        if wanted != tuple(source.frame_indices):
+            for label in wanted:
+                if run.stop_requested:
+                    return
+                frame = run.frames_by_label[label]
+                image = source.load_frame(label)
+                runtime = run.context_runtime
+                accepted = (
+                    output.submit(frame, image)
+                    if runtime is None
+                    else runtime.submit(output, frame, image)
+                )
+                if not accepted:
+                    break
+            return
 
         pending: Queue[object] = Queue(maxsize=_SOURCE_PREFETCH_FRAMES)
         accepting = Event()
@@ -1788,14 +1775,15 @@ class StandardRunExecutor:
                     if item is _SOURCE_SUBMISSION_END:
                         return
                     frame, image = item
-                    if run.stop_requested:
-                        session.stop()
+                    if not accepting.is_set() or run.stop_requested:
+                        accepting.clear()
+                        return
                     runtime = run.context_runtime
                     submit_started = monotonic()
                     accepted = (
-                        session.submit(frame, image)
+                        output.submit(frame, image)
                         if runtime is None
-                        else runtime.submit(session, frame, image)
+                        else runtime.submit(output, frame, image)
                     )
                     _perf_add(
                         run, "submit_wait", monotonic() - submit_started
@@ -1819,7 +1807,8 @@ class StandardRunExecutor:
         def enqueue(item: object) -> bool:
             while accepting.is_set() and not consumer_done.is_set():
                 if run.stop_requested:
-                    session.stop()
+                    accepting.clear()
+                    return False
                 try:
                     pending.put(item, timeout=0.05)
                     return True
@@ -1851,21 +1840,30 @@ class StandardRunExecutor:
         except BaseException as error:
             producer_error = error
             accepting.clear()
-            session.stop()
+            runtime = run.context_runtime
+            try:
+                if runtime is None:
+                    output.stop()
+                else:
+                    runtime.request_stop(output)
+            except BaseException as stop_error:
+                run.cleanup_failures.append(detach_exception(
+                    stop_error, "dynamic_output.stop"
+                ))
         finally:
             close_chunks = getattr(chunks, "close", None)
             if callable(close_chunks):
                 close_chunks()
             if run.stop_requested:
-                session.stop()
+                accepting.clear()
             if accepting.is_set() and not consumer_done.is_set():
                 enqueue(_SOURCE_SUBMISSION_END)
             consumer.join()
 
-        if consumer_errors:
-            raise consumer_errors[0]
         if producer_error is not None:
             raise producer_error
+        if consumer_errors:
+            raise consumer_errors[0]
 
     def _frame_ready(self, run: _StandardRun, event: Any) -> None:
         started = monotonic()
@@ -1897,7 +1895,7 @@ class StandardRunExecutor:
         run: _StandardRun,
         event: Any,
         image: np.ndarray | None,
-        session: ScanSession,
+        session: Any,
     ) -> None:
         records, scan = (run.records, run.scan)
         if records is None or scan is None:
@@ -1944,9 +1942,10 @@ class StandardRunExecutor:
             str(owner.artifact),
             label,
         )
+        run.current_epoch_published += 1
         run.current_published = min(
             run.current_total,
-            run.current_published + 1,
+            run.current_completed + run.current_epoch_published,
         )
         key = navigation.appended
         source_identity = (
@@ -1986,7 +1985,7 @@ class StandardRunExecutor:
         self._publish_payload(
             run,
             payload,
-            run.completed + session.frames_completed,
+            run.completed - run.current_completed + run.current_published,
             run.total,
             navigation=navigation,
         )
@@ -2008,11 +2007,6 @@ class StandardRunExecutor:
                 return
             run.display.put_payload(payload)
         artifact_completed = run.current_published
-        in_flight_files = (
-            min(run.current_file_total, artifact_completed)
-            if run.current_files_incremental
-            else 0
-        )
         self._events.put(StandardRunEvent(
             run.identity,
             StandardEventKind.FRAME_READY,
@@ -2022,7 +2016,6 @@ class StandardRunExecutor:
             detail=(
                 _directory_status(
                     run,
-                    in_flight_processed=in_flight_files,
                 )
                 if run.files_discovered
                 else payload.status
@@ -2031,10 +2024,7 @@ class StandardRunExecutor:
             navigation_delta=navigation,
             artifact_completed=artifact_completed,
             artifact_total=run.current_total,
-            **_directory_event_fields(
-                run,
-                in_flight_processed=in_flight_files,
-            ),
+            **_directory_event_fields(run),
         ))
 
     def _cleanup(self, run: _StandardRun, primary: DetachedDiagnostic | None=None) -> ExecutorClosed:
@@ -2043,25 +2033,36 @@ class StandardRunExecutor:
                 run.primary = primary
             if run.closed:
                 return self._receipt(run)
-            if run.session is not None:
+            output = run.output
+            if output is not None:
+                output_finished = False
                 try:
-                    self._finish_session(run)
+                    output.finish_all(stopped=run.stop_requested)
                 except Exception as error:
-                    run.cleanup_failures.append(detach_exception(error, 'session.finish'))
+                    run.cleanup_failures.append(detach_exception(
+                        error, 'dynamic_output.finish'
+                    ))
+                else:
+                    output_finished = True
             try:
                 self._finish_display_projection(run)
             except Exception as error:
                 run.cleanup_failures.append(detach_exception(
                     error, 'display_projection.finish'
                 ))
-            sink = run.sink
-            if sink is not None and (run.session is None or run.sink_requires_abort):
-                try:
-                    sink.abort(None)
-                except Exception as error:
-                    run.cleanup_failures.append(detach_exception(error, 'sink.abort'))
-                else:
-                    run.sink = None
+            else:
+                if output is not None:
+                    try:
+                        self._project_new_durable(run, output)
+                    except Exception as error:
+                        run.cleanup_failures.append(detach_exception(
+                            error, 'dynamic_output.project'
+                        ))
+                    else:
+                        if output_finished:
+                            run.output = None
+                            run.session = None
+                            run.sink = None
             source = run.source
             if source is not None:
                 try:
@@ -2074,17 +2075,12 @@ class StandardRunExecutor:
                     run.source = None
             resources = run.resources
             if resources is not None:
-                release_target = all(value is None for value in (
-                    run.session, run.sink, run.source,
-                ))
-                for context, error in resources.cleanup(
-                    release_target=release_target
-                ):
+                for context, error in resources.cleanup():
                     run.cleanup_failures.append(detach_exception(error, context))
                 if resources.cleaned:
                     run.resources = None
             cleaned = all(value is None for value in (
-                run.session, run.sink, run.source, run.resources))
+                run.session, run.sink, run.output, run.source, run.resources))
             run.cleanup_status = CleanupStatus.CLEANED if cleaned else CleanupStatus.CLEANUP_PENDING
             if cleaned:
                 run.closed = True
@@ -2094,19 +2090,6 @@ class StandardRunExecutor:
                 run.records = None
                 run.frames_by_label.clear()
             return self._receipt(run)
-
-    @staticmethod
-    def _finish_session(run: _StandardRun) -> object:
-        session = run.session
-        try:
-            result = session.finish(raise_on_failure=False)
-        except Exception:
-            run.sink_requires_abort = True
-            raise
-        run.session = None
-        if not run.sink_requires_abort:
-            run.sink = None
-        return result
 
     def _terminal_event(
         self,

@@ -6,7 +6,6 @@ import os
 
 from xrd_tools.session.run_configuration import RunIntent
 
-from .output_values import APPEND_UNAVAILABLE
 from .shell_values import RunStripProjection, ShellPhase
 from .state_machine import RunPhase
 
@@ -21,10 +20,6 @@ RUN_MODE_CHOICES = (
     "XYE Viewer",
 )
 UNOWNED_RUN_MODE_REASONS = (
-    (
-        "Int 1D (XYE)",
-        "XYE output has no mounted vNext sink contract yet.",
-    ),
     (
         "Stitch 1D",
         "Stitching has no mounted vNext operation service yet.",
@@ -42,7 +37,7 @@ UNOWNED_RUN_MODE_REASONS = (
         "XYE Viewer has no mounted vNext viewer context yet.",
     ),
 )
-_NATIVE_RUN_MODES = frozenset(("Int 1D", "Int 2D"))
+_NATIVE_RUN_MODES = frozenset(("Int 1D", "Int 2D", "Int 1D (XYE)"))
 
 
 def build_run_strip_projection(
@@ -56,9 +51,14 @@ def build_run_strip_projection(
     source_count_is_files: bool = False,
     source_count_includes_immediate: bool = False,
 ) -> RunStripProjection:
-    overwrite = (
+    mode = str(intent.processing_mode or "")
+    output_supported = (
         type(intent.output_mode) is str
-        and intent.output_mode.strip().lower() == "overwrite"
+        and intent.output_mode.strip().lower() in {"overwrite", "append"}
+    )
+    xye_append = (
+        mode == "Int 1D (XYE)"
+        and intent.output_mode.strip().lower() == "append"
     )
     missing: list[str] = []
     if intent.source_spec is None:
@@ -67,7 +67,6 @@ def build_run_strip_projection(
         missing.append("PONI")
     if not intent.save_path:
         missing.append("output")
-    mode = str(intent.processing_mode or "")
     mode_blocker = dict(UNOWNED_RUN_MODE_REASONS).get(mode)
     if mode not in _NATIVE_RUN_MODES and mode_blocker is None:
         mode_blocker = (
@@ -78,8 +77,10 @@ def build_run_strip_projection(
         readiness = mode_blocker
     elif not executor_available:
         readiness = "Execution is unavailable"
-    elif not overwrite:
-        readiness = APPEND_UNAVAILABLE
+    elif xye_append:
+        readiness = "XYE-only Append has no persisted lineage owner"
+    elif not output_supported:
+        readiness = "Choose Overwrite or Append"
     elif missing:
         readiness = f"Needs {', '.join(missing)}"
     elif not start_permitted:
@@ -98,7 +99,8 @@ def build_run_strip_projection(
             readiness += f" · {count}"
     ready = (
         executor_available
-        and overwrite
+        and output_supported
+        and not xye_append
         and not missing
         and start_permitted
         and mode_blocker is None

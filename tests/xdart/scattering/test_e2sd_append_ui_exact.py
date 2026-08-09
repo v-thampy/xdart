@@ -5,7 +5,6 @@ from pyqtgraph.Qt import QtWidgets
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.controls_projection import OUTPUT_MODE
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
-from xdart.gui.tabs.scattering.output_values import APPEND_UNAVAILABLE
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_values import (
     ShellCommand,
@@ -43,9 +42,9 @@ def test_unsupported_append_cannot_remain_a_selectable_visual_mode() -> None:
 
         button.click()
         app.processEvents()
-        assert run_store.snapshot().thaw().output_mode == "Overwrite"
-        assert shell.run_controls.write_mode() == "Overwrite"
-        assert button.text() == "Replace ⇄"
+        assert run_store.snapshot().thaw().output_mode == "Append"
+        assert shell.run_controls.write_mode() == "Append"
+        assert button.text() == "Append ⇄"
     finally:
         page.close_workspace()
 
@@ -65,10 +64,9 @@ def test_refused_append_edit_cannot_diverge_view_from_intent() -> None:
         assert shell.run_controls.write_mode() == "Overwrite"
         button.click()
         app.processEvents()
-        assert run_store.snapshot().thaw().output_mode == "Overwrite"
-        assert run_store.snapshot().revision == prior_revision
-        assert shell.run_controls.write_mode() == "Overwrite"
-        assert shell.scientific.status.text() == APPEND_UNAVAILABLE
+        assert run_store.snapshot().thaw().output_mode == "Append"
+        assert run_store.snapshot().revision == prior_revision + 1
+        assert shell.run_controls.write_mode() == "Append"
     finally:
         page.close_workspace()
 
@@ -92,7 +90,7 @@ def test_real_controls_projects_append_reason_then_exact_overwrite() -> None:
         assert button.text() == "Append ⇄"
         assert (
             shell.run_controls.readinessLabel.text()
-            == APPEND_UNAVAILABLE
+            == "Needs source, PONI, output"
         )
         assert all(
             row.path != OUTPUT_MODE

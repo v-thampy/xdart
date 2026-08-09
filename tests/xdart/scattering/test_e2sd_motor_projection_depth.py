@@ -13,7 +13,6 @@ from xdart.gui.tabs.scattering.contracts import (
 from xdart.gui.tabs.scattering.controls_projection import GI_MOTOR
 from xdart.gui.tabs.scattering.controls_projection import OUTPUT_MODE, project_controls
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
-from xdart.gui.tabs.scattering.output_values import APPEND_UNAVAILABLE
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
@@ -203,7 +202,7 @@ def test_current_append_projects_the_deferred_reason() -> None:
 
     assert field.value == "Append"
     assert field.choices == ("Overwrite", "Append")
-    assert field.reason == APPEND_UNAVAILABLE
+    assert field.reason == ""
 
 
 def test_combo_reconciliation_is_signal_blocked() -> None:

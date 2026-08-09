@@ -299,10 +299,13 @@ def test_recursive_tiff_count_includes_only_immediate_subfolders(
     )
     assert header.text == "3 files (folder + 1 level) · Image Directory"
     assert (
-        "Count includes the selected folder and immediate subfolders."
+        "Only the selected folder and immediate subfolders are processed."
         in header.detail
     )
-    assert "Deeper subfolders are evaluated during Run." in header.detail
+    assert (
+        "Deeper subfolders are outside the supported Run scope."
+        in header.detail
+    )
 
 
 def test_source_header_never_claims_unobserved_or_empty_directory_ready() -> None:
@@ -376,7 +379,10 @@ def test_recursive_nested_only_beyond_shallow_preview_is_not_ready(
         "0 files (folder + 1 level) · Image Directory"
     )
     assert not header.ready
-    assert "Deeper subfolders are evaluated during Run." in header.detail
+    assert (
+        "Deeper subfolders are outside the supported Run scope."
+        in header.detail
+    )
 
 
 def test_project_header_requires_existing_project_and_creatable_save_target(

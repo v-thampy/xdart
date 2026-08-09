@@ -1234,6 +1234,7 @@ def open_live_scan_session(
     policy: SessionPolicy | None = None,
     accounting=None,
     xye_receipt_boundary=None,
+    _headless_scan: Scan | None = None,
 ):
     """Open a public :class:`xrd_tools.session.ScanSession` over xdart live
     frames (4f-bridge).
@@ -1333,9 +1334,16 @@ def open_live_scan_session(
         accounting = accounting.ledger
         sink = sink_binding.sink
 
-    scan, plan, _n = _build_live_scan_and_plan(
-        live_frames, plan, scan_name=scan_name, global_mask=global_mask,
-        integrator=integrator, poni=poni)
+    if _headless_scan is None:
+        scan, plan, _n = _build_live_scan_and_plan(
+            live_frames, plan, scan_name=scan_name, global_mask=global_mask,
+            integrator=integrator, poni=poni)
+    else:
+        if type(_headless_scan) is not Scan:
+            raise TypeError("headless session requires an exact Scan")
+        if not _headless_scan.frames:
+            raise ValueError("cannot open a session without frames")
+        scan = _headless_scan
     if policy is not None:
         image = scan.frames[0].image
         descriptor = SimpleNamespace(
@@ -1374,6 +1382,18 @@ def open_live_scan_session(
         # streaming live/batch write path ran loud and a single degraded frame
         # (dead monitor / all-dummy 2D) aborted the whole-scan save (B-1 regression).
         strict=StrictPolicy.graceful(),
+    )
+
+
+def open_headless_scan_session(
+    scan: Scan,
+    plan: ReductionPlan,
+    **kwargs: Any,
+):
+    """Open the accepted session graph over one exact nonempty ``Scan``."""
+
+    return open_live_scan_session(
+        (), plan, _headless_scan=scan, **kwargs,
     )
 
 
@@ -1885,6 +1905,7 @@ __all__ = [
     "reduce_live_frames",
     "open_live_reduction_session",
     "open_live_scan_nexus_session",
+    "open_headless_scan_session",
     "live_target_maps",
     "open_live_scan_session",
     "freeze_live_scan_gi_ranges",

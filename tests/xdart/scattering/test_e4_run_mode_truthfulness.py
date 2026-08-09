@@ -37,10 +37,6 @@ _EXPECTED_MODES = (
 )
 _EXPECTED_DISABLED_REASONS = (
     (
-        "Int 1D (XYE)",
-        "XYE output has no mounted vNext sink contract yet.",
-    ),
-    (
         "Stitch 1D",
         "Stitching has no mounted vNext operation service yet.",
     ),
@@ -160,11 +156,9 @@ def test_projection_owns_modes_and_refuses_run_readiness_for_unowned_mode() -> N
     assert unsupported.modes == RUN_MODE_CHOICES
     assert unsupported.disabled_modes == UNOWNED_RUN_MODE_REASONS
     assert unsupported.mode == "Int 1D (XYE)"
-    assert not unsupported.ready
-    assert not unsupported.run_enabled
-    assert unsupported.readiness == dict(UNOWNED_RUN_MODE_REASONS)[
-        "Int 1D (XYE)"
-    ]
+    assert unsupported.ready
+    assert unsupported.run_enabled
+    assert unsupported.readiness == "Ready · Int 1D (XYE)"
 
 
 def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:

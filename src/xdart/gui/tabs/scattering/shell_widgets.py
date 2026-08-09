@@ -544,12 +544,12 @@ def source_header_projection(
         is SourceCountScope.SELECTED_PLUS_IMMEDIATE
     ):
         detail = (
-            f"{detail} Count includes the selected folder and immediate "
-            "subfolders. Deeper subfolders are evaluated during Run."
+            f"{detail} Only the selected folder and immediate subfolders are "
+            "processed. Deeper subfolders are outside the supported Run scope."
         )
     elif observation.subdirectories_deferred:
         detail = (
-            f"{detail} Subfolders are evaluated during Run."
+            f"{detail} Run is limited to immediate subfolders."
         )
     return SectionHeaderProjection(" · ".join(parts), ready, detail)
 

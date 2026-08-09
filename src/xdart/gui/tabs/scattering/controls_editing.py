@@ -58,7 +58,6 @@ from .controls_inventory import (
     integration_values,
     points_2d,
 )
-from .output_values import APPEND_UNAVAILABLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -929,8 +928,8 @@ def _control_value(
     if path == OUTPUT_MODE:
         return (
             value
-            if value == "Overwrite"
-            else EditRefusal(APPEND_UNAVAILABLE)
+            if value in {"Overwrite", "Append"}
+            else EditRefusal("Output mode must be Overwrite or Append.")
         )
     if path in {GI_ENABLED, THRESHOLD_ENABLED, MASK_SATURATION}:
         return (

@@ -172,6 +172,12 @@ class AcquisitionRuntime:
         with self._command_lock:
             session.stop()
 
+    def request_stop(self, adapter) -> None:
+        try:
+            adapter.stop()
+        finally:
+            self._gate.set()
+
     def terminal_stop(self, session) -> None:
         """Stop one failed session without reopening frame submission."""
 

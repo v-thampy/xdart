@@ -14,7 +14,6 @@ from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.contracts import SourceCapture, StartCapture
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.events import RequestId
-from xdart.gui.tabs.scattering.output_values import APPEND_UNAVAILABLE
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_values import (
     ShellCommand,
@@ -57,6 +56,10 @@ def test_append_refusal_returns_idle_then_overwrite_can_admit(
     lifecycle = ScatteringCoordinator()
     executor = StandardRunExecutor()
     run_store = store(tmp_path, output_mode="Append")
+    snapshot = run_store.snapshot()
+    intent = snapshot.thaw()
+    intent.processing_mode = "Int 1D (XYE)"
+    run_store.commit(intent, expected_revision=snapshot.revision)
     page = ScatteringWorkspace(
         intents=run_store,
         lifecycle=lifecycle,
@@ -69,7 +72,9 @@ def test_append_refusal_returns_idle_then_overwrite_can_admit(
         _settle(qapp, lambda: page._admission is None)
         assert lifecycle.phase is RunPhase.IDLE
         assert executor._admission is None
-        assert shell.scientific.status.text() == APPEND_UNAVAILABLE
+        assert shell.run_controls.readinessLabel.text() == (
+            "XYE-only Append has no persisted lineage owner"
+        )
 
         shell.run_controls.writeModeButton.click()
         assert run_store.snapshot().thaw().output_mode == "Overwrite"

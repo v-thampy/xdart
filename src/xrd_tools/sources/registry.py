@@ -288,6 +288,33 @@ def _image_scan_name(path: Path) -> str:
     return match.group(1) if match else stem
 
 
+_CBF_BINARY_STARTER = b"\x0c\x1a\x04\xd5"
+
+
+def _cbf_incomplete_reason(path: Path) -> str | None:
+    try:
+        before = path.stat()
+        captured = (int(before.st_size), int(before.st_mtime_ns))
+        with path.open("rb") as stream:
+            header = stream.read(min(captured[0], 1 << 20))
+        after = path.stat()
+    except OSError as exc:
+        return f"CBF is not yet stable: {exc}"
+    if captured != (int(after.st_size), int(after.st_mtime_ns)):
+        return "CBF changed during structural completeness probing"
+    starter = header.find(_CBF_BINARY_STARTER)
+    if starter < 0:
+        return "CBF binary STARTER is absent within the 1 MiB header ceiling"
+    size_line = next((line for line in reversed(header[:starter].splitlines())
+                      if line.partition(b":")[0].strip() == b"X-Binary-Size"), None)
+    value = b"" if size_line is None else size_line.partition(b":")[2].strip()
+    if not value.isdigit() or len(value) > 20:
+        return "CBF X-Binary-Size is absent or invalid"
+    if captured[0] < starter + len(_CBF_BINARY_STARTER) + int(value):
+        return "CBF binary payload is still incomplete"
+    return None
+
+
 def _image_probe(path: Path) -> Any:
     from xrd_tools.sources.probe import ProbeResult, ProbeState
     if path.suffix.lower() == ".raw":
@@ -329,6 +356,11 @@ def _image_probe(path: Path) -> Any:
             reason="RAW image file readable",
             kind=SourceKind.IMAGE_FILE,
         )
+    if path.suffix.lower() == ".cbf":
+        reason = _cbf_incomplete_reason(path)
+        if reason is not None:
+            return ProbeResult(
+                ProbeState.IN_PROGRESS, reason=reason, kind=SourceKind.IMAGE_FILE)
     import fabio
     try:
         with fabio.open(str(path)) as f:

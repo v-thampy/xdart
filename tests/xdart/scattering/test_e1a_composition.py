@@ -295,11 +295,12 @@ def test_source_selection_is_one_store_value_and_observes_off_gui_thread(
         assert store.commit_calls == 1
         assert _wait_until(qapp, lambda: source.observation_thread is not None)
         assert source.observation_thread != gui_thread
-        # Accepted selected-plus-immediate counting; deeper levels defer to Run.
+        # Selected plus immediate is the shared preview and Run boundary.
         assert _wait_until(qapp, lambda: "2 matching files" in source_status._count.text())
         assert source_status._count.text() == (
-            "2 matching files through immediate subfolders · "
-            "Deeper subfolders processed during Run"
+            "2 matching files · Only the selected folder and immediate "
+            "subfolders are processed · "
+            "Deeper subfolders are outside the supported Run scope"
         )
         assert store.snapshot().thaw().source_spec == DirectorySourceSpec(
             tmp_path, recursive=True, suffixes=(".tif",)

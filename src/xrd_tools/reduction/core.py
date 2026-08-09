@@ -897,6 +897,7 @@ class TransactionalXYESink:
     directory: Path | str
     stale_paths: tuple[Path | str, ...] = field(default=(), kw_only=True)
     pattern: str = field(default="{scan}_{frame:04d}.xye", kw_only=True)
+    prefix: str | None = field(default=None, kw_only=True)
     _run_owner: OwnerToken = field(init=False, repr=False)
     _transaction: Any = field(init=False, repr=False)
     _canonical_directory: Path = field(init=False, repr=False)
@@ -918,6 +919,12 @@ class TransactionalXYESink:
             raise ValueError(
                 "transactional XYE supports only the direct per-frame pattern"
             )
+        if self.prefix is not None:
+            if type(self.prefix) is not str or self.prefix not in {
+                "iq", "itth", "iqip", "iqoop", "iexit",
+            }:
+                raise ValueError("transactional XYE prefix is invalid")
+            self.pattern = f"{self.prefix}_{{scan}}_{{frame:04d}}.xye"
         self.stale_paths = tuple(self.stale_paths)
         self._stale_paths = self.stale_paths
         self._pattern = self.pattern

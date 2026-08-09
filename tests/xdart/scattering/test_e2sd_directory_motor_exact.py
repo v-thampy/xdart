@@ -77,6 +77,7 @@ def _tiff_directory_start(
     metadata_format: str | None = "auto",
     incidence_motor: str = "th",
     recursive: bool = False,
+    save_path: Path | None = None,
 ) -> StartCapture:
     poni = tmp_path / "cal.poni"
     write_poni(poni)
@@ -89,7 +90,9 @@ def _tiff_directory_start(
     snapshot = RunIntentStore(RunIntent(
         source_spec=source,
         poni_file=str(poni),
-        save_path=str(tmp_path / "processed"),
+        save_path=str(
+            tmp_path / "processed" if save_path is None else save_path
+        ),
         output_mode="Overwrite",
         gi=GIIntent(enabled=True, incidence_motor=incidence_motor),
     )).snapshot()
@@ -2230,7 +2233,10 @@ def test_recursive_tiff_preview_reads_every_nested_sidecar(
     assert header.text == (
         "2 files (folder + 1 level) · Image Directory"
     )
-    assert "Deeper subfolders are evaluated during Run." in header.detail
+    assert (
+        "Deeper subfolders are outside the supported Run scope."
+        in header.detail
+    )
     # Recursive discovery owns one deterministic natural path order.  The
     # nested path sorts first here, so its metadata order owns the result.
     assert calls == [child, direct]
@@ -2336,18 +2342,35 @@ def test_recursive_tiff_preview_is_shallow_but_run_rejects_deeper_gi_gap(
     calls.clear()
     sessions: list[object] = []
     try:
-        with pytest.raises(
-            ValueError,
-            match=(
-                "GI metadata motor 'th'.*finite value in every admitted TIFF"
+        receipt = prepare_output(
+            _tiff_directory_start(
+                tmp_path,
+                recursive=True,
+                save_path=tmp_path.with_name(f"{tmp_path.name}-processed"),
             ),
-        ):
-            prepare_output(
-                _tiff_directory_start(tmp_path, recursive=True),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
+            cancelled=lambda: False,
+            session_owner=sessions.append,
+        )
+        assert len(receipt.outputs) == 2
+        member_path_groups = {
+            tuple(
+                Path(member.path).resolve()
+                for member in output.item.source_stamp.members
             )
-        assert grandchild in calls
+            for output in receipt.outputs
+        }
+        assert member_path_groups == {
+            (direct.resolve(),),
+            (child.resolve(),),
+        }
+        frame_counts = sorted(
+            output.item.source_stamp.frame_count
+            for output in receipt.outputs
+        )
+        assert frame_counts == [1, 1]
+        assert sum(frame_counts) == 2
+        assert set(calls) == {direct, child}
+        assert grandchild not in calls
     finally:
         for session in sessions:
             session.close()
@@ -2390,7 +2413,10 @@ def test_recursive_tiff_preview_keeps_the_32_candidate_bound(
         "33 files (folder + 1 level) · Image Directory"
     )
     assert not header.ready
-    assert "Deeper subfolders are evaluated during Run." in header.detail
+    assert (
+        "Deeper subfolders are outside the supported Run scope."
+        in header.detail
+    )
 
 
 def test_recursive_over_limit_preview_never_infers_from_direct_tiffs(
@@ -2450,7 +2476,10 @@ def test_recursive_over_limit_preview_never_infers_from_direct_tiffs(
         "33 files (folder + 1 level) · Image Directory"
     )
     assert not header.ready
-    assert "Deeper subfolders are evaluated during Run." in header.detail
+    assert (
+        "Deeper subfolders are outside the supported Run scope."
+        in header.detail
+    )
 
 
 def test_recursive_tiff_preview_requires_at_least_one_readable_image(
