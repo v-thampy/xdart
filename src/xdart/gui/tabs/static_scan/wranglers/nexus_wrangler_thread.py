@@ -121,7 +121,6 @@ class PreparedNexusExecution:
         "target",
         "stack",
         "scan_metadata",
-        "scan",
         "poni",
         "master",
         "source",
@@ -136,7 +135,6 @@ class PreparedNexusExecution:
         self.master = master
         self.stack = None
         self.scan_metadata = None
-        self.scan = None
         self.poni = poni
         self.source = None
         self.observations = ()
@@ -883,7 +881,6 @@ class nexusThread(wranglerThread):
             # N1: the accepted project root -> entry/@source_base + relative raw
             # source paths in the writer (portable .nxs).
             scan.source_base = target.source_base or None
-            prepared.scan = scan
             self._active_scan = scan
         except BaseException:
             nexusThread._release_execution(self)

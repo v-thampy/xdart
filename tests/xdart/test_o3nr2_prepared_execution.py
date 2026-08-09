@@ -162,7 +162,8 @@ def test_preparation_is_one_owner_and_one_derivation(
     assert first.frozen is accepted, "the envelope holds the exact admitted object"
     scan = thread._initialize_scan(Path(src).stem)
     assert thread._execution is first, "_initialize_scan re-derived the target"
-    assert first.scan is scan
+    assert not hasattr(first, "scan")
+    assert thread._active_scan is scan
     assert scan.data_file == first.target.output_path
     assert thread.poni is first.poni, "a second PONI object reached execution"
 

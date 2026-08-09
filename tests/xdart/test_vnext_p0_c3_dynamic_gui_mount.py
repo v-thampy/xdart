@@ -1252,7 +1252,7 @@ def test_nexus_controller_uses_the_same_dynamic_mount_without_legacy_output_owne
         "_xye_lock", "_xye_ready_dirs",
     }
     assert retired_instance_state.isdisjoint(fresh.__dict__)
-    retired_envelope_state = {"append_qualified", "overwrite", "xye"}
+    retired_envelope_state = {"append_qualified", "overwrite", "scan", "xye"}
     assert retired_envelope_state.isdisjoint(
         set(mod.PreparedNexusExecution.__slots__))
     from xdart.gui.tabs.static_scan.wranglers import image_wrangler_thread as image_mod
