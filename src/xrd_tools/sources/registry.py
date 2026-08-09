@@ -200,13 +200,16 @@ _NEXUS_CANDIDATE_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
 
 def _nexus_is_candidate(path: Path) -> bool:
     path = Path(path)
-    if path.suffix.lower() not in _NEXUS_CANDIDATE_EXTS:
+    suffix = path.suffix.lower()
+    if suffix not in _NEXUS_CANDIDATE_EXTS:
         return False
-    from xrd_tools.io.image import _is_eiger_master
-    # An Eiger _data_NNNNNN.h5 sidecar is not its own candidate — its frames
-    # are only reachable through the sibling _master.h5 (mirrors
-    # xrd_tools.sources.discover.discover_scans's EIGER_MASTER branch).
-    if "_data_" in path.stem and not _is_eiger_master(path):
+    prefix, marker, ordinal = path.stem.rpartition("data_")
+    # Only an exact Eiger HDF5 data-sidecar name is excluded.  Legitimate
+    # NeXus-family scan names may contain ``_data_`` without being sidecars.
+    if (suffix == ".h5" and marker
+            and (not prefix or prefix.endswith("_"))
+            and len(ordinal) in {5, 6} and ordinal.isascii()
+            and ordinal.isdecimal()):
         return False
     return True
 

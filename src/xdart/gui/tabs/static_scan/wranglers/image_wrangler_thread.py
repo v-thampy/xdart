@@ -4440,6 +4440,7 @@ class imageThread(wranglerThread):
 
             # ── Current master exhausted?  Try to advance ────────────────────
             if (self._eiger_frame_idx >= self._eiger_nframes
+                    and self._eiger_nframes > 0
                     and frozen.live_mode and not frozen.batch_mode
                     and frozen.source.family == "directory"):
                 path, candidate = self._eiger_master_path, self._eiger_master_candidate

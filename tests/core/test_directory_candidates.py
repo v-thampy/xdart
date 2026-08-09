@@ -81,6 +81,26 @@ def test_eiger_data_sidecar_excluded_but_master_included(tmp_path):
     assert [c.path.name for c in candidates] == ["run_master.h5"]
 
 
+def test_exact_eiger_sidecar_shape_preserves_legitimate_data_names(tmp_path):
+    excluded = {
+        "data_00001.h5", "data_000001.h5",
+        "run_data_00001.h5", "run_data_000001.H5",
+    }
+    included = {
+        "aa_data_00001.nxs", "bb_data_000001.cxi",
+        "cc_data_00001.hdf5", "dd_data_000001.hdf5",
+        "ee_data_0001.h5", "ff_data_0000001.h5",
+        "gg_data_00001_tail.h5", "metadata_00001.h5",
+        "zz_data_\u0660\u0660\u0660\u0660\u0661.h5",
+    }
+    for name in excluded | included:
+        _touch(tmp_path / name)
+
+    candidates = enumerate_candidates(tmp_path)
+    assert {c.path.name: c.adapter_id for c in candidates} == {
+        name: "nexus_hdf5" for name in included}
+
+
 def test_tiff_files_are_image_file_candidates(tmp_path):
     _touch(tmp_path / "frame_1.tif")
     _touch(tmp_path / "frame_2.tiff")

@@ -122,7 +122,16 @@ def test_live_repolls_partial_frame_and_does_not_drop_it(tmp_path):
     p.write_bytes(good)                              # the write completes
     r2 = _imageThread().get_next_image(stub, stub.run_configuration)         # sweep 2: now reads it
     assert r2[3] is not None and r2[3].shape == (16, 16)
-    assert str(p) in stub.processed                  # now committed exactly once
+    facts = r2[4].facts
+    assert facts["commit_path"] == str(p)
+    assert str(p) not in stub.processed
+    assert list(stub.img_fnames) == [str(p)]
+    stub._commit_frame(
+        facts["commit_path"],
+        count_discovery=not facts.get("discovery_counted", False),
+    )
+    assert stub.processed.count(str(p)) == 1
+    assert list(stub.img_fnames) == []
 
 
 def test_live_skips_frame_once_past_deadline(tmp_path):

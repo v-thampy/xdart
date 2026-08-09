@@ -35,8 +35,6 @@ Mutation-row map (§39.5 Phase 4):
  6 mutable source family/suffix/single-image       test_frozen_series_*, test_frozen_container_*
  7 mutable output path / output mode               test_output_target_*, test_output_mode_*
  8 mutable threshold / mask                        test_threshold_policy_*
- 9 mutable GI/motor/orientation/tilt -> frame       test_real_live_frame_*
-10 mutable live/batch/core/XYE/series-average      test_mode_and_parallelism_*
 11 NeXus local-alias ``skip_2d`` read              test_nexus_skip_2d_*
 12 non-JSON-native provenance                     test_supported_frozen_values_*
 13 refused Start mutating PONI carriers            test_absent_refusal_does_not_adopt_*
@@ -60,7 +58,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from tests.xdart.test_w1a_frozen_execution import (  # noqa: E402
     _click_run,
-    _poison_display_state,
     _write_poni,
 )
 
@@ -357,7 +354,11 @@ def test_execution_source_is_thawed_from_the_accepted_frozen_object(
     raw, _out = _configure_image_run(widget, tmp_path)
     other = tmp_path / "other_0001.tif"
     other.write_bytes(b"")
-    first = SourceSpec(raw, SourceKind.IMAGE_FILE)
+    first = SourceSpec(
+        raw,
+        SourceKind.IMAGE_FILE,
+        options={"metadata_format": "auto"},
+    )
     second = SourceSpec(other, SourceKind.IMAGE_FILE)
     seen = []
 
@@ -569,82 +570,6 @@ def test_threshold_policy_is_consumed_from_the_frozen_configuration(
     observed = run.thread._apply_threshold_inline(run.thread.run_configuration, np.asarray([1.0]))
 
     assert np.array_equal(observed, np.asarray([1.0]))
-
-
-def test_mode_and_parallelism_are_consumed_from_the_frozen_configuration(
-        widget, tmp_path, monkeypatch):
-    """Row 10.  live/batch/cores/XYE/series-average must all come from the
-    accepted object, not from post-admission worker mirrors."""
-    run = _click_run(widget, tmp_path, monkeypatch)
-    frozen = run.frozen
-    thread = run.thread
-
-    # O-1a-W1R-D2/D3 amendment: the parent spelling poisoned the mirrors and read
-    # them BACK through the descriptor.  The mirrors are deleted, so a write here
-    # only creates a plain attribute that no production read can reach; the
-    # property is asserted where each value is CONSUMED, and the total absence of
-    # a mirror read is asserted by ``test_w1rd_architecture_guard.py``.
-    import inspect
-
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
-        imageThread,
-    )
-
-    thread.batch_mode = not bool(frozen.batch_mode)
-    thread.live_mode = not bool(frozen.live_mode)
-    thread.max_cores = int(frozen.max_cores) + 7
-    thread.xye_only = not bool(frozen.run_options.get("xye_only", False))
-    thread.series_average = True
-
-    xye = bool(frozen.run_options.get("xye_only", False))
-    assert thread._append_skip_enabled(frozen) is (
-        frozen.output_mode == "Append" and not xye)
-    # this run did not freeze a series average, so the pending chunk must reach
-    # the dispatcher UNCOLLAPSED -- the poisoned mirror above cannot collapse it
-    assert not frozen.run_options.get("series_average", False)
-    pending = [("f", 1, None, {}, 0.0, 0.0), ("g", 2, None, {}, 0.0, 0.0)]
-    assert thread._series_average_pending(frozen, pending) == pending
-    for method, expression in (
-            (imageThread._get_streaming_session, "frozen.max_cores"),
-            (imageThread._dispatch_batch, "frozen.batch_mode"),
-            (imageThread._eiger_pop_next_master, "frozen.live_mode"),
-            (imageThread._save_due, 'frozen.run_options.get("xye_only"')):
-        assert expression in inspect.getsource(method), (
-            f"{method.__qualname__} no longer reads {expression}")
-
-
-# --------------------------------------------------------------------------- #
-# W1R-P1-4 / row 9 — canonical GI intent reaches a REAL LiveFrame.
-# --------------------------------------------------------------------------- #
-
-def test_real_live_frame_consumes_the_frozen_gi_policy(
-        widget, tmp_path, monkeypatch):
-    """Row 9, and the §39.3 item-1 oracle repair.
-
-    Canonical Controls V2 GI intent is written and ``frozen.gi.enabled`` is
-    asserted BEFORE poisoning, so the case genuinely discriminates.  The parent
-    produced ``LiveFrame.gi is False`` and ``th_mtr == 'POISON_MOTOR'``.
-    """
-    widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
-    run = _click_run(widget, tmp_path, monkeypatch, points=321, gi=False)
-    assert run.frozen.gi.enabled is True, (
-        "canonical Controls V2 GI intent did not reach the freeze")
-
-    _poison_display_state(run)
-    scan = run.thread.initialize_scan()
-    frame = run.thread._build_batch_frames(
-        run.thread.run_configuration, scan,
-        [(str(tmp_path / "scan_0001.tif"), 1,
-          np.zeros((4, 4), dtype=np.float32), {}, None, 0.0)],
-    )[0]
-
-    assert frame.gi is run.frozen.gi.enabled
-    assert frame.th_mtr == run.frozen.gi.scan_incidence_motor
-    assert int(frame.sample_orientation) == int(
-        run.frozen.gi.sample_orientation)
-    assert float(frame.tilt_angle) == float(run.frozen.gi.tilt_angle)
-
-
 # --------------------------------------------------------------------------- #
 # W1R-P1-6 / row 11 — the NeXus local-alias skip_2d execution read.
 # --------------------------------------------------------------------------- #

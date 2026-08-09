@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,6 +15,7 @@ from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
     _PREFETCH_QUEUE_SIZE,
     imageThread,
 )
+from xrd_tools.sources.discover import Candidate
 
 
 def _bare_image_thread(*, master="/nonexistent/scan_master.h5", **options):
@@ -32,6 +34,16 @@ def _bare_image_thread(*, master="/nonexistent/scan_master.h5", **options):
     worker._admitted_run_configuration = worker.run_configuration
     worker.run_configuration_floor = 0
     return worker
+
+
+def _install_stable_source_facts(worker):
+    candidate = Candidate(
+        Path(worker._eiger_master_path), "nexus_hdf5", 1, 1)
+    worker._eiger_source_facts = lambda frame_idx: dict(
+        observation=candidate, source_revision=1, container=True,
+        extent=int(worker._eiger_nframes), dataset_paths=(),
+        external_members=(), source_frame_idx=int(frame_idx), commit_path=None,
+    )
 
 
 class _FakeReadBlock:
@@ -94,6 +106,7 @@ def test_sync_eiger_read_keeps_native_dataset_dtype(tmp_path):
         np.arange(4, dtype=np.uint16).reshape(1, 2, 2))
     worker._eiger_provider = None
     worker.inp_type = "Image File"
+    _install_stable_source_facts(worker)
 
     _path, _scan_name, _number, image, _meta = worker._get_next_eiger_frame_sync(worker.run_configuration)
 
@@ -117,6 +130,7 @@ def test_prefetch_bulk_read_keeps_native_dataset_dtype(tmp_path):
     worker._eiger_read_plan = SimpleNamespace(block_frames=16)
     worker._eiger_provider = None
     worker._eiger_fabio_handle = None
+    _install_stable_source_facts(worker)
 
     calls = 0
 
@@ -221,6 +235,7 @@ def _owner_tracked_worker(tmp_path, n_frames, *, maxsize, block_frames=2):
     worker._eiger_read_plan = SimpleNamespace(block_frames=block_frames)
     worker._eiger_provider = None
     worker._eiger_fabio_handle = None
+    _install_stable_source_facts(worker)
 
     calls = {"n": 0}
 

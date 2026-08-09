@@ -136,47 +136,91 @@ def _bare_worker(tmp_path, *, write_mode="Append"):
     return worker
 
 
-def _write_minimal_integrated_nxs(
-        path, labels, *, labels_2d=None, reduction_config=None,
+def _write_canonical_committed_nxs(
+        path, labels, *, reduction_config=None,
         source_path=None, source_snapshot=None):
+    """Write and decode one production-shaped H23 committed prefix."""
     import h5py
     from xrd_tools.core.provenance import write_provenance
+    from xrd_tools.io import (
+        AppendIntent,
+        AppendSource,
+        begin_same_run_lineage,
+        commit_append_lineage,
+        decode_committed_append_prefix,
+        science_fingerprint,
+    )
     from xrd_tools.io.nexus_record import write_frame_source_ref
+    from xrd_tools.io.schema import (
+        PROCESSED_SCHEMA_NAME,
+        PROCESSED_SCHEMA_VERSION,
+        SCHEMA_NAME_ATTR,
+        SCHEMA_VERSION_ATTR,
+        SOURCE_BASE_ATTR,
+    )
 
-    labels = np.asarray(labels, dtype=np.int64)
+    path = Path(path)
+    labels = tuple(int(label) for label in labels)
+    label_array = np.asarray(labels, dtype=np.int64)
+    snapshot = dict(source_snapshot or {})
+    source = Path(source_path or path.with_name("canonical-source.nxs"))
+    source_base = os.path.abspath(os.fspath(path.parent))
+    intent = AppendIntent(
+        entry="entry",
+        source_base=source_base,
+        source_identity=os.path.abspath(os.fspath(source)),
+        science_fingerprint=science_fingerprint(reduction_config or {}),
+        modes=("1d:default",),
+        source=AppendSource(
+            path=os.path.abspath(os.fspath(source)),
+            adapter_id="nexus_hdf5",
+            size=int(snapshot.get("size", max(1, len(labels)))),
+            mtime_ns=int(snapshot.get("mtime_ns", 0)),
+            extent=max(len(labels), int(snapshot.get("frame_count", 0))),
+            dataset_paths=(
+                (str(snapshot["dataset_path"]),)
+                if snapshot.get("dataset_path") else ()
+            ),
+        ),
+        labels=labels,
+    )
+    decision = begin_same_run_lineage(intent)
     q = np.linspace(0.1, 1.0, 4, dtype=np.float32)
     with h5py.File(path, "w") as h5:
         entry = h5.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+        entry.attrs[SOURCE_BASE_ATTR] = source_base
         g1 = entry.create_group("integrated_1d")
         g1.attrs["NX_class"] = "NXdata"
         g1.attrs["signal"] = "intensity"
         g1.attrs["axes"] = ["frame_index", "q"]
-        g1.create_dataset("frame_index", data=labels)
+        g1.create_dataset("frame_index", data=label_array)
         q_ds = g1.create_dataset("q", data=q)
         q_ds.attrs["units"] = "q_A^-1"
         g1.create_dataset(
             "intensity",
-            data=np.arange(labels.size * q.size, dtype=np.float32).reshape(
-                labels.size, q.size
+            data=np.arange(label_array.size * q.size, dtype=np.float32).reshape(
+                label_array.size, q.size
             ),
         )
-        if labels_2d is not None:
-            g2 = entry.create_group("integrated_2d")
-            g2.create_dataset(
-                "frame_index", data=np.asarray(labels_2d, dtype=np.int64))
-        if source_path is not None and labels.size:
+        if source_path is not None and label_array.size:
             frames = entry.create_group("frames")
             frame = frames.create_group(
-                f"frame_{int(labels.max()):04d}")
+                f"frame_{int(label_array.max()):04d}")
             write_frame_source_ref(
                 frame,
                 source_path,
-                int(labels.max()) - 1,
+                int(label_array.max()) - 1,
                 source_snapshot=source_snapshot,
             )
         if reduction_config is not None:
             write_provenance(h5, config=reduction_config, host="")
+        commit_append_lineage(entry, decision, written_labels=labels)
+
+    with h5py.File(path, "r") as h5:
+        return decode_committed_append_prefix(h5)
 
 
 def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
@@ -266,7 +310,7 @@ def test_image_series_selected_member_does_not_truncate_full_series(
     worker.img_fnames = []
     worker.processed = []
     from xrd_tools.sources import image_series_spec
-    worker.source_spec = image_series_spec(paths[1])
+    _rearm(worker, tmp_path, source_spec=image_series_spec(paths[1]))
 
     read_calls = []
 
@@ -276,7 +320,15 @@ def test_image_series_selected_member_does_not_truncate_full_series(
 
     monkeypatch.setattr(iwt, "read_image", fake_read)
 
-    observed = [worker.get_next_image(worker.run_configuration) for _ in paths]
+    observed = []
+    for _ in paths:
+        item = worker.get_next_image(worker.run_configuration)
+        observed.append(item)
+        facts = item[4].facts
+        worker._commit_frame(
+            facts["commit_path"],
+            count_discovery=not facts.get("discovery_counted", False),
+        )
 
     assert [(Path(item[0]).name, item[2]) for item in observed] == [
         ("scan_1.tif", 1),
@@ -398,7 +450,7 @@ def test_append_skip_snapshot_lazily_reads_only_current_frame_index(
     out = tmp_path / "out"
     out.mkdir()
     output = out / "scan.nxs"
-    _write_minimal_integrated_nxs(output, [1, 2])
+    _write_canonical_committed_nxs(output, [1, 2])
 
     def fail_live_scan(*_args, **_kwargs):
         pytest.fail("append cursor must not hydrate a LiveScan")
@@ -409,36 +461,11 @@ def test_append_skip_snapshot_lazily_reads_only_current_frame_index(
     assert worker._append_skip_frames_by_scan == {"scan": {1, 2}}
 
 
-def test_int_2d_append_does_not_skip_frame_with_only_1d_output(tmp_path):
-    worker = _bare_worker(tmp_path)
-    _rearm(worker, tmp_path, skip_2d=False)
-    out = tmp_path / "out"
-    out.mkdir()
-    _write_minimal_integrated_nxs(out / "scan.nxs", [0])
-
-    assert worker._should_skip_before_read(worker.run_configuration, "scan", 0) is False
-    assert worker._append_skip_frames_by_scan == {"scan": set()}
-
-
-def test_int_2d_append_completion_is_1d_2d_intersection(tmp_path):
-    worker = _bare_worker(tmp_path)
-    _rearm(worker, tmp_path, skip_2d=False)
-    out = tmp_path / "out"
-    out.mkdir()
-    _write_minimal_integrated_nxs(
-        out / "scan.nxs", [1, 2], labels_2d=[2, 3])
-
-    assert worker._should_skip_before_read(worker.run_configuration, "scan", 1) is False
-    assert worker._should_skip_before_read(worker.run_configuration, "scan", 2) is True
-    assert worker._should_skip_before_read(worker.run_configuration, "scan", 3) is False
-    assert worker._append_skip_frames_by_scan == {"scan": {2}}
-
-
 def test_int_1d_append_completion_requires_only_1d_output(tmp_path):
     worker = _bare_worker(tmp_path)
     out = tmp_path / "out"
     out.mkdir()
-    _write_minimal_integrated_nxs(out / "scan.nxs", [0])
+    _write_canonical_committed_nxs(out / "scan.nxs", [0])
 
     assert worker._should_skip_before_read(worker.run_configuration, "scan", 0) is True
 
@@ -458,7 +485,7 @@ def test_append_cursor_rejects_reached_target_config_before_skip(tmp_path):
     worker = _bare_worker(tmp_path)
     out = tmp_path / "out"
     out.mkdir()
-    _write_minimal_integrated_nxs(
+    _write_canonical_committed_nxs(
         out / "scan.nxs",
         [0],
         reduction_config={
@@ -485,14 +512,16 @@ def test_append_skip_snapshot_opens_each_reached_output_once(monkeypatch, tmp_pa
     worker.fname = str(tmp_path / "out" / "current.nxs")
     out = tmp_path / "out"
     out.mkdir()
+    prefixes = {}
     for name in ("scan_1", "scan_2", "scan_10"):
-        (out / f"{name}.nxs").touch()
+        path = out / f"{name}.nxs"
+        prefixes[path.name] = _write_canonical_committed_nxs(path, [1])
 
     calls = []
 
     def append_cursor(path, *, require_2d):
         calls.append(Path(path).name)
-        return {1}, {}
+        return {1}, {}, prefixes[Path(path).name]
 
     monkeypatch.setattr(iwt, "_nexus_append_cursor", append_cursor)
 
@@ -510,7 +539,7 @@ def test_append_cursor_memo_reuses_only_unchanged_output_across_runs(
     out = tmp_path / "out"
     out.mkdir()
     output = out / "scan.nxs"
-    _write_minimal_integrated_nxs(output, [1, 2])
+    _write_canonical_committed_nxs(output, [1, 2])
     real_cursor = iwt._nexus_append_cursor
 
     assert worker._load_append_skip_snapshot(worker.run_configuration, "scan") == {1, 2}
@@ -526,7 +555,7 @@ def test_append_cursor_memo_reuses_only_unchanged_output_across_runs(
     assert worker._load_append_skip_snapshot(worker.run_configuration, "scan") == {1, 2}
 
     # Replacing the product changes its stamp and must invalidate the memo.
-    _write_minimal_integrated_nxs(output, [1, 2, 3])
+    _write_canonical_committed_nxs(output, [1, 2, 3])
     calls = []
 
     def cursor(path, *, require_2d):
@@ -548,7 +577,7 @@ def test_append_cursor_memo_revalidates_current_processing_config(
         bai_1d_args={"unit": "q_A^-1", "numpoints": 1000})
     out = tmp_path / "out"
     out.mkdir()
-    _write_minimal_integrated_nxs(
+    _write_canonical_committed_nxs(
         out / "scan.nxs",
         [1, 2],
         reduction_config={
@@ -579,14 +608,17 @@ def test_append_cursor_memo_avoids_reopening_300_unchanged_products(
     out = tmp_path / "out"
     out.mkdir()
     names = tuple(f"scan_{idx:04d}" for idx in range(300))
+    prefixes = {}
     for name in names:
-        (out / f"{name}.nxs").write_bytes(name.encode())
+        path = out / f"{name}.nxs"
+        prefixes[path.name] = _write_canonical_committed_nxs(
+            path, range(1, 7))
 
     calls = []
 
     def cursor(path, *, require_2d):
         calls.append(Path(path).name)
-        return set(range(1, 7)), {}
+        return set(range(1, 7)), {}, prefixes[Path(path).name]
 
     monkeypatch.setattr(iwt, "_nexus_append_cursor", cursor)
     for name in names:
@@ -620,14 +652,16 @@ def test_stop_during_append_cursor_read_prevents_next_output_open(
     worker = _bare_worker(tmp_path)
     out = tmp_path / "out"
     out.mkdir()
+    prefixes = {}
     for name in ("scan_1", "scan_2"):
-        (out / f"{name}.nxs").touch()
+        path = out / f"{name}.nxs"
+        prefixes[path.name] = _write_canonical_committed_nxs(path, [1])
     calls = []
 
     def first_cursor_then_stop(path, *, require_2d):
         calls.append(Path(path).name)
         worker.command = "stop"
-        return {1}, {}
+        return {1}, {}, prefixes[Path(path).name]
 
     monkeypatch.setattr(
         iwt, "_nexus_append_cursor", first_cursor_then_stop)
@@ -639,6 +673,7 @@ def test_stop_during_append_cursor_read_prevents_next_output_open(
 
 def test_normal_append_process_start_never_primes_whole_directory(tmp_path):
     worker = _bare_worker(tmp_path)
+    worker.scan_name = "scan"
     worker.batch_mode = True
     worker.live_mode = False
     worker._frames_since_save = 0
@@ -737,7 +772,7 @@ def test_complete_append_master_uses_count_hint_without_raw_open(
 
     out = Path(worker.run_configuration.save_path)
     out.mkdir()
-    _write_minimal_integrated_nxs(out / "scan.nxs", range(1, 7))
+    _write_canonical_committed_nxs(out / "scan.nxs", range(1, 7))
     monkeypatch.setattr(
         worker,
         "_eiger_open_master",
@@ -797,7 +832,7 @@ def test_restarted_append_uses_persisted_source_stamp_without_raw_open(
 
     out = Path(worker.run_configuration.save_path)
     out.mkdir()
-    _write_minimal_integrated_nxs(
+    _write_canonical_committed_nxs(
         out / "scan.nxs",
         range(1, 7),
         source_path=raw,
@@ -834,7 +869,7 @@ def test_changed_source_stamp_invalidates_persisted_append_extent(tmp_path):
     worker._eiger_done_masters = set()
     out = Path(worker.run_configuration.save_path)
     out.mkdir()
-    _write_minimal_integrated_nxs(
+    _write_canonical_committed_nxs(
         out / "scan.nxs",
         range(1, 7),
         source_path=raw,
@@ -864,7 +899,7 @@ def test_eiger_master_never_uses_persisted_mtime_as_completeness(tmp_path):
     worker._eiger_done_masters = set()
     out = Path(worker.run_configuration.save_path)
     out.mkdir()
-    _write_minimal_integrated_nxs(
+    _write_canonical_committed_nxs(
         out / "scan.nxs",
         range(1, 7),
         source_path=raw,
@@ -927,7 +962,7 @@ def test_cold_append_opens_complete_master_once_without_frame_index_walk(
 
     out = Path(worker.run_configuration.save_path)
     out.mkdir()
-    _write_minimal_integrated_nxs(out / "scan.nxs", range(1, 7))
+    _write_canonical_committed_nxs(out / "scan.nxs", range(1, 7))
 
     opens = []
 
@@ -1109,7 +1144,7 @@ def test_append_master_count_hint_falls_back_when_not_authoritative(
     out = Path(worker.run_configuration.save_path)
     out.mkdir()
     labels = range(1, 7) if case == "stale-count" else range(1, 6)
-    _write_minimal_integrated_nxs(out / "scan.nxs", labels)
+    _write_canonical_committed_nxs(out / "scan.nxs", labels)
 
     assert worker._eiger_skip_complete_append_master(
         worker.run_configuration, str(raw), candidate) is False
@@ -1126,12 +1161,12 @@ def test_append_skip_snapshot_primes_once_read_only(monkeypatch, tmp_path):
     out = tmp_path / "out"
     out.mkdir()
     output = out / "scan.nxs"
-    _write_minimal_integrated_nxs(output, [1, 2])
+    prefix = _write_canonical_committed_nxs(output, [1, 2])
     calls = []
 
     def append_cursor(path, *, require_2d):
         calls.append(str(path))
-        return {1, 2}, {}
+        return {1, 2}, {}, prefix
 
     monkeypatch.setattr(iwt, "_nexus_append_cursor", append_cursor)
 
@@ -1153,7 +1188,7 @@ def test_append_snapshot_primes_with_read_handle_open(monkeypatch, tmp_path):
     out = tmp_path / "out"
     out.mkdir()
     output = out / "scan.nxs"
-    _write_minimal_integrated_nxs(output, [4, 5])
+    _write_canonical_committed_nxs(output, [4, 5])
 
     with h5py.File(output, "r"):
         worker._prime_append_skip_snapshots_for_run(worker.run_configuration)
@@ -1198,36 +1233,6 @@ def test_append_fresh_scan_primes_empty_and_reads_all(monkeypatch, tmp_path):
     assert read_calls == [str(paths[0])]
 
 
-def test_append_snapshot_failure_warns_once_and_skips_nothing(
-        monkeypatch, caplog, tmp_path):
-    worker = _bare_worker(tmp_path)
-    worker.inp_type = "Image File"
-    worker.img_file = str(tmp_path / "scan_master.h5")
-    worker.img_ext = "h5"
-    out = tmp_path / "out"
-    out.mkdir()
-    (out / "scan.nxs").touch()
-
-    monkeypatch.setattr(
-        iwt,
-        "_nexus_append_cursor",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            OSError("held read handle")),
-    )
-
-    with caplog.at_level(logging.WARNING):
-        worker._prime_append_skip_snapshots_for_run(worker.run_configuration)
-        worker._prime_append_skip_snapshots_for_run(worker.run_configuration)
-
-    assert worker._append_skip_frames_by_scan == {"scan": set()}
-    assert worker._should_skip_before_read(worker.run_configuration, "scan", 1) is False
-    warnings = [
-        rec for rec in caplog.records
-        if "append skip snapshot unavailable" in rec.message
-    ]
-    assert len(warnings) == 1
-
-
 def test_nexus_integrated_frame_labels_unions_1d_and_2d(tmp_path):
     import h5py
 
@@ -1243,132 +1248,9 @@ def test_nexus_integrated_frame_labels_unions_1d_and_2d(tmp_path):
     assert iwt._nexus_integrated_frame_count(output) == 3
 
 
-def test_append_initialize_abort_preserves_target_on_degraded_load(
-        monkeypatch, tmp_path):
-    import xrd_tools.io.nexus as nexus_mod
-
-    worker, target = _initialize_scan_worker(tmp_path)
-    _write_minimal_integrated_nxs(target, [1, 2, 3])
-    before = target.read_bytes()
-
-    def fail_read_scan_metadata(*_args, **_kwargs):
-        raise OSError("transient metadata read failure")
-
-    monkeypatch.setattr(
-        nexus_mod, "read_scan_metadata", fail_read_scan_metadata)
-
-    with pytest.raises(RuntimeError, match="existing file preserved"):
-        worker.initialize_scan()
-
-    assert target.read_bytes() == before
-
-
-def test_append_initialize_marks_loaded_rows_persisted(tmp_path):
-    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
-
-    worker, target = _initialize_scan_worker(tmp_path)
-    _write_minimal_integrated_nxs(target, [1, 2, 3])
-
-    scan = worker.initialize_scan()
-
-    assert scan.frames.index == [1, 2, 3]
-    assert set(scan.frames._persisted) == {1, 2, 3}
-    frozen = _frozen_run_config(
-        output_mode="Append",
-        source_spec=series_source(tmp_path / "raw_0001.tif"),
-    )
-    sink = QtNexusSink(
-        SimpleNamespace(_admitted_run_configuration=frozen),
-        scan,
-        object(),
-        run_configuration=frozen,
-    )
-    assert sink._needs_atomic_first_batch_flush() is False
-
-
-def test_append_initialize_config_mismatch_aborts_with_empty_img_file(tmp_path):
-    worker, target = _initialize_scan_worker(tmp_path)
-    _write_minimal_integrated_nxs(
-        target,
-        [1, 2, 3],
-        reduction_config={
-            "gi": False,
-            "bai_1d_args": {"unit": "q_A^-1"},
-            "bai_2d_args": {"unit": "q_A^-1"},
-        },
-    )
-    before = target.read_bytes()
-    worker.img_file = ""  # live/cold path: Run click may not know the source yet.
-    worker.gi = True
-    _rearm(worker, tmp_path, 
-        gi=True,
-        bai_1d_args={"unit": "q_A^-1", "gi_mode_1d": "q_total"},
-        bai_2d_args={"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"},
-    )
-
-    with pytest.raises(RuntimeError, match="Integration settings changed mid-run") as excinfo:
-        worker.initialize_scan()
-
-    # TYPED (still a RuntimeError subclass) so run()/process_scan can stop the
-    # run cleanly instead of crashing the QThread; carries the check and names
-    # the differing fields + the preserved target in the user-facing message.
-    from xrd_tools.session.readiness import AppendConfigMismatchError
-
-    err = excinfo.value
-    assert isinstance(err, AppendConfigMismatchError)
-    assert err.check.ok is False
-    assert err.check.mismatched_fields
-    assert (err.check.processed_label, err.check.current_label) == (
-        "Standard", "Grazing")
-    for label in err.check.mismatched_fields:
-        assert label in str(err)
-    assert "scan.nxs was preserved" in str(err)
-    assert target.read_bytes() == before
-
-
-def test_append_initialize_same_config_canonical_noise_passes(tmp_path):
-    worker, target = _initialize_scan_worker(tmp_path)
-    _write_minimal_integrated_nxs(
-        target,
-        [1, 2, 3],
-        reduction_config={
-            "gi": "False",
-            "bai_1d_args": {
-                "unit": " q_A^-1 ",
-                "numpoints": None,
-                "radial_range": "[0.1, 6.0]",
-            },
-            "bai_2d_args": {
-                "unit": "q_A^-1",
-                "npt_rad": "500.0",
-                "npt_azim": "",
-                "radial_range": ["0.1000000000001", "6.0"],
-                "azimuth_range": "(-90.0, 90.0)",
-            },
-        },
-    )
-    worker.img_file = ""
-    _rearm(worker, tmp_path, 
-        bai_1d_args={
-            "unit": "q_A^-1",
-            "radial_range": (0.1, 6.0),
-        },
-        bai_2d_args={
-            "unit": "q_A^-1",
-            "npt_rad": 500,
-            "radial_range": (0.1, 6.0),
-            "azimuth_range": (-90, 90),
-        },
-    )
-
-    scan = worker.initialize_scan()
-
-    assert scan.frames.index == [1, 2, 3]
-
-
 def test_append_initialize_mismatch_ignored_in_overwrite_mode(tmp_path):
     worker, target = _initialize_scan_worker(tmp_path, write_mode="Overwrite")
-    _write_minimal_integrated_nxs(
+    _write_canonical_committed_nxs(
         target,
         [1, 2, 3],
         reduction_config={

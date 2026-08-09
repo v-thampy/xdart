@@ -1,375 +1,17 @@
-"""Pause/Resume (Phase B) — the worker-thread freeze primitive + the GUI
-freeze-guard lift.
+"""Pause/Resume tests for the worker pause primitive and GUI freeze guard.
 
-Pause is a THIRD command state between the run state ('start') and 'stop': the
-worker's processing loops call ``_wait_if_paused`` at their top, which on entry
-quiesces the writer at a frame boundary (``_enter_pause``: streaming ->
-session.drain() + sink flush; serial -> flush the unsaved tail) and emits
-``sigPaused`` so the GUI lifts the disk-read freeze guard for browsing, then
-spins until ``command`` leaves 'pause' ('start' = resume, 'stop' = terminal).
-
-These are headless unit tests of the pure logic (offscreen Qt not even needed
-for most); the live drain/flush/browse loop is verified in the GUI.
+The dynamic worker quiesces and commits through its mounted
+``ScanSessionAdapter`` before publishing ``sigPaused``.  Resume keeps the same
+session alive and does not change the display generation.
 """
 import threading
 import time
 from types import SimpleNamespace, MethodType
 
-import pytest
-
 from tests.xdart._accepted_run import accepted_run  # noqa: E402
 import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as itmod
-import xdart.gui.tabs.static_scan.wranglers.wrangler_widget as wwmod
 
 imageThread = itmod.imageThread
-
-
-def _bind_serial_tail(w):
-    """Bind the DRYed serial-save methods (flush_serial_tail + _h5pool_bracket)
-    onto a stand-in so _enter_pause / _dispatch_batch_serial reach them.  The
-    caller supplies the ``_save_due`` gate (a stub) for the desired outcome."""
-    from types import MethodType as _MT
-    w.flush_serial_tail = _MT(imageThread.flush_serial_tail, w)
-    w._h5pool_bracket = _MT(imageThread._h5pool_bracket, w)
-
-
-# ── _enter_pause: drain/flush ordering + signal ─────────────────────────────
-
-def test_enter_pause_streaming_drains_then_flushes_then_signals():
-    """Streaming pause: drain() (non-terminal) MUST run before the sink flush,
-    and sigPaused fires only AFTER both (so the writer is provably idle before
-    the GUI reads disk)."""
-    calls = []
-    session = SimpleNamespace(
-        drain=lambda timeout=None: (calls.append('drain'), True)[1])
-    sink = SimpleNamespace(flush=lambda *, force=False: calls.append(('flush', force)))
-    emitted = []
-    w = SimpleNamespace(
-        _streaming_session=session, _streaming_sink=sink,
-        _active_scan=None, run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=0,
-        sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
-    )
-    w._enter_pause = MethodType(imageThread._enter_pause, w)
-
-    w._enter_pause(w.run_configuration)
-
-    assert calls == ['drain', ('flush', True)]      # drain strictly before flush
-    assert emitted == ['paused']                    # signalled after drain+flush
-
-
-def test_enter_pause_serial_tail_wins_over_open_streaming_session(monkeypatch):
-    """Adversarial-review fix: in the true-live WATCH loop the Phase-2 streaming
-    session is still open but DORMANT, while the serial path accumulates the
-    watch tail (_frames_since_save).  _enter_pause must route on the serial tail
-    FIRST -- flush the .nxs + reset the counter -- not take the streaming branch
-    (which would leave _frames_since_save leaked).  It still drains the dormant
-    session first (a no-op) to keep the writer idle."""
-    monkeypatch.setattr(itmod, '_get_h5pool',
-                        lambda: SimpleNamespace(pause=lambda f: None,
-                                                resume=lambda f: None))
-    order = []
-    session = SimpleNamespace(
-        drain=lambda timeout=None: order.append('drain') or True)
-    sink = SimpleNamespace(flush=lambda *, force=False: order.append('sink_flush'))
-    scan = SimpleNamespace(data_file='x.nxs',
-                           _save_to_nexus=lambda: order.append('save'))
-    w = SimpleNamespace(
-        _streaming_session=session, _streaming_sink=sink,   # open but dormant
-        _active_scan=scan, run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=4,
-        file_lock=threading.RLock(),
-        _save_due=lambda _frozen, scan, force=False: True,
-        _flush_xye_buffer=lambda s: order.append('xye'),
-        sigPaused=SimpleNamespace(emit=lambda: order.append('paused')),
-    )
-    w._enter_pause = MethodType(imageThread._enter_pause, w)
-    _bind_serial_tail(w)
-
-    w._enter_pause(w.run_configuration)
-
-    # Serial branch ran (drain the dormant session, then SERIAL save+xye), and
-    # the sink streaming flush did NOT (would re-route the watch tail wrongly).
-    assert 'save' in order and 'xye' in order
-    assert 'sink_flush' not in order
-    assert order.index('drain') < order.index('save')   # idle the writer first
-    assert w._frames_since_save == 0                     # counter reset, not leaked
-    assert order[-1] == 'paused'
-
-
-def test_enter_pause_serial_flushes_unsaved_tail(monkeypatch):
-    """Serial true-live pause: flush the unsaved _frames_since_save tail to .nxs
-    (so the file is at a frame boundary) then signal."""
-    monkeypatch.setattr(itmod, '_get_h5pool',
-                        lambda: SimpleNamespace(pause=lambda f: None,
-                                                resume=lambda f: None))
-    saved, flushed, emitted = [], [], []
-    scan = SimpleNamespace(data_file='x.nxs',
-                           _save_to_nexus=lambda: saved.append('save'))
-    w = SimpleNamespace(
-        _streaming_session=None, _streaming_sink=None,
-        _active_scan=scan, run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=3,
-        file_lock=threading.RLock(),
-        _save_due=lambda _frozen, scan, force=False: True,
-        _flush_xye_buffer=lambda s: flushed.append(s),
-        sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
-    )
-    w._enter_pause = MethodType(imageThread._enter_pause, w)
-    _bind_serial_tail(w)
-
-    w._enter_pause(w.run_configuration)
-
-    assert saved == ['save'] and flushed == [scan]
-    assert w._frames_since_save == 0                # tail flushed -> counter reset
-    assert emitted == ['paused']
-
-
-def test_enter_pause_serial_nothing_to_flush_still_signals(monkeypatch):
-    """Pause before any frame / right after a save (_frames_since_save==0):
-    nothing to flush, but sigPaused still fires so the guard lifts."""
-    monkeypatch.setattr(itmod, '_get_h5pool',
-                        lambda: SimpleNamespace(pause=lambda f: None,
-                                                resume=lambda f: None))
-    emitted = []
-    w = SimpleNamespace(
-        _streaming_session=None, _streaming_sink=None,
-        _active_scan=None, run_configuration=accepted_run(
-            run_options={"xye_only": True}), _frames_since_save=0,
-        sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
-    )
-    w._enter_pause = MethodType(imageThread._enter_pause, w)
-    w._enter_pause(w.run_configuration)
-    assert emitted == ['paused']
-
-
-def test_enter_pause_signals_even_if_drain_raises():
-    """A drain/flush failure must not strand the run: log + still emit sigPaused
-    (we've stopped submitting, so the writer is idle and reads are safe)."""
-    def _boom(timeout=None):
-        raise RuntimeError("writer exploded")
-    emitted = []
-    w = SimpleNamespace(
-        _streaming_session=SimpleNamespace(drain=_boom),
-        _streaming_sink=SimpleNamespace(flush=lambda *, force=False: None),
-        _active_scan=None, run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=0,
-        sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
-    )
-    w._enter_pause = MethodType(imageThread._enter_pause, w)
-    w._enter_pause(w.run_configuration)
-    assert emitted == ['paused']
-
-
-# ── D₂: the DRYed serial-save helpers (_h5pool_bracket / flush_serial_tail) ──
-
-def test_h5pool_bracket_resumes_even_when_body_raises(monkeypatch):
-    """The symmetric bracket resumes the h5 pool even if the wrapped body raises
-    — a save failure must never strand the pool paused (which would deadlock
-    every later write to that file)."""
-    events = []
-    monkeypatch.setattr(itmod, '_get_h5pool',
-                        lambda: SimpleNamespace(
-                            pause=lambda f: events.append(('pause', f)),
-                            resume=lambda f: events.append(('resume', f))))
-    scan = SimpleNamespace(data_file='x.nxs')
-    w = SimpleNamespace()
-    w._h5pool_bracket = MethodType(imageThread._h5pool_bracket, w)
-
-    with pytest.raises(RuntimeError, match="boom"):
-        with w._h5pool_bracket(scan):
-            raise RuntimeError("boom")
-
-    assert events == [('pause', 'x.nxs'), ('resume', 'x.nxs')]   # balanced
-
-
-def test_flush_serial_tail_locks_before_pausing_h5pool(monkeypatch):
-    """Writer must own file_lock before closing pooled read handles.
-
-    A load worker borrows from h5pool while holding this same lock.  Pausing the
-    pool before the lock can close a read handle that is still active, leaving
-    HDF5 to reject the following r+ writer open as "already open read-only".
-    """
-    events = []
-
-    class _TrackingLock:
-        held = False
-
-        def __enter__(self):
-            events.append("lock-enter")
-            self.held = True
-            return self
-
-        def __exit__(self, *_exc):
-            events.append("lock-exit")
-            self.held = False
-            return False
-
-    lock = _TrackingLock()
-
-    class _Pool:
-        def pause(self, path):
-            events.append(("pause", path, lock.held))
-            assert lock.held is True
-
-        def resume(self, path):
-            events.append(("resume", path, lock.held))
-            assert lock.held is True
-
-    monkeypatch.setattr(itmod, '_get_h5pool', lambda: _Pool())
-    scan = SimpleNamespace(
-        data_file='x.nxs',
-        _save_to_nexus=lambda: events.append(("save", lock.held)),
-    )
-    w = SimpleNamespace(
-        run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=1, file_lock=lock,
-        _save_due=lambda _frozen, scan, force=False: True,
-        _flush_xye_buffer=lambda s: events.append(("xye", lock.held)),
-    )
-    _bind_serial_tail(w)
-
-    assert w.flush_serial_tail(w.run_configuration, scan, force=True) is True
-    assert events == [
-        "lock-enter",
-        ("pause", "x.nxs", True),
-        ("save", True),
-        ("resume", "x.nxs", True),
-        "lock-exit",
-        ("xye", False),
-    ]
-
-
-def test_base_save_to_disk_locks_before_pausing_h5pool(monkeypatch):
-    events = []
-
-    class _TrackingLock:
-        held = False
-
-        def __enter__(self):
-            events.append("lock-enter")
-            self.held = True
-            return self
-
-        def __exit__(self, *_exc):
-            events.append("lock-exit")
-            self.held = False
-            return False
-
-    lock = _TrackingLock()
-
-    class _Pool:
-        def pause(self, path):
-            events.append(("pause", path, lock.held))
-            assert lock.held is True
-
-        def resume(self, path):
-            events.append(("resume", path, lock.held))
-            assert lock.held is True
-
-    monkeypatch.setattr(wwmod, '_get_h5pool', lambda: _Pool())
-    scan = SimpleNamespace(
-        data_file='x.nxs',
-        _save_to_nexus=lambda: events.append(("save", lock.held)),
-    )
-    w = SimpleNamespace(run_configuration=accepted_run(
-            run_options={"xye_only": False}), file_lock=lock)
-    w._save_to_disk = MethodType(wwmod.wranglerThread._save_to_disk, w)
-
-    w._save_to_disk(w.run_configuration, scan)
-
-    assert events == [
-        "lock-enter",
-        ("pause", "x.nxs", True),
-        ("save", True),
-        ("resume", "x.nxs", True),
-        "lock-exit",
-    ]
-
-
-def test_nexus_final_save_locks_before_pausing_h5pool(monkeypatch):
-    import xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread as nxmod
-    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
-        nexusThread)
-
-    events = []
-
-    class _TrackingLock:
-        held = False
-
-        def __enter__(self):
-            events.append("lock-enter")
-            self.held = True
-            return self
-
-        def __exit__(self, *_exc):
-            events.append("lock-exit")
-            self.held = False
-            return False
-
-    lock = _TrackingLock()
-
-    class _Pool:
-        def pause(self, path):
-            events.append(("pause", path, lock.held))
-            assert lock.held is True
-
-        def resume(self, path):
-            events.append(("resume", path, lock.held))
-            assert lock.held is True
-
-    monkeypatch.setattr(nxmod, '_get_h5pool', lambda: _Pool())
-    scan = SimpleNamespace(
-        data_file='x.nxs',
-        default_geometry=lambda: events.append(("geometry", lock.held)),
-        save_to_nexus=lambda replace=False, finalize=True: events.append(
-            ("save", replace, finalize, lock.held)),
-    )
-    w = SimpleNamespace(run_configuration=accepted_run(
-            run_options={"xye_only": False}), command='stop', file_lock=lock)
-    w._final_save_to_nexus = MethodType(nexusThread._final_save_to_nexus, w)
-
-    w._final_save_to_nexus(w.run_configuration, scan, 3)
-
-    assert events == [
-        "lock-enter",
-        ("pause", "x.nxs", True),
-        ("geometry", True),
-        ("save", False, False, True),
-        ("resume", "x.nxs", True),
-        "lock-exit",
-    ]
-
-
-def test_flush_serial_tail_persists_before_resetting_counter(monkeypatch):
-    """persist-before-evict: ``_save_to_nexus`` (which marks frames persisted)
-    completes BEFORE ``_frames_since_save`` is reset — the save sees the
-    pre-reset counter, so an unsaved frame can never be evicted out from under
-    the writer."""
-    monkeypatch.setattr(itmod, '_get_h5pool',
-                        lambda: SimpleNamespace(pause=lambda f: None,
-                                                resume=lambda f: None))
-    saw_counter = []
-    scan = SimpleNamespace(
-        data_file='x.nxs',
-        _save_to_nexus=lambda: saw_counter.append(w._frames_since_save))
-    w = SimpleNamespace(
-        run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=5, file_lock=threading.RLock(),
-        _save_due=lambda _frozen, scan, force=False: True,
-        _flush_xye_buffer=lambda s: None,
-    )
-    _bind_serial_tail(w)
-
-    assert w.flush_serial_tail(w.run_configuration, scan, force=True) is True
-    assert saw_counter == [5]              # counter NOT yet reset when saving
-    assert w._frames_since_save == 0       # reset only AFTER the persist
-
-    # not-due (the _save_due gate says no) and scan-None are no-ops -> False.
-    w._save_due = lambda _frozen, scan, force=False: False
-    assert w.flush_serial_tail(w.run_configuration, scan, force=True) is False
-    assert w.flush_serial_tail(w.run_configuration, None, force=True) is False
-
 
 # ── _wait_if_paused: block until resume/stop, no-op otherwise ────────────────
 
@@ -543,37 +185,6 @@ def test_guard_lift_noop_when_not_in_run():
     staticWidget._on_run_resuming(w)
     assert calls == []
 
-
-def test_enter_pause_drain_timeout_skips_flush_but_signals():
-    """RS-1: a drain() timeout means the writer is provably NOT idle — a
-    save/flush from the wrangler thread would violate the single-writer
-    invariant, and resetting the save counter without saving would break
-    persist-before-evict.  Pause still proceeds (sigPaused fires) without
-    touching the file; the tail flushes on resume/finish."""
-    calls, emitted = [], []
-    session = SimpleNamespace(
-        drain=lambda timeout=None: (calls.append('drain'), False)[1])
-    sink = SimpleNamespace(
-        flush=lambda *, force=False: calls.append(('flush', force)))
-    scan = SimpleNamespace(data_file='x.nxs',
-                           _save_to_nexus=lambda: calls.append('save'))
-    w = SimpleNamespace(
-        _streaming_session=session, _streaming_sink=sink,
-        _active_scan=scan, run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=4,
-        file_lock=threading.RLock(),
-        _flush_xye_buffer=lambda s: calls.append('xye'),
-        sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
-    )
-    w._enter_pause = MethodType(imageThread._enter_pause, w)
-
-    w._enter_pause(w.run_configuration)
-
-    assert calls == ['drain']            # no save, no sink flush, no xye
-    assert w._frames_since_save == 4     # counter preserved for the next save
-    assert emitted == ['paused']         # the freeze guard still lifts
-
-
 def _rs2_wrangler(command, thread_command):
     """Light holder driving the real pause()/_on_resume() command logic."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
@@ -629,120 +240,80 @@ def test_pause_and_resume_still_work_when_running():
     assert calls2[0] == 'resuming'       # guard re-engaged FIRST
     assert ('button', 'running') in calls2
 
-
-def test_serial_dispatch_drains_xye_buffer_without_nxs_save():
-    """Int 1D (XYE) on the serial fallback (XDART_LIVE_EXECUTION=serial) has
-    no .nxs save to ride on (_save_due is always False with xye_only), so the
-    dispatch itself must drain the XYE buffer -- it previously never did,
-    and the documented fallback path silently wrote ZERO output."""
-    from types import MethodType, SimpleNamespace
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
-        imageThread)
-
-    flushed = []
-    w = SimpleNamespace(
-        run_configuration=accepted_run(
-            run_options={"xye_only": True}),
-        _frames_since_save=0,
-        _wait_if_paused=lambda: None,
-        _save_due=lambda _frozen, scan, force=False: False,
-        _flush_xye_buffer=lambda scan, **k: flushed.append(scan),
-    )
-    w._dispatch_batch_serial = MethodType(
-        imageThread._dispatch_batch_serial, w)
-    _bind_serial_tail(w)
-    scan = object()
-    w._dispatch_batch_serial(w.run_configuration, scan, [])
-    assert flushed == [scan]
-
-    # Non-XYE mode with no save due: no flush (unchanged behavior).
-    flushed.clear()
-    w.run_configuration = accepted_run(run_options={"xye_only": False})
-    w._dispatch_batch_serial(w.run_configuration, scan, [])
-    assert flushed == []
-
-
 # ── 4c-1: _enter_pause / _wait_if_paused route through ScanSessionAdapter ────
 
 class _SpyAdapter:
-    """Records quiesce/flush/resume; the production pause path (4c-1)."""
-    def __init__(self, drained=True):
+    """Record the accepted adapter cadence used by the pause path."""
+
+    def __init__(self, drained=True, flush_due=True, commit_error=None):
         self._drained = drained
+        self._flush_due = flush_due
+        self._commit_error = commit_error
         self.calls = []
-        self._paused = False
 
     def quiesce(self, timeout=None):
         self.calls.append(('quiesce', timeout))
-        self._paused = self._drained
         return self._drained
 
-    def flush(self):
-        self.calls.append('flush')
+    def should_flush(self, frames_since_flush, *, unsaved_in_memory=None,
+                     force=False):
+        self.calls.append(
+            ('should_flush', frames_since_flush, unsaved_in_memory, force))
+        return self._flush_due
+
+    def commit_epoch(self):
+        self.calls.append('commit_epoch')
+        if self._commit_error is not None:
+            raise self._commit_error
 
     def resume(self):
         self.calls.append('resume')
-        self._paused = False
-
-    @property
-    def is_paused(self):
-        return self._paused
 
 
 def test_enter_pause_streaming_routes_through_adapter():
-    """With an adapter present (production streaming), _enter_pause quiesces
-    via the adapter (session.pause: flag+drain) then flushes via the adapter,
-    BEFORE sigPaused — the legacy bare session.drain/sink.flush are bypassed."""
+    """Pause commits in cadence order and resets only after commit succeeds."""
     adapter = _SpyAdapter()
-    emitted = []
-    # legacy session/sink present too, but the adapter must win and they must
-    # NOT be touched.
-    session = SimpleNamespace(drain=lambda timeout=None: emitted.append('LEGACY_drain') or True)
-    sink = SimpleNamespace(flush=lambda *, force=False: emitted.append('LEGACY_flush'))
     w = SimpleNamespace(
+        PAUSE_DRAIN_TIMEOUT=imageThread.PAUSE_DRAIN_TIMEOUT,
         _scan_session_adapter=adapter,
-        _streaming_session=session, _streaming_sink=sink,
-        _active_scan=None, run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=0,
-        sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
+        _frames_since_save=4,
+        sigPaused=SimpleNamespace(emit=lambda: adapter.calls.append('sigPaused')),
+        _retain_dynamic_failure=lambda *_args: None,
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
-    w._enter_pause(w.run_configuration)
+    w._enter_pause(accepted_run())
 
-    assert adapter.calls == [('quiesce', 30.0), 'flush']   # quiesce before flush
-    assert 'LEGACY_drain' not in emitted and 'LEGACY_flush' not in emitted
-    assert emitted == ['paused']
-
-
-def test_enter_pause_serial_tail_wins_with_adapter_present(monkeypatch):
-    """The serial-tail routing survives the adapter: in live-watch the adapter
-    (dormant streaming session) is quiesced, but the SERIAL flush wins and the
-    adapter's sink flush is NOT called (would mis-route the watch tail)."""
-    monkeypatch.setattr(itmod, '_get_h5pool',
-                        lambda: SimpleNamespace(pause=lambda f: None,
-                                                resume=lambda f: None))
-    adapter = _SpyAdapter()
-    order = []
-    scan = SimpleNamespace(data_file='x.nxs',
-                           _save_to_nexus=lambda: order.append('save'))
-    w = SimpleNamespace(
-        _scan_session_adapter=adapter,
-        _streaming_session=SimpleNamespace(), _streaming_sink=SimpleNamespace(),
-        _active_scan=scan, run_configuration=accepted_run(
-            run_options={"xye_only": False}), _frames_since_save=4,
-        file_lock=threading.RLock(),
-        _save_due=lambda _frozen, scan, force=False: True,
-        _flush_xye_buffer=lambda s: order.append('xye'),
-        sigPaused=SimpleNamespace(emit=lambda: order.append('paused')),
-    )
-    w._enter_pause = MethodType(imageThread._enter_pause, w)
-    _bind_serial_tail(w)
-    w._enter_pause(w.run_configuration)
-
-    assert adapter.calls == [('quiesce', 30.0)]      # quiesced, but NOT flushed
-    assert 'flush' not in adapter.calls
-    assert 'save' in order and 'xye' in order
+    assert adapter.calls == [
+        ('quiesce', 30.0),
+        ('should_flush', 4, None, True),
+        'commit_epoch',
+        'sigPaused',
+    ]
     assert w._frames_since_save == 0
-    assert order[-1] == 'paused'
+
+    error = RuntimeError("commit failed")
+    failed = _SpyAdapter(commit_error=error)
+    retained = []
+    w = SimpleNamespace(
+        PAUSE_DRAIN_TIMEOUT=imageThread.PAUSE_DRAIN_TIMEOUT,
+        _scan_session_adapter=failed,
+        _frames_since_save=4,
+        sigPaused=SimpleNamespace(emit=lambda: failed.calls.append('sigPaused')),
+        _retain_dynamic_failure=lambda exc, message: retained.append(
+            (exc, message)),
+    )
+    w._enter_pause = MethodType(imageThread._enter_pause, w)
+    w._enter_pause(accepted_run())
+
+    assert failed.calls == [
+        ('quiesce', 30.0),
+        ('should_flush', 4, None, True),
+        'commit_epoch',
+    ]
+    assert w._frames_since_save == 4
+    assert retained == [(error, "Pause failed; run stopped")]
+
+
 
 
 def test_wait_if_paused_resumes_adapter_on_exit():
@@ -765,42 +336,28 @@ def test_wait_if_paused_resumes_adapter_on_exit():
     assert adapter.calls[-1] == 'resume'      # resumed on exit
 
 
-# ── 4d: run-state reads the session seam; pause must not bump generation ─────
-
-def test_scan_session_property_exposes_adapter():
-    """4d: `wrangler.scan_session` is the single read-only accessor for the
-    streaming adapter — None before a session opens, the adapter once set.  The
-    GUI reads run-state through this, never the private slot."""
-    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
-    w = SimpleNamespace(_scan_session_adapter=None)
-    assert wranglerThread.scan_session.fget(w) is None
-    sentinel = object()
-    w._scan_session_adapter = sentinel
-    assert wranglerThread.scan_session.fget(w) is sentinel
-
+# ── 4d: run-state reads the public probe; pause must not bump generation ─────
 
 def test_session_run_active_or_logic():
-    """4d: `_session_run_active` reads `wrangler.scan_session.is_running` when a
-    session is open, returns False otherwise (so the OR with `_run_active` falls
-    through to the cache), and never raises on a partial/duck wrangler."""
+    """The scalar public probe is total over absent/false/true/raising states."""
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     f = staticWidget._session_run_active
 
-    # no wrangler / no session -> False (cache governs)
+    # No wrangler or no public activity probe leaves the cache in control.
     assert f(SimpleNamespace(wrangler=None)) is False
-    assert f(SimpleNamespace(wrangler=SimpleNamespace(scan_session=None))) is False
-    # open session reports its state through
-    assert f(SimpleNamespace(wrangler=SimpleNamespace(
-        scan_session=SimpleNamespace(is_running=True)))) is True
-    assert f(SimpleNamespace(wrangler=SimpleNamespace(
-        scan_session=SimpleNamespace(is_running=False)))) is False
+    assert f(SimpleNamespace(wrangler=SimpleNamespace())) is False
 
-    # a raising `is_running` is swallowed (never crashes the control-state apply)
-    class _Boom:
-        @property
-        def is_running(self):
-            raise RuntimeError("boom")
-    assert f(SimpleNamespace(wrangler=SimpleNamespace(scan_session=_Boom()))) is False
+    # The public scalar probe reports the healthy dynamic run state.
+    assert f(SimpleNamespace(wrangler=SimpleNamespace(
+        dynamic_session_running=lambda: False))) is False
+    assert f(SimpleNamespace(wrangler=SimpleNamespace(
+        dynamic_session_running=lambda: True))) is True
+
+    def raising_probe():
+        raise RuntimeError("boom")
+
+    assert f(SimpleNamespace(wrangler=SimpleNamespace(
+        dynamic_session_running=raising_probe))) is False
 
 
 def test_pause_resume_does_not_bump_display_generation():

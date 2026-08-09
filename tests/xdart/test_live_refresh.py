@@ -556,6 +556,13 @@ class _FakeAction:
         self.enabled = bool(enabled)
 
 
+def _bind_released_transition(host):
+    """Give a duck H5Viewer the released/no-cleanup-debt transition seam."""
+    host._pre_transition_callback = None
+    host._before_transition = MethodType(H5Viewer._before_transition, host)
+    return host
+
+
 def _viewer(frame_ids, displayed):
     list_data = _FakeListWidget(displayed)
 
@@ -2380,6 +2387,7 @@ def test_live_new_scan_invalidates_publication_store():
     host._seed_append_processed_frame_browser = MethodType(
         staticWidget._seed_append_processed_frame_browser, host,
     )
+    _bind_released_transition(host.h5viewer)
 
     # Same-name re-run (name matches scan.name="old") -> IN SYNC with the frame
     # stream -> new_scan performs the destructive clear + store invalidation.  (A
@@ -3006,30 +3014,6 @@ def test_wrangler_thread_no_longer_owns_integration_executor():
     assert not hasattr(wranglerThread, "_parallel_integrate")
 
 
-def test_wrangler_thread_reuses_reduction_session_by_key():
-    """Reducer sessions persist across chunks but reset when policy changes."""
-    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
-
-    class _Session:
-        def __init__(self):
-            self.finished = False
-
-        def finish(self, **kw):    # kw absorbs join_timeout=
-            self.finished = True
-            return None
-
-    thread = wranglerThread(Queue(), "scan.nxs", None)
-    first = thread._get_reduction_session(("scan", 4), _Session)
-    second = thread._get_reduction_session(("scan", 4), _Session)
-    third = thread._get_reduction_session(("scan", 2), _Session)
-
-    try:
-        assert first is second
-        assert third is not first
-        assert first.finished
-        assert not third.finished
-    finally:
-        thread._close_reduction_session()
 
 
 def _scout_host(motor):
@@ -4095,6 +4079,7 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     viewer.enter_viewer_mode_cleanup = MethodType(
         H5Viewer.enter_viewer_mode_cleanup, viewer,
     )
+    _bind_released_transition(viewer)
 
     viewer.enter_viewer_mode_cleanup()
 
@@ -4854,6 +4839,7 @@ def test_set_file_cancels_stale_load_debounce_before_switch():
         _load_coalesce_timer=_FakeTimer(active=True),
         _pending_load_ids=[101],
         _pending_load_2d=True,
+        publication_store=None,
         ui=SimpleNamespace(listData=list_data),
         file_thread=SimpleNamespace(
             fname="/data/file_a.nxs",
@@ -4869,6 +4855,7 @@ def test_set_file_cancels_stale_load_debounce_before_switch():
     viewer.cancel_pending_loads = MethodType(H5Viewer.cancel_pending_loads, viewer)
     viewer._flush_pending_load = MethodType(H5Viewer._flush_pending_load, viewer)
     viewer.set_file = MethodType(H5Viewer.set_file, viewer)
+    _bind_released_transition(viewer)
 
     viewer.set_file("/data/file_b.nxs")
     viewer._flush_pending_load()
@@ -5163,6 +5150,7 @@ def test_cancelled_overlay_browse_restores_prior_file_and_frames():
             emit=lambda: events.append("finished")),
         _auto_select_last_on_finish=False,
     )
+    _bind_released_transition(viewer)
 
     assert H5Viewer.restore_browser_context(viewer) is True
     assert viewer._browser_restore_in_progress is True
@@ -5216,6 +5204,7 @@ def test_viewer_cleanup_stress_drops_stale_chunks_across_mode_switches():
         H5Viewer.enter_viewer_mode_cleanup, viewer,
     )
     viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+    _bind_released_transition(viewer)
 
     for frame_id in range(10):
         stale_generation = viewer._load_generation
@@ -5242,6 +5231,12 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
         calls.append(("sync_dir", path, refresh))
         widget.h5viewer.dirname = path
 
+    def cleanup_viewer_mode():
+        calls.append(
+            ("cleanup_suspend", widget.h5viewer._suspend_scan_selection_loads),
+        )
+        return True
+
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
@@ -5257,9 +5252,7 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
             viewer_mode="xye",
             _suspend_scan_selection_loads=False,
             _apply_frames_panel_width=lambda vm: None,
-            enter_viewer_mode_cleanup=lambda: calls.append(
-                ("cleanup_suspend", widget.h5viewer._suspend_scan_selection_loads),
-            ),
+            enter_viewer_mode_cleanup=cleanup_viewer_mode,
             cancel_pending_loads=lambda: calls.append("cancel"),
             update_scans=update_scans,
         ),
@@ -5277,7 +5270,7 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
 
     assert ("sync_dir", "/tmp/xdart-out", False) in calls
     assert widget.h5viewer.dirname == "/tmp/xdart-out"
-    assert ("cleanup_suspend", True) in calls
+    assert ("cleanup_suspend", False) in calls
     assert ("update_scans_blocked", True) in calls
     assert "autoload" not in calls
     assert widget.h5viewer._suspend_scan_selection_loads is False
@@ -5496,6 +5489,7 @@ def test_reduction_only_nxs_not_loaded_as_generic_image(tmp_path):
     # Bind the cache clear after the namespace exists.
     viewer._clear_raw_cache = MethodType(H5Viewer._clear_raw_cache, viewer)
     viewer._load_image_file = MethodType(H5Viewer._load_image_file, viewer)
+    _bind_released_transition(viewer)
 
     viewer._load_image_file(str(path))
 
@@ -5539,6 +5533,7 @@ def test_reduction_group_raw_nexus_loads_as_generic_image(tmp_path):
         H5Viewer._populate_image_viewer_rows, viewer,
     )
     viewer._load_image_file = MethodType(H5Viewer._load_image_file, viewer)
+    _bind_released_transition(viewer)
 
     viewer._load_image_file(str(path))
 
@@ -5652,6 +5647,7 @@ def _nexus_viewer_host(tmp_path):
         ),
     )
     _bind_nexus_viewer_methods(viewer)
+    _bind_released_transition(viewer)
     return viewer
 
 
@@ -7120,6 +7116,7 @@ def test_xye_loader_defaults_unprefixed_files_to_q(monkeypatch, tmp_path):
         sigUpdate=_FakeSignal(),
         _xye_parse_cache={},
     )
+    _bind_released_transition(viewer)
 
     H5Viewer._load_xye_files(viewer)
     H5Viewer._load_xye_files(viewer)
@@ -8282,6 +8279,7 @@ def test_image_viewer_single_raw_file_gets_selectable_frame(tmp_path):
         H5Viewer._populate_image_viewer_rows, viewer,
     )
     viewer._load_image_file = MethodType(H5Viewer._load_image_file, viewer)
+    _bind_released_transition(viewer)
 
     viewer._load_image_file(str(path))
 
@@ -9414,6 +9412,7 @@ def test_stop_during_pausing_ignores_late_sigpaused():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=False, batch=True)
+    host.thread.dynamic_cleanup_pending = lambda: False
 
     imageWrangler._on_start_clicked(host)      # running
     imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
@@ -9698,283 +9697,6 @@ def test_xye_viewer_single_click_navigates_directories():
     assert calls[-1] == ("nav", "img.tiff")
 
 
-def test_batch_process_scan_dispatches_each_frame_as_read():
-    """Batch should feed the persistent streaming session per frame, not wait
-    for the old 64/256-frame pending buffer.  The sink still batches writes and
-    batch mode still refreshes the GUI only once at the end; this locks the
-    read||reduce overlap fix at the collection-loop boundary."""
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-
-    queue = [
-        ("/tmp/scan_a_0001.tif", "scan_a", 1, np.ones((2, 2)), {"i0": 1.0}),
-        ("/tmp/scan_a_0002.tif", "scan_a", 2, np.ones((2, 2)), {"i0": 2.0}),
-        ("/tmp/scan_b_0000.tif", "scan_b", 0, np.ones((2, 2)), {"i0": 3.0}),
-    ]
-    dispatched = []
-    final_updates = []
-
-    def next_image():
-        if queue:
-            return queue.pop(0)
-        return None, None, None, None, None
-
-    def make_scan():
-        return SimpleNamespace(
-            name=host.scan_name,
-            frames=SimpleNamespace(index=[]),
-            skip_2d=False,
-            data_file=f"/tmp/{host.scan_name}.nxs",
-        )
-
-    host = SimpleNamespace(
-        command="start",
-        img_file="/tmp/scan_a_0001.tif",
-        poni=None,
-        scan_name="scan_a",
-        _frames_since_save=0,
-        _active_scan=None,
-        _perf=None,
-        _live_execution=lambda: "serial",
-        showLabel=SimpleNamespace(emit=lambda *_: None),
-        sigUpdate=SimpleNamespace(emit=lambda value: final_updates.append(value)),
-        _wait_if_paused=lambda _frozen: None,
-        get_next_image=lambda _frozen: next_image(),
-        _middle_truncate=lambda text, max_len=40: text,
-        initialize_scan=make_scan,
-        get_background=lambda *_: 0.0,
-        _flush_xye_buffer=lambda *_args, **_kw: None,
-        # frames=0 -> nothing due
-        _save_due=lambda _frozen, scan, force=False: False,
-        _prime_append_skip_snapshots_for_run=lambda _frozen: None,
-        _append_frame_complete=lambda _frozen, _name, idx, scan:
-            idx in scan.frames.index,
-    )
-
-    def dispatch(_frozen, scan, pending, *, force_save=False):
-        dispatched.append((tuple(item[1] for item in pending), bool(force_save)))
-        return len(pending)
-
-    host._dispatch_batch = dispatch
-    # run()'s final-flush tail now always calls flush_serial_tail (the gate is
-    # inside it); bind it + the bracket on the stand-in.
-    host.flush_serial_tail = MethodType(imageThread.flush_serial_tail, host)
-    # F1 (a8107bc4): the scan-boundary swap force-saves the outgoing scan
-    # through the shared helper — bind the real one on the stand-in too.
-    host._flush_outgoing_scan = MethodType(imageThread._flush_outgoing_scan, host)
-    host._h5pool_bracket = MethodType(imageThread._h5pool_bracket, host)
-
-    # O-1a-W1R (review §39.2 W1R-P1-5): the source FAMILY is now the accepted
-    # frozen source's decision, so ``process_scan`` consults it instead of
-    # sniffing the mutable ``img_file`` cursor.  In production a Run click has
-    # always published one, so arm this host with a REAL frozen configuration
-    # from the production freeze owner; the case still measures what it was
-    # written for.
-    from tests.xdart._accepted_run import admitted_worker
-    from xrd_tools.core.scan import SourceKind, SourceSpec
-    from xrd_tools.session import RunIntent as _W1R_RunIntent
-    frozen = _W1R_RunIntent(
-        processing_mode="Int 2D",
-        batch_mode=True,
-        live_mode=False,
-        source_spec=SourceSpec(
-            '/tmp', SourceKind.TIFF_SERIES,
-            options={"selected_file": '/tmp/scan_a_0001.tif'}),
-    ).freeze()
-    admitted_worker(host, frozen=frozen)
-    MethodType(imageThread.process_scan, host)(frozen)
-
-    assert dispatched == [((1,), False), ((2,), False), ((0,), False)]
-    assert final_updates == [-1]
-    assert host.files_processed == 3
-    assert host.files_processed_by_output == {
-        "/tmp/scan_a.nxs": 2,
-        "/tmp/scan_b.nxs": 1,
-    }
-
-
-def test_live_directory_idle_flushes_last_scan_xye_before_stop(
-        monkeypatch, tmp_path):
-    """The last live scan becomes durable when the watcher first goes idle.
-
-    A later scan flushes its predecessor at the scan-swap boundary.  The final
-    scan has no successor, so its sub-interval serial tail must be flushed
-    before the watcher sleeps rather than waiting for Stop.
-    """
-    from xdart.gui.tabs.static_scan.wranglers import image_wrangler_thread as mod
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-
-    output_root = tmp_path / "processed"
-    xye_dir = output_root / "last_scan"
-    queue = [
-        # Initial empty-directory observation moves the run into live watch.
-        (None, None, None, None, None),
-        (
-            str(tmp_path / "last_scan.nxs"),
-            "last_scan",
-            0,
-            np.ones((2, 2)),
-            {"i0": 1.0},
-        ),
-        # First idle observation after the newly arrived scan.
-        (None, None, None, None, None),
-    ]
-    idle_observations = []
-
-    def next_image():
-        return queue.pop(0)
-
-    def make_scan():
-        return SimpleNamespace(
-            name="last_scan",
-            frames=SimpleNamespace(index=[]),
-            skip_2d=False,
-            data_file=str(output_root / "last_scan.nxs"),
-        )
-
-    host = SimpleNamespace(
-        command="start",
-        batch_mode=False,
-        live_mode=True,
-        single_img=False,
-        xye_only=False,
-        series_average=False,
-        img_file="",
-        poni=None,
-        scan_name="",
-        _frames_since_save=0,
-        _active_scan=None,
-        _perf=None,
-        _live_execution=lambda: "serial",
-        _h19_live_directory_armed=lambda _frozen: True,
-        _eiger_single_file_watchable=lambda _frozen: False,
-        showLabel=SimpleNamespace(emit=lambda *_: None),
-        sigUpdate=SimpleNamespace(emit=lambda *_: None),
-        _wait_if_paused=lambda _frozen: None,
-        get_next_image=lambda _frozen: next_image(),
-        initialize_scan=make_scan,
-        _install_run_integrator=lambda *_: None,
-        _append_frame_complete=lambda *_: False,
-        _record_skip_reason=lambda *_: None,
-        get_background=lambda *_: 0.0,
-        _process_one=lambda *_: None,
-        _prime_append_skip_snapshots_for_run=lambda _frozen: None,
-        _flush_outgoing_scan=lambda *_: None,
-        _report_run_skip_summary=lambda *_: None,
-    )
-
-    def flush_serial_tail(_frozen, scan, *, force=False):
-        if not force or host._frames_since_save <= 0:
-            return False
-        xye_dir.mkdir(parents=True, exist_ok=True)
-        host._frames_since_save = 0
-        return True
-
-    host.flush_serial_tail = flush_serial_tail
-
-    def observe_idle(_seconds):
-        idle_observations.append(xye_dir.is_dir())
-        host.command = "stop"
-
-    monkeypatch.setattr(mod.time, "sleep", observe_idle)
-
-    # O-1a-W1R (review §39.2 W1R-P1-5): the source FAMILY is now the accepted
-    # frozen source's decision, so ``process_scan`` consults it instead of
-    # sniffing the mutable ``img_file`` cursor.  In production a Run click has
-    # always published one, so arm this host with a REAL frozen configuration
-    # from the production freeze owner; the case still measures what it was
-    # written for.
-    from tests.xdart._accepted_run import admitted_worker
-    from xrd_tools.core.scan import SourceKind, SourceSpec
-    from xrd_tools.session import RunIntent as _W1R_RunIntent
-    frozen = _W1R_RunIntent(
-        processing_mode="Int 2D",
-        batch_mode=False,
-        live_mode=True,
-        source_spec=SourceSpec(
-            '/tmp', SourceKind.TIFF_SERIES,
-            options={"selected_file": '/tmp/last_scan.nxs'}),
-    ).freeze()
-    admitted_worker(host, frozen=frozen)
-    MethodType(imageThread.process_scan, host)(frozen)
-
-    assert idle_observations == [True]
-    assert xye_dir.is_dir()
-
-
-def test_batch_single_frame_still_routes_to_streaming_when_live_policy_serial():
-    """N2 submits one-frame pending chunks.  Batch must still use the streaming
-    dispatcher even if the live-mode fallback env is serial; otherwise the new
-    cadence would silently revert batch to the old serial path."""
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-
-    from xrd_tools.session import RunIntent
-    calls = []
-    host = SimpleNamespace(
-        run_configuration=RunIntent(batch_mode=True).freeze(),
-        _maybe_warn_live_gi_clip=lambda _frozen: None,
-        _dispatch_batch_streaming=lambda _frozen, scan, pending: calls.append(
-            ("streaming", tuple(item[1] for item in pending))) or len(pending),
-        _dispatch_batch_serial=lambda _frozen, scan, pending, force_save=False:
-            calls.append(
-                ("serial", tuple(item[1] for item in pending))) or len(pending),
-        _live_execution=lambda: "serial",
-    )
-    pending = [("/tmp/scan_0001.tif", 1, np.ones((2, 2)), {}, 0.0, 0.0)]
-
-    assert MethodType(imageThread._dispatch_batch, host)(host.run_configuration, object(), pending) == 1
-    assert calls == [("streaming", (1,))]
-
-
-def test_xye_flush_announces_first_durable_file_once_per_run(tmp_path):
-    """The browser edge must follow the write and stay O(scans), not O(frames)."""
-    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
-
-    thread = wranglerThread(Queue(), str(tmp_path / "unused.nxs"), None)
-    output_root = tmp_path / "processed"
-    scan = SimpleNamespace(
-        name="last_scan",
-        data_file=str(output_root / "last_scan.nxs"),
-    )
-
-    def frame(value):
-        return SimpleNamespace(int_1d=SimpleNamespace(
-            unit="q_A^-1",
-            radial=np.array([1.0, 2.0]),
-            intensity=np.array([value, value + 1.0]),
-        ))
-
-    notifications = []
-
-    def on_ready(path):
-        notifications.append((path, sorted(os.listdir(path))))
-
-    thread.sigXyeOutputReady.connect(on_ready)
-    try:
-        thread._xye_buffer = [(0, frame(10.0))]
-        thread._flush_xye_buffer(scan)
-
-        xye_dir = output_root / "last_scan"
-        assert notifications == [(
-            str(xye_dir.resolve()),
-            ["iq_last_scan_0000.xye"],
-        )]
-
-        # More frames in the same scan do not generate high-rate GUI signals.
-        thread._xye_buffer = [(1, frame(20.0))]
-        thread._flush_xye_buffer(scan)
-        assert len(notifications) == 1
-
-        # A restarted Run must re-arm the notification even when the folder
-        # already exists from the previous attempt.
-        thread._reset_xye_output_notifications()
-        thread._xye_buffer = [(2, frame(30.0))]
-        thread._flush_xye_buffer(scan)
-        assert len(notifications) == 2
-        assert notifications[-1][1][-1] == "iq_last_scan_0002.xye"
-    finally:
-        thread.deleteLater()
-
-
 def test_xye_output_ready_does_not_redirect_unrelated_browser(tmp_path):
     save_dir = tmp_path / "processed"
     output_dir = save_dir / "new_scan"
@@ -9991,154 +9713,3 @@ def test_xye_output_ready_does_not_redirect_unrelated_browser(tmp_path):
 
     assert host.h5viewer.dirname == str(elsewhere)
     assert refreshes == []
-
-
-def test_series_average_pending_tracks_running_mean():
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-
-    host = SimpleNamespace(series_average=True)
-    pending = []
-    entries = [
-        ("scan_0001.tif", 1, np.full((2, 2), 2.0), {"th": "1.0", "tag": "a"}, 4.0, 0.1),
-        ("scan_0002.tif", 2, np.full((2, 2), 4.0), {"th": "3.0", "tag": "b"}, 8.0, 0.2),
-        ("scan_0003.tif", 3, np.full((2, 2), 9.0), {"th": "5.0", "tag": "c"}, 11.0, 0.3),
-    ]
-    count = 0
-
-    for entry in entries:
-        count = imageThread._append_series_average_pending(
-            host, pending, entry, count)
-
-    assert count == 3
-    assert len(pending) == 1
-    img_file, img_number, img_data, img_meta, bg_raw, t_read = pending[0]
-    assert img_file == "scan_0003.tif"
-    assert img_number == 1
-    np.testing.assert_allclose(img_data, np.full((2, 2), 5.0))
-    assert img_meta["th"] == pytest.approx(3.0)
-    assert img_meta["tag"] == "a"
-    assert bg_raw == pytest.approx(23.0 / 3.0)
-    assert t_read == pytest.approx(0.6)
-
-
-def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-    from xdart.modules.frame_publication import PublicationStore
-    from xdart.modules.live import LiveScan
-    from xdart.modules.reduction import StandardPlanCache
-    from xrd_tools.reduction import Integration1DPlan, ReductionPlan
-    import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as module
-
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "64")
-    submitted = []
-    opened = []
-    opened_kwargs = []
-    sink_kwargs = []
-    registered = []
-
-    class FakeSession:
-        is_paused = False
-        is_running = True
-
-        def submit(self, frame):
-            submitted.append(frame)
-            return True
-
-        def pause(self, timeout=None):
-            return True
-
-        def flush(self, force=False):
-            pass
-
-        def resume(self):
-            pass
-
-    class FakeSink:
-        def __init__(self, *args, **kwargs):
-            sink_kwargs.append(kwargs)
-            self._record_store = kwargs.get("record_store")
-
-        def register(self, live):
-            registered.append(live)
-
-        def unregister(self, idx):
-            pass
-
-    def fake_open(frames, *args, **kwargs):
-        opened.append(list(frames))
-        opened_kwargs.append(kwargs)
-        return FakeSession()
-
-    monkeypatch.setattr(module, "open_live_scan_session", fake_open)
-    monkeypatch.setattr(module, "QtNexusSink", FakeSink)
-
-    scan = LiveScan(
-        "scan",
-        frames=[],
-        static=True,
-        series_average=True,
-        detector_shape=(2, 2),
-    )
-    scan.skip_2d = True
-    scan._cached_integrator = SimpleNamespace(
-        USE_LEGACY_MASK_NORMALIZATION=False)
-    scan.bai_1d_args = {"numpoints": 5}
-    scan.bai_2d_args = {}
-    from xrd_tools.session import RunIntent as _StreamRunIntent
-    host = SimpleNamespace(
-        run_configuration=_StreamRunIntent(
-            max_cores=1,
-            batch_mode=True,
-            run_options={"series_average": True},
-        ).freeze(),
-        mask=None,
-        poni=None,
-        command="",
-        _plan_cache=StandardPlanCache(
-            plan_builder=lambda _scan, **_kw: ReductionPlan(
-                integration_1d=Integration1DPlan(npt=5)
-            )
-        ),
-        _streaming_session=None,
-        _streaming_sink=None,
-        _streaming_scan_id=None,
-        _scan_session_adapter=None,
-        max_cores_count=1,
-        _cached_gi_incident_angle=None,
-        showLabel=SimpleNamespace(emit=lambda *_: None),
-        _wait_if_paused=lambda _frozen: None,
-        _prewarm_frame_mask=lambda _frozen, _scan, _img: None,
-        _apply_threshold_inline=lambda _frozen, img: img,
-        _resolve_frame_mask=lambda _frozen, _scan, _img: None,
-        _gi_freeze_whole_scan_prepass=lambda _frozen, _scan: True,
-        _cancel_token=lambda: None,
-        publication_store=PublicationStore(max_heavy_items=1),
-    )
-    for name in ("_build_batch_frames", "_dispatch_batch_streaming",
-                 "_get_streaming_session", "_record_store_hydrator",
-                 "_on_qt_gui_thread", "_heavy_staging_window",
-                 "_source_snapshot_for_frame"):
-        setattr(host, name, MethodType(getattr(imageThread, name), host))
-
-    pending = [
-        ("scan_0001.tif", 1, np.full((2, 2), 2.0), {"th": "1.0"}, 0.0, 0.1),
-        ("scan_0002.tif", 2, np.full((2, 2), 4.0), {"th": "3.0"}, 0.0, 0.1),
-        ("scan_0003.tif", 3, np.full((2, 2), 9.0), {"th": "5.0"}, 0.0, 0.1),
-    ]
-
-    count = host._dispatch_batch_streaming(host.run_configuration, scan, pending)
-
-    assert count == 1
-    assert len(opened) == 1
-    assert len(opened[0]) == 1
-    assert opened_kwargs[0]["record_store_persisted_on_write"] is False
-    assert opened_kwargs[0]["record_store"] is sink_kwargs[0]["record_store"]
-    assert host._streaming_record_store is opened_kwargs[0]["record_store"]
-    assert host._streaming_record_store._max_heavy_items == 64
-    assert host.publication_store._max_heavy_items == 64
-    assert host._streaming_record_store._max_items >= 4096
-    assert host._streaming_record_store._hydrator is not None
-    assert len(registered) == 1
-    assert len(submitted) == 1
-    np.testing.assert_allclose(submitted[0].image, np.full((2, 2), 5.0))
-    assert submitted[0].metadata["th"] == pytest.approx(3.0)

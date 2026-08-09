@@ -187,6 +187,27 @@ def test_discover_scans_eiger_filters_master(tmp_path):
     assert specs[0].kind is SourceKind.EIGER_MASTER
 
 
+def test_discover_scans_nexus_reuses_exact_eiger_sidecar_policy(tmp_path):
+    excluded = (
+        "data_00001.h5", "data_000001.h5",
+        "run_data_00001.h5", "run_data_000001.H5",
+    )
+    included = (
+        "aa_data_00001.nxs", "bb_data_000001.cxi",
+        "cc_data_00001.hdf5", "dd_data_000001.hdf5",
+        "ee_data_0001.h5", "ff_data_0000001.h5",
+        "gg_data_00001_tail.h5", "metadata_00001.h5",
+        "zz_data_\u0660\u0660\u0660\u0660\u0661.h5",
+    )
+    for name in excluded + included:
+        (tmp_path / name).write_bytes(b"")
+
+    specs = discover_scans(tmp_path, "nexus_stack")
+
+    assert [spec.uri.name for spec in specs] == list(included)
+    assert all(spec.kind is SourceKind.NEXUS_STACK for spec in specs)
+
+
 def test_discover_scans_spec_per_scan(tmp_path):
     pytest.importorskip("silx")
     spec = tmp_path / "myscan"
