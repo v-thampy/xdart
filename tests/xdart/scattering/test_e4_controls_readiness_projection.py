@@ -279,6 +279,7 @@ def test_recursive_container_count_includes_only_immediate_subfolders_without_pr
             DirectorySourceSpec(tmp_path, recursive=False, suffixes=(suffix,)),
         )
     )
+    header = source_header_projection(observed)
 
     assert observed.direct_child_count == 1
     assert observed.one_level_file_count == 2
@@ -288,8 +289,18 @@ def test_recursive_container_count_includes_only_immediate_subfolders_without_pr
         is SourceCountScope.SELECTED_PLUS_IMMEDIATE
     )
     assert observed.candidate_fingerprint == direct.candidate_fingerprint
-    assert source_header_projection(observed).text == (
+    assert header.text == (
         "2 files (folder + 1 level) · Image Directory"
+    )
+    assert header.ready
+    assert "content is qualified just in time" in header.detail
+    assert (
+        "Only the selected folder and immediate subfolders are processed."
+        in header.detail
+    )
+    assert (
+        "Deeper subfolders are outside the supported Run scope."
+        in header.detail
     )
 
 
@@ -374,6 +385,20 @@ def test_source_header_never_claims_unobserved_or_empty_directory_ready() -> Non
         assert panel.source_card.status.text() == "unavailable"
         assert panel.source_card.status.toolTip() == (
             "Directory metadata is unavailable."
+        )
+        assert panel.source_card.valid_marker.isHidden()
+
+        source.render(
+            _directory_observation(
+                count=0,
+                status=SourceObservationStatus.MISSING,
+                exists=False,
+                reason="The selected source directory is missing.",
+            )
+        )
+        assert panel.source_card.status.text() == "missing"
+        assert panel.source_card.status.toolTip() == (
+            "The selected source directory is missing."
         )
         assert panel.source_card.valid_marker.isHidden()
     finally:
