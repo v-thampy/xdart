@@ -1143,19 +1143,31 @@ _STORE_RECEIVERS = ("record_store", "_record_store", "_streaming_record_store",
 
 
 def test_g15_scan_session_is_the_only_production_store_projection_writer():
-    """Owner-aware census: ``LiveFrameSeries.mark_persisted`` (a ``.frames``
-    receiver) is a DIFFERENT owner and stays legal everywhere."""
+    """Owner-aware census keeps noncanonical light/display owners legal."""
     offenders: list[tuple] = []
     live_series: list[tuple] = []
+    display_light: list[tuple] = []
+    display_notifications: list[tuple] = []
     for rel, path in _py_files(_src_root()):
         for attr, recv, where, line in _method_calls(path, _PROJECTION_WRITES):
             tail = "" if recv is None else recv.rsplit(".", 1)[-1]
             if tail == "frames":
                 live_series.append((rel, attr, recv))
+            elif tail == "light_records":
+                display_light.append((rel, attr, recv))
+            elif attr == "mark_durable" and recv == "run.display":
+                display_notifications.append((rel, attr, recv))
             elif rel != "xrd_tools/session/scan_session.py":
                 offenders.append((rel, attr, recv, where, line))
     assert live_series, (
         "the LiveFrameSeries owner stays distinguishable from the store API")
+    assert display_light, (
+        "the GUI-light cache stays distinguishable from the canonical store")
+    assert display_notifications == [(
+        "xdart/gui/tabs/scattering/adapters/run_executor.py",
+        "mark_durable",
+        "run.display",
+    )], "the GUI durable notification must keep one explicit call site"
     assert offenders == [], (
         "ScanSession is the ONLY production writer of the store projection; "
         f"found {offenders} (mutation 19: a direct GUI writer)")

@@ -40,7 +40,9 @@ import numpy as np
 import pytest
 import tifffile
 
+from xrd_tools.core import Axis, FrameRecord, FrameView
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.io import read_frame_record
 from xrd_tools.io.nexus import write_integrated_stack
 from xrd_tools.io.nexus_record import (
     ensure_frames_container,
@@ -192,6 +194,25 @@ def _state(
 def _catalog(state, owner, labels):
     keys = {}
     for label in labels:
+        if owner.records.get(label) is None and Path(owner.artifact).is_file():
+            record = read_frame_record(owner.artifact, label)
+            view = record.active_view()
+            source_identity = (
+                f"{view.source_path or ''}#{view.source_frame_index}"
+            )
+            owner.records.upsert(
+                record,
+                source_identity=source_identity,
+            )
+            modes = tuple(
+                [("1d", mode) for mode in record.results_1d]
+                + [("2d", mode) for mode in record.results_2d]
+            )
+            owner.records.replace_projection(
+                label,
+                hydratable=modes,
+                durable=modes,
+            )
         delta = state.append_navigation(
             owner.source_scan, str(owner.artifact), label
         )
@@ -722,8 +743,7 @@ def test_newest_active_selection_supersedes_older_queued_read(
 def _install_seam_failure(monkeypatch, state, owner, seam, *, permanent):
     """Inject one exact commit-seam failure (fail-once or persistent)."""
     target, name = {
-        "records": (owner.records, "upsert"),
-        "light": (owner.light_records, "upsert"),
+        "light": (owner.light_records, "exchange_releasable_record"),
         "residency": (state._residency, "observe"),
         "publication": (owner.publications, "upsert"),
     }[seam]
@@ -750,7 +770,7 @@ def _hydrate_ok(state, owner_value, gate, processed, label, generation):
     return request
 
 
-@pytest.mark.parametrize("seam", ["records", "light", "residency", "publication"])
+@pytest.mark.parametrize("seam", ["light", "residency", "publication"])
 def test_persistent_seam_failure_rejects_candidate_and_preserves_display(
     monkeypatch, tmp_path, seam
 ):
@@ -786,7 +806,7 @@ def test_persistent_seam_failure_rejects_candidate_and_preserves_display(
     assert state.payloads.get(keys[2]) is prior_payload
 
 
-@pytest.mark.parametrize("seam", ["records", "light", "residency", "publication"])
+@pytest.mark.parametrize("seam", ["light", "residency", "publication"])
 def test_fail_once_seam_retries_exact_prepared_commit_once(
     monkeypatch, tmp_path, seam
 ):
@@ -841,6 +861,64 @@ def test_failed_rehydration_preserves_the_exact_existing_publication(
     outcomes = _completion_outcomes(state)
     assert outcomes.count((2, HydrationOutcome.FAILED)) == 1
     assert owner.publications.get(2) is prior_publication
+    assert not events
+
+
+def test_owed_multimode_light_row_refuses_hydration_before_mutation(
+    tmp_path,
+):
+    """P1-C L1: hydration cannot merge onto an unreleasable GUI-light row."""
+    state, owner, processed, _raw, events = _bound_state(None, tmp_path)
+    keys = _catalog(state, owner, (1,))
+    owner_value, gate = _acquisition_identity(state)
+    view = FrameView(
+        label=1,
+        axis_1d=Axis("q", "1/angstrom", np.array([0.1, 0.2, 0.3])),
+        intensity_1d=np.array([4.0, 5.0, 6.0]),
+        source_path="/owed/source.tif",
+        source_frame_index=1,
+    )
+    owed = FrameRecord.from_view(view, mode_1d="owed-a").with_result_1d(
+        "owed-b", view, make_active=False,
+    )
+    source_identity = "/owed/source.tif#1"
+    owner.light_records.upsert(
+        owed,
+        source_identity=source_identity,
+        persisted=False,
+    )
+    before = (
+        owner.light_records.get(1),
+        owner.light_records.source_identity(1),
+        owner.light_records.is_persisted(1),
+        owner.publications.get(1),
+        state.payloads.get(keys[1]),
+        state.residency_snapshot(),
+    )
+
+    request = _typed_request(
+        state,
+        owner_value,
+        gate,
+        processed,
+        1,
+        HydrationPurpose.PREVIEW,
+        1,
+    )
+    assert state.transport.submit(request) is not None
+    assert _wait_transport_idle(state)
+
+    assert _completion_outcomes(state).count(
+        (1, HydrationOutcome.FAILED)
+    ) == 1
+    assert (
+        owner.light_records.get(1),
+        owner.light_records.source_identity(1),
+        owner.light_records.is_persisted(1),
+        owner.publications.get(1),
+        state.payloads.get(keys[1]),
+        state.residency_snapshot(),
+    ) == before
     assert not events
 
 
@@ -1044,7 +1122,7 @@ def test_failed_commit_does_not_publish_detector_outcome(
     state.bind_transport(event_sink=lambda event: None)
     keys = _catalog(state, owner, (1,))
     owner_value, gate = _acquisition_identity(state)
-    _install_seam_failure(monkeypatch, state, owner, "records",
+    _install_seam_failure(monkeypatch, state, owner, "light",
                           permanent=True)
     rejected = _typed_request(
         state, owner_value, gate, processed, 1, HydrationPurpose.PREVIEW, 1
@@ -1057,7 +1135,7 @@ def test_failed_commit_does_not_publish_detector_outcome(
     assert state.detector_outcome(keys[1]) is None
 
 
-@pytest.mark.parametrize("seam", ["records", "light", "residency", "publication"])
+@pytest.mark.parametrize("seam", ["light", "residency", "publication"])
 @pytest.mark.parametrize("shape", ["fresh", "rehydrated"])
 def test_failed_attempt_restores_every_public_surface_exactly(
     monkeypatch, tmp_path, seam, shape
@@ -1182,10 +1260,11 @@ def test_failed_hydration_restore_preserves_concurrent_live_residency(
     hydration_reached_publication = threading.Event()
     live_complete = threading.Event()
     live_errors = []
-    original_record_upsert = owner.records.upsert
+    canonical_record = owner.records.get(2)
+    original_light_upsert = owner.light_records.upsert
     original_publication_upsert = owner.publications.upsert
 
-    def coordinated_record_upsert(candidate, *args, **kwargs):
+    def coordinated_light_upsert(candidate, *args, **kwargs):
         if (
             candidate.label == 2
             and threading.current_thread().name == "live-producer"
@@ -1194,7 +1273,7 @@ def test_failed_hydration_restore_preserves_concurrent_live_residency(
             # rejected parent.
             live_passed_display_lock.set()
             assert release_live_store_write.wait(timeout=10)
-        return original_record_upsert(candidate, *args, **kwargs)
+        return original_light_upsert(candidate, *args, **kwargs)
 
     def coordinated_publication_upsert(candidate):
         if (
@@ -1209,7 +1288,9 @@ def test_failed_hydration_restore_preserves_concurrent_live_residency(
             raise RuntimeError("injected hydration publication failure")
         return original_publication_upsert(candidate)
 
-    monkeypatch.setattr(owner.records, "upsert", coordinated_record_upsert)
+    monkeypatch.setattr(
+        owner.light_records, "upsert", coordinated_light_upsert
+    )
     monkeypatch.setattr(
         owner.publications, "upsert", coordinated_publication_upsert
     )
@@ -1274,7 +1355,7 @@ def test_failed_hydration_restore_preserves_concurrent_live_residency(
     assert _completion_outcomes(state).count(
         (1, HydrationOutcome.FAILED)
     ) == 1
-    assert owner.records.get(2) is record
+    assert owner.records.get(2) is canonical_record
     assert owner.publications.get(2) is publication
     residency = state._residency
     assert keys[2] in residency._stores

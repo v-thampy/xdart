@@ -147,13 +147,9 @@ class RunDisplayResidency:
     ) -> None:
         """Drop catalog-qualified browse tiers while bounded live data drains."""
         for key in keys:
-            stores = self._stores.get(key)
-            if stores is None:
-                continue
-            stores.light_records.discard(key.local_frame_label)
-            stores.publications.discard(key.local_frame_label)
-            self._browse.pop(key, None)
-            self._thumbnails.pop(key, None)
+            if self._evict_browse(key):
+                self._browse.pop(key, None)
+                self._thumbnails.pop(key, None)
 
     @staticmethod
     def _touch(
@@ -176,42 +172,75 @@ class RunDisplayResidency:
 
     def _evict_heavy(self, key: DisplayFrameKey) -> bool:
         stores = self._stores.get(key)
-        if stores is None or not stores.records.is_persisted(
-            key.local_frame_label
-        ):
+        if stores is None:
             return False
-        stores.records.evict_heavy(key.local_frame_label)
-        stores.publications.evict_heavy(key.local_frame_label)
-        return True
+        label = key.local_frame_label
+        publication_done = (
+            stores.publications.get(label) is None
+            or not stores.publications.has_heavy_payload(label)
+            or stores.publications.evict_heavy(label)
+        )
+        if not publication_done:
+            return False
+        return (
+            not stores.records.has_heavy_payload(label)
+            or stores.records.release_heavy(label)
+        )
 
     def _evict_thumbnail(self, key: DisplayFrameKey) -> bool:
         stores = self._stores.get(key)
-        if stores is None or not stores.records.is_persisted(
-            key.local_frame_label
-        ):
+        if stores is None:
             return False
-        stores.publications.evict_thumbnail(key.local_frame_label)
-        return True
+        label = key.local_frame_label
+        return (
+            stores.publications.get(label) is None
+            or not stores.publications.has_thumbnail(label)
+            or stores.publications.evict_thumbnail(label)
+        )
 
     def _evict_browse(self, key: DisplayFrameKey) -> bool:
         stores = self._stores.get(key)
-        if stores is None or not stores.records.is_persisted(
-            key.local_frame_label
+        if stores is None:
+            return False
+        label = key.local_frame_label
+        light = stores.light_records.get(label)
+        if (
+            light is not None
+            and not stores.light_records.can_release_record(label)
         ):
             return False
-        stores.light_records.discard(key.local_frame_label)
-        stores.publications.discard(key.local_frame_label)
+        publication = stores.publications.get(label)
+        if (
+            publication is not None
+            and not stores.records.can_release_record(label)
+        ):
+            return False
+        publication_done = (
+            publication is None
+            or stores.publications.discard(label)
+        )
+        if not publication_done:
+            return False
+        if light is not None and not stores.light_records.release_record(label):
+            raise RuntimeError("qualified display light release was lost")
         return True
 
     def _evict_live(self, key: DisplayFrameKey) -> bool:
         stores = self._stores.get(key)
         if stores is None:
             return False
-        removed = bool(stores.records.discard(key.local_frame_label))
-        if removed and stores.publications.get(key.local_frame_label) is None:
+        label = key.local_frame_label
+        if not self._evict_browse(key):
+            return False
+        removed = (
+            stores.records.get(label) is None
+            or stores.records.release_record(label)
+        )
+        if removed:
             self._heavy.pop(key, None)
             self._thumbnails.pop(key, None)
             self._browse.pop(key, None)
+            self._live.pop(key, None)
             self._stores.pop(key, None)
         return removed
 

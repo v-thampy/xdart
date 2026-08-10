@@ -363,6 +363,107 @@ def test_hydration_rechecks_projected_membership_not_only_projection_sets():
     assert not store.has_heavy_payload(1)
 
 
+def test_release_record_is_durability_qualified_and_preserves_revision_fence():
+    store = FrameRecordStore(max_items=None, max_heavy_items=None)
+    mode = ("1d", "q_total")
+    record = _record(label=1, mode=mode[1], source="/data/a.tif")
+    store.upsert(record)
+    initial_revision = store._revisions[1]
+
+    assert store.release_record(1) is False
+    assert store.get(1) is record
+    assert store._revisions[1] == initial_revision
+
+    store.replace_projection(1, hydratable=(mode,))
+    assert store.release_record(1) is False
+    assert store.get(1) is record
+
+    store.replace_projection(1, hydratable=(mode,), durable=(mode,))
+    assert store.can_release_record(1) is True
+    assert store.release_record(1) is True
+    assert store.get(1) is None
+    assert store.labels() == ()
+    assert store._revisions[1] == initial_revision
+    assert store.release_record(1) is False
+
+
+def test_exchange_releasable_record_is_atomic_identity_qualified_cas():
+    store = FrameRecordStore(max_items=None, max_heavy_items=None)
+    prior = _record(label=1, mode="prior", source="/data/a.tif")
+    candidate = _record(label=1, mode="candidate", source="/data/a.tif")
+    store.upsert(prior, source_identity="/data/a.tif#0")
+
+    assert store.exchange_releasable_record(
+        1,
+        expected=prior,
+        replacement=candidate,
+        source_identity="/data/a.tif#0",
+        persisted=True,
+    ) is False
+    assert store.get(1) is prior
+
+    store.mark_persisted(1)
+    revision = store._revisions[1]
+    assert store.exchange_releasable_record(
+        1,
+        expected=prior,
+        replacement=candidate,
+        source_identity="/data/a.tif#0",
+        persisted=True,
+    ) is True
+    assert store.get(1) is candidate
+    assert store.is_persisted(1)
+    assert store._revisions[1] == revision + 1
+    assert store.exchange_releasable_record(
+        1,
+        expected=prior,
+        replacement=None,
+    ) is False
+    assert store.get(1) is candidate
+
+
+def test_exchange_releasable_record_refuses_bounds_before_mutation():
+    store = FrameRecordStore(
+        max_items=1,
+        max_heavy_items=0,
+        require_persisted_for_eviction=False,
+    )
+    installed = store.upsert(
+        _record(label=1, mode="prior", source="/data/a.tif"),
+        source_identity="/data/a.tif#0",
+        persisted=True,
+    )
+    revision = store._revisions[1]
+    source = store.source_identity(1)
+    persisted = store.persisted_modes(1)
+    heavy_candidate = _record(
+        label=1,
+        mode="candidate",
+        source="/data/a.tif",
+    )
+
+    assert store.exchange_releasable_record(
+        1,
+        expected=installed,
+        replacement=heavy_candidate,
+        source_identity="/data/a.tif#0",
+        persisted=True,
+    ) is False
+    assert store.get(1) is installed
+    assert store._revisions[1] == revision
+    assert store.source_identity(1) == source
+    assert store.persisted_modes(1) == persisted
+
+    assert store.exchange_releasable_record(
+        2,
+        expected=None,
+        replacement=_record(label=2, source="/data/b.tif"),
+        source_identity="/data/b.tif#0",
+        persisted=True,
+    ) is False
+    assert store.labels() == (1,)
+
+
 def test_hydration_request_cannot_replay_across_commit_epoch_aba():
     store = FrameRecordStore(max_heavy_items=1)
     store.upsert(_record(label=1, source="/data/a.tif"), persisted=True)

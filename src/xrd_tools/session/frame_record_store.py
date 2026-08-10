@@ -417,6 +417,76 @@ class FrameRecordStore:
                 self._drop_heavy_label_locked(label)
             return True
 
+    def can_release_record(self, label: int | str) -> bool:
+        """Return whether the exact row is qualified for complete release."""
+        with self._lock:
+            return self._label_deletable_locked(label)
+
+    def release_record(self, label: int | str) -> bool:
+        """Release one recoverable row without weakening projection truth."""
+        with self._lock:
+            if not self._label_deletable_locked(label):
+                return False
+            self._forget_label_locked(label)
+            return True
+
+    def exchange_releasable_record(
+        self,
+        label: int | str,
+        *,
+        expected: FrameRecord | None,
+        replacement: FrameRecord | None,
+        source_identity: str | None = None,
+        persisted: bool = False,
+    ) -> bool:
+        """Atomically exchange one exact releasable row without merging."""
+        if replacement is not None and replacement.label != label:
+            raise ValueError(
+                "replacement record label differs from exchange label"
+            )
+        resolved_source = ""
+        replacement_is_heavy = False
+        if replacement is not None:
+            resolved_source = (
+                str(source_identity)
+                if source_identity is not None
+                else _source_identity_from_record(replacement)
+            )
+            replacement_is_heavy = _has_heavy_payload(replacement)
+        with self._lock:
+            current = self._records.get(label)
+            if current is not expected:
+                return False
+            if current is not None and not self._label_deletable_locked(label):
+                return False
+            if replacement is not None:
+                next_items = len(self._records) + (current is None)
+                next_heavy = (
+                    len(self._heavy_labels)
+                    - int(label in self._heavy_labels)
+                    + int(replacement_is_heavy)
+                )
+                if (
+                    self._max_items is not None
+                    and next_items > self._max_items
+                ) or (
+                    self._max_heavy_items is not None
+                    and next_heavy > self._max_heavy_items
+                ):
+                    return False
+            if current is not None:
+                self._forget_label_locked(label)
+            if replacement is None:
+                return True
+            self._records[label] = replacement
+            self._source_ids[label] = resolved_source
+            self._revisions[label] = self._revisions.get(label, 0) + 1
+            if persisted:
+                self._persisted_modes[label] = _record_mode_keys(replacement)
+            if replacement_is_heavy:
+                self._heavy_labels.append(label)
+            return True
+
     def durable_modes(self, label: int | str) -> frozenset[_ModeKey]:
         """Modes durable on EVERY applicable target; the only releasable ones."""
         with self._lock:

@@ -82,8 +82,9 @@ class _PreparedCommitState:
     identity instead of re-deriving them from mutated stores."""
 
     key: DisplayFrameKey
-    record: FrameRecord | None
     light: FrameRecord | None
+    light_source_identity: str
+    light_persisted: bool
     outcome_present: bool
     outcome: "DetectorHydrationOutcome | None"
     residency: tuple
@@ -276,7 +277,7 @@ class RunDisplayState:
             max_heavy_items=None,
             max_thumbnail_items=None,
         )
-        publications.set_evictable_probe(records.is_persisted)
+        publications.set_evictable_probe(records.can_release_record)
         frozen_mask = None if mask is None else np.asarray(mask, dtype=bool)
         if frozen_mask is not None:
             frozen_mask.setflags(write=False)
@@ -377,11 +378,6 @@ class RunDisplayState:
             # publication, and residency touch in that ownership boundary so
             # a failed historical hydration cannot restore over a concurrently
             # published live frame.
-            owner.records.upsert(
-                record,
-                source_identity=source_identity,
-                persisted=False,
-            )
             owner.light_records.upsert(
                 light_record(record),
                 source_identity=source_identity,
@@ -405,7 +401,6 @@ class RunDisplayState:
         """Project only exact writer-boundary durable labels as persisted."""
 
         with self._lock:
-            owner.records.mark_persisted(labels)
             owner.light_records.mark_persisted(labels)
             self._residency.enforce()
 
@@ -826,23 +821,31 @@ class RunDisplayState:
         # event are written only after the publication landed.
         undo = _PreparedCommitState(
             key=key,
-            record=art.records.get(key.local_frame_label),
             light=art.light_records.get(key.local_frame_label),
+            light_source_identity=art.light_records.source_identity(
+                key.local_frame_label
+            ),
+            light_persisted=art.light_records.is_persisted(
+                key.local_frame_label
+            ),
             outcome_present=key in self._detector_outcomes,
             outcome=self._detector_outcomes.get(key),
             residency=self._residency.capture(key),
         )
+        candidate_light = light_record(record)
         try:
-            art.records.upsert(
-                record,
+            if not art.light_records.exchange_releasable_record(
+                key.local_frame_label,
+                expected=undo.light,
+                replacement=candidate_light,
                 source_identity=source_identity,
                 persisted=True,
-            )
-            art.light_records.upsert(
-                light_record(record),
-                source_identity=source_identity,
-                persisted=True,
-            )
+            ):
+                raise RuntimeError(
+                    "display light record remains owed during hydration"
+                )
+            if art.light_records.get(key.local_frame_label) is not candidate_light:
+                raise RuntimeError("display light record install lost identity")
             self._residency.observe(
                 key,
                 records=art.records,
@@ -853,7 +856,7 @@ class RunDisplayState:
             )
             publication = art.publications.upsert(candidate)
         except BaseException:
-            self._abort_commit_locked(art, undo)
+            self._abort_commit_locked(art, undo, candidate_light)
             raise
         if detector_outcome is not None:
             self._detector_outcomes[key] = detector_outcome
@@ -876,17 +879,18 @@ class RunDisplayState:
         )
 
     def _abort_commit_locked(
-        self, art: DisplayArtifact, undo: _PreparedCommitState
+        self,
+        art: DisplayArtifact,
+        undo: _PreparedCommitState,
+        candidate_light: FrameRecord,
     ) -> None:
         """Restore the exact captured pre-attempt state (§22.3 abort half).
 
-        The identity-compare guards make each restore a no-op for a seam
-        whose mutation never happened (including the seam that raised), so
-        the abort never re-enters the method that just failed.  Restored
-        record/light entries re-insert into an EMPTY slot (discard first),
-        so the store's merge path cannot contaminate them; both display
-        stores only ever hold persisted entries, and the source identity is
-        the one deterministic formula both write paths use.
+        The identity guards make each restore a no-op for a seam whose
+        mutation never happened.  Otherwise the store-owned CAS exchanges
+        the exact candidate directly back to the captured light object,
+        source identity, and persistence fact, without a merge or an exposed
+        empty slot.  A foreign concurrent row refuses restoration loudly.
         """
         key = undo.key
         label = key.local_frame_label
@@ -894,22 +898,20 @@ class RunDisplayState:
             self._detector_outcomes[key] = undo.outcome
         else:
             self._detector_outcomes.pop(key, None)
-        if art.records.get(label) is not undo.record:
-            art.records.discard(label)
-            if undo.record is not None:
-                art.records.upsert(
-                    undo.record,
-                    source_identity=_record_source_identity(undo.record),
-                    persisted=True,
-                )
         if art.light_records.get(label) is not undo.light:
-            art.light_records.discard(label)
-            if undo.light is not None:
-                art.light_records.upsert(
-                    undo.light,
-                    source_identity=_record_source_identity(undo.light),
-                    persisted=True,
-                )
+            current = art.light_records.get(label)
+            if current is not None and current is not candidate_light:
+                raise RuntimeError("display light rollback found a foreign row")
+            if not art.light_records.exchange_releasable_record(
+                label,
+                expected=current,
+                replacement=undo.light,
+                source_identity=undo.light_source_identity,
+                persisted=undo.light_persisted,
+            ):
+                raise RuntimeError("display light record rollback was refused")
+            if art.light_records.get(label) is not undo.light:
+                raise RuntimeError("display light record restore lost identity")
         self._residency.restore(undo.residency)
 
     def _commit_browse_locked(
@@ -958,12 +960,6 @@ def has_integrated_values(view: object) -> bool:
         )
     except Exception:
         return False
-
-
-def _record_source_identity(record: FrameRecord) -> str:
-    """The one deterministic source-identity formula both write paths use."""
-    view = record.active_view()
-    return f"{view.source_path or ''}#{view.source_frame_index}"
 
 
 def _projection_masks_values(
