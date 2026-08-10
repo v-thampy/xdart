@@ -338,6 +338,24 @@ class RunDisplayState:
             self._residency.retire_navigation(delta.retired)
         return delta
 
+    def seed_navigation(
+        self,
+        source_scan: str,
+        artifact: str,
+        local_frame_label: int,
+    ) -> DisplayFrameKey:
+        """Install one payload-free persisted key, deduplicated exactly."""
+
+        with self._lock:
+            existing = self.catalog.resolve_exact(
+                artifact, local_frame_label,
+            )
+            if existing is not None:
+                return existing
+            return self.append_navigation(
+                source_scan, artifact, local_frame_label,
+            ).appended
+
     @property
     def navigation_capacity(self) -> int:
         return self.catalog.max_items

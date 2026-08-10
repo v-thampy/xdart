@@ -115,6 +115,37 @@ def _mounted_host(selected_key=None):
     return _gui_main.Main(selected_page_key=selected_key)
 
 
+def test_host_hides_only_the_redundant_vnext_application_statusbar(
+        qapp, isolated_settings):
+    workspace = _mounted_host(SCATTERING_WORKSPACE_PAGE.key)
+    try:
+        assert workspace.statusBar().isHidden()
+
+        # The visible, authoritative status remains the scientific footer
+        # immediately below the 1-D plot.  The hidden host presenter may still
+        # receive the same notice for its existing logging/contract bridge.
+        workspace.main_widget._notice("bridge probe notice")
+        workspace.main_widget._refresh_shell()
+        assert (
+            workspace.main_widget._shell.scientific.status.text()
+            == "bridge probe notice"
+        )
+        assert workspace.statusBar().currentMessage() == "bridge probe notice"
+        assert workspace.page_handle.close().status is PageCleanup.CLEAN
+    finally:
+        workspace.close()
+        workspace.deleteLater()
+        qapp.processEvents()
+
+    legacy = _mounted_host(LEGACY_STATIC_PAGE.key)
+    try:
+        assert not legacy.statusBar().isHidden()
+    finally:
+        legacy.close()
+        legacy.deleteLater()
+        qapp.processEvents()
+
+
 def test_host_mounts_the_real_workspace_on_explicit_optin(
         qapp, isolated_settings):
     window = _mounted_host("scattering-workspace")

@@ -198,7 +198,11 @@ else:
 
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
-from xdart.gui.pages.catalog import BUILTIN_PAGES, DEFAULT_PAGE_KEY
+from xdart.gui.pages.catalog import (
+    BUILTIN_PAGES,
+    DEFAULT_PAGE_KEY,
+    SCATTERING_WORKSPACE_PAGE,
+)
 from xdart.gui.pages.descriptors import PageDescriptor
 from xdart.gui.pages.handle import validate_page_handle
 from xdart.gui.pages.registry import PageRegistry
@@ -384,6 +388,9 @@ class Main(QMainWindow):
         # host behavior routes only through the typed handle below.
         self.main_widget = handle.widget
         self.setCentralWidget(handle.widget)
+        self.ui.statusbar.setHidden(
+            descriptor.key == SCATTERING_WORKSPACE_PAGE.key
+        )
         if self._menus_initialized:
             self._attach_application_menus()
             self._sync_capability_actions()

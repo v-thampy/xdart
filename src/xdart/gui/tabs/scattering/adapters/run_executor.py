@@ -1049,20 +1049,38 @@ class StandardRunExecutor:
         )
         run.sink = output
         write_labels = set(output.write_labels)
+        persisted_prefix_labels = output.persisted_prefix_labels
         run.current_completed = max(0, run.current_total - len(write_labels))
         run.current_published = run.current_completed
         run.current_epoch_published = 0
+        self._seed_persisted_prefix_navigation(
+            run, owner, persisted_prefix_labels,
+        )
         if run.session is not None and run.display_projection_worker is None:
             self._start_display_projection(run)
         if created:
             run.session.on_frame_completed(
                 lambda event: self._frame_ready(run, event)
             )
-        if run.session is not None:
+        if run.session is not None or persisted_prefix_labels:
             self._adopt_acquisition_context(
                 run, owner, source_path=str(source_spec.uri)
             )
         return run
+
+    @staticmethod
+    def _seed_persisted_prefix_navigation(
+        run: _StandardRun,
+        owner: DisplayArtifact,
+        labels: tuple[int, ...],
+    ) -> None:
+        capacity = run.display.navigation_capacity
+        for label in labels[-capacity:]:
+            run.display.seed_navigation(
+                owner.source_scan,
+                str(owner.artifact),
+                int(label),
+            )
 
     def _adopt_acquisition_context(
         self, run: _StandardRun, owner: DisplayArtifact, *, source_path: str

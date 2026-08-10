@@ -71,6 +71,22 @@ def _frame_events(events) -> tuple[object, ...]:
     )
 
 
+def _browser_captions(frames) -> tuple[str, ...]:
+    from pyqtgraph.Qt import QtCore
+
+    from xdart.gui.tabs.scattering.browser_model import FrameListModel
+
+    model = FrameListModel()
+    model.reconcile(tuple(frames))
+    return tuple(
+        str(model.data(
+            model.index(row, 0),
+            int(QtCore.Qt.ItemDataRole.DisplayRole),
+        ))
+        for row in range(model.rowCount())
+    )
+
+
 def _source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
@@ -701,8 +717,21 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     """B03: missing/no-op/mismatch use H23 before source pixel reads."""
 
     import xrd_tools.sources.image as image_source
+    import xdart.gui.tabs.scattering.adapters.run_executor as run_executor_module
 
     _bridge_legacy_expected_target_state(monkeypatch)
+
+    output_adapters = []
+    real_output_adapter = run_executor_module.DynamicOutputAdapter
+
+    def observed_output_adapter(configuration):
+        owner = real_output_adapter(configuration)
+        output_adapters.append(owner)
+        return owner
+
+    monkeypatch.setattr(
+        run_executor_module, "DynamicOutputAdapter", observed_output_adapter,
+    )
 
     raw1 = tmp_path / "series_0001.tif"
     raw2 = tmp_path / "series_0002.tif"
@@ -719,6 +748,8 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     assert next(event for event in first_events if event.kind in _TERMINAL).kind \
         is StandardEventKind.FINISHED
     first_executor.close(_identity)
+    assert len(output_adapters) == 1
+    assert output_adapters[0].persisted_prefix_labels == ()
     assert _nexus_rows(target) == (1, 2)
     xye_directory = tmp_path / "series"
     seeded_xye = tuple(sorted(xye_directory.glob("*.xye")))
@@ -794,6 +825,20 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     assert missing_frame.frame_key.local_frame_label == 3
     missing_run = missing_executor._exact_run(missing_identity)
     assert missing_run is not None
+    missing_catalog = missing_executor.frame_catalog(missing_identity)
+    assert missing_catalog is not None
+    assert tuple(
+        key.local_frame_label for key in missing_catalog.entries
+    ) == (1, 2, 3), "B03 missing persisted-prefix catalog"
+    assert tuple(
+        key.work_ordinal for key in missing_catalog.entries
+    ) == (1, 2, 3), "B03 missing persisted-prefix ordinals"
+    assert _browser_captions(missing_catalog.entries) == (
+        "1", "2", "3",
+    ), "B03 missing persisted-prefix browser"
+    missing_context = missing_executor.acquisition_context(missing_identity)
+    assert missing_context is not None
+    assert missing_context.frame_ids.entries == missing_catalog.entries
     assert missing_run.display.artifacts[
         missing_frame.frame_key.artifact
     ].records.is_persisted(3)
@@ -821,6 +866,36 @@ def test_p1b_b03_native_cross_run_append_missing_only(
         name: xye_facts(missing_xye)[name]
         for name in seeded_xye_facts
     } == seeded_xye_facts, "B03 missing"
+    persisted_key = missing_catalog.entries[0]
+    assert missing_run.display.project(
+        persisted_key,
+        1,
+        closed=missing_run.closed,
+        owner=missing_context.hydration_owner,
+        commit_gate=missing_context.commit_gate,
+    ) is None
+    hydrated_events = _drain_until(
+        missing_executor,
+        lambda values: any(
+            event.kind is StandardEventKind.DISPLAY_READY
+            and event.frame_key is persisted_key
+            for event in values
+        ),
+    )
+    assert not _frame_events(hydrated_events)
+    hydrated = missing_run.display.project(
+        persisted_key,
+        1,
+        closed=missing_run.closed,
+        owner=missing_context.hydration_owner,
+        commit_gate=missing_context.commit_gate,
+    )
+    assert hydrated is not None
+    assert hydrated.frame_key is persisted_key
+    assert hydrated.view.axis_1d is not None
+    assert hydrated.view.intensity_1d is not None
+    assert len(output_adapters) == 2
+    assert output_adapters[1].persisted_prefix_labels == (1, 2)
     missing_executor.close(missing_identity)
 
     # no-op: exact committed content performs no source read or replacement.
@@ -844,6 +919,23 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns, "B03 no-op"
     assert xye_facts(tuple(sorted(xye_directory.glob("*.xye")))) \
         == before_xye, "B03 no-op"
+    noop_catalog = noop_executor.frame_catalog(noop_identity)
+    assert noop_catalog is not None
+    assert tuple(
+        key.local_frame_label for key in noop_catalog.entries
+    ) == (1, 2, 3), "B03 no-op persisted-prefix catalog"
+    assert tuple(
+        key.work_ordinal for key in noop_catalog.entries
+    ) == (1, 2, 3), "B03 no-op persisted-prefix ordinals"
+    assert _browser_captions(noop_catalog.entries) == (
+        "1", "2", "3",
+    ), "B03 no-op persisted-prefix browser"
+    noop_context = noop_executor.acquisition_context(noop_identity)
+    assert noop_context is not None
+    assert noop_context.frame_ids.entries == noop_catalog.entries
+    assert _frame_events(noop_events) == (), "B03 no-op synthetic frame event"
+    assert len(output_adapters) == 3
+    assert output_adapters[2].persisted_prefix_labels == (1, 2, 3)
     noop_executor.close(noop_identity)
 
     # Same-path scientific-asset drift is part of the signed science identity,
@@ -904,6 +996,45 @@ def test_p1b_b03_native_cross_run_append_missing_only(
             == before_xye, "B03 mismatch"
     finally:
         mismatch_executor.cancel_admission(token)
+
+    # A very large committed prefix seeds only the retained navigation tail;
+    # an exact key already in that tail is reused rather than duplicated.
+    from xdart.gui.tabs.scattering.display_runtime import RunDisplayState
+
+    display = RunDisplayState(
+        RunIdentity(1, "append-prefix-tail"),
+        max_payload_items=1,
+        catalog_max_items=3,
+    )
+    artifact = str(Path("/processed/series.nexus"))
+    owner = SimpleNamespace(source_scan="series", artifact=Path(artifact))
+    run = SimpleNamespace(display=display)
+    display.seed_navigation(owner.source_scan, artifact, 999_998)
+
+    calls = []
+    real_seed = display.seed_navigation
+
+    def observed_seed(source_scan, target, label):
+        calls.append((source_scan, target, label))
+        return real_seed(source_scan, target, label)
+
+    monkeypatch.setattr(display, "seed_navigation", observed_seed)
+    StandardRunExecutor._seed_persisted_prefix_navigation(
+        run,
+        owner,
+        tuple(range(1, 1_000_001)),
+    )
+
+    assert calls == [
+        ("series", artifact, 999_998),
+        ("series", artifact, 999_999),
+        ("series", artifact, 1_000_000),
+    ]
+    entries = display.catalog_snapshot().entries
+    assert tuple(key.local_frame_label for key in entries) == (
+        999_998, 999_999, 1_000_000,
+    )
+    assert tuple(key.work_ordinal for key in entries) == (1, 2, 3)
 
 
 def test_p1b_b04_xye_only_prefix_and_append_envelope(

@@ -393,6 +393,16 @@ class DynamicOutputAdapter:
             else tuple(self._current["write_labels"])
         )
 
+    @property
+    def persisted_prefix_labels(self) -> tuple[int, ...]:
+        """Exact cross-run prefix captured by the locked Append preflight."""
+
+        return (
+            ()
+            if self._current is None
+            else tuple(self._current["persisted_prefix_labels"])
+        )
+
     def _revision(self, graph: dict[str, Any], item: PlannedOutput) -> int:
         exact = item.source_stamp.execution_identity_v1
         revisions = graph["revisions"]
@@ -497,6 +507,10 @@ class DynamicOutputAdapter:
                 if nexus is not None:
                     extension = graph["session"].extend_live(intent)
                     write_labels = tuple(extension.write_labels)
+                    if self.configuration.output_mode == "Append":
+                        graph["persisted_prefix_labels"] = tuple(
+                            extension.skip_labels
+                        )
                 else:
                     extension = extend_same_run_lineage(
                         graph["xye_lineage"], graph["intent"], intent,
@@ -532,6 +546,7 @@ class DynamicOutputAdapter:
             raise ValueError("XYE-only Append has no persisted lineage owner")
 
         preflight = None
+        persisted_prefix_labels: tuple[int, ...] = ()
         if not xye_only and self.configuration.output_mode == "Append":
             if cancelled():
                 raise RuntimeError("admission cancelled")
@@ -541,7 +556,9 @@ class DynamicOutputAdapter:
                 self._pending_preflights.append(error.owner)
                 raise
             self._pending_preflights.append(preflight)
-            if preflight.snapshot.disposition is AppendDisposition.SKIP:
+            preflight_snapshot = preflight.snapshot
+            persisted_prefix_labels = tuple(preflight_snapshot.skip_labels)
+            if preflight_snapshot.disposition is AppendDisposition.SKIP:
                 preflight.complete_noop()
                 self._release_construction_custody(
                     preflight=preflight,
@@ -551,6 +568,7 @@ class DynamicOutputAdapter:
                     "sink": None,
                     "accounting": None,
                     "write_labels": (),
+                    "persisted_prefix_labels": persisted_prefix_labels,
                 }
                 return None, False
 
@@ -670,6 +688,7 @@ class DynamicOutputAdapter:
                 "source_revisions": {},
                 "armed_labels": frozenset(),
                 "write_labels": write_labels,
+                "persisted_prefix_labels": persisted_prefix_labels,
                 "settled_labels": set(),
                 "xye_lineage": xye_lineage,
                 "xye_pending": None,
