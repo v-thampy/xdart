@@ -417,6 +417,31 @@ def test_footer_and_left_frames_reconcile_to_same_exact_key() -> None:
     shell = ScatteringWorkspaceShell()
     try:
         shell.apply_state(state)
+        browser_model = shell.browser.frame_model
+        assert [
+            browser_model.index(index, 0).data(
+                QtCore.Qt.ItemDataRole.DisplayRole
+            )
+            for index in range(browser_model.rowCount())
+        ] == ["1", "2"]
+        assert [
+            shell.scientific.frame_selector.itemText(index)
+            for index in range(shell.scientific.frame_selector.count())
+        ] == ["1", "2"]
+        assert [
+            (
+                browser_model.index(index, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+            ).local_frame_label
+            for index in range(browser_model.rowCount())
+        ] == [0, 1]
+        assert [
+            shell.scientific.frame_selector.itemData(
+                index
+            ).local_frame_label
+            for index in range(shell.scientific.frame_selector.count())
+        ] == [0, 1]
         selected = shell.browser.frames.selectionModel().selectedRows()
         assert len(selected) == 1
         assert selected[0].data(QtCore.Qt.ItemDataRole.UserRole) is keys[1]

@@ -75,7 +75,7 @@ def test_e3_ui2_renders_raw_cake_axes_and_all_retained_overlay_rows(
         footer = tuple(
             frame
             for frame in state.navigation.frames
-            if frame.source_scan == current.source_scan
+            if frame.artifact == current.artifact
         )
         assert shell.browser.frame_model.frames is state.navigation.frames
         assert tuple(
@@ -85,7 +85,9 @@ def test_e3_ui2_renders_raw_cake_axes_and_all_retained_overlay_rows(
         assert [
             shell.scientific.frame_selector.itemText(index)
             for index in range(shell.scientific.frame_selector.count())
-        ] == [str(frame.local_frame_label) for frame in footer]
+        ] == [
+            str(position) for position in range(1, len(footer) + 1)
+        ]
     finally:
         shell.close()
         shell.deleteLater()

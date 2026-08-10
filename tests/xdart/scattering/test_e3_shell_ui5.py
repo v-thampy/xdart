@@ -223,7 +223,7 @@ def test_e3_ui5_processing_rows_use_axis_paths_ranges_units_and_pills(
         _dispose(shell, qapp)
 
 
-def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
+def test_e3_ui5_one_based_visible_captions_keep_exact_key_commands(
     qapp: QtWidgets.QApplication,
 ) -> None:
     state = make_shell_projection()
@@ -235,11 +235,11 @@ def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
     shell.scientific.commandRequested.connect(scientific_commands.append)
     try:
         shell.apply_state(state)
-        expected = [str(frame.local_frame_label) for frame in frames]
+        expected = [str(position) for position in range(1, len(frames) + 1)]
         footer = tuple(
             frame
             for frame in frames
-            if frame.source_scan == state.navigation.current.source_scan
+            if frame.artifact == state.navigation.current.artifact
         )
         model = shell.browser.frames.model()
         assert [
@@ -254,7 +254,9 @@ def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
         assert [
             shell.scientific.frame_selector.itemText(index)
             for index in range(shell.scientific.frame_selector.count())
-        ] == [str(frame.local_frame_label) for frame in footer]
+        ] == [
+            str(position) for position in range(1, len(footer) + 1)
+        ]
         assert all(
             shell.scientific.frame_selector.itemData(index)
             is footer[index]
@@ -291,13 +293,13 @@ def test_e3_ui5_duplicate_visible_captions_keep_exact_key_commands(
         shell.scientific.frame_selector.setCurrentIndex(1)
         assert len(scientific_commands) == 1
         assert scientific_commands[0].kind is ShellCommandKind.HYDRATE_FRAME
-        assert scientific_commands[0].frame is frames[3]
+        assert scientific_commands[0].frame is frames[1]
         assert scientific_commands[0].frames == frames
         assert frames[0].local_frame_label == (
             frames[3].local_frame_label
         ) == 1
         assert expected[0] == "1"
-        assert expected[3] == "1"
+        assert expected[3] == "4"
     finally:
         _dispose(shell, qapp)
 

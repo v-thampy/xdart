@@ -188,13 +188,13 @@ def test_e3_ui5_maintainer_controls_are_exact_at_review_viewports(
         ] == ["Mask Saturated", "Average Scan"]
 
         expected_browser_frames = [
-            str(frame.local_frame_label)
-            for frame in state.navigation.frames
+            str(position)
+            for position in range(1, len(state.navigation.frames) + 1)
         ]
         expected_footer = [
             frame
             for frame in state.navigation.frames
-            if frame.source_scan == state.navigation.current.source_scan
+            if frame.artifact == state.navigation.current.artifact
         ]
         browser_model = shell.browser.frames.model()
         assert [
@@ -212,7 +212,10 @@ def test_e3_ui5_maintainer_controls_are_exact_at_review_viewports(
         assert [
             shell.scientific.frame_selector.itemText(index)
             for index in range(shell.scientific.frame_selector.count())
-        ] == [str(frame.local_frame_label) for frame in expected_footer]
+        ] == [
+            str(position)
+            for position in range(1, len(expected_footer) + 1)
+        ]
         assert all(
             shell.scientific.frame_selector.itemData(index)
             is expected_footer[index]
