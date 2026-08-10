@@ -132,6 +132,13 @@ _NO_DELIBERATE_MANUAL = object()
 _NO_AUTOMATIC_GI_MOTOR = object()
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
+_LIVE_SOURCE_REFRESH_PHASES = frozenset({
+    RunPhase.RUNNING,
+    RunPhase.PAUSING,
+    RunPhase.PAUSED,
+    RunPhase.RESUMING,
+    RunPhase.STOPPING,
+})
 
 
 def _slice_pins_for_plot_axis(
@@ -210,6 +217,8 @@ class _ObservationOperation:
     future: Future[object]
     preview: bool = False
     candidate_fingerprint: str = ""
+    passive_refresh: bool = False
+    refresh_identity: RunIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +296,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ThreadPoolExecutor(max_workers=1)
         )
         self._observation: _ObservationOperation | None = None
+        self._pending_source_refresh: SourceObservationRequest | None = None
+        self._live_source_refresh_source: DirectorySourceSpec | None = None
         self._source_observation: SourceObservation | None = None
         # LV-UI-5b: source_spec a DELIBERATE user 'Manual' belongs to
         # (F3 sticky rule).  A sentinel — NOT None — marks "no deliberate
@@ -468,6 +479,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         first = not self._closing
         if first:
             self._closing = True
+            self._clear_live_source_refresh()
             self._shell.browser.cancel_pending_frame_selection()
             self._run_timer.stop()
             self._browser_catalog_timer.stop()
@@ -1005,6 +1017,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         outcome = pipeline.start(receipt)
         if isinstance(outcome, StartLaunched):
             self._admission = None
+            launched_source = outcome.source_capture.source
+            self._pending_source_refresh = None
+            self._live_source_refresh_source = (
+                launched_source
+                if (
+                    outcome.configuration.live_mode
+                    and type(launched_source) is DirectorySourceSpec
+                )
+                else None
+            )
             self._begin_browser_follow(outcome.run_identity)
             self._active_batch_mode = outcome.configuration.batch_mode
             self._run_frame_seen = False
@@ -1253,6 +1275,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     tuple(self._artifact_progress.values()),
                     _directory_file_progress(event),
                 )
+                self._queue_live_source_refresh(event)
                 changed = True
                 continue
             if event.kind is StandardEventKind.CONTEXT_READY:
@@ -1339,6 +1362,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self, event: StandardRunEvent
     ) -> None:
         identity = event.run_identity
+        self._clear_live_source_refresh()
         stop_was_requested = (
             self._lifecycle.phase is RunPhase.STOPPING
         )
@@ -2139,8 +2163,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._observation_token, snapshot.revision, source
         )
         self._source_status.show_checking(_source_label(source))
+        self._submit_observation(request)
+
+    def _submit_observation(
+        self,
+        request: SourceObservationRequest,
+        *,
+        passive_refresh: bool = False,
+        refresh_identity: RunIdentity | None = None,
+    ) -> None:
+        pool = self._observation_pool
+        if pool is None or self._closing:
+            return
         future = pool.submit(self._sources.observe, request)
-        operation = _ObservationOperation(request, future)
+        operation = _ObservationOperation(
+            request,
+            future,
+            passive_refresh=passive_refresh,
+            refresh_identity=refresh_identity,
+        )
         self._observation = operation
         page_ref = weakref.ref(self)
         future.add_done_callback(
@@ -2148,6 +2189,80 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 page_ref, operation, done
             )
         )
+
+    def _queue_live_source_refresh(
+        self, event: StandardRunEvent
+    ) -> None:
+        """Coalesce one Live discovery into one passive source observation."""
+
+        source = self._live_source_refresh_source
+        if source is None:
+            return
+        identity = event.run_identity
+        snapshot = self._intents.snapshot()
+        self._observation_token += 1
+        pending = SourceObservationRequest(
+            self._observation_token,
+            snapshot.revision,
+            source,
+        )
+        if not self._live_source_refresh_is_current(identity, pending):
+            return
+        if self._observation is not None:
+            self._pending_source_refresh = pending
+            return
+        self._submit_observation(
+            pending,
+            passive_refresh=True,
+            refresh_identity=identity,
+        )
+
+    def _live_source_refresh_is_current(
+        self,
+        identity: RunIdentity,
+        request: SourceObservationRequest,
+    ) -> bool:
+        source = self._live_source_refresh_source
+        if (
+            self._closing
+            or self._closed
+            or self._observation_pool is None
+            or source is None
+            or request.source != source
+            or self._lifecycle.active_run_identity is not identity
+            or self._lifecycle.phase not in _LIVE_SOURCE_REFRESH_PHASES
+        ):
+            return False
+        snapshot = self._intents.snapshot()
+        intent = snapshot.thaw()
+        return (
+            intent.live_mode
+            and type(intent.source_spec) is DirectorySourceSpec
+            and intent.source_spec == source
+        )
+
+    def _launch_pending_source_refresh(self) -> None:
+        if self._observation is not None:
+            return
+        pending, self._pending_source_refresh = (
+            self._pending_source_refresh,
+            None,
+        )
+        identity = self._lifecycle.active_run_identity
+        if (
+            pending is not None
+            and identity is not None
+            and self._live_source_refresh_is_current(identity, pending)
+        ):
+            self._submit_observation(
+                pending,
+                passive_refresh=True,
+                refresh_identity=identity,
+            )
+
+    def _clear_live_source_refresh(self) -> None:
+        self._pending_source_refresh = None
+        self._live_source_refresh_source = None
 
     @staticmethod
     def _deliver_observation(
@@ -2181,18 +2296,34 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         self._observation = None
         try:
+            self._settle_observation(operation)
+        finally:
+            self._launch_pending_source_refresh()
+
+    def _settle_observation(
+        self, operation: _ObservationOperation
+    ) -> None:
+        request = operation.request
+        if operation.passive_refresh:
+            identity = operation.refresh_identity
+            if identity is None or not self._live_source_refresh_is_current(
+                identity, request
+            ):
+                return
+        try:
             observation: object = operation.future.result()
         except Exception:
-            self._source_status.show_unavailable(
-                _source_label(operation.request.source)
-            )
+            if not operation.passive_refresh:
+                self._source_status.show_unavailable(
+                    _source_label(request.source)
+                )
             return
         if type(observation) is not SourceObservation:
-            self._source_status.show_unavailable(
-                _source_label(operation.request.source)
-            )
+            if not operation.passive_refresh:
+                self._source_status.show_unavailable(
+                    _source_label(request.source)
+                )
             return
-        request = operation.request
         snapshot = self._intents.snapshot()
         expected_fingerprint = (
             operation.candidate_fingerprint
@@ -2202,12 +2333,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not observation.qualifies(
             request, expected_fingerprint
         ):
-            self._source_status.show_unavailable(
-                _source_label(operation.request.source)
-            )
+            if not operation.passive_refresh:
+                self._source_status.show_unavailable(
+                    _source_label(request.source)
+                )
             return
         if snapshot.thaw().source_spec != request.source:
             return
+        if operation.passive_refresh:
+            identity = operation.refresh_identity
+            if identity is None or not self._live_source_refresh_is_current(
+                identity, request
+            ):
+                return
+            observation = self._retain_exact_motor_knowledge(observation)
         prior_observation = self._source_observation
         if (
             self._progress.terminal
@@ -2239,6 +2378,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._refresh_shell()
         if (
             not operation.preview
+            and not operation.passive_refresh
             and (
                 type(request.source) is DirectorySourceSpec
                 or (
@@ -2266,6 +2406,28 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     page_ref, preview, done
                 )
             )
+
+    def _retain_exact_motor_knowledge(
+        self, observation: SourceObservation
+    ) -> SourceObservation:
+        fingerprint = observation.candidate_fingerprint
+        if not fingerprint or observation.gi_motor_choices is not None:
+            return observation
+        knowledge = self._sources.project_motor_knowledge(
+            observation.source,
+            fingerprint,
+        )
+        if (
+            type(knowledge) is SourceObservation
+            and knowledge.source == observation.source
+            and knowledge.candidate_fingerprint == fingerprint
+            and knowledge.gi_motor_choices is not None
+        ):
+            return replace(
+                observation,
+                gi_motor_choices=knowledge.gi_motor_choices,
+            )
+        return observation
 
     def _cancel_observation(self) -> None:
         operation, self._observation = self._observation, None
@@ -2318,6 +2480,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_browser_catalog()
         self._refresh_shell()
         if prior_source != current_source:
+            self._clear_live_source_refresh()
             self._gi_auto_motor = _NO_AUTOMATIC_GI_MOTOR
             self._source_observation = None
             self._cancel_observation()
