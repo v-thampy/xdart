@@ -508,9 +508,9 @@ def source_header_projection(
         is_directory_source
         and observation.exists
         and observation.is_directory
-        and direct_count is not None
-        and observation.gi_motor_choices is not None
-        and (direct_count > 0 or observation.subdirectories_deferred)
+        and count is not None
+        and count > 0
+        and observation.candidate_fingerprint
     )
     explicit_file_ready = bool(
         type(source) is SourceSpec
@@ -521,17 +521,19 @@ def source_header_projection(
     )
     ready = frozen_series_ready or directory_ready or explicit_file_ready
     if ready:
-        detail = (
-            (
+        if frozen_series_ready:
+            detail = (
                 "The selected source image is present."
                 if is_single_image
                 else "Every frozen image-series member is present."
             )
-            if frozen_series_ready
-            else "Source preview found at least one readable candidate."
-            if directory_ready
-            else "The selected source file is present."
-        )
+        elif directory_ready:
+            detail = (
+                "The source directory and at least one matching candidate "
+                "were observed; content is qualified just in time."
+            )
+        else:
+            detail = "The selected source file is present."
     elif count:
         detail = (
             "Matching names are present; content readiness has not "

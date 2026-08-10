@@ -19,6 +19,7 @@ from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.controls_projection import project_controls
 from xdart.gui.tabs.scattering.controls_readiness import (
     ControlsReadinessProjection,
+    SectionHeaderProjection,
 )
 from xdart.gui.tabs.scattering.shell_widgets import (
     experiment_header_projection,
@@ -76,6 +77,7 @@ def _directory_observation(
     exists: bool = True,
     reason: str = "",
     probed: bool = False,
+    candidate_fingerprint: str = "",
 ) -> SourceObservation:
     source = DirectorySourceSpec(
         Path("/data/raw"),
@@ -93,6 +95,7 @@ def _directory_observation(
         direct_child_count=count if exists else None,
         reason=reason,
         gi_motor_choices=() if probed else None,
+        candidate_fingerprint=candidate_fingerprint,
     )
 
 
@@ -102,7 +105,11 @@ def test_source_observation_projects_into_header_not_large_summary_card() -> Non
     source = SourceStatusView(panel)
     panel.set_source_widget(source, visible=False)
     try:
-        source.render(_directory_observation(count=8, probed=True))
+        source.render(_directory_observation(
+            count=8,
+            probed=True,
+            candidate_fingerprint="observed-generation",
+        ))
 
         assert source.layout().count() == 1
         assert source.layout().itemAt(0).widget() is source._choose
@@ -114,11 +121,29 @@ def test_source_observation_projects_into_header_not_large_summary_card() -> Non
         )
         assert not panel.source_card.valid_marker.isHidden()
         assert panel.source_card.valid_marker.toolTip() == (
-            "Source preview found at least one readable candidate."
+            "The source directory and at least one matching candidate were "
+            "observed; content is qualified just in time."
         )
 
     finally:
         _dispose(panel)
+
+
+def test_nonempty_directory_marker_does_not_wait_for_content_probe() -> None:
+    observed = _directory_observation(
+        count=1,
+        candidate_fingerprint="stat-generation",
+    )
+
+    header = source_header_projection(observed)
+
+    assert observed.gi_motor_choices is None
+    assert header.text == "1 file · Image Directory"
+    assert header.ready
+    assert header.detail == (
+        "The source directory and at least one matching candidate were "
+        "observed; content is qualified just in time."
+    )
 
 
 def test_typed_image_series_counts_its_frozen_members_as_ready_frames(
@@ -205,10 +230,14 @@ def test_container_directory_counts_files_while_explicit_series_counts_frames(
     series_observed = adapter.observe(
         SourceObservationRequest(2, 0, source)
     )
+    directory_header = source_header_projection(directory_observed)
 
     assert directory_observed.direct_child_count == 1
-    assert source_header_projection(directory_observed).text == (
-        "1 file · Image Directory"
+    assert directory_header == SectionHeaderProjection(
+        "1 file · Image Directory",
+        True,
+        "The source directory and at least one matching candidate were "
+        "observed; content is qualified just in time.",
     )
     assert series_observed.direct_child_count == 651
     assert source_header_projection(series_observed).text == (
@@ -490,7 +519,11 @@ def test_shell_reapplies_observed_source_and_typed_processing_readiness() -> Non
     source = SourceStatusView(shell.controls)
     shell.controls.set_source_widget(source)
     try:
-        source.render(_directory_observation(count=8, probed=True))
+        source.render(_directory_observation(
+            count=8,
+            probed=True,
+            candidate_fingerprint="observed-generation",
+        ))
         state = make_shell_projection(revision=1)
         shell.apply_state(state)
 

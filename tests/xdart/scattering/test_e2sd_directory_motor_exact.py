@@ -2412,7 +2412,8 @@ def test_recursive_tiff_preview_keeps_the_32_candidate_bound(
     assert header.text == (
         "33 files (folder + 1 level) · Image Directory"
     )
-    assert not header.ready
+    assert header.ready
+    assert "content is qualified just in time" in header.detail
     assert (
         "Deeper subfolders are outside the supported Run scope."
         in header.detail
@@ -2475,14 +2476,15 @@ def test_recursive_over_limit_preview_never_infers_from_direct_tiffs(
     assert header.text == (
         "33 files (folder + 1 level) · Image Directory"
     )
-    assert not header.ready
+    assert header.ready
+    assert "content is qualified just in time" in header.detail
     assert (
         "Deeper subfolders are outside the supported Run scope."
         in header.detail
     )
 
 
-def test_recursive_tiff_preview_requires_at_least_one_readable_image(
+def test_nonempty_recursive_tiff_marker_defers_corrupt_content_to_run(
     tmp_path: Path,
 ) -> None:
     nested = tmp_path / "nested"
@@ -2503,7 +2505,9 @@ def test_recursive_tiff_preview_requires_at_least_one_readable_image(
     assert passive.observed_file_count == 1
     assert preview == passive
     assert preview.gi_motor_choices is None
-    assert not source_header_projection(preview).ready
+    header = source_header_projection(preview)
+    assert header.ready
+    assert "content is qualified just in time" in header.detail
 
 
 def test_recursive_tiff_preview_filter_matches_exact_suffix_stripping(
