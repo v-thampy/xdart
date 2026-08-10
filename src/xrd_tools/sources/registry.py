@@ -33,6 +33,7 @@ one seam serves both in-tree and out-of-tree formats.  Pinned by
 
 from __future__ import annotations
 
+import struct
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -290,6 +291,20 @@ def _image_scan_name(path: Path) -> str:
 
 _CBF_BINARY_STARTER = b"\x0c\x1a\x04\xd5"
 
+_TIFF_PAYLOAD_TAG_PAIRS = ((273, 279), (324, 325))
+_TIFF_INTEGER_FIELD_FORMATS = {
+    1: "B",   # BYTE
+    3: "H",   # SHORT
+    4: "I",   # LONG
+    13: "I",  # IFD
+    16: "Q",  # LONG8
+    18: "Q",  # IFD8
+}
+_TIFF_MAX_IFDS = 4096
+_TIFF_MAX_TOTAL_IFD_ENTRIES = 65536
+_TIFF_MAX_PAYLOAD_PARTS = 1_000_000
+_TIFF_MAX_TOTAL_TAG_BYTES = 8 << 20
+
 
 def _cbf_incomplete_reason(path: Path) -> str | None:
     try:
@@ -313,6 +328,169 @@ def _cbf_incomplete_reason(path: Path) -> str | None:
     if captured[0] < starter + len(_CBF_BINARY_STARTER) + int(value):
         return "CBF binary payload is still incomplete"
     return None
+
+
+def _tiff_header_incomplete_reason(stream: Any, captured_size: int) -> str | None:
+    """Prove a recognized TIFF's declared pixel payload extends beyond EOF.
+
+    This is deliberately a small, bounded classic/BigTIFF IFD reader, not an
+    image decoder.  It reads only directory entries and the integer arrays
+    named by StripOffsets/StripByteCounts or TileOffsets/TileByteCounts.  Any
+    unknown field type, missing/duplicate tag, implausible count, or other
+    ambiguity falls through to Fabio unchanged; only structural truncation is
+    classified here.
+    """
+    stream.seek(0)
+    header = stream.read(min(16, captured_size))
+    if len(header) < 2:
+        if not header or header in {b"I", b"M"}:
+            return "TIFF header is still incomplete"
+        return None
+    if header[:2] not in {b"II", b"MM"}:
+        return None
+    endian = "<" if header[:2] == b"II" else ">"
+    if len(header) < 4:
+        return "TIFF header is still incomplete"
+    magic = struct.unpack(endian + "H", header[2:4])[0]
+    if magic == 42:
+        if len(header) < 8:
+            return "TIFF header is still incomplete"
+        count_format, offset_format = "H", "I"
+        entry_format, entry_size, inline_size = "HHI4s", 12, 4
+        ifd_offset = struct.unpack(endian + "I", header[4:8])[0]
+    elif magic == 43:
+        if len(header) < 16:
+            return "BigTIFF header is still incomplete"
+        offset_size, reserved = struct.unpack(endian + "HH", header[4:8])
+        if offset_size != 8 or reserved != 0:
+            return None
+        count_format, offset_format = "Q", "Q"
+        entry_format, entry_size, inline_size = "HHQ8s", 20, 8
+        ifd_offset = struct.unpack(endian + "Q", header[8:16])[0]
+    else:
+        return None
+
+    count_size = struct.calcsize(count_format)
+    next_size = struct.calcsize(offset_format)
+    seen_ifds: set[int] = set()
+    relevant_tags = {
+        tag for pair in _TIFF_PAYLOAD_TAG_PAIRS for tag in pair
+    }
+    total_entries = 0
+    total_tag_bytes = 0
+
+    for _page in range(_TIFF_MAX_IFDS):
+        if ifd_offset == 0:
+            return None
+        if ifd_offset in seen_ifds:
+            return None
+        seen_ifds.add(ifd_offset)
+        if ifd_offset > captured_size - count_size:
+            return "TIFF image directory is still incomplete"
+        stream.seek(ifd_offset)
+        raw_count = stream.read(count_size)
+        if len(raw_count) != count_size:
+            return "TIFF image directory is still incomplete"
+        entry_count = struct.unpack(endian + count_format, raw_count)[0]
+        if (entry_count < 1
+                or entry_count > _TIFF_MAX_TOTAL_IFD_ENTRIES - total_entries):
+            return None
+        total_entries += entry_count
+        entries_size = entry_count * entry_size
+        directory_end = ifd_offset + count_size + entries_size + next_size
+        if directory_end > captured_size:
+            return "TIFF image directory is still incomplete"
+        raw_entries = stream.read(entries_size)
+        raw_next = stream.read(next_size)
+        if len(raw_entries) != entries_size or len(raw_next) != next_size:
+            return "TIFF image directory is still incomplete"
+
+        values_by_tag: dict[int, tuple[int, ...]] = {}
+        for index in range(entry_count):
+            start = index * entry_size
+            raw_entry = raw_entries[start:start + entry_size]
+            tag, field_type, value_count, value_or_offset = struct.unpack(
+                endian + entry_format, raw_entry)
+            if tag not in relevant_tags:
+                continue
+            if tag in values_by_tag:
+                return None
+            value_format = _TIFF_INTEGER_FIELD_FORMATS.get(field_type)
+            if value_format is None:
+                return None
+            if value_count < 1 or value_count > _TIFF_MAX_PAYLOAD_PARTS:
+                return None
+            field_size = struct.calcsize(value_format)
+            value_bytes = value_count * field_size
+            if value_bytes > _TIFF_MAX_TOTAL_TAG_BYTES - total_tag_bytes:
+                return None
+            total_tag_bytes += value_bytes
+            if value_bytes <= inline_size:
+                raw_values = value_or_offset[:value_bytes]
+            else:
+                value_offset = struct.unpack(
+                    endian + offset_format, value_or_offset)[0]
+                if value_offset > captured_size - value_bytes:
+                    return "TIFF strip/tile metadata is still incomplete"
+                position = stream.tell()
+                stream.seek(value_offset)
+                raw_values = stream.read(value_bytes)
+                stream.seek(position)
+                if len(raw_values) != value_bytes:
+                    return "TIFF strip/tile metadata is still incomplete"
+            values_by_tag[tag] = tuple(struct.unpack(
+                endian + f"{value_count}{value_format}", raw_values))
+
+        pairs = []
+        for offset_tag, count_tag in _TIFF_PAYLOAD_TAG_PAIRS:
+            offsets = values_by_tag.get(offset_tag)
+            byte_counts = values_by_tag.get(count_tag)
+            if (offsets is None) != (byte_counts is None):
+                return None
+            if offsets is not None:
+                pairs.append((offsets, byte_counts))
+        if len(pairs) != 1:
+            return None
+        offsets, byte_counts = pairs[0]
+        if (not offsets or len(offsets) != len(byte_counts)
+                or len(offsets) > _TIFF_MAX_PAYLOAD_PARTS):
+            return None
+        for offset, byte_count in zip(offsets, byte_counts):
+            if byte_count < 1:
+                return None
+            if offset > captured_size or byte_count > captured_size - offset:
+                return "TIFF pixel payload is still incomplete"
+
+        ifd_offset = struct.unpack(endian + offset_format, raw_next)[0]
+
+    # More IFDs than the explicit ceiling is outside this fast structural
+    # proof; preserve the decoder fallback instead of guessing.
+    return None
+
+
+def _tiff_incomplete_reason(path: Path) -> str | None:
+    try:
+        before = path.stat()
+        captured = (
+            int(before.st_dev), int(before.st_ino),
+            int(before.st_size), int(before.st_mtime_ns),
+        )
+        with path.open("rb") as stream:
+            reason = _tiff_header_incomplete_reason(stream, captured[2])
+        after = path.stat()
+    except OSError as exc:
+        return f"TIFF is not yet stable: {exc}"
+    except (KeyError, OverflowError, struct.error, ValueError):
+        # A malformed or unsupported header is not proof of truncation.  Let
+        # the existing decoder retain authority over its verdict.
+        return None
+    current = (
+        int(after.st_dev), int(after.st_ino),
+        int(after.st_size), int(after.st_mtime_ns),
+    )
+    if current != captured:
+        return "TIFF changed during structural completeness probing"
+    return reason
 
 
 def _image_probe(path: Path) -> Any:
@@ -358,6 +536,11 @@ def _image_probe(path: Path) -> Any:
         )
     if path.suffix.lower() == ".cbf":
         reason = _cbf_incomplete_reason(path)
+        if reason is not None:
+            return ProbeResult(
+                ProbeState.IN_PROGRESS, reason=reason, kind=SourceKind.IMAGE_FILE)
+    if path.suffix.lower() in {".tif", ".tiff"}:
+        reason = _tiff_incomplete_reason(path)
         if reason is not None:
             return ProbeResult(
                 ProbeState.IN_PROGRESS, reason=reason, kind=SourceKind.IMAGE_FILE)
