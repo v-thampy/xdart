@@ -1,4 +1,5 @@
 from __future__ import annotations
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import logging
 import os
@@ -6,7 +7,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Lock, Thread, current_thread
 from time import monotonic
-from typing import Any
+from typing import Any, Callable
 import numpy as np
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core.scan import SourceKind
@@ -222,6 +223,16 @@ def _physical_file_key(path: Path | str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
+@contextmanager
+def _run_effect(run: _StandardRun):
+    runtime = run.context_runtime
+    if runtime is None:
+        yield
+        return
+    with runtime._live_effect():
+        yield
+
+
 def _planned_primary_paths(item: PlannedOutput) -> tuple[Path, ...]:
     """Physical candidates that own their own directory counter slots."""
 
@@ -373,6 +384,9 @@ class StandardRunExecutor:
         )
         run.display.set_factories(FrameRecordStore, PublicationStore)
         run.display.bind_transport(event_sink=self._events.put)
+        if type(admission.deferred_directory) is DeferredDirectoryPlan and admission.deferred_directory.live:
+            run.context_runtime = AcquisitionRuntime()
+            run.context_runtime._arm_live()
         with self._lock:
             self._active = run
         worker = Thread(target=self._run, args=(run,), name='scattering-standard', daemon=True)
@@ -563,10 +577,12 @@ class StandardRunExecutor:
                 session.stop()
             else:
                 runtime.stop(session)
+        elif run.context_runtime is not None:
+            run.context_runtime.request_stop(None)
 
     def pause(self, run_identity: RunIdentity) -> DurablePaused:
         run = self._exact_run(run_identity)
-        if run is None or run.closed or run.session is None:
+        if run is None or run.closed:
             raise RuntimeError("acquisition is not pausable")
         runtime = run.context_runtime
         if runtime is None:
@@ -579,6 +595,7 @@ class StandardRunExecutor:
                 drain_projection=lambda timeout: self._drain_display_projection(
                     run, timeout
                 ),
+                session_supplier=lambda: run.session,
             )
         except TerminalPauseFailure as failure:
             failure.cleanup_receipt = self._terminate_projection_failure(
@@ -588,7 +605,7 @@ class StandardRunExecutor:
 
     def resume(self, run_identity: RunIdentity) -> None:
         run = self._exact_run(run_identity)
-        if run is None or run.closed or run.session is None:
+        if run is None or run.closed:
             raise RuntimeError("acquisition is not resumable")
         runtime = run.context_runtime
         if runtime is None:
@@ -618,16 +635,16 @@ class StandardRunExecutor:
         run = self._exact_run(run_identity)
         if run is None:
             return ExecutorClosed(run_identity, CleanupStatus.CLEANUP_PENDING)
-        if run.context_runtime is not None:
-            run.context_runtime.retire()
-        display_clean = run.display.retire(
-            join_timeout=self._join_timeout
-        )
         try:
             self.stop(run_identity)
         except Exception as error:
             with run.cleanup_lock:
                 run.cleanup_failures.append(detach_exception(error, 'session.stop'))
+        if run.context_runtime is not None:
+            run.context_runtime.retire()
+        display_clean = run.display.retire(
+            join_timeout=self._join_timeout
+        )
         worker = run.worker
         if worker is not None and worker is not current_thread() and (worker.ident is not None):
             worker.join(timeout=self._join_timeout)
@@ -1161,11 +1178,12 @@ class StandardRunExecutor:
         outputs = receipt.outputs
         resources = run.resources
         try:
-            validate_admitted_receipt(
-                receipt,
-                None if resources is None else resources.directory_session,
-                cancelled=lambda: run.stop_requested,
-            )
+            with _run_effect(run):
+                validate_admitted_receipt(
+                    receipt,
+                    None if resources is None else resources.directory_session,
+                    cancelled=lambda: run.stop_requested,
+                )
         except RuntimeError as error:
             if (
                 run.stop_requested
@@ -1328,13 +1346,15 @@ class StandardRunExecutor:
                 **_directory_event_fields(run),
             ))
 
-        publish(force=True)
+        with _run_effect(run):
+            publish(force=True)
         while not run.stop_requested:
-            observation = session.observe(refresh=True)
-            groups = live_directory_groups(receipt, observation)
-            for group in groups:
-                discovered_paths.update(group.physical_paths)
-            publish()
+            with _run_effect(run):
+                observation = session.observe(refresh=True)
+                groups = live_directory_groups(receipt, observation)
+                for group in groups:
+                    discovered_paths.update(group.physical_paths)
+                publish()
 
             for group in groups:
                 if run.stop_requested:
@@ -1357,25 +1377,100 @@ class StandardRunExecutor:
                         raise RuntimeError(
                             "settled Live source identity lost its exact attempt"
                         )
-                    try:
-                        validate_planned_source(
-                            retained.decision.item,
-                            cancelled=lambda: run.stop_requested,
-                        )
-                    except SourceRevisionChanged:
-                        settled_revisions.pop(target_key, None)
-                    else:
-                        continue
-                reprobe = retry_revisions.pop(target_key, None) == revision
+                    with _run_effect(run):
+                        try:
+                            validate_planned_source(
+                                retained.decision.item,
+                                cancelled=lambda: run.stop_requested,
+                            )
+                        except SourceRevisionChanged:
+                            settled_revisions.pop(target_key, None)
+                        else:
+                            continue
                 try:
-                    attempt = materialize_live_directory_group(
-                        receipt,
-                        configuration,
-                        session,
-                        group,
-                        cancelled=lambda: run.stop_requested,
-                        reprobe=reprobe,
-                    )
+                    with _run_effect(run):
+                        reprobe = (
+                            retry_revisions.pop(target_key, None) == revision
+                        )
+                        attempt = materialize_live_directory_group(
+                            receipt,
+                            configuration,
+                            session,
+                            group,
+                            cancelled=lambda: run.stop_requested,
+                            reprobe=reprobe,
+                        )
+                        if attempt.state is ProbeState.IN_PROGRESS:
+                            if attempt.revision_changed:
+                                retry_revisions[target_key] = revision
+                            continue
+                        if attempt.state is not ProbeState.READY:
+                            settled_revisions[target_key] = (revision, None)
+                            skipped_paths.update(group.physical_paths)
+                            publish()
+                            continue
+
+                        decision = attempt.decision
+                        if decision is None:  # pragma: no cover - typed invariant
+                            raise RuntimeError(
+                                "READY Live attempt lost its output"
+                            )
+                        if target_key != _physical_file_key(decision.item.target):
+                            raise RuntimeError(
+                                "Live output target changed after JIT"
+                            )
+                        if (
+                            configuration.output_mode == "Overwrite"
+                            and not target_state_matches(decision)
+                        ):
+                            raise RuntimeError(
+                                "output target changed after Live admission: "
+                                f"{decision.item.target}"
+                            )
+
+                        item = decision.item
+                        run.artifact = item.target
+                        run.current_file_total = len(group.physical_paths)
+                        run.current_files_incremental = (
+                            item.source_spec.kind is SourceKind.TIFF_SERIES
+                        )
+                        if (
+                            run.display.artifacts
+                            and str(item.target) not in run.display.artifacts
+                        ):
+                            run.display.admit_additional_partition()
+                        try:
+                            self._construct(
+                                run,
+                                item=item,
+                                labels=decision.labels,
+                                decision=decision,
+                            )
+                        except SourceRevisionChanged:
+                            source_owner = run.source
+                            if source_owner is not None:
+                                close = getattr(source_owner, "close", None)
+                                if callable(close):
+                                    close()
+                            run.source = None
+                            run.scan = None
+                            run.records = None
+                            run.frames_by_label.clear()
+                            run.current_total = 0
+                            run.current_completed = 0
+                            run.current_published = 0
+                            run.current_file_total = 0
+                            run.current_files_incremental = False
+                            retry_revisions[target_key] = revision
+                            publish(force=True)
+                            continue
+                        output = run.output
+                        if output is None:
+                            raise RuntimeError(
+                                "Live output graph was not constructed"
+                            )
+                        run.total += len(output.write_labels)
+                        publish(force=True)
                 except RuntimeError as error:
                     if (
                         run.stop_requested
@@ -1383,89 +1478,34 @@ class StandardRunExecutor:
                     ):
                         return True
                     raise
-                if attempt.state is ProbeState.IN_PROGRESS:
-                    if attempt.revision_changed:
-                        retry_revisions[target_key] = revision
-                    continue
-                if attempt.state is not ProbeState.READY:
-                    settled_revisions[target_key] = (revision, None)
-                    skipped_paths.update(group.physical_paths)
-                    publish()
-                    continue
-
-                decision = attempt.decision
-                if decision is None:  # pragma: no cover - typed invariant
-                    raise RuntimeError("READY Live attempt lost its output")
-                if target_key != _physical_file_key(decision.item.target):
-                    raise RuntimeError("Live output target changed after JIT")
-                if (
-                    configuration.output_mode == "Overwrite"
-                    and not target_state_matches(decision)
-                ):
-                    raise RuntimeError(
-                        "output target changed after Live admission: "
-                        f"{decision.item.target}"
-                    )
-
-                item = decision.item
-                run.artifact = item.target
-                run.current_file_total = len(group.physical_paths)
-                run.current_files_incremental = (
-                    item.source_spec.kind is SourceKind.TIFF_SERIES
-                )
-                known_artifact = str(item.target) in run.display.artifacts
-                if run.display.artifacts and not known_artifact:
-                    run.display.admit_additional_partition()
-                try:
-                    self._construct(
-                        run,
-                        item=item,
-                        labels=decision.labels,
-                        decision=decision,
-                    )
-                except SourceRevisionChanged:
-                    source_owner = run.source
-                    if source_owner is not None:
-                        close = getattr(source_owner, "close", None)
-                        if callable(close):
-                            close()
-                    run.source = None
-                    run.scan = None
-                    run.records = None
-                    run.frames_by_label.clear()
-                    run.current_total = 0
-                    run.current_completed = 0
-                    run.current_published = 0
+                def settle_live(stopped: bool) -> None:
+                    if run.current_files_incremental:
+                        processed_paths.update(
+                            group.physical_paths[:run.current_completed]
+                        )
+                    elif run.current_completed >= run.current_total:
+                        processed_paths.update(group.physical_paths)
+                    skipped_paths.difference_update(processed_paths)
+                    if (
+                        not stopped
+                        and run.current_completed >= run.current_total
+                    ):
+                        with run.live_revision_lock:
+                            run.processed_live_revisions[target_key] = attempt
+                        settled_revisions[target_key] = (
+                            revision,
+                            decision.item.source_stamp.execution_identity_v1,
+                        )
                     run.current_file_total = 0
                     run.current_files_incremental = False
-                    retry_revisions[target_key] = revision
                     publish(force=True)
-                    continue
-                output = run.output
-                if output is None:
-                    raise RuntimeError("Live output graph was not constructed")
-                run.total += len(output.write_labels)
-                publish(force=True)
+
                 stopped = self._execute_current(
-                    run, construct=False, retain_session=True,
+                    run,
+                    construct=False,
+                    retain_session=True,
+                    settle=settle_live,
                 )
-                if run.current_files_incremental:
-                    processed_paths.update(
-                        group.physical_paths[:run.current_completed]
-                    )
-                elif run.current_completed >= run.current_total:
-                    processed_paths.update(group.physical_paths)
-                skipped_paths.difference_update(processed_paths)
-                if not stopped and run.current_completed >= run.current_total:
-                    with run.live_revision_lock:
-                        run.processed_live_revisions[target_key] = attempt
-                    settled_revisions[target_key] = (
-                        revision,
-                        decision.item.source_stamp.execution_identity_v1,
-                    )
-                run.current_file_total = 0
-                run.current_files_incremental = False
-                publish(force=True)
                 if stopped or run.stop_requested:
                     return True
 
@@ -1624,6 +1664,7 @@ class StandardRunExecutor:
         *,
         construct: bool = True,
         retain_session: bool = False,
+        settle: Callable[[bool], None] | None = None,
     ) -> bool:
         if construct and run.session is None:
             self._construct(run)
@@ -1634,16 +1675,20 @@ class StandardRunExecutor:
             and output is not None
             and not output.write_labels
         ):
-            close = getattr(run.source, "close", None)
-            if callable(close):
-                close()
-            run.source = None
-            run.scan = None
-            run.records = None
-            run.frames_by_label.clear()
-            if run.artifact not in run.artifacts:
-                run.artifacts.append(run.artifact)
-            return bool(run.stop_requested)
+            with _run_effect(run):
+                close = getattr(run.source, "close", None)
+                if callable(close):
+                    close()
+                run.source = None
+                run.scan = None
+                run.records = None
+                run.frames_by_label.clear()
+                if run.artifact not in run.artifacts:
+                    run.artifacts.append(run.artifact)
+                stopped = bool(run.stop_requested)
+                if settle is not None:
+                    settle(stopped)
+                return stopped
         if scan is None or session is None or output is None:
             raise RuntimeError('scattering executor lost its constructed owners')
         write_labels = set(output.write_labels)
@@ -1652,7 +1697,8 @@ class StandardRunExecutor:
             for frame in scan.frames
             if int(frame.index) in write_labels
         }
-        session.start()
+        with _run_effect(run):
+            session.start()
         if isinstance(run.source, NexusStackSource) and write_labels:
             self._submit_container_source(run, output)
         else:
@@ -1671,54 +1717,66 @@ class StandardRunExecutor:
                     _perf_add(run, "submit_wait", monotonic() - submit_started)
                     break
                 _perf_add(run, "submit_wait", monotonic() - submit_started)
-        finish_started = monotonic()
-        session_error: BaseException | None = None
-        projection_error: BaseException | None = None
-        result = None
-        try:
-            if retain_session and not run.stop_requested:
-                result = output.commit_epoch()
-            else:
-                result = output.finish_current()
-        except BaseException as error:
-            session_error = error
-        if session_error is None:
+        with _run_effect(run):
+            finish_started = monotonic()
+            session_error: BaseException | None = None
+            projection_error: BaseException | None = None
+            result = None
             try:
-                self._finish_display_projection(run)
+                if retain_session and not run.stop_requested:
+                    result = output.commit_epoch()
+                else:
+                    result = output.finish_current()
             except BaseException as error:
-                projection_error = error
-        _perf_add(run, "finish_wait", monotonic() - finish_started)
-        if session_error is not None:
-            raise session_error.with_traceback(session_error.__traceback__)
-        if projection_error is not None:
-            try:
-                self.stop(run.identity)
-            except BaseException as error:
-                run.cleanup_failures.append(detach_exception(
-                    error, "dynamic_output.stop"
-                ))
-            raise projection_error.with_traceback(projection_error.__traceback__)
-        self._project_new_durable(run, output)
-        if result is None:  # pragma: no cover - defensive type narrowing
-            raise RuntimeError("scattering session returned no terminal result")
-        if run.perf_enabled:
-            snapshot = getattr(session, "perf_snapshot", None)
-            if callable(snapshot):
-                for key, elapsed in snapshot().items():
-                    _perf_add(run, key, elapsed)
-        if getattr(result, "failed", False):
-            raise RuntimeError(result.error or 'scattering reduction failed')
-        run.current_published = max(
-            run.current_published, run.current_completed,
-        )
-        close = getattr(run.source, 'close', None)
-        if callable(close):
-            close()
-        run.source = None
-        run.scan = None
-        run.records = None
-        run.frames_by_label.clear()
-        return bool(getattr(result, "cancelled", False) or run.stop_requested)
+                session_error = error
+            if session_error is None:
+                try:
+                    self._finish_display_projection(run)
+                except BaseException as error:
+                    projection_error = error
+            _perf_add(run, "finish_wait", monotonic() - finish_started)
+            if session_error is not None:
+                raise session_error.with_traceback(session_error.__traceback__)
+            if projection_error is not None:
+                try:
+                    self.stop(run.identity)
+                except BaseException as error:
+                    run.cleanup_failures.append(detach_exception(
+                        error, "dynamic_output.stop"
+                    ))
+                raise projection_error.with_traceback(
+                    projection_error.__traceback__
+                )
+            self._project_new_durable(run, output)
+            if result is None:  # pragma: no cover - defensive type narrowing
+                raise RuntimeError(
+                    "scattering session returned no terminal result"
+                )
+            if run.perf_enabled:
+                snapshot = getattr(session, "perf_snapshot", None)
+                if callable(snapshot):
+                    for key, elapsed in snapshot().items():
+                        _perf_add(run, key, elapsed)
+            if getattr(result, "failed", False):
+                raise RuntimeError(
+                    result.error or "scattering reduction failed"
+                )
+            run.current_published = max(
+                run.current_published, run.current_completed,
+            )
+            close = getattr(run.source, "close", None)
+            if callable(close):
+                close()
+            run.source = None
+            run.scan = None
+            run.records = None
+            run.frames_by_label.clear()
+            stopped = bool(
+                getattr(result, "cancelled", False) or run.stop_requested
+            )
+            if settle is not None:
+                settle(stopped)
+            return stopped
 
     @staticmethod
     def _project_new_durable(run: _StandardRun, output) -> None:

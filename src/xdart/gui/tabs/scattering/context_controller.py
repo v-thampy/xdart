@@ -240,10 +240,12 @@ class ContextController:
         accepted = self._lifecycle.durable_paused(durable)
         if accepted.phase is not RunPhase.PAUSED:
             raise RuntimeError("lifecycle refused durable Pause")
+        if self._runtime.acquisition_context is None:
+            return durable
         self._runtime.select_acquisition()
         return durable
 
-    def resume(self) -> DisplaySelection | ResumeFailed:
+    def resume(self) -> DisplaySelection | ResumeFailed | None:
         identity = self._require_identity()
         requested = self._lifecycle.resume_requested(
             ResumeRequested(identity)
@@ -269,7 +271,8 @@ class ContextController:
         return (
             self._runtime.selection
             if finished
-            else self._runtime.select_acquisition()
+            else (self._runtime.select_acquisition()
+                  if self._runtime.acquisition_context is not None else None)
         )
 
     def stop(self):
@@ -287,6 +290,7 @@ class ContextController:
                 not finished
                 and selection is not None
                 and selection.kind is ContextKind.BROWSE
+                and self._runtime.acquisition_context is not None
             ):
                 self._runtime.select_acquisition()
             self._executor.stop(identity)
@@ -605,7 +609,8 @@ class ContextController:
     def _require_identity(self) -> RunIdentity:
         if self._closed:
             raise RuntimeError("no acquisition identity")
-        return self._runtime.require_identity()
+        identity = self._lifecycle.active_run_identity
+        return identity if type(identity) is RunIdentity else self._runtime.require_identity()
 
     def _browse_lifecycle_admissible(self) -> bool:
         phase = self._lifecycle.phase

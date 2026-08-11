@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from threading import Event, Lock
+from contextlib import contextmanager
+from threading import Condition, Event, Lock
 from time import monotonic
 
 from xdart.modules.display_context import (
@@ -58,6 +59,72 @@ class AcquisitionRuntime:
         self._gate.set()
         self._command_lock = Lock()
         self._durable_generation = 0
+        self._live_condition = Condition()
+        self._live_armed = self._live_terminal = self._live_retired = False
+        self._live_admitting = True
+        self._live_effects = self._live_pause_request = 0
+        self._live_paused_session = None
+
+    def _arm_live(self) -> None:
+        self._live_armed = True
+
+    @contextmanager
+    def _live_effect(self):
+        if not self._live_armed:
+            yield
+            return
+        with self._live_condition:
+            self._live_condition.wait_for(
+                lambda: self._live_admitting or self._live_terminal)
+            if self._live_terminal:
+                raise RuntimeError("admission cancelled")
+            self._live_effects += 1
+        try:
+            yield
+        finally:
+            with self._live_condition:
+                self._live_effects -= 1
+                retire = self.context if self._live_retired else None
+                self._live_condition.notify_all()
+            if retire is not None:
+                retire.retire()
+
+    def _fence_live(self) -> None:
+        with self._live_condition:
+            self._live_terminal, self._live_admitting = True, False
+            self._live_pause_request += 1
+            self._gate.clear()
+            self._live_condition.notify_all()
+
+    def _quiesce_live(self, deadline: float) -> int:
+        with self._live_condition:
+            if self._live_terminal:
+                raise RuntimeError("acquisition is stopped")
+            self._gate.clear()
+            self._live_admitting = False
+            self._live_pause_request += 1
+            request = self._live_pause_request
+            settled = self._live_condition.wait_for(
+                lambda: not self._live_effects or self._live_terminal,
+                max(0.0, deadline - monotonic()))
+            if not settled:
+                self._require_live_request(request, reopen=True)
+                raise TimeoutError("Live effects did not reach durable pause")
+            if self._live_terminal or request != self._live_pause_request:
+                raise RuntimeError("acquisition is stopped")
+            return request
+
+    def _require_live_request(self, request: int, session=_NO_IMAGE,
+                              *, reopen=False) -> None:
+        with self._live_condition:
+            if (self._live_terminal or request != self._live_pause_request
+                    or session is not _NO_IMAGE
+                    and session is not self._live_paused_session):
+                raise RuntimeError("acquisition is stopped")
+            if reopen:
+                self._live_paused_session, self._live_admitting = None, True
+                self._gate.set()
+                self._live_condition.notify_all()
 
     def adopt(self, run, artifact, source_path: str) -> AcquisitionContext:
         context = self.context
@@ -96,6 +163,8 @@ class AcquisitionRuntime:
             with self._command_lock:
                 if not self._gate.is_set():
                     continue
+                if self._live_terminal:
+                    return False
                 if image is _NO_IMAGE:
                     return bool(session.submit(frame))
                 return bool(session.submit(frame, image))
@@ -107,19 +176,30 @@ class AcquisitionRuntime:
         timeout: float,
         *,
         drain_projection: Callable[[float], bool] | None = None,
+        session_supplier: Callable[[], object | None] | None = None,
     ) -> DurablePaused:
         deadline = monotonic() + max(0.0, float(timeout))
+        live = self._live_armed
+        request = self._quiesce_live(deadline) if live else 0
         self._gate.clear()
+        if session is None and not live:
+            self._gate.set()
+            raise RuntimeError("acquisition is not pausable")
         try:
+            if live and session_supplier is not None:
+                session = session_supplier()
+            if live:
+                self._require_live_request(request)
             with self._command_lock:
-                drained = bool(session.pause(timeout=max(
-                    0.0, deadline - monotonic()
-                )))
+                drained = session is None or bool(session.pause(
+                    timeout=max(0.0, deadline - monotonic())))
         except BaseException as primary:
-            self._resume_after_pause_failure(session, primary)
+            self._resume_after_pause_failure(session, primary, request)
         if not drained:
             primary = TimeoutError("acquisition did not reach durable pause")
-            self._resume_after_pause_failure(session, primary)
+            self._resume_after_pause_failure(session, primary, request)
+        if live:
+            self._require_live_request(request)
         if drain_projection is not None:
             try:
                 projected = bool(drain_projection(max(
@@ -130,16 +210,35 @@ class AcquisitionRuntime:
                 # must terminate the run instead of compensating to Running.
                 raise
             except BaseException as primary:
-                self._resume_after_pause_failure(session, primary)
+                self._resume_after_pause_failure(session, primary, request)
             if not projected:
                 primary = TimeoutError(
                     "display projection did not reach durable pause"
                 )
-                self._resume_after_pause_failure(session, primary)
+                self._resume_after_pause_failure(session, primary, request)
+        if live:
+            with self._live_condition:
+                if self._live_terminal or request != self._live_pause_request:
+                    raise RuntimeError("acquisition is stopped")
+                self._live_paused_session = session
+                self._durable_generation += 1
+                return DurablePaused(run_identity, self._durable_generation)
         self._durable_generation += 1
         return DurablePaused(run_identity, self._durable_generation)
 
     def resume(self, session, timeout: float = 5.0) -> None:
+        live = self._live_armed
+        if live:
+            with self._live_condition:
+                if self._live_terminal:
+                    raise RuntimeError("acquisition is stopped")
+                request = self._live_pause_request
+                session = self._live_paused_session
+        if live and session is None:
+            self._require_live_request(request, reopen=True)
+            return
+        if session is None:
+            raise RuntimeError("acquisition is not resumable")
         try:
             with self._command_lock:
                 session.resume()
@@ -154,41 +253,56 @@ class AcquisitionRuntime:
                 raise CommandCompensationFailure(
                     primary, recovery, "context.resume") from None
             raise
-        self._gate.set()
+        if live:
+            self._require_live_request(request, session, reopen=True)
+        else:
+            self._gate.set()
 
     def _resume_after_pause_failure(self, session,
-                                    primary: BaseException) -> None:
+                                    primary: BaseException, request: int = 0) -> None:
+        if request:
+            self._require_live_request(request)
         try:
-            with self._command_lock:
-                session.resume()
+            if session is not None:
+                with self._command_lock:
+                    session.resume()
         except BaseException as recovery:
             raise CommandCompensationFailure(
                 primary, recovery, "context.pause") from None
-        self._gate.set()
+        if request:
+            self._require_live_request(request, reopen=True)
+        else:
+            self._gate.set()
         raise primary
 
     def stop(self, session) -> None:
-        self._gate.set()
-        with self._command_lock:
-            session.stop()
+        self._fence_live()
+        try:
+            with self._command_lock:
+                session.stop()
+        finally:
+            self._gate.set()
 
     def request_stop(self, adapter) -> None:
+        self._fence_live()
         try:
-            adapter.stop()
+            if adapter is not None:
+                adapter.stop()
         finally:
             self._gate.set()
 
     def terminal_stop(self, session) -> None:
         """Stop one failed session without reopening frame submission."""
-
-        self._gate.clear()
-        with self._command_lock:
-            session.stop()
+        self.stop(session)
 
     def retire(self) -> None:
+        self._fence_live()
         self._gate.set()
-        if self.context is not None:
-            self.context.retire()
+        with self._live_condition:
+            self._live_retired = True
+            context = self.context
+        if context is not None:
+            context.retire()
 
 
 __all__ = [
