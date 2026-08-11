@@ -1320,10 +1320,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         event
                     )
                     is not None
-                    and (
-                        self._run_frame_seen
-                        or self._lifecycle.phase is RunPhase.IDLE
-                    )
                     and not self._active_batch_mode
                 ):
                     changed = True

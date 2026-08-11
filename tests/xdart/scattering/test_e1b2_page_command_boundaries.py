@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
+from xrd_tools.core import FrameView
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
@@ -16,6 +18,7 @@ from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import (
     DisplayFrameKey,
     DisplayNavigationDelta,
+    StandardDisplayPayload,
     StandardEventKind,
     StandardRunEvent,
 )
@@ -113,11 +116,15 @@ class _Executor(ImmediateAdmission):
         events, self.events = tuple(self.events), []
         return events
 
-def _active_page(executor: _Executor) -> tuple[ScatteringWorkspace, ScatteringCoordinator, RunIdentity]:
+def _active_page(
+    executor: _Executor,
+    *,
+    output_mode: str = "Overwrite",
+) -> tuple[ScatteringWorkspace, ScatteringCoordinator, RunIdentity]:
     lifecycle = ScatteringCoordinator()
     request = lifecycle.begin_start().request_id
     assert request is not None
-    configuration = RunIntent().freeze()
+    configuration = RunIntent(output_mode=output_mode).freeze()
     identity = lifecycle.preflight_accepted(PreflightAccepted(request, configuration)).run_identity
     assert identity is not None
     assert lifecycle.executor_accepted(ExecutorAccepted(identity)).phase is RunPhase.RUNNING
@@ -127,7 +134,7 @@ def _active_page(executor: _Executor) -> tuple[ScatteringWorkspace, ScatteringCo
                 source_spec=image_series_spec(Path("frame_0001.tif")),
                 poni_file="calibration.poni",
                 save_path="output.nxs",
-                output_mode="Overwrite",
+                output_mode=output_mode,
             )
         ),
         lifecycle=lifecycle,
@@ -421,6 +428,167 @@ def test_cold_frame_refresh_catches_up_distinct_acquisition_owner_before_paint(
         assert shell.scientific.raw.image.image is not None
         assert shell.scientific.cake.image.image is not None
         assert shell.scientific.curve.listDataItems()
+    finally:
+        _dispose(page, qapp)
+
+
+def test_noop_append_display_ready_replaces_outgoing_paint_while_running(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+) -> None:
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(
+        executor, output_mode="Append",
+    )
+    frames = tuple(
+        DisplayFrameKey(
+            identity, "run.append", "/out/noop.nxs", label, label,
+        )
+        for label in range(1, 6)
+    )
+    runtime = page._context_controller._runtime
+    runtime._acquisition_navigation = FrameNavigationProjection(
+        frames, frames[-1], (frames[-1],),
+    )
+    payloads: dict[DisplayFrameKey, StandardDisplayPayload] = {}
+    monkeypatch.setattr(
+        runtime,
+        "resident_frame_keys",
+        lambda *_args: frozenset(payloads),
+    )
+    monkeypatch.setattr(
+        page._context_controller,
+        "project_navigation",
+        lambda **_kwargs: tuple(
+            payloads[frame]
+            for frame in runtime.navigation.selected
+            if frame in payloads
+        ),
+    )
+    monkeypatch.setattr(
+        page._context_controller,
+        "owns_frame",
+        lambda frame: any(frame is candidate for candidate in frames),
+    )
+
+    def select_navigation(frame, selected):
+        runtime._acquisition_navigation = FrameNavigationProjection(
+            frames, frame, selected,
+        )
+        return True
+
+    monkeypatch.setattr(
+        page._context_controller, "select_navigation", select_navigation,
+    )
+
+    def qualify(event):
+        if (
+            event.run_identity is identity
+            and any(event.frame_key is frame for frame in frames)
+            and event.selection_generation == 0
+        ):
+            return payloads.get(event.frame_key)
+        return None
+
+    monkeypatch.setattr(
+        page._context_controller, "qualify_display_event", qualify,
+    )
+    shell = _shell(page)
+    page._retain_outgoing_display = True
+    events: list[StandardRunEvent] = []
+
+    def install_hydrated(label: int) -> DisplayFrameKey:
+        key = frames[label - 1]
+        raw = np.full((2, 3), float(label))
+        view = FrameView(
+            label,
+            raw=raw,
+            thumbnail=raw,
+            source_path=f"/data/scan_{label}.tif",
+            source_frame_index=label,
+        )
+        payloads[key] = StandardDisplayPayload(
+            0, key, f"frame {label}", view,
+        )
+        event = StandardRunEvent(
+            identity,
+            StandardEventKind.DISPLAY_READY,
+            artifact=key.artifact,
+            frame_key=key,
+            selection_generation=0,
+        )
+        events.append(event)
+        executor.events.append(event)
+        return key
+
+    try:
+        page._refresh_shell(preserve_display=True)
+        controller = page._context_controller
+        assert tuple(
+            frame.local_frame_label for frame in controller.navigation.frames
+        ) == (1, 2, 3, 4, 5)
+        assert controller.navigation.current is frames[-1]
+        assert page._retain_outgoing_display is True
+        assert page._run_frame_seen is False
+
+        foreign = (
+            StandardRunEvent(
+                RunIdentity(
+                    identity.generation + 1,
+                    f"{identity.fingerprint}-stale",
+                ),
+                StandardEventKind.DISPLAY_READY,
+                artifact=frames[-1].artifact,
+                selection_generation=0,
+            ),
+            StandardRunEvent(
+                identity,
+                StandardEventKind.DISPLAY_READY,
+                artifact="foreign.nxs",
+                frame_key=DisplayFrameKey(
+                    identity, "foreign", "foreign.nxs", 1, 1,
+                ),
+                selection_generation=0,
+            ),
+        )
+        events.extend(foreign)
+        executor.events.extend(foreign)
+        page._drain_executor()
+        assert page._retain_outgoing_display is True
+
+        page._active_batch_mode = True
+        latest = install_hydrated(5)
+        page._drain_executor()
+        assert page._retain_outgoing_display is True
+
+        page._active_batch_mode = False
+        executor.events.append(events[-1])
+        page._drain_executor()
+        assert lifecycle.phase is RunPhase.RUNNING
+        assert page._run_frame_seen is False
+        assert page._retain_outgoing_display is False
+        assert not any(
+            event.kind is StandardEventKind.FRAME_READY for event in events
+        )
+        assert shell.scientific.frame_selector.currentData() is latest
+        assert shell.scientific.progress.text() == "5/5"
+        assert shell.scientific.title.text() == "scan_5.tif"
+
+        first = frames[0]
+        shell.scientific.frame_selector.setCurrentIndex(0)
+        assert controller.navigation.current is first
+        install_hydrated(1)
+        page._drain_executor()
+
+        assert lifecycle.phase is RunPhase.RUNNING
+        assert page._run_frame_seen is False
+        assert not any(
+            event.kind is StandardEventKind.FRAME_READY for event in events
+        )
+        assert shell.scientific.frame_selector.currentData() is first
+        assert shell.scientific.progress.text() == "1/5"
+        assert shell.scientific.title.text() == "scan_1.tif"
+        assert shell.scientific.raw.image.image is not None
     finally:
         _dispose(page, qapp)
 
