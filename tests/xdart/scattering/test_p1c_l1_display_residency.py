@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from pathlib import Path
 import threading
 import time
@@ -20,15 +21,23 @@ from tests.xdart.scattering.test_p1b_output_graph import (
     _drain_until,
     _start,
 )
+from xdart.gui.tabs.scattering.adapters import dynamic_output
+from xdart.gui.tabs.scattering.adapters.dynamic_output import DynamicOutputAdapter
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.display_runtime import RunDisplayState
 from xdart.gui.tabs.scattering.display_residency import DisplayResidencyLimits
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
 from xdart.gui.tabs.scattering.events import CleanupStatus, RunIdentity
 from xdart.gui.tabs.scattering.state_machine import RunPhase
-from xdart.modules.frame_publication import FramePublication
+from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core import Axis, FrameRecord, FrameView, TwoDKind
-from xrd_tools.session import FrameRecordStore
+from xrd_tools.session import (
+    DynamicRunAccounting,
+    FrameRecordStore,
+    Light1DCustodyState,
+    Light1DLeaseState,
+    SessionResourceAuthority,
+)
 from xrd_tools.session.intent_store import RunIntentStore
 
 
@@ -100,6 +109,156 @@ def _publish(
     return record, delta.appended
 
 
+def _p2_construction_case(monkeypatch, root, case_id, terminal_run):
+    """Run one independent P2 construction seam and return its full ledger."""
+
+    cases = {
+        "store-hooks": (RunDisplayState, "bind_light_1d", False, True),
+        "display-lease": (dynamic_output, "Light1DCustodySlot", False, True),
+        "slot-pending": (RunDisplayState, "bind_light_custody", False, True),
+        "custody": (RunDisplayState, "bind_light_custody", True, False),
+        "accounting": (DynamicRunAccounting, "bind_light_1d", True, False),
+        "subscription-before": (
+            RunDisplayState, "bind_light_subscription", False, False,
+        ),
+        "subscription-after": (
+            RunDisplayState, "bind_light_subscription", True, False,
+        ),
+    }
+    target_owner, method, after, pre_slot = cases[case_id]
+    with monkeypatch.context() as seam:
+        seen = {}
+        real_acquire = dynamic_output.acquire_light_1d_retention
+        real_open = dynamic_output.open_headless_scan_session
+        real_hooks = PublicationStore.light_1d_cleanup_hooks
+        real_slot = dynamic_output.Light1DCustodySlot
+        real_transfer = DynamicOutputAdapter._release_construction_custody
+        real_release = SessionResourceAuthority._release
+        original = getattr(target_owner, method)
+        cleanup_blocked = [pre_slot]
+
+        def capture_acquire(*args, **kwargs):
+            seen["lease"] = real_acquire(*args, **kwargs)
+            return seen["lease"]
+
+        def capture_open(*args, **kwargs):
+            seen["session"] = real_open(*args, **kwargs)
+            seen["accounting"] = kwargs["accounting"]
+            return seen["session"]
+
+        def capture_hooks(self, *args, **kwargs):
+            seen["hooks"] = real_hooks(self, *args, **kwargs)
+            return seen["hooks"]
+
+        def capture_slot(*args, **kwargs):
+            seen["slot"] = real_slot(*args, **kwargs)
+            return seen["slot"]
+
+        def capture_transfer(self, *args, **kwargs):
+            seen["adapter"] = self
+            return real_transfer(self, *args, **kwargs)
+
+        def fail_boundary(*args, **kwargs):
+            if after:
+                original(*args, **kwargs)
+            adapter = seen.get("adapter")
+            seen["graph_at_failure"] = bool(
+                adapter is not None and adapter._graphs
+            )
+            raise RuntimeError(f"injected construction seam {case_id}")
+
+        def block_cleanup(self, *args, **kwargs):
+            if cleanup_blocked[0]:
+                raise RuntimeError("injected construction cleanup")
+            return real_release(self, *args, **kwargs)
+
+        seam.setattr(dynamic_output, "acquire_light_1d_retention", capture_acquire)
+        seam.setattr(dynamic_output, "open_headless_scan_session", capture_open)
+        seam.setattr(PublicationStore, "light_1d_cleanup_hooks", capture_hooks)
+        seam.setattr(
+            DynamicOutputAdapter, "_release_construction_custody",
+            capture_transfer,
+        )
+        if method != "Light1DCustodySlot":
+            seam.setattr(dynamic_output, "Light1DCustodySlot", capture_slot)
+        seam.setattr(target_owner, method, fail_boundary)
+        seam.setattr(SessionResourceAuthority, "_release", block_cleanup)
+        executor, identity, run, artifact, _target, terminal = terminal_run(
+            root / case_id
+        )
+        session, lease = seen["session"], seen["lease"]
+        terminal_truth = terminal.cleanup_status.value, run.closed
+        try:
+            first_value = executor.close(identity).cleanup_status.value
+        except BaseException as error:
+            first_value = f"{type(error).__name__}: {error}"
+        token = None if lease.cleanup_receipt is None \
+            else lease.cleanup_receipt.retry_token
+        retained = (
+            artifact.light_lease is lease,
+            artifact.light_hooks is seen.get("hooks"),
+            seen.get("slot") is not None
+            and artifact.light_slot is seen["slot"],
+            artifact.light_retry_token is token and token is not None,
+        )
+        cleanup_blocked[0] = False
+        try:
+            second_value = executor.close(identity).cleanup_status.value
+        except BaseException as error:
+            second_value = f"{type(error).__name__}: {error}"
+        result = {
+            "terminal": terminal.kind.value,
+            "session_terminal": not session.is_running,
+            "accounting": seen["accounting"].snapshot().state.value,
+            "sink_terminal": session.terminal_result is not None,
+            "graph_at_failure": bool(seen.get("graph_at_failure")),
+            "terminal_truth": terminal_truth,
+            "first": first_value,
+            "retained": retained,
+            "second": second_value,
+            "released": lease.state.value,
+            "reservation": lease.authority.snapshot().reservation_count,
+            "frame_callbacks": len(session._frame_cbs),
+            "detached": artifact.publications.allocation is None
+            and artifact.publications._light_1d is None,
+            "cleared": artifact.light_lease is artifact.light_slot is None
+            and artifact.light_hooks is artifact.light_retry_token is None
+            and artifact.light_unsubscribe is None and not session._frame_cbs,
+        }
+        try:
+            executor.close(identity)
+        except BaseException:
+            pass
+        slot = seen.get("slot")
+        assert slot is None or slot.state in {
+            Light1DCustodyState.CANCELLED,
+            Light1DCustodyState.RELEASED,
+        }
+        return result
+
+
+def _p2_wait_transport_idle(transport, gate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not transport.retains_gate(gate):
+            return
+        time.sleep(0.01)
+    raise AssertionError("hydration transport did not settle")
+
+
+def _p2_demote_combined(store):
+    base = store._items[0]
+    if base.view.thumbnail is None:
+        source = base.view.raw
+        if source is None:
+            source = base.view.intensity_2d
+        assert source is not None
+        store.upsert(replace(base, view=replace(
+            base.view, thumbnail=np.asarray(source)[::8, ::8],
+        )))
+    assert store.evict_heavy(0)
+
+
 def test_display_retain_does_not_rewrite_session_projection() -> None:
     state = RunDisplayState(RunIdentity(1, "p1c-projection"), max_payload_items=2)
     state.configure(partition_count=1, npt=8, frame_bytes=32)
@@ -165,7 +324,8 @@ def test_nine_durable_frames_cross_real_heavy_cap_and_cleanly_demote(
     assert snapshot.heavy == snapshot.limits.heavy == 8
     assert owner.records.has_heavy_payload(1) is False
     assert owner.publications.get(1).raw_status == "thumbnail"
-    assert owner.light_records.get(1) is not None
+    assert not hasattr(owner, "light_records")
+    assert owner.publications.get(1) is not None
 
 
 def test_owed_live_retirement_is_unchanged_then_durable_retry_is_total() -> None:
@@ -179,11 +339,10 @@ def test_owed_live_retirement_is_unchanged_then_durable_retry_is_total() -> None
         owner,
         1,
         hydratable=modes,
-        durable=modes,
+        durable=(),
     )
     before = (
         owner.records.get(1),
-        owner.light_records.get(1),
         owner.publications.get(1),
         state._residency.capture(key),
     )
@@ -191,15 +350,16 @@ def test_owed_live_retirement_is_unchanged_then_durable_retry_is_total() -> None
     assert state._residency._evict_live(key) is False
     assert (
         owner.records.get(1),
-        owner.light_records.get(1),
         owner.publications.get(1),
         state._residency.capture(key),
     ) == before
 
+    owner.records.replace_projection(
+        1, hydratable=modes, durable=modes,
+    )
     state.mark_durable(owner, (1,))
     assert state._residency._evict_live(key) is True
     assert owner.records.get(1) is None
-    assert owner.light_records.get(1) is None
     assert owner.publications.get(1) is None
     assert key not in state._residency._stores
     assert key not in state._residency._heavy
@@ -225,9 +385,7 @@ def test_removed_store_calls_and_canonical_projection_writes_stay_absent() -> No
                 continue
             receiver = ast.unparse(node.func.value)
             method = node.func.attr
-            canonical = receiver.endswith(".records") and not receiver.endswith(
-                ".light_records"
-            )
+            canonical = receiver.endswith(".records")
             if (
                 canonical
                 and method in {
@@ -237,12 +395,17 @@ def test_removed_store_calls_and_canonical_projection_writes_stay_absent() -> No
                     "evict_heavy",
                     "discard",
                 }
-            ) or (
-                receiver.endswith(".light_records") and method == "discard"
             ):
                 offenders.append((relative, receiver, method, node.lineno))
 
     assert offenders == []
+    assert all(
+        "light_records" not in (root / relative).read_text(encoding="utf-8")
+        for relative in (
+            "src/xdart/gui/tabs/scattering/display_runtime.py",
+            "src/xdart/gui/tabs/scattering/display_residency.py",
+        )
+    )
     assert not hasattr(FrameRecordStore, "discard")
     assert not hasattr(FrameRecordStore, "evict_heavy")
 

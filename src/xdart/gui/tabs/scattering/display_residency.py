@@ -29,7 +29,6 @@ class DisplayResidencySnapshot:
 @dataclass(frozen=True, slots=True)
 class _ResidentStores:
     records: Any
-    light_records: Any
     publications: Any
 
 
@@ -49,7 +48,6 @@ class RunDisplayResidency:
         key: DisplayFrameKey,
         *,
         records: Any,
-        light_records: Any,
         publications: Any,
         incoming_heavy: bool = False,
         incoming_thumbnail: bool = False,
@@ -64,7 +62,7 @@ class RunDisplayResidency:
         publication landed — a rejected candidate therefore never evicts
         prior public state (its touches are undone by :meth:`reconcile`).
         """
-        stores = _ResidentStores(records, light_records, publications)
+        stores = _ResidentStores(records, publications)
         self._stores[key] = stores
         self._touch(self._live, key)
         self._touch(self._browse, key)
@@ -203,12 +201,6 @@ class RunDisplayResidency:
         if stores is None:
             return False
         label = key.local_frame_label
-        light = stores.light_records.get(label)
-        if (
-            light is not None
-            and not stores.light_records.can_release_record(label)
-        ):
-            return False
         publication = stores.publications.get(label)
         if (
             publication is not None
@@ -221,8 +213,6 @@ class RunDisplayResidency:
         )
         if not publication_done:
             return False
-        if light is not None and not stores.light_records.release_record(label):
-            raise RuntimeError("qualified display light release was lost")
         return True
 
     def _evict_live(self, key: DisplayFrameKey) -> bool:

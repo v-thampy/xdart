@@ -7,7 +7,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from threading import RLock, Thread
+from threading import Lock, RLock, Thread
 from typing import Callable
 
 import numpy as np
@@ -46,6 +46,15 @@ from xrd_tools.session.scan_norm import (
     fold_norm_metadata,
     next_norm_revision,
 )
+from xrd_tools.session import (
+    DynamicRunState,
+    Light1DCleanupPending,
+    Light1DCustodyState,
+    Light1DLeaseState,
+    Light1DModeData,
+    Light1DRecord,
+    Light1DRetentionLease,
+)
 
 from .display_values import (
     DisplayFrameCatalog,
@@ -75,28 +84,18 @@ class DetectorHydrationOutcome(str, Enum):
     DETECTOR_UNAVAILABLE = "detector_unavailable"
 
 
-@dataclass(frozen=True, slots=True)
-class _PreparedCommitState:
-    """Exact pre-attempt state of every public-consumed surface for ONE key
-    (§22.3 prepare half): the abort half restores these captured facts by
-    identity instead of re-deriving them from mutated stores."""
-
-    key: DisplayFrameKey
-    light: FrameRecord | None
-    light_source_identity: str
-    light_persisted: bool
-    outcome_present: bool
-    outcome: "DetectorHydrationOutcome | None"
-    residency: tuple
-
-
 @dataclass(slots=True)
 class DisplayArtifact:
     artifact: Path
     source_scan: str
     records: FrameRecordStore
-    light_records: FrameRecordStore
     publications: PublicationStore
+    light_lease: Light1DRetentionLease | None = None
+    light_slot: object | None = None
+    light_hooks: object | None = None
+    light_retry_token: object | None = None
+    light_release_reason: str | None = None
+    light_unsubscribe: Callable[[], None] | None = None
     mask: np.ndarray | None = None
     mask_saturation: bool = True
     measurement_mode: str = "Standard"
@@ -165,6 +164,7 @@ class RunDisplayState:
             DisplayResidencyLimits(1, 1, 1, 1)
         )
         self._lock = RLock()
+        self._light_admission_lock = Lock()
         self._event_sink: Callable[[StandardRunEvent], object] | None = None
         self._transport = HydrationTransport(
             self.commit_preview, self._derive_target
@@ -268,10 +268,6 @@ class RunDisplayState:
             max_items=None,
             max_heavy_items=None,
         )
-        light_records = self._record_store_factory(
-            max_items=None,
-            max_heavy_items=None,
-        )
         publications = self._publication_store_factory(
             max_items=None,
             max_heavy_items=None,
@@ -285,7 +281,6 @@ class RunDisplayState:
             artifact=artifact,
             source_scan=source_scan,
             records=records,
-            light_records=light_records,
             publications=publications,
             mask=frozen_mask,
             mask_saturation=bool(mask_saturation),
@@ -301,6 +296,160 @@ class RunDisplayState:
         self.artifacts[str(artifact)] = owner
         self._partition_index += 1
         return owner
+
+    def stage_light_1d(self, owner: DisplayArtifact, lease: Light1DRetentionLease,
+                       *, hooks=None, slot=None) -> None:
+        with self._light_admission_lock:
+            if any(incoming is not None and current is not None
+                   and current is not incoming for current, incoming in (
+                       (owner.light_lease, lease), (owner.light_hooks, hooks),
+                       (owner.light_slot, slot),
+                   )):
+                raise RuntimeError("display artifact light-1D custody changed")
+            if slot is not None and hooks is None and owner.light_hooks is None:
+                raise RuntimeError("custody slot requires staged cleanup hooks")
+            owner.light_lease = lease
+            owner.light_hooks = owner.light_hooks if hooks is None else hooks
+            owner.light_slot = owner.light_slot if slot is None else slot
+
+    def bind_light_1d(self, owner: DisplayArtifact, lease: Light1DRetentionLease) -> None:
+        with self._light_admission_lock:
+            if owner.light_lease is not lease or owner.light_hooks is None:
+                raise RuntimeError("display artifact has no staged light-1D lease")
+
+    def bind_light_custody(self, owner: DisplayArtifact, hooks: object, slot: object) -> None:
+        with self._light_admission_lock:
+            if owner.light_lease is None or owner.light_hooks is not hooks \
+                    or owner.light_slot is not slot:
+                raise RuntimeError("display artifact has no staged custody graph")
+
+    def bind_light_subscription(self, owner: DisplayArtifact, register, callback) -> None:
+        with self._light_admission_lock:
+            lease, slot = owner.light_lease, owner.light_slot
+            if (
+                self.artifacts.get(str(owner.artifact)) is not owner
+                or (lease is None and (owner.light_hooks is not None or slot is not None))
+                or (lease is not None and (
+                    owner.light_hooks is None or slot is None
+                    or lease.state is not Light1DLeaseState.ACTIVE
+                    or slot.state is not Light1DCustodyState.PENDING))
+                or any(value is not None for value in (
+                    owner.light_release_reason, owner.light_retry_token,
+                    owner.light_unsubscribe))
+            ):
+                raise RuntimeError("display artifact has no active subscription owner")
+            owner.light_unsubscribe = register(callback)
+
+    def cancel_light_1d(self, owner: DisplayArtifact, commit_gate: object | None) -> None:
+        with self._light_admission_lock:
+            unsubscribe = owner.light_unsubscribe
+        if unsubscribe is not None:
+            unsubscribe()
+        with self._light_admission_lock:
+            if owner.light_unsubscribe is unsubscribe:
+                owner.light_unsubscribe = None
+            if commit_gate is not None:
+                self._transport.cancel_gate(commit_gate)
+
+    def verify_light_1d(self, owner: DisplayArtifact, commit_gate: object | None) -> None:
+        if commit_gate is not None and self._transport.retains_gate(commit_gate):
+            raise RuntimeError("shared hydration gate remains retained")
+
+    def release_light_1d(self, owner: DisplayArtifact, *, reason: str, terminal=None) -> bool:
+        reason = str(reason)
+        with self._light_admission_lock:
+            lease, slot = owner.light_lease, owner.light_slot
+            hooks, token = owner.light_hooks, owner.light_retry_token
+            unsubscribe = owner.light_unsubscribe
+            if lease is None:
+                if any(value is not None for value in (slot, hooks, token)):
+                    return False
+            else:
+                state = lease.state
+                pending_slot = slot is not None and slot.state is Light1DCustodyState.PENDING
+                if state is Light1DLeaseState.FENCED:
+                    return False
+                if state is Light1DLeaseState.CLEANUP_PENDING:
+                    receipt = lease.cleanup_receipt
+                    if token is None or receipt is None \
+                            or token is not receipt.retry_token:
+                        return False
+                elif state is Light1DLeaseState.ACTIVE:
+                    if (slot is None or pending_slot) and terminal is None:
+                        return False
+                    if (slot is None or pending_slot) and type(terminal) is not DynamicRunState:
+                        raise TypeError("construction release requires exact terminal intent")
+                if owner.light_release_reason not in {None, reason}:
+                    raise ValueError("light-1D release reason cannot change")
+                owner.light_release_reason = reason
+                if state is Light1DLeaseState.ACTIVE:
+                    lease.fence()
+                if state is Light1DLeaseState.ACTIVE and pending_slot:
+                    slot.cancel(terminal=terminal)
+        if lease is None:
+            if unsubscribe is not None:
+                unsubscribe()
+                with self._light_admission_lock:
+                    if owner.light_unsubscribe is unsubscribe:
+                        owner.light_unsubscribe = None
+            return True
+        try:
+            if slot is not None \
+                    and slot.state is Light1DCustodyState.CLEANUP_PENDING:
+                slot.retry_cleanup(token)
+            elif lease.state is Light1DLeaseState.CLEANUP_PENDING:
+                lease.retry_cleanup(token, hooks=hooks)
+            elif slot is not None and slot.state is Light1DCustodyState.RETAINED:
+                slot.release(reason=owner.light_release_reason)
+            elif slot is None or slot.state is Light1DCustodyState.CANCELLED:
+                if lease.state is not Light1DLeaseState.RELEASED:
+                    lease.release(reason=owner.light_release_reason, hooks=hooks)
+            elif slot.state is not Light1DCustodyState.RELEASED:
+                raise RuntimeError("light-1D custody is not terminally releasable")
+        except Light1DCleanupPending as error:
+            with self._light_admission_lock:
+                receipt = lease.cleanup_receipt
+                if owner.light_lease is lease and receipt is not None \
+                        and error.token is receipt.retry_token:
+                    owner.light_retry_token = receipt.retry_token
+            return False
+        with self._light_admission_lock:
+            clean = owner.light_lease is lease \
+                and lease.state is Light1DLeaseState.RELEASED \
+                and lease.authority.snapshot().reservation_count == 0 \
+                and owner.publications.allocation is None \
+                and owner.publications._light_1d is None \
+                and owner.light_unsubscribe is None
+            if not clean:
+                return False
+            owner.light_lease = owner.light_slot = None
+            owner.light_hooks = owner.light_retry_token = None
+            owner.light_release_reason = owner.light_unsubscribe = None
+        return True
+
+    def light_1d_cleanup_unresolved(self) -> bool:
+        with self._light_admission_lock:
+            for owner in self.artifacts.values():
+                lease, slot = owner.light_lease, owner.light_slot
+                if lease is None:
+                    if any(value is not None for value in (
+                        slot, owner.light_hooks, owner.light_retry_token,
+                        owner.light_release_reason, owner.light_unsubscribe,
+                        owner.publications.allocation, owner.publications._light_1d,
+                    )):
+                        return True
+                    continue
+                historical = lease.state is Light1DLeaseState.ACTIVE \
+                    and slot is not None and slot.state is Light1DCustodyState.RETAINED \
+                    and owner.light_hooks is not None \
+                    and owner.light_release_reason is None and owner.light_retry_token is None \
+                    and owner.light_unsubscribe is not None \
+                    and owner.publications.allocation is not None \
+                    and owner.publications._light_1d is lease \
+                    and lease.authority.snapshot().reservation_count == 1
+                if not historical:
+                    return True
+        return False
 
     def admit_additional_partition(self) -> None:
         """Monotonically admit one next Live artifact partition.
@@ -360,6 +509,24 @@ class RunDisplayState:
     def navigation_capacity(self) -> int:
         return self.catalog.max_items
 
+    def publish_light_1d(self, owner: DisplayArtifact, record: FrameRecord, *, source_identity: str) -> FramePublication:
+        with self._light_admission_lock:
+            lease = owner.light_lease
+            if type(lease) is not Light1DRetentionLease \
+                    or lease.state is not Light1DLeaseState.ACTIVE:
+                raise RuntimeError("light-1D callback has no active lineage lease")
+            light_record = _light_1d_record(
+                record, generation=lease.generation, source_identity=source_identity,
+                scan_key=owner.source_scan)
+            display_record = FrameRecord(
+                record.label, results_1d=dict(record.results_1d),
+                active_mode_1d=record.active_mode_1d)
+            publication = FramePublication(
+                display_record.active_view(), record=display_record,
+                source_identity=source_identity, generation=owner.publications.generation,
+                scan_key=owner.source_scan)
+            return owner.publications.publish_gui_light_1d(publication, light_record)
+
     def retain_frame(
         self,
         owner: DisplayArtifact,
@@ -376,10 +543,6 @@ class RunDisplayState:
                 self._frame_mask_qualified.add(key)
             else:
                 self._frame_mask_qualified.discard(key)
-            # E6-NORM-N1 (§25.2): draft from the artifact's current aggregate,
-            # fold the accepted publication's admitted numeric metadata once,
-            # and publish with ONE revision advance only at the successful
-            # transaction tail — a failed retain leaves the prior aggregate.
             draft = owner.norm_aggregate
             if draft is None:
                 draft = empty_norm_aggregate((
@@ -391,21 +554,10 @@ class RunDisplayState:
             draft = fold_norm_metadata(
                 draft, publication.view.metadata_numeric
             )
-            # Residency rollback captures and restores the complete four-tier
-            # order under this same lock. Keep the live producer's stores,
-            # publication, and residency touch in that ownership boundary so
-            # a failed historical hydration cannot restore over a concurrently
-            # published live frame.
-            owner.light_records.upsert(
-                light_record(record),
-                source_identity=source_identity,
-                persisted=False,
-            )
-            owner.publications.upsert(publication)
+            owner.publications.upsert(_without_light_1d(publication))
             self._residency.observe(
                 key,
                 records=owner.records,
-                light_records=owner.light_records,
                 publications=owner.publications,
             )
             self._residency.enforce()
@@ -419,7 +571,6 @@ class RunDisplayState:
         """Project only exact writer-boundary durable labels as persisted."""
 
         with self._lock:
-            owner.light_records.mark_persisted(labels)
             self._residency.enforce()
 
     def frame_norm_aggregate(
@@ -505,13 +656,12 @@ class RunDisplayState:
                 key,
                 selection_generation,
             )
-        if payload is None:
-            payload = self._payload_from_publication(
-                artifact_owner,
-                key,
-                publication,
-                closed=closed,
-            )
+        payload = self._payload_from_publication(
+            artifact_owner,
+            key,
+            publication,
+            closed=closed,
+        )
         return self._qualified_payload(
             payload,
             key,
@@ -525,6 +675,9 @@ class RunDisplayState:
         key = payload.frame_key
         if type(key) is not DisplayFrameKey:
             return
+        payload = replace(payload, view=replace(
+            payload.view, axis_1d=None, intensity_1d=None, sigma_1d=None,
+        ))
         with self._lock:
             if self._retired:
                 return
@@ -534,10 +687,18 @@ class RunDisplayState:
                 self.payloads.popitem(last=False)
 
     def retire(self, *, join_timeout: float) -> bool:
-        """Invalidate queued hydration and join or report its exact worker."""
         with self._lock:
             self._retired = True
-        return self._transport.retire(join_timeout=join_timeout)
+        if not self._transport.retire(join_timeout=join_timeout):
+            return False
+        clean = True
+        for owner in tuple(self.artifacts.values()):
+            reason = owner.light_release_reason or (
+                "construction" if owner.light_lease is not None
+                and owner.light_slot is None else "run-close")
+            if not self.release_light_1d(owner, reason=reason):
+                clean = False
+        return clean
 
     def _qualified_payload(
         self,
@@ -560,16 +721,6 @@ class RunDisplayState:
         *,
         closed: bool,
     ) -> StandardDisplayPayload:
-        view = publication.view
-        light = owner.light_records.get(key.local_frame_label)
-        if light is not None:
-            light_view = light.active_view()
-            view = replace(
-                view,
-                axis_1d=light_view.axis_1d,
-                intensity_1d=light_view.intensity_1d,
-                sigma_1d=light_view.sigma_1d,
-            )
         return StandardDisplayPayload(
             0,
             key,
@@ -577,7 +728,7 @@ class RunDisplayState:
                 f"{owner.measurement_mode} · {key.source_scan} · "
                 f"frame {key.local_frame_label}"
             ),
-            view,
+            publication.view,
             "finished" if closed else "running",
             measurement_mode=owner.measurement_mode,
             gi_incidence_motor=owner.gi_incidence_motor,
@@ -648,14 +799,18 @@ class RunDisplayState:
                 HydrationPurpose.PREVIEW,
                 int(selection_generation),
                 owner,
-                (art.records, art.light_records, art.publications),
+                (art.records, art.publications),
                 commit_gate,
                 read_key=read_key,
                 token=token,
             )
         except (TypeError, ValueError):
             return
-        self._transport.submit(request, closed=closed)
+        with self._light_admission_lock:
+            lease = art.light_lease
+            if lease is not None and lease.state is not Light1DLeaseState.ACTIVE:
+                return
+            self._transport.submit(request, closed=closed)
 
     def _derive_target(self, request: HydrationRequest):
         """Derive the frozen values-only projection and exact key ONCE at
@@ -670,10 +825,9 @@ class RunDisplayState:
             stores = request.stores
             exact = (
                 art is not None
-                and len(stores) == 3
+                and len(stores) == 2
                 and stores[0] is art.records
-                and stores[1] is art.light_records
-                and stores[2] is art.publications
+                and stores[1] is art.publications
             )
             if not exact:
                 return None, None
@@ -733,10 +887,9 @@ class RunDisplayState:
             art = self.artifacts.get(request.read_key.artifact_identity)
             acquisition_target = (
                 art is not None
-                and len(stores) == 3
+                and len(stores) == 2
                 and stores[0] is art.records
-                and stores[1] is art.light_records
-                and stores[2] is art.publications
+                and stores[1] is art.publications
             )
             browse_target = not acquisition_target and len(stores) == 1
             key = None
@@ -822,59 +975,46 @@ class RunDisplayState:
             mode_1d=art.gi_mode_1d or DEFAULT_MODE_KEY,
             mode_2d=art.gi_mode_2d or DEFAULT_MODE_KEY,
         )
+        shell = art.publications.get_light_1d_shell(key.local_frame_label)
         source_identity = (
-            f"{view.source_path or ''}#{view.source_frame_index}"
+            shell.source_identity if shell is not None
+            else f"{view.source_path or ''}#{view.source_frame_index}"
         )
         candidate = FramePublication(
             view,
             record=record,
             source_identity=source_identity,
+            generation=art.publications.generation,
             scan_key=art.source_scan,
         )
-        # §22.3 failure-atomic prepared commit: capture the exact pre-attempt
-        # state of every public-consumed surface, run the fallible supporting
-        # seams before the authoritative publication, and on ANY throw restore
-        # the captured state exactly — never re-derive it from stores the
-        # failed attempt already mutated.  The detector outcome, payload and
-        # event are written only after the publication landed.
-        undo = _PreparedCommitState(
-            key=key,
-            light=art.light_records.get(key.local_frame_label),
-            light_source_identity=art.light_records.source_identity(
-                key.local_frame_label
-            ),
-            light_persisted=art.light_records.is_persisted(
-                key.local_frame_label
-            ),
-            outcome_present=key in self._detector_outcomes,
-            outcome=self._detector_outcomes.get(key),
-            residency=self._residency.capture(key),
-        )
-        candidate_light = light_record(record)
+        residency = self._residency.capture(key)
         try:
-            if not art.light_records.exchange_releasable_record(
-                key.local_frame_label,
-                expected=undo.light,
-                replacement=candidate_light,
-                source_identity=source_identity,
-                persisted=True,
-            ):
-                raise RuntimeError(
-                    "display light record remains owed during hydration"
-                )
-            if art.light_records.get(key.local_frame_label) is not candidate_light:
-                raise RuntimeError("display light record install lost identity")
             self._residency.observe(
                 key,
                 records=art.records,
-                light_records=art.light_records,
                 publications=art.publications,
                 incoming_heavy=_publication_has_heavy_payload(candidate),
                 incoming_thumbnail=view.thumbnail is not None,
             )
-            publication = art.publications.upsert(candidate)
+            lease = art.light_lease
+            if (
+                type(lease) is Light1DRetentionLease
+                and lease.state is Light1DLeaseState.ACTIVE
+                and record.results_1d
+            ):
+                publication = art.publications.publish_gui_light_1d(
+                    candidate,
+                    _light_1d_record(
+                        record,
+                        generation=lease.generation,
+                        source_identity=source_identity,
+                        scan_key=art.source_scan,
+                    ),
+                )
+            else:
+                publication = art.publications.upsert(candidate)
         except BaseException:
-            self._abort_commit_locked(art, undo, candidate_light)
+            self._residency.restore(residency)
             raise
         if detector_outcome is not None:
             self._detector_outcomes[key] = detector_outcome
@@ -895,42 +1035,6 @@ class RunDisplayState:
             frame_key=key,
             selection_generation=prepared.token.presentation_generation,
         )
-
-    def _abort_commit_locked(
-        self,
-        art: DisplayArtifact,
-        undo: _PreparedCommitState,
-        candidate_light: FrameRecord,
-    ) -> None:
-        """Restore the exact captured pre-attempt state (§22.3 abort half).
-
-        The identity guards make each restore a no-op for a seam whose
-        mutation never happened.  Otherwise the store-owned CAS exchanges
-        the exact candidate directly back to the captured light object,
-        source identity, and persistence fact, without a merge or an exposed
-        empty slot.  A foreign concurrent row refuses restoration loudly.
-        """
-        key = undo.key
-        label = key.local_frame_label
-        if undo.outcome_present:
-            self._detector_outcomes[key] = undo.outcome
-        else:
-            self._detector_outcomes.pop(key, None)
-        if art.light_records.get(label) is not undo.light:
-            current = art.light_records.get(label)
-            if current is not None and current is not candidate_light:
-                raise RuntimeError("display light rollback found a foreign row")
-            if not art.light_records.exchange_releasable_record(
-                label,
-                expected=current,
-                replacement=undo.light,
-                source_identity=undo.light_source_identity,
-                persisted=undo.light_persisted,
-            ):
-                raise RuntimeError("display light record rollback was refused")
-            if art.light_records.get(label) is not undo.light:
-                raise RuntimeError("display light record restore lost identity")
-        self._residency.restore(undo.residency)
 
     def _commit_browse_locked(
         self, store: object, prepared: PreparedHydrationCommit
@@ -991,11 +1095,36 @@ def _projection_masks_values(
     )
 
 
-def light_record(record: FrameRecord) -> FrameRecord:
-    return FrameRecord(
-        record.label,
-        results_1d=dict(record.results_1d),
-        active_mode_1d=record.active_mode_1d,
+def _light_1d_record(record: FrameRecord, *, generation: int,
+                     source_identity: str, scan_key: str) -> Light1DRecord:
+    modes = {}
+    for mode, view in record.results_1d.items():
+        axis = view.axis_1d
+        if axis is None or axis.values is None or view.intensity_1d is None:
+            raise ValueError("light-1D record has an incomplete mode")
+        modes[mode] = Light1DModeData(
+            np.asarray(axis.values, dtype=np.float64),
+            np.asarray(view.intensity_1d, dtype=np.float64),
+            None if view.sigma_1d is None
+            else np.asarray(view.sigma_1d, dtype=np.float64),
+        )
+    return Light1DRecord(
+        record.label, generation, record.active_mode_1d, modes,
+        {"source_identity": source_identity, "scan_key": scan_key},
+    )
+
+
+def _without_light_1d(publication: FramePublication) -> FramePublication:
+    return replace(
+        publication,
+        view=replace(publication.view, axis_1d=None, intensity_1d=None,
+                     sigma_1d=None),
+        record=FrameRecord(
+            publication.label,
+            results_2d=dict(publication.record.results_2d),
+            active_mode_2d=publication.record.active_mode_2d,
+        ),
+        raw_ref=None,
     )
 
 
@@ -1006,10 +1135,21 @@ def publication_needs_hydration(
     return (
         publication is None
         or not _publication_has_full_payload(publication)
+        or any(
+            view.axis_1d is None
+            or view.axis_1d.values is None
+            or view.intensity_1d is None
+            for view in publication.record.results_1d.values()
+        )
         or (
             publication.view.raw is None
-            and publication.view.thumbnail is None
-            and detector_outcome is None
+            and (
+                publication.raw_status in {"thumbnail", "evicted"}
+                or (
+                    detector_outcome is None
+                    and publication.view.thumbnail is None
+                )
+            )
         )
         or (
             bool(publication.record.results_2d)
@@ -1066,7 +1206,6 @@ __all__ = [
     "RunDisplayState",
     "THUMBNAIL_MAX_ITEMS",
     "has_integrated_values",
-    "light_record",
     "project_detector_values",
     "project_frame_detector_values",
 ]

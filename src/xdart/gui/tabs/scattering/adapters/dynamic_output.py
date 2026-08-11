@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 from threading import RLock
+from types import SimpleNamespace
 from typing import Any
+
+import numpy as np
 
 from xdart.modules.reduction import open_headless_scan_session
 from xrd_tools.io import (
@@ -31,8 +35,24 @@ from xrd_tools.session import (
     DynamicAccountingLimits,
     DynamicFrameIdentity,
     DynamicRunAccounting,
+    DynamicRunState,
+    FlushPolicy,
+    Light1DBufferLayout,
+    Light1DCustodySlot,
+    Light1DFundingMode,
+    Light1DLayout,
+    Light1DModeLayout,
+    SessionResourceAuthority,
     StageLedger,
+    acquire_light_1d_retention,
     required_result_modes,
+    resolve_session_policy,
+)
+from xrd_tools.session.policy import requirements_from
+from xrd_tools.core import DEFAULT_MODE_KEY
+from xrd_tools.core.staging import (
+    browse_publication_max_items,
+    total_physical_ram_bytes,
 )
 from xrd_tools.session.display_logic import xye_prefix_for_unit
 
@@ -42,6 +62,66 @@ from ..output_preflight import source_snapshots
 
 _MISSING = object()
 _SUPPORTED_LINEAGE_FRAME_CEILING = 1_000_000
+
+
+def _light_policy_layout(configuration, plan, item, scan, write_labels):
+    if not write_labels:
+        raise ValueError("dynamic light-1D mount has no admitted write frame")
+    try:
+        frame = next(value for value in scan.frames
+                     if int(value.index) == int(write_labels[0]))
+    except StopIteration:
+        raise ValueError("dynamic light-1D write frame is absent from the Scan")
+    descriptor = item.descriptor
+    if descriptor is not None and descriptor.frame_shape is not None \
+            and descriptor.dtype is not None:
+        shape, native_dtype = descriptor.frame_shape, descriptor.dtype
+    else:
+        if frame.image is None:
+            frame.load_image()
+        shape, native_dtype = frame.image.shape, frame.image.dtype
+    requirements = requirements_from(SimpleNamespace(
+        frame_shape=tuple(shape), dtype=np.dtype(native_dtype)), plan)
+    requested = max(1, int(configuration.max_cores))
+    policy = resolve_session_policy(requirements, requested_workers=requested)
+    allocation = policy.allocation
+    interval = 8 if plan.integration_2d is not None else 1000
+    policy = replace(policy, flush=FlushPolicy(
+        interval=interval, cap=int(allocation.staging_items), margin=8,
+    ))
+    one_d = getattr(plan, "integration_1d", None)
+    modes = tuple(mode.key for mode in required_result_modes(plan)
+                  if mode.kind == "1d")
+    if one_d is None or not modes:
+        return policy, None, 0, 0, frame
+    active = (configuration.gi.mode_1d if configuration.gi.enabled
+              else DEFAULT_MODE_KEY)
+    if active not in modes:
+        raise ValueError("active 1-D mode is absent from the reduction plan")
+    dtype = np.dtype(np.float64)
+
+    def buffer(mode: str, role: str) -> Light1DBufferLayout:
+        return Light1DBufferLayout(
+            int(one_d.npt), dtype.itemsize, f"{mode}:{role}", dtype.str,
+            shared=False,
+        )
+
+    layout = Light1DLayout(
+        tuple(
+            Light1DModeLayout(
+                mode, buffer(mode, "coordinate"), buffer(mode, "intensity"),
+                buffer(mode, "uncertainty") if one_d.error_model else None,
+            )
+            for mode in modes
+        ),
+        active,
+    )
+    total = max(0, int(total_physical_ram_bytes() or 0))
+    rows = browse_publication_max_items(int(one_d.npt), total_ram_bytes=total)
+    ceiling = min(1024 ** 3, int(0.05 * total)) if total else (
+        layout.shared_bytes + rows * layout.per_row_unique_ndarray_bytes
+    )
+    return policy, layout, rows, ceiling, frame
 
 
 def _supported_lineage_frame_count(stamp: SourceExecutionStamp) -> int:
@@ -403,6 +483,48 @@ class DynamicOutputAdapter:
             else tuple(self._current["persisted_prefix_labels"])
         )
 
+    def predecessor_owner(self, item: PlannedOutput):
+        graph = self._current
+        if graph is None or graph.get("display_owner") is None:
+            return None
+        if (
+            graph.get("target") == _target_key(item.target)
+            and graph.get("lineage") == _stable_lineage(item)
+        ):
+            return None
+        return graph["display_owner"]
+
+    def predecessor_owner_for_target(self, target: Path):
+        graph = self._current
+        return (None if graph is None or graph.get("target") == _target_key(target)
+                else graph.get("display_owner"))
+
+    def drop_released_predecessor(self, owner: object) -> None:
+        graph = self._current
+        if graph is None or graph.get("display_owner") is not owner:
+            raise RuntimeError("dynamic predecessor identity changed")
+        session = graph["session"]
+        if (
+            session.is_running
+            or graph["accounting"].snapshot().state not in {
+                DynamicRunState.FINISHED, DynamicRunState.STOPPED,
+            }
+            or graph["transition"] is not None or graph["projection_pending"]
+            or any(getattr(owner, name) is not None for name in (
+                "light_lease", "light_slot", "light_hooks",
+                "light_retry_token", "light_unsubscribe",
+            ))
+        ):
+            raise RuntimeError("dynamic predecessor graph is not terminal")
+        self._graphs.pop(graph["target"], None)
+        self._current = None
+
+    def finish_predecessor(self, owner: object):
+        graph = self._current
+        if graph is None or graph.get("display_owner") is not owner:
+            raise RuntimeError("dynamic predecessor identity changed")
+        return self._finish_transition(graph)
+
     def _revision(self, graph: dict[str, Any], item: PlannedOutput) -> int:
         exact = item.source_stamp.execution_identity_v1
         revisions = graph["revisions"]
@@ -462,6 +584,15 @@ class DynamicOutputAdapter:
         record_store,
         run_provenance,
         cancelled,
+        publication_store=None,
+        display_owner=None,
+        display_state=None,
+        source_owner=None,
+        gui_thread_id=None,
+        light_cancel=None,
+        light_drain=None,
+        light_verify=None,
+        on_frame_completed=None,
     ):
         if type(run_provenance) is not dict:
             raise TypeError("dynamic output requires exact run provenance")
@@ -544,6 +675,15 @@ class DynamicOutputAdapter:
         xye_only = self.configuration.processing_mode == "Int 1D (XYE)"
         if xye_only and self.configuration.output_mode == "Append":
             raise ValueError("XYE-only Append has no persisted lineage owner")
+        mount_values = (
+            publication_store, display_owner, display_state, gui_thread_id,
+            light_cancel, light_drain, light_verify, on_frame_completed,
+        )
+        coordinated = any(value is not None for value in mount_values)
+        if coordinated and any(value is None for value in mount_values):
+            raise TypeError("dynamic GUI light mount requires one exact graph")
+        policy = layout = lease = hooks = slot = None
+        session = None
 
         preflight = None
         persisted_prefix_labels: tuple[int, ...] = ()
@@ -577,6 +717,36 @@ class DynamicOutputAdapter:
         try:
             if cancelled():
                 raise RuntimeError("admission cancelled")
+            write_labels = labels if preflight is None else tuple(
+                preflight.snapshot.write_labels
+            )
+            if coordinated:
+                policy, layout, requested_rows, ceiling, first_write_frame = \
+                    _light_policy_layout(
+                        self.configuration, plan, item, scan, write_labels,
+                )
+                allocation = policy.allocation
+                bind_source = getattr(source_owner, "bind_allocation", None)
+                if callable(bind_source):
+                    bind_source(allocation)
+                if first_write_frame.image is None:
+                    first_write_frame.load_image()
+                if layout is not None:
+                    lease = acquire_light_1d_retention(
+                        SessionResourceAuthority.from_allocation(allocation),
+                        owner=f"scattering-light-1d:{key}",
+                        generation=int(self.configuration.generation),
+                        layout=layout,
+                        requested_rows=requested_rows,
+                        compatibility_byte_ceiling=ceiling,
+                        gui_thread_id=int(gui_thread_id),
+                        funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+                        current_lineage_rows=(None if self.configuration.live_mode
+                                              else frame_count),
+                    )
+                    display_state.stage_light_1d(display_owner, lease)
+            session_scan = scan if not coordinated else replace(
+                scan, frames=[frame for frame in scan.frames if int(frame.index) in write_labels])
             integration_1d = getattr(plan, "integration_1d", None)
             if integration_1d is not None:
                 xye = TransactionalXYESink(
@@ -644,25 +814,46 @@ class DynamicOutputAdapter:
             ):
                 raise AppendRefused(xye_lineage)
             session = open_headless_scan_session(
-                scan,
+                session_scan,
                 plan,
                 sink=sink,
-                executor=self.configuration.max_cores,
-                inflight_max=max(1, self.configuration.max_cores),
+                executor=(self.configuration.max_cores if policy is None
+                          else policy.allocation.workers),
+                inflight_max=(max(1, self.configuration.max_cores)
+                              if policy is None
+                              else policy.allocation.reduction_inflight),
                 gi_freeze_mode=(
                     "scout_union" if self.configuration.gi.enabled else None
                 ),
                 record_store=record_store,
                 record_store_persisted_on_write=False,
-                nexus_target=(
-                    None if nexus is None else f"nexus:{nexus.path}"
-                ),
-                xye_target=(
-                    None if xye is None else xye.canonical_target
-                ),
+                nexus_target=None if nexus is None else f"nexus:{nexus.path}",
+                xye_target=None if xye is None else xye.canonical_target,
                 accounting=accounting,
                 xye_receipt_boundary=xye,
+                policy=policy,
             )
+            if coordinated:
+                session.set_generation(int(self.configuration.generation))
+            if lease is not None:
+                publication_store.bind_allocation(policy.allocation)
+                publication_store.bind_light_1d(lease)
+                hooks = publication_store.light_1d_cleanup_hooks(
+                    lease, cancel=light_cancel, drain=light_drain,
+                    verify=light_verify,
+                )
+                display_state.stage_light_1d(display_owner, lease, hooks=hooks)
+                display_state.bind_light_1d(display_owner, lease)
+                slot = Light1DCustodySlot(
+                    grant_id=lease.grant_id, owner=lease.owner,
+                    generation=lease.generation, cleanup_hooks=hooks,
+                )
+                display_state.stage_light_1d(
+                    display_owner, lease, hooks=hooks, slot=slot)
+                display_state.bind_light_custody(display_owner, hooks, slot)
+                accounting.bind_light_1d(
+                    lease, cleanup_hooks=hooks, custody_slot=slot,
+                )
             if nexus is not None and nexus.append_preflight is not None:
                 write_labels = tuple(
                     nexus.append_preflight.snapshot.write_labels
@@ -681,6 +872,7 @@ class DynamicOutputAdapter:
                 "xye": xye,
                 "accounting": accounting,
                 "record_store": record_store,
+                "display_owner": display_owner,
                 "revisions": {
                     item.source_stamp.execution_identity_v1: revision
                 },
@@ -701,11 +893,46 @@ class DynamicOutputAdapter:
             self._release_construction_custody(
                 preflight=preflight, nexus=nexus, xye=xye,
             )
+            if coordinated:
+                display_state.bind_light_subscription(display_owner, session.on_frame_completed, on_frame_completed)
             self._arm(graph, write_labels, revision)
             if cancelled():
                 raise RuntimeError("admission cancelled")
             return session, True
-        except BaseException:
+        except BaseException as primary:
+            cleanup: BaseException | None = None
+            try:
+                terminal = DynamicRunState.ABORTED
+                if session is not None:
+                    try:
+                        if graph is not None and self._graphs.get(key) is graph:
+                            self._finish_transition(graph, stopped=True)
+                        else:
+                            if session.is_running:
+                                session.stop()
+                            session.finish(raise_on_failure=False)
+                    except BaseException as error:
+                        cleanup = error
+                    try:
+                        state = accounting.snapshot().state
+                    except BaseException as error:
+                        cleanup = cleanup or error
+                    else:
+                        if state in {
+                            DynamicRunState.FINISHED,
+                            DynamicRunState.STOPPED,
+                            DynamicRunState.ABORTED,
+                        }:
+                            terminal = state
+                if coordinated:
+                    display_state.release_light_1d(
+                        display_owner, reason="construction",
+                        terminal=terminal,
+                    )
+            except BaseException as error:
+                cleanup = cleanup or error
+            if cleanup is not None:
+                raise primary from cleanup
             raise
 
     def _arm(

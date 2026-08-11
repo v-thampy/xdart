@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 from queue import Empty, Full, Queue, SimpleQueue
-from threading import Event, Lock, Thread, current_thread
+from threading import Event, Lock, Thread, current_thread, get_ident
 from time import monotonic
 from typing import Any, Callable
 import numpy as np
@@ -123,6 +123,9 @@ class _StandardRun:
     display_projection_queue: Queue[object] | None = None
     display_projection_worker: Thread | None = None
     display_projection_errors: list[BaseException] = field(default_factory=list)
+    light_projection_error: BaseException | None = None
+    light_projection_error_lock: Lock = field(default_factory=Lock)
+    gui_thread_id: int = field(default_factory=get_ident)
     command_failure: DetachedDiagnostic | None = None
 
     def __post_init__(self) -> None:
@@ -640,35 +643,29 @@ class StandardRunExecutor:
         except Exception as error:
             with run.cleanup_lock:
                 run.cleanup_failures.append(detach_exception(error, 'session.stop'))
-        if run.context_runtime is not None:
-            run.context_runtime.retire()
+        context_runtime = run.context_runtime
+        if context_runtime is not None:
+            context_runtime.retire()
         display_clean = run.display.retire(
             join_timeout=self._join_timeout
         )
         worker = run.worker
-        if worker is not None and worker is not current_thread() and (worker.ident is not None):
+        worker_was_alive = worker is not None and worker is not current_thread() and worker.is_alive()
+        if worker_was_alive:
             worker.join(timeout=self._join_timeout)
         if worker is not None and worker.is_alive():
             return self._receipt(run)
+        if not display_clean and worker_was_alive:
+            display_clean = run.display.retire(join_timeout=self._join_timeout)
         if not run.closed:
             worker = self._start_cleanup_retry(run)
             if worker is not None and worker is not current_thread():
                 worker.join(timeout=self._join_timeout)
         if not display_clean:
             run.cleanup_status = CleanupStatus.CLEANUP_PENDING
-        elif (
-            run.closed
-            and all(
-                value is None
-                for value in (
-                    run.session,
-                    run.sink,
-                    run.output,
-                    run.source,
-                    run.resources,
-                )
-            )
-        ):
+        elif run.closed and all(value is None for value in (
+            run.session, run.sink, run.output, run.source, run.resources,
+        )) and not getattr(run.display, 'light_1d_cleanup_unresolved', lambda: False)():
             run.cleanup_status = CleanupStatus.CLEANED
         return self._receipt(run)
 
@@ -699,10 +696,10 @@ class StandardRunExecutor:
                 try:
                     if item is _DISPLAY_PROJECTION_END:
                         return
-                    event, image, session = item
+                    label, image, session = item
                     started = monotonic()
                     self._frame_ready_owned(
-                        run, event, image, session
+                        run, label, image, session
                     )
                     _perf_add(
                         run,
@@ -905,6 +902,41 @@ class StandardRunExecutor:
         runtime = None if run is None else run.context_runtime
         return None if runtime is None else runtime.context
 
+    @staticmethod
+    def _commit_gate(run: _StandardRun):
+        context = None if run.context_runtime is None else run.context_runtime.context
+        return None if context is None else context.commit_gate
+
+    def _drain_light_lineage(
+        self, run: _StandardRun, owner: DisplayArtifact,
+    ) -> None:
+        self._finish_display_projection(run)
+        run.display.verify_light_1d(owner, self._commit_gate(run))
+
+    def _release_predecessor_before_target(
+        self, run: _StandardRun, target: Path,
+    ) -> None:
+        output = run.output
+        predecessor = (
+            None if output is None
+            else output.predecessor_owner_for_target(target)
+        )
+        if predecessor is None:
+            return
+        self._settle_predecessor(run, output, predecessor)
+
+    def _settle_predecessor(self, run, output, predecessor) -> None:
+        result = output.finish_predecessor(predecessor)
+        self._finish_display_projection(run)
+        self._project_new_durable(run, output)
+        if getattr(result, "failed", False):
+            raise RuntimeError(result.error or "predecessor settlement failed")
+        if not run.display.release_light_1d(
+            predecessor, reason="lineage-replaced",
+        ):
+            raise RuntimeError("prior light-1D lineage cleanup remains pending")
+        output.drop_released_predecessor(predecessor)
+
     def _construct(self, run: _StandardRun, *, item: PlannedOutput | None=None, labels: tuple[int, ...] | None=None, decision: AdmittedOutput | None=None) -> _StandardRun:
         configuration, capture = (run.configuration, run.capture)
         if configuration is None or capture is None:
@@ -913,6 +945,13 @@ class StandardRunExecutor:
         if source_spec is None or not configuration.poni_file or (not configuration.save_path):
             raise ValueError('Standard execution requires source, PONI, and output paths')
         artifact = item.target if item is not None else Path(configuration.save_path)
+        output = run.output
+        predecessor = (
+            None if output is None or item is None
+            else output.predecessor_owner(item)
+        )
+        if predecessor is not None:
+            self._settle_predecessor(run, output, predecessor)
         # Establish the item identity before validation/open.  A failure at any
         # later construction seam must be reported against this artifact, not
         # the previously completed one.
@@ -1063,6 +1102,19 @@ class StandardRunExecutor:
             record_store=run.records,
             run_provenance=run_provenance,
             cancelled=cancelled,
+            publication_store=owner.publications,
+            display_owner=owner,
+            display_state=run.display,
+            source_owner=run.source,
+            gui_thread_id=run.gui_thread_id,
+            light_cancel=lambda: run.display.cancel_light_1d(
+                owner, self._commit_gate(run),
+            ),
+            light_drain=lambda: self._drain_light_lineage(run, owner),
+            light_verify=lambda: run.display.verify_light_1d(
+                owner, self._commit_gate(run),
+            ),
+            on_frame_completed=lambda event: self._frame_ready(run, event),
         )
         run.sink = output
         write_labels = set(output.write_labels)
@@ -1075,10 +1127,6 @@ class StandardRunExecutor:
         )
         if run.session is not None and run.display_projection_worker is None:
             self._start_display_projection(run)
-        if created:
-            run.session.on_frame_completed(
-                lambda event: self._frame_ready(run, event)
-            )
         if run.session is not None or persisted_prefix_labels:
             self._adopt_acquisition_context(
                 run, owner, source_path=str(source_spec.uri)
@@ -1392,6 +1440,9 @@ class StandardRunExecutor:
                         reprobe = (
                             retry_revisions.pop(target_key, None) == revision
                         )
+                        self._release_predecessor_before_target(
+                            run, group.target,
+                        )
                         attempt = materialize_live_directory_group(
                             receipt,
                             configuration,
@@ -1551,6 +1602,9 @@ class StandardRunExecutor:
                 stopped = True
                 break
             try:
+                self._release_predecessor_before_target(
+                    run, entry.target,
+                )
                 decision, _ready_files, skipped_files = (
                     materialize_deferred_output(
                         receipt,
@@ -1748,6 +1802,10 @@ class StandardRunExecutor:
                     projection_error.__traceback__
                 )
             self._project_new_durable(run, output)
+            with run.light_projection_error_lock:
+                light_error = run.light_projection_error
+            if light_error is not None:
+                raise light_error.with_traceback(light_error.__traceback__)
             if result is None:  # pragma: no cover - defensive type narrowing
                 raise RuntimeError(
                     "scattering session returned no terminal result"
@@ -1944,13 +2002,40 @@ class StandardRunExecutor:
     def _frame_ready(self, run: _StandardRun, event: Any) -> None:
         started = monotonic()
         try:
+            with run.light_projection_error_lock:
+                if run.light_projection_error is not None:
+                    return
+                try:
+                    label = int(event.frame_index)
+                    records = run.records
+                    if records is None:
+                        raise RuntimeError("display completion lost its record store")
+                    record = records.get(label)
+                    if record is None:
+                        raise RuntimeError("display completion lost its exact record")
+                    owner = run.display.artifacts.get(str(run.artifact))
+                    if owner is None:
+                        raise RuntimeError("display completion lost its exact owner")
+                    view = record.active_view()
+                    if owner.light_lease is not None:
+                        run.display.publish_light_1d(
+                            owner,
+                            record,
+                            source_identity=(
+                                f"{view.source_path or ''}#"
+                                f"{view.source_frame_index}"
+                            ),
+                        )
+                except BaseException as error:
+                    run.light_projection_error = error
+                    return
             pending = run.display_projection_queue
             # ``ScanSession.finish`` can detach ``run.session`` before this
             # bounded projection queue is drained.  Carry the exact session
             # owner with every completion so trailing durable frames retain
             # their saturation policy and navigation publication.
             session = run.session
-            frame = run.frames_by_label.get(int(event.frame_index))
+            frame = run.frames_by_label.get(label)
             image = None if frame is None else frame.image
             if pending is not None and session is not None:
                 while True:
@@ -1958,7 +2043,7 @@ class StandardRunExecutor:
                         return
                     try:
                         pending.put(
-                            (event, image, session), timeout=0.05
+                            (label, image, session), timeout=0.05
                         )
                         break
                     except Full:
@@ -1969,14 +2054,14 @@ class StandardRunExecutor:
     def _frame_ready_owned(
         self,
         run: _StandardRun,
-        event: Any,
+        label: int,
         image: np.ndarray | None,
         session: Any,
     ) -> None:
         records, scan = (run.records, run.scan)
         if records is None or scan is None:
             return
-        label = int(event.frame_index)
+        label = int(label)
         record = records.get(label)
         frame = run.frames_by_label.get(label)
         if record is None or frame is None:
@@ -2155,8 +2240,17 @@ class StandardRunExecutor:
                     run.cleanup_failures.append(detach_exception(error, context))
                 if resources.cleaned:
                     run.resources = None
+            if run.output is None:
+                for owner in tuple(run.display.artifacts.values()):
+                    if owner.light_lease is None:
+                        try:
+                            run.display.cancel_light_1d(owner, None)
+                        except Exception as error:
+                            run.cleanup_failures.append(detach_exception(
+                                error, 'display_subscription.cancel'))
             cleaned = all(value is None for value in (
-                run.session, run.sink, run.output, run.source, run.resources))
+                run.session, run.sink, run.output, run.source, run.resources,
+            )) and not run.display.light_1d_cleanup_unresolved()
             run.cleanup_status = CleanupStatus.CLEANED if cleaned else CleanupStatus.CLEANUP_PENDING
             if cleaned:
                 run.closed = True
