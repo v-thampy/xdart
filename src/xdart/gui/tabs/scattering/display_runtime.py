@@ -12,7 +12,13 @@ from typing import Callable
 
 import numpy as np
 
-from xdart.modules.display_context import HydrationOwner, HydrationRequest
+from xdart.modules.display_context import (
+    HydrationOwner,
+    HydrationRequest,
+    Viewer2DCatalogHydrationRequest,
+    Viewer2DCommitGate,
+    Viewer2DFrameHydrationRequest,
+)
 from xdart.modules.frame_publication import (
     FramePublication,
     PublicationStore,
@@ -345,11 +351,51 @@ class RunDisplayState:
             unsubscribe = owner.light_unsubscribe
         if unsubscribe is not None:
             unsubscribe()
+        mutation = None
         with self._light_admission_lock:
             if owner.light_unsubscribe is unsubscribe:
                 owner.light_unsubscribe = None
             if commit_gate is not None:
-                self._transport.cancel_gate(commit_gate)
+                mutation = self._transport.cancel_gate_detached(commit_gate)
+        if mutation is not None:
+            self._transport.dispatch_detached(mutation)
+
+    def _mutate_transport_locked(self, request=None, *, gate=None, closed=False):
+        if request is not None:
+            return self._transport.submit_detached(request, closed=closed)
+        return self._transport.cancel_gate_detached(gate) if gate is not None else None
+
+    def _dispatch_transport(self, mutation) -> None:
+        if mutation is not None:
+            self._transport.dispatch_detached(mutation)
+
+    def submit_viewer_2d(self, request, *, closed=False):
+        if type(request) not in (Viewer2DCatalogHydrationRequest,
+                                 Viewer2DFrameHydrationRequest) or type(
+                                     request.commit_gate) is not Viewer2DCommitGate:
+            return None
+        with self._light_admission_lock:
+            mutation = self._transport.submit_detached(request, closed=closed)
+        self._transport.dispatch_detached(mutation)
+        return mutation.token
+
+    def cancel_viewer_2d(self, gate) -> None:
+        if type(gate) is not Viewer2DCommitGate:
+            return
+        with self._light_admission_lock:
+            mutation = self._mutate_transport_locked(gate=gate)
+        self._dispatch_transport(mutation)
+
+    def viewer_2d_retains_gate(self, gate) -> bool:
+        if type(gate) is not Viewer2DCommitGate:
+            return False
+        return self._transport.retains_gate(gate)
+
+    def viewer_2d_blocked_cleanup_token(self, token):
+        return self._transport.blocked_cleanup_token(token)
+
+    def retry_viewer_2d_blocked_cleanup(self, token):
+        return self._transport.retry_blocked_cleanup(token)
 
     def verify_light_1d(self, owner: DisplayArtifact, commit_gate: object | None) -> None:
         if commit_gate is not None and self._transport.retains_gate(commit_gate):
@@ -810,7 +856,12 @@ class RunDisplayState:
             lease = art.light_lease
             if lease is not None and lease.state is not Light1DLeaseState.ACTIVE:
                 return
-            self._transport.submit(request, closed=closed)
+            if (len(request.stores) != 2 or request.stores[0] is not art.records
+                    or request.stores[1] is not art.publications):
+                return
+            mutation = self._transport.submit_detached(request, closed=closed)
+        if mutation is not None:
+            self._transport.dispatch_detached(mutation)
 
     def _derive_target(self, request: HydrationRequest):
         """Derive the frozen values-only projection and exact key ONCE at

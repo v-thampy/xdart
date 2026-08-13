@@ -85,6 +85,30 @@ def _function_tree(path: Path, name: str) -> ast.FunctionDef:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     raise AssertionError(f"missing function {name}")
+
+
+def _attribute_calls(node: ast.AST, name: str) -> list[ast.Call]:
+    return [
+        child for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr == name
+    ]
+
+
+def _light_lock_descendants(function: ast.FunctionDef) -> set[int]:
+    locks = [
+        node for node in ast.walk(function)
+        if isinstance(node, ast.With)
+        and any(
+            ast.unparse(item.context_expr) == "self._light_admission_lock"
+            for item in node.items
+        )
+    ]
+    assert locks
+    return {id(child) for lock in locks for child in ast.walk(lock)}
+
+
 def test_p2_0_constructs_exact_light_graph_and_unwinds_every_boundary(monkeypatch, tmp_path) -> None:
     executor, identity, _run, artifact, _target, terminal = _terminal_run(tmp_path)
     lease = artifact.light_lease
@@ -424,16 +448,27 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
         read_key=read_key,
         token=HydrationToken(read_key, 51),
     )
-    submit_calls: list[HydrationRequest] = []
-    original_submit = transport.submit
+    detached_calls: list[HydrationRequest] = []
+    original_submit_detached = transport.submit_detached
+    original_dispatch_detached = transport.dispatch_detached
     original_derive = transport._derive
     derive_entered = Event()
     derive_release = Event()
     browse_errors: list[BaseException] = []
 
-    def counted_submit(request, *, closed=False):
-        submit_calls.append(request)
-        return original_submit(request, closed=closed)
+    def counted_capture(request, *, closed=False):
+        if request is browse_request:
+            assert run.display._light_admission_lock.acquire(blocking=False)
+            run.display._light_admission_lock.release()
+            return original_submit_detached(request, closed=closed)
+        assert not run.display._light_admission_lock.acquire(blocking=False)
+        detached_calls.append(request)
+        return original_submit_detached(request, closed=closed)
+
+    def checked_dispatch(mutation):
+        assert run.display._light_admission_lock.acquire(blocking=False)
+        run.display._light_admission_lock.release()
+        return original_dispatch_detached(mutation)
 
     def held_derive(request):
         if request is browse_request:
@@ -442,7 +477,8 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
             assert derive_release.wait(timeout=10.0)
         return original_derive(request)
 
-    monkeypatch.setattr(transport, "submit", counted_submit)
+    monkeypatch.setattr(transport, "submit_detached", counted_capture)
+    monkeypatch.setattr(transport, "dispatch_detached", checked_dispatch)
     monkeypatch.setattr(transport, "_derive", held_derive)
 
     def submit_browse() -> None:
@@ -469,7 +505,7 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
     preview_thread = Thread(target=attempt_fenced_preview)
     preview_thread.start()
     assert preview_done.wait(timeout=2.0)
-    assert submit_calls == [browse_request]
+    assert detached_calls == []
     derive_release.set()
     preview_thread.join(timeout=10.0)
     browse_thread.join(timeout=10.0)
@@ -512,6 +548,7 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
         b_owner = run.display.artifacts[str(run.artifact)]
         b_key = run.display.catalog.resolve_exact(str(run.artifact), 0)
         assert b_key is not None and b_owner.publications.discard(0)
+        detached_calls.clear()
         assert run.display.project(
             b_key,
             53,
@@ -519,6 +556,9 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
             owner=run.context_runtime.context.hydration_owner,
             commit_gate=gate,
         ) is None
+        assert detached_calls and detached_calls[-1].stores == (
+            b_owner.records, b_owner.publications,
+        )
         _wait_transport_idle(transport, gate)
         hydrated = b_owner.publications.get(0)
         assert hydrated is not None and hydrated.view.intensity_1d is not None
@@ -529,7 +569,8 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
         submit_entered = Event()
         release_started = Event()
 
-        def barrier_submit(_request, *, closed=False):
+        def barrier_capture(_request, *, closed=False):
+            assert not run.display._light_admission_lock.acquire(blocking=False)
             submit_entered.set()
             assert release_started.wait(timeout=2.0)
             deadline = monotonic() + 0.25
@@ -538,7 +579,7 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
                 sleep(0.005)
             race_states.append(b_lease.state)
 
-        monkeypatch.setattr(transport, "submit", barrier_submit)
+        monkeypatch.setattr(transport, "submit_detached", barrier_capture)
         race_preview = Thread(target=lambda: run.display._request_preview(
             b_owner, b_key, 54, True, hydration_owner, gate,
         ))
@@ -561,7 +602,8 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
             semantic_failures.append(("atomic-admission", race_states))
         assert release_results == [True]
     finally:
-        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+        cleanup_status = executor.close(identity).cleanup_status
+    assert cleanup_status is CleanupStatus.CLEANED
     assert semantic_failures == []
 def test_p2_0_removes_light_records_and_second_ndarray_owner() -> None:
     for path in (DISPLAY_RUNTIME, DISPLAY_RESIDENCY):
@@ -595,9 +637,23 @@ def test_p2_0_removes_light_records_and_second_ndarray_owner() -> None:
         for node in ast.walk(init)
     ) == 1
     for name in ("cancel_light_1d", "_request_preview"):
-        source = ast.unparse(_function_tree(DISPLAY_RUNTIME, name))
+        function = _function_tree(DISPLAY_RUNTIME, name)
+        source = ast.unparse(function)
         assert "self._light_admission_lock" in source
         assert "with self._lock" not in source
+        calls = {
+            node.func.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert not {"submit", "cancel_gate"} & calls
+        capture_name = ("submit_detached" if name == "_request_preview"
+                        else "cancel_gate_detached")
+        capture = _attribute_calls(function, capture_name)
+        dispatch = _attribute_calls(function, "dispatch_detached")
+        locked = _light_lock_descendants(function)
+        assert len(capture) == 1 and id(capture[0]) in locked
+        assert dispatch and all(id(call) not in locked for call in dispatch)
     assert "_light_admission_lock" not in ast.unparse(
         _function_tree(DISPLAY_RUNTIME, "commit_preview")
     )
@@ -713,13 +769,14 @@ def test_p2_0_preview_preserves_pair_and_light_miss_stays_array_free(monkeypatch
     gate = run.context_runtime.context.commit_gate
     transport = run.display.transport
     submitted = []
-    real_submit = transport.submit
+    real_submit = transport.submit_detached
 
     def count_submit(request, *, closed=False):
+        assert not run.display._light_admission_lock.acquire(blocking=False)
         submitted.append(request)
         return real_submit(request, closed=closed)
 
-    monkeypatch.setattr(transport, "submit", count_submit)
+    monkeypatch.setattr(transport, "submit_detached", count_submit)
     ledger: dict[str, object] = {}
     try:
         assert terminal.kind is StandardEventKind.FINISHED

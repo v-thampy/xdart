@@ -51,6 +51,7 @@ import os
 import threading
 from dataclasses import dataclass, field, fields as dataclass_fields
 from enum import Enum
+from typing import Protocol, runtime_checkable
 
 from xrd_tools.session.hydration import (
     HydrationPurpose,
@@ -65,6 +66,23 @@ __all__ = [
     "CurrentDisplayScope",
     "HydrationOwner",
     "HydrationRequest",
+    "Prepared2DCatalogCommit",
+    "Prepared2DFrameCommit",
+    "TwoDViewerCommitPort",
+    "Viewer2DCatalogHydrationRequest",
+    "Viewer2DCommitGate",
+    "Viewer2DCleanupReceipt",
+    "Viewer2DCleanupState",
+    "Viewer2DContext",
+    "Viewer2DDisposal",
+    "Viewer2DDisposalToken",
+    "Viewer2DFrameHydrationRequest",
+    "Viewer2DReadActivation",
+    "Viewer2DReadBudgetReceipt",
+    "Viewer2DReceiptPhase",
+    "Viewer2DRendererClearReceipt",
+    "Viewer2DRendererClearRequest",
+    "Viewer2DState",
     "FINALIZATION_FINALIZED",
     "FINALIZATION_IN_PROGRESS",
     "FINALIZATION_PENDING",
@@ -91,6 +109,7 @@ class ContextKind(str, Enum):
 
     ACQUISITION = "acquisition"
     BROWSE = "browse"
+    VIEWER_2D = "viewer_2d"
 
 
 class DisplayContextError(RuntimeError):
@@ -229,6 +248,10 @@ class CommitGate:
             self._cancelled = True
             self._reserved_epoch = 0
             self._epoch += 1
+
+
+class Viewer2DCommitGate(CommitGate):
+    __slots__ = ()
 
 
 def _clear(obj) -> None:
@@ -450,6 +473,379 @@ class HydrationRequest:
         """
         return bool(self.owner.qualified and self.stores
                     and self.commit_gate is not None)
+
+
+class Viewer2DState(str, Enum):
+    EMPTY = "empty"
+    CATALOG_LOADING = "catalog_loading"
+    FRAME_LOADING = "frame_loading"
+    READY = "ready"
+    CLEANUP_PENDING = "cleanup_pending"
+    CLOSED = "closed"
+
+
+class Viewer2DReceiptPhase(str, Enum):
+    CATALOG_R = "catalog_r"
+    FRAME_A = "frame_a"
+    FRAME_READY_A = "frame_ready_a"
+    CLEANUP_PENDING = "cleanup_pending"
+    RELEASED = "released"
+
+
+class Viewer2DCleanupState(str, Enum):
+    CLEANUP_PENDING = "cleanup_pending"
+    CLEANED = "cleaned"
+    STALE = "stale"
+
+
+def _viewer_malformed(condition, message):
+    if condition: raise TypeError(message)
+
+
+def _viewer_sha256_text(value):
+    return (type(value) is str and len(value) == 64
+            and not set(value) - set("0123456789abcdef"))
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DContext:
+    context_token: str
+    generation: int
+    original_path: str
+    commit_gate: Viewer2DCommitGate
+    state: Viewer2DState = Viewer2DState.EMPTY
+
+    def __post_init__(self):
+        _viewer_malformed(type(self.context_token) is not str or not self.context_token
+            or type(self.generation) is not int or self.generation < 0
+            or type(self.original_path) is not str or not self.original_path
+            or len(os.fsencode(self.original_path)) > 4096
+            or type(self.commit_gate) is not Viewer2DCommitGate
+            or type(self.state) is not Viewer2DState,
+            "viewer context values are malformed")
+
+    @property
+    def kind(self):
+        return ContextKind.VIEWER_2D
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DReadBudgetReceipt:
+    identity: object
+    capacity: int
+    reserved: int
+    phase: Viewer2DReceiptPhase
+    request_token: HydrationToken | None = None
+
+    def __post_init__(self):
+        from xrd_tools.io.viewer_2d import CATALOG_RESERVATION, viewer_2d_memory_ledger
+        budget = viewer_2d_memory_ledger(1, 1).budget
+        released = self.phase is Viewer2DReceiptPhase.RELEASED
+        _viewer_malformed(self.identity is None or type(self.capacity) is not int
+            or self.capacity != budget or type(self.reserved) is not int
+            or type(self.phase) is not Viewer2DReceiptPhase
+            or released and self.reserved != 0
+            or not released and not 0 < self.reserved <= self.capacity
+            or self.phase is Viewer2DReceiptPhase.CATALOG_R
+            and self.reserved != CATALOG_RESERVATION
+            or self.request_token is not None and type(self.request_token) is not HydrationToken,
+            "viewer budget receipt is malformed")
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DReadActivation:
+    token: HydrationToken
+    receipt: Viewer2DReadBudgetReceipt | None
+    phase: Viewer2DReceiptPhase | None
+    accepted: bool = True
+    diagnostic: str = ""
+
+    def __post_init__(self):
+        _viewer_malformed(type(self.token) is not HydrationToken
+            or type(self.accepted) is not bool or type(self.diagnostic) is not str,
+            "viewer activation identity is malformed")
+        if not self.accepted:
+            if self.receipt is not None or self.phase is not None or not self.diagnostic:
+                raise ValueError("refused viewer activation must be inert and diagnostic")
+            return
+        if type(self.receipt) is Viewer2DReadBudgetReceipt:
+            self.receipt.__post_init__()
+        if (type(self.receipt) is not Viewer2DReadBudgetReceipt
+                or self.phase not in (Viewer2DReceiptPhase.CATALOG_R, Viewer2DReceiptPhase.FRAME_A)
+                or self.receipt.phase is not self.phase
+                or self.receipt.request_token is not self.token):
+            raise ValueError("viewer activation phase is not readable")
+
+    @property
+    def receipt_identity(self):
+        return None if self.receipt is None else self.receipt.identity
+
+
+@runtime_checkable
+class TwoDViewerCommitPort(Protocol):
+    def activate(self, request): ...
+    def dispose(self, disposal): ...
+    def commit(self, prepared): ...
+    def complete(self, completion): ...
+
+
+def _viewer_request_identity(generation, gate, port, read_key, token, label):
+    if (type(generation) is not int or generation < 0
+            or type(gate) is not Viewer2DCommitGate
+            or not isinstance(port, TwoDViewerCommitPort)
+            or type(read_key) is not HydrationReadKey
+            or type(token) is not HydrationToken
+            or token.read_key != read_key
+            or token.presentation_generation != generation
+            or read_key.scope.scan_key != "viewer-2d"
+            or read_key.scope.source != "viewer-2d"
+            or read_key.artifact_identity != "viewer-2d"
+            or read_key.frame_identity != label
+            or read_key.purpose is not HydrationPurpose.PREVIEW
+            or read_key.scope.epoch != gate.epoch):
+        raise ValueError("viewer request identity is inconsistent")
+
+
+class _ViewerRequest:
+    @property
+    def scope(self): return self.read_key.scope
+
+    @property
+    def enqueueable(self): return not self.commit_gate.cancelled
+
+
+def _viewer_policy(value):
+    from xrd_tools.io.viewer_2d import Viewer2DFormatPolicy
+    if type(value) is not Viewer2DFormatPolicy:
+        raise TypeError("viewer request requires an exact frozen format policy")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DCatalogHydrationRequest(_ViewerRequest):
+    path: str
+    policy: object
+    generation: int
+    commit_gate: Viewer2DCommitGate
+    port: TwoDViewerCommitPort
+    read_key: HydrationReadKey
+    token: HydrationToken
+
+    def __post_init__(self):
+        if type(self.path) is not str or not self.path or len(os.fsencode(self.path)) > 4096:
+            raise TypeError("viewer catalog path must be an exact bounded string")
+        _viewer_policy(self.policy)
+        _viewer_request_identity(self.generation, self.commit_gate, self.port,
+                                 self.read_key, self.token, "catalog")
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DFrameHydrationRequest(_ViewerRequest):
+    label: int
+    generation: int
+    commit_gate: Viewer2DCommitGate
+    port: TwoDViewerCommitPort
+    catalog: object
+    receipt_identity: object
+    policy: object
+    read_key: HydrationReadKey
+    token: HydrationToken
+
+    def __post_init__(self):
+        from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog
+        labels = getattr(self.catalog, "frame_labels", None)
+        identity = getattr(self.catalog, "catalog_identity", None)
+        if type(self.catalog) is Viewer2DArtifactCatalog:
+            self.catalog.__post_init__()
+        if (type(self.label) is not int or self.receipt_identity is None
+                or type(self.catalog) is not Viewer2DArtifactCatalog
+                or type(labels) is not tuple or self.label not in labels
+                or type(identity) is not str or not identity
+                or _viewer_policy(self.policy).identity != getattr(self.catalog, "policy_identity", None)):
+            raise TypeError("viewer frame request values are malformed")
+        _viewer_request_identity(self.generation, self.commit_gate, self.port,
+                                 self.read_key, self.token, self.label)
+
+
+@dataclass(frozen=True, slots=True)
+class Prepared2DCatalogCommit:
+    request: Viewer2DCatalogHydrationRequest
+    activation: Viewer2DReadActivation
+    catalog: object
+
+    def __post_init__(self):
+        from xrd_tools.io.viewer_2d import (
+            CATALOG_RESERVATION, Viewer2DArtifactCatalog, viewer_2d_memory_ledger,
+        )
+        if type(self.request) is Viewer2DCatalogHydrationRequest:
+            self.request.__post_init__()
+        if type(self.activation) is Viewer2DReadActivation:
+            self.activation.__post_init__()
+        if type(self.catalog) is Viewer2DArtifactCatalog:
+            self.catalog.__post_init__()
+        receipt = getattr(self.activation, "receipt", None)
+        _viewer_malformed(type(self.request) is not Viewer2DCatalogHydrationRequest
+            or type(self.activation) is not Viewer2DReadActivation
+            or not self.activation.accepted
+            or self.activation.token is not self.request.token
+            or self.activation.phase is not Viewer2DReceiptPhase.CATALOG_R
+            or receipt.capacity != viewer_2d_memory_ledger(1, 1).budget
+            or receipt.reserved != CATALOG_RESERVATION
+            or type(self.catalog) is not Viewer2DArtifactCatalog
+            or self.request.policy.identity != self.catalog.policy_identity
+            or os.path.realpath(os.path.expanduser(self.request.path)) !=
+                self.catalog.canonical_path,
+            "prepared viewer catalog is inconsistent")
+
+
+@dataclass(frozen=True, slots=True)
+class Prepared2DFrameCommit:
+    request: Viewer2DFrameHydrationRequest
+    activation: Viewer2DReadActivation
+    frame: object
+    receipt_identity: object
+
+    def __post_init__(self):
+        from xrd_tools.io.viewer_2d import (
+            Viewer2DFrame, _validate_frame_against_catalog,
+            viewer_2d_selected_ledger,
+        )
+        if type(self.request) is Viewer2DFrameHydrationRequest:
+            self.request.__post_init__()
+        if type(self.activation) is Viewer2DReadActivation:
+            self.activation.__post_init__()
+        if type(self.frame) is Viewer2DFrame:
+            self.frame.__post_init__()
+        receipt = getattr(self.activation, "receipt", None)
+        ledger = (viewer_2d_selected_ledger(self.request.catalog, self.request.label)
+                  if type(self.request) is Viewer2DFrameHydrationRequest else None)
+        _viewer_malformed(type(self.request) is not Viewer2DFrameHydrationRequest
+            or type(self.activation) is not Viewer2DReadActivation
+            or not self.activation.accepted
+            or self.activation.token is not self.request.token
+            or self.activation.phase is not Viewer2DReceiptPhase.FRAME_A
+            or self.activation.receipt_identity is not self.request.receipt_identity
+            or self.receipt_identity is not self.request.receipt_identity
+            or receipt.capacity != ledger.budget or receipt.reserved != ledger.admission
+            or type(self.frame) is not Viewer2DFrame
+            or self.frame.catalog_identity !=
+                getattr(self.request.catalog, "catalog_identity", None)
+            or getattr(self.frame, "label", None) != self.request.label,
+            "prepared viewer frame is inconsistent")
+        _validate_frame_against_catalog(self.request.catalog, self.request.label, self.frame)
+
+
+class Viewer2DDisposalToken:
+    __slots__ = ()
+
+
+def _viewer_disposal_expected(request):
+    from xrd_tools.io.viewer_2d import (
+        CATALOG_RESERVATION,
+        viewer_2d_memory_ledger,
+        viewer_2d_selected_ledger,
+    )
+    if type(request) is Viewer2DCatalogHydrationRequest:
+        return (Viewer2DReceiptPhase.CATALOG_R,
+                viewer_2d_memory_ledger(1, 1).budget,
+                CATALOG_RESERVATION)
+    ledger = viewer_2d_selected_ledger(request.catalog, request.label)
+    return Viewer2DReceiptPhase.FRAME_A, ledger.budget, ledger.admission
+
+
+def _viewer_quarantine_readable(request, activation):
+    receipt = getattr(activation, "receipt", None)
+    phase = getattr(activation, "phase", None)
+    return (type(activation) is Viewer2DReadActivation
+            and getattr(activation, "accepted", None) is True
+            and type(getattr(activation, "diagnostic", None)) is str
+            and getattr(activation, "token", None) is request.token
+            and type(receipt) is Viewer2DReadBudgetReceipt
+            and getattr(receipt, "request_token", None) is request.token
+            and (phase is Viewer2DReceiptPhase.CATALOG_R
+                 or phase is Viewer2DReceiptPhase.FRAME_A)
+            and getattr(receipt, "phase", None) is phase
+            and getattr(receipt, "identity", None) is not None
+            and type(getattr(receipt, "capacity", None)) is int
+            and receipt.capacity >= 0
+            and type(getattr(receipt, "reserved", None)) is int
+            and receipt.reserved >= 0
+            and (type(request) is not Viewer2DFrameHydrationRequest
+                 or receipt.identity is request.receipt_identity))
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DDisposal:
+    request: object
+    activation: Viewer2DReadActivation
+    prepared: object | None
+    token: Viewer2DDisposalToken
+
+    def __post_init__(self):
+        request_type = type(self.request)
+        _viewer_malformed(request_type not in (Viewer2DCatalogHydrationRequest,
+                Viewer2DFrameHydrationRequest)
+            or type(self.token) is not Viewer2DDisposalToken,
+            "viewer disposal identity is inconsistent")
+        self.request.__post_init__()
+        readable = _viewer_quarantine_readable(self.request, self.activation)
+        expected_phase, expected_capacity, expected_reserved = \
+            _viewer_disposal_expected(self.request)
+        normal = (readable and self.activation.phase is expected_phase
+                  and self.activation.receipt.capacity == expected_capacity
+                  and self.activation.receipt.reserved == expected_reserved)
+        if normal:
+            self.activation.__post_init__()
+            if self.prepared is None:
+                return
+            prepared_type = (Prepared2DCatalogCommit
+                if request_type is Viewer2DCatalogHydrationRequest
+                else Prepared2DFrameCommit)
+            _viewer_malformed(type(self.prepared) is not prepared_type
+                or self.prepared.request is not self.request
+                or self.prepared.activation is not self.activation,
+                "viewer disposal identity is inconsistent")
+            self.prepared.__post_init__()
+            return
+        _viewer_malformed(self.prepared is not None or not readable,
+                          "viewer disposal identity is inconsistent")
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DCleanupReceipt:
+    token: Viewer2DDisposalToken
+    state: Viewer2DCleanupState
+
+    def __post_init__(self):
+        _viewer_malformed(type(self.token) is not Viewer2DDisposalToken
+            or type(self.state) is not Viewer2DCleanupState, "viewer cleanup receipt is malformed")
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DRendererClearRequest:
+    context_token: str
+    generation: int
+    catalog_identity: str
+    label: int | None
+
+    def __post_init__(self):
+        _viewer_malformed(type(self.context_token) is not str or not self.context_token
+            or type(self.generation) is not int or self.generation < 0
+            or not _viewer_sha256_text(self.catalog_identity)
+            or self.label is not None and (type(self.label) is not int or self.label < 0),
+            "viewer renderer-clear request is malformed")
+
+
+@dataclass(frozen=True, slots=True)
+class Viewer2DRendererClearReceipt:
+    request: Viewer2DRendererClearRequest
+    cleared: bool
+
+    def __post_init__(self):
+        if type(self.request) is Viewer2DRendererClearRequest:
+            self.request.__post_init__()
+        _viewer_malformed(type(self.request) is not Viewer2DRendererClearRequest
+            or type(self.cleared) is not bool, "viewer renderer-clear receipt is malformed")
 
 
 @dataclass(frozen=True, slots=True)
