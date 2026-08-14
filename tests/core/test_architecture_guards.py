@@ -40,7 +40,7 @@ def test_viewer_1d_io_is_a_pure_leaf():
     path = PACKAGE / "io" / "viewer_1d.py"; tree = ast.parse(path.read_text(), filename=str(path))
     # Finite source ratchet, not a sandbox: computed, reflective, sys.modules and native loading are review threats.
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
-    reserved = {"importlib", "__import__"}; imported_loaders = {*reserved, "import_module"}
+    reserved = {"importlib", "__import__"}; imported_loaders = {*reserved, "import_module"}; type_params = tuple(getattr(ast, name) for name in ("TypeVar", "TypeVarTuple", "ParamSpec") if hasattr(ast, name))
     resolve = lambda name, level=0: ".".join((*((("xrd_tools", "io")[:max(0, 3 - level)]) if level else ()), *filter(None, name.split("."))))
     forbidden = lambda name: name == "xdart" or name.startswith("xdart.") or name == "xrd_tools.session" or name.startswith("xrd_tools.session.")
     offenders = []
@@ -65,7 +65,7 @@ def test_viewer_1d_io_is_a_pure_leaf():
                 and parent.attr == "import_module" and isinstance(grandparent, ast.Call) and grandparent.func is parent)
             if isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in reserved or isinstance(node.ctx, ast.Load) and (node.id == "__builtins__" or node.id in reserved and not allowed): offenders.append(f"name:{node.lineno}")
         binding = (node.arg if isinstance(node, ast.arg) else node.name
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) else node.rest
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar, *type_params)) else node.rest
             if isinstance(node, ast.MatchMapping) else None)
         if binding in reserved: offenders.append(f"binding:{node.lineno}")
     offenders += [f"__getattr__:{node.lineno}" for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__getattr__"]
