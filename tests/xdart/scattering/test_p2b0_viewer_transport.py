@@ -26,7 +26,6 @@ def _request(dc, reader, transport, port, path, generation):
         transport,
     )
 
-
 class _Port:
     def __init__(self, dc, *, adopt=True):
         self.dc, self.adopt = dc, adopt
@@ -36,7 +35,7 @@ class _Port:
         self.calls, self.completions, self.notices, self.holders = [], [], [], []
 
     def commit(self, prepared):
-        import xrd_tools.io.viewer_1d as reader
+        import xrd_tools.session.viewer_1d as reader
         self.calls.append(("commit", prepared.request.generation))
         if not self.adopt:
             return None
@@ -68,17 +67,14 @@ class _Port:
                            completion.outcome))
         self.completions.append(completion)
 
-
 def _modules():
     import xdart.modules.display_context as dc
     import xdart.gui.tabs.scattering.hydration_transport as ht
-    import xrd_tools.io.viewer_1d as reader
+    import xrd_tools.session.viewer_1d as reader
     return dc, ht, reader
-
 
 def _transport(ht):
     return ht.HydrationTransport(lambda value: None, lambda value: (None, None))
-
 
 def _wait(ticket, timeout=5):
     deadline = time.monotonic() + timeout
@@ -86,7 +82,6 @@ def _wait(ticket, timeout=5):
         time.sleep(.005)
     assert ticket.result() is not None
     return ticket.result()
-
 
 def _force_real_cleanup_pending(reader, monkeypatch):
     complete, close = reader.Viewer1DReadOperation.complete, reader._BuildingGraph.close_streams
@@ -104,10 +99,8 @@ def _force_real_cleanup_pending(reader, monkeypatch):
     monkeypatch.setattr(reader.Viewer1DReadOperation, "complete", stop_first)
     monkeypatch.setattr(reader._BuildingGraph, "close_streams", fail_drain_once)
 
-
 class _FatalControl(BaseException):
     pass
-
 
 def _capture_thread_controls(monkeypatch):
     seen, arrived = [], threading.Event()
@@ -117,13 +110,30 @@ def _capture_thread_controls(monkeypatch):
     monkeypatch.setattr(threading, "excepthook", capture)
     return seen, arrived
 
-
 def _wait_for(predicate, timeout=3):
     deadline = time.monotonic() + timeout
     while not predicate() and time.monotonic() < deadline:
         time.sleep(.005)
     assert predicate()
 
+
+@pytest.mark.parametrize("forgery", ["wrong_generation", "foreign_read_key"])
+def test_canonical_request_is_revalidated_before_admission_mutation(tmp_path, forgery):
+    dc, ht, reader = _modules()
+    transport, port = _transport(ht), _Port(dc)
+    request = _request(dc, reader, transport, port, tmp_path / "unused.xye", 1)
+    if forgery == "wrong_generation":
+        token = HydrationToken(request.read_key, request.generation + 1)
+    else:
+        scope = HydrationScope("foreign", "viewer-1d", "viewer-1d", port.gate.epoch)
+        token = HydrationToken(HydrationReadKey(
+            scope, "viewer-1d", "batch", HydrationPurpose.ONE_D), request.generation)
+    object.__setattr__(request, "token", token)
+    mutation = transport.submit_detached(request)
+    assert mutation.ticket is None
+    assert transport.active_token is transport.queued_token is None
+    assert all(value == 0 for value in transport.counters().values())
+    assert transport.retire(join_timeout=1)
 
 def test_qt_free_values_port_and_path_independent_identity(tmp_path):
     dc, ht, reader = _modules()
@@ -143,7 +153,6 @@ def test_qt_free_values_port_and_path_independent_identity(tmp_path):
     assert one.read_key.frame_identity == two.read_key.frame_identity == "batch"
     assert one.token != two.token
     assert transport.retire(join_timeout=1)
-
 
 def test_one_d_never_coalesces_and_latest_cross_generation_wins(tmp_path, monkeypatch):
     dc, ht, reader = _modules()
@@ -178,7 +187,6 @@ def test_one_d_never_coalesces_and_latest_cross_generation_wins(tmp_path, monkey
         assert holder.release("done")
     assert transport.retire(join_timeout=1)
 
-
 def test_adoption_cell_decides_lost_commit_return(tmp_path):
     dc, ht, reader = _modules()
     path = tmp_path / "values.xye"
@@ -198,7 +206,6 @@ def test_adoption_cell_decides_lost_commit_return(tmp_path):
     assert len(port.holders) == 1 and len(port.completions) == 1
     assert port.holders[0].release("done")
     assert transport.retire(join_timeout=1)
-
 
 def test_cleanup_pending_acknowledges_before_token_and_retry(tmp_path, monkeypatch):
     dc, ht, reader = _modules()
@@ -221,7 +228,6 @@ def test_cleanup_pending_acknowledges_before_token_and_retry(tmp_path, monkeypat
     assert len(port.completions) == 1
     assert transport.retire(join_timeout=1)
 
-
 @pytest.mark.parametrize("ack_first", [False, True])
 def test_cleanup_blocked_pre_and_post_ack_keep_only_latest(tmp_path, monkeypatch, ack_first):
     dc, ht, reader = _modules()
@@ -241,9 +247,16 @@ def test_cleanup_blocked_pre_and_post_ack_keep_only_latest(tmp_path, monkeypatch
 
     port = HeldAck(dc)
     _force_real_cleanup_pending(reader, monkeypatch)
+    reads, real_begin = [], ht.begin_viewer_1d_read
+    monkeypatch.setattr(ht, "begin_viewer_1d_read", lambda request, *args: (
+        reads.append(request.generation) or real_begin(request, *args)))
     a = _request(dc, reader, transport, port, path, 1)
     ta = transport._submit_admission(a)
     assert port.entered.wait(2) and port.notices and ta.result() is None
+    assert transport.blocked_cleanup_token(a.token) is None
+    with transport._lock:
+        exact_a = (transport._active.disposal, transport._active.terminal,
+                   transport._active.terminal.notice, transport._active.delivery_guard)
     b = _request(dc, reader, transport, port, path, 2)
     tb = transport._submit_admission(b)
     c = _request(dc, reader, transport, port, path, 3)
@@ -264,12 +277,16 @@ def test_cleanup_blocked_pre_and_post_ack_keep_only_latest(tmp_path, monkeypatch
     assert _wait(tc).outcome is HydrationOutcome.SUPERSEDED
     outer = transport.blocked_cleanup_token(a.token)
     assert outer is not None
+    with transport._lock:
+        assert exact_a[:3] == (transport._active.disposal, transport._active.terminal,
+                              transport._active.terminal.notice)
+        assert transport._active.delivery_guard is None
     assert transport.retry_blocked_cleanup(outer).state is dc.Viewer2DCleanupState.CLEANED
     assert _wait(ta).outcome is HydrationOutcome.FAILED
     assert _wait(td).outcome is HydrationOutcome.FAILED
+    assert reads == [1, 4]
     assert [item.token.presentation_generation for item in port.completions] == [2, 3, 1, 4]
     assert transport.retire(join_timeout=1)
-
 
 @pytest.mark.parametrize("control_type", [MemoryError, _FatalControl])
 @pytest.mark.parametrize("seam, expected", [
@@ -354,7 +371,6 @@ def test_control_identity_and_terminalization_at_every_custody_seam(
         assert holder.release("done")
     assert transport.retire(join_timeout=1)
 
-
 @pytest.mark.parametrize("control_type", [MemoryError, _FatalControl])
 def test_control_after_successful_positive_cleanup_is_terminal(tmp_path, monkeypatch,
                                                                control_type):
@@ -381,7 +397,6 @@ def test_control_after_successful_positive_cleanup_is_terminal(tmp_path, monkeyp
     assert transport.active_token is transport.queued_token is transport.worker is None
     assert port.completions == [completion]
     assert transport.retire(join_timeout=1)
-
 
 @pytest.mark.parametrize("control_type", [MemoryError, _FatalControl])
 def test_control_cleanup_pending_ack_then_token_then_retry(tmp_path, monkeypatch,
@@ -426,7 +441,6 @@ def test_control_cleanup_pending_ack_then_token_then_retry(tmp_path, monkeypatch
     assert port.completions == [completion]
     assert transport.retire(join_timeout=1)
 
-
 @pytest.mark.parametrize("control_type", [MemoryError, _FatalControl])
 def test_retry_control_preserves_exact_blocked_custody(tmp_path, monkeypatch,
                                                        control_type):
@@ -462,7 +476,6 @@ def test_retry_control_preserves_exact_blocked_custody(tmp_path, monkeypatch,
     assert _wait(ticket).outcome is HydrationOutcome.FAILED
     assert len(port.completions) == 1
     assert transport.retire(join_timeout=1)
-
 
 def test_pre_ack_displaced_completion_control_preserves_replacement_order(
         tmp_path, monkeypatch):
@@ -528,7 +541,6 @@ def test_pre_ack_displaced_completion_control_preserves_replacement_order(
         assert holder.release("done")
     assert transport.retire(join_timeout=1)
 
-
 def test_blocked_lineage_refusals_and_retirement_cancel_only_queued(
         tmp_path, monkeypatch):
     dc, ht, reader = _modules()
@@ -565,6 +577,18 @@ def test_blocked_lineage_refusals_and_retirement_cancel_only_queued(
         base.read_key, base.token, base.gui_thread_id, object(),
         base.owner_request_claim, base.admitted_provider_identity)
     assert transport._submit_admission(foreign_owner) is None
+    for field in ("owner_request_claim", "commit_gate", "admitted_provider_identity",
+                  "token", "port"):
+        forged = _request(dc, reader, transport, port, path, 3)
+        value = (dc.Viewer1DCommitGate() if field == "commit_gate" else
+                 HydrationToken(forged.read_key, forged.generation + 1)
+                 if field == "token" else object())
+        object.__setattr__(forged, field, value)
+        assert transport._submit_admission(forged) is None, field
+    notice = port.notices[0]
+    object.__setattr__(notice, "_acknowledgement", object())
+    assert notice.acknowledgement is None and transport.blocked_cleanup_token(a.token) is None
+    object.__setattr__(notice, "_acknowledgement", None)
     assert not transport.retire(join_timeout=.01)
     assert _wait(tb).outcome is HydrationOutcome.CANCELLED
     assert transport.active_token is a.token and transport.queued_token is None
@@ -579,8 +603,8 @@ def test_blocked_lineage_refusals_and_retirement_cancel_only_queued(
         _request(dc, reader, transport, port, path, 4)) is None
     assert transport.retire(join_timeout=1)
 
-
 def test_factory_only_custody_records_refuse_direct_construction():
+    from dataclasses import fields
     dc, _, reader = _modules()
     with pytest.raises(TypeError, match="foreign viewer 1-D transfer"):
         reader.Viewer1DAdoptionTransfer(object(), object(), object())
@@ -588,3 +612,104 @@ def test_factory_only_custody_records_refuse_direct_construction():
         reader.Viewer1DDisposal(object(), "foreign")
     with pytest.raises(TypeError, match="prepared viewer 1-D batch"):
         dc.Prepared1DBatchCommit(object(), object(), object(), "0" * 64, object())
+    assert [field.name for field in fields(dc.Prepared1DBatchCommit)] == [
+        "request", "retired_receipt_identity", "identity", "batch_identity", "transfer"]
+    assert reader.Viewer1DDisposal.__slots__ == (
+        "transfer", "reason", "_inner_token", "_hooks", "_no_lease_step")
+    assert set(reader._BuildingCustody.__slots__) == {"graph", "claim"}
+    assert set(reader._OwnerAdoption.__slots__) == {"holder", "receipt", "claim"}
+    assert set(reader._DisposalCustody.__slots__) == {"graph", "disposal", "claim"}
+    assert set(reader._Released.__slots__) == {"identity", "claim"}
+    assert reader._BatchCustody.__slots__ == (
+        "batch", "batch_identity", "prepared_identity", "retired_receipt_identity",
+        "request_identity", "transport_token_identity", "issuer_transport_identity",
+        "port_identity", "claim")
+    _, ht, _ = _modules()
+    assert ht.HydrationTransport.__slots__ == ("_viewer_1d_claim", "__dict__")
+    assert [field.name for field in fields(ht._TransportEntry)] == [
+        "request", "projection", "key", "closed", "token", "ticket",
+        "committed_token", "committed_ticket", "state", "disposal",
+        "viewer_1d_receipt", "viewer_1d_transfer", "cleanup_token", "terminal",
+        "retrying", "delivery_guard"]
+
+def test_r12_retry_retirement_control_keeps_visible_usable_token(
+        tmp_path, monkeypatch):
+    dc, ht, reader = _modules()
+    path = tmp_path / "values.xye"
+    path.write_text("0 1\n1 2\n")
+    control, retire_calls, drain_calls = MemoryError("retry retirement"), [], []
+    real_retire = ht._retire_viewer_1d_budget_receipt
+    real_close = reader._BuildingGraph.close_streams
+    def retire(receipt, reason):
+        retire_calls.append((receipt, reason))
+        if len(retire_calls) == 1: raise RuntimeError("ordinary pre-retirement failure")
+        real_retire(receipt, reason)
+        if len(retire_calls) == 2: raise control
+    def close(graph):
+        if not drain_calls:
+            drain_calls.append(True)
+            raise RuntimeError("ordinary cleanup pending")
+        return real_close(graph)
+    monkeypatch.setattr(ht, "_retire_viewer_1d_budget_receipt", retire)
+    monkeypatch.setattr(reader._BuildingGraph, "close_streams", close)
+    transport, port = _transport(ht), _Port(dc, adopt=False)
+    request = _request(dc, reader, transport, port, path, 1)
+    ticket = transport._submit_admission(request)
+    _wait_for(lambda: transport.blocked_cleanup_token(request.token) is not None)
+    outer = transport.blocked_cleanup_token(request.token)
+    caught = None
+    try: transport.retry_blocked_cleanup(outer)
+    except BaseException as error: caught = error
+    assert caught is control and ticket.result() is None
+    assert transport.blocked_cleanup_token(request.token) is outer
+    with transport._lock:
+        disposal = transport._active.disposal
+        assert disposal is not None and transport._active.cleanup_token is outer
+    assert transport.retry_blocked_cleanup(object()).state is dc.Viewer2DCleanupState.STALE
+    real_retry = reader.Viewer1DDisposal.retry
+    def retry(value):
+        assert transport.retry_blocked_cleanup(outer).state is dc.Viewer2DCleanupState.STALE
+        return real_retry(value)
+    monkeypatch.setattr(reader.Viewer1DDisposal, "retry", retry)
+    assert transport.retry_blocked_cleanup(outer).state is dc.Viewer2DCleanupState.CLEANED
+    assert _wait(ticket).outcome is HydrationOutcome.FAILED
+    assert disposal._hooks is disposal._inner_token is None
+    assert transport.retry_blocked_cleanup(outer).state is dc.Viewer2DCleanupState.STALE
+    assert len(port.completions) == 1 and transport.retire(join_timeout=1)
+
+
+def test_post_capture_retry_control_delivers_finalizes_and_wakes_latest(
+        tmp_path, monkeypatch):
+    dc, ht, reader = _modules()
+    path = tmp_path / "values.xye"; path.write_text("0 1\n1 2\n")
+    control, injected, reads = MemoryError("post-capture"), [], []
+    transport, port = _transport(ht), _Port(dc, adopt=False)
+    _force_real_cleanup_pending(reader, monkeypatch)
+    real_begin, real_capture = ht.begin_viewer_1d_read, ht.HydrationTransport._capture_locked
+    monkeypatch.setattr(ht, "begin_viewer_1d_read", lambda request, *args: (
+        reads.append(request.generation) or real_begin(request, *args)))
+    a = _request(dc, reader, transport, port, path, 1)
+    ta = transport._submit_admission(a)
+    _wait_for(lambda: transport.blocked_cleanup_token(a.token) is not None)
+    outer = transport.blocked_cleanup_token(a.token)
+    b = _request(dc, reader, transport, port, path, 2)
+    tb = transport._submit_admission(b)
+    def capture_then_control(self, entry, *args, **kwargs):
+        delivery = real_capture(self, entry, *args, **kwargs)
+        if entry.request is a and not injected:
+            injected.append(delivery)
+            raise control
+        return delivery
+    monkeypatch.setattr(ht.HydrationTransport, "_capture_locked", capture_then_control)
+    caught = None
+    try: transport.retry_blocked_cleanup(outer)
+    except BaseException as error: caught = error
+    assert caught is control
+    assert _wait(ta).outcome is HydrationOutcome.FAILED
+    assert _wait(tb).outcome is HydrationOutcome.FAILED
+    assert reads == [1, 2]
+    assert [item.token for item in port.completions] == [a.token, b.token]
+    assert tuple(item.token for item in transport.completions()).count(a.token) == 1
+    assert transport.active_token is transport.queued_token is transport.worker is None
+    assert transport.retry_blocked_cleanup(outer).state is dc.Viewer2DCleanupState.STALE
+    assert transport.retire(join_timeout=1)

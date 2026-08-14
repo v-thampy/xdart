@@ -60,6 +60,27 @@ from xrd_tools.session.hydration import (
     HydrationToken,
     normalize_hydration_purpose,
 )
+from xrd_tools.session.viewer_1d import (
+    OneDViewerCommitPort,
+    Prepared1DBatchCommit,
+    Viewer1DBatchHydrationRequest,
+    Viewer1DCleanupPendingNotice,
+    Viewer1DCommitGate,
+    Viewer1DCommitReceipt,
+    Viewer1DReadBudgetReceipt,
+    Viewer1DReadBudgetState,
+    Viewer1DRendererClearReceipt,
+    Viewer1DRendererClearRequest,
+    Viewer1DState,
+    _mint_viewer_1d_budget_receipt,
+    _new_prepared_viewer_1d_commit,
+    _new_viewer_1d_cleanup_notice,
+    _new_viewer_1d_commit_receipt,
+    _new_viewer_1d_renderer_clear_receipt,
+    _new_viewer_1d_renderer_clear_request,
+    _retire_viewer_1d_budget_receipt,
+    acknowledge_viewer_1d_cleanup_pending,
+)
 
 __all__ = [
     "CommitGate",
@@ -265,10 +286,6 @@ class CommitGate:
 
 
 class Viewer2DCommitGate(CommitGate):
-    __slots__ = ()
-
-
-class Viewer1DCommitGate(CommitGate):
     __slots__ = ()
 
 
@@ -502,26 +519,6 @@ class Viewer2DState(str, Enum):
     CLOSED = "closed"
 
 
-class Viewer1DState(str, Enum):
-    EMPTY = "empty"
-    LOADING = "loading"
-    READY = "ready"
-    CLEANUP_PENDING = "cleanup_pending"
-    CLOSED = "closed"
-
-
-class Viewer1DReadBudgetState(str, Enum):
-    ACTIVE = "active"
-    RETIRED = "retired"
-
-
-@runtime_checkable
-class OneDViewerCommitPort(Protocol):
-    def commit(self, prepared): ...
-    def cleanup_pending(self, notice): ...
-    def complete(self, completion): ...
-
-
 @dataclass(frozen=True, slots=True)
 class Viewer1DContext:
     context_token: str
@@ -541,249 +538,6 @@ class Viewer1DContext:
 
     @property
     def kind(self): return ContextKind.VIEWER_1D
-
-
-@dataclass(frozen=True, slots=True)
-class Viewer1DBatchHydrationRequest:
-    paths: tuple[str, ...]
-    policy: object
-    generation: int
-    commit_gate: Viewer1DCommitGate
-    port: OneDViewerCommitPort
-    read_key: HydrationReadKey
-    token: HydrationToken
-    gui_thread_id: int
-    owner_identity: object
-    owner_request_claim: object
-    admitted_provider_identity: object
-
-    def __post_init__(self):
-        from xrd_tools.io.viewer_1d import Viewer1DFormatPolicy
-        scope = self.read_key.scope if type(self.read_key) is HydrationReadKey else None
-        _viewer_malformed(type(self.paths) is not tuple or not 1 <= len(self.paths) <= 256
-            or any(type(path) is not str or not path or len(os.fsencode(path)) > 4096
-                   for path in self.paths) or type(self.policy) is not Viewer1DFormatPolicy
-            or type(self.generation) is not int or self.generation <= 0
-            or type(self.commit_gate) is not Viewer1DCommitGate
-            or not isinstance(self.port, OneDViewerCommitPort)
-            or type(self.read_key) is not HydrationReadKey or type(self.token) is not HydrationToken
-            or self.token.read_key != self.read_key
-            or self.token.presentation_generation != self.generation
-            or scope.scan_key != "viewer-1d" or scope.source != "viewer-1d"
-            or scope.epoch != self.commit_gate.epoch
-            or self.read_key.artifact_identity != "viewer-1d"
-            or self.read_key.frame_identity != "batch"
-            or self.read_key.purpose is not HydrationPurpose.ONE_D
-            or type(self.gui_thread_id) is not int or self.gui_thread_id <= 0
-            or self.owner_identity is None or self.owner_request_claim is None
-            or self.admitted_provider_identity is None, "viewer 1-D request is malformed")
-
-    @property
-    def enqueueable(self): return not self.commit_gate.cancelled
-
-
-_VIEWER_1D_FACTORY = object()
-
-
-@dataclass(frozen=True, slots=True)
-class Viewer1DReadBudgetReceipt:
-    identity: object; request: Viewer1DBatchHydrationRequest; transport_token: HydrationToken
-    capacity_bytes: int; reserved_bytes: int; gui_thread_id: int; worker_thread_id: int
-    issuer: object; _claim: InitVar[object] = None
-    _retirement: str | None = field(default=None, init=False, repr=False)
-    def __post_init__(self, _claim):
-        if (_claim is not _VIEWER_1D_FACTORY or self.identity is None
-                or type(self.request) is not Viewer1DBatchHydrationRequest
-                or self.transport_token is not self.request.token
-                or type(self.capacity_bytes) is not int or type(self.reserved_bytes) is not int
-                or not 0 < self.reserved_bytes <= self.capacity_bytes
-                or self.gui_thread_id != self.request.gui_thread_id
-                or type(self.worker_thread_id) is not int or self.worker_thread_id <= 0
-                or self.worker_thread_id == self.gui_thread_id
-                or self.issuer is not self.request.admitted_provider_identity):
-            raise TypeError("viewer 1-D budget receipt is malformed")
-    @property
-    def state(self):
-        return (Viewer1DReadBudgetState.ACTIVE if self._retirement is None
-                else Viewer1DReadBudgetState.RETIRED)
-    @property
-    def retirement_reason(self): return self._retirement
-
-
-def _mint_viewer_1d_budget_receipt(request, capacity, reserved, worker, issuer):
-    return Viewer1DReadBudgetReceipt(object(), request, request.token, capacity,
-        reserved, request.gui_thread_id, worker, issuer, _VIEWER_1D_FACTORY)
-
-
-def _retire_viewer_1d_budget_receipt(receipt, reason):
-    if (type(receipt) is not Viewer1DReadBudgetReceipt
-            or receipt.state is not Viewer1DReadBudgetState.ACTIVE
-            or reason not in {"transferred", "abandoned"}):
-        raise RuntimeError("viewer 1-D receipt retirement is not current")
-    object.__setattr__(receipt, "_retirement", reason)
-
-
-@dataclass(frozen=True, slots=True)
-class Prepared1DBatchCommit:
-    request: Viewer1DBatchHydrationRequest; retired_receipt_identity: object
-    identity: object; batch_identity: str; transfer: object
-    _claim: InitVar[object] = None
-    def __post_init__(self, _claim):
-        if (_claim is not _VIEWER_1D_FACTORY
-                or type(self.request) is not Viewer1DBatchHydrationRequest
-                or self.retired_receipt_identity is None or self.identity is None
-                or not _viewer_sha256_text(self.batch_identity) or self.transfer is None):
-            raise TypeError("prepared viewer 1-D batch is malformed")
-
-
-def _new_prepared_viewer_1d_commit(request, retired, identity, batch, transfer):
-    current = transfer.inspect()
-    if (getattr(current, "prepared_identity", None) is not identity
-            or getattr(current, "retired_receipt_identity", None) is not retired
-            or getattr(current, "batch_identity", None) != batch
-            or getattr(current, "request_identity", None) is not request
-            or getattr(current, "transport_token_identity", None) is not request.token
-            or getattr(current, "issuer_transport_identity", None)
-                is not request.admitted_provider_identity
-            or getattr(current, "port_identity", None) is not request.port
-            or transfer.request_identity is not request
-            or transfer.active_receipt_identity is not retired
-            or transfer.transport_token_identity is not request.token
-            or transfer.issuer_transport_identity is not request.admitted_provider_identity
-            or transfer.port_identity is not request.port):
-        raise RuntimeError("prepared viewer 1-D custody is not current")
-    return Prepared1DBatchCommit(request, retired, identity, batch, transfer,
-                                 _VIEWER_1D_FACTORY)
-
-
-@dataclass(frozen=True, slots=True)
-class Viewer1DCommitReceipt:
-    identity: object; transfer_identity: object; request_identity: object
-    prepared_identity: object; transport_token_identity: object; port_identity: object
-    owner_identity: object; batch_identity: str; decision: str
-    _claim: InitVar[object] = None
-    def __post_init__(self, _claim):
-        if _claim is not _VIEWER_1D_FACTORY: raise TypeError("foreign viewer 1-D receipt")
-
-
-def _new_viewer_1d_commit_receipt(transfer, request, prepared, owner):
-    if (prepared.request is not request or prepared.transfer is not transfer
-            or transfer.request_identity is not request
-            or transfer.transport_token_identity is not request.token
-            or transfer.port_identity is not request.port
-            or transfer.active_receipt_identity is not prepared.retired_receipt_identity):
-        raise RuntimeError("viewer 1-D commit receipt lineage is foreign")
-    return Viewer1DCommitReceipt(object(), transfer.identity, request,
-        prepared.identity, request.token, request.port, owner,
-        prepared.batch_identity, "OWNER_OWNS", _VIEWER_1D_FACTORY)
-
-
-@dataclass(frozen=True, slots=True)
-class Viewer1DCleanupPendingNotice:
-    identity: object; request: Viewer1DBatchHydrationRequest; transport_token: HydrationToken
-    owner_identity: object; owner_request_claim: object; commit_gate_identity: object
-    admission_generation: int; admitted_provider_identity: object; diagnostic: str | None
-    issuer_transport_identity: object; issuer_claim: object; _claim: InitVar[object] = None
-    _acknowledgement: object = field(default=None, init=False, repr=False)
-    def __post_init__(self, _claim):
-        if (_claim is not _VIEWER_1D_FACTORY or self.identity is None
-                or type(self.request) is not Viewer1DBatchHydrationRequest
-                or self.transport_token is not self.request.token
-                or self.owner_identity is not self.request.owner_identity
-                or self.owner_request_claim is not self.request.owner_request_claim
-                or self.commit_gate_identity is not self.request.commit_gate
-                or self.admission_generation != self.request.generation
-                or self.admitted_provider_identity is not self.request.admitted_provider_identity
-                or self.issuer_transport_identity is not self.admitted_provider_identity
-                or self.diagnostic is not None and (type(self.diagnostic) is not str
-                    or len(self.diagnostic.encode("utf8")) > 256)):
-            raise TypeError("foreign cleanup notice")
-    @property
-    def acknowledgement(self):
-        value = self._acknowledgement
-        return value if (type(value) is _Viewer1DCleanupPendingAcknowledgement
-            and value._claim is _VIEWER_1D_FACTORY and value.notice is self
-            and value.owner_identity is self.owner_identity
-            and value.owner_request_claim is self.owner_request_claim
-            and value.port_identity is self.request.port) else None
-
-
-def _new_viewer_1d_cleanup_notice(request, diagnostic, issuer, claim):
-    if (issuer is not request.admitted_provider_identity or claim is None
-            or claim is not getattr(issuer, "_viewer_1d_claim", None)):
-        raise TypeError("foreign cleanup notice issuer")
-    return Viewer1DCleanupPendingNotice(object(), request, request.token,
-        request.owner_identity, request.owner_request_claim, request.commit_gate,
-        request.generation, request.admitted_provider_identity, diagnostic,
-        issuer, claim, _VIEWER_1D_FACTORY)
-
-
-@dataclass(frozen=True, slots=True)
-class _Viewer1DCleanupPendingAcknowledgement:
-    identity: object
-    notice: Viewer1DCleanupPendingNotice
-    owner_identity: object
-    owner_request_claim: object
-    port_identity: object
-    owner_generation: int
-    _claim: object
-
-
-def acknowledge_viewer_1d_cleanup_pending(notice, *, port, owner_identity,
-        owner_request_claim, commit_gate, admitted_provider, owner_generation,
-        owner_state):
-    request = getattr(notice, "request", None)
-    if (type(notice) is not Viewer1DCleanupPendingNotice or port is not request.port
-            or owner_identity is not request.owner_identity
-            or owner_request_claim is not request.owner_request_claim
-            or commit_gate is not request.commit_gate
-            or admitted_provider is not request.admitted_provider_identity
-            or type(owner_generation) is not int or request.generation > owner_generation
-            or owner_state is not Viewer1DState.CLEANUP_PENDING
-            or notice.issuer_transport_identity is not request.admitted_provider_identity
-            or notice.issuer_claim is not getattr(
-                notice.issuer_transport_identity, "_viewer_1d_claim", None)):
-        return notice
-    if notice._acknowledgement is None:
-        object.__setattr__(notice, "_acknowledgement", _Viewer1DCleanupPendingAcknowledgement(
-            object(), notice, owner_identity, owner_request_claim, port,
-            owner_generation, _VIEWER_1D_FACTORY))
-    return notice
-
-
-@dataclass(frozen=True, slots=True)
-class Viewer1DRendererClearRequest:
-    context_token: str; display_generation: int; batch_identity: str
-    _claim: InitVar[object] = None
-    acknowledgement_identity: object = field(default=None, init=False)
-    def __post_init__(self, _claim):
-        if (_claim is not _VIEWER_1D_FACTORY or type(self.context_token) is not str
-                or not self.context_token or type(self.display_generation) is not int
-                or self.display_generation <= 0 or not _viewer_sha256_text(self.batch_identity)):
-            raise TypeError("bad 1-D clear request")
-
-
-@dataclass(frozen=True, slots=True)
-class Viewer1DRendererClearReceipt:
-    identity: object; request: Viewer1DRendererClearRequest; cleared: bool
-    mint_claim: object; _claim: InitVar[object] = None
-    def __post_init__(self, _claim):
-        if (_claim is not _VIEWER_1D_FACTORY or self.mint_claim is not _VIEWER_1D_FACTORY
-                or type(self.request) is not Viewer1DRendererClearRequest
-                or type(self.cleared) is not bool): raise TypeError("bad 1-D clear receipt")
-        if self.cleared:
-            if self.request.acknowledgement_identity is not None:
-                raise RuntimeError("viewer 1-D clear is already acknowledged")
-            object.__setattr__(self.request, "acknowledgement_identity", self.identity)
-
-
-def _new_viewer_1d_renderer_clear_request(context, generation, batch):
-    return Viewer1DRendererClearRequest(context, generation, batch, _VIEWER_1D_FACTORY)
-
-
-def _new_viewer_1d_renderer_clear_receipt(request, cleared):
-    return Viewer1DRendererClearReceipt(object(), request, cleared,
-        _VIEWER_1D_FACTORY, _VIEWER_1D_FACTORY)
 
 
 class Viewer2DReceiptPhase(str, Enum):

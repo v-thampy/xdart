@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import importlib
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -33,6 +35,36 @@ def test_ssrl_tree_does_not_import_xdart():
                 if module == "xdart" or module.startswith("xdart."):
                     offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
     assert offenders == []
+
+
+def test_viewer_1d_io_is_a_pure_leaf():
+    path = PACKAGE / "io" / "viewer_1d.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    upward = []
+    for node in ast.walk(tree):
+        names = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
+                 else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
+        for name in names:
+            if name == "xdart" or name.startswith("xdart.") or name == "xrd_tools.session" or name.startswith("xrd_tools.session."):
+                upward.append(f"{name}:{node.lineno}")
+    assert upward == []
+
+
+def test_viewer_1d_io_and_session_import_headlessly_in_clean_processes():
+    environment = dict(os.environ, PYTHONPATH=str(SRC))
+    script = """import importlib, sys
+importlib.import_module(sys.argv[1])
+roots = ('xdart', 'PySide', 'PyQt', 'qtpy', 'napari', 'pyqtgraph', 'matplotlib')
+forbidden = sorted(name for name in sys.modules if name.startswith(roots))
+if forbidden: raise SystemExit(repr(forbidden))
+if sys.argv[1] == 'xrd_tools.io.viewer_1d':
+    upward = sorted(name for name in sys.modules if name.startswith('xrd_tools.session'))
+    if upward: raise SystemExit(repr(upward))
+"""
+    for module in ("xrd_tools.io.viewer_1d", "xrd_tools.session.viewer_1d"):
+        result = subprocess.run([sys.executable, "-c", script, module],
+            env=environment, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_headless_contract_imports_do_not_pull_gui_modules():
