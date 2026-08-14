@@ -34,6 +34,28 @@ from xdart.modules.display_context import (
     Viewer2DFrameHydrationRequest,
     Viewer2DReadActivation,
     Viewer2DReceiptPhase,
+    Viewer1DBatchHydrationRequest,
+    Viewer1DCommitReceipt,
+    Viewer1DCleanupPendingNotice,
+    Viewer1DReadBudgetState,
+    _mint_viewer_1d_budget_receipt,
+    _new_prepared_viewer_1d_commit,
+    _new_viewer_1d_cleanup_notice,
+    _retire_viewer_1d_budget_receipt,
+)
+from xrd_tools.io.viewer_1d import (
+    VIEWER_1D_R,
+    Viewer1DBatch,
+    Viewer1DDisposal,
+    Viewer1DReadFailure,
+    Viewer1DReadOperation,
+    _Viewer1DReaderControl,
+    begin_viewer_1d_read,
+    mint_viewer_1d_pass_two_permit,
+    mint_viewer_1d_transfer,
+    viewer_1d_disposal_is_current,
+    viewer_1d_transfer_is_released,
+    viewer_1d_budget,
 )
 from xrd_tools.io.viewer_2d import (
     CATALOG_RESERVATION,
@@ -55,7 +77,9 @@ from xrd_tools.session.hydration import (
 
 from .display_values import DisplayFrameKey
 
-_VIEWER_REQUEST_TYPES = (Viewer2DCatalogHydrationRequest, Viewer2DFrameHydrationRequest)
+_VIEWER_2D_REQUEST_TYPES = (Viewer2DCatalogHydrationRequest, Viewer2DFrameHydrationRequest)
+_VIEWER_1D_REQUEST_TYPES = (Viewer1DBatchHydrationRequest,)
+_VIEWER_REQUEST_TYPES = (*_VIEWER_2D_REQUEST_TYPES, *_VIEWER_1D_REQUEST_TYPES)
 
 
 def _viewer_activation_matches(request, activation):
@@ -151,7 +175,9 @@ class _TransportEntry:
     committed_token: HydrationToken | None = None
     committed_ticket: _HydrationTicket | None = None
     state: _EntryState = _EntryState.READING
-    disposal: Viewer2DDisposal | None = None
+    disposal: object | None = None
+    viewer_1d_receipt: object | None = None
+    viewer_1d_transfer: object | None = None
     cleanup_token: HydrationTransportCleanupToken | None = None
     terminal: tuple | None = None
     retrying: bool = False
@@ -181,6 +207,33 @@ class DetachedHydrationMutation:
 
 
 @dataclass(frozen=True, slots=True)
+class _Viewer1DExecutionTerminal:
+    outcome: HydrationOutcome
+    diagnostic: str | None
+    control: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Viewer1DBlockedTerminal:
+    outcome: HydrationOutcome
+    diagnostic: str | None
+    notice: Viewer1DCleanupPendingNotice
+
+
+class _Viewer1DUnwind(BaseException):
+    def __init__(self, control, entry=None, guard=None):
+        self.control, self.entry, self.guard = control, entry, guard
+
+
+def _viewer_1d_cleanup_current(entry):
+    disposal = entry.disposal
+    return (type(disposal) is Viewer1DDisposal
+        and entry.viewer_1d_transfer is disposal.transfer
+        and (viewer_1d_disposal_is_current(disposal)
+             or viewer_1d_transfer_is_released(disposal.transfer)))
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedHydrationCommit:
     """The one frozen value the target-port operation may consume."""
 
@@ -195,12 +248,15 @@ class PreparedHydrationCommit:
 class HydrationTransport:
     """Externally observable, internally synchronized single-lane transport."""
 
+    __slots__ = ("_viewer_1d_claim", "__dict__")
+
     def __init__(self, commit, derive, *, completion_sink=None) -> None:
         # commit/derive are owner-bound at construction, never queue-carried.
         self._commit = commit
         self._derive = derive
         self._completion_sink = completion_sink
         self._lock = RLock()
+        self._viewer_1d_claim = object()
         self._active: _TransportEntry | None = None
         self._queued: _TransportEntry | None = None
         self._worker: Thread | None = None
@@ -262,10 +318,29 @@ class HydrationTransport:
         token = request.token
         with self._lock:
             if (self._retired or request.commit_gate.cancelled
+                    or type(request) is Viewer1DBatchHydrationRequest
+                    and request.admitted_provider_identity is not self
                     or any(entry is not None and entry.state is _EntryState.DELIVERY_PENDING
                            for entry in (self._active, self._queued))):
                 return DetachedHydrationMutation()
             active = self._active
+            if (active is not None and active.state is _EntryState.CLEANUP_BLOCKED
+                    and type(active.request) is Viewer1DBatchHydrationRequest):
+                prior = active.request
+                terminal = active.terminal
+                if (not _viewer_1d_cleanup_current(active)
+                        or active.cleanup_token is None
+                        or type(terminal) is not _Viewer1DBlockedTerminal
+                        or terminal.notice.request is not prior
+                        or terminal.notice.transport_token is not active.token
+                        or type(request) is not Viewer1DBatchHydrationRequest
+                        or request.owner_identity is not prior.owner_identity
+                        or request.owner_request_claim is not prior.owner_request_claim
+                        or request.port is not prior.port
+                        or request.commit_gate is not prior.commit_gate
+                        or request.admitted_provider_identity is not prior.admitted_provider_identity
+                        or request.generation <= prior.generation):
+                    return DetachedHydrationMutation()
             if (
                 type(request) is HydrationRequest
                 and
@@ -308,6 +383,7 @@ class HydrationTransport:
         if type(mutation) is not DetachedHydrationMutation:
             return
         pending = mutation
+        control = None
         while True:
             while pending.deliveries:
                 with self._lock:
@@ -327,8 +403,11 @@ class HydrationTransport:
                             request.port.complete(delivery.completion)
                         elif self._completion_sink is not None:
                             self._completion_sink(delivery.completion)
-                    except Exception:
-                        pass
+                    except BaseException as error:
+                        if type(request) is Viewer1DBatchHydrationRequest:
+                            if (_viewer_1d_control(error) and control is None): control = error
+                        elif not isinstance(error, Exception):
+                            raise
                 with self._lock:
                     if any(not self._delivery_valid_locked(delivery, claimed=True)
                            for delivery in deliveries):
@@ -355,11 +434,18 @@ class HydrationTransport:
             with self._lock:
                 thread = self._ensure_worker_locked()
             if thread is None:
+                if control is not None: raise control
                 return
             try:
                 thread.start()
-                return
-            except Exception:
+            except BaseException as error:
+                with self._lock:
+                    one_d_start = (self._worker is thread and self._queued is not None
+                        and type(self._queued.request) is Viewer1DBatchHydrationRequest)
+                if one_d_start:
+                    if _viewer_1d_control(error) and control is None: control = error
+                elif not isinstance(error, Exception):
+                    raise
                 with self._lock:
                     failed = None
                     if self._worker is thread:
@@ -374,6 +460,9 @@ class HydrationTransport:
                 if failed is None:
                     return
                 pending = DetachedHydrationMutation(deliveries=(failed,))
+                continue
+            if control is not None: raise control
+            return
 
     # -- cancellation and retirement ---------------------------------------- #
 
@@ -443,7 +532,20 @@ class HydrationTransport:
             return None
         thread = None
         def run():
-            self._run(thread)
+            try:
+                self._run(thread)
+            except _Viewer1DUnwind as unwind:
+                with self._lock:
+                    entry, guard = unwind.entry, unwind.guard
+                    if (entry is not None and self._active is entry
+                            and entry.state is _EntryState.CLEANUP_BLOCKED
+                            and entry.delivery_guard is guard and guard.claimed
+                            and type(entry.terminal) is _Viewer1DBlockedTerminal
+                            and entry.terminal.notice.acknowledgement is not None):
+                        entry.delivery_guard = None
+                    if self._worker is thread: self._worker = None
+                self.dispatch_detached(DetachedHydrationMutation())
+                raise unwind.control
         thread = Thread(
             target=run,
             name="scattering-preview-transport",
@@ -473,9 +575,17 @@ class HydrationTransport:
                         self._active = None
                         self._queued = entry
                         continue
+                    if (self._active is entry and entry.state is _EntryState.CLEANUP_BLOCKED
+                            and type(entry.terminal) is _Viewer1DBlockedTerminal
+                            and entry.terminal.notice.acknowledgement is not None
+                            and entry.delivery_guard is not None
+                            and entry.delivery_guard.claimed):
+                        entry.delivery_guard = None
                     if self._worker is worker: self._worker = None
                 return
-            outcome, diagnostic = result
+            terminal = result if type(result) is _Viewer1DExecutionTerminal else None
+            outcome, diagnostic = ((terminal.outcome, terminal.diagnostic)
+                                   if terminal is not None else result)
             with self._lock:
                 if not self._entry_current_locked(entry, token, ticket):
                     if self._worker is worker: self._worker = None
@@ -500,7 +610,13 @@ class HydrationTransport:
                     deliveries = (self._capture_locked(
                         entry, final, outcome, current_ticket, diagnostic,
                         clear=True),)
-            self.dispatch_detached(DetachedHydrationMutation(deliveries=deliveries))
+            try:
+                self.dispatch_detached(DetachedHydrationMutation(deliveries=deliveries))
+            except BaseException as control:
+                if terminal is not None: raise _Viewer1DUnwind(control) from None
+                raise
+            if terminal is not None and terminal.control is not None:
+                raise _Viewer1DUnwind(terminal.control) from None
 
     def _entry_current_locked(self, entry, token, ticket):
         return (self._active is entry and entry.token is token and entry.ticket is ticket
@@ -508,7 +624,9 @@ class HydrationTransport:
                 and entry.state in (_EntryState.READING, _EntryState.PREPARED))
 
     def _execute(self, entry: _TransportEntry, token, ticket):
-        if type(entry.request) in _VIEWER_REQUEST_TYPES:
+        if type(entry.request) is Viewer1DBatchHydrationRequest:
+            return self._execute_viewer_1d(entry, token, ticket)
+        if type(entry.request) in _VIEWER_2D_REQUEST_TYPES:
             return self._execute_viewer(entry, token, ticket)
         try:
             preview = read_frame_preview(
@@ -540,6 +658,130 @@ class HydrationTransport:
                 return outcome, preview.detector_diagnostic
             return HydrationOutcome.FAILED, "target port returned no outcome"
         return HydrationOutcome.FAILED, "unreachable"
+
+    def _execute_viewer_1d(self, entry, token, ticket):
+        caught = None
+        for _ in (0, 1):
+            try:
+                if caught is None: return self._execute_viewer_1d_body(entry, token, ticket)
+                return self._recover_viewer_1d(entry, token, ticket, caught)
+            except _Viewer1DUnwind:
+                raise
+            except BaseException as error:
+                if caught is None: caught = error
+        raise caught
+
+    def _execute_viewer_1d_body(self, entry, token, ticket):
+        request = entry.request
+        receipt = _mint_viewer_1d_budget_receipt(
+            request, viewer_1d_budget(), VIEWER_1D_R, current_thread().ident, self)
+        entry.viewer_1d_receipt = receipt
+        transfer = mint_viewer_1d_transfer(request, receipt, self)
+        entry.viewer_1d_transfer = transfer
+        operation = begin_viewer_1d_read(request, receipt, transfer)
+        if type(operation) is Viewer1DReadFailure:
+            return self._dispose_viewer_1d(entry, operation.disposal,
+                HydrationOutcome.FAILED, operation.diagnostic, token, ticket)
+        _retire_viewer_1d_budget_receipt(receipt, "transferred")
+        permit = mint_viewer_1d_pass_two_permit(operation, receipt, self)
+        batch = operation.complete(permit)
+        if type(batch) is Viewer1DReadFailure:
+            return self._dispose_viewer_1d(entry, batch.disposal,
+                HydrationOutcome.FAILED, batch.diagnostic, token, ticket)
+        if type(batch) is not Viewer1DBatch: raise RuntimeError("viewer 1-D returned no batch")
+        prepared_identity = object()
+        transfer.install_batch(batch, prepared_identity, receipt.identity)
+        prepared = _new_prepared_viewer_1d_commit(
+            request, receipt.identity, prepared_identity, batch.batch_identity, transfer)
+        with self._lock:
+            if (not self._entry_current_locked(entry, token, ticket)
+                    or entry.viewer_1d_transfer is not transfer):
+                raise RuntimeError("viewer 1-D active lineage changed")
+            entry.state = _EntryState.PREPARED
+        error = None
+        for attempt in (0, 1):
+            try:
+                returned = request.port.commit(prepared)
+            except BaseException as caught:
+                if transfer.owner_receipt is not None:
+                    return _Viewer1DExecutionTerminal(HydrationOutcome.HYDRATED, None,
+                        caught if _viewer_1d_control(caught) else None)
+                if not _viewer_1d_control(caught) and attempt == 0:
+                    error = caught
+                    continue
+                raise
+            if (type(returned) is Viewer1DCommitReceipt
+                    and transfer.owner_receipt is returned):
+                return _Viewer1DExecutionTerminal(HydrationOutcome.HYDRATED, None)
+            if transfer.owner_receipt is not None:
+                return _Viewer1DExecutionTerminal(HydrationOutcome.HYDRATED, None)
+            break
+        raise RuntimeError(_viewer_1d_diagnostic(error)
+                           if error else "viewer target refused batch")
+
+    def _recover_viewer_1d(self, entry, token, ticket, error):
+        original = error.control if type(error) is _Viewer1DReaderControl else error
+        control = original if _viewer_1d_control(original) else None
+        transfer = entry.viewer_1d_transfer
+        if transfer is not None and transfer.owner_receipt is not None:
+            return _Viewer1DExecutionTerminal(HydrationOutcome.HYDRATED, None, control)
+        if transfer is None:
+            receipt = entry.viewer_1d_receipt
+            if receipt is not None and receipt.state is Viewer1DReadBudgetState.ACTIVE:
+                _retire_viewer_1d_budget_receipt(receipt, "abandoned")
+            return _Viewer1DExecutionTerminal(HydrationOutcome.FAILED,
+                _viewer_1d_diagnostic(original), control)
+        if viewer_1d_transfer_is_released(transfer):
+            receipt = entry.viewer_1d_receipt
+            if receipt is not None and receipt.state is Viewer1DReadBudgetState.ACTIVE:
+                _retire_viewer_1d_budget_receipt(receipt, "abandoned")
+            return _Viewer1DExecutionTerminal(HydrationOutcome.FAILED,
+                _viewer_1d_diagnostic(original), control)
+        disposal = (error.disposal if type(error) is _Viewer1DReaderControl
+                    else transfer.disposal(_viewer_1d_diagnostic(original)))
+        return self._dispose_viewer_1d(entry, disposal, HydrationOutcome.FAILED,
+            _viewer_1d_diagnostic(original), token, ticket, control=control)
+
+    def _dispose_viewer_1d(self, entry, disposal, outcome, diagnostic, token, ticket,
+                           *, control=None):
+        with self._lock:
+            if (not self._entry_current_locked(entry, token, ticket)
+                    or type(disposal) is not Viewer1DDisposal
+                    or entry.viewer_1d_transfer is not disposal.transfer
+                    or not viewer_1d_disposal_is_current(disposal)):
+                return None
+        try: cleaned = disposal.release()
+        except BaseException as escaped:
+            escaped = getattr(escaped, "control", escaped)
+            if control is None and _viewer_1d_control(escaped): control = escaped
+            cleaned = viewer_1d_transfer_is_released(disposal.transfer)
+        if cleaned:
+            receipt = entry.viewer_1d_receipt
+            if receipt is not None and receipt.state is Viewer1DReadBudgetState.ACTIVE:
+                _retire_viewer_1d_budget_receipt(receipt, "abandoned")
+            return _Viewer1DExecutionTerminal(outcome, diagnostic, control)
+        notice = _new_viewer_1d_cleanup_notice(
+            entry.request, diagnostic, self, self._viewer_1d_claim)
+        guard, outer = _DeliveryGuard(), HydrationTransportCleanupToken()
+        guard.claimed = True
+        terminal = _Viewer1DBlockedTerminal(outcome, diagnostic, notice)
+        with self._lock:
+            if (not self._entry_current_locked(entry, token, ticket)
+                    or not viewer_1d_disposal_is_current(disposal)): return None
+            entry.disposal = disposal
+            entry.state, entry.cleanup_token, entry.terminal = _EntryState.CLEANUP_BLOCKED, outer, terminal
+            entry.delivery_guard = guard
+        pending_control = control
+        for _ in (0, 1):
+            try: entry.request.port.cleanup_pending(notice)
+            except BaseException as escaped:
+                if pending_control is None and _viewer_1d_control(escaped):
+                    pending_control = escaped
+            if notice.acknowledgement is not None: break
+        if notice.acknowledgement is None: return None
+        if pending_control is not None:
+            raise _Viewer1DUnwind(pending_control, entry, guard)
+        return None
 
     def _execute_viewer(self, entry, token, ticket):
         request = entry.request
@@ -633,9 +875,10 @@ class HydrationTransport:
     def _capture_locked(self, entry, token, outcome, ticket,
                         diagnostic=None, *, clear, restore=None, guard=None):
         completion = HydrationCompletion(token, outcome, diagnostic or None)
-        self._counters[outcome] += 1
-        self._completions.append(completion)
         notify = ticket is None or ticket._settle(completion)
+        if notify or type(entry.request) not in _VIEWER_1D_REQUEST_TYPES:
+            self._counters[outcome] += 1
+            self._completions.append(completion)
         guard = _DeliveryGuard() if guard is None else guard
         active_slot = self._active is entry
         if not active_slot and self._queued is not entry:
@@ -664,7 +907,13 @@ class HydrationTransport:
         with self._lock:
             entry = self._active
             if (entry is not None and entry.state is _EntryState.CLEANUP_BLOCKED
-                    and entry.token is expected_transport_token):
+                    and entry.token is expected_transport_token
+                    and (type(entry.request) not in _VIEWER_1D_REQUEST_TYPES
+                         or entry.delivery_guard is None
+                         and self._worker is None
+                         and _viewer_1d_cleanup_current(entry)
+                         and type(entry.terminal) is _Viewer1DBlockedTerminal
+                         and entry.terminal.notice.acknowledgement is not None)):
                 return entry.cleanup_token
             return None
 
@@ -672,39 +921,72 @@ class HydrationTransport:
         with self._lock:
             entry = self._active
             if (entry is None or entry.state is not _EntryState.CLEANUP_BLOCKED
-                    or entry.cleanup_token is not outer_token or entry.retrying):
+                    or entry.cleanup_token is not outer_token or entry.retrying
+                    or type(entry.request) in _VIEWER_1D_REQUEST_TYPES
+                    and (entry.delivery_guard is not None or self._worker is not None
+                         or type(entry.terminal) is not _Viewer1DBlockedTerminal
+                         or entry.terminal.notice.acknowledgement is None
+                         or not _viewer_1d_cleanup_current(entry))):
                 return HydrationTransportCleanupReceipt(
                     outer_token, Viewer2DCleanupState.STALE)
             entry.retrying = True
             disposal = entry.disposal
+        control = None
         try:
-            receipt = entry.request.port.dispose(disposal)
-        except Exception:
+            receipt = (disposal.retry() if type(disposal) is Viewer1DDisposal
+                       else entry.request.port.dispose(disposal))
+        except BaseException as escaped:
             receipt = None
+            if type(disposal) is Viewer1DDisposal:
+                escaped = getattr(escaped, "control", escaped)
+                if _viewer_1d_control(escaped): control = escaped
+            elif not isinstance(escaped, Exception):
+                raise
         with self._lock:
             entry.retrying = False
             if (self._active is not entry or entry.cleanup_token is not outer_token):
                 state = Viewer2DCleanupState.STALE
                 mutation = DetachedHydrationMutation()
-            elif (type(receipt) is not Viewer2DCleanupReceipt
-                    or receipt.token is not disposal.token
-                    or receipt.state is not Viewer2DCleanupState.CLEANED):
+            elif (type(disposal) is Viewer1DDisposal and receipt is not True
+                    or type(disposal) is not Viewer1DDisposal
+                    and (type(receipt) is not Viewer2DCleanupReceipt
+                         or receipt.token is not disposal.token
+                         or receipt.state is not Viewer2DCleanupState.CLEANED)):
                 state = Viewer2DCleanupState.CLEANUP_PENDING
                 mutation = DetachedHydrationMutation()
             else:
                 state = Viewer2DCleanupState.CLEANED
-                outcome, diagnostic = entry.terminal
+                terminal = entry.terminal
+                outcome, diagnostic = ((terminal.outcome, terminal.diagnostic)
+                    if type(terminal) is _Viewer1DBlockedTerminal else terminal)
                 entry.disposal = None
+                if (type(disposal) is Viewer1DDisposal
+                        and entry.viewer_1d_receipt is not None
+                        and entry.viewer_1d_receipt.state is Viewer1DReadBudgetState.ACTIVE):
+                    _retire_viewer_1d_budget_receipt(entry.viewer_1d_receipt, "abandoned")
                 delivery = self._capture_locked(
                     entry, entry.token, outcome, entry.ticket, diagnostic,
                     clear=True)
                 mutation = DetachedHydrationMutation(deliveries=(delivery,))
         self.dispatch_detached(mutation)
+        if control is not None: raise control
         return HydrationTransportCleanupReceipt(outer_token, state)
 
 
 def _diagnostic(error: BaseException) -> str:
     return str(error) or type(error).__name__
+
+
+def _viewer_1d_diagnostic(error: BaseException) -> str:
+    try: value = str(error) or type(error).__name__
+    except BaseException: value = type(error).__name__
+    while len(value.encode("utf8")) > 256: value = value[:-1]
+    return value
+
+
+def _viewer_1d_control(error):
+    return isinstance(error, MemoryError) or (isinstance(error, BaseException)
+                                               and not isinstance(error, Exception))
 
 
 __all__ = [
