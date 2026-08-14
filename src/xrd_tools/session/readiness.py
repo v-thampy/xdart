@@ -2289,6 +2289,10 @@ def tool_from_mode_text(mode_text: str | None) -> Tool:
     lets tests pin the bridge while the V2 panel is feature-flagged.
     """
     text = str(mode_text or "").strip().lower()
+    if text in {"2d viewer", "image viewer"}:
+        return Tool.IMAGE_VIEWER
+    if text in {"1d viewer", "xye viewer"}:
+        return Tool.XYE_VIEWER
     if "image viewer" in text:
         return Tool.IMAGE_VIEWER
     if "xye viewer" in text:

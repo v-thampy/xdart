@@ -15,6 +15,7 @@ from xrd_tools.session.readiness import (
     SectionId,
     Tool,
     build_bound_control_state,
+    tool_from_mode_text,
 )
 
 from .contracts import SourceObservation
@@ -115,12 +116,7 @@ def project_controls(
     )
     unlocked = phase in {RunPhase.IDLE, RunPhase.FAILED}
     processing_mode = str(intent.processing_mode or "")
-    skip_2d = (
-        "Viewer" not in processing_mode
-        and "1D" in processing_mode
-        and "2D" not in processing_mode
-    )
-    tool = Tool.INT_1D if skip_2d else Tool.INT_2D
+    tool = tool_from_mode_text(processing_mode)
     projected = build_bound_control_state(
         values,
         choices,
@@ -202,7 +198,7 @@ def project_controls(
         choices=output_choices,
         reason=output_reason,
     )
-    output = replace(output, enabled=unlocked)
+    output = replace(output, enabled=unlocked and tool is not Tool.IMAGE_VIEWER)
     insertion = next(
         (
             index + 1
@@ -214,6 +210,10 @@ def project_controls(
     fields.insert(insertion, output)
     fields = _threshold_auto_fields(fields, intent, unlocked=unlocked)
     fields = [truthful_field(candidate) for candidate in fields]
+    if tool is Tool.IMAGE_VIEWER:
+        fields = [replace(candidate, enabled=False,
+                          reason="2D Viewer has no acquisition authority.")
+                  for candidate in fields]
     reintegration_unavailable = (
         "Loaded-result reintegration is not available in this workspace yet."
     )
@@ -258,13 +258,13 @@ def project_controls(
                 ControlAction.ADVANCED_PROCESSING,
                 "Advanced",
                 SectionId.PROCESSING,
-                advanced_editor_available and unlocked,
+                advanced_editor_available and unlocked and tool is not Tool.IMAGE_VIEWER,
                 (
                     "Open advanced integration settings."
-                    if advanced_editor_available and unlocked
+                    if advanced_editor_available and unlocked and tool is not Tool.IMAGE_VIEWER
                     else "Controls are locked during the active run."
                     if not unlocked
-                    else "Advanced settings require a native vNext editor."
+                    else operation_unavailable
                 ),
                 True,
             ),
@@ -272,7 +272,9 @@ def project_controls(
     }
     profile = ControlProfile(
         processing_page=(
-            ProcessingPage.INT_1D
+            ProcessingPage.VIEWER
+            if tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER}
+            else ProcessingPage.INT_1D
             if tool is Tool.INT_1D
             else ProcessingPage.INT_2D
         ),

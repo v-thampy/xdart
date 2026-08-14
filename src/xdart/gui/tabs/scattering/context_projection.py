@@ -4,25 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import os
 
 from xdart.modules.display_context import (
-    AcquisitionContext,
-    BrowseContext,
-    ContextKind,
-    DisplaySelection,
-    HydrationRequest,
+    AcquisitionContext, BrowseContext, ContextKind, DisplaySelection,
+    HydrationRequest, Viewer2DContext, Viewer2DState,
 )
-from xrd_tools.core.energy import (
-    WavelengthUnit,
-    canonical_wavelength_m,
+from xrd_tools.core import FrameView
+from xrd_tools.io.viewer_2d import (
+    Viewer2DArtifactCatalog, Viewer2DFrame, Viewer2DSourceKind,
 )
+from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m
 from xrd_tools.session.hydration import (
-    HydrationPurpose,
-    HydrationReadKey,
-    HydrationScope,
-    HydrationToken,
+    HydrationPurpose, HydrationReadKey, HydrationScope, HydrationToken,
 )
-from xrd_tools.session.readiness import ControlPanelRenderState
+from xrd_tools.session.readiness import ControlPanelRenderState, Tool, tool_from_mode_text
 from xrd_tools.session.run_configuration import RunIntent
 
 from .browser_catalog import BrowserCatalogEntry
@@ -34,24 +30,16 @@ from .context_values import (
     TerminalMiss,
 )
 from .controls_readiness import ControlsReadinessProjection
-from .display_values import (
-    DisplayFrameKey,
-    StandardDisplayPayload,
-)
-from .display_runtime import (
-    publication_needs_hydration,
-)
+from .display_values import DisplayFrameKey, StandardDisplayPayload
+from .display_runtime import publication_needs_hydration
 from .events import RunIdentity
 from .shell_projection import (
-    ScientificPreferences,
-    build_browser_projection,
-    build_run_strip_projection,
-    build_scientific_projection,
+    ScientificPreferences, build_browser_projection,
+    build_run_strip_projection, build_scientific_projection,
 )
 from .shell_values import (
-    FrameNavigationProjection,
-    ProgressProjection,
-    ShellProjection,
+    FrameNavigationProjection, HeavyProjection, ProgressProjection,
+    ScientificProjection, ShellProjection,
 )
 from .state_machine import RunPhase
 
@@ -71,6 +59,41 @@ class ProjectionRequest:
             or type(self.require_complete) is not bool
         ):
             raise TypeError("context projection request is invalid")
+
+
+def _viewer_2d_payload(context, request, selection, frame_keys, catalog, frame):
+    owns = (type(frame_keys) is dict
+            and frame_keys.get(id(request.frame)) is request.frame)
+    if (type(context) is not Viewer2DContext or context.state is not Viewer2DState.READY
+            or type(catalog) is not Viewer2DArtifactCatalog or type(frame) is not Viewer2DFrame
+            or request.selection is not selection or selection.kind is not ContextKind.VIEWER_2D
+            or selection.context_token != context.context_token
+            or request.run_identity is not request.frame.run_identity
+            or request.run_identity.generation != context.generation
+            or request.run_identity.fingerprint != context.context_token
+            or not owns or frame.catalog_identity != catalog.catalog_identity
+            or frame.label != request.frame.local_frame_label):
+        return None
+    kind = frame.provenance.source_kind
+    text = {
+        Viewer2DSourceKind.RAW_DETECTOR: "Raw detector",
+        Viewer2DSourceKind.PROCESSED_RAW: "Processed raw",
+        Viewer2DSourceKind.PROCESSED_THUMBNAIL: "Thumbnail preview",
+        Viewer2DSourceKind.CSV_MATRIX: "CSV matrix",
+        Viewer2DSourceKind.NUMPY_ARRAY: "NumPy array",
+    }[kind]
+    status = f"2D Viewer · {text}"
+    if kind is Viewer2DSourceKind.PROCESSED_THUMBNAIL:
+        status += " · Raw source unavailable; displaying stored thumbnail."
+    name = os.path.basename(catalog.canonical_path)
+    view = FrameView(label=frame.label, raw=frame.array,
+                     source_path=catalog.canonical_path,
+                     source_frame_index=frame.provenance.frame_index)
+    if view.raw is not frame.array:
+        return None
+    title = f"{name} · frame {frame.label} · {text}"
+    return StandardDisplayPayload(selection.display_generation, request.frame,
+                                  title, view, status)
 
 
 class ContextProjection:
@@ -153,18 +176,24 @@ class ContextProjection:
     ) -> ShellProjection:
         """Build the one complete shell value; retain no input or output."""
 
+        viewer_selected = (tool_from_mode_text(intent.processing_mode)
+                           is Tool.IMAGE_VIEWER
+                           or any(type(item) is Viewer2DContext for item in contexts))
+        viewer_navigation = (navigation if selection is not None
+                             and selection.kind is ContextKind.VIEWER_2D
+                             else FrameNavigationProjection())
         run = build_run_strip_projection(
             phase,
             intent,
             executor_available=executor_available,
             start_permitted=start_permitted,
             start_blocker=start_blocker,
-            source_count=source_count,
+            source_count=None if viewer_selected else source_count,
             source_count_is_files=source_count_is_files,
-            source_count_includes_immediate=(
-                source_count_includes_immediate
-            ),
+            source_count_includes_immediate=source_count_includes_immediate,
         )
+        if viewer_selected:
+            run = replace(run, mode="2D Viewer")
         progress_detail = progress.detail
         if progress.directory_files is not None and (
             not progress.terminal or phase is RunPhase.FAILED
@@ -183,7 +212,7 @@ class ContextProjection:
                     RunPhase.FINALIZING: "Finalizing",
                 }.get(phase, "Running")
             )
-        if (
+        if (not viewer_selected and
             (
                 phase not in {RunPhase.IDLE, RunPhase.FAILED, RunPhase.CLOSED}
                 or progress.terminal
@@ -195,21 +224,31 @@ class ContextProjection:
             and progress_detail
         ):
             run = replace(run, readiness=progress_detail)
-        controls = replace(
-            controls,
-            profile=replace(
-                controls.profile,
-                run_enabled=run.run_enabled,
-                run_blockers=(
-                    () if run.ready else (run.readiness,)
-                ),
-            ),
+        controls = replace(controls, profile=replace(
+            controls.profile, run_enabled=run.run_enabled,
+            run_blockers=(() if run.ready else (run.readiness,))))
+        current = viewer_navigation.current
+        payload = next((item for item in payloads if item.frame_key is current), None)
+        viewer_ready = (current is not None
+            and current.source_scan == "viewer-2d" and current.artifact == "viewer-2d"
+            and payload is not None and current in resident_frames
+            and payload.view.raw is not None
+        )
+        viewer_scientific = ScientificProjection(
+            heavy_available=resident_frames if viewer_ready else frozenset(),
+            heavy=(HeavyProjection(current, raw=payload.view.raw)
+                   if viewer_ready else None),
+            title=payload.title if viewer_ready else "Current",
+            processing_mode="2D Viewer", color_map=preferences.color_map,
+            log_scale=preferences.log_scale,
+            status=payload.status if viewer_ready else notice,
+            retain_display=False,
         )
         return ShellProjection(
             revision,
             build_browser_projection(
-                contexts=contexts,
-                selection=selection,
+                contexts=() if viewer_selected else contexts,
+                selection=None if viewer_selected else selection,
                 navigation=navigation,
                 browser_directory=browser_directory,
                 date_sorted=date_sorted,
@@ -217,33 +256,28 @@ class ContextProjection:
                 catalog=browser_catalog,
                 transient_frame=browser_transient_frame,
             ),
-            build_scientific_projection(
-                payloads,
-                navigation,
-                resident_frames,
-                preferences,
-                notice,
-                phase,
-                processing_mode=intent.processing_mode,
-                # E6-NORM-N2 (§25.3): the exact runtime-captured snapshot,
-                # one-refresh transport — never a reread of the producer.
-                norm_aggregate=norm_aggregate,
-            ),
-            navigation,
+            (viewer_scientific if viewer_selected else build_scientific_projection(
+                payloads, navigation, resident_frames, preferences, notice,
+                phase, processing_mode=intent.processing_mode,
+                norm_aggregate=norm_aggregate)),
+            viewer_navigation if viewer_selected else navigation,
             controls,
             run,
-            progress,
+            ProgressProjection() if viewer_selected else progress,
             controls_readiness,
         )
 
     def project(
         self,
-        context: AcquisitionContext | BrowseContext,
+        context: AcquisitionContext | BrowseContext | Viewer2DContext,
         request: ProjectionRequest,
         current_selection: DisplaySelection,
         accepted_run_identity: RunIdentity | None,
         frame_keys: tuple[DisplayFrameKey, ...] | dict[int, DisplayFrameKey],
         browse_hydration_owner=None,
+        *,
+        viewer_catalog=None,
+        viewer_frame=None,
     ) -> StandardDisplayPayload | None:
         if type(frame_keys) is dict:
             owns_frame = frame_keys.get(id(request.frame)) is request.frame
@@ -253,6 +287,11 @@ class ContextProjection:
             owns_frame = any(frame is request.frame for frame in frame_keys)
         else:
             owns_frame = False
+        if type(context) is Viewer2DContext:
+            return _viewer_2d_payload(
+                context, request, current_selection, frame_keys,
+                viewer_catalog, viewer_frame,
+            )
         if (
             request.run_identity is not accepted_run_identity
             or request.selection is not current_selection
@@ -306,7 +345,6 @@ class ContextProjection:
             frame,
             request.selection.display_generation,
         )
-
     def resolve_browse(
         self,
         context: BrowseContext,

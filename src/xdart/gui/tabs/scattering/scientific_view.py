@@ -10,6 +10,9 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from xdart.modules.display_context import (
+    Viewer2DRendererClearReceipt, Viewer2DRendererClearRequest,
+)
 from xdart.gui.themes import apply_seaborn_plot_style
 from xrd_tools.session.display_logic import (
     canonical_axis_key,
@@ -243,6 +246,7 @@ class ScientificView(QtWidgets.QFrame):
         self._waterfall_source_keys: tuple[tuple[object, ...], ...] = ()
         self._waterfall_render_contract: tuple[object, ...] | None = None
         self._processing_mode = ""
+        self._viewer_2d_payload = None
         self._rendered_image_axis: str | None = None
         self._rendered_cake_axis_key: str | None = None
         self._rendered_cake_x_axis: AxisProjection | None = None
@@ -542,6 +546,52 @@ class ScientificView(QtWidgets.QFrame):
         total: int,
         detail: str,
     ) -> None:
+        if state.processing_mode == "2D Viewer":
+            self._processing_mode = "2D Viewer"
+            if state.heavy is None:
+                cleared = ScientificView.clear_viewer_2d(self, None, failure=True)
+                if not cleared:
+                    raise RuntimeError("2D Viewer render failed.") from None
+                self.title.setText(state.title)
+                self.status.setText(state.status)
+                self.progress.setText("0/0")
+                return
+            try:
+                if not ScientificView.clear_viewer_2d(self, None, failure=True):
+                    raise ValueError("viewer reset is incomplete")
+                frame = navigation.current
+                heavy = state.heavy
+                if frame is None or heavy.frame is not frame or heavy.raw is None:
+                    raise ValueError("viewer projection is incomplete")
+                blockers = [QtCore.QSignalBlocker(widget) for widget in (
+                    self.frame_selector, self.color_map, self.log_scale)]
+                self.raw.render(heavy.raw, color_map=state.color_map,
+                                log_scale=state.log_scale,
+                                level_scan_token=(id(frame), id(heavy.raw)))
+                self.raw.canvas.imageItem.pos_label.setText("")
+                self.cake.canvas.imageItem.pos_label.setText("")
+                self._heavy_available = state.heavy_available
+                self._selected_keys = navigation.selected
+                self._plot_mode, self._single_mode = "Single", True
+                self._rebuild_frames(navigation.frames, frame)
+                set_combo_value(self.color_map, state.color_map, fallback="Default")
+                self.log_scale.setChecked(state.log_scale)
+                self._viewer_2d_payload = heavy.raw
+                self.title.setText(state.title)
+                self.status.setText(state.status)
+                self.progress.setText(f"{completed}/{total}")
+                current = next((index for index, item in enumerate(navigation.frames)
+                                if item is frame), None)
+                self.previous_frame.setEnabled(current is not None and current > 0)
+                self.next_frame.setEnabled(
+                    current is not None and current < len(navigation.frames) - 1)
+                self._apply_processing_layout("2D Viewer")
+                del blockers
+            except Exception:
+                ScientificView.clear_viewer_2d(self, None, failure=True)
+            else:
+                return
+            raise RuntimeError("2D Viewer render failed.") from None
         slice_contract = (
             state.plot_axis,
             state.slice_enabled,
@@ -707,6 +757,92 @@ class ScientificView(QtWidgets.QFrame):
         self.progress.setText(f"{completed}/{total}")
         del blockers
 
+    def clear_viewer_2d(self, request, *, failure=False):
+        if not failure and type(request) is not Viewer2DRendererClearRequest:
+            return None
+        cleared, canonical = True, self._viewer_2d_payload
+        def scrub(target, name, value=None, *, read=False):
+            nonlocal cleared
+            try:
+                member = getattr(target, name, None)
+                if read:
+                    return member
+                if callable(member):
+                    if value is None:
+                        return member()
+                    return member(value)
+                setattr(target, name, value)
+                actual = getattr(target, name, None)
+                if (canonical is not None and (actual is canonical
+                        or isinstance(actual, np.ndarray)
+                        and np.shares_memory(actual, canonical))):
+                    cleared = False
+            except Exception:
+                cleared = False
+        for pane in (self.raw, self.cake):
+            scrub(pane, "clear")
+            canvas = scrub(pane, "canvas", read=True)
+            image = scrub(canvas, "imageItem", read=True)
+            histogram = scrub(canvas, "histogram", read=True)
+            view = scrub(canvas, "imageViewBox", read=True)
+            hover = scrub(image, "pos_label", read=True)
+            scrub(hover, "setText", "")
+            for target, name, value in (
+                (canvas, "raw_image", np.zeros(0)), (canvas, "displayed_image", np.zeros(0)),
+                (canvas, "_level_cache", None), (canvas, "_level_scan_token", None),
+                (histogram, "lo_lim", None), (histogram, "hi_lim", None),
+                (image, "image", None), (image, "qimage", None), (image, "levels", None),
+                (image, "_defferedLevels", None), (image, "_lastDownsample", (1, 1)),
+                (image, "_displayBuffer", None), (image, "_processingBuffer", None),
+                (image, "_imageNanLocations", None), (image, "_imageHasNans", None),
+            ):
+                scrub(target, name, value)
+            scrub(histogram, "setLevels", (0.0, 1.0))
+            scrub(view, "setRange", QtCore.QRectF(0.0, 0.0, 1.0, 1.0))
+            for method in ("resetTransform", "prepareGeometryChange",
+                           "informViewBoundsChanged", "update"):
+                scrub(image, method)
+        for root in (self.curve, self.waterfall):
+            scrub(root, "clear")
+        try:
+            blocker = QtCore.QSignalBlocker(self.frame_selector)
+        except Exception:
+            blocker = None
+            cleared = False
+        scrub(self.frame_selector, "clear")
+        scrub(self.frame_selector, "setCurrentIndex", -1)
+        del blocker
+        bottom = scrub(self.vertical_splitter, "widget", 1)
+        for widget in (
+            self.image_splitter, self.raw, self.cake, bottom, self.norm, self.background,
+            self.image_axis, self.share_axis, self.slice,
+            self.slice_center, self.slice_width, self.pin,
+        ):
+            scrub(widget, "hide")
+        for name, value in (
+            ("_viewer_2d_payload", None), ("_frame_keys", ()), ("_selected_keys", ()),
+            ("_trace_selection_keys", ()), ("_trace_history_keys", ()), ("_rendered_trace_keys", ()),
+            ("_waterfall_y_values", ()), ("_waterfall_source_keys", ()), ("_label_indices", {}),
+            ("_heavy_available", frozenset()), ("_trace_history_scope", None), ("_pinned_trace_scope", None),
+            ("_rendered_plot_options", None), ("_rendered_overlay_step", None), ("_trace_history_by_identity", {}),
+            ("_pinned_trace_by_id", {}), ("_rendered_plot_mode", ""), ("_bottom_waterfall_active", False),
+            ("_waterfall_render_contract", None), ("_rendered_image_axis", None), ("_rendered_cake_axis_key", None),
+            ("_rendered_cake_x_axis", None), ("_rendered_cake_y_axis", None), ("_rendered_trace_axis_key", None),
+        ):
+            scrub(self, name, value)
+        for widget, method, value in (
+            (self.previous_frame, "setEnabled", False),
+            (self.next_frame, "setEnabled", False),
+            (self.title, "setText", (
+                "2D Viewer · Render failed" if failure else "Current")),
+            (self.status, "setText", (
+                "2D Viewer · Render failed; retry available."
+                if failure else "")),
+            (self.progress, "setText", "0/0"),
+        ):
+            scrub(widget, method, value)
+        return cleared if failure else Viewer2DRendererClearReceipt(request, cleared)
+
     def _reconcile_slice_extent(self, state: ScientificProjection) -> None:
         orientation = (
             slice_region_orientation(
@@ -809,9 +945,12 @@ class ScientificView(QtWidgets.QFrame):
             self._selector_operations += 1
             start = 0
         for index, frame in enumerate(frames[start:], start):
+            viewer = (self._processing_mode == "2D Viewer"
+                      and frame.source_scan == frame.artifact == "viewer-2d")
             label = frame.local_frame_label
             indices = self._label_indices.setdefault(label, [])
             self.frame_selector.add_frame(
+                str(label) if viewer else
                 frame_caption(frame, frozenset(), position=index),
                 frame,
                 f"{frame.source_scan}:{frame.local_frame_label}",
@@ -1351,6 +1490,12 @@ class ScientificView(QtWidgets.QFrame):
         frame = self.frame_selector.itemData(index)
         if type(frame) is not DisplayFrameKey:
             return
+        if (self._processing_mode == "2D Viewer"
+                and frame.source_scan == frame.artifact == "viewer-2d"
+                and any(frame is item for item in self._frame_keys)):
+            self.commandRequested.emit(ShellCommand(
+                ShellCommandKind.SELECT_FRAME, frame=frame, frames=(frame,)))
+            return
         kind = (
             ShellCommandKind.SELECT_FRAME
             if any(frame is item for item in self._heavy_available)
@@ -1406,13 +1551,28 @@ class ScientificView(QtWidgets.QFrame):
             self._align_curve_under_cake()
 
     def _apply_processing_layout(self, mode: str) -> None:
-        """Make the mounted center geometry an exact function of native mode."""
-
         normalized = str(mode or "")
+        if normalized == "2D Viewer":
+            self._processing_mode = "2D Viewer"
+            for widget in (
+                self.cake, self.vertical_splitter.widget(1), self.image_axis,
+                self.share_axis, self.slice,
+                self.slice_center, self.slice_width, self.pin,
+            ):
+                widget.setVisible(False)
+            self._set_share_link(False)
+            self.raw.setVisible(True)
+            self.image_splitter.setVisible(True)
+            return
         has_2d = normalized != "Int 1D"
         prior_has_2d = self._processing_mode != "Int 1D"
         self._processing_mode = normalized
+        self.norm.setVisible(True)
+        self.background.setVisible(True)
         self.image_splitter.setVisible(has_2d)
+        self.raw.setVisible(True)
+        self.cake.setVisible(True)
+        self.vertical_splitter.widget(1).setVisible(True)
         for widget in (
             self.image_axis,
             self.share_axis,
@@ -1695,6 +1855,8 @@ class ScientificView(QtWidgets.QFrame):
         if not self._frame_keys:
             return
         current = self.frame_selector.currentIndex()
+        if current < 0:
+            return
         target = min(max(current + offset, 0), len(self._frame_keys) - 1)
         if target != current:
             self.frame_selector.setCurrentIndex(target)

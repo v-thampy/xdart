@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from xdart.modules.display_context import (
-    AcquisitionContext, BrowseContext, ContextKind, DisplaySelection)
+    AcquisitionContext, BrowseContext, ContextKind, DisplaySelection,
+    HydrationOwner, Viewer2DContext,
+)
+from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog, Viewer2DFrame
 from xrd_tools.session.hydration import (
     HydrationPurpose, HydrationReadKey, HydrationToken)
 from xrd_tools.session.scan_norm import (
@@ -89,12 +92,17 @@ class _ContextRuntime:
         self._run_identity: RunIdentity | None = None
         self._acquisition: AcquisitionContext | None = None
         self._browse: BrowseContext | None = None
+        self._viewer_2d: Viewer2DContext | None = None
+        self._viewer_2d_catalog: Viewer2DArtifactCatalog | None = None
+        self._viewer_2d_frame: Viewer2DFrame | None = None
         self._browse_projection_identity: RunIdentity | None = None
         self._selection: DisplaySelection | None = None
         self._acquisition_navigation = FrameNavigationProjection()
         self._browse_navigation = FrameNavigationProjection()
+        self._viewer_2d_navigation = FrameNavigationProjection()
         self._acquisition_frame_by_id: dict[int, DisplayFrameKey] = {}
         self._browse_frame_by_id: dict[int, DisplayFrameKey] = {}
+        self._viewer_2d_frame_by_id: dict[int, DisplayFrameKey] = {}
         self._pending_replacement: _PendingBrowseReplacement | None = None
         self._display_generation = 0
         self._committed_trace_scope: tuple[object, ...] | None = None
@@ -125,7 +133,7 @@ class _ContextRuntime:
     def retained_contexts(self) -> tuple:
         return tuple(
             context
-            for context in (self._acquisition, self._browse)
+            for context in (self._acquisition, self._browse, self._viewer_2d)
             if context is not None
         )
 
@@ -143,6 +151,7 @@ class _ContextRuntime:
                     and not browse.released
                     else None
                 ),
+                self._viewer_2d,
             )
             if context is not None
         )
@@ -153,6 +162,8 @@ class _ContextRuntime:
         if pending is not None:
             return pending.navigation
         selection = self._selection
+        if selection is not None and selection.kind is ContextKind.VIEWER_2D:
+            return self._viewer_2d_navigation
         if selection is not None and selection.kind is ContextKind.BROWSE:
             return self._browse_navigation
         return self._acquisition_navigation
@@ -169,6 +180,12 @@ class _ContextRuntime:
         selection = self._selection
         if selection is None:
             return frozenset()
+        if selection.kind is ContextKind.VIEWER_2D:
+            current = self._viewer_2d_navigation.current
+            frame = self._viewer_2d_frame
+            owns_current = (current is not None and frame is not None
+                            and frame.label == current.local_frame_label)
+            return frozenset((current,)) if owns_current else frozenset()
         context = (
             self._browse
             if selection.kind is ContextKind.BROWSE
@@ -215,6 +232,72 @@ class _ContextRuntime:
             and type(frame) is DisplayFrameKey
             and self._selected_frame_by_id().get(id(frame)) is frame
         )
+
+    def adopt_viewer_2d(self, context: Viewer2DContext,
+                        catalog: Viewer2DArtifactCatalog) -> None:
+        if (type(context) is not Viewer2DContext
+                or type(catalog) is not Viewer2DArtifactCatalog):
+            raise TypeError("viewer context/catalog must be exact")
+        identity = RunIdentity(context.generation, context.context_token)
+        frames = tuple(DisplayFrameKey(
+            identity, "viewer-2d", "viewer-2d", label, index + 1)
+            for index, label in enumerate(catalog.frame_labels))
+        navigation = FrameNavigationProjection(frames, frames[0], (frames[0],))
+        self._display_generation += 1
+        selection = DisplaySelection(ContextKind.VIEWER_2D, HydrationOwner(
+            context.context_token, "viewer-2d", "viewer-2d",
+            context.commit_gate.epoch), self._display_generation)
+        self._viewer_2d, self._viewer_2d_catalog, self._viewer_2d_frame = (
+            context, catalog, None)
+        self._set_viewer_2d_navigation(navigation)
+        self._selection, self._pending_replacement = selection, None
+        self._reset_trace_projection()
+
+    def replace_viewer_2d_context(self, context: Viewer2DContext) -> bool:
+        current = self._viewer_2d
+        if (type(context) is not Viewer2DContext or current is None
+                or context.context_token != current.context_token
+                or context.generation != current.generation
+                or context.original_path != current.original_path
+                or context.commit_gate is not current.commit_gate):
+            return False
+        self._viewer_2d = context
+        return True
+
+    def select_viewer_2d(self, label: int, *, advance: bool = True) -> DisplaySelection:
+        context = self._viewer_2d
+        if context is None or type(label) is not int:
+            raise RuntimeError("no selectable 2D Viewer context")
+        frame = next((item for item in self._viewer_2d_navigation.frames
+                      if item.local_frame_label == label), None)
+        if frame is None:
+            raise RuntimeError("2D Viewer frame is not in the catalog")
+        current = self._viewer_2d_navigation.current
+        if (not advance and current is frame and self._selection is not None
+                and self._selection.kind is ContextKind.VIEWER_2D):
+            return self._selection
+        self._display_generation += int(advance)
+        self._selection = DisplaySelection(
+            ContextKind.VIEWER_2D,
+            HydrationOwner(context.context_token, "viewer-2d", "viewer-2d",
+                           context.commit_gate.epoch), self._display_generation)
+        navigation = FrameNavigationProjection(
+            self._viewer_2d_navigation.frames, frame, (frame,))
+        self._set_viewer_2d_navigation(navigation)
+        self._pending_replacement = None
+        self._reset_trace_projection()
+        return self._selection
+
+    def clear_viewer_2d(self, *, release: bool = False) -> None:
+        self._viewer_2d_frame = None
+        if not release:
+            return
+        if (self._selection is not None
+                and self._selection.kind is ContextKind.VIEWER_2D):
+            self._selection = None
+        self._viewer_2d = self._viewer_2d_catalog = None
+        self._set_viewer_2d_navigation(FrameNavigationProjection())
+        self._reset_trace_projection()
 
     def adopt_acquisition(
         self, run_identity: RunIdentity, context: AcquisitionContext
@@ -328,9 +411,10 @@ class _ContextRuntime:
         selection = self._selection
         if selection is None:
             return False
+        if selection.kind is ContextKind.VIEWER_2D:
+            return False
         navigation = (
-            self._browse_navigation
-            if selection.kind is ContextKind.BROWSE
+            self._browse_navigation if selection.kind is ContextKind.BROWSE
             else self._acquisition_navigation
         )
         if not navigation.frames:
@@ -367,7 +451,9 @@ class _ContextRuntime:
         except (TypeError, ValueError):
             return False
         selection = self._selection
-        if selection is not None and selection.kind is ContextKind.BROWSE:
+        if selection is not None and selection.kind is ContextKind.VIEWER_2D:
+            return False
+        elif selection is not None and selection.kind is ContextKind.BROWSE:
             self._set_browse_navigation(navigation)
         else:
             self._set_acquisition_navigation(navigation)
@@ -587,6 +673,8 @@ class _ContextRuntime:
         context = (
             self._acquisition
             if request.selection.kind is ContextKind.ACQUISITION
+            else self._viewer_2d
+            if request.selection.kind is ContextKind.VIEWER_2D
             else self._browse
         )
         if context is None:
@@ -622,6 +710,8 @@ class _ContextRuntime:
                 identity,
                 self._selected_frame_by_id(),
                 browse_hydration_owner,
+                viewer_catalog=self._viewer_2d_catalog,
+                viewer_frame=self._viewer_2d_frame,
             )
         if (
             type(payload) is not StandardDisplayPayload
@@ -680,6 +770,9 @@ class _ContextRuntime:
                     browse.requested_path,
                 )
                 candidate = browse.norm_aggregate
+        elif selection is not None and selection.kind is ContextKind.VIEWER_2D:
+            self._norm_aggregate = None
+            return
         elif selection is not None:
             context = self._acquisition
             identity = self._run_identity
@@ -821,6 +914,9 @@ class _ContextRuntime:
                     projection, request, browse_hydration_owner
                 )
                 if payload is None and require_complete and not browse_selected:
+                    if (self._selection is not None and
+                            self._selection.kind is ContextKind.VIEWER_2D):
+                        continue
                     # E4's incomplete-acquisition fallback only: a typed
                     # Browse miss/terminal never buys a second current read.
                     request = self.project_request(
@@ -991,6 +1087,7 @@ class _ContextRuntime:
 
     def close_selection(self) -> None:
         self.clear_browse(select_acquisition=False)
+        self.clear_viewer_2d(release=True)
         self._selection = None
         self._pending_replacement = None
 
@@ -1003,11 +1100,11 @@ class _ContextRuntime:
         selection = self._selection
         if selection is None:
             return None
-        return (
-            self._browse_projection_identity
-            if selection.kind is ContextKind.BROWSE
-            else self._run_identity
-        )
+        if selection.kind is ContextKind.VIEWER_2D:
+            current = self._viewer_2d_navigation.current
+            return None if current is None else current.run_identity
+        return (self._browse_projection_identity
+                if selection.kind is ContextKind.BROWSE else self._run_identity)
 
     def _select(
         self, context: AcquisitionContext | BrowseContext
@@ -1061,7 +1158,9 @@ class _ContextRuntime:
         if selection is None:
             return {}
         return (
-            self._browse_frame_by_id
+            self._viewer_2d_frame_by_id
+            if selection.kind is ContextKind.VIEWER_2D
+            else self._browse_frame_by_id
             if selection.kind is ContextKind.BROWSE
             else self._acquisition_frame_by_id
         )
@@ -1088,6 +1187,14 @@ class _ContextRuntime:
             self._browse_frame_by_id = {
                 id(frame): frame for frame in navigation.frames
             }
+
+    def _set_viewer_2d_navigation(
+        self, navigation: FrameNavigationProjection) -> None:
+        prior = self._viewer_2d_navigation.frames
+        self._viewer_2d_navigation = navigation
+        if navigation.frames is not prior:
+            self._viewer_2d_frame_by_id = {id(frame): frame
+                                           for frame in navigation.frames}
 
     def _trace_projection_scope(
         self,

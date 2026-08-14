@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.session.run_configuration import RunIntent
 
 from .shell_values import RunStripProjection, ShellPhase
@@ -16,8 +17,8 @@ RUN_MODE_CHOICES = (
     "Int 1D (XYE)",
     "Stitch 1D",
     "Stitch 2D",
-    "Image Viewer",
-    "XYE Viewer",
+    "2D Viewer",
+    "1D Viewer",
 )
 UNOWNED_RUN_MODE_REASONS = (
     (
@@ -29,12 +30,8 @@ UNOWNED_RUN_MODE_REASONS = (
         "Stitching has no mounted vNext operation service yet.",
     ),
     (
-        "Image Viewer",
-        "Image Viewer has no mounted vNext viewer context yet.",
-    ),
-    (
-        "XYE Viewer",
-        "XYE Viewer has no mounted vNext viewer context yet.",
+        "1D Viewer",
+        "1D Viewer has no mounted vNext viewer context yet.",
     ),
 )
 _NATIVE_RUN_MODES = frozenset(("Int 1D", "Int 2D", "Int 1D (XYE)"))
@@ -52,20 +49,28 @@ def build_run_strip_projection(
     source_count_includes_immediate: bool = False,
 ) -> RunStripProjection:
     mode = str(intent.processing_mode or "")
+    tool = tool_from_mode_text(mode)
+    viewer_2d = tool is Tool.IMAGE_VIEWER
+    if viewer_2d:
+        mode = "2D Viewer"
+    elif tool is Tool.XYE_VIEWER:
+        mode = "1D Viewer"
     output_supported = (
         type(intent.output_mode) is str
         and intent.output_mode.strip().lower() in {"overwrite", "append"}
     )
+    if viewer_2d:
+        output_supported = True
     xye_append = (
         mode == "Int 1D (XYE)"
         and intent.output_mode.strip().lower() == "append"
     )
     missing: list[str] = []
-    if intent.source_spec is None:
+    if intent.source_spec is None and not viewer_2d:
         missing.append("source")
-    if not intent.poni_file:
+    if not intent.poni_file and not viewer_2d:
         missing.append("PONI")
-    if not intent.save_path:
+    if not intent.save_path and not viewer_2d:
         missing.append("output")
     mode_blocker = dict(UNOWNED_RUN_MODE_REASONS).get(mode)
     if mode not in _NATIVE_RUN_MODES and mode_blocker is None:
@@ -73,9 +78,11 @@ def build_run_strip_projection(
             f"{mode or 'Selected mode'} has no mounted vNext operation "
             "service yet."
         )
+    if viewer_2d:
+        mode_blocker = None
     if mode_blocker is not None:
         readiness = mode_blocker
-    elif not executor_available:
+    elif not executor_available and not viewer_2d:
         readiness = "Execution is unavailable"
     elif xye_append:
         readiness = "XYE-only Append has no persisted lineage owner"
@@ -98,7 +105,7 @@ def build_run_strip_projection(
                 count += " (folder + 1 level)"
             readiness += f" · {count}"
     ready = (
-        executor_available
+        (executor_available or viewer_2d)
         and output_supported
         and not xye_append
         and not missing

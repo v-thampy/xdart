@@ -20,6 +20,7 @@ from xrd_tools.session.intent_store import (
     RunIntentStore,
     RunIntentSnapshot,
 )
+from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
     image_series_spec,
@@ -86,6 +87,7 @@ from .events import (
     ExecutorClosed,
     FatalExecution,
     LifecycleStatus,
+    LifecycleResult,
     OwnersClosed,
     RunIdentity,
     detached_exception_strings,
@@ -254,6 +256,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         lifecycle: ScatteringCoordinator,
         sources: SourcePort,
         executor: RunExecutorPort | None = None,
+        viewer_file_chooser: Callable[[str], str | None] | None = None,
         browser_directory_chooser: (
             Callable[[str, str], str | None] | None
         ) = None,
@@ -330,6 +333,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browser_directory_chooser
             if browser_directory_chooser is not None
             else self._choose_directory_dialog
+        )
+        self._viewer_file_chooser = (
+            viewer_file_chooser if viewer_file_chooser is not None
+            else self._choose_viewer_2d_dialog
         )
         self._control_path_chooser = control_path_chooser
         self._source_selection_chooser = source_selection_chooser
@@ -493,6 +500,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or self._lifecycle.attempt_run_identity
             )
 
+        if not self._clear_viewer_2d_renderer(close=True):
+            return StartClosed(
+                LifecycleResult(
+                    LifecycleStatus.REJECTED,
+                    self._lifecycle.phase,
+                    run_identity=self._close_identity,
+                ),
+                (),
+                CleanupStatus.CLEANUP_PENDING,
+                cleanup_identity=self._close_identity,
+            )
         token = self._admission
         if token is not None and self._run_executor is not None:
             self._release_admission(token)
@@ -699,6 +717,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_browser_catalog()
             return
         if kind is ShellCommandKind.SELECT_SCAN:
+            if self._context_controller.viewer_2d_owned:
+                if not self._clear_viewer_2d_renderer(close=True):
+                    return
             self._select_scan(command.value)
             return
         if kind in {
@@ -780,6 +801,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
                 self._refresh_shell()
                 self._ensure_timer()
+            return
+        intent = self._intents.snapshot().thaw()
+        if tool_from_mode_text(intent.processing_mode) is Tool.IMAGE_VIEWER:
+            if intent.live_mode and self._context_controller.run_identity is None:
+                self._notice("2D Viewer Live requires a retained acquisition session")
+                return
+            self._choose_viewer_2d_file(
+                reload=self._context_controller.viewer_2d_context is not None)
+            return
+        if (self._context_controller.viewer_2d_owned
+                and not self._clear_viewer_2d_renderer(close=True)):
+            self._notice("2D Viewer cleanup remains pending")
             return
         if not self._commit_focused_control_edit_for_run():
             return
@@ -1184,6 +1217,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return
         selection = getattr(self._context_controller, "selection", None)
+        if selection is not None and selection.kind is ContextKind.VIEWER_2D:
+            if frame is None:
+                return
+            current = self._context_controller.navigation.current
+            if (current is not frame
+                    and self._context_controller.viewer_2d_frame is not None
+                    and not self._clear_viewer_2d_renderer()):
+                return
+            self._context_controller.select_viewer_2d_frame(
+                frame.local_frame_label)
+            self._ensure_timer()
+            return
         if (
             command.kind is ShellCommandKind.SELECT_BROWSER_FRAMES
             and self._preferences.plot_mode in {"Overlay", "Waterfall"}
@@ -1223,6 +1268,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if self._closing or self._closed:
             return
         changed = self._poll_admission()
+        if self._context_controller.poll_viewer_2d():
+            changed = True
         if self._context_controller.poll_browse_preview():
             changed = True
         if self._context_controller.browse_pending:
@@ -1279,6 +1326,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 changed = True
                 continue
             if event.kind is StandardEventKind.CONTEXT_READY:
+                if self._context_controller.viewer_2d_owned:
+                    continue
                 try:
                     self._context_controller.adopt_acquisition(
                         event.run_identity
@@ -1437,6 +1486,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _polling_needed(self) -> bool:
         if (
             self._admission is not None
+            or self._context_controller.viewer_2d_loading
             or self._context_controller.browse_pending
             or self._context_controller.browse_preview_polling_needed
         ):
@@ -1467,6 +1517,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         intent = snapshot.thaw()
         controls = self._project_controls(snapshot)
         permitted, blocker = self._start_permitted()
+        viewer = tool_from_mode_text(intent.processing_mode) is Tool.IMAGE_VIEWER
+        if viewer:
+            blocked = (self._closing or self._closed
+                       or self._context_controller.viewer_2d_cleanup_pending
+                       or self._context_controller.browse_pending
+                       or self._lifecycle.active_run_identity is not None
+                       or self._lifecycle.attempt_run_identity is not None
+                       or intent.live_mode
+                       and self._context_controller.run_identity is None)
+            permitted = not blocked and (
+                self._lifecycle.phase is RunPhase.IDLE
+                or self._lifecycle.phase is RunPhase.FAILED
+                and self._lifecycle.reset_permitted)
+            blocker = ("2D Viewer Live requires a retained acquisition session"
+                       if intent.live_mode and self._context_controller.run_identity is None
+                       else "2D Viewer cleanup remains pending" if blocked else "")
         navigation = self._context_controller.navigation
         if self._preferences.slice_pins:
             retained_pins = tuple(
@@ -1543,7 +1609,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             executor_available=self._run_executor is not None,
             start_permitted=permitted,
             start_blocker=blocker,
-            notice=self._notice_text,
+            notice=(self._context_controller.viewer_2d_diagnostic
+                    if viewer else self._notice_text),
             source_count=source_count,
             source_count_is_files=source_count_is_files,
             source_count_includes_immediate=(
@@ -1668,6 +1735,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
                 return
+            if (self._context_controller.viewer_2d_owned
+                    and tool_from_mode_text(value) is not Tool.IMAGE_VIEWER
+                    and not self._clear_viewer_2d_renderer(close=True)):
+                self._notice("2D Viewer cleanup remains pending")
+                return
             candidate.processing_mode = value
         elif kind is ShellCommandKind.SET_BATCH:
             if type(value) is not bool:
@@ -1687,6 +1759,60 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             candidate, expected_revision=snapshot.revision
         )
         self._reconcile_snapshot(snapshot, result.snapshot)
+
+    def _choose_viewer_2d_file(self, *, reload: bool) -> None:
+        context = self._context_controller.viewer_2d_context
+        if reload:
+            selected = None if context is None else context.original_path
+        else:
+            try:
+                selected = self._viewer_file_chooser(
+                    self._viewer_2d_start_directory())
+            except Exception as error:
+                self._error_notice("2D Viewer chooser failed", error)
+                return
+            if selected is None or type(selected) is not str or not selected:
+                return
+        if context is not None and not self._clear_viewer_2d_renderer():
+            self._notice("2D Viewer cleanup remains pending")
+            return
+        try:
+            request = self._context_controller.open_viewer_2d(selected)
+        except Exception as error:
+            self._error_notice("2D Viewer refused", error)
+            return
+        if request is not None:
+            self._notice("")
+        self._ensure_timer()
+
+    def _choose_viewer_2d_dialog(self, start: str) -> str | None:
+        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open 2D Viewer source", start, "All files (*)")
+        return selected or None
+
+    def _viewer_2d_start_directory(self) -> str:
+        context = self._context_controller.viewer_2d_context
+        return "" if context is None else os.path.dirname(context.original_path)
+
+    def _clear_viewer_2d_renderer(self, *, close=False) -> bool:
+        request = self._context_controller.begin_viewer_2d_renderer_clear()
+        if request is None:
+            self._last_scientific_projection = None
+            cleared = self._context_controller.viewer_2d_frame is None
+        else:
+            try:
+                receipt = self._shell.scientific.clear_viewer_2d(request)
+            except Exception:
+                self._last_scientific_projection = None
+                return False
+            self._last_scientific_projection = None
+            try:
+                cleared = self._context_controller.acknowledge_viewer_2d_renderer_clear(
+                    receipt)
+            except Exception:
+                return False
+        return bool(cleared and (not close
+                    or self._context_controller.close_viewer_2d()))
 
     def _edit_scientific_preference(
         self, command: ShellCommand
