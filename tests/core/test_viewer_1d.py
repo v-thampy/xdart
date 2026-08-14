@@ -121,10 +121,16 @@ def test_session_is_canonical_and_xdart_exports_direct_aliases():
         "viewer_1d_transfer_is_released", "viewer_1d_budget",
     )
     tree = ast.parse(inspect.getsource(ht))
-    origins = [(alias.asname or alias.name, node.module) for node in tree.body
-        if isinstance(node, ast.ImportFrom) for alias in node.names
-        if (alias.asname or alias.name) in transport_names]
-    assert origins == [(name, "xrd_tools.session.viewer_1d") for name in transport_names]
+    imports = [(alias.asname or alias.name, alias.name, node.module or "", node.level)
+        for node in tree.body if isinstance(node, ast.ImportFrom) for alias in node.names]
+    normalized = lambda name: "".join(character for character in name.lower() if character.isalnum())
+    session_module, display_module = "xrd_tools.session.viewer_1d", "xdart.modules.display_context"
+    census = [row for row in imports if row[2] == session_module
+        or any("viewer1d" in normalized(name) for name in row[:2])
+        or row[1] == "*" and row[2] in {session_module, display_module}]
+    assert census == [(name, name, session_module, 0) for name in transport_names]
+    assert not [row for row in imports if row[2] == display_module
+        and (row[1] == "*" or any("viewer1d" in normalized(name) for name in row[:2]))]
     assert all(getattr(ht, name) is getattr(session, name) for name in transport_names)
     assert all(not hasattr(io_owner, name) for name in transport_names)
 

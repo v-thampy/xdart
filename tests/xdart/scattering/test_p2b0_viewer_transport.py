@@ -131,19 +131,21 @@ def test_canonical_request_is_revalidated_before_admission_mutation(tmp_path, fo
     object.__setattr__(request, "token", token)
     gate, epoch = request.commit_gate, request.commit_gate.epoch
     def snapshot():
-        return (gate, gate.epoch, gate.cancelled, gate._reserved_epoch,
+        return (request.commit_gate, port.gate, gate, gate.epoch, gate.cancelled, gate._reserved_epoch,
             transport._active, transport._queued, transport._worker, transport._retired,
             transport.completions(), transport.counters(), tuple(port.calls),
             tuple(port.completions), tuple(port.notices), tuple(port.holders))
     before = snapshot()
-    assert before == (gate, epoch, False, 0, None, None, None, False, (),
+    assert before == (gate, gate, gate, epoch, False, 0, None, None, None, False, (),
         {outcome: 0 for outcome in HydrationOutcome}, (), (), (), ())
     mutation = transport.submit_detached(request)
     assert type(mutation) is ht.DetachedHydrationMutation
     assert mutation.ticket is None and mutation.deliveries == () and mutation.replacement is None
+    assert request.commit_gate is port.gate is gate
     assert snapshot() == before
     assert gate is port.gate and gate.enter(epoch)
     gate.leave()
+    assert request.commit_gate is port.gate is gate
     assert snapshot() == before
     assert transport.retire(join_timeout=1)
 

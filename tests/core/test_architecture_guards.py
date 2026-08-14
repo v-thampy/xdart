@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib
-import os
-import subprocess
+import os, subprocess
 import sys
 from pathlib import Path
 
@@ -38,48 +37,51 @@ def test_ssrl_tree_does_not_import_xdart():
 
 
 def test_viewer_1d_io_is_a_pure_leaf():
-    path = PACKAGE / "io" / "viewer_1d.py"
-    tree = ast.parse(path.read_text(), filename=str(path))
-    def resolve(name, level=0):
-        parts = tuple(part for part in name.split(".") if part)
-        prefix = ("xrd_tools", "io")[:max(0, 3 - level)] if level else ()
-        return ".".join((*prefix, *parts))
-    def forbidden(name):
-        return (name == "xdart" or name.startswith("xdart.")
-                or name == "xrd_tools.session" or name.startswith("xrd_tools.session."))
-    upward = []
+    path = PACKAGE / "io" / "viewer_1d.py"; tree = ast.parse(path.read_text(), filename=str(path))
+    # Finite source ratchet, not a sandbox: computed, reflective, sys.modules and native loading are review threats.
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    reserved = {"importlib", "__import__"}; imported_loaders = {*reserved, "import_module"}
+    resolve = lambda name, level=0: ".".join((*((("xrd_tools", "io")[:max(0, 3 - level)]) if level else ()), *filter(None, name.split("."))))
+    forbidden = lambda name: name == "xdart" or name.startswith("xdart.") or name == "xrd_tools.session" or name.startswith("xrd_tools.session.")
+    offenders = []
     for node in ast.walk(tree):
-        names = ([alias.name for alias in node.names] if isinstance(node, ast.Import) else
-                 [resolve(node.module or alias.name, node.level) for alias in node.names]
-                 if isinstance(node, ast.ImportFrom) else [])
-        if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-            function = node.func
-            if (isinstance(function, ast.Name) and function.id in {"__import__", "import_module"}
-                    or isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name)
-                    and function.value.id == "importlib" and function.attr == "import_module"):
-                value = node.args[0].value; level = len(value) - len(value.lstrip("."))
-                names.append(resolve(value, level))
-        upward.extend(f"{name}:{node.lineno}" for name in names if forbidden(name))
-    upward.extend(f"__getattr__:{node.lineno}" for node in tree.body
-                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                  and node.name == "__getattr__")
-    assert upward == []
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                exact = len(node.names) == 1 and alias.name == "importlib" and alias.asname is None; bound, root = alias.asname or alias.name.split(".")[0], alias.name.split(".")[0]
+                if forbidden(alias.name) or root == "builtins" or root == "importlib" and not exact or bound in imported_loaders and not exact: offenders.append(f"import:{node.lineno}")
+        elif isinstance(node, ast.ImportFrom):
+            source = resolve(node.module or "", node.level); targets = (source, *(f"{source}.{alias.name}".strip(".") for alias in node.names if alias.name != "*"))
+            bindings = tuple(alias.asname or alias.name for alias in node.names)
+            if any(forbidden(name) for name in targets) or source.split(".")[0] in {"builtins", "importlib"} or any(alias.name in {"import_module", "__import__"} or bound in imported_loaders for alias, bound in zip(node.names, bindings)): offenders.append(f"from:{node.lineno}")
+        elif isinstance(node, ast.Call):
+            function = node.func; direct = isinstance(function, ast.Name) and function.id == "__import__"
+            dotted = isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name) and function.value.id == "importlib" and function.attr == "import_module"
+            valid = (len(node.args) == 1 and not node.keywords and isinstance(node.args[0], ast.Constant)
+                and type(node.args[0].value) is str and bool(node.args[0].value) and not node.args[0].value.startswith(".") and not forbidden(node.args[0].value))
+            if (direct or dotted) and not valid: offenders.append(f"call:{node.lineno}")
+        if isinstance(node, ast.Name):
+            parent = parents.get(node); grandparent = parents.get(parent)
+            allowed = (node.id == "__import__" and isinstance(parent, ast.Call) and parent.func is node or node.id == "importlib" and isinstance(parent, ast.Attribute) and parent.value is node
+                and parent.attr == "import_module" and isinstance(grandparent, ast.Call) and grandparent.func is parent)
+            if isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in reserved or isinstance(node.ctx, ast.Load) and (node.id == "__builtins__" or node.id in reserved and not allowed): offenders.append(f"name:{node.lineno}")
+        binding = (node.arg if isinstance(node, ast.arg) else node.name
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) else node.rest
+            if isinstance(node, ast.MatchMapping) else None)
+        if binding in reserved: offenders.append(f"binding:{node.lineno}")
+    offenders += [f"__getattr__:{node.lineno}" for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__getattr__"]
+    assert offenders == []
 
 
 def test_viewer_1d_io_and_session_import_headlessly_in_clean_processes():
     environment = dict(os.environ, PYTHONPATH=str(SRC))
     script = """import importlib, sys
 importlib.import_module(sys.argv[1])
-roots = ('xdart', 'PySide', 'PyQt', 'qtpy', 'napari', 'pyqtgraph', 'matplotlib')
-forbidden = sorted(name for name in sys.modules if name.startswith(roots))
-if forbidden: raise SystemExit(repr(forbidden))
-if sys.argv[1] == 'xrd_tools.io.viewer_1d':
-    upward = sorted(name for name in sys.modules if name.startswith('xrd_tools.session'))
-    if upward: raise SystemExit(repr(upward))
+bad = sorted(name for name in sys.modules if name.startswith(('xdart', 'PySide', 'PyQt', 'qtpy', 'napari', 'pyqtgraph', 'matplotlib')))
+if sys.argv[1] == 'xrd_tools.io.viewer_1d': bad += sorted(name for name in sys.modules if name.startswith('xrd_tools.session'))
+if bad: raise SystemExit(repr(bad))
 """
     for module in ("xrd_tools.io.viewer_1d", "xrd_tools.session.viewer_1d"):
-        result = subprocess.run([sys.executable, "-c", script, module],
-            env=environment, capture_output=True, text=True, timeout=30)
+        result = subprocess.run([sys.executable, "-c", script, module], env=environment, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stdout + result.stderr
 
 
