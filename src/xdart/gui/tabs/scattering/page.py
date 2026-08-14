@@ -1624,6 +1624,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 preserve_display=preserve_display,
             )
         except Exception as error:
+            if viewer:
+                self._last_scientific_projection = None
             self._notice(
                 "Passive shell render failed: "
                 f"{detached_exception_strings(error)[2]}"
@@ -1795,17 +1797,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return "" if context is None else os.path.dirname(context.original_path)
 
     def _clear_viewer_2d_renderer(self, *, close=False) -> bool:
+        self._last_scientific_projection = None
         request = self._context_controller.begin_viewer_2d_renderer_clear()
         if request is None:
-            self._last_scientific_projection = None
             cleared = self._context_controller.viewer_2d_frame is None
         else:
             try:
                 receipt = self._shell.scientific.clear_viewer_2d(request)
             except Exception:
-                self._last_scientific_projection = None
                 return False
-            self._last_scientific_projection = None
             try:
                 cleared = self._context_controller.acknowledge_viewer_2d_renderer_clear(
                     receipt)

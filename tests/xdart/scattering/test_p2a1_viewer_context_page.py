@@ -20,16 +20,12 @@ from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.state_machine import RunPhase
-from xdart.modules.display_context import (
-    ContextKind, Viewer2DCleanupState, Viewer2DRendererClearReceipt,
-    Viewer2DRendererClearRequest, Viewer2DReceiptPhase, Viewer2DState)
+from xdart.modules.display_context import (ContextKind, Viewer2DCleanupState, Viewer2DRendererClearReceipt,
+                                           Viewer2DRendererClearRequest, Viewer2DReceiptPhase, Viewer2DState)
 from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome, HydrationScope, HydrationToken
 from xrd_tools.io import viewer_2d as viewer_api
-
 from tests.core import test_viewer_2d as a0
 from tests.xdart.scattering.test_e3_context_contract import _acquisition
-
-
 _PARENT = "ddf266ec6c6f17edbf23bfabb5435b55fe772a6e"
 def _ast_facts(source: str):
     tree, aliases = ast.parse(source), {}
@@ -49,12 +45,10 @@ def _ast_facts(source: str):
         elif isinstance(node, ast.Attribute):
             identifiers[node.attr] += 1
     return tree, calls, identifiers
-
 def _controller() -> ContextController:
-    return ContextController(
-        lifecycle=SimpleNamespace(phase=RunPhase.IDLE, reset_permitted=False, active_run_identity=None, attempt_run_identity=None),
+    return ContextController(lifecycle=SimpleNamespace(
+        phase=RunPhase.IDLE, reset_permitted=False, active_run_identity=None, attempt_run_identity=None),
         executor=None, browse_loader=SimpleNamespace(), projection=ContextProjection())
-
 def _await_viewer(controller: ContextController, timeout: float = 4.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -63,21 +57,17 @@ def _await_viewer(controller: ContextController, timeout: float = 4.0) -> None:
             break
         time.sleep(0.005)
     assert not controller.viewer_2d_loading and controller.viewer_2d_frame is not None
-
 def _clear(controller: ContextController) -> None:
     request = controller.begin_viewer_2d_renderer_clear()
     assert request is not None
     state = (controller.viewer_2d_context, controller.viewer_2d_frame, controller._viewer_2d.receipt, controller._viewer_2d.clear_request)
     for forged in (replace(request), request):
-        assert not controller.acknowledge_viewer_2d_renderer_clear(
-            Viewer2DRendererClearReceipt(forged, forged is not request))
+        assert not controller.acknowledge_viewer_2d_renderer_clear(Viewer2DRendererClearReceipt(forged, forged is not request))
         assert state == (controller.viewer_2d_context, controller.viewer_2d_frame, controller._viewer_2d.receipt, controller._viewer_2d.clear_request)
     assert controller.acknowledge_viewer_2d_renderer_clear(Viewer2DRendererClearReceipt(request, True))
-
 def _mount_source(tmp_path, family):
     base = np.arange(12, dtype=np.uint16).reshape(3, 4)
-    suffix = {"edf": ".edf", "tiff": ".tiff", "cbf": ".cbf", "raw": ".raw", "hdf": ".h5",
-              "nexus": ".nxs", "csv": ".csv", "npy2": ".npy", "npy3": ".npy", "npz": ".npz"}.get(family, ".nxs")
+    suffix = {"edf": ".edf", "tiff": ".tiff", "cbf": ".cbf", "raw": ".raw", "hdf": ".h5", "nexus": ".nxs", "csv": ".csv", "npy2": ".npy", "npy3": ".npy", "npz": ".npz"}.get(family, ".nxs")
     path, policy, expected = tmp_path / f"{family}{suffix}", None, (base,)
     if family in {"edf", "tiff", "cbf", "raw"}:
         a0._write_selected_source(path, "fabio" if family == "edf" else family, base)
@@ -107,13 +97,11 @@ def _mount_source(tmp_path, family):
         expected = (base, base + 20)
         a0._npz(path, [("image.npy", a0._npy_bytes(np.stack(expected)))])
     return path, policy, expected
-
 @pytest.mark.parametrize("family", ("edf", "tiff", "cbf", "raw", "hdf", "nexus", "eiger", "processed", "csv", "npy2", "npy3", "npz"))
 def test_catalog_first_controller_mounts_exact_identity_and_navigation(tmp_path, monkeypatch, family) -> None:
     path, policy, expected = _mount_source(tmp_path, family)
     if policy is not None:
-        monkeypatch.setattr("xdart.gui.tabs.scattering.context_controller.Viewer2DFormatPolicy",
-                            lambda: policy)
+        monkeypatch.setattr("xdart.gui.tabs.scattering.context_controller.Viewer2DFormatPolicy", lambda: policy)
     controller = _controller()
     request = controller.open_viewer_2d(str(path))
     assert (request.path, controller.viewer_2d_loading) == (str(path), True)
@@ -136,15 +124,12 @@ def test_catalog_first_controller_mounts_exact_identity_and_navigation(tmp_path,
             assert controller.select_viewer_2d_frame(navigation.frames[index].local_frame_label)
             _await_viewer(controller)
         payload = controller.project(controller.navigation.current)
-        assert (payload is not None and payload.view.raw is controller.viewer_2d_frame.array
-                and np.array_equal(payload.view.raw, value))
+        assert payload is not None and payload.view.raw is controller.viewer_2d_frame.array and np.array_equal(payload.view.raw, value)
         assert all(getattr(payload.view, name) is None for name in (
-            "axis_1d", "intensity_1d", "sigma_1d", "axis_2d_x", "axis_2d_y",
-            "intensity_2d", "sigma_2d", "thumbnail", "geometry"))
+            "axis_1d", "intensity_1d", "sigma_1d", "axis_2d_x", "axis_2d_y", "intensity_2d", "sigma_2d", "thumbnail", "geometry"))
         ledger = viewer_api.viewer_2d_selected_ledger(owner.catalog, owner.frame.label)
         assert (owner.receipt.phase, owner.receipt.capacity, owner.receipt.reserved) == (Viewer2DReceiptPhase.FRAME_READY_A, ledger.budget, ledger.admission)
-        kind = ({"processed": ("Processed raw", "Thumbnail preview"), "csv": ("CSV matrix",)}.get(
-            family, ("NumPy array",) * len(expected) if family in {"npy2", "npy3", "npz"} else ("Raw detector",)))[index]
+        kind = ({"processed": ("Processed raw", "Thumbnail preview"), "csv": ("CSV matrix",)}.get(family, ("NumPy array",) * len(expected) if family in {"npy2", "npy3", "npz"} else ("Raw detector",)))[index]
         assert payload.title == f"{path.name} · frame {controller.navigation.current.local_frame_label} · {kind}"
         assert payload.status == (f"2D Viewer · {kind}" + (" · Raw source unavailable; displaying stored thumbnail." if kind == "Thumbnail preview" else ""))
         token = controller._viewer_2d.request_token
@@ -164,7 +149,6 @@ def test_catalog_first_controller_mounts_exact_identity_and_navigation(tmp_path,
         assert request.path == str(path) and controller.viewer_2d_context.generation > original.generation
         _clear(controller)
         assert controller.close_viewer_2d()
-
 def test_retained_acquisition_generation_submit_order_and_owner_first(tmp_path) -> None:
     path = tmp_path / "retained.npy"
     np.save(path, np.arange(6.0).reshape(2, 3))
@@ -185,9 +169,7 @@ def test_retained_acquisition_generation_submit_order_and_owner_first(tmp_path) 
     assert request.read_key.scope.context_token == context.context_token
     _await_viewer(controller)
     owner = controller._viewer_2d
-    assert (owner.frame is controller._runtime._viewer_2d_frame
-            and owner.receipt.phase is Viewer2DReceiptPhase.FRAME_READY_A
-            and controller.viewer_2d_context.state is Viewer2DState.READY)
+    assert owner.frame is controller._runtime._viewer_2d_frame and owner.receipt.phase is Viewer2DReceiptPhase.FRAME_READY_A and controller.viewer_2d_context.state is Viewer2DState.READY
     assert owner.provider is acquisition.publication_store
     assert seen == [(0, False)]
     before = controller.navigation
@@ -196,7 +178,6 @@ def test_retained_acquisition_generation_submit_order_and_owner_first(tmp_path) 
     assert controller._viewer_2d_standalone is None
     _clear(controller)
     assert controller.close_viewer_2d()
-
 def test_refusal_and_rapid_latest_use_one_scalar_and_truthful_loading(tmp_path, monkeypatch) -> None:
     path = tmp_path / "latest.npy"
     np.save(path, np.arange(36.0).reshape(3, 3, 4))
@@ -217,10 +198,8 @@ def test_refusal_and_rapid_latest_use_one_scalar_and_truthful_loading(tmp_path, 
     assert owner.receipt.request_token is owner.request is owner.request_token is None
     assert not owner.loading and owner.diagnostic == "2D Viewer transport refused request"
     def snapshot():
-        return (owner.context, owner.catalog, owner.receipt, owner.frame, owner.request,
-                owner.request_token, owner.loading, owner.diagnostic, owner.changed,
-                owner.latest_label, controller.selection, controller.navigation,
-                controller._runtime._display_generation)
+        return (owner.context, owner.catalog, owner.receipt, owner.frame, owner.request, owner.request_token,
+                owner.loading, owner.diagnostic, owner.changed, owner.latest_label, controller.selection, controller.navigation, controller._runtime._display_generation)
     refused_state = snapshot()
     owner.complete(HydrationCompletion(refused_request.token, HydrationOutcome.FAILED, "late completion"))
     assert snapshot() == refused_state
@@ -254,17 +233,14 @@ def test_refusal_and_rapid_latest_use_one_scalar_and_truthful_loading(tmp_path, 
     assert controller.viewer_2d_frame.label == 2 and calls == [1, 2]
     _clear(controller)
     assert controller.close_viewer_2d()
-
 def test_viewer_authority_census_provider_order_refusal_and_cleanup(tmp_path, monkeypatch) -> None:
     root = Path(__file__).parents[3]
     module = "src/xdart/gui/tabs/scattering/"
-    relative_paths = ("src/xrd_tools/session/readiness.py", *(module + name for name in (
-        "context_runtime.py", "context_controller.py", "context_projection.py", "controls_projection.py", "run_mode_projection.py", "page.py", "scientific_view.py")))
+    relative_paths = ("src/xrd_tools/session/readiness.py", *(module + name for name in ("context_runtime.py", "context_controller.py", "context_projection.py", "controls_projection.py", "run_mode_projection.py", "page.py", "scientific_view.py")))
     trees, calls, identifiers, baseline = [], Counter(), Counter(), Counter()
     for path in relative_paths:
         tree, path_calls, path_identifiers = _ast_facts((root / path).read_text())
-        parent = subprocess.check_output(
-            ("git", "-C", str(root), "show", f"{_PARENT}:{path}"), text=True)
+        parent = subprocess.check_output(("git", "-C", str(root), "show", f"{_PARENT}:{path}"), text=True)
         _, _, parent_identifiers = _ast_facts(parent)
         trees.append(tree)
         calls.update(path_calls)
@@ -273,17 +249,14 @@ def test_viewer_authority_census_provider_order_refusal_and_cleanup(tmp_path, mo
     classes = tuple(node for tree in trees for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
     owners = tuple(node for node in classes if node.name == "_TwoDViewerOwner")
     assert len(owners) == calls["_TwoDViewerOwner"] == 1
-    assert {node.name for node in owners[0].body if isinstance(node, ast.FunctionDef)
-            and not node.name.startswith("_")} == {
+    assert {node.name for node in owners[0].body if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")} == {
         "activate", "dispose", "commit", "complete"}
     assert calls["RLock"] == calls["HydrationTransport"] == 1
-    authority_terms = (
-        "target", "port", "provider", "generation", "worker", "thread", "timer", "queue", "scheduler", "cache", "watcher", "store", "lease", "writer",
+    authority_terms = ("target", "port", "provider", "generation", "worker", "thread", "timer", "queue", "scheduler", "cache", "watcher", "store", "lease", "writer",
         "output", "durability", "accounting", "calibration", "mask", "integration", "rsm",
         "descriptor", "archive", "parser", "mmap", "callback", "resource")
     identifiers.subtract(baseline)
-    authority_delta = {name: count for name, count in identifiers.items()
-                       if count and any(term in name.lower() for term in authority_terms)}
+    authority_delta = {name: count for name, count in identifiers.items() if count and any(term in name.lower() for term in authority_terms)}
     assert authority_delta == {
         "_display_generation": 7, "_ensure_timer": 2, "_release_browse": 1,
         "_release_browse_for_viewer": 1, "display_generation": 5,
@@ -340,8 +313,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         browse_pending=False, adopt_acquisition=lambda value: calls.append(("adopt", value)),
         begin_viewer_2d_renderer_clear=lambda: clear_request,
         acknowledge_viewer_2d_renderer_clear=lambda receipt: calls.append(("ack", receipt)) or receipt == "positive",
-        close_viewer_2d=lambda: calls.append("close") or True,
-    )
+        close_viewer_2d=lambda: calls.append("close") or True)
     scientific = SimpleNamespace(clear_viewer_2d=lambda _request: "forged")
     page = SimpleNamespace(
         _closing=False, _closed=False, _context_controller=controller,
@@ -351,8 +323,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _run_executor=SimpleNamespace(drain_events=lambda: (StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)),
         _lifecycle=SimpleNamespace(active_run_identity=identity, attempt_run_identity=None),
         _refresh_shell=lambda: calls.append("refresh"), _polling_needed=lambda: True,
-        _run_timer=SimpleNamespace(stop=lambda: calls.append("stop")),
-    )
+        _run_timer=SimpleNamespace(stop=lambda: calls.append("stop")))
     page._clear_viewer_2d_renderer = partial(ScatteringWorkspace._clear_viewer_2d_renderer, page)
     command = ShellCommand(ShellCommandKind.SELECT_SCAN, "/retained/result.nxs")
     ScatteringWorkspace._handle_shell_command(page, command)
@@ -363,6 +334,35 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     ScatteringWorkspace._handle_shell_command(page, command)
     assert calls[-3:] == [("ack", "positive"), "close", "/retained/result.nxs"]
     assert page._last_scientific_projection is None
+    canonical = np.arange(4.0).reshape(2, 2)
+    frame, context = controller.viewer_2d_frame, object()
+    retained = SimpleNamespace(heavy=SimpleNamespace(raw=canonical, frame=frame))
+    controller.viewer_2d_context = context
+    controller.__dict__.update(
+        synchronize_acquisition_scope=lambda: None, viewer_2d_cleanup_pending=False,
+        navigation=SimpleNamespace(current=None), project_navigation=lambda **_: (),
+        resident_frame_keys=(), projectable_contexts=(), selection=None,
+        norm_aggregate=None, viewer_2d_diagnostic="")
+    page._lifecycle.phase, page._lifecycle.reset_permitted = RunPhase.IDLE, False
+    page.__dict__.update(
+        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: SimpleNamespace(
+            processing_mode="2D Viewer", live_mode=False, source_spec=None))),
+        _project_controls=lambda _snapshot: None, _start_permitted=lambda: (True, ""),
+        _preferences=SimpleNamespace(slice_pins=()), _retain_outgoing_display=False,
+        _source_observation=None,
+        _context_projection=SimpleNamespace(build_shell=lambda **_: SimpleNamespace(scientific=retained)),
+        _shell_revision=0, _controls_readiness=None, _progress=None,
+        _browser_directory=None, _browser_catalog=None, _browser_transient_frame=None,
+        _date_sorted=False, _auto_last=False, _notice_text="")
+    def fail_render(_projection, *, preserve_display=False):
+        raise RuntimeError("render")
+    page._shell = SimpleNamespace(apply_state=fail_render)
+    page._notice = lambda text: setattr(page, "_notice_text", text)
+    page._last_scientific_projection = retained
+    owner_state = (controller.viewer_2d_frame, controller.viewer_2d_context)
+    assert retained.heavy.raw is canonical
+    ScatteringWorkspace._refresh_shell(page)
+    assert page._last_scientific_projection is None and owner_state == (controller.viewer_2d_frame, controller.viewer_2d_context)
 
 def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation(monkeypatch) -> None:
     calls = []
