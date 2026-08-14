@@ -129,10 +129,22 @@ def test_canonical_request_is_revalidated_before_admission_mutation(tmp_path, fo
         token = HydrationToken(HydrationReadKey(
             scope, "viewer-1d", "batch", HydrationPurpose.ONE_D), request.generation)
     object.__setattr__(request, "token", token)
+    gate, epoch = request.commit_gate, request.commit_gate.epoch
+    def snapshot():
+        return (gate, gate.epoch, gate.cancelled, gate._reserved_epoch,
+            transport._active, transport._queued, transport._worker, transport._retired,
+            transport.completions(), transport.counters(), tuple(port.calls),
+            tuple(port.completions), tuple(port.notices), tuple(port.holders))
+    before = snapshot()
+    assert before == (gate, epoch, False, 0, None, None, None, False, (),
+        {outcome: 0 for outcome in HydrationOutcome}, (), (), (), ())
     mutation = transport.submit_detached(request)
-    assert mutation.ticket is None
-    assert transport.active_token is transport.queued_token is None
-    assert all(value == 0 for value in transport.counters().values())
+    assert type(mutation) is ht.DetachedHydrationMutation
+    assert mutation.ticket is None and mutation.deliveries == () and mutation.replacement is None
+    assert snapshot() == before
+    assert gate is port.gate and gate.enter(epoch)
+    gate.leave()
+    assert snapshot() == before
     assert transport.retire(join_timeout=1)
 
 def test_qt_free_values_port_and_path_independent_identity(tmp_path):

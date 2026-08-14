@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import io
 import inspect
 import os
@@ -108,13 +109,24 @@ def test_session_is_canonical_and_xdart_exports_direct_aliases():
     )
     assert all(getattr(dc, name) is getattr(session, name) for name in names)
     assert all(not hasattr(io_owner, name) for name in names)
-    source = inspect.getsource(ht)
-    display_import = source.split("from xdart.modules.display_context import (", 1)[1].split(")", 1)[0]
-    session_import = source.split("from xrd_tools.session.viewer_1d import (", 1)[1].split(")", 1)[0]
-    assert "Viewer1D" not in display_import and "viewer_1d" not in display_import
-    assert all(name in session_import for name in (
-        "Viewer1DBatchHydrationRequest", "begin_viewer_1d_read",
-        "mint_viewer_1d_transfer", "_new_prepared_viewer_1d_commit"))
+    transport_names = (
+        "VIEWER_1D_R", "Viewer1DBatch", "Viewer1DBatchHydrationRequest",
+        "Viewer1DCleanupPendingNotice", "Viewer1DCommitReceipt", "Viewer1DDisposal",
+        "Viewer1DReadFailure", "Viewer1DReadBudgetState", "Viewer1DReadOperation",
+        "_Viewer1DReaderControl", "_mint_viewer_1d_budget_receipt",
+        "_new_prepared_viewer_1d_commit", "_new_viewer_1d_cleanup_notice",
+        "_retire_viewer_1d_budget_receipt", "begin_viewer_1d_read",
+        "mint_viewer_1d_pass_two_permit", "mint_viewer_1d_transfer",
+        "viewer_1d_disposal_is_current", "viewer_1d_request_is_canonical",
+        "viewer_1d_transfer_is_released", "viewer_1d_budget",
+    )
+    tree = ast.parse(inspect.getsource(ht))
+    origins = [(alias.asname or alias.name, node.module) for node in tree.body
+        if isinstance(node, ast.ImportFrom) for alias in node.names
+        if (alias.asname or alias.name) in transport_names]
+    assert origins == [(name, "xrd_tools.session.viewer_1d") for name in transport_names]
+    assert all(getattr(ht, name) is getattr(session, name) for name in transport_names)
+    assert all(not hasattr(io_owner, name) for name in transport_names)
 
 
 def test_headless_session_functional_path_never_imports_xdart(tmp_path):

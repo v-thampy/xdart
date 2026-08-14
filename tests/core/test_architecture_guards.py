@@ -40,13 +40,29 @@ def test_ssrl_tree_does_not_import_xdart():
 def test_viewer_1d_io_is_a_pure_leaf():
     path = PACKAGE / "io" / "viewer_1d.py"
     tree = ast.parse(path.read_text(), filename=str(path))
+    def resolve(name, level=0):
+        parts = tuple(part for part in name.split(".") if part)
+        prefix = ("xrd_tools", "io")[:max(0, 3 - level)] if level else ()
+        return ".".join((*prefix, *parts))
+    def forbidden(name):
+        return (name == "xdart" or name.startswith("xdart.")
+                or name == "xrd_tools.session" or name.startswith("xrd_tools.session."))
     upward = []
     for node in ast.walk(tree):
-        names = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
-                 else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
-        for name in names:
-            if name == "xdart" or name.startswith("xdart.") or name == "xrd_tools.session" or name.startswith("xrd_tools.session."):
-                upward.append(f"{name}:{node.lineno}")
+        names = ([alias.name for alias in node.names] if isinstance(node, ast.Import) else
+                 [resolve(node.module or alias.name, node.level) for alias in node.names]
+                 if isinstance(node, ast.ImportFrom) else [])
+        if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            function = node.func
+            if (isinstance(function, ast.Name) and function.id in {"__import__", "import_module"}
+                    or isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name)
+                    and function.value.id == "importlib" and function.attr == "import_module"):
+                value = node.args[0].value; level = len(value) - len(value.lstrip("."))
+                names.append(resolve(value, level))
+        upward.extend(f"{name}:{node.lineno}" for name in names if forbidden(name))
+    upward.extend(f"__getattr__:{node.lineno}" for node in tree.body
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node.name == "__getattr__")
     assert upward == []
 
 
