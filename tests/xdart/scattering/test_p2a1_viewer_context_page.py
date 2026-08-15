@@ -258,11 +258,14 @@ def test_viewer_authority_census_provider_order_refusal_and_cleanup(tmp_path, mo
     identifiers.subtract(baseline)
     authority_delta = {name: count for name, count in identifiers.items() if count and any(term in name.lower() for term in authority_terms)}
     assert authority_delta == {
-        "_display_generation": 7, "_ensure_timer": 2, "_release_browse": 1,
-        "_release_browse_for_viewer": 1, "display_generation": 5,
-        "generation": 18, "output_supported": 1, "presentation_generation": 3,
-        "port": 1, "provider": 27, "publication_store": 1, "release": 1,
-        "_viewer_2d_provider": 1, "HydrationTransport": 2, "target": 5,
+        "_display_generation": 14, "_ensure_timer": 4, "_release_browse": 1,
+        "_release_browse_for_viewer": 2, "_release_viewer_1d_holder": 2,
+        "_viewer_1d_provider": 1, "_viewer_2d_provider": 2,
+        "admission_generation": 1, "admitted_provider_identity": 3,
+        "display_generation": 7, "generation": 51, "output_supported": 1,
+        "port": 2, "presentation_generation": 4, "provider": 73,
+        "publication_store": 2, "release": 2, "target": 5,
+        "transport_token": 1, "HydrationTransport": 2,
     }
     assert not {"StageLedger", "TargetLease"}.intersection(identifiers)
     path = tmp_path / "deliberately-missing.npy"
