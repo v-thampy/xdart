@@ -29,10 +29,6 @@ UNOWNED_RUN_MODE_REASONS = (
         "Stitch 2D",
         "Stitching has no mounted vNext operation service yet.",
     ),
-    (
-        "1D Viewer",
-        "1D Viewer has no mounted vNext viewer context yet.",
-    ),
 )
 _NATIVE_RUN_MODES = frozenset(("Int 1D", "Int 2D", "Int 1D (XYE)"))
 
@@ -51,6 +47,7 @@ def build_run_strip_projection(
     mode = str(intent.processing_mode or "")
     tool = tool_from_mode_text(mode)
     viewer_2d = tool is Tool.IMAGE_VIEWER
+    viewer = viewer_2d or tool is Tool.XYE_VIEWER
     if viewer_2d:
         mode = "2D Viewer"
     elif tool is Tool.XYE_VIEWER:
@@ -59,18 +56,18 @@ def build_run_strip_projection(
         type(intent.output_mode) is str
         and intent.output_mode.strip().lower() in {"overwrite", "append"}
     )
-    if viewer_2d:
+    if viewer:
         output_supported = True
     xye_append = (
         mode == "Int 1D (XYE)"
         and intent.output_mode.strip().lower() == "append"
     )
     missing: list[str] = []
-    if intent.source_spec is None and not viewer_2d:
+    if intent.source_spec is None and not viewer:
         missing.append("source")
-    if not intent.poni_file and not viewer_2d:
+    if not intent.poni_file and not viewer:
         missing.append("PONI")
-    if not intent.save_path and not viewer_2d:
+    if not intent.save_path and not viewer:
         missing.append("output")
     mode_blocker = dict(UNOWNED_RUN_MODE_REASONS).get(mode)
     if mode not in _NATIVE_RUN_MODES and mode_blocker is None:
@@ -78,11 +75,11 @@ def build_run_strip_projection(
             f"{mode or 'Selected mode'} has no mounted vNext operation "
             "service yet."
         )
-    if viewer_2d:
+    if viewer:
         mode_blocker = None
     if mode_blocker is not None:
         readiness = mode_blocker
-    elif not executor_available and not viewer_2d:
+    elif not executor_available and not viewer:
         readiness = "Execution is unavailable"
     elif xye_append:
         readiness = "XYE-only Append has no persisted lineage owner"
@@ -105,7 +102,7 @@ def build_run_strip_projection(
                 count += " (folder + 1 level)"
             readiness += f" · {count}"
     ready = (
-        (executor_available or viewer_2d)
+        (executor_available or viewer)
         and output_supported
         and not xye_append
         and not missing

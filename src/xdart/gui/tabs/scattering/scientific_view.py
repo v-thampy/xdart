@@ -19,6 +19,10 @@ from xrd_tools.session.display_logic import (
     resample_image_axis_to_uniform,
     waterfall_display_rows,
 )
+from xrd_tools.session.viewer_1d import (
+    Viewer1DRendererClearRequest,
+    _new_viewer_1d_renderer_clear_receipt,
+)
 
 from .display_values import DisplayFrameKey
 from .scientific_axes import (
@@ -843,6 +847,24 @@ class ScientificView(QtWidgets.QFrame):
             scrub(widget, method, value)
         return cleared if failure else Viewer2DRendererClearReceipt(request, cleared)
 
+    def clear_viewer_1d(self, request, *, failure=False):
+        if not failure and type(request) is not Viewer1DRendererClearRequest:
+            return None
+        cleared = ScientificView.clear_viewer_2d(self, None, failure=True)
+        try:
+            self.title.setText("1D Viewer · Render failed" if failure else "Current")
+            self.status.setText(
+                "1D Viewer · Render failed; retry available." if failure else "")
+            cleared = bool(cleared and not self.curve.listDataItems()
+                           and not self._trace_history_by_identity
+                           and not self._pinned_trace_by_id
+                           and not self._trace_history_keys
+                           and not self._rendered_trace_keys)
+        except Exception:
+            cleared = False
+        return (cleared if failure else
+                _new_viewer_1d_renderer_clear_receipt(request, cleared))
+
     def _reconcile_slice_extent(self, state: ScientificProjection) -> None:
         orientation = (
             slice_region_orientation(
@@ -945,8 +967,9 @@ class ScientificView(QtWidgets.QFrame):
             self._selector_operations += 1
             start = 0
         for index, frame in enumerate(frames[start:], start):
-            viewer = (self._processing_mode == "2D Viewer"
-                      and frame.source_scan == frame.artifact == "viewer-2d")
+            viewer_scope = {"1D Viewer": "viewer-1d",
+                            "2D Viewer": "viewer-2d"}.get(self._processing_mode)
+            viewer = frame.source_scan == frame.artifact == viewer_scope
             label = frame.local_frame_label
             indices = self._label_indices.setdefault(label, [])
             self.frame_selector.add_frame(
@@ -988,17 +1011,19 @@ class ScientificView(QtWidgets.QFrame):
             for frame in navigation.selected
             if presented_by_id.get(id(frame)) is frame
         )
-        self._bottom_waterfall_active = waterfall_should_be_active(
-            state.plot_mode,
-            len(rows),
-            was_active=self._bottom_waterfall_active,
-        )
+        self._bottom_waterfall_active = (
+            state.plot_mode == "Waterfall"
+            if state.processing_mode == "1D Viewer"
+            else waterfall_should_be_active(
+                state.plot_mode, len(rows),
+                was_active=self._bottom_waterfall_active))
         waterfall_scope = rows
         stacked_selection = (
             state.plot_mode in {"Overlay", "Waterfall"}
             or (state.plot_mode == "Single" and len(rows) > 1)
         )
-        if stacked_selection or self._bottom_waterfall_active:
+        if ((stacked_selection or self._bottom_waterfall_active)
+                and state.processing_mode != "1D Viewer"):
             start_index = state.plot_options.waterfall_start - 1
             stop_index = state.plot_options.waterfall_stop or None
             rows = rows[
@@ -1185,6 +1210,8 @@ class ScientificView(QtWidgets.QFrame):
         selected = navigation.selected
         prefix = (
             (state.retain_display or bool(state.traces))
+            and not (state.processing_mode == "1D Viewer"
+                     and state.plot_mode == "Single")
             and scope == self._trace_history_scope
             and len(selected) >= len(self._trace_selection_keys)
             and all(
@@ -1320,11 +1347,14 @@ class ScientificView(QtWidgets.QFrame):
         if rows is None:
             return False
         now = time.monotonic()
-        rows, x_values = resample_image_axis_to_uniform(
-            rows,
-            axis.values,
-            axis=1,
-        )
+        if self._processing_mode == "1D Viewer":
+            x_values = axis.values
+        else:
+            rows, x_values = resample_image_axis_to_uniform(
+                rows,
+                axis.values,
+                axis=1,
+            )
         y_values, y_label = self._waterfall_axis(
             waterfall_scope,
             traces,
@@ -1490,6 +1520,13 @@ class ScientificView(QtWidgets.QFrame):
         frame = self.frame_selector.itemData(index)
         if type(frame) is not DisplayFrameKey:
             return
+        if (self._processing_mode == "1D Viewer"
+                and frame.source_scan == frame.artifact == "viewer-1d"
+                and any(frame is item for item in self._frame_keys)):
+            self.commandRequested.emit(ShellCommand(
+                ShellCommandKind.SELECT_FRAME, frame=frame,
+                frames=self._selected_keys))
+            return
         if (self._processing_mode == "2D Viewer"
                 and frame.source_scan == frame.artifact == "viewer-2d"
                 and any(frame is item for item in self._frame_keys)):
@@ -1552,6 +1589,26 @@ class ScientificView(QtWidgets.QFrame):
 
     def _apply_processing_layout(self, mode: str) -> None:
         normalized = str(mode or "")
+        aggregate_enabled = normalized != "1D Viewer"
+        combo = getattr(self, "plot_mode", None)
+        for choice in ("Average", "Sum"):
+            item = (None if combo is None else
+                    combo.model().item(combo.findText(choice)))
+            if item is not None: item.setEnabled(aggregate_enabled)
+        if not aggregate_enabled:
+            self._processing_mode = normalized
+            for widget in (
+                self.image_splitter, self.raw, self.cake, self.norm,
+                self.background, self.image_axis,
+                getattr(self, "plot_axis", self.image_axis),
+                self.share_axis, self.slice, self.slice_center,
+                self.slice_width, self.pin,
+            ):
+                widget.setVisible(False)
+            self.vertical_splitter.widget(1).setVisible(True)
+            self.vertical_splitter.setSizes([0, 1])
+            self._set_share_link(False)
+            return
         if normalized == "2D Viewer":
             self._processing_mode = "2D Viewer"
             for widget in (
@@ -1565,7 +1622,7 @@ class ScientificView(QtWidgets.QFrame):
             self.image_splitter.setVisible(True)
             return
         has_2d = normalized != "Int 1D"
-        prior_has_2d = self._processing_mode != "Int 1D"
+        prior_has_2d = self._processing_mode not in {"Int 1D", "1D Viewer"}
         self._processing_mode = normalized
         self.norm.setVisible(True)
         self.background.setVisible(True)

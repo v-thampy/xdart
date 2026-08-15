@@ -117,6 +117,7 @@ def project_controls(
     unlocked = phase in {RunPhase.IDLE, RunPhase.FAILED}
     processing_mode = str(intent.processing_mode or "")
     tool = tool_from_mode_text(processing_mode)
+    viewer = tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER}
     projected = build_bound_control_state(
         values,
         choices,
@@ -198,7 +199,7 @@ def project_controls(
         choices=output_choices,
         reason=output_reason,
     )
-    output = replace(output, enabled=unlocked and tool is not Tool.IMAGE_VIEWER)
+    output = replace(output, enabled=unlocked and not viewer)
     insertion = next(
         (
             index + 1
@@ -210,9 +211,10 @@ def project_controls(
     fields.insert(insertion, output)
     fields = _threshold_auto_fields(fields, intent, unlocked=unlocked)
     fields = [truthful_field(candidate) for candidate in fields]
-    if tool is Tool.IMAGE_VIEWER:
+    if viewer:
         fields = [replace(candidate, enabled=False,
-                          reason="2D Viewer has no acquisition authority.")
+                          reason=("1D Viewer" if tool is Tool.XYE_VIEWER
+                                  else "2D Viewer") + " has no acquisition authority.")
                   for candidate in fields]
     reintegration_unavailable = (
         "Loaded-result reintegration is not available in this workspace yet."
@@ -258,10 +260,10 @@ def project_controls(
                 ControlAction.ADVANCED_PROCESSING,
                 "Advanced",
                 SectionId.PROCESSING,
-                advanced_editor_available and unlocked and tool is not Tool.IMAGE_VIEWER,
+                advanced_editor_available and unlocked and not viewer,
                 (
                     "Open advanced integration settings."
-                    if advanced_editor_available and unlocked and tool is not Tool.IMAGE_VIEWER
+                    if advanced_editor_available and unlocked and not viewer
                     else "Controls are locked during the active run."
                     if not unlocked
                     else operation_unavailable

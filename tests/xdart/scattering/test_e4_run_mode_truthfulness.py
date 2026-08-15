@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
+import subprocess
 
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.controls_projection import project_controls
@@ -43,10 +45,6 @@ _EXPECTED_DISABLED_REASONS = (
         "Stitch 2D",
         "Stitching has no mounted vNext operation service yet.",
     ),
-    (
-        "1D Viewer",
-        "1D Viewer has no mounted vNext viewer context yet.",
-    ),
 )
 
 
@@ -72,13 +70,14 @@ def test_viewer_aliases_share_one_headless_parser_and_2d_is_mounted() -> None:
     aliases = ("2D Viewer", "Image Viewer", "1D Viewer", "XYE Viewer")
     assert tuple(tool_from_mode_text(value) for value in aliases) == (
         Tool.IMAGE_VIEWER, Tool.IMAGE_VIEWER, Tool.XYE_VIEWER, Tool.XYE_VIEWER)
-    viewer, legacy, legacy_1d = (
+    viewer, legacy, one_d, legacy_1d = (
         _run_strip(RunIntent(processing_mode=value, output_mode=""))
-        for value in ("2D Viewer", "Image Viewer", "XYE Viewer"))
+        for value in ("2D Viewer", "Image Viewer", "1D Viewer", "XYE Viewer"))
     assert (viewer.mode, viewer.ready, viewer.run_enabled, viewer.readiness) == (
         "2D Viewer", True, True, "Ready · 2D Viewer")
-    assert (legacy.mode, legacy_1d.mode, legacy_1d.ready) == (
-        "2D Viewer", "1D Viewer", False)
+    assert (legacy.mode, one_d.mode, one_d.ready, one_d.run_enabled,
+            legacy_1d.mode, legacy_1d.ready) == (
+        "2D Viewer", "1D Viewer", True, True, "1D Viewer", True)
     assert "Image Viewer" not in legacy.modes
     store = RunIntentStore(RunIntent())
     snapshot = store.snapshot()
@@ -86,11 +85,22 @@ def test_viewer_aliases_share_one_headless_parser_and_2d_is_mounted() -> None:
     candidate.processing_mode = "2D Viewer"
     snapshot = store.commit(candidate, expected_revision=snapshot.revision).snapshot
     controls = project_controls(snapshot, None, RunPhase.IDLE, advanced_editor_available=True)
+    one_d_candidate = snapshot.thaw()
+    one_d_candidate.processing_mode = "1D Viewer"
+    one_d_snapshot = store.commit(
+        one_d_candidate, expected_revision=snapshot.revision).snapshot
+    one_d_controls = project_controls(
+        one_d_snapshot, None, RunPhase.IDLE, advanced_editor_available=True)
     assert (snapshot.thaw().processing_mode, Tool.IMAGE_VIEWER.value, Tool.XYE_VIEWER.value, Mode.IMAGE_VIEWER.value, Mode.XYE_VIEWER.value, ProcessingPage.VIEWER.value) == (
         "2D Viewer", "image_viewer", "xye_viewer", "image_viewer", "xye_viewer", "viewer")
     assert controls.profile.processing_page is ProcessingPage.VIEWER
     assert all(not field.enabled for field in controls.bound_controls.fields)
     assert all(not action.enabled for actions in controls.profile.section_actions.values()
+               for action in actions)
+    assert one_d_controls.profile.processing_page is ProcessingPage.VIEWER
+    assert all(not field.enabled for field in one_d_controls.bound_controls.fields)
+    assert {field.reason for field in one_d_controls.bound_controls.fields} == {"1D Viewer has no acquisition authority."}
+    assert all(not action.enabled for actions in one_d_controls.profile.section_actions.values()
                for action in actions)
     assert RUN_MODE_CHOICES == _EXPECTED_MODES
     assert UNOWNED_RUN_MODE_REASONS == _EXPECTED_DISABLED_REASONS
@@ -223,3 +233,25 @@ def test_native_processing_mode_immediately_owns_mounted_center_layout() -> None
     assert full.scientific.processing_mode == "Int 2D"
     assert one_d.scientific.processing_mode == "Int 1D"
     assert restored.scientific.processing_mode == "Int 2D"
+
+
+def test_viewer_1d_authority_identifier_delta_is_frozen() -> None:
+    from tests.xdart.scattering.test_p2a1_viewer_context_page import _ast_facts
+    root, parent, identifiers, baseline = Path(__file__).parents[3], "bf999b35184ba42229da6d545478b7270f1ac0b1", Counter(), Counter()
+    paths = tuple("src/xdart/gui/tabs/scattering/" + name for name in ("context_controller.py", "context_runtime.py",
+        "context_projection.py", "controls_projection.py", "run_mode_projection.py", "page.py", "scientific_view.py"))
+    for path in paths:
+        _, _, current = _ast_facts((root / path).read_text())
+        source = subprocess.check_output(("git", "-C", str(root), "show", f"{parent}:{path}"), text=True)
+        _, _, prior = _ast_facts(source)
+        identifiers.update(current); baseline.update(prior)
+    terms = ("target", "port", "provider", "generation", "worker", "thread", "timer", "queue", "scheduler", "cache", "watcher", "store", "lease", "owner",
+        "holder", "borrow", "claim", "custody", "authority", "lock", "transport", "writer", "output", "durability", "accounting", "calibration",
+        "mask", "integration", "rsm", "descriptor", "archive", "parser", "mmap", "callback", "resource")
+    identifiers.subtract(baseline)
+    delta = {name: count for name, count in identifiers.items()
+             if count and any(term in name.lower() for term in terms)}
+    assert delta == {"HydrationOwner": 1, "_OneDViewerOwner": 1, "_display_generation": 7, "_ensure_timer": 2, "_release_browse_for_viewer": 1,
+        "_release_viewer_1d_holder": 2, "_viewer_1d_provider": 1, "_viewer_2d_lock": 14, "_viewer_2d_provider": 1, "admission_generation": 1,
+        "admitted_provider_identity": 3, "blocked_cleanup_token": 2, "borrow": 3, "display_generation": 2, "generation": 33, "holder": 33, "owner": 135,
+        "owner_holder": 1, "owner_identity": 6, "owner_request_claim": 6, "port": 1, "presentation_generation": 1, "provider": 46, "publication_store": 1, "release": 1, "retry_blocked_cleanup": 2, "retry_holder": 3, "transport_token": 1, "viewer_1d_owner": 4}

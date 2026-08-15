@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import json
 import os
+import numpy as np
 
 from xdart.modules.display_context import (
     AcquisitionContext, BrowseContext, ContextKind, DisplaySelection,
-    HydrationRequest, Viewer2DContext, Viewer2DState,
+    HydrationRequest, Viewer1DContext, Viewer1DState,
+    Viewer2DContext, Viewer2DState,
 )
-from xrd_tools.core import FrameView
+from xrd_tools.core import Axis, FrameView
 from xrd_tools.io.viewer_2d import (
     Viewer2DArtifactCatalog, Viewer2DFrame, Viewer2DSourceKind,
 )
@@ -38,8 +40,8 @@ from .shell_projection import (
     build_run_strip_projection, build_scientific_projection,
 )
 from .shell_values import (
-    FrameNavigationProjection, HeavyProjection, ProgressProjection,
-    ScientificProjection, ShellProjection,
+    AxisProjection, FrameNavigationProjection, HeavyProjection,
+    ProgressProjection, ScientificProjection, ShellProjection, TraceProjection,
 )
 from .state_machine import RunPhase
 
@@ -59,8 +61,47 @@ class ProjectionRequest:
             or type(self.require_complete) is not bool
         ):
             raise TypeError("context projection request is invalid")
+@dataclass(frozen=True, slots=True)
+class _Viewer1DTraceProjection(TraceProjection):
+    sigma: np.ndarray | None = None
 
-
+    def __post_init__(self) -> None:
+        TraceProjection.__post_init__(self)
+        if self.sigma is not None and (type(self.sigma) is not np.ndarray
+                or self.sigma.shape != self.intensity.shape
+                or self.sigma.flags.writeable):
+            raise TypeError("viewer 1-D sigma projection is invalid")
+def _viewer_1d_payload(context, request, selection, frame_keys, owner):
+    holder = getattr(owner, "holder", None); borrow = getattr(holder, "borrow", None)
+    batch = getattr(holder, "batch", None); manifest = getattr(batch, "manifest", None)
+    sources = getattr(manifest, "sources", None); index = request.frame.local_frame_label
+    mode = (None if borrow is None or type(index) is not int else borrow.modes.get(index))
+    owns = type(frame_keys) is dict and frame_keys.get(id(request.frame)) is request.frame
+    if (type(context) is not Viewer1DContext or context.state is not Viewer1DState.READY
+            or getattr(owner, "context", None) is not context or holder is None
+            or getattr(owner, "batch_identity", None) != getattr(manifest, "identity", None)
+            or type(sources) is not tuple or type(index) is not int
+            or not 0 <= index < len(sources) or mode is None or not owns
+            or request.selection is not selection or selection.kind is not ContextKind.VIEWER_1D
+            or selection.context_token != context.context_token
+            or request.run_identity is not request.frame.run_identity
+            or request.run_identity.generation != context.generation
+            or request.run_identity.fingerprint != context.context_token
+            or request.frame.source_scan != "viewer-1d"
+            or request.frame.artifact != "viewer-1d"):
+        return None
+    source = sources[index]
+    view = FrameView(label=index, axis_1d=Axis(source.x_label, source.x_unit,
+        values=mode.coordinate), intensity_1d=mode.intensity,
+        sigma_1d=mode.uncertainty, source_path=source.canonical_path,
+        source_frame_index=index)
+    if (view.axis_1d.values is not mode.coordinate
+            or view.intensity_1d is not mode.intensity
+            or view.sigma_1d is not mode.uncertainty):
+        return None
+    name = os.path.basename(source.canonical_path)
+    return StandardDisplayPayload(selection.display_generation, request.frame,
+        f"{name} · 1D Viewer", view, f"1D Viewer · {name}")
 def _viewer_2d_payload(context, request, selection, frame_keys, catalog, frame):
     owns = (type(frame_keys) is dict
             and frame_keys.get(id(request.frame)) is request.frame)
@@ -94,6 +135,55 @@ def _viewer_2d_payload(context, request, selection, frame_keys, catalog, frame):
     title = f"{name} · frame {frame.label} · {text}"
     return StandardDisplayPayload(selection.display_generation, request.frame,
                                   title, view, status)
+def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice):
+    effective = (preferences.plot_mode if preferences.plot_mode in {
+        "Single", "Overlay", "Waterfall"} else "Single")
+    payload_by_id = {id(item.frame_key): item for item in payloads
+                     if type(item) is StandardDisplayPayload}
+    frames = ((navigation.current,) if effective == "Single" else navigation.selected)
+    frames = tuple(frame for frame in frames if frame is not None)
+    accepted = tuple(payload_by_id.get(id(frame)) for frame in frames)
+    ready = (bool(frames) and all(item is not None for item in accepted)
+             and all(frame in resident for frame in frames))
+    status = notice or ("1D Viewer" if ready else "Loading 1D Viewer…")
+    if ready and effective != "Single" and len({item.view.axis_1d.unit
+                                                 for item in accepted}) != 1:
+        ready, status = False, "1D Viewer refused: conflicting units"
+    if ready and effective == "Waterfall":
+        axes = tuple(item.view.axis_1d.values for item in accepted)
+        if any(len(axis) < 2 or not np.all(np.isfinite(axis)) or np.any(np.diff(axis) <= 0)
+               for axis in axes):
+            ready, status = False, "1D Viewer refused: axes must be finite and strictly increasing"
+        elif not np.allclose(axes[0], np.linspace(axes[0][0], axes[0][-1], len(axes[0])),
+                             rtol=1e-12, atol=1e-12):
+            ready, status = False, "1D Viewer refused: first selected axis is nonuniform"
+        else:
+            status = "1D Viewer · first selected 1D source display grid"
+    traces = []
+    if ready:
+        grid = accepted[0].view.axis_1d.values
+        for index, (frame, payload) in enumerate(zip(frames, accepted)):
+            view = payload.view; values = view.axis_1d.values
+            intensity, sigma = view.intensity_1d, view.sigma_1d
+            if effective == "Waterfall" and index:
+                intensity = np.interp(grid, values, intensity, left=np.nan, right=np.nan)
+                sigma = (None if sigma is None else
+                         np.interp(grid, values, sigma, left=np.nan, right=np.nan))
+                intensity.setflags(write=False)
+                if sigma is not None: sigma.setflags(write=False)
+                values = grid
+            axis = AxisProjection(values, view.axis_1d.label, view.axis_1d.unit)
+            traces.append(_Viewer1DTraceProjection(
+                frame, axis, intensity, os.path.basename(view.source_path or ""),
+                sigma=sigma))
+    current = payload_by_id.get(id(navigation.current))
+    return ScientificProjection(heavy_available=resident, traces=tuple(traces),
+        title=("Current" if current is None else current.title),
+        processing_mode="1D Viewer", color_map=preferences.color_map,
+        log_scale=preferences.log_scale,
+        plot_axis=(preferences.plot_axis if not traces else traces[0].axis.label),
+        plot_mode=effective, share_axis=False, plot_options=preferences.plot_options,
+        status=status, retain_display=False)
 
 
 class ContextProjection:
@@ -176,11 +266,16 @@ class ContextProjection:
     ) -> ShellProjection:
         """Build the one complete shell value; retain no input or output."""
 
-        viewer_selected = (tool_from_mode_text(intent.processing_mode)
-                           is Tool.IMAGE_VIEWER
-                           or any(type(item) is Viewer2DContext for item in contexts))
+        tool = tool_from_mode_text(intent.processing_mode)
+        viewer_1d_selected = (selection is not None
+                              and selection.kind is ContextKind.VIEWER_1D)
+        viewer_2d_selected = (selection is not None
+                              and selection.kind is ContextKind.VIEWER_2D)
+        viewer_selected = viewer_1d_selected or viewer_2d_selected
+        viewer_requested = tool in {Tool.XYE_VIEWER, Tool.IMAGE_VIEWER}
         viewer_navigation = (navigation if selection is not None
-                             and selection.kind is ContextKind.VIEWER_2D
+                             and selection.kind in {
+                                 ContextKind.VIEWER_1D, ContextKind.VIEWER_2D}
                              else FrameNavigationProjection())
         run = build_run_strip_projection(
             phase,
@@ -188,12 +283,12 @@ class ContextProjection:
             executor_available=executor_available,
             start_permitted=start_permitted,
             start_blocker=start_blocker,
-            source_count=None if viewer_selected else source_count,
+            source_count=None if viewer_requested else source_count,
             source_count_is_files=source_count_is_files,
             source_count_includes_immediate=source_count_includes_immediate,
         )
-        if viewer_selected:
-            run = replace(run, mode="2D Viewer")
+        if viewer_requested:
+            run = replace(run, mode=("1D Viewer" if tool is Tool.XYE_VIEWER else "2D Viewer"))
         progress_detail = progress.detail
         if progress.directory_files is not None and (
             not progress.terminal or phase is RunPhase.FAILED
@@ -244,6 +339,9 @@ class ContextProjection:
             status=payload.status if viewer_ready else notice,
             retain_display=False,
         )
+        if viewer_1d_selected:
+            viewer_scientific = _viewer_1d_scientific(
+                viewer_navigation, payloads, resident_frames, preferences, notice)
         return ShellProjection(
             revision,
             build_browser_projection(
@@ -269,13 +367,14 @@ class ContextProjection:
 
     def project(
         self,
-        context: AcquisitionContext | BrowseContext | Viewer2DContext,
+        context: AcquisitionContext | BrowseContext | Viewer1DContext | Viewer2DContext,
         request: ProjectionRequest,
         current_selection: DisplaySelection,
         accepted_run_identity: RunIdentity | None,
         frame_keys: tuple[DisplayFrameKey, ...] | dict[int, DisplayFrameKey],
         browse_hydration_owner=None,
         *,
+        viewer_1d_owner=None,
         viewer_catalog=None,
         viewer_frame=None,
     ) -> StandardDisplayPayload | None:
@@ -287,6 +386,9 @@ class ContextProjection:
             owns_frame = any(frame is request.frame for frame in frame_keys)
         else:
             owns_frame = False
+        if type(context) is Viewer1DContext:
+            return _viewer_1d_payload(
+                context, request, current_selection, frame_keys, viewer_1d_owner)
         if type(context) is Viewer2DContext:
             return _viewer_2d_payload(
                 context, request, current_selection, frame_keys,

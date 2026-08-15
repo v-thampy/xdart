@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import namedtuple
 from dataclasses import replace
 import os
-from threading import RLock
+from threading import RLock, get_ident
 
 from xdart.modules.display_context import (
     AcquisitionContext, BrowseContext, ContextKind, DisplaySelection,
@@ -15,7 +16,9 @@ from xdart.modules.display_context import (
     Viewer2DReadActivation, Viewer2DReadBudgetReceipt,
     Viewer2DReceiptPhase, Viewer2DRendererClearReceipt,
     Viewer2DRendererClearRequest, Viewer2DState, new_context_token,
+    Viewer1DContext,
 )
+from xrd_tools.io.viewer_1d import Viewer1DFormatPolicy
 from xrd_tools.io.viewer_2d import (
     CATALOG_RESERVATION, Viewer2DFormatPolicy,
     viewer_2d_memory_ledger, viewer_2d_selected_ledger,
@@ -24,6 +27,11 @@ from xrd_tools.session.hydration import (
     HydrationCompletion, HydrationOutcome, HydrationPurpose,
     HydrationReadKey, HydrationScope, HydrationToken,
 )
+from xrd_tools.session.viewer_1d import (
+    Prepared1DBatchCommit, Viewer1DBatchHydrationRequest, Viewer1DCommitGate,
+    Viewer1DCleanupPendingNotice, Viewer1DRendererClearReceipt, Viewer1DState,
+    _new_viewer_1d_renderer_clear_request, acknowledge_viewer_1d_cleanup_pending, adopt_prepared_viewer_1d,
+    viewer_1d_request_is_canonical)
 
 from .acquisition_runtime import (
     CommandCompensationFailure,
@@ -55,8 +63,108 @@ from .state_machine import RunPhase
 from .shell_projection import ScientificPreferences
 from .shell_values import FrameNavigationProjection
 from .hydration_transport import HydrationTransport
-
-
+_Viewer1DIntent = namedtuple("_Viewer1DIntent", "paths policy generation provider")
+class _OneDViewerOwner:
+    __slots__ = ("controller", "owner_identity", "owner_request_claim", "context", "policy",
+        "provider", "request", "request_token", "holder", "batch_identity", "loading", "diagnostic",
+        "changed", "clear_request", "latest_intent", "reserved_epoch", "cleanup_notice", "cleanup_token")
+    def __init__(self, controller) -> None:
+        self.controller, self.owner_identity, self.owner_request_claim = controller, object(), object()
+        self.context = self.policy = self.provider = self.request = None
+        self.request_token = self.holder = self.batch_identity = None
+        self.clear_request = self.latest_intent = self.reserved_epoch = None
+        self.cleanup_notice = self.cleanup_token = None
+        self.loading = self.changed = False; self.diagnostic = ""
+    def _lineage(self, request) -> bool:
+        context = self.context
+        return (context is not None and type(request) is Viewer1DBatchHydrationRequest
+            and request.port is self and request.owner_identity is self.owner_identity
+            and request.owner_request_claim is self.owner_request_claim and request.commit_gate is context.commit_gate
+            and request.admitted_provider_identity is self.provider)
+    def commit(self, prepared):
+        if type(prepared) is not Prepared1DBatchCommit: return None
+        controller = self.controller
+        with controller._viewer_2d_lock:
+            request, context = prepared.request, self.context
+            current = prepared.transfer.inspect(); batch = getattr(current, "batch", None)
+            manifest = getattr(batch, "manifest", None); sources = getattr(manifest, "sources", None)
+            if (not self.loading or request is not self.request or not self._lineage(request)
+                    or not viewer_1d_request_is_canonical(request, self.provider) or request.token is not self.request_token
+                    or self.holder is not None or context.state is not Viewer1DState.LOADING
+                    or request.generation != context.generation or request.read_key.scope.epoch != context.commit_gate.epoch
+                    or request.token.presentation_generation != context.generation or prepared.batch_identity != getattr(manifest, "identity", None)
+                    or type(sources) is not tuple or len(sources) != len(request.paths) or any(
+                        os.path.realpath(os.path.expanduser(path)) != source.canonical_path for path, source in zip(request.paths, sources))):
+                return None
+            candidate = replace(context, state=Viewer1DState.READY)
+            try:
+                navigation = controller._runtime.prepare_viewer_1d_navigation(candidate, len(sources))
+                receipt = adopt_prepared_viewer_1d(prepared, owner_identity=self.owner_identity,
+                    owner_request_claim=self.owner_request_claim, port=self, owner_generation=context.generation,
+                    commit_gate=context.commit_gate, owner_state=context.state)
+            except Exception: return None
+            try:
+                holder = prepared.transfer.owner_holder(receipt)
+            except BaseException:
+                holder = getattr(prepared.transfer.inspect(), "holder", None)
+                if holder is None: raise
+            self.context, self.holder, self.batch_identity = (
+                candidate, holder, prepared.batch_identity)
+            runtime = controller._runtime
+            runtime._viewer_1d, runtime._viewer_1d_navigation, runtime._viewer_1d_frame_by_id = candidate, navigation[0], navigation[1]
+            self.changed = True; return receipt
+    def cleanup_pending(self, notice):
+        request = getattr(notice, "request", None)
+        with self.controller._viewer_2d_lock:
+            context, provider = self.context, self.provider
+            if (context is None or type(notice) is not Viewer1DCleanupPendingNotice or not self._lineage(request)
+                    or self.holder is not None or notice.acknowledgement is not None
+                    or request.generation > context.generation or notice.transport_token is not request.token
+                    or notice.commit_gate_identity is not request.commit_gate or notice.admission_generation != request.generation or notice.admitted_provider_identity is not provider or self.controller._runtime._viewer_1d is not context):
+                return
+            candidate = replace(context, state=Viewer1DState.CLEANUP_PENDING)
+            acknowledge_viewer_1d_cleanup_pending(notice, port=self, owner_identity=self.owner_identity,
+                owner_request_claim=self.owner_request_claim, commit_gate=context.commit_gate, admitted_provider=provider,
+                owner_generation=context.generation, owner_state=candidate.state)
+            if notice.acknowledgement is None or not self.controller._runtime.replace_viewer_1d_context(candidate): return
+            self.context, self.cleanup_notice = candidate, notice
+            self.changed = True
+    def complete(self, completion):
+        if type(completion) is not HydrationCompletion: return
+        with self.controller._viewer_2d_lock:
+            context, notice = self.context, self.cleanup_notice
+            if context is None: return
+            if notice is not None and completion.token is notice.request.token:
+                prior = notice.request; self.cleanup_notice = self.cleanup_token = None
+                if context.commit_gate.cancelled: state = Viewer1DState.CLOSED
+                elif (self.loading and context.state is Viewer1DState.CLEANUP_PENDING
+                        and self.request is not prior and self.request is not None and self._lineage(self.request)
+                        and self.request.token is self.request_token and self.request.generation == context.generation
+                        and self.request.generation > prior.generation):
+                    state = Viewer1DState.LOADING
+                else:
+                    state = Viewer1DState.EMPTY; self.loading = False
+                    self.request = self.request_token = None
+                    self.diagnostic = completion.diagnostic or "1D Viewer read failed"
+                candidate = replace(context, state=state); self.context = candidate
+                self.controller._runtime.replace_viewer_1d_context(candidate)
+                self.changed = True; return
+            hydrated = completion.outcome in {HydrationOutcome.HYDRATED, HydrationOutcome.ALREADY_RESIDENT}
+            coherent = (hydrated and context.state is Viewer1DState.READY and self.holder is not None
+                        or not hydrated and context.state is Viewer1DState.LOADING and self.holder is None)
+            if (not self.loading or not coherent or not self._lineage(self.request)
+                    or completion.token is not self.request_token
+                    or completion.token is not getattr(self.request, "token", None)):
+                return
+            self.loading = False
+            if not hydrated:
+                state = (Viewer1DState.CLOSED if context.commit_gate.cancelled
+                         else Viewer1DState.EMPTY)
+                candidate = replace(context, state=state); self.context = candidate
+                self.controller._runtime.replace_viewer_1d_context(candidate)
+                self.diagnostic = completion.diagnostic or "1D Viewer read failed"
+            else: self.diagnostic = ""
+            self.changed = True
 class _TwoDViewerOwner:
     __slots__ = ("controller", "context", "policy", "provider", "catalog",
                  "frame", "receipt", "request", "request_token", "loading",
@@ -246,6 +354,7 @@ class ContextController:
         self._projection = projection
         self._runtime = _ContextRuntime()
         self._viewer_2d_lock = RLock()
+        self._viewer_1d = _OneDViewerOwner(self)
         self._viewer_2d = _TwoDViewerOwner(self)
         self._viewer_2d_standalone: HydrationTransport | None = None
         self._browse_request: BrowseLoadRequest | None = None
@@ -269,6 +378,22 @@ class ContextController:
     @property
     def viewer_2d_context(self):
         return self._viewer_2d.context
+
+    @property
+    def _viewer_1d_lock(self): return self._viewer_2d_lock
+    @property
+    def viewer_1d_context(self): return self._viewer_1d.context
+    @property
+    def viewer_1d_loading(self) -> bool: return self._viewer_1d.loading
+    @property
+    def viewer_1d_diagnostic(self) -> str: return self._viewer_1d.diagnostic
+    @property
+    def viewer_1d_cleanup_pending(self) -> bool:
+        owner = self._viewer_1d; return bool(owner.clear_request is not None or owner.cleanup_notice is not None
+            or owner.cleanup_token is not None or owner.context is not None and owner.context.state in {Viewer1DState.CLEANUP_PENDING, Viewer1DState.CLOSED})
+    @property
+    def viewer_1d_owned(self) -> bool:
+        return self.viewer_1d_context is not None or self.viewer_1d_cleanup_pending
     @property
     def viewer_2d_frame(self):
         return self._viewer_2d.frame
@@ -289,7 +414,7 @@ class ContextController:
                     owner.context.state is Viewer2DState.CLEANUP_PENDING or
                     owner.cleanup_token is not None or
                     self._viewer_2d_standalone is not None and
-                    owner.context is None)
+                    owner.context is None and self.viewer_1d_context is None)
 
     @property
     def viewer_2d_owned(self) -> bool:
@@ -357,7 +482,7 @@ class ContextController:
         return consumed
 
     def adopt_acquisition(self, run_identity: RunIdentity) -> DisplaySelection:
-        if self._closed or type(run_identity) is not RunIdentity:
+        if self._closed or self.viewer_1d_owned or type(run_identity) is not RunIdentity:
             raise RuntimeError("context controller cannot adopt acquisition")
         context = self._executor.acquisition_context(run_identity)
         return self._runtime.adopt_acquisition(run_identity, context)
@@ -417,6 +542,7 @@ class ContextController:
         return self._runtime.select_navigation(current, selected)
 
     def apply_display_retirement(self, receipt: DisplayRetirementReceipt) -> bool:
+        if self.viewer_1d_owned: return False
         if not self._runtime.retirement_matches(receipt):
             return False
         if self._cleanup_receipt is not None:
@@ -443,6 +569,7 @@ class ContextController:
         return self._runtime.apply_display_retirement(receipt)
 
     def release_acquisition(self, identity: RunIdentity | None) -> bool:
+        if self.viewer_1d_owned: return False
         return self._runtime.release_acquisition(identity)
 
     def pause(self) -> DurablePaused | PauseFailed:
@@ -523,12 +650,15 @@ class ContextController:
         return result
 
     def select_acquisition(self) -> DisplaySelection:
+        if self.viewer_1d_owned: raise RuntimeError("1D Viewer cleanup remains pending")
         return self._runtime.select_acquisition()
 
     def select_browse(self) -> DisplaySelection:
+        if self.viewer_1d_owned: raise RuntimeError("1D Viewer cleanup remains pending")
         return self._runtime.select_browse()
 
     def select_browser_target(self, identifier: str) -> bool:
+        if self.viewer_1d_owned: return False
         return self._runtime.select_browser_target(identifier)
 
     def project_request(
@@ -548,7 +678,8 @@ class ContextController:
         self, request: ProjectionRequest
     ) -> StandardDisplayPayload | None:
         return self._runtime.resolve_projection(
-            self._projection, request, self._browse_hydration_owner
+            self._projection, request, self._browse_hydration_owner,
+            self._viewer_1d,
         )
 
     def project(self, frame: object) -> StandardDisplayPayload | None:
@@ -569,6 +700,7 @@ class ContextController:
             processing_mode=processing_mode,
             live_update=live_update,
             browse_hydration_owner=self._browse_hydration_owner,
+            viewer_1d_owner=self._viewer_1d,
         )
 
     def commit_navigation_projection(
@@ -590,12 +722,254 @@ class ContextController:
             self._projection, event, self._browse_hydration_owner
         )
 
+    def open_viewer_1d(self, paths: tuple[str, ...]):
+        paths = self._viewer_1d_paths(paths)
+        if (self._closed or self._close is not None or not self._viewer_2d_admissible()):
+            raise RuntimeError("1D Viewer is not allowed in the current lifecycle")
+        if self._viewer_2d.context is not None or self._viewer_1d.context is None and self.viewer_2d_owned:
+            if self._viewer_2d.frame is not None or self._viewer_2d.clear_request is not None:
+                raise RuntimeError("2D Viewer renderer clear is required")
+            if not self.close_viewer_2d():
+                raise RuntimeError("2D Viewer cleanup remains pending")
+        if self._browse_request is not None: self._invalidate_browse_request()
+        if self._cleanup_receipt is not None:
+            cleanup = self._retain_cancel(self._cleanup_receipt.request)
+            if cleanup.cleanup_status is not CleanupStatus.CLEANED:
+                raise RuntimeError("Browse cleanup remains pending")
+        self._release_browse_for_viewer()
+        owner = self._viewer_1d
+        with self._viewer_2d_lock:
+            if owner.holder is not None and owner.clear_request is None: raise RuntimeError(
+                "1D Viewer renderer clear is required")
+            if owner.clear_request is not None:
+                generation = self._runtime._display_generation + 1
+                owner.latest_intent = _Viewer1DIntent(paths, owner.policy, generation, owner.provider)
+                self._runtime._display_generation = generation
+                selection = self._runtime._selection
+                if selection is not None and selection.kind is ContextKind.VIEWER_1D: self._runtime._selection = replace(
+                    selection, display_generation=generation)
+                return None
+            context = owner.context
+            if context is not None and (context.state is Viewer1DState.CLOSED or context.commit_gate.cancelled):
+                raise RuntimeError("1D Viewer cleanup remains pending")
+            provider = owner.provider if context is not None else self._viewer_1d_provider(install=False)
+            policy = owner.policy or Viewer1DFormatPolicy()
+            generation = self._runtime._display_generation + 1
+            reserved = None
+            try:
+                gate = Viewer1DCommitGate() if context is None else context.commit_gate
+                if context is not None: reserved = gate.reserve_advance()
+                candidate = Viewer1DContext(new_context_token(ContextKind.VIEWER_1D) if context is None
+                    else context.context_token, generation, paths, gate, Viewer1DState.CLEANUP_PENDING
+                    if owner.cleanup_notice is not None else Viewer1DState.LOADING)
+                begin = self._runtime.prepare_viewer_1d_begin(candidate)
+                if reserved is not None and gate.advance() != reserved: raise RuntimeError("1D Viewer request fence failed")
+                request = self._viewer_1d_request(candidate, policy, provider)
+                if not viewer_1d_request_is_canonical(request, provider):
+                    raise RuntimeError("1D Viewer request is not canonical")
+            except Exception:
+                if context is not None:
+                    gate.cancel(); owner.context = self._runtime._viewer_1d = replace(
+                        context, state=Viewer1DState.EMPTY)
+                    owner.request = owner.request_token = None; owner.loading = False
+                    owner.diagnostic = "1D Viewer request build failed"
+                return None
+            if (self._viewer_2d_standalone is None and provider is not getattr(
+                    getattr(self._runtime.acquisition_context, "publication_store", None), "transport", None)):
+                self._viewer_2d_standalone = provider
+            owner.context, owner.policy, owner.provider = candidate, policy, provider
+            owner.request, owner.request_token = request, request.token
+            owner.loading, owner.diagnostic = True, ""
+            runtime = self._runtime
+            runtime._display_generation, runtime._viewer_1d = generation, candidate
+            runtime._viewer_1d_navigation, runtime._viewer_1d_frame_by_id, runtime._selection = begin
+            runtime._pending_replacement = None; runtime._reset_trace_projection()
+        return self._viewer_1d_submit(request)
+    def select_viewer_1d_frame(self, frame: DisplayFrameKey) -> bool:
+        with self._viewer_2d_lock:
+            owner, selection = self._viewer_1d, self._runtime.selection
+            if (owner.context is None or owner.context.state is not Viewer1DState.READY or owner.holder is None
+                    or selection is None or selection.kind is not ContextKind.VIEWER_1D
+                    or selection.context_token != owner.context.context_token
+                    or self._runtime._viewer_1d is not owner.context): return False
+            return self._runtime.select_viewer_1d(frame)
+    def begin_viewer_1d_renderer_clear(self, paths=None):
+        paths = None if paths is None else self._viewer_1d_paths(paths)
+        with self._viewer_2d_lock:
+            owner, context = self._viewer_1d, self._viewer_1d.context
+            if owner.clear_request is not None: return owner.clear_request
+            if (context is None or context.state is not Viewer1DState.READY or owner.holder is None
+                    or owner.batch_identity is None): return None
+            generation = self._runtime._display_generation + 1
+            selection = self._runtime._selection
+            if (self._runtime._viewer_1d is not context or selection is None or
+                    selection.kind is not ContextKind.VIEWER_1D): return None
+            predicted = context.commit_gate.epoch + 1
+            try:
+                request = _new_viewer_1d_renderer_clear_request(context.context_token, generation, owner.batch_identity)
+                candidate = replace(context, state=Viewer1DState.CLEANUP_PENDING)
+                failed = replace(context, state=Viewer1DState.EMPTY)
+                candidate_selection = replace(selection, owner=replace(selection.owner, epoch=predicted),
+                    display_generation=generation)
+                intent = None if paths is None else _Viewer1DIntent(paths, owner.policy, generation, owner.provider)
+            except Exception: return None
+            try: epoch = context.commit_gate.reserve_advance()
+            except Exception: return None
+            if epoch != predicted:
+                context.commit_gate.cancel(); owner.context = self._runtime._viewer_1d = failed
+                owner.loading = False; owner.diagnostic = "1D Viewer clear fence failed"
+                return None
+            self._runtime._viewer_1d, self._runtime._display_generation, self._runtime._selection = candidate, generation, candidate_selection
+            owner.context, owner.clear_request, owner.reserved_epoch = candidate, request, epoch
+            owner.latest_intent = intent
+            return request
+    def acknowledge_viewer_1d_renderer_clear(self, receipt) -> bool:
+        with self._viewer_2d_lock:
+            owner = self._viewer_1d
+            if (type(receipt) is not Viewer1DRendererClearReceipt
+                    or not receipt.cleared or receipt.request is not owner.clear_request
+                    or owner.holder is None): return False
+            holder = owner.holder
+            reason = ("viewer 1-D replacement" if owner.latest_intent is not None
+                      else "viewer 1-D close")
+        return self._release_viewer_1d_holder(holder, reason)
+    def poll_viewer_1d(self) -> bool:
+        with self._viewer_2d_lock:
+            owner = self._viewer_1d
+            changed, holder, notice = owner.changed, owner.holder, owner.cleanup_notice
+            owner.changed = False
+            retry_holder = (holder if holder is not None and owner.clear_request is not None
+                            and owner.clear_request.acknowledgement_identity is not None else None)
+            reason = "viewer 1-D replacement" if owner.latest_intent is not None else "viewer 1-D close"
+            provider = owner.provider
+        if retry_holder is not None:
+            if self._release_viewer_1d_holder(retry_holder, reason): return True
+        if notice is not None and provider is not None:
+            try: token = provider.blocked_cleanup_token(notice.request.token)
+            except Exception: token = None
+            if token is not None:
+                with self._viewer_2d_lock:
+                    if self._viewer_1d.cleanup_notice is notice: self._viewer_1d.cleanup_token = token
+                try: provider.retry_blocked_cleanup(token)
+                except BaseException: pass
+                return True
+        return changed
+    def close_viewer_1d(self) -> bool:
+        with self._viewer_2d_lock:
+            owner, context = self._viewer_1d, self._viewer_1d.context
+            if context is None: return True
+            if owner.holder is not None or owner.clear_request is not None:
+                if owner.clear_request is not None and owner.reserved_epoch is not None:
+                    context.commit_gate.cancel(); owner.latest_intent = owner.reserved_epoch = None
+                return False
+            context.commit_gate.cancel()
+            owner.latest_intent = owner.reserved_epoch = None
+            owner.context = replace(context, state=Viewer1DState.CLOSED)
+            self._runtime.replace_viewer_1d_context(owner.context)
+            provider, notice = owner.provider, owner.cleanup_notice
+        try:
+            provider.cancel_gate(context.commit_gate)
+            if notice is not None:
+                outer = provider.blocked_cleanup_token(notice.request.token)
+                if outer is not None: provider.retry_blocked_cleanup(outer)
+            if provider.retains_gate(context.commit_gate): return False
+            if provider is self._viewer_2d_standalone and not provider.retire(join_timeout=0.0):
+                return False
+        except BaseException: return False
+        with self._viewer_2d_lock:
+            owner = self._viewer_1d
+            self._runtime.clear_viewer_1d()
+            owner.context = owner.policy = owner.provider = owner.request = owner.request_token = None
+            owner.holder = owner.batch_identity = owner.clear_request = owner.latest_intent = None
+            owner.reserved_epoch = owner.cleanup_notice = owner.cleanup_token = None
+            owner.loading = owner.changed = False; owner.diagnostic = ""
+            if provider is self._viewer_2d_standalone: self._viewer_2d_standalone = None
+        return True
+    def _viewer_1d_paths(self, paths):
+        if (type(paths) is not tuple or not 1 <= len(paths) <= 256 or any(
+                type(path) is not str or not path or len(os.fsencode(path)) > 4096 for path in paths)):
+            raise RuntimeError("1D Viewer paths are invalid")
+        return paths
+    def _viewer_1d_provider(self, *, install=True):
+        acquisition = self._runtime.acquisition_context
+        if acquisition is not None:
+            provider = getattr(acquisition.publication_store, "transport", None)
+            methods = ("submit", "cancel_gate", "retains_gate", "blocked_cleanup_token", "retry_blocked_cleanup")
+            if provider is None or not all(callable(getattr(provider, name, None)) for name in methods):
+                raise RuntimeError("acquisition has no 1D Viewer provider")
+            return provider
+        return self._viewer_2d_provider(install=install)
+    def _viewer_1d_request(self, context, policy, provider):
+        scope = HydrationScope(context.context_token, "viewer-1d", "viewer-1d",
+                               context.commit_gate.epoch)
+        key = HydrationReadKey(scope, "viewer-1d", "batch", HydrationPurpose.ONE_D)
+        token = HydrationToken(key, context.generation); owner = self._viewer_1d
+        return Viewer1DBatchHydrationRequest(
+            context.paths, policy, context.generation, context.commit_gate,
+            owner, key, token, get_ident(), owner.owner_identity,
+            owner.owner_request_claim, provider)
+    def _viewer_1d_submit(self, request):
+        try: token = request.admitted_provider_identity.submit(request)
+        except BaseException: token = None
+        with self._viewer_2d_lock:
+            owner = self._viewer_1d
+            if owner.request is not request: return None
+            if token is not request.token:
+                owner.loading = False; owner.diagnostic = "1D Viewer transport refused request"
+                owner.context = replace(owner.context, state=Viewer1DState.EMPTY)
+                self._runtime.replace_viewer_1d_context(owner.context)
+                owner.changed = True; return None
+        return request
+    def _release_viewer_1d_holder(self, holder, reason):
+        try: cleaned = holder.release(reason)
+        except BaseException: cleaned = False
+        if not cleaned: return False
+        request = self._finish_viewer_1d_adopted_cleanup(holder)
+        if request is not None: self._viewer_1d_submit(request)
+        return True
+    def _finish_viewer_1d_adopted_cleanup(self, holder):
+        with self._viewer_2d_lock:
+            owner, context, runtime = self._viewer_1d, self._viewer_1d.context, self._runtime
+            if owner.holder is not holder or context is None: return None
+            intent, reserved, clear = owner.latest_intent, owner.reserved_epoch, owner.clear_request
+            empty = replace(context, state=Viewer1DState.EMPTY)
+            owner.holder = owner.batch_identity = owner.clear_request = None
+            if intent is None or context.commit_gate.cancelled:
+                owner.context = runtime._viewer_1d = empty
+                owner.reserved_epoch = None; return None
+            selection = runtime._selection
+            valid = (clear is not None and clear.acknowledgement_identity is not None and reserved is not None
+                and context.commit_gate._reserved_epoch == reserved and intent.provider is owner.provider
+                and selection is not None and selection.kind is ContextKind.VIEWER_1D
+                and selection.context_token == context.context_token and selection.owner.epoch == reserved
+                and selection.display_generation == intent.generation)
+            try:
+                candidate = Viewer1DContext(context.context_token, intent.generation, intent.paths, context.commit_gate, Viewer1DState.LOADING)
+                begin = runtime.prepare_viewer_1d_begin(candidate)
+                if valid and context.commit_gate.advance() == reserved: request = self._viewer_1d_request(
+                    candidate, intent.policy, intent.provider)
+                else: request = None
+            except Exception: request = None
+            if not viewer_1d_request_is_canonical(request, intent.provider):
+                context.commit_gate.cancel(); owner.context = runtime._viewer_1d = empty
+                owner.request = owner.request_token = owner.latest_intent = owner.reserved_epoch = None
+                owner.loading = False
+                owner.diagnostic = "1D Viewer replacement request build failed"; return None
+            owner.context, owner.request, owner.request_token, owner.loading, owner.diagnostic, owner.latest_intent, owner.reserved_epoch = candidate, request, request.token, True, "", None, None
+            runtime._display_generation, runtime._viewer_1d = intent.generation, candidate
+            runtime._viewer_1d_navigation, runtime._viewer_1d_frame_by_id, runtime._selection = begin
+            runtime._pending_replacement = None; runtime._reset_trace_projection(); return request
     def open_viewer_2d(self, path: str):
         if (type(path) is not str or not path or len(os.fsencode(path)) > 4096
                 or self._closed or self._close is not None
                 or self.viewer_2d_cleanup_pending
                 or not self._viewer_2d_admissible()):
             raise RuntimeError("2D Viewer is not allowed in the current lifecycle")
+        if self.viewer_1d_owned:
+            if self._viewer_1d.holder is not None or self._viewer_1d.clear_request is not None:
+                raise RuntimeError("1D Viewer renderer clear is required")
+            if not self.close_viewer_1d():
+                raise RuntimeError("1D Viewer cleanup remains pending")
         if self._viewer_2d.context is not None:
             if self._viewer_2d.frame is not None:
                 raise RuntimeError("2D Viewer renderer clear is required")
@@ -777,7 +1151,7 @@ class ContextController:
                 and (phase is RunPhase.IDLE or phase is RunPhase.FAILED
                      and self._lifecycle.reset_permitted))
 
-    def _viewer_2d_provider(self):
+    def _viewer_2d_provider(self, *, install=True):
         acquisition = self._runtime.acquisition_context
         if acquisition is not None:
             provider = acquisition.publication_store
@@ -787,11 +1161,14 @@ class ContextController:
             if not all(callable(getattr(provider, name, None)) for name in methods):
                 raise RuntimeError("acquisition has no 2D Viewer provider")
             return provider
-        if self._viewer_2d_standalone is None:
-            self._viewer_2d_standalone = HydrationTransport(
+        provider = self._viewer_2d_standalone
+        if provider is None:
+            provider = HydrationTransport(
                 lambda _prepared: HydrationOutcome.FAILED,
                 lambda _request: (None, None))
-        return self._viewer_2d_standalone
+            if install:
+                self._viewer_2d_standalone = provider
+        return provider
 
     def _viewer_2d_request(self, label):
         owner, context = self._viewer_2d, self._viewer_2d.context
@@ -895,6 +1272,8 @@ class ContextController:
         self._runtime.clear_browse(select_acquisition=False)
 
     def begin_browse(self, source_path: str) -> BrowseLoadRequest:
+        if self.viewer_1d_owned:
+            raise RuntimeError("1D Viewer cleanup remains pending")
         if self.viewer_2d_owned:
             raise RuntimeError("2D Viewer cleanup remains pending")
         if self._cleanup_receipt is not None:
@@ -1048,7 +1427,7 @@ class ContextController:
         expected = pending.request if pending is not None else (
             self._browse_request or (None if browse is None else browse.load_request)
         )
-        if not self.close_viewer_2d():
+        if not self.close_viewer_1d() or not self.close_viewer_2d():
             return self._set_close(expected)
         if self._close is None:
             self._set_close(expected)
