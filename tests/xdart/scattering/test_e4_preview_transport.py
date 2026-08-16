@@ -540,7 +540,7 @@ def test_full_after_thumbnail_preview_performs_distinct_detector_read(
     monkeypatch, tmp_path
 ):
     state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
-    _catalog(state, owner, (1, 2, 3))
+    keys = _catalog(state, owner, (1, 2, 3))
     owner_value, gate = _acquisition_identity(state)
     counts = _instrument_reads(monkeypatch, processed)
 
@@ -551,10 +551,8 @@ def test_full_after_thumbnail_preview_performs_distinct_detector_read(
     assert _wait_transport_idle(state)
     assert counts["detector"] == 0
 
-    full = _typed_request(
-        state, owner_value, gate, processed, 2, HydrationPurpose.FULL, 7
-    )
-    assert state.transport.submit(full) is not None
+    assert state.request_full(
+        keys[2], 7, owner=owner_value, commit_gate=gate) is not None
     assert _wait_transport_idle(state)
 
     assert counts["detector"] == 1  # thumbnail-backed PREVIEW never satisfies FULL
@@ -618,7 +616,7 @@ def test_full_never_coalesces_with_an_active_preview(
     """Mutation-detectability row (§7.6): a FULL submitted while the same
     frame's PREVIEW read is active is a DISTINCT latest request."""
     state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
-    _catalog(state, owner, (1, 2, 3))
+    keys = _catalog(state, owner, (1, 2, 3))
     owner_value, gate = _acquisition_identity(state)
     preview_module = import_module("xrd_tools.io.frame_preview")
     hold = threading.Event()
@@ -634,12 +632,10 @@ def test_full_never_coalesces_with_an_active_preview(
     preview = _typed_request(
         state, owner_value, gate, processed, 2, HydrationPurpose.PREVIEW, 6
     )
-    full = _typed_request(
-        state, owner_value, gate, processed, 2, HydrationPurpose.FULL, 7
-    )
     assert state.transport.submit(preview) is not None
     assert hold.wait(timeout=10.0)
-    token = state.transport.submit(full)
+    token = state.request_full(
+        keys[2], 7, owner=owner_value, commit_gate=gate)
     assert token is not None
     queued = state.transport.queued_token
     assert queued is not None
@@ -3019,3 +3015,134 @@ def test_e6pm2_worker_start_failure_settles_failed(monkeypatch, tmp_path):
     )
     assert ticket is not None
     assert ticket.result().outcome is HydrationOutcome.FAILED
+
+
+def _b1_acquisition(tmp_path, labels):
+    from tests.xdart.scattering.test_e3_context_contract import _configuration
+
+    processed, raw_path = _write_processed(tmp_path, labels=labels)
+    configuration = _configuration()
+    identity = RunIdentity.from_configuration(configuration)
+    state, artifact = _state(processed, identity=identity)
+    state.max_payload_items = 16
+    if len(labels) > 2:
+        from xrd_tools.session import Light1DBufferLayout, Light1DLayout, Light1DModeLayout, SessionResourceAuthority, SessionResourceRequirements, acquire_light_1d_retention, resolve_session_policy
+        allocation = resolve_session_policy(SessionResourceRequirements(4, 4, 2, modes_1d=1, modes_2d=1, npt_1d=3, npt_rad=3, npt_azim=2), envelope_bytes=4 * 1024 ** 3, requests={"record_heavy_items": 1, "publication_heavy_items": 1}, env={}).allocation
+        artifact.publications.bind_allocation(allocation); state.bind_heavy_allocation(allocation); artifact.mask = np.eye(4, dtype=bool)
+        buffer = lambda owner: Light1DBufferLayout(3, 8, owner, np.dtype(np.float64).str)
+        layout = Light1DLayout((Light1DModeLayout("default", buffer("q"), buffer("i")),), "default")
+        lease = acquire_light_1d_retention(SessionResourceAuthority.from_allocation(allocation), owner="b1", generation=1, layout=layout, requested_rows=len(labels), compatibility_byte_ceiling=layout.shared_bytes + len(labels) * layout.per_row_unique_ndarray_bytes, gui_thread_id=threading.get_ident())
+        artifact.publications.bind_light_1d(lease); hooks = artifact.publications.light_1d_cleanup_hooks(lease); state.stage_light_1d(artifact, lease, hooks=hooks); state.bind_light_1d(artifact, lease)
+    events = []; state.bind_transport(event_sink=events.append)
+    keys = _catalog(state, artifact, labels)
+    context = AcquisitionContext(
+        new_context_token(ContextKind.ACQUISITION), configuration,
+        configuration.generation, configuration.fingerprint, "scan",
+        str(processed), object(), None, state.catalog, state.artifacts, (), (),
+        state, origin="scattering-standard", poni_identity=configuration.poni_file,
+    )
+    context.adopt_record_store(state)
+    runtime = _ContextRuntime(); runtime.adopt_acquisition(identity, context)
+    for generation, label in enumerate(labels, 1):
+        _hydrate_ok(state, context.hydration_owner, context.commit_gate,
+                    processed, label, generation)
+    events.clear()
+    return runtime, state, artifact, context, keys, raw_path, events
+
+
+def test_b1_full_demand_latest_current_lru8_and_thumbnail_clear(monkeypatch, tmp_path):
+    labels = tuple(range(1, 10))
+    runtime, state, artifact, context, keys, _raw, events = _b1_acquisition(
+        tmp_path, labels,
+    )
+    before_publication = artifact.publications.get(9); before_payload = state.payloads[keys[9]]
+    nonraw = ("axis_2d_x", "axis_2d_y", "intensity_2d", "thumbnail", "metadata_raw", "extra")
+    entered, release = threading.Event(), threading.Event()
+    original = _transport_api().read_frame_preview
+
+    def hold_first_full(read_key, **kwargs):
+        if read_key.purpose is HydrationPurpose.FULL and read_key.frame_identity == 1:
+            entered.set(); release.wait(timeout=10.0)
+        return original(read_key, **kwargs)
+
+    monkeypatch.setattr(_transport_api(), "read_frame_preview", hold_first_full)
+    assert runtime.select_navigation(keys[1], (keys[1],))
+    token_a = runtime.request_full_current()
+    assert token_a.read_key.frame_identity == 1 and entered.wait(timeout=10.0)
+    assert runtime.clear_full_raw()
+    token_same = runtime.request_full_current()
+    assert token_same is not token_a
+    assert token_same.presentation_generation != token_a.presentation_generation
+    assert runtime.select_navigation(keys[2], (keys[2],))
+    token_b = runtime.request_full_current()
+    assert token_b.read_key.frame_identity == 2
+    release.set(); assert _wait_transport_idle(state)
+    assert not artifact.publications.has_raw(1)
+    assert artifact.publications.has_raw(2)
+    assert artifact.records.get(2).active_view().raw is None
+    assert not any(event.frame_key is keys[1] for event in events)
+    assert next(event for event in events if event.frame_key is keys[2]).selection_generation == runtime.selection.display_generation
+
+    monkeypatch.setattr(_transport_api(), "read_frame_preview", original)
+    for label in labels:
+        assert runtime.select_navigation(keys[label], (keys[label],))
+        assert runtime.request_full_current().read_key.frame_identity == label
+        assert _wait_transport_idle(state)
+    after_publication = artifact.publications.get(9); after_payload = state.payloads[keys[9]]
+    state.publish_light_1d(artifact, artifact.records.get(9), source_identity=after_publication.source_identity); light_only = artifact.publications.get(9)
+    light_preserved = light_only.view.raw is after_publication.view.raw and light_only.view.mask_baked is True and all(getattr(light_only.view, name) is getattr(after_publication.view, name) for name in nonraw[:4]) and all(getattr(light_only.view, name) == getattr(after_publication.view, name) for name in nonraw[4:])
+    state.retain_frame(artifact, keys[9], artifact.records.get(9), before_publication, source_identity=before_publication.source_identity, frame_mask_qualified=False); retained = artifact.publications.get(9)
+    dataclasses = import_module("dataclasses"); raw_free = dataclasses.replace(after_payload, view=dataclasses.replace(after_payload.view, raw=None, mask_baked=False))
+    state.put_payload(raw_free); republished = state.payloads[keys[9]]
+    assert light_preserved
+    assert retained.view.raw is after_publication.view.raw and retained.view.mask_baked is True
+    assert all(getattr(retained.view, name) is getattr(before_publication.view, name) for name in nonraw[:4]) and all(getattr(retained.view, name) == getattr(before_publication.view, name) for name in nonraw[4:])
+    assert republished.view.raw is retained.view.raw and republished.view.mask_baked is True
+    assert all(getattr(republished.view, name) is getattr(raw_free.view, name) for name in nonraw[:4])
+    _hydrate_ok(state, context.hydration_owner, context.commit_gate, Path(artifact.artifact), 9, 90)
+    _hydrate_ok(state, context.hydration_owner, context.commit_gate, Path(artifact.artifact), 1, 91)
+    limits = state._residency.limits
+    state._residency.limits = type(limits)(1, 1, 1, 1)
+    state.mark_durable(artifact, labels)
+    assert not artifact.publications.has_raw(1)
+    assert all(artifact.publications.has_raw(label) for label in labels[1:])
+    assert all(state.payloads[keys[label]].view.raw is artifact.publications.get(label).view.raw for label in labels[1:])
+    assert keys[1] not in state.payloads or state.payloads[keys[1]].view.raw is None
+    assert runtime.clear_full_raw()
+    assert all(not artifact.publications.has_raw(label) for label in labels)
+    assert all(payload.view.raw is None for payload in state.payloads.values())
+    state.mark_durable(artifact, labels); snapshot = state.residency_snapshot(); assert max(snapshot.heavy, snapshot.thumbnails, snapshot.browse, snapshot.live) <= 1
+
+
+def test_b1_full_failure_keeps_thumbnail_and_retirement_clears_raw(tmp_path):
+    runtime, state, artifact, context, keys, raw_path, events = _b1_acquisition(
+        tmp_path, (1, 2),
+    )
+    assert runtime.select_navigation(keys[2], (keys[2],))
+    assert runtime.request_full_current() is not None and _wait_transport_idle(state)
+    assert artifact.publications.has_raw(2)
+    before = artifact.publications.get(1); before_payload = state.payloads[keys[1]]
+    raw_path.unlink()
+    assert runtime.select_navigation(keys[1], (keys[1],))
+    assert runtime.request_full_current() is not None and _wait_transport_idle(state)
+    after = artifact.publications.get(1)
+    resident, pending, diagnostic = runtime.full_raw_status()
+    assert not resident and not pending and diagnostic
+    assert diagnostic == state.transport.completions()[-1].diagnostic
+    assert after is before
+    assert state.payloads[keys[1]] is before_payload
+    assert any(event.frame_key is keys[1] for event in events)
+    module = import_module("xdart.modules.display_context")
+    viewer = module.Viewer1DContext("b1-viewer", 1, ("scan.xye",), module.Viewer1DCommitGate())
+    viewer_runtime = _ContextRuntime()
+    viewer_runtime._selection = viewer_runtime.prepare_viewer_1d_begin(viewer)[2]
+    assert viewer_runtime.full_raw_availability()[0] is False
+    assert viewer_runtime.request_full_current() is None
+    assert artifact.publications.has_raw(2)
+    assert runtime.release_acquisition(state.identity)
+    assert not artifact.publications.has_raw(2)
+    assert runtime.full_raw_availability()[0] is False
+    assert "acquisition" in runtime.full_raw_availability()[1].lower()
+    browse, _context, _processed = _adopted_cold_browse(tmp_path / "browse")
+    assert browse.full_raw_availability()[0] is False
+    assert browse.request_full_current() is None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from copy import copy
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -39,6 +40,7 @@ from xrd_tools.core.staging import (
 from xrd_tools.io.frame_preview import DetectorPreviewProjection
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.hydration import (
+    HydrationCompletion,
     HydrationOutcome,
     HydrationPurpose,
     HydrationReadKey,
@@ -173,12 +175,18 @@ class RunDisplayState:
         self._light_admission_lock = Lock()
         self._event_sink: Callable[[StandardRunEvent], object] | None = None
         self._transport = HydrationTransport(
-            self.commit_preview, self._derive_target
+            self.commit_preview, self._derive_target,
+            completion_sink=self._complete_hydration,
         )
         self._frame_mask_qualified: set[DisplayFrameKey] = set()
         self._detector_outcomes: dict[
             DisplayFrameKey, DetectorHydrationOutcome
         ] = {}
+        self._full_demand: tuple | None = None
+        self._full_demand_generation = 0
+        self._full_pending = False
+        self._full_diagnostic: tuple[DisplayFrameKey, str] | None = None
+        self._raw_lru: OrderedDict[DisplayFrameKey, None] = OrderedDict()
         self._retired = False
 
     @property
@@ -266,7 +274,7 @@ class RunDisplayState:
             self._residency.limits = replace(
                 self._residency.limits, heavy=effective,
             )
-            self._residency.enforce()
+            self._residency.enforce(protected=self._raw_lru)
             return effective
 
     def add_artifact(
@@ -399,6 +407,41 @@ class RunDisplayState:
             mutation = self._transport.submit_detached(request, closed=closed)
         self._transport.dispatch_detached(mutation)
         return mutation.token
+
+    def _evict_raw_key_locked(self, key: DisplayFrameKey) -> None:
+        art = self.artifacts.get(key.artifact); label = key.local_frame_label
+        if art is not None: art.publications.evict_raw(label)
+        payload = self.payloads.get(key)
+        if payload is not None and payload.view.raw is not None:
+            view = copy(payload.view); object.__setattr__(view, "raw", None)
+            updated = copy(payload); object.__setattr__(updated, "view", view)
+            self.payloads[key] = updated
+        self._raw_lru.pop(key, None); self._residency._rearm_heavy_key(key)
+
+    def _protected_raw_labels_locked(self, owner: DisplayArtifact, incoming=None) -> tuple:
+        labels = []
+        for key in tuple(self._raw_lru):
+            art = self.artifacts.get(key.artifact); publication = None if art is None else art.publications.get(key.local_frame_label)
+            payload = self.payloads.get(key); raw = None if publication is None else publication.view.raw
+            exact = bool(art is not None and self.catalog.resolve(key) is key and art.source_scan == key.source_scan and raw is not None and publication.generation == art.publications.generation and publication.scan_key == key.source_scan and (payload is None or payload.frame_key is key and payload.view.raw is raw))
+            if exact and art is owner and incoming is not None and incoming.label == key.local_frame_label:
+                exact = (incoming.generation, incoming.source_identity, incoming.scan_key) == (publication.generation, publication.source_identity, publication.scan_key)
+            if not exact: self._evict_raw_key_locked(key)
+            elif art is owner: labels.append(key.local_frame_label)
+        return tuple(labels)
+
+    def _complete_hydration(self, completion: HydrationCompletion) -> None:
+        event = sink = None
+        with self._lock:
+            demand = self._full_demand
+            if type(completion) is not HydrationCompletion or demand is None or completion.token is not demand[1]: return
+            key = demand[3]; self._full_pending = False
+            art = self.artifacts.get(key.artifact); publication = None if art is None else art.publications.get(key.local_frame_label)
+            resident = bool(publication is not None and publication.view.raw is not None); diagnostic = None if resident else completion.diagnostic or "Full Raw detector pixels unavailable"
+            self._full_diagnostic = None if diagnostic is None else (key, diagnostic)
+            if diagnostic is not None and not self._retired:
+                event = StandardRunEvent(self.identity, StandardEventKind.DISPLAY_READY, artifact=key.artifact, frame_key=key, selection_generation=demand[6]); sink = self._event_sink
+        if event is not None and sink is not None: sink(event)
 
     def cancel_viewer_2d(self, gate) -> None:
         if type(gate) is not Viewer2DCommitGate:
@@ -551,6 +594,7 @@ class RunDisplayState:
             for retired in delta.retired:
                 self._frame_mask_qualified.discard(retired)
                 self._detector_outcomes.pop(retired, None)
+                self._evict_raw_key_locked(retired)
             self._residency.retire_navigation(delta.retired)
         return delta
 
@@ -577,7 +621,7 @@ class RunDisplayState:
         return self.catalog.max_items
 
     def publish_light_1d(self, owner: DisplayArtifact, record: FrameRecord, *, source_identity: str) -> FramePublication:
-        with self._light_admission_lock:
+        with self._lock, self._light_admission_lock:
             lease = owner.light_lease
             if type(lease) is not Light1DRetentionLease \
                     or lease.state is not Light1DLeaseState.ACTIVE:
@@ -592,7 +636,9 @@ class RunDisplayState:
                 display_record.active_view(), record=display_record,
                 source_identity=source_identity, generation=owner.publications.generation,
                 scan_key=owner.source_scan)
-            return owner.publications.publish_gui_light_1d(publication, light_record)
+            protected = self._protected_raw_labels_locked(owner, publication)
+            return owner.publications.publish_gui_light_1d(
+                publication, light_record, protected=protected)
 
     def retain_frame(
         self,
@@ -621,13 +667,15 @@ class RunDisplayState:
             draft = fold_norm_metadata(
                 draft, publication.view.metadata_numeric
             )
-            owner.publications.upsert(_without_light_1d(publication))
+            candidate = _without_light_1d(publication)
+            protected = self._protected_raw_labels_locked(owner, candidate)
+            owner.publications.upsert(candidate, protected=protected)
             self._residency.observe(
                 key,
                 records=owner.records,
                 publications=owner.publications,
             )
-            self._residency.enforce()
+            self._residency.enforce(protected=self._raw_lru)
             owner.norm_aggregate = next_norm_revision(draft)
 
     def mark_durable(
@@ -641,7 +689,7 @@ class RunDisplayState:
             self._residency._rearm_heavy_owner(
                 owner.records, owner.publications
             )
-            self._residency.enforce()
+            self._residency.enforce(protected=self._raw_lru)
 
     def frame_norm_aggregate(
         self, key: DisplayFrameKey
@@ -667,6 +715,48 @@ class RunDisplayState:
     ) -> DetectorHydrationOutcome | None:
         with self._lock:
             return self._detector_outcomes.get(key)
+
+    def full_raw_status(self, key: DisplayFrameKey) -> tuple[bool, bool, str | None]:
+        with self._lock:
+            art = self.artifacts.get(key.artifact); publication = None if art is None or self.catalog.resolve(key) is not key else art.publications.get(key.local_frame_label)
+            resident = bool(publication is not None and publication.view.raw is not None)
+            pending = bool(self._full_pending and self._full_demand is not None and self._full_demand[3] is key)
+            diagnostic = self._full_diagnostic
+            return resident, pending, diagnostic[1] if diagnostic is not None and diagnostic[0] is key else None
+
+    def invalidate_full_demand(self, *, clear_raw: bool = False) -> None:
+        with self._lock:
+            self._full_demand = None; self._full_pending = False; self._full_diagnostic = None
+            if clear_raw:
+                for key in tuple(self._raw_lru): self._evict_raw_key_locked(key)
+
+    def request_full(self, key: DisplayFrameKey, generation: int, *,
+                     owner: HydrationOwner, commit_gate: object,
+                     closed: bool = False) -> HydrationToken | None:
+        if (type(key) is not DisplayFrameKey or type(generation) is not int or generation < 0
+                or type(owner) is not HydrationOwner or not owner.qualified or commit_gate is None): return None
+        with self._lock:
+            art = self.artifacts.get(key.artifact)
+            if self._retired or art is None or self.catalog.resolve(key) is not key: return None
+            read_key = HydrationReadKey(HydrationScope(*owner.as_tuple()), key.artifact, key.local_frame_label, HydrationPurpose.FULL)
+            serial = self._full_demand_generation = self._full_demand_generation + 1
+            token = HydrationToken(read_key, serial)
+            request = HydrationRequest(key.local_frame_label, HydrationPurpose.FULL, serial,
+                owner, (art.records, art.publications), commit_gate, read_key=read_key, token=token)
+            self._full_demand = (serial, token, owner, key, HydrationPurpose.FULL, commit_gate, generation)
+            self._full_diagnostic = None; publication = art.publications.get(key.local_frame_label)
+            if publication is not None and publication.view.raw is not None:
+                self._full_pending = False; self._raw_lru.pop(key, None); self._raw_lru[key] = None
+                return token
+            self._full_pending = True
+        with self._light_admission_lock:
+            mutation = self._transport.submit_detached(request, closed=closed)
+        if mutation.token is None:
+            with self._lock:
+                if self._full_demand is not None and self._full_demand[1] is token: self._full_demand = None; self._full_pending = False
+            return None
+        self._transport.dispatch_detached(mutation)
+        return mutation.token
 
     def resolve_frame(
         self, frame: DisplayFrameKey
@@ -745,12 +835,17 @@ class RunDisplayState:
         key = payload.frame_key
         if type(key) is not DisplayFrameKey:
             return
-        payload = replace(payload, view=replace(
-            payload.view, axis_1d=None, intensity_1d=None, sigma_1d=None,
-        ))
         with self._lock:
             if self._retired:
                 return
+            art = self.artifacts.get(key.artifact)
+            if key in self._raw_lru and art is None: self._evict_raw_key_locked(key)
+            elif key in self._raw_lru and key.local_frame_label in self._protected_raw_labels_locked(art):
+                publication = art.publications.get(key.local_frame_label)
+                payload = replace(payload, view=replace(payload.view, raw=publication.view.raw,
+                    mask_baked=publication.view.mask_baked))
+            payload = replace(payload, view=replace(
+                payload.view, axis_1d=None, intensity_1d=None, sigma_1d=None))
             self.payloads[key] = payload
             self.payloads.move_to_end(key)
             while len(self.payloads) > self.max_payload_items:
@@ -759,6 +854,7 @@ class RunDisplayState:
     def retire(self, *, join_timeout: float) -> bool:
         with self._lock:
             self._retired = True
+            self.invalidate_full_demand(clear_raw=True)
         if not self._transport.retire(join_timeout=join_timeout):
             return False
         clean = True
@@ -977,6 +1073,15 @@ class RunDisplayState:
                     return HydrationOutcome.OWNER_MISMATCH
             elif not browse_target:
                 return HydrationOutcome.OWNER_MISMATCH
+            if request.purpose is HydrationPurpose.FULL:
+                demand = self._full_demand
+                if (not acquisition_target or demand is None or prepared.token is not demand[1]
+                        or request.owner != demand[2] or key is not demand[3]
+                        or demand[4] is not HydrationPurpose.FULL or request.commit_gate is not demand[5]
+                        or prepared.token.presentation_generation != demand[0]
+                        or prepared.token.read_key.purpose is not HydrationPurpose.FULL
+                        or prepared.token.read_key.scope != HydrationScope(*demand[2].as_tuple())):
+                    return HydrationOutcome.OWNER_MISMATCH
             if not gate.enter(request.epoch):
                 return (
                     HydrationOutcome.CANCELLED
@@ -992,14 +1097,14 @@ class RunDisplayState:
                     event = self._commit_browse_locked(stores[0], prepared)
             finally:
                 gate.leave()
-            if acquisition_target:
+            if acquisition_target and event is not None:
                 # The commit is SEALED: publication/payload landed coherently.
                 # Cap enforcement is demotion-only bookkeeping by the same
                 # trusted owner; a raise here must not un-publish the sealed
                 # commit — it is logged and the next commit's enforce retries
                 # the identical trims over current state.
                 try:
-                    self._residency.enforce()
+                    self._residency.enforce(protected=self._raw_lru)
                 except Exception:
                     logger.exception(
                         "display residency cap enforcement failed; the next "
@@ -1017,6 +1122,22 @@ class RunDisplayState:
         prepared: PreparedHydrationCommit,
     ) -> StandardRunEvent | None:
         preview = prepared.preview
+        if prepared.token.read_key.purpose is HydrationPurpose.FULL:
+            presentation_generation = self._full_demand[6]
+            if preview.raw is None: return None
+            publication = art.publications.install_raw(key.local_frame_label, preview.raw, mask_baked=_projection_masks_values(prepared.projection))
+            if publication is None: return None
+            payload = self.payloads.get(key)
+            if payload is None:
+                self.put_payload(replace(self._payload_from_publication(art, key, publication, closed=prepared.closed), selection_generation=presentation_generation))
+            else:
+                view = copy(payload.view); object.__setattr__(view, "raw", preview.raw); object.__setattr__(view, "mask_baked", publication.view.mask_baked)
+                payload = copy(payload); object.__setattr__(payload, "view", view); object.__setattr__(payload, "selection_generation", presentation_generation)
+                self.payloads[key] = payload
+            self._raw_lru.pop(key, None); self._raw_lru[key] = None
+            while len(self._raw_lru) > 8: self._evict_raw_key_locked(next(iter(self._raw_lru)))
+            return StandardRunEvent(self.identity, StandardEventKind.DISPLAY_READY, artifact=key.artifact, frame_key=key, selection_generation=presentation_generation)
+        presentation_generation = prepared.token.presentation_generation
         view = preview.view
         if preview.raw is not None:
             view = replace(
@@ -1060,8 +1181,10 @@ class RunDisplayState:
             record=record,
             source_identity=source_identity,
             generation=art.publications.generation,
+            raw_status="ready" if preview.raw is not None else "thumbnail" if view.thumbnail is not None else "missing",
             scan_key=art.source_scan,
         )
+        protected = self._protected_raw_labels_locked(art, candidate)
         residency = self._residency.capture(key)
         try:
             self._residency.observe(
@@ -1085,9 +1208,10 @@ class RunDisplayState:
                         source_identity=source_identity,
                         scan_key=art.source_scan,
                     ),
+                    protected=protected,
                 )
             else:
-                publication = art.publications.upsert(candidate)
+                publication = art.publications.upsert(candidate, protected=protected)
         except BaseException:
             self._residency.restore(residency)
             raise
@@ -1100,7 +1224,7 @@ class RunDisplayState:
                 publication,
                 closed=prepared.closed,
             ),
-            selection_generation=prepared.token.presentation_generation,
+            selection_generation=presentation_generation,
         )
         self.put_payload(payload)
         return StandardRunEvent(
@@ -1108,7 +1232,7 @@ class RunDisplayState:
             StandardEventKind.DISPLAY_READY,
             artifact=key.artifact,
             frame_key=key,
-            selection_generation=prepared.token.presentation_generation,
+            selection_generation=presentation_generation,
         )
 
     def _commit_browse_locked(

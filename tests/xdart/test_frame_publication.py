@@ -73,7 +73,7 @@ class DuckFrame:
 
 def _bound_gui_light_graph(
     *, rows=3, shared_coordinate=False, same_owner_coordinate=False,
-    dtype=np.float64,
+    dtype=np.float64, heavy_rows=None,
 ):
     """Build the exact fixed GUI layout and its bound store without Qt."""
     from xrd_tools.session import (
@@ -103,7 +103,7 @@ def _bound_gui_light_graph(
     allocation = resolve_session_policy(
         requirements,
         envelope_bytes=4 * 1024 ** 3,
-        requests={"publication_items": rows, "record_items": rows},
+        requests={"publication_items": rows, "record_items": rows, **({} if heavy_rows is None else {"publication_heavy_items": heavy_rows})},
         env={},
     ).allocation
     layout = Light1DLayout(
@@ -3413,3 +3413,72 @@ def test_bound_reintegrate_refuses_before_any_mutation():
         store.allocation,
         store._light_1d,
     ) == prior
+
+
+def test_b1_raw_only_eviction_preserves_every_nonraw_view_identity():
+    raw_a = np.full((4, 4), 7.0); raw_b = np.full((4, 4), 8.0); base = _mode_pub(7, mode_1d="q_total", mode_2d="q_chi")
+    active = replace(base.view, raw=raw_a, mask_baked=True); alternate = replace(active, raw=raw_b)
+    one_d = {mode: replace(view, raw=raw_a) for mode, view in base.record.results_1d.items()}
+    publication = replace(
+        base,
+        view=active,
+        record=replace(
+            base.record,
+            results_1d=one_d,
+            results_2d={"q_chi": active, "q_ip_q_oop": alternate},
+        ),
+        raw_ref=DuckFrame(idx=7),
+        raw_status="ready",
+        source_identity="scan.nxs#7",
+        scan_key="scan-owner",
+    )
+    store = PublicationStore(max_heavy_items=None, max_thumbnail_items=None); store.upsert(publication); before = store.get(7)
+    preserved = {
+        name: getattr(before.view, name)
+        for name in (
+            "axis_1d", "intensity_1d", "axis_2d_x", "axis_2d_y",
+            "intensity_2d", "thumbnail",
+        )
+    }
+    assert store.has_raw(7) and store.evict_raw(7)
+    evicted = store.get(7)
+    assert not store.has_raw(7) and not store.evict_raw(7)
+    assert evicted.raw_ref is None and evicted.raw_status == "thumbnail"
+    assert evicted.source_identity == "scan.nxs#7" and evicted.scan_key == "scan-owner"
+    assert evicted.view.mask_baked is True
+    assert all(getattr(evicted.view, name) is value for name, value in preserved.items())
+    assert evicted.view.metadata_raw == before.view.metadata_raw and evicted.view.extra == before.view.extra
+    assert all(view.raw is None for view in evicted.record.results_1d.values())
+    assert all(view.raw is None for view in evicted.record.results_2d.values())
+    assert set(evicted.record.results_2d) == {"q_chi", "q_ip_q_oop"}
+
+
+def test_b1_bound_raw_overlay_is_additive_protected_and_identity_qualified():
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph(
+        rows=3, heavy_rows=1)
+    publication, light = build(0)
+    publication = replace(publication, view=replace(publication.view, raw=None),
+        record=replace(publication.record, results_1d={mode: replace(view, raw=None) for mode, view in publication.record.results_1d.items()},
+            results_2d={mode: replace(view, raw=None) for mode, view in publication.record.results_2d.items()}),
+        raw_status="thumbnail")
+    store.publish_gui_light_1d(publication, light)
+    before = store._items[0]; pair = store._light_1d_items[0]
+    orders = (tuple(store._items), tuple(store._heavy_labels), tuple(store._thumb_labels), tuple(store._light_1d_items), lease.keys())
+    raw = np.full((4, 4), 11.0); raw.setflags(write=False)
+    installed = store.install_raw(0, raw, mask_baked=True); fields = ("axis_2d_x", "axis_2d_y", "intensity_2d", "thumbnail", "metadata_raw", "extra")
+    assert installed is not None and store._items[0].view.raw is raw
+    assert all(getattr(store._items[0].view, name) is getattr(before.view, name) for name in fields)
+    assert all(getattr(getattr(store._items[0].record, dimension)[mode], name) is getattr(view, name) for dimension in ("results_1d", "results_2d") for mode, view in getattr(before.record, dimension).items() for name in fields)
+    assert all(view.raw is raw for view in (*store._items[0].record.results_1d.values(), *store._items[0].record.results_2d.values()))
+    assert store._items[0].raw_status == "ready" and store._items[0].view.mask_baked is True
+    assert orders == (tuple(store._items), tuple(store._heavy_labels), tuple(store._thumb_labels), tuple(store._light_1d_items), lease.keys())
+
+    store.publish_gui_light_1d(publication, light, protected=(0,))
+    assert store.has_raw(0) and store._light_1d_items[0] is pair
+    for label in (1, 2): store.publish_gui_light_1d(*build(label), protected=(0,))
+    assert store.has_raw(0) and store._items[0].view.raw is raw
+    foreign, _light = build(0, publication_source="foreign")
+    frozen = (store._items[0], store._light_1d_items[0], lease.keys())
+    with pytest.raises(ValueError, match="protected raw publication identity"):
+        store.upsert(_without_1d(foreign), protected=(0,))
+    assert frozen == (store._items[0], store._light_1d_items[0], lease.keys())

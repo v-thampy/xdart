@@ -85,16 +85,17 @@ class RunDisplayResidency:
         ):
             self._touch(self._thumbnails, key)
 
-    def enforce(self) -> None:
+    def enforce(self, *, protected=()) -> None:
         """Apply the cap trims (demotion-only store operations)."""
-        self._trim_heavy()
+        self._trim_heavy(protected)
         self._trim(
             self._thumbnails,
             self.limits.thumbnails,
             self._evict_thumbnail,
+            protected,
         )
-        self._trim(self._browse, self.limits.browse, self._evict_browse)
-        self._trim(self._live, self.limits.live, self._evict_live)
+        self._trim(self._browse, self.limits.browse, self._evict_browse, protected)
+        self._trim(self._live, self.limits.live, self._evict_live, protected)
 
     def capture(self, key: DisplayFrameKey) -> tuple:
         """Exact pre-attempt facts for ONE key (§22.3 prepare half).
@@ -175,10 +176,12 @@ class RunDisplayResidency:
         values.pop(key, None)
         values[key] = None
 
-    def _trim(self, values, limit: int, evict) -> None:
+    def _trim(self, values, limit: int, evict, protected=()) -> None:
         while len(values) > limit:
             removed = False
             for key in tuple(values):
+                if key in protected:
+                    continue
                 if evict(key):
                     values.pop(key, None)
                     removed = True
@@ -209,9 +212,12 @@ class RunDisplayResidency:
             if candidate in armed:
                 self._heavy_candidates[candidate] = None
 
-    def _trim_heavy(self) -> None:
+    def _trim_heavy(self, protected=()) -> None:
         while len(self._heavy) > self.limits.heavy and self._heavy_candidates:
             key = next(iter(self._heavy_candidates))
+            if key in protected:
+                self._heavy_candidates.pop(key, None)
+                continue
             removed = self._evict_heavy(key)
             self._heavy_candidates.pop(key, None)
             if removed:

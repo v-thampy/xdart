@@ -570,20 +570,27 @@ class HydrationTransport:
                 token, ticket = entry.token, entry.ticket
             result = self._execute(entry, token, ticket)
             if result is None:
+                delivery = None
                 with self._lock:
                     if (self._active is entry and entry.state is _EntryState.READING
                             and entry.delivery_guard is None):
-                        self._active = None
-                        self._queued = entry
-                        continue
-                    if (self._active is entry and entry.state is _EntryState.CLEANUP_BLOCKED
+                        if self._queued is None:
+                            self._active = None
+                            self._queued = entry
+                            continue
+                        delivery = self._capture_locked(
+                            entry, entry.token, HydrationOutcome.SUPERSEDED,
+                            entry.ticket, clear=True)
+                    elif (self._active is entry and entry.state is _EntryState.CLEANUP_BLOCKED
                             and type(entry.terminal) is _Viewer1DBlockedTerminal
                             and entry.terminal.notice.acknowledgement is not None
                             and entry.delivery_guard is not None
                             and entry.delivery_guard.claimed):
                         entry.delivery_guard = None
-                    if self._worker is worker: self._worker = None
-                return
+                    if delivery is None and self._worker is worker: self._worker = None
+                if delivery is None: return
+                self.dispatch_detached(DetachedHydrationMutation(deliveries=(delivery,)))
+                continue
             terminal = result if type(result) is _Viewer1DExecutionTerminal else None
             outcome, diagnostic = ((terminal.outcome, terminal.diagnostic)
                                    if terminal is not None else result)

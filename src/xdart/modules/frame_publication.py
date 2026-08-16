@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import posixpath
+from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from threading import RLock
 from types import MappingProxyType
@@ -426,6 +427,26 @@ def _publication_has_heavy_payload(publication: FramePublication) -> bool:
             if _view_has_heavy_arrays(mode_view):
                 return True
     return False
+
+
+def _publication_has_raw(publication: FramePublication) -> bool:
+    views = (publication.view, *publication.record.results_1d.values(), *publication.record.results_2d.values())
+    return bool(any(view.raw is not None for view in views) or getattr(publication.raw_ref, "map_raw", None) is not None)
+
+
+def _with_raw_overlay(publication: FramePublication, raw, mask_baked=None) -> FramePublication:
+    def overlay(view):
+        result = copy(view); object.__setattr__(result, "raw", raw)
+        if mask_baked is not None: object.__setattr__(result, "mask_baked", bool(view.mask_baked or mask_baked))
+        return result
+    record = copy(publication.record)
+    for name in ("results_1d", "results_2d"):
+        object.__setattr__(record, name, MappingProxyType({mode: overlay(view) for mode, view in getattr(record, name).items()}))
+    updated = copy(publication)
+    object.__setattr__(updated, "view", overlay(publication.view)); object.__setattr__(updated, "record", record)
+    object.__setattr__(updated, "raw_ref", None)
+    object.__setattr__(updated, "raw_status", "ready" if raw is not None else "thumbnail" if publication.view.thumbnail is not None else "evicted")
+    return updated
 
 
 def _view_has_data_arrays(view: FrameView) -> bool:
@@ -1019,17 +1040,30 @@ class PublicationStore:
         except (KeyError, ValueError, TypeError):
             return False
 
-    def _project_total_victims_locked(self, label: int | str) -> tuple:
+    @staticmethod
+    def _protected_candidate_locked(existing, incoming, protected, keep=False):
+        if existing is None or incoming.label not in protected or not _publication_has_raw(existing):
+            return incoming
+        if ((existing.generation, existing.source_identity, existing.scan_key) !=
+                (incoming.generation, incoming.source_identity, incoming.scan_key)):
+            raise ValueError("protected raw publication identity changed")
+        raw = next((view.raw for view in (existing.view,
+            *existing.record.results_1d.values(), *existing.record.results_2d.values())
+            if view.raw is not None), getattr(existing.raw_ref, "map_raw", None))
+        return existing if keep else _with_raw_overlay(incoming, raw, existing.view.mask_baked)
+
+    def _project_total_victims_locked(self, label: int | str, protected=()) -> tuple:
         order = tuple(key for key in self._items if key != label) + (label,)
         over = 0 if self._max_items is None else max(0, len(order) - self._max_items)
         victims = []
         for candidate in order:
             if len(victims) == over: break
-            if self._label_evictable_locked(candidate): victims.append(candidate)
+            if candidate not in protected and self._label_evictable_locked(candidate): victims.append(candidate)
         return tuple(victims)
 
-    def _install_base_locked(self, publication: FramePublication, *, enforce_total=True) -> None:
+    def _install_base_locked(self, publication: FramePublication, *, enforce_total=True, protected=()) -> None:
         label = publication.label
+        publication = self._protected_candidate_locked(self._items.get(label), publication, protected)
         self._items.pop(label, None)
         self._drop_heavy_label_locked(label)
         self._drop_thumb_label_locked(label)
@@ -1038,18 +1072,19 @@ class PublicationStore:
             self._heavy_labels.append(label)
         if publication.view.thumbnail is not None:
             self._thumb_labels.append(label)
-        self._enforce_bounds_locked(enforce_total=enforce_total)
+        self._enforce_bounds_locked(enforce_total=enforce_total, protected=protected)
 
-    def publish_gui_light_1d(self, publication, light_record):
+    def publish_gui_light_1d(self, publication, light_record, *, protected=()):
         from xrd_tools.session import Light1DUnavailable
 
         with self._lock:
+            protected = frozenset(protected)
             templates = self._validate_gui_light_1d_locked(
                 publication, light_record,
             )
             lease = self._light_1d
             label = publication.label
-            base = _without_1d_arrays(publication)
+            base = self._protected_candidate_locked(self._items.get(label), _without_1d_arrays(publication), protected, True)
             prior = self._light_1d_items.get(label)
             reuse_pair = False
             if prior is not None:
@@ -1064,7 +1099,7 @@ class PublicationStore:
                     reuse_pair = True
                 elif not identity:
                     raise ValueError("GUI light-1D pair identity changed")
-            total_victims = self._project_total_victims_locked(label)
+            total_victims = self._project_total_victims_locked(label, protected)
             if label in total_victims: raise Light1DUnavailable("incoming GUI publication is pinned")
             keys = lease.keys()
             victims = list(dict.fromkeys((() if reuse_pair else ((label,) if prior else ())) + total_victims))
@@ -1097,7 +1132,7 @@ class PublicationStore:
                             self._generation, publication.scan_key,
                             light_record.active_mode, templates, guard,
                         )
-                self._install_base_locked(base, enforce_total=False)
+                self._install_base_locked(base, enforce_total=False, protected=protected)
                 return self._compose_locked(label, self._items.get(label))
 
             return lease._preflight_store_record(record=light_record, retiring=retiring, commit=commit, needs_retain=not reuse_pair)
@@ -1450,13 +1485,17 @@ class PublicationStore:
                 logger.debug("batch 1D publication hydration failed", exc_info=True)
         return self.get_many(requested)
 
-    def upsert(self, publication: FramePublication) -> FramePublication:
+    def upsert(self, publication: FramePublication, *, protected=()) -> FramePublication:
         from xrd_tools.session import Light1DLeaseState
 
         with self._lock:
+            protected = frozenset(protected)
             incoming_generation = publication.generation
             label = publication.label
             existing = self._items.get(label)
+            if (existing is not None and label in protected and _publication_has_raw(existing)
+                    and incoming_generation != self._generation): return existing
+            publication = self._protected_candidate_locked(existing, publication, protected)
             foreign_pair = False
             if self._light_1d is not None:
                 if self._light_1d.state is not Light1DLeaseState.ACTIVE:
@@ -1547,7 +1586,7 @@ class PublicationStore:
                 self._heavy_labels.append(label)
             if publication.view.thumbnail is not None:
                 self._thumb_labels.append(label)
-            self._enforce_bounds_locked()
+            self._enforce_bounds_locked(protected=protected)
             if self._light_1d is None:
                 return publication
             return self._compose_locked(label, self._items.get(label)) or publication
@@ -1575,6 +1614,25 @@ class PublicationStore:
                 publication is not None
                 and publication.view.thumbnail is not None
             )
+
+    def has_raw(self, label: int | str) -> bool:
+        with self._lock:
+            publication = self._items.get(label)
+            return publication is not None and _publication_has_raw(publication)
+
+    def install_raw(self, label: int | str, raw: np.ndarray, *, mask_baked: bool) -> FramePublication | None:
+        with self._lock:
+            publication = self._items.get(label)
+            if publication is None or type(raw) is not np.ndarray or raw.flags.writeable: return None
+            self._items[label] = _with_raw_overlay(publication, raw, mask_baked)
+            return self._compose_locked(label, self._items[label])
+
+    def evict_raw(self, label: int | str) -> bool:
+        with self._lock:
+            publication = self._items.get(label)
+            if publication is None or not _publication_has_raw(publication): return False
+            self._items[label] = _with_raw_overlay(publication, None)
+            return True
 
     def evict_heavy(self, label: int | str) -> bool:
         """Drop full arrays for one evictable publication, retaining thumbnail."""
@@ -1679,12 +1737,14 @@ class PublicationStore:
         except Exception:
             return False
 
-    def _enforce_bounds_locked(self, *, enforce_total=True) -> None:
+    def _enforce_bounds_locked(self, *, enforce_total=True, protected=()) -> None:
+        protected = frozenset(protected)
         if enforce_total and self._max_items is not None:
             probe = self._evictable
             if probe is None:
                 while len(self._items) > self._max_items:
-                    label = next(iter(self._items))
+                    label = next((item for item in self._items if item not in protected), None)
+                    if label is None: break
                     self._retire_light_pair_locked(label)
                     self._items.pop(label, None)
                     self._drop_heavy_label_locked(label)
@@ -1700,6 +1760,7 @@ class PublicationStore:
                     for label in list(self._items):
                         if over <= 0:
                             break
+                        if label in protected: continue
                         try:
                             if not probe(label):
                                 continue
@@ -1714,7 +1775,9 @@ class PublicationStore:
         # tier 1 (D2): over the heavy bound -> drop arrays, KEEP thumbnail
         if self._max_heavy_items is not None:
             while len(self._heavy_labels) > self._max_heavy_items:
-                label = self._heavy_labels.pop(0)
+                label = next((item for item in self._heavy_labels if item not in protected), None)
+                if label is None: break
+                self._heavy_labels.remove(label)
                 publication = self._items.get(label)
                 if publication is None:
                     continue
@@ -1723,7 +1786,9 @@ class PublicationStore:
         # tier 2: thumbnails have their own, larger bound
         if self._max_thumbnail_items is not None:
             while len(self._thumb_labels) > self._max_thumbnail_items:
-                label = self._thumb_labels.pop(0)
+                label = next((item for item in self._thumb_labels if item not in protected), None)
+                if label is None: break
+                self._thumb_labels.remove(label)
                 publication = self._items.get(label)
                 if publication is None:
                     continue

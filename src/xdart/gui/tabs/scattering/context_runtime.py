@@ -245,9 +245,39 @@ class _ContextRuntime:
             and self._selected_frame_by_id().get(id(frame)) is frame
         )
 
+    def _full_raw_target(self):
+        selection, context = self._selection, self._acquisition
+        current = self._acquisition_navigation.current
+        return ((context, current) if selection is not None and context is not None
+                and current is not None and selection.kind is ContextKind.ACQUISITION
+                and selection.names(context) and selection.owner == context.hydration_owner
+                and self.owns_frame(current) else None)
+
+    def full_raw_availability(self) -> tuple[bool, str]:
+        return ((True, "") if self._full_raw_target() is not None else (False,
+            "Full Raw is available only for an exact acquisition frame."))
+
+    def full_raw_status(self) -> tuple[bool, bool, str | None]:
+        target = self._full_raw_target()
+        return ((False, False, self.full_raw_availability()[1]) if target is None else
+                target[0].publication_store.full_raw_status(target[1]))
+
+    def request_full_current(self):
+        target = self._full_raw_target()
+        if target is None: return None
+        context, frame = target; selection = self._selection
+        return context.publication_store.request_full(frame, selection.display_generation,
+            owner=selection.owner, commit_gate=context.commit_gate)
+
+    def clear_full_raw(self) -> bool:
+        if self._acquisition is None: return False
+        self._acquisition.publication_store.invalidate_full_demand(clear_raw=True)
+        return True
+
     def prepare_viewer_1d_begin(self, context: Viewer1DContext):
         if type(context) is not Viewer1DContext: raise TypeError(
             "viewer 1-D context must be exact")
+        self.clear_full_raw()
         navigation = FrameNavigationProjection()
         selection = DisplaySelection(ContextKind.VIEWER_1D, HydrationOwner(
             context.context_token, "viewer-1d", "viewer-1d", context.commit_gate.epoch),
@@ -288,6 +318,7 @@ class _ContextRuntime:
         if (type(context) is not Viewer2DContext
                 or type(catalog) is not Viewer2DArtifactCatalog):
             raise TypeError("viewer context/catalog must be exact")
+        self.clear_full_raw()
         identity = RunIdentity(context.generation, context.context_token)
         frames = tuple(DisplayFrameKey(
             identity, "viewer-2d", "viewer-2d", label, index + 1)
@@ -454,7 +485,7 @@ class _ContextRuntime:
         # `_navigation_after_append` guarantees one exact suffix append.  Keep
         # the identity index O(new) instead of rebuilding it from the growing
         # immutable public tuple on every live frame.
-        self._acquisition_navigation = navigation
+        self._set_acquisition_navigation(navigation)
         self._acquisition_frame_by_id[id(delta.appended)] = delta.appended
         return True
 
@@ -530,6 +561,7 @@ class _ContextRuntime:
             return False
         if self._run_identity is None:
             return self._acquisition is None
+        self.clear_full_raw()
         self.clear_browse(select_acquisition=False)
         self._selection = None
         if self._acquisition is not None:
@@ -546,6 +578,7 @@ class _ContextRuntime:
             return self._acquisition is None and self._run_identity is None
         if identity is not self._run_identity or self._acquisition is None:
             return False
+        self.clear_full_raw()
         self._acquisition.retire()
         self._acquisition = None
         self._set_acquisition_navigation(FrameNavigationProjection())
@@ -1066,6 +1099,7 @@ class _ContextRuntime:
             and pending.request is not request
         ):
             raise RuntimeError("Browse replacement identity is not exact")
+        self.clear_full_raw()
         identity = self._run_identity or RunIdentity(
             request.load_generation, request.token
         )
@@ -1155,6 +1189,7 @@ class _ContextRuntime:
         self._reset_trace_projection()
 
     def close_selection(self) -> None:
+        self.clear_full_raw()
         self.clear_browse(select_acquisition=False)
         self.clear_viewer_1d()
         self.clear_viewer_2d(release=True)
@@ -1183,6 +1218,7 @@ class _ContextRuntime:
         self, context: AcquisitionContext | BrowseContext
     ) -> DisplaySelection:
         self.invalidate_browse_pass()
+        if type(context) is BrowseContext: self.clear_full_raw()
         self._display_generation += 1
         selection = DisplaySelection.for_context(
             context, self._display_generation)
@@ -1246,6 +1282,9 @@ class _ContextRuntime:
         navigation: FrameNavigationProjection,
     ) -> None:
         prior_frames = self._acquisition_navigation.frames
+        if navigation.current is not self._acquisition_navigation.current \
+                and self._acquisition is not None:
+            self._acquisition.publication_store.invalidate_full_demand()
         self._acquisition_navigation = navigation
         if navigation.frames is not prior_frames:
             self._acquisition_frame_by_id = {

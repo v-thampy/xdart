@@ -468,6 +468,10 @@ class ContextController:
     def owns_frame(self, frame: object) -> bool:
         return self._runtime.owns_frame(frame)
 
+    def full_raw_availability(self): return self._runtime.full_raw_availability()
+    def full_raw_status(self): return self._runtime.full_raw_status()
+    def request_full_current(self): return None if self._closed else self._runtime.request_full_current()
+    def clear_full_raw(self): return self._runtime.clear_full_raw()
     def poll_browse_preview(self) -> bool:
         consumed = (
             not self._closed
