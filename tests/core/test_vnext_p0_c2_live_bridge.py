@@ -739,6 +739,71 @@ def test_close_revalidates_compact_frame_proof_after_checkpoint_corruption(
     session.abort()
 
 
+def test_descriptor_bound_close_reads_each_mode_array_once_with_checkpoint_digest_equivalence(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "one-pass-source.nxs"
+    source.write_bytes(b"source")
+    fact = observe_source_fact(tmp_path, source.name, logical_identity=0)
+    target = tmp_path / "one-pass-output.nexus"
+    _ledger, accounting, mode, _target = accounting_for(target)
+    key = discover(accounting, fact, group="proof", ordinal=0, label=0)
+    successful_attempt(accounting, key, fact.source_revision, mode)
+    intent = append_intent(
+        tmp_path, extent=1, labels=(0,), generation=0,
+        source_identity=fact.source_identity,
+    )
+    session = open_session(live_scan(target, intent, (0,)), accounting)
+    session.flush(force=True)
+
+    writer = session.sink._writer
+    binding = writer._transaction_binding
+    assert binding is not None
+    checkpoint_digests = {
+        key: proof.digest for key, proof in writer._durable_mode_proofs.items()
+    }
+    assert checkpoint_digests
+    reads = {}
+    real_getitem = h5py.Dataset.__getitem__
+
+    def count_mode_array_reads(dataset, item):
+        if dataset.name.rsplit("/", 1)[-1] in {
+            "q", "intensity", "sigma", "chi",
+        }:
+            reads[dataset.name] = reads.get(dataset.name, 0) + 1
+        return real_getitem(dataset, item)
+
+    observed_digests = {}
+    real_reverify = writer._reverify_durable_mode_proof
+
+    def capture_observed_digest(proof):
+        evidence = real_reverify(proof)
+        observed_digests[(proof.group_name, proof.label)] = (
+            evidence.observed_hexdigest()
+        )
+        return evidence
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", count_mode_array_reads)
+    monkeypatch.setattr(
+        writer, "_reverify_durable_mode_proof", capture_observed_digest,
+    )
+    writer._close_handle()
+
+    expected_reads = {}
+    for proof in writer._durable_mode_proofs.values():
+        prefix = f"/{writer.entry}/{proof.group_name}"
+        for name in ("q", "intensity"):
+            expected_reads[f"{prefix}/{name}"] = 1
+        if proof.sigma_expected:
+            expected_reads[f"{prefix}/sigma"] = 1
+        if proof.dimension == "2d":
+            expected_reads[f"{prefix}/chi"] = 1
+    assert reads == expected_reads
+    assert observed_digests == checkpoint_digests
+    session.abort()
+
+
 def test_one_shot_refuses_a_second_owner_during_live_cadence(tmp_path):
     from xdart.modules.reduction import write_live_scan_to_nexus
 

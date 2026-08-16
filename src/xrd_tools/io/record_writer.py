@@ -821,6 +821,7 @@ class NexusRecordWriter:
         self,
         evidence: _EvidenceBuilder,
         expected: _ExpectedModeRow,
+        observed: _ExpectedModeRow | None = None,
     ) -> _DurableModeProof:
         entry = self._entry_group()
         group = entry.get(expected.group_name)
@@ -854,13 +855,20 @@ class NexusRecordWriter:
             np.asarray(expected.label, dtype=frame_index.dtype),
             np.asarray(frame_index[expected.row]),
         )
-        evidence.array(f"{role}/q", expected.radial, np.asarray(group["q"][()]))
+        observed_radial = (
+            np.asarray(group["q"][()])
+            if observed is None else observed.radial
+        )
+        evidence.array(f"{role}/q", expected.radial, observed_radial)
         evidence.text(
             f"{role}/q@units",
             expected.unit,
             self._text_value(group["q"].attrs.get("units", "")),
         )
-        observed_intensity = np.asarray(group["intensity"][expected.row])
+        observed_intensity = (
+            np.asarray(group["intensity"][expected.row])
+            if observed is None else observed.intensity
+        )
         evidence.array(f"{role}/intensity", expected.intensity, observed_intensity)
         evidence.text(
             f"{role}/shape-facts",
@@ -883,10 +891,14 @@ class NexusRecordWriter:
         )
         sigma = group.get("sigma")
         if expected.sigma is None:
-            if sigma is None:
+            observed_sigma = (
+                None if observed is None and sigma is None
+                else (np.asarray(sigma[expected.row])
+                      if observed is None else observed.sigma)
+            )
+            if observed_sigma is None:
                 evidence.absent(f"{role}/sigma", True)
             else:
-                observed_sigma = np.asarray(sigma[expected.row])
                 evidence.array(
                     f"{role}/sigma-absent-row",
                     np.full(expected.intensity.shape, np.nan, dtype=np.float32),
@@ -898,7 +910,8 @@ class NexusRecordWriter:
             evidence.array(
                 f"{role}/sigma",
                 expected.sigma,
-                np.asarray(sigma[expected.row]),
+                (np.asarray(sigma[expected.row])
+                 if observed is None else observed.sigma),
             )
         if expected.dimension == "2d":
             if expected.azimuthal is None:
@@ -906,7 +919,8 @@ class NexusRecordWriter:
             evidence.array(
                 f"{role}/chi",
                 expected.azimuthal,
-                np.asarray(group["chi"][()]),
+                (np.asarray(group["chi"][()])
+                 if observed is None else observed.azimuthal),
             )
             evidence.text(
                 f"{role}/chi@units",
@@ -1277,14 +1291,16 @@ class NexusRecordWriter:
             raise WriterStateError(
                 f"durable-row proof lost label {proof.label}"
             )
-        sigma = None
+        sigma_dataset = group.get("sigma")
         if proof.sigma_expected:
-            sigma_dataset = group.get("sigma")
             if not isinstance(sigma_dataset, h5py.Dataset):
                 raise WriterStateError(
                     f"durable-row proof lost sigma for label {proof.label}"
                 )
-            sigma = np.asarray(sigma_dataset[proof.row])
+        sigma = (
+            None if sigma_dataset is None
+            else np.asarray(sigma_dataset[proof.row])
+        )
         azimuthal = None
         if proof.dimension == "2d":
             chi = group.get("chi")
@@ -1293,7 +1309,7 @@ class NexusRecordWriter:
                     f"durable-row proof lost chi for label {proof.label}"
                 )
             azimuthal = np.asarray(chi[()])
-        expected = _ExpectedModeRow(
+        observation = _ExpectedModeRow(
             group_name=proof.group_name,
             label=proof.label,
             row=proof.row,
@@ -1308,9 +1324,24 @@ class NexusRecordWriter:
             two_d_kind=proof.two_d_kind,
             source_shape=proof.source_shape,
         )
+        expected = _ExpectedModeRow(
+            group_name=proof.group_name,
+            label=proof.label,
+            row=proof.row,
+            dimension=proof.dimension,
+            mode=proof.mode,
+            radial=observation.radial,
+            azimuthal=observation.azimuthal,
+            intensity=observation.intensity,
+            sigma=observation.sigma if proof.sigma_expected else None,
+            unit=proof.unit,
+            azimuthal_unit=proof.azimuthal_unit,
+            two_d_kind=proof.two_d_kind,
+            source_shape=proof.source_shape,
+        )
         evidence = _EvidenceBuilder()
-        observed = self._verify_mode_row(evidence, expected)
-        if observed.digest != proof.digest:
+        self._verify_mode_row(evidence, expected, observation)
+        if evidence.observed_hexdigest() != proof.digest:
             raise WriterStateError(
                 f"durable-row proof changed for {proof.group_name} "
                 f"label {proof.label}"
