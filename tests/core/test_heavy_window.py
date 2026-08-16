@@ -6,11 +6,38 @@ frame shape is unknown, and a detection-failure fallback to today's 64.
 """
 
 import xrd_tools.core.staging as hw
+import pytest
 from xrd_tools.core import heavy_window, heavy_window_log_line
 from xrd_tools.core import live_record_store_max_items, live_record_trace_bytes
+from xrd_tools.session import run_configuration as run_config
 
 GiB = 1024 ** 3
 MiB = 1024 ** 2
+
+
+def test_heavy_residency_choice_is_exact_and_rejects_mutated_intent():
+    assert run_config.heavy_residency_choice({}) == ("auto", None)
+    for value in (16, 32, 64):
+        assert run_config.heavy_residency_choice(
+            {"heavy_window": value}
+        ) == (str(value), value)
+    for value in (True, 16.0, "16", 8, 128, None):
+        with pytest.raises((TypeError, ValueError)):
+            run_config.RunIntent(run_options={"heavy_window": value})
+    intent = run_config.RunIntent()
+    intent.run_options["heavy_window"] = 48
+    with pytest.raises(ValueError):
+        intent.freeze()
+
+
+def test_explicit_heavy_residency_changes_fingerprint_and_provenance():
+    automatic = run_config.RunIntent().freeze()
+    explicit = run_config.RunIntent(
+        run_options={"heavy_window": 16}
+    ).freeze()
+    assert automatic.fingerprint != explicit.fingerprint
+    assert automatic.run_options == {}
+    assert explicit.as_provenance()["run_options"] == {"heavy_window": 16}
 
 
 # ── budget math: 25% of total RAM / frame_bytes, clamped [16, 64] ────────────

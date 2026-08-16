@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.themes.spacing import current_spacing_tokens
 from xdart.utils.throttle import Coalescer
@@ -403,10 +403,38 @@ class BrowserView(QtWidgets.QFrame):
                         ShellCommandKind.MENU, value
                     )
                 )
+            if title == "Config":
+                self._heavy_residency_menu = QtWidgets.QMenu("Heavy residency", menu); menu.addMenu(self._heavy_residency_menu)
+                self._heavy_residency_group = QtGui.QActionGroup(self._heavy_residency_menu)
+                self._heavy_residency_group.setExclusive(True)
+                self._heavy_residency_actions = {}
+                for label in ("Auto", "16", "32", "64"):
+                    action = self._heavy_residency_menu.addAction(label)
+                    action.setCheckable(True)
+                    self._heavy_residency_group.addAction(action)
+                    action.triggered.connect(
+                        lambda _checked=False, choice=label: self._emit(
+                            ShellCommandKind.MENU,
+                            f"Config:Heavy residency:{choice}",
+                        )
+                    )
+                    self._heavy_residency_actions[label.lower()] = action
+                self._heavy_residency_actions["auto"].setChecked(True)
             button.setMenu(menu)
             row.addWidget(button)
         row.addStretch(1)
         return row
+
+    def reconcile_heavy_residency(
+        self, choice: str, *, next_run: bool,
+    ) -> None:
+        action = self._heavy_residency_actions.get(str(choice).lower())
+        if action is None:
+            raise ValueError("unsupported heavy residency choice")
+        action.setChecked(True)
+        self._heavy_residency_menu.setTitle(
+            "Heavy residency (next run)" if next_run else "Heavy residency"
+        )
 
     def _make_header(self) -> QtWidgets.QHBoxLayout:
         row = QtWidgets.QHBoxLayout()

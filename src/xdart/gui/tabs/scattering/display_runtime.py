@@ -165,6 +165,7 @@ class RunDisplayState:
             ..., PublicationStore
         ] = PublicationStore
         self._configured = False
+        self._allocated_heavy_limit: int | None = None
         self._residency = RunDisplayResidency(
             DisplayResidencyLimits(1, 1, 1, 1)
         )
@@ -246,6 +247,27 @@ class RunDisplayState:
                 live_record_store_max_items(self._npt),
             )
         )
+
+    def bind_heavy_allocation(self, allocation: object) -> int:
+        """Bind the display tier to the monotonic minimum actual heavy grant."""
+
+        record = getattr(allocation, "record_heavy_items", None)
+        publication = getattr(allocation, "publication_heavy_items", None)
+        if any(type(value) is not int or value < 1
+               for value in (record, publication)):
+            raise ValueError("display heavy allocation grants must be positive integers")
+        granted = min(record, publication)
+        with self._lock:
+            effective = (
+                granted if self._allocated_heavy_limit is None
+                else min(self._allocated_heavy_limit, granted)
+            )
+            self._allocated_heavy_limit = effective
+            self._residency.limits = replace(
+                self._residency.limits, heavy=effective,
+            )
+            self._residency.enforce()
+            return effective
 
     def add_artifact(
         self,

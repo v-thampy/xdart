@@ -57,7 +57,7 @@ from .target_reservation import (
     AdmissionOperation as _AdmissionOperation,
     RunResources,
 )
-from .dynamic_output import DynamicOutputAdapter
+from .dynamic_output import DynamicOutputAdapter, HeavyResidencyFact
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,7 @@ class _StandardRun:
     light_projection_error_lock: Lock = field(default_factory=Lock)
     gui_thread_id: int = field(default_factory=get_ident)
     command_failure: DetachedDiagnostic | None = None
+    resource_facts: list[HeavyResidencyFact] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.perf_enabled = bool(os.environ.get("XDART_PERF"))
@@ -1114,6 +1115,7 @@ class StandardRunExecutor:
                 owner, self._commit_gate(run),
             ),
             on_frame_completed=lambda event: self._frame_ready(run, event),
+            resource_fact_sink=run.resource_facts.append,
         )
         run.sink = output
         write_labels = set(output.write_labels)
@@ -2321,6 +2323,8 @@ class StandardRunExecutor:
             throughput,
             run.artifact,
         )
+        for fact in run.resource_facts:
+            logger.info("%s", fact.log_line("[PERF-RESOURCES]"))
         if run.perf_enabled:
             with run.perf_lock:
                 perf = dict(run.perf_values)

@@ -746,6 +746,23 @@ def _normalize_output_mode(value: str) -> str:
     raise ValueError("output_mode must be Append, Overwrite, or Replace")
 
 
+def heavy_residency_choice(
+    run_options: Mapping[Any, Any],
+) -> tuple[str, int | None]:
+    """Return the exact next-run heavy choice, rejecting every other value."""
+
+    if not isinstance(run_options, Mapping):
+        raise TypeError("run_options must be a mapping")
+    if "heavy_window" not in run_options:
+        return "auto", None
+    value = run_options["heavy_window"]
+    if type(value) is not int:
+        raise TypeError("heavy_window must be an exact integer")
+    if value not in {16, 32, 64}:
+        raise ValueError("heavy_window must be one of 16, 32, or 64")
+    return str(value), value
+
+
 @dataclass(frozen=True, slots=True)
 class FrozenRunConfiguration:
     """One generation-stamped, deeply immutable processing-run configuration."""
@@ -797,6 +814,7 @@ class FrozenRunConfiguration:
             "output_mode",
             _normalize_output_mode(self.output_mode),
         )
+        heavy_residency_choice(self.run_options)
         payload = self._content_fingerprint_value()
         digest = hashlib.sha256(
             _canonical_json(payload).encode("utf-8")
@@ -1004,6 +1022,7 @@ class RunIntent:
         self.bai_1d_args = dict(self.bai_1d_args or {})
         self.bai_2d_args = dict(self.bai_2d_args or {})
         self.run_options = dict(self.run_options or {})
+        heavy_residency_choice(self.run_options)
         if isinstance(self.gi, Mapping):
             self.gi = GIIntent.from_mapping(self.gi)
         if not isinstance(self.gi, GIIntent):
@@ -1038,6 +1057,7 @@ class RunIntent:
         rather than independently by each run consumer.
         """
 
+        heavy_residency_choice(self.run_options)
         if generation is None:
             next_generation = int(self.generation) + 1
         else:
@@ -1400,6 +1420,7 @@ __all__ = [
     "RunIntent",
     "ThresholdIntent",
     "admit_run_configuration",
+    "heavy_residency_choice",
     "jsonable_run_value",
     "require_run_configuration",
     "resolve_gi_motor",

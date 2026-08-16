@@ -20,6 +20,7 @@ from xrd_tools.session.intent_store import (
     RunIntentStore,
     RunIntentSnapshot,
 )
+from xrd_tools.session.run_configuration import heavy_residency_choice
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
@@ -714,6 +715,35 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._stop_run()
             return
         if kind is ShellCommandKind.MENU:
+            prefix = "Config:Heavy residency:"
+            if str(command.value).startswith(prefix):
+                label = str(command.value)[len(prefix):]
+                values = {"Auto": None, "16": 16, "32": 32, "64": 64}
+                if label not in values:
+                    return
+                snapshot = self._intents.snapshot()
+                candidate = snapshot.thaw()
+                value = values[label]
+                if value is None:
+                    candidate.run_options.pop("heavy_window", None)
+                else:
+                    candidate.run_options["heavy_window"] = value
+                result = self._intents.commit(
+                    candidate, expected_revision=snapshot.revision,
+                )
+                if isinstance(result, IntentRecaptureRequired):
+                    self._notice("Heavy residency edit superseded; review current value.")
+                else:
+                    active = any(value is not None for value in (
+                        self._lifecycle.active_run_identity,
+                        self._lifecycle.attempt_run_identity,
+                    ))
+                    self._notice(
+                        f"Heavy residency {label} selected"
+                        + (" for the next run." if active else ".")
+                    )
+                self._refresh_shell()
+                return
             if command.value == "File:Open Folder":
                 self._choose_browser_directory()
             return
@@ -1668,6 +1698,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             norm_aggregate=self._context_controller.norm_aggregate,
         )
         try:
+            choice, _ = heavy_residency_choice(intent.run_options)
+            self._shell.browser.reconcile_heavy_residency(
+                choice,
+                next_run=any(value is not None for value in (
+                    self._lifecycle.active_run_identity,
+                    self._lifecycle.attempt_run_identity,
+                )),
+            )
             self._shell.apply_state(
                 projection,
                 preserve_display=preserve_display,

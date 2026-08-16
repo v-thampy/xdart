@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
@@ -52,8 +53,10 @@ from xrd_tools.session.policy import requirements_from
 from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.core.staging import (
     browse_publication_max_items,
+    heavy_window,
     total_physical_ram_bytes,
 )
+from xrd_tools.session.run_configuration import heavy_residency_choice
 from xrd_tools.session.display_logic import xye_prefix_for_unit
 
 from ..contracts import AdmittedOutput, PlannedOutput, SourceExecutionStamp
@@ -62,9 +65,37 @@ from ..output_preflight import source_snapshots
 
 _MISSING = object()
 _SUPPORTED_LINEAGE_FRAME_CEILING = 1_000_000
+logger = logging.getLogger(__name__)
 
 
-def _light_policy_layout(configuration, plan, item, scan, write_labels):
+@dataclass(frozen=True, slots=True)
+class HeavyResidencyFact:
+    artifact: str; choice: str; resolution_source: str
+    requested_heavy_bound: int; granted_staging_count: int
+    granted_record_heavy_count: int; granted_publication_heavy_count: int; effective_display_count: int
+
+    def log_line(self, prefix: str) -> str:
+        return (
+            f"{prefix} artifact={self.artifact} choice={self.choice} "
+            f"source={self.resolution_source} requested={self.requested_heavy_bound} "
+            f"staging={self.granted_staging_count} record-heavy={self.granted_record_heavy_count} "
+            f"publication-heavy={self.granted_publication_heavy_count} "
+            f"effective-display={self.effective_display_count}")
+
+
+def _heavy_resolution_source(bound: int | None, env: dict[str, str]) -> str:
+    if bound is not None: return "ui"
+    raw = env.get("XDART_HEAVY_WINDOW")
+    try:
+        int(str(raw).strip())
+    except (TypeError, ValueError): return "auto"
+    return "environment" if str(raw).strip() else "auto"
+
+
+def _light_policy_layout(
+    configuration, plan, item, scan, write_labels, *, heavy_request=None,
+    env=None,
+):
     if not write_labels:
         raise ValueError("dynamic light-1D mount has no admitted write frame")
     try:
@@ -83,7 +114,16 @@ def _light_policy_layout(configuration, plan, item, scan, write_labels):
     requirements = requirements_from(SimpleNamespace(
         frame_shape=tuple(shape), dtype=np.dtype(native_dtype)), plan)
     requested = max(1, int(configuration.max_cores))
-    policy = resolve_session_policy(requirements, requested_workers=requested)
+    requests = None
+    if heavy_request is not None:
+        _, heavy_request = heavy_residency_choice({"heavy_window": heavy_request})
+        requests = {
+            "staging_items": heavy_request, "record_heavy_items": heavy_request,
+            "publication_heavy_items": heavy_request,
+        }
+    policy = resolve_session_policy(
+        requirements, requested_workers=requested, requests=requests, env=env,
+    )
     allocation = policy.allocation
     interval = 8 if plan.integration_2d is not None else 1000
     policy = replace(policy, flush=FlushPolicy(
@@ -381,6 +421,7 @@ class DynamicOutputAdapter:
         self._command_lock = RLock()
         self._activating = False
         self._stop_requested = False
+        self.resource_facts: tuple[HeavyResidencyFact, ...] = ()
 
     @staticmethod
     def _discard_identity(values: list[Any], owner: Any) -> None:
@@ -593,6 +634,7 @@ class DynamicOutputAdapter:
         light_drain=None,
         light_verify=None,
         on_frame_completed=None,
+        resource_fact_sink=None,
     ):
         if type(run_provenance) is not dict:
             raise TypeError("dynamic output requires exact run provenance")
@@ -721,11 +763,35 @@ class DynamicOutputAdapter:
                 preflight.snapshot.write_labels
             )
             if coordinated:
+                resource_env = dict(os.environ)
+                choice, heavy_request = heavy_residency_choice(
+                    self.configuration.run_options
+                )
                 policy, layout, requested_rows, ceiling, first_write_frame = \
                     _light_policy_layout(
                         self.configuration, plan, item, scan, write_labels,
+                        heavy_request=heavy_request,
+                        env=resource_env,
                 )
                 allocation = policy.allocation
+                requested_heavy = (
+                    heavy_request if heavy_request is not None else heavy_window(
+                        8 * allocation.requirements.pixels, env=resource_env,
+                    )
+                )
+                effective_display = display_state.bind_heavy_allocation(
+                    allocation
+                )
+                fact = HeavyResidencyFact(
+                    str(target), choice,
+                    _heavy_resolution_source(heavy_request, resource_env),
+                    requested_heavy, allocation.staging_items,
+                    allocation.record_heavy_items,
+                    allocation.publication_heavy_items, effective_display,
+                )
+                self.resource_facts += (fact,)
+                if resource_fact_sink is not None: resource_fact_sink(fact)
+                logger.info("%s", fact.log_line("[RUN-RESOURCES]"))
                 bind_source = getattr(source_owner, "bind_allocation", None)
                 if callable(bind_source):
                     bind_source(allocation)

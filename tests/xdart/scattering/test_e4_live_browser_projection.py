@@ -40,6 +40,127 @@ from xrd_tools.session.run_configuration import RunIntent
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
 
 
+def test_heavy_residency_menu_is_exclusive_and_edits_only_next_intent():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    intents = RunIntentStore(RunIntent())
+    lifecycle = ScatteringCoordinator()
+    page = ScatteringWorkspace(
+        intents=intents, lifecycle=lifecycle, sources=FilesystemSourceAdapter()
+    )
+    frozen = intents.snapshot().thaw().freeze()
+    lifecycle._active_run_identity = RunIdentity.from_configuration(frozen)
+    try:
+        button = page._shell.browser.findChild(
+            QtWidgets.QToolButton, "configMenuButton"
+        )
+        heavy = next(
+            action.menu() for action in button.menu().actions()
+            if action.menu() is not None
+            and action.menu().title().startswith("Heavy residency")
+        )
+        choices = {action.text(): action for action in heavy.actions()}
+        assert choices["Auto"].isChecked()
+        assert sum(action.isChecked() for action in choices.values()) == 1
+        revision = intents.revision
+        choices["32"].trigger()
+        app.processEvents()
+        assert intents.revision == revision + 1
+        assert intents.snapshot().thaw().run_options == {"heavy_window": 32}
+        assert frozen.run_options == {}
+        assert choices["32"].isChecked()
+        assert "next run" in heavy.title().lower()
+    finally:
+        lifecycle._active_run_identity = None
+        page.close_workspace()
+        page.deleteLater()
+        app.processEvents()
+
+
+def test_explicit_heavy_residency_requests_all_three_bounds_without_env_mutation(
+    monkeypatch,
+):
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
+    before = dict(os.environ)
+    observed = {}
+    original = dynamic_output.resolve_session_policy
+
+    def capture(requirements, **kwargs):
+        observed.update(kwargs)
+        return original(requirements, envelope_bytes=8 * 1024 ** 3, **kwargs)
+
+    monkeypatch.setattr(dynamic_output, "resolve_session_policy", capture)
+    configuration = RunIntent(
+        max_cores=1, run_options={"heavy_window": 64}
+    ).freeze()
+    descriptor = SimpleNamespace(
+        frame_shape=(4, 4), dtype=dynamic_output.np.dtype("uint16")
+    )
+    item = SimpleNamespace(descriptor=descriptor)
+    scan = SimpleNamespace(frames=(SimpleNamespace(index=1, image=None),))
+    plan = SimpleNamespace(integration_1d=None, integration_2d=None, gi=None)
+    policy, *_ = dynamic_output._light_policy_layout(
+        configuration, plan, item, scan, (1,), heavy_request=64,
+        env=dict(os.environ),
+    )
+    assert observed["requests"] == {
+        "staging_items": 64,
+        "record_heavy_items": 64,
+        "publication_heavy_items": 64,
+    }
+    assert policy.allocation.staging_items == 64
+    assert dict(os.environ) == before
+
+
+def test_auto_fact_survives_post_allocation_failure_and_reaches_terminal(
+    monkeypatch, tmp_path, caplog,
+):
+    import logging
+    from xdart.gui.tabs.scattering.adapters import dynamic_output, run_executor as executor_module
+    from xdart.gui.tabs.scattering.display_runtime import RunDisplayState; from xdart.gui.tabs.scattering.display_values import StandardEventKind
+    from xdart.gui.tabs.scattering.events import CleanupStatus, ExecutorClosed
+    from xrd_tools.core import staging
+
+    configuration = RunIntent(output_mode="Overwrite").freeze(); identity = RunIdentity.from_configuration(configuration)
+    state = RunDisplayState(identity, max_payload_items=1); state.configure(partition_count=2, npt=10, frame_bytes=1024)
+    monkeypatch.delenv("XDART_HEAVY_WINDOW", raising=False); monkeypatch.setattr(staging, "total_physical_ram_bytes", lambda: 64 * 1024 ** 3)
+    monkeypatch.setattr(dynamic_output, "total_physical_ram_bytes", lambda: 64 * 1024 ** 3)
+    real_policy = dynamic_output.resolve_session_policy
+    monkeypatch.setattr(dynamic_output, "resolve_session_policy", lambda req, **kw: real_policy(req, envelope_bytes=8 * 1024 ** 3, **kw))
+    monkeypatch.setattr(dynamic_output, "_science_projection", lambda *_: {})
+    monkeypatch.setattr(dynamic_output, "_stable_lineage", lambda *_: ("auto",))
+    monkeypatch.setattr(dynamic_output, "_append_intent", lambda *_a, **_k: SimpleNamespace(modes=()))
+    monkeypatch.setattr(dynamic_output, "required_result_modes", lambda *_: ())
+    frame = SimpleNamespace(index=1, image=None)
+    item = SimpleNamespace(target=tmp_path / "auto.nxs", descriptor=SimpleNamespace(frame_shape=(4, 4), dtype=dynamic_output.np.dtype("uint16")), source_stamp=SimpleNamespace(frame_count=1, first_label=1))
+    plan = SimpleNamespace(integration_1d=None, integration_2d=SimpleNamespace(npt_rad=2, npt_azim=2, error_model=None), gi=None); facts = []
+    def fail_bind(_allocation): raise RuntimeError("injected post-allocation failure")
+    caplog.set_level(logging.INFO)
+    try:
+        dynamic_output.DynamicOutputAdapter(configuration).activate(
+            SimpleNamespace(frames=(frame,)), plan, item, object(),
+            record_store=object(), run_provenance={}, publication_store=object(), display_owner=object(),
+            display_state=state, source_owner=SimpleNamespace(bind_allocation=fail_bind), gui_thread_id=1,
+            light_cancel=lambda: None, light_drain=lambda: None, light_verify=lambda: None,
+            on_frame_completed=lambda _event: None, resource_fact_sink=facts.append,
+        )
+    except RuntimeError as error: assert str(error) == "injected post-allocation failure"
+    else: raise AssertionError("post-allocation failure was not injected")
+    assert len(facts) == 1
+    fact = facts[0]
+    assert (fact.choice, fact.resolution_source, fact.requested_heavy_bound) == ("auto", "auto", 64)
+    for grants, expected in (((32, 16), 16), ((64, 64), 16), ((8, 12), 8)):
+        assert state.bind_heavy_allocation(SimpleNamespace(record_heavy_items=grants[0], publication_heavy_items=grants[1])) == expected
+    run = executor_module._StandardRun(configuration, identity, None, None, None, None, item.target, resource_facts=facts)
+    executor_module.StandardRunExecutor()._terminal_event(
+        run, StandardEventKind.FINISHED,
+        ExecutorClosed(identity, CleanupStatus.CLEANED), 1, 1)
+    messages = [record.getMessage() for record in caplog.records]
+    assert [value for value in messages if value.startswith("[RUN-RESOURCES]")] == [fact.log_line("[RUN-RESOURCES]")]
+    assert [value for value in messages if value.startswith("[PERF-RESOURCES]")] == [fact.log_line("[PERF-RESOURCES]")]
+
+
 def test_processed_catalog_includes_parent_and_child_directory_navigation(
     tmp_path: Path,
 ) -> None:
