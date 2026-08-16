@@ -614,9 +614,12 @@ class RunDisplayState:
         owner: DisplayArtifact,
         labels: tuple[int, ...],
     ) -> None:
-        """Project only exact writer-boundary durable labels as persisted."""
+        """Rearm this writer-bound owner's heavy keys at durability."""
 
         with self._lock:
+            self._residency._rearm_heavy_owner(
+                owner.records, owner.publications
+            )
             self._residency.enforce()
 
     def frame_norm_aggregate(

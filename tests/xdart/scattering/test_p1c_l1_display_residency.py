@@ -9,6 +9,7 @@ import threading
 import time
 
 import numpy as np
+import pytest
 from pyqtgraph import QtWidgets
 
 from tests.xdart.scattering._e2sd_support import write_poni
@@ -257,6 +258,142 @@ def _p2_demote_combined(store):
             base.view, thumbnail=np.asarray(source)[::8, ::8],
         )))
     assert store.evict_heavy(0)
+
+
+def _heavy_case(identity: str, labels: tuple[int, ...]):
+    state = RunDisplayState(RunIdentity(1, identity), max_payload_items=2)
+    state.configure(partition_count=1, npt=8, frame_bytes=32)
+    owner = _owner(state)
+    modes = (("1d", "default"), ("2d", "default"))
+    keys = tuple(
+        _publish(state, owner, label, hydratable=modes, durable=())[1]
+        for label in labels
+    )
+    return state, owner, modes, keys
+
+
+def test_blocked_heavy_candidates_probe_once_until_owner_rearm(
+    monkeypatch,
+) -> None:
+    state, owner, modes, keys = _heavy_case("p1c-candidates", (1, 2))
+    state._residency.limits = DisplayResidencyLimits(1, 8, 8, 8)
+    attempts = []
+    real_evict = state._residency._evict_heavy
+
+    def counted_evict(key):
+        attempts.append(key)
+        return real_evict(key)
+
+    monkeypatch.setattr(state._residency, "_evict_heavy", counted_evict)
+    state._residency.enforce()
+    assert attempts == list(keys)
+    state._residency.enforce()
+    state._residency.enforce()
+    assert attempts == list(keys)
+
+    for label in (1, 2):
+        owner.records.replace_projection(
+            label, hydratable=modes, durable=modes
+        )
+    state.mark_durable(owner, (1, 2))
+    assert attempts == [*keys, keys[0]]
+    assert tuple(state._residency._heavy) == (keys[1],)
+
+
+def test_owner_rearm_uses_global_fifo_and_includes_dropped_projection(
+    monkeypatch,
+) -> None:
+    state = RunDisplayState(RunIdentity(1, "p1c-owner-fifo"), max_payload_items=2)
+    state.configure(partition_count=2, npt=8, frame_bytes=32)
+    owners = [
+        state.add_artifact(
+            Path(f"/run/p1c-{name}.nexus"),
+            "p1c-l1",
+            mask=None,
+            mask_saturation=False,
+            measurement_mode="Standard",
+        )
+        for name in ("a", "b")
+    ]
+    modes = (("1d", "default"), ("2d", "default"))
+    keys = [
+        _publish(state, owner, label, hydratable=modes, durable=())[1]
+        for owner in owners
+        for label in (1, 2)
+    ]
+    residency = state._residency
+    residency.limits = DisplayResidencyLimits(2, 8, 8, 8)
+    residency.enforce()
+    residency.observe(
+        keys[3],
+        records=owners[1].records,
+        publications=owners[1].publications,
+    )
+    assert tuple(residency._heavy_candidates) == (keys[3],)
+
+    owners[0].records.replace_projection(
+        1, hydratable=modes, durable=modes
+    )
+    owners[0].records.replace_projection(
+        2,
+        hydratable=(("1d", "default"),),
+        durable=(("1d", "default"),),
+        dropped=(("2d", "default"),),
+    )
+    attempts = []
+    real_evict = residency._evict_heavy
+
+    def counted_evict(key):
+        attempts.append(key)
+        return real_evict(key)
+
+    monkeypatch.setattr(residency, "_evict_heavy", counted_evict)
+    state.mark_durable(owners[0], (1,))
+
+    assert attempts == keys[:2]
+    assert tuple(residency._heavy) == tuple(keys[2:])
+    assert tuple(residency._heavy_candidates) == (keys[3],)
+    assert owners[0].records.dropped_modes(2) == {("2d", "default")}
+    assert not owners[0].records.has_heavy_payload(2)
+    assert owners[1].records.has_heavy_payload(1)
+
+
+def test_heavy_candidate_capture_restore_and_exception_retry(
+    monkeypatch,
+) -> None:
+    state, owner, modes, keys = _heavy_case("p1c-retry", (1, 2, 3))
+    residency = state._residency
+    captured = residency.capture(keys[1])
+    before = tuple(residency._heavy), tuple(residency._heavy_candidates)
+    residency.observe(
+        keys[0], records=owner.records, publications=owner.publications
+    )
+    assert (tuple(residency._heavy), tuple(residency._heavy_candidates)) != before
+    residency.restore(captured)
+    assert (tuple(residency._heavy), tuple(residency._heavy_candidates)) == before
+
+    owner.records.replace_projection(1, hydratable=modes, durable=modes)
+    residency.limits = DisplayResidencyLimits(2, 8, 8, 8)
+    attempts = []
+    real_evict = residency._evict_heavy
+
+    def fail_once(key):
+        attempts.append(key)
+        if len(attempts) == 1:
+            raise RuntimeError("injected heavy eviction failure")
+        return real_evict(key)
+
+    monkeypatch.setattr(residency, "_evict_heavy", fail_once)
+    with pytest.raises(RuntimeError, match="injected heavy eviction failure"):
+        residency.enforce()
+    assert attempts == [keys[0]]
+    assert tuple(residency._heavy_candidates) == keys
+    assert tuple(residency._heavy) == keys
+
+    residency.enforce()
+    assert attempts == [keys[0], keys[0]]
+    assert tuple(residency._heavy_candidates) == keys[1:]
+    assert tuple(residency._heavy) == keys[1:]
 
 
 def test_display_retain_does_not_rewrite_session_projection() -> None:

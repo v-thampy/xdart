@@ -39,6 +39,9 @@ class RunDisplayResidency:
         self.limits = limits
         self._stores: dict[DisplayFrameKey, _ResidentStores] = {}
         self._heavy: OrderedDict[DisplayFrameKey, None] = OrderedDict()
+        self._heavy_candidates: OrderedDict[
+            DisplayFrameKey, None
+        ] = OrderedDict()
         self._thumbnails: OrderedDict[DisplayFrameKey, None] = OrderedDict()
         self._browse: OrderedDict[DisplayFrameKey, None] = OrderedDict()
         self._live: OrderedDict[DisplayFrameKey, None] = OrderedDict()
@@ -66,12 +69,16 @@ class RunDisplayResidency:
         self._stores[key] = stores
         self._touch(self._live, key)
         self._touch(self._browse, key)
-        if (
+        has_heavy = (
             incoming_heavy
             or records.has_heavy_payload(key.local_frame_label)
             or publications.has_heavy_payload(key.local_frame_label)
-        ):
+        )
+        if has_heavy:
             self._touch(self._heavy, key)
+            self._touch(self._heavy_candidates, key)
+        elif key in self._heavy:
+            self._rearm_heavy_key(key)
         if (
             incoming_thumbnail
             or publications.has_thumbnail(key.local_frame_label)
@@ -80,7 +87,7 @@ class RunDisplayResidency:
 
     def enforce(self) -> None:
         """Apply the cap trims (demotion-only store operations)."""
-        self._trim(self._heavy, self.limits.heavy, self._evict_heavy)
+        self._trim_heavy()
         self._trim(
             self._thumbnails,
             self.limits.thumbnails,
@@ -93,15 +100,16 @@ class RunDisplayResidency:
         """Exact pre-attempt facts for ONE key (§22.3 prepare half).
 
         Detached values: the key's registration entry plus the COMPLETE
-        four-tier key order, so :meth:`restore` can put back membership AND
-        FIFO eviction order exactly — never re-derive them from stores the
-        failed attempt already mutated (the §22.2 root cause).
+        four-tier and heavy-probe key orders, so :meth:`restore` can put back
+        membership AND FIFO eviction order exactly — never re-derive them from
+        stores the failed attempt already mutated (the §22.2 root cause).
         """
         return (
             key,
             key in self._stores,
             self._stores.get(key),
             tuple(self._heavy),
+            tuple(self._heavy_candidates),
             tuple(self._thumbnails),
             tuple(self._browse),
             tuple(self._live),
@@ -116,13 +124,23 @@ class RunDisplayResidency:
         position of a re-observed public key and the complete removal of a
         never-published candidate.  Idempotent; pure dict operations.
         """
-        key, registered, stores, heavy, thumbnails, browse, live = captured
+        (
+            key,
+            registered,
+            stores,
+            heavy,
+            heavy_candidates,
+            thumbnails,
+            browse,
+            live,
+        ) = captured
         if registered:
             self._stores[key] = stores
         else:
             self._stores.pop(key, None)
         for tier, snapshot in (
             (self._heavy, heavy),
+            (self._heavy_candidates, heavy_candidates),
             (self._thumbnails, thumbnails),
             (self._browse, browse),
             (self._live, live),
@@ -167,6 +185,37 @@ class RunDisplayResidency:
                     break
             if not removed:
                 return
+
+    def _rearm_heavy_owner(self, records: Any, publications: Any) -> None:
+        armed = set(self._heavy_candidates)
+        self._heavy_candidates.clear()
+        for key in self._heavy:
+            stores = self._stores.get(key)
+            if (
+                key in armed
+                or (
+                    stores is not None
+                    and stores.records is records
+                    and stores.publications is publications
+                )
+            ):
+                self._heavy_candidates[key] = None
+
+    def _rearm_heavy_key(self, key: DisplayFrameKey) -> None:
+        armed = set(self._heavy_candidates)
+        armed.add(key)
+        self._heavy_candidates.clear()
+        for candidate in self._heavy:
+            if candidate in armed:
+                self._heavy_candidates[candidate] = None
+
+    def _trim_heavy(self) -> None:
+        while len(self._heavy) > self.limits.heavy and self._heavy_candidates:
+            key = next(iter(self._heavy_candidates))
+            removed = self._evict_heavy(key)
+            self._heavy_candidates.pop(key, None)
+            if removed:
+                self._heavy.pop(key, None)
 
     def _evict_heavy(self, key: DisplayFrameKey) -> bool:
         stores = self._stores.get(key)
@@ -228,6 +277,7 @@ class RunDisplayResidency:
         )
         if removed:
             self._heavy.pop(key, None)
+            self._heavy_candidates.pop(key, None)
             self._thumbnails.pop(key, None)
             self._browse.pop(key, None)
             self._live.pop(key, None)
