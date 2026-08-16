@@ -748,6 +748,10 @@ class DynamicOutputAdapter:
             session_scan = scan if not coordinated else replace(
                 scan, frames=[frame for frame in scan.frames if int(frame.index) in write_labels])
             integration_1d = getattr(plan, "integration_1d", None)
+            inflight_max = (
+                max(1, self.configuration.max_cores)
+                if policy is None else policy.allocation.reduction_inflight
+            )
             if integration_1d is not None:
                 xye = TransactionalXYESink(
                     target.parent / str(scan.name),
@@ -776,6 +780,9 @@ class DynamicOutputAdapter:
                     nexus = NexusSink(
                         target, same_run_intent=intent, **sink_values,
                     )
+                nexus._configure_writer_batch_size(
+                    1 if self.configuration.live_mode else min(8, inflight_max)
+                )
                 self._pending_nexus.append(nexus)
             if nexus is None:
                 sink = xye
@@ -819,9 +826,7 @@ class DynamicOutputAdapter:
                 sink=sink,
                 executor=(self.configuration.max_cores if policy is None
                           else policy.allocation.workers),
-                inflight_max=(max(1, self.configuration.max_cores)
-                              if policy is None
-                              else policy.allocation.reduction_inflight),
+                inflight_max=inflight_max,
                 gi_freeze_mode=(
                     "scout_union" if self.configuration.gi.enabled else None
                 ),

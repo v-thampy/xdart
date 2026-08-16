@@ -2829,6 +2829,69 @@ def test_c2_all_nan_is_written_before_pending_drop_and_committed_canonical(tmp_p
     assert final.durable == frozenset()
 
 
+def test_c2_nexus_preparation_classifies_each_result_array_once(monkeypatch):
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+    from xrd_tools.reduction import Frame, FrameReduction, NexusSink
+    from xrd_tools.session import ResultMode
+    import xrd_tools.reduction.core as reduction_core
+
+    class Writer:
+        def __init__(self):
+            self.records = []
+            self.drops = []
+
+        def write(self, record):
+            self.records.append(record)
+
+        def write_batch(self, records):
+            self.records.extend(records)
+
+        def drop_publication(self, label, mode):
+            self.drops.append((int(label), mode))
+
+    result_1d = IntegrationResult1D(
+        radial=np.array([0.0, 1.0]),
+        intensity=np.array([np.nan, np.nan]),
+        sigma=None,
+        unit="q_A^-1",
+    )
+    result_2d = IntegrationResult2D(
+        radial=np.array([0.0, 1.0]),
+        azimuthal=np.array([-1.0, 1.0]),
+        intensity=np.ones((2, 2)),
+    )
+    tracked = {
+        id(result_1d.intensity): 0,
+        id(result_2d.intensity): 0,
+        id(result_2d.radial): 0,
+        id(result_2d.azimuthal): 0,
+    }
+    original_isfinite = reduction_core.np.isfinite
+
+    def count_isfinite(value, *args, **kwargs):
+        identity = id(value)
+        if identity in tracked:
+            tracked[identity] += 1
+        return original_isfinite(value, *args, **kwargs)
+
+    monkeypatch.setattr(reduction_core.np, "isfinite", count_isfinite)
+    sink = NexusSink("unused.nexus", write_thumbnails=False)
+    writer = Writer()
+    sink._writer = writer
+    sink.write(
+        Frame(7, image=None),
+        FrameReduction(7, result_1d=result_1d, result_2d=result_2d),
+    )
+
+    assert list(tracked.values()) == [1, 1, 1, 1]
+    assert len(writer.records) == 1
+    assert writer.records[0].result_1d is None
+    assert writer.records[0].result_2d is result_2d
+    assert writer.drops == [
+        (7, ResultMode.one_d()),
+    ]
+
+
 @pytest.mark.parametrize("failure_owner", ("sink", "accounting"))
 def test_c2_authority_and_sink_failures_never_publish_false_write(
     tmp_path, monkeypatch, failure_owner,

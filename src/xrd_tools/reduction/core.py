@@ -638,6 +638,7 @@ class CompositeSink:
     output_sink_kinds: frozenset[OutputSinkKind] = field(
         default_factory=frozenset, init=False,
     )
+    writer_batch_size: int = field(default=1, init=False)
 
     @property
     def output_sink_children(self) -> tuple[object, ...]:
@@ -661,6 +662,8 @@ class CompositeSink:
             self, "output_receipt_capabilities", frozenset(capabilities),
         )
         object.__setattr__(self, "output_sink_kinds", frozenset(kinds))
+        sizes = (_sink_writer_batch_size(sink) for sink in self.sinks)
+        object.__setattr__(self, "writer_batch_size", max(sizes, default=1))
         workers = tuple(
             hook for sink in self.sinks
             if callable(hook := getattr(sink, "worker_process", None))
@@ -690,6 +693,11 @@ class CompositeSink:
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         for sink in self.sinks:
             sink.write(frame, reduction)
+
+    def write_batch(self, items: Iterable[tuple[Frame, FrameReduction]]) -> None:
+        batch = tuple(items)
+        for sink in self.sinks:
+            _emit_sink_write_batch(sink, batch)
 
     def _bind_run_saturation_mask(self, state) -> None:
         for sink in self.sinks:
@@ -789,6 +797,22 @@ def _emit_sink_replace(
     if callable(replace):
         replace(frame, reduction)
     else:
+        sink.write(frame, reduction)
+
+
+def _sink_writer_batch_size(sink: object) -> int:
+    value = getattr(sink, "writer_batch_size", 1)
+    if type(value) is not int or value < 1:
+        raise TypeError("sink writer_batch_size must be a positive exact int")
+    return value
+
+
+def _emit_sink_write_batch(sink: ReductionSink, items: tuple[tuple, ...]) -> None:
+    write_batch = getattr(sink, "write_batch", None)
+    if callable(write_batch):
+        write_batch(items)
+        return
+    for frame, reduction in items:
         sink.write(frame, reduction)
 
 
@@ -1182,6 +1206,7 @@ class NexusSink:
     _defer_publication_drop_settlement: bool = field(
         default=False, init=False, repr=False,
     )
+    _writer_batch_size: int = field(default=1, init=False, repr=False)
     _existing_append_intent: AppendIntent | None = field(
         default=None, init=False, repr=False,
     )
@@ -1222,6 +1247,17 @@ class NexusSink:
     @property
     def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
         return frozenset({OutputSinkKind.NEXUS})
+
+    @property
+    def writer_batch_size(self) -> int:
+        return self._writer_batch_size
+
+    def _configure_writer_batch_size(self, value: int) -> None:
+        if type(value) is not int or not 1 <= value <= 8:
+            raise TypeError("Nexus writer batch size must be an exact int in [1, 8]")
+        if self._writer is not None:
+            raise RuntimeError("Nexus writer batch size must bind before begin")
+        self._writer_batch_size = value
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -1655,14 +1691,41 @@ class NexusSink:
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         return self._write_or_replace(frame, reduction, replace_existing=False)
 
+    def write_batch(self, items: Iterable[tuple[Frame, FrameReduction]]) -> None:
+        self._write_batch(tuple(items), replace_existing=False)
+
     def _write_or_replace(
         self, frame: Frame, reduction: FrameReduction, *, replace_existing: bool,
     ) -> None:
+        dropped = self._write_batch(
+            ((frame, reduction),), replace_existing=replace_existing,
+        )
+        return frozenset(dropped[0])
+
+    def _write_batch(self, items: tuple[tuple, ...], *, replace_existing: bool
+                     ) -> tuple[tuple[ResultMode, ...], ...]:
+        if not items:
+            return ()
         writer = self._writer
         if writer is None:
             raise RuntimeError("NexusSink.write called before begin().")
         self._apply_pending_extension()
         writer = self._writer
+        prepared = tuple(self._prepare_frame_write(
+            frame, reduction, replace_existing=replace_existing,
+        ) for frame, reduction in items)
+        writer.write_batch(tuple(record for record, _dropped in prepared))
+        for (frame, reduction), (_record, dropped) in zip(items, prepared):
+            if self._defer_publication_drop_settlement:
+                self._deferred_publication_drops[id(reduction)] = dropped
+            else:
+                for mode in dropped:
+                    writer.drop_publication(int(frame.index), mode)
+        return tuple(dropped for _record, dropped in prepared)
+
+    def _prepare_frame_write(self, frame: Frame, reduction: FrameReduction, *,
+                             replace_existing: bool
+                             ) -> tuple[RecordWrite, tuple[ResultMode, ...]]:
         mode_1d = str(getattr(reduction, "mode_1d", None)
                       or self._primary_mode_1d or DEFAULT_MODE_KEY)
         mode_2d = str(getattr(reduction, "mode_2d", None)
@@ -1684,27 +1747,22 @@ class NexusSink:
         )
         with self._prepared_thumbnails_lock:
             prepared = self._prepared_thumbnails.pop(id(reduction), None)
-        if replace_existing:
-            record = self._write_frame_record(
-                frame, reduction, prepared=prepared, replace_existing=True,
-            )
-        else:
-            record = self._write_frame_record(
-                frame, reduction, prepared=prepared,
-            )
-        writer.write(record)
         dropped = tuple(
             mode for mode, dropped in (
                 (ResultMode.one_d(mode_1d), drop_1d),
                 (ResultMode.two_d(mode_2d), drop_2d),
             ) if dropped
         )
-        if self._defer_publication_drop_settlement:
-            self._deferred_publication_drops[id(reduction)] = dropped
-        else:
-            for mode in dropped:
-                writer.drop_publication(int(frame.index), mode)
-        return frozenset(dropped)
+        record = self._write_frame_record(
+            frame, reduction,
+            result_1d=None if drop_1d else result_1d,
+            result_2d=None if drop_2d else result_2d,
+            mode_1d=mode_1d,
+            mode_2d=mode_2d,
+            prepared=prepared,
+            replace_existing=replace_existing,
+        )
+        return record, dropped
 
     def _settle_deferred_publication_drops(
         self, frame: Frame, reduction: FrameReduction,
@@ -1780,6 +1838,10 @@ class NexusSink:
         frame: Frame,
         reduction: FrameReduction,
         *,
+        result_1d: IntegrationResult1D | None,
+        result_2d: IntegrationResult2D | None,
+        mode_1d: str,
+        mode_2d: str,
         prepared: tuple[np.ndarray | None, bool] | None = None,
         replace_existing: bool = False,
     ) -> RecordWrite:
@@ -1790,29 +1852,6 @@ class NexusSink:
         if explicit_thumb is not None:
             thumb, mask_baked = explicit_thumb, False
         path = getattr(frame, "source_path", None)
-        mode_1d = str(
-            getattr(reduction, "mode_1d", None)
-            or self._primary_mode_1d or DEFAULT_MODE_KEY
-        )
-        mode_2d = str(
-            getattr(reduction, "mode_2d", None)
-            or self._primary_mode_2d or DEFAULT_MODE_KEY
-        )
-        result_1d = reduction.result_1d
-        result_2d = reduction.result_2d
-        if result_1d is not None and not np.isfinite(
-            np.asarray(result_1d.intensity, dtype=float)
-        ).any():
-            result_1d = None
-        if result_2d is not None:
-            intensity = np.asarray(result_2d.intensity, dtype=float)
-            if (
-                not np.isfinite(intensity).any()
-                or np.isclose(intensity, -1.0, equal_nan=False).mean() >= 0.95
-                or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
-                or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
-            ):
-                result_2d = None
         return RecordWrite(
             label=int(frame.index),
             result_1d=result_1d,
@@ -2295,6 +2334,7 @@ class ReductionSession:
     _inflight: Any = field(default=None, init=False, repr=False)
     _write_queue: Any = field(default=None, init=False, repr=False)
     _writer_thread: Any = field(default=None, init=False, repr=False)
+    _writer_batch_size: int = field(default=1, init=False, repr=False)
     _stream_started: bool = field(default=False, init=False, repr=False)
     _submitted: int = field(default=0, init=False, repr=False)
     # §13.2.3: ATTEMPT-axis facts for the private cancellation diagnostic —
@@ -2545,6 +2585,7 @@ class ReductionSession:
             else max(2, 2 * n_workers)
         )
         self.inflight_max = bound
+        self._writer_batch_size = min(_sink_writer_batch_size(self._sink), bound)
         self._inflight = _InFlightWindow(bound)
         self._write_queue = queue.Queue()
         self._writer_thread = threading.Thread(
@@ -2822,99 +2863,89 @@ class ReductionSession:
         except Exception:
             logger.exception("ReductionSession outcome_cb listener raised")
 
-    def _writer_loop(self) -> None:
-        """The single consumer thread: drain completed frames → sink by index.
+    def _resolve_writer_ticket(self, ticket: "_StreamPublication") -> tuple:
+        idx = int(ticket.frame.index)
+        state, attempt = ticket.await_decision()
+        if state == _TICKET_REJECTED:
+            return "rejected", ticket, attempt, None, None
+        _admission_trace("writer_item_dequeued", label=idx, attempt=attempt)
+        try:
+            reduction, prep_error = ticket.future.result()
+        except _ReductionCancelled as exc:
+            return "cancelled", ticket, attempt, None, exc
+        except BaseException as exc:
+            return "failed", ticket, attempt, None, exc
+        if prep_error is not None:
+            return "prep_failed", ticket, attempt, reduction, prep_error
+        return "ready", ticket, attempt, reduction, None
 
-        The ONLY thread that ever calls the sink (``write``/``replace``),
-        satisfying the HDF5-single-writer invariant.  Releases one in-flight
-        slot per frame so ``submit`` can proceed.  Records (does not raise)
-        failures so a bad write surfaces in ``finish`` without deadlocking the
-        bounded window.  A re-fed index is a *replace* (not a new completion),
-        preserving the A1 idempotency contract.
-        """
-        self._writer_ident = threading.get_ident()
-        while True:
-            item = self._write_queue.get()
-            if item is _STREAM_SENTINEL:
-                _admission_trace("writer_sentinel_exit")
-                self._write_queue.task_done()
-                break
-            ticket = item
-            frame = ticket.frame
-            idx = int(frame.index)
-            # §18.2: the writer may dequeue a still-PENDING ticket.  It waits
-            # for the caller's one decision and NEVER decides for it; an
-            # exactly-REJECTED item is dropped without touching a Future or
-            # calling the sink — one ``task_done``, one release, no outcome.
-            state, attempt = ticket.await_decision()
-            if state == _TICKET_REJECTED:
+    def _settle_writer_barrier(self, resolved: tuple) -> None:
+        kind, ticket, attempt, reduction, error = resolved
+        frame, idx = ticket.frame, int(ticket.frame.index)
+        replacing = idx in self._seen_idxs
+        try:
+            if kind == "rejected":
                 _admission_trace("writer_dropped_unaccepted", label=idx)
-                self._complete_stream_publication(ticket)
-                continue
-            _admission_trace("writer_item_dequeued", label=idx, attempt=attempt)
-            replacing = idx in self._seen_idxs
+                return
+            if kind == "cancelled":
+                self._dropped_attempts += 1
+                outcome = FrameOutcome.CANCELLED_BEFORE_COMPLETION
+            else:
+                outcome = FrameOutcome.FAILED if kind == "failed" else FrameOutcome.COMPLETED
+            emitted = True
             try:
-                try:
-                    reduction, prep_error = ticket.future.result()
-                except _ReductionCancelled:
-                    # The exact attempt-keyed drop identity (§13.2.3): this
-                    # queue item is the thing that was dropped in flight.
-                    self._dropped_attempts += 1
-                    try:
-                        self._emit_outcome(
-                            idx, FrameOutcome.CANCELLED_BEFORE_COMPLETION,
-                            replacing=replacing, attempt=attempt)
-                    except BaseException as exc:
-                        self._record_failure(exc)
-                    self._mark_cancelled()
-                    if self.clear_frame_images:
-                        frame.image = None
-                        frame.background = None
-                    continue
-                except BaseException as exc:  # integration failure for one frame
-                    try:
-                        self._emit_outcome(
-                            idx, FrameOutcome.FAILED,
-                            replacing=replacing,
-                            error=f"{type(exc).__name__}: {exc}",
-                            attempt=attempt)
-                    except BaseException as authority_error:
-                        self._record_failure(authority_error)
-                    self._record_failure(exc)
-                    if self.clear_frame_images:
-                        frame.image = None
-                        frame.background = None
-                    continue
-                # Compute success is observed BEFORE the sink write: a failed
-                # write must stay distinguishable from a failed compute.
-                try:
-                    self._emit_outcome(
-                        idx, FrameOutcome.COMPLETED,
-                        replacing=replacing, reduction=reduction, attempt=attempt)
-                except BaseException as exc:
-                    self._record_failure(exc)
-                    if self.clear_frame_images:
-                        frame.image = None
-                        frame.background = None
-                    continue
-                if prep_error is not None:
-                    # The typed result is real and already reported; the sink's
-                    # pool-side worker_process prep is what failed.  Record it
-                    # on the fail-loud run path and do NOT write the frame — a
-                    # prep failure is neither a failed compute nor a write.
-                    self._record_failure(prep_error)
-                    if self.clear_frame_images:
-                        frame.image = None
-                        frame.background = None
-                    continue
+                self._emit_outcome(
+                    idx, outcome, replacing=replacing, reduction=reduction,
+                    error=(f"{type(error).__name__}: {error}"
+                           if kind == "failed" else None), attempt=attempt)
+            except BaseException as exc:
+                emitted = False
+                self._record_failure(exc)
+            if kind == "cancelled":
+                self._mark_cancelled()
+            elif kind == "failed" or (kind == "prep_failed" and emitted):
+                self._record_failure(error)
+            if self.clear_frame_images:
+                frame.image = None
+                frame.background = None
+        finally:
+            self._complete_stream_publication(ticket)
+
+    def _settle_writer_batch(self, batch: tuple[tuple, ...]) -> None:
+        outcomes_ok = True
+        for ticket, attempt, reduction, replacing in batch:
+            frame = ticket.frame
+            try:
+                self._emit_outcome(
+                    int(frame.index), FrameOutcome.COMPLETED,
+                    replacing=replacing, reduction=reduction, attempt=attempt)
+            except BaseException as exc:
+                self._record_failure(exc)
+                outcomes_ok = False
+                if self.clear_frame_images:
+                    frame.image = None
+                    frame.background = None
+        try:
+            if not outcomes_ok:
+                return
+            items = tuple((item[0].frame, item[2]) for item in batch)
+            try:
+                if batch[0][3]:
+                    _emit_sink_replace(self._sink, *items[0])
+                elif self._writer_batch_size == 1:
+                    self._sink.write(*items[0])
+                else:
+                    _emit_sink_write_batch(self._sink, items)
+            except BaseException as exc:
+                self._record_failure(exc)
+                return
+            for ticket, attempt, reduction, _replacing in batch:
+                frame = ticket.frame
+                idx = int(frame.index)
                 try:
                     self._seen_idxs.add(idx)
                     if self.retain_products:
                         self._products[idx] = reduction
-                    if replacing:
-                        _emit_sink_replace(self._sink, frame, reduction)
-                    else:
-                        self._sink.write(frame, reduction)
                     if self.written_authority_cb is not None:
                         self.written_authority_cb(frame, reduction, attempt)
                     settle = getattr(
@@ -2922,9 +2953,6 @@ class ReductionSession:
                     )
                     if callable(settle):
                         settle(frame, reduction)
-                    # The top-level sink hook returned: record the DISTINCT
-                    # label identity (§4.1), never an increment — plus the
-                    # attempt-axis write fact for the cancellation diagnostic.
                     self._written_labels.add(idx)
                     self._written_attempts += 1
                     post_write = getattr(self._sink, "_post_write", None)
@@ -2942,8 +2970,63 @@ class ReductionSession:
                             _clear_source_frame_image(self.source, frame.index)
                     except BaseException as exc:
                         self._record_failure(exc)
-            finally:
+        finally:
+            for ticket, _attempt, _reduction, _replacing in batch:
                 self._complete_stream_publication(ticket)
+
+    def _writer_loop(self) -> None:
+        """Drain queued tickets on the single existing writer lane."""
+        self._writer_ident = threading.get_ident()
+        pending_ticket = None
+        pending_resolved = None
+        while True:
+            if pending_resolved is not None:
+                resolved, pending_resolved = pending_resolved, None
+            else:
+                item = pending_ticket or self._write_queue.get()
+                pending_ticket = None
+                if item is _STREAM_SENTINEL:
+                    _admission_trace("writer_sentinel_exit")
+                    self._write_queue.task_done()
+                    break
+                resolved = self._resolve_writer_ticket(item)
+            if resolved[0] != "ready":
+                self._settle_writer_barrier(resolved)
+                continue
+            _kind, ticket, attempt, reduction, _error = resolved
+            idx = int(ticket.frame.index)
+            replacing = idx in self._seen_idxs
+            if replacing:
+                self._settle_writer_batch(((ticket, attempt, reduction, True),))
+                continue
+            batch = [(ticket, attempt, reduction, False)]
+            batch_labels = {idx}
+            stop_after_batch = False
+            while len(batch) < self._writer_batch_size:
+                try:
+                    item = self._write_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is _STREAM_SENTINEL:
+                    stop_after_batch = True
+                    break
+                next_idx = int(item.frame.index)
+                if (item.decision is None or next_idx in self._seen_idxs or
+                        next_idx in batch_labels):
+                    pending_ticket = item
+                    break
+                candidate = self._resolve_writer_ticket(item)
+                if candidate[0] != "ready":
+                    pending_resolved = candidate
+                    break
+                _, next_ticket, next_attempt, next_reduction, _ = candidate
+                batch.append((next_ticket, next_attempt, next_reduction, False))
+                batch_labels.add(next_idx)
+            self._settle_writer_batch(tuple(batch))
+            if stop_after_batch:
+                _admission_trace("writer_sentinel_exit")
+                self._write_queue.task_done()
+                break
 
     def _complete_stream_publication(self, ticket: _StreamPublication) -> None:
         try:

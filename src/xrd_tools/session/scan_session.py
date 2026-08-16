@@ -158,6 +158,7 @@ class _EventSink:
         self._inner = inner
         self._on_completed = on_completed
         self._defer_terminal = bool(defer_terminal)
+        self.writer_batch_size = getattr(inner, "writer_batch_size", 1)
         worker_process = getattr(inner, "worker_process", None)
         if callable(worker_process):
             self.worker_process = worker_process
@@ -174,6 +175,13 @@ class _EventSink:
     def write(self, frame, reduction) -> None:
         if self._inner is not None:
             self._inner.write(frame, reduction)
+
+    def write_batch(self, items) -> None:
+        inner_batch = getattr(self._inner, "write_batch", None)
+        if callable(inner_batch):
+            return inner_batch(items)
+        for item in items:
+            self.write(*item)
 
     def replace(self, frame, reduction) -> None:
         inner_replace = getattr(self._inner, "replace", None)

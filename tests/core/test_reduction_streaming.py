@@ -246,6 +246,164 @@ def test_streaming_default_inflight_is_twice_workers(monkeypatch):
     assert session.inflight_max == 8     # 2 x workers
 
 
+def test_streaming_writer_batches_queued_short_tail_in_exact_order(monkeypatch):
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    class BatchSink:
+        writer_batch_size = 8
+
+        def __init__(self):
+            self.batches = []
+            self.completed = []
+
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            self.batches.append((int(frame.index),))
+
+        def write_batch(self, items):
+            self.batches.append(tuple(int(frame.index) for frame, _ in items))
+
+        def _post_write(self, frame, reduction):
+            self.completed.append(int(frame.index))
+
+        def finish(self, result):
+            pass
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+    frames = _frames(17)
+    sink = BatchSink()
+    outcomes = []
+    session = ReductionSession(
+        _plan(), Scan("batch-17", frames, integrator=object()),
+        sink=sink, execution="streaming", executor=4, inflight_max=17,
+        outcome_cb=outcomes.append,
+    )
+    for frame in frames:
+        assert session.submit(frame)
+    gate.set()
+    result = session.finish()
+
+    assert sink.batches == [tuple(range(8)), tuple(range(8, 16)), (16,)]
+    assert [receipt.frame_index for receipt in outcomes] == list(range(17))
+    assert sink.completed == list(range(17))
+    assert result.n_processed == 17
+
+
+def test_streaming_batch_failure_publishes_no_per_frame_write_facts(monkeypatch):
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    class FailingBatchSink:
+        writer_batch_size = 3
+
+        def __init__(self):
+            self.attempts = []
+            self.completed = []
+
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            self.attempts.append((int(frame.index),))
+            raise OSError("batch boundary fault")
+
+        def write_batch(self, items):
+            self.attempts.append(tuple(int(frame.index) for frame, _ in items))
+            raise OSError("batch boundary fault")
+
+        def _post_write(self, frame, reduction):
+            self.completed.append(int(frame.index))
+
+        def finish(self, result):
+            pass
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+    frames = _frames(3)
+    sink = FailingBatchSink()
+    outcomes, written = [], []
+    session = ReductionSession(
+        _plan(), Scan("batch-failure", frames, integrator=object()),
+        sink=sink, execution="streaming", executor=3, inflight_max=3,
+        outcome_cb=outcomes.append,
+        written_authority_cb=lambda frame, reduction, attempt: written.append(
+            int(frame.index)
+        ),
+    )
+    for frame in frames:
+        assert session.submit(frame)
+    gate.set()
+    result = session.finish(raise_on_failure=False)
+
+    assert sink.attempts == [(0, 1, 2)]
+    assert [receipt.frame_index for receipt in outcomes] == [0, 1, 2]
+    assert written == sink.completed == []
+    assert session._written_labels == set()
+    assert session._seen_idxs == set()
+    assert session.frames == {}
+    assert result.failed and "batch boundary fault" in (result.error or "")
+
+
+def test_streaming_replacement_fences_fresh_writer_batches(monkeypatch):
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    class BatchSink:
+        writer_batch_size = 8
+
+        def __init__(self):
+            self.calls = []
+
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            self.calls.append(("batch", (int(frame.index),)))
+
+        def write_batch(self, items):
+            self.calls.append((
+                "batch", tuple(int(frame.index) for frame, _ in items),
+            ))
+
+        def replace(self, frame, reduction):
+            self.calls.append(("replace", int(frame.index)))
+
+        def finish(self, result):
+            pass
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+    frames = _frames(4)
+    sink = BatchSink()
+    session = ReductionSession(
+        _plan(), Scan("batch-replace", frames, integrator=object()),
+        sink=sink, execution="streaming", executor=4, inflight_max=5,
+    )
+    for frame in frames[:3]:
+        assert session.submit(frame)
+    assert session.submit(Frame(1, image=np.full((2, 2), 11.0)))
+    assert session.submit(frames[3])
+    gate.set()
+    result = session.finish()
+
+    assert sink.calls == [
+        ("batch", (0, 1, 2)),
+        ("replace", 1),
+        ("batch", (3,)),
+    ]
+    assert result.n_processed == 4
+
+
 # ---------------------------------------------------------------------------
 # Replace idempotency (A1) — re-fed index doesn't double-count
 # ---------------------------------------------------------------------------
