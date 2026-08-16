@@ -125,28 +125,25 @@ def test_accumulating_click_carries_exact_toggle_membership(
         commands.clear()
         _click_frame(qapp, shell, 2)
 
-        assert _selected_browser_rows(shell) == (0, 2)
+        assert _selected_browser_rows(shell) == (2,)
         assert len(commands) == 1
         assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
-        assert commands[0].frames == (
-            state.navigation.frames[0],
-            state.navigation.frames[2],
-        )
+        assert commands[0].frames == state.navigation.frames
         assert commands[0].frame is state.navigation.frames[2]
 
         commands.clear()
-        _click_frame(qapp, shell, 2)
+        _click_frame(qapp, shell, 1)
 
-        assert _selected_browser_rows(shell) == (0,)
+        assert _selected_browser_rows(shell) == (1,)
         assert len(commands) == 1
-        assert commands[0].frames == (state.navigation.frames[0],)
-        assert commands[0].frame is state.navigation.frames[2]
-        assert (
-            shell.browser.frames.currentIndex().data(
-                QtCore.Qt.ItemDataRole.UserRole
-            )
-            is state.navigation.frames[2]
-        )
+        assert commands[0].frames == state.navigation.frames
+        assert commands[0].frame is state.navigation.frames[1]
+
+        commands.clear()
+        _click_frame(qapp, shell, 1)
+        assert _selected_browser_rows(shell) == (1,)
+        assert commands == []
+        assert shell.browser._trace_frames == state.navigation.frames
     finally:
         shell.close()
 
@@ -162,13 +159,14 @@ def test_idle_accumulating_selection_carries_exact_highlighted_rows(
     """Historical Browse selection is operator-owned once the run is idle."""
 
     state = make_shell_projection(plot_mode=plot_mode)
-    first = state.navigation.frames[0]
+    frames = state.navigation.frames
+    first = frames[0]
     state = replace(
         state,
         navigation=replace(
             state.navigation,
             current=first,
-            selected=(first,),
+            selected=(first, frames[2]),
         ),
     )
     shell = ScatteringWorkspaceShell()
@@ -183,14 +181,21 @@ def test_idle_accumulating_selection_carries_exact_highlighted_rows(
 
         _click_frame(qapp, shell, 2)
 
-        assert _selected_browser_rows(shell) == (0, 2)
+        assert _selected_browser_rows(shell) == (2,)
         assert len(commands) == 1
-        assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
-        assert commands[0].frame is state.navigation.frames[2]
-        assert commands[0].frames == (
-            state.navigation.frames[0],
-            state.navigation.frames[2],
+        assert commands[0].frame is frames[2]
+        assert commands[0].frames == (frames[0], frames[2])
+        assert shell.browser._trace_frames == (frames[0], frames[2])
+
+        commands.clear()
+        _click_frame(
+            qapp, shell, 4,
+            modifiers=QtCore.Qt.KeyboardModifier.ShiftModifier,
         )
+        assert _selected_browser_rows(shell) == (2, 3, 4)
+        assert len(commands) == 1
+        assert commands[0].frame is frames[4]
+        assert commands[0].frames == frames[2:5]
     finally:
         shell.close()
 
@@ -217,10 +222,9 @@ def test_accumulating_sole_row_toggle_preserves_visible_membership(
 
         _click_frame(qapp, shell, 0)
 
-        assert len(commands) == 1
-        assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
-        assert commands[0].frame is state.navigation.frames[0]
-        assert commands[0].frames == (state.navigation.frames[0],)
+        assert commands == []
+        assert _selected_browser_rows(shell) == (0,)
+        assert shell.browser._trace_frames == (state.navigation.frames[0],)
     finally:
         shell.close()
 
@@ -252,17 +256,22 @@ def test_plain_click_in_single_mode_still_replaces_the_exact_row(
 
 
 @pytest.mark.parametrize(
-    "modifier",
-    (
-        QtCore.Qt.KeyboardModifier.ControlModifier,
-        QtCore.Qt.KeyboardModifier.MetaModifier,
+    ("plot_mode", "modifier"),
+    tuple(
+        (plot_mode, modifier)
+        for plot_mode in ("Overlay", "Waterfall")
+        for modifier in (
+            QtCore.Qt.KeyboardModifier.ControlModifier,
+            QtCore.Qt.KeyboardModifier.MetaModifier,
+        )
     ),
 )
 def test_modified_single_click_toggles_without_collapsing_membership(
     qapp: QtWidgets.QApplication,
+    plot_mode: str,
     modifier: QtCore.Qt.KeyboardModifier,
 ) -> None:
-    state = make_shell_projection(plot_mode="Single")
+    state = make_shell_projection(plot_mode=plot_mode)
     shell = ScatteringWorkspaceShell()
     commands = []
     shell.commandRequested.connect(commands.append)
@@ -288,7 +297,26 @@ def test_modified_single_click_toggles_without_collapsing_membership(
         assert _selected_browser_rows(shell) == (2,)
         assert len(commands) == 1
         assert commands[0].frames == (state.navigation.frames[2],)
+        assert commands[0].frame is state.navigation.frames[0]
+        assert (
+            shell.browser.frames.currentIndex().data(
+                QtCore.Qt.ItemDataRole.UserRole
+            )
+            is state.navigation.frames[0]
+        )
+
+        commands.clear()
+        _click_frame(qapp, shell, 2)
+        assert _selected_browser_rows(shell) == (2,)
+        assert len(commands) == 1
         assert commands[0].frame is state.navigation.frames[2]
+        assert commands[0].frames == (state.navigation.frames[2],)
+        assert (
+            shell.browser.frames.currentIndex().data(
+                QtCore.Qt.ItemDataRole.UserRole
+            )
+            is state.navigation.frames[2]
+        )
     finally:
         shell.close()
 
@@ -409,10 +437,12 @@ def test_held_arrow_is_one_gesture_with_no_intermediate_command(
         shell.close()
 
 
+@pytest.mark.parametrize("plot_mode", ("Overlay", "Waterfall"))
 def test_held_overlay_arrow_carries_exact_new_ui_membership(
     qapp: QtWidgets.QApplication,
+    plot_mode: str,
 ) -> None:
-    base = make_shell_projection(plot_mode="Overlay")
+    base = make_shell_projection(plot_mode=plot_mode)
     initial = base.navigation.frames[0]
     state = replace(
         base,
@@ -463,8 +493,10 @@ def test_held_overlay_arrow_carries_exact_new_ui_membership(
         QtTest.QTest.qWait(130)
 
         assert len(commands) == 1
+        assert _selected_browser_rows(shell) == (3,)
         assert commands[0].frame is state.navigation.frames[3]
-        assert commands[0].frames == (state.navigation.frames[3],)
+        assert commands[0].frames == state.navigation.frames[:4]
+        assert shell.browser._trace_frames == state.navigation.frames[:4]
     finally:
         shell.close()
 

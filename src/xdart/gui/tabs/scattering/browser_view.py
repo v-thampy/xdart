@@ -36,22 +36,24 @@ _FRAME_NAVIGATION_KEYS = frozenset(
 
 
 class _AccumulatingFrameClickFilter(QtCore.QObject):
-    """Give accumulating modes modifier-free toggle selection.
+    """Own accumulating click intent separately from trace membership.
 
     The production browser keeps ``ExtendedSelection`` active and owns plain
-    mouse clicks explicitly.  That avoids Qt's default replace-on-click
-    behaviour (which collapses a completed Overlay/Waterfall selection to one
-    row) while retaining native Shift-range and keyboard handling.
+    mouse clicks explicitly.  Overlay/Waterfall visits replace visible
+    membership; Ctrl/Meta toggles and Shift ranges remain explicit gestures,
+    while Sum/Average retain plain-click toggling and native keyboard handling.
     """
 
     def __init__(
         self,
         view: QtWidgets.QListView,
         get_plot_mode,
+        set_selection_intent,
     ) -> None:
         super().__init__(view)
         self._view = view
         self._get_plot_mode = get_plot_mode
+        self._set_selection_intent = set_selection_intent
 
     def eventFilter(self, watched, event) -> bool:
         # The filter is installed only on the viewport.  Check the event
@@ -66,8 +68,9 @@ class _AccumulatingFrameClickFilter(QtCore.QObject):
             return False
         if button != QtCore.Qt.MouseButton.LeftButton:
             return False
-        if modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier:
-            return False
+        shift_modifier = bool(
+            modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier
+        )
         toggle_modifier = bool(
             modifiers
             & (
@@ -75,9 +78,9 @@ class _AccumulatingFrameClickFilter(QtCore.QObject):
                 | QtCore.Qt.KeyboardModifier.MetaModifier
             )
         )
-        accumulating = (
-            self._get_plot_mode() in _ACCUMULATING_PLOT_MODES
-        )
+        plot_mode = self._get_plot_mode()
+        accumulating = plot_mode in _ACCUMULATING_PLOT_MODES
+        visit_mode = plot_mode in _VISIT_ACCUMULATING_PLOT_MODES
         if not toggle_modifier and not accumulating:
             return False
         try:
@@ -89,15 +92,29 @@ class _AccumulatingFrameClickFilter(QtCore.QObject):
             # An empty-area click must not destroy an accumulating selection.
             return accumulating
         selection = self._view.selectionModel()
-        selection.select(
-            index,
-            QtCore.QItemSelectionModel.SelectionFlag.Toggle
-            | QtCore.QItemSelectionModel.SelectionFlag.Rows,
-        )
+        explicit = shift_modifier or toggle_modifier or not visit_mode
+        self._set_selection_intent(explicit, index.data(_USER_ROLE))
+        anchor = selection.currentIndex()
         selection.setCurrentIndex(
             index,
             QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
         )
+        selection.select(
+            (
+                QtCore.QItemSelection(
+                    *sorted((anchor, index), key=lambda item: item.row())
+                )
+                if shift_modifier and anchor.isValid()
+                else index
+            ),
+            (
+                QtCore.QItemSelectionModel.SelectionFlag.Toggle
+                if explicit and not shift_modifier
+                else QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+            )
+            | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+        )
+        self._set_selection_intent(None, None)
         return True
 
 
@@ -118,6 +135,7 @@ class _FrameSelectionCadenceFilter(QtCore.QObject):
         try:
             key = int(event.key())
             auto_repeat = bool(event.isAutoRepeat())
+            modifiers = event.modifiers()
         except (AttributeError, RuntimeError):
             return False
 
@@ -126,7 +144,7 @@ class _FrameSelectionCadenceFilter(QtCore.QObject):
             if event_type == QtCore.QEvent.Type.KeyPress:
                 if key in _FRAME_NAVIGATION_KEYS:
                     if not owner._frame_gesture_active:
-                        owner._begin_frame_gesture()
+                        owner._begin_frame_gesture(modifiers)
                     return False
                 return False
 
@@ -208,6 +226,7 @@ class BrowserView(QtWidgets.QFrame):
         self.setMinimumWidth(255)
         self._scans = ()
         self._selected_frames: tuple[DisplayFrameKey, ...] = ()
+        self._trace_frames: tuple[DisplayFrameKey, ...] = ()
         self._plot_mode = "Single"
         self._reconciling_frames = False
         self._has_committed_navigation = False
@@ -215,6 +234,8 @@ class BrowserView(QtWidgets.QFrame):
         self._committed_selected: tuple[DisplayFrameKey, ...] = ()
         self._pending_frame_command: ShellCommand | None = None
         self._frame_gesture_active = False
+        self._frame_selection_explicit: bool | None = None
+        self._frame_pointer_current: DisplayFrameKey | None = None
         layout = QtWidgets.QVBoxLayout(self)
         self._root_layout = layout
         layout.addLayout(self._make_menu_row())
@@ -260,6 +281,7 @@ class BrowserView(QtWidgets.QFrame):
         self._frame_click_filter = _AccumulatingFrameClickFilter(
             self.frames,
             lambda: self._plot_mode,
+            self._set_frame_selection_intent,
         )
         self.frames.viewport().installEventFilter(
             self._frame_click_filter
@@ -463,6 +485,7 @@ class BrowserView(QtWidgets.QFrame):
                 membership,
             )
             self._pending_frame_command = pending
+            self._trace_frames = membership
         if authoritative_changed and pending is None:
             self._cancel_pending_frame_selection()
         self._committed_current = navigation.current
@@ -504,12 +527,17 @@ class BrowserView(QtWidgets.QFrame):
                 else None
             )
             if plot_mode in _VISIT_ACCUMULATING_PLOT_MODES:
+                trace_frames = tuple(
+                    frame
+                    for frame in navigation.selected
+                    if any(candidate is frame for candidate in frames)
+                )
                 selected_frames = tuple(
                     frame
                     for frame in self._selected_frames
                     if any(candidate is frame for candidate in frames)
                 )
-                if changed or not selected_frames:
+                if (changed or not selected_frames) and trace_frames:
                     selected_frames = (
                         () if current is None else (current,)
                     )
@@ -519,9 +547,11 @@ class BrowserView(QtWidgets.QFrame):
                     for frame in navigation.selected
                     if any(candidate is frame for candidate in frames)
                 )
+                trace_frames = selected_frames
         else:
             selected_frames = self._selected_frames
             current = pending.frame
+            trace_frames = self._trace_frames
 
         selection = self.frames.selectionModel()
         self._reconciling_frames = True
@@ -542,6 +572,7 @@ class BrowserView(QtWidgets.QFrame):
                         | QtCore.QItemSelectionModel.SelectionFlag.Rows,
                     )
             self._selected_frames = selected_frames
+        self._trace_frames = trace_frames
         if current is None:
             selection.setCurrentIndex(
                 QtCore.QModelIndex(),
@@ -612,31 +643,66 @@ class BrowserView(QtWidgets.QFrame):
                 else self._committed_current
             ),
         )
+        if type(self._frame_pointer_current) is DisplayFrameKey:
+            current = self._frame_pointer_current
 
         selected_frames = ui_selected_frames
-        if (
-            self._plot_mode in _VISIT_ACCUMULATING_PLOT_MODES
-            and not selected_frames
-            and current is not None
-        ):
-            # Reconcile already keeps the current row visibly selected.  Carry
-            # that same minimum membership to the owner so a sole-row toggle
-            # cannot produce a visually selected frame with a blank 1-D plot.
-            selected_frames = (current,)
+        if self._plot_mode in _VISIT_ACCUMULATING_PLOT_MODES:
+            selected_frames = (
+                ui_selected_frames
+                if self._frame_selection_explicit is True
+                else _catalog_ordered_membership(
+                    self.frame_model.frames,
+                    self._trace_frames,
+                    () if current is None else (current,),
+                )
+            )
 
         self._pending_frame_command = ShellCommand(
             ShellCommandKind.SELECT_BROWSER_FRAMES,
             frame=current,
             frames=selected_frames,
         )
-        self._selected_frames = selected_frames
+        self._selected_frames = ui_selected_frames
+        self._trace_frames = selected_frames
         if not self._frame_gesture_active:
+            self._frame_selection_explicit = None
             self._frame_selection_coalescer.trigger()
 
-    def _begin_frame_gesture(self) -> None:
+    def _set_frame_selection_intent(
+        self,
+        explicit: bool | None,
+        current: DisplayFrameKey | None,
+    ) -> None:
+        if (
+            explicit is False
+            and current is not self.frames.currentIndex().data(_USER_ROLE)
+            and _same_frame_identities(self._ui_selected_frames(), (current,))
+        ):
+            self._trace_frames = _catalog_ordered_membership(
+                self.frame_model.frames, self._trace_frames, (current,)
+            )
+            self._pending_frame_command = ShellCommand(
+                ShellCommandKind.SELECT_BROWSER_FRAMES,
+                frame=current,
+                frames=self._trace_frames,
+            )
+            self._frame_selection_coalescer.trigger()
+        self._frame_selection_explicit = explicit
+        self._frame_pointer_current = current
+
+    def _begin_frame_gesture(self, modifiers) -> None:
         if self._frame_gesture_active:
             return
         self._frame_selection_coalescer.cancel()
+        self._frame_selection_explicit = bool(
+            modifiers
+            & (
+                QtCore.Qt.KeyboardModifier.ShiftModifier
+                | QtCore.Qt.KeyboardModifier.ControlModifier
+                | QtCore.Qt.KeyboardModifier.MetaModifier
+            )
+        )
         self._frame_gesture_active = True
 
     def _finish_frame_gesture(self) -> None:
@@ -645,6 +711,7 @@ class BrowserView(QtWidgets.QFrame):
         self._frame_gesture_active = False
         if self._pending_frame_command is not None:
             self._frame_selection_coalescer.trigger()
+        self._frame_selection_explicit = None
 
     def _ui_selected_frames(self) -> tuple[DisplayFrameKey, ...]:
         frames = tuple(
@@ -670,6 +737,7 @@ class BrowserView(QtWidgets.QFrame):
         self._frame_selection_coalescer.cancel()
         self._pending_frame_command = None
         self._frame_gesture_active = False
+        self._frame_selection_explicit = None
 
     def _emit(self, kind: ShellCommandKind, value=None) -> None:
         self.commandRequested.emit(ShellCommand(kind, value))
@@ -681,6 +749,14 @@ def _same_frame_identities(
 ) -> bool:
     return len(left) == len(right) and all(
         first is second for first, second in zip(left, right)
+    )
+
+
+def _catalog_ordered_membership(catalog, *groups):
+    return tuple(
+        frame
+        for frame in catalog
+        if any(frame is member for group in groups for member in group)
     )
 
 
