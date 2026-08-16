@@ -959,6 +959,46 @@ def test_page_preserves_explicit_single_multiselection_but_mode_entry_collapses(
     assert events == ["cancel", "select"]
 
 
+def test_show_all_page_dispatch_preserves_current_order_and_skips_empty_noop(
+) -> None:
+    frames = make_shell_projection().navigation.frames[:3]
+    events: list[tuple[object, ...]] = []
+    outcome = [True]
+
+    def select_navigation(current, selected) -> bool:
+        events.append(("select", current, selected))
+        return outcome[0]
+
+    controller = SimpleNamespace(
+        navigation=FrameNavigationProjection(frames, frames[1], (frames[1],)),
+        select_navigation=select_navigation,
+    )
+    owner = SimpleNamespace(
+        _closing=False, _closed=False,
+        _shell=SimpleNamespace(
+            browser=SimpleNamespace(
+                cancel_pending_frame_selection=lambda: events.append(("cancel",))
+            )
+        ),
+        _context_controller=controller,
+        _refresh_shell=lambda: events.append(("refresh",)),
+        _edit_scientific_preference=lambda command: False,
+    )
+    command = ShellCommand(ShellCommandKind.SHOW_ALL)
+    ScatteringWorkspace._handle_shell_command(owner, command)
+    assert events == [("cancel",), ("select", frames[1], frames), ("refresh",)]
+
+    events.clear()
+    outcome[0] = False
+    ScatteringWorkspace._handle_shell_command(owner, command)
+    assert events == [("cancel",), ("select", frames[1], frames)]
+
+    events.clear()
+    controller.navigation = FrameNavigationProjection((), None, ())
+    ScatteringWorkspace._handle_shell_command(owner, command)
+    assert events == [("cancel",)]
+
+
 def test_active_acquisition_overlay_visit_preserves_arrival_membership() -> None:
     state = make_shell_projection(plot_mode="Overlay")
     frames = state.navigation.frames

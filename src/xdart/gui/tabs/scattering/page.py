@@ -721,6 +721,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._browser_directory_time_cache.clear()
             self._request_browser_catalog()
             return
+        if kind is ShellCommandKind.SHOW_ALL:
+            self._shell.browser.cancel_pending_frame_selection()
+            navigation = self._context_controller.navigation
+            if (
+                navigation.frames
+                and self._context_controller.select_navigation(
+                    navigation.current, navigation.frames
+                )
+            ):
+                self._refresh_shell()
+            return
         if kind is ShellCommandKind.SELECT_SCAN:
             if (getattr(self._context_controller, "viewer_1d_owned", False)
                     and not self._clear_viewer_1d_renderer(close=True)):
