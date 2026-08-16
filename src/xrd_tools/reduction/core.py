@@ -505,6 +505,7 @@ class FrameReduction:
         compare=False,
     )
     thumbnail: np.ndarray | None = field(default=None, repr=False, compare=False)
+    _thumbnail_mask_baked: bool = field(default=False, repr=False, compare=False)
     write_frame_record: bool = True
 
 
@@ -1329,12 +1330,6 @@ class NexusSink:
     _extension_owner: Any | None = field(default=None, init=False, repr=False)
     _pending_append_decision: Any | None = field(default=None, init=False, repr=False)
     _epoch_decision: Any | None = field(default=None, init=False, repr=False)
-    _prepared_thumbnails: dict[int, tuple[np.ndarray | None, bool]] = field(
-        default_factory=dict, init=False, repr=False,
-    )
-    _prepared_thumbnails_lock: Any = field(
-        default_factory=threading.Lock, init=False, repr=False,
-    )
     _source_snapshots: dict[str, dict[str, Any]] = field(
         default_factory=dict, init=False, repr=False,
     )
@@ -1659,8 +1654,6 @@ class NexusSink:
                 )
                 for path, snapshot in snapshots.items()
             }
-        with self._prepared_thumbnails_lock:
-            self._prepared_thumbnails.clear()
         self._writer = None
         self._attempt = None
         self._terminal_result = None
@@ -1858,6 +1851,7 @@ class NexusSink:
             raise RuntimeError("NexusSink.write called before begin().")
         self._apply_pending_extension()
         writer = self._writer
+        for frame, reduction in items: self.worker_process(frame, reduction)
         prepared = tuple(self._prepare_frame_write(
             frame, reduction, replace_existing=replace_existing,
         ) for frame, reduction in items)
@@ -1892,8 +1886,6 @@ class NexusSink:
             or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
             or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
         )
-        with self._prepared_thumbnails_lock:
-            prepared = self._prepared_thumbnails.pop(id(reduction), None)
         dropped = tuple(
             mode for mode, dropped in (
                 (ResultMode.one_d(mode_1d), drop_1d),
@@ -1906,7 +1898,6 @@ class NexusSink:
             result_2d=None if drop_2d else result_2d,
             mode_1d=mode_1d,
             mode_2d=mode_2d,
-            prepared=prepared,
             replace_existing=replace_existing,
         )
         return record, dropped
@@ -1923,11 +1914,12 @@ class NexusSink:
 
     def worker_process(self, frame: Frame, reduction: FrameReduction) -> None:
         """Prepare the persisted thumbnail on the parallel reduction worker."""
+        if reduction.thumbnail is not None:
+            return
         prepared = self._prepare_frame_thumbnail(
             frame, corrected_image=reduction.corrected_image,
         )
-        with self._prepared_thumbnails_lock:
-            self._prepared_thumbnails[id(reduction)] = prepared
+        reduction.thumbnail, reduction._thumbnail_mask_baked = prepared
 
     def _bind_run_saturation_mask(self, state: "_RunSaturationMask") -> None:
         self._run_saturation_mask = state
@@ -1992,12 +1984,7 @@ class NexusSink:
         prepared: tuple[np.ndarray | None, bool] | None = None,
         replace_existing: bool = False,
     ) -> RecordWrite:
-        thumb, mask_baked = (
-            prepared if prepared is not None else self._prepare_frame_thumbnail(frame)
-        )
-        explicit_thumb = getattr(reduction, "thumbnail", None)
-        if explicit_thumb is not None:
-            thumb, mask_baked = explicit_thumb, False
+        thumb, mask_baked = reduction.thumbnail, reduction._thumbnail_mask_baked
         path = getattr(frame, "source_path", None)
         return RecordWrite(
             label=int(frame.index),

@@ -569,7 +569,8 @@ class ScientificView(QtWidgets.QFrame):
                     raise ValueError("viewer projection is incomplete")
                 blockers = [QtCore.QSignalBlocker(widget) for widget in (
                     self.frame_selector, self.color_map, self.log_scale)]
-                self.raw.render(heavy.raw, color_map=state.color_map,
+                self.raw.render(heavy.raw, detector_shape=heavy.detector_shape,
+                                color_map=state.color_map,
                                 log_scale=state.log_scale,
                                 level_scan_token=(id(frame), id(heavy.raw)))
                 self.raw.canvas.imageItem.pos_label.setText("")
@@ -672,6 +673,7 @@ class ScientificView(QtWidgets.QFrame):
                 if state.heavy.raw is not None:
                     self.raw.render(
                         state.heavy.raw,
+                        detector_shape=state.heavy.detector_shape,
                         color_map=color_map,
                         log_scale=state.log_scale,
                         level_scan_token=(

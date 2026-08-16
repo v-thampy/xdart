@@ -23,7 +23,6 @@ from xdart.modules.frame_publication import (
     FramePublication,
     PublicationStore,
     _publication_has_heavy_payload,
-    _publication_has_full_payload,
 )
 from xrd_tools.core import FrameRecord
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
@@ -1188,27 +1187,14 @@ def publication_needs_hydration(
 ) -> bool:
     return (
         publication is None
-        or not _publication_has_full_payload(publication)
+        or publication.record.is_empty
         or any(
             view.axis_1d is None
             or view.axis_1d.values is None
             or view.intensity_1d is None
             for view in publication.record.results_1d.values()
         )
-        or (
-            publication.view.raw is None
-            and (
-                publication.raw_status in {"thumbnail", "evicted"}
-                or (
-                    detector_outcome is None
-                    and publication.view.thumbnail is None
-                )
-            )
-        )
-        or (
-            bool(publication.record.results_2d)
-            and publication.view.intensity_2d is None
-        )
+        or any(not view.has_2d or view.axis_2d_x.values is None or view.axis_2d_y.values is None for view in publication.record.results_2d.values())
     )
 
 

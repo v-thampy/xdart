@@ -36,6 +36,7 @@ def _write_processed(
     frame: int = 17,
     thumbnail: bool,
     raw: np.ndarray | None = None,
+    detector_shape: np.ndarray | None = None,
 ) -> tuple[Path, Path]:
     raw = np.arange(16, dtype=np.uint16).reshape(4, 4) if raw is None else raw
     raw_path = root / "raw" / "image.tif"
@@ -57,6 +58,10 @@ def _write_processed(
     )
     with h5py.File(processed, "w") as handle:
         entry = handle.create_group("entry")
+        if detector_shape is not None:
+            entry.create_dataset(
+                "instrument/detector/detector_shape", data=detector_shape
+            )
         write_integrated_stack(
             entry,
             frame_indices=[frame],
@@ -135,7 +140,7 @@ def test_thumbnail_preview_opens_processed_once_and_never_reads_detector(
         assert array.flags.writeable is False
 
 
-def test_no_thumbnail_preview_reads_one_exact_detector_frame_and_masks_it(
+def test_no_thumbnail_preview_never_reads_detector_and_reports_missing_thumbnail(
     tmp_path, monkeypatch
 ):
     raw = np.arange(16, dtype=np.uint16).reshape(4, 4)
@@ -143,27 +148,15 @@ def test_no_thumbnail_preview_reads_one_exact_detector_frame_and_masks_it(
     processed, _ = _write_processed(tmp_path, thumbnail=False, raw=raw)
     counts = _instrument_reads(monkeypatch, processed)
     api = _api()
-    static = np.zeros(raw.shape, dtype=bool)
-    static[2, 2] = True
-    projection = api.DetectorPreviewProjection.from_mask(
-        static,
-        apply_threshold=True,
-        threshold_min=2,
-        threshold_max=None,
-        mask_saturation=False,
-    )
     result = api.read_frame_preview(
         _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
-        detector_projection=projection,
+        detector_projection=api.DetectorPreviewProjection.without_static_mask(),
     )
-    assert counts["processed"] == 1
-    assert counts["detector"] == 1
-    assert result.detector_fallback_used is True
-    assert result.raw.shape == raw.shape
-    assert np.isnan(result.raw[0, 0])
-    assert np.isnan(result.raw[2, 2])
-    assert result.raw[3, 3] == np.iinfo(np.uint16).max
-    assert result.raw.flags.writeable is False
+    assert counts == {"processed": 1, "detector": 0, "detector_paths": []}
+    assert result.view.has_1d and result.view.has_2d
+    assert result.thumbnail is result.raw is None
+    assert result.detector_fallback_used is False
+    assert result.detector_diagnostic == "stored thumbnail unavailable"
 
 
 def test_no_thumbnail_without_exact_mask_truth_fails_closed(
@@ -196,7 +189,7 @@ def test_saturation_projection_uses_the_accepted_detector_ceiling(
         saturation_ceiling=np.iinfo(np.uint8).max,
     )
     result = api.read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=projection,
     )
     assert counts["detector"] == 1
@@ -218,13 +211,13 @@ def test_detector_value_toggle_uses_native_values_and_accepted_science(
 
     monkeypatch.setattr(api, "_masked_detector", observed_mask)
     disabled = api.read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=api.DetectorPreviewProjection.without_static_mask(
             mask_saturation=False
         ),
     )
     enabled = api.read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=api.DetectorPreviewProjection.without_static_mask(
             mask_saturation=True,
             saturation_ceiling=float(np.iinfo(np.int64).max),
@@ -245,7 +238,7 @@ def test_upper_threshold_is_independent_of_detector_value_toggle(
     counts = _instrument_reads(monkeypatch, processed)
     api = _api()
     result = api.read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=api.DetectorPreviewProjection.without_static_mask(
             apply_threshold=True,
             threshold_max=10,
@@ -336,7 +329,7 @@ def test_missing_or_negative_detector_frame_fails_before_detector_io(
     counts = _instrument_reads(monkeypatch, processed)
     api = _api()
     result = api.read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=api.DetectorPreviewProjection.without_static_mask(),
     )
     assert counts["detector"] == 0
@@ -398,7 +391,7 @@ def test_preview_honors_exact_persisted_hdf_dataset_path(tmp_path):
         source.attrs["dataset_path"] = "/entry/instrument/detector/right"
     api = _api()
     result = api.read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=api.DetectorPreviewProjection.without_static_mask(),
     )
     assert result.raw_dataset_path == "/entry/instrument/detector/right"
@@ -436,7 +429,7 @@ def test_eiger_anchor_reads_global_index_across_segments_once(
 
     monkeypatch.setattr(image.h5py, "File", counted_open)
     result = _api().read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=_api().DetectorPreviewProjection.without_static_mask(),
     )
     assert source_opens == 1
@@ -491,7 +484,7 @@ def test_eiger_external_link_anchor_keeps_master_identity_and_opens_once(
 
     monkeypatch.setattr(image.h5py, "File", counted_open)
     result = _api().read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=_api().DetectorPreviewProjection.without_static_mask(),
     )
     assert source_opens == 1
@@ -530,7 +523,7 @@ def test_exact_single_frame_source_rejects_nonzero_index(tmp_path, source_kind):
         if dataset_path is not None:
             source.attrs["dataset_path"] = dataset_path
     result = _api().read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=_api().DetectorPreviewProjection.without_static_mask(),
     )
     assert result.raw is None
@@ -552,7 +545,7 @@ def test_hdf_fallback_without_dataset_identity_fails_before_detector_io(
     counts = _instrument_reads(monkeypatch, processed)
     api = _api()
     result = api.read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=api.DetectorPreviewProjection.without_static_mask(),
     )
     assert counts["detector"] == 0
@@ -596,7 +589,7 @@ def test_relative_raw_locator_uses_moved_project_root_not_cwd(
     counts = _instrument_reads(monkeypatch, moved_processed)
     api = _api()
     result = api.read_frame_preview(
-        _read_key(moved_processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(moved_processed, _hydration().HydrationPurpose.FULL),
         detector_projection=api.DetectorPreviewProjection.without_static_mask(),
     )
     assert result.raw_locator == "raw/image.tif"
@@ -693,14 +686,7 @@ def test_frame_preview_accepts_complete_purpose_truth_table():
     assert _preview_result(purpose.ONE_D).raw is None
     assert _preview_result(purpose.PREVIEW, thumbnail=True).raw is None
     assert _preview_result(
-        purpose.PREVIEW,
-        raw=True,
-        locator="/raw/image.tif",
-        source_index=0,
-        fallback=True,
-    ).detector_fallback_used
-    assert _preview_result(
-        purpose.PREVIEW, diagnostic="detector unavailable"
+        purpose.PREVIEW, diagnostic="stored thumbnail unavailable"
     ).detector_diagnostic
     assert _preview_result(
         purpose.FULL,
@@ -781,12 +767,30 @@ def test_wrong_mask_shape_never_exposes_unmasked_raw(tmp_path, monkeypatch):
         np.zeros((2, 2), dtype=bool)
     )
     result = api.read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
         detector_projection=projection,
     )
     assert counts["detector"] == 1
     assert result.raw is None
     assert result.detector_fallback_used is False
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [(np.array([4, 6], dtype=np.int64), (4, 6)),
+     (np.array([[4, 6]], dtype=np.int64), None)],
+    ids=("exact-positive-pair", "malformed-rank"),
+)
+def test_preview_carries_only_exact_persisted_detector_shape(
+    tmp_path, shape, expected
+):
+    processed, _ = _write_processed(
+        tmp_path, thumbnail=True, detector_shape=shape
+    )
+    result = _api().read_frame_preview(
+        _read_key(processed, _hydration().HydrationPurpose.PREVIEW)
+    )
+    assert result.view.extra.get("detector_shape") == expected
 
 
 def test_frame_preview_result_rejects_malformed_fields_and_label_aliases(

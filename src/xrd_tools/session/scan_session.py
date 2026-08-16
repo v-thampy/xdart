@@ -1645,7 +1645,7 @@ class ScanSession:
         if self._dynamic_accounting is None:
             self._record_written(event)
         started = time.perf_counter() if self._perf_enabled else 0.0
-        self._upsert_record_store(frame, event)
+        self._upsert_record_store(frame, reduction, event)
         self._perf_add("session_record_upsert", started)
         started = time.perf_counter() if self._perf_enabled else 0.0
         for cb in cbs:
@@ -1683,7 +1683,8 @@ class ScanSession:
                     if self._accounting.current_revision(label, mode) >= 1]
         if receipts:
             self._accounting.record_durable(receipts)
-    def _upsert_record_store(self, frame: Frame, event: FrameEvent) -> None:
+    def _upsert_record_store(self, frame: Frame, reduction: Any,
+                             event: FrameEvent) -> None:
         if self._record_store is None:
             return
         mode_1d, mode_2d = _dimension_modes(event.mode_key)
@@ -1697,11 +1698,15 @@ class ScanSession:
                 incident_angle=getattr(getattr(frame, "geometry", None), "incident_angle", None),
                 source_path=getattr(frame, "source_path", None),
                 source_frame_index=getattr(frame, "source_frame_index", None),
+                thumbnail=getattr(reduction, "thumbnail", None),
+                mask_baked=bool(getattr(reduction, "_thumbnail_mask_baked", False)),
+                extra={"detector_shape": tuple(np.asarray(frame.image).shape)}
+                if frame.image is not None and np.asarray(frame.image).ndim == 2 and all(np.asarray(frame.image).shape) else {},
             )
             record = FrameRecord.from_view(view, mode_1d=mode_1d, mode_2d=mode_2d)
         except Exception:
             logger.exception("ScanSession record_store view build failed")
-            return
+            raise
         label = int(event.frame_index)
         with self._projection_lock:
             try:
@@ -1711,7 +1716,7 @@ class ScanSession:
                 )
             except Exception:
                 logger.exception("ScanSession record_store upsert failed")
-                return
+                raise
             self._settle_locked(label)
             try:
                 self._mint_write_receipts_locked(label)

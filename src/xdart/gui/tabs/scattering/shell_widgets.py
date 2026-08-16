@@ -141,6 +141,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         *,
         x_axis: AxisProjection | None = None,
         y_axis: AxisProjection | None = None,
+        detector_shape: tuple[int, int] | None = None,
         color_map: str = "viridis",
         log_scale: bool = False,
         level_scan_token: object | None = None,
@@ -154,12 +155,14 @@ class ScientificImagePane(QtWidgets.QWidget):
             linear_percentiles = (0.5, 99.5)
             expand_degenerate = True
         else:
-            height, width = source.shape
+            height, width = detector_shape or source.shape
             # Detector data are stored row-major from the lower-left detector
             # origin.  The canonical raw view transposes to pyqtgraph's
             # column-major image order and mirrors detector Y exactly once.
             image = image[:, ::-1]
-            rect = QtCore.QRectF(0.0, 0.0, float(width), float(height))
+            x0, x1 = (-0.5, 0.5) if width == 1 else (0.0, float(width - 1))
+            y0, y1 = (-0.5, 0.5) if height == 1 else (0.0, float(height - 1))
+            rect = QtCore.QRectF(x0, y0, x1 - x0, y1 - y0)
             linear_percentiles = (2.0, 98.0)
             expand_degenerate = False
         self.canvas.setImage(

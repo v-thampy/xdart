@@ -36,7 +36,6 @@ from ..display_values import (
 from ..display_runtime import (
     DisplayArtifact,
     RunDisplayState,
-    project_frame_detector_values,
 )
 from ..display_retirement import (
     DisplayRetirementOwner,
@@ -678,7 +677,7 @@ class StandardRunExecutor:
     def _start_display_projection(self, run: _StandardRun) -> None:
         """Build display publications off the single HDF5 writer thread.
 
-        The completion listener transfers one native image reference into a
+        The completion listener transfers one exact frame label into a
         bounded queue.  Projection is CPU-only and owns no Qt object; public
         events remain arrays-free and are still coalesced by the page's normal
         125 ms drain.
@@ -696,10 +695,10 @@ class StandardRunExecutor:
                 try:
                     if item is _DISPLAY_PROJECTION_END:
                         return
-                    label, image, session = item
+                    label = item
                     started = monotonic()
                     self._frame_ready_owned(
-                        run, label, image, session
+                        run, label, None, None
                     )
                     _perf_add(
                         run,
@@ -2030,24 +2029,31 @@ class StandardRunExecutor:
                     run.light_projection_error = error
                     return
             pending = run.display_projection_queue
-            # ``ScanSession.finish`` can detach ``run.session`` before this
-            # bounded projection queue is drained.  Carry the exact session
-            # owner with every completion so trailing durable frames retain
-            # their saturation policy and navigation publication.
             session = run.session
             frame = run.frames_by_label.get(label)
             image = None if frame is None else frame.image
             if pending is not None and session is not None:
+                try:
+                    if image is not None: run.display.stamp_saturation_ceiling(owner, image)
+                    if (session.saturation_mask_seeded
+                            and not owner.saturation_mask_seeded):
+                        run.display.stamp_saturation_mask(owner, session.saturation_mask)
+                except BaseException as error:
+                    run.display_projection_errors.append(error)
+                    return
                 while True:
                     if run.display_projection_errors:
                         return
                     try:
                         pending.put(
-                            (label, image, session), timeout=0.05
+                            label, timeout=0.05
                         )
                         break
                     except Full:
                         continue
+            else:
+                run.display_projection_errors.append(RuntimeError(
+                    "display completion lost its projection queue or session"))
         finally:
             _perf_add(run, "display_callback", monotonic() - started)
 
@@ -2058,42 +2064,21 @@ class StandardRunExecutor:
         image: np.ndarray | None,
         session: Any,
     ) -> None:
+        if type(label) is not int: raise TypeError("display projection item must be an exact int")
         records, scan = (run.records, run.scan)
         if records is None or scan is None:
-            return
+            raise RuntimeError("display projection lost its record store or scan")
         label = int(label)
         record = records.get(label)
         frame = run.frames_by_label.get(label)
         if record is None or frame is None:
-            return
+            raise RuntimeError("display projection lost its exact record or frame")
         owner = run.display.artifacts.get(str(run.artifact))
         if owner is None:
-            return
-        if image is not None:
-            run.display.stamp_saturation_ceiling(owner, image)
-        stable_seeded = bool(session.saturation_mask_seeded)
-        if stable_seeded and not owner.saturation_mask_seeded:
-            run.display.stamp_saturation_mask(owner, session.saturation_mask)
-        if image is None:
-            raw, mask_baked = None, False
-        else:
-            raw, mask_baked = project_frame_detector_values(
-                image,
-                owner.mask,
-                frame.mask,
-                value_mask_enabled=bool(
-                    owner.mask_saturation and not stable_seeded
-                ),
-                stable_value_mask=(
-                    session.saturation_mask
-                    if owner.mask_saturation and stable_seeded
-                    else None
-                ),
-            )
+            raise RuntimeError("display projection lost its exact owner")
         view = replace(
             record.active_view(),
-            raw=raw,
-            mask_baked=mask_baked,
+            raw=None,
         )
         configuration = run.configuration
         is_gi = bool(configuration is not None and configuration.gi.enabled)

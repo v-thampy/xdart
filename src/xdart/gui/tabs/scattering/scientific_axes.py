@@ -403,6 +403,15 @@ def heavy_projection(
             return None
         view = payload.view
         raw = view.raw if view.raw is not None else view.thumbnail
+        detector_shape = view.extra.get("detector_shape")
+        if (
+            type(detector_shape) is not tuple
+            or len(detector_shape) != 2
+            or any(type(value) is not int or value <= 0 for value in detector_shape)
+        ):
+            detector_shape = None
+        if view.raw is not None and detector_shape != tuple(view.raw.shape):
+            detector_shape = None
         cake = view.intensity_2d
         cake_x = view.axis_2d_x
         cake_y = view.axis_2d_y
@@ -443,7 +452,10 @@ def heavy_projection(
             y_axis = None
         if raw is None and cake is None:
             return None
-        return HeavyProjection(frame, raw, cake, x_axis, y_axis)
+        return HeavyProjection(
+            frame, raw, cake, x_axis, y_axis,
+            detector_shape=detector_shape,
+        )
     except Exception:
         return None
 

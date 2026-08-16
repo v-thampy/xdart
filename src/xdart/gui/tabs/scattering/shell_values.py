@@ -258,6 +258,7 @@ class HeavyProjection:
     cake: np.ndarray | None = None
     cake_x: AxisProjection | None = None
     cake_y: AxisProjection | None = None
+    detector_shape: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if type(self.frame) is not DisplayFrameKey:
@@ -277,6 +278,12 @@ class HeavyProjection:
             or self.cake_y.values.shape != (self.cake.shape[0],)
         ):
             raise TypeError("cake axes do not match the cake image")
+        if self.detector_shape is not None and (
+            type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(value) is not int or value <= 0 for value in self.detector_shape)
+        ):
+            raise TypeError("detector shape must be an exact positive pair")
 
 
 @dataclass(frozen=True, slots=True)

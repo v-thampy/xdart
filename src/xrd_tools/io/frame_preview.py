@@ -88,9 +88,9 @@ class FramePreview:
         _check(self.raw_locator == self.view.source_path and self.source_frame_index == self.view.source_frame_index, "raw provenance must match the exact view", ValueError)
         purpose, has_raw = self.read_key.purpose, self.raw is not None
         requested = purpose is HydrationPurpose.FULL or (purpose is HydrationPurpose.PREVIEW and self.thumbnail is None)
-        fallback = has_raw and purpose is HydrationPurpose.PREVIEW and self.thumbnail is None
+        fallback = False
         _check(self.detector_fallback_used == fallback, "detector fallback flag is inconsistent", ValueError)
-        _check(not has_raw or requested, "purpose does not authorize detector raw", ValueError)
+        _check(not has_raw or purpose is HydrationPurpose.FULL, "purpose does not authorize detector raw", ValueError)
         _check(not has_raw or self.detector_diagnostic is None, "detector success cannot carry a diagnostic", ValueError)
         _check(not has_raw or (self.raw_locator is not None and self.source_frame_index is not None), "detector success requires exact provenance", ValueError)
         hdf_raw = has_raw and Path(self.raw_locator).suffix.lower() in {".h5", ".hdf5", ".nxs"}
@@ -144,11 +144,17 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
             raise KeyError(f"processed frame {frame} is absent")
         view = reader.read(frame)
         provenance = _source_provenance(reader, frame)
+        dataset = None if reader._entry is None else reader._entry.get("instrument/detector/detector_shape")
+        try: shape_values = np.asarray(dataset[()]) if dataset is not None else np.asarray(())
+        except Exception: shape_values = np.asarray(())
+        detector_shape = tuple(int(value) for value in shape_values) if shape_values.shape == (2,) and shape_values.dtype.kind in "iu" and np.all(shape_values > 0) else None
     locator, source_index, dataset_path, source_base, source_error = provenance
-    view = replace(view, source_path=locator, source_frame_index=source_index)
-    wants_detector = read_key.purpose is HydrationPurpose.FULL or (read_key.purpose is HydrationPurpose.PREVIEW and view.thumbnail is None)
+    extra = {**view.extra, **({"detector_shape": detector_shape} if detector_shape is not None else {})}
+    view = replace(view, source_path=locator, source_frame_index=source_index, extra=extra)
     raw = diagnostic = None
-    if wants_detector:
+    if read_key.purpose is HydrationPurpose.PREVIEW and view.thumbnail is None:
+        diagnostic = "stored thumbnail unavailable"
+    elif read_key.purpose is HydrationPurpose.FULL:
         if detector_projection is None or not detector_projection.mask_available:
             diagnostic = "detector mask/value projection unavailable"
         elif not locator:

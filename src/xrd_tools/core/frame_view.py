@@ -127,7 +127,7 @@ class FrameView:
         object.__setattr__(self, "intensity_2d", _readonly_array(self.intensity_2d))
         object.__setattr__(self, "sigma_2d", _readonly_array(self.sigma_2d))
         object.__setattr__(self, "raw", _readonly_array(self.raw))
-        object.__setattr__(self, "thumbnail", _readonly_array(self.thumbnail))
+        object.__setattr__(self, "thumbnail", _readonly_array(self.thumbnail, dtype=None))
         object.__setattr__(self, "metadata_raw", _readonly_mapping(self.metadata_raw))
         object.__setattr__(self, "metadata_numeric", _readonly_mapping(self.metadata_numeric))
         object.__setattr__(self, "extra", _readonly_mapping(self.extra))

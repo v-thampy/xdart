@@ -249,7 +249,7 @@ def _typed_request(
         owner_value,
         stores
         if stores is not None
-        else (art.records, art.light_records, art.publications),
+        else (art.records, art.publications),
         gate,
         read_key=read_key,
         token=token,
@@ -350,7 +350,7 @@ def test_absent_frame_fails_typed_without_alias_or_invention(
 # Row 3 — no-thumbnail fallback truth and fail-closed
 # --------------------------------------------------------------------------- #
 
-def test_no_thumbnail_qualified_fallback_reads_once_masked_readonly(
+def test_no_thumbnail_preview_keeps_science_without_detector_fallback(
     monkeypatch, tmp_path
 ):
     state, owner, processed, _raw, _events = _bound_state(
@@ -367,12 +367,140 @@ def test_no_thumbnail_qualified_fallback_reads_once_masked_readonly(
     assert _wait_transport_idle(state)
 
     assert counts["processed"] == 1
-    assert counts["detector"] == 1
+    assert counts["detector"] == 0
     publication = owner.publications.get(2)
     assert publication is not None
-    raw = publication.view.raw
-    assert raw is not None and not raw.flags.writeable
+    assert publication.view.raw is publication.view.thumbnail is None
+    assert publication.view.has_1d and publication.view.has_2d
     assert (2, HydrationOutcome.HYDRATED) in _completion_outcomes(state)
+
+
+@pytest.mark.parametrize("with_2d", (False, True), ids=("Int1D", "Int2D"))
+def test_live_thumbnail_carrier_is_exact_complete_and_label_only(
+    monkeypatch, tmp_path, with_2d
+):
+    from queue import Queue; from types import SimpleNamespace; import xrd_tools.reduction.core as reduction_core
+    from xrd_tools.reduction import Frame, Integration1DPlan, Integration2DPlan, NexusSink, ReductionPlan, Scan
+    from xrd_tools.session import ScanSession
+    from xdart.gui.tabs.scattering.adapters import dynamic_output; from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor, _StandardRun
+
+    one = IntegrationResult1D(np.array([0., 1.]), np.array([2., 3.]), unit="q_A^-1")
+    two = IntegrationResult2D(np.array([0., 1.]), np.array([-1., 1.]),
+                              np.arange(4.).reshape(2, 2), unit="q_A^-1",
+                              azimuthal_unit="chi_deg")
+    monkeypatch.setattr(reduction_core, "integrate_1d", lambda *_a, **_k: one)
+    monkeypatch.setattr(reduction_core, "integrate_2d", lambda *_a, **_k: two)
+    image = np.arange(48, dtype=np.uint16).reshape(8, 6)
+    mask = np.zeros(image.shape, dtype=bool); mask[:2, :2] = True
+    frame = Frame(1, image=image, mask=mask)
+    plan = ReductionPlan(integration_1d=Integration1DPlan(npt=2), integration_2d=Integration2DPlan() if with_2d else None); scan = Scan("live", [frame], integrator=object())
+    target = tmp_path / "live.nxs"
+    run = _StandardRun(None, RunIdentity(1, "perf-c5"), scan, None, None, None, target)
+    owner = run.display.add_artifact(target, "live", mask=None, mask_saturation=False, measurement_mode="Standard")
+    policy, layout, rows, ceiling, _ = dynamic_output._light_policy_layout(SimpleNamespace(max_cores=1, gi=SimpleNamespace(enabled=False)), plan, SimpleNamespace(descriptor=None), scan, (1,))
+    lease = dynamic_output.acquire_light_1d_retention(dynamic_output.SessionResourceAuthority.from_allocation(policy.allocation), owner="scattering-light-1d:perf-c5", generation=1, layout=layout, requested_rows=rows, compatibility_byte_ceiling=ceiling, gui_thread_id=run.gui_thread_id, funding_mode=dynamic_output.Light1DFundingMode.REPLACE_PUBLICATION_A1, current_lineage_rows=1)
+    owner.publications.bind_allocation(policy.allocation); owner.publications.bind_light_1d(lease)
+    hooks = owner.publications.light_1d_cleanup_hooks(lease)
+    run.display.stage_light_1d(owner, lease, hooks=hooks); run.display.bind_light_1d(owner, lease)
+    prepared, writes = [], []
+    original_prepare, original_write = (NexusSink._prepare_frame_thumbnail, NexusSink._write_frame_record)
+
+    def observe_prepare(self, owned_frame, **kwargs):
+        prepared.append(owned_frame.index); return original_prepare(self, owned_frame, **kwargs)
+
+    def observe_write(self, owned_frame, reduction, **kwargs):
+        value = original_write(self, owned_frame, reduction, **kwargs)
+        writes.append((reduction, value)); return value
+
+    monkeypatch.setattr(NexusSink, "_prepare_frame_thumbnail", observe_prepare)
+    monkeypatch.setattr(NexusSink, "_write_frame_record", observe_write)
+    session = ScanSession(plan, scan, sink=NexusSink(target, overwrite=True, thumbnail_max=4),
+                          executor=1, record_store=owner.records)
+    run.session, run.records, run.frames_by_label[1] = session, owner.records, frame
+    session.submit(frame)
+    session.finish()
+    reduction, record_write = writes[0]; view = owner.records.get(1).active_view(); thumbnail = reduction.thumbnail
+    assert prepared == [1] and record_write.thumbnail is thumbnail is view.thumbnail
+    assert thumbnail.dtype == np.float32 and not thumbnail.flags.writeable
+    assert reduction._thumbnail_mask_baked is record_write.thumbnail_mask_baked is view.mask_baked is True
+    assert np.isnan(thumbnail[0, 0]) and np.isfinite(thumbnail[-1, -1])
+    assert view.raw is None and view.has_1d and view.has_2d is with_2d
+    assert view.extra["detector_shape"] == image.shape
+
+    run.total = run.current_total = 1
+    executor = StandardRunExecutor(); executor._active = run
+    pending = run.display_projection_queue = Queue()
+    executor._frame_ready(run, SimpleNamespace(frame_index=1)); queued = pending.get_nowait()
+    assert type(queued) is int and queued == 1
+    executor._frame_ready_owned(run, queued, None, None)
+    event = executor.drain_events()[-1]; payload = run.display.payloads[event.frame_key]
+    assert payload.view.thumbnail is thumbnail and payload.view.raw is None
+    assert run.display.project(event.frame_key, 0, closed=False) is not None
+    assert sum(run.display.transport.counters().values()) == 0
+    error = RuntimeError("stamp failed"); monkeypatch.setattr(run.display, "stamp_saturation_ceiling",
+                        lambda *_a, **_k: (_ for _ in ()).throw(error))
+    executor._frame_ready(run, SimpleNamespace(frame_index=1))
+    assert run.display_projection_errors == [error] and pending.empty()
+    run.display.artifacts.pop(str(target))
+    with pytest.raises(RuntimeError, match="exact owner"):
+        executor._frame_ready_owned(run, 1, None, None)
+
+    if not with_2d:
+        supplied = np.arange(6, dtype=np.float32).reshape(2, 3)
+        direct = reduction_core.FrameReduction(2, result_1d=one, thumbnail=supplied,
+                                                _thumbnail_mask_baked=True)
+        direct_frame = Frame(2, image=np.ones((2, 3)))
+        direct_sink = NexusSink(tmp_path / "direct.nxs", overwrite=True)
+        direct_sink.begin(Scan("direct", [direct_frame]), plan)
+        before = len(prepared)
+        direct_sink.write_batch(((direct_frame, direct),))
+        direct_sink.finish(reduction_core.ReductionResult("direct", {}, 1))
+        assert len(prepared) == before
+        assert writes[-1][1].thumbnail is supplied
+        assert writes[-1][1].thumbnail_mask_baked is True
+
+
+def test_thumbnail_semilight_missing_science_rehydrates_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(display_runtime, "heavy_window", lambda _bytes: 1)
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    keys = _catalog(state, owner, (1, 2))
+    owner_value, gate = _acquisition_identity(state)
+    _hydrate_ok(state, owner_value, gate, processed, 1, 1)
+    _hydrate_ok(state, owner_value, gate, processed, 2, 2)
+    semilight = owner.publications.get(1)
+    assert semilight.view.thumbnail is not None and semilight.record.is_empty
+    counts = _instrument_reads(monkeypatch, processed)
+    before = dict(state.transport.counters())
+    assert state.project(keys[1], 3, closed=False, owner=owner_value,
+                         commit_gate=gate) is None
+    assert _wait_transport_idle(state)
+    restored = owner.publications.get(1)
+    assert restored.view.has_1d and restored.view.has_2d and restored.view.raw is None
+    assert counts["processed"] == 1 and counts["detector"] == 0
+    assert state.project(keys[1], 4, closed=False) is not None
+    assert state.transport.counters()[HydrationOutcome.HYDRATED] == before[HydrationOutcome.HYDRATED] + 1
+
+
+def test_non_square_thumbnail_uses_true_extent_without_remask_or_cake_drift(tmp_path):
+    from types import SimpleNamespace; from unittest.mock import Mock
+    from xdart.gui.tabs.scattering.scientific_axes import heavy_projection
+    from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+    thumbnail = np.array([[np.nan, 1., 2.], [3., 4., 5.]], dtype=np.float32)
+    cake = np.arange(6., dtype=float).reshape(2, 3)
+    state, owner = _state(tmp_path / "render.nxs")
+    key = state.append_navigation(owner.source_scan, str(owner.artifact), 1).appended
+    view = FrameView(label=1, thumbnail=thumbnail, axis_2d_x=Axis("q", "1/angstrom", values=np.array([.1, .2, .3])), axis_2d_y=Axis("chi", "degree", values=np.array([-1., 1.])), intensity_2d=cake, extra={"detector_shape": (8, 12)})
+    heavy = heavy_projection(StandardDisplayPayload(0, key, "frame", view))
+    assert heavy.detector_shape == (8, 12) and heavy.raw is thumbnail
+    pane = SimpleNamespace(canvas=Mock(), plot=Mock()); pane.canvas.imageViewBox = Mock()
+    ScientificImagePane.render(pane, heavy.raw, detector_shape=heavy.detector_shape)
+    image, options = pane.canvas.setImage.call_args.args[0], pane.canvas.setImage.call_args.kwargs
+    np.testing.assert_allclose(image, thumbnail.T[:, ::-1], equal_nan=True); rect = options["rect"]
+    assert (rect.x(), rect.y(), rect.width(), rect.height()) == (0., 0., 11., 7.)
+    pane.canvas.setImage.reset_mock(); ScientificImagePane.render(pane, heavy.cake, x_axis=heavy.cake_x, y_axis=heavy.cake_y)
+    np.testing.assert_array_equal(pane.canvas.setImage.call_args.args[0], cake.T)
+    assert pane.canvas.setImage.call_args.kwargs["linear_percentiles"] == (0.5, 99.5)
 
 
 def test_frame_mask_qualified_no_thumbnail_fails_closed_with_usable_cake(
