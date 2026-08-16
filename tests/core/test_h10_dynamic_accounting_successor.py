@@ -236,6 +236,38 @@ def test_retry_reuses_one_logical_outstanding_slot_at_capacity():
     assert accounting.snapshot().enqueued == frozenset((key0,))
 
 
+def test_begin_attempt_skips_outstanding_scan_through_registered_key_ceiling(
+    monkeypatch,
+):
+    (_Limits, AttemptState, _Identity, Accounting, _RunState) = _api()
+
+    def fail_scan(_self):
+        raise AssertionError("registered-key ceiling must not scan outstanding state")
+
+    monkeypatch.setattr(Accounting, "_outstanding_keys", fail_scan)
+
+    _ledger, accounting = _accounting(max_attempts=3, max_outstanding=2)
+    key0 = _discover(accounting, "fast-path", 0)
+    key1 = _discover(accounting, "fast-path", 1)
+    assert type(accounting._attempts) is dict
+    assert accounting._attempts == {key0: [], key1: []}
+
+    first = accounting.begin_attempt(key0, source_revision=1)
+    accounting.record_failed(first, error="partial", retryable=True)
+    retry = accounting.begin_attempt(key0, source_revision=2)
+    accounting.record_failed(retry, error="terminal", retryable=False)
+    accounting.begin_attempt(key1, source_revision=1)
+
+    _ledger, accounting = _accounting(max_outstanding=2)
+    key0 = _discover(accounting, "uncanonical", 0)
+    key1 = _discover(accounting, "uncanonical", 1)
+    completed = _successful_attempt(accounting, key0)
+    snap = accounting.snapshot()
+    assert snap.attempt_states[completed] is AttemptState.COMPLETED
+    assert (key0, MODE, TARGET) not in snap.durable
+    accounting.begin_attempt(key1, source_revision=1)
+
+
 def test_same_path_revision_growth_does_not_cross_a_durable_hole():
     _ledger, accounting = _accounting()
     key0 = _discover(accounting, "growing.h5", 0)

@@ -522,9 +522,10 @@ class DynamicRunAccounting:
                 raise ValueError(
                     "dynamic live attempt must be failed or cancelled before retry"
                 )
-            outstanding = self._outstanding_keys()
-            if key not in outstanding and len(outstanding) >= self._limits.max_outstanding:
-                raise ValueError("dynamic outstanding attempt limit exceeded")
+            if len(self._attempts) > self._limits.max_outstanding:
+                outstanding = self._outstanding_keys()
+                if key not in outstanding and len(outstanding) >= self._limits.max_outstanding:
+                    raise ValueError("dynamic outstanding attempt limit exceeded")
             prior = self._latest_source_revision.get(key)
             if prior is not None and source_revision < prior:
                 raise ValueError(
