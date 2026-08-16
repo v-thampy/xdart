@@ -397,6 +397,7 @@ class WriterIncomplete(RuntimeError):
 
 
 _VECTOR_FIELDS = tuple(WriterOperationVector.__dataclass_fields__)
+_SEMANTIC_READ_GROUP_SIZE = 8
 
 
 class NexusRecordWriter:
@@ -485,6 +486,9 @@ class NexusRecordWriter:
         self._lineage_expected: str | None = None
         self._checkpoint_rows = 0
         self._checkpoint_read_bytes = 0
+        self._semantic_read_groups = {"checkpoint": 0, "close": 0}
+        self._semantic_read_rows = {"checkpoint": 0, "close": 0}
+        self._semantic_mode_observation = None
         self._stream_close_attempt = None
         self._stream_terminal: StreamTerminal | None = None
         self._close_verification_descriptor = None
@@ -507,6 +511,52 @@ class NexusRecordWriter:
     @property
     def checkpoint_read_volume(self) -> tuple[int, int]:
         return self._checkpoint_rows, self._checkpoint_read_bytes
+
+    @property
+    def grouped_semantic_read_volume(self) -> Mapping[str, tuple[int, int]]:
+        return MappingProxyType({
+            phase: (self._semantic_read_groups[phase], self._semantic_read_rows[phase])
+            for phase in ("checkpoint", "close")
+        })
+
+    @staticmethod
+    def _semantic_groups(rows):
+        group = []
+        for row in rows:
+            if group and (
+                len(group) == _SEMANTIC_READ_GROUP_SIZE
+                or row.group_name != group[-1].group_name
+                or row.row != group[-1].row + 1
+            ):
+                yield tuple(group)
+                group = []
+            group.append(row)
+        if group:
+            yield tuple(group)
+
+    def _read_grouped_mode(self, rows, phase: str):
+        group = self._entry_group().get(rows[0].group_name)
+        intensity = group.get("intensity") if isinstance(group, h5py.Group) else None
+        radial = group.get("q") if isinstance(group, h5py.Group) else None
+        azimuthal = group.get("chi") if rows[0].dimension == "2d" else None
+        if not isinstance(intensity, h5py.Dataset) or not isinstance(
+            radial, h5py.Dataset,
+        ) or (rows[0].dimension == "2d" and not isinstance(
+            azimuthal, h5py.Dataset,
+        )):
+            return None
+        start = rows[0].row
+        observed = np.asarray(intensity[start:start + len(rows)])
+        if observed.shape[:1] != (len(rows),):
+            raise WriterStateError(
+                f"grouped durability read lost rows for {rows[0].group_name}"
+            )
+        self._semantic_read_groups[phase] += 1
+        self._semantic_read_rows[phase] += len(rows)
+        return (
+            np.asarray(radial[()]), observed,
+            None if azimuthal is None else np.asarray(azimuthal[()]),
+        )
 
     def bind_session(self, facade) -> None:
         if self.phase is not WriterPhase.NEW:
@@ -855,9 +905,10 @@ class NexusRecordWriter:
             np.asarray(expected.label, dtype=frame_index.dtype),
             np.asarray(frame_index[expected.row]),
         )
+        grouped = self._semantic_mode_observation
         observed_radial = (
-            np.asarray(group["q"][()])
-            if observed is None else observed.radial
+            grouped[0] if grouped is not None else
+            np.asarray(group["q"][()]) if observed is None else observed.radial
         )
         evidence.array(f"{role}/q", expected.radial, observed_radial)
         evidence.text(
@@ -865,10 +916,12 @@ class NexusRecordWriter:
             expected.unit,
             self._text_value(group["q"].attrs.get("units", "")),
         )
-        observed_intensity = (
-            np.asarray(group["intensity"][expected.row])
-            if observed is None else observed.intensity
-        )
+        observed_intensity = None if grouped is None else grouped[1]
+        if observed_intensity is None:
+            observed_intensity = (
+                np.asarray(group["intensity"][expected.row])
+                if observed is None else observed.intensity
+            )
         evidence.array(f"{role}/intensity", expected.intensity, observed_intensity)
         evidence.text(
             f"{role}/shape-facts",
@@ -919,7 +972,8 @@ class NexusRecordWriter:
             evidence.array(
                 f"{role}/chi",
                 expected.azimuthal,
-                (np.asarray(group["chi"][()])
+                (grouped[2] if grouped is not None else
+                 np.asarray(group["chi"][()])
                  if observed is None else observed.azimuthal),
             )
             evidence.text(
@@ -1233,11 +1287,21 @@ class NexusRecordWriter:
             aggregate.text(role, digest, digest)
             read_bytes += evidence.read_bytes
 
-        for key in sorted(self._dirty_modes):
-            evidence = _EvidenceBuilder()
-            proof = self._verify_mode_row(evidence, self._dirty_modes[key])
-            mode_proofs[(proof.group_name, proof.label)] = proof
-            absorb(f"mode:{proof.group_name}:{proof.label}", evidence)
+        mode_rows = tuple(self._dirty_modes[key] for key in sorted(self._dirty_modes))
+        for rows in self._semantic_groups(mode_rows):
+            grouped = self._read_grouped_mode(rows, "checkpoint")
+            for offset, expected in enumerate(rows):
+                self._semantic_mode_observation = (
+                    None if grouped is None else
+                    (grouped[0], grouped[1][offset], grouped[2])
+                )
+                try:
+                    evidence = _EvidenceBuilder()
+                    proof = self._verify_mode_row(evidence, expected)
+                    mode_proofs[(proof.group_name, proof.label)] = proof
+                    absorb(f"mode:{proof.group_name}:{proof.label}", evidence)
+                finally:
+                    self._semantic_mode_observation = None
         for group_name, label in sorted(self._dirty_absent_modes):
             evidence = _EvidenceBuilder()
             self._verify_absent_mode_row(evidence, group_name, label)
@@ -1301,6 +1365,7 @@ class NexusRecordWriter:
             None if sigma_dataset is None
             else np.asarray(sigma_dataset[proof.row])
         )
+        grouped = self._semantic_mode_observation
         azimuthal = None
         if proof.dimension == "2d":
             chi = group.get("chi")
@@ -1308,16 +1373,21 @@ class NexusRecordWriter:
                 raise WriterStateError(
                     f"durable-row proof lost chi for label {proof.label}"
                 )
-            azimuthal = np.asarray(chi[()])
+            azimuthal = (
+                np.asarray(chi[()]) if grouped is None else grouped[2]
+            )
+        observed_intensity = None if grouped is None else grouped[1]
+        if observed_intensity is None:
+            observed_intensity = np.asarray(intensity[proof.row])
         observation = _ExpectedModeRow(
             group_name=proof.group_name,
             label=proof.label,
             row=proof.row,
             dimension=proof.dimension,
             mode=proof.mode,
-            radial=np.asarray(radial[()]),
+            radial=np.asarray(radial[()]) if grouped is None else grouped[0],
             azimuthal=azimuthal,
-            intensity=np.asarray(intensity[proof.row]),
+            intensity=observed_intensity,
             sigma=sigma,
             unit=proof.unit,
             azimuthal_unit=proof.azimuthal_unit,
@@ -1399,16 +1469,30 @@ class NexusRecordWriter:
                     else self._vfd_descriptor()
                 )
                 before = self._descriptor_stat_tuple(descriptor)
-                for key in sorted(self._durable_mode_proofs):
-                    proof = self._durable_mode_proofs[key]
-                    evidence = self._reverify_durable_mode_proof(proof)
-                    digest = evidence.hexdigest()
-                    aggregate.text(
-                        f"mode:{proof.group_name}:{proof.label}",
-                        digest,
-                        digest,
+                proofs = tuple(
+                    self._durable_mode_proofs[key]
+                    for key in sorted(self._durable_mode_proofs)
+                )
+                for proofs_group in self._semantic_groups(proofs):
+                    grouped = self._read_grouped_mode(
+                        proofs_group, "close",
                     )
-                    read_bytes += evidence.read_bytes
+                    for offset, proof in enumerate(proofs_group):
+                        self._semantic_mode_observation = (
+                            None if grouped is None else
+                            (grouped[0], grouped[1][offset], grouped[2])
+                        )
+                        try:
+                            evidence = self._reverify_durable_mode_proof(proof)
+                            digest = evidence.hexdigest()
+                            aggregate.text(
+                                f"mode:{proof.group_name}:{proof.label}",
+                                digest,
+                                digest,
+                            )
+                            read_bytes += evidence.read_bytes
+                        finally:
+                            self._semantic_mode_observation = None
                 for key in sorted(self._durable_absence_proofs):
                     proof = self._durable_absence_proofs[key]
                     evidence = _EvidenceBuilder()

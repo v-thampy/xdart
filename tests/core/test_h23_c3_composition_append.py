@@ -148,6 +148,176 @@ def _release(transaction, lease, owners) -> None:
         transaction.release_lease_owner(lease, role, owners[role])
 
 
+def _bound_writer(tmp_path, *, prior=None, complete_record=False, facade_type=_Facade):
+    from xrd_tools.io.record_writer import NexusRecordWriter, WriterTransactionBinding
+
+    (_coordinator, transaction, target, transaction_owner, target_owner,
+     owners, lease) = _transaction(tmp_path, prior=prior)
+    pool = _Pool()
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=transaction_owner,
+        target_owner=target_owner, lease=lease, pool=pool,
+        file_lock=threading.RLock(),
+    )
+    writer = NexusRecordWriter(
+        target, atomic=False, flush_every=None, complete_record=complete_record,
+        file_lock=threading.RLock(),
+        transaction_binding=WriterTransactionBinding(transaction, attempt, lease),
+    )
+    facade = facade_type(target)
+    writer.bind_session(facade)
+    writer.begin()
+    return writer, transaction, attempt, lease, owners, pool, facade, target
+
+
+def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.record_writer import RecordWrite
+
+    (writer, transaction, attempt, lease, owners, _pool, _facade, target) = (
+        _bound_writer(tmp_path))
+    groups = []
+    real_group_read = writer._read_grouped_mode
+
+    def trace_group(rows, phase):
+        groups.append((phase, rows[0].group_name, tuple(row.label for row in rows)))
+        return real_group_read(rows, phase)
+
+    monkeypatch.setattr(writer, "_read_grouped_mode", trace_group)
+    records = []
+    for label in range(10):
+        one_d, two_d = _r1(label + 1), _r2(label + 1)
+        if label % 2:
+            one_d.sigma = two_d.sigma = None
+        records.append(RecordWrite(label=label, result_1d=one_d, result_2d=two_d))
+    writer.write_batch(records)
+    writer.flush(force=True)
+
+    expected_groups = [
+        ("integrated_1d", tuple(range(8))),
+        ("integrated_1d", (8, 9)),
+        ("integrated_2d", tuple(range(8))),
+        ("integrated_2d", (8, 9)),
+    ]
+    assert groups == [("checkpoint", name, labels) for name, labels in expected_groups]
+    assert tuple(writer.grouped_semantic_read_volume.values()) == ((4, 20), (0, 0))
+    checkpoint = {key: proof.digest
+                  for key, proof in writer._durable_mode_proofs.items()}
+    assert all(
+        not isinstance(getattr(proof, field), np.ndarray)
+        for proof in writer._durable_mode_proofs.values()
+        for field in proof.__slots__
+    )
+    close_observed = {}
+    real_reverify = writer._reverify_durable_mode_proof
+
+    def trace_reverify(proof):
+        evidence = real_reverify(proof)
+        close_observed[(proof.group_name, proof.label)] = evidence.observed_hexdigest()
+        return evidence
+
+    monkeypatch.setattr(writer, "_reverify_durable_mode_proof", trace_reverify)
+    writer.finish()
+    assert groups[4:] == [("close", name, labels) for name, labels in expected_groups]
+    assert close_observed == checkpoint
+    assert tuple(writer.grouped_semantic_read_volume.values()) == ((4, 20), (4, 20))
+    assert transaction.commit_stream(attempt, lease=lease).phase is TransactionPhase.COMMITTED
+    _release(transaction, lease, owners)
+
+    with h5py.File(target, "r") as handle:
+        one_d, two_d = handle["entry/integrated_1d"], handle["entry/integrated_2d"]
+        np.testing.assert_array_equal(one_d["q"][()], _r1(1).radial.astype("f4"))
+        np.testing.assert_array_equal(two_d["q"][()], _r2(1).radial.astype("f4"))
+        np.testing.assert_array_equal(two_d["chi"][()], _r2(1).azimuthal.astype("f4"))
+        for label in range(10):
+            np.testing.assert_array_equal(one_d["intensity"][label], _r1(label + 1).intensity)
+            np.testing.assert_array_equal(two_d["intensity"][label], _r2(label + 1).intensity.T)
+            if label % 2:
+                assert np.isnan(one_d["sigma"][label]).all()
+                assert np.isnan(two_d["sigma"][label]).all()
+            else:
+                np.testing.assert_allclose(one_d["sigma"][label], _r1(label + 1).sigma)
+                np.testing.assert_allclose(two_d["sigma"][label], _r2(label + 1).sigma.T)
+
+
+def test_grouped_semantic_reads_split_sparse_replacements_and_clear_on_failure(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.record_writer import NexusRecordWriter, RecordWrite, WriterIncomplete
+
+    seed_path = tmp_path / "seed.nexus"
+    seed = NexusRecordWriter(seed_path, atomic=False, flush_every=None,
+                             complete_record=True)
+    seed.begin()
+    seed.write_batch(
+        RecordWrite(label=label, result_1d=_r1(label + 1), result_2d=_r2(label + 1))
+        for label in range(10)
+    )
+    seed.finish()
+
+    class DropFacade(_Facade):
+        def __init__(self, target):
+            super().__init__(target)
+            self.dropped = []
+
+        def commit_publication_drop(self, label, mode, expected_revision):
+            self.dropped.append((label, mode, expected_revision))
+
+    (writer, transaction, attempt, lease, owners, _pool, facade, target) = (
+        _bound_writer(tmp_path, prior=seed_path.read_bytes(), complete_record=True,
+                      facade_type=DropFacade))
+    groups = []
+    real_group_read = writer._read_grouped_mode
+
+    def trace_group(rows, phase):
+        groups.append((phase, rows[0].group_name, tuple(row.label for row in rows)))
+        return real_group_read(rows, phase)
+
+    monkeypatch.setattr(writer, "_read_grouped_mode", trace_group)
+    writer.write_batch(
+        RecordWrite(label=label, result_1d=_r1(100 + label),
+                    result_2d=_r2(100 + label), replace_existing=True)
+        for label in (0, 2, 3, 9)
+    )
+    dropped_mode = ResultMode.one_d()
+    writer.mark_publication_dropped(5, dropped_mode, expected_revision=1)
+    real_verify = writer._verify_mode_row
+    failed = []
+
+    def fail_once(evidence, expected, observed=None):
+        if expected.label == 2 and not failed:
+            failed.append(expected.label)
+            raise OSError("grouped row observation unavailable")
+        return real_verify(evidence, expected, observed)
+
+    monkeypatch.setattr(writer, "_verify_mode_row", fail_once)
+    with pytest.raises(WriterIncomplete, match="grouped row observation unavailable"):
+        writer.flush(force=True)
+    assert writer._semantic_mode_observation is None
+    groups.clear()
+    writer.flush(force=True)
+    sparse = [(name, labels) for name in ("integrated_1d", "integrated_2d")
+              for labels in ((0,), (2, 3), (9,))]
+    assert groups == [("checkpoint", name, labels) for name, labels in sparse]
+    assert facade.dropped == [(5, dropped_mode, 1)]
+    assert ("integrated_1d", 5) in writer._durable_absence_proofs
+    writer.finish()
+    assert groups[6:] == [("close", name, labels) for name, labels in sparse]
+    assert writer._semantic_mode_observation is None
+    assert transaction.commit_stream(attempt, lease=lease).phase is TransactionPhase.COMMITTED
+    _release(transaction, lease, owners)
+
+    with h5py.File(target, "r") as handle:
+        one_d, two_d = handle["entry/integrated_1d"], handle["entry/integrated_2d"]
+        assert tuple(one_d["frame_index"][()]) == (0, 1, 2, 3, 4, 6, 7, 8, 9)
+        assert tuple(two_d["frame_index"][()]) == tuple(range(10))
+        for label in (0, 2, 3, 9):
+            row_1d = list(one_d["frame_index"][()]).index(label)
+            np.testing.assert_array_equal(one_d["intensity"][row_1d], _r1(100 + label).intensity)
+            np.testing.assert_array_equal(two_d["intensity"][label], _r2(100 + label).intensity.T)
+
+
 def test_stream_attempt_keeps_one_lease_through_open_flush_and_commit(tmp_path):
     (coordinator, transaction, target, transaction_owner, target_owner,
      owners, lease) = _transaction(tmp_path)
