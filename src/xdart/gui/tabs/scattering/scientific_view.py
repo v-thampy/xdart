@@ -865,6 +865,18 @@ class ScientificView(QtWidgets.QFrame):
         return (cleared if failure else
                 _new_viewer_1d_renderer_clear_receipt(request, cleared))
 
+    def clear_workspace(self) -> bool:
+        """Drop every mounted scientific payload before owner retirement."""
+        cleared = ScientificView.clear_viewer_1d(
+            self, None, failure=True
+        )
+        try:
+            self.title.setText("Current")
+            self.status.setText("")
+        except Exception:
+            return False
+        return bool(cleared)
+
     def _reconcile_slice_extent(self, state: ScientificProjection) -> None:
         orientation = (
             slice_region_orientation(

@@ -519,10 +519,26 @@ def test_real_host_exit_action_closes_after_nine_frame_run(
     try:
         window.page_handle.run_control.run_pause()
         assert wait_for(lambda: page._lifecycle.phase is RunPhase.RUNNING)
-        assert wait_for(lambda: page._lifecycle.phase is RunPhase.IDLE)
+        assert wait_for(
+            lambda: page._lifecycle.phase is RunPhase.IDLE
+            and bool(page._shell.scientific._trace_history_by_identity)
+            and bool(page._shell.scientific.curve.listDataItems())
+        )
+        run = executor._active
+        assert run is not None and run.closed
+        owner = next(iter(run.display.artifacts.values()))
+        lease, slot = owner.light_lease, owner.light_slot
+        assert lease is not None and lease.state is Light1DLeaseState.ACTIVE
+        assert slot is not None and slot.state is Light1DCustodyState.RETAINED
         window.ui.actionExit.trigger()
-        assert wait_for(lambda: bool(terminated) and not window.isVisible())
+        assert wait_for(
+            lambda: bool(terminated) and not window.isVisible(), timeout=5.0
+        )
         assert window.page_handle.close().status is PageCleanup.CLEAN
+        assert page._context_controller.acquisition_context is None
+        assert lease.state is Light1DLeaseState.RELEASED
+        assert slot.state is Light1DCustodyState.RELEASED
+        assert lease.authority.snapshot().reservation_count == 0
         assert wait_for(
             lambda: not any(
                 thread.is_alive() and thread.name.startswith("scattering-")

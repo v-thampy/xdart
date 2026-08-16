@@ -504,7 +504,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
 
         if (not self._clear_viewer_1d_renderer(close=True)
-                or not self._clear_viewer_2d_renderer(close=True)):
+                or not self._clear_viewer_2d_renderer(close=True)
+                or not self._shell.scientific.clear_workspace()):
             return StartClosed(
                 LifecycleResult(
                     LifecycleStatus.REJECTED,
