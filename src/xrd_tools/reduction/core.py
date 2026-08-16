@@ -24,6 +24,7 @@ from enum import Enum
 from types import MappingProxyType
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Protocol, runtime_checkable
+from uuid import uuid4
 
 import numpy as np
 
@@ -937,6 +938,16 @@ class TransactionalXYESink:
     )
     _transition_ordinal: int = field(default=0, init=False, repr=False)
     _published_any: bool = field(default=False, init=False, repr=False)
+    _stage_nonce: str = field(init=False, repr=False)
+    _stage_paths: dict[int, Path] = field(default_factory=dict, init=False, repr=False)
+    _ready_labels: set[int] = field(default_factory=set, init=False, repr=False)
+    _pending: Any = field(default=None, init=False, repr=False)
+    _worker: Any = field(default=None, init=False, repr=False)
+    _errors: list[BaseException] = field(default_factory=list, init=False, repr=False)
+    _perf_enabled: bool = field(default=False, init=False, repr=False)
+    _perf_values: dict[str, float] = field(
+        default_factory=dict, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.pattern != "{scan}_{frame:04d}.xye":
@@ -962,6 +973,8 @@ class TransactionalXYESink:
         self._run_owner = owner
         self._transaction = transaction
         self._canonical_target = f"xye:{normalized}"
+        self._stage_nonce = uuid4().hex
+        self._perf_enabled = bool(os.environ.get("XDART_PERF"))
 
     @property
     def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
@@ -1011,6 +1024,42 @@ class TransactionalXYESink:
             raise ValueError("transactional XYE target cannot satisfy a 2-D mode")
         self._scan_name = scan.name
         self._mode = mode
+        self._errors.clear()
+        self._perf_values = {
+            "sink_xye_write": 0.0,
+            "sink_xye_worker_format": 0.0,
+            "sink_xye_enqueue_wait": 0.0,
+            "sink_xye_queue_high_water": 0,
+            "sink_xye_drain": 0.0,
+            "sink_xye_promotion": 0.0,
+            "sink_xye_generated": 0,
+        }
+        self._canonical_directory.mkdir(parents=True, exist_ok=True)
+        pending: queue.Queue[object] = queue.Queue(maxsize=16)
+        self._pending = pending
+
+        def write_pending() -> None:
+            while True:
+                item = pending.get()
+                try:
+                    if item is _XYE_WRITE_END:
+                        return
+                    label, radial, intensity, sigma = item
+                    try:
+                        self._format_stage(
+                            label, radial, intensity, sigma, worker=True,
+                        )
+                    except BaseException as error:
+                        self._errors.append(error)
+                finally:
+                    pending.task_done()
+
+        self._worker = threading.Thread(
+            target=write_pending,
+            name="xrd-tools-xye-writer",
+            daemon=True,
+        )
+        self._worker.start()
 
     def _path_for(self, frame: Frame) -> Path:
         path = os.path.normcase(os.path.abspath(str(
@@ -1026,6 +1075,61 @@ class TransactionalXYESink:
             )
         return Path(path)
 
+    def _stage_path(self, label: int) -> Path:
+        return self._canonical_directory / (
+            f".xdart-xye-{self._stage_nonce}-{int(label)}.tmp"
+        )
+
+    def _format_stage(
+        self, label: int, radial, intensity, sigma, *, worker: bool,
+    ) -> None:
+        label = int(label)
+        stage = self._stage_path(label)
+        self._stage_paths[label] = stage
+        self._ready_labels.discard(label)
+        started = time.perf_counter() if self._perf_enabled else 0.0
+        try:
+            write_xye(stage, radial, intensity, sigma)
+        finally:
+            if self._perf_enabled and worker:
+                elapsed = max(0.0, time.perf_counter() - started)
+                self._perf_values["sink_xye_worker_format"] += elapsed
+                self._perf_values["sink_xye_write"] += elapsed
+        self._ready_labels.add(label)
+        if self._perf_enabled:
+            self._perf_values["sink_xye_generated"] += 1
+
+    def _drain_worker(self, *, terminal: bool) -> None:
+        pending, worker = self._pending, self._worker
+        started = time.perf_counter() if self._perf_enabled else 0.0
+        if pending is not None and worker is not None:
+            if terminal:
+                pending.put(_XYE_WRITE_END)
+                worker.join()
+                self._pending = None
+                self._worker = None
+            else:
+                pending.join()
+        if self._perf_enabled:
+            self._perf_values["sink_xye_drain"] += max(
+                0.0, time.perf_counter() - started,
+            )
+
+    def _cleanup_staging(self) -> None:
+        failures: list[BaseException] = []
+        for label, path in tuple(self._stage_paths.items()):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as error:
+                failures.append(error)
+                continue
+            self._stage_paths.pop(label, None)
+            self._ready_labels.discard(label)
+        if failures:
+            raise failures[0]
+
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         result = reduction.result_1d
         if result is None:
@@ -1037,12 +1141,28 @@ class TransactionalXYESink:
             raise RuntimeError("TransactionalXYESink.write called before begin().")
         if mode != self._mode:
             raise ValueError("transactional XYE result mode changed during the run")
+        pending = self._pending
+        if pending is None:
+            raise RuntimeError("TransactionalXYESink worker is not active")
+        label = int(frame.index)
         path = self._path_for(frame)
         self._transaction.stage(
             self._run_owner,
-            int(frame.index),
+            label,
             (path, mode, result.radial, result.intensity, result.sigma),
         )
+        self._stage_paths[label] = self._stage_path(label)
+        started = time.perf_counter() if self._perf_enabled else 0.0
+        pending.put((
+            label, result.radial, result.intensity, result.sigma,
+        ))
+        if self._perf_enabled:
+            self._perf_values["sink_xye_enqueue_wait"] += max(
+                0.0, time.perf_counter() - started,
+            )
+            self._perf_values["sink_xye_queue_high_water"] = max(
+                self._perf_values["sink_xye_queue_high_water"], pending.qsize(),
+            )
 
     def replace(self, frame: Frame, reduction: FrameReduction) -> None:
         self.write(frame, reduction)
@@ -1056,14 +1176,37 @@ class TransactionalXYESink:
     def abort(self, result: ReductionResult | None) -> None:
         if self._settlement_pending:
             raise RuntimeError("attempted XYE publication requires exact retry")
+        self._drain_worker(terminal=True)
         self._transaction.abandon(run_owner=self._run_owner)
+        self._cleanup_staging()
+        if self._errors:
+            error = self._errors[0]
+            self._errors.clear()
+            raise error
 
     def _publish_values(self, values) -> tuple[tuple[int, ResultMode, str], ...]:
+        if self._errors:
+            error = self._errors[0]
+            self._errors.clear()
+            raise error
         descriptors = []
+        started = time.perf_counter() if self._perf_enabled else 0.0
         for label, value in values:
             path, mode, radial, intensity, sigma = value
-            write_xye(path, radial, intensity, sigma)
+            label = int(label)
+            stage = self._stage_path(label)
+            if label not in self._ready_labels or not stage.exists():
+                self._format_stage(
+                    label, radial, intensity, sigma, worker=False,
+                )
+            os.replace(stage, path)
+            self._stage_paths.pop(label, None)
+            self._ready_labels.discard(label)
             descriptors.append((int(label), mode, self._canonical_target))
+        if self._perf_enabled:
+            self._perf_values["sink_xye_promotion"] += max(
+                0.0, time.perf_counter() - started,
+            )
         return tuple(descriptors)
 
     def _settle_transition(self, kind: str, boundary: Any):
@@ -1082,6 +1225,7 @@ class TransactionalXYESink:
                 published.extend(self._publish_values(values))
 
             try:
+                self._drain_worker(terminal=kind == "finish")
                 snapshot = self._transaction.snapshot()
                 if snapshot.retryable:
                     token = snapshot.cleanup_token
@@ -1118,6 +1262,9 @@ class TransactionalXYESink:
         )
         boundary.commit_durable(receipts)
         return handoff.identity
+
+    def perf_snapshot(self) -> dict[str, float]:
+        return dict(self._perf_values)
 
     def _acknowledge_transition(self, identity) -> None:
         handoff = self._handoff

@@ -227,6 +227,49 @@ def _observe_terminal_callbacks(monkeypatch, boundary, events=None):
     return events
 
 
+def test_transactional_xye_formats_hidden_stage_on_owned_worker_before_publication(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.reduction.core as reduction_core
+
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    original_write = reduction_core.write_xye
+
+    def observe_write(path, radial, intensity, sigma=None):
+        value = original_write(path, radial, intensity, sigma)
+        calls.append((threading.current_thread().name, Path(path)))
+        entered.set()
+        assert release.wait(timeout=5.0)
+        return value
+
+    monkeypatch.setattr(reduction_core, "write_xye", observe_write)
+    case = _open_case(
+        tmp_path, "worker-stage", frame_count=1, nexus=False,
+    )
+    _key, token = _arm(case.accounting, 0)
+    assert case.session.submit(case.session.scan.frames[0], attempt_token=token)
+    entered_before_finish = entered.wait(timeout=2.0)
+    observed = tuple(calls)
+    hidden_before = tuple(case.xye_directory.glob(".xdart-xye-*.tmp"))
+    canonical_before = _xye_files(case.xye_directory)
+    release.set()
+    result = case.session.finish()
+
+    # Parent RED reaches and cleans finish before this first new expectation.
+    assert entered_before_finish is True
+    assert len(observed) == 1
+    assert observed[0][0] == "xrd-tools-xye-writer"
+    assert observed[0][1] == hidden_before[0]
+    assert observed[0][1].name.startswith(".xdart-xye-")
+    assert canonical_before == ()
+    assert result.failed is False
+    assert len(_xye_files(case.xye_directory)) == 1
+    assert tuple(case.xye_directory.glob(".xdart-xye-*.tmp")) == ()
+    assert case.xye._worker is None
+    assert case.xye._pending is None
+
+
 def test_xye_only_epoch_then_finish_uses_one_transaction_owner(
     tmp_path, monkeypatch,
 ):
@@ -319,9 +362,8 @@ def test_xye_only_epoch_then_finish_uses_one_transaction_owner(
 def test_nexus_xye_epoch_settles_nexus_then_xye_and_blocks_early_extend(
     tmp_path, monkeypatch,
 ):
-    import xrd_tools.reduction.core as reduction_core
     from xrd_tools.io.output_transaction import XyeOutputTransaction
-    from xrd_tools.reduction import NexusSink
+    from xrd_tools.reduction import NexusSink, TransactionalXYESink
     from xrd_tools.session import DynamicAttemptToken, DynamicFrameIdentity
 
     first = append_intent(
@@ -343,7 +385,7 @@ def test_nexus_xye_epoch_settles_nexus_then_xye_and_blocks_early_extend(
     failures = [fault]
     original_nexus_epoch = NexusSink.commit_epoch
     original_xye_epoch = XyeOutputTransaction.publish_epoch
-    original_write_xye = reduction_core.write_xye
+    original_publish_values = TransactionalXYESink._publish_values
     holder = {}
 
     def observe_nexus_epoch(owner, result):
@@ -357,8 +399,8 @@ def test_nexus_xye_epoch_settles_nexus_then_xye_and_blocks_early_extend(
         events.append("xye-physical")
         return original_xye_epoch(owner, **kwargs)
 
-    def write_and_probe(path, radial, intensity, sigma=None):
-        value = original_write_xye(path, radial, intensity, sigma)
+    def publish_and_probe(owner, values):
+        value = original_publish_values(owner, values)
         try:
             holder["session"].extend_live(second)
         except BaseException as error:
@@ -371,7 +413,7 @@ def test_nexus_xye_epoch_settles_nexus_then_xye_and_blocks_early_extend(
     monkeypatch.setattr(
         XyeOutputTransaction, "publish_epoch", observe_xye_epoch,
     )
-    monkeypatch.setattr(reduction_core, "write_xye", write_and_probe)
+    monkeypatch.setattr(TransactionalXYESink, "_publish_values", publish_and_probe)
 
     case = _open_case(
         tmp_path,
