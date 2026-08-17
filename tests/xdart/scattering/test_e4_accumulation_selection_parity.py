@@ -906,6 +906,46 @@ def test_catalog_replacement_cancels_stale_debounced_selection(
         shell.close()
 
 
+@pytest.mark.parametrize("plot_mode", ("Overlay", "Waterfall"))
+def test_catalog_identity_replacement_preserves_excluded_current_trace(
+    qapp: QtWidgets.QApplication, plot_mode: str,
+) -> None:
+    base = make_shell_projection(
+        selected_index=2, heavy_indices=(), plot_mode=plot_mode
+    )
+    frames = base.navigation.frames
+    current = frames[2]
+    included = (*frames[:2], *frames[3:])
+    state = replace(base, navigation=FrameNavigationProjection(
+        frames, current, included))
+    shell = ScatteringWorkspaceShell()
+    commands = []
+    shell.commandRequested.connect(commands.append)
+    shell.show()
+    try:
+        shell.apply_state(state)
+        qapp.processEvents()
+        commands.clear()
+        replacement = replace(current)
+        assert replacement == current and replacement is not current
+        catalog = (*frames[:2], replacement, *frames[3:])
+        revised = replace(
+            state, revision=state.revision + 1,
+            browser=replace(state.browser, frames=catalog),
+            navigation=FrameNavigationProjection(catalog, replacement, included),
+        )
+        shell.apply_state(revised)
+        qapp.processEvents()
+        assert shell.browser.frame_model.frames[2] is shell.browser._committed_current is replacement
+        assert _selected_browser_rows(shell) == (2,)
+        trace_ids = tuple(map(id, shell.browser._trace_frames))
+        assert trace_ids == tuple(map(id, included))
+        assert id(current) not in trace_ids and id(replacement) not in trace_ids
+        assert commands == []
+    finally:
+        shell.close()
+
+
 @pytest.mark.parametrize("plot_mode", ("Single", "Overlay", "Waterfall"))
 def test_production_parity_keeps_raw_and_cake_on_current_frame(
     plot_mode: str,
