@@ -930,6 +930,7 @@ def test_production_parity_keeps_raw_and_cake_on_current_frame(
             FrameView(
                 frame.local_frame_label,
                 raw=np.full((2, 3), float(index + 1)),
+                thumbnail=np.full((2, 3), float(index + 101)),
                 axis_1d=Axis("radial", "q_A^-1", values=radial),
                 intensity_1d=np.full((4,), float(index + 10)),
                 axis_2d_x=Axis("radial", "q_A^-1", values=radial),
@@ -954,8 +955,9 @@ def test_production_parity_keeps_raw_and_cake_on_current_frame(
     assert projection.heavy.frame is current
     np.testing.assert_array_equal(
         projection.heavy.raw,
-        np.full((2, 3), 2.0),
+        np.full((2, 3), 102.0),
     )
+    assert projection.heavy.detector_source == "thumbnail"
     np.testing.assert_array_equal(
         projection.heavy.cake,
         np.full((3, 4), 21.0),
