@@ -259,12 +259,14 @@ def _bounds(req: SessionResourceRequirements, requests) -> dict:
                    if requests and name in requests else low)
             for name, (low, _u) in table.items()}
 def _grant(req: SessionResourceRequirements, bounds: dict,
-           envelope: int) -> dict:
+           envelope: int, *, automatic_inflight: bool = False) -> dict:
     """Raise each count toward its bound in ``GRANT_ORDER``, recomputing the
     remainder each step so no category can overrun."""
     table = _tunables(req)
     counts = {name: low for name, (low, _u) in table.items()}
     wants = dict(bounds)
+    if automatic_inflight:
+        wants["reduction_inflight"] = 2 * wants["workers"]
     # A worker forces an in-flight slot, so the worker grant is capped by the
     # INFLIGHT request: clamp workers down, never raise inflight.
     wants["workers"] = min(wants["workers"], wants["reduction_inflight"])
@@ -281,6 +283,8 @@ def _grant(req: SessionResourceRequirements, bounds: dict,
         if name == "workers":
             counts["reduction_inflight"] = max(counts["reduction_inflight"],
                                                counts["workers"])
+            if automatic_inflight:
+                wants["reduction_inflight"] = 2 * counts["workers"]
     return counts
 def _prefetch_queue_request(env) -> int:
     """The ONE parse of the prefetch-depth request, off the frozen snapshot."""
@@ -310,7 +314,7 @@ def _default_requests(req: SessionResourceRequirements, requested_workers,
             "staging_items": window, "record_heavy_items": window,
             "publication_heavy_items": window, "thumbnail_items": 512,
             "record_items": light, "publication_items": light,
-            "workers": workers, "reduction_inflight": 16 if workers == 4 else 2 * workers}
+            "workers": workers, "reduction_inflight": 2 * workers}
 def _build(req, counts, envelope, floor, minimum, origin,
            oversize=0) -> SessionResourceAllocation:
     cats = _categories(req, counts)
@@ -371,7 +375,8 @@ def resolve_session_policy(requirements: SessionResourceRequirements, *,
         _int("workers", requests["workers"], low=1)
         if requested_workers is not None and requests["workers"] != requested_workers:
             raise ValueError("requested_workers and requests['workers'] disagree")
-    if requested_workers is not None:
+    if requested_workers is not None and allocation is not None \
+            and not (requests and "workers" in requests):
         requests = dict(requests or {}, workers=requested_workers)
     frozen_env = dict(os.environ) if env is None else dict(env)
     if allocation is not None:
@@ -405,7 +410,10 @@ def resolve_session_policy(requirements: SessionResourceRequirements, *,
         wanted = _bounds(req, {**_default_requests(req, requested_workers,
                                                    frozen_env),
                                **(requests or {})})
-        built = _build(req, _grant(req, wanted, envelope), envelope, floor,
+        built = _build(req, _grant(
+            req, wanted, envelope,
+            automatic_inflight=not (requests and "reduction_inflight" in requests),
+        ), envelope, floor,
                        minimum, "automatic")
     return SessionPolicy(flush=flush if flush is not None else FlushPolicy(),
                          allocation=built)

@@ -113,6 +113,58 @@ def test_explicit_heavy_residency_requests_all_three_bounds_without_env_mutation
     assert dict(os.environ) == before
 
 
+def test_dynamic_policy_widens_only_standard_four_worker_grants(monkeypatch):
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.reduction import (
+        Integration1DPlan, Integration2DPlan, ReductionPlan,
+    )
+
+    original = dynamic_output.resolve_session_policy
+    calls = []
+
+    def capture(requirements, **kwargs):
+        kwargs.setdefault("envelope_bytes", 32 * 1024 ** 3)
+        policy = original(requirements, **kwargs)
+        calls.append((kwargs, policy.allocation))
+        return policy
+
+    monkeypatch.setattr(dynamic_output, "resolve_session_policy", capture)
+    descriptor = SimpleNamespace(
+        frame_shape=(2167, 2070), dtype=dynamic_output.np.dtype("uint32")
+    )
+    item = SimpleNamespace(descriptor=descriptor, source_stamp=None)
+    scan = SimpleNamespace(frames=(SimpleNamespace(index=1, image=None),))
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=1000),
+        integration_2d=Integration2DPlan(npt_rad=500, npt_azim=500),
+    )
+    frozen_env = {"XDART_REDUCTION_WORKERS": "4"}
+
+    standard, *_ = dynamic_output._light_policy_layout(
+        RunIntent(max_cores=4).freeze(), plan, item, scan, (1,),
+        env=frozen_env,
+    )
+    assert [(a.workers, a.reduction_inflight) for _, a in calls] == [
+        (4, 8), (4, 16),
+    ]
+    assert calls[1][0]["envelope_bytes"] == calls[0][1].envelope_bytes
+    assert calls[0][0]["env"] is calls[1][0]["env"]
+    assert {
+        name: calls[1][1].categories[name] - calls[0][1].categories[name]
+        for name in calls[0][1].categories
+    } == {"source_native": 143_542_080, "staging": 0, "records": 0,
+          "publication": 0, "worker": 16_192_000}
+    assert standard.allocation is calls[1][1]
+
+    calls.clear()
+    live, *_ = dynamic_output._light_policy_layout(
+        RunIntent(max_cores=4, live_mode=True).freeze(), plan, item, scan, (1,),
+        env=frozen_env,
+    )
+    assert [(a.workers, a.reduction_inflight) for _, a in calls] == [(4, 8)]
+    assert live.allocation is calls[0][1]
+
+
 def test_auto_fact_survives_post_allocation_failure_and_reaches_terminal(
     monkeypatch, tmp_path, caplog,
 ):
@@ -135,7 +187,10 @@ def test_auto_fact_survives_post_allocation_failure_and_reaches_terminal(
     frame = SimpleNamespace(index=1, image=None)
     item = SimpleNamespace(target=tmp_path / "auto.nxs", descriptor=SimpleNamespace(frame_shape=(4, 4), dtype=dynamic_output.np.dtype("uint16")), source_stamp=SimpleNamespace(frame_count=1, first_label=1))
     plan = SimpleNamespace(integration_1d=None, integration_2d=SimpleNamespace(npt_rad=2, npt_azim=2, error_model=None), gi=None); facts = []
-    def fail_bind(_allocation): raise RuntimeError("injected post-allocation failure")
+    bound = []
+    def fail_bind(allocation):
+        bound.append(allocation)
+        raise RuntimeError("injected post-allocation failure")
     caplog.set_level(logging.INFO)
     try:
         dynamic_output.DynamicOutputAdapter(configuration).activate(
@@ -147,6 +202,7 @@ def test_auto_fact_survives_post_allocation_failure_and_reaches_terminal(
         )
     except RuntimeError as error: assert str(error) == "injected post-allocation failure"
     else: raise AssertionError("post-allocation failure was not injected")
+    assert len(bound) == 1
     assert len(facts) == 1
     fact = facts[0]
     assert (fact.choice, fact.resolution_source, fact.requested_heavy_bound) == ("auto", "auto", 64)

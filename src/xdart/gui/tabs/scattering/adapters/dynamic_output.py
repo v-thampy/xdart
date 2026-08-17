@@ -137,9 +137,17 @@ def _light_policy_layout(
             "staging_items": heavy_request, "record_heavy_items": heavy_request,
             "publication_heavy_items": heavy_request,
         })
+    frozen_env = dict(os.environ) if env is None else dict(env)
     policy = resolve_session_policy(
-        requirements, requested_workers=requested, requests=requests or None, env=env,
+        requirements, requested_workers=requested, requests=requests or None,
+        env=frozen_env,
     )
+    if not configuration.live_mode and policy.allocation.workers == 4:
+        policy = resolve_session_policy(
+            requirements, envelope_bytes=policy.allocation.envelope_bytes,
+            requested_workers=requested,
+            requests={**requests, "reduction_inflight": 16}, env=frozen_env,
+        )
     allocation = policy.allocation
     interval = 8 if plan.integration_2d is not None else 1000
     policy = replace(policy, flush=FlushPolicy(

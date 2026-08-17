@@ -405,7 +405,7 @@ def test_g4_resolution_never_reads_the_real_process_environment():
 
 # ── grant discipline ─────────────────────────────────────────────────────────
 
-def test_e5_selected_four_worker_default_is_evidence_bounded():
+def test_automatic_inflight_is_twice_the_actual_worker_grant():
     p = _policy()
     from xrd_tools.core import staging
     req = p.SessionResourceRequirements(
@@ -421,24 +421,55 @@ def test_e5_selected_four_worker_default_is_evidence_bounded():
 
     assert {workers: automatic(workers).reduction_inflight
             for workers in (1, 2, 3, 4, 5, 16)} == {
-                1: 2, 2: 4, 3: 6, 4: 16, 5: 10, 16: 32}
-    selected = automatic(4)
-    requests = dict(selected.counts)
-    requests["reduction_inflight"] = 8
-    baseline = p.resolve_session_policy(
-        req, envelope_bytes=envelope, requests=requests,
+                1: 2, 2: 4, 3: 6, 4: 8, 5: 10, 16: 32}
+    constrained = p.resolve_session_policy(
+        req, envelope_bytes=4 * 1024 ** 3,
         env={staging.REDUCTION_WORKERS_ENV: "4"}).allocation
-    fingerprint = (2167, 2070, 4, 0, 1, 1, 1000, 500, 500, 0, 0, 0)
-    assert selected.origin == baseline.origin == "automatic"
-    assert selected.requirements.fingerprint == baseline.requirements.fingerprint == fingerprint
-    assert {name: (baseline.counts[name], selected.counts[name])
-            for name in baseline.counts if baseline.counts[name] != selected.counts[name]
-            } == {"reduction_inflight": (8, 16)}
-    deltas = {name: selected.categories[name] - baseline.categories[name]
-              for name in baseline.categories}
-    assert deltas == {"source_native": 143_542_080, "staging": 0, "records": 0,
-                      "publication": 0, "worker": 16_192_000}
-    assert selected.assigned_bytes - baseline.assigned_bytes == 159_734_080
+    assert (constrained.workers, constrained.reduction_inflight,
+            constrained.staging_items) == (3, 6, 30)
+
+
+def test_requested_workers_are_normalized_unless_the_mapping_is_explicit(
+    monkeypatch,
+):
+    p = _policy()
+    from xrd_tools.core import staging
+    monkeypatch.setattr(
+        staging, "total_physical_ram_bytes", lambda: 8 * 1024 ** 3,
+    )
+    req = _requirements()
+    normalized = p.resolve_session_policy(
+        req, envelope_bytes=64 * 1024 ** 3, requested_workers=12, env={},
+    ).allocation
+    explicit = p.resolve_session_policy(
+        req, envelope_bytes=64 * 1024 ** 3, requested_workers=4,
+        requests={"workers": 4}, env={},
+    ).allocation
+    assert (normalized.workers, normalized.reduction_inflight) == (2, 4)
+    assert (explicit.workers, explicit.reduction_inflight) == (4, 8)
+    same = p.resolve_session_policy(
+        req, allocation=explicit, requests=dict(explicit.counts), env={},
+    )
+    assert same.allocation is explicit
+
+
+def test_explicit_workers_only_mapping_gets_automatic_two_per_actual():
+    p = _policy()
+    req = _requirements()
+    automatic = {
+        workers: p.resolve_session_policy(
+            req, envelope_bytes=64 * 1024 ** 3,
+            requests={"workers": workers}, env={},
+        ).allocation
+        for workers in (12, 16)
+    }
+    assert {workers: (a.workers, a.reduction_inflight)
+            for workers, a in automatic.items()} == {12: (12, 24), 16: (16, 32)}
+    bounded = p.resolve_session_policy(
+        req, envelope_bytes=64 * 1024 ** 3,
+        requests={"workers": 16, "reduction_inflight": 3}, env={},
+    ).allocation
+    assert (bounded.workers, bounded.reduction_inflight) == (3, 3)
 
 
 def test_grants_stay_between_each_minimum_and_its_request():
