@@ -32,6 +32,8 @@ class NexusStackSource(BaseFrameSource):
         # metadata -> public-streaming route).  It is consumed and closed by
         # iter_chunks()/close(); no h5py object leaves the producer thread.
         self._consumption_cursor = cursor
+        self._direct_chunk_policy = None
+        self._direct_chunk_fact = None
         if cursor is None:
             with open_nexus_image_stack(self.path, entry) as stack:
                 n = int(stack.shape[0])
@@ -73,6 +75,34 @@ class NexusStackSource(BaseFrameSource):
                 "NexusStackSource is already bound to a different allocation")
         self.allocation = allocation
 
+    def bind_eiger_direct_chunk(self, allocation) -> None:
+        """Bind the vNext-only decoder to the exact source owner grant."""
+        if allocation is not self.allocation:
+            raise ValueError("direct decode requires the bound allocation identity")
+        from xrd_tools.sources.eiger_direct_chunk import EigerDirectChunkPolicy
+
+        policy = EigerDirectChunkPolicy.from_owner_grant(
+            allocation.requirements.native_frame_bytes,
+            allocation.owner_block_bytes,
+        )
+        if self._direct_chunk_policy not in (None, policy):
+            raise ValueError("NexusStackSource direct-decode policy changed")
+        self._direct_chunk_policy = policy
+
+    def note_direct_chunk_bypass(self, reason: str, frame_count: int) -> None:
+        policy = self._direct_chunk_policy
+        if policy is None:
+            return
+        from xrd_tools.sources.eiger_direct_chunk import EigerDirectChunkState
+
+        state = EigerDirectChunkState(policy)
+        state.refuse(reason, frame_count)
+        self._direct_chunk_fact = state.fact(str(self.path))
+
+    def take_direct_chunk_fact(self):
+        fact, self._direct_chunk_fact = self._direct_chunk_fact, None
+        return fact
+
     def open_cursor(self):
         """A context-managed :class:`~xrd_tools.sources.cursor.ContainerCursor`
         for sustained consumption: one open handle supplies descriptor,
@@ -95,28 +125,35 @@ class NexusStackSource(BaseFrameSource):
             cursor.close()
 
     def iter_chunks(self, chunk_size: int) -> Iterator[tuple[np.ndarray, list[int]]]:
-        """Yield source-owner blocks bounded by the descriptor's ``ReadPlan``.
+        """Yield byte-planned blocks through the frozen one-argument port."""
+        yield from self._iter_vnext_chunks(chunk_size, lambda: False)
+    _canonical_iter_chunks = iter_chunks
 
-        ``chunk_size`` remains a consumer/progress cap, never permission to
-        decode a larger source block than the native-byte budget permits.
-        """
+    def _iter_vnext_chunks(self, chunk_size: int, cancelled) -> Iterator[
+            tuple[np.ndarray, list[int]]]:
+        """Cancellation-aware vNext source-owner block iterator."""
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
-
+        def consume(cursor):
+            method = self._iter_cursor_chunks
+            canonical = getattr(type(self), "_canonical_iter_cursor_chunks", None)
+            args = (cursor, chunk_size, cancelled) if getattr(method, "__func__", None) is canonical else (cursor, chunk_size)
+            return method(*args)
         cursor = self._consumption_cursor
         if cursor is not None:
             self._consumption_cursor = None
             try:
-                yield from self._iter_cursor_chunks(cursor, chunk_size)
+                yield from consume(cursor)
             finally:
                 cursor.close()
             return
 
         # ONE cursor for the whole consumption window (no per-chunk reopen).
         with self.open_cursor() as cursor:
-            yield from self._iter_cursor_chunks(cursor, chunk_size)
+            yield from consume(cursor)
 
-    def _iter_cursor_chunks(self, cursor, chunk_size: int) -> Iterator[
+    def _iter_cursor_chunks(self, cursor, chunk_size: int,
+                            cancelled=lambda: False) -> Iterator[
             tuple[np.ndarray, list[int]]]:
         """Yield a byte-planned sequence from an open owner-thread cursor."""
         from xrd_tools.core.staging import source_block_budget_bytes
@@ -145,8 +182,27 @@ class NexusStackSource(BaseFrameSource):
             requested_block_frames=chunk_size,
             two_d=desc.is_2d,
         )
-        for block in cursor.iter_blocks(read_plan):
-            yield np.asarray(block.array), labels[block.start:block.stop]
+        policy = self._direct_chunk_policy
+        state = None
+        if policy is not None:
+            from xrd_tools.sources.eiger_direct_chunk import EigerDirectChunkState
+            state = EigerDirectChunkState(policy)
+        blocks = (
+            cursor.iter_blocks(read_plan)
+            if state is None else cursor.iter_eiger_direct_blocks(
+                read_plan, policy, cancelled=cancelled, state=state,
+            )
+        )
+        try:
+            for block in blocks:
+                yield np.asarray(block.array), labels[block.start:block.stop]
+        finally:
+            close = getattr(blocks, "close", None)
+            if callable(close):
+                close()
+            if state is not None:
+                self._direct_chunk_fact = state.fact(str(self.path))
+    _canonical_iter_cursor_chunks = _iter_cursor_chunks
 
     def frame_for(self, index: int) -> ScanFrame:
         return ScanFrame(

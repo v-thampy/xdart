@@ -495,6 +495,76 @@ class NexusImageStack:
         """Internal HDF5 paths of the underlying datasets, in stack order."""
         return tuple(self._paths)
 
+    def eiger_direct_chunk_layout(self):
+        """Return a detached direct-decode layout, or a refusal reason."""
+        from xrd_tools.sources.eiger_direct_chunk import (
+            EigerDirectChunkLayout,
+            decoder_unavailability,
+        )
+
+        unavailable = decoder_unavailability()
+        if unavailable:
+            return None, unavailable
+        if self._squeeze2d:
+            return None, "2-D detector datasets do not use Eiger direct decode"
+        frame_shape, dtype = tuple(self.shape[1:]), np.dtype(self.dtype)
+        for position, dataset in enumerate(self._dsets):
+            if not all(hasattr(dataset.id, name) for name in (
+                    "get_chunk_info_by_coord", "read_direct_chunk")):
+                return None, "h5py direct-chunk APIs are unavailable"
+            shape = tuple(int(value) for value in dataset.shape)
+            chunks = tuple(int(value) for value in (dataset.chunks or ()))
+            if (dataset.ndim != 3 or shape[1:] != frame_shape
+                    or np.dtype(dataset.dtype) != dtype):
+                return None, f"segment {position} has a different rank/shape/dtype"
+            if chunks != (1, *frame_shape):
+                return None, f"segment {position} chunks {chunks} are not one full frame"
+            try:
+                creation = dataset.id.get_create_plist()
+                if creation.get_nfilters() != 1:
+                    return None, f"segment {position} does not have exactly one filter"
+                code, _flags, values, _name = creation.get_filter(0)
+                values = tuple(int(value) for value in values)
+            except Exception as error:
+                return None, (
+                    f"segment {position} filter metadata is unavailable: "
+                    f"{type(error).__name__}"
+                )
+            if (int(code) != 32008 or len(values) < 5
+                    or values[2] != dtype.itemsize or values[4] != 2):
+                return None, f"segment {position} is not dtype-matched bitshuffle/LZ4"
+        return EigerDirectChunkLayout(
+            frame_shape, dtype.str, int(np.prod(frame_shape)) * dtype.itemsize,
+        ), ""
+
+    def read_eiger_direct_chunk(
+        self, index: int, compressed_cap: int,
+    ) -> tuple[bytearray | None, str]:
+        """Read detached bytes on the stack owner thread; never expose an ID."""
+        seg, local = self._locate(int(index))
+        dataset = self._dsets[seg]
+        offset = (local, 0, 0)
+        info = dataset.id.get_chunk_info_by_coord(offset)
+        size, mask = int(info.size), int(info.filter_mask)
+        if size <= 0:
+            return None, "unallocated/fill chunk"
+        if mask:
+            return None, f"stored chunk has filter mask {mask}"
+        if size > int(compressed_cap):
+            return None, f"stored chunk {size}B exceeds {compressed_cap}B cap"
+        raw = bytearray(size)
+        observed_mask, view = dataset.id.read_direct_chunk(offset, out=raw)
+        if int(observed_mask) != 0:
+            raise ValueError(
+                f"frame {index}: direct-chunk filter mask changed to {observed_mask}"
+            )
+        if len(view) != size:
+            raise ValueError(
+                f"frame {index}: stored direct-chunk size changed {size}->{len(view)}"
+            )
+        del view
+        return raw, ""
+
     # ── Container protocol ──────────────────────────────────────────────
     def __len__(self) -> int:
         return self.shape[0]

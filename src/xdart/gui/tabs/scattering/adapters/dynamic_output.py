@@ -51,6 +51,7 @@ from xrd_tools.session import (
 )
 from xrd_tools.session.policy import requirements_from
 from xrd_tools.core import DEFAULT_MODE_KEY
+from xrd_tools.core.scan import SourceKind
 from xrd_tools.core.staging import (
     browse_publication_max_items,
     heavy_window,
@@ -92,6 +93,14 @@ def _heavy_resolution_source(bound: int | None, env: dict[str, str]) -> str:
     return "environment" if str(raw).strip() else "auto"
 
 
+def _direct_eiger_candidate(item, write_labels) -> bool:
+    descriptor = getattr(item, "descriptor", None)
+    stamp = getattr(item, "source_stamp", None)
+    return (getattr(descriptor, "kind", None) is SourceKind.EIGER_MASTER
+            and getattr(descriptor, "finalized", False)
+            and len(write_labels) == getattr(stamp, "frame_count", -1))
+
+
 def _light_policy_layout(
     configuration, plan, item, scan, write_labels, *, heavy_request=None,
     env=None,
@@ -114,15 +123,22 @@ def _light_policy_layout(
     requirements = requirements_from(SimpleNamespace(
         frame_shape=tuple(shape), dtype=np.dtype(native_dtype)), plan)
     requested = max(1, int(configuration.max_cores))
-    requests = None
+    requests = {}
+    if _direct_eiger_candidate(item, write_labels):
+        from xrd_tools.sources.eiger_direct_chunk import (
+            direct_chunk_workspace_bytes,
+        )
+        requests["owner_block_bytes"] = direct_chunk_workspace_bytes(
+            requirements.native_frame_bytes,
+        )
     if heavy_request is not None:
         _, heavy_request = heavy_residency_choice({"heavy_window": heavy_request})
-        requests = {
+        requests.update({
             "staging_items": heavy_request, "record_heavy_items": heavy_request,
             "publication_heavy_items": heavy_request,
-        }
+        })
     policy = resolve_session_policy(
-        requirements, requested_workers=requested, requests=requests, env=env,
+        requirements, requested_workers=requested, requests=requests or None, env=env,
     )
     allocation = policy.allocation
     interval = 8 if plan.integration_2d is not None else 1000
@@ -795,6 +811,10 @@ class DynamicOutputAdapter:
                 bind_source = getattr(source_owner, "bind_allocation", None)
                 if callable(bind_source):
                     bind_source(allocation)
+                if _direct_eiger_candidate(item, write_labels):
+                    bind_direct = getattr(source_owner, "bind_eiger_direct_chunk", None)
+                    if callable(bind_direct):
+                        bind_direct(allocation)
                 if first_write_frame.image is None:
                     first_write_frame.load_image()
                 if layout is not None:

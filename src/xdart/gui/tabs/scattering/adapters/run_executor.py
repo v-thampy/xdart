@@ -126,7 +126,7 @@ class _StandardRun:
     light_projection_error_lock: Lock = field(default_factory=Lock)
     gui_thread_id: int = field(default_factory=get_ident)
     command_failure: DetachedDiagnostic | None = None
-    resource_facts: list[HeavyResidencyFact] = field(default_factory=list)
+    resource_facts: list[Any] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.perf_enabled = bool(os.environ.get("XDART_PERF"))
@@ -1867,32 +1867,50 @@ class StandardRunExecutor:
         The executor thread remains the sole HDF5/cursor owner.  One bounded
         consumer thread performs only ``session.submit`` calls, allowing the
         next source frame to decode while the previous frame waits for a
-        reduction slot.  Four queued native frames matches the established
-        production prefetch cadence without transferring an h5py object across
-        threads or retaining an unbounded source window.
+        reduction slot.  The exact allocation grant bounds that native-frame
+        queue; no h5py object crosses threads.
         """
         source = run.source
         if not isinstance(source, NexusStackSource):
             raise TypeError("container submission requires NexusStackSource")
 
+        def publish_direct_fact() -> None:
+            take = getattr(source, "take_direct_chunk_fact", None)
+            fact = take() if callable(take) else None
+            if fact is not None:
+                run.resource_facts.append(fact)
+                logger.info("%s", fact.log_line("[SOURCE-READ]"))
+
         wanted = tuple(run.frames_by_label)
         if wanted != tuple(source.frame_indices):
-            for label in wanted:
-                if run.stop_requested:
-                    return
-                frame = run.frames_by_label[label]
-                image = source.load_frame(label)
-                runtime = run.context_runtime
-                accepted = (
-                    output.submit(frame, image)
-                    if runtime is None
-                    else runtime.submit(output, frame, image)
-                )
-                if not accepted:
-                    break
+            observed_fallbacks = 0
+            try:
+                for label in wanted:
+                    if run.stop_requested:
+                        return
+                    frame = run.frames_by_label[label]
+                    image = source.load_frame(label)
+                    observed_fallbacks += 1
+                    runtime = run.context_runtime
+                    accepted = (
+                        output.submit(frame, image)
+                        if runtime is None
+                        else runtime.submit(output, frame, image)
+                    )
+                    if not accepted:
+                        break
+            finally:
+                note = getattr(source, "note_direct_chunk_bypass", None)
+                if callable(note):
+                    note("non-complete source selection uses random access",
+                         observed_fallbacks)
+                publish_direct_fact()
             return
 
-        pending: Queue[object] = Queue(maxsize=_SOURCE_PREFETCH_FRAMES)
+        allocation = getattr(source, "allocation", None)
+        queue_depth = (_SOURCE_PREFETCH_FRAMES if allocation is None
+                       else int(allocation.queue_depth))
+        pending: Queue[object] = Queue(maxsize=queue_depth)
         accepting = Event()
         accepting.set()
         consumer_done = Event()
@@ -1951,7 +1969,17 @@ class StandardRunExecutor:
                     continue
             return False
 
-        chunks = iter(source.iter_chunks(_CONTAINER_READ_CHUNK_FRAMES))
+        vnext_chunks = getattr(source, "_iter_vnext_chunks", None)
+        public_chunks = source.iter_chunks
+        canonical = getattr(type(source), "_canonical_iter_chunks", None)
+        cancelled = lambda: (run.stop_requested or run.stop_signal.is_set()
+                             or not accepting.is_set())
+        chunks = iter(
+            vnext_chunks(_CONTAINER_READ_CHUNK_FRAMES, cancelled)
+            if (callable(vnext_chunks)
+                and getattr(public_chunks, "__func__", None) is canonical)
+            else public_chunks(_CONTAINER_READ_CHUNK_FRAMES)
+        )
         producer_error: BaseException | None = None
         try:
             while accepting.is_set() and not run.stop_requested:
@@ -1994,6 +2022,7 @@ class StandardRunExecutor:
             if accepting.is_set() and not consumer_done.is_set():
                 enqueue(_SOURCE_SUBMISSION_END)
             consumer.join()
+            publish_direct_fact()
 
         if producer_error is not None:
             raise producer_error

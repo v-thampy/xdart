@@ -300,6 +300,63 @@ class ContainerCursor:
         for start, stop in plan.ranges:
             yield self.read_block(start, stop)
 
+    def iter_eiger_direct_blocks(
+        self,
+        plan: ReadPlan,
+        policy,
+        *,
+        cancelled,
+        state,
+    ) -> Iterator[ReadBlock]:
+        """Use detached raw chunks when every physical segment is eligible."""
+        self._require_readable()
+
+        def standard(reason):
+            state.refuse(reason, 0)
+            for block in self.iter_blocks(plan):
+                state.fallback_frames += block.n_frames
+                yield block
+        if not policy.enabled:
+            yield from standard(policy.reason)
+            return
+        descriptor = self.descriptor
+        from xrd_tools.core.scan import SourceKind
+        if descriptor.kind is not SourceKind.EIGER_MASTER:
+            yield from standard("direct decode requires an admitted Eiger master")
+            return
+        if descriptor.state is not ProbeState.READY or not descriptor.finalized:
+            yield from standard("direct decode requires a finalized READY container")
+            return
+        layout, reason = self._stack.eiger_direct_chunk_layout()
+        if layout is None:
+            yield from standard(reason)
+            return
+        if (layout.frame_bytes != plan.frame_bytes
+                or layout.frame_bytes != policy.frame_bytes):
+            yield from standard("direct layout differs from the admitted read plan")
+            return
+
+        from xrd_tools.sources.eiger_direct_chunk import (
+            iter_ordered_eiger_frames,
+        )
+
+        state.select()
+        indices = (
+            index
+            for start, stop in plan.ranges
+            for index in range(start, stop)
+        )
+        for index, array in iter_ordered_eiger_frames(
+            indices,
+            layout=layout,
+            policy=policy,
+            read_raw=self._stack.read_eiger_direct_chunk,
+            read_fallback=self.read_frame,
+            cancelled=cancelled,
+            state=state,
+        ):
+            yield ReadBlock(index, index + 1, array[np.newaxis, ...])
+
     # -- helpers --------------------------------------------------------------
     @staticmethod
     def _resolved_paths(descriptor: ContainerDescriptor) -> list[str]:

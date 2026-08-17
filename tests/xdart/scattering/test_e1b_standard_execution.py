@@ -344,6 +344,7 @@ def test_eiger_submission_uses_bounded_reads_and_stops_before_next_chunk(
     yielded_chunks: list[int] = []
 
     class Source:
+        frame_indices = tuple(range(16))
         def iter_chunks(self, size: int):
             requested_chunks.append(size)
             yielded_chunks.append(1)
@@ -381,12 +382,8 @@ def test_eiger_submission_uses_bounded_reads_and_stops_before_next_chunk(
         None,
         Path("out.nxs"),
     )
-
-    stopped = StandardRunExecutor()._execute_current(
-        run, construct=False
-    )
-
-    assert stopped is True
+    run.frames_by_label = {int(frame.index): frame for frame in run.scan.frames}
+    StandardRunExecutor._submit_container_source(run, run.session)
     assert requested_chunks == [8]
     assert yielded_chunks == [1]
 
@@ -400,6 +397,7 @@ def test_eiger_source_read_overlaps_submit_backpressure(monkeypatch) -> None:
     submit_threads: list[str] = []
 
     class Source:
+        frame_indices = (0, 1)
         def iter_chunks(self, _size: int):
             source_threads.append(current_thread().name)
             yield np.ones((1, 2, 2)), (0,)
@@ -465,6 +463,7 @@ def test_eiger_source_read_failure_releases_waiting_submitter(monkeypatch) -> No
     identity = RunIdentity(1, "e" * 64)
 
     class Source:
+        frame_indices = ()
         def iter_chunks(self, _size: int):
             if False:
                 yield
@@ -542,9 +541,13 @@ def test_executor_failure_stop_and_close_release_resources_once() -> None:
             def __len__(self) -> int:
                 return 1
 
-        return _StandardRun(
-            None, identity, Scan(), source, session, None, Path("out.nxs"),
-        )
+        finished = []
+        finish = lambda **_kwargs: finished[0] if finished else (finished.append(session.finish()) or finished[0])
+        output = SimpleNamespace(write_labels=(1,), submit=session.submit, stop=session.stop,
+                                 finish_current=finish, finish_all=finish,
+                                 project_new_durable=lambda _apply: None)
+        return _StandardRun(None, identity, Scan(), source, session, None,
+                            Path("out.nxs"), output=output)
 
     failure_source, failure_sink = Source(), Sink()
     failure_session = Session(failure_sink, submit=True)
@@ -568,3 +571,152 @@ def test_executor_failure_stop_and_close_release_resources_once() -> None:
     close_executor.close(identity)
     close_executor.close(identity)
     assert close_session.stop_calls == close_session.finish_calls == close_sink.abort_calls == close_source.close_calls == 1
+
+
+def test_complete_eiger_submission_uses_cancel_aware_route_and_publishes_one_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from queue import Queue
+    from xrd_tools.sources.eiger_direct_chunk import EigerDirectChunkFact
+    fact = EigerDirectChunkFact("master.h5", True, "selected", 1, 8, 8, 2, 0, 4); queue_depths: list[int] = []; real_queue = Queue
+
+    class Source:
+        frame_indices = (0, 1)
+        allocation = SimpleNamespace(queue_depth=1)
+        _canonical_iter_chunks = None
+
+        def __init__(self, direct_fact):
+            self.direct_fact = direct_fact
+            self.private_calls = 0
+            self.public_calls: list[int] = []
+            self.take_calls = 0
+            self.cancelled = None
+
+        def iter_chunks(self, _size):
+            raise AssertionError("canonical public route bypassed the private route")
+
+        def _iter_vnext_chunks(self, size, cancelled):
+            self.private_calls += 1
+            self.cancelled = cancelled
+            assert size == 8 and not cancelled()
+            yield np.arange(8).reshape(2, 2, 2), (0, 1)
+
+        def load_frame(self, _label):
+            raise AssertionError("complete selection used conventional random access")
+
+        def take_direct_chunk_fact(self):
+            self.take_calls += 1
+            value, self.direct_fact = self.direct_fact, None
+            return value
+
+    Source._canonical_iter_chunks = Source.iter_chunks
+    monkeypatch.setattr(executor_module, "NexusStackSource", Source)
+    monkeypatch.setattr(
+        executor_module, "Queue",
+        lambda maxsize: queue_depths.append(maxsize) or real_queue(maxsize),
+    )
+    for override in (False, True):
+        source = Source(fact if not override else None)
+        if override:
+            source.iter_chunks = lambda size: (
+                source.public_calls.append(size)
+                or iter(((np.arange(8).reshape(2, 2, 2), (0, 1)),))
+            )
+        submitted: list[int] = []
+        run = SimpleNamespace(
+            source=source,
+            frames_by_label={i: SimpleNamespace(index=i) for i in (0, 1)},
+            stop_requested=False, stop_signal=Event(), context_runtime=None,
+            resource_facts=[], cleanup_failures=[], perf_enabled=False,
+        )
+        output = SimpleNamespace(
+            submit=lambda frame, _image: submitted.append(frame.index) or True,
+        )
+        StandardRunExecutor._submit_container_source(run, output)
+        assert submitted == [0, 1] and source.take_calls == 1
+        if override:
+            assert source.public_calls == [8] and source.private_calls == 0
+            assert run.resource_facts == []
+        else:
+            assert source.private_calls == 1 and source.public_calls == []
+            assert callable(source.cancelled) and run.resource_facts == [fact]
+    assert queue_depths == [1, 1]
+
+
+@pytest.mark.parametrize("mode", ("success", "submit-false", "load-error", "pre-stop"))
+def test_equal_length_noncomplete_eiger_bypass_counts_only_observed_fallbacks(
+    mode: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xrd_tools.sources.eiger_direct_chunk import EigerDirectChunkFact
+    reason = "non-complete source selection uses random access"
+    scenarios = (
+        ("submit-false", "submit-error", "cancel-next")
+        if mode == "submit-false" else (mode,)
+    )
+    load_error = RuntimeError("load failed"); submit_error = RuntimeError("submit failed")
+
+    class Source:
+        frame_indices = (0, 1)
+
+        def __init__(self, scenario):
+            self.scenario = scenario
+            self.loads: list[int] = []
+            self.notes: list[tuple[str, int]] = []
+            self.fact = None
+            self.take_calls = 0
+
+        def load_frame(self, label):
+            self.loads.append(label)
+            if self.scenario == "load-error" and len(self.loads) == 2:
+                raise load_error
+            return np.full((2, 2), label)
+
+        def note_direct_chunk_bypass(self, observed_reason, count):
+            self.notes.append((observed_reason, count))
+            self.fact = EigerDirectChunkFact(
+                "master.h5", False, observed_reason, 1, 8, 8, 0, count, 0,
+            )
+
+        def take_direct_chunk_fact(self):
+            self.take_calls += 1
+            value, self.fact = self.fact, None
+            return value
+
+    monkeypatch.setattr(executor_module, "NexusStackSource", Source)
+    for scenario in scenarios:
+        source = Source(scenario)
+        frames = {i: SimpleNamespace(index=i) for i in (1, 0)}
+        run = SimpleNamespace(
+            source=source, frames_by_label=frames,
+            stop_requested=scenario == "pre-stop", stop_signal=Event(),
+            context_runtime=None, resource_facts=[], cleanup_failures=[],
+        )
+
+        def submit(_frame, _image):
+            if scenario == "submit-error":
+                raise submit_error
+            if scenario == "cancel-next":
+                run.stop_requested = True
+            return scenario != "submit-false"
+
+        expected_error = (
+            load_error if scenario == "load-error"
+            else submit_error if scenario == "submit-error" else None
+        )
+        if expected_error is None:
+            StandardRunExecutor._submit_container_source(
+                run, SimpleNamespace(submit=submit),
+            )
+        else:
+            with pytest.raises(RuntimeError) as caught:
+                StandardRunExecutor._submit_container_source(
+                    run, SimpleNamespace(submit=submit),
+                )
+            assert caught.value is expected_error
+        expected = 2 if scenario == "success" else 0 if scenario == "pre-stop" else 1
+        assert tuple(frames) == (1, 0) and len(frames) == len(source.frame_indices)
+        assert source.notes == [(reason, expected)] and source.take_calls == 1
+        assert len(run.resource_facts) == 1
+        observed = run.resource_facts[0]
+        assert not observed.selected and observed.direct_frames == 0
+        assert observed.reason == reason and observed.fallback_frames == expected
