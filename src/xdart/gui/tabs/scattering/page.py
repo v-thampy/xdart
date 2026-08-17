@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import math
@@ -347,6 +348,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._run_frame_seen = False
         self._retain_outgoing_display = False
         self._batch_latest_frame: DisplayFrameKey | None = None
+        self._presentation_targets: deque[DisplayFrameKey] = deque(maxlen=3)
+        self._presentation_run_identity: RunIdentity | None = None
         self._browser_directory_chooser = (
             browser_directory_chooser
             if browser_directory_chooser is not None
@@ -509,6 +512,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         first = not self._closing
         if first:
             self._closing = True
+            ScatteringWorkspace._clear_presentation_targets(self)
             self._clear_live_source_refresh()
             self._shell.browser.cancel_pending_frame_selection()
             self._run_timer.stop()
@@ -771,6 +775,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_browser_catalog()
             return
         if kind is ShellCommandKind.SHOW_ALL:
+            ScatteringWorkspace._clear_presentation_targets(self)
             self._shell.browser.cancel_pending_frame_selection()
             navigation = self._context_controller.navigation
             if (
@@ -782,6 +787,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._refresh_shell()
             return
         if kind is ShellCommandKind.SELECT_SCAN:
+            ScatteringWorkspace._clear_presentation_targets(self)
             if (getattr(self._context_controller, "viewer_1d_owned", False)
                     and not self._clear_viewer_1d_renderer(close=True)):
                 return
@@ -795,6 +801,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ShellCommandKind.HYDRATE_FRAME,
             ShellCommandKind.SELECT_BROWSER_FRAMES,
         }:
+            ScatteringWorkspace._clear_presentation_targets(self)
             if kind is not ShellCommandKind.SELECT_BROWSER_FRAMES:
                 self._shell.browser.cancel_pending_frame_selection()
             self._select_frames(command)
@@ -846,6 +853,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _run_action(self) -> None:
         phase = self._lifecycle.phase
         if phase is RunPhase.RUNNING:
+            ScatteringWorkspace._flush_presentation_target(self)
             try:
                 result = self._context_controller.pause()
             except Exception as error:
@@ -858,6 +866,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._refresh_shell()
             return
         if phase is RunPhase.PAUSED:
+            ScatteringWorkspace._clear_presentation_targets(self)
             try:
                 result = self._context_controller.resume()
             except Exception as error:
@@ -1126,6 +1135,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         outcome = pipeline.start(receipt)
         if isinstance(outcome, StartLaunched):
             self._admission = None
+            ScatteringWorkspace._clear_presentation_targets(self)
             launched_source = outcome.source_capture.source
             self._pending_source_refresh = None
             self._live_source_refresh_source = (
@@ -1249,6 +1259,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell()
             return
         try:
+            ScatteringWorkspace._flush_presentation_target(self)
             self._context_controller.stop()
         except Exception as error:
             self._error_notice("Standard stop dispatch failed", error)
@@ -1258,6 +1269,70 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         self._refresh_shell()
         self._ensure_timer()
+
+    def _clear_presentation_targets(self) -> None:
+        getattr(self, "_presentation_targets", []).clear()
+        self._presentation_run_identity = None
+
+    def _presentation_pacing_active(self, identity: RunIdentity) -> bool:
+        controller = self._context_controller
+        context, selection = controller.acquisition_context, controller.selection
+        return (
+            self._lifecycle.phase is RunPhase.RUNNING
+            and self._lifecycle.active_run_identity is identity
+            and controller.run_identity is identity
+            and not self._active_batch_mode
+            and self._preferences.plot_mode == "Single"
+            and self._auto_last
+            and context is not None
+            and selection is not None
+            and selection.kind is ContextKind.ACQUISITION
+            and selection.names(context)
+            and selection.owner == context.hydration_owner
+        )
+
+    def _select_presentation_target(
+            self, identity: RunIdentity, frame: DisplayFrameKey) -> bool:
+        controller = self._context_controller
+        navigation = controller.navigation
+        if (
+            frame.run_identity is not identity
+            or controller.run_identity is not identity
+            or not controller.owns_frame(frame)
+            or not any(candidate is frame for candidate in navigation.frames)
+        ):
+            return False
+        return controller.select_navigation(frame, (frame,))
+
+    def _queue_presentation_target(
+            self, identity: RunIdentity, frame: DisplayFrameKey) -> None:
+        if self._presentation_run_identity is not identity:
+            self._clear_presentation_targets()
+            self._presentation_run_identity = identity
+        self._presentation_targets.append(frame)
+
+    def _advance_presentation_target(self) -> bool:
+        identity = getattr(self, "_presentation_run_identity", None)
+        if identity is None or not self._presentation_pacing_active(identity):
+            self._clear_presentation_targets()
+            return False
+        while self._presentation_targets:
+            frame = self._presentation_targets.popleft()
+            if self._select_presentation_target(identity, frame):
+                if not self._presentation_targets:
+                    self._presentation_run_identity = None
+                return True
+        self._clear_presentation_targets()
+        return False
+
+    def _flush_presentation_target(self) -> bool:
+        identity = getattr(self, "_presentation_run_identity", None)
+        targets = tuple(getattr(self, "_presentation_targets", ()))
+        ScatteringWorkspace._clear_presentation_targets(self)
+        if identity is None:
+            return False
+        return any(self._select_presentation_target(identity, frame)
+                   for frame in reversed(targets))
 
     def _select_scan(self, value: object) -> None:
         if type(value) is not str or not value:
@@ -1336,6 +1411,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if self._closing or self._closed:
             return
         changed = self._poll_admission()
+        if ScatteringWorkspace._advance_presentation_target(self):
+            changed = True
         poll_viewer_1d = getattr(self._context_controller, "poll_viewer_1d", None)
         if poll_viewer_1d is not None and poll_viewer_1d():
             changed = True
@@ -1414,12 +1491,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 event.kind is StandardEventKind.FRAME_READY
                 and event.navigation_delta is not None
             ):
+                paced = self._presentation_pacing_active(event.run_identity)
                 if self._context_controller.accept_navigation(
                     event.navigation_delta,
                     plot_mode=self._preferences.plot_mode,
-                    follow_latest=self._auto_last,
+                    follow_latest=False if paced else self._auto_last,
                 ):
                     frame = event.navigation_delta.appended
+                    first_paced_frame = paced and not self._run_frame_seen
                     self._run_frame_seen = True
                     self._batch_latest_frame = frame
                     self._browser_transient_frame = frame
@@ -1432,6 +1511,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         _directory_file_progress(event),
                     )
                     changed = True
+                    if first_paced_frame:
+                        self._select_presentation_target(
+                            event.run_identity, frame,
+                        )
+                    elif paced:
+                        self._queue_presentation_target(
+                            event.run_identity, frame,
+                        )
                     if not self._active_batch_mode:
                         self._follow_processed_artifact(frame)
                 continue
@@ -1450,6 +1537,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 StandardEventKind.STOPPED,
                 StandardEventKind.FAILED,
             }:
+                ScatteringWorkspace._flush_presentation_target(self)
                 self._retain_outgoing_display = False
                 if self._batch_latest_frame is not None:
                     self._follow_processed_artifact(
@@ -2089,6 +2177,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             }:
                 return False
             prior_mode = self._preferences.plot_mode
+            ScatteringWorkspace._clear_presentation_targets(self)
             updates["plot_mode"] = value
             if value not in {"Overlay", "Waterfall"}:
                 updates["slice_pins"] = ()
@@ -2234,6 +2323,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._request_browser_catalog()
             return True
         elif kind is ShellCommandKind.SET_AUTO_LAST:
+            ScatteringWorkspace._clear_presentation_targets(self)
             self._auto_last = bool(value)
             if self._auto_last:
                 self._context_controller.select_latest_navigation(

@@ -156,6 +156,34 @@ def _shell(page: ScatteringWorkspace) -> ScatteringWorkspaceShell:
     return shell
 
 
+def _paced_frame_events(page, executor, identity, count):
+    from tests.xdart.scattering.test_e3_context_contract import _acquisition
+
+    _, acquisition = _acquisition(
+        configuration=RunIntent(output_mode="Overwrite").freeze(), identity=identity)
+    executor.acquisition_context = lambda candidate: acquisition if candidate is identity else None
+    acquisition.publication_store.catalog.resize(16)
+    page._context_controller.adopt_acquisition(identity)
+    display = acquisition.publication_store
+    deltas = [DisplayNavigationDelta(display.catalog_snapshot().entries[0])]
+    deltas.extend(display.append_navigation("run.a", "/out/a.nxs", label)
+                  for label in range(2, count + 1))
+    return tuple(
+        StandardRunEvent(
+            identity,
+            StandardEventKind.FRAME_READY,
+            completed=index,
+            total=count,
+            artifact=delta.appended.artifact,
+            frame_key=delta.appended,
+            navigation_delta=delta,
+            artifact_completed=index,
+            artifact_total=count,
+        )
+        for index, delta in enumerate(deltas, start=1)
+    )
+
+
 def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) -> None:
     executor = _Executor()
     page, lifecycle, identity = _active_page(executor)
@@ -175,6 +203,158 @@ def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) ->
             shell.run_controls.readinessLabel.text()
             == "Standard cleanup remains pending"
         )
+    finally:
+        _dispose(page, qapp)
+
+
+def test_single_auto_last_paces_eight_frame_burst_as_1_6_7_8(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    executor = _Executor()
+    page, _, identity = _active_page(executor)
+    events = _paced_frame_events(page, executor, identity, 8)
+    accepted_follow_latest: list[bool] = []
+    accept_navigation = page._context_controller.accept_navigation
+
+    def accept(delta, *, plot_mode="Single", follow_latest=True):
+        accepted_follow_latest.append(follow_latest)
+        return accept_navigation(
+            delta,
+            plot_mode=plot_mode,
+            follow_latest=follow_latest,
+        )
+
+    monkeypatch.setattr(page._context_controller, "accept_navigation", accept)
+    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
+    paints: list[int | None] = []
+    def record_paint(**_kwargs):
+        current = page._context_controller.navigation.current
+        paints.append(None if current is None else current.local_frame_label)
+
+    monkeypatch.setattr(page, "_refresh_shell", record_paint)
+    try:
+        executor.events.extend(events)
+        page._drain_executor()
+
+        assert tuple(
+            frame.local_frame_label
+            for frame in page._context_controller.navigation.frames
+        ) == (
+            1, 2, 3, 4, 5, 6, 7, 8,
+        )
+        assert page._progress.completed == 8
+        assert page._artifact_progress["/out/a.nxs"].published == 8
+        assert accepted_follow_latest == [False] * 8
+        assert paints == [1]
+        assert tuple(
+            frame.local_frame_label for frame in page._presentation_targets
+        ) == (6, 7, 8)
+
+        for _ in range(3):
+            page._drain_executor()
+
+        assert paints == [1, 6, 7, 8]
+        assert tuple(page._presentation_targets) == ()
+    finally:
+        _dispose(page, qapp)
+
+
+def test_pacer_boundaries_clear_stale_work_and_flush_exact_latest(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(executor)
+    events = _paced_frame_events(page, executor, identity, 5)
+    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
+    monkeypatch.setattr(page, "_refresh_shell", lambda **_kwargs: None)
+    try:
+        executor.events.extend(events)
+        page._drain_executor()
+        assert tuple(page._presentation_targets)
+
+        first = events[0].frame_key
+        assert first is not None
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SELECT_FRAME,
+            frame=first,
+            frames=(first,),
+        ))
+        assert tuple(page._presentation_targets) == ()
+        assert page._auto_last is False
+        assert page._context_controller.navigation.current is first
+
+        latest = events[-1].frame_key
+        assert latest is not None
+
+        def refill(*targets):
+            page._presentation_targets.extend(targets or (latest,))
+            page._presentation_run_identity = identity
+
+        refill(*(
+            event.frame_key for event in events[-3:]
+            if event.frame_key is not None
+        ))
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_AUTO_LAST, True,
+        ))
+        assert tuple(page._presentation_targets) == ()
+        assert page._presentation_run_identity is None
+        assert page._context_controller.navigation.current is latest
+
+        refill()
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PLOT_MODE, "Overlay",
+        ))
+        assert tuple(page._presentation_targets) == ()
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PLOT_MODE, "Single",
+        ))
+
+        dispatched: list[tuple[str, int]] = []
+
+        def pause():
+            current = page._context_controller.navigation.current
+            dispatched.append(("pause", current.local_frame_label))
+
+        refill()
+        monkeypatch.setattr(page._context_controller, "pause", pause)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.RUN_ACTION))
+        assert dispatched == [("pause", 5)]
+        assert tuple(page._presentation_targets) == ()
+
+        def stop():
+            current = page._context_controller.navigation.current
+            dispatched.append(("stop", current.local_frame_label))
+
+        refill()
+        monkeypatch.setattr(page._context_controller, "stop", stop)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.STOP))
+        assert dispatched[-1] == ("stop", 5)
+        assert tuple(page._presentation_targets) == ()
+
+        foreign_identity = RunIdentity(
+            identity.generation + 1, f"{identity.fingerprint}-stale",
+        )
+        stale = DisplayFrameKey(
+            foreign_identity, "run.a", "/out/a.nxs", 99, 99,
+        )
+        refill(stale, latest)
+        assert page._context_controller.select_navigation(
+            events[0].frame_key, (events[0].frame_key,),
+        )
+        page._drain_executor()
+        assert page._context_controller.navigation.current is latest
+        assert tuple(page._presentation_targets) == ()
+
+        refill()
+        executor.events.append(StandardRunEvent(
+            identity, StandardEventKind.FINISHED,
+            completed=5, total=5, artifact="/out/a.nxs",
+            cleanup_status=CleanupStatus.CLEANED,
+        ))
+        page._drain_executor()
+        assert page._context_controller.navigation.current is latest
+        assert tuple(page._presentation_targets) == ()
+        assert page._presentation_run_identity is None
+        assert lifecycle.phase is RunPhase.IDLE
     finally:
         _dispose(page, qapp)
 
