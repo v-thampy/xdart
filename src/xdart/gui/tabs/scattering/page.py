@@ -104,6 +104,7 @@ from .scientific_axes import (
 from .shell_values import (
     ArtifactProgress,
     DirectoryFileProgress,
+    FrameSelectionIntent,
     ProgressProjection,
     ShellCommand,
     ShellCommandKind,
@@ -158,6 +159,22 @@ def _slice_pins_for_plot_axis(
     return tuple(
         replace(pin, plot_axis=requested_axis)
         for pin in pins
+    )
+
+
+def _linearized_frame_selection(navigation, command: ShellCommand):
+    if command.intent is FrameSelectionIntent.EXACT:
+        return command.frames
+    selected_ids = {id(frame) for frame in navigation.selected}
+    operand_ids = {id(frame) for frame in command.frames}
+    if command.intent is FrameSelectionIntent.TOGGLE_TRACE:
+        selected_ids.symmetric_difference_update(operand_ids)
+    elif command.intent is FrameSelectionIntent.REMOVE_TRACE_RANGE:
+        selected_ids.difference_update(operand_ids)
+    else:
+        selected_ids.update(operand_ids)
+    return tuple(
+        frame for frame in navigation.frames if id(frame) in selected_ids
     )
 
 
@@ -1293,26 +1310,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 frame.local_frame_label)
             self._ensure_timer()
             return
-        if (
-            command.kind is ShellCommandKind.SELECT_BROWSER_FRAMES
-            and self._preferences.plot_mode in {"Overlay", "Waterfall"}
-            and selection is not None
-            and selection.kind is ContextKind.ACQUISITION
-            and self._lifecycle.phase in {
-                RunPhase.PREPARING,
-                RunPhase.STARTING,
-                RunPhase.RUNNING,
-                RunPhase.PAUSING,
-                RunPhase.PAUSED,
-                RunPhase.RESUMING,
-                RunPhase.STOPPING,
-                RunPhase.FINALIZING,
-            }
-        ):
-            # A live acquisition owns arrival membership. Browser visits move
-            # only the heavy-frame anchor until the run is terminal; an idle
-            # or Browse selection adopts the exact highlighted rows below.
-            frames = self._context_controller.navigation.selected
+        if command.kind is ShellCommandKind.SELECT_BROWSER_FRAMES:
+            frames = _linearized_frame_selection(
+                self._context_controller.navigation,
+                command,
+            )
         if not self._context_controller.select_navigation(
             frame, frames
         ):

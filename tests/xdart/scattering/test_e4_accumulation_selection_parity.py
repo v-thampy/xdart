@@ -8,6 +8,7 @@ import pytest
 from pyqtgraph.Qt import QtCore, QtGui, QtTest, QtWidgets
 
 from xdart.modules.display_context import ContextKind
+from xdart.gui.tabs.scattering import shell_values as shell_values_module
 from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_projection import (
@@ -53,6 +54,7 @@ def _click_frame(
     modifiers: QtCore.Qt.KeyboardModifier = (
         QtCore.Qt.KeyboardModifier.NoModifier
     ),
+    settle: bool = True,
 ) -> None:
     index = shell.browser.frame_model.index(row, 0)
     shell.browser.frames.scrollTo(index)
@@ -66,7 +68,8 @@ def _click_frame(
     qapp.processEvents()
     # Leave scheduler headroom beyond the production 100 ms quiet window;
     # loaded full packets can otherwise sample the timer before delivery.
-    QtTest.QTest.qWait(200)
+    if settle:
+        QtTest.QTest.qWait(200)
 
 
 def _set_current_row(
@@ -128,7 +131,7 @@ def test_accumulating_click_carries_exact_toggle_membership(
         assert _selected_browser_rows(shell) == (2,)
         assert len(commands) == 1
         assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
-        assert commands[0].frames == state.navigation.frames
+        assert commands[0].frames == (state.navigation.frames[2],)
         assert commands[0].frame is state.navigation.frames[2]
 
         commands.clear()
@@ -136,7 +139,7 @@ def test_accumulating_click_carries_exact_toggle_membership(
 
         assert _selected_browser_rows(shell) == (1,)
         assert len(commands) == 1
-        assert commands[0].frames == state.navigation.frames
+        assert commands[0].frames == (state.navigation.frames[1],)
         assert commands[0].frame is state.navigation.frames[1]
 
         commands.clear()
@@ -184,7 +187,7 @@ def test_idle_accumulating_selection_carries_exact_highlighted_rows(
         assert _selected_browser_rows(shell) == (2,)
         assert len(commands) == 1
         assert commands[0].frame is frames[2]
-        assert commands[0].frames == (frames[0], frames[2])
+        assert commands[0].frames == (frames[2],)
         assert shell.browser._trace_frames == (frames[0], frames[2])
 
         commands.clear()
@@ -266,7 +269,7 @@ def test_plain_click_in_single_mode_still_replaces_the_exact_row(
         )
     ),
 )
-def test_modified_single_click_toggles_without_collapsing_membership(
+def test_overlay_modifier_gestures_emit_exact_typed_operands(
     qapp: QtWidgets.QApplication,
     plot_mode: str,
     modifier: QtCore.Qt.KeyboardModifier,
@@ -282,41 +285,85 @@ def test_modified_single_click_toggles_without_collapsing_membership(
         qapp.processEvents()
         commands.clear()
 
-        _click_frame(qapp, shell, 2, modifiers=modifier)
+        _click_frame(qapp, shell, 0, modifiers=modifier, settle=False)
+        _click_frame(qapp, shell, 0, settle=False)
+        _click_frame(qapp, shell, 2, modifiers=modifier, settle=False)
+        QtTest.QTest.qWait(200)
 
         assert _selected_browser_rows(shell) == (0, 2)
-        assert len(commands) == 1
-        assert commands[0].frames == (
-            state.navigation.frames[0],
-            state.navigation.frames[2],
-        )
-        assert commands[0].frame is state.navigation.frames[2]
+        intent = shell_values_module.FrameSelectionIntent
+        assert tuple((row.frame, row.frames, row.intent) for row in commands) == (
+            (state.navigation.frames[0], (state.navigation.frames[0],), intent.TOGGLE_TRACE),
+            (state.navigation.frames[0], (state.navigation.frames[0],), intent.VISIT),
+            (state.navigation.frames[2], (state.navigation.frames[2],), intent.TOGGLE_TRACE))
 
         commands.clear()
-        _click_frame(qapp, shell, 0, modifiers=modifier)
-        assert _selected_browser_rows(shell) == (2,)
-        assert len(commands) == 1
-        assert commands[0].frames == (state.navigation.frames[2],)
-        assert commands[0].frame is state.navigation.frames[0]
-        assert (
-            shell.browser.frames.currentIndex().data(
-                QtCore.Qt.ItemDataRole.UserRole
-            )
-            is state.navigation.frames[0]
-        )
+        _click_frame(qapp, shell, 1, modifiers=QtCore.Qt.KeyboardModifier.ShiftModifier, settle=False)
+        _click_frame(qapp, shell, 4, modifiers=QtCore.Qt.KeyboardModifier.ShiftModifier, settle=False)
+        QtTest.QTest.qWait(200)
+        assert tuple(row.frames for row in commands) == (
+            state.navigation.frames[1:3], state.navigation.frames[1:5])
+        assert all(row.intent is intent.REMOVE_TRACE_RANGE for row in commands)
+    finally:
+        shell.close()
 
+
+@pytest.mark.parametrize("plot_mode", ("Overlay", "Waterfall"))
+def test_overlay_shift_reversal_emits_one_final_remove_range(
+    qapp: QtWidgets.QApplication,
+    plot_mode: str,
+) -> None:
+    intent = shell_values_module.FrameSelectionIntent
+    base = make_shell_projection(plot_mode=plot_mode)
+    frames = base.navigation.frames
+    state = replace(
+        base,
+        navigation=FrameNavigationProjection(frames, frames[2], frames),
+    )
+    shell = ScatteringWorkspaceShell()
+    commands = []
+    shell.commandRequested.connect(commands.append)
+    shell.show()
+    try:
+        shell.apply_state(state)
+        shell.browser.frames.setFocus()
+        qapp.processEvents()
         commands.clear()
-        _click_frame(qapp, shell, 2)
-        assert _selected_browser_rows(shell) == (2,)
-        assert len(commands) == 1
-        assert commands[0].frame is state.navigation.frames[2]
-        assert commands[0].frames == (state.navigation.frames[2],)
-        assert (
-            shell.browser.frames.currentIndex().data(
-                QtCore.Qt.ItemDataRole.UserRole
-            )
-            is state.navigation.frames[2]
+
+        _send_key(
+            qapp,
+            shell,
+            QtCore.QEvent.Type.KeyPress,
+            QtCore.Qt.Key.Key_Shift,
+            modifiers=QtCore.Qt.KeyboardModifier.ShiftModifier,
         )
+        for key in (
+            QtCore.Qt.Key.Key_Down,
+            QtCore.Qt.Key.Key_Down,
+            QtCore.Qt.Key.Key_Up,
+        ):
+            _send_key(
+                qapp,
+                shell,
+                QtCore.QEvent.Type.KeyPress,
+                key,
+                modifiers=QtCore.Qt.KeyboardModifier.ShiftModifier,
+            )
+        _send_key(
+            qapp,
+            shell,
+            QtCore.QEvent.Type.KeyRelease,
+            QtCore.Qt.Key.Key_Shift,
+        )
+        assert commands == []
+        QtTest.QTest.qWait(130)
+
+        assert _selected_browser_rows(shell) == (2, 3)
+        assert len(commands) == 1
+        command = commands[0]
+        assert command.intent is intent.REMOVE_TRACE_RANGE
+        assert command.frame is frames[3]
+        assert command.frames == frames[2:4]
     finally:
         shell.close()
 
@@ -438,11 +485,11 @@ def test_held_arrow_is_one_gesture_with_no_intermediate_command(
 
 
 @pytest.mark.parametrize("plot_mode", ("Overlay", "Waterfall"))
-def test_held_overlay_arrow_carries_exact_new_ui_membership(
-    qapp: QtWidgets.QApplication,
-    plot_mode: str,
+def test_held_overlay_arrow_is_one_bounded_page_refresh(
+    qapp: QtWidgets.QApplication, plot_mode: str,
 ) -> None:
-    base = make_shell_projection(plot_mode=plot_mode)
+    steps = 300 if plot_mode == "Overlay" else 3621
+    base = make_shell_projection(plot_mode=plot_mode, frame_count=steps + 1)
     initial = base.navigation.frames[0]
     state = replace(
         base,
@@ -453,8 +500,25 @@ def test_held_overlay_arrow_carries_exact_new_ui_membership(
         ),
     )
     shell = ScatteringWorkspaceShell()
-    commands = []
+    commands, refreshes = [], []
+    frames = base.navigation.frames
+
+    class Controller:
+        navigation = state.navigation
+        selection = SimpleNamespace(kind=ContextKind.ACQUISITION)
+
+        @staticmethod
+        def owns_frame(frame: object) -> bool: return any(
+            frame is candidate for candidate in frames)
+
+        @classmethod
+        def select_navigation(cls, current, selected) -> bool:
+            cls.navigation = FrameNavigationProjection(frames, current, selected); return True
+
+    owner = SimpleNamespace(_context_controller=Controller(), _auto_last=True,
+        _refresh_shell=lambda: refreshes.append(Controller.navigation), _ensure_timer=lambda: None)
     shell.commandRequested.connect(commands.append)
+    shell.commandRequested.connect(lambda row: ScatteringWorkspace._select_frames(owner, row))
     shell.show()
     try:
         shell.apply_state(state)
@@ -468,7 +532,7 @@ def test_held_overlay_arrow_carries_exact_new_ui_membership(
             QtCore.QEvent.Type.KeyPress,
             QtCore.Qt.Key.Key_Down,
         )
-        for _ in range(2):
+        for _ in range(steps - 1):
             _send_key(
                 qapp,
                 shell,
@@ -492,26 +556,36 @@ def test_held_overlay_arrow_carries_exact_new_ui_membership(
         assert commands == []
         QtTest.QTest.qWait(130)
 
-        assert len(commands) == 1
-        assert _selected_browser_rows(shell) == (3,)
-        assert commands[0].frame is state.navigation.frames[3]
-        assert commands[0].frames == state.navigation.frames[:4]
-        assert shell.browser._trace_frames == state.navigation.frames[:4]
+        assert len(commands) == len(refreshes) == 1
+        assert commands[0].frame is frames[-1]
+        assert commands[0].frames == frames[1:]
+        assert Controller.navigation.selected == frames
+
+        commands.clear(); refreshes.clear()
+        shell.browser._begin_frame_gesture(QtCore.Qt.KeyboardModifier.ControlModifier)
+        for row in (1, 2, 1, 3):
+            _set_current_row(shell, row, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        shell.browser._finish_frame_gesture()
+        QtTest.QTest.qWait(130)
+        assert len(commands) == len(refreshes) == 1
+        assert commands[0].intent is shell_values_module.FrameSelectionIntent.TOGGLE_TRACE
+        assert commands[0].frames == (frames[2], frames[3])
     finally:
         shell.close()
 
 
-def test_live_append_rebases_pending_overlay_anchor_on_new_membership(
+def test_pending_overlay_remove_rebases_over_live_append(
     qapp: QtWidgets.QApplication,
 ) -> None:
+    intent = shell_values_module.FrameSelectionIntent
     base = make_shell_projection(plot_mode="Overlay")
     frames = base.navigation.frames
     state = replace(
         base,
         navigation=FrameNavigationProjection(
             frames,
-            frames[0],
-            frames[:2],
+            frames[1],
+            frames[:3],
         ),
     )
     shell = ScatteringWorkspaceShell()
@@ -520,15 +594,24 @@ def test_live_append_rebases_pending_overlay_anchor_on_new_membership(
     shell.show()
     try:
         shell.apply_state(state)
+        shell.browser.frames.setFocus()
         qapp.processEvents()
         commands.clear()
 
-        _set_current_row(
+        _send_key(
+            qapp,
             shell,
-            2,
-            QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect,
+            QtCore.QEvent.Type.KeyPress,
+            QtCore.Qt.Key.Key_Shift,
+            modifiers=QtCore.Qt.KeyboardModifier.ShiftModifier,
         )
-        qapp.processEvents()
+        _send_key(
+            qapp,
+            shell,
+            QtCore.QEvent.Type.KeyPress,
+            QtCore.Qt.Key.Key_Down,
+            modifiers=QtCore.Qt.KeyboardModifier.ShiftModifier,
+        )
         assert shell.browser.frame_selection_pending
         assert commands == []
 
@@ -540,7 +623,7 @@ def test_live_append_rebases_pending_overlay_anchor_on_new_membership(
             99,
         )
         appended_frames = (*frames, appended)
-        latest_membership = (*frames[:2], appended)
+        latest_membership = (*frames[:3], appended)
         shell.apply_state(
             replace(
                 state,
@@ -560,10 +643,17 @@ def test_live_append_rebases_pending_overlay_anchor_on_new_membership(
         assert shell.browser.frame_selection_pending
         assert commands == []
 
+        _send_key(
+            qapp,
+            shell,
+            QtCore.QEvent.Type.KeyRelease,
+            QtCore.Qt.Key.Key_Shift,
+        )
         QtTest.QTest.qWait(130)
         assert len(commands) == 1
         assert commands[0].frame is frames[2]
-        assert commands[0].frames == latest_membership
+        assert commands[0].frames == frames[1:3]
+        assert commands[0].intent is intent.REMOVE_TRACE_RANGE
     finally:
         shell.close()
 
@@ -1031,7 +1121,7 @@ def test_show_all_page_dispatch_preserves_current_order_and_skips_empty_noop(
     assert events == [("cancel",)]
 
 
-def test_active_acquisition_overlay_visit_preserves_arrival_membership() -> None:
+def test_active_acquisition_overlay_visit_accumulates_over_arrivals() -> None:
     state = make_shell_projection(plot_mode="Overlay")
     frames = state.navigation.frames
     arrival_membership = frames[:2]
@@ -1067,11 +1157,85 @@ def test_active_acquisition_overlay_visit_preserves_arrival_membership() -> None
         ShellCommand(
             ShellCommandKind.SELECT_BROWSER_FRAMES,
             frame=frames[3],
-            frames=(frames[0], frames[3]),
+            frames=(frames[3],),
+            intent=shell_values_module.FrameSelectionIntent.VISIT,
         ),
     )
 
-    assert calls == [(frames[3], arrival_membership)]
+    assert calls == [(frames[3], (*arrival_membership, frames[3]))]
+
+
+def test_active_live_overlay_intents_linearize_against_latest_navigation(
+) -> None:
+    intent = shell_values_module.FrameSelectionIntent
+    frames = make_shell_projection(plot_mode="Overlay").navigation.frames
+    calls = []
+
+    class Controller:
+        navigation = FrameNavigationProjection(
+            frames,
+            frames[4],
+            (frames[0], frames[1], frames[4]),
+        )
+        selection = SimpleNamespace(kind=ContextKind.ACQUISITION)
+
+        @staticmethod
+        def owns_frame(frame: object) -> bool:
+            return any(frame is candidate for candidate in frames)
+
+        @classmethod
+        def select_navigation(cls, current, selected) -> bool:
+            calls.append((current, selected))
+            cls.navigation = FrameNavigationProjection(
+                frames,
+                current,
+                selected,
+            )
+            return True
+
+    owner = SimpleNamespace(
+        _context_controller=Controller(),
+        _preferences=ScientificPreferences(plot_mode="Overlay"),
+        _lifecycle=SimpleNamespace(phase=RunPhase.RUNNING),
+        _auto_last=True,
+        _refresh_shell=lambda: None,
+        _ensure_timer=lambda: None,
+    )
+    commands = (
+        ShellCommand(
+            ShellCommandKind.SELECT_BROWSER_FRAMES,
+            frame=frames[2],
+            frames=(frames[2],),
+            intent=intent.VISIT,
+        ),
+        ShellCommand(
+            ShellCommandKind.SELECT_BROWSER_FRAMES,
+            frame=frames[1],
+            frames=(frames[1],),
+            intent=intent.TOGGLE_TRACE,
+        ),
+        ShellCommand(
+            ShellCommandKind.SELECT_BROWSER_FRAMES,
+            frame=frames[3],
+            frames=(frames[3],),
+            intent=intent.TOGGLE_TRACE,
+        ),
+        ShellCommand(
+            ShellCommandKind.SELECT_BROWSER_FRAMES,
+            frame=frames[3],
+            frames=frames[2:4],
+            intent=intent.REMOVE_TRACE_RANGE,
+        ),
+    )
+    for command in commands:
+        ScatteringWorkspace._select_frames(owner, command)
+
+    assert calls == [
+        (frames[2], (frames[0], frames[1], frames[2], frames[4])),
+        (frames[1], (frames[0], frames[2], frames[4])),
+        (frames[3], (frames[0], frames[2], frames[3], frames[4])),
+        (frames[3], (frames[0], frames[4])),
+    ]
 
 
 @pytest.mark.parametrize(

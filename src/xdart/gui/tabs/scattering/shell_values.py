@@ -58,6 +58,13 @@ class ShellCommandKind(str, Enum):
     SET_OUTPUT_POLICY = "set_output_policy"
 
 
+class FrameSelectionIntent(str, Enum):
+    EXACT = "exact"
+    VISIT = "visit"
+    TOGGLE_TRACE = "toggle_trace"
+    REMOVE_TRACE_RANGE = "remove_trace_range"
+
+
 @dataclass(frozen=True, slots=True)
 class ShellCommand:
     kind: ShellCommandKind
@@ -65,6 +72,7 @@ class ShellCommand:
     path: tuple[str, ...] = ()
     frame: DisplayFrameKey | None = None
     frames: tuple[DisplayFrameKey, ...] = ()
+    intent: FrameSelectionIntent = FrameSelectionIntent.EXACT
 
     def __post_init__(self) -> None:
         if type(self.kind) is not ShellCommandKind:
@@ -83,6 +91,8 @@ class ShellCommand:
             or not all(type(item) is DisplayFrameKey for item in self.frames)
         ):
             raise TypeError("shell command frames must be exact frame keys")
+        if type(self.intent) is not FrameSelectionIntent:
+            raise TypeError("frame selection intent must be exact")
 
 
 class ShellPhase(str, Enum):
@@ -478,6 +488,7 @@ __all__ = [
     "BrowserProjection",
     "DirectoryFileProgress",
     "BrowserScan",
+    "FrameSelectionIntent",
     "FrameNavigationProjection",
     "HeavyProjection",
     "ProgressProjection",

@@ -11,6 +11,7 @@ from .browser_model import FrameListModel
 from .display_values import DisplayFrameKey
 from .shell_values import (
     BrowserProjection,
+    FrameSelectionIntent,
     FrameNavigationProjection,
     ShellCommand,
     ShellCommandKind,
@@ -92,9 +93,21 @@ class _AccumulatingFrameClickFilter(QtCore.QObject):
             # An empty-area click must not destroy an accumulating selection.
             return accumulating
         selection = self._view.selectionModel()
-        explicit = shift_modifier or toggle_modifier or not visit_mode
-        self._set_selection_intent(explicit, index.data(_USER_ROLE))
         anchor = selection.currentIndex()
+        intent = (
+            FrameSelectionIntent.REMOVE_TRACE_RANGE
+            if visit_mode and shift_modifier
+            else FrameSelectionIntent.TOGGLE_TRACE
+            if visit_mode and toggle_modifier
+            else FrameSelectionIntent.VISIT
+            if visit_mode
+            else FrameSelectionIntent.EXACT
+        )
+        self._set_selection_intent(
+            intent,
+            index.data(_USER_ROLE),
+            anchor.data(_USER_ROLE) if anchor.isValid() else None,
+        )
         selection.setCurrentIndex(
             index,
             QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
@@ -109,12 +122,12 @@ class _AccumulatingFrameClickFilter(QtCore.QObject):
             ),
             (
                 QtCore.QItemSelectionModel.SelectionFlag.Toggle
-                if explicit and not shift_modifier
+                if (toggle_modifier or not visit_mode) and not shift_modifier
                 else QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
             )
             | QtCore.QItemSelectionModel.SelectionFlag.Rows,
         )
-        self._set_selection_intent(None, None)
+        self._set_selection_intent(None, None, None)
         return True
 
 
@@ -234,8 +247,9 @@ class BrowserView(QtWidgets.QFrame):
         self._committed_selected: tuple[DisplayFrameKey, ...] = ()
         self._pending_frame_command: ShellCommand | None = None
         self._frame_gesture_active = False
-        self._frame_selection_explicit: bool | None = None
+        self._frame_selection_intent: FrameSelectionIntent | None = None
         self._frame_pointer_current: DisplayFrameKey | None = None
+        self._frame_range_anchor: DisplayFrameKey | None = None
         layout = QtWidgets.QVBoxLayout(self)
         self._root_layout = layout
         layout.addLayout(self._make_menu_row())
@@ -490,8 +504,7 @@ class BrowserView(QtWidgets.QFrame):
             self._cancel_pending_frame_selection()
             pending = None
         if pending is not None and not _command_belongs_to_catalog(
-            pending,
-            state.frames,
+            pending, state.frames
         ):
             self._cancel_pending_frame_selection()
             pending = None
@@ -500,20 +513,12 @@ class BrowserView(QtWidgets.QFrame):
             and authoritative_changed
             and plot_mode in _VISIT_ACCUMULATING_PLOT_MODES
         ):
-            membership = (
-                navigation.selected
-                if navigation.selected
-                else (() if pending.frame is None else (pending.frame,))
+            self._trace_frames = _membership_after_intent(
+                state.frames,
+                navigation.selected,
+                pending.frames,
+                pending.intent,
             )
-            pending = ShellCommand(
-                pending.kind,
-                pending.value,
-                pending.path,
-                pending.frame,
-                membership,
-            )
-            self._pending_frame_command = pending
-            self._trace_frames = membership
         if authoritative_changed and pending is None:
             self._cancel_pending_frame_selection()
         self._committed_current = navigation.current
@@ -674,62 +679,100 @@ class BrowserView(QtWidgets.QFrame):
         if type(self._frame_pointer_current) is DisplayFrameKey:
             current = self._frame_pointer_current
 
-        selected_frames = ui_selected_frames
+        intent = FrameSelectionIntent.EXACT
+        operands = ui_selected_frames
         if self._plot_mode in _VISIT_ACCUMULATING_PLOT_MODES:
-            selected_frames = (
-                ui_selected_frames
-                if self._frame_selection_explicit is True
-                else _catalog_ordered_membership(
+            intent = self._frame_selection_intent or FrameSelectionIntent.VISIT
+            if intent is FrameSelectionIntent.REMOVE_TRACE_RANGE:
+                operands = _catalog_range(
                     self.frame_model.frames,
-                    self._trace_frames,
-                    () if current is None else (current,),
+                    self._frame_range_anchor,
+                    current,
                 )
+            else:
+                operands = () if current is None else (current,)
+            self._trace_frames = _membership_after_intent(
+                self.frame_model.frames,
+                self._trace_frames,
+                operands,
+                intent,
             )
+        else:
+            self._trace_frames = operands
 
-        self._pending_frame_command = ShellCommand(
-            ShellCommandKind.SELECT_BROWSER_FRAMES,
-            frame=current,
-            frames=selected_frames,
+        self._queue_frame_command(
+            ShellCommand(
+                ShellCommandKind.SELECT_BROWSER_FRAMES,
+                frame=current,
+                frames=operands,
+                intent=intent,
+            )
         )
         self._selected_frames = ui_selected_frames
-        self._trace_frames = selected_frames
         if not self._frame_gesture_active:
-            self._frame_selection_explicit = None
+            self._frame_selection_intent = None
+            self._frame_range_anchor = None
             self._frame_selection_coalescer.trigger()
 
     def _set_frame_selection_intent(
         self,
-        explicit: bool | None,
+        intent: FrameSelectionIntent | None,
         current: DisplayFrameKey | None,
+        anchor: DisplayFrameKey | None,
     ) -> None:
         if (
-            explicit is False
+            intent is not None
+            and not self._frame_gesture_active
+            and self._pending_frame_command is not None
+        ):
+            self._frame_selection_coalescer.cancel()
+            self._flush_frame_selection()
+        if (
+            intent is FrameSelectionIntent.VISIT
             and current is not self.frames.currentIndex().data(_USER_ROLE)
             and _same_frame_identities(self._ui_selected_frames(), (current,))
         ):
             self._trace_frames = _catalog_ordered_membership(
                 self.frame_model.frames, self._trace_frames, (current,)
             )
-            self._pending_frame_command = ShellCommand(
-                ShellCommandKind.SELECT_BROWSER_FRAMES,
-                frame=current,
-                frames=self._trace_frames,
+            self._queue_frame_command(
+                ShellCommand(
+                    ShellCommandKind.SELECT_BROWSER_FRAMES,
+                    frame=current,
+                    frames=(current,),
+                    intent=intent,
+                )
             )
             self._frame_selection_coalescer.trigger()
-        self._frame_selection_explicit = explicit
+        self._frame_selection_intent = intent
         self._frame_pointer_current = current
+        self._frame_range_anchor = anchor
 
     def _begin_frame_gesture(self, modifiers) -> None:
         if self._frame_gesture_active:
             return
         self._frame_selection_coalescer.cancel()
-        self._frame_selection_explicit = bool(
-            modifiers
+        if self._pending_frame_command is not None:
+            self._flush_frame_selection()
+        visit_mode = self._plot_mode in _VISIT_ACCUMULATING_PLOT_MODES
+        self._frame_selection_intent = (
+            FrameSelectionIntent.REMOVE_TRACE_RANGE
+            if visit_mode
+            and modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier
+            else FrameSelectionIntent.TOGGLE_TRACE
+            if visit_mode
+            and modifiers
             & (
-                QtCore.Qt.KeyboardModifier.ShiftModifier
-                | QtCore.Qt.KeyboardModifier.ControlModifier
+                QtCore.Qt.KeyboardModifier.ControlModifier
                 | QtCore.Qt.KeyboardModifier.MetaModifier
             )
+            else FrameSelectionIntent.VISIT
+            if visit_mode
+            else FrameSelectionIntent.EXACT
+        )
+        anchor = self.frames.currentIndex().data(_USER_ROLE)
+        self._frame_range_anchor = (
+            anchor if type(anchor) is DisplayFrameKey else None
         )
         self._frame_gesture_active = True
 
@@ -739,7 +782,8 @@ class BrowserView(QtWidgets.QFrame):
         self._frame_gesture_active = False
         if self._pending_frame_command is not None:
             self._frame_selection_coalescer.trigger()
-        self._frame_selection_explicit = None
+        self._frame_selection_intent = None
+        self._frame_range_anchor = None
 
     def _ui_selected_frames(self) -> tuple[DisplayFrameKey, ...]:
         frames = tuple(
@@ -761,11 +805,36 @@ class BrowserView(QtWidgets.QFrame):
         if command is not None:
             self.commandRequested.emit(command)
 
+    def _queue_frame_command(self, command: ShellCommand) -> None:
+        pending = self._pending_frame_command
+        if (
+            pending is not None
+            and self._frame_gesture_active
+            and command.intent in {
+                FrameSelectionIntent.VISIT,
+                FrameSelectionIntent.TOGGLE_TRACE,
+            }
+        ):
+            command = ShellCommand(
+                command.kind,
+                frame=command.frame,
+                frames=_membership_after_intent(
+                    self.frame_model.frames,
+                    pending.frames,
+                    command.frames,
+                    command.intent,
+                ),
+                intent=command.intent,
+            )
+        self._pending_frame_command = command
+
     def _cancel_pending_frame_selection(self) -> None:
         self._frame_selection_coalescer.cancel()
         self._pending_frame_command = None
         self._frame_gesture_active = False
-        self._frame_selection_explicit = None
+        self._frame_selection_intent = None
+        self._frame_pointer_current = None
+        self._frame_range_anchor = None
 
     def _emit(self, kind: ShellCommandKind, value=None) -> None:
         self.commandRequested.emit(ShellCommand(kind, value))
@@ -786,6 +855,30 @@ def _catalog_ordered_membership(catalog, *groups):
         for frame in catalog
         if any(frame is member for group in groups for member in group)
     )
+
+
+def _catalog_range(catalog, anchor, endpoint):
+    positions = {
+        id(frame): index for index, frame in enumerate(catalog)
+    }
+    if id(anchor) not in positions or id(endpoint) not in positions:
+        return () if endpoint is None else (endpoint,)
+    first, last = sorted((positions[id(anchor)], positions[id(endpoint)]))
+    return tuple(catalog[first:last + 1])
+
+
+def _membership_after_intent(catalog, selected, operands, intent):
+    identities = {id(frame) for frame in selected}
+    operand_ids = {id(frame) for frame in operands}
+    if intent is FrameSelectionIntent.EXACT:
+        identities = operand_ids
+    elif intent is FrameSelectionIntent.TOGGLE_TRACE:
+        identities.symmetric_difference_update(operand_ids)
+    elif intent is FrameSelectionIntent.REMOVE_TRACE_RANGE:
+        identities.difference_update(operand_ids)
+    else:
+        identities.update(operand_ids)
+    return tuple(frame for frame in catalog if id(frame) in identities)
 
 
 def _command_belongs_to_catalog(

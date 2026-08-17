@@ -1203,7 +1203,7 @@ class ScientificView(QtWidgets.QFrame):
         state: ScientificProjection,
         navigation: FrameNavigationProjection,
     ) -> tuple[TraceProjection, ...]:
-        """Merge an exact selected-prefix delta into detached 1-D history."""
+        """Merge exact selected identities into detached 1-D history."""
 
         scope = (
             state.plot_mode,
@@ -1222,18 +1222,12 @@ class ScientificView(QtWidgets.QFrame):
             ),
         )
         selected = navigation.selected
-        prefix = (
-            (state.retain_display or bool(state.traces))
-            and not (state.processing_mode == "1D Viewer"
-                     and state.plot_mode == "Single")
+        same_scope = (
+            not (state.processing_mode == "1D Viewer"
+                 and state.plot_mode == "Single")
             and scope == self._trace_history_scope
-            and len(selected) >= len(self._trace_selection_keys)
-            and all(
-                frame is selected[index]
-                for index, frame in enumerate(self._trace_selection_keys)
-            )
         )
-        if not prefix:
+        if not same_scope:
             self._trace_history_by_identity.clear()
             self._rendered_trace_keys = ()
             self._rendered_plot_mode = ""
@@ -1246,15 +1240,11 @@ class ScientificView(QtWidgets.QFrame):
             frame = trace.frame
             if selected_by_id.get(id(frame)) is frame:
                 self._trace_history_by_identity[id(frame)] = trace
-        if prefix:
-            # Prefix growth never removes a retained row.  A defensive prune
-            # still bounds stale entries if a malformed delta names a frame
-            # outside the exact selected target.
-            self._trace_history_by_identity = {
-                identity: trace
-                for identity, trace in self._trace_history_by_identity.items()
-                if selected_by_id.get(identity) is trace.frame
-            }
+        self._trace_history_by_identity = {
+            identity: trace
+            for identity, trace in self._trace_history_by_identity.items()
+            if selected_by_id.get(identity) is trace.frame
+        }
         self._trace_history_scope = scope
         self._trace_selection_keys = selected
         traces = tuple(

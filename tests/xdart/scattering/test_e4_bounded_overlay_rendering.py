@@ -6,6 +6,7 @@ import numpy as np
 from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.tabs.scattering import scientific_view as scientific_view_module
+from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_projection import (
     ScientificPreferences,
@@ -15,7 +16,7 @@ from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
-from tests.xdart.scattering.test_e3_context_contract import _running_controller
+from tests.xdart.scattering.test_e3_context_contract import _running_controller, _view
 
 
 def _reconcile(
@@ -279,7 +280,7 @@ def test_3621_runtime_projection_is_two_phase_and_prefix_delta_only(
     def record_request(
         _projection,
         request,
-        _browse_hydration_owner=None,
+        *_owners,
     ):
         requested.append(request.frame)
         return None
@@ -364,3 +365,132 @@ def test_3621_runtime_projection_is_two_phase_and_prefix_delta_only(
     assert equal_distinct == appended.appended
     assert equal_distinct is not appended.appended
     assert runtime.owns_frame(equal_distinct) is False
+
+
+def test_3621_sparse_membership_delta_projects_only_changed_identities(
+    monkeypatch,
+) -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = (
+        _running_controller()
+    )
+    runtime = controller._runtime
+    display = acquisition.publication_store
+    for label in range(2, 3622):
+        delta = display.append_navigation(
+            "run.a",
+            "/out/a.nxs",
+            label,
+        )
+        assert runtime.accept_navigation(delta, plot_mode="Overlay")
+    frames = runtime.navigation.frames
+    assert runtime.select_navigation(frames[-1], frames)
+
+    requested = []
+
+    def record_request(
+        _projection,
+        request,
+        *_owners,
+    ):
+        requested.append(request.frame)
+        return None
+
+    monkeypatch.setattr(runtime, "resolve_projection", record_request)
+    preferences = ScientificPreferences(plot_mode="Overlay")
+    controller.project_navigation(
+        preferences=preferences,
+        processing_mode="Int 2D",
+        live_update=True,
+    )
+    assert controller.commit_navigation_projection(frames)
+
+    removed = (frames[100], frames[1800], frames[-2])
+    removed_ids = {id(frame) for frame in removed}
+    target = tuple(
+        frame for frame in frames if id(frame) not in removed_ids
+    )
+    assert runtime.select_navigation(frames[-1], target)
+    requested.clear()
+    controller.project_navigation(
+        preferences=preferences,
+        processing_mode="Int 2D",
+        live_update=True,
+    )
+    assert requested == [frames[-1], frames[-1]]
+    assert controller.commit_navigation_projection(target)
+
+    readded = removed[1]
+    readded_target = tuple(
+        frame
+        for frame in frames
+        if frame is readded or id(frame) not in removed_ids
+    )
+    assert runtime.select_navigation(frames[-1], readded_target)
+    requested.clear()
+    controller.project_navigation(
+        preferences=preferences,
+        processing_mode="Int 2D",
+        live_update=True,
+    )
+    assert requested == [readded, frames[-1], frames[-1]]
+
+
+def test_3621_excluded_current_prunes_history_without_reseed(monkeypatch) -> None:
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    controller, _lifecycle, _executor, _loader, acquisition = (
+        _running_controller()
+    )
+    runtime = controller._runtime
+    for label in range(2, 3622):
+        delta = acquisition.publication_store.append_navigation(
+            "run.a", "/out/a.nxs", label
+        )
+        assert runtime.accept_navigation(delta, plot_mode="Overlay")
+    frames = runtime.navigation.frames
+    generation = controller.selection.display_generation
+    payload_by_id = {
+        id(frame): StandardDisplayPayload(
+            generation, frame, str(frame.local_frame_label),
+            _view(frame.local_frame_label, float(frame.local_frame_label)),
+        )
+        for frame in frames
+    }
+    requested = []
+    def resolve(_projection, request, *_owners):
+        requested.append(request.frame); return payload_by_id[id(request.frame)]
+    monkeypatch.setattr(runtime, "resolve_projection", resolve)
+    preferences = ScientificPreferences(plot_mode="Overlay")
+    view = ScientificView()
+    try:
+        def project_render_commit():
+            payloads = controller.project_navigation(preferences=preferences)
+            scientific = build_scientific_projection(
+                payloads, runtime.navigation, frozenset(frames), preferences, "", RunPhase.RUNNING,
+            )
+            _reconcile(view, scientific, runtime.navigation, completed=3621, total=3621)
+            assert controller.commit_navigation_projection(view._trace_history_keys)
+            return scientific
+
+        project_render_commit()
+        assert len(view._trace_history_keys) == 3621
+        prior_by_id = dict(view._trace_history_by_identity)
+        target = frames[:-1]
+        assert runtime.select_navigation(frames[-1], target)
+        requested.clear()
+        removal = project_render_commit()
+        assert requested == [frames[-1]]
+        assert removal.traces == ()
+        assert removal.heavy is not None and removal.heavy.frame is frames[-1]
+        assert removal.retain_display is False
+        assert view._trace_history_keys == target
+        assert all(
+            trace is prior_by_id[id(frame)]
+            for frame, trace in zip(target, view._trace_history_by_identity.values(), strict=True)
+        )
+        retained = tuple(view._trace_history_by_identity.values())
+        requested.clear()
+        unchanged = project_render_commit()
+        assert unchanged.traces == () and requested == [frames[-1]]
+        assert tuple(view._trace_history_by_identity.values()) == retained
+    finally:
+        view.close()

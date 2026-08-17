@@ -510,10 +510,10 @@ class _ContextRuntime:
             navigation.frames,
             latest,
             (
-                navigation.frames
-                if plot_mode in {
-                    "Overlay", "Waterfall", "Average", "Sum"
-                }
+                navigation.selected
+                if plot_mode in {"Overlay", "Waterfall"}
+                else navigation.frames
+                if plot_mode in {"Average", "Sum"}
                 else (latest,)
             ),
         )
@@ -946,25 +946,18 @@ class _ContextRuntime:
                 preferences,
                 processing_mode,
             )
-            committed = self._committed_trace_selection
-            prefix = (
-                scope == self._committed_trace_scope
-                and len(selected) >= len(committed)
-                and all(
-                    frame is selected[index]
-                    for index, frame in enumerate(committed)
-                )
-            )
-            reseed = not prefix
-            planned = selected if reseed else selected[len(committed):]
-            if not live_update and prefix:
-                committed_ids = {id(frame) for frame in committed}
-                missing = tuple(
-                    frame
-                    for frame in selected
+            reseed = scope != self._committed_trace_scope
+            committed_ids = {
+                id(frame) for frame in self._committed_trace_selection
+            }
+            planned = (
+                selected
+                if reseed
+                else tuple(
+                    frame for frame in selected
                     if id(frame) not in committed_ids
                 )
-                planned = missing
+            )
             pending = _PendingTraceProjection(
                 scope,
                 selected,
@@ -1039,7 +1032,7 @@ class _ContextRuntime:
         self,
         presented_frames: tuple[DisplayFrameKey, ...],
     ) -> bool:
-        """Acknowledge only the exact trace prefix accepted by the shell."""
+        """Acknowledge the exact selected identities accepted by the shell."""
 
         pending = self._pending_trace_projection
         if pending is None or type(presented_frames) is not tuple:
@@ -1052,13 +1045,13 @@ class _ContextRuntime:
         ):
             return False
         presented_ids = {id(frame) for frame in presented_frames}
-        committed: list[DisplayFrameKey] = []
-        for frame in pending.target:
-            if id(frame) not in presented_ids:
-                break
-            committed.append(frame)
+        committed = tuple(
+            frame
+            for frame in pending.target
+            if id(frame) in presented_ids
+        )
         self._committed_trace_scope = pending.scope
-        self._committed_trace_selection = tuple(committed)
+        self._committed_trace_selection = committed
         self._pending_trace_projection = None
         return True
 

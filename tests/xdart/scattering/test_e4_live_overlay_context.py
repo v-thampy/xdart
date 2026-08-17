@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import pytest
 
 from tests.xdart.scattering.test_e2lv_live_display import (
@@ -14,6 +15,8 @@ from tests.xdart.scattering.test_e3_context_contract import (
     _running_controller,
 )
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 
 
@@ -126,7 +129,7 @@ def test_live_single_delta_keeps_only_the_exact_newest_key() -> None:
 
 
 @pytest.mark.parametrize("plot_mode", _HISTORY_MODES)
-def test_reenabling_auto_last_restores_full_accumulating_catalog(
+def test_reenabling_auto_last_moves_only_current_and_keeps_exclusions(
     plot_mode: str,
 ) -> None:
     controller, _lifecycle, _executor, _loader, acquisition = (
@@ -154,7 +157,7 @@ def test_reenabling_auto_last_restores_full_accumulating_catalog(
     assert controller.navigation.current is third_delta.appended
     _assert_exact(
         controller.navigation.selected,
-        controller.navigation.frames,
+        (first,) if plot_mode in {"Overlay", "Waterfall"} else controller.navigation.frames,
     )
     fourth_delta = display.append_navigation(
         "run.a", "/out/a.nxs", 4
@@ -164,7 +167,86 @@ def test_reenabling_auto_last_restores_full_accumulating_catalog(
     )
     _assert_exact(
         controller.navigation.selected,
-        controller.navigation.frames,
+        (first, fourth_delta.appended) if plot_mode in {"Overlay", "Waterfall"}
+        else controller.navigation.frames,
+    )
+
+
+def test_show_all_clears_exclusions_and_auto_last_preserves_them() -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = _running_controller()
+    display = acquisition.publication_store
+    first = controller.navigation.current
+    assert first is not None
+    second_delta = display.append_navigation("run.a", "/out/a.nxs", 2)
+    third_delta = display.append_navigation("run.a", "/out/a.nxs", 3)
+    assert controller.accept_navigation(second_delta, plot_mode="Overlay")
+    assert controller.accept_navigation(third_delta, plot_mode="Overlay")
+    second = second_delta.appended
+    third = third_delta.appended
+    assert controller.select_navigation(first, (first, third))
+
+    assert controller.select_latest_navigation(plot_mode="Overlay")
+    assert controller.navigation.current is third
+    _assert_exact(controller.navigation.selected, (first, third))
+
+    events = []
+    owner = SimpleNamespace(
+        _closing=False,
+        _closed=False,
+        _shell=SimpleNamespace(
+            browser=SimpleNamespace(
+                cancel_pending_frame_selection=lambda: events.append(
+                    "cancel"
+                )
+            )
+        ),
+        _context_controller=controller,
+        _refresh_shell=lambda: events.append("refresh"),
+    )
+    ScatteringWorkspace._handle_shell_command(
+        owner,
+        ShellCommand(ShellCommandKind.SHOW_ALL),
+    )
+    _assert_exact(
+        controller.navigation.selected,
+        (first, second, third),
+    )
+    assert events == ["cancel", "refresh"]
+
+
+@pytest.mark.parametrize("plot_mode", _HISTORY_MODES)
+def test_auto_last_off_keeps_mode_specific_arrival_contract(plot_mode: str) -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = _running_controller()
+    display = acquisition.publication_store
+    first = controller.navigation.current
+    assert first is not None
+    second_delta = display.append_navigation("run.a", "/out/a.nxs", 2)
+    third_delta = display.append_navigation("run.a", "/out/a.nxs", 3)
+    assert controller.accept_navigation(
+        second_delta, plot_mode=plot_mode
+    )
+    assert controller.accept_navigation(
+        third_delta, plot_mode=plot_mode
+    )
+    assert controller.select_navigation(
+        first,
+        (first, third_delta.appended),
+    )
+
+    fourth_delta = display.append_navigation(
+        "run.a", "/out/a.nxs", 4
+    )
+    assert controller.accept_navigation(
+        fourth_delta,
+        plot_mode=plot_mode,
+        follow_latest=False,
+    )
+
+    assert controller.navigation.current is first
+    _assert_exact(
+        controller.navigation.selected,
+        (first, third_delta.appended, fourth_delta.appended) if plot_mode in {"Overlay", "Waterfall"}
+        else (first, third_delta.appended),
     )
 
 

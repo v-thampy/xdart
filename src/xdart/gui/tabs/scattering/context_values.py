@@ -155,7 +155,7 @@ def _navigation_after_append(
     )
     if not any(frame is delta.appended for frame in frames):
         frames = (*frames, delta.appended)
-    if not follow_latest:
+    if not follow_latest and plot_mode not in {"Overlay", "Waterfall"}:
         current = (
             navigation.current
             if any(frame is navigation.current for frame in frames)
@@ -181,4 +181,11 @@ def _navigation_after_append(
     selected = tuple(
         frame for frame in frames if id(frame) in selected_identities
     )
-    return frames, delta.appended, selected
+    current = (
+        delta.appended
+        if follow_latest
+        else navigation.current
+        if any(frame is navigation.current for frame in frames)
+        else delta.appended
+    )
+    return frames, current, selected
