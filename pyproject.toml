@@ -73,7 +73,7 @@ gui = [
 ]
 notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab", "nbformat"]
 all = ["xdart[fitting,rsm,gui,notebook]"]
-dev = ["pytest", "pytest-timeout", "pytest-xdist>=3.8", "build", "twine", "tifffile"]  # tifffile: test fixtures write TIFFs; pytest-xdist: `pytest -n auto` parallel tests/core
+dev = ["pytest", "pytest-timeout", "pytest-xdist>=3.8", "build", "twine", "tifffile", "imagecodecs"]  # tifffile: test fixtures write TIFFs; pytest-xdist: `pytest -n auto` parallel tests/core
 
 [project.scripts]
 xdart = "xdart.xdart_main:main"

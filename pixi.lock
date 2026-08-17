@@ -7694,6 +7694,7 @@ packages:
   - pyqtgraph>=0.13.7 ; extra == 'gui'
   - qtawesome ; extra == 'gui'
   - imagecodecs ; extra == 'gui'
+  - imagecodecs ; extra == 'dev'
   - imageio ; extra == 'gui'
   - packaging ; extra == 'gui'
   - xdart[fitting,rsm] ; extra == 'gui'

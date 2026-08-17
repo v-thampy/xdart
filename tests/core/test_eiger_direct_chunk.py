@@ -128,6 +128,73 @@ def test_external_link_direct_chunks_decode_tail_and_stay_detached_in_cursor_ord
                    for thread in live_threads())
 
 
+def test_missing_imagecodecs_refuses_direct_decode_and_uses_conventional_blocks(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+    import h5py
+    import numpy as np
+    from xrd_tools.core.scan import SourceKind
+    from xrd_tools.sources import eiger_direct_chunk as direct
+    from xrd_tools.sources.cursor import ContainerCursor
+    from xrd_tools.sources.probe import ProbeState
+    from xrd_tools.sources.read_plan import plan_reads
+
+    expected = np.stack([
+        np.full((2, 2), value, dtype=np.uint16) for value in (7, 8, 9, 10)
+    ])
+    data_path = tmp_path / "scan_data_000001.h5"
+    with h5py.File(data_path, "w") as handle:
+        handle.create_dataset("data", data=expected, chunks=(1, 2, 2))
+    master = tmp_path / "scan_master.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data["data_000001"] = h5py.ExternalLink(data_path.name, "/data")
+
+    original_import = builtins.__import__
+
+    def import_without_imagecodecs(name, *args, **kwargs):
+        if name == "imagecodecs":
+            raise ModuleNotFoundError("imagecodecs excluded by test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_imagecodecs)
+    monkeypatch.setattr(
+        direct,
+        "ThreadPoolExecutor",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing codec constructed a decoder executor")
+        ),
+    )
+    frame_bytes = expected[0].nbytes
+    policy = direct.EigerDirectChunkPolicy.from_owner_grant(
+        frame_bytes, 2 * frame_bytes,
+    )
+    assert policy.enabled
+    state = direct.EigerDirectChunkState(policy)
+    plan = plan_reads(
+        len(expected), expected.shape[1:], expected.dtype, (1, 2, 2),
+        2 * frame_bytes,
+    )
+    with ContainerCursor(master) as cursor:
+        assert cursor.descriptor.kind is SourceKind.EIGER_MASTER
+        assert cursor.descriptor.state is ProbeState.READY
+        assert cursor.descriptor.finalized
+        blocks = list(cursor.iter_eiger_direct_blocks(
+            plan, policy, cancelled=lambda: False, state=state,
+        ))
+
+    assert [int(value) for block in blocks for value in block.array[:, 0, 0]] == [
+        7, 8, 9, 10,
+    ]
+    assert state.selected is False
+    assert state.direct_frames == 0
+    assert state.fallback_frames == len(expected)
+    assert state.reason == "imagecodecs unavailable: ModuleNotFoundError"
+
+
 def test_direct_iterator_preserves_order_and_counts_only_observed_per_frame_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
