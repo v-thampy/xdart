@@ -405,6 +405,42 @@ def test_g4_resolution_never_reads_the_real_process_environment():
 
 # ── grant discipline ─────────────────────────────────────────────────────────
 
+def test_e5_selected_four_worker_default_is_evidence_bounded():
+    p = _policy()
+    from xrd_tools.core import staging
+    req = p.SessionResourceRequirements(
+        height=2167, width=2070, native_itemsize=4,
+        modes_1d=1, modes_2d=1, npt_1d=1000,
+        npt_rad=500, npt_azim=500)
+    envelope = 32 * 1024 ** 3
+
+    def automatic(workers):
+        return p.resolve_session_policy(
+            req, envelope_bytes=envelope,
+            env={staging.REDUCTION_WORKERS_ENV: str(workers)}).allocation
+
+    assert {workers: automatic(workers).reduction_inflight
+            for workers in (1, 2, 3, 4, 5, 16)} == {
+                1: 2, 2: 4, 3: 6, 4: 16, 5: 10, 16: 32}
+    selected = automatic(4)
+    requests = dict(selected.counts)
+    requests["reduction_inflight"] = 8
+    baseline = p.resolve_session_policy(
+        req, envelope_bytes=envelope, requests=requests,
+        env={staging.REDUCTION_WORKERS_ENV: "4"}).allocation
+    fingerprint = (2167, 2070, 4, 0, 1, 1, 1000, 500, 500, 0, 0, 0)
+    assert selected.origin == baseline.origin == "automatic"
+    assert selected.requirements.fingerprint == baseline.requirements.fingerprint == fingerprint
+    assert {name: (baseline.counts[name], selected.counts[name])
+            for name in baseline.counts if baseline.counts[name] != selected.counts[name]
+            } == {"reduction_inflight": (8, 16)}
+    deltas = {name: selected.categories[name] - baseline.categories[name]
+              for name in baseline.categories}
+    assert deltas == {"source_native": 143_542_080, "staging": 0, "records": 0,
+                      "publication": 0, "worker": 16_192_000}
+    assert selected.assigned_bytes - baseline.assigned_bytes == 159_734_080
+
+
 def test_grants_stay_between_each_minimum_and_its_request():
     p = _policy()
     req = _requirements()

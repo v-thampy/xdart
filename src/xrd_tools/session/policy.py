@@ -310,7 +310,7 @@ def _default_requests(req: SessionResourceRequirements, requested_workers,
             "staging_items": window, "record_heavy_items": window,
             "publication_heavy_items": window, "thumbnail_items": 512,
             "record_items": light, "publication_items": light,
-            "workers": workers, "reduction_inflight": 2 * workers}
+            "workers": workers, "reduction_inflight": 16 if workers == 4 else 2 * workers}
 def _build(req, counts, envelope, floor, minimum, origin,
            oversize=0) -> SessionResourceAllocation:
     cats = _categories(req, counts)
