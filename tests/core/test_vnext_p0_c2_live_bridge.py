@@ -1705,6 +1705,116 @@ def test_c2_dynamic_genuine_frame_reaches_exact_written_then_typed_commit(
         assert graph_finishes == memory_finishes == []
 
 
+@pytest.mark.parametrize(
+    (
+        "frame_count", "batch_size", "cap", "margin", "checkpoint_threshold",
+        "expected_threshold",
+    ),
+    (
+        (56, 8, 64, 8, None, 56),
+        (8, 8, 64, 8, 8, 8),
+    ),
+    ids=("policy-derived", "diagnostic-eight-full-batch"),
+)
+def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
+    tmp_path, monkeypatch, frame_count, batch_size, cap, margin,
+    checkpoint_threshold, expected_threshold,
+):
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import (
+        CompositeSink, Integration1DPlan, MemorySink, NexusSink, ReductionPlan,
+    )
+    from xrd_tools.session import (
+        FlushPolicy, SessionResourceRequirements, resolve_session_policy,
+    )
+
+    gate = threading.Event()
+
+    class BlockedIntegrator(DeterministicIntegrator):
+        def integrate1d(self, *args, **kwargs):
+            assert gate.wait(5.0)
+            return super().integrate1d(*args, **kwargs)
+
+    target = tmp_path / "settled-checkpoint.nexus"
+    _ledger, accounting, mode, target_name = accounting_for(
+        target, max_attempts=2, max_outstanding=frame_count,
+    )
+    tokens = [
+        _armed_submission(accounting, label=label) for label in range(frame_count)
+    ]
+    integrator = BlockedIntegrator()
+    live = tuple(SimpleNamespace(
+        idx=label, map_raw=np.ones((2, 2)), bg_raw=None, scan_info={},
+        source_file=str(tmp_path / f"frame-{label}.tif"), source_frame_idx=0,
+        mask=None, poni=None, integrator=integrator,
+    ) for label in range(frame_count))
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=8), integration_2d=None,
+    )
+    flush = FlushPolicy(interval=3, cap=cap, margin=margin)
+    policy = resolve_session_policy(
+        SessionResourceRequirements(
+            height=2, width=2, native_itemsize=8, modes_1d=1, npt_1d=8,
+        ),
+        envelope_bytes=64 * 1024 ** 3, requested_workers=3,
+        requests={"reduction_inflight": frame_count}, flush=flush, env={},
+    )
+    nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
+    nexus._configure_writer_batch_size(batch_size)
+    memory = MemorySink()
+    graph = CompositeSink((memory, nexus))
+    checkpoint_calls = []
+    events = []
+    session_box = {}
+    real_flush = NexusSink.flush
+
+    def observed_flush(owner, *, force=False):
+        if owner is nexus:
+            snapshot = accounting.snapshot()
+            checkpoint_calls.append((
+                force,
+                len(owner._writer._dirty_frames),
+                len(snapshot.written_attempts),
+                len(events),
+                len(session_box["session"]._session._inflight._members),
+            ))
+        return real_flush(owner, force=force)
+
+    monkeypatch.setattr(NexusSink, "flush", observed_flush)
+    session = open_live_scan_session(
+        live, plan, sink=graph, accounting=accounting,
+        executor=policy.allocation.workers,
+        inflight_max=policy.allocation.reduction_inflight,
+        nexus_target=target_name, policy=policy,
+        dynamic_nexus_checkpoint=True,
+        dynamic_nexus_checkpoint_threshold=checkpoint_threshold,
+    )
+    session_box["session"] = session
+    session.on_frame_completed(events.append)
+    for frame, (_key, token) in zip(session.scan.frames, tokens):
+        assert session.submit(frame, attempt_token=token)
+    gate.set()
+    assert session.pause(timeout=5.0)
+
+    staged = accounting.snapshot()
+    assert session._dynamic_nexus_checkpoint_threshold == expected_threshold
+    assert session._dynamic_nexus_checkpoint_count == 0
+    assert checkpoint_calls == [
+        (True, frame_count, frame_count, frame_count, batch_size)
+    ]
+    assert [event.frame_index for event in events] == list(range(frame_count))
+    assert set(memory.frames) == set(range(frame_count))
+    assert staged.pending_durable == frozenset(
+        (key, mode, target_name) for key, _token in tokens
+    )
+    assert staged.durable == frozenset()
+    assert nexus._writer._dirty_frames == {}
+
+    result = session.finish()
+    assert result.failed is False
+    assert len(accounting.snapshot().durable) == frame_count
+
+
 def test_c2_dynamic_submit_refuses_every_invalid_capability_before_engine(tmp_path):
     from xdart.modules.reduction import open_live_scan_session
     from xrd_tools.reduction import Frame, NexusSink

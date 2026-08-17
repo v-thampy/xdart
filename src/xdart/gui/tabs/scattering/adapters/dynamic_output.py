@@ -931,6 +931,11 @@ class DynamicOutputAdapter:
                 accounting=accounting,
                 xye_receipt_boundary=xye,
                 policy=policy,
+                dynamic_nexus_checkpoint=bool(
+                    nexus is not None
+                    and policy is not None
+                    and not self.configuration.live_mode
+                ),
             )
             if coordinated:
                 session.set_generation(int(self.configuration.generation))

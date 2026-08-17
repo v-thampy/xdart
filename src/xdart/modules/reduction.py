@@ -1234,6 +1234,8 @@ def open_live_scan_session(
     policy: SessionPolicy | None = None,
     accounting=None,
     xye_receipt_boundary=None,
+    dynamic_nexus_checkpoint: bool = False,
+    dynamic_nexus_checkpoint_threshold: int | None = None,
     _headless_scan: Scan | None = None,
 ):
     """Open a public :class:`xrd_tools.session.ScanSession` over xdart live
@@ -1378,6 +1380,8 @@ def open_live_scan_session(
         policy=policy,
         accounting=accounting,
         dynamic_accounting=dynamic_accounting,
+        dynamic_nexus_checkpoint=dynamic_nexus_checkpoint,
+        dynamic_nexus_checkpoint_threshold=dynamic_nexus_checkpoint_threshold,
         # GUI never aborts a save (loud is the headless default).  Without this, the
         # streaming live/batch write path ran loud and a single degraded frame
         # (dead monitor / all-dummy 2D) aborted the whole-scan save (B-1 regression).

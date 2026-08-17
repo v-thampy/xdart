@@ -364,6 +364,8 @@ class ScanSession:
         write_targets_by_mode: Mapping[ResultMode, Iterable[str]] | None = None,
         accounting: StageLedger | None = None,
         dynamic_accounting: DynamicRunAccounting | None = None,
+        dynamic_nexus_checkpoint: bool = False,
+        dynamic_nexus_checkpoint_threshold: int | None = None,
         policy: SessionPolicy | None = None,
         envelope_bytes: int | None = None,
         executor_workers: int | None = None,
@@ -381,6 +383,20 @@ class ScanSession:
             and type(dynamic_accounting) is not DynamicRunAccounting
         ):
             raise TypeError("dynamic_accounting must be an exact DynamicRunAccounting")
+        if type(dynamic_nexus_checkpoint) is not bool:
+            raise TypeError("dynamic_nexus_checkpoint must be an exact bool")
+        if (
+            dynamic_nexus_checkpoint_threshold is not None
+            and type(dynamic_nexus_checkpoint_threshold) is not int
+        ):
+            raise TypeError("Nexus checkpoint threshold must be an exact int or None")
+        if dynamic_nexus_checkpoint_threshold is not None:
+            if dynamic_nexus_checkpoint_threshold < 1:
+                raise ValueError("Nexus checkpoint threshold must be positive")
+            if not dynamic_nexus_checkpoint:
+                raise ValueError("Nexus checkpoint threshold requires checkpointing")
+        if dynamic_nexus_checkpoint and dynamic_accounting is None:
+            raise ValueError("Nexus checkpointing requires dynamic accounting")
         if dynamic_accounting is not None and record_store_persisted_on_write:
             raise RuntimeError(
                 "dynamic durable truth is owned only by the writer boundary"
@@ -460,6 +476,10 @@ class ScanSession:
             self._dynamic_xye_only_continuation = (
                 transactional_xye is not None and nexus is None
             )
+        if dynamic_nexus_checkpoint and self._dynamic_nexus_sink is None:
+            raise ValueError("Nexus checkpointing requires one exact dynamic Nexus sink")
+        if dynamic_nexus_checkpoint and policy is None:
+            raise ValueError("Nexus checkpointing requires one exact session policy")
         applicable = self._accounting.targets_by_mode
         self._store_targets = (
             applicable if store_targets_by_mode is None else
@@ -497,6 +517,18 @@ class ScanSession:
             inflight_max = allocation.reduction_inflight
             if executor is None or isinstance(executor, int):
                 executor = allocation.workers
+        self._dynamic_nexus_checkpoint_count = 0
+        policy_checkpoint_threshold = (
+            self._policy.flush.hard_threshold() if dynamic_nexus_checkpoint else None
+        )
+        if (
+            dynamic_nexus_checkpoint_threshold is not None
+            and dynamic_nexus_checkpoint_threshold > policy_checkpoint_threshold
+        ):
+            raise ValueError("Nexus checkpoint threshold exceeds the policy bound")
+        self._dynamic_nexus_checkpoint_threshold = (
+            dynamic_nexus_checkpoint_threshold or policy_checkpoint_threshold
+        )
         self._user_sink = sink
         self._dynamic_boundary = (
             None if dynamic_accounting is None else dynamic_accounting.writer_boundary
@@ -576,6 +608,11 @@ class ScanSession:
                 written_authority_cb=(
                     self._on_dynamic_written
                     if dynamic_accounting is not None else None
+                ),
+                batch_settled_authority_cb=(
+                    self._on_dynamic_nexus_batch_settled
+                    if self._dynamic_nexus_checkpoint_threshold is not None
+                    else None
                 ),
             )
         except BaseException as primary:
@@ -1604,6 +1641,19 @@ class ScanSession:
         if getattr(reduction, "result_2d", None) is not None:
             modes.append(ResultMode.two_d(mode_2d))
         dynamic.record_written(token, modes=modes)
+
+    def _on_dynamic_nexus_batch_settled(self, count: int) -> None:
+        if type(count) is not int or count < 1:
+            raise ValueError("settled batch count must be a positive exact int")
+        threshold = self._dynamic_nexus_checkpoint_threshold
+        nexus = self._dynamic_nexus_sink
+        if threshold is None or nexus is None:
+            raise RuntimeError("dynamic Nexus checkpoint owner is absent")
+        self._dynamic_nexus_checkpoint_count += count
+        if self._dynamic_nexus_checkpoint_count < threshold:
+            return
+        nexus.flush(force=True)
+        self._dynamic_nexus_checkpoint_count = 0
 
     def _record_written(self, event: FrameEvent) -> None:
         """The TOP-LEVEL sink hook returned successfully for this event.

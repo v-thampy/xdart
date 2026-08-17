@@ -2428,6 +2428,7 @@ class ReductionSession:
     # and stop the write/publication path.
     outcome_authority_cb: Callable[[FrameOutcomeReceipt], None] | None = None
     written_authority_cb: Callable[[Frame, FrameReduction, int | None], None] | None = None
+    batch_settled_authority_cb: Callable[[int], None] | None = None
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -3073,6 +3074,7 @@ class ReductionSession:
             except BaseException as exc:
                 self._record_failure(exc)
                 return
+            batch_settled = True
             for ticket, attempt, reduction, _replacing in batch:
                 frame = ticket.frame
                 idx = int(frame.index)
@@ -3094,6 +3096,7 @@ class ReductionSession:
                         post_write(frame, reduction)
                 except BaseException as exc:
                     self._record_failure(exc)
+                    batch_settled = False
                 else:
                     try:
                         _emit(self.progress_cb, self.scan.name, "write",
@@ -3104,6 +3107,13 @@ class ReductionSession:
                             _clear_source_frame_image(self.source, frame.index)
                     except BaseException as exc:
                         self._record_failure(exc)
+                        batch_settled = False
+            authority = self.batch_settled_authority_cb
+            if batch_settled and authority is not None:
+                try:
+                    authority(len(batch))
+                except BaseException as exc:
+                    self._record_failure(exc)
         finally:
             for ticket, _attempt, _reduction, _replacing in batch:
                 self._complete_stream_publication(ticket)

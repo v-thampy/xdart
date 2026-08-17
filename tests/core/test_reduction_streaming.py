@@ -352,6 +352,116 @@ def test_streaming_batch_failure_publishes_no_per_frame_write_facts(monkeypatch)
     assert result.failed and "batch boundary fault" in (result.error or "")
 
 
+def test_batch_settled_authority_follows_every_item_hook_before_release(monkeypatch):
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    trace = []
+
+    class SettledSink:
+        writer_batch_size = 3
+
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            raise AssertionError("three queued items must use write_batch")
+
+        def write_batch(self, items):
+            trace.append(("write", tuple(int(frame.index) for frame, _ in items)))
+
+        def _settle_deferred_publication_drops(self, frame, reduction):
+            trace.append(("drop", int(frame.index)))
+
+        def _post_write(self, frame, reduction):
+            trace.append(("post", int(frame.index)))
+
+        def finish(self, result):
+            pass
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+    frames = _frames(3)
+    session_box = {}
+
+    def settled(count):
+        session = session_box["session"]
+        held = tuple(sorted(
+            int(ticket.frame.index) for ticket in session._inflight._members
+        ))
+        trace.append(("settled", count, held))
+
+    session = ReductionSession(
+        _plan(), Scan("settled-order", frames, integrator=object()),
+        sink=SettledSink(), execution="streaming", executor=3, inflight_max=3,
+        written_authority_cb=lambda frame, reduction, attempt: trace.append(
+            ("written", int(frame.index))
+        ),
+        batch_settled_authority_cb=settled,
+    )
+    session_box["session"] = session
+    for frame in frames:
+        assert session.submit(frame)
+    gate.set()
+    result = session.finish()
+
+    assert trace == [
+        ("write", (0, 1, 2)),
+        ("written", 0), ("drop", 0), ("post", 0),
+        ("written", 1), ("drop", 1), ("post", 1),
+        ("written", 2), ("drop", 2), ("post", 2),
+        ("settled", 3, (0, 1, 2)),
+    ]
+    assert session._inflight._members == {}
+    assert result.failed is False
+
+
+def test_batch_settled_authority_skips_an_incompletely_settled_batch(monkeypatch):
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    class BrokenPostWriteSink:
+        writer_batch_size = 2
+
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            raise AssertionError("two queued items must use write_batch")
+
+        def write_batch(self, items):
+            pass
+
+        def _post_write(self, frame, reduction):
+            if int(frame.index) == 1:
+                raise RuntimeError("injected post-write failure")
+
+        def finish(self, result):
+            pass
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+    frames = _frames(2)
+    settled = []
+    session = ReductionSession(
+        _plan(), Scan("settled-failure", frames, integrator=object()),
+        sink=BrokenPostWriteSink(), execution="streaming", executor=2,
+        inflight_max=2, batch_settled_authority_cb=settled.append,
+    )
+    for frame in frames:
+        assert session.submit(frame)
+    gate.set()
+    result = session.finish(raise_on_failure=False)
+
+    assert settled == []
+    assert result.failed is True
+    assert "injected post-write failure" in (result.error or "")
+
+
 def test_streaming_replacement_fences_fresh_writer_batches(monkeypatch):
     gate = threading.Event()
 
