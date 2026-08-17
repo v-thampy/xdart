@@ -251,6 +251,8 @@ class ScientificView(QtWidgets.QFrame):
         self._waterfall_render_contract: tuple[object, ...] | None = None
         self._processing_mode = ""
         self._viewer_2d_payload = None
+        self.raw_popup_dialog = None
+        self.raw_popup_image = None
         self._rendered_image_axis: str | None = None
         self._rendered_cake_axis_key: str | None = None
         self._rendered_cake_x_axis: AxisProjection | None = None
@@ -384,8 +386,23 @@ class ScientificView(QtWidgets.QFrame):
         self.color_map.addItems(self._color_map_choices)
         self.log_scale = QtWidgets.QPushButton("Log")
         self.log_scale.setCheckable(True)
+        self.detector_controls = QtWidgets.QWidget()
+        detector_layout = QtWidgets.QHBoxLayout(self.detector_controls)
+        detector_layout.setContentsMargins(0, 0, 0, 0)
+        detector_layout.setSpacing(0)
+        self.detector_thumbnail = QtWidgets.QPushButton("Thumbnail")
+        self.detector_full = QtWidgets.QPushButton("Full Raw")
+        self.detector_mode_group = QtWidgets.QButtonGroup(self)
+        self.detector_mode_group.setExclusive(True)
+        for button in (self.detector_thumbnail, self.detector_full):
+            button.setCheckable(True)
+            self.detector_mode_group.addButton(button)
+            detector_layout.addWidget(button)
+        self.raw_popup_button = QtWidgets.QPushButton("Raw")
         row.addWidget(self.norm)
         row.addWidget(self.background)
+        row.addWidget(self.raw_popup_button)
+        row.addWidget(self.detector_controls)
         row.addWidget(self.title, 1)
         row.addWidget(self.color_map)
         row.addWidget(self.log_scale)
@@ -405,7 +422,89 @@ class ScientificView(QtWidgets.QFrame):
                 ShellCommandKind.SET_LOG_SCALE, bool(value)
             )
         )
+        self.detector_thumbnail.clicked.connect(
+            lambda: self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail")
+        )
+        self.detector_full.clicked.connect(
+            lambda: self._emit(ShellCommandKind.SET_DETECTOR_MODE, "full")
+        )
+        self.raw_popup_button.clicked.connect(self._open_raw_popup)
         return row
+
+    def _ensure_raw_popup(self) -> None:
+        if self.raw_popup_dialog is not None:
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Raw Image")
+        dialog.resize(600, 600)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        controls = QtWidgets.QHBoxLayout()
+        self.raw_popup_thumbnail = QtWidgets.QPushButton("Thumbnail")
+        self.raw_popup_full = QtWidgets.QPushButton("Full Raw")
+        self.raw_popup_mode_group = QtWidgets.QButtonGroup(dialog)
+        self.raw_popup_mode_group.setExclusive(True)
+        for button in (self.raw_popup_thumbnail, self.raw_popup_full):
+            button.setCheckable(True)
+            self.raw_popup_mode_group.addButton(button)
+            controls.addWidget(button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+        self.raw_popup_image = ScientificImagePane(lock_aspect=True)
+        layout.addWidget(self.raw_popup_image, 1)
+        self.raw_popup_status = QtWidgets.QLabel("")
+        layout.addWidget(self.raw_popup_status)
+        self.raw_popup_thumbnail.clicked.connect(lambda: self._emit(
+            ShellCommandKind.SET_DETECTOR_MODE, "thumbnail", ("popup",)))
+        self.raw_popup_full.clicked.connect(lambda: self._emit(
+            ShellCommandKind.SET_DETECTOR_MODE, "full", ("popup",)))
+        dialog.finished.connect(self._release_raw_popup)
+        self.raw_popup_dialog = dialog
+
+    def _open_raw_popup(self) -> None:
+        if not self.raw_popup_button.isEnabled():
+            return
+        self._ensure_raw_popup()
+        self.raw_popup_dialog.show(); self.raw_popup_dialog.raise_()
+        self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail", ("popup",))
+        self.raw_popup_full.setChecked(True)
+        self._emit(ShellCommandKind.SET_DETECTOR_MODE, "full", ("popup",))
+
+    def _release_raw_popup(self, *_args) -> None:
+        if self.raw_popup_image is not None:
+            self._scrub_detector_pane(self.raw_popup_image)
+        if hasattr(self, "raw_popup_status"): self.raw_popup_status.setText("")
+        if self._processing_mode == "Int 1D":
+            self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail", ("popup",))
+
+    @staticmethod
+    def _scrub_detector_pane(pane) -> None:
+        pane.clear()
+        for name in ("qimage", "levels", "_defferedLevels", "_displayBuffer", "_processingBuffer", "_imageNanLocations", "_imageHasNans"):
+            setattr(pane.image, name, None)
+
+    def _reconcile_raw_popup(self, state: ScientificProjection) -> None:
+        heavy = state.heavy
+        dialog = self.raw_popup_dialog
+        if dialog is None or not dialog.isVisible():
+            return
+        if heavy is None or heavy.raw is None:
+            self._scrub_detector_pane(self.raw_popup_image)
+            return
+        if heavy.detector_source != "full":
+            self._scrub_detector_pane(self.raw_popup_image)
+        self.raw_popup_image.render(
+            heavy.raw, detector_shape=heavy.detector_shape,
+            color_map=state.color_map, log_scale=state.log_scale,
+            level_scan_token=(id(heavy.frame), id(heavy.raw)),
+        )
+        self.raw_popup_thumbnail.setChecked(state.detector_mode == "thumbnail")
+        self.raw_popup_full.setChecked(state.detector_mode == "full")
+        self.raw_popup_full.setEnabled(state.detector_available)
+        self.raw_popup_status.setText(
+            "Loading Full Raw…" if state.detector_pending
+            else state.detector_diagnostic if state.detector_mode == "full"
+            else ""
+        )
 
     def _make_plot_bar(self) -> QtWidgets.QHBoxLayout:
         row = QtWidgets.QHBoxLayout()
@@ -620,6 +719,8 @@ class ScientificView(QtWidgets.QFrame):
             self.plot_mode,
             self.share_axis,
             self.frame_selector,
+            self.detector_thumbnail,
+            self.detector_full,
         )
         blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
         set_combo(self.norm, state.norm_channels, state.norm_channel)
@@ -642,6 +743,13 @@ class ScientificView(QtWidgets.QFrame):
         self.share_axis.setChecked(state.share_axis)
         self.plot_options_dialog.reconcile(state.plot_options)
         self._apply_processing_layout(state.processing_mode)
+        self.detector_thumbnail.setChecked(state.detector_mode == "thumbnail")
+        self.detector_full.setChecked(state.detector_mode == "full")
+        self.detector_full.setEnabled(state.detector_available)
+        self.raw_popup_button.setEnabled(state.detector_available)
+        explanation = state.detector_diagnostic if not state.detector_available else ""
+        self.detector_full.setToolTip(explanation)
+        self.raw_popup_button.setToolTip(explanation or "Show exact-current raw image")
         if not state.retain_display:
             self.image_axis.setEnabled(state.measurement_mode != "GI")
         replace_presentation = (
@@ -670,7 +778,9 @@ class ScientificView(QtWidgets.QFrame):
         self._share_axis_syncing = True
         try:
             if state.heavy is not None:
-                if state.heavy.raw is not None:
+                if state.heavy.raw is not None and state.processing_mode != "Int 1D":
+                    if state.heavy.detector_source != "full":
+                        self._scrub_detector_pane(self.raw)
                     self.raw.render(
                         state.heavy.raw,
                         detector_shape=state.heavy.detector_shape,
@@ -682,7 +792,7 @@ class ScientificView(QtWidgets.QFrame):
                         ),
                     )
                 else:
-                    self.raw.clear()
+                    self._scrub_detector_pane(self.raw)
                 if state.heavy.cake is not None:
                     self.cake.render(
                         state.heavy.cake,
@@ -714,7 +824,7 @@ class ScientificView(QtWidgets.QFrame):
             else:
                 # An accepted absence is a complete transition, not permission
                 # to leave a stale raw/cake hybrid on screen.
-                self.raw.clear()
+                self._scrub_detector_pane(self.raw)
                 self.cake.clear()
                 self._rendered_cake_axis_key = None
                 self._rendered_cake_x_axis = None
@@ -726,6 +836,8 @@ class ScientificView(QtWidgets.QFrame):
                     navigation,
                     live_update=state.live_update,
                 )
+            if state.processing_mode == "Int 1D":
+                self._reconcile_raw_popup(state)
         finally:
             self._share_axis_syncing = prior_syncing
         if replace_presentation:
@@ -759,7 +871,7 @@ class ScientificView(QtWidgets.QFrame):
             self._autorange_slice_projection(self._share_link_on)
         if replace_presentation:
             self._rendered_slice_contract = slice_contract
-        self.status.setText(state.status or detail)
+        self.status.setText(state.detector_diagnostic if state.detector_mode == "full" and not state.detector_pending and state.heavy is not None and state.heavy.detector_source != "full" else state.status or detail)
         self.progress.setText(f"{completed}/{total}")
         del blockers
 
@@ -873,6 +985,8 @@ class ScientificView(QtWidgets.QFrame):
             self, None, failure=True
         )
         try:
+            if self.raw_popup_dialog is not None:
+                self.raw_popup_dialog.close()
             self.title.setText("Current")
             self.status.setText("")
         except Exception:
@@ -1593,6 +1707,10 @@ class ScientificView(QtWidgets.QFrame):
 
     def _apply_processing_layout(self, mode: str) -> None:
         normalized = str(mode or "")
+        self.detector_controls.setVisible(normalized == "Int 2D")
+        self.raw_popup_button.setVisible(normalized == "Int 1D")
+        if normalized != "Int 1D" and self.raw_popup_dialog is not None:
+            self.raw_popup_dialog.close()
         aggregate_enabled = normalized != "1D Viewer"
         combo = getattr(self, "plot_mode", None)
         for choice in ("Average", "Sum"):

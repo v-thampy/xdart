@@ -503,6 +503,113 @@ def test_non_square_thumbnail_uses_true_extent_without_remask_or_cake_drift(tmp_
     assert pane.canvas.setImage.call_args.kwargs["linear_percentiles"] == (0.5, 99.5)
 
 
+@pytest.mark.parametrize(
+    ("mode", "persisted_shape", "expected_source", "expected_shape"),
+    (("thumbnail", (8, 12), "thumbnail", (8, 12)),
+     ("thumbnail", (0, 12), "thumbnail", None),
+     ("full", (8, 12), "full", None)),
+)
+def test_detector_projection_is_thumbnail_first_identity_preserving_and_extent_exact(
+    tmp_path, mode, persisted_shape, expected_source, expected_shape,
+):
+    from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
+    from xdart.gui.tabs.scattering.scientific_axes import heavy_projection
+    thumbnail = np.array([[np.nan, 1., 2.], [3., 4., 5.]], dtype=np.float32)
+    raw = np.arange(20, dtype=np.float32).reshape(4, 5)
+    cake = np.arange(6, dtype=np.float32).reshape(2, 3)
+    state, owner = _state(tmp_path / "b2-projection.nxs")
+    key = state.append_navigation(owner.source_scan, str(owner.artifact), 1).appended
+    view = FrameView(
+        label=1, raw=raw, thumbnail=thumbnail,
+        axis_2d_x=Axis("q", "1/angstrom", values=np.arange(3.)),
+        axis_2d_y=Axis("chi", "degree", values=np.arange(2.)),
+        intensity_2d=cake, extra={"detector_shape": persisted_shape},
+    )
+    heavy = heavy_projection(
+        StandardDisplayPayload(0, key, "frame", view), detector_mode=mode,
+    )
+    assert heavy.raw is (view.thumbnail if mode == "thumbnail" else view.raw)
+    assert heavy.cake is view.intensity_2d and heavy.detector_source == expected_source
+    assert heavy.detector_shape == expected_shape
+    assert heavy.cake_x.values is view.axis_2d_x.values
+    assert heavy.cake_y.values is view.axis_2d_y.values
+
+
+def test_b2_full_demand_is_zero_by_default_and_one_per_exact_current() -> None:
+    from types import SimpleNamespace
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    first, second, requests = object(), object(), []
+    navigation = SimpleNamespace(current=first)
+    selection = SimpleNamespace(kind=ContextKind.ACQUISITION, owner=object())
+    controller = SimpleNamespace(
+        navigation=navigation, selection=selection,
+        full_raw_availability=lambda: (True, ""),
+        full_raw_status=lambda: (False, bool(requests), None),
+        request_full_current=lambda: requests.append(navigation.current) or object(),
+        clear_full_raw=lambda: True,
+    )
+    page = SimpleNamespace(
+        _preferences=ScientificPreferences(), _context_controller=controller,
+        _detector_scope_owner=selection.owner, _detector_demand_frame=None,
+        _ensure_timer=lambda: None, _notice=lambda _text: None,
+    )
+    ScatteringWorkspace._sync_detector_demand(page)
+    assert requests == []
+    assert ScatteringWorkspace._set_detector_mode(page, "full")
+    ScatteringWorkspace._sync_detector_demand(page)
+    ScatteringWorkspace._sync_detector_demand(page)
+    navigation.current = second
+    ScatteringWorkspace._sync_detector_demand(page)
+    assert requests == [first, second]
+
+
+def test_b2_failure_thumbnail_reset_and_context_replacement_are_fail_closed(
+    tmp_path,
+) -> None:
+    from types import SimpleNamespace
+    from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xdart.gui.tabs.scattering.scientific_axes import heavy_projection
+    thumbnail = np.arange(6, dtype=np.float32).reshape(2, 3)
+    state, owner = _state(tmp_path / "b2-failure.nxs")
+    key = state.append_navigation(owner.source_scan, str(owner.artifact), 1).appended
+    heavy = heavy_projection(
+        StandardDisplayPayload(0, key, "frame", FrameView(
+            label=1, thumbnail=thumbnail, extra={"detector_shape": (8, 12)},
+        )), detector_mode="full",
+    )
+    assert heavy.raw is thumbnail and heavy.detector_source == "thumbnail"
+
+    clears, requests = [], []
+    old_owner, new_owner = object(), object()
+    selection = SimpleNamespace(kind=ContextKind.ACQUISITION, owner=new_owner)
+    controller = SimpleNamespace(
+        navigation=SimpleNamespace(current=key), selection=selection,
+        full_raw_availability=lambda: (True, ""),
+        full_raw_status=lambda: (False, False, "detector read failed"),
+        request_full_current=lambda: requests.append(key) or object(),
+        clear_full_raw=lambda: clears.append(None) or True,
+    )
+    page = SimpleNamespace(
+        _preferences=ScientificPreferences(detector_mode="full"),
+        _context_controller=controller, _detector_scope_owner=new_owner,
+        _detector_demand_frame=key, _ensure_timer=lambda: None,
+        _notice=lambda _text: None,
+    )
+    ScatteringWorkspace._sync_detector_demand(page)
+    assert page._preferences.detector_mode == "full"
+    assert page._preferences.detector_diagnostic == "detector read failed"
+    selection.owner = old_owner
+    ScatteringWorkspace._sync_detector_demand(page)
+    assert page._preferences.detector_mode == "thumbnail"
+    assert clears == [None] and requests == []
+    controller.full_raw_availability = lambda: (
+        False, "Full Raw is available only for an exact acquisition frame."
+    )
+    assert not ScatteringWorkspace._set_detector_mode(page, "full")
+    assert page._preferences.detector_mode == "thumbnail"
+
+
 def test_frame_mask_qualified_no_thumbnail_fails_closed_with_usable_cake(
     monkeypatch, tmp_path
 ):

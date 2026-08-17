@@ -396,13 +396,23 @@ def heavy_projection(
     payload: StandardDisplayPayload,
     *,
     requested_axis: str = "Q-Chi",
+    detector_mode: str = "thumbnail",
 ) -> HeavyProjection | None:
     try:
         frame = payload.frame_key
         if type(frame) is not DisplayFrameKey:
             return None
         view = payload.view
-        raw = view.raw if view.raw is not None else view.thumbnail
+        if detector_mode not in {"thumbnail", "full"}:
+            return None
+        if detector_mode == "thumbnail":
+            raw = view.thumbnail
+            detector_source = "thumbnail" if raw is not None else "none"
+        elif view.raw is not None:
+            raw, detector_source = view.raw, "full"
+        else:
+            raw = view.thumbnail
+            detector_source = "thumbnail" if raw is not None else "none"
         detector_shape = view.extra.get("detector_shape")
         if (
             type(detector_shape) is not tuple
@@ -410,7 +420,7 @@ def heavy_projection(
             or any(type(value) is not int or value <= 0 for value in detector_shape)
         ):
             detector_shape = None
-        if view.raw is not None and detector_shape != tuple(view.raw.shape):
+        if detector_source == "full" and detector_shape != tuple(raw.shape):
             detector_shape = None
         cake = view.intensity_2d
         cake_x = view.axis_2d_x
@@ -455,6 +465,7 @@ def heavy_projection(
         return HeavyProjection(
             frame, raw, cake, x_axis, y_axis,
             detector_shape=detector_shape,
+            detector_source=detector_source,
         )
     except Exception:
         return None

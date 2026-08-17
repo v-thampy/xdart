@@ -58,6 +58,99 @@ def _dispose(view: ScientificView) -> None:
     view.close()
 
 
+@pytest.mark.parametrize("available", (True, False))
+def test_int2d_detector_control_is_exclusive_and_acquisition_gated(
+    available: bool,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(plot_mode="Single")
+    scientific = replace(
+        projection.scientific,
+        processing_mode="Int 2D",
+        detector_mode="thumbnail",
+        detector_available=available,
+        detector_diagnostic=(
+            "" if available
+            else "Full Raw is available only for an exact acquisition frame."
+        ),
+    )
+    commands = []
+    view.commandRequested.connect(commands.append)
+    try:
+        _reconcile(view, scientific, projection.navigation)
+        assert view.detector_mode_group.exclusive()
+        assert view.detector_thumbnail.isChecked()
+        assert view.detector_full.isEnabled() is available
+        assert not commands
+        view.detector_full.click()
+        if available:
+            assert commands[-1].kind is ShellCommandKind.SET_DETECTOR_MODE
+            assert commands[-1].value == "full"
+        else:
+            assert not commands
+            assert view.detector_full.toolTip() == scientific.detector_diagnostic
+    finally:
+        _dispose(view)
+
+
+def test_int1d_raw_popup_tracks_exact_current_and_releases_full_references() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(frame_count=2, plot_mode="Single")
+    frames = projection.navigation.frames
+    thumbnail = np.arange(6, dtype=np.float32).reshape(2, 3)
+    thumbnail.flags.writeable = False
+    first = replace(
+        projection.scientific.heavy,
+        frame=frames[0], raw=thumbnail, detector_shape=(8, 12),
+        detector_source="thumbnail",
+    )
+    scientific = replace(
+        projection.scientific, processing_mode="Int 1D", heavy=first,
+        detector_mode="thumbnail", detector_available=True,
+    )
+    commands = []
+    def collect(command):
+        commands.append(command)
+        if command.value == "thumbnail" and view.raw_popup_dialog.isVisible():
+            _reconcile(view, scientific, projection.navigation)
+    view.commandRequested.connect(collect)
+    try:
+        _reconcile(view, scientific, projection.navigation)
+        assert view.raw.image.image is None
+        view.raw_popup_button.click()
+        assert view.raw_popup_dialog.isVisible()
+        np.testing.assert_array_equal(
+            view.raw_popup_image.image.image, thumbnail.T[:, ::-1]
+        )
+        assert commands[-1].value == "full" and commands[-1].path == ("popup",)
+
+        full = np.arange(20, dtype=np.float32).reshape(4, 5)
+        full.flags.writeable = False
+        second = replace(
+            first, frame=frames[1], raw=full, detector_shape=None,
+            detector_source="full",
+        )
+        navigation = FrameNavigationProjection(frames, frames[1], (frames[1],))
+        _reconcile(
+            view,
+            replace(scientific, heavy=second, detector_mode="full"),
+            navigation,
+        )
+        assert view.raw.image.image is None
+        np.testing.assert_array_equal(
+            view.raw_popup_image.image.image, full.T[:, ::-1]
+        )
+        view.raw_popup_dialog.close()
+        app.processEvents()
+        assert commands[-1].value == "thumbnail"
+        assert view.raw_popup_image.image.image is None
+        assert view.raw_popup_image.canvas.raw_image.size == 0
+    finally:
+        _dispose(view)
+
+
 def test_overlay_footer_moves_anchor_without_mutating_accumulator() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     view = ScientificView()

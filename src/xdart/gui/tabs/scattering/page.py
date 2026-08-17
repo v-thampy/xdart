@@ -393,6 +393,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         self._shell_revision = 0
         self._preferences = ScientificPreferences()
+        self._detector_scope_owner = None
+        self._detector_demand_frame = None
         self._last_scientific_projection = None
         self._rendered_image_axis = self._preferences.image_axis
         self._detector_summary_key: tuple[str, str] | None = None
@@ -1580,6 +1582,69 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not self._run_timer.isActive():
             self._run_timer.start()
 
+    def _set_detector_mode(self, mode: str) -> bool:
+        if mode == "thumbnail":
+            self._context_controller.clear_full_raw()
+            self._detector_demand_frame = None
+            self._preferences = replace(
+                self._preferences, detector_mode=mode,
+                detector_pending=False, detector_diagnostic="",
+            )
+            return True
+        if mode != "full":
+            return False
+        available, reason = self._context_controller.full_raw_availability()
+        if not available:
+            self._notice(reason)
+            self._preferences = replace(
+                self._preferences, detector_mode="thumbnail",
+                detector_available=False, detector_pending=False,
+                detector_diagnostic=reason,
+            )
+            return False
+        self._detector_demand_frame = None
+        self._preferences = replace(
+            self._preferences, detector_mode=mode,
+            detector_available=True, detector_pending=False,
+            detector_diagnostic="",
+        )
+        return True
+
+    def _sync_detector_demand(self) -> None:
+        controller = self._context_controller
+        selection = getattr(controller, "selection", None)
+        owner = (
+            selection.owner
+            if selection is not None
+            and selection.kind is ContextKind.ACQUISITION
+            else None
+        )
+        if owner != self._detector_scope_owner:
+            if self._detector_scope_owner is not None or self._preferences.detector_mode == "full":
+                controller.clear_full_raw()
+            self._detector_scope_owner = owner
+            self._detector_demand_frame = None
+            self._preferences = replace(
+                self._preferences, detector_mode="thumbnail",
+                detector_pending=False, detector_diagnostic="",
+            )
+        available, reason = controller.full_raw_availability()
+        current = controller.navigation.current
+        if (self._preferences.detector_mode == "full" and available
+                and current is not None and current is not self._detector_demand_frame):
+            token = controller.request_full_current()
+            self._detector_demand_frame = current
+            if token is not None:
+                self._ensure_timer()
+        resident, pending, diagnostic = controller.full_raw_status()
+        if self._preferences.detector_mode == "full" and not resident and not pending:
+            diagnostic = diagnostic or "Full Raw detector pixels unavailable."
+        self._preferences = replace(
+            self._preferences, detector_available=available,
+            detector_pending=pending,
+            detector_diagnostic=diagnostic or reason,
+        )
+
     def _refresh_shell(self, *, preserve_display: bool = False) -> None:
         # The worker can rescope the one mutable acquisition context after its
         # event queue snapshot but before this GUI refresh.  Catch up only an
@@ -1614,6 +1679,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                        else "Workspace is closing" if self._closing or self._closed
                        else "Viewer unavailable during active run" if blocked else "")
         navigation = self._context_controller.navigation
+        self._sync_detector_demand()
         if self._preferences.slice_pins:
             retained_pins = tuple(
                 pin
@@ -1721,7 +1787,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 f"{detached_exception_strings(error)[2]}"
             )
             return
-        self._last_scientific_projection = projection.scientific
+        scientific, heavy = projection.scientific, projection.scientific.heavy
+        self._last_scientific_projection = (None
+            if scientific.processing_mode == "Int 1D" and heavy is not None
+            and heavy.detector_source == "full" else scientific)
         self._context_controller.commit_navigation_projection(
             self._shell.scientific.trace_history_keys
         )
@@ -1978,6 +2047,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             updates["color_map"] = str(value)
         elif kind is ShellCommandKind.SET_LOG_SCALE:
             updates["log_scale"] = bool(value)
+        elif kind is ShellCommandKind.SET_DETECTOR_MODE:
+            return self._set_detector_mode(str(value))
         elif kind is ShellCommandKind.SET_IMAGE_AXIS:
             if type(value) is not str or value not in {
                 "Q-Chi",

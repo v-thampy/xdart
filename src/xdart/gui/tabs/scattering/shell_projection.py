@@ -60,6 +60,10 @@ class ScientificPreferences:
     chi_range: tuple[float, float] = (-180.0, 180.0)
     plot_options: ScientificPlotOptions = ScientificPlotOptions()
     background_set: bool = False
+    detector_mode: str = "thumbnail"
+    detector_available: bool = False
+    detector_pending: bool = False
+    detector_diagnostic: str = ""
 
 
 def build_browser_projection(
@@ -267,6 +271,7 @@ def build_scientific_projection(
                 current_payload,
                 preferences.image_axis,
             ),
+            detector_mode=preferences.detector_mode,
         )
     )
     rendered_image_axis = (
@@ -373,6 +378,10 @@ def build_scientific_projection(
         norm_revision=norm_revision,
         color_map=preferences.color_map,
         log_scale=preferences.log_scale,
+        detector_mode=preferences.detector_mode,
+        detector_available=preferences.detector_available,
+        detector_pending=preferences.detector_pending,
+        detector_diagnostic=preferences.detector_diagnostic,
         image_axis=rendered_image_axis,
         plot_axis=rendered_plot_axis,
         plot_mode=preferences.plot_mode,

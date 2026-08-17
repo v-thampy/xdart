@@ -30,6 +30,7 @@ class ShellCommandKind(str, Enum):
     SET_BACKGROUND = "set_background"
     SET_COLOR_MAP = "set_color_map"
     SET_LOG_SCALE = "set_log_scale"
+    SET_DETECTOR_MODE = "set_detector_mode"
     SET_IMAGE_AXIS = "set_image_axis"
     SET_PLOT_AXIS = "set_plot_axis"
     SET_PLOT_MODE = "set_plot_mode"
@@ -269,6 +270,7 @@ class HeavyProjection:
     cake_x: AxisProjection | None = None
     cake_y: AxisProjection | None = None
     detector_shape: tuple[int, int] | None = None
+    detector_source: str = "none"
 
     def __post_init__(self) -> None:
         if type(self.frame) is not DisplayFrameKey:
@@ -294,6 +296,8 @@ class HeavyProjection:
             or any(type(value) is not int or value <= 0 for value in self.detector_shape)
         ):
             raise TypeError("detector shape must be an exact positive pair")
+        if self.detector_source not in {"none", "thumbnail", "full"}:
+            raise ValueError("detector source must be exact")
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +367,18 @@ class ScientificProjection:
     #: divisor results.  Backward-safe defaults mean "no accepted value".
     norm_identity: tuple[object, ...] | None = None
     norm_revision: int = 0
+    detector_mode: str = "thumbnail"
+    detector_available: bool = False
+    detector_pending: bool = False
+    detector_diagnostic: str = ""
+
+    def __post_init__(self) -> None:
+        if self.detector_mode not in {"thumbnail", "full"}:
+            raise ValueError("detector mode must be exact")
+        if type(self.detector_available) is not bool or type(self.detector_pending) is not bool:
+            raise TypeError("detector availability must be boolean")
+        if type(self.detector_diagnostic) is not str:
+            raise TypeError("detector diagnostic must be text")
 
 
 @dataclass(frozen=True, slots=True)
