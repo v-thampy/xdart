@@ -1467,8 +1467,10 @@ class ScanSession:
         store = self._record_store
         if store is None:
             return
-        snapshot = self._accounting.snapshot()
+        labels = tuple(int(label) for label in labels)
+        projections = self._accounting._target_projections(labels)
         for label in labels:
+            projection = projections[label]
             fenced = self._fenced_locked(label)
             hydratable: list[tuple[str, str]] = []
             durable: list[tuple[str, str]] = []
@@ -1477,14 +1479,14 @@ class ScanSession:
                 if mode in fenced:
                     continue
                 key = (mode.kind, mode.key)
-                if (label, mode) in snapshot.publication_dropped:
+                if mode in projection.publication_dropped:
                     dropped.append(key)
                     continue
-                applies = snapshot.targets_by_mode.get(mode, frozenset())
-                if any((label, mode, target) in snapshot.persisted
+                applies = self._accounting.targets_by_mode.get(mode, frozenset())
+                if any((mode, target) in projection.persisted
                        for target in self._store_targets.get(mode, applies)):
                     hydratable.append(key)          # this store can recover it
-                if applies and all((label, mode, target) in snapshot.durable
+                if applies and all((mode, target) in projection.durable
                                    for target in applies):
                     durable.append(key)             # EVERY applicable target
             try:

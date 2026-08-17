@@ -1306,3 +1306,45 @@ def test_g15_c2_private_facade_and_headless_import_purity_split():
                 if module.startswith(("PySide", "PyQt", "pyqtgraph", "qtpy", "xdart"))
             )
     assert offenders == [], f"xrd_tools imports Qt or xdart: {offenders}"
+
+
+def test_label_scoped_reconcile_queries_once_and_never_builds_global_snapshot(
+        monkeypatch):
+    """The store owner keeps caller order/duplicates but takes one scoped
+    ledger observation; whole-run ``snapshot()`` is forbidden at this seam."""
+    _requires_session_projection()
+    store = _InstrumentedStore(max_heavy_items=None)
+    frames = _frames(1)
+    session = _session(frames, store=store, **NX1)
+    try:
+        session.submit(frames[0])
+        _drain(session)
+        session.record_durable((session.accounting.receipt(0, M1, NEXUS),))
+        accounting = session.accounting
+        project_target = accounting._target_projections
+        queries = []
+
+        def scoped(labels):
+            labels = tuple(labels)
+            queries.append(labels)
+            return project_target(labels)
+
+        def global_snapshot_forbidden():
+            raise AssertionError("record-store reconcile rebuilt global snapshot")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(accounting, "_target_projections", scoped)
+            patch.setattr(accounting, "snapshot", global_snapshot_forbidden)
+            before = len(store.calls)
+            with session._projection_lock:
+                session._reconcile_locked(iter((0, 0, 999)))
+            assert queries == [(0, 0, 999)]
+            assert store.calls[before:] == [
+                ("replace_projection", 0),
+                ("replace_projection", 0),
+                ("replace_projection", 999),
+            ]
+            assert set(store.durable_modes(0)) == {K1}
+    finally:
+        session.resume()
+        session.finish(raise_on_failure=False)

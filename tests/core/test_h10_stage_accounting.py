@@ -3477,3 +3477,92 @@ def test_r8_terminal_release_fault_keeps_writer_and_queue_exact(path, edge):
                             join_timeout=GATE_TIMEOUT)
     assert result.failed is True
     assert not writer.is_alive()
+
+
+def test_label_target_projection_is_current_scoped_frozen_and_prelocks_generator():
+    """One ledger instant returns only requested current target truth.
+
+    The generator re-enters the ledger on every yield.  It therefore finishes
+    only when the complete iterable is materialized before the ledger's
+    deliberately non-reentrant lock is acquired.
+    """
+    sa = _sa()
+    one_d, two_d = sa.ResultMode.one_d(), sa.ResultMode.two_d()
+    nexus, xye = "nexus:projection-test", "xye:projection-test"
+    modes = (one_d, two_d)
+    ledger = sa.StageLedger(
+        required_modes=modes,
+        targets_by_mode={one_d: (nexus, xye), two_d: (nexus,)},
+    )
+
+    def complete(label):
+        attempt = ledger.record_accepted(label)
+        ledger.record_outcome(
+            label, sa.ItemDisposition.COMPLETED,
+            produced=modes, attempt=attempt,
+        )
+        ledger.record_written(label, modes)
+
+    complete(7)
+    seven = {
+        (one_d, nexus): ledger.receipt(7, one_d, nexus),
+        (one_d, xye): ledger.receipt(7, one_d, xye),
+        (two_d, nexus): ledger.receipt(7, two_d, nexus),
+    }
+    ledger.record_persisted((seven[(one_d, xye)],))
+    ledger.record_durable((seven[(one_d, nexus)], seven[(two_d, nexus)]))
+
+    complete(8)
+    ledger.record_durable(
+        ledger.receipt(8, mode, target)
+        for mode in modes for target in ledger.targets_by_mode[mode]
+    )
+    complete(8)  # replacement: every revision-1 certification is now stale
+
+    complete(9)
+    ledger.record_publication_dropped(
+        9, one_d, expected_revision=ledger.current_revision(9, one_d)
+    )
+    ledger.record_durable((ledger.receipt(9, two_d, nexus),))
+
+    requested = (7, 999, 7, 8, 9)
+    yielded, outcome, done = [], {}, threading.Event()
+
+    def labels():
+        for label in requested:
+            yielded.append(ledger.current_revision(7, one_d))
+            yield label
+
+    def project():
+        try:
+            outcome["value"] = ledger._target_projections(labels())
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(
+        target=project, name="stage-target-projection-generator", daemon=True
+    )
+    worker.start()
+    assert done.wait(2.0), "label generator ran under the non-reentrant ledger lock"
+    assert "error" not in outcome, repr(outcome.get("error"))
+    projection = outcome["value"]
+    assert yielded == [1] * len(requested)
+    assert tuple(projection) == (7, 999, 8, 9), "dedup keeps first-request order"
+
+    assert projection[7].persisted == frozenset(seven)
+    assert projection[7].durable == frozenset(
+        ((one_d, nexus), (two_d, nexus))
+    )
+    assert projection[8].persisted == projection[8].durable == frozenset()
+    assert projection[9].publication_dropped == frozenset((one_d,))
+    assert projection[9].persisted == projection[9].durable == frozenset(
+        ((two_d, nexus),)
+    )
+    assert all(not getattr(projection[999], name)
+               for name in ("persisted", "durable", "publication_dropped"))
+    with pytest.raises(TypeError):
+        projection[7] = projection[8]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        projection[7].persisted = frozenset()

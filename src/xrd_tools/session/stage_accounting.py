@@ -159,6 +159,15 @@ class StageReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class _StageTargetProjection:
+    """Current target truth for one label at one ledger instant."""
+
+    persisted: frozenset[tuple[ResultMode, str]]
+    durable: frozenset[tuple[ResultMode, str]]
+    publication_dropped: frozenset[ResultMode]
+
+
+@dataclass(frozen=True, slots=True)
 class StageSnapshot:
     """Immutable public accounting snapshot (the §4.1 exposure contract)."""
 
@@ -562,6 +571,43 @@ class StageLedger:
                         f"pair {pair!r} revision {revision} is already "
                         "persisted/durable; dropping it now is incoherent")
             self._dropped[pair] = revision
+
+    def _target_projections(
+        self, labels: Iterable[int]
+    ) -> Mapping[int, _StageTargetProjection]:
+        """Return current target truth for *labels* from one ledger instant.
+
+        This deliberately avoids building the public whole-run snapshot for
+        the session's label-scoped record-store reconciliation.  Materialize
+        before taking the non-reentrant lock so caller iterators cannot run
+        ledger code while the lock is held.
+        """
+        requested = tuple(dict.fromkeys(int(label) for label in labels))
+        with self._lock:
+            result: dict[int, _StageTargetProjection] = {}
+            for label in requested:
+                persisted: set[tuple[ResultMode, str]] = set()
+                durable: set[tuple[ResultMode, str]] = set()
+                dropped: set[ResultMode] = set()
+                for mode in self._required_modes:
+                    pair = (label, mode)
+                    revision = self._revisions.get(pair, 0)
+                    if revision < 1:
+                        continue
+                    if self._dropped.get(pair) == revision:
+                        dropped.add(mode)
+                        continue
+                    for target in self._targets_by_mode.get(mode, ()):
+                        key = (label, mode, target)
+                        target_pair = (mode, target)
+                        if self._persisted.get(key) == revision:
+                            persisted.add(target_pair)
+                        if self._durable.get(key) == revision:
+                            durable.add(target_pair)
+                result[label] = _StageTargetProjection(
+                    frozenset(persisted), frozenset(durable),
+                    frozenset(dropped))
+            return MappingProxyType(result)
 
     def _require_applicable_target(self, mode: ResultMode, target: str) -> None:
         """Against THAT MODE's targets, never the union."""
