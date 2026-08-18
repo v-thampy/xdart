@@ -110,6 +110,29 @@ def test_streaming_output_matches_chunked(monkeypatch):
         )
 
 
+def test_quartile_perf_snapshot_counts_worker_reductions_without_history(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("XDART_PERF_QUARTILES", "1")
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **_kwargs: _r1d(float(np.sum(image))),
+    )
+    frames = _frames(8)
+    session, result = _stream(
+        _plan(), frames, MemorySink(), executor=4, inflight_max=8,
+    )
+
+    snapshot = session.perf_snapshot()
+    assert result.n_processed == 8
+    assert set(snapshot) == {
+        "reducer_compute", "reducer_compute_count",
+    }
+    assert snapshot["reducer_compute"] >= 0.0
+    assert snapshot["reducer_compute_count"] == 8.0
+
+
 def test_worker_process_gets_transient_corrected_image(monkeypatch):
     monkeypatch.setattr(reduction_core, "integrate_1d",
                         lambda image, ai, **kw: _r1d(float(np.sum(image))))

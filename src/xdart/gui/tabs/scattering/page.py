@@ -79,7 +79,9 @@ from .detector_projection import detector_summary
 from .display_values import (
     DisplayFrameKey,
     StandardEventKind,
+    StandardQuartileTiming,
     StandardRunEvent,
+    StandardTerminalTiming,
     standard_event_is_valid,
 )
 from .display_retirement import DisplayRetirementReceipt
@@ -376,6 +378,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._presentation_run_identity: RunIdentity | None = None
         self._live_plot_interval_ms = _live_plot_interval_ms()
         self._last_live_plot_at: float | None = None
+        self._quartile_refresh_identity: RunIdentity | None = None
+        self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
         self._browser_directory_chooser = (
             browser_directory_chooser
             if browser_directory_chooser is not None
@@ -1185,6 +1189,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._active_batch_mode = outcome.configuration.batch_mode
             self._run_frame_seen = False
             self._last_live_plot_at = None
+            self._quartile_refresh_identity = (
+                outcome.run_identity
+                if os.environ.get(
+                    "XDART_PERF_QUARTILES", "",
+                ).strip() == "1"
+                else None
+            )
+            self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
             self._batch_latest_frame = None
             self._browser_transient_frame = None
             self._browser_transient_clear_token = None
@@ -1622,9 +1634,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 preserve_scientific = True
             if preserve_scientific:
-                self._refresh_shell(preserve_scientific=True)
+                self._refresh_event_shell(preserve_scientific=True)
             else:
-                self._refresh_shell()
+                self._refresh_event_shell()
         if not self._polling_needed():
             self._run_timer.stop()
 
@@ -1637,7 +1649,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._lifecycle.phase is RunPhase.STOPPING
         )
         self._record_artifact_progress(event)
-        timing = event.terminal_timing
+        timing = self._terminal_timing_with_gui_refresh(
+            event.terminal_timing,
+            identity,
+        )
+        self._quartile_refresh_identity = None
         terminal_state = (
             "Failed"
             if event.kind is StandardEventKind.FAILED
@@ -1689,6 +1705,72 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or stop_was_requested
             )
             else ""
+        )
+
+    def _refresh_event_shell(
+        self,
+        *,
+        preserve_scientific: bool = False,
+    ) -> None:
+        started = (
+            time.monotonic()
+            if self._quartile_refresh_identity is not None
+            else None
+        )
+        if preserve_scientific:
+            self._refresh_shell(preserve_scientific=True)
+        else:
+            self._refresh_shell()
+        if started is None:
+            return
+        identity = self._lifecycle.active_run_identity
+        if identity is not self._quartile_refresh_identity:
+            return
+        completed, total = self._progress.completed, self._progress.total
+        if total < 4 or completed <= 0 or completed > total:
+            return
+        thresholds = (
+            (total + 3) // 4,
+            (total + 1) // 2,
+            (3 * total + 3) // 4,
+        )
+        index = next(
+            (
+                candidate
+                for candidate, threshold in enumerate(thresholds)
+                if completed <= threshold
+            ),
+            3,
+        )
+        self._quartile_refresh_seconds[index] += max(
+            0.0, time.monotonic() - started,
+        )
+
+    def _terminal_timing_with_gui_refresh(
+        self,
+        timing: StandardTerminalTiming | None,
+        identity: RunIdentity,
+    ) -> StandardTerminalTiming | None:
+        if (
+            timing is None
+            or timing.quartiles is None
+            or identity is not self._quartile_refresh_identity
+        ):
+            return timing
+        quartiles = timing.quartiles
+        details = tuple(
+            item for item in quartiles.details if item[0] != "gui_refresh"
+        ) + ((
+            "gui_refresh",
+            tuple(float(value) for value in self._quartile_refresh_seconds),
+        ),)
+        return replace(
+            timing,
+            quartiles=StandardQuartileTiming(
+                quartiles.frame_counts,
+                details,
+                quartiles.compute_counts,
+            ),
         )
 
     def _record_artifact_progress(self, event: StandardRunEvent) -> None:
@@ -2570,6 +2652,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._live_plot_interval_ms = values.plot_interval_ms
         self._last_live_plot_at = None
         os.environ["XDART_PERF"] = "1"
+        if values.quartile_telemetry:
+            os.environ["XDART_PERF_QUARTILES"] = "1"
+        else:
+            os.environ.pop("XDART_PERF_QUARTILES", None)
         notice = (
             "Performance diagnostics applied: pipeline and output values "
             "take effect on the next run; plot cadence is active now."
@@ -2578,6 +2664,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             notice += (
                 " Diagnostic fsync is off: crash or power-loss persistence "
                 "is not guaranteed."
+            )
+        if values.quartile_telemetry:
+            notice += (
+                " Within-run quartile timing is enabled for the next run."
             )
         if values.staging_frame_cap > 64:
             notice += (

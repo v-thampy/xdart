@@ -7,7 +7,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Lock, Thread, current_thread, get_ident
 from time import monotonic
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 import numpy as np
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core.scan import SourceKind
@@ -32,6 +32,7 @@ from ..display_values import (
     StandardDisplayPayload,
     StandardEventKind,
     StandardRunEvent,
+    StandardQuartileTiming,
     StandardTerminalTiming,
 )
 from ..display_runtime import (
@@ -68,6 +69,185 @@ _DISPLAY_PROJECTION_FRAMES = 8
 _LIVE_DIRECTORY_POLL_S = 0.1
 
 _SOURCE_SUBMISSION_END = object()
+
+_QUARTILE_STAGE_NAMES = (
+    "reducer_compute",
+    "source_read",
+    "submit_wait",
+    "writer_batch",
+    "writer_flush",
+    "xye",
+    "completion_display",
+    "finish_wait",
+)
+
+
+def _quartile_stage_totals(
+    cumulative: Mapping[str, float],
+) -> dict[str, float]:
+    value = lambda key: max(0.0, float(cumulative.get(key, 0.0)))
+    return {
+        "reducer_compute": value("reducer_compute"),
+        "source_read": value("source_read"),
+        "submit_wait": value("submit_wait"),
+        "writer_batch": value("sink_nexus_write"),
+        "writer_flush": value("sink_nexus_flush"),
+        "xye": (
+            value("sink_xye_write") + value("sink_xye_promotion")
+        ),
+        "completion_display": sum(value(key) for key in (
+            "session_record_upsert",
+            "session_frame_listeners",
+            "session_progress_listeners",
+            "display_projection",
+        )),
+        "finish_wait": value("finish_wait"),
+    }
+
+
+def _quartile_compute_count(cumulative: Mapping[str, float]) -> int:
+    raw = cumulative.get("reducer_compute_count", 0)
+    value = float(raw)
+    count = int(value)
+    if not np.isfinite(value) or value < 0.0 or value != count:
+        raise ValueError("reducer compute count is invalid")
+    return count
+
+
+@dataclass(frozen=True, slots=True)
+class _RunQuartileBoundary:
+    quartile: int
+    completed: int
+    total: int
+    frame_count: int
+    wall_seconds: float
+
+
+@dataclass(slots=True)
+class _RunQuartileCapture:
+    """Fixed-size temporal snapshots; no per-frame timing history."""
+
+    total: int
+    started_at: float
+    thresholds: tuple[int, int, int] = field(init=False)
+    frame_counts: tuple[int, int, int, int] = field(init=False)
+    completed: int = field(default=0, init=False)
+    _next_quartile: int = field(default=0, init=False, repr=False)
+    _previous_wall: float = field(default=0.0, init=False, repr=False)
+    _previous_stages: dict[str, float] = field(
+        default_factory=lambda: dict.fromkeys(_QUARTILE_STAGE_NAMES, 0.0),
+        init=False,
+        repr=False,
+    )
+    _wall_rows: list[float] = field(default_factory=list, init=False, repr=False)
+    _previous_compute_count: int = field(default=0, init=False, repr=False)
+    _compute_counts: list[int] = field(default_factory=list, init=False, repr=False)
+    _stage_rows: dict[str, list[float]] = field(
+        default_factory=lambda: {
+            name: [] for name in _QUARTILE_STAGE_NAMES
+        },
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.total) is not int
+            or self.total < 4
+            or type(self.started_at) is not float
+            or not np.isfinite(self.started_at)
+        ):
+            raise TypeError("quartile capture boundary is invalid")
+        first = (self.total + 3) // 4
+        second = (self.total + 1) // 2
+        third = (3 * self.total + 3) // 4
+        self.thresholds = (first, second, third)
+        self.frame_counts = (
+            first,
+            second - first,
+            third - second,
+            self.total - third,
+        )
+
+    def observe(
+        self,
+        completed: int,
+        *,
+        now: float,
+        cumulative: Mapping[str, float],
+    ) -> _RunQuartileBoundary | None:
+        if type(completed) is not int or completed != self.completed + 1:
+            raise ValueError("quartile completion sequence is not contiguous")
+        self.completed = completed
+        if (
+            self._next_quartile >= 3
+            or completed < self.thresholds[self._next_quartile]
+        ):
+            return None
+        wall = max(0.0, float(now) - self.started_at)
+        stages = _quartile_stage_totals(cumulative)
+        compute_count = _quartile_compute_count(cumulative)
+        wall_delta = max(0.0, wall - self._previous_wall)
+        self._wall_rows.append(wall_delta)
+        for name in _QUARTILE_STAGE_NAMES:
+            total = stages[name]
+            self._stage_rows[name].append(max(
+                0.0, total - self._previous_stages[name],
+            ))
+        self._previous_wall = wall
+        self._previous_stages = stages
+        self._compute_counts.append(
+            max(0, compute_count - self._previous_compute_count)
+        )
+        self._previous_compute_count = compute_count
+        quartile = self._next_quartile + 1
+        frame_count = self.frame_counts[self._next_quartile]
+        self._next_quartile += 1
+        return _RunQuartileBoundary(
+            quartile,
+            completed,
+            self.total,
+            frame_count,
+            wall_delta,
+        )
+
+    def finish(
+        self,
+        *,
+        completed: int,
+        now: float,
+        cumulative: Mapping[str, float],
+    ) -> StandardQuartileTiming | None:
+        if (
+            completed != self.total
+            or self.completed != self.total
+            or self._next_quartile != 3
+        ):
+            return None
+        wall = max(0.0, float(now) - self.started_at)
+        stages = _quartile_stage_totals(cumulative)
+        compute_count = _quartile_compute_count(cumulative)
+        wall_rows = tuple(
+            self._wall_rows
+            + [max(0.0, wall - self._previous_wall)]
+        )
+        details = [("wall", wall_rows)]
+        details.extend(
+            (
+                name,
+                tuple(self._stage_rows[name] + [max(
+                    0.0, stages[name] - self._previous_stages[name],
+                )]),
+            )
+            for name in _QUARTILE_STAGE_NAMES
+        )
+        return StandardQuartileTiming(
+            self.frame_counts,
+            tuple(details),
+            tuple(self._compute_counts + [max(
+                0, compute_count - self._previous_compute_count,
+            )]),
+        )
 _DISPLAY_PROJECTION_END = object()
 
 
@@ -118,6 +298,9 @@ class _StandardRun:
     context_runtime: AcquisitionRuntime | None = None
     frames_by_label: dict[int, Any] = field(default_factory=dict)
     perf_enabled: bool = field(init=False)
+    perf_quartiles_enabled: bool = field(init=False)
+    perf_started_at: float | None = None
+    perf_quartiles: _RunQuartileCapture | None = None
     perf_values: dict[str, float] = field(default_factory=dict)
     perf_lock: Lock = field(default_factory=Lock)
     display_projection_queue: Queue[object] | None = None
@@ -130,7 +313,13 @@ class _StandardRun:
     resource_facts: list[Any] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.perf_enabled = bool(os.environ.get("XDART_PERF"))
+        self.perf_quartiles_enabled = (
+            os.environ.get("XDART_PERF_QUARTILES", "").strip() == "1"
+        )
+        self.perf_enabled = (
+            bool(os.environ.get("XDART_PERF"))
+            or self.perf_quartiles_enabled
+        )
         self.display = RunDisplayState(
             self.identity,
             max_payload_items=self.max_display_items,
@@ -144,6 +333,57 @@ def _perf_add(run: _StandardRun, key: str, elapsed: float) -> None:
         run.perf_values[key] = run.perf_values.get(key, 0.0) + max(
             0.0, float(elapsed)
         )
+
+
+def _combined_perf_snapshot(run: _StandardRun) -> dict[str, float]:
+    with run.perf_lock:
+        values = dict(run.perf_values)
+    snapshot = getattr(run.session, "perf_snapshot", None)
+    if callable(snapshot):
+        for key, value in snapshot().items():
+            values[key] = values.get(key, 0.0) + float(value)
+    return values
+
+
+def _observe_quartile_completion(run: _StandardRun) -> None:
+    if not run.perf_quartiles_enabled:
+        return
+    try:
+        started_at = run.perf_started_at
+        if started_at is None or run.total < 4:
+            return
+        capture = run.perf_quartiles
+        if capture is None:
+            capture = _RunQuartileCapture(run.total, started_at)
+            run.perf_quartiles = capture
+        completed = capture.completed + 1
+        boundary_due = (
+            capture._next_quartile < 3
+            and completed == capture.thresholds[capture._next_quartile]
+        )
+        boundary = capture.observe(
+            completed,
+            now=monotonic() if boundary_due else started_at,
+            cumulative=(
+                _combined_perf_snapshot(run) if boundary_due else {}
+            ),
+        )
+        if boundary is not None:
+            logger.info(
+                "[PERF-QUARTILE] q=%d frames=%d/%d bucket-frames=%d "
+                "wall=%.2fs mean=%.4fs/frame",
+                boundary.quartile,
+                boundary.completed,
+                boundary.total,
+                boundary.frame_count,
+                boundary.wall_seconds,
+                boundary.wall_seconds / boundary.frame_count,
+            )
+    except Exception:
+        # Diagnostics must never change run correctness or terminal outcome.
+        run.perf_quartiles_enabled = False
+        run.perf_quartiles = None
+        logger.exception("[PERF-QUARTILE] telemetry disabled after snapshot failure")
 
 
 def _directory_status(
@@ -1169,6 +1409,8 @@ class StandardRunExecutor:
 
     def _run(self, run: _StandardRun) -> None:
         started_at = monotonic()
+        if run.perf_quartiles_enabled:
+            run.perf_started_at = started_at
         primary: DetachedDiagnostic | None = None
         stopped = False
         try:
@@ -2088,6 +2330,7 @@ class StandardRunExecutor:
                     "display completion lost its projection queue or session"))
         finally:
             _perf_add(run, "display_callback", monotonic() - started)
+            _observe_quartile_completion(run)
 
     def _frame_ready_owned(
         self,
@@ -2339,6 +2582,24 @@ class StandardRunExecutor:
                 "display",
                 float(sum(perf.get(key, 0.0) for key in display_keys)),
             ))
+        quartile_timing = None
+        capture = run.perf_quartiles
+        if (
+            elapsed is not None
+            and run.perf_quartiles_enabled
+            and capture is not None
+            and run.perf_started_at is not None
+        ):
+            try:
+                quartile_timing = capture.finish(
+                    completed=completed,
+                    now=run.perf_started_at + float(elapsed),
+                    cumulative=perf,
+                )
+            except Exception:
+                logger.exception(
+                    "[PERF-QUARTILE] terminal snapshot was unavailable"
+                )
         timing = (
             None
             if elapsed is None
@@ -2347,6 +2608,7 @@ class StandardRunExecutor:
                 float(work_elapsed),
                 float(cleanup_elapsed),
                 tuple(timing_details),
+                quartile_timing,
             )
         )
         self._events.put(StandardRunEvent(
@@ -2433,6 +2695,37 @@ class StandardRunExecutor:
                 perf.get("session_frame_listeners", 0.0),
                 perf.get("session_progress_listeners", 0.0),
             )
+        if quartile_timing is not None:
+            logger.info(
+                "[PERF-QUARTILES] frames=%s",
+                "/".join(str(value) for value in quartile_timing.frame_counts),
+            )
+            for name, values in quartile_timing.details:
+                if name == "reducer_compute":
+                    logger.info(
+                        "[PERF-QUARTILES] reducer-compute "
+                        "q1=%.3fms/frame(n=%d) q2=%.3fms/frame(n=%d) "
+                        "q3=%.3fms/frame(n=%d) q4=%.3fms/frame(n=%d)",
+                        *tuple(
+                            item
+                            for value, count in zip(
+                                values,
+                                quartile_timing.compute_counts,
+                                strict=True,
+                            )
+                            for item in (
+                                1000.0 * value / count if count else 0.0,
+                                count,
+                            )
+                        ),
+                    )
+                    continue
+                logger.info(
+                    "[PERF-QUARTILES] %s q1=%.3fs q2=%.3fs "
+                    "q3=%.3fs q4=%.3fs",
+                    name,
+                    *values,
+                )
 
     def _exact_run(self, identity: RunIdentity) -> _StandardRun | None:
         with self._lock:

@@ -87,6 +87,48 @@ def _terminal_timing_tooltip(progress: ProgressProjection) -> str:
     )
     if timing.details:
         lines.append("Parallel detail timers may overlap.")
+    quartiles = timing.quartiles
+    if quartiles is not None:
+        lines.append(
+            "Within-run quartiles (Q1 → Q4; Q4 includes terminal tail)"
+        )
+        lines.append("Frames: " + " | ".join(
+            str(value) for value in quartiles.frame_counts
+        ))
+        quartile_labels = {
+            "wall": "Wall",
+            "reducer_compute": "Reducer compute",
+            "source_read": "Source read",
+            "submit_wait": "Submit/backpressure",
+            "writer_batch": "NeXus write/checkpoint",
+            "writer_flush": "Checkpoint flush/fsync",
+            "xye": "XYE",
+            "completion_display": "Completion/display",
+            "finish_wait": "Finish/drain",
+            "gui_refresh": "GUI refresh (pre-terminal)",
+        }
+        for name, values in quartiles.details:
+            if name == "reducer_compute" and any(
+                quartiles.compute_counts
+            ):
+                formatted = " | ".join(
+                    f"{value:.2f} s / {count} "
+                    f"({(1000.0 * value / count if count else 0.0):.2f} ms/frame)"
+                    for value, count in zip(
+                        values, quartiles.compute_counts, strict=True,
+                    )
+                )
+            else:
+                formatted = " | ".join(
+                    f"{value:.2f} s" for value in values
+                )
+            lines.append(
+                f"{quartile_labels.get(name, name)}: {formatted}"
+            )
+        lines.append("Quartile timers may overlap and do not sum to Wall.")
+        lines.append(
+            "Submit/backpressure is orchestration wait, not pure integration."
+        )
     return "\n".join(lines)
 @dataclass(frozen=True, slots=True)
 class _Viewer1DTraceProjection(TraceProjection):

@@ -821,6 +821,13 @@ def _emit_sink_write_batch(sink: ReductionSink, items: tuple[tuple, ...]) -> Non
 _XYE_WRITE_END = object()
 
 
+def _performance_timing_enabled() -> bool:
+    return (
+        bool(os.environ.get("XDART_PERF"))
+        or os.environ.get("XDART_PERF_QUARTILES", "").strip() == "1"
+    )
+
+
 @dataclass(slots=True)
 class XYESink:
     """Write 1D reductions as one ``.xye`` file per frame."""
@@ -830,6 +837,9 @@ class XYESink:
     _scan_name: str = field(default="", init=False, repr=False)
     _perf_enabled: bool = field(default=False, init=False, repr=False)
     _perf_write: float = field(default=0.0, init=False, repr=False)
+    _perf_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False,
+    )
     _pending: Any = field(default=None, init=False, repr=False)
     _worker: Any = field(default=None, init=False, repr=False)
     _errors: list[BaseException] = field(default_factory=list, init=False, repr=False)
@@ -841,11 +851,12 @@ class XYESink:
     def __post_init__(self) -> None:
         if not isinstance(self.directory, Path):
             self.directory = Path(self.directory)
-        self._perf_enabled = bool(os.environ.get("XDART_PERF"))
+        self._perf_enabled = _performance_timing_enabled()
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         self._scan_name = scan.name
-        self._perf_write = 0.0
+        with self._perf_lock:
+            self._perf_write = 0.0
         self._errors.clear()
         self.directory.mkdir(parents=True, exist_ok=True)
         pending: queue.Queue[object] = queue.Queue(maxsize=16)
@@ -865,7 +876,10 @@ class XYESink:
                         self._errors.append(error)
                     finally:
                         if self._perf_enabled:
-                            self._perf_write += time.perf_counter() - started
+                            with self._perf_lock:
+                                self._perf_write += (
+                                    time.perf_counter() - started
+                                )
                 finally:
                     pending.task_done()
 
@@ -906,7 +920,8 @@ class XYESink:
         self.finish(result)
 
     def perf_snapshot(self) -> dict[str, float]:
-        return {"sink_xye_write": self._perf_write}
+        with self._perf_lock:
+            return {"sink_xye_write": self._perf_write}
 
 
 @dataclass(frozen=True, slots=True)
@@ -949,6 +964,9 @@ class TransactionalXYESink:
     _perf_values: dict[str, float] = field(
         default_factory=dict, init=False, repr=False,
     )
+    _perf_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.pattern != "{scan}_{frame:04d}.xye":
@@ -975,7 +993,7 @@ class TransactionalXYESink:
         self._transaction = transaction
         self._canonical_target = f"xye:{normalized}"
         self._stage_nonce = uuid4().hex
-        self._perf_enabled = bool(os.environ.get("XDART_PERF"))
+        self._perf_enabled = _performance_timing_enabled()
 
     @property
     def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
@@ -1026,15 +1044,16 @@ class TransactionalXYESink:
         self._scan_name = scan.name
         self._mode = mode
         self._errors.clear()
-        self._perf_values = {
-            "sink_xye_write": 0.0,
-            "sink_xye_worker_format": 0.0,
-            "sink_xye_enqueue_wait": 0.0,
-            "sink_xye_queue_high_water": 0,
-            "sink_xye_drain": 0.0,
-            "sink_xye_promotion": 0.0,
-            "sink_xye_generated": 0,
-        }
+        with self._perf_lock:
+            self._perf_values = {
+                "sink_xye_write": 0.0,
+                "sink_xye_worker_format": 0.0,
+                "sink_xye_enqueue_wait": 0.0,
+                "sink_xye_queue_high_water": 0,
+                "sink_xye_drain": 0.0,
+                "sink_xye_promotion": 0.0,
+                "sink_xye_generated": 0,
+            }
         self._canonical_directory.mkdir(parents=True, exist_ok=True)
         pending: queue.Queue[object] = queue.Queue(maxsize=16)
         self._pending = pending
@@ -1094,11 +1113,13 @@ class TransactionalXYESink:
         finally:
             if self._perf_enabled and worker:
                 elapsed = max(0.0, time.perf_counter() - started)
-                self._perf_values["sink_xye_worker_format"] += elapsed
-                self._perf_values["sink_xye_write"] += elapsed
+                with self._perf_lock:
+                    self._perf_values["sink_xye_worker_format"] += elapsed
+                    self._perf_values["sink_xye_write"] += elapsed
         self._ready_labels.add(label)
         if self._perf_enabled:
-            self._perf_values["sink_xye_generated"] += 1
+            with self._perf_lock:
+                self._perf_values["sink_xye_generated"] += 1
 
     def _drain_worker(self, *, terminal: bool) -> None:
         pending, worker = self._pending, self._worker
@@ -1112,9 +1133,10 @@ class TransactionalXYESink:
             else:
                 pending.join()
         if self._perf_enabled:
-            self._perf_values["sink_xye_drain"] += max(
-                0.0, time.perf_counter() - started,
-            )
+            with self._perf_lock:
+                self._perf_values["sink_xye_drain"] += max(
+                    0.0, time.perf_counter() - started,
+                )
 
     def _cleanup_staging(self) -> None:
         failures: list[BaseException] = []
@@ -1158,12 +1180,14 @@ class TransactionalXYESink:
             label, result.radial, result.intensity, result.sigma,
         ))
         if self._perf_enabled:
-            self._perf_values["sink_xye_enqueue_wait"] += max(
-                0.0, time.perf_counter() - started,
-            )
-            self._perf_values["sink_xye_queue_high_water"] = max(
-                self._perf_values["sink_xye_queue_high_water"], pending.qsize(),
-            )
+            with self._perf_lock:
+                self._perf_values["sink_xye_enqueue_wait"] += max(
+                    0.0, time.perf_counter() - started,
+                )
+                self._perf_values["sink_xye_queue_high_water"] = max(
+                    self._perf_values["sink_xye_queue_high_water"],
+                    pending.qsize(),
+                )
 
     def replace(self, frame: Frame, reduction: FrameReduction) -> None:
         self.write(frame, reduction)
@@ -1205,9 +1229,10 @@ class TransactionalXYESink:
             self._ready_labels.discard(label)
             descriptors.append((int(label), mode, self._canonical_target))
         if self._perf_enabled:
-            self._perf_values["sink_xye_promotion"] += max(
-                0.0, time.perf_counter() - started,
-            )
+            with self._perf_lock:
+                self._perf_values["sink_xye_promotion"] += max(
+                    0.0, time.perf_counter() - started,
+                )
         return tuple(descriptors)
 
     def _settle_transition(self, kind: str, boundary: Any):
@@ -1265,7 +1290,8 @@ class TransactionalXYESink:
         return handoff.identity
 
     def perf_snapshot(self) -> dict[str, float]:
-        return dict(self._perf_values)
+        with self._perf_lock:
+            return dict(self._perf_values)
 
     def _acknowledge_transition(self, identity) -> None:
         handoff = self._handoff
@@ -1679,7 +1705,7 @@ class NexusSink:
             raise RuntimeError("NexusSink.begin called before the prior writer terminated")
         self._scan = scan
         self._plan = plan
-        self._perf_nexus_enabled = bool(os.environ.get("XDART_PERF"))
+        self._perf_nexus_enabled = _performance_timing_enabled()
         with self._perf_nexus_lock:
             self._perf_nexus_write = 0.0
             self._perf_nexus_flush = 0.0
@@ -2621,6 +2647,14 @@ class ReductionSession:
     _state_lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False,
     )
+    _perf_quartiles_enabled: bool = field(
+        default=False, init=False, repr=False,
+    )
+    _perf_compute_seconds: float = field(default=0.0, init=False, repr=False)
+    _perf_compute_count: int = field(default=0, init=False, repr=False)
+    _perf_compute_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False,
+    )
 
     @property
     def _completed(self) -> int:
@@ -2677,6 +2711,9 @@ class ReductionSession:
             self._finished = True
 
     def __post_init__(self) -> None:
+        self._perf_quartiles_enabled = (
+            os.environ.get("XDART_PERF_QUARTILES", "").strip() == "1"
+        )
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {self.chunk_size}")
         self.scan = _coerce_to_scan(self.source)
@@ -2768,6 +2805,16 @@ class ReductionSession:
     @property
     def saturation_mask(self) -> np.ndarray | None:
         return self._run_saturation_mask.mask
+
+    def perf_snapshot(self) -> dict[str, float]:
+        """Return aggregate worker compute timing without per-frame history."""
+        if not self._perf_quartiles_enabled:
+            return {}
+        with self._perf_compute_lock:
+            return {
+                "reducer_compute": float(self._perf_compute_seconds),
+                "reducer_compute_count": float(self._perf_compute_count),
+            }
 
     def release_products(self, indices) -> None:
         """Drop retained :class:`FrameReduction` objects for *indices*.
@@ -3058,14 +3105,24 @@ class ReductionSession:
         label = int(frame.index)
         worker_process = getattr(self._sink, "worker_process", None)
         _admission_trace("reduction_begin", label=label)
-        reduction = _reduce_frame(
-            frame, image, self.plan, self._integrators, self._plan_masks,
-            self._frame_masks,
-            self.cancel_token, self._warned_monitor_keys,
-            include_corrected_image=callable(worker_process),
-            run_saturation_mask=self._run_saturation_mask,
-            strict=self.strict,
+        compute_started = (
+            time.perf_counter() if self._perf_quartiles_enabled else 0.0
         )
+        try:
+            reduction = _reduce_frame(
+                frame, image, self.plan, self._integrators, self._plan_masks,
+                self._frame_masks,
+                self.cancel_token, self._warned_monitor_keys,
+                include_corrected_image=callable(worker_process),
+                run_saturation_mask=self._run_saturation_mask,
+                strict=self.strict,
+            )
+        finally:
+            if self._perf_quartiles_enabled:
+                elapsed = max(0.0, time.perf_counter() - compute_started)
+                with self._perf_compute_lock:
+                    self._perf_compute_seconds += elapsed
+                    self._perf_compute_count += 1
         _admission_trace("reduction_end", label=label)
         prep_error: BaseException | None = None
         try:

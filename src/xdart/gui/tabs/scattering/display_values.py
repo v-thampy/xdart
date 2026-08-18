@@ -84,6 +84,61 @@ class DisplayNavigationDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class StandardQuartileTiming:
+    """Four temporal timing buckets captured at run-completion quartiles."""
+
+    frame_counts: tuple[int, int, int, int]
+    details: tuple[
+        tuple[str, tuple[float, float, float, float]], ...
+    ]
+    compute_counts: tuple[int, int, int, int] = (0, 0, 0, 0)
+
+    def __post_init__(self) -> None:
+        counts = self.frame_counts
+        details = self.details
+        valid_counts = (
+            type(counts) is tuple
+            and len(counts) == 4
+            and all(type(value) is int and value > 0 for value in counts)
+        )
+        valid_compute_counts = (
+            type(self.compute_counts) is tuple
+            and len(self.compute_counts) == 4
+            and all(
+                type(value) is int and value >= 0
+                for value in self.compute_counts
+            )
+        )
+        valid_details = (
+            type(details) is tuple
+            and all(
+                type(item) is tuple
+                and len(item) == 2
+                and type(item[0]) is str
+                and bool(item[0])
+                and type(item[1]) is tuple
+                and len(item[1]) == 4
+                and all(
+                    type(value) is float
+                    and np.isfinite(value)
+                    and value >= 0.0
+                    for value in item[1]
+                )
+                for item in details
+            )
+        )
+        names = tuple(item[0] for item in details) if valid_details else ()
+        if (
+            not valid_counts
+            or not valid_compute_counts
+            or not valid_details
+            or not details
+            or len(set(names)) != len(names)
+        ):
+            raise TypeError("quartile timing is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class StandardTerminalTiming:
     """Executor-clock terminal duration plus available measured components."""
 
@@ -91,6 +146,7 @@ class StandardTerminalTiming:
     work_seconds: float
     cleanup_seconds: float
     details: tuple[tuple[str, float], ...] = ()
+    quartiles: StandardQuartileTiming | None = None
 
     def __post_init__(self) -> None:
         details = self.details
@@ -126,6 +182,10 @@ class StandardTerminalTiming:
             )
             or not valid_details
             or len(set(names)) != len(names)
+            or (
+                self.quartiles is not None
+                and type(self.quartiles) is not StandardQuartileTiming
+            )
         ):
             raise TypeError("terminal timing is invalid")
 

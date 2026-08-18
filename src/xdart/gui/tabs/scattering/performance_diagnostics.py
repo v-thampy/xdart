@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Mapping
 
 from pyqtgraph.Qt import QtWidgets
@@ -33,6 +34,7 @@ class PerformanceDiagnosticsValues:
     save_xye: bool = True
     durable_fsync: bool = True
     staging_frame_cap: int = 64
+    quartile_telemetry: bool = False
 
     def pipeline_mapping(self) -> dict[str, int]:
         return dict(zip(
@@ -59,7 +61,11 @@ def performance_diagnostics_error(
 ) -> str:
     if type(values) is not PerformanceDiagnosticsValues:
         return "Performance diagnostics values are invalid."
-    if type(values.save_xye) is not bool or type(values.durable_fsync) is not bool:
+    if (
+        type(values.save_xye) is not bool
+        or type(values.durable_fsync) is not bool
+        or type(values.quartile_telemetry) is not bool
+    ):
         return "Output diagnostics values must be exact booleans."
     row = (
         values.settlement,
@@ -157,6 +163,12 @@ class PerformanceDiagnosticsDialog(QtWidgets.QDialog):
         self.save_xye.setObjectName("performanceSaveXye")
         self.durable_fsync = QtWidgets.QCheckBox("Durable fsync")
         self.durable_fsync.setObjectName("performanceDurableFsync")
+        self.quartile_telemetry = QtWidgets.QCheckBox(
+            "Within-run quartile timing"
+        )
+        self.quartile_telemetry.setObjectName(
+            "performanceQuartileTelemetry"
+        )
         self.plot_interval.setSuffix(" ms")
         form.addRow("Settlement batch", self.settlement)
         form.addRow("NeXus record batch", self.record)
@@ -166,6 +178,7 @@ class PerformanceDiagnosticsDialog(QtWidgets.QDialog):
         form.addRow("Live plot interval", self.plot_interval)
         form.addRow("Output", self.save_xye)
         form.addRow("Safety", self.durable_fsync)
+        form.addRow("Diagnostics", self.quartile_telemetry)
         layout.addLayout(form)
         warning = QtWidgets.QLabel(
             "Turning off Durable fsync is a diagnostic benchmark only; "
@@ -212,6 +225,9 @@ class PerformanceDiagnosticsDialog(QtWidgets.QDialog):
         self.plot_interval.setValue(max(125, int(plot_interval_ms)))
         self.save_xye.setChecked(save_xye)
         self.durable_fsync.setChecked(durable_fsync)
+        self.quartile_telemetry.setChecked(
+            os.environ.get("XDART_PERF_QUARTILES", "").strip() == "1"
+        )
         if self.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
         return PerformanceDiagnosticsValues(
@@ -223,6 +239,7 @@ class PerformanceDiagnosticsDialog(QtWidgets.QDialog):
             self.save_xye.isChecked(),
             self.durable_fsync.isChecked(),
             self.staging.value(),
+            self.quartile_telemetry.isChecked(),
         )
 
 

@@ -261,6 +261,83 @@ def test_terminal_summary_is_measured_and_emitted_exactly_once(
     ]
 
 
+@pytest.mark.parametrize(
+    ("total", "expected_counts"),
+    (
+        (651, (163, 163, 163, 162)),
+        (3_621, (906, 905, 905, 905)),
+    ),
+)
+def test_quartile_capture_uses_exact_cumulative_boundaries_and_terminal_tail(
+    total: int,
+    expected_counts: tuple[int, int, int, int],
+) -> None:
+    capture_type = getattr(executor_module, "_RunQuartileCapture")
+    capture = capture_type(total=total, started_at=0.0)
+    boundaries = []
+    for completed in range(1, total + 1):
+        boundary = capture.observe(
+            completed,
+            now=completed / 10.0,
+            cumulative={
+                "reducer_compute": float(completed) / 100.0,
+                "reducer_compute_count": float(completed),
+                "source_read": float(completed),
+                "submit_wait": float(completed * 2),
+                "sink_nexus_write": float(completed * 3),
+                "sink_nexus_flush": float(completed * 4),
+                "sink_xye_write": float(completed * 5),
+                "sink_xye_promotion": float(completed),
+                "session_record_upsert": float(completed),
+                "session_frame_listeners": float(completed * 2),
+                "session_progress_listeners": float(completed * 3),
+                "display_projection": float(completed * 4),
+                "finish_wait": 0.0,
+            },
+        )
+        if boundary is not None:
+            boundaries.append(boundary)
+    timing = capture.finish(
+        completed=total,
+        now=total / 10.0,
+        cumulative={
+            "reducer_compute": float(total) / 100.0,
+            "reducer_compute_count": float(total),
+            "source_read": float(total),
+            "submit_wait": float(total * 2),
+            "sink_nexus_write": float(total * 3),
+            "sink_nexus_flush": float(total * 4),
+            "sink_xye_write": float(total * 5),
+            "sink_xye_promotion": float(total),
+            "session_record_upsert": float(total),
+            "session_frame_listeners": float(total * 2),
+            "session_progress_listeners": float(total * 3),
+            "display_projection": float(total * 4),
+            "finish_wait": 7.0,
+        },
+    )
+
+    assert capture.frame_counts == expected_counts
+    assert [boundary.quartile for boundary in boundaries] == [1, 2, 3]
+    assert timing is not None
+    assert timing.frame_counts == expected_counts
+    assert timing.compute_counts == expected_counts
+    details = dict(timing.details)
+    assert details["reducer_compute"] == pytest.approx(
+        tuple(float(count) / 100.0 for count in expected_counts)
+    )
+    assert details["source_read"] == pytest.approx(
+        tuple(float(count) for count in expected_counts)
+    )
+    assert details["xye"] == pytest.approx(
+        tuple(float(count * 6) for count in expected_counts)
+    )
+    assert details["completion_display"] == pytest.approx(
+        tuple(float(count * 10) for count in expected_counts)
+    )
+    assert details["finish_wait"] == pytest.approx((0.0, 0.0, 0.0, 7.0))
+
+
 def test_unmeasured_projection_failure_omits_false_zero_timing(
     caplog,
 ) -> None:

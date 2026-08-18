@@ -25,6 +25,7 @@ from xdart.gui.tabs.scattering.display_values import (
     StandardRunEvent,
     StandardTerminalTiming,
 )
+import xdart.gui.tabs.scattering.display_values as display_values_module
 from xdart.gui.tabs.scattering.events import (
     CleanupStatus, ExecutorAccepted, ExecutorClosed, PreflightAccepted, RunIdentity,
 )
@@ -34,6 +35,7 @@ from xdart.gui.tabs.scattering.display_retirement import (
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 import xdart.gui.tabs.scattering.page as page_module
 from xdart.gui.tabs.scattering.performance_diagnostics import (
+    PerformanceDiagnosticsDialog,
     PerformanceDiagnosticsValues,
 )
 from xdart.gui.tabs.scattering.shell_values import (
@@ -194,6 +196,7 @@ def _paced_frame_events(page, executor, identity, count):
 def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         qapp: QtWidgets.QApplication, monkeypatch) -> None:
     monkeypatch.delenv("XDART_PERF", raising=False)
+    monkeypatch.delenv("XDART_PERF_QUARTILES", raising=False)
     monkeypatch.delenv(
         "XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC", raising=False,
     )
@@ -208,6 +211,13 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         assert "Performance Diagnostics…" in {
             action.text() for action in config.menu().actions()
         }
+        dialog = PerformanceDiagnosticsDialog(page)
+        quartile_checkbox = dialog.findChild(
+            QtWidgets.QCheckBox, "performanceQuartileTelemetry",
+        )
+        assert quartile_checkbox is not None
+        assert quartile_checkbox.text() == "Within-run quartile timing"
+        dialog.deleteLater()
         initial = page._intents.snapshot()
         assert "_post_g2_pipeline_v2" not in initial.thaw().run_options
         assert "XDART_PERF" not in os.environ
@@ -218,6 +228,7 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
                 save_xye=False,
                 durable_fsync=False,
                 staging_frame_cap=64,
+                quartile_telemetry=True,
             )
         )
         page._handle_shell_command(ShellCommand(
@@ -241,6 +252,7 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         }
         assert page._live_plot_interval_ms == 375
         assert os.environ["XDART_PERF"] == "1"
+        assert os.environ["XDART_PERF_QUARTILES"] == "1"
         assert "next run" in page._notice_text.lower()
         assert "crash" in page._notice_text.lower()
 
@@ -272,6 +284,7 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
             PerformanceDiagnosticsValues(
                 1, 8, 8, 56, 375,
                 staging_frame_cap=64,
+                quartile_telemetry=False,
             )
         )
         page._handle_shell_command(ShellCommand(
@@ -283,6 +296,7 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
             "_post_g2_unfunded_staging_diagnostic_v1"
             not in ordinary.thaw().run_options
         )
+        assert "XDART_PERF_QUARTILES" not in os.environ
 
         page._performance_diagnostics_editor = lambda *_args: None
         page._handle_shell_command(ShellCommand(
@@ -338,6 +352,24 @@ def test_terminal_elapsed_and_split_remain_in_run_status(
         qapp: QtWidgets.QApplication) -> None:
     executor = _Executor()
     page, _, identity = _active_page(executor)
+    quartile_type = getattr(
+        display_values_module, "StandardQuartileTiming",
+    )
+    quartiles = quartile_type(
+        (163, 163, 163, 162),
+        (
+            ("wall", (5.0, 5.5, 5.75, 7.164)),
+            ("reducer_compute", (4.0, 4.2, 4.4, 4.6)),
+            ("source_read", (1.0, 1.1, 1.2, 1.95)),
+            ("submit_wait", (2.5, 2.75, 3.0, 4.25)),
+            ("writer_batch", (0.2, 0.3, 0.35, 0.4)),
+            ("writer_flush", (0.1, 0.1, 0.1, 0.2)),
+            ("xye", (0.4, 0.45, 0.5, 0.65)),
+            ("completion_display", (0.15, 0.2, 0.2, 0.2)),
+            ("finish_wait", (0.0, 0.0, 0.0, 3.0)),
+        ),
+        (160, 162, 163, 161),
+    )
     timing = StandardTerminalTiming(
         23.414,
         20.0,
@@ -351,6 +383,7 @@ def test_terminal_elapsed_and_split_remain_in_run_status(
             ("finish_wait", 3.0),
             ("display", 0.75),
         ),
+        quartiles,
     )
     executor.events.append(StandardRunEvent(
         identity,
@@ -359,6 +392,8 @@ def test_terminal_elapsed_and_split_remain_in_run_status(
         total=651,
         terminal_timing=timing,
     ))
+    page._quartile_refresh_identity = identity
+    page._quartile_refresh_seconds = [0.03, 0.04, 0.05, 0.06]
     try:
         page._drain_executor()
         label = _shell(page).run_controls.readinessLabel
@@ -374,7 +409,24 @@ def test_terminal_elapsed_and_split_remain_in_run_status(
             "XYE: 2.00 s\n"
             "Finish/drain (includes terminal seal): 3.00 s\n"
             "Display: 0.75 s\n"
-            "Parallel detail timers may overlap."
+            "Parallel detail timers may overlap.\n"
+            "Within-run quartiles (Q1 → Q4; Q4 includes terminal tail)\n"
+            "Frames: 163 | 163 | 163 | 162\n"
+            "Wall: 5.00 s | 5.50 s | 5.75 s | 7.16 s\n"
+            "Reducer compute: 4.00 s / 160 (25.00 ms/frame) | "
+            "4.20 s / 162 (25.93 ms/frame) | "
+            "4.40 s / 163 (26.99 ms/frame) | "
+            "4.60 s / 161 (28.57 ms/frame)\n"
+            "Source read: 1.00 s | 1.10 s | 1.20 s | 1.95 s\n"
+            "Submit/backpressure: 2.50 s | 2.75 s | 3.00 s | 4.25 s\n"
+            "NeXus write/checkpoint: 0.20 s | 0.30 s | 0.35 s | 0.40 s\n"
+            "Checkpoint flush/fsync: 0.10 s | 0.10 s | 0.10 s | 0.20 s\n"
+            "XYE: 0.40 s | 0.45 s | 0.50 s | 0.65 s\n"
+            "Completion/display: 0.15 s | 0.20 s | 0.20 s | 0.20 s\n"
+            "Finish/drain: 0.00 s | 0.00 s | 0.00 s | 3.00 s\n"
+            "GUI refresh (pre-terminal): 0.03 s | 0.04 s | 0.05 s | 0.06 s\n"
+            "Quartile timers may overlap and do not sum to Wall.\n"
+            "Submit/backpressure is orchestration wait, not pure integration."
         )
         page._refresh_shell()
         assert label.text() == "Complete · 23.41 s"

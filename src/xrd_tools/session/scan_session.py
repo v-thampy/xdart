@@ -506,7 +506,10 @@ class ScanSession:
         self._pending: dict[int, set[ResultMode]] = {}
         self._swept = False
         self._record_store = record_store
-        self._perf_enabled = bool(os.environ.get("XDART_PERF"))
+        self._perf_enabled = (
+            bool(os.environ.get("XDART_PERF"))
+            or os.environ.get("XDART_PERF_QUARTILES", "").strip() == "1"
+        )
         self._perf_values: dict[str, float] = {}
         self._policy = policy
         allocation = self._resolve_resource_envelope(
@@ -1720,6 +1723,9 @@ class ScanSession:
     def perf_snapshot(self) -> dict[str, float]:
         """Return writer-side timings without exposing mutable state."""
         values = dict(self._perf_values)
+        engine_snapshot = getattr(self._session, "perf_snapshot", None)
+        if callable(engine_snapshot):
+            values.update(engine_snapshot())
         snapshot = getattr(self._user_sink, "perf_snapshot", None)
         if callable(snapshot):
             values.update(snapshot())

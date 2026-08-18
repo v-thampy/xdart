@@ -203,6 +203,94 @@ def _assert_durable(case, key, token, target: str):
     ] is token
 
 
+def test_transactional_xye_perf_snapshot_cannot_observe_half_worker_update(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import xrd_tools.reduction.core as reduction_core
+    from xrd_tools.reduction import TransactionalXYESink
+
+    half_update = threading.Event()
+    release_update = threading.Event()
+
+    class InterleavingValues(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            if key == "sink_xye_worker_format" and value > 0.0:
+                half_update.set()
+                assert release_update.wait(2.0)
+
+    sink = TransactionalXYESink(tmp_path / "race-safe-xye")
+    sink._perf_enabled = True
+    sink._perf_values = InterleavingValues({
+        "sink_xye_write": 0.0,
+        "sink_xye_worker_format": 0.0,
+        "sink_xye_enqueue_wait": 0.0,
+        "sink_xye_queue_high_water": 0,
+        "sink_xye_drain": 0.0,
+        "sink_xye_promotion": 0.0,
+        "sink_xye_generated": 0,
+    })
+    monkeypatch.setattr(reduction_core, "write_xye", lambda *_args: None)
+    failures: list[BaseException] = []
+    snapshots: list[dict[str, float]] = []
+
+    def format_stage() -> None:
+        try:
+            values = np.arange(4, dtype=float)
+            sink._format_stage(1, values, values, values, worker=True)
+        except BaseException as error:  # pragma: no cover - thread handoff
+            failures.append(error)
+
+    worker = threading.Thread(target=format_stage)
+    worker.start()
+    assert half_update.wait(2.0)
+    snapshot_worker = threading.Thread(
+        target=lambda: snapshots.append(sink.perf_snapshot())
+    )
+    snapshot_worker.start()
+    snapshot_worker.join(0.1)
+    release_update.set()
+    worker.join(2.0)
+    snapshot_worker.join(2.0)
+
+    assert not failures
+    assert not worker.is_alive()
+    assert not snapshot_worker.is_alive()
+    assert len(snapshots) == 1
+    assert snapshots[0]["sink_xye_worker_format"] == pytest.approx(
+        snapshots[0]["sink_xye_write"]
+    )
+
+
+def test_quartile_env_alone_activates_reducer_nexus_and_xye_counters(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("XDART_PERF", raising=False)
+    monkeypatch.setenv("XDART_PERF_QUARTILES", "1")
+    case = _open_case(
+        tmp_path, "quartile-env-only", frame_count=2, nexus=True,
+    )
+    for label, frame in enumerate(case.session.scan.frames):
+        _key, token = _arm(case.accounting, label)
+        assert case.session.submit(frame, attempt_token=token)
+    assert case.session.finish().failed is False
+
+    snapshot = case.session.perf_snapshot()
+    assert case.xye._perf_enabled is True
+    assert case.nexus._perf_nexus_enabled is True
+    assert {
+        "reducer_compute",
+        "reducer_compute_count",
+        "sink_nexus_write",
+        "sink_nexus_flush",
+        "sink_xye_write",
+        "sink_xye_promotion",
+    } <= set(snapshot)
+    assert snapshot["reducer_compute_count"] == 2.0
+
+
 def _observe_terminal_callbacks(monkeypatch, boundary, events=None):
     """Observe the real boundary callbacks while delegating unchanged."""
     events = [] if events is None else events
