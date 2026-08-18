@@ -348,7 +348,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._run_frame_seen = False
         self._retain_outgoing_display = False
         self._batch_latest_frame: DisplayFrameKey | None = None
-        self._presentation_targets: deque[DisplayFrameKey] = deque(maxlen=3)
+        self._presentation_targets: deque[DisplayFrameKey] = deque(maxlen=1)
         self._presentation_run_identity: RunIdentity | None = None
         self._browser_directory_chooser = (
             browser_directory_chooser
@@ -1510,15 +1510,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         tuple(self._artifact_progress.values()),
                         _directory_file_progress(event),
                     )
-                    changed = True
                     if first_paced_frame:
-                        self._select_presentation_target(
-                            event.run_identity, frame,
+                        changed = (
+                            self._select_presentation_target(
+                                event.run_identity, frame,
+                            )
+                            or changed
                         )
                     elif paced:
                         self._queue_presentation_target(
                             event.run_identity, frame,
                         )
+                    else:
+                        changed = True
                     if not self._active_batch_mode:
                         self._follow_processed_artifact(frame)
                 continue

@@ -207,11 +207,11 @@ def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) ->
         _dispose(page, qapp)
 
 
-def test_single_auto_last_paces_eight_frame_burst_as_1_6_7_8(
+def test_single_auto_last_paces_eight_frame_burst_as_1_8(
         qapp: QtWidgets.QApplication, monkeypatch) -> None:
     executor = _Executor()
     page, _, identity = _active_page(executor)
-    events = _paced_frame_events(page, executor, identity, 8)
+    events = _paced_frame_events(page, executor, identity, 16)
     accepted_follow_latest: list[bool] = []
     accept_navigation = page._context_controller.accept_navigation
 
@@ -232,7 +232,7 @@ def test_single_auto_last_paces_eight_frame_burst_as_1_6_7_8(
 
     monkeypatch.setattr(page, "_refresh_shell", record_paint)
     try:
-        executor.events.extend(events)
+        executor.events.extend(events[:8])
         page._drain_executor()
 
         assert tuple(
@@ -247,12 +247,33 @@ def test_single_auto_last_paces_eight_frame_burst_as_1_6_7_8(
         assert paints == [1]
         assert tuple(
             frame.local_frame_label for frame in page._presentation_targets
-        ) == (6, 7, 8)
+        ) == (8,)
 
         for _ in range(3):
             page._drain_executor()
 
-        assert paints == [1, 6, 7, 8]
+        assert paints == [1, 8]
+        assert tuple(page._presentation_targets) == ()
+
+        executor.events.extend(events[8:])
+        page._drain_executor()
+
+        assert tuple(
+            frame.local_frame_label
+            for frame in page._context_controller.navigation.frames
+        ) == tuple(range(1, 17))
+        assert page._progress.completed == 16
+        assert page._artifact_progress["/out/a.nxs"].published == 16
+        assert accepted_follow_latest == [False] * 16
+        assert paints == [1, 8]
+        assert tuple(
+            frame.local_frame_label for frame in page._presentation_targets
+        ) == (16,)
+
+        for _ in range(3):
+            page._drain_executor()
+
+        assert paints == [1, 8, 16]
         assert tuple(page._presentation_targets) == ()
     finally:
         _dispose(page, qapp)
