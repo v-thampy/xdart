@@ -321,6 +321,70 @@ def test_post_g2_pipeline_four_knob_choice_is_named_bounded_and_nonlive():
         )
 
 
+def test_post_g2_output_diagnostics_are_exact_private_v2_values():
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    pipeline = {
+        "writer_settlement_batch_size": 1,
+        "nexus_record_batch_size": 8,
+        "reduction_inflight": 16,
+        "semantic_checkpoint_frame_cap": 56,
+    }
+    configured = RunIntent(
+        output_mode="Overwrite",
+        run_options={
+            "_post_g2_pipeline_v2": pipeline,
+            "_post_g2_output_diagnostics_v1": {
+                "save_xye": False,
+                "durable_fsync": False,
+            },
+        },
+    ).freeze()
+    choice = dynamic_output._post_g2_output_diagnostics_choice(
+        configured,
+        pipeline_v2=dynamic_output._post_g2_pipeline_v2_choice(
+            configured,
+            coordinated=True,
+        ),
+    )
+    assert choice.save_xye is False
+    assert choice.durable_fsync is False
+    assert choice.explicit is True
+
+    defaults = dynamic_output._post_g2_output_diagnostics_choice(
+        RunIntent().freeze(),
+        pipeline_v2=None,
+    )
+    assert (defaults.save_xye, defaults.durable_fsync) == (True, True)
+    assert defaults.explicit is False
+
+    for value in (
+        {"save_xye": False},
+        {"save_xye": False, "durable_fsync": False, "extra": True},
+        {"save_xye": 0, "durable_fsync": True},
+        {"save_xye": True, "durable_fsync": 1},
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            dynamic_output._post_g2_output_diagnostics_choice(
+                RunIntent(run_options={
+                    "_post_g2_pipeline_v2": pipeline,
+                    "_post_g2_output_diagnostics_v1": value,
+                }).freeze(),
+                pipeline_v2=object(),
+            )
+
+    with pytest.raises(ValueError, match="V2"):
+        dynamic_output._post_g2_output_diagnostics_choice(
+            RunIntent(run_options={
+                "_post_g2_output_diagnostics_v1": {
+                    "save_xye": True,
+                    "durable_fsync": True,
+                },
+            }).freeze(),
+            pipeline_v2=None,
+        )
+
+
 def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(monkeypatch):
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 

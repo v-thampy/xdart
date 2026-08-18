@@ -464,9 +464,14 @@ def _descriptor_content_receipt(
     descriptor: int,
     path: Path,
     role: str,
+    *,
+    durable_fsync: bool = True,
 ) -> _ObjectReceipt:
-    """Fsync and hash the exact descriptor before publishing its authority."""
-    os.fsync(descriptor)
+    """Hash the exact descriptor, optionally forcing crash durability first."""
+    if type(durable_fsync) is not bool:
+        raise TypeError("durable_fsync must be an exact bool")
+    if durable_fsync:
+        os.fsync(descriptor)
     before = os.fstat(descriptor)
     offset = os.lseek(descriptor, 0, os.SEEK_CUR)
     os.lseek(descriptor, 0, os.SEEK_SET)
@@ -521,13 +526,16 @@ def _descriptor_stream_stat_receipt(
     ordinal: int,
     role: str,
     expected_stat: tuple[int, int, int, int, int] | None = None,
+    durable_fsync: bool = True,
 ) -> _StreamStatReceipt:
-    """Seal bounded evidence to the exact post-fsync descriptor identity.
+    """Seal bounded evidence to the exact descriptor identity.
 
     This helper intentionally performs no content read.  The caller owns the
     semantic expected-vs-readback comparison and passes the descriptor of the
     still-open canonical HDF5 owner.
     """
+    if type(durable_fsync) is not bool:
+        raise TypeError("durable_fsync must be an exact bool")
     digest = _require_evidence_digest(evidence_digest)
     byte_count = int(evidence_bytes)
     if byte_count < 0:
@@ -537,7 +545,8 @@ def _descriptor_stream_stat_receipt(
         raise TargetChanged(
             f"{role} descriptor changed after semantic verification: {path}"
         )
-    os.fsync(descriptor)
+    if durable_fsync:
+        os.fsync(descriptor)
     first = os.fstat(descriptor)
     try:
         named = os.stat(path)
@@ -551,7 +560,7 @@ def _descriptor_stream_stat_receipt(
     }
     if len(identities) != 1:
         raise TargetChanged(
-            f"{role} descriptor/path identity changed after fsync: {path}"
+            f"{role} descriptor/path identity changed during seal: {path}"
         )
     return _StreamStatReceipt(
         _normalize_target(path),
@@ -616,12 +625,15 @@ class OutputTransactionCoordinator:
         *,
         transaction_owner: OwnerToken,
         target_owner: OwnerToken,
+        durable_fsync: bool = True,
     ) -> "OutputTransaction":
         """Bind one exact transaction and target owner to a stable snapshot."""
         if not isinstance(transaction_owner, OwnerToken):
             raise TypeError("transaction_owner must be an OwnerToken")
         if not isinstance(target_owner, OwnerToken):
             raise TypeError("target_owner must be an OwnerToken")
+        if type(durable_fsync) is not bool:
+            raise TypeError("durable_fsync must be an exact bool")
         normalized = _normalize_target(target)
         admission = TargetAdmission(
             normalized,
@@ -633,6 +645,7 @@ class OutputTransactionCoordinator:
             admission=admission,
             transaction_owner=transaction_owner,
             target_owner=target_owner,
+            durable_fsync=durable_fsync,
         )
 
     def prepare_xye(
@@ -729,11 +742,15 @@ class OutputTransaction:
         admission: TargetAdmission,
         transaction_owner: OwnerToken,
         target_owner: OwnerToken,
+        durable_fsync: bool = True,
     ):
+        if type(durable_fsync) is not bool:
+            raise TypeError("durable_fsync must be an exact bool")
         self._coordinator = coordinator
         self._admission = admission
         self._transaction_owner = transaction_owner
         self._target_owner = target_owner
+        self._durable_fsync = durable_fsync
         self._lease: TargetLease | None = None
         self._phase = TransactionPhase.ADMITTED
         self._pending: set[RetryAction] = set()
@@ -2081,6 +2098,7 @@ class OutputTransaction:
                     source_descriptor,
                     self.backup,
                     "stream-seed-source",
+                    durable_fsync=self._durable_fsync,
                 )
                 if source_before.snapshot != self.stream_base_snapshot:
                     raise TargetChanged(
@@ -2099,6 +2117,7 @@ class OutputTransaction:
                     source_descriptor,
                     self.backup,
                     "stream-seed-source",
+                    durable_fsync=self._durable_fsync,
                 )
                 if source_after != source_before:
                     raise TargetChanged("staged prior changed while seeding stream")
@@ -2106,6 +2125,7 @@ class OutputTransaction:
                 destination,
                 target,
                 "stream-seed",
+                durable_fsync=self._durable_fsync,
             )
             checkpoint = _descriptor_stream_stat_receipt(
                 destination,
@@ -2114,6 +2134,7 @@ class OutputTransaction:
                 evidence_bytes=int(receipt.snapshot.size or 0),
                 ordinal=self._coordinator._next_ordinal(),
                 role="stream-seed",
+                durable_fsync=self._durable_fsync,
             )
         finally:
             if source_descriptor is not None:
@@ -2262,7 +2283,7 @@ class OutputTransaction:
                 ):
                     self._phase = TransactionPhase.INTEGRITY_HOLD
                     raise TargetChanged(
-                        "stream checkpoint failed post-fsync identity verification"
+                        "stream checkpoint failed identity verification"
                     )
                 self._stream_checkpoint_fresh = False
                 self._stream_terminal_receipt = None
@@ -2291,6 +2312,7 @@ class OutputTransaction:
                     evidence_bytes=evidence_bytes,
                     ordinal=self._coordinator._next_ordinal(),
                     role="stream-checkpoint",
+                    durable_fsync=self._durable_fsync,
                 )
             except (OSError, TransactionStateError, TargetChanged) as exc:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
@@ -2416,6 +2438,7 @@ class OutputTransaction:
                         ordinal=self._coordinator._next_ordinal(),
                         role="stream-close",
                         expected_stat=expected_stat,
+                        durable_fsync=self._durable_fsync,
                     )
                 except TargetChanged:
                     self._phase = TransactionPhase.INTEGRITY_HOLD
@@ -2518,6 +2541,7 @@ class OutputTransaction:
                     descriptor,
                     Path(self._admission.target),
                     "stream-terminal",
+                    durable_fsync=self._durable_fsync,
                 )
                 terminal_stat = _descriptor_stream_stat_receipt(
                     descriptor,
@@ -2526,6 +2550,7 @@ class OutputTransaction:
                     evidence_bytes=int(receipt.snapshot.size or 0),
                     ordinal=self._coordinator._next_ordinal(),
                     role="stream-terminal",
+                    durable_fsync=self._durable_fsync,
                 )
             except (OSError, TransactionStateError, TargetChanged) as exc:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
@@ -2884,6 +2909,7 @@ class OutputTransaction:
                             descriptor,
                             Path(self._admission.target),
                             "durable-floor-preserved",
+                            durable_fsync=self._durable_fsync,
                         )
                     finally:
                         os.close(descriptor)

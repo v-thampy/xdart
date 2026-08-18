@@ -1312,6 +1312,7 @@ class NexusSink:
     same_run_intent: AppendIntent | None = None
     allow_unbound_same_run: bool = False
     incremental_finalization: bool = False
+    durable_fsync: bool = True
     _writer: NexusRecordWriter | None = field(default=None, init=False, repr=False)
     _transaction: Any | None = field(default=None, init=False, repr=False)
     _lease: Any | None = field(default=None, init=False, repr=False)
@@ -1394,6 +1395,8 @@ class NexusSink:
         sink = cls(path, **sink_values)
         if sink.overwrite:
             raise ValueError("existing Append cannot overwrite its target")
+        if not sink.durable_fsync:
+            raise ValueError("diagnostic no-fsync is unavailable for Append")
         sink._existing_append_intent = intent
         sink._existing_append_prefix = committed_prefix
         sink._existing_append_pending = True
@@ -1428,6 +1431,12 @@ class NexusSink:
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
             self.path = Path(self.path)
+        if type(self.durable_fsync) is not bool:
+            raise TypeError("Nexus durable_fsync must be an exact bool")
+        if not self.durable_fsync and self.append_preflight is not None:
+            raise ValueError(
+                "diagnostic no-fsync is unavailable for Append"
+            )
         if self.overwrite and self.append_preflight is not None:
             raise ValueError("Overwrite cannot consume an Append preflight")
         if self.same_run_intent is not None and self.append_preflight is not None:
@@ -1620,6 +1629,7 @@ class NexusSink:
                 self.path,
                 transaction_owner=transaction_owner,
                 target_owner=target_owner,
+                durable_fsync=self.durable_fsync,
             )
             lease = transaction.acquire_lease(
                 admission=transaction.admission,

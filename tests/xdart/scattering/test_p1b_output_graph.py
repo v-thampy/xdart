@@ -2107,6 +2107,85 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
         executor.close(identity)
 
 
+def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.io import output_transaction
+
+    raw = tmp_path / "diagnostics_0001.tif"
+    target = tmp_path / "diagnostics.nexus"
+    poni = tmp_path / "diagnostics.poni"
+    _write_tiff(raw, 7)
+    write_poni(poni)
+    intent = _intent(raw, target, poni)
+    intent.max_cores = 4
+    intent.run_options["_post_g2_pipeline_v2"] = {
+        "writer_settlement_batch_size": 1,
+        "nexus_record_batch_size": 8,
+        "reduction_inflight": 16,
+        "semantic_checkpoint_frame_cap": 56,
+    }
+    intent.run_options["_post_g2_output_diagnostics_v1"] = {
+        "save_xye": False,
+        "durable_fsync": False,
+    }
+    resolve = dynamic_output.resolve_session_policy
+    open_session = dynamic_output.open_headless_scan_session
+    observed = []
+
+    def fixed_envelope(requirements, **kwargs):
+        kwargs["envelope_bytes"] = 64 * 1024 ** 3
+        return resolve(requirements, **kwargs)
+
+    def capture_session(*args, **kwargs):
+        sink = kwargs["sink"]
+        children = getattr(sink, "output_sink_children", (sink,))
+        (nexus,) = tuple(children)
+        session = open_session(*args, **kwargs)
+        observed.append((
+            tuple(type(child).__name__ for child in children),
+            nexus.durable_fsync,
+            nexus,
+        ))
+        return session
+
+    fsync_calls = []
+    monkeypatch.setattr(
+        dynamic_output, "resolve_session_policy", fixed_envelope,
+    )
+    monkeypatch.setattr(
+        dynamic_output, "open_headless_scan_session", capture_session,
+    )
+    monkeypatch.setattr(output_transaction.os, "fsync", fsync_calls.append)
+    caplog.set_level(logging.INFO, logger=dynamic_output.__name__)
+    executor, identity, events = _run_to_terminal(
+        intent, request_value=1711,
+    )
+    try:
+        terminal = next(event for event in events if event.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+        assert _nexus_rows(target) == (1,)
+        assert tuple(tmp_path.rglob("*.xye")) == ()
+        assert len(observed) == 1
+        child_names, durable_fsync, nexus = observed[0]
+        assert child_names == ("NexusSink",)
+        assert durable_fsync is False
+        assert nexus._transaction._durable_fsync is False
+        assert fsync_calls == []
+        assert [
+            record.getMessage() for record in caplog.records
+            if record.getMessage().startswith("[RUN-OUTPUT-DIAGNOSTICS]")
+        ] == [
+            "[RUN-OUTPUT-DIAGNOSTICS] save-xye=off durable-fsync=off "
+            "durability=UNSAFE_SIMULATED"
+        ]
+    finally:
+        executor.close(identity)
+
+
 def test_p1b_b18_headless_and_single_owner_census(tmp_path: Path) -> None:
     """B18: exact Scan identity survives one Qt-free public facade."""
 

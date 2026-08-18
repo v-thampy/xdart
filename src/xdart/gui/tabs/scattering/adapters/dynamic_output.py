@@ -77,6 +77,9 @@ _POST_G2_PIPELINE_V2_FIELDS = frozenset({
     "writer_settlement_batch_size", "nexus_record_batch_size",
     "reduction_inflight", "semantic_checkpoint_frame_cap",
 })
+_POST_G2_OUTPUT_DIAGNOSTICS_FIELDS = frozenset({
+    "save_xye", "durable_fsync",
+})
 logger = logging.getLogger(__name__)
 
 
@@ -117,6 +120,13 @@ class _PostG2PipelineV2Choice:
         return self.nexus_record_batch_size > 1
 
 
+@dataclass(frozen=True, slots=True)
+class _PostG2OutputDiagnosticsChoice:
+    save_xye: bool = True
+    durable_fsync: bool = True
+    explicit: bool = False
+
+
 def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
     legacy = configuration.run_options.get("_post_g2_pipeline", _MISSING)
     value = configuration.run_options.get("_post_g2_pipeline_v2", _MISSING)
@@ -151,6 +161,36 @@ def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
     if configuration.processing_mode == "Int 1D (XYE)":
         raise ValueError("post-G2 pipeline V2 requires Nexus output")
     return _PostG2PipelineV2Choice(*row)
+
+
+def _post_g2_output_diagnostics_choice(configuration, *, pipeline_v2):
+    value = configuration.run_options.get(
+        "_post_g2_output_diagnostics_v1",
+        _MISSING,
+    )
+    if value is _MISSING:
+        return _PostG2OutputDiagnosticsChoice()
+    if pipeline_v2 is None:
+        raise ValueError("post-G2 output diagnostics require pipeline V2")
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            "post-G2 output diagnostics must be one exact mapping"
+        )
+    if set(value) != _POST_G2_OUTPUT_DIAGNOSTICS_FIELDS:
+        raise ValueError(
+            "post-G2 output diagnostics have an invalid exact keyset"
+        )
+    save_xye = value["save_xye"]
+    durable_fsync = value["durable_fsync"]
+    if type(save_xye) is not bool or type(durable_fsync) is not bool:
+        raise TypeError(
+            "post-G2 output diagnostics values must be exact booleans"
+        )
+    return _PostG2OutputDiagnosticsChoice(
+        save_xye,
+        durable_fsync,
+        True,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -774,6 +814,10 @@ class DynamicOutputAdapter:
                 self.configuration, coordinated=pipeline_coordinated,
             ) if pipeline_v2 is None else None
         )
+        output_diagnostics = _post_g2_output_diagnostics_choice(
+            self.configuration,
+            pipeline_v2=pipeline_v2,
+        )
         science_identity = science_fingerprint(_science_projection(
             self.configuration,
             run_provenance.get("scientific_signature"),
@@ -959,7 +1003,7 @@ class DynamicOutputAdapter:
                 max(1, self.configuration.max_cores)
                 if policy is None else policy.allocation.reduction_inflight
             )
-            if integration_1d is not None:
+            if integration_1d is not None and output_diagnostics.save_xye:
                 xye = TransactionalXYESink(
                     target.parent / str(scan.name),
                     prefix=xye_prefix_for_unit(integration_1d.unit),
@@ -978,6 +1022,7 @@ class DynamicOutputAdapter:
                     source_snapshots_provenance=(
                         _writer_source_snapshots(item)
                     ),
+                    durable_fsync=output_diagnostics.durable_fsync,
                 )
                 if self.configuration.output_mode == "Append":
                     nexus = NexusSink(
@@ -1153,6 +1198,18 @@ class DynamicOutputAdapter:
                     pipeline_v2.semantic_checkpoint_frame_cap,
                     session._dynamic_nexus_checkpoint_threshold,
                     self.configuration.max_cores, policy.allocation.workers,
+                )
+            if output_diagnostics.explicit:
+                logger.info(
+                    "[RUN-OUTPUT-DIAGNOSTICS] save-xye=%s "
+                    "durable-fsync=%s durability=%s",
+                    "on" if output_diagnostics.save_xye else "off",
+                    "on" if output_diagnostics.durable_fsync else "off",
+                    (
+                        "DURABLE"
+                        if output_diagnostics.durable_fsync
+                        else "UNSAFE_SIMULATED"
+                    ),
                 )
             elif pipeline is not None:
                 logger.info(

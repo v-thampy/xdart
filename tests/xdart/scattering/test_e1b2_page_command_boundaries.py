@@ -210,7 +210,11 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         assert "XDART_PERF" not in os.environ
 
         page._performance_diagnostics_editor = lambda *_args: (
-            PerformanceDiagnosticsValues(1, 8, 16, 56, 375)
+            PerformanceDiagnosticsValues(
+                1, 8, 16, 56, 375,
+                save_xye=False,
+                durable_fsync=False,
+            )
         )
         page._handle_shell_command(ShellCommand(
             ShellCommandKind.MENU, "Config:Performance Diagnostics…",
@@ -224,9 +228,16 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
             "reduction_inflight": 16,
             "semantic_checkpoint_frame_cap": 56,
         }
+        assert applied.thaw().run_options[
+            "_post_g2_output_diagnostics_v1"
+        ] == {
+            "save_xye": False,
+            "durable_fsync": False,
+        }
         assert page._live_plot_interval_ms == 375
         assert os.environ["XDART_PERF"] == "1"
         assert "next run" in page._notice_text.lower()
+        assert "crash" in page._notice_text.lower()
 
         page._performance_diagnostics_editor = lambda *_args: None
         page._handle_shell_command(ShellCommand(

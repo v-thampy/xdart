@@ -63,6 +63,58 @@ def _prepared(tmp_path: Path, *, prior: bytes | None = b"prior"):
     )
 
 
+@pytest.mark.parametrize(
+    ("durable_fsync", "expected_calls"),
+    ((True, 2), (False, 0)),
+    ids=("durable", "diagnostic-no-fsync"),
+)
+def test_descriptor_receipts_can_skip_only_diagnostic_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_fsync: bool,
+    expected_calls: int,
+) -> None:
+    api = _api()
+    target = tmp_path / "diagnostic.nexus"
+    target.write_bytes(b"semantic-content")
+    descriptor = os.open(target, os.O_RDONLY)
+    calls: list[int] = []
+    monkeypatch.setattr(api.os, "fsync", calls.append)
+    try:
+        content = api._descriptor_content_receipt(
+            descriptor,
+            target,
+            "diagnostic-content",
+            durable_fsync=durable_fsync,
+        )
+        stream = api._descriptor_stream_stat_receipt(
+            descriptor,
+            target,
+            evidence_digest=content.snapshot.digest,
+            evidence_bytes=content.snapshot.size,
+            ordinal=1,
+            role="diagnostic-stream",
+            durable_fsync=durable_fsync,
+        )
+    finally:
+        os.close(descriptor)
+    assert len(calls) == expected_calls
+    assert content.snapshot.digest == hashlib.sha256(
+        b"semantic-content"
+    ).hexdigest()
+    assert stream.evidence_digest == content.snapshot.digest
+    assert stream.evidence_bytes == len(b"semantic-content")
+
+    coordinator = api.OutputTransactionCoordinator()
+    transaction = coordinator.admit(
+        tmp_path / "owned.nexus",
+        transaction_owner=api.OwnerToken("transaction"),
+        target_owner=api.OwnerToken("target"),
+        durable_fsync=durable_fsync,
+    )
+    assert transaction._durable_fsync is durable_fsync
+
+
 class _Pool:
     def __init__(self, *, fail_pause: int = 0, fail_resume: int = 0):
         self.fail_pause = fail_pause

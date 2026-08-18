@@ -2530,6 +2530,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         candidate.run_options["_post_g2_pipeline_v2"] = (
             values.pipeline_mapping()
         )
+        candidate.run_options["_post_g2_output_diagnostics_v1"] = (
+            values.output_diagnostics_mapping()
+        )
         try:
             result = self._intents.commit(
                 candidate, expected_revision=snapshot.revision,
@@ -2546,10 +2549,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._live_plot_interval_ms = values.plot_interval_ms
         self._last_live_plot_at = None
         os.environ["XDART_PERF"] = "1"
-        self._notice(
-            "Performance diagnostics applied: pipeline values take effect "
-            "on the next run; plot cadence is active now."
+        notice = (
+            "Performance diagnostics applied: pipeline and output values "
+            "take effect on the next run; plot cadence is active now."
         )
+        if not values.durable_fsync:
+            notice += (
+                " Diagnostic fsync is off: crash or power-loss persistence "
+                "is not guaranteed."
+            )
+        self._notice(notice)
         self._refresh_shell()
 
     def _edit_advanced_settings(self) -> None:
