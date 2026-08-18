@@ -32,6 +32,7 @@ from ..display_values import (
     StandardDisplayPayload,
     StandardEventKind,
     StandardRunEvent,
+    StandardTerminalTiming,
 )
 from ..display_runtime import (
     DisplayArtifact,
@@ -2285,7 +2286,7 @@ class StandardRunExecutor:
         completed: int,
         total: int,
         *,
-        elapsed: float = 0.0,
+        elapsed: float | None = None,
         work_elapsed: float = 0.0,
         cleanup_elapsed: float = 0.0,
         core_count: int = 0,
@@ -2317,6 +2318,37 @@ class StandardRunExecutor:
             if run.display.payloads
             else "Standard"
         )
+        perf: dict[str, float] = {}
+        if run.perf_enabled:
+            with run.perf_lock:
+                perf = dict(run.perf_values)
+        timing_details: list[tuple[str, float]] = []
+        for name, key in (
+            ("source_read", "source_read"),
+            ("submit_wait", "submit_wait"),
+            ("writer_batch", "sink_nexus_write"),
+            ("writer_flush", "sink_nexus_flush"),
+            ("xye", "sink_xye_write"),
+            ("finish_wait", "finish_wait"),
+        ):
+            if key in perf:
+                timing_details.append((name, float(perf[key])))
+        display_keys = ("display_callback", "display_projection")
+        if any(key in perf for key in display_keys):
+            timing_details.append((
+                "display",
+                float(sum(perf.get(key, 0.0) for key in display_keys)),
+            ))
+        timing = (
+            None
+            if elapsed is None
+            else StandardTerminalTiming(
+                float(elapsed),
+                float(work_elapsed),
+                float(cleanup_elapsed),
+                tuple(timing_details),
+            )
+        )
         self._events.put(StandardRunEvent(
             run.identity,
             kind,
@@ -2330,33 +2362,49 @@ class StandardRunExecutor:
             artifacts=tuple(str(item) for item in run.artifacts),
             artifact_completed=run.current_completed,
             artifact_total=run.current_total,
+            terminal_timing=timing,
             **_directory_event_fields(
                 run,
                 in_flight_processed=_terminal_in_flight_files(run),
             ),
         ))
-        throughput = completed / elapsed if completed and elapsed > 0.0 else 0.0
-        logger.info("Total Frames Processed: %d", completed)
-        logger.info("Total Time: %.2fs", elapsed)
-        logger.info(
-            "[PERF-SUMMARY] outcome=%s frames=%d/%d cores=%s | "
-            "total=%.2fs work=%.2fs cleanup=%.2fs | "
-            "throughput=%.1f frames/s | output=%s",
-            kind.value,
-            completed,
-            total,
-            core_count if core_count > 0 else "unknown",
-            elapsed,
-            work_elapsed,
-            cleanup_elapsed,
-            throughput,
-            run.artifact,
+        measured_elapsed = 0.0 if elapsed is None else elapsed
+        throughput = (
+            completed / measured_elapsed
+            if completed and measured_elapsed > 0.0
+            else 0.0
         )
+        logger.info("Total Frames Processed: %d", completed)
+        if elapsed is None:
+            logger.info("Total Time: unavailable")
+            logger.info(
+                "[PERF-SUMMARY] outcome=%s frames=%d/%d cores=%s | "
+                "total=unavailable | output=%s",
+                kind.value,
+                completed,
+                total,
+                core_count if core_count > 0 else "unknown",
+                run.artifact,
+            )
+        else:
+            logger.info("Total Time: %.2fs", measured_elapsed)
+            logger.info(
+                "[PERF-SUMMARY] outcome=%s frames=%d/%d cores=%s | "
+                "total=%.2fs work=%.2fs cleanup=%.2fs | "
+                "throughput=%.1f frames/s | output=%s",
+                kind.value,
+                completed,
+                total,
+                core_count if core_count > 0 else "unknown",
+                measured_elapsed,
+                work_elapsed,
+                cleanup_elapsed,
+                throughput,
+                run.artifact,
+            )
         for fact in run.resource_facts:
             logger.info("%s", fact.log_line("[PERF-RESOURCES]"))
         if run.perf_enabled:
-            with run.perf_lock:
-                perf = dict(run.perf_values)
             logger.info(
                 "[PERF-DETAIL] source-read=%.2fs submit/backpressure=%.2fs "
                 "finish/drain=%.2fs display-callback=%.2fs "
@@ -2369,10 +2417,13 @@ class StandardRunExecutor:
                 perf.get("display_projection", 0.0),
             )
             logger.info(
-                "[PERF-WRITER] nexus-integrated=%.2fs named-modes=%.2fs "
+                "[PERF-WRITER] nexus-write=%.2fs nexus-flush=%.2fs "
+                "nexus-integrated=%.2fs named-modes=%.2fs "
                 "frame-record=%.2fs h5-flush=%.2fs xye=%.2fs | "
                 "record-upsert=%.2fs completion-listeners=%.2fs "
                 "progress-listeners=%.2fs",
+                perf.get("sink_nexus_write", 0.0),
+                perf.get("sink_nexus_flush", 0.0),
                 perf.get("sink_nexus_integrated", 0.0),
                 perf.get("sink_nexus_named_modes", 0.0),
                 perf.get("sink_nexus_frame_record", 0.0),

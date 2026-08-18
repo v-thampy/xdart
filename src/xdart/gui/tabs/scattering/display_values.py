@@ -84,6 +84,53 @@ class DisplayNavigationDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class StandardTerminalTiming:
+    """Executor-clock terminal duration plus available measured components."""
+
+    elapsed_seconds: float
+    work_seconds: float
+    cleanup_seconds: float
+    details: tuple[tuple[str, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        details = self.details
+        durations = (
+            self.elapsed_seconds,
+            self.work_seconds,
+            self.cleanup_seconds,
+        )
+        valid_details = (
+            type(details) is tuple
+            and all(
+                type(item) is tuple
+                and len(item) == 2
+                and type(item[0]) is str
+                and bool(item[0])
+                and type(item[1]) is float
+                and np.isfinite(item[1])
+                and item[1] >= 0.0
+                for item in details
+            )
+        )
+        names = (
+            tuple(item[0] for item in details)
+            if valid_details
+            else ()
+        )
+        if (
+            any(
+                type(value) is not float
+                or not np.isfinite(value)
+                or value < 0.0
+                for value in durations
+            )
+            or not valid_details
+            or len(set(names)) != len(names)
+        ):
+            raise TypeError("terminal timing is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class StandardRunEvent:
     run_identity: RunIdentity
     kind: StandardEventKind
@@ -104,6 +151,7 @@ class StandardRunEvent:
     files_skipped: int = 0
     files_pending: int = 0
     files_discovered: int = 0
+    terminal_timing: StandardTerminalTiming | None = None
 
 @dataclass(frozen=True, slots=True)
 class StandardDisplayPayload:
@@ -153,7 +201,16 @@ def standard_event_is_valid(value: object, identity: RunIdentity) -> bool:
                 and value.files_processed
                 + value.files_skipped
                 + value.files_pending
-                == value.files_discovered)
+                == value.files_discovered
+                and (
+                    value.terminal_timing is None
+                    or type(value.terminal_timing) is StandardTerminalTiming
+                    and value.kind in {
+                        StandardEventKind.FINISHED,
+                        StandardEventKind.STOPPED,
+                        StandardEventKind.FAILED,
+                    }
+                ))
     except Exception:
         return False
 

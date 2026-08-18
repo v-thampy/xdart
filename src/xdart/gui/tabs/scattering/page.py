@@ -118,6 +118,11 @@ from .shell_widgets import (
     project_header_projection,
 )
 from .source_view import SourceStatusView
+from .performance_diagnostics import (
+    PerformanceDiagnosticsDialog,
+    PerformanceDiagnosticsValues,
+    performance_diagnostics_error,
+)
 from .start_outcomes import (
     RecoveryFailure,
     StartCapture,
@@ -384,6 +389,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             advanced_settings_editor
             if advanced_settings_editor is not None
             else self._show_advanced_settings_dialog
+        )
+        self._performance_diagnostics_dialog: (
+            PerformanceDiagnosticsDialog | None
+        ) = None
+        self._performance_diagnostics_editor = (
+            self._show_performance_diagnostics_dialog
         )
         initial_intent = intents.snapshot().thaw()
         self._source_mode = source_mode(initial_intent.source_spec)
@@ -753,6 +764,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._stop_run()
             return
         if kind is ShellCommandKind.MENU:
+            if command.value == "Config:Performance Diagnostics…":
+                self._edit_performance_diagnostics()
+                return
             prefix = "Config:Heavy residency:"
             if str(command.value).startswith(prefix):
                 label = str(command.value)[len(prefix):]
@@ -1617,13 +1631,27 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._lifecycle.phase is RunPhase.STOPPING
         )
         self._record_artifact_progress(event)
+        timing = event.terminal_timing
+        terminal_state = (
+            "Failed"
+            if event.kind is StandardEventKind.FAILED
+            else "Stopped"
+            if event.kind is StandardEventKind.STOPPED
+            else "Complete"
+        )
+        terminal_detail = (
+            f"{terminal_state} · {timing.elapsed_seconds:.2f} s"
+            if timing is not None
+            else event.detail
+        )
         self._progress = ProgressProjection(
             event.completed,
             event.total,
-            event.detail,
+            terminal_detail,
             tuple(self._artifact_progress.values()),
             _directory_file_progress(event),
             terminal=True,
+            terminal_timing=timing,
         )
         failed = event.kind is StandardEventKind.FAILED
         if failed or event.cleanup_status is not CleanupStatus.CLEANED:
@@ -2469,6 +2497,60 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             dialog = AdvancedSettingsDialog(self)
             self._advanced_dialog = dialog
         return dialog.edit(snapshot)
+
+    def _show_performance_diagnostics_dialog(
+        self,
+        snapshot: RunIntentSnapshot,
+        plot_interval_ms: int,
+    ) -> PerformanceDiagnosticsValues | None:
+        dialog = self._performance_diagnostics_dialog
+        if dialog is None:
+            dialog = PerformanceDiagnosticsDialog(self)
+            self._performance_diagnostics_dialog = dialog
+        return dialog.edit(snapshot, plot_interval_ms)
+
+    def _edit_performance_diagnostics(self) -> None:
+        snapshot = self._intents.snapshot()
+        try:
+            values = self._performance_diagnostics_editor(
+                snapshot, self._live_plot_interval_ms,
+            )
+        except Exception as error:
+            self._error_notice("Performance diagnostics failed", error)
+            return
+        if values is None:
+            return
+        error = performance_diagnostics_error(values)
+        if error:
+            self._notice(error)
+            self._refresh_shell()
+            return
+        candidate = snapshot.thaw()
+        candidate.run_options.pop("_post_g2_pipeline", None)
+        candidate.run_options["_post_g2_pipeline_v2"] = (
+            values.pipeline_mapping()
+        )
+        try:
+            result = self._intents.commit(
+                candidate, expected_revision=snapshot.revision,
+            )
+        except Exception as error:
+            self._error_notice("Performance diagnostics commit failed", error)
+            return
+        if isinstance(result, IntentRecaptureRequired):
+            self._notice(
+                "Performance diagnostics edit was superseded; review current values."
+            )
+            self._refresh_shell()
+            return
+        self._live_plot_interval_ms = values.plot_interval_ms
+        self._last_live_plot_at = None
+        os.environ["XDART_PERF"] = "1"
+        self._notice(
+            "Performance diagnostics applied: pipeline values take effect "
+            "on the next run; plot cadence is active now."
+        )
+        self._refresh_shell()
 
     def _edit_advanced_settings(self) -> None:
         if self._closing or self._closed:

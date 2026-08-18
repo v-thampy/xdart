@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ from xdart.gui.tabs.scattering.display_values import (
     StandardDisplayPayload,
     StandardEventKind,
     StandardRunEvent,
+    StandardTerminalTiming,
 )
 from xdart.gui.tabs.scattering.events import (
     CleanupStatus, ExecutorAccepted, ExecutorClosed, PreflightAccepted, RunIdentity,
@@ -31,6 +33,9 @@ from xdart.gui.tabs.scattering.display_retirement import (
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 import xdart.gui.tabs.scattering.page as page_module
+from xdart.gui.tabs.scattering.performance_diagnostics import (
+    PerformanceDiagnosticsValues,
+)
 from xdart.gui.tabs.scattering.shell_values import (
     FrameNavigationProjection,
     ShellCommand,
@@ -184,6 +189,128 @@ def _paced_frame_events(page, executor, identity, count):
         )
         for index, delta in enumerate(deltas, start=1)
     )
+
+
+def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    monkeypatch.delenv("XDART_PERF", raising=False)
+    executor = _Executor()
+    page, _, _ = _active_page(executor)
+    shell = _shell(page)
+    try:
+        config = shell.browser.findChild(
+            QtWidgets.QToolButton, "configMenuButton",
+        )
+        assert config is not None
+        assert "Performance Diagnostics…" in {
+            action.text() for action in config.menu().actions()
+        }
+        initial = page._intents.snapshot()
+        assert "_post_g2_pipeline_v2" not in initial.thaw().run_options
+        assert "XDART_PERF" not in os.environ
+
+        page._performance_diagnostics_editor = lambda *_args: (
+            PerformanceDiagnosticsValues(1, 8, 16, 56, 375)
+        )
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU, "Config:Performance Diagnostics…",
+        ))
+
+        applied = page._intents.snapshot()
+        assert applied.revision == initial.revision + 1
+        assert applied.thaw().run_options["_post_g2_pipeline_v2"] == {
+            "writer_settlement_batch_size": 1,
+            "nexus_record_batch_size": 8,
+            "reduction_inflight": 16,
+            "semantic_checkpoint_frame_cap": 56,
+        }
+        assert page._live_plot_interval_ms == 375
+        assert os.environ["XDART_PERF"] == "1"
+        assert "next run" in page._notice_text.lower()
+
+        page._performance_diagnostics_editor = lambda *_args: None
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU, "Config:Performance Diagnostics…",
+        ))
+        assert page._intents.snapshot().revision == applied.revision
+        assert page._live_plot_interval_ms == 375
+    finally:
+        _dispose(page, qapp)
+
+
+def test_performance_diagnostics_reject_invalid_coupled_values(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    monkeypatch.delenv("XDART_PERF", raising=False)
+    page, _, _ = _active_page(_Executor())
+    initial = page._intents.snapshot()
+    try:
+        page._performance_diagnostics_editor = lambda *_args: None
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU, "Config:Performance Diagnostics…",
+        ))
+        assert page._intents.snapshot().revision == initial.revision
+        assert "XDART_PERF" not in os.environ
+
+        page._performance_diagnostics_editor = lambda *_args: (
+            PerformanceDiagnosticsValues(5, 8, 4, 56, 125)
+        )
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU, "Config:Performance Diagnostics…",
+        ))
+        assert page._intents.snapshot().revision == initial.revision
+        assert "batching bounds" in page._notice_text.lower()
+        assert page._live_plot_interval_ms == 125
+        assert "XDART_PERF" not in os.environ
+    finally:
+        _dispose(page, qapp)
+
+
+def test_terminal_elapsed_and_split_remain_in_run_status(
+        qapp: QtWidgets.QApplication) -> None:
+    executor = _Executor()
+    page, _, identity = _active_page(executor)
+    timing = StandardTerminalTiming(
+        23.414,
+        20.0,
+        3.414,
+        (
+            ("source_read", 5.25),
+            ("submit_wait", 12.5),
+            ("writer_batch", 1.25),
+            ("writer_flush", 0.5),
+            ("xye", 2.0),
+            ("finish_wait", 3.0),
+            ("display", 0.75),
+        ),
+    )
+    executor.events.append(StandardRunEvent(
+        identity,
+        StandardEventKind.FINISHED,
+        completed=651,
+        total=651,
+        terminal_timing=timing,
+    ))
+    try:
+        page._drain_executor()
+        label = _shell(page).run_controls.readinessLabel
+        assert label.text() == "Complete · 23.41 s"
+        assert label.toolTip() == (
+            "Total: 23.41 s\n"
+            "Work: 20.00 s\n"
+            "Cleanup: 3.41 s\n"
+            "Source read: 5.25 s\n"
+            "Submit/backpressure: 12.50 s\n"
+            "NeXus write/checkpoint: 1.25 s\n"
+            "Checkpoint flush/fsync: 0.50 s\n"
+            "XYE: 2.00 s\n"
+            "Finish/drain (includes terminal seal): 3.00 s\n"
+            "Display: 0.75 s\n"
+            "Parallel detail timers may overlap."
+        )
+        page._refresh_shell()
+        assert label.text() == "Complete · 23.41 s"
+    finally:
+        _dispose(page, qapp)
 
 
 def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) -> None:

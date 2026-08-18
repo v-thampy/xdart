@@ -10,7 +10,7 @@ import numpy as np
 from xrd_tools.session.readiness import ControlPanelRenderState
 
 from .controls_readiness import ControlsReadinessProjection
-from .display_values import DisplayFrameKey
+from .display_values import DisplayFrameKey, StandardTerminalTiming
 
 
 Scalar = str | int | float | bool | None
@@ -393,6 +393,7 @@ class RunStripProjection:
     live: bool = False
     output_policy: str = "Append"
     readiness: str = "Needs setup"
+    readiness_tooltip: str = ""
     ready: bool = False
     run_enabled: bool = False
     stop_enabled: bool = False
@@ -460,6 +461,7 @@ class ProgressProjection:
     artifacts: tuple[ArtifactProgress, ...] = ()
     directory_files: DirectoryFileProgress | None = None
     terminal: bool = False
+    terminal_timing: StandardTerminalTiming | None = None
 
     def for_artifact(self, artifact: str) -> ArtifactProgress | None:
         return next(

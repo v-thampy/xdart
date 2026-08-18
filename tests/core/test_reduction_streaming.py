@@ -575,6 +575,7 @@ def test_nexus_record_batching_is_independent_and_drains_its_terminal_tail(
         return real_write_batch(owner, records)
 
     monkeypatch.setattr(NexusRecordWriter, "write_batch", observed_write_batch)
+    monkeypatch.setenv("XDART_PERF", "1")
     sink = NexusSink(
         tmp_path / "independent-record-batch.nexus",
         overwrite=True,
@@ -595,6 +596,11 @@ def test_nexus_record_batching_is_independent_and_drains_its_terminal_tail(
     assert sink.nexus_record_batch_size == 3
     assert calls == [(0, 1, 2), (3, 4, 5)]
     assert tuple(item[0].label for item in sink._pending_record_writes) == (6,)
+    sink.flush(force=True)
+    perf = sink.perf_snapshot()
+    assert set(perf) == {"sink_nexus_write", "sink_nexus_flush"}
+    assert perf["sink_nexus_write"] >= 0.0
+    assert perf["sink_nexus_flush"] >= 0.0
     sink.finish(result=None)
     assert calls == [(0, 1, 2), (3, 4, 5), (6,)]
 

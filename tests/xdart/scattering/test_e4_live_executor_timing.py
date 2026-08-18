@@ -179,6 +179,17 @@ def test_terminal_summary_is_measured_and_emitted_exactly_once(
         total=5,
     )
     executor = StandardRunExecutor()
+    run.perf_enabled = True
+    run.perf_values = {
+        "source_read": 0.5,
+        "submit_wait": 1.5,
+        "sink_nexus_write": 0.25,
+        "sink_nexus_flush": 0.125,
+        "sink_xye_write": 0.75,
+        "finish_wait": 0.375,
+        "display_callback": 0.05,
+        "display_projection": 0.075,
+    }
 
     def execute(_run: _StandardRun) -> bool:
         if failure:
@@ -208,6 +219,19 @@ def test_terminal_summary_is_measured_and_emitted_exactly_once(
     assert terminal[0].kind is expected
     assert terminal[0].completed == 4
     assert terminal[0].total == 5
+    assert terminal[0].terminal_timing is not None
+    assert terminal[0].terminal_timing.elapsed_seconds == 3.0
+    assert terminal[0].terminal_timing.work_seconds == 2.5
+    assert terminal[0].terminal_timing.cleanup_seconds == pytest.approx(0.4)
+    assert dict(terminal[0].terminal_timing.details) == {
+        "source_read": 0.5,
+        "submit_wait": 1.5,
+        "writer_batch": 0.25,
+        "writer_flush": 0.125,
+        "xye": 0.75,
+        "finish_wait": 0.375,
+        "display": pytest.approx(0.125),
+    }
 
     executor._terminal_event(
         run,
@@ -235,6 +259,48 @@ def test_terminal_summary_is_measured_and_emitted_exactly_once(
             "throughput=1.3 frames/s | output=measured-output.nxs"
         )
     ]
+
+
+def test_unmeasured_projection_failure_omits_false_zero_timing(
+    caplog,
+) -> None:
+    configuration = RunIntent().freeze()
+    identity = RunIdentity.from_configuration(configuration)
+    run = _StandardRun(
+        configuration,
+        identity,
+        None,
+        None,
+        None,
+        None,
+        Path("projection-failed.nxs"),
+    )
+    diagnostic = executor_module.detach_exception(
+        RuntimeError("projection failed"), "display_projection",
+    )
+    executor = StandardRunExecutor()
+    caplog.set_level(logging.INFO, logger=executor_module.__name__)
+    executor._terminal_event(
+        run,
+        StandardEventKind.FAILED,
+        ExecutorClosed(
+            identity,
+            CleanupStatus.CLEANED,
+            primary=diagnostic,
+        ),
+        0,
+        1,
+    )
+    event = executor.drain_events()[0]
+    assert event.terminal_timing is None
+    assert event.detail == "projection failed"
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Total Time: unavailable" in messages
+    assert any(
+        message.startswith("[PERF-SUMMARY]")
+        and "total=unavailable" in message
+        for message in messages
+    )
 
 
 def test_failed_terminal_folds_a_durably_completed_container_file(

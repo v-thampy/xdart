@@ -347,6 +347,7 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         self.run_controls.set_readiness_summary(
             state.readiness,
             ready=state.ready,
+            tooltip=state.readiness_tooltip,
             live=state.live,
         )
         phase = {

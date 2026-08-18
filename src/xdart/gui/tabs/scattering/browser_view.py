@@ -399,7 +399,7 @@ class BrowserView(QtWidgets.QFrame):
             (
                 "Config",
                 "configMenuButton",
-                ("Save", "Load", "Advanced"),
+                ("Save", "Load", "Advanced", "Performance Diagnostics…"),
             ),
             ("Help", "helpMenuButton", ("Help",)),
         ):

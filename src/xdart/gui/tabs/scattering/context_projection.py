@@ -61,6 +61,33 @@ class ProjectionRequest:
             or type(self.require_complete) is not bool
         ):
             raise TypeError("context projection request is invalid")
+
+
+def _terminal_timing_tooltip(progress: ProgressProjection) -> str:
+    timing = progress.terminal_timing
+    if timing is None:
+        return ""
+    lines = [
+        f"Total: {timing.elapsed_seconds:.2f} s",
+        f"Work: {timing.work_seconds:.2f} s",
+        f"Cleanup: {timing.cleanup_seconds:.2f} s",
+    ]
+    labels = {
+        "source_read": "Source read",
+        "submit_wait": "Submit/backpressure",
+        "writer_batch": "NeXus write/checkpoint",
+        "writer_flush": "Checkpoint flush/fsync",
+        "xye": "XYE",
+        "finish_wait": "Finish/drain (includes terminal seal)",
+        "display": "Display",
+    }
+    lines.extend(
+        f"{labels.get(name, name)}: {elapsed:.2f} s"
+        for name, elapsed in timing.details
+    )
+    if timing.details:
+        lines.append("Parallel detail timers may overlap.")
+    return "\n".join(lines)
 @dataclass(frozen=True, slots=True)
 class _Viewer1DTraceProjection(TraceProjection):
     sigma: np.ndarray | None = None
@@ -318,7 +345,11 @@ class ContextProjection:
             )
             and progress_detail
         ):
-            run = replace(run, readiness=progress_detail)
+            run = replace(
+                run,
+                readiness=progress_detail,
+                readiness_tooltip=_terminal_timing_tooltip(progress),
+            )
         controls = replace(controls, profile=replace(
             controls.profile, run_enabled=run.run_enabled,
             run_blockers=(() if run.ready else (run.readiness,))))

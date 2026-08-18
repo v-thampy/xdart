@@ -1363,6 +1363,12 @@ class NexusSink:
         default=None, init=False, repr=False,
     )
     _existing_append_pending: bool = field(default=False, init=False, repr=False)
+    _perf_nexus_write: float = field(default=0.0, init=False, repr=False)
+    _perf_nexus_flush: float = field(default=0.0, init=False, repr=False)
+    _perf_nexus_enabled: bool = field(default=False, init=False, repr=False)
+    _perf_nexus_lock: Any = field(
+        default_factory=threading.Lock, init=False, repr=False,
+    )
 
     @classmethod
     def for_existing_append(
@@ -1663,6 +1669,10 @@ class NexusSink:
             raise RuntimeError("NexusSink.begin called before the prior writer terminated")
         self._scan = scan
         self._plan = plan
+        self._perf_nexus_enabled = bool(os.environ.get("XDART_PERF"))
+        with self._perf_nexus_lock:
+            self._perf_nexus_write = 0.0
+            self._perf_nexus_flush = 0.0
         if not self._source_snapshots:
             snapshots = (scan.extra or {}).get("source_snapshots") or {}
             from xrd_tools.reduction.provenance_config import jsonable_run_value
@@ -1885,7 +1895,15 @@ class NexusSink:
                     self._deferred_publication_drops[key] = dropped
             self._drain_pending_record_writes(force=False)
             return tuple(dropped for _record, dropped in prepared)
-        writer.write_batch(tuple(record for record, _dropped in prepared))
+        records = tuple(record for record, _dropped in prepared)
+        if self._perf_nexus_enabled:
+            started = time.perf_counter()
+            try:
+                writer.write_batch(records)
+            finally:
+                self._record_nexus_perf("write", started)
+        else:
+            writer.write_batch(records)
         for (frame, reduction), (_record, dropped) in zip(items, prepared):
             if self._defer_publication_drop_settlement:
                 self._deferred_publication_drops[id(reduction)] = dropped
@@ -1906,7 +1924,15 @@ class NexusSink:
             batch = tuple(self._pending_record_writes[:count])
             del self._pending_record_writes[:count]
             try:
-                writer.write_batch(tuple(item[0] for item in batch))
+                records = tuple(item[0] for item in batch)
+                if self._perf_nexus_enabled:
+                    started = time.perf_counter()
+                    try:
+                        writer.write_batch(records)
+                    finally:
+                        self._record_nexus_perf("write", started)
+                else:
+                    writer.write_batch(records)
                 for record, dropped, key in batch:
                     if self._defer_publication_drop_settlement:
                         if record.label not in self._settled_buffered_drop_labels:
@@ -2083,7 +2109,31 @@ class NexusSink:
         if self._writer.phase.value == "finished":
             return
         self._drain_pending_record_writes(force=force)
-        self._writer.flush(force=force)
+        if self._perf_nexus_enabled:
+            started = time.perf_counter()
+            try:
+                self._writer.flush(force=force)
+            finally:
+                self._record_nexus_perf("flush", started)
+        else:
+            self._writer.flush(force=force)
+
+    def _record_nexus_perf(self, kind: str, started: float) -> None:
+        elapsed = max(0.0, time.perf_counter() - started)
+        with self._perf_nexus_lock:
+            if kind == "write":
+                self._perf_nexus_write += elapsed
+            else:
+                self._perf_nexus_flush += elapsed
+
+    def perf_snapshot(self) -> dict[str, float]:
+        if not self._perf_nexus_enabled:
+            return {}
+        with self._perf_nexus_lock:
+            return {
+                "sink_nexus_write": self._perf_nexus_write,
+                "sink_nexus_flush": self._perf_nexus_flush,
+            }
 
     def _writer_finalization(self, writer: NexusRecordWriter) -> WriterFinalization:
         scan = self._scan
