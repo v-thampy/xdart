@@ -193,7 +193,11 @@ def test_post_g2_pipeline_matrix_is_exact_private_nonlive_configuration():
     fields = (
         "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
     )
-    rows = ((8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48))
+    rows = (
+        (1, 4, 56),
+        (8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48),
+    )
+    assert dynamic_output._POST_G2_PIPELINE_ROWS == frozenset(rows)
     for row in rows:
         configuration = RunIntent(run_options={
             "_post_g2_pipeline": dict(zip(fields, row, strict=True)),

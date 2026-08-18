@@ -71,7 +71,7 @@ _POST_G2_PIPELINE_FIELDS = frozenset({
     "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
 })
 _POST_G2_PIPELINE_ROWS = frozenset({
-    (8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48),
+    (1, 4, 56), (8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48),
 })
 logger = logging.getLogger(__name__)
 

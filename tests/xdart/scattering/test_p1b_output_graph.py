@@ -1988,9 +1988,18 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
         append_executor.cancel_admission(token)
 
 
-@pytest.mark.parametrize("use_pipeline", (False, True), ids=("default", "diagnostic"))
+@pytest.mark.parametrize(
+    ("pipeline", "expected"),
+    (
+        (None, (8, 16, None, 56, 8, 4, 4)),
+        ((16, 16, 48), (16, 16, 48, 48, 16, 4, 4)),
+        ((1, 4, 56), (1, 4, 56, 56, 1, 4, 4)),
+    ),
+    ids=("default", "diagnostic-16-16-48", "diagnostic-1-4-56"),
+)
 def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog, use_pipeline: bool,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog,
+    pipeline: tuple[int, int, int] | None, expected: tuple[int, ...],
 ) -> None:
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 
@@ -2001,11 +2010,11 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
     write_poni(poni)
     intent = _intent(raw, target, poni)
     intent.max_cores = 4
-    if use_pipeline:
+    if pipeline is not None:
         intent.run_options["_post_g2_pipeline"] = {
-            "writer_batch_size": 16,
-            "reduction_inflight": 16,
-            "checkpoint_frame_cap": 48,
+            "writer_batch_size": pipeline[0],
+            "reduction_inflight": pipeline[1],
+            "checkpoint_frame_cap": pipeline[2],
         }
     resolve = dynamic_output.resolve_session_policy
     open_session = dynamic_output.open_headless_scan_session
@@ -2021,6 +2030,8 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             kwargs["sink"].writer_batch_size, kwargs["inflight_max"],
             kwargs["dynamic_nexus_checkpoint_threshold"],
             session._dynamic_nexus_checkpoint_threshold,
+            session._session._writer_batch_size,
+            kwargs["executor"], session._session._worker._max_workers,
         ))
         return session
 
@@ -2038,18 +2049,19 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
         terminal = next(event for event in events if event.kind in _TERMINAL)
         assert terminal.kind is StandardEventKind.FINISHED
         assert _nexus_rows(target) == (1,)
-        assert observed == [
-            (16, 16, 48, 48) if use_pipeline else (8, 16, None, 56)
-        ]
+        assert observed == [expected]
         facts = [
             record.getMessage() for record in caplog.records
             if record.getMessage().startswith("[RUN-PIPELINE]")
         ]
-        expected_facts = [
-            "[RUN-PIPELINE] requested-batch=16 effective-batch=16 "
-            "requested-inflight=16 effective-inflight=16 "
-            "requested-checkpoint=48 effective-checkpoint=48"
-        ] if use_pipeline else []
+        expected_facts = [] if pipeline is None else [
+            f"[RUN-PIPELINE] requested-batch={pipeline[0]} "
+            f"effective-batch={pipeline[0]} "
+            f"requested-inflight={pipeline[1]} "
+            f"effective-inflight={pipeline[1]} "
+            f"requested-checkpoint={pipeline[2]} "
+            f"effective-checkpoint={pipeline[2]}"
+        ]
         assert facts == expected_facts
     finally:
         executor.close(identity)

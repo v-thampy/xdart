@@ -1708,17 +1708,19 @@ def test_c2_dynamic_genuine_frame_reaches_exact_written_then_typed_commit(
 @pytest.mark.parametrize(
     (
         "frame_count", "batch_size", "cap", "margin", "checkpoint_threshold",
-        "expected_threshold",
+        "expected_threshold", "inflight", "expected_remainder",
     ),
     (
-        (56, 8, 64, 8, None, 56),
-        (8, 8, 64, 8, 8, 8),
+        (56, 8, 64, 8, None, 56, 56, 0),
+        (8, 8, 64, 8, 8, 8, 8, 0),
+        (57, 1, 64, 8, 56, 56, 4, 1),
     ),
-    ids=("policy-derived", "diagnostic-eight-full-batch"),
+    ids=("policy-derived", "diagnostic-eight-full-batch",
+         "diagnostic-56-singletons-plus-tail"),
 )
 def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
     tmp_path, monkeypatch, frame_count, batch_size, cap, margin,
-    checkpoint_threshold, expected_threshold,
+    checkpoint_threshold, expected_threshold, inflight, expected_remainder,
 ):
     from xdart.modules.reduction import open_live_scan_session
     from xrd_tools.reduction import (
@@ -1757,7 +1759,7 @@ def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
             height=2, width=2, native_itemsize=8, modes_1d=1, npt_1d=8,
         ),
         envelope_bytes=64 * 1024 ** 3, requested_workers=3,
-        requests={"reduction_inflight": frame_count}, flush=flush, env={},
+        requests={"reduction_inflight": inflight}, flush=flush, env={},
     )
     nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
     nexus._configure_writer_batch_size(batch_size)
@@ -1791,6 +1793,8 @@ def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
     )
     session_box["session"] = session
     session.on_frame_completed(events.append)
+    if inflight < frame_count:
+        gate.set()
     for frame, (_key, token) in zip(session.scan.frames, tokens):
         assert session.submit(frame, attempt_token=token)
     gate.set()
@@ -1798,20 +1802,35 @@ def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
 
     staged = accounting.snapshot()
     assert session._dynamic_nexus_checkpoint_threshold == expected_threshold
-    assert session._dynamic_nexus_checkpoint_count == 0
-    assert checkpoint_calls == [
-        (True, frame_count, frame_count, frame_count, batch_size)
-    ]
+    assert session._dynamic_nexus_checkpoint_count == expected_remainder
+    assert len(checkpoint_calls) == 1
+    assert checkpoint_calls[0][:4] == (
+        True, expected_threshold, expected_threshold, expected_threshold,
+    )
+    if batch_size == 1:
+        assert 1 <= checkpoint_calls[0][4] <= inflight
+    else:
+        assert checkpoint_calls[0][4] == batch_size
+    assert session._session._writer_batch_size == batch_size
+    assert session._session.inflight_max == inflight
     assert [event.frame_index for event in events] == list(range(frame_count))
     assert set(memory.frames) == set(range(frame_count))
     assert staged.pending_durable == frozenset(
-        (key, mode, target_name) for key, _token in tokens
+        (key, mode, target_name)
+        for key, _token in tokens[:expected_threshold]
     )
     assert staged.durable == frozenset()
-    assert nexus._writer._dirty_frames == {}
+    for key, token in tokens[expected_threshold:]:
+        assert staged.written_attempts[(key, mode)] is token
+        assert (key, mode, target_name) not in staged.pending_durable
+    assert len(nexus._writer._dirty_frames) == expected_remainder
 
     result = session.finish()
     assert result.failed is False
+    assert len(checkpoint_calls) == 2
+    assert checkpoint_calls[1] == (
+        True, expected_remainder, frame_count, frame_count, 0,
+    )
     assert len(accounting.snapshot().durable) == frame_count
 
 
