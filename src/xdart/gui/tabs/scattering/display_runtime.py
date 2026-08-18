@@ -25,7 +25,7 @@ from xdart.modules.frame_publication import (
     PublicationStore,
     _publication_has_heavy_payload,
 )
-from xrd_tools.core import FrameRecord
+from xrd_tools.core import FrameRecord, FrameView
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
 from xrd_tools.core.invalid import (
     combine_detector_masks,
@@ -887,6 +887,9 @@ class RunDisplayState:
         *,
         closed: bool,
     ) -> StandardDisplayPayload:
+        view = publication.view
+        if owner.light_lease is not None:
+            view = _detached_light_1d_view(view)
         return StandardDisplayPayload(
             0,
             key,
@@ -894,7 +897,7 @@ class RunDisplayState:
                 f"{owner.measurement_mode} · {key.source_scan} · "
                 f"frame {key.local_frame_label}"
             ),
-            publication.view,
+            view,
             "finished" if closed else "running",
             measurement_mode=owner.measurement_mode,
             gi_incidence_motor=owner.gi_incidence_motor,
@@ -1291,6 +1294,31 @@ def _projection_masks_values(
         projection.mask_saturation
         or projection.apply_threshold
         or (projection.mask_available and projection.mask_bytes)
+    )
+
+
+def _detached_light_1d_view(view: FrameView) -> FrameView:
+    """Give the GUI immutable 1-D values independent of run custody."""
+
+    axis = view.axis_1d
+    if axis is not None and axis.values is not None:
+        axis = replace(
+            axis,
+            values=np.array(axis.values, copy=True),
+        )
+    return replace(
+        view,
+        axis_1d=axis,
+        intensity_1d=(
+            None
+            if view.intensity_1d is None
+            else np.array(view.intensity_1d, copy=True)
+        ),
+        sigma_1d=(
+            None
+            if view.sigma_1d is None
+            else np.array(view.sigma_1d, copy=True)
+        ),
     )
 
 

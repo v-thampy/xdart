@@ -762,6 +762,74 @@ def test_p2_0_projection_queue_is_array_free_and_preserves_pair(monkeypatch, tmp
             session.finish(raise_on_failure=False)
     assert receipt.cleanup_status is CleanupStatus.CLEANED
     assert leaked == ()
+
+
+def test_p2_0_acquisition_payload_detaches_light_1d_before_historical_retirement(
+    tmp_path,
+) -> None:
+    executor, identity, run, artifact, _target, terminal = _terminal_run(
+        tmp_path
+    )
+    projected = pair = None
+    closed = False
+    try:
+        assert terminal.kind is StandardEventKind.FINISHED
+        key = run.display.catalog_snapshot().entries[0]
+        pair = artifact.publications.get(0)
+        projected = run.display.project(
+            key,
+            0,
+            closed=True,
+            require_complete=False,
+        )
+        assert pair is not None
+        assert projected is not None
+        assert projected.view.axis_1d is not None
+        assert projected.view.intensity_1d is not None
+        expected_axis = np.array(pair.view.axis_1d.values, copy=True)
+        expected_intensity = np.array(
+            pair.view.intensity_1d,
+            copy=True,
+        )
+        axis_detached = not np.shares_memory(
+            projected.view.axis_1d.values,
+            pair.view.axis_1d.values,
+        )
+        intensity_detached = not np.shares_memory(
+            projected.view.intensity_1d,
+            pair.view.intensity_1d,
+        )
+        lease = artifact.light_lease
+        assert lease is not None
+        del pair
+        pair = None
+
+        receipt = executor.close(identity)
+        closed = receipt.cleanup_status is CleanupStatus.CLEANED
+        assert closed
+        assert axis_detached
+        assert intensity_detached
+        assert lease.state is Light1DLeaseState.RELEASED
+        assert lease.authority.snapshot().reservation_count == 0
+        assert not projected.view.axis_1d.values.flags.writeable
+        assert not projected.view.intensity_1d.flags.writeable
+        assert np.array_equal(
+            projected.view.axis_1d.values,
+            expected_axis,
+        )
+        assert np.array_equal(
+            projected.view.intensity_1d,
+            expected_intensity,
+        )
+    finally:
+        del projected, pair
+        if not closed:
+            assert (
+                executor.close(identity).cleanup_status
+                is CleanupStatus.CLEANED
+            )
+
+
 def test_p2_0_preview_preserves_pair_and_light_miss_stays_array_free(monkeypatch, tmp_path) -> None:
     executor, identity, run, artifact, target, terminal = _terminal_run(
         tmp_path, processing_mode="Int 2D")
