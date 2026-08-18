@@ -879,11 +879,15 @@ class NexusRecordWriter:
             raise WriterStateError(
                 f"durability readback missing mode group {expected.group_name}"
             )
-        role = f"{group.name}[label={expected.label},row={expected.row}]"
+        # The row is only the current lookup coordinate.  A publication drop
+        # compacts later labels in place, so including that mutable coordinate
+        # in the retained digest makes unchanged label/content evidence stale.
+        # Keep the proof bound to the stable label and the observed payload;
+        # frame_index[row] below still proves that the lookup found this label.
+        role = f"{group.name}[label={expected.label}]"
         evidence.text(f"{role}/dimension", expected.dimension, expected.dimension)
         evidence.text(f"{role}/mode", expected.mode, expected.mode)
         evidence.text(f"{role}/group", expected.group_name, expected.group_name)
-        evidence.text(f"{role}/row", expected.row, expected.row)
         top_name = f"integrated_{expected.dimension}"
         top = entry.get(top_name)
         if not isinstance(top, h5py.Group):

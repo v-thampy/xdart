@@ -241,6 +241,65 @@ def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
                 np.testing.assert_allclose(two_d["sigma"][label], _r2(label + 1).sigma.T)
 
 
+@pytest.mark.parametrize("corrupt_shifted_row", (False, True))
+def test_bound_close_keeps_label_content_proof_after_middle_publication_drop(
+    tmp_path, monkeypatch, corrupt_shifted_row,
+):
+    from xrd_tools.io.record_writer import RecordWrite, WriterIncomplete
+
+    class DropFacade(_Facade):
+        def __init__(self, target):
+            super().__init__(target)
+            self.dropped = []
+
+        def commit_publication_drop(self, label, mode, expected_revision):
+            self.dropped.append((int(label), mode, int(expected_revision)))
+
+    (writer, transaction, attempt, lease, owners, _pool, facade, target) = (
+        _bound_writer(tmp_path, facade_type=DropFacade)
+    )
+    mode = ResultMode.one_d()
+    writer.write_batch(
+        RecordWrite(label=label, result_1d=_r1(label + 1))
+        for label in (0, 1, 2)
+    )
+    writer.flush(force=True)
+    before = writer._durable_mode_proofs[("integrated_1d", 2)]
+    assert before.row == 2
+
+    writer.mark_publication_dropped(1, mode, expected_revision=1)
+    writer.flush(force=True)
+    shifted = writer._durable_mode_proofs[("integrated_1d", 2)]
+    assert shifted.row == 1
+    assert shifted.digest == before.digest
+    assert facade.dropped == [(1, mode, 1)]
+
+    if corrupt_shifted_row:
+        real_verify = writer._seal_verified_stream_close
+
+        def corrupt_then_verify(binding):
+            with h5py.File(target, "r+") as handle:
+                intensity = handle["entry/integrated_1d/intensity"]
+                intensity[shifted.row, 0] = (
+                    float(intensity[shifted.row, 0]) + 100.0
+                )
+            return real_verify(binding)
+
+        monkeypatch.setattr(
+            writer, "_seal_verified_stream_close", corrupt_then_verify,
+        )
+        with pytest.raises(WriterIncomplete, match="durable-row proof changed"):
+            writer.finish()
+        assert transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
+        return
+
+    writer.finish()
+    assert transaction.commit_stream(
+        attempt, lease=lease,
+    ).phase is TransactionPhase.COMMITTED
+    _release(transaction, lease, owners)
+
+
 def test_grouped_semantic_reads_split_sparse_replacements_and_clear_on_failure(
     tmp_path, monkeypatch,
 ):
