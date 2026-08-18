@@ -17,8 +17,10 @@ _PIPELINE_FIELDS = (
     "nexus_record_batch_size",
     "reduction_inflight",
     "semantic_checkpoint_frame_cap",
+    "staging_frame_cap",
 )
-_DEFAULT_PIPELINE = (1, 8, 16, 56)
+_LEGACY_PIPELINE_FIELDS = _PIPELINE_FIELDS[:-1]
+_DEFAULT_PIPELINE = (1, 8, 16, 56, 64)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +32,7 @@ class PerformanceDiagnosticsValues:
     plot_interval_ms: int
     save_xye: bool = True
     durable_fsync: bool = True
+    staging_frame_cap: int = 64
 
     def pipeline_mapping(self) -> dict[str, int]:
         return dict(zip(
@@ -39,6 +42,7 @@ class PerformanceDiagnosticsValues:
                 self.record,
                 self.inflight,
                 self.checkpoint,
+                self.staging_frame_cap,
             ),
             strict=True,
         ))
@@ -63,31 +67,53 @@ def performance_diagnostics_error(
         values.inflight,
         values.checkpoint,
         values.plot_interval_ms,
+        values.staging_frame_cap,
     )
     if any(type(value) is not int for value in row):
         return "Performance diagnostics values must be exact integers."
-    settlement, record, inflight, checkpoint, plot = row
+    settlement, record, inflight, checkpoint, plot, staging = row
     if not (
         1 <= settlement <= 16
         and 1 <= record <= 16
         and 1 <= inflight <= 64
-        and checkpoint >= 1
+        and 1 <= checkpoint <= 10_000
         and plot >= 125
+        and 9 <= staging <= 10_008
     ):
         return "Performance diagnostics values are invalid or out of bounds."
     if settlement > inflight or record > checkpoint or checkpoint % settlement:
         return "Performance diagnostics values violate batching bounds."
+    if checkpoint > staging - 8:
+        return (
+            "Semantic checkpoint exceeds the staging cap minus its "
+            "8-frame safety margin."
+        )
     return ""
 
 
-def _loaded_pipeline(snapshot: RunIntentSnapshot) -> tuple[int, int, int, int]:
+def _loaded_pipeline(
+    snapshot: RunIntentSnapshot,
+) -> tuple[int, int, int, int, int]:
     candidate = snapshot.thaw().run_options.get(_PIPELINE_KEY)
-    if not isinstance(candidate, Mapping) or set(candidate) != set(_PIPELINE_FIELDS):
+    if not isinstance(candidate, Mapping):
         return _DEFAULT_PIPELINE
-    row = tuple(candidate[field] for field in _PIPELINE_FIELDS)
+    fields = (
+        _PIPELINE_FIELDS
+        if set(candidate) == set(_PIPELINE_FIELDS)
+        else _LEGACY_PIPELINE_FIELDS
+        if set(candidate) == set(_LEGACY_PIPELINE_FIELDS)
+        else ()
+    )
+    if not fields:
+        return _DEFAULT_PIPELINE
+    row = tuple(candidate[field] for field in fields)
+    if fields == _LEGACY_PIPELINE_FIELDS:
+        row += (64,)
     if any(type(value) is not int for value in row):
         return _DEFAULT_PIPELINE
-    values = PerformanceDiagnosticsValues(*row, 125)
+    values = PerformanceDiagnosticsValues(
+        *row[:4], 125, staging_frame_cap=row[4],
+    )
     return row if not performance_diagnostics_error(values) else _DEFAULT_PIPELINE
 
 
@@ -124,7 +150,8 @@ class PerformanceDiagnosticsDialog(QtWidgets.QDialog):
         self.settlement = self._spin("performanceSettlement", 1, 16)
         self.record = self._spin("performanceRecord", 1, 16)
         self.inflight = self._spin("performanceInflight", 1, 64)
-        self.checkpoint = self._spin("performanceCheckpoint", 1, 1_000_000)
+        self.checkpoint = self._spin("performanceCheckpoint", 1, 10_000)
+        self.staging = self._spin("performanceStaging", 9, 10_008)
         self.plot_interval = self._spin("performancePlotInterval", 125, 60_000)
         self.save_xye = QtWidgets.QCheckBox("Save XYE sidecars")
         self.save_xye.setObjectName("performanceSaveXye")
@@ -135,13 +162,16 @@ class PerformanceDiagnosticsDialog(QtWidgets.QDialog):
         form.addRow("NeXus record batch", self.record)
         form.addRow("Reduction in-flight", self.inflight)
         form.addRow("Semantic checkpoint", self.checkpoint)
+        form.addRow("Staging cap", self.staging)
         form.addRow("Live plot interval", self.plot_interval)
         form.addRow("Output", self.save_xye)
         form.addRow("Safety", self.durable_fsync)
         layout.addLayout(form)
         warning = QtWidgets.QLabel(
             "Turning off Durable fsync is a diagnostic benchmark only; "
-            "crash or power-loss persistence is not guaranteed."
+            "crash or power-loss persistence is not guaranteed. Large "
+            "staging caps permit memory to grow with frame count and can "
+            "consume tens of GiB; exact resource admission occurs on Run."
         )
         warning.setWordWrap(True)
         layout.addWidget(warning)
@@ -171,7 +201,10 @@ class PerformanceDiagnosticsDialog(QtWidgets.QDialog):
         pipeline = _loaded_pipeline(snapshot)
         save_xye, durable_fsync = _loaded_output_diagnostics(snapshot)
         for editor, value in zip(
-            (self.settlement, self.record, self.inflight, self.checkpoint),
+            (
+                self.settlement, self.record, self.inflight,
+                self.checkpoint, self.staging,
+            ),
             pipeline,
             strict=True,
         ):
@@ -189,6 +222,7 @@ class PerformanceDiagnosticsDialog(QtWidgets.QDialog):
             self.plot_interval.value(),
             self.save_xye.isChecked(),
             self.durable_fsync.isChecked(),
+            self.staging.value(),
         )
 
 

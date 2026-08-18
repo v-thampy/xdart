@@ -260,6 +260,7 @@ def test_post_g2_pipeline_four_knob_choice_is_named_bounded_and_nonlive():
     assert choice.nexus_record_batch_size == 8
     assert choice.reduction_inflight == 4
     assert choice.semantic_checkpoint_frame_cap == 56
+    assert choice.staging_frame_cap == 64
     assert choice.buffers_nexus_records_across_calls is True
     with pytest.raises(FrozenInstanceError):
         choice.nexus_record_batch_size = 1
@@ -305,6 +306,38 @@ def test_post_g2_pipeline_four_knob_choice_is_named_bounded_and_nonlive():
                 run_options={"_post_g2_pipeline_v2": complete},
             ).freeze(),
             coordinated=False,
+        )
+
+    five_fields = {
+        **complete,
+        "semantic_checkpoint_frame_cap": 1_000,
+        "staging_frame_cap": 1_008,
+    }
+    five_choice = dynamic_output._post_g2_pipeline_v2_choice(
+        RunIntent(
+            output_mode="Overwrite",
+            run_options={"_post_g2_pipeline_v2": five_fields},
+        ).freeze(),
+        coordinated=True,
+    )
+    assert five_choice.semantic_checkpoint_frame_cap == 1_000
+    assert five_choice.staging_frame_cap == 1_008
+    assert dynamic_output._unsafe_unfunded_staging_requested(
+        choice,
+        run_options={},
+        env={"XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC": "1"},
+        frame_count=651,
+    ) is False
+    with pytest.raises(ValueError, match="staging"):
+        dynamic_output._post_g2_pipeline_v2_choice(
+            RunIntent(
+                output_mode="Overwrite",
+                run_options={"_post_g2_pipeline_v2": {
+                    **complete,
+                    "semantic_checkpoint_frame_cap": 1_000,
+                }},
+            ).freeze(),
+            coordinated=True,
         )
 
     legacy = {

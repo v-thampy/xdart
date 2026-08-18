@@ -143,6 +143,12 @@ _NO_DELIBERATE_MANUAL = object()
 _NO_AUTOMATIC_GI_MOTOR = object()
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
 _LIVE_PLOT_INTERVAL_ENV = "XDART_LIVE_PLOT_INTERVAL_MS"
+_UNSAFE_UNFUNDED_STAGING_ENV = (
+    "XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC"
+)
+_UNSAFE_UNFUNDED_STAGING_KEY = (
+    "_post_g2_unfunded_staging_diagnostic_v1"
+)
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _LIVE_SOURCE_REFRESH_PHASES = frozenset({
     RunPhase.RUNNING,
@@ -2533,6 +2539,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         candidate.run_options["_post_g2_output_diagnostics_v1"] = (
             values.output_diagnostics_mapping()
         )
+        candidate.run_options.pop(_UNSAFE_UNFUNDED_STAGING_KEY, None)
+        unsafe_unfunded_staging = (
+            os.environ.get(_UNSAFE_UNFUNDED_STAGING_ENV, "").strip() == "1"
+            and (
+                values.checkpoint,
+                values.staging_frame_cap,
+            ) == (10_000, 10_008)
+        )
+        if unsafe_unfunded_staging:
+            candidate.run_options[_UNSAFE_UNFUNDED_STAGING_KEY] = {
+                "mode": "UNSAFE_UNFUNDED",
+                "checkpoint": 10_000,
+                "staging_frame_cap": 10_008,
+                "max_frames": 3_621,
+            }
         try:
             result = self._intents.commit(
                 candidate, expected_revision=snapshot.revision,
@@ -2557,6 +2578,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             notice += (
                 " Diagnostic fsync is off: crash or power-loss persistence "
                 "is not guaranteed."
+            )
+        if values.staging_frame_cap > 64:
+            notice += (
+                f" Staging cap {values.staging_frame_cap} can increase memory "
+                "with frame count and is subject to exact resource admission."
+            )
+        if unsafe_unfunded_staging:
+            notice += (
+                " UNSAFE UNFUNDED staging is active for this process: the "
+                "64-frame grant is not enlarged, memory can grow with frame "
+                "count, and crash recovery is delayed until terminal verify."
             )
         self._notice(notice)
         self._refresh_shell()

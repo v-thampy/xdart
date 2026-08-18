@@ -73,13 +73,28 @@ _POST_G2_PIPELINE_FIELDS = frozenset({
 _POST_G2_PIPELINE_ROWS = frozenset({
     (1, 4, 56), (8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48),
 })
-_POST_G2_PIPELINE_V2_FIELDS = frozenset({
+_POST_G2_PIPELINE_V2_LEGACY_FIELDS = frozenset({
     "writer_settlement_batch_size", "nexus_record_batch_size",
     "reduction_inflight", "semantic_checkpoint_frame_cap",
+})
+_POST_G2_PIPELINE_V2_FIELDS = frozenset({
+    *_POST_G2_PIPELINE_V2_LEGACY_FIELDS, "staging_frame_cap",
 })
 _POST_G2_OUTPUT_DIAGNOSTICS_FIELDS = frozenset({
     "save_xye", "durable_fsync",
 })
+_UNSAFE_UNFUNDED_STAGING_ENV = (
+    "XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC"
+)
+_UNSAFE_UNFUNDED_STAGING_KEY = (
+    "_post_g2_unfunded_staging_diagnostic_v1"
+)
+_UNSAFE_UNFUNDED_STAGING_FIELDS = frozenset({
+    "mode", "checkpoint", "staging_frame_cap", "max_frames",
+})
+_UNSAFE_UNFUNDED_STAGING_PAIR = (10_000, 10_008)
+_UNSAFE_UNFUNDED_STAGING_MAX_FRAMES = 3_621
+_UNSAFE_UNFUNDED_STAGING_RESIDUAL_BYTES = 16 * 1024 ** 3
 logger = logging.getLogger(__name__)
 
 
@@ -114,6 +129,7 @@ class _PostG2PipelineV2Choice:
     nexus_record_batch_size: int
     reduction_inflight: int
     semantic_checkpoint_frame_cap: int
+    staging_frame_cap: int = 64
 
     @property
     def buffers_nexus_records_across_calls(self) -> bool:
@@ -136,20 +152,32 @@ def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
         return None
     if not isinstance(value, Mapping):
         raise TypeError("post-G2 pipeline V2 choice must be one exact mapping")
-    if set(value) != _POST_G2_PIPELINE_V2_FIELDS:
+    fields = set(value)
+    if fields not in {
+        _POST_G2_PIPELINE_V2_LEGACY_FIELDS,
+        _POST_G2_PIPELINE_V2_FIELDS,
+    }:
         raise ValueError("post-G2 pipeline V2 choice has an invalid exact keyset")
     row = tuple(value[field] for field in (
         "writer_settlement_batch_size", "nexus_record_batch_size",
         "reduction_inflight", "semantic_checkpoint_frame_cap",
     ))
+    staging = value.get("staging_frame_cap", 64)
+    row += (staging,)
     if any(type(item) is not int for item in row):
         raise TypeError("post-G2 pipeline V2 values must be exact integers")
-    settlement, record, inflight, checkpoint = row
+    settlement, record, inflight, checkpoint, staging = row
     if not (1 <= settlement <= 16 and 1 <= record <= 16
-            and 1 <= inflight <= 64 and checkpoint >= 1):
+            and 1 <= inflight <= 64 and 1 <= checkpoint <= 10_000
+            and 9 <= staging <= 10_008):
         raise ValueError("post-G2 pipeline V2 values are out of bounds")
     if settlement > inflight or record > checkpoint or checkpoint % settlement:
         raise ValueError("post-G2 pipeline V2 values violate batching bounds")
+    if checkpoint > staging - 8:
+        raise ValueError(
+            "post-G2 pipeline V2 semantic checkpoint exceeds the staging "
+            "cap minus its 8-frame safety margin"
+        )
     if configuration.live_mode:
         raise ValueError("post-G2 pipeline V2 requires a non-Live run")
     if configuration.batch_mode:
@@ -161,6 +189,88 @@ def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
     if configuration.processing_mode == "Int 1D (XYE)":
         raise ValueError("post-G2 pipeline V2 requires Nexus output")
     return _PostG2PipelineV2Choice(*row)
+
+
+def _unsafe_unfunded_staging_requested(
+    pipeline_v2: _PostG2PipelineV2Choice | None,
+    *,
+    run_options: Mapping[str, object],
+    env: Mapping[str, str],
+    frame_count: int,
+) -> bool:
+    raw = env.get(_UNSAFE_UNFUNDED_STAGING_ENV)
+    marker = run_options.get(_UNSAFE_UNFUNDED_STAGING_KEY, _MISSING)
+    if marker is _MISSING:
+        return False
+    if raw is None or not str(raw).strip():
+        raise ValueError(
+            "unsafe unfunded staging marker requires its private process "
+            "opt-in"
+        )
+    if str(raw).strip() != "1":
+        raise ValueError(
+            f"{_UNSAFE_UNFUNDED_STAGING_ENV} must be exactly 1 when enabled"
+        )
+    pair = None if pipeline_v2 is None else (
+        pipeline_v2.semantic_checkpoint_frame_cap,
+        pipeline_v2.staging_frame_cap,
+    )
+    if pair != _UNSAFE_UNFUNDED_STAGING_PAIR:
+        raise ValueError(
+            "unsafe unfunded staging requires the exact private "
+            "checkpoint=10000/staging=10008 pair"
+        )
+    if not isinstance(marker, Mapping):
+        raise ValueError(
+            "unsafe unfunded staging requires its exact persisted marker"
+        )
+    if set(marker) != _UNSAFE_UNFUNDED_STAGING_FIELDS or marker != {
+        "mode": "UNSAFE_UNFUNDED",
+        "checkpoint": 10_000,
+        "staging_frame_cap": 10_008,
+        "max_frames": _UNSAFE_UNFUNDED_STAGING_MAX_FRAMES,
+    }:
+        raise ValueError("unsafe unfunded staging marker is invalid")
+    if frame_count > _UNSAFE_UNFUNDED_STAGING_MAX_FRAMES:
+        raise ValueError(
+            "unsafe unfunded staging exceeds its 3621-frame source ceiling"
+        )
+    return True
+
+
+def _unsafe_unfunded_staging_projection(
+    allocation,
+    *,
+    frame_count: int,
+    checkpoint: int,
+) -> tuple[int, int, int]:
+    requirements = allocation.requirements
+    retained_rows = min(max(0, int(frame_count)), int(checkpoint))
+    one_d = requirements.result_1d_bytes
+    two_d = requirements.result_2d_bytes
+    thumbnail = requirements.thumbnail_bytes
+    writer_unfunded = max(
+        0, retained_rows - allocation.staging_items,
+    ) * (one_d + two_d + thumbnail)
+    record_unfunded = (
+        max(0, retained_rows - allocation.record_items) * one_d
+        + max(0, retained_rows - allocation.record_heavy_items) * two_d
+        + max(0, retained_rows - allocation.thumbnail_items) * thumbnail
+    )
+    publication_unfunded = (
+        max(0, retained_rows - allocation.publication_items) * one_d
+        + max(
+            0, retained_rows - allocation.publication_heavy_items,
+        ) * two_d
+        + max(0, retained_rows - allocation.thumbnail_items) * thumbnail
+    )
+    unfunded_bytes = (
+        writer_unfunded + record_unfunded + publication_unfunded
+    )
+    projected_bytes = (
+        int(allocation.assigned_bytes) + unfunded_bytes
+    )
+    return retained_rows, unfunded_bytes, projected_bytes
 
 
 def _post_g2_output_diagnostics_choice(configuration, *, pipeline_v2):
@@ -227,7 +337,9 @@ def _direct_eiger_candidate(item, write_labels) -> bool:
 
 def _light_policy_layout(
     configuration, plan, item, scan, write_labels, *, heavy_request=None,
-    reduction_inflight=None, env=None,
+    reduction_inflight=None, staging_frame_cap=None,
+    semantic_checkpoint_frame_cap=None, unsafe_unfunded_staging=False,
+    env=None,
 ):
     if not write_labels:
         raise ValueError("dynamic light-1D mount has no admitted write frame")
@@ -261,6 +373,15 @@ def _light_policy_layout(
             "staging_items": heavy_request, "record_heavy_items": heavy_request,
             "publication_heavy_items": heavy_request,
         })
+    if staging_frame_cap is not None:
+        if type(staging_frame_cap) is not int:
+            raise TypeError("requested staging frame cap must be an exact int")
+        if not 9 <= staging_frame_cap <= 10_008:
+            raise TypeError(
+                "requested staging frame cap must be in 9..10008"
+            )
+        if not unsafe_unfunded_staging:
+            requests["staging_items"] = staging_frame_cap
     if reduction_inflight is not None:
         if type(reduction_inflight) is not int or reduction_inflight < 1:
             raise TypeError("requested reduction in-flight must be a positive int")
@@ -288,9 +409,87 @@ def _light_policy_layout(
         raise RuntimeError(
             "post-G2 pipeline in-flight request was not granted exactly"
         )
+    if (
+        staging_frame_cap is not None
+        and not unsafe_unfunded_staging
+        and allocation.staging_items != staging_frame_cap
+    ):
+        requirements = allocation.requirements
+        unit_bytes = (
+            requirements.native_frame_bytes
+            + requirements.background_bytes
+            + requirements.result_1d_bytes
+            + requirements.result_2d_bytes
+            + requirements.thumbnail_bytes
+        )
+        raise RuntimeError(
+            "post-G2 staging request was not granted exactly: "
+            f"requested={staging_frame_cap} granted={allocation.staging_items} "
+            f"staging-unit={unit_bytes}B "
+            f"requested-staging={staging_frame_cap * unit_bytes}B "
+            f"modeled-session={allocation.assigned_bytes}B "
+            f"envelope={allocation.envelope_bytes}B"
+        )
+    if (
+        semantic_checkpoint_frame_cap is not None
+        and not unsafe_unfunded_staging
+    ):
+        checkpoint = int(semantic_checkpoint_frame_cap)
+        requirements = allocation.requirements
+        retained_grants = {}
+        if requirements.result_1d_bytes:
+            retained_grants.update({
+                "record-1d": allocation.record_items,
+                "publication-1d": allocation.publication_items,
+            })
+        if requirements.result_2d_bytes:
+            retained_grants.update({
+                "record-2d": allocation.record_heavy_items,
+                "publication-2d": allocation.publication_heavy_items,
+            })
+        if requirements.thumbnail_bytes:
+            retained_grants["thumbnail"] = allocation.thumbnail_items
+        short = {
+            name: value
+            for name, value in retained_grants.items()
+            if value < checkpoint
+        }
+        if short:
+            raise RuntimeError(
+                "post-G2 semantic checkpoint retention was not funded: "
+                f"checkpoint={checkpoint} grants={retained_grants} "
+                f"insufficient={short}"
+            )
+    if unsafe_unfunded_staging:
+        if staging_frame_cap is None:
+            raise ValueError("unsafe unfunded staging requires an explicit cap")
+        retained_rows, unfunded_bytes, projected_bytes = (
+            _unsafe_unfunded_staging_projection(
+                allocation,
+                frame_count=len(write_labels),
+                checkpoint=staging_frame_cap - 8,
+            )
+        )
+        total = max(0, int(total_physical_ram_bytes() or 0))
+        limit = min(
+            total // 2,
+            max(0, total - _UNSAFE_UNFUNDED_STAGING_RESIDUAL_BYTES),
+        )
+        if total <= 0 or projected_bytes > limit:
+            raise RuntimeError(
+                "unsafe unfunded staging exceeds its modeled host-memory "
+                f"guard: retained={retained_rows} "
+                f"unfunded={unfunded_bytes}B "
+                f"projected={projected_bytes}B limit={limit}B total={total}B"
+            )
     interval = 8 if plan.integration_2d is not None else 1000
     policy = replace(policy, flush=FlushPolicy(
-        interval=interval, cap=int(allocation.staging_items), margin=8,
+        interval=interval,
+        cap=int(
+            staging_frame_cap
+            if unsafe_unfunded_staging else allocation.staging_items
+        ),
+        margin=8,
     ))
     one_d = getattr(plan, "integration_1d", None)
     modes = tuple(mode.key for mode in required_result_modes(plan)
@@ -818,13 +1017,33 @@ class DynamicOutputAdapter:
             self.configuration,
             pipeline_v2=pipeline_v2,
         )
+        resource_env = dict(os.environ)
+        frame_count = _supported_lineage_frame_count(item.source_stamp)
+        unsafe_unfunded_staging = _unsafe_unfunded_staging_requested(
+            pipeline_v2,
+            run_options=self.configuration.run_options,
+            env=resource_env,
+            frame_count=frame_count,
+        )
+        if unsafe_unfunded_staging:
+            descriptor = item.descriptor
+            if not (
+                getattr(descriptor, "kind", None) is SourceKind.EIGER_MASTER
+                and getattr(descriptor, "finalized", False)
+                and getattr(descriptor, "frame_shape", None) is not None
+                and getattr(descriptor, "dtype", None) is not None
+            ):
+                raise ValueError(
+                    "unsafe unfunded staging requires one finalized, "
+                    "descriptor-complete Eiger master"
+                )
         science_identity = science_fingerprint(_science_projection(
             self.configuration,
             run_provenance.get("scientific_signature"),
         ))
-        frame_count = _supported_lineage_frame_count(item.source_stamp)
         if cancelled():
             raise RuntimeError("admission cancelled")
+        science_identity_was_unset = self._science_identity is None
         if self._science_identity is None:
             self._science_identity = science_identity
         elif self._science_identity != science_identity:
@@ -939,7 +1158,6 @@ class DynamicOutputAdapter:
                 preflight.snapshot.write_labels
             )
             if coordinated:
-                resource_env = dict(os.environ)
                 choice, heavy_request = heavy_residency_choice(
                     self.configuration.run_options
                 )
@@ -952,9 +1170,46 @@ class DynamicOutputAdapter:
                             if pipeline_v2 is not None else
                             (None if pipeline is None else pipeline[1])
                         ),
+                        staging_frame_cap=(
+                            pipeline_v2.staging_frame_cap
+                            if pipeline_v2 is not None else None
+                        ),
+                        semantic_checkpoint_frame_cap=(
+                            pipeline_v2.semantic_checkpoint_frame_cap
+                            if pipeline_v2 is not None else None
+                        ),
+                        unsafe_unfunded_staging=unsafe_unfunded_staging,
                         env=resource_env,
                 )
                 allocation = policy.allocation
+                if unsafe_unfunded_staging:
+                    retained, unfunded_bytes, projected_bytes = (
+                        _unsafe_unfunded_staging_projection(
+                            allocation,
+                            frame_count=len(write_labels),
+                            checkpoint=(
+                                pipeline_v2.semantic_checkpoint_frame_cap
+                            ),
+                        )
+                    )
+                    run_provenance[
+                        "unsafe_unfunded_staging_diagnostic"
+                    ] = {
+                        "mode": "UNSAFE_UNFUNDED",
+                        "requested_staging_frame_cap": (
+                            pipeline_v2.staging_frame_cap
+                        ),
+                        "funded_staging_frame_cap": (
+                            allocation.staging_items
+                        ),
+                        "semantic_checkpoint_frame_cap": (
+                            pipeline_v2.semantic_checkpoint_frame_cap
+                        ),
+                        "modeled_retained_rows": retained,
+                        "modeled_unfunded_bytes": unfunded_bytes,
+                        "modeled_session_bytes": projected_bytes,
+                        "host_physical_bytes": total_physical_ram_bytes(),
+                    }
                 requested_heavy = (
                     heavy_request if heavy_request is not None else heavy_window(
                         8 * allocation.requirements.pixels, env=resource_env,
@@ -1188,7 +1443,8 @@ class DynamicOutputAdapter:
                     "effective-record=%d requested-inflight=%d "
                     "effective-inflight=%d requested-checkpoint=%d "
                     "effective-checkpoint=%d requested-workers=%d "
-                    "effective-workers=%d",
+                    "effective-workers=%d requested-staging=%d "
+                    "effective-staging=%d staging-mode=%s",
                     pipeline_v2.writer_settlement_batch_size,
                     nexus.writer_batch_size,
                     pipeline_v2.nexus_record_batch_size,
@@ -1198,7 +1454,33 @@ class DynamicOutputAdapter:
                     pipeline_v2.semantic_checkpoint_frame_cap,
                     session._dynamic_nexus_checkpoint_threshold,
                     self.configuration.max_cores, policy.allocation.workers,
+                    pipeline_v2.staging_frame_cap,
+                    policy.allocation.staging_items,
+                    (
+                        "UNSAFE_UNFUNDED"
+                        if unsafe_unfunded_staging else "FUNDED"
+                    ),
                 )
+                if unsafe_unfunded_staging:
+                    diagnostic = run_provenance[
+                        "unsafe_unfunded_staging_diagnostic"
+                    ]
+                    logger.warning(
+                        "[RUN-STAGING] mode=UNSAFE_UNFUNDED "
+                        "requested-staging=%d funded-staging=%d "
+                        "effective-flush-cap=%d requested-checkpoint=%d "
+                        "effective-checkpoint=%d retained=%d "
+                        "unfunded=%dB modeled-session=%dB host=%dB",
+                        pipeline_v2.staging_frame_cap,
+                        policy.allocation.staging_items,
+                        policy.flush.cap,
+                        pipeline_v2.semantic_checkpoint_frame_cap,
+                        session._dynamic_nexus_checkpoint_threshold,
+                        diagnostic["modeled_retained_rows"],
+                        diagnostic["modeled_unfunded_bytes"],
+                        diagnostic["modeled_session_bytes"],
+                        diagnostic["host_physical_bytes"],
+                    )
             if output_diagnostics.explicit:
                 logger.info(
                     "[RUN-OUTPUT-DIAGNOSTICS] save-xye=%s "
@@ -1222,6 +1504,8 @@ class DynamicOutputAdapter:
                 )
             return session, True
         except BaseException as primary:
+            if science_identity_was_unset and not self._graphs:
+                self._science_identity = None
             cleanup: BaseException | None = None
             try:
                 terminal = DynamicRunState.ABORTED

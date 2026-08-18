@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from dataclasses import replace
 import inspect
+import json
 import logging
 import os
 from pathlib import Path
@@ -231,6 +232,24 @@ def _write_tiff(path: Path, value: int) -> None:
     fabio.tifimage.TifImage(
         data=np.full((195, 487), value, dtype=np.uint16)
     ).write(str(path))
+
+
+def _write_eiger(master: Path, member: Path, frames: int) -> None:
+    with h5py.File(member, "w") as handle:
+        handle.create_dataset(
+            "entry/data/data",
+            data=np.ones((frames, 195, 487), dtype=np.uint16),
+            chunks=(1, 195, 487),
+            maxshape=(None, 195, 487),
+        )
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data["data_000001"] = h5py.ExternalLink(
+            str(member), "/entry/data/data",
+        )
 
 
 def _nexus_rows(path: Path) -> tuple[int, ...]:
@@ -1995,10 +2014,12 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
         ((16, 16, 48), (16, 16, 48, 48, 16, 4, 4)),
         ((1, 4, 56), (1, 4, 56, 56, 1, 4, 4)),
         ((1, 8, 16, 56), (1, 16, 56, 56, 1, 4, 4)),
+        ((1, 8, 8, 64, 72), (1, 8, 64, 64, 1, 4, 4)),
     ),
     ids=(
         "default", "diagnostic-16-16-48", "diagnostic-1-4-56",
         "v2-settlement1-record8-inflight16-checkpoint56",
+        "v2-funded-staging72-checkpoint64",
     ),
 )
 def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
@@ -2028,6 +2049,10 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
                 "reduction_inflight": pipeline[2],
                 "semantic_checkpoint_frame_cap": pipeline[3],
             }
+            if len(pipeline) == 5:
+                intent.run_options["_post_g2_pipeline_v2"][
+                    "staging_frame_cap"
+                ] = pipeline[4]
     resolve = dynamic_output.resolve_session_policy
     open_session = dynamic_output.open_headless_scan_session
     observed = []
@@ -2046,7 +2071,7 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             session._session._writer_batch_size,
             kwargs["executor"], session._session._worker._max_workers,
         ))
-        if pipeline is not None and len(pipeline) == 4:
+        if pipeline is not None and len(pipeline) in (4, 5):
             children = kwargs["sink"].output_sink_children
             (nexus,) = tuple(
                 child for child in children
@@ -2078,33 +2103,230 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
         assert _nexus_rows(target) == (1,)
         assert observed == [expected]
         assert v2_observed == ([] if pipeline is None or len(pipeline) == 3 else [
-            (1, 16, 16, 4, 4, 8, ("TransactionalXYESink", "NexusSink")),
+            (
+                1,
+                pipeline[2],
+                pipeline[2],
+                4,
+                4,
+                8,
+                ("TransactionalXYESink", "NexusSink"),
+            ),
         ])
         facts = [
             record.getMessage() for record in caplog.records
             if record.getMessage().startswith("[RUN-PIPELINE]")
         ]
-        expected_facts = [] if pipeline is None or len(pipeline) == 4 else [
-            f"[RUN-PIPELINE] requested-batch={pipeline[0]} "
-            f"effective-batch={pipeline[0]} "
-            f"requested-inflight={pipeline[1]} "
-            f"effective-inflight={pipeline[1]} "
-            f"requested-checkpoint={pipeline[2]} "
-            f"effective-checkpoint={pipeline[2]}"
-        ]
+        expected_facts = (
+            [] if pipeline is None or len(pipeline) in (4, 5) else [
+                f"[RUN-PIPELINE] requested-batch={pipeline[0]} "
+                f"effective-batch={pipeline[0]} "
+                f"requested-inflight={pipeline[1]} "
+                f"effective-inflight={pipeline[1]} "
+                f"requested-checkpoint={pipeline[2]} "
+                f"effective-checkpoint={pipeline[2]}"
+            ]
+        )
         assert facts == expected_facts
         v2_facts = [
             record.getMessage() for record in caplog.records
             if record.getMessage().startswith("[RUN-PIPELINE-V2]")
         ]
-        assert v2_facts == ([] if pipeline is None or len(pipeline) == 3 else [
-            "[RUN-PIPELINE-V2] requested-settlement=1 effective-settlement=1 "
-            "requested-record=8 effective-record=8 requested-inflight=16 "
-            "effective-inflight=16 requested-checkpoint=56 "
-            "effective-checkpoint=56 requested-workers=4 effective-workers=4"
-        ])
+        if pipeline is None or len(pipeline) == 3:
+            assert v2_facts == []
+        else:
+            assert len(v2_facts) == 1
+            assert (
+                f"requested-inflight={pipeline[2]} "
+                f"effective-inflight={pipeline[2]}"
+            ) in v2_facts[0]
+            assert (
+                f"requested-checkpoint={pipeline[3]} "
+                f"effective-checkpoint={pipeline[3]}"
+            ) in v2_facts[0]
+            assert (
+                "requested-staging=64 effective-staging=64"
+                if len(pipeline) == 4
+                else "requested-staging=72 effective-staging=72"
+            ) in v2_facts[0]
     finally:
         executor.close(identity)
+
+
+def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    raw = tmp_path / "funded_0001.tif"
+    target = tmp_path / "funded.nexus"
+    poni = tmp_path / "funded.poni"
+    _write_tiff(raw, 7)
+    write_poni(poni)
+    intent = _intent(raw, target, poni)
+    intent.max_cores = 4
+    intent.run_options["_post_g2_pipeline_v2"] = {
+        "writer_settlement_batch_size": 1,
+        "nexus_record_batch_size": 8,
+        "reduction_inflight": 8,
+        "semantic_checkpoint_frame_cap": 10_000,
+        "staging_frame_cap": 10_008,
+    }
+    resolve = dynamic_output.resolve_session_policy
+
+    def constrained(requirements, **kwargs):
+        kwargs["envelope_bytes"] = 5 * 1024 ** 3
+        return resolve(requirements, **kwargs)
+
+    monkeypatch.setattr(dynamic_output, "resolve_session_policy", constrained)
+    executor = StandardRunExecutor(join_timeout=2.0)
+    identity = _start(executor, intent, request_value=1711)
+    events = _drain_until(
+        executor,
+        lambda values: any(event.kind in _TERMINAL for event in values),
+    )
+    terminal = next(event for event in events if event.kind in _TERMINAL)
+    assert terminal.kind is StandardEventKind.FAILED
+    assert "staging request was not granted exactly" in terminal.detail
+    assert "requested=10008" in terminal.detail
+    assert not target.exists()
+    assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+
+    intent.run_options["_post_g2_pipeline_v2"] = {
+        "writer_settlement_batch_size": 1,
+        "nexus_record_batch_size": 8,
+        "reduction_inflight": 8,
+        "semantic_checkpoint_frame_cap": 1_000,
+        "staging_frame_cap": 1_008,
+    }
+    identity = _start(executor, intent, request_value=1712)
+    events = _drain_until(
+        executor,
+        lambda values: any(event.kind in _TERMINAL for event in values),
+    )
+    terminal = next(event for event in events if event.kind in _TERMINAL)
+    assert terminal.kind is StandardEventKind.FAILED
+    assert "checkpoint retention was not funded" in terminal.detail
+    assert "checkpoint=1000" in terminal.detail
+    assert not target.exists()
+    assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+
+    intent.run_options["_post_g2_pipeline_v2"] = {
+        "writer_settlement_batch_size": 1,
+        "nexus_record_batch_size": 8,
+        "reduction_inflight": 8,
+        "semantic_checkpoint_frame_cap": 56,
+        "staging_frame_cap": 64,
+    }
+    identity = _start(executor, intent, request_value=1714)
+    events = _drain_until(
+        executor,
+        lambda values: any(event.kind in _TERMINAL for event in values),
+    )
+    try:
+        assert (
+            next(event for event in events if event.kind in _TERMINAL).kind
+            is StandardEventKind.FINISHED
+        )
+        assert _nexus_rows(target) == (1,)
+    finally:
+        assert (
+            executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+        )
+
+
+def test_post_g2_unsafe_unfunded_staging_accepts_exact_eiger(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    master = tmp_path / "unsafe_master.h5"
+    member = tmp_path / "unsafe_data_000001.h5"
+    target = tmp_path / "unsafe.nexus"
+    poni = tmp_path / "unsafe.poni"
+    _write_eiger(master, member, 1)
+    write_poni(poni)
+    intent = _intent(
+        master, target, poni,
+        processing_mode="Int 2D",
+    )
+    intent.max_cores = 4
+    intent.run_options["heavy_window"] = 64
+    intent.run_options["_post_g2_pipeline_v2"] = {
+        "writer_settlement_batch_size": 1,
+        "nexus_record_batch_size": 8,
+        "reduction_inflight": 8,
+        "semantic_checkpoint_frame_cap": 10_000,
+        "staging_frame_cap": 10_008,
+    }
+    marker = {
+        "mode": "UNSAFE_UNFUNDED",
+        "checkpoint": 10_000,
+        "staging_frame_cap": 10_008,
+        "max_frames": 3_621,
+    }
+    intent.run_options[
+        "_post_g2_unfunded_staging_diagnostic_v1"
+    ] = marker
+    resolve = dynamic_output.resolve_session_policy
+    open_session = dynamic_output.open_headless_scan_session
+    observed = []
+
+    def fixed_envelope(requirements, **kwargs):
+        kwargs["envelope_bytes"] = 64 * 1024 ** 3
+        return resolve(requirements, **kwargs)
+
+    def capture_session(*args, **kwargs):
+        session = open_session(*args, **kwargs)
+        observed.append((
+            session._policy.allocation.staging_items,
+            session._policy.flush.cap,
+            session._dynamic_nexus_checkpoint_threshold,
+        ))
+        return session
+
+    monkeypatch.setenv("XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC", "1")
+    monkeypatch.setattr(
+        dynamic_output, "total_physical_ram_bytes", lambda: 128 * 1024 ** 3,
+    )
+    monkeypatch.setattr(
+        dynamic_output, "resolve_session_policy", fixed_envelope,
+    )
+    monkeypatch.setattr(
+        dynamic_output, "open_headless_scan_session", capture_session,
+    )
+    caplog.set_level(logging.INFO, logger=dynamic_output.__name__)
+    executor, identity, events = _run_to_terminal(
+        intent, request_value=1713,
+    )
+    try:
+        assert (
+            next(event for event in events if event.kind in _TERMINAL).kind
+            is StandardEventKind.FINISHED
+        )
+        assert observed == [(64, 10_008, 10_000)]
+        with h5py.File(target, "r") as handle:
+            raw = handle["entry/reduction/config/run_configuration"].asstr()[()]
+            configuration = json.loads(raw)
+        assert configuration["run_options"][
+            "_post_g2_unfunded_staging_diagnostic_v1"
+        ] == marker
+        assert configuration[
+            "unsafe_unfunded_staging_diagnostic"
+        ]["mode"] == "UNSAFE_UNFUNDED"
+        facts = tuple(record.getMessage() for record in caplog.records)
+        assert any(
+            "[RUN-STAGING] mode=UNSAFE_UNFUNDED" in fact
+            and "requested-staging=10008 funded-staging=64" in fact
+            for fact in facts
+        )
+    finally:
+        assert (
+            executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+        )
 
 
 def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(

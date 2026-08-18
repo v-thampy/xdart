@@ -194,6 +194,9 @@ def _paced_frame_events(page, executor, identity, count):
 def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         qapp: QtWidgets.QApplication, monkeypatch) -> None:
     monkeypatch.delenv("XDART_PERF", raising=False)
+    monkeypatch.delenv(
+        "XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC", raising=False,
+    )
     executor = _Executor()
     page, _, _ = _active_page(executor)
     shell = _shell(page)
@@ -214,6 +217,7 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
                 1, 8, 16, 56, 375,
                 save_xye=False,
                 durable_fsync=False,
+                staging_frame_cap=64,
             )
         )
         page._handle_shell_command(ShellCommand(
@@ -227,6 +231,7 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
             "nexus_record_batch_size": 8,
             "reduction_inflight": 16,
             "semantic_checkpoint_frame_cap": 56,
+            "staging_frame_cap": 64,
         }
         assert applied.thaw().run_options[
             "_post_g2_output_diagnostics_v1"
@@ -239,11 +244,51 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         assert "next run" in page._notice_text.lower()
         assert "crash" in page._notice_text.lower()
 
+        monkeypatch.setenv(
+            "XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC", "1",
+        )
+        page._performance_diagnostics_editor = lambda *_args: (
+            PerformanceDiagnosticsValues(
+                1, 8, 8, 10_000, 375,
+                staging_frame_cap=10_008,
+            )
+        )
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU, "Config:Performance Diagnostics…",
+        ))
+        unsafe = page._intents.snapshot()
+        assert unsafe.revision == applied.revision + 1
+        assert unsafe.thaw().run_options[
+            "_post_g2_unfunded_staging_diagnostic_v1"
+        ] == {
+            "mode": "UNSAFE_UNFUNDED",
+            "checkpoint": 10_000,
+            "staging_frame_cap": 10_008,
+            "max_frames": 3_621,
+        }
+        assert "unsafe unfunded" in page._notice_text.lower()
+
+        page._performance_diagnostics_editor = lambda *_args: (
+            PerformanceDiagnosticsValues(
+                1, 8, 8, 56, 375,
+                staging_frame_cap=64,
+            )
+        )
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU, "Config:Performance Diagnostics…",
+        ))
+        ordinary = page._intents.snapshot()
+        assert ordinary.revision == unsafe.revision + 1
+        assert (
+            "_post_g2_unfunded_staging_diagnostic_v1"
+            not in ordinary.thaw().run_options
+        )
+
         page._performance_diagnostics_editor = lambda *_args: None
         page._handle_shell_command(ShellCommand(
             ShellCommandKind.MENU, "Config:Performance Diagnostics…",
         ))
-        assert page._intents.snapshot().revision == applied.revision
+        assert page._intents.snapshot().revision == ordinary.revision
         assert page._live_plot_interval_ms == 375
     finally:
         _dispose(page, qapp)
@@ -272,6 +317,19 @@ def test_performance_diagnostics_reject_invalid_coupled_values(
         assert "batching bounds" in page._notice_text.lower()
         assert page._live_plot_interval_ms == 125
         assert "XDART_PERF" not in os.environ
+
+        page._performance_diagnostics_editor = lambda *_args: (
+            PerformanceDiagnosticsValues(
+                1, 8, 8, 1_000, 125,
+                staging_frame_cap=64,
+            )
+        )
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU, "Config:Performance Diagnostics…",
+        ))
+        assert page._intents.snapshot().revision == initial.revision
+        assert "staging" in page._notice_text.lower()
+        assert "checkpoint" in page._notice_text.lower()
     finally:
         _dispose(page, qapp)
 
