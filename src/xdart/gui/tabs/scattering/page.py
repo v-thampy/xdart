@@ -1411,8 +1411,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if self._closing or self._closed:
             return
         changed = self._poll_admission()
-        if ScatteringWorkspace._advance_presentation_target(self):
-            changed = True
         poll_viewer_1d = getattr(self._context_controller, "poll_viewer_1d", None)
         if poll_viewer_1d is not None and poll_viewer_1d():
             changed = True
@@ -1562,6 +1560,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._batch_latest_frame = None
                 changed = True
 
+        if ScatteringWorkspace._advance_presentation_target(self):
+            changed = True
         if changed:
             self._refresh_shell()
         if not self._polling_needed():

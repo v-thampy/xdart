@@ -207,7 +207,7 @@ def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) ->
         _dispose(page, qapp)
 
 
-def test_single_auto_last_paces_eight_frame_burst_as_1_8(
+def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
         qapp: QtWidgets.QApplication, monkeypatch) -> None:
     executor = _Executor()
     page, _, identity = _active_page(executor)
@@ -244,15 +244,13 @@ def test_single_auto_last_paces_eight_frame_burst_as_1_8(
         assert page._progress.completed == 8
         assert page._artifact_progress["/out/a.nxs"].published == 8
         assert accepted_follow_latest == [False] * 8
-        assert paints == [1]
-        assert tuple(
-            frame.local_frame_label for frame in page._presentation_targets
-        ) == (8,)
+        assert paints == [8]
+        assert tuple(page._presentation_targets) == ()
 
         for _ in range(3):
             page._drain_executor()
 
-        assert paints == [1, 8]
+        assert paints == [8]
         assert tuple(page._presentation_targets) == ()
 
         executor.events.extend(events[8:])
@@ -265,15 +263,13 @@ def test_single_auto_last_paces_eight_frame_burst_as_1_8(
         assert page._progress.completed == 16
         assert page._artifact_progress["/out/a.nxs"].published == 16
         assert accepted_follow_latest == [False] * 16
-        assert paints == [1, 8]
-        assert tuple(
-            frame.local_frame_label for frame in page._presentation_targets
-        ) == (16,)
+        assert paints == [8, 16]
+        assert tuple(page._presentation_targets) == ()
 
         for _ in range(3):
             page._drain_executor()
 
-        assert paints == [1, 8, 16]
+        assert paints == [8, 16]
         assert tuple(page._presentation_targets) == ()
     finally:
         _dispose(page, qapp)
@@ -289,7 +285,8 @@ def test_pacer_boundaries_clear_stale_work_and_flush_exact_latest(
     try:
         executor.events.extend(events)
         page._drain_executor()
-        assert tuple(page._presentation_targets)
+        assert tuple(page._presentation_targets) == ()
+        assert page._context_controller.navigation.current is events[-1].frame_key
 
         first = events[0].frame_key
         assert first is not None
