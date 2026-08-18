@@ -7,6 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import math
 import os
+import time
 from typing import Any, Callable
 import weakref
 
@@ -136,6 +137,7 @@ from .workspace_shell import ScatteringWorkspaceShell
 _NO_DELIBERATE_MANUAL = object()
 _NO_AUTOMATIC_GI_MOTOR = object()
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
+_LIVE_PLOT_INTERVAL_ENV = "XDART_LIVE_PLOT_INTERVAL_MS"
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _LIVE_SOURCE_REFRESH_PHASES = frozenset({
     RunPhase.RUNNING,
@@ -144,6 +146,17 @@ _LIVE_SOURCE_REFRESH_PHASES = frozenset({
     RunPhase.RESUMING,
     RunPhase.STOPPING,
 })
+
+
+def _live_plot_interval_ms() -> int:
+    try:
+        value = int(os.environ.get(
+            _LIVE_PLOT_INTERVAL_ENV,
+            str(_LIVE_EVENT_DRAIN_INTERVAL_MS),
+        ))
+    except (TypeError, ValueError):
+        value = _LIVE_EVENT_DRAIN_INTERVAL_MS
+    return max(_LIVE_EVENT_DRAIN_INTERVAL_MS, value)
 
 
 def _slice_pins_for_plot_axis(
@@ -350,6 +363,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._batch_latest_frame: DisplayFrameKey | None = None
         self._presentation_targets: deque[DisplayFrameKey] = deque(maxlen=1)
         self._presentation_run_identity: RunIdentity | None = None
+        self._live_plot_interval_ms = _live_plot_interval_ms()
+        self._last_live_plot_at: float | None = None
         self._browser_directory_chooser = (
             browser_directory_chooser
             if browser_directory_chooser is not None
@@ -1149,6 +1164,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._begin_browser_follow(outcome.run_identity)
             self._active_batch_mode = outcome.configuration.batch_mode
             self._run_frame_seen = False
+            self._last_live_plot_at = None
             self._batch_latest_frame = None
             self._browser_transient_frame = None
             self._browser_transient_clear_token = None
@@ -1432,6 +1448,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if current is not None:
                     self._follow_processed_artifact(current)
 
+        force_scientific = changed
+
         executor = self._run_executor
         events: tuple[StandardRunEvent, ...] = ()
         if executor is not None:
@@ -1480,6 +1498,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         event.run_identity
                     )
                     changed = True
+                    force_scientific = True
                 except Exception as error:
                     self._error_notice(
                         "Acquisition context refused", error
@@ -1509,6 +1528,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         _directory_file_progress(event),
                     )
                     if first_paced_frame:
+                        force_scientific = True
                         changed = (
                             self._select_presentation_target(
                                 event.run_identity, frame,
@@ -1521,6 +1541,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         )
                     else:
                         changed = True
+                        force_scientific = True
                     if not self._active_batch_mode:
                         self._follow_processed_artifact(frame)
                 continue
@@ -1533,12 +1554,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     and not self._active_batch_mode
                 ):
                     changed = True
+                    force_scientific = True
                 continue
             if event.kind in {
                 StandardEventKind.FINISHED,
                 StandardEventKind.STOPPED,
                 StandardEventKind.FAILED,
             }:
+                force_scientific = True
                 ScatteringWorkspace._flush_presentation_target(self)
                 self._retain_outgoing_display = False
                 if self._batch_latest_frame is not None:
@@ -1560,10 +1583,28 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._batch_latest_frame = None
                 changed = True
 
-        if ScatteringWorkspace._advance_presentation_target(self):
+        advanced_presentation = (
+            ScatteringWorkspace._advance_presentation_target(self)
+        )
+        if advanced_presentation:
             changed = True
         if changed:
-            self._refresh_shell()
+            preserve_scientific = False
+            last_plot = self._last_live_plot_at
+            if (
+                advanced_presentation
+                and not force_scientific
+                and self._live_plot_interval_ms
+                > _LIVE_EVENT_DRAIN_INTERVAL_MS
+                and last_plot is not None
+                and time.monotonic() - last_plot
+                < self._live_plot_interval_ms / 1000.0
+            ):
+                preserve_scientific = True
+            if preserve_scientific:
+                self._refresh_shell(preserve_scientific=True)
+            else:
+                self._refresh_shell()
         if not self._polling_needed():
             self._run_timer.stop()
 
@@ -1737,11 +1778,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             detector_diagnostic=diagnostic or reason,
         )
 
-    def _refresh_shell(self, *, preserve_display: bool = False) -> None:
+    def _refresh_shell(
+        self,
+        *,
+        preserve_display: bool = False,
+        preserve_scientific: bool = False,
+    ) -> None:
         # The worker can rescope the one mutable acquisition context after its
         # event queue snapshot but before this GUI refresh.  Catch up only an
         # already-selected exact acquisition owner; Browse remains untouched.
-        self._context_controller.synchronize_acquisition_scope()
+        if self._context_controller.synchronize_acquisition_scope():
+            preserve_scientific = False
         snapshot = self._intents.snapshot()
         intent = snapshot.thaw()
         controls = self._project_controls(snapshot)
@@ -1805,7 +1852,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             and any(frame is current for frame in resident_frames)
         )
-        if self._retain_outgoing_display and replacement_ready:
+        if (
+            not preserve_scientific
+            and self._retain_outgoing_display
+            and replacement_ready
+        ):
             self._retain_outgoing_display = False
         preserve_display = (
             preserve_display or self._retain_outgoing_display
@@ -1866,10 +1917,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._lifecycle.attempt_run_identity,
                 )),
             )
-            self._shell.apply_state(
-                projection,
-                preserve_display=preserve_display,
-            )
+            apply_options = {"preserve_display": preserve_display}
+            if preserve_scientific:
+                apply_options["preserve_scientific"] = True
+            self._shell.apply_state(projection, **apply_options)
         except Exception as error:
             if viewer:
                 self._last_scientific_projection = None
@@ -1879,16 +1930,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 f"{detached_exception_strings(error)[2]}"
             )
             return
-        scientific, heavy = projection.scientific, projection.scientific.heavy
-        self._last_scientific_projection = (None
-            if scientific.processing_mode == "Int 1D" and heavy is not None
-            and heavy.detector_source == "full" else scientific)
-        self._context_controller.commit_navigation_projection(
-            self._shell.scientific.trace_history_keys
-        )
-        rendered_axis = self._shell.scientific.rendered_image_axis
-        if rendered_axis is not None:
-            self._rendered_image_axis = rendered_axis
+        if not preserve_scientific:
+            scientific, heavy = (
+                projection.scientific,
+                projection.scientific.heavy,
+            )
+            self._last_scientific_projection = (None
+                if scientific.processing_mode == "Int 1D" and heavy is not None
+                and heavy.detector_source == "full" else scientific)
+            self._context_controller.commit_navigation_projection(
+                self._shell.scientific.trace_history_keys
+            )
+            rendered_axis = self._shell.scientific.rendered_image_axis
+            if rendered_axis is not None:
+                self._rendered_image_axis = rendered_axis
+            if not preserve_display:
+                self._last_live_plot_at = time.monotonic()
         self._shell_revision += 1
 
     def _project_controls(

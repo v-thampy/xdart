@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ from xdart.gui.tabs.scattering.display_retirement import (
     DisplayRetirementReceipt,
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+import xdart.gui.tabs.scattering.page as page_module
 from xdart.gui.tabs.scattering.shell_values import (
     FrameNavigationProjection,
     ShellCommand,
@@ -162,7 +164,7 @@ def _paced_frame_events(page, executor, identity, count):
     _, acquisition = _acquisition(
         configuration=RunIntent(output_mode="Overwrite").freeze(), identity=identity)
     executor.acquisition_context = lambda candidate: acquisition if candidate is identity else None
-    acquisition.publication_store.catalog.resize(16)
+    acquisition.publication_store.catalog.resize(max(16, count))
     page._context_controller.adopt_acquisition(identity)
     display = acquisition.publication_store
     deltas = [DisplayNavigationDelta(display.catalog_snapshot().entries[0])]
@@ -207,11 +209,27 @@ def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) ->
         _dispose(page, qapp)
 
 
+@pytest.mark.parametrize(
+    ("plot_interval_ms", "expected_light_refreshes"),
+    ((125, (False, False, False)), (375, (False, True, False))),
+)
 def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
-        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+        qapp: QtWidgets.QApplication, monkeypatch,
+        plot_interval_ms: int,
+        expected_light_refreshes: tuple[bool, bool, bool]) -> None:
+    monkeypatch.setenv(
+        "XDART_LIVE_PLOT_INTERVAL_MS", str(plot_interval_ms),
+    )
     executor = _Executor()
     page, _, identity = _active_page(executor)
-    events = _paced_frame_events(page, executor, identity, 16)
+    events = _paced_frame_events(page, executor, identity, 24)
+    now = [0.0]
+    monkeypatch.setattr(
+        page_module, "time", SimpleNamespace(monotonic=lambda: now[0]),
+        raising=False,
+    )
+    assert page._live_plot_interval_ms == plot_interval_ms
+    page._last_live_plot_at = None
     accepted_follow_latest: list[bool] = []
     accept_navigation = page._context_controller.accept_navigation
 
@@ -225,10 +243,15 @@ def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
 
     monkeypatch.setattr(page._context_controller, "accept_navigation", accept)
     monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
-    paints: list[int | None] = []
-    def record_paint(**_kwargs):
+    paints: list[tuple[int | None, bool]] = []
+    def record_paint(*, preserve_scientific=False, **_kwargs):
         current = page._context_controller.navigation.current
-        paints.append(None if current is None else current.local_frame_label)
+        paints.append((
+            None if current is None else current.local_frame_label,
+            preserve_scientific,
+        ))
+        if not preserve_scientific:
+            page._last_live_plot_at = now[0]
 
     monkeypatch.setattr(page, "_refresh_shell", record_paint)
     try:
@@ -244,16 +267,17 @@ def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
         assert page._progress.completed == 8
         assert page._artifact_progress["/out/a.nxs"].published == 8
         assert accepted_follow_latest == [False] * 8
-        assert paints == [8]
+        assert paints == [(8, expected_light_refreshes[0])]
         assert tuple(page._presentation_targets) == ()
 
         for _ in range(3):
             page._drain_executor()
 
-        assert paints == [8]
+        assert paints == [(8, expected_light_refreshes[0])]
         assert tuple(page._presentation_targets) == ()
 
-        executor.events.extend(events[8:])
+        now[0] = 0.125
+        executor.events.extend(events[8:16])
         page._drain_executor()
 
         assert tuple(
@@ -263,14 +287,36 @@ def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
         assert page._progress.completed == 16
         assert page._artifact_progress["/out/a.nxs"].published == 16
         assert accepted_follow_latest == [False] * 16
-        assert paints == [8, 16]
+        assert paints == [
+            (8, expected_light_refreshes[0]),
+            (16, expected_light_refreshes[1]),
+        ]
         assert tuple(page._presentation_targets) == ()
 
         for _ in range(3):
             page._drain_executor()
 
-        assert paints == [8, 16]
+        assert paints == [
+            (8, expected_light_refreshes[0]),
+            (16, expected_light_refreshes[1]),
+        ]
         assert tuple(page._presentation_targets) == ()
+
+        now[0] = 0.375
+        executor.events.extend(events[16:])
+        page._drain_executor()
+
+        assert tuple(
+            frame.local_frame_label
+            for frame in page._context_controller.navigation.frames
+        ) == tuple(range(1, 25))
+        assert page._progress.completed == 24
+        assert accepted_follow_latest == [False] * 24
+        assert paints == [
+            (8, expected_light_refreshes[0]),
+            (16, expected_light_refreshes[1]),
+            (24, expected_light_refreshes[2]),
+        ]
     finally:
         _dispose(page, qapp)
 

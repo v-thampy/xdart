@@ -220,8 +220,9 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         state: ShellProjection,
         *,
         preserve_display: bool = False,
+        preserve_scientific: bool = False,
     ) -> None:
-        """Reconcile passive state, optionally retaining browser/display paint."""
+        """Reconcile passive state with independently retainable plot paint."""
 
         if type(state) is not ShellProjection:
             raise TypeError("shell state must be an exact ShellProjection")
@@ -241,7 +242,10 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                 # older committed selection while the browser owns newer
                 # pending intent.  The one trailing typed command reconciles
                 # both surfaces together.
-                if not self.browser.frame_selection_pending:
+                if (
+                    not preserve_scientific
+                    and not self.browser.frame_selection_pending
+                ):
                     current = state.navigation.current
                     local_frames = (
                         tuple(

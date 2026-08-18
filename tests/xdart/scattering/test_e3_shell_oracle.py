@@ -444,3 +444,38 @@ def test_e3_ui3_651_reconciliation_preserves_gui_heartbeat(
     finally:
         timer.stop()
         _dispose(shell, qapp)
+
+
+def test_shell_light_refresh_skips_only_scientific_reconcile(
+        qapp: QtWidgets.QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(frame_count=2, heavy_indices=(0, 1))
+    browser_calls: list[int] = []
+    scientific_calls: list[int] = []
+    monkeypatch.setattr(
+        shell.browser, "reconcile",
+        lambda *_args, **_kwargs: browser_calls.append(1),
+    )
+    monkeypatch.setattr(
+        shell.scientific, "reconcile",
+        lambda *_args, **_kwargs: scientific_calls.append(1),
+    )
+    try:
+        shell.apply_state(state, preserve_scientific=True)
+        assert browser_calls == [1]
+        assert scientific_calls == []
+        assert shell._revision == state.revision
+
+        shell.apply_state(replace(state, revision=state.revision + 1))
+        assert browser_calls == [1, 1]
+        assert scientific_calls == [1]
+
+        shell.apply_state(
+            replace(state, revision=state.revision + 2),
+            preserve_display=True,
+            preserve_scientific=True,
+        )
+        assert browser_calls == [1, 1]
+        assert scientific_calls == [1]
+    finally:
+        _dispose(shell, qapp)
