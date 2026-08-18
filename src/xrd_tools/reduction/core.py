@@ -1395,8 +1395,8 @@ class NexusSink:
         return self._writer_batch_size
 
     def _configure_writer_batch_size(self, value: int) -> None:
-        if type(value) is not int or not 1 <= value <= 8:
-            raise TypeError("Nexus writer batch size must be an exact int in [1, 8]")
+        if type(value) is not int or not 1 <= value <= 16:
+            raise TypeError("Nexus writer batch size must be an exact int in [1, 16]")
         if self._writer is not None:
             raise RuntimeError("Nexus writer batch size must bind before begin")
         self._writer_batch_size = value

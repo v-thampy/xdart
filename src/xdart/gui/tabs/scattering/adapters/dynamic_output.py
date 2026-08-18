@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
@@ -66,7 +67,38 @@ from ..output_preflight import source_snapshots
 
 _MISSING = object()
 _SUPPORTED_LINEAGE_FRAME_CEILING = 1_000_000
+_POST_G2_PIPELINE_FIELDS = frozenset({
+    "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
+})
+_POST_G2_PIPELINE_ROWS = frozenset({
+    (8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48),
+})
 logger = logging.getLogger(__name__)
+
+
+def _post_g2_pipeline_choice(configuration, *, coordinated):
+    value = configuration.run_options.get("_post_g2_pipeline", _MISSING)
+    if value is _MISSING:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("post-G2 pipeline choice must be one exact mapping")
+    if set(value) != _POST_G2_PIPELINE_FIELDS:
+        raise ValueError("post-G2 pipeline choice has an invalid exact keyset")
+    row = (
+        value["writer_batch_size"], value["reduction_inflight"],
+        value["checkpoint_frame_cap"],
+    )
+    if any(type(item) is not int for item in row):
+        raise TypeError("post-G2 pipeline values must be exact integers")
+    if row not in _POST_G2_PIPELINE_ROWS:
+        raise ValueError("post-G2 pipeline choice is not an allowed row")
+    if configuration.live_mode:
+        raise ValueError("post-G2 pipeline choice requires a non-Live run")
+    if not coordinated:
+        raise ValueError("post-G2 pipeline choice requires a coordinated run")
+    if configuration.processing_mode == "Int 1D (XYE)":
+        raise ValueError("post-G2 pipeline choice requires Nexus output")
+    return row
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +135,7 @@ def _direct_eiger_candidate(item, write_labels) -> bool:
 
 def _light_policy_layout(
     configuration, plan, item, scan, write_labels, *, heavy_request=None,
-    env=None,
+    reduction_inflight=None, env=None,
 ):
     if not write_labels:
         raise ValueError("dynamic light-1D mount has no admitted write frame")
@@ -137,18 +169,33 @@ def _light_policy_layout(
             "staging_items": heavy_request, "record_heavy_items": heavy_request,
             "publication_heavy_items": heavy_request,
         })
+    if reduction_inflight is not None:
+        if type(reduction_inflight) is not int or reduction_inflight < 1:
+            raise TypeError("requested reduction in-flight must be a positive int")
+        requests["reduction_inflight"] = reduction_inflight
     frozen_env = dict(os.environ) if env is None else dict(env)
     policy = resolve_session_policy(
         requirements, requested_workers=requested, requests=requests or None,
         env=frozen_env,
     )
-    if not configuration.live_mode and policy.allocation.workers == 4:
+    if (
+        reduction_inflight is None
+        and not configuration.live_mode
+        and policy.allocation.workers == 4
+    ):
         policy = resolve_session_policy(
             requirements, envelope_bytes=policy.allocation.envelope_bytes,
             requested_workers=requested,
             requests={**requests, "reduction_inflight": 16}, env=frozen_env,
         )
     allocation = policy.allocation
+    if (
+        reduction_inflight is not None
+        and allocation.reduction_inflight != reduction_inflight
+    ):
+        raise RuntimeError(
+            "post-G2 pipeline in-flight request was not granted exactly"
+        )
     interval = 8 if plan.integration_2d is not None else 1000
     policy = replace(policy, flush=FlushPolicy(
         interval=interval, cap=int(allocation.staging_items), margin=8,
@@ -662,6 +709,14 @@ class DynamicOutputAdapter:
     ):
         if type(run_provenance) is not dict:
             raise TypeError("dynamic output requires exact run provenance")
+        mount_values = (
+            publication_store, display_owner, display_state, gui_thread_id,
+            light_cancel, light_drain, light_verify, on_frame_completed,
+        )
+        pipeline = _post_g2_pipeline_choice(
+            self.configuration,
+            coordinated=all(value is not None for value in mount_values),
+        )
         science_identity = science_fingerprint(_science_projection(
             self.configuration,
             run_provenance.get("scientific_signature"),
@@ -741,10 +796,6 @@ class DynamicOutputAdapter:
         xye_only = self.configuration.processing_mode == "Int 1D (XYE)"
         if xye_only and self.configuration.output_mode == "Append":
             raise ValueError("XYE-only Append has no persisted lineage owner")
-        mount_values = (
-            publication_store, display_owner, display_state, gui_thread_id,
-            light_cancel, light_drain, light_verify, on_frame_completed,
-        )
         coordinated = any(value is not None for value in mount_values)
         if coordinated and any(value is None for value in mount_values):
             raise TypeError("dynamic GUI light mount requires one exact graph")
@@ -795,6 +846,9 @@ class DynamicOutputAdapter:
                     _light_policy_layout(
                         self.configuration, plan, item, scan, write_labels,
                         heavy_request=heavy_request,
+                        reduction_inflight=(
+                            None if pipeline is None else pipeline[1]
+                        ),
                         env=resource_env,
                 )
                 allocation = policy.allocation
@@ -875,7 +929,10 @@ class DynamicOutputAdapter:
                         target, same_run_intent=intent, **sink_values,
                     )
                 nexus._configure_writer_batch_size(
-                    1 if self.configuration.live_mode else min(8, inflight_max)
+                    (
+                        1 if self.configuration.live_mode
+                        else min(8, inflight_max)
+                    ) if pipeline is None else pipeline[0]
                 )
                 self._pending_nexus.append(nexus)
             if nexus is None:
@@ -935,6 +992,9 @@ class DynamicOutputAdapter:
                     nexus is not None
                     and policy is not None
                     and not self.configuration.live_mode
+                ),
+                dynamic_nexus_checkpoint_threshold=(
+                    None if pipeline is None else pipeline[2]
                 ),
             )
             if coordinated:
@@ -1002,6 +1062,15 @@ class DynamicOutputAdapter:
             self._arm(graph, write_labels, revision)
             if cancelled():
                 raise RuntimeError("admission cancelled")
+            if pipeline is not None:
+                logger.info(
+                    "[RUN-PIPELINE] requested-batch=%d effective-batch=%d "
+                    "requested-inflight=%d effective-inflight=%d "
+                    "requested-checkpoint=%d effective-checkpoint=%d",
+                    pipeline[0], nexus.writer_batch_size,
+                    pipeline[1], policy.allocation.reduction_inflight,
+                    pipeline[2], session._dynamic_nexus_checkpoint_threshold,
+                )
             return session, True
         except BaseException as primary:
             cleanup: BaseException | None = None

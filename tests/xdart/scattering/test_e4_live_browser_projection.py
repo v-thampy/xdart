@@ -8,6 +8,7 @@ import time
 from types import SimpleNamespace
 
 from pyqtgraph.Qt import QtCore, QtWidgets
+import pytest
 
 from xdart.gui.tabs.scattering.adapters.source import (
     FilesystemSourceAdapter,
@@ -121,10 +122,17 @@ def test_dynamic_policy_widens_only_standard_four_worker_grants(monkeypatch):
 
     original = dynamic_output.resolve_session_policy
     calls = []
+    clamp_inflight = [False]
 
     def capture(requirements, **kwargs):
         kwargs.setdefault("envelope_bytes", 32 * 1024 ** 3)
         policy = original(requirements, **kwargs)
+        if clamp_inflight[0]:
+            policy = replace(policy, allocation=replace(
+                policy.allocation, counts={
+                    **policy.allocation.counts, "reduction_inflight": 15,
+                },
+            ))
         calls.append((kwargs, policy.allocation))
         return policy
 
@@ -163,6 +171,106 @@ def test_dynamic_policy_widens_only_standard_four_worker_grants(monkeypatch):
     )
     assert [(a.workers, a.reduction_inflight) for _, a in calls] == [(4, 8)]
     assert live.allocation is calls[0][1]
+
+    calls.clear()
+    clamp_inflight[0] = True
+    with pytest.raises(RuntimeError, match="not granted exactly"):
+        dynamic_output._light_policy_layout(
+            RunIntent(max_cores=4).freeze(), plan, item, scan, (1,),
+            reduction_inflight=16, env=frozen_env,
+        )
+    assert len(calls) == 1
+    assert calls[0][0]["requests"] == {"reduction_inflight": 16}
+
+
+def test_post_g2_pipeline_matrix_is_exact_private_nonlive_configuration():
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    assert dynamic_output._post_g2_pipeline_choice(
+        RunIntent().freeze(), coordinated=False,
+    ) is None
+
+    fields = (
+        "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
+    )
+    rows = ((8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48))
+    for row in rows:
+        configuration = RunIntent(run_options={
+            "_post_g2_pipeline": dict(zip(fields, row, strict=True)),
+        }).freeze()
+        assert dynamic_output._post_g2_pipeline_choice(
+            configuration, coordinated=True,
+        ) == row
+
+    complete = dict(zip(fields, rows[0], strict=True))
+    malformed = (
+        (None, TypeError),
+        ({**complete, "writer_batch_size": True}, TypeError),
+        ({key: complete[key] for key in fields[:-1]}, ValueError),
+        ({**complete, "extra": 1}, ValueError),
+        (dict(zip(fields, (8, 4, 8), strict=True)), ValueError),
+    )
+    for value, error in malformed:
+        configuration = RunIntent(
+            run_options={"_post_g2_pipeline": value},
+        ).freeze()
+        with pytest.raises(error):
+            dynamic_output._post_g2_pipeline_choice(
+                configuration, coordinated=True,
+            )
+
+    for configuration, message in (
+        (RunIntent(live_mode=True, run_options={
+            "_post_g2_pipeline": complete,
+        }).freeze(), "non-Live"),
+        (RunIntent(run_options={
+            "_post_g2_pipeline": complete,
+        }).freeze(), "coordinated"),
+        (RunIntent(processing_mode="Int 1D (XYE)", run_options={
+            "_post_g2_pipeline": complete,
+        }).freeze(), "Nexus"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            dynamic_output._post_g2_pipeline_choice(
+                configuration, coordinated=message != "coordinated",
+            )
+
+
+def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(monkeypatch):
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    touched = []
+    monkeypatch.setattr(
+        dynamic_output, "_science_projection",
+        lambda *_args: touched.append("science"),
+    )
+    fields = (
+        "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
+    )
+    valid = dict(zip(fields, (8, 8, 8), strict=True))
+    configurations = (
+        RunIntent(run_options={"_post_g2_pipeline": valid}).freeze(),
+        RunIntent(live_mode=True, run_options={
+            "_post_g2_pipeline": valid,
+        }).freeze(),
+        RunIntent(run_options={
+            "_post_g2_pipeline": {**valid, "checkpoint_frame_cap": False},
+        }).freeze(),
+    )
+    for configuration in configurations:
+        adapter = dynamic_output.DynamicOutputAdapter(configuration)
+        with pytest.raises((TypeError, ValueError)):
+            adapter.activate(
+                SimpleNamespace(frames=()), SimpleNamespace(),
+                SimpleNamespace(), SimpleNamespace(),
+                record_store=object(), run_provenance={},
+            )
+        assert adapter._science_identity is None
+        assert adapter._graphs == {}
+        assert adapter._pending_preflights == []
+        assert adapter._pending_nexus == []
+        assert adapter._pending_xye == []
+    assert touched == []
 
 
 def test_auto_fact_survives_post_allocation_failure_and_reaches_terminal(

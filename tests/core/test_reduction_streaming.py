@@ -20,6 +20,7 @@ from xrd_tools.reduction import (
     CancelToken,
     Frame,
     MemorySink,
+    NexusSink,
     ReductionPlan,
     Scan,
     ReductionSession,
@@ -246,7 +247,10 @@ def test_streaming_default_inflight_is_twice_workers(monkeypatch):
     assert session.inflight_max == 8     # 2 x workers
 
 
-def test_streaming_writer_batches_queued_short_tail_in_exact_order(monkeypatch):
+@pytest.mark.parametrize("writer_batch_size", (8, 16))
+def test_streaming_writer_batches_queued_short_tail_in_exact_order(
+    monkeypatch, writer_batch_size,
+):
     gate = threading.Event()
 
     def blocked(image, ai, **kw):
@@ -254,8 +258,6 @@ def test_streaming_writer_batches_queued_short_tail_in_exact_order(monkeypatch):
         return _r1d(float(np.sum(image)))
 
     class BatchSink:
-        writer_batch_size = 8
-
         def __init__(self):
             self.batches = []
             self.completed = []
@@ -276,23 +278,51 @@ def test_streaming_writer_batches_queued_short_tail_in_exact_order(monkeypatch):
             pass
 
     monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
-    frames = _frames(17)
+    frame_count = 2 * writer_batch_size + 1
+    frames = _frames(frame_count)
     sink = BatchSink()
-    outcomes = []
+    sink.writer_batch_size = writer_batch_size
+    outcomes, written, settled = [], [], []
+    session_box = {}
+
+    def on_settled(count):
+        members = session_box["session"]._inflight._members
+        settled.append((count, tuple(
+            int(ticket.frame.index) for ticket in members
+        )))
+
     session = ReductionSession(
-        _plan(), Scan("batch-17", frames, integrator=object()),
-        sink=sink, execution="streaming", executor=4, inflight_max=17,
+        _plan(), Scan(f"batch-{frame_count}", frames, integrator=object()),
+        sink=sink, execution="streaming", executor=4,
+        inflight_max=frame_count,
         outcome_cb=outcomes.append,
+        written_authority_cb=lambda frame, _reduction, _attempt: written.append(
+            int(frame.index)
+        ),
+        batch_settled_authority_cb=on_settled,
     )
+    session_box["session"] = session
     for frame in frames:
         assert session.submit(frame)
     gate.set()
     result = session.finish()
 
-    assert sink.batches == [tuple(range(8)), tuple(range(8, 16)), (16,)]
-    assert [receipt.frame_index for receipt in outcomes] == list(range(17))
-    assert sink.completed == list(range(17))
-    assert result.n_processed == 17
+    assert sink.batches == [
+        tuple(range(writer_batch_size)),
+        tuple(range(writer_batch_size, 2 * writer_batch_size)),
+        (frame_count - 1,),
+    ]
+    assert [receipt.frame_index for receipt in outcomes] == list(
+        range(frame_count)
+    )
+    assert written == sink.completed == list(range(frame_count))
+    assert settled == [
+        (writer_batch_size, tuple(range(frame_count))),
+        (writer_batch_size, tuple(range(writer_batch_size, frame_count))),
+        (1, (frame_count - 1,)),
+    ]
+    assert session._inflight._members == {}
+    assert result.n_processed == frame_count
 
 
 def test_streaming_batch_failure_publishes_no_per_frame_write_facts(monkeypatch):
@@ -303,7 +333,7 @@ def test_streaming_batch_failure_publishes_no_per_frame_write_facts(monkeypatch)
         return _r1d(float(np.sum(image)))
 
     class FailingBatchSink:
-        writer_batch_size = 3
+        writer_batch_size = 16
 
         def __init__(self):
             self.attempts = []
@@ -327,25 +357,27 @@ def test_streaming_batch_failure_publishes_no_per_frame_write_facts(monkeypatch)
             pass
 
     monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
-    frames = _frames(3)
+    frames = _frames(16)
     sink = FailingBatchSink()
-    outcomes, written = [], []
+    outcomes, written, settled = [], [], []
     session = ReductionSession(
         _plan(), Scan("batch-failure", frames, integrator=object()),
-        sink=sink, execution="streaming", executor=3, inflight_max=3,
+        sink=sink, execution="streaming", executor=4, inflight_max=16,
         outcome_cb=outcomes.append,
         written_authority_cb=lambda frame, reduction, attempt: written.append(
             int(frame.index)
         ),
+        batch_settled_authority_cb=settled.append,
     )
     for frame in frames:
         assert session.submit(frame)
     gate.set()
     result = session.finish(raise_on_failure=False)
 
-    assert sink.attempts == [(0, 1, 2)]
-    assert [receipt.frame_index for receipt in outcomes] == [0, 1, 2]
+    assert sink.attempts == [tuple(range(16))]
+    assert [receipt.frame_index for receipt in outcomes] == list(range(16))
     assert written == sink.completed == []
+    assert settled == []
     assert session._written_labels == set()
     assert session._seen_idxs == set()
     assert session.frames == {}
@@ -462,7 +494,12 @@ def test_batch_settled_authority_skips_an_incompletely_settled_batch(monkeypatch
     assert "injected post-write failure" in (result.error or "")
 
 
-def test_streaming_replacement_fences_fresh_writer_batches(monkeypatch):
+@pytest.mark.parametrize(
+    ("writer_batch_size", "fresh_count"), ((8, 3), (16, 16)),
+)
+def test_streaming_replacement_fences_fresh_writer_batches(
+    monkeypatch, writer_batch_size, fresh_count,
+):
     gate = threading.Event()
 
     def blocked(image, ai, **kw):
@@ -470,8 +507,6 @@ def test_streaming_replacement_fences_fresh_writer_batches(monkeypatch):
         return _r1d(float(np.sum(image)))
 
     class BatchSink:
-        writer_batch_size = 8
-
         def __init__(self):
             self.calls = []
 
@@ -493,25 +528,37 @@ def test_streaming_replacement_fences_fresh_writer_batches(monkeypatch):
             pass
 
     monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
-    frames = _frames(4)
+    frame_count = fresh_count + 1
+    frames = _frames(frame_count)
     sink = BatchSink()
+    sink.writer_batch_size = writer_batch_size
     session = ReductionSession(
         _plan(), Scan("batch-replace", frames, integrator=object()),
-        sink=sink, execution="streaming", executor=4, inflight_max=5,
+        sink=sink, execution="streaming", executor=4,
+        inflight_max=frame_count + 1,
     )
-    for frame in frames[:3]:
+    for frame in frames[:fresh_count]:
         assert session.submit(frame)
     assert session.submit(Frame(1, image=np.full((2, 2), 11.0)))
-    assert session.submit(frames[3])
+    assert session.submit(frames[fresh_count])
     gate.set()
     result = session.finish()
 
     assert sink.calls == [
-        ("batch", (0, 1, 2)),
+        ("batch", tuple(range(fresh_count))),
         ("replace", 1),
-        ("batch", (3,)),
+        ("batch", (fresh_count,)),
     ]
-    assert result.n_processed == 4
+    assert result.n_processed == frame_count
+
+
+def test_nexus_writer_batch_size_accepts_exact_16_only_through_its_cap():
+    sink = NexusSink("batch-cap.nexus", flush_every=None)
+    for value in (True, 0, 17, 1.0):
+        with pytest.raises(TypeError, match=r"\[1, 16\]"):
+            sink._configure_writer_batch_size(value)
+    sink._configure_writer_batch_size(16)
+    assert sink.writer_batch_size == 16
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +603,14 @@ def test_streaming_stop_flushes_completed_only(monkeypatch, caplog):
     monkeypatch.setattr(reduction_core, "integrate_1d", integ)
     plan = _plan()
     frames = _frames(30)
-    sink = MemorySink()
+    class BatchMemorySink(MemorySink):
+        writer_batch_size = 16
+
+        def write_batch(self, items):
+            for frame, reduction in items:
+                self.write(frame, reduction)
+
+    sink = BatchMemorySink()
     session = ReductionSession(
         plan, Scan("s", frames, integrator=object()),
         sink=sink, execution="streaming", executor=2, cancel_token=token,
@@ -570,6 +624,7 @@ def test_streaming_stop_flushes_completed_only(monkeypatch, caplog):
     # Only genuinely-completed frames were written; none are torn/half.
     assert len(sink.frames) <= 30
     assert all(r.result_1d is not None for r in sink.frames.values())
+    assert session._inflight._members == {}
     if session._submitted > result.n_processed:
         assert "dropped in-flight" in caplog.text
 

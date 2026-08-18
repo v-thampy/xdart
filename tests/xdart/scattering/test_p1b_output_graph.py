@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from dataclasses import replace
 import inspect
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -1985,6 +1986,73 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
         assert not output_root.exists()
     finally:
         append_executor.cancel_admission(token)
+
+
+@pytest.mark.parametrize("use_pipeline", (False, True), ids=("default", "diagnostic"))
+def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog, use_pipeline: bool,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    raw = tmp_path / "pipeline_0001.tif"
+    target = tmp_path / "pipeline.nexus"
+    poni = tmp_path / "pipeline.poni"
+    _write_tiff(raw, 7)
+    write_poni(poni)
+    intent = _intent(raw, target, poni)
+    intent.max_cores = 4
+    if use_pipeline:
+        intent.run_options["_post_g2_pipeline"] = {
+            "writer_batch_size": 16,
+            "reduction_inflight": 16,
+            "checkpoint_frame_cap": 48,
+        }
+    resolve = dynamic_output.resolve_session_policy
+    open_session = dynamic_output.open_headless_scan_session
+    observed = []
+
+    def fixed_envelope(requirements, **kwargs):
+        kwargs["envelope_bytes"] = 64 * 1024 ** 3
+        return resolve(requirements, **kwargs)
+
+    def capture_session(*args, **kwargs):
+        session = open_session(*args, **kwargs)
+        observed.append((
+            kwargs["sink"].writer_batch_size, kwargs["inflight_max"],
+            kwargs["dynamic_nexus_checkpoint_threshold"],
+            session._dynamic_nexus_checkpoint_threshold,
+        ))
+        return session
+
+    monkeypatch.setattr(
+        dynamic_output, "resolve_session_policy", fixed_envelope,
+    )
+    monkeypatch.setattr(
+        dynamic_output, "open_headless_scan_session", capture_session,
+    )
+    caplog.set_level(logging.INFO, logger=dynamic_output.__name__)
+    executor, identity, events = _run_to_terminal(
+        intent, request_value=1710,
+    )
+    try:
+        terminal = next(event for event in events if event.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED
+        assert _nexus_rows(target) == (1,)
+        assert observed == [
+            (16, 16, 48, 48) if use_pipeline else (8, 16, None, 56)
+        ]
+        facts = [
+            record.getMessage() for record in caplog.records
+            if record.getMessage().startswith("[RUN-PIPELINE]")
+        ]
+        expected_facts = [
+            "[RUN-PIPELINE] requested-batch=16 effective-batch=16 "
+            "requested-inflight=16 effective-inflight=16 "
+            "requested-checkpoint=48 effective-checkpoint=48"
+        ] if use_pipeline else []
+        assert facts == expected_facts
+    finally:
+        executor.close(identity)
 
 
 def test_p1b_b18_headless_and_single_owner_census(tmp_path: Path) -> None:
