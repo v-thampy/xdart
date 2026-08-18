@@ -73,6 +73,10 @@ _POST_G2_PIPELINE_FIELDS = frozenset({
 _POST_G2_PIPELINE_ROWS = frozenset({
     (1, 4, 56), (8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48),
 })
+_POST_G2_PIPELINE_V2_FIELDS = frozenset({
+    "writer_settlement_batch_size", "nexus_record_batch_size",
+    "reduction_inflight", "semantic_checkpoint_frame_cap",
+})
 logger = logging.getLogger(__name__)
 
 
@@ -99,6 +103,54 @@ def _post_g2_pipeline_choice(configuration, *, coordinated):
     if configuration.processing_mode == "Int 1D (XYE)":
         raise ValueError("post-G2 pipeline choice requires Nexus output")
     return row
+
+
+@dataclass(frozen=True, slots=True)
+class _PostG2PipelineV2Choice:
+    writer_settlement_batch_size: int
+    nexus_record_batch_size: int
+    reduction_inflight: int
+    semantic_checkpoint_frame_cap: int
+
+    @property
+    def buffers_nexus_records_across_calls(self) -> bool:
+        return self.nexus_record_batch_size > 1
+
+
+def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
+    legacy = configuration.run_options.get("_post_g2_pipeline", _MISSING)
+    value = configuration.run_options.get("_post_g2_pipeline_v2", _MISSING)
+    if legacy is not _MISSING and value is not _MISSING:
+        raise ValueError("post-G2 pipeline cannot supply both V1 and V2")
+    if value is _MISSING:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("post-G2 pipeline V2 choice must be one exact mapping")
+    if set(value) != _POST_G2_PIPELINE_V2_FIELDS:
+        raise ValueError("post-G2 pipeline V2 choice has an invalid exact keyset")
+    row = tuple(value[field] for field in (
+        "writer_settlement_batch_size", "nexus_record_batch_size",
+        "reduction_inflight", "semantic_checkpoint_frame_cap",
+    ))
+    if any(type(item) is not int for item in row):
+        raise TypeError("post-G2 pipeline V2 values must be exact integers")
+    settlement, record, inflight, checkpoint = row
+    if not (1 <= settlement <= 16 and 1 <= record <= 16
+            and 1 <= inflight <= 64 and checkpoint >= 1):
+        raise ValueError("post-G2 pipeline V2 values are out of bounds")
+    if settlement > inflight or record > checkpoint or checkpoint % settlement:
+        raise ValueError("post-G2 pipeline V2 values violate batching bounds")
+    if configuration.live_mode:
+        raise ValueError("post-G2 pipeline V2 requires a non-Live run")
+    if configuration.batch_mode:
+        raise ValueError("post-G2 pipeline V2 requires a non-batch run")
+    if configuration.output_mode != "Overwrite":
+        raise ValueError("post-G2 pipeline V2 requires Overwrite output")
+    if not coordinated:
+        raise ValueError("post-G2 pipeline V2 requires a coordinated run")
+    if configuration.processing_mode == "Int 1D (XYE)":
+        raise ValueError("post-G2 pipeline V2 requires Nexus output")
+    return _PostG2PipelineV2Choice(*row)
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,9 +765,14 @@ class DynamicOutputAdapter:
             publication_store, display_owner, display_state, gui_thread_id,
             light_cancel, light_drain, light_verify, on_frame_completed,
         )
-        pipeline = _post_g2_pipeline_choice(
-            self.configuration,
-            coordinated=all(value is not None for value in mount_values),
+        pipeline_coordinated = all(value is not None for value in mount_values)
+        pipeline_v2 = _post_g2_pipeline_v2_choice(
+            self.configuration, coordinated=pipeline_coordinated,
+        )
+        pipeline = (
+            _post_g2_pipeline_choice(
+                self.configuration, coordinated=pipeline_coordinated,
+            ) if pipeline_v2 is None else None
         )
         science_identity = science_fingerprint(_science_projection(
             self.configuration,
@@ -847,7 +904,9 @@ class DynamicOutputAdapter:
                         self.configuration, plan, item, scan, write_labels,
                         heavy_request=heavy_request,
                         reduction_inflight=(
-                            None if pipeline is None else pipeline[1]
+                            pipeline_v2.reduction_inflight
+                            if pipeline_v2 is not None else
+                            (None if pipeline is None else pipeline[1])
                         ),
                         env=resource_env,
                 )
@@ -928,19 +987,32 @@ class DynamicOutputAdapter:
                     nexus = NexusSink(
                         target, same_run_intent=intent, **sink_values,
                     )
-                nexus._configure_writer_batch_size(
-                    (
-                        1 if self.configuration.live_mode
-                        else min(8, inflight_max)
-                    ) if pipeline is None else pipeline[0]
-                )
+                if pipeline_v2 is not None:
+                    nexus._configure_writer_batch_size(
+                        pipeline_v2.writer_settlement_batch_size,
+                    )
+                    nexus._configure_nexus_record_batch_size(
+                        pipeline_v2.nexus_record_batch_size,
+                    )
+                else:
+                    nexus._configure_writer_batch_size(
+                        (
+                            1 if self.configuration.live_mode
+                            else min(8, inflight_max)
+                        ) if pipeline is None else pipeline[0]
+                    )
                 self._pending_nexus.append(nexus)
             if nexus is None:
                 sink = xye
             elif xye is None:
                 sink = nexus
             else:
-                sink = CompositeSink((nexus, xye))
+                sink = CompositeSink(
+                    (xye, nexus) if (
+                        pipeline_v2 is not None
+                        and pipeline_v2.buffers_nexus_records_across_calls
+                    ) else (nexus, xye)
+                )
             if sink is None:
                 raise ValueError("dynamic output graph has no applicable sink")
 
@@ -994,7 +1066,9 @@ class DynamicOutputAdapter:
                     and not self.configuration.live_mode
                 ),
                 dynamic_nexus_checkpoint_threshold=(
-                    None if pipeline is None else pipeline[2]
+                    pipeline_v2.semantic_checkpoint_frame_cap
+                    if pipeline_v2 is not None else
+                    (None if pipeline is None else pipeline[2])
                 ),
             )
             if coordinated:
@@ -1062,7 +1136,25 @@ class DynamicOutputAdapter:
             self._arm(graph, write_labels, revision)
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            if pipeline is not None:
+            if pipeline_v2 is not None:
+                logger.info(
+                    "[RUN-PIPELINE-V2] requested-settlement=%d "
+                    "effective-settlement=%d requested-record=%d "
+                    "effective-record=%d requested-inflight=%d "
+                    "effective-inflight=%d requested-checkpoint=%d "
+                    "effective-checkpoint=%d requested-workers=%d "
+                    "effective-workers=%d",
+                    pipeline_v2.writer_settlement_batch_size,
+                    nexus.writer_batch_size,
+                    pipeline_v2.nexus_record_batch_size,
+                    nexus.nexus_record_batch_size,
+                    pipeline_v2.reduction_inflight,
+                    policy.allocation.reduction_inflight,
+                    pipeline_v2.semantic_checkpoint_frame_cap,
+                    session._dynamic_nexus_checkpoint_threshold,
+                    self.configuration.max_cores, policy.allocation.workers,
+                )
+            elif pipeline is not None:
                 logger.info(
                     "[RUN-PIPELINE] requested-batch=%d effective-batch=%d "
                     "requested-inflight=%d effective-inflight=%d "

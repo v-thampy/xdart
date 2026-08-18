@@ -561,6 +561,88 @@ def test_nexus_writer_batch_size_accepts_exact_16_only_through_its_cap():
     assert sink.writer_batch_size == 16
 
 
+def test_nexus_record_batching_is_independent_and_drains_its_terminal_tail(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.record_writer import NexusRecordWriter
+
+    calls = []
+    real_write_batch = NexusRecordWriter.write_batch
+
+    def observed_write_batch(owner, records):
+        records = tuple(records)
+        calls.append(tuple(int(record.label) for record in records))
+        return real_write_batch(owner, records)
+
+    monkeypatch.setattr(NexusRecordWriter, "write_batch", observed_write_batch)
+    sink = NexusSink(
+        tmp_path / "independent-record-batch.nexus",
+        overwrite=True,
+        atomic=False,
+        flush_every=None,
+    )
+    sink._configure_writer_batch_size(1)
+    sink._configure_nexus_record_batch_size(3)
+    frames = _frames(7)
+    sink.begin(Scan("record-batch", frames, integrator=object()), _plan())
+
+    for frame in frames:
+        sink.write(frame, reduction_core.FrameReduction(
+            frame_index=int(frame.index), result_1d=_r1d(float(frame.index)),
+        ))
+
+    assert sink.writer_batch_size == 1
+    assert sink.nexus_record_batch_size == 3
+    assert calls == [(0, 1, 2), (3, 4, 5)]
+    assert tuple(item[0].label for item in sink._pending_record_writes) == (6,)
+    sink.finish(result=None)
+    assert calls == [(0, 1, 2), (3, 4, 5), (6,)]
+
+
+def test_nexus_record_batching_fences_replacement_and_stop_tail(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.record_writer import NexusRecordWriter
+
+    calls = []
+    real_write_batch = NexusRecordWriter.write_batch
+
+    def observed_write_batch(owner, records):
+        records = tuple(records)
+        calls.append(tuple(int(record.label) for record in records))
+        return real_write_batch(owner, records)
+
+    monkeypatch.setattr(NexusRecordWriter, "write_batch", observed_write_batch)
+    sink = NexusSink(
+        tmp_path / "record-batch-stop.nexus",
+        overwrite=True,
+        atomic=False,
+        flush_every=None,
+    )
+    sink._configure_writer_batch_size(1)
+    sink._configure_nexus_record_batch_size(8)
+    frames = _frames(3)
+    sink.begin(Scan("record-batch-stop", frames, integrator=object()), _plan())
+    for frame in frames[:2]:
+        sink.write(frame, reduction_core.FrameReduction(
+            frame_index=int(frame.index), result_1d=_r1d(float(frame.index)),
+        ))
+    sink.replace(frames[0], reduction_core.FrameReduction(
+        frame_index=0, result_1d=_r1d(99.0),
+    ))
+    sink.write(frames[2], reduction_core.FrameReduction(
+        frame_index=2, result_1d=_r1d(2.0),
+    ))
+
+    assert calls == [(0, 1), (0,)]
+    stopped = reduction_core.ReductionResult(
+        scan_name="record-batch-stop", frames={}, n_processed=3,
+        cancelled=True,
+    )
+    sink.finish(stopped)
+    assert calls == [(0, 1), (0,), (2,)]
+
+
 # ---------------------------------------------------------------------------
 # Replace idempotency (A1) — re-fed index doesn't double-count
 # ---------------------------------------------------------------------------

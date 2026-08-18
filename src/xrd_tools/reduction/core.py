@@ -1349,6 +1349,13 @@ class NexusSink:
         default=False, init=False, repr=False,
     )
     _writer_batch_size: int = field(default=1, init=False, repr=False)
+    _nexus_record_batch_size: int | None = field(default=None, init=False, repr=False)
+    _pending_record_writes: list[tuple[RecordWrite, tuple[ResultMode, ...], int]] = field(
+        default_factory=list, init=False, repr=False,
+    )
+    _settled_buffered_drop_labels: set[int] = field(
+        default_factory=set, init=False, repr=False,
+    )
     _existing_append_intent: AppendIntent | None = field(
         default=None, init=False, repr=False,
     )
@@ -1400,6 +1407,17 @@ class NexusSink:
         if self._writer is not None:
             raise RuntimeError("Nexus writer batch size must bind before begin")
         self._writer_batch_size = value
+
+    @property
+    def nexus_record_batch_size(self) -> int | None:
+        return self._nexus_record_batch_size
+
+    def _configure_nexus_record_batch_size(self, value: int) -> None:
+        if type(value) is not int or not 1 <= value <= 16:
+            raise TypeError("Nexus record batch size must be an exact int in [1, 16]")
+        if self._writer is not None:
+            raise RuntimeError("Nexus record batch size must bind before begin")
+        self._nexus_record_batch_size = value
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -1658,6 +1676,8 @@ class NexusSink:
         self._attempt = None
         self._terminal_result = None
         self._deferred_publication_drops.clear()
+        self._pending_record_writes.clear()
+        self._settled_buffered_drop_labels.clear()
         self._primary_mode_1d, self._primary_mode_2d = _plan_mode_keys(plan)
         append_decision = self._prepare_transaction()
         try:
@@ -1846,6 +1866,8 @@ class NexusSink:
                      ) -> tuple[tuple[ResultMode, ...], ...]:
         if not items:
             return ()
+        if replace_existing:
+            self._drain_pending_record_writes(force=True)
         writer = self._writer
         if writer is None:
             raise RuntimeError("NexusSink.write called before begin().")
@@ -1855,6 +1877,14 @@ class NexusSink:
         prepared = tuple(self._prepare_frame_write(
             frame, reduction, replace_existing=replace_existing,
         ) for frame, reduction in items)
+        if self._nexus_record_batch_size is not None and not replace_existing:
+            for (_frame, reduction), (record, dropped) in zip(items, prepared):
+                key = id(reduction)
+                self._pending_record_writes.append((record, dropped, key))
+                if self._defer_publication_drop_settlement:
+                    self._deferred_publication_drops[key] = dropped
+            self._drain_pending_record_writes(force=False)
+            return tuple(dropped for _record, dropped in prepared)
         writer.write_batch(tuple(record for record, _dropped in prepared))
         for (frame, reduction), (_record, dropped) in zip(items, prepared):
             if self._defer_publication_drop_settlement:
@@ -1863,6 +1893,35 @@ class NexusSink:
                 for mode in dropped:
                     writer.drop_publication(int(frame.index), mode)
         return tuple(dropped for _record, dropped in prepared)
+
+    def _drain_pending_record_writes(self, *, force: bool) -> None:
+        size = self._nexus_record_batch_size
+        writer = self._writer
+        if size is None or writer is None:
+            return
+        while self._pending_record_writes and (
+            force or len(self._pending_record_writes) >= size
+        ):
+            count = len(self._pending_record_writes) if force else size
+            batch = tuple(self._pending_record_writes[:count])
+            del self._pending_record_writes[:count]
+            try:
+                writer.write_batch(tuple(item[0] for item in batch))
+                for record, dropped, key in batch:
+                    if self._defer_publication_drop_settlement:
+                        if record.label not in self._settled_buffered_drop_labels:
+                            continue
+                        self._settled_buffered_drop_labels.remove(record.label)
+                        self._deferred_publication_drops.pop(key, None)
+                    for mode in dropped:
+                        writer.drop_publication(record.label, mode)
+            except BaseException:
+                abandoned = batch + tuple(self._pending_record_writes)
+                self._pending_record_writes.clear()
+                for record, _dropped, key in abandoned:
+                    self._settled_buffered_drop_labels.discard(record.label)
+                    self._deferred_publication_drops.pop(key, None)
+                raise
 
     def _prepare_frame_write(self, frame: Frame, reduction: FrameReduction, *,
                              replace_existing: bool
@@ -1905,7 +1964,13 @@ class NexusSink:
     def _settle_deferred_publication_drops(
         self, frame: Frame, reduction: FrameReduction,
     ) -> None:
-        modes = self._deferred_publication_drops.pop(id(reduction), ())
+        key = id(reduction)
+        label = int(frame.index)
+        if any(item[0].label == label for item in self._pending_record_writes):
+            self._deferred_publication_drops.pop(key, None)
+            self._settled_buffered_drop_labels.add(label)
+            return
+        modes = self._deferred_publication_drops.pop(key, ())
         writer = self._writer
         if writer is None and modes:
             raise RuntimeError("deferred publication drop lost its writer")
@@ -2017,6 +2082,7 @@ class NexusSink:
         self._apply_pending_extension()
         if self._writer.phase.value == "finished":
             return
+        self._drain_pending_record_writes(force=force)
         self._writer.flush(force=force)
 
     def _writer_finalization(self, writer: NexusRecordWriter) -> WriterFinalization:
@@ -2086,6 +2152,7 @@ class NexusSink:
         if self._writer is None:
             raise RuntimeError("epoch commit requires an owned Append-lineage writer")
         self._apply_pending_extension()
+        self._drain_pending_record_writes(force=True)
         writer = self._writer
         if writer.phase.value == "active":
             writer.finish(self._writer_finalization(writer))
@@ -2102,6 +2169,7 @@ class NexusSink:
         if self._terminal_result is not None:
             return self._terminal_result
         self._apply_pending_extension()
+        self._drain_pending_record_writes(force=True)
         writer = self._writer
         if writer is None:
             raise RuntimeError("NexusSink finish has no transaction writer")
@@ -2163,6 +2231,10 @@ class NexusSink:
     def abort(self, result: ReductionResult | None) -> NexusTerminalResult | None:
         if self._terminal_result is not None:
             return self._terminal_result
+        if self._nexus_record_batch_size is not None:
+            self._pending_record_writes.clear()
+            self._settled_buffered_drop_labels.clear()
+            self._deferred_publication_drops.clear()
         self._scan = None
         self._plan = None
         if self._transaction is not None and self._transaction_owners is not None:

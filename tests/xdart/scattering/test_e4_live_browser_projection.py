@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 import os
 from pathlib import Path
 from threading import Event, Thread
@@ -190,7 +190,7 @@ def test_post_g2_pipeline_matrix_is_exact_private_nonlive_configuration():
         RunIntent().freeze(), coordinated=False,
     ) is None
 
-    fields = (
+    legacy_fields = (
         "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
     )
     rows = (
@@ -200,19 +200,19 @@ def test_post_g2_pipeline_matrix_is_exact_private_nonlive_configuration():
     assert dynamic_output._POST_G2_PIPELINE_ROWS == frozenset(rows)
     for row in rows:
         configuration = RunIntent(run_options={
-            "_post_g2_pipeline": dict(zip(fields, row, strict=True)),
+            "_post_g2_pipeline": dict(zip(legacy_fields, row, strict=True)),
         }).freeze()
         assert dynamic_output._post_g2_pipeline_choice(
             configuration, coordinated=True,
         ) == row
 
-    complete = dict(zip(fields, rows[0], strict=True))
+    complete = dict(zip(legacy_fields, rows[0], strict=True))
     malformed = (
         (None, TypeError),
         ({**complete, "writer_batch_size": True}, TypeError),
-        ({key: complete[key] for key in fields[:-1]}, ValueError),
+        ({key: complete[key] for key in legacy_fields[:-1]}, ValueError),
         ({**complete, "extra": 1}, ValueError),
-        (dict(zip(fields, (8, 4, 8), strict=True)), ValueError),
+        (dict(zip(legacy_fields, (8, 4, 8), strict=True)), ValueError),
     )
     for value, error in malformed:
         configuration = RunIntent(
@@ -238,6 +238,87 @@ def test_post_g2_pipeline_matrix_is_exact_private_nonlive_configuration():
             dynamic_output._post_g2_pipeline_choice(
                 configuration, coordinated=message != "coordinated",
             )
+
+
+def test_post_g2_pipeline_four_knob_choice_is_named_bounded_and_nonlive():
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    fields = (
+        "writer_settlement_batch_size", "nexus_record_batch_size",
+        "reduction_inflight", "semantic_checkpoint_frame_cap",
+    )
+    values = (1, 8, 4, 56)
+    complete = dict(zip(fields, values, strict=True))
+    choice = dynamic_output._post_g2_pipeline_v2_choice(
+        RunIntent(
+            output_mode="Overwrite",
+            run_options={"_post_g2_pipeline_v2": complete},
+        ).freeze(),
+        coordinated=True,
+    )
+    assert choice.writer_settlement_batch_size == 1
+    assert choice.nexus_record_batch_size == 8
+    assert choice.reduction_inflight == 4
+    assert choice.semantic_checkpoint_frame_cap == 56
+    assert choice.buffers_nexus_records_across_calls is True
+    with pytest.raises(FrozenInstanceError):
+        choice.nexus_record_batch_size = 1
+
+    invalid = (
+        {**complete, "writer_settlement_batch_size": True},
+        {**complete, "nexus_record_batch_size": 0},
+        {**complete, "nexus_record_batch_size": 17},
+        {**complete, "writer_settlement_batch_size": 17},
+        {**complete, "reduction_inflight": 65},
+        {**complete, "semantic_checkpoint_frame_cap": 0},
+        {**complete, "writer_settlement_batch_size": 5},
+        {**complete, "nexus_record_batch_size": 9,
+         "semantic_checkpoint_frame_cap": 8},
+        {**complete, "writer_settlement_batch_size": 3,
+         "semantic_checkpoint_frame_cap": 56},
+    )
+    for value in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            dynamic_output._post_g2_pipeline_v2_choice(
+                RunIntent(run_options={"_post_g2_pipeline_v2": value}).freeze(),
+                coordinated=True,
+            )
+
+    for intent, message in (
+        (RunIntent(live_mode=True), "non-Live"),
+        (RunIntent(batch_mode=True), "non-batch"),
+        (RunIntent(output_mode="Append"), "Overwrite"),
+        (RunIntent(output_mode="Inspect"), "Overwrite"),
+        (RunIntent(
+            output_mode="Overwrite", processing_mode="Int 1D (XYE)",
+        ), "Nexus"),
+    ):
+        intent.run_options["_post_g2_pipeline_v2"] = complete
+        with pytest.raises(ValueError, match=message):
+            dynamic_output._post_g2_pipeline_v2_choice(
+                intent.freeze(), coordinated=True,
+            )
+    with pytest.raises(ValueError, match="coordinated"):
+        dynamic_output._post_g2_pipeline_v2_choice(
+            RunIntent(
+                output_mode="Overwrite",
+                run_options={"_post_g2_pipeline_v2": complete},
+            ).freeze(),
+            coordinated=False,
+        )
+
+    legacy = {
+        "writer_batch_size": 1, "reduction_inflight": 4,
+        "checkpoint_frame_cap": 56,
+    }
+    configuration = RunIntent(run_options={
+        "_post_g2_pipeline": legacy,
+        "_post_g2_pipeline_v2": complete,
+    }).freeze()
+    with pytest.raises(ValueError, match="both"):
+        dynamic_output._post_g2_pipeline_v2_choice(
+            configuration, coordinated=True,
+        )
 
 
 def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(monkeypatch):

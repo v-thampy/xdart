@@ -1994,12 +1994,16 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
         (None, (8, 16, None, 56, 8, 4, 4)),
         ((16, 16, 48), (16, 16, 48, 48, 16, 4, 4)),
         ((1, 4, 56), (1, 4, 56, 56, 1, 4, 4)),
+        ((1, 8, 16, 56), (1, 16, 56, 56, 1, 4, 4)),
     ),
-    ids=("default", "diagnostic-16-16-48", "diagnostic-1-4-56"),
+    ids=(
+        "default", "diagnostic-16-16-48", "diagnostic-1-4-56",
+        "v2-settlement1-record8-inflight16-checkpoint56",
+    ),
 )
 def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog,
-    pipeline: tuple[int, int, int] | None, expected: tuple[int, ...],
+    pipeline: tuple[int, ...] | None, expected: tuple[int, ...],
 ) -> None:
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 
@@ -2011,14 +2015,23 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
     intent = _intent(raw, target, poni)
     intent.max_cores = 4
     if pipeline is not None:
-        intent.run_options["_post_g2_pipeline"] = {
-            "writer_batch_size": pipeline[0],
-            "reduction_inflight": pipeline[1],
-            "checkpoint_frame_cap": pipeline[2],
-        }
+        if len(pipeline) == 3:
+            intent.run_options["_post_g2_pipeline"] = {
+                "writer_batch_size": pipeline[0],
+                "reduction_inflight": pipeline[1],
+                "checkpoint_frame_cap": pipeline[2],
+            }
+        else:
+            intent.run_options["_post_g2_pipeline_v2"] = {
+                "writer_settlement_batch_size": pipeline[0],
+                "nexus_record_batch_size": pipeline[1],
+                "reduction_inflight": pipeline[2],
+                "semantic_checkpoint_frame_cap": pipeline[3],
+            }
     resolve = dynamic_output.resolve_session_policy
     open_session = dynamic_output.open_headless_scan_session
     observed = []
+    v2_observed = []
 
     def fixed_envelope(requirements, **kwargs):
         kwargs["envelope_bytes"] = 64 * 1024 ** 3
@@ -2033,6 +2046,20 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             session._session._writer_batch_size,
             kwargs["executor"], session._session._worker._max_workers,
         ))
+        if pipeline is not None and len(pipeline) == 4:
+            children = kwargs["sink"].output_sink_children
+            (nexus,) = tuple(
+                child for child in children
+                if type(child).__name__ == "NexusSink"
+            )
+            v2_observed.append((
+                session._session._writer_batch_size,
+                session._policy.allocation.reduction_inflight,
+                session._session.inflight_max,
+                kwargs["executor"], session._session._worker._max_workers,
+                nexus.nexus_record_batch_size,
+                tuple(type(child).__name__ for child in children),
+            ))
         return session
 
     monkeypatch.setattr(
@@ -2050,11 +2077,14 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
         assert terminal.kind is StandardEventKind.FINISHED
         assert _nexus_rows(target) == (1,)
         assert observed == [expected]
+        assert v2_observed == ([] if pipeline is None or len(pipeline) == 3 else [
+            (1, 16, 16, 4, 4, 8, ("TransactionalXYESink", "NexusSink")),
+        ])
         facts = [
             record.getMessage() for record in caplog.records
             if record.getMessage().startswith("[RUN-PIPELINE]")
         ]
-        expected_facts = [] if pipeline is None else [
+        expected_facts = [] if pipeline is None or len(pipeline) == 4 else [
             f"[RUN-PIPELINE] requested-batch={pipeline[0]} "
             f"effective-batch={pipeline[0]} "
             f"requested-inflight={pipeline[1]} "
@@ -2063,6 +2093,16 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             f"effective-checkpoint={pipeline[2]}"
         ]
         assert facts == expected_facts
+        v2_facts = [
+            record.getMessage() for record in caplog.records
+            if record.getMessage().startswith("[RUN-PIPELINE-V2]")
+        ]
+        assert v2_facts == ([] if pipeline is None or len(pipeline) == 3 else [
+            "[RUN-PIPELINE-V2] requested-settlement=1 effective-settlement=1 "
+            "requested-record=8 effective-record=8 requested-inflight=16 "
+            "effective-inflight=16 requested-checkpoint=56 "
+            "effective-checkpoint=56 requested-workers=4 effective-workers=4"
+        ])
     finally:
         executor.close(identity)
 
