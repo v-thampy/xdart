@@ -287,6 +287,31 @@ class _DurableModeProof:
 
 
 @dataclass(frozen=True, slots=True)
+class _CloseModeGroupContext:
+    group_name: str
+    group_path: str
+    top_path: str
+    dimension: str
+    primary_mode: str
+    frame_index_dtype: np.dtype
+    radial: np.ndarray
+    unit: str
+    azimuthal: np.ndarray | None
+    azimuthal_unit: str | None
+    two_d_kind: str | None
+    sigma_present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _CloseModeObservation:
+    context: _CloseModeGroupContext
+    start: int
+    frame_indices: np.ndarray
+    intensities: np.ndarray
+    sigmas: np.ndarray | None
+
+
+@dataclass(frozen=True, slots=True)
 class _DurableAbsenceProof:
     """Small selector proving one publication row remains absent."""
 
@@ -539,7 +564,32 @@ class NexusRecordWriter:
         if group:
             yield tuple(group)
 
-    def _read_grouped_mode(self, rows, phase: str):
+    def _read_grouped_mode(self, rows, phase: str, close_context=None, close_datasets=None):
+        if close_context is not None:
+            if close_datasets is None:
+                raise WriterStateError("close mode read has no datasets")
+            labels, intensity, sigma = close_datasets
+            start = rows[0].row
+            stop = start + len(rows)
+            observed_labels = np.asarray(labels[start:stop])
+            observed_intensity = np.asarray(intensity[start:stop])
+            observed_sigma = None if sigma is None else np.asarray(sigma[start:stop])
+            if (
+                observed_labels.ndim != 1 or observed_labels.shape != (len(rows),)
+                or observed_intensity.shape[:1] != (len(rows),)
+                or (
+                    observed_sigma is not None
+                    and observed_sigma.shape[:1] != (len(rows),)
+                )
+            ):
+                raise WriterStateError(
+                    f"grouped durability read lost rows for {rows[0].group_name}"
+                )
+            self._semantic_read_groups[phase] += 1
+            self._semantic_read_rows[phase] += len(rows)
+            return _CloseModeObservation(
+                close_context, start, observed_labels, observed_intensity, observed_sigma,
+            )
         group = self._entry_group().get(rows[0].group_name)
         intensity = group.get("intensity") if isinstance(group, h5py.Group) else None
         radial = group.get("q") if isinstance(group, h5py.Group) else None
@@ -562,6 +612,59 @@ class NexusRecordWriter:
             np.asarray(radial[()]), observed,
             None if azimuthal is None else np.asarray(azimuthal[()]),
         )
+
+    def _close_mode_groups(self, proofs):
+        entry = self._entry_group()
+        index = 0
+        while index < len(proofs):
+            end = index + 1
+            while end < len(proofs) and proofs[end].group_name == proofs[index].group_name:
+                end += 1
+            group_proofs = proofs[index:end]
+            first = group_proofs[0]
+            group = entry.get(first.group_name)
+            if not isinstance(group, h5py.Group):
+                raise WriterStateError(f"durable-row proof lost mode group {first.group_name}")
+            labels = group.get("frame_index")
+            intensity = group.get("intensity")
+            radial = group.get("q")
+            sigma = group.get("sigma")
+            if not all(isinstance(value, h5py.Dataset) for value in (
+                labels, intensity, radial,
+            )) or (sigma is not None and not isinstance(sigma, h5py.Dataset)):
+                raise WriterStateError(f"durable-row proof lost arrays for {first.group_name}")
+            if any(proof.dimension != first.dimension for proof in group_proofs):
+                raise WriterStateError(f"durable-row proof changed dimension for {first.group_name}")
+            top = entry.get(f"integrated_{first.dimension}")
+            if not isinstance(top, h5py.Group):
+                raise WriterStateError(f"durable-row proof lost integrated_{first.dimension}")
+            chi = group.get("chi") if first.dimension == "2d" else None
+            if first.dimension == "2d" and not isinstance(chi, h5py.Dataset):
+                raise WriterStateError(
+                    f"durable-row proof lost chi for {first.group_name}"
+                )
+            context = _CloseModeGroupContext(
+                first.group_name,
+                group.name,
+                top.name,
+                first.dimension,
+                self._text_value(top.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)),
+                labels.dtype,
+                np.asarray(radial[()]),
+                self._text_value(radial.attrs.get("units", "")),
+                None if chi is None else np.asarray(chi[()]),
+                None if chi is None else self._text_value(chi.attrs.get("units", "")),
+                None if chi is None else self._text_value(
+                    group.attrs.get("two_d_kind", "")
+                ),
+                sigma is not None,
+            )
+            datasets = (labels, intensity, sigma)
+            for rows in self._semantic_groups(group_proofs):
+                yield rows, self._read_grouped_mode(
+                    rows, "close", context, datasets,
+                )
+            index = end
 
     def bind_session(self, facade) -> None:
         if self.phase is not WriterPhase.NEW:
@@ -894,15 +997,15 @@ class NexusRecordWriter:
         evidence.text(f"{role}/dimension", expected.dimension, expected.dimension)
         evidence.text(f"{role}/mode", expected.mode, expected.mode)
         evidence.text(f"{role}/group", expected.group_name, expected.group_name)
-        top_name = f"integrated_{expected.dimension}"
-        top = entry.get(top_name)
-        if not isinstance(top, h5py.Group):
-            raise WriterStateError(f"durability readback missing {top_name}")
         wanted_primary = (
             self._primary_mode_1d
             if expected.dimension == "1d"
             else self._primary_mode_2d
         )
+        top_name = f"integrated_{expected.dimension}"
+        top = entry.get(top_name)
+        if not isinstance(top, h5py.Group):
+            raise WriterStateError(f"durability readback missing {top_name}")
         observed_primary = self._text_value(
             top.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)
         )
@@ -1342,7 +1445,81 @@ class NexusRecordWriter:
     def _reverify_durable_mode_proof(
         self,
         proof: _DurableModeProof,
+        grouped: _CloseModeObservation | None = None,
+        offset: int = 0,
     ) -> _EvidenceBuilder:
+        if grouped is not None:
+            context = grouped.context
+            if (
+                offset < 0 or offset >= len(grouped.frame_indices)
+                or proof.row != grouped.start + offset
+                or context.group_name != proof.group_name
+                or context.dimension != proof.dimension
+            ):
+                raise WriterStateError(f"durable-row proof lost label {proof.label}")
+            label = int(np.asarray(grouped.frame_indices[offset]).item())
+            if label != proof.label:
+                raise WriterStateError(f"durable-row proof changed label {proof.label}")
+            intensity = np.asarray(grouped.intensities[offset])
+            sigma = None if grouped.sigmas is None else np.asarray(grouped.sigmas[offset])
+            evidence = _EvidenceBuilder(observed_only=True)
+            role = f"{context.group_path}[label={proof.label}]"
+            evidence.text(f"{role}/dimension", proof.dimension, proof.dimension)
+            evidence.text(f"{role}/mode", proof.mode, proof.mode)
+            evidence.text(f"{role}/group", proof.group_name, proof.group_name)
+            wanted_primary = (
+                self._primary_mode_1d if proof.dimension == "1d"
+                else self._primary_mode_2d
+            )
+            evidence.text(
+                f"{context.top_path}/primary_mode",
+                wanted_primary, context.primary_mode,
+            )
+            evidence.array(
+                f"{role}/frame_index",
+                np.asarray(proof.label, dtype=context.frame_index_dtype),
+                np.asarray(label, dtype=context.frame_index_dtype),
+            )
+            evidence.array(f"{role}/q", context.radial, context.radial)
+            evidence.text(f"{role}/q@units", proof.unit, context.unit)
+            evidence.array(f"{role}/intensity", intensity, intensity)
+            shape_facts = json.dumps({
+                "source": proof.source_shape,
+                "stored": tuple(intensity.shape),
+                "transpose": proof.dimension == "2d",
+            }, sort_keys=True)
+            evidence.text(f"{role}/shape-facts", shape_facts, shape_facts)
+            if proof.sigma_expected:
+                if sigma is None:
+                    raise WriterStateError(f"durable-row proof lost sigma for label {proof.label}")
+                evidence.array(f"{role}/sigma", sigma, sigma)
+            elif sigma is None:
+                evidence.absent(f"{role}/sigma", True)
+            else:
+                evidence.array(
+                    f"{role}/sigma-absent-row",
+                    np.full(intensity.shape, np.nan, dtype=np.float32), sigma,
+                )
+            if proof.dimension == "2d":
+                if context.azimuthal is None:
+                    raise WriterStateError(f"durable-row proof lost chi for label {proof.label}")
+                evidence.array(
+                    f"{role}/chi", context.azimuthal, context.azimuthal,
+                )
+                evidence.text(
+                    f"{role}/chi@units", str(proof.azimuthal_unit or ""),
+                    str(context.azimuthal_unit or ""),
+                )
+                evidence.text(
+                    f"{role}/two_d_kind", str(proof.two_d_kind),
+                    str(context.two_d_kind),
+                )
+            if evidence.observed_hexdigest() != proof.digest:
+                raise WriterStateError(
+                    f"durable-row proof changed for {proof.group_name} "
+                    f"label {proof.label}"
+                )
+            return evidence
         if self._h5 is None:
             raise WriterStateError("durable-row proof has no HDF5 reader")
         entry = self._h5.get(self.entry)
@@ -1483,26 +1660,18 @@ class NexusRecordWriter:
                     self._durable_mode_proofs[key]
                     for key in sorted(self._durable_mode_proofs)
                 )
-                for proofs_group in self._semantic_groups(proofs):
-                    grouped = self._read_grouped_mode(
-                        proofs_group, "close",
-                    )
+                for proofs_group, grouped in self._close_mode_groups(proofs):
                     for offset, proof in enumerate(proofs_group):
-                        self._semantic_mode_observation = (
-                            None if grouped is None else
-                            (grouped[0], grouped[1][offset], grouped[2])
+                        evidence = self._reverify_durable_mode_proof(
+                            proof, grouped, offset,
                         )
-                        try:
-                            evidence = self._reverify_durable_mode_proof(proof)
-                            digest = evidence.hexdigest()
-                            aggregate.text(
-                                f"mode:{proof.group_name}:{proof.label}",
-                                digest,
-                                digest,
-                            )
-                            read_bytes += evidence.read_bytes
-                        finally:
-                            self._semantic_mode_observation = None
+                        digest = evidence.hexdigest()
+                        aggregate.text(
+                            f"mode:{proof.group_name}:{proof.label}",
+                            digest,
+                            digest,
+                        )
+                        read_bytes += evidence.read_bytes
                 for key in sorted(self._durable_absence_proofs):
                     proof = self._durable_absence_proofs[key]
                     evidence = _EvidenceBuilder()

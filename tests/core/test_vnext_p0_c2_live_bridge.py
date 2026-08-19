@@ -788,8 +788,8 @@ def test_descriptor_bound_close_reads_each_mode_array_once_and_hashes_each_obser
     real_reverify = writer._reverify_durable_mode_proof
     real_update = record_writer._EvidenceBuilder._update
 
-    def capture_observed_digest(proof):
-        evidence = real_reverify(proof)
+    def capture_observed_digest(proof, *args):
+        evidence = real_reverify(proof, *args)
         observed_digests[(proof.group_name, proof.label)] = (
             evidence.observed_hexdigest()
         )

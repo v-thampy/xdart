@@ -180,9 +180,9 @@ def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
     groups = []
     real_group_read = writer._read_grouped_mode
 
-    def trace_group(rows, phase):
+    def trace_group(rows, phase, *args):
         groups.append((phase, rows[0].group_name, tuple(row.label for row in rows)))
-        return real_group_read(rows, phase)
+        return real_group_read(rows, phase, *args)
 
     monkeypatch.setattr(writer, "_read_grouped_mode", trace_group)
     records = []
@@ -210,18 +210,41 @@ def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
         for field in proof.__slots__
     )
     close_observed = {}
+    close_reads = {}
+    real_getitem = h5py.Dataset.__getitem__
     real_reverify = writer._reverify_durable_mode_proof
 
-    def trace_reverify(proof):
-        evidence = real_reverify(proof)
+    def trace_close_reads(dataset, item):
+        if (
+            "/integrated_" in dataset.name
+            and dataset.name.rsplit("/", 1)[-1]
+            in {"frame_index", "q", "intensity", "sigma", "chi"}
+        ):
+            close_reads.setdefault(dataset.name, []).append(item)
+        return real_getitem(dataset, item)
+
+    def trace_reverify(proof, *args):
+        evidence = real_reverify(proof, *args)
         close_observed[(proof.group_name, proof.label)] = evidence.observed_hexdigest()
         return evidence
 
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", trace_close_reads)
     monkeypatch.setattr(writer, "_reverify_durable_mode_proof", trace_reverify)
     writer.finish()
     assert groups[4:] == [("close", name, labels) for name, labels in expected_groups]
     assert close_observed == checkpoint
     assert tuple(writer.grouped_semantic_read_volume.values()) == ((4, 20), (4, 20))
+    expected_slices = [slice(0, 8), slice(8, 10)]
+    for group_name in ("integrated_1d", "integrated_2d"):
+        prefix = f"/{writer.entry}/{group_name}"
+        assert close_reads[f"{prefix}/q"] == [()]
+        assert close_reads[f"{prefix}/frame_index"] == expected_slices
+        assert close_reads[f"{prefix}/intensity"] == expected_slices
+        assert all(
+            isinstance(item, slice)
+            for item in close_reads[f"{prefix}/frame_index"]
+        )
+    assert close_reads[f"/{writer.entry}/integrated_2d/chi"] == [()]
     assert transaction.commit_stream(attempt, lease=lease).phase is TransactionPhase.COMMITTED
     _release(transaction, lease, owners)
 
@@ -329,9 +352,9 @@ def test_grouped_semantic_reads_split_sparse_replacements_and_clear_on_failure(
     groups = []
     real_group_read = writer._read_grouped_mode
 
-    def trace_group(rows, phase):
+    def trace_group(rows, phase, *args):
         groups.append((phase, rows[0].group_name, tuple(row.label for row in rows)))
-        return real_group_read(rows, phase)
+        return real_group_read(rows, phase, *args)
 
     monkeypatch.setattr(writer, "_read_grouped_mode", trace_group)
     writer.write_batch(
@@ -366,7 +389,6 @@ def test_grouped_semantic_reads_split_sparse_replacements_and_clear_on_failure(
     assert writer._semantic_mode_observation is None
     assert transaction.commit_stream(attempt, lease=lease).phase is TransactionPhase.COMMITTED
     _release(transaction, lease, owners)
-
     with h5py.File(target, "r") as handle:
         one_d, two_d = handle["entry/integrated_1d"], handle["entry/integrated_2d"]
         assert tuple(one_d["frame_index"][()]) == (0, 1, 2, 3, 4, 6, 7, 8, 9)
@@ -375,6 +397,31 @@ def test_grouped_semantic_reads_split_sparse_replacements_and_clear_on_failure(
             row_1d = list(one_d["frame_index"][()]).index(label)
             np.testing.assert_array_equal(one_d["intensity"][row_1d], _r1(100 + label).intensity)
             np.testing.assert_array_equal(two_d["intensity"][label], _r2(100 + label).intensity.T)
+
+
+def test_grouped_close_rejects_rank_drift_in_frame_index(tmp_path, monkeypatch):
+    from xrd_tools.io.record_writer import RecordWrite, WriterIncomplete
+
+    (writer, transaction, _attempt, _lease, _owners, _pool, _facade, _target) = (
+        _bound_writer(tmp_path)
+    )
+    writer.write_batch(
+        RecordWrite(label=label, result_1d=_r1(label + 1))
+        for label in range(2)
+    )
+    writer.flush(force=True)
+    real_getitem = h5py.Dataset.__getitem__
+
+    def rank_drift(dataset, item):
+        observed = real_getitem(dataset, item)
+        if dataset.name.endswith("/integrated_1d/frame_index") and isinstance(item, slice):
+            return np.asarray(observed).reshape(-1, 1)
+        return observed
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", rank_drift)
+    with pytest.raises(WriterIncomplete, match="grouped durability read lost rows"):
+        writer.finish()
+    assert transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
 
 
 def test_stream_attempt_keeps_one_lease_through_open_flush_and_commit(tmp_path):
@@ -1364,11 +1411,11 @@ def test_durable_abort_retries_transient_semantic_observation_exactly(
     real_verify = writer._reverify_durable_mode_proof
     failures = []
 
-    def fail_once(proof):
+    def fail_once(proof, *args):
         if not failures:
             failures.append("observation")
             raise OSError("post-close semantic observation unavailable")
-        return real_verify(proof)
+        return real_verify(proof, *args)
 
     monkeypatch.setattr(writer, "_reverify_durable_mode_proof", fail_once)
     with pytest.raises(WriterIncomplete, match="observation unavailable"):
@@ -1689,6 +1736,82 @@ def _seed_target(path: Path, labels, source_base: Path) -> None:
         for name in ("integrated_1d", "integrated_2d"):
             group = entry.create_group(name)
             group.create_dataset("frame_index", data=np.asarray(labels, dtype=np.int64))
+
+
+def test_existing_stream_startup_full_hashes_prior_exactly_three_times(
+    tmp_path, monkeypatch,
+):
+    module = importlib.import_module("xrd_tools.io.output_transaction")
+    prior = b"immutable prior bytes"
+    real_hash = module._sha256_handle
+    prior_hashes = []
+
+    def count_prior_hash(handle):
+        observed = os.fstat(handle.fileno())
+        if observed.st_size == len(prior):
+            prior_hashes.append((observed.st_dev, observed.st_ino))
+        return real_hash(handle)
+
+    monkeypatch.setattr(module, "_sha256_handle", count_prior_hash)
+    (_coordinator, transaction, target, transaction_owner, target_owner,
+     owners, lease) = _transaction(tmp_path, prior=prior)
+    pool = _Pool()
+    attempt = transaction.begin_stream(
+        admission=transaction.admission,
+        transaction_owner=transaction_owner,
+        target_owner=target_owner,
+        lease=lease,
+        pool=pool,
+        file_lock=threading.RLock(),
+        seed_mode=module.StreamSeedMode.EMPTY_REPLACEMENT,
+    )
+
+    assert len(prior_hashes) == 3
+    assert prior_hashes[0] == prior_hashes[1]
+    assert prior_hashes[2] == prior_hashes[0]
+    assert target.read_bytes() == b""
+    assert transaction.backup.read_bytes() == prior
+    assert transaction.abort_stream(
+        attempt, lease=lease,
+    ).phase is TransactionPhase.ABORTED
+    assert target.read_bytes() == prior
+    _release(transaction, lease, owners)
+
+
+def test_same_stat_mutation_during_pool_pause_refuses_before_target_move(
+    tmp_path,
+):
+    module = importlib.import_module("xrd_tools.io.output_transaction")
+    prior = b"original"
+    mutated = b"mutated!"
+    (_coordinator, transaction, target, transaction_owner, target_owner,
+     owners, lease) = _transaction(tmp_path, prior=prior)
+    admitted = target.stat()
+
+    class MutatingPool(_Pool):
+        def pause(self, path):
+            super().pause(path)
+            target.write_bytes(mutated)
+            os.utime(
+                target,
+                ns=(admitted.st_atime_ns, admitted.st_mtime_ns),
+            )
+
+    pool = MutatingPool()
+    with pytest.raises(TargetChanged, match="changed after admission"):
+        transaction.begin_stream(
+            admission=transaction.admission,
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            pool=pool,
+            file_lock=threading.RLock(),
+            seed_mode=module.StreamSeedMode.EMPTY_REPLACEMENT,
+        )
+
+    assert target.read_bytes() == mutated
+    assert not transaction.backup.exists()
+    assert pool.events == [("pause", str(target)), ("resume", str(target))]
 
 
 def test_existing_overwrite_routes_empty_seed_without_prior_copy_and_abort_restores(

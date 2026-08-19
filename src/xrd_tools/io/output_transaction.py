@@ -2215,7 +2215,6 @@ class OutputTransaction:
                         "retry-ready phase lacks positive rollback receipt"
                     )
                 self._terminal_receipt = None
-            self._validate_target()
             if self.backup.exists() or self._candidate.exists():
                 raise TransactionStateError(
                     "unowned private transaction path blocks streaming attempt"
