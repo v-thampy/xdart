@@ -2690,6 +2690,71 @@ def test_gui_light_1d_pair_is_frame_equivalent_with_one_zero_copy_owner():
     assert census["publication"].isdisjoint(census["lease"])
 
 
+def test_gui_light_1d_publication_uses_constant_time_lease_residency_queries(
+    monkeypatch,
+):
+    from xrd_tools.session import Light1DRetentionLease
+
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph(
+        rows=3,
+    )
+    for label in (0, 1, 2):
+        store.publish_gui_light_1d(*build(label))
+
+    def forbidden_prefix_snapshot(owner):
+        if owner is lease:
+            raise AssertionError("GUI publication materialized the lease prefix")
+        return original_keys(owner)
+
+    original_keys = Light1DRetentionLease.keys
+    monkeypatch.setattr(
+        Light1DRetentionLease, "keys", forbidden_prefix_snapshot,
+    )
+    composed = store.publish_gui_light_1d(*build(3))
+
+    assert composed.label == 3 and composed.view.has_1d
+    assert store.labels() == (1, 2, 3)
+    assert lease.retained_count == 3
+    assert lease.oldest_row_identity == 1
+    assert not lease.contains(0) and lease.contains(3)
+
+
+def test_light_1d_publication_uses_constant_time_lease_residency_queries(
+    monkeypatch,
+):
+    from xrd_tools.session import Light1DRetentionLease
+
+    store, lease, _allocation, _authority, build = _bound_gui_light_graph(
+        rows=3,
+    )
+    for label in (0, 1, 2):
+        publication, light_record = build(label)
+        store.publish_light_1d(
+            light_record, source_identity=publication.source_identity,
+        )
+
+    original_keys = Light1DRetentionLease.keys
+
+    def forbidden_prefix_snapshot(owner):
+        if owner is lease:
+            raise AssertionError("publication materialized the lease prefix")
+        return original_keys(owner)
+
+    monkeypatch.setattr(
+        Light1DRetentionLease, "keys", forbidden_prefix_snapshot,
+    )
+    publication, light_record = build(3)
+    shell = store.publish_light_1d(
+        light_record, source_identity=publication.source_identity,
+    )
+
+    assert shell.label == 3
+    assert store.get_light_1d_shell(0) is None
+    assert store.get_light_1d_shell(3) is shell
+    assert lease.retained_count == 3
+    assert lease.oldest_row_identity == 1
+
+
 def test_gui_light_1d_pair_refuses_identity_authority_mismatches_atomically():
     from xrd_tools.session import Light1DStaleGeneration
 

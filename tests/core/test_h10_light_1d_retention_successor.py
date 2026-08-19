@@ -1,6 +1,7 @@
 """Finite Qt-free byte-owner contract for retained light 1-D rows."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import replace
 import copy
 import gc
@@ -229,6 +230,293 @@ def test_deterministic_oldest_eviction_uses_grant_not_requested_rows():
     first.close()
     second.close()
     assert lease.keys() == (2, 3, 4)  # access is not LRU mutation
+
+
+def test_retain_does_not_walk_the_resident_root_prefix():
+    """A new row consults only its roots and the inverse ownership index."""
+    class NoPrefixWalkDict(dict):
+        def __iter__(self):
+            raise AssertionError("resident ownership prefix was iterated")
+
+        def items(self):
+            raise AssertionError("resident root prefix was walked")
+
+        def values(self):
+            raise AssertionError("resident ownership values were walked")
+
+    _authority, lease = _lease(rows=4)
+    axis = np.linspace(0.0, 1.0, 4, dtype=np.float64)
+    for label in (0, 1):
+        lease.retain(
+            _record(label, axis),
+            grant_id=lease.grant_id,
+            generation=lease.generation,
+        )
+
+    lease._roots = NoPrefixWalkDict(lease._roots)
+    lease._root_owners = NoPrefixWalkDict(lease._root_owners)
+    lease.retain(
+        _record(2, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+
+    assert lease.contains(0)
+    assert lease.contains(2)
+    assert lease.retained_count == 3
+    assert lease.oldest_row_identity == 0
+
+
+def test_shared_root_index_survives_zero_rows_and_unique_index_does_not_pin():
+    _authority, lease = _lease(rows=1)
+    axis = np.linspace(0.0, 1.0, 4, dtype=np.float64)
+    lease.retain(
+        _record(0, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+    shared_root = lease._shared_roots["q-axis"]
+    shared_id = id(shared_root)
+    unique_ids = {
+        id(root) for owner_key, root in lease._roots[0].items()
+        if not lease.layout._groups[owner_key].shared
+    }
+
+    assert lease.retire(
+        0, grant_id=lease.grant_id, generation=lease.generation,
+    )
+    shared_entry = lease._root_owners[shared_id]
+    assert shared_entry.root is shared_root
+    assert shared_entry.owner_key == "q-axis"
+    assert shared_entry.rows == set()
+    assert not (unique_ids & lease._root_owners.keys())
+
+    # With a one-row grant, this succeeds only if no retired unique root is
+    # kept alive by the inverse index while its payload receipt is pruned.
+    gc.collect()
+    lease.retain(
+        _record(1, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+    assert lease.keys() == (1,)
+    assert lease._root_owners[shared_id].rows == {1}
+
+
+@pytest.mark.parametrize(
+    ("candidate_owner", "resident_owner"),
+    (("raw-intensity", "raw-intensity"),
+     ("raw-sigma", "raw-intensity")),
+)
+def test_inverse_root_ownership_preserves_shared_and_foreign_alias_semantics(
+    candidate_owner, resident_owner,
+):
+    _authority, lease = _lease(rows=3)
+    axis = np.linspace(0.0, 1.0, 4, dtype=np.float64)
+    lease.retain(
+        _record(0, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+    lease.retain(
+        _record(1, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+
+    # The one declared shared owner is intentionally reused by both rows.
+    assert lease._roots[0]["q-axis"] is lease._roots[1]["q-axis"]
+    before = (
+        lease.keys(), lease.owned_buffer_ids,
+        lease.unique_owned_ndarray_bytes,
+    )
+    canonical, roots, supplied, views = lease._canonicalize_record(
+        _record(2, axis),
+    )
+    attacked = dict(roots)
+    attacked[candidate_owner] = lease._roots[0][resident_owner]
+
+    with pytest.raises(ValueError, match="another owner"):
+        lease._retain_validated(canonical, attacked, supplied, views)
+
+    assert (
+        lease.keys(), lease.owned_buffer_ids,
+        lease.unique_owned_ndarray_bytes,
+    ) == before
+
+    # A normal same-row replacement remains legal and moves that row to the
+    # newest insertion position, exactly as the prior map implementation did.
+    lease.retain(
+        _record(0, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+    assert lease.keys() == (1, 0)
+    assert lease.retained_count == 2
+    assert lease.oldest_row_identity == 1
+
+
+def test_inverse_root_ownership_tracks_retire_hydration_and_cleanup():
+    api = _api()
+    authority, lease = _lease(rows=2)
+    axis = np.linspace(0.0, 1.0, 4, dtype=np.float64)
+    lease.retain(
+        _record(0, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+
+    tokens = []
+    worker = threading.Thread(
+        target=lambda: tokens.append(lease.issue_hydration_token(1)),
+    )
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive() and len(tokens) == 1
+    lease.complete_hydration(tokens[0], _record(1, axis))
+    assert lease.retained_count == 2
+    assert lease.contains(0) and lease.contains(1)
+    assert lease.oldest_row_identity == 0
+
+    assert lease.retire(
+        0, grant_id=lease.grant_id, generation=lease.generation,
+    )
+    assert not lease.contains(0)
+    assert lease.contains(1)
+    assert lease.retained_count == 1
+    assert lease.oldest_row_identity == 1
+
+    receipt = lease.release(
+        reason="close", hooks=api["Light1DCleanupHooks"](),
+    )
+    assert receipt.released_bytes == lease.reserved_ndarray_bytes
+    assert lease.retained_count == 0
+    assert lease.oldest_row_identity is None
+    assert not lease.contains(1)
+    assert lease._root_owners == {}
+    assert authority.snapshot().reserved_bytes == 0
+
+
+def test_hydration_abandon_and_fenced_completion_leave_root_index_unchanged():
+    api = _api()
+    _authority, lease = _lease(rows=2)
+    axis = np.linspace(0.0, 1.0, 4, dtype=np.float64)
+    lease.retain(
+        _record(0, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+
+    def index_state():
+        return {
+            root_id: (id(entry.root), entry.owner_key, frozenset(entry.rows))
+            for root_id, entry in lease._root_owners.items()
+        }
+
+    expected = index_state()
+    tokens = []
+    worker = threading.Thread(
+        target=lambda: tokens.append(lease.issue_hydration_token(1)),
+    )
+    worker.start()
+    worker.join(timeout=2)
+    lease.abandon_hydration(tokens.pop())
+    assert index_state() == expected
+
+    worker = threading.Thread(
+        target=lambda: tokens.append(lease.issue_hydration_token(2)),
+    )
+    worker.start()
+    worker.join(timeout=2)
+    lease.fence()
+    with pytest.raises(api["Light1DStaleGeneration"]):
+        lease.complete_hydration(tokens.pop(), _record(2, axis))
+    assert index_state() == expected
+
+
+def test_cleanup_retry_keeps_partial_root_index_exact_then_empties_it(
+    monkeypatch,
+):
+    api = _api()
+    authority, lease = _lease(rows=2)
+    axis = np.linspace(0.0, 1.0, 4, dtype=np.float64)
+    for label in (0, 1):
+        lease.retain(
+            _record(label, axis),
+            grant_id=lease.grant_id,
+            generation=lease.generation,
+        )
+    first_unique_ids = {
+        id(root) for owner_key, root in lease._roots[0].items()
+        if not lease.layout._groups[owner_key].shared
+    }
+    original = api["Light1DRetentionLease"]._retire_row
+    calls = 0
+
+    def fail_second(owner, key):
+        nonlocal calls
+        if owner is lease:
+            calls += 1
+            if calls == 2:
+                raise OSError("injected partial clear")
+        return original(owner, key)
+
+    monkeypatch.setattr(
+        api["Light1DRetentionLease"], "_retire_row", fail_second,
+    )
+    with pytest.raises(api["Light1DCleanupPending"]) as pending:
+        lease.release(reason="close", hooks=api["Light1DCleanupHooks"]())
+    assert not lease.contains(0) and lease.contains(1)
+    assert not (first_unique_ids & lease._root_owners.keys())
+    assert any(entry.rows == {1} for entry in lease._root_owners.values())
+
+    monkeypatch.setattr(api["Light1DRetentionLease"], "_retire_row", original)
+    receipt = lease.retry_cleanup(pending.value.token)
+    assert receipt.released_bytes == lease.reserved_ndarray_bytes
+    assert lease._root_owners == {}
+    assert authority.snapshot().reserved_bytes == 0
+
+
+def test_cleanup_receipt_allocation_failure_keeps_shared_index_retryable():
+    api = _api()
+
+    class FailSecondAppend(deque):
+        def __init__(self, values=()):
+            super().__init__(values)
+            self.calls = 0
+
+        def append(self, value):
+            self.calls += 1
+            if self.calls == 2:
+                raise MemoryError("injected shared receipt allocation")
+            return super().append(value)
+
+    authority, lease = _lease(rows=1)
+    axis = np.linspace(0.0, 1.0, 4, dtype=np.float64)
+    lease.retain(
+        _record(0, axis),
+        grant_id=lease.grant_id,
+        generation=lease.generation,
+    )
+    shared_root = lease._shared_roots["q-axis"]
+    lease._retired_payload_groups = FailSecondAppend(
+        lease._retired_payload_groups,
+    )
+
+    with pytest.raises(api["Light1DCleanupPending"]) as pending:
+        lease.release(reason="close", hooks=api["Light1DCleanupHooks"]())
+    shared_entry = lease._root_owners[id(shared_root)]
+    assert shared_entry.root is shared_root
+    assert shared_entry.rows == set()
+    assert lease._shared_roots["q-axis"] is shared_root
+
+    retry_token = pending.value.token
+    del pending, shared_entry, shared_root
+    gc.collect()
+    receipt = lease.retry_cleanup(retry_token)
+    assert receipt.released_bytes == lease.reserved_ndarray_bytes
+    assert lease._root_owners == {}
+    assert authority.snapshot().reserved_bytes == 0
 
 
 def test_more_than_512_light_rows_stay_resident_without_hydration():

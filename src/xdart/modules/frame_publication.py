@@ -830,10 +830,17 @@ class PublicationStore:
             if int(record.generation) != int(lease.generation):
                 raise Light1DStaleGeneration("light-1D publication generation is stale")
             label = record.row_identity
-            keys = lease.keys()
+            resident, retained_count, oldest, _ = lease._residency_snapshot(
+                label,
+            )
             victims = [label] if label in self._light_1d_items else []
-            if label not in keys and keys and len(keys) >= lease.row_cap:
-                oldest = keys[0]
+            if (
+                not resident
+                and retained_count > 0
+                and retained_count >= lease.row_cap
+            ):
+                if oldest is None:
+                    raise RuntimeError("light-1D resident count has no oldest row")
                 if oldest not in self._light_1d_items:
                     raise RuntimeError(f"light-1D resident {oldest!r} has no publication shell")
                 victims.append(oldest)
@@ -1122,12 +1129,24 @@ class PublicationStore:
                     raise ValueError("GUI light-1D pair identity changed")
             total_victims = self._project_total_victims_locked(label, protected)
             if label in total_victims: raise Light1DUnavailable("incoming GUI publication is pinned")
-            keys = lease.keys()
             victims = list(dict.fromkeys((() if reuse_pair else ((label,) if prior else ())) + total_victims))
-            if not reuse_pair and label not in keys and len(keys) >= lease.row_cap > 0 and not any(victim in keys for victim in victims):
-                victims.append(keys[0])
+            resident, retained_count, oldest, resident_victims = (
+                lease._residency_snapshot(label, victims)
+            )
+            if (
+                not reuse_pair
+                and not resident
+                and retained_count >= lease.row_cap > 0
+                and not resident_victims
+            ):
+                if oldest is None:
+                    raise RuntimeError("light-1D resident count has no oldest row")
+                victims.append(oldest)
+                resident_victims = resident_victims | frozenset((oldest,))
             retiring = tuple((victim, getattr(self._light_1d_items.get(victim), "guard", None))
-                             for victim in victims if victim in keys or victim in self._light_1d_items)
+                             for victim in victims
+                             if victim in resident_victims
+                             or victim in self._light_1d_items)
             def commit(retain_candidate):
                 for victim in victims:
                     pair = self._light_1d_items.get(victim)

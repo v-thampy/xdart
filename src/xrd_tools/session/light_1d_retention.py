@@ -2,7 +2,7 @@
 """Qt- and NumPy-import-free byte owner for canonical light 1-D records."""
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Mapping as MappingABC
 import threading
 import sys
@@ -828,6 +828,15 @@ class _Light1DGrant:
     gui_thread_id: int
 
 
+@dataclass(slots=True)
+class _CanonicalRootOwnership:
+    """Exact inverse owner entry for one live canonical root identity."""
+
+    root: object
+    owner_key: str
+    rows: set[Hashable]
+
+
 class Light1DRetentionLease:
     """One reservation and one canonical record index for one generation.
 
@@ -878,8 +887,9 @@ class Light1DRetentionLease:
         self._lock = threading.RLock()
         self._cleanup_lock = threading.Lock()
         self._state = Light1DLeaseState.ACTIVE
-        self._records: dict[Hashable, Light1DRecord] = {}
+        self._records: OrderedDict[Hashable, Light1DRecord] = OrderedDict()
         self._roots: dict[Hashable, dict[str, object]] = {}
+        self._root_owners: dict[int, _CanonicalRootOwnership] = {}
         self._shared_roots: dict[str, object] = {}
         self._shared_views: dict[str, object] = {}
         self._borrow_ordinal = 0
@@ -1311,7 +1321,9 @@ class Light1DRetentionLease:
 
     def _retire_row(self, key: Hashable) -> None:
         """Move one resident row into its still-charged alias receipt."""
-        roots = self._roots.pop(key)
+        roots = self._roots[key]
+        self._unregister_root_ownership(key, roots)
+        self._roots.pop(key)
         self._records.pop(key)
         payload_by_identity: dict[int, bytes] = {}
         for owner_key, root in roots.items():
@@ -1383,12 +1395,6 @@ class Light1DRetentionLease:
         roots: Mapping[str, object],
     ) -> None:
         """Validate aliases in a short-lived frame before any row retires."""
-        other_roots = tuple(
-            (owner_key, root)
-            for key, row_roots in self._roots.items()
-            if key != row_identity
-            for owner_key, root in row_roots.items()
-        )
         for owner_key, root in roots.items():
             spec = self.layout._groups[owner_key]
             prior_shared = self._shared_roots.get(owner_key)
@@ -1396,13 +1402,125 @@ class Light1DRetentionLease:
                 raise ValueError(
                     f"light-1D shared owner {owner_key!r} changed identity"
                 )
-            for prior_owner, prior_root in other_roots:
-                if prior_root is root and (
-                    not spec.shared or prior_owner != owner_key
-                ):
-                    raise ValueError(
-                        "light-1D row reuses a buffer charged to another owner"
+            ownership = self._root_owners.get(id(root))
+            if ownership is None:
+                continue
+            if ownership.root is not root:
+                raise RuntimeError(
+                    "light-1D canonical root ownership index is inconsistent"
+                )
+            if not ownership.rows and (
+                not spec.shared
+                or ownership.owner_key != owner_key
+                or prior_shared is not root
+            ):
+                raise RuntimeError(
+                    "light-1D canonical root ownership index is inconsistent"
+                )
+            other_row_count = len(ownership.rows) - int(
+                row_identity in ownership.rows
+            )
+            if other_row_count and (
+                not spec.shared or ownership.owner_key != owner_key
+            ):
+                raise ValueError(
+                    "light-1D row reuses a buffer charged to another owner"
+                )
+
+    def _register_root_ownership(
+        self,
+        row_identity: Hashable,
+        roots: Mapping[str, object],
+    ) -> None:
+        prepared = []
+        candidate_roots = {}
+        for owner_key, root in roots.items():
+            root_id = id(root)
+            prior_candidate = candidate_roots.get(root_id)
+            if prior_candidate is not None and (
+                prior_candidate[0] is not root
+                or prior_candidate[1] != owner_key
+            ):
+                raise RuntimeError(
+                    "light-1D candidate aliases distinct canonical owners"
+                )
+            candidate_roots[root_id] = (root, owner_key)
+            ownership = self._root_owners.get(root_id)
+            if ownership is not None:
+                if (
+                    ownership.root is not root
+                    or ownership.owner_key != owner_key
+                    or row_identity in ownership.rows
+                    or (
+                        not ownership.rows
+                        and (
+                            not self.layout._groups[owner_key].shared
+                            or self._shared_roots.get(owner_key) is not root
+                        )
                     )
+                ):
+                    raise RuntimeError(
+                        "light-1D canonical root ownership index is inconsistent"
+                    )
+            prepared.append((root_id, owner_key, root, ownership))
+
+        changed = []
+        try:
+            for root_id, owner_key, root, ownership in prepared:
+                if ownership is None:
+                    entry = _CanonicalRootOwnership(
+                        root=root,
+                        owner_key=owner_key,
+                        rows={row_identity},
+                    )
+                    self._root_owners[root_id] = entry
+                    changed.append((root_id, entry, True))
+                else:
+                    ownership.rows.add(row_identity)
+                    changed.append((root_id, ownership, False))
+        except BaseException:
+            for root_id, ownership, created in reversed(changed):
+                if created:
+                    if self._root_owners.get(root_id) is ownership:
+                        self._root_owners.pop(root_id, None)
+                else:
+                    ownership.rows.discard(row_identity)
+            raise
+
+    def _unregister_root_ownership(
+        self,
+        row_identity: Hashable,
+        roots: Mapping[str, object],
+    ) -> None:
+        prepared = []
+        for owner_key, root in roots.items():
+            root_id = id(root)
+            ownership = self._root_owners.get(root_id)
+            if (
+                ownership is None
+                or ownership.root is not root
+                or ownership.owner_key != owner_key
+                or row_identity not in ownership.rows
+            ):
+                raise RuntimeError(
+                    "light-1D canonical root ownership index is inconsistent"
+                )
+            prepared.append((root_id, ownership))
+        for root_id, ownership in prepared:
+            ownership.rows.remove(row_identity)
+            if not ownership.rows:
+                spec = self.layout._groups[ownership.owner_key]
+                if (
+                    spec.shared
+                    and self._shared_roots.get(ownership.owner_key)
+                    is ownership.root
+                ):
+                    continue
+                if self._root_owners.get(root_id) is not ownership:
+                    raise RuntimeError(
+                        "light-1D canonical root ownership index changed"
+                    )
+                self._root_owners.pop(root_id)
 
     def _retain_validated(
         self,
@@ -1460,6 +1578,12 @@ class Light1DRetentionLease:
             self._remove(oldest, evicted=True)
         self._records[record.row_identity] = record
         self._roots[record.row_identity] = roots
+        try:
+            self._register_root_ownership(record.row_identity, roots)
+        except BaseException:
+            self._roots.pop(record.row_identity, None)
+            self._records.pop(record.row_identity, None)
+            raise
         for owner_key, root in roots.items():
             if self.layout._groups[owner_key].shared:
                 self._shared_roots[owner_key] = root
@@ -1482,6 +1606,40 @@ class Light1DRetentionLease:
     def keys(self) -> tuple[Hashable, ...]:
         with self._lock:
             return tuple(self._records)
+
+    def _residency_snapshot(
+        self,
+        row_identity: Hashable,
+        candidates=(),
+    ) -> tuple[bool, int, Hashable | None, frozenset[Hashable]]:
+        row_identity = _freeze_light_identity(row_identity, "resident row")
+        frozen_candidates = tuple(
+            _freeze_light_identity(candidate, "resident candidate")
+            for candidate in candidates
+        )
+        with self._lock:
+            return (
+                row_identity in self._records,
+                len(self._records),
+                next(iter(self._records), None),
+                frozenset(
+                    candidate for candidate in frozen_candidates
+                    if candidate in self._records
+                ),
+            )
+
+    def contains(self, row_identity: Hashable) -> bool:
+        return self._residency_snapshot(row_identity)[0]
+
+    @property
+    def retained_count(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    @property
+    def oldest_row_identity(self) -> Hashable | None:
+        with self._lock:
+            return next(iter(self._records), None)
 
     def retire(
         self, row_identity: Hashable, *, grant_id: str, generation: int,
@@ -1668,14 +1826,33 @@ class Light1DRetentionLease:
         for key in tuple(self._records):
             self._retire_row(key)
         shared_payloads: dict[int, bytes] = {}
+        shared_ownership = []
         for owner_key, root in self._shared_roots.items():
             spec = self.layout._groups[owner_key]
             payload = _canonical_payload(root, spec.nbytes)
             shared_payloads.setdefault(id(payload), payload)
+            root_id = id(root)
+            ownership = self._root_owners.get(root_id)
+            if (
+                ownership is None
+                or ownership.root is not root
+                or ownership.owner_key != owner_key
+                or ownership.rows
+            ):
+                raise RuntimeError(
+                    "light-1D shared root ownership index is inconsistent"
+                )
+            shared_ownership.append((root_id, ownership))
         if shared_payloads:
             self._retired_payload_groups.append(
                 tuple(shared_payloads.values())
             )
+        for root_id, ownership in shared_ownership:
+            if self._root_owners.get(root_id) is not ownership:
+                raise RuntimeError(
+                    "light-1D shared root ownership index changed"
+                )
+            self._root_owners.pop(root_id)
         self._shared_roots.clear()
         self._shared_views.clear()
         self._evicted.clear()
@@ -1729,7 +1906,8 @@ class Light1DRetentionLease:
                         self._prune_borrows()
                         if (
                             self._records or self._roots or self._shared_roots
-                            or self._shared_views or self._hydration_tokens
+                            or self._root_owners or self._shared_views
+                            or self._hydration_tokens
                             or self._hydration_rows or self._borrows
                             or self._evicted or not self._owned_buffers_detached()
                         ):
