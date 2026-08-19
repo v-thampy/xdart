@@ -108,6 +108,13 @@ class TransactionPhase(str, Enum):
     ABORTED = "aborted"
 
 
+class StreamSeedMode(str, Enum):
+    """Initial bytes installed for one final-path streaming writer."""
+
+    PRESERVE_BASE = "preserve-base"
+    EMPTY_REPLACEMENT = "empty-replacement"
+
+
 class RetryAction(str, Enum):
     """Exact fallible transition still owned by a transaction."""
 
@@ -2075,7 +2082,13 @@ class OutputTransaction:
             }
         )
 
-    def _copy_stream_seed(self) -> tuple[_ObjectReceipt, _StreamStatReceipt]:
+    def _copy_stream_seed(
+        self,
+        *,
+        seed_mode: StreamSeedMode = StreamSeedMode.PRESERVE_BASE,
+    ) -> tuple[_ObjectReceipt, _StreamStatReceipt]:
+        if type(seed_mode) is not StreamSeedMode:
+            raise TypeError("seed_mode must be a StreamSeedMode")
         target = Path(self._admission.target)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
@@ -2092,7 +2105,10 @@ class OutputTransaction:
                 target,
                 "stream-reservation",
             )
-            if self._prior_receipt is not None:
+            if (
+                seed_mode is StreamSeedMode.PRESERVE_BASE
+                and self._prior_receipt is not None
+            ):
                 source_descriptor = os.open(self.backup, os.O_RDONLY)
                 source_before = _descriptor_content_receipt(
                     source_descriptor,
@@ -2121,12 +2137,19 @@ class OutputTransaction:
                 )
                 if source_after != source_before:
                     raise TargetChanged("staged prior changed while seeding stream")
-            receipt = _descriptor_content_receipt(
-                destination,
-                target,
-                "stream-seed",
-                durable_fsync=self._durable_fsync,
-            )
+            if seed_mode is StreamSeedMode.EMPTY_REPLACEMENT:
+                receipt = _descriptor_receipt(
+                    destination,
+                    target,
+                    "stream-seed",
+                )
+            else:
+                receipt = _descriptor_content_receipt(
+                    destination,
+                    target,
+                    "stream-seed",
+                    durable_fsync=self._durable_fsync,
+                )
             checkpoint = _descriptor_stream_stat_receipt(
                 destination,
                 target,
@@ -2161,7 +2184,10 @@ class OutputTransaction:
         lease: TargetLease,
         pool=None,
         file_lock=None,
+        seed_mode: StreamSeedMode = StreamSeedMode.PRESERVE_BASE,
     ) -> StreamAttempt:
+        if type(seed_mode) is not StreamSeedMode:
+            raise TypeError("seed_mode must be a StreamSeedMode")
         with self._lock:
             self._require_admission_owners(
                 admission=admission,
@@ -2221,7 +2247,9 @@ class OutputTransaction:
                         self._admission.target,
                         self._coordinator._next_ordinal(),
                     )
-                    reservation, checkpoint = self._copy_stream_seed()
+                    reservation, checkpoint = self._copy_stream_seed(
+                        seed_mode=seed_mode,
+                    )
                     self._stream_attempt = attempt
                     self._stream_reservation = reservation
                     self._stream_checkpoint = checkpoint

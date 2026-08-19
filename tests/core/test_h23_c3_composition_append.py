@@ -1486,6 +1486,149 @@ def _seed_target(path: Path, labels, source_base: Path) -> None:
             group.create_dataset("frame_index", data=np.asarray(labels, dtype=np.int64))
 
 
+def test_existing_overwrite_routes_empty_seed_without_prior_copy_and_abort_restores(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+
+    core = importlib.import_module("xrd_tools.reduction.core")
+    target = tmp_path / "overwrite-empty-seed.nexus"
+    prior = b"immutable prior bytes"
+    target.write_bytes(prior)
+    sink = NexusSink(target, overwrite=True)
+    observed = []
+
+    def reject_writer(*_args, **_kwargs):
+        observed.append(
+            (target.read_bytes(), Path(sink._transaction.backup).read_bytes())
+        )
+        raise RuntimeError("observe empty overwrite seed")
+
+    monkeypatch.setattr(core, "NexusRecordWriter", reject_writer)
+    with pytest.raises(RuntimeError, match="observe empty overwrite seed"):
+        sink.begin(Scan("overwrite", []), ReductionPlan())
+
+    assert observed == [(b"", prior)]
+    assert target.read_bytes() == prior
+    assert sink._transaction.snapshot().phase is TransactionPhase.ABORTED
+    assert not sink._transaction.backup.exists()
+    _assert_lease_available(target)
+
+
+def test_fresh_overwrite_empty_seed_has_no_backup_and_typed_zero_checkpoint(
+    tmp_path,
+):
+    module = importlib.import_module("xrd_tools.io.output_transaction")
+    StreamSeedMode = module.StreamSeedMode
+    (_coordinator, transaction, target, transaction_owner, target_owner,
+     owners, lease) = _transaction(tmp_path, prior=None)
+    pool = _Pool()
+
+    with pytest.raises(TypeError, match="seed_mode must be a StreamSeedMode"):
+        transaction.begin_stream(
+            admission=transaction.admission,
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            pool=pool,
+            file_lock=threading.RLock(),
+            seed_mode=StreamSeedMode.EMPTY_REPLACEMENT.value,
+        )
+
+    attempt = transaction.begin_stream(
+        admission=transaction.admission,
+        transaction_owner=transaction_owner,
+        target_owner=target_owner,
+        lease=lease,
+        pool=pool,
+        file_lock=threading.RLock(),
+        seed_mode=StreamSeedMode.EMPTY_REPLACEMENT,
+    )
+    checkpoint = transaction._stream_checkpoint
+    assert type(checkpoint) is module._StreamStatReceipt
+    assert checkpoint.size == 0
+    assert checkpoint.evidence_bytes == 0
+    assert checkpoint.evidence_digest == hashlib.sha256(b"").hexdigest()
+    assert target.read_bytes() == b""
+    assert not transaction.backup.exists()
+
+    assert transaction.abort_stream(
+        attempt, lease=lease,
+    ).phase is TransactionPhase.ABORTED
+    assert not target.exists()
+    assert pool.events == [("pause", str(target)), ("resume", str(target))]
+    _release(transaction, lease, owners)
+
+
+def test_existing_append_routes_preserve_seed(tmp_path, monkeypatch):
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.io import prepare_append_preflight
+    from xrd_tools.reduction import (
+        FrameReduction,
+        NexusSink,
+        ReductionPlan,
+        ReductionResult,
+    )
+
+    target = tmp_path / "append-preserve-seed.nexus"
+    first = _intent(
+        tmp_path, extent=1, labels=(0,), generation=0,
+        modes=("1d:default",),
+    )
+    initial = NexusSink(
+        target,
+        overwrite=True,
+        source_base=tmp_path,
+        same_run_intent=first,
+        flush_every=None,
+    )
+    initial.begin(Scan("append-preserve", []), ReductionPlan(integration_2d=None))
+    initial.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(0)))
+    initial.finish(ReductionResult("append-preserve", {}, 1))
+    prior = target.read_bytes()
+
+    second = _intent(
+        tmp_path, extent=2, labels=(0, 1), generation=0,
+        modes=("1d:default",),
+    )
+    preflight = prepare_append_preflight(target, second)
+    resumed = NexusSink(
+        target,
+        source_base=tmp_path,
+        append_preflight=preflight,
+        flush_every=None,
+    )
+    core = importlib.import_module("xrd_tools.reduction.core")
+    transaction_module = importlib.import_module("xrd_tools.io.output_transaction")
+    real_begin = transaction_module.OutputTransaction.begin_stream
+    policies = []
+    observed = []
+
+    def trace_begin(self, *args, **kwargs):
+        policies.append(kwargs.get("seed_mode"))
+        return real_begin(self, *args, **kwargs)
+
+    def reject_writer(*_args, **_kwargs):
+        observed.append(target.read_bytes())
+        raise RuntimeError("observe preserved append seed")
+
+    monkeypatch.setattr(
+        transaction_module.OutputTransaction, "begin_stream", trace_begin,
+    )
+    monkeypatch.setattr(core, "NexusRecordWriter", reject_writer)
+    with pytest.raises(RuntimeError, match="observe preserved append seed"):
+        resumed.begin(
+            Scan("append-preserve", []), ReductionPlan(integration_2d=None),
+        )
+
+    assert policies == [transaction_module.StreamSeedMode.PRESERVE_BASE]
+    assert observed == [prior]
+    assert target.read_bytes() == prior
+    assert preflight.snapshot.state.value == "aborted"
+    _assert_lease_available(target)
+
+
 def test_science_fingerprint_rejects_unsupported_values_deterministically():
     module = importlib.import_module("xrd_tools.io.append")
 

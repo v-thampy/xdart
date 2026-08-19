@@ -83,6 +83,7 @@ from xrd_tools.io.output_transaction import (
     OutputReceiptCapability,
     OutputReceiptCapabilityProvider,
     OwnerToken,
+    StreamSeedMode,
     StreamTerminal,
     TransactionPhase,
     TransactionSnapshot,
@@ -1635,6 +1636,7 @@ class NexusSink:
                     target_owner=binding.target_owner,
                     lease=binding.lease,
                     file_lock=self.file_lock,
+                    seed_mode=StreamSeedMode.PRESERVE_BASE,
                 )
             except BaseException as primary:
                 try:
@@ -1691,6 +1693,11 @@ class NexusSink:
                 target_owner=target_owner,
                 lease=lease,
                 file_lock=self.file_lock,
+                seed_mode=(
+                    StreamSeedMode.EMPTY_REPLACEMENT
+                    if self.overwrite
+                    else StreamSeedMode.PRESERVE_BASE
+                ),
             )
         except BaseException as primary:
             try:
