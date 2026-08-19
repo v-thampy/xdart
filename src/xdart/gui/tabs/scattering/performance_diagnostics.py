@@ -21,7 +21,7 @@ _PIPELINE_FIELDS = (
     "staging_frame_cap",
 )
 _LEGACY_PIPELINE_FIELDS = _PIPELINE_FIELDS[:-1]
-_DEFAULT_PIPELINE = (1, 8, 16, 56, 64)
+_DEFAULT_PIPELINE = (1, 8, 8, 40, 64)
 
 
 @dataclass(frozen=True, slots=True)

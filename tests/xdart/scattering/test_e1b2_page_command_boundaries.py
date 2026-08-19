@@ -308,6 +308,30 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         _dispose(page, qapp)
 
 
+def test_performance_diagnostics_fresh_default_is_tuned_tuple(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    monkeypatch.delenv("XDART_PERF_QUARTILES", raising=False)
+    page, _, _ = _active_page(_Executor())
+    dialog = PerformanceDiagnosticsDialog(page)
+    monkeypatch.setattr(
+        dialog,
+        "exec",
+        lambda: QtWidgets.QDialog.DialogCode.Accepted,
+    )
+    try:
+        values = dialog.edit(page._intents.snapshot(), 375)
+        assert values is not None
+        assert (
+            values.settlement,
+            values.record,
+            values.inflight,
+            values.checkpoint,
+            values.staging_frame_cap,
+        ) == (1, 8, 8, 40, 64)
+    finally:
+        _dispose(page, qapp)
+
+
 def test_performance_diagnostics_reject_invalid_coupled_values(
         qapp: QtWidgets.QApplication, monkeypatch) -> None:
     monkeypatch.delenv("XDART_PERF", raising=False)
