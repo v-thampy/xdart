@@ -303,7 +303,8 @@ class _DurableFrameProof:
 
 
 class _EvidenceBuilder:
-    def __init__(self) -> None:
+    def __init__(self, *, observed_only: bool = False) -> None:
+        self._observed_only = bool(observed_only)
         self._digest = hashlib.sha256(b"xrd-tools-row-evidence-v1\0")
         self._observed_digest = hashlib.sha256(
             b"xrd-tools-row-observed-v1\0"
@@ -336,8 +337,9 @@ class _EvidenceBuilder:
             )
         expected_raw = expected_text.encode("utf-8")
         observed_raw = observed_text.encode("utf-8")
-        self._part(role, "expected", expected_raw)
-        self._part(role, "observed", observed_raw)
+        if not self._observed_only:
+            self._part(role, "expected", expected_raw)
+            self._part(role, "observed", observed_raw)
         self._observed_part(role, "observed", observed_raw)
         self.read_bytes += len(observed_raw)
 
@@ -361,26 +363,29 @@ class _EvidenceBuilder:
             [expected_array.dtype.str, list(expected_array.shape)],
             separators=(",", ":"),
         ).encode("utf-8")
-        self._part(role, "facts", facts)
-        self._part(role, "expected", expected_array.tobytes(order="C"))
-        self._part(role, "observed", observed_array.tobytes(order="C"))
+        observed_raw = observed_array.tobytes(order="C")
+        if not self._observed_only:
+            self._part(role, "facts", facts)
+            self._part(role, "expected", expected_array.tobytes(order="C"))
+            self._part(role, "observed", observed_raw)
         self._observed_part(role, "facts", facts)
-        self._observed_part(
-            role,
-            "observed",
-            observed_array.tobytes(order="C"),
-        )
+        self._observed_part(role, "observed", observed_raw)
         self.read_bytes += int(observed_array.nbytes)
 
     def absent(self, role: str, absent: bool) -> None:
         if not absent:
             raise WriterStateError(f"durability readback expected absent {role}")
-        self._part(role, "expected", b"absent")
-        self._part(role, "observed", b"absent")
+        if not self._observed_only:
+            self._part(role, "expected", b"absent")
+            self._part(role, "observed", b"absent")
         self._observed_part(role, "observed", b"absent")
 
     def hexdigest(self) -> str:
-        return self._digest.hexdigest()
+        return (
+            self._observed_digest.hexdigest()
+            if self._observed_only
+            else self._digest.hexdigest()
+        )
 
     def observed_hexdigest(self) -> str:
         return self._observed_digest.hexdigest()
@@ -1414,7 +1419,7 @@ class NexusRecordWriter:
             two_d_kind=proof.two_d_kind,
             source_shape=proof.source_shape,
         )
-        evidence = _EvidenceBuilder()
+        evidence = _EvidenceBuilder(observed_only=True)
         self._verify_mode_row(evidence, expected, observation)
         if evidence.observed_hexdigest() != proof.digest:
             raise WriterStateError(

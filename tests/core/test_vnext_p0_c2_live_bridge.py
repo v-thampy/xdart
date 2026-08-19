@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import ast
 import gc
+import importlib
 import inspect
 import threading
 import time
@@ -722,6 +723,8 @@ def test_close_revalidates_compact_frame_proof_after_checkpoint_corruption(
         source_identity=fact.source_identity,
     )
     session = open_session(live_scan(target, intent, (0,)), accounting)
+    session._record_checkpoint_revoked = lambda _owner: None
+    session._record_checkpoint_recoverable = lambda *_args: None
     session.flush(force=True)
 
     writer = session.sink._writer
@@ -739,10 +742,11 @@ def test_close_revalidates_compact_frame_proof_after_checkpoint_corruption(
     session.abort()
 
 
-def test_descriptor_bound_close_reads_each_mode_array_once_with_checkpoint_digest_equivalence(
+def test_descriptor_bound_close_reads_each_mode_array_once_and_hashes_each_observed_payload_once(
     tmp_path,
     monkeypatch,
 ):
+    record_writer = importlib.import_module("xrd_tools.io.record_writer")
     source = tmp_path / "one-pass-source.nxs"
     source.write_bytes(b"source")
     fact = observe_source_fact(tmp_path, source.name, logical_identity=0)
@@ -755,6 +759,10 @@ def test_descriptor_bound_close_reads_each_mode_array_once_with_checkpoint_diges
         source_identity=fact.source_identity,
     )
     session = open_session(live_scan(target, intent, (0,)), accounting)
+    # This terminal-proof discriminator does not exercise the separate active
+    # hydration gate; the lightweight C2 bridge lacks that optional callback.
+    session._record_checkpoint_revoked = lambda _owner: None
+    session._record_checkpoint_recoverable = lambda *_args: None
     session.flush(force=True)
 
     writer = session.sink._writer
@@ -775,7 +783,10 @@ def test_descriptor_bound_close_reads_each_mode_array_once_with_checkpoint_diges
         return real_getitem(dataset, item)
 
     observed_digests = {}
+    expected_payload_hashes = {}
+    observed_payload_hashes = {}
     real_reverify = writer._reverify_durable_mode_proof
+    real_update = record_writer._EvidenceBuilder._update
 
     def capture_observed_digest(proof):
         evidence = real_reverify(proof)
@@ -784,9 +795,24 @@ def test_descriptor_bound_close_reads_each_mode_array_once_with_checkpoint_diges
         )
         return evidence
 
+    def count_observed_payload_hash(digest, role, side, payload):
+        if role.startswith("/") and role.rsplit("/", 1)[-1] in {
+            "frame_index", "q", "intensity", "sigma", "chi",
+        }:
+            if side == "expected":
+                expected_payload_hashes[role] = expected_payload_hashes.get(role, 0) + 1
+            elif side == "observed":
+                observed_payload_hashes[role] = observed_payload_hashes.get(role, 0) + 1
+        return real_update(digest, role, side, payload)
+
     monkeypatch.setattr(h5py.Dataset, "__getitem__", count_mode_array_reads)
     monkeypatch.setattr(
         writer, "_reverify_durable_mode_proof", capture_observed_digest,
+    )
+    monkeypatch.setattr(
+        record_writer._EvidenceBuilder,
+        "_update",
+        staticmethod(count_observed_payload_hash),
     )
     writer._close_handle()
 
@@ -801,6 +827,9 @@ def test_descriptor_bound_close_reads_each_mode_array_once_with_checkpoint_diges
             expected_reads[f"{prefix}/chi"] = 1
     assert reads == expected_reads
     assert observed_digests == checkpoint_digests
+    assert expected_payload_hashes == {}
+    assert observed_payload_hashes
+    assert set(observed_payload_hashes.values()) == {1}
     session.abort()
 
 

@@ -2622,7 +2622,7 @@ class OutputTransaction:
                 if self._stream_file_lock is None
                 else self._stream_file_lock
             ):
-                failure = self._verify_stream_terminal()
+                failure = self._verify_stream_terminal(role="epoch-committed")
                 if failure is not None:
                     self._phase = TransactionPhase.INTEGRITY_HOLD
                     raise failure
@@ -2632,10 +2632,6 @@ class OutputTransaction:
                     raise TransactionStateError(
                         "epoch commit lacks an exact terminal receipt")
                 self._stream_epoch_receipt = receipt
-                self._terminal_receipt = _TerminalReceipt(
-                    self._admission.target, receipt.snapshot, receipt.snapshot,
-                    "epoch-committed",
-                )
                 self._pending.discard(RetryAction.ROLLBACK)
                 if (
                     self._backup_owned
@@ -2838,22 +2834,41 @@ class OutputTransaction:
             return replace_error if replace_error is not None else exc
         return replace_error
 
-    def _verify_stream_terminal(self) -> BaseException | None:
+    def _verify_stream_terminal(
+        self, *, role: str = "committed-result",
+    ) -> BaseException | None:
         receipt = self._stream_terminal_receipt
         terminal_stat = self._stream_terminal_stat
-        if receipt is None or terminal_stat is None:
-            return TargetChanged("stream terminal bytes were not exactly sealed")
-        if not _exact_receipt(_capture_target(self._admission.target), receipt):
+        reservation = self._stream_reservation
+        target = _normalize_target(self._admission.target)
+        snapshot = None if receipt is None else receipt.snapshot
+        sealed = None if terminal_stat is None else TargetSnapshot(
+            True,
+            terminal_stat.size,
+            terminal_stat.mtime_ns,
+            terminal_stat.identity.device,
+            terminal_stat.identity.inode,
+            terminal_stat.evidence_digest,
+        )
+        if (
+            receipt is None
+            or terminal_stat is None
+            or reservation is None
+            or receipt.path != target
+            or terminal_stat.path != target
+            or receipt.identity != reservation.identity
+            or terminal_stat.identity != reservation.identity
+            or snapshot != sealed
+            or terminal_stat.evidence_bytes != terminal_stat.size
+            or not _stream_stat_matches(target, terminal_stat)
+        ):
             self._terminal_receipt = None
             return TargetChanged("stream terminal seal changed before commit")
-        if receipt.identity != terminal_stat.identity:
-            self._terminal_receipt = None
-            return TargetChanged("stream terminal receipts disagree on inode")
         self._terminal_receipt = _TerminalReceipt(
             self._admission.target,
-            receipt.snapshot,
-            receipt.snapshot,
-            "committed-result",
+            snapshot,
+            snapshot,
+            role,
         )
         return None
 
@@ -3251,17 +3266,19 @@ class OutputTransaction:
                     if failure is not None:
                         failures.append(failure)
             if self._published and self._stream_committed:
-                failure = self._verify_stream_terminal()
-                if failure is not None:
-                    failures.append(failure)
-                elif (
-                    self._backup_owned
-                    or self._captured_prior is not None
-                    or RetryAction.BACKUP_UNLINK in self._pending
-                ):
-                    failure = self._attempt_backup_unlink()
+                with (nullcontext() if self._stream_file_lock is None
+                      else self._stream_file_lock):
+                    failure = self._verify_stream_terminal()
                     if failure is not None:
                         failures.append(failure)
+                    elif (
+                        self._backup_owned
+                        or self._captured_prior is not None
+                        or RetryAction.BACKUP_UNLINK in self._pending
+                    ):
+                        failure = self._attempt_backup_unlink()
+                        if failure is not None:
+                            failures.append(failure)
             elif self._published:
                 failures.extend(self._finish_published_cleanup())
             elif RetryAction.BACKUP_UNLINK in self._pending:
@@ -3312,10 +3329,11 @@ class OutputTransaction:
                 try:
                     with (nullcontext() if self._stream_file_lock is None
                           else self._stream_file_lock):
-                        self._install_terminal_receipt(
-                            expected=self._stream_epoch_receipt.snapshot,
+                        failure = self._verify_stream_terminal(
                             role="epoch-committed",
                         )
+                        if failure is not None:
+                            raise failure
                 except BaseException as exc:
                     failures.append(exc)
                     self._phase = TransactionPhase.INTEGRITY_HOLD

@@ -477,31 +477,236 @@ def test_checkpoint_rejects_same_stat_changed_bytes(tmp_path):
     assert RetryAction.ROLLBACK in transaction.snapshot().pending_actions
 
 
-def test_terminal_commit_rechecks_exact_bytes_not_only_stat_receipt(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize("boundary", ("final", "epoch"))
+def test_stream_terminal_commit_transfers_one_full_seal_under_exact_exclusion(
+    tmp_path, monkeypatch, boundary,
 ):
     module = importlib.import_module("xrd_tools.io.output_transaction")
+
+    class TrackingLock:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.depth = 0
+
+        def __enter__(self):
+            self.lock.acquire()
+            self.depth += 1
+            return self
+
+        def __exit__(self, *_args):
+            self.depth -= 1
+            self.lock.release()
+
     (_coordinator, transaction, target, transaction_owner, target_owner,
-     _owners, lease) = _transaction(tmp_path)
+     owners, lease) = _transaction(tmp_path)
+    pool, lock = _Pool(), TrackingLock()
     attempt = transaction.begin_stream(
         admission=transaction.admission,
         transaction_owner=transaction_owner,
         target_owner=target_owner,
         lease=lease,
-        pool=_Pool(),
-        file_lock=threading.RLock(),
+        pool=pool,
+        file_lock=lock,
     )
     transaction.authorize_stream_mutation(attempt, lease=lease)
     target.write_bytes(b"AAAA")
-    transaction.seal_stream_terminal(attempt, lease=lease)
-    accepted = target.stat()
-    target.write_bytes(b"BBBB")
-    os.utime(target, ns=(accepted.st_atime_ns, accepted.st_mtime_ns))
-    monkeypatch.setattr(module, "_stream_stat_matches", lambda *_args: True)
+    hashes = 0
+    stat_checks = 0
+    real_hash = module._sha256_handle
+    real_stat_match = module._stream_stat_matches
 
-    with pytest.raises(TargetChanged, match="terminal seal changed"):
-        transaction.commit_stream(attempt, lease=lease)
-    assert transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
+    def count_hash(handle):
+        nonlocal hashes
+        observed = os.fstat(handle.fileno())
+        current = target.stat()
+        if (observed.st_dev, observed.st_ino) == (current.st_dev, current.st_ino):
+            assert lock.depth > 0
+            hashes += 1
+        return real_hash(handle)
+
+    def check_stat_under_exclusion(path, receipt):
+        nonlocal stat_checks
+        assert lock.depth > 0
+        stat_checks += 1
+        return real_stat_match(path, receipt)
+
+    monkeypatch.setattr(module, "_sha256_handle", count_hash)
+    monkeypatch.setattr(module, "_stream_stat_matches", check_stat_under_exclusion)
+    with lock:
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    if boundary == "final":
+        snapshot = transaction.commit_stream(attempt, lease=lease)
+    else:
+        snapshot = transaction.commit_stream_epoch(attempt, lease=lease)
+        assert snapshot.phase is TransactionPhase.EPOCH_COMMITTED
+        snapshot = transaction.commit_stream(attempt, lease=lease)
+    assert snapshot.phase is TransactionPhase.COMMITTED
+    assert hashes == 1
+    assert stat_checks >= 1
+    _release(transaction, lease, owners)
+
+
+def test_stream_terminal_commit_rejects_stat_or_identity_drift_without_rehash(
+    tmp_path, monkeypatch,
+):
+    module = importlib.import_module("xrd_tools.io.output_transaction")
+
+    for drift in ("stat", "identity"):
+        root = tmp_path / drift
+        root.mkdir()
+        (_coordinator, transaction, target, transaction_owner, target_owner,
+         _owners, lease) = _transaction(root)
+        attempt = transaction.begin_stream(
+            admission=transaction.admission,
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            pool=_Pool(),
+            file_lock=threading.RLock(),
+        )
+        transaction.authorize_stream_mutation(attempt, lease=lease)
+        target.write_bytes(b"AAAA")
+        transaction.seal_stream_terminal(attempt, lease=lease)
+        if drift == "stat":
+            accepted = target.stat()
+            os.utime(
+                target,
+                ns=(accepted.st_atime_ns, accepted.st_mtime_ns + 1_000_000_000),
+            )
+        else:
+            replacement = root / "replacement.nexus"
+            replacement.write_bytes(b"AAAA")
+            os.replace(replacement, target)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                module,
+                "_sha256_handle",
+                lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("terminal commit rehashed the full target")
+                ),
+            )
+            with pytest.raises(TargetChanged, match="terminal seal"):
+                transaction.commit_stream(attempt, lease=lease)
+        assert transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
+
+
+def test_stream_terminal_cleanup_retry_reuses_seal_and_retains_exclusion(
+    tmp_path, monkeypatch,
+):
+    module = importlib.import_module("xrd_tools.io.output_transaction")
+
+    class TrackingLock:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.depth = 0
+
+        def __enter__(self):
+            self.lock.acquire()
+            self.depth += 1
+            return self
+
+        def __exit__(self, *_args):
+            self.depth -= 1
+            self.lock.release()
+
+    for boundary in ("final", "epoch"):
+        root = tmp_path / boundary
+        root.mkdir()
+        (coordinator, transaction, target, transaction_owner, target_owner,
+         owners, lease) = _transaction(root)
+        pool, lock = _Pool(), TrackingLock()
+        attempt = transaction.begin_stream(
+            admission=transaction.admission,
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            pool=pool,
+            file_lock=lock,
+        )
+        transaction.authorize_stream_mutation(attempt, lease=lease)
+        target.write_bytes(b"terminal")
+        real_hash = module._sha256_handle
+        real_unlink = module._unlink
+        real_stat_match = module._stream_stat_matches
+        hashes = 0
+        stat_checks = 0
+        failed = False
+        sealed_receipt = None
+        sealed_stat = None
+
+        def count_hash(handle):
+            nonlocal hashes
+            observed = os.fstat(handle.fileno())
+            current = target.stat()
+            if (observed.st_dev, observed.st_ino) == (current.st_dev, current.st_ino):
+                hashes += 1
+            return real_hash(handle)
+
+        def check_stat_under_exclusion(path, receipt):
+            nonlocal stat_checks
+            assert lock.depth > 0
+            stat_checks += 1
+            return real_stat_match(path, receipt)
+
+        def fail_backup_once(path):
+            nonlocal failed
+            if Path(path) == transaction.backup and not failed:
+                failed = True
+                raise OSError("backup cleanup fault")
+            return real_unlink(path)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "_sha256_handle", count_hash)
+            patch.setattr(module, "_stream_stat_matches", check_stat_under_exclusion)
+            patch.setattr(module, "_unlink", fail_backup_once)
+            with lock:
+                transaction.seal_stream_terminal(attempt, lease=lease)
+            sealed_receipt = transaction._stream_terminal_receipt
+            sealed_stat = transaction._stream_terminal_stat
+            commit = (
+                transaction.commit_stream
+                if boundary == "final"
+                else transaction.commit_stream_epoch
+            )
+            with pytest.raises(CleanupIncomplete):
+                commit(attempt, lease=lease)
+            held = transaction.snapshot()
+            assert held.phase is TransactionPhase.CLEANUP_PENDING
+            # Admission fingerprints before it reaches the lease refusal; do
+            # not charge that independent contender read to terminal retry.
+            with monkeypatch.context() as admission_patch:
+                admission_patch.setattr(module, "_sha256_handle", real_hash)
+                with pytest.raises(LeaseUnavailable):
+                    contender = coordinator.admit(
+                        target,
+                        transaction_owner=OwnerToken("retry contender"),
+                        target_owner=OwnerToken("retry target"),
+                    )
+                    contender.acquire_lease(
+                        admission=contender.admission,
+                        transaction_owner=contender._transaction_owner,
+                        target_owner=contender._target_owner,
+                        owners={
+                            role: OwnerToken(f"retry {role.value}")
+                            for role in LeaseOwner
+                        },
+                    )
+            complete = transaction.retry_cleanup(held.cleanup_token)
+            expected = (
+                TransactionPhase.COMMITTED
+                if boundary == "final"
+                else TransactionPhase.EPOCH_COMMITTED
+            )
+            assert complete.phase is expected
+            assert transaction._stream_terminal_receipt is sealed_receipt
+            assert transaction._stream_terminal_stat is sealed_stat
+            if boundary == "epoch":
+                complete = transaction.commit_stream(attempt, lease=lease)
+                assert complete.phase is TransactionPhase.COMMITTED
+            assert hashes == 1, boundary
+            assert stat_checks >= 2
+        _release(transaction, lease, owners)
 
 
 def test_routine_checkpoint_never_hashes_or_captures_the_whole_target(
