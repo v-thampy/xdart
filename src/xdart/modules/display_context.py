@@ -59,6 +59,8 @@ from xrd_tools.session.hydration import (
     HydrationScope,
     HydrationToken,
     normalize_hydration_purpose,
+    _CheckpointHydrationGate,
+    _CheckpointHydrationToken,
 )
 from xrd_tools.session.viewer_1d import (
     OneDViewerCommitPort,
@@ -449,6 +451,8 @@ class HydrationRequest:
     commit_gate: object
     read_key: HydrationReadKey | None = None
     token: HydrationToken | None = None
+    checkpoint_token: _CheckpointHydrationToken | None = None
+    checkpoint_gate: _CheckpointHydrationGate | None = None
     scope: HydrationScope = field(init=False)
 
     def __post_init__(self):
@@ -467,6 +471,13 @@ class HydrationRequest:
         object.__setattr__(self, "scope", scope)
         if (self.read_key is None) != (self.token is None):
             raise ValueError("read_key and token must be supplied together")
+        if (self.checkpoint_token is None) != (self.checkpoint_gate is None):
+            raise ValueError("checkpoint token and gate must be supplied together")
+        if self.checkpoint_token is not None and (
+            type(self.checkpoint_token) is not _CheckpointHydrationToken
+            or type(self.checkpoint_gate) is not _CheckpointHydrationGate
+        ):
+            raise TypeError("checkpoint hydration authority is malformed")
         if self.read_key is None:
             return
         if (
@@ -480,6 +491,9 @@ class HydrationRequest:
             or self.read_key.purpose is not purpose
             or self.read_key.frame_identity != self.label
             or self.token.presentation_generation != self.generation
+            or self.checkpoint_token is not None
+            and self.checkpoint_token.artifact_identity
+            != self.read_key.artifact_identity
         ):
             raise ValueError("hydration request identity is inconsistent")
 

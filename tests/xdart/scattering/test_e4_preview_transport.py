@@ -237,11 +237,18 @@ def _typed_request(
     generation: int,
     *,
     stores: tuple | None = None,
+    checkpoint: bool = False,
 ):
     scope = HydrationScope(*owner_value.as_tuple())
     read_key = HydrationReadKey(scope, str(artifact), label, purpose)
     token = HydrationToken(read_key, generation)
     art = state.artifacts[str(artifact)]
+    checkpoint_token = checkpoint_gate = None
+    if checkpoint:
+        checkpoint_token, checkpoint_gate = (
+            art.records._checkpoint_hydration_authority()
+        )
+        assert checkpoint_token is not None and checkpoint_gate is not None
     return HydrationRequest(
         label,
         purpose,
@@ -253,6 +260,8 @@ def _typed_request(
         gate,
         read_key=read_key,
         token=token,
+        checkpoint_token=checkpoint_token,
+        checkpoint_gate=checkpoint_gate,
     )
 
 
@@ -376,7 +385,7 @@ def test_no_thumbnail_preview_keeps_science_without_detector_fallback(
 
 
 @pytest.mark.parametrize("with_2d", (False, True), ids=("Int1D", "Int2D"))
-def test_live_thumbnail_carrier_is_exact_complete_and_label_only(
+def test_live_thumbnail_carrier_is_exact_complete_and_snapshot_ordered(
     monkeypatch, tmp_path, with_2d
 ):
     from queue import Queue; from types import SimpleNamespace; import xrd_tools.reduction.core as reduction_core
@@ -397,7 +406,7 @@ def test_live_thumbnail_carrier_is_exact_complete_and_label_only(
     target = tmp_path / "live.nxs"
     run = _StandardRun(None, RunIdentity(1, "perf-c5"), scan, None, None, None, target)
     owner = run.display.add_artifact(target, "live", mask=None, mask_saturation=False, measurement_mode="Standard")
-    policy, layout, rows, ceiling, _ = dynamic_output._light_policy_layout(SimpleNamespace(max_cores=1, gi=SimpleNamespace(enabled=False)), plan, SimpleNamespace(descriptor=None), scan, (1,))
+    policy, layout, rows, ceiling, _ = dynamic_output._light_policy_layout(SimpleNamespace(max_cores=1, live_mode=False, gi=SimpleNamespace(enabled=False)), plan, SimpleNamespace(descriptor=None), scan, (1,))
     lease = dynamic_output.acquire_light_1d_retention(dynamic_output.SessionResourceAuthority.from_allocation(policy.allocation), owner="scattering-light-1d:perf-c5", generation=1, layout=layout, requested_rows=rows, compatibility_byte_ceiling=ceiling, gui_thread_id=run.gui_thread_id, funding_mode=dynamic_output.Light1DFundingMode.REPLACE_PUBLICATION_A1, current_lineage_rows=1)
     owner.publications.bind_allocation(policy.allocation); owner.publications.bind_light_1d(lease)
     hooks = owner.publications.light_1d_cleanup_hooks(lease)
@@ -431,19 +440,38 @@ def test_live_thumbnail_carrier_is_exact_complete_and_label_only(
     executor = StandardRunExecutor(); executor._active = run
     pending = run.display_projection_queue = Queue()
     executor._frame_ready(run, SimpleNamespace(frame_index=1)); queued = pending.get_nowait()
-    assert type(queued) is int and queued == 1
+    assert queued.frame_index == 1 and queued.record is owner.records.get(1)
     executor._frame_ready_owned(run, queued, None, None)
     event = executor.drain_events()[-1]; payload = run.display.payloads[event.frame_key]
     assert payload.view.thumbnail is thumbnail and payload.view.raw is None
     assert run.display.project(event.frame_key, 0, closed=False) is not None
     assert sum(run.display.transport.counters().values()) == 0
+    run.display_projection_queue = None
+    order, entered, release = [], threading.Event(), threading.Event()
+    project, mark = executor._frame_ready_owned, run.display.mark_checkpoint_recoverable
+    def delayed(*args):
+        order.append("frame"); entered.set(); assert release.wait(2); return project(*args)
+    def checkpoint(*args):
+        order.append("checkpoint"); return mark(*args)
+    monkeypatch.setattr(executor, "_frame_ready_owned", delayed)
+    monkeypatch.setattr(run.display, "mark_checkpoint_recoverable", checkpoint)
+    executor._start_display_projection(run)
+    executor._frame_ready(run, SimpleNamespace(frame_index=1))
+    executor._checkpoint_ready(run, SimpleNamespace(labels=(1,)))
+    assert entered.wait(2) and order == ["frame"]
+    release.set(); assert executor._drain_display_projection(run, 2)
+    executor._finish_display_projection(run)
+    assert order == ["frame", "checkpoint"]
+    monkeypatch.setattr(executor, "_frame_ready_owned", project)
+    monkeypatch.setattr(run.display, "mark_checkpoint_recoverable", mark)
+    pending = run.display_projection_queue = Queue()
     error = RuntimeError("stamp failed"); monkeypatch.setattr(run.display, "stamp_saturation_ceiling",
                         lambda *_a, **_k: (_ for _ in ()).throw(error))
     executor._frame_ready(run, SimpleNamespace(frame_index=1))
     assert run.display_projection_errors == [error] and pending.empty()
     run.display.artifacts.pop(str(target))
     with pytest.raises(RuntimeError, match="exact owner"):
-        executor._frame_ready_owned(run, 1, None, None)
+        executor._frame_ready_owned(run, queued, None, None)
 
     if not with_2d:
         supplied = np.arange(6, dtype=np.float32).reshape(2, 3)
@@ -1945,6 +1973,69 @@ def test_injected_commit_failure_retains_exact_prepared_commit_once(
         if getattr(event, "frame_key", None) is keys[2]
     ]
     assert len(ready) == 1  # publication-last, exactly one public signal
+
+
+def test_stale_active_checkpoint_read_publishes_nothing_but_closed_browse_runs(
+    monkeypatch, tmp_path,
+):
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    keys = _catalog(state, owner, (1, 2, 3))
+    state.bind_checkpoint_hydration(owner)
+    owner.records._authorize_checkpoint_hydration(object())
+    owner_value, context_gate = _acquisition_identity(state)
+    entered, release = _hold_reads(monkeypatch)
+    request = _typed_request(
+        state, owner_value, context_gate, processed, 2,
+        HydrationPurpose.PREVIEW, 5, checkpoint=True,
+    )
+    assert state.transport.submit(request) is not None
+    assert entered.wait(2.0)
+    owner.records._revoke_checkpoint_recovery()
+    release.set()
+    assert _wait_transport_idle(state)
+    assert owner.publications.get(2) is None and keys[2] not in state.payloads
+    assert dict(_completion_outcomes(state))[2] is HydrationOutcome.OWNER_MISMATCH
+
+    assert state.project(
+        keys[3], 6, closed=True, owner=owner_value, commit_gate=context_gate,
+    ) is None
+    assert _wait_transport_idle(state) and owner.publications.get(3) is not None
+
+
+def test_active_commit_holds_checkpoint_gate_until_bounded_publish_finishes(
+    monkeypatch, tmp_path,
+):
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    _catalog(state, owner, (1, 2, 3))
+    state.bind_checkpoint_hydration(owner)
+    owner.records._authorize_checkpoint_hydration(object())
+    owner_value, context_gate = _acquisition_identity(state)
+    entered, release, revoked = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+    original = state._commit_acquisition_locked
+
+    def held_commit(*args):
+        entered.set()
+        assert release.wait(2.0)
+        return original(*args)
+
+    monkeypatch.setattr(state, "_commit_acquisition_locked", held_commit)
+    request = _typed_request(
+        state, owner_value, context_gate, processed, 2,
+        HydrationPurpose.PREVIEW, 5, checkpoint=True,
+    )
+    assert state.transport.submit(request) is not None
+    assert entered.wait(2.0)
+    worker = threading.Thread(target=lambda: (
+        owner.records._revoke_checkpoint_recovery(), revoked.set()
+    ))
+    worker.start()
+    assert not revoked.wait(0.05)
+    release.set()
+    assert revoked.wait(2.0)
+    worker.join(2.0)
+    assert _wait_transport_idle(state)
 
 
 # --------------------------------------------------------------------------- #

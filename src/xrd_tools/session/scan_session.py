@@ -123,6 +123,9 @@ class FrameEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class CheckpointRecoveryEvent:
+    labels: tuple[int, ...]
+@dataclass(frozen=True, slots=True)
 class ProgressEvent:
     """Absolute (not delta) progress counts; may fire from two threads, so
     consumers treat it as idempotent."""
@@ -373,6 +376,7 @@ class ScanSession:
     ) -> None:
         self._lock = threading.RLock()
         self._frame_cbs: list[Callable[[FrameEvent], None]] = []
+        self._checkpoint_cbs: list[Callable[[CheckpointRecoveryEvent], None]] = []
         self._progress_cbs: list[Callable[[ProgressEvent], None]] = []
         self._state_cbs: list[Callable[[StateChangeEvent], None]] = []
         self._generation = 0
@@ -992,6 +996,7 @@ class ScanSession:
         if self._record_store is not None:
             with self._projection_lock:
                 self._reconcile_locked(self._record_store.labels())
+                self._record_store.clear_checkpoint_recoverable()
         self._final_sweep()
         if not self._terminal_state_emitted:
             self._terminal_state_emitted = True
@@ -1046,6 +1051,7 @@ class ScanSession:
         if self._record_store is not None:
             with self._projection_lock:
                 self._reconcile_locked(self._record_store.labels())
+                self._record_store.clear_checkpoint_recoverable()
         self._final_sweep()
         if not self._terminal_state_emitted:
             self._terminal_state_emitted = True
@@ -1200,6 +1206,7 @@ class ScanSession:
         if self._record_store is not None:
             with self._projection_lock:
                 self._reconcile_locked(self._record_store.labels())
+                self._record_store.clear_checkpoint_recoverable()
         return anchor
 
     def _commit_dynamic_xye_epoch(self):
@@ -1270,6 +1277,7 @@ class ScanSession:
         if self._record_store is not None:
             with self._projection_lock:
                 self._reconcile_locked(self._record_store.labels())
+                self._record_store.clear_checkpoint_recoverable()
         return settled
 
     def extend_live(self, intent: AppendIntent) -> AppendDecision:
@@ -1409,6 +1417,9 @@ class ScanSession:
     # handle is idempotent — calling it twice is a no-op.
     def on_frame_completed(self, cb: Callable[[FrameEvent], None]) -> Callable[[], None]:
         return self._subscribe(self._frame_cbs, cb)
+
+    def on_checkpoint_recoverable(self, cb):
+        return self._subscribe(self._checkpoint_cbs, cb)
 
     def on_progress(self, cb: Callable[[ProgressEvent], None]) -> Callable[[], None]:
         return self._subscribe(self._progress_cbs, cb)
@@ -1658,6 +1669,55 @@ class ScanSession:
         nexus.flush(force=True)
         self._dynamic_nexus_checkpoint_count = 0
 
+    def _record_checkpoint_recoverable(
+        self, owner_token, checkpoint, receipts, drops,
+        frame_labels, thumbnail_labels,
+    ) -> None:
+        if owner_token is not self._dynamic_owner_token:
+            raise RuntimeError("checkpoint recovery requires the exact run owner")
+        store = self._record_store
+        if store is None:
+            return
+        frames, thumbnails = set(frame_labels), set(thumbnail_labels)
+        grouped: dict[int, dict[tuple[str, str], int]] = {}
+        for receipt in receipts:
+            grouped.setdefault(int(receipt.label), {})[
+                (receipt.mode.kind, receipt.mode.key)
+            ] = int(receipt.revision)
+        absent: dict[int, set[tuple[str, str]]] = {}
+        for receipt in drops:
+            absent.setdefault(int(receipt.label), set()).add(
+                (receipt.mode.kind, receipt.mode.key))
+        recovered = []
+        with self._projection_lock:
+            for label in sorted(set(grouped) | set(absent)):
+                revisions = grouped.get(label, {})
+                expected = store.get(label)
+                if expected is not None and store._mark_checkpoint_recoverable(
+                    label, expected=expected, revisions=revisions,
+                    frame_verified=(label in frames),
+                    thumbnail_verified=label in thumbnails,
+                    verified_absent=absent.get(label, ()),
+                ):
+                    recovered.append(label)
+            store._authorize_checkpoint_hydration(checkpoint)
+        if not recovered:
+            return
+        event = CheckpointRecoveryEvent(tuple(sorted(recovered)))
+        with self._lock:
+            callbacks = tuple(self._checkpoint_cbs)
+        for callback in callbacks:
+            try:
+                callback(event)
+            except Exception:
+                logger.exception("checkpoint recovery listener raised")
+
+    def _record_checkpoint_revoked(self, owner_token) -> None:
+        if owner_token is not self._dynamic_owner_token:
+            raise RuntimeError("checkpoint revocation requires the exact run owner")
+        if self._record_store is not None:
+            self._record_store._revoke_checkpoint_recovery()
+
     def _record_written(self, event: FrameEvent) -> None:
         """The TOP-LEVEL sink hook returned successfully for this event.
 
@@ -1768,10 +1828,21 @@ class ScanSession:
         label = int(event.frame_index)
         with self._projection_lock:
             try:
-                self._record_store.upsert(
+                stored = self._record_store.upsert(
                     record,
                     source_identity=getattr(frame, "source_identity", None),
                 )
+                if self._dynamic_accounting is not None:
+                    revisions = {
+                        (mode.kind, mode.key):
+                        self._accounting.current_revision(label, mode)
+                        for mode in self._accounting.required_modes
+                        if ((mode.kind == "1d" and event.result_1d is not None)
+                            or (mode.kind == "2d" and event.result_2d is not None))
+                    }
+                    self._record_store._bind_checkpoint_revisions(
+                        label, expected=stored, revisions=revisions,
+                    )
             except Exception:
                 logger.exception("ScanSession record_store upsert failed")
                 raise

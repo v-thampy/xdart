@@ -309,6 +309,8 @@ class RunDisplayState:
             max_thumbnail_items=None,
         )
         publications.set_evictable_probe(records.can_release_record)
+        publications.set_heavy_evictable_probe(records.can_release_heavy)
+        publications.set_thumbnail_evictable_probe(records.can_release_thumbnail)
         frozen_mask = None if mask is None else np.asarray(mask, dtype=bool)
         if frozen_mask is not None:
             frozen_mask.setflags(write=False)
@@ -331,6 +333,16 @@ class RunDisplayState:
         self.artifacts[str(artifact)] = owner
         self._partition_index += 1
         return owner
+
+    def bind_checkpoint_hydration(self, owner: DisplayArtifact) -> None:
+        owner.records._bind_checkpoint_hydration_lineage(
+            str(owner.artifact), self.identity)
+
+    @staticmethod
+    def _checkpoint_authority(owner: DisplayArtifact):
+        required = owner.records._checkpoint_hydration_required()
+        token, gate = owner.records._checkpoint_hydration_authority()
+        return required, token, gate
 
     def stage_light_1d(self, owner: DisplayArtifact, lease: Light1DRetentionLease,
                        *, hooks=None, slot=None) -> None:
@@ -691,6 +703,14 @@ class RunDisplayState:
             )
             self._residency.enforce(protected=self._raw_lru)
 
+    def mark_checkpoint_recoverable(
+        self, owner: DisplayArtifact, labels: tuple[int, ...],
+    ) -> None:
+        with self._lock:
+            self._residency._rearm_heavy_labels(
+                owner.records, owner.publications, labels)
+            self._residency.enforce(protected=self._raw_lru)
+
     def frame_norm_aggregate(
         self, key: DisplayFrameKey
     ) -> ScanNormAggregate | None:
@@ -738,11 +758,17 @@ class RunDisplayState:
         with self._lock:
             art = self.artifacts.get(key.artifact)
             if self._retired or art is None or self.catalog.resolve(key) is not key: return None
+            required, checkpoint_token, checkpoint_gate = (
+                (False, None, None) if closed else self._checkpoint_authority(art))
+            if required and checkpoint_token is None: return None
             read_key = HydrationReadKey(HydrationScope(*owner.as_tuple()), key.artifact, key.local_frame_label, HydrationPurpose.FULL)
             serial = self._full_demand_generation = self._full_demand_generation + 1
             token = HydrationToken(read_key, serial)
             request = HydrationRequest(key.local_frame_label, HydrationPurpose.FULL, serial,
                 owner, (art.records, art.publications), commit_gate, read_key=read_key, token=token)
+            request = replace(
+                request, checkpoint_token=checkpoint_token,
+                checkpoint_gate=checkpoint_gate)
             self._full_demand = (serial, token, owner, key, HydrationPurpose.FULL, commit_gate, generation)
             self._full_diagnostic = None; publication = art.publications.get(key.local_frame_label)
             if publication is not None and publication.view.raw is not None:
@@ -963,6 +989,10 @@ class RunDisplayState:
                 HydrationPurpose.PREVIEW,
             )
             token = HydrationToken(read_key, int(selection_generation))
+            required, checkpoint_token, checkpoint_gate = (
+                (False, None, None) if closed else self._checkpoint_authority(art))
+            if required and checkpoint_token is None:
+                return
             request = HydrationRequest(
                 key.local_frame_label,
                 HydrationPurpose.PREVIEW,
@@ -972,6 +1002,8 @@ class RunDisplayState:
                 commit_gate,
                 read_key=read_key,
                 token=token,
+                checkpoint_token=checkpoint_token,
+                checkpoint_gate=checkpoint_gate,
             )
         except (TypeError, ValueError):
             return
@@ -1076,6 +1108,18 @@ class RunDisplayState:
                     return HydrationOutcome.OWNER_MISMATCH
             elif not browse_target:
                 return HydrationOutcome.OWNER_MISMATCH
+            checkpoint_gate = request.checkpoint_gate
+            checkpoint_required = bool(
+                acquisition_target
+                and not prepared.closed
+                and art.records._checkpoint_hydration_required()
+            )
+            if checkpoint_required and (
+                request.checkpoint_token is None
+                or checkpoint_gate is not art.records._checkpoint_hydration_authority()[1]
+                or request.checkpoint_token.run_lineage is not self.identity
+            ):
+                return HydrationOutcome.OWNER_MISMATCH
             if request.purpose is HydrationPurpose.FULL:
                 demand = self._full_demand
                 if (not acquisition_target or demand is None or prepared.token is not demand[1]
@@ -1091,7 +1135,13 @@ class RunDisplayState:
                     if bool(getattr(gate, "cancelled", False))
                     else HydrationOutcome.OWNER_MISMATCH
                 )
+            checkpoint_entered = False
             try:
+                if checkpoint_required:
+                    checkpoint_entered = checkpoint_gate.enter(
+                        request.checkpoint_token)
+                    if not checkpoint_entered:
+                        return HydrationOutcome.OWNER_MISMATCH
                 if acquisition_target:
                     event = self._commit_acquisition_locked(
                         art, key, prepared
@@ -1099,6 +1149,8 @@ class RunDisplayState:
                 else:
                     event = self._commit_browse_locked(stores[0], prepared)
             finally:
+                if checkpoint_entered:
+                    checkpoint_gate.leave()
                 gate.leave()
             if acquisition_target and event is not None:
                 # The commit is SEALED: publication/payload landed coherently.

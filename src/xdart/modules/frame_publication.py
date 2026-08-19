@@ -429,6 +429,20 @@ def _publication_has_heavy_payload(publication: FramePublication) -> bool:
     return False
 
 
+def _publication_heavy_modes(publication: FramePublication) -> frozenset[tuple[str, str]]:
+    record = publication.record
+    if record is None:
+        return frozenset()
+    return frozenset(
+        (dimension, mode)
+        for dimension, values in (
+            ("1d", record.results_1d), ("2d", record.results_2d),
+        )
+        for mode, view in values.items()
+        if _view_has_data_arrays(view)
+    )
+
+
 def _publication_has_raw(publication: FramePublication) -> bool:
     views = (publication.view, *publication.record.results_1d.values(), *publication.record.results_2d.values())
     return bool(any(view.raw is not None for view in views) or getattr(publication.raw_ref, "map_raw", None) is not None)
@@ -761,6 +775,8 @@ class PublicationStore:
         # probe must be cheap, lock-safe to call under this store's lock, and
         # must never call back into this store.
         self._evictable = None
+        self._heavy_evictable = None
+        self._thumbnail_evictable = None
         # Step 6: prior-pass (record, source_identity) carried across a same-scan
         # reintegrate so a re-upsert MERGES the recomputed mode into the frame's
         # accumulated record (begin_reintegrate populates it; upsert consumes per
@@ -1053,6 +1069,11 @@ class PublicationStore:
         return existing if keep else _with_raw_overlay(incoming, raw, existing.view.mask_baked)
 
     def _project_total_victims_locked(self, label: int | str, protected=()) -> tuple:
+        if (
+            self._max_items is None
+            or len(self._items) + int(label not in self._items) <= self._max_items
+        ):
+            return ()
         order = tuple(key for key in self._items if key != label) + (label,)
         over = 0 if self._max_items is None else max(0, len(order) - self._max_items)
         victims = []
@@ -1641,7 +1662,9 @@ class PublicationStore:
             if (
                 publication is None
                 or not _publication_has_heavy_payload(publication)
-                or not self._label_evictable_locked(label)
+                or not self._heavy_evictable_locked(
+                    label, _publication_heavy_modes(publication)
+                )
             ):
                 return False
             self._items[label] = _semilight_publication(publication)
@@ -1655,7 +1678,7 @@ class PublicationStore:
             if (
                 publication is None
                 or publication.view.thumbnail is None
-                or not self._label_evictable_locked(label)
+                or not self._thumbnail_evictable_locked(label)
             ):
                 return False
             self._items[label] = _lightweight_publication(publication)
@@ -1727,6 +1750,32 @@ class PublicationStore:
         stores, whose publications come FROM disk, keep it unset)."""
         with self._lock:
             self._evictable = probe
+
+    def set_heavy_evictable_probe(self, probe) -> None:
+        with self._lock:
+            self._heavy_evictable = probe
+
+    def set_thumbnail_evictable_probe(self, probe) -> None:
+        with self._lock:
+            self._thumbnail_evictable = probe
+
+    def _heavy_evictable_locked(self, label, modes) -> bool:
+        probe = self._heavy_evictable
+        if probe is None:
+            return self._label_evictable_locked(label)
+        try:
+            return bool(probe(label, modes))
+        except Exception:
+            return False
+
+    def _thumbnail_evictable_locked(self, label) -> bool:
+        probe = self._thumbnail_evictable
+        if probe is None:
+            return self._label_evictable_locked(label)
+        try:
+            return bool(probe(label))
+        except Exception:
+            return False
 
     def _label_evictable_locked(self, label: int | str) -> bool:
         probe = self._evictable

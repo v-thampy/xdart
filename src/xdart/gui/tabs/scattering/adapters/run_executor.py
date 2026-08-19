@@ -123,6 +123,16 @@ class _RunQuartileBoundary:
     wall_seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class _FrameProjectionItem:
+    frame_index: int; record: Any; frame_mask_qualified: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointProjectionItem:
+    artifact: str; labels: tuple[int, ...]
+
+
 @dataclass(slots=True)
 class _RunQuartileCapture:
     """Fixed-size temporal snapshots; no per-frame timing history."""
@@ -937,11 +947,16 @@ class StandardRunExecutor:
                 try:
                     if item is _DISPLAY_PROJECTION_END:
                         return
-                    label = item
                     started = monotonic()
-                    self._frame_ready_owned(
-                        run, label, None, None
-                    )
+                    if type(item) is _FrameProjectionItem:
+                        self._frame_ready_owned(run, item, None, None)
+                    elif type(item) is _CheckpointProjectionItem:
+                        owner = run.display.artifacts.get(item.artifact)
+                        if owner is None:
+                            raise RuntimeError("checkpoint projection lost its exact owner")
+                        run.display.mark_checkpoint_recoverable(owner, item.labels)
+                    else:
+                        raise TypeError("unknown display projection item")
                     _perf_add(
                         run,
                         "display_projection",
@@ -1323,6 +1338,7 @@ class StandardRunExecutor:
                 ),
             )
         run.records = owner.records
+        run.display.bind_checkpoint_hydration(owner)
         run_provenance = configuration.as_provenance()
         if admission is not None:
             run_provenance['scientific_signature'] = admission.candidate.processing_mapping()
@@ -1356,6 +1372,7 @@ class StandardRunExecutor:
                 owner, self._commit_gate(run),
             ),
             on_frame_completed=lambda event: self._frame_ready(run, event),
+            on_checkpoint_recoverable=lambda event: self._checkpoint_ready(run, event),
             resource_fact_sink=run.resource_facts.append,
         )
         run.sink = output
@@ -2319,9 +2336,8 @@ class StandardRunExecutor:
                     if run.display_projection_errors:
                         return
                     try:
-                        pending.put(
-                            label, timeout=0.05
-                        )
+                        pending.put(_FrameProjectionItem(label, record, bool(
+                            frame is not None and frame.mask is not None)), timeout=0.05)
                         break
                     except Full:
                         continue
@@ -2335,19 +2351,18 @@ class StandardRunExecutor:
     def _frame_ready_owned(
         self,
         run: _StandardRun,
-        label: int,
+        item: _FrameProjectionItem,
         image: np.ndarray | None,
         session: Any,
     ) -> None:
+        label, record = item.frame_index, item.record
         if type(label) is not int: raise TypeError("display projection item must be an exact int")
-        records, scan = (run.records, run.scan)
-        if records is None or scan is None:
-            raise RuntimeError("display projection lost its record store or scan")
+        scan = run.scan
+        if scan is None:
+            raise RuntimeError("display projection lost its scan")
         label = int(label)
-        record = records.get(label)
-        frame = run.frames_by_label.get(label)
-        if record is None or frame is None:
-            raise RuntimeError("display projection lost its exact record or frame")
+        if record.label != label:
+            raise RuntimeError("display projection record identity changed")
         owner = run.display.artifacts.get(str(run.artifact))
         if owner is None:
             raise RuntimeError("display projection lost its exact owner")
@@ -2384,7 +2399,7 @@ class StandardRunExecutor:
             record,
             publication,
             source_identity=source_identity,
-            frame_mask_qualified=frame.mask is not None,
+            frame_mask_qualified=item.frame_mask_qualified,
         )
         payload = StandardDisplayPayload(
             0,
@@ -2410,6 +2425,20 @@ class StandardRunExecutor:
             run.total,
             navigation=navigation,
         )
+
+    def _checkpoint_ready(self, run: _StandardRun, event: Any) -> None:
+        pending = run.display_projection_queue
+        if pending is None:
+            run.display_projection_errors.append(RuntimeError(
+                "checkpoint recovery lost its projection queue"))
+            return
+        item = _CheckpointProjectionItem(str(run.artifact), tuple(event.labels))
+        while not run.display_projection_errors:
+            try:
+                pending.put(item, timeout=0.05)
+                return
+            except Full:
+                continue
 
     def _publish_payload(
         self,

@@ -20,6 +20,15 @@ from xrd_tools.core import (
 )
 from xrd_tools.session import FrameHydrationResult, FrameRecordStore
 
+@pytest.mark.parametrize("method", ("clear", "clear_checkpoint_recoverable"))
+def test_checkpoint_clear_revokes_outside_record_lock(monkeypatch, method):
+    store = FrameRecordStore(); gate_type = type(store._checkpoint_hydration)
+    original = gate_type.revoke
+    def checked(gate):
+        assert not store._lock._is_owned(); original(gate)
+    monkeypatch.setattr(gate_type, "revoke", checked)
+    getattr(store, method)()
+
 
 def _set_certified_hydrator(store, hydrate):
     def certified(request):

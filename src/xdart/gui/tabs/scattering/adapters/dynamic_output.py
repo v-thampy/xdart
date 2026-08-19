@@ -996,6 +996,7 @@ class DynamicOutputAdapter:
         light_drain=None,
         light_verify=None,
         on_frame_completed=None,
+        on_checkpoint_recoverable=None,
         resource_fact_sink=None,
     ):
         if type(run_provenance) is not dict:
@@ -1003,6 +1004,7 @@ class DynamicOutputAdapter:
         mount_values = (
             publication_store, display_owner, display_state, gui_thread_id,
             light_cancel, light_drain, light_verify, on_frame_completed,
+            on_checkpoint_recoverable,
         )
         pipeline_coordinated = all(value is not None for value in mount_values)
         pipeline_v2 = _post_g2_pipeline_v2_choice(
@@ -1433,6 +1435,7 @@ class DynamicOutputAdapter:
             )
             if coordinated:
                 display_state.bind_light_subscription(display_owner, session.on_frame_completed, on_frame_completed)
+                session.on_checkpoint_recoverable(on_checkpoint_recoverable)
             self._arm(graph, write_labels, revision)
             if cancelled():
                 raise RuntimeError("admission cancelled")

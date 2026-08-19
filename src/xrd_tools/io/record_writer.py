@@ -575,6 +575,7 @@ class NexusRecordWriter:
             self._in_boundary = False
 
     def _authorize_transaction_mutation(self) -> None:
+        self._invalidate_checkpoint_recovery()
         binding = self._transaction_binding
         if binding is None:
             return
@@ -2054,7 +2055,7 @@ class NexusRecordWriter:
 
     def _current_publication_drops(
         self,
-    ) -> tuple[tuple[int, ResultMode, int], ...]:
+    ) -> tuple[StageReceipt, ...]:
         if self._facade is None:
             self._pending_publication_drops.clear()
             return ()
@@ -2066,7 +2067,7 @@ class NexusRecordWriter:
             if receipt is None or receipt.revision != revision:
                 self._pending_publication_drops.pop((label, mode), None)
                 continue
-            current.append((label, mode, revision))
+            current.append(receipt)
         return tuple(current)
 
     def _commit_receipts(
@@ -2083,14 +2084,20 @@ class NexusRecordWriter:
 
     def _commit_publication_drops(
         self,
-        batch: tuple[tuple[int, ResultMode, int], ...],
+        batch: tuple[StageReceipt, ...],
     ) -> None:
-        for label, mode, revision in batch:
-            self._facade.commit_publication_drop(label, mode, revision)
-            self._pending_publication_drops.pop((label, mode), None)
+        for receipt in batch:
+            self._facade.commit_publication_drop(
+                receipt.label, receipt.mode, receipt.revision)
+            self._pending_publication_drops.pop(
+                (receipt.label, receipt.mode), None)
 
     def _flush_handle(self) -> None:
         self._h5.flush()
+
+    def _invalidate_checkpoint_recovery(self) -> None:
+        revoke = getattr(self._facade, "revoke_checkpoint_recovery", None)
+        if callable(revoke): revoke()
 
     def _seal_checkpoint_and_receipts(self, *, publish_receipts: bool = True) -> None:
         batch = self._current_receipts() if publish_receipts else ()
@@ -2107,6 +2114,7 @@ class NexusRecordWriter:
             self._facade is not None
             and getattr(self._facade, "defer_epoch_durability", False)
         )
+        checkpoint = None
         if binding is not None:
             checkpoint = binding.transaction.seal_stream_checkpoint(
                 binding.attempt,
@@ -2119,10 +2127,12 @@ class NexusRecordWriter:
                 self._durable_mode_proofs.update(mode_proofs)
             self._durable_frame_proofs.update(frame_proofs)
             if dropped:
-                for label, mode, _revision in dropped:
-                    group_name = self._mode_cursor_name(mode.kind, mode.key)
-                    proof = _DurableAbsenceProof(group_name, int(label))
-                    self._durable_absence_proofs[(group_name, int(label))] = proof
+                for receipt in dropped:
+                    group_name = self._mode_cursor_name(
+                        receipt.mode.kind, receipt.mode.key)
+                    proof = _DurableAbsenceProof(group_name, int(receipt.label))
+                    self._durable_absence_proofs[
+                        (group_name, int(receipt.label))] = proof
             if (
                 not defer_epoch
                 and (
@@ -2138,8 +2148,27 @@ class NexusRecordWriter:
                 )
         if batch:
             self._commit_receipts(batch)
+        recover = getattr(self._facade, "commit_checkpoint_recoverable", None)
+        checkpoint_recovered = checkpoint is not None and callable(recover)
+        if checkpoint_recovered:
+            frame_labels = tuple(sorted(
+                set(frame_proofs)
+                | {int(receipt.label) for receipt in (*batch, *dropped)}
+            ))
+            recover(
+                checkpoint, batch, dropped,
+                frame_labels,
+                tuple(label for label in frame_labels
+                      if label in self._dirty_frames
+                      and self._dirty_frames[label].thumbnail is not None),
+            )
         if dropped:
-            self._commit_publication_drops(dropped)
+            if checkpoint_recovered:
+                for receipt in dropped:
+                    self._pending_publication_drops.pop(
+                        (receipt.label, receipt.mode), None)
+            else:
+                self._commit_publication_drops(dropped)
         self._checkpoint_rows += rows
         self._checkpoint_read_bytes += read_bytes
         self._clear_dirty_evidence()
@@ -2738,6 +2767,7 @@ class NexusRecordWriter:
             return self._outcome()
         try:
             self._pending_owner = "abort"
+            self._invalidate_checkpoint_recovery()
             with self._boundary():
                 if (
                     self._h5 is not None

@@ -16,6 +16,7 @@ from threading import RLock
 from types import MappingProxyType
 
 from xrd_tools.core import FrameRecord, FrameView
+from xrd_tools.session.hydration import _CheckpointHydrationGate
 
 _ModeKey = tuple[str, str]
 
@@ -28,6 +29,7 @@ class FrameHydrationRequest:
     generation: int
     persisted_modes: frozenset[_ModeKey] = frozenset()
     durable_modes: frozenset[_ModeKey] = frozenset()
+    checkpoint_recoverable_modes: frozenset[_ModeKey] = frozenset()
     dropped_modes: frozenset[_ModeKey] = frozenset()
     projected: bool = False
     commit_epoch: object | None = None
@@ -207,6 +209,11 @@ class FrameRecordStore:
         self._persisted_modes: dict[int | str, set[_ModeKey]] = {}
         self._durable_modes: dict[int | str, set[_ModeKey]] = {}
         self._dropped_modes: dict[int | str, set[_ModeKey]] = {}
+        self._checkpoint_recoverable: dict[int | str, set[_ModeKey]] = {}
+        self._checkpoint_absent: dict[int | str, set[_ModeKey]] = {}
+        self._checkpoint_revisions: dict[int | str, dict[_ModeKey, int]] = {}
+        self._checkpoint_thumbnails: set[int | str] = set()
+        self._checkpoint_hydration = _CheckpointHydrationGate()
         self._projected: set[int | str] = set()
         self._heavy_labels: list[int | str] = []
         self._max_items = max_items
@@ -216,6 +223,7 @@ class FrameRecordStore:
         self._hydrator_revision_qualified = False
 
     def clear(self) -> None:
+        self._checkpoint_hydration.revoke()
         with self._lock:
             self._records.clear()
             self._source_ids.clear()
@@ -224,6 +232,10 @@ class FrameRecordStore:
             self._persisted_modes.clear()
             self._durable_modes.clear()
             self._dropped_modes.clear()
+            self._checkpoint_recoverable.clear()
+            self._checkpoint_absent.clear()
+            self._checkpoint_revisions.clear()
+            self._checkpoint_thumbnails.clear()
             self._projected.clear()
             self._heavy_labels.clear()
 
@@ -267,10 +279,28 @@ class FrameRecordStore:
                     if stale is not None:
                         self._assign_locked(registry, label,
                                             stale - incoming_mode_keys)
+                self._assign_locked(
+                    self._checkpoint_recoverable, label,
+                    self._checkpoint_recoverable.get(label, set()) - incoming_mode_keys,
+                )
+                self._assign_locked(
+                    self._checkpoint_absent, label,
+                    self._checkpoint_absent.get(label, set()) - incoming_mode_keys,
+                )
+                self._assign_locked(self._checkpoint_revisions, label, {
+                    key: value for key, value in
+                    self._checkpoint_revisions.get(label, {}).items()
+                    if key not in incoming_mode_keys
+                })
+                self._checkpoint_thumbnails.discard(label)
             else:
                 persisted_set = set()
                 self._durable_modes.pop(label, None)
                 self._dropped_modes.pop(label, None)
+                self._checkpoint_recoverable.pop(label, None)
+                self._checkpoint_absent.pop(label, None)
+                self._checkpoint_revisions.pop(label, None)
+                self._checkpoint_thumbnails.discard(label)
 
             self._records.pop(label, None)
             self._drop_heavy_label_locked(label)
@@ -395,11 +425,99 @@ class FrameRecordStore:
             self._enforce_bounds_locked()
 
     @staticmethod
-    def _assign_locked(registry: dict, label, value: set[_ModeKey]) -> None:
+    def _assign_locked(registry: dict, label, value) -> None:
         if value:
             registry[label] = value
         else:
             registry.pop(label, None)
+
+    def _bind_checkpoint_revisions(
+        self, label, *, expected: FrameRecord, revisions: Mapping[_ModeKey, int],
+    ) -> bool:
+        """Bind private writer revisions to this exact resident record."""
+        with self._lock:
+            if self._records.get(label) is not expected:
+                return False
+            valid = _record_mode_keys(expected)
+            bound = self._checkpoint_revisions.setdefault(label, {})
+            for key, revision in revisions.items():
+                key = tuple(key)
+                if key in valid:
+                    bound[key] = int(revision)
+            return True
+
+    def _mark_checkpoint_recoverable(
+        self, label, *, expected: FrameRecord,
+        revisions: Mapping[_ModeKey, int], frame_verified: bool,
+        thumbnail_verified: bool, verified_absent: Iterable[_ModeKey] = (),
+    ) -> bool:
+        """Project a verified rollback-capable checkpoint without public truth."""
+        requested = {tuple(key): int(value) for key, value in revisions.items()}
+        absent = _normalize_mode_keys(verified_absent)
+        with self._lock:
+            if (
+                not frame_verified
+                or self._records.get(label) is not expected
+                or not (requested or absent)
+                or any(self._checkpoint_revisions.get(label, {}).get(key) != value
+                       for key, value in requested.items())
+            ):
+                return False
+            recoverable = self._checkpoint_recoverable.setdefault(label, set())
+            recoverable.difference_update(absent); recoverable.update(requested)
+            self._assign_locked(self._checkpoint_recoverable, label, recoverable)
+            verified = self._checkpoint_absent.setdefault(label, set())
+            verified.difference_update(requested); verified.update(absent)
+            self._assign_locked(self._checkpoint_absent, label, verified)
+            if thumbnail_verified:
+                self._checkpoint_thumbnails.add(label)
+            return True
+
+    def checkpoint_recoverable_modes(self, label) -> frozenset[_ModeKey]:
+        with self._lock:
+            return frozenset(self._checkpoint_recoverable.get(label, set()))
+
+    def checkpoint_verified_absent_modes(self, label) -> frozenset[_ModeKey]:
+        with self._lock:
+            return frozenset(self._checkpoint_absent.get(label, set()))
+
+    def _bind_checkpoint_hydration_lineage(self, artifact, run_lineage) -> None:
+        self._checkpoint_hydration.bind(str(artifact), run_lineage)
+
+    def _checkpoint_hydration_required(self) -> bool:
+        return self._checkpoint_hydration.bound
+
+    def _checkpoint_hydration_authority(self):
+        return self._checkpoint_hydration.authority()
+
+    def _authorize_checkpoint_hydration(self, checkpoint_identity):
+        token = self._checkpoint_hydration.authorize(checkpoint_identity)
+        return token, self._checkpoint_hydration if token is not None else None
+
+    def _revoke_checkpoint_recovery(self) -> None:
+        self._checkpoint_hydration.revoke()
+
+    def clear_checkpoint_recoverable(self) -> None:
+        self._checkpoint_hydration.revoke()
+        with self._lock:
+            self._checkpoint_recoverable.clear(); self._checkpoint_revisions.clear()
+            self._checkpoint_absent.clear(); self._checkpoint_thumbnails.clear()
+
+    def can_release_heavy(self, label, modes=None) -> bool:
+        with self._lock:
+            record = self._records.get(label)
+            if record is None:
+                return False
+            requested = (_heavy_mode_keys(record) if modes is None
+                         else _normalize_mode_keys(modes))
+            return bool(requested) and requested.issubset(
+                self._heavy_releasable_modes_locked(label)
+            )
+
+    def can_release_thumbnail(self, label) -> bool:
+        with self._lock:
+            return (label in self._checkpoint_thumbnails
+                    or self._label_deletable_locked(label))
 
     def release_heavy(self, label: int | str) -> bool:
         """Release only the heavy arrays this label is licensed to drop."""
@@ -407,7 +525,7 @@ class FrameRecordStore:
             record = self._records.get(label)
             if record is None:
                 return False
-            releasable = (self._releasable_modes_locked(label)
+            releasable = (self._heavy_releasable_modes_locked(label)
                           & _heavy_mode_keys(record))
             if not releasable:
                 return False
@@ -526,9 +644,10 @@ class FrameRecordStore:
             # must NOT inherit persisted status — else it could be thinned before
             # it is written (persist-before-evict, the 748fcac bug).
             prev_persisted = set(self._persisted_modes.get(label, set()))
+            prev_recoverable = set(self._checkpoint_recoverable.get(label, set()))
             # Stale-read fence: merge back only if every captured fact is current.
             captured = self._capture_locked(label, record, prev_persisted)
-            if label in self._projected and not prev_persisted:
+            if label in self._projected and not (prev_persisted or prev_recoverable):
                 return record
         if hydrator is None:
             return record
@@ -539,6 +658,7 @@ class FrameRecordStore:
             generation=captured[3],
             persisted_modes=captured[4],
             durable_modes=captured[5],
+            checkpoint_recoverable_modes=captured[8],
             dropped_modes=captured[6],
             projected=captured[7],
             commit_epoch=commit_epoch,
@@ -585,6 +705,12 @@ class FrameRecordStore:
                 ) != captured:
                     return current
                 durable = set(self._durable_modes.get(label, set()))
+                recoverable = set(self._checkpoint_recoverable.get(label, set()))
+                absent = set(self._checkpoint_absent.get(label, set()))
+                checkpoint_revisions = dict(
+                    self._checkpoint_revisions.get(label, {})
+                )
+                checkpoint_thumbnail = label in self._checkpoint_thumbnails
                 dropped = set(self._dropped_modes.get(label, set()))
                 projected = label in self._projected
                 merged = self.upsert(
@@ -595,6 +721,19 @@ class FrameRecordStore:
                 # Hydration RE-ARMS an existing revision: restore its projection.
                 valid = _record_mode_keys(merged)
                 self._assign_locked(self._durable_modes, label, durable & valid)
+                self._assign_locked(
+                    self._checkpoint_recoverable, label, recoverable & valid,
+                )
+                self._assign_locked(
+                    self._checkpoint_absent, label, absent & valid,
+                )
+                self._assign_locked(
+                    self._checkpoint_revisions, label,
+                    {key: value for key, value in checkpoint_revisions.items()
+                     if key in valid},
+                )
+                if checkpoint_thumbnail:
+                    self._checkpoint_thumbnails.add(label)
                 self._assign_locked(self._dropped_modes, label, dropped & valid)
                 if projected:
                     self._projected.add(label)
@@ -610,7 +749,11 @@ class FrameRecordStore:
                 frozenset(persisted),
                 frozenset(self._durable_modes.get(label, set())),
                 frozenset(self._dropped_modes.get(label, set())),
-                label in self._projected)
+                label in self._projected,
+                frozenset(self._checkpoint_recoverable.get(label, set())),
+                frozenset(self._checkpoint_revisions.get(label, {}).items()),
+                label in self._checkpoint_thumbnails,
+                frozenset(self._checkpoint_absent.get(label, set())))
 
     def is_persisted(self, label: int | str) -> bool:
         with self._lock:
@@ -676,6 +819,14 @@ class FrameRecordStore:
             return set(self._durable_modes.get(label, set()))
         return set(self._persisted_modes.get(label, set()))
 
+    def _heavy_releasable_modes_locked(self, label) -> set[_ModeKey]:
+        modes = self._releasable_modes_locked(label)
+        if label in self._projected:
+            modes.update(self._checkpoint_recoverable.get(label, set()))
+            modes.update(self._checkpoint_absent.get(label, set()))
+        modes.update(self._dropped_modes.get(label, set()))
+        return modes
+
     def _label_persisted_locked(self, label: int | str) -> bool:
         record = self._records.get(label)
         if record is None:
@@ -738,6 +889,10 @@ class FrameRecordStore:
         self._persisted_modes.pop(label, None)
         self._durable_modes.pop(label, None)
         self._dropped_modes.pop(label, None)
+        self._checkpoint_recoverable.pop(label, None)
+        self._checkpoint_absent.pop(label, None)
+        self._checkpoint_revisions.pop(label, None)
+        self._checkpoint_thumbnails.discard(label)
         self._projected.discard(label)
         self._drop_heavy_label_locked(label)
 

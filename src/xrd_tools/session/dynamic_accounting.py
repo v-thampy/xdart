@@ -218,6 +218,16 @@ class _DynamicWriterBoundary:
     def commit_durable(self, receipts: Iterable[StageReceipt]) -> None:
         self._accounting._stage_durable(receipts)
 
+    def commit_checkpoint_recoverable(
+        self, checkpoint, receipts, drops, frame_labels, thumbnail_labels,
+    ) -> None:
+        self._accounting._checkpoint_recoverable(
+            checkpoint, receipts, drops, frame_labels, thumbnail_labels,
+        )
+
+    def revoke_checkpoint_recovery(self) -> None:
+        self._accounting._revoke_checkpoint_recovery()
+
     def commit_publication_drop(self, label, mode, expected_revision) -> None:
         self._accounting._stage_publication_drop(label, mode, expected_revision)
 
@@ -881,6 +891,64 @@ class DynamicRunAccounting:
             for token, key, receipt in fresh:
                 self._pending_persisted[key] = (token, receipt)
                 self._pending_durable[key] = (token, receipt)
+
+    def _checkpoint_recoverable(
+        self, checkpoint, receipts, drops, frame_labels, thumbnail_labels,
+    ) -> None:
+        batch, absent = tuple(receipts), tuple(drops)
+        with self._lock:
+            self._require_preterminal()
+            for receipt in (*batch, *absent):
+                self._validate_receipt(receipt)
+                if not str(receipt.target).startswith("nexus:"):
+                    raise ValueError("checkpoint recovery requires a Nexus receipt")
+            for receipt in absent:
+                token, key = self._validate_receipt(receipt)
+                pair = key[:2]
+                if any(
+                    triple[:2] == pair and supplier is token
+                    for triple, supplier in {
+                        **self._persisted, **self._durable,
+                    }.items()
+                ):
+                    raise ValueError("checkpoint cannot replace canonical truth")
+                if self._active_seal is not None:
+                    raise RuntimeError("checkpoint cannot mutate a sealed epoch")
+                retire = set()
+                for triple, (prior, positive) in {
+                    **self._pending_persisted, **self._pending_durable,
+                }.items():
+                    if triple[:2] != pair:
+                        continue
+                    if prior is token and positive == receipt:
+                        retire.add(triple)
+                        continue
+                    if not self._strictly_newer(token, prior):
+                        raise ValueError("checkpoint absence contradicts pending truth")
+                    retire.add(triple)
+                pending = self._pending_dropped.get(pair)
+                if pending is not None and pending != (token, receipt.revision):
+                    if not self._strictly_newer(token, pending[0]):
+                        raise ValueError("checkpoint absence is stale")
+                for triple in retire:
+                    self._pending_persisted.pop(triple, None)
+                    self._pending_durable.pop(triple, None)
+                self._pending_dropped[pair] = (token, receipt.revision)
+            session = self._live_session_ref() if self._live_session_ref else None
+            owner = self._live_owner_token
+        if session is not None:
+            session._record_checkpoint_recoverable(
+                owner, checkpoint, batch, absent,
+                tuple(frame_labels), tuple(thumbnail_labels),
+            )
+
+    def _revoke_checkpoint_recovery(self) -> None:
+        with self._lock:
+            self._require_preterminal()
+            session = self._live_session_ref() if self._live_session_ref else None
+            owner = self._live_owner_token
+        if session is not None:
+            session._record_checkpoint_revoked(owner)
 
     def _stage_publication_drop(self, label, mode, expected_revision) -> None:
         label, expected = int(label), int(expected_revision)

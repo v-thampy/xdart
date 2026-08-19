@@ -204,6 +204,20 @@ class RunDisplayResidency:
             ):
                 self._heavy_candidates[key] = None
 
+    def _rearm_heavy_labels(self, records, publications, labels) -> None:
+        labels = set(labels)
+        armed = set(self._heavy_candidates)
+        self._heavy_candidates.clear()
+        for key in self._heavy:
+            stores = self._stores.get(key)
+            if key in armed or (
+                stores is not None
+                and stores.records is records
+                and stores.publications is publications
+                and key.local_frame_label in labels
+            ):
+                self._heavy_candidates[key] = None
+
     def _rearm_heavy_key(self, key: DisplayFrameKey) -> None:
         armed = set(self._heavy_candidates)
         armed.add(key)

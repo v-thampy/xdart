@@ -2152,6 +2152,79 @@ def test_accumulation_cross_dimension():
     assert set(rec.modes_2d) == {"qip_qoop"}            # 2D mode added
 
 
+@pytest.mark.parametrize("checkpoint", ("verified", "failed", "stale"))
+def test_checkpoint_recovery_is_private_mode_exact_and_revision_qualified(
+    checkpoint,
+):
+    from xrd_tools.session import FrameRecordStore
+
+    publications = PublicationStore(max_heavy_items=None, max_thumbnail_items=None)
+    publications.upsert(_mode_pub(7, mode_2d="q_chi"))
+    publications.upsert(_mode_pub(7, mode_2d="qip_qoop"))
+    records = FrameRecordStore(max_heavy_items=None)
+    stored = records.upsert(publications.get(7).record)
+    records.replace_projection(7)
+    revisions = {("2d", "q_chi"): 1, ("2d", "qip_qoop"): 1}
+    assert records._bind_checkpoint_revisions(
+        7, expected=stored, revisions=revisions,
+    )
+    expected = stored
+    if checkpoint == "stale":
+        current = records.upsert(_mode_pub(7, mode_2d="q_chi", scale=9).record)
+        assert current is not expected
+    marked = records._mark_checkpoint_recoverable(
+        7,
+        expected=expected,
+        revisions=revisions,
+        frame_verified=checkpoint != "failed",
+        thumbnail_verified=checkpoint != "failed",
+    )
+    assert marked is (checkpoint == "verified")
+
+    publications.set_heavy_evictable_probe(records.can_release_heavy)
+    publications.set_thumbnail_evictable_probe(records.can_release_thumbnail)
+    assert records.persisted_modes(7) == frozenset()
+    assert records.durable_modes(7) == frozenset()
+    assert records.can_release_record(7) is False
+    assert publications.evict_heavy(7) is (checkpoint == "verified")
+    assert publications.evict_thumbnail(7) is (checkpoint == "verified")
+
+
+def test_checkpoint_hydration_capability_is_exact_monotonic_and_revocable():
+    from xrd_tools.session import FrameRecordStore
+
+    store = FrameRecordStore(max_heavy_items=None)
+    lineage, first_checkpoint, second_checkpoint = object(), object(), object()
+    store._bind_checkpoint_hydration_lineage("/tmp/live.nxs", lineage)
+    first, gate = store._authorize_checkpoint_hydration(first_checkpoint)
+    assert first.artifact_identity == "/tmp/live.nxs"
+    assert first.run_lineage is lineage
+    assert first.checkpoint_identity is first_checkpoint
+    assert gate.enter(first); gate.leave()
+
+    store._revoke_checkpoint_recovery()
+    assert gate.enter(first) is False
+    assert store._checkpoint_hydration_authority()[0] is None
+    second, same_gate = store._authorize_checkpoint_hydration(second_checkpoint)
+    assert same_gate is gate and second.generation > first.generation
+    assert second.checkpoint_identity is second_checkpoint
+    assert gate.enter(first) is False
+    assert gate.enter(second); gate.leave()
+    store.clear_checkpoint_recoverable()
+    assert gate.enter(second) is False
+
+
+def test_unbounded_total_projection_does_not_scan_publication_order():
+    class NoScan(dict):
+        def __iter__(self):
+            raise AssertionError("unbounded total projection scanned all labels")
+
+    store = PublicationStore(max_items=None)
+    with store._lock:
+        store._items = NoScan(store._items)
+        assert store._project_total_victims_locked(7) == ()
+
+
 def test_accumulation_same_mode_overwrites_no_dup():
     store = PublicationStore()
     store.upsert(_mode_pub(0, mode_1d="q_total", scale=1.0, generation=store.generation))

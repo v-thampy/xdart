@@ -132,19 +132,24 @@ def _open_case(
     integrator=None,
     stale_paths=(),
     first_intent=None,
+    record_store=None,
+    checkpoint_threshold=None,
+    with_xye=True,
 ):
     from xdart.modules.reduction import open_live_scan_session
     from xrd_tools.reduction import CompositeSink, NexusSink
+    from xrd_tools.session import (
+        FlushPolicy, SessionResourceRequirements, resolve_session_policy,
+    )
 
     integrator = integrator or _CountingIntegrator()
     xye_directory, xye_target, nexus_path, nexus_target = _targets(
         tmp_path, name, nexus=nexus,
     )
-    target_values = (xye_target,) if nexus_target is None else (
-        nexus_target, xye_target,
-    )
+    if not with_xye: xye_target = None
+    target_values = tuple(value for value in (nexus_target, xye_target) if value)
     ledger, accounting, mode = _accounting(*target_values)
-    xye = _transactional_sink(xye_directory, stale_paths=stale_paths)
+    xye = _transactional_sink(xye_directory, stale_paths=stale_paths) if with_xye else None
     if nexus:
         nexus_sink = NexusSink(
             nexus_path,
@@ -153,12 +158,26 @@ def _open_case(
             flush_every=None,
             same_run_intent=first_intent,
         )
+        if checkpoint_threshold is not None:
+            nexus_sink._configure_writer_batch_size(int(checkpoint_threshold))
         # XYE-first input order is intentional: the exact binder/session must
         # still impose NeXus-first settlement rather than trust tuple order.
-        sink = CompositeSink((xye, nexus_sink))
+        sink = CompositeSink((xye, nexus_sink)) if with_xye else nexus_sink
     else:
         nexus_sink = None
         sink = xye
+    policy = None
+    if checkpoint_threshold is not None:
+        policy = resolve_session_policy(
+            SessionResourceRequirements(
+                height=2, width=2, native_itemsize=8, modes_1d=1, npt_1d=8,
+            ),
+            envelope_bytes=64 * 1024 ** 3,
+            requested_workers=1,
+            requests={"reduction_inflight": 2},
+            flush=FlushPolicy(interval=2, cap=8, margin=2),
+            env={},
+        )
     session = open_live_scan_session(
         _live_frames(tmp_path, frame_count, integrator),
         _plan(),
@@ -169,6 +188,10 @@ def _open_case(
         nexus_target=nexus_target,
         xye_target=xye_target,
         xye_receipt_boundary=xye,
+        record_store=record_store,
+        dynamic_nexus_checkpoint=checkpoint_threshold is not None,
+        dynamic_nexus_checkpoint_threshold=checkpoint_threshold,
+        policy=policy,
     )
     return SimpleNamespace(
         session=session,
@@ -183,6 +206,181 @@ def _open_case(
         nexus_target=nexus_target,
         integrator=integrator,
     )
+
+
+def test_periodic_nexus_checkpoint_is_private_recovery_while_xye_is_pending(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from xrd_tools.session import FrameRecordStore
+
+    records = FrameRecordStore(max_heavy_items=None)
+    case = _open_case(
+        tmp_path,
+        "checkpoint-private-recovery",
+        frame_count=5,
+        nexus=True,
+        record_store=records,
+        checkpoint_threshold=2,
+    )
+    order = []
+
+    case.session.on_frame_completed(
+        lambda event: order.append(("frame", event.frame_index))
+    )
+
+    def checkpoint(event):
+        order.append(("checkpoint", event.labels))
+        for label in event.labels:
+            assert records.can_release_heavy(label)
+            assert records.release_heavy(label)
+
+    try:
+        case.session.on_checkpoint_recoverable(checkpoint)
+    except BaseException:
+        case.session.stop()
+        case.session.finish(raise_on_failure=False)
+        raise
+    for label, frame in enumerate(case.session.scan.frames):
+        _key, token = _arm(case.accounting, label)
+        assert case.session.submit(frame, attempt_token=token)
+    assert case.session.pause(timeout=5.0)
+
+    assert order == [
+        ("frame", 0), ("frame", 1), ("checkpoint", (0, 1)),
+        ("frame", 2), ("frame", 3), ("checkpoint", (2, 3)),
+        ("frame", 4),
+    ]
+    snapshot = case.accounting.snapshot()
+    assert snapshot.durable == frozenset()
+    assert len(snapshot.pending_durable) == 4
+    for label in range(4):
+        assert records.persisted_modes(label) == frozenset()
+        assert records.durable_modes(label) == frozenset()
+        assert records.checkpoint_recoverable_modes(label) == frozenset({
+            ("1d", "default"),
+        })
+        assert records.can_release_record(label) is False
+        assert records.has_heavy_payload(label) is False
+    assert records.checkpoint_recoverable_modes(4) == frozenset()
+    assert records.has_heavy_payload(4) is True
+
+    writer = case.nexus._writer; verify = writer._verify_dirty_evidence
+    monkeypatch.setattr(writer, "_verify_dirty_evidence",
+                        lambda: (_ for _ in ()).throw(RuntimeError("bad checkpoint")))
+    with pytest.raises(RuntimeError, match="bad checkpoint"):
+        writer._seal_checkpoint_and_receipts()
+    assert all(records.checkpoint_recoverable_modes(label) for label in range(4))
+    assert records.checkpoint_recoverable_modes(4) == frozenset()
+    monkeypatch.setattr(writer, "_verify_dirty_evidence", verify)
+    assert case.session.finish().failed is False
+    assert all(
+        records.checkpoint_recoverable_modes(label) == frozenset()
+        for label in range(5)
+    )
+
+
+def test_checkpoint_gate_blocks_writer_mutation_and_failed_seal_stays_revoked(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from xrd_tools.session import FrameRecordStore
+
+    records = FrameRecordStore(max_heavy_items=None)
+    lineage = object()
+    records._bind_checkpoint_hydration_lineage("artifact:nexus", lineage)
+    case = _open_case(
+        tmp_path, "checkpoint-gate", frame_count=2, nexus=True,
+        record_store=records, checkpoint_threshold=2,
+    )
+    for label, frame in enumerate(case.session.scan.frames):
+        _key, attempt = _arm(case.accounting, label)
+        assert case.session.submit(frame, attempt_token=attempt)
+    assert case.session.pause(timeout=5.0)
+
+    old, gate = records._checkpoint_hydration_authority()
+    assert old is not None and old.run_lineage is lineage
+    assert gate.enter(old)
+    entered, finished, failures = threading.Event(), threading.Event(), []
+
+    def mutate():
+        entered.set()
+        try:
+            case.nexus._writer._authorize_transaction_mutation()
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=mutate)
+    worker.start()
+    assert entered.wait(2.0) and not finished.wait(0.05)
+    gate.leave()
+    assert finished.wait(2.0)
+    worker.join(2.0)
+    assert failures == [] and gate.enter(old) is False
+    assert records._checkpoint_hydration_authority()[0] is None
+
+    writer = case.nexus._writer
+    verify = writer._verify_dirty_evidence
+    monkeypatch.setattr(
+        writer, "_verify_dirty_evidence",
+        lambda: (_ for _ in ()).throw(RuntimeError("failed semantic seal")),
+    )
+    with pytest.raises(RuntimeError, match="failed semantic seal"):
+        writer._seal_checkpoint_and_receipts()
+    assert records._checkpoint_hydration_authority()[0] is None
+    monkeypatch.setattr(writer, "_verify_dirty_evidence", verify)
+    writer._seal_checkpoint_and_receipts()
+    fresh, fresh_gate = records._checkpoint_hydration_authority()
+    assert fresh is not None and fresh_gate is gate
+    assert fresh.generation > old.generation and gate.enter(old) is False
+    assert fresh_gate.enter(fresh); fresh_gate.leave()
+    assert case.session.finish().failed is False
+    assert records._checkpoint_hydration_authority()[0] is None
+
+
+@pytest.mark.parametrize("shape", ("drop-only", "mixed"))
+def test_checkpoint_projects_verified_absence_for_drop_only_and_mixed_seals(
+    tmp_path: Path, shape,
+) -> None:
+    from xrd_tools.session import FrameRecordStore
+
+    records = FrameRecordStore(max_heavy_items=None)
+    records._bind_checkpoint_hydration_lineage("artifact:nexus", object())
+    case = _open_case(
+        tmp_path, f"checkpoint-{shape}", frame_count=2, nexus=True,
+        record_store=records, checkpoint_threshold=6, with_xye=False,
+    )
+    events = []
+    case.session.on_checkpoint_recoverable(events.append)
+    for label, frame in enumerate(case.session.scan.frames):
+        _key, attempt = _arm(case.accounting, label)
+        assert case.session.submit(frame, attempt_token=attempt)
+    assert case.session.pause(timeout=5.0)
+    writer = case.nexus._writer
+    if shape == "drop-only":
+        writer.flush(force=True)
+        events.clear()
+    writer.drop_publication(0, case.mode)
+    writer.flush(force=True)
+
+    assert [event.labels for event in events][-1] == (
+        (0,) if shape == "drop-only" else (0, 1))
+    assert records.checkpoint_verified_absent_modes(0) == frozenset({
+        ("1d", "default"),
+    })
+    assert records.checkpoint_recoverable_modes(0) == frozenset()
+    assert records.checkpoint_recoverable_modes(1) == frozenset({
+        ("1d", "default"),
+    })
+    assert records.persisted_modes(0) == records.durable_modes(0) == frozenset()
+    assert records.dropped_modes(0) == frozenset()
+    assert records.can_release_heavy(0) and records.can_release_heavy(1)
+    with h5py.File(case.nexus_path, "r") as handle:
+        assert tuple(handle["entry/integrated_1d/frame_index"][()]) == (1,)
+    snapshot = case.accounting.snapshot()
+    assert snapshot.publication_dropped == frozenset()
+    assert snapshot.pending_publication_dropped
+    assert case.session.finish().failed is False
 
 
 def _xye_files(directory: Path):
