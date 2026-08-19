@@ -2646,6 +2646,35 @@ def test_scan_owner_preserved_through_hydration_replacement():
     assert hydrated.scan_key == "run_a"              # owner survived
 
 
+def test_gui_light_1d_completeness_query_does_not_compose_publications(
+    monkeypatch,
+):
+    from xdart.gui.tabs.scattering.display_runtime import (
+        publication_needs_hydration,
+    )
+
+    store, _lease, _allocation, _authority, build = _bound_gui_light_graph()
+    store.publish_gui_light_1d(*build(0))
+    store.publish_gui_light_1d(*build(1, heavy=False))
+    store.upsert(FramePublication(
+        FrameView(label=2),
+        generation=store.generation,
+        source_identity="scan.nxs#empty",
+    ))
+    labels = (0, 1, 2, 99)
+    expected = frozenset(
+        label for label in labels
+        if not publication_needs_hydration(store.get(label), None)
+    )
+    assert expected == frozenset({0, 1})
+
+    def fail_compose(*_args, **_kwargs):
+        raise AssertionError("completeness query materialized a publication")
+
+    monkeypatch.setattr(store, "_compose_locked", fail_compose)
+    assert store.complete_labels(labels) == expected
+
+
 def test_gui_light_1d_pair_is_frame_equivalent_with_one_zero_copy_owner():
     store, lease, _allocation, _authority, build = _bound_gui_light_graph()
     publication, light_record = build(0)

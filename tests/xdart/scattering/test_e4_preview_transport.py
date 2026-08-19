@@ -2169,6 +2169,52 @@ def test_light_one_d_history_order_survives_preview_churn(
     assert tuple(sorted(owner.light_records.labels())) == labels
 
 
+def test_acquisition_residency_does_not_compose_historical_publications(
+    monkeypatch, tmp_path
+) -> None:
+    from tests.xdart.scattering.test_e3_context_contract import _configuration
+
+    monkeypatch.setattr(display_runtime, "heavy_window", lambda _bytes: 2)
+    labels = (1, 2, 3, 4)
+    processed, _raw = _write_processed(tmp_path, labels=labels)
+    configuration = _configuration()
+    identity = RunIdentity.from_configuration(configuration)
+    state, owner = _state(processed, identity=identity)
+    state.bind_transport(event_sink=lambda event: None)
+    keys_by_label = _catalog(state, owner, labels)
+    owner_value, gate = _acquisition_identity(state)
+    for label in labels:
+        _hydrate_ok(state, owner_value, gate, processed, label, label)
+    context = AcquisitionContext(
+        context_token=new_context_token(ContextKind.ACQUISITION),
+        run_configuration=configuration,
+        config_generation=configuration.generation,
+        config_fingerprint=configuration.fingerprint,
+        run_scan_key="scan",
+        source_path=str(processed),
+        scan=object(),
+        frame=None,
+        frame_ids=state.catalog,
+        frames=state.artifacts,
+        viewer_rows_1d=(),
+        viewer_rows_2d=(),
+        publication_store=state,
+        origin="scattering-standard",
+        poni_identity=configuration.poni_file,
+    )
+    context.adopt_record_store(state)
+    keys = tuple(keys_by_label[label] for label in labels)
+    projection_owner = ContextProjection()
+    expected = projection_owner.resident_frame_keys(context, keys)
+    assert expected
+
+    def fail_compose(*_args, **_kwargs):
+        raise AssertionError("residency projection materialized a publication")
+
+    monkeypatch.setattr(owner.publications, "_compose_locked", fail_compose)
+    assert projection_owner.resident_frame_keys(context, keys) == expected
+
+
 def test_sixteen_trace_members_project_from_light_history_with_heavy_window_eight(
     monkeypatch, tmp_path
 ) -> None:

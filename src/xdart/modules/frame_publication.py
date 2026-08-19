@@ -1639,6 +1639,47 @@ class PublicationStore:
         with self._lock:
             return self._compose_locked(label, self._items.get(label))
 
+    def complete_labels(
+        self, labels: Iterable[int | str],
+    ) -> frozenset[int | str]:
+        """Return complete labels without materializing light-1D views.
+
+        This is the batch equivalent of testing ``get(label)`` for a complete
+        record.  A retained light-1D pair supplies every 1-D array that
+        ``_compose_locked`` would install; 2-D completeness remains a property
+        of the stored base publication.
+        """
+        with self._lock:
+            complete = []
+            for label in labels:
+                publication = self._items.get(label)
+                if publication is None:
+                    continue
+                pair = self._light_1d_items.get(label)
+                pair_supplies_1d = pair is not None and bool(pair.modes)
+                has_1d = pair_supplies_1d or bool(
+                    publication.record.results_1d
+                )
+                has_2d = bool(publication.record.results_2d)
+                if not has_1d and not has_2d:
+                    continue
+                if not pair_supplies_1d and any(
+                    view.axis_1d is None
+                    or view.axis_1d.values is None
+                    or view.intensity_1d is None
+                    for view in publication.record.results_1d.values()
+                ):
+                    continue
+                if any(
+                    not view.has_2d
+                    or view.axis_2d_x.values is None
+                    or view.axis_2d_y.values is None
+                    for view in publication.record.results_2d.values()
+                ):
+                    continue
+                complete.append(label)
+            return frozenset(complete)
+
     def has_heavy_payload(self, label: int | str) -> bool:
         with self._lock:
             publication = self._items.get(label)

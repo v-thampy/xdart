@@ -12,6 +12,7 @@ from xdart.modules.display_context import (
     HydrationRequest, Viewer1DContext, Viewer1DState,
     Viewer2DContext, Viewer2DState,
 )
+from xdart.modules.frame_publication import PublicationStore
 from xrd_tools.core import Axis, FrameView
 from xrd_tools.io.viewer_2d import (
     Viewer2DArtifactCatalog, Viewer2DFrame, Viewer2DSourceKind,
@@ -285,23 +286,29 @@ class ContextProjection:
         if type(context) is not AcquisitionContext:
             return frozenset()
         display = context.publication_store
-        resident: list[DisplayFrameKey] = []
+        grouped: dict[
+            PublicationStore, list[tuple[DisplayFrameKey, int | str]]
+        ] = {}
         for frame in frames:
             try:
                 owner = display.artifacts.get(frame.artifact)
-                publication = (
-                    None
-                    if owner is None
-                    else owner.publications.get(frame.local_frame_label)
-                )
-                detector_outcome = display.detector_outcome(frame)
-                if not publication_needs_hydration(
-                    publication,
-                    detector_outcome,
-                ):
-                    resident.append(frame)
+                if owner is not None:
+                    grouped.setdefault(owner.publications, []).append(
+                        (frame, frame.local_frame_label)
+                    )
             except Exception:
                 continue
+        resident: list[DisplayFrameKey] = []
+        for store, candidates in grouped.items():
+            try:
+                complete = store.complete_labels(
+                    tuple(label for _frame, label in candidates)
+                )
+            except Exception:
+                continue
+            resident.extend(
+                frame for frame, label in candidates if label in complete
+            )
         return frozenset(resident)
 
     def build_shell(
