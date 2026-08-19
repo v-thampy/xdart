@@ -482,10 +482,14 @@ class _ContextRuntime:
                 follow_latest=follow_latest,
             )
         )
-        # `_navigation_after_append` guarantees one exact suffix append.  Keep
-        # the identity index O(new) instead of rebuilding it from the growing
-        # immutable public tuple on every live frame.
-        self._set_acquisition_navigation(navigation)
+        if (
+            navigation.current is not self._acquisition_navigation.current
+            and self._acquisition is not None
+        ):
+            self._acquisition.publication_store.invalidate_full_demand()
+        self._acquisition_navigation = navigation
+        for retired in delta.retired:
+            self._acquisition_frame_by_id.pop(id(retired), None)
         self._acquisition_frame_by_id[id(delta.appended)] = delta.appended
         return True
 

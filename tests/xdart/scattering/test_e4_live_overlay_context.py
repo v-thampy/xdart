@@ -14,7 +14,11 @@ from tests.xdart.scattering.test_e2lv_live_display import (
 from tests.xdart.scattering.test_e3_context_contract import (
     _running_controller,
 )
-from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+from xdart.gui.tabs.scattering.display_values import (
+    DisplayFrameKey,
+    DisplayNavigationDelta,
+)
+from xdart.gui.tabs.scattering.events import RunIdentity
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.state_machine import RunPhase
@@ -29,6 +33,127 @@ def _assert_exact(
 ) -> None:
     assert len(actual) == len(expected)
     assert all(left is right for left, right in zip(actual, expected))
+
+
+class _HostileIdentityIndex(dict[int, DisplayFrameKey]):
+    """Exact index whose existing contents may not be scanned or copied."""
+
+    def __iter__(self):
+        raise AssertionError("live append rebuilt the acquisition identity index")
+
+    def keys(self):
+        raise AssertionError("live append scanned acquisition identity keys")
+
+    def items(self):
+        raise AssertionError("live append scanned acquisition identity items")
+
+    def values(self):
+        raise AssertionError("live append scanned acquisition identity values")
+
+
+def test_live_delta_updates_identity_index_in_place_without_full_rebuild() -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = (
+        _running_controller()
+    )
+    runtime = controller._runtime
+    display = acquisition.publication_store
+    assert display.catalog.resize(2) == ()
+    first = controller.navigation.current
+    assert first is not None
+    second_delta = display.append_navigation("run.a", "/out/a.nxs", 2)
+    assert controller.accept_navigation(second_delta, plot_mode="Overlay")
+    second = second_delta.appended
+
+    hostile = _HostileIdentityIndex()
+    dict.__setitem__(hostile, id(first), first)
+    dict.__setitem__(hostile, id(second), second)
+    runtime._acquisition_frame_by_id = hostile
+    third_delta = display.append_navigation("run.a", "/out/a.nxs", 3)
+    assert third_delta.retired == (first,)
+
+    assert controller.accept_navigation(third_delta, plot_mode="Overlay")
+
+    assert runtime._acquisition_frame_by_id is hostile
+    assert len(hostile) == 2
+    assert hostile.get(id(first)) is None
+    assert hostile.get(id(second)) is second
+    assert hostile.get(id(third_delta.appended)) is third_delta.appended
+    _assert_exact(controller.navigation.frames, (second, third_delta.appended))
+    assert controller.owns_frame(first) is False
+    assert controller.owns_frame(second) is True
+    assert controller.owns_frame(third_delta.appended) is True
+
+
+def test_live_delta_invalidates_full_demand_only_when_current_changes(
+    monkeypatch,
+) -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = (
+        _running_controller()
+    )
+    display = acquisition.publication_store
+    first = controller.navigation.current
+    assert first is not None
+    invalidations: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        display,
+        "invalidate_full_demand",
+        lambda **kwargs: invalidations.append(kwargs),
+    )
+
+    held_delta = display.append_navigation("run.a", "/out/a.nxs", 2)
+    assert controller.accept_navigation(
+        held_delta,
+        plot_mode="Overlay",
+        follow_latest=False,
+    )
+    assert controller.navigation.current is first
+    assert invalidations == []
+
+    followed_delta = display.append_navigation("run.a", "/out/a.nxs", 3)
+    assert controller.accept_navigation(followed_delta, plot_mode="Overlay")
+    assert controller.navigation.current is followed_delta.appended
+    assert invalidations == [{}]
+
+
+def test_foreign_and_stale_live_deltas_leave_navigation_index_unchanged() -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = (
+        _running_controller()
+    )
+    runtime = controller._runtime
+    display = acquisition.publication_store
+    identity = controller.run_identity
+    assert identity is not None
+    original_navigation = controller.navigation
+    original_index = runtime._acquisition_frame_by_id
+    original_frame = original_navigation.current
+    assert original_frame is not None
+
+    foreign_identity = RunIdentity(
+        identity.generation + 1,
+        f"{identity.fingerprint}-foreign",
+    )
+    foreign = DisplayFrameKey(
+        foreign_identity,
+        "run.a",
+        "/out/a.nxs",
+        90,
+        90,
+    )
+    assert controller.accept_navigation(
+        DisplayNavigationDelta(foreign),
+        plot_mode="Overlay",
+    ) is False
+
+    assert display.catalog.resize(1) == ()
+    stale_delta = display.append_navigation("run.a", "/out/a.nxs", 2)
+    latest_delta = display.append_navigation("run.a", "/out/a.nxs", 3)
+    assert stale_delta.appended in latest_delta.retired
+    assert controller.accept_navigation(stale_delta, plot_mode="Overlay") is False
+
+    assert controller.navigation is original_navigation
+    assert runtime._acquisition_frame_by_id is original_index
+    assert len(original_index) == 1
+    assert original_index.get(id(original_frame)) is original_frame
 
 
 @pytest.mark.parametrize("plot_mode", _HISTORY_MODES)

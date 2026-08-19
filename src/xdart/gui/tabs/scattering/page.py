@@ -1342,12 +1342,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _select_presentation_target(
             self, identity: RunIdentity, frame: DisplayFrameKey) -> bool:
         controller = self._context_controller
-        navigation = controller.navigation
         if (
             frame.run_identity is not identity
             or controller.run_identity is not identity
             or not controller.owns_frame(frame)
-            or not any(candidate is frame for candidate in navigation.frames)
         ):
             return False
         return controller.select_navigation(frame, (frame,))

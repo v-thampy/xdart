@@ -569,6 +569,49 @@ def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
         _dispose(page, qapp)
 
 
+def test_pacer_uses_exact_runtime_membership_without_scanning_navigation() -> None:
+    identity = RunIdentity(7, "pacer-membership")
+    owned = DisplayFrameKey(identity, "run.a", "/out/a.nxs", 1, 1)
+    foreign_identity = RunIdentity(8, "pacer-membership-foreign")
+    foreign = DisplayFrameKey(
+        foreign_identity,
+        "run.a",
+        "/out/a.nxs",
+        2,
+        2,
+    )
+
+    class _HostileFrames:
+        def __iter__(self):
+            raise AssertionError("pacer scanned the immutable navigation prefix")
+
+    exact_membership = {id(owned): owned}
+    selected: list[tuple[DisplayFrameKey, tuple[DisplayFrameKey, ...]]] = []
+    controller = SimpleNamespace(
+        run_identity=identity,
+        navigation=SimpleNamespace(frames=_HostileFrames()),
+        owns_frame=lambda frame: exact_membership.get(id(frame)) is frame,
+        select_navigation=lambda frame, frames: (
+            selected.append((frame, frames)) or True
+        ),
+    )
+    owner = SimpleNamespace(_context_controller=controller)
+
+    assert ScatteringWorkspace._select_presentation_target(
+        owner, identity, owned,
+    )
+    assert selected == [(owned, (owned,))]
+
+    exact_membership.clear()
+    assert ScatteringWorkspace._select_presentation_target(
+        owner, identity, owned,
+    ) is False
+    assert ScatteringWorkspace._select_presentation_target(
+        owner, foreign_identity, foreign,
+    ) is False
+    assert selected == [(owned, (owned,))]
+
+
 def test_pacer_boundaries_clear_stale_work_and_flush_exact_latest(
         qapp: QtWidgets.QApplication, monkeypatch) -> None:
     executor = _Executor()
