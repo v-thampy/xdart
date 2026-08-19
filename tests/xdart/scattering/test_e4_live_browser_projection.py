@@ -20,6 +20,7 @@ from xdart.gui.tabs.scattering.browser_catalog import (
     DirectoryModifiedCache,
     enumerate_processed_artifacts,
 )
+from xdart.gui.tabs.scattering.browser_view import BrowserView
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import RunIdentity
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
@@ -849,6 +850,16 @@ def test_browser_menu_theme_uses_canonical_indicator_and_font_contract() -> None
     ]
     assert "font-size: 13px;" in default_block
     assert "font-size: 15px;" in extra_large_block
+
+
+def test_browser_frame_list_uses_uniform_item_sizes_for_long_live_prefix() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    browser = BrowserView()
+    try:
+        assert browser.frames.uniformItemSizes() is True
+    finally:
+        browser.deleteLater()
+        app.processEvents()
 
 
 def test_footer_and_left_frames_reconcile_to_same_exact_key() -> None:

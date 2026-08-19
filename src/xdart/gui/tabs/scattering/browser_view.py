@@ -286,6 +286,7 @@ class BrowserView(QtWidgets.QFrame):
         self._frame_pane_layout = frame_pane_layout
         self.frames_label = QtWidgets.QLabel("Frames")
         self.frames = QtWidgets.QListView()
+        self.frames.setUniformItemSizes(True)
         self.frames.setObjectName("e3BrowserFrameList")
         self.frame_model = FrameListModel(self.frames)
         self.frames.setModel(self.frame_model)
