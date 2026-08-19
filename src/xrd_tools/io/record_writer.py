@@ -458,6 +458,7 @@ class NexusRecordWriter:
         opener=open_nexus_writer,
         transaction_binding: WriterTransactionBinding | None = None,
         append_decision: AppendDecision | None = None,
+        fast_regenerable: bool = False,
     ) -> None:
         if flush_every is not None and int(flush_every) <= 0:
             raise ValueError(f"flush_every must be > 0 or None; got {flush_every}")
@@ -476,6 +477,7 @@ class NexusRecordWriter:
         self._replace_attempts = int(replace_attempts)
         self._opener = opener
         self._transaction_binding = transaction_binding
+        self._fast_regenerable = fast_regenerable
         self._append_decision = append_decision
         if append_decision is not None and (
             append_decision.disposition is not AppendDisposition.WRITE
@@ -1725,6 +1727,37 @@ class NexusRecordWriter:
                 os.close(verification_descriptor)
                 self._close_verification_descriptor = None
 
+    def _verify_fast_close_structure(self) -> None:
+        """Check bounded schema facts; regenerable history is not reread."""
+        entry = self._h5.get(self.entry)
+        if not isinstance(entry, h5py.Group) or self._text_value(
+            entry.attrs.get("NX_class", "")) != "NXentry":
+            raise WriterStateError("fast close lost its NXentry metadata")
+        for name, cursor in self._row_cursors.items():
+            if not cursor or not name.startswith("integrated_"):
+                continue
+            group = entry.get(name)
+            two_d = name.startswith("integrated_2d")
+            keys = ("frame_index", "intensity", *(("chi",) if two_d else ()), "q")
+            arrays = tuple(group.get(key) for key in keys) \
+                if isinstance(group, h5py.Group) else ()
+            if not arrays or not all(isinstance(value, h5py.Dataset)
+                                     for value in arrays):
+                raise WriterStateError(f"fast close lost arrays for {name}")
+            labels, intensity, *axes = arrays
+            sigma = group.get("sigma")
+            expected = (len(cursor), *(axis.shape[0] for axis in axes))
+            if (
+                labels.shape != (len(cursor),)
+                or any(axis.ndim != 1 for axis in axes)
+                or intensity.shape != expected
+                or (sigma is not None and (
+                    not isinstance(sigma, h5py.Dataset)
+                    or sigma.shape != expected
+                ))
+            ):
+                raise WriterStateError(f"fast close found invalid row shape for {name}")
+
     def _clear_dirty_evidence(self) -> None:
         self._dirty_modes.clear()
         self._dirty_absent_modes.clear()
@@ -2361,6 +2394,7 @@ class NexusRecordWriter:
             self._h5 is not None
             and binding is not None
             and self._durable_frame_proofs
+            and not self._fast_regenerable
         ):
             verification_descriptor = os.dup(self._vfd_descriptor())
             self._close_verification_descriptor = verification_descriptor
@@ -2386,6 +2420,15 @@ class NexusRecordWriter:
                     self._h5.close()
                     self._h5 = None
                     return
+            if self._fast_regenerable and self._stream_close_attempt is not None:
+                try:
+                    self._verify_fast_close_structure()
+                except BaseException:
+                    binding.transaction.hold_stream_close(
+                        binding.attempt, self._stream_close_attempt,
+                        lease=binding.lease,
+                    )
+                    raise
         if self._h5 is not None:
             try:
                 self._h5.close()
@@ -2401,7 +2444,7 @@ class NexusRecordWriter:
                 self._durable_mode_proofs or self._durable_absence_proofs
                 or self._durable_frame_proofs
             )
-            if retained_proofs:
+            if retained_proofs and not self._fast_regenerable:
                 if self._stream_close_attempt is not None:
                     self._seal_verified_stream_close(binding)
                 else:

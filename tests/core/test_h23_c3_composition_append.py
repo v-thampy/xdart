@@ -1778,6 +1778,164 @@ def test_existing_stream_startup_full_hashes_prior_exactly_three_times(
     _release(transaction, lease, owners)
 
 
+@pytest.mark.parametrize(
+    ("provenance", "overwrite", "fast"),
+    (
+        ({"output_mode": "Overwrite", "live_mode": False}, True, True),
+        ({"output_mode": "Overwrite", "live_mode": True}, True, False),
+        ({"output_mode": "Append", "live_mode": False}, True, False),
+        ({"output_mode": "Overwrite"}, True, False),
+        ({"output_mode": "Overwrite", "live_mode": "false"}, True, False),
+        ({"output_mode": "Overwrite", "live_mode": False}, False, False),
+    ),
+)
+def test_frozen_provenance_routes_only_exact_overwrite_to_fast_regenerable(
+    tmp_path, monkeypatch, provenance, overwrite, fast,
+):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+
+    core = importlib.import_module("xrd_tools.reduction.core")
+    transaction_module = importlib.import_module("xrd_tools.io.output_transaction")
+    target = tmp_path / "route.nexus"
+    prior = b"regenerable prior"
+    target.write_bytes(prior)
+    real_hash = transaction_module._sha256_handle
+    hashes = []
+
+    def observe_hash(handle):
+        hashes.append(os.fstat(handle.fileno()).st_size)
+        return real_hash(handle)
+
+    def reject_writer(*_args, **_kwargs):
+        raise RuntimeError("stop after transaction routing")
+
+    monkeypatch.setattr(transaction_module, "_sha256_handle", observe_hash)
+    monkeypatch.setattr(core, "NexusRecordWriter", reject_writer)
+    sink = NexusSink(
+        target,
+        overwrite=overwrite,
+        run_configuration_provenance=provenance,
+    )
+    with pytest.raises(RuntimeError, match="transaction routing"):
+        sink.begin(Scan("route", []), ReductionPlan(integration_2d=None))
+
+    assert (hashes == []) is fast
+    assert target.read_bytes() == prior
+    assert not sink._transaction.backup.exists()
+    assert sink._transaction.snapshot().phase is TransactionPhase.ABORTED
+    _assert_lease_available(target)
+
+
+def test_fast_regenerable_finish_keeps_checkpoint_fsync_and_structure_without_scans(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.reduction import (
+        FrameReduction,
+        NexusSink,
+        NexusTerminalDisposition,
+        ReductionPlan,
+        ReductionResult,
+    )
+
+    transaction_module = importlib.import_module("xrd_tools.io.output_transaction")
+    target = tmp_path / "fast-finish.nexus"
+    target.write_bytes(b"old regenerable result")
+    real_fsync = transaction_module.os.fsync
+    fsync_calls = []
+
+    def forbidden_hash(_handle):
+        raise AssertionError("fast regenerable output performed a whole-file hash")
+
+    def observe_fsync(descriptor):
+        fsync_calls.append(os.fstat(descriptor).st_ino)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(transaction_module, "_sha256_handle", forbidden_hash)
+    monkeypatch.setattr(transaction_module.os, "fsync", observe_fsync)
+    sink = NexusSink(
+        target,
+        overwrite=True,
+        flush_every=None,
+        run_configuration_provenance={
+            "output_mode": "Overwrite",
+            "live_mode": False,
+        },
+    )
+    sink.begin(Scan("fast", []), ReductionPlan(integration_2d=None))
+    writer = sink._writer
+    checkpoints = []
+    close_reads = []
+    real_verify = writer._verify_dirty_evidence
+    real_grouped = writer._read_grouped_mode
+
+    def observe_checkpoint():
+        checkpoints.append(True)
+        return real_verify()
+
+    def forbid_close_history(rows, phase, *args, **kwargs):
+        if phase == "close":
+            close_reads.append(tuple(row.label for row in rows))
+            raise AssertionError("fast close reread historical result rows")
+        return real_grouped(rows, phase, *args, **kwargs)
+
+    monkeypatch.setattr(writer, "_verify_dirty_evidence", observe_checkpoint)
+    monkeypatch.setattr(writer, "_read_grouped_mode", forbid_close_history)
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(3)))
+    terminal = sink.finish(ReductionResult("fast", {}, 1))
+
+    assert terminal.disposition is NexusTerminalDisposition.COMMITTED
+    assert checkpoints == [True]
+    assert close_reads == []
+    assert fsync_calls
+    assert not sink._transaction.backup.exists()
+    with h5py.File(target, "r") as handle:
+        group = handle["entry/integrated_1d"]
+        assert group["frame_index"].shape == (1,)
+        assert group["intensity"].shape == (1, 8)
+        np.testing.assert_array_equal(group["intensity"][0], _r1(3).intensity)
+
+
+def test_fast_regenerable_close_rejects_broken_stack_shape_after_checkpoint(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.io.record_writer import WriterIncomplete
+    from xrd_tools.reduction import (
+        FrameReduction,
+        NexusSink,
+        ReductionPlan,
+        ReductionResult,
+    )
+
+    target = tmp_path / "fast-shape.nexus"
+    sink = NexusSink(
+        target,
+        overwrite=True,
+        flush_every=None,
+        run_configuration_provenance={
+            "output_mode": "Overwrite",
+            "live_mode": False,
+        },
+    )
+    sink.begin(Scan("shape", []), ReductionPlan(integration_2d=None))
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(5)))
+    writer = sink._writer
+    real_close = writer._close_handle
+
+    def break_shape_after_checkpoint():
+        intensity = writer._h5["entry/integrated_1d/intensity"]
+        intensity.resize((0, intensity.shape[1]))
+        writer._h5.flush()
+        return real_close()
+
+    monkeypatch.setattr(writer, "_close_handle", break_shape_after_checkpoint)
+    with pytest.raises(WriterIncomplete, match="row|shape|durability"):
+        sink.finish(ReductionResult("shape", {}, 1))
+    assert sink._transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
+
+
 def test_same_stat_mutation_during_pool_pause_refuses_before_target_move(
     tmp_path,
 ):
@@ -2366,6 +2524,9 @@ def test_committed_epoch_extension_rollback_restores_epoch_not_original(
     sink = NexusSink(
         target, overwrite=True, source_base=tmp_path,
         same_run_intent=first, flush_every=None,
+        run_configuration_provenance={
+            "output_mode": "Overwrite", "live_mode": True,
+        },
     )
     sink.begin(Scan("epoch", []), ReductionPlan(integration_2d=None))
     owner, lease = sink.extension_owner, sink._lease

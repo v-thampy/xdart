@@ -389,7 +389,7 @@ def _sha256_handle(handle) -> str:
         digest.update(block)
 
 
-def _capture_target(target: str) -> TargetSnapshot:
+def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot:
     """Capture one stable pathname/inode/content observation.
 
     The public value intentionally stores size/mtime/inode plus a digest.
@@ -397,6 +397,8 @@ def _capture_target(target: str) -> TargetSnapshot:
     same-stat in-place mutation.  Internal ctime checks only prove that the
     hash itself was not sampled across a concurrent write.
     """
+    if type(hash_content) is not bool:
+        raise TypeError("hash_content must be an exact bool")
     try:
         before = os.stat(target)
     except FileNotFoundError:
@@ -405,6 +407,20 @@ def _capture_target(target: str) -> TargetSnapshot:
         except FileNotFoundError:
             return TargetSnapshot(False, None, None, None, None, None)
         raise TargetChanged(f"target appeared while admitting {target}")
+
+    if not hash_content:
+        try:
+            after = os.stat(target)
+        except FileNotFoundError as exc:
+            raise TargetChanged(
+                f"target disappeared while admitting {target}"
+            ) from exc
+        if _stat_identity(before) != _stat_identity(after):
+            raise TargetChanged(f"target mutated while fingerprinting {target}")
+        return TargetSnapshot(
+            True, int(after.st_size), int(after.st_mtime_ns),
+            int(after.st_dev), int(after.st_ino), hashlib.sha256(b"").hexdigest() if after.st_size == 0 else None,
+        )
 
     try:
         with open(target, "rb") as handle:
@@ -473,18 +489,22 @@ def _descriptor_content_receipt(
     role: str,
     *,
     durable_fsync: bool = True,
+    evidence_digest: str | None = None,
 ) -> _ObjectReceipt:
-    """Hash the exact descriptor, optionally forcing crash durability first."""
+    """Seal exact descriptor identity, hashing unless evidence is supplied."""
     if type(durable_fsync) is not bool:
         raise TypeError("durable_fsync must be an exact bool")
     if durable_fsync:
         os.fsync(descriptor)
     before = os.fstat(descriptor)
-    offset = os.lseek(descriptor, 0, os.SEEK_CUR)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
-        digest = _sha256_handle(handle)
-    os.lseek(descriptor, offset, os.SEEK_SET)
+    if evidence_digest is None:
+        offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+            digest = _sha256_handle(handle)
+        os.lseek(descriptor, offset, os.SEEK_SET)
+    else:
+        digest = _require_evidence_digest(evidence_digest)
     after = os.fstat(descriptor)
     if _stat_identity(before) != _stat_identity(after):
         raise TargetChanged(f"{role} mutated while sealing descriptor {path}")
@@ -633,6 +653,7 @@ class OutputTransactionCoordinator:
         transaction_owner: OwnerToken,
         target_owner: OwnerToken,
         durable_fsync: bool = True,
+        fast_regenerable: bool = False,
     ) -> "OutputTransaction":
         """Bind one exact transaction and target owner to a stable snapshot."""
         if not isinstance(transaction_owner, OwnerToken):
@@ -641,10 +662,12 @@ class OutputTransactionCoordinator:
             raise TypeError("target_owner must be an OwnerToken")
         if type(durable_fsync) is not bool:
             raise TypeError("durable_fsync must be an exact bool")
+        if type(fast_regenerable) is not bool:
+            raise TypeError("fast_regenerable must be an exact bool")
         normalized = _normalize_target(target)
         admission = TargetAdmission(
             normalized,
-            _capture_target(normalized),
+            _capture_target(normalized, hash_content=not fast_regenerable),
             self._next_ordinal(),
         )
         return OutputTransaction(
@@ -653,6 +676,7 @@ class OutputTransactionCoordinator:
             transaction_owner=transaction_owner,
             target_owner=target_owner,
             durable_fsync=durable_fsync,
+            fast_regenerable=fast_regenerable,
         )
 
     def prepare_xye(
@@ -750,14 +774,18 @@ class OutputTransaction:
         transaction_owner: OwnerToken,
         target_owner: OwnerToken,
         durable_fsync: bool = True,
+        fast_regenerable: bool = False,
     ):
         if type(durable_fsync) is not bool:
             raise TypeError("durable_fsync must be an exact bool")
+        if type(fast_regenerable) is not bool:
+            raise TypeError("fast_regenerable must be an exact bool")
         self._coordinator = coordinator
         self._admission = admission
         self._transaction_owner = transaction_owner
         self._target_owner = target_owner
         self._durable_fsync = durable_fsync
+        self._fast_regenerable = fast_regenerable
         self._lease: TargetLease | None = None
         self._phase = TransactionPhase.ADMITTED
         self._pending: set[RetryAction] = set()
@@ -812,6 +840,11 @@ class OutputTransaction:
         self._stream_partial_cleanup: _ObjectReceipt | None = None
         self._stream_preserved_partial: str | None = None
         self._stream_retain_partial = False
+
+    def _capture(self, path: Path | str) -> TargetSnapshot:
+        return _capture_target(
+            str(path), hash_content=not self._fast_regenerable,
+        )
 
     @property
     def admission(self) -> TargetAdmission:
@@ -915,7 +948,7 @@ class OutputTransaction:
                 raise TransactionStateError(
                     "only an untouched or exactly restored lease can be abandoned"
                 )
-            observed = _capture_target(self._admission.target)
+            observed = self._capture(self._admission.target)
             if observed != self.stream_base_snapshot:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
                 raise TargetChanged("preflight target changed before abandonment")
@@ -937,7 +970,7 @@ class OutputTransaction:
         return self._cleanup_token
 
     def _validate_target(self) -> None:
-        current = _capture_target(self._admission.target)
+        current = self._capture(self._admission.target)
         if current != self.stream_base_snapshot:
             raise TargetChanged(
                 f"target changed after admission: {self._admission.target}"
@@ -949,7 +982,7 @@ class OutputTransaction:
         expected: TargetSnapshot,
         role: str,
     ) -> _TerminalReceipt:
-        observed = _capture_target(self._admission.target)
+        observed = self._capture(self._admission.target)
         if observed != expected:
             self._terminal_receipt = None
             raise TargetChanged(
@@ -1084,7 +1117,7 @@ class OutputTransaction:
     def _resolve_backup_reservation(self) -> None:
         if RetryAction.BACKUP_RESERVATION not in self._pending:
             return
-        current = _capture_target(str(self.backup))
+        current = self._capture(self.backup)
         receipt = self._backup_reservation
         if receipt is None:
             if current.exists:
@@ -1155,8 +1188,8 @@ class OutputTransaction:
         receipt = self._stage_receipt
         if receipt is None:
             raise TransactionStateError("staging transition has no immutable receipt")
-        backup = _capture_target(str(self.backup))
-        target = _capture_target(self._admission.target)
+        backup = self._capture(self.backup)
+        target = self._capture(self._admission.target)
         admitted = receipt.admitted_prior
         placeholder = receipt.placeholder
         target_exact = _exact_receipt(target, admitted)
@@ -1494,8 +1527,8 @@ class OutputTransaction:
         receipt = self._rollback_receipt
         if receipt is None:
             raise TransactionStateError("rollback link has no immutable receipt")
-        source = _capture_target(str(self.backup))
-        destination = _capture_target(self._admission.target)
+        source = self._capture(self.backup)
+        destination = self._capture(self._admission.target)
         source_exact = _exact_receipt(source, receipt.source)
         destination_exact = _exact_receipt(destination, receipt.source)
         if destination_exact:
@@ -1548,8 +1581,8 @@ class OutputTransaction:
         receipt = self._prior_receipt
         if receipt is None:
             raise TransactionStateError("captured prior lacks immutable authority")
-        source = _capture_target(str(self.backup))
-        target = _capture_target(self._admission.target)
+        source = self._capture(self.backup)
+        target = self._capture(self._admission.target)
         if target.exists:
             if self._rollback_receipt is not None:
                 self._resolve_rollback_link()
@@ -1587,7 +1620,7 @@ class OutputTransaction:
             return
 
     def _settle_backup_after_restore(self) -> BaseException | None:
-        current = _capture_target(str(self.backup))
+        current = self._capture(self.backup)
         if not current.exists:
             rollback = self._rollback_receipt
             if rollback is not None:
@@ -1652,11 +1685,11 @@ class OutputTransaction:
                     raise stage_failure
                 raise TargetChanged("staged prior remains unresolved")
             else:
-                current = _capture_target(str(target))
+                current = self._capture(target)
                 if current != self.stream_base_snapshot:
                     raise TargetChanged(f"rollback refused foreign occupant at {target}")
         else:
-            current = _capture_target(str(target))
+            current = self._capture(target)
             if current.exists:
                 raise TargetChanged(f"rollback refused foreign occupant at {target}")
 
@@ -1664,7 +1697,7 @@ class OutputTransaction:
         if self._prior_receipt is not None:
             backup_failure = self._settle_backup_after_restore()
         elif self._backup_reservation is not None:
-            current_backup = _capture_target(str(self.backup))
+            current_backup = self._capture(self.backup)
             if current_backup.exists and _exact_receipt(
                 current_backup,
                 self._backup_reservation,
@@ -1747,7 +1780,7 @@ class OutputTransaction:
         self._ensure_cleanup_token()
         self._pending.add(RetryAction.BACKUP_UNLINK)
         try:
-            current = _capture_target(str(self.backup))
+            current = self._capture(self.backup)
         except BaseException as exc:
             return exc
 
@@ -2388,14 +2421,22 @@ class OutputTransaction:
                 raise TransactionStateError(
                     "stream close authorization requires EXECUTING"
                 )
-            if self._stream_durable_floor is None:
+            if (
+                self._stream_durable_floor is None
+                and not self._fast_regenerable
+            ):
                 return None
             if self._stream_close_owner is not None:
                 return self._stream_close_owner
             checkpoint = self._stream_checkpoint
+            floor = (
+                self._stream_durable_floor
+                if self._stream_durable_floor is not None
+                else self._stream_checkpoint_token
+            )
             if (
                 not self._stream_checkpoint_fresh
-                or self._stream_checkpoint_token is not self._stream_durable_floor
+                or self._stream_checkpoint_token is not floor
                 or checkpoint is None
                 or not _stream_stat_matches(self._admission.target, checkpoint)
             ):
@@ -2564,17 +2605,27 @@ class OutputTransaction:
                 )
             descriptor = os.open(self._admission.target, os.O_RDONLY)
             try:
+                checkpoint = self._stream_checkpoint if self._fast_regenerable else None
+                if self._fast_regenerable and (
+                    checkpoint is None or not self._stream_checkpoint_fresh
+                    or not _stream_stat_matches(self._admission.target, checkpoint)
+                ):
+                    raise TargetChanged("fast stream terminal lost its close checkpoint")
                 receipt = _descriptor_content_receipt(
-                    descriptor,
-                    Path(self._admission.target),
-                    "stream-terminal",
+                    descriptor, Path(self._admission.target), "stream-terminal",
                     durable_fsync=self._durable_fsync,
+                    evidence_digest=(
+                        None if checkpoint is None else checkpoint.evidence_digest
+                    ),
                 )
                 terminal_stat = _descriptor_stream_stat_receipt(
                     descriptor,
                     Path(self._admission.target),
                     evidence_digest=str(receipt.snapshot.digest),
-                    evidence_bytes=int(receipt.snapshot.size or 0),
+                    evidence_bytes=(
+                        int(receipt.snapshot.size or 0)
+                        if checkpoint is None else checkpoint.evidence_bytes
+                    ),
                     ordinal=self._coordinator._next_ordinal(),
                     role="stream-terminal",
                     durable_fsync=self._durable_fsync,
@@ -2762,8 +2813,8 @@ class OutputTransaction:
         if reservation is None:
             self._pending.discard(RetryAction.STREAM_RETIRE)
             return None
-        target = _capture_target(self._admission.target)
-        partial = _capture_target(str(self._stream_partial))
+        target = self._capture(self._admission.target)
+        partial = self._capture(self._stream_partial)
         receipt = self._stream_partial_receipt
         if partial.exists:
             if receipt is None or not _exact_receipt(partial, receipt):
@@ -2784,7 +2835,7 @@ class OutputTransaction:
                 pass
             except BaseException as exc:
                 return exc
-            partial = _capture_target(str(self._stream_partial))
+            partial = self._capture(self._stream_partial)
             if partial.exists:
                 return TargetChanged("owned stream partial survived exact cleanup")
             self._stream_partial_receipt = self._stream_partial_cleanup = None
@@ -2822,9 +2873,9 @@ class OutputTransaction:
         except BaseException as exc:
             replace_error = exc
         try:
-            observed = _capture_target(str(self._stream_partial))
+            observed = self._capture(self._stream_partial)
             if not _exact_receipt(observed, self._stream_partial_receipt):
-                current = _capture_target(self._admission.target)
+                current = self._capture(self._admission.target)
                 if replace_error is not None and _exact_receipt(current, reservation):
                     self._stream_partial_receipt = None
                     return replace_error
@@ -2858,7 +2909,10 @@ class OutputTransaction:
             or receipt.identity != reservation.identity
             or terminal_stat.identity != reservation.identity
             or snapshot != sealed
-            or terminal_stat.evidence_bytes != terminal_stat.size
+            or (
+                not self._fast_regenerable
+                and terminal_stat.evidence_bytes != terminal_stat.size
+            )
             or not _stream_stat_matches(target, terminal_stat)
         ):
             self._terminal_receipt = None

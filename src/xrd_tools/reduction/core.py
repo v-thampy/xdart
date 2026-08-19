@@ -1364,6 +1364,7 @@ class NexusSink:
     _run_configuration: dict[str, Any] | None = field(
         default=None, init=False, repr=False,
     )
+    _fast_regenerable: bool = field(default=False, init=False, repr=False)
     _source_execution: dict[str, Any] | None = field(
         default=None, init=False, repr=False,
     )
@@ -1483,6 +1484,10 @@ class NexusSink:
                 self.run_configuration_provenance,
                 path="run_configuration",
             )
+        config = self._run_configuration or {}
+        self._fast_regenerable = bool(
+            self.overwrite and config.get("output_mode") == "Overwrite"
+            and config.get("live_mode") is False)
         if self.source_execution_provenance is not None:
             self._source_execution = jsonable_run_value(
                 self.source_execution_provenance,
@@ -1658,6 +1663,7 @@ class NexusSink:
                 transaction_owner=transaction_owner,
                 target_owner=target_owner,
                 durable_fsync=self.durable_fsync,
+                fast_regenerable=self._fast_regenerable,
             )
             lease = transaction.acquire_lease(
                 admission=transaction.admission,
@@ -1749,6 +1755,7 @@ class NexusSink:
                     self._transaction, self._attempt, self._lease,
                 ),
                 append_decision=append_decision,
+                fast_regenerable=self._fast_regenerable,
             )
             self._writer = writer
             if self._session_facade is not None:
@@ -1838,6 +1845,7 @@ class NexusSink:
                     self._transaction, self._attempt, self._lease,
                 ),
                 append_decision=decision,
+                fast_regenerable=self._fast_regenerable,
             )
             self._writer = writer
             if self._session_facade is not None:
