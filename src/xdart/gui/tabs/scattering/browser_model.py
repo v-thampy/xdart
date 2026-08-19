@@ -39,6 +39,16 @@ class FrameListModel(QtCore.QAbstractListModel):
     def row_for(self, frame: DisplayFrameKey) -> int | None:
         return self._rows_by_identity.get(id(frame))
 
+    def owns(self, frame: DisplayFrameKey | None) -> bool:
+        if frame is None:
+            return False
+        row = self._rows_by_identity.get(id(frame))
+        return (
+            row is not None
+            and 0 <= row < len(self._frames)
+            and self._frames[row] is frame
+        )
+
     def reconcile(self, frames: tuple[DisplayFrameKey, ...]) -> bool:
         if frames is self._frames:
             return False

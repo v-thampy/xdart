@@ -551,25 +551,23 @@ class BrowserView(QtWidgets.QFrame):
         self._plot_mode = plot_mode
         frames = state.frames
         changed = self.frame_model.reconcile(frames)
+        owns_frame = self.frame_model.owns
         if pending is None:
             current = (
                 navigation.current
-                if any(
-                    candidate is navigation.current
-                    for candidate in frames
-                )
+                if owns_frame(navigation.current)
                 else None
             )
             if plot_mode in _VISIT_ACCUMULATING_PLOT_MODES:
                 trace_frames = tuple(
                     frame
                     for frame in navigation.selected
-                    if any(candidate is frame for candidate in frames)
+                    if owns_frame(frame)
                 )
                 selected_frames = tuple(
                     frame
                     for frame in self._selected_frames
-                    if any(candidate is frame for candidate in frames)
+                    if owns_frame(frame)
                 )
                 if (changed or not selected_frames) and trace_frames:
                     selected_frames = (
@@ -579,7 +577,7 @@ class BrowserView(QtWidgets.QFrame):
                 selected_frames = tuple(
                     frame
                     for frame in navigation.selected
-                    if any(candidate is frame for candidate in frames)
+                    if owns_frame(frame)
                 )
                 trace_frames = selected_frames
         else:

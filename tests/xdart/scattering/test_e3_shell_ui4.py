@@ -9,6 +9,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xrd_tools.session.readiness import BoundControlState, ControlPanelRenderState
 
 from xdart.gui.tabs.scattering.browser_view import BrowserView
+import xdart.gui.tabs.scattering.browser_view as browser_view_module
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import RunIdentity
 from xdart.gui.tabs.scattering.scientific_view import (
@@ -330,6 +331,31 @@ def test_e3_ui4_browser_15000_unchanged_and_prefix_delta_are_bounded(
         assert browser.frames.model().rowCount() == 15_001
         assert unchanged_s < 0.25
         assert prefix_s < 0.25
+    finally:
+        _dispose(browser, qapp)
+
+
+def test_e3_ui4_overlay_membership_never_rescans_catalog_per_trace(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+) -> None:
+    browser = BrowserView()
+    navigation = _large_browser_state(3_621)
+    navigation = replace(navigation, selected=navigation.frames)
+    browser_state = replace(
+        BrowserProjection("/data/processed"),
+        frames=navigation.frames,
+    )
+
+    def _forbid_prefix_scan(_items) -> bool:
+        raise AssertionError("overlay membership rescanned the frame catalog")
+
+    monkeypatch.setattr(
+        browser_view_module, "any", _forbid_prefix_scan, raising=False,
+    )
+    try:
+        browser.reconcile(browser_state, navigation, plot_mode="Overlay")
+        assert browser._trace_frames == navigation.frames
     finally:
         _dispose(browser, qapp)
 
