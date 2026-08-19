@@ -327,7 +327,7 @@ def test_performance_diagnostics_fresh_default_is_tuned_tuple(
             values.inflight,
             values.checkpoint,
             values.staging_frame_cap,
-        ) == (1, 8, 8, 40, 64)
+        ) == (1, 8, 8, 16, 64)
     finally:
         _dispose(page, qapp)
 

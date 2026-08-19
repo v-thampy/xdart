@@ -2010,7 +2010,7 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
 @pytest.mark.parametrize(
     ("pipeline", "expected"),
     (
-        (None, (8, 16, None, 56, 8, 4, 4)),
+        (None, (1, 8, 16, 16, 1, 4, 4)),
         ((16, 16, 48), (16, 16, 48, 48, 16, 4, 4)),
         ((1, 4, 56), (1, 4, 56, 56, 1, 4, 4)),
         ((1, 8, 16, 56), (1, 16, 56, 56, 1, 4, 4)),
@@ -2053,6 +2053,9 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
                 intent.run_options["_post_g2_pipeline_v2"][
                     "staging_frame_cap"
                 ] = pipeline[4]
+    expected_pipeline = (
+        (1, 8, 8, 16, 64) if pipeline is None else pipeline
+    )
     resolve = dynamic_output.resolve_session_policy
     open_session = dynamic_output.open_headless_scan_session
     observed = []
@@ -2071,7 +2074,7 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             session._session._writer_batch_size,
             kwargs["executor"], session._session._worker._max_workers,
         ))
-        if pipeline is not None and len(pipeline) in (4, 5):
+        if len(expected_pipeline) in (4, 5):
             children = kwargs["sink"].output_sink_children
             (nexus,) = tuple(
                 child for child in children
@@ -2102,14 +2105,14 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
         assert terminal.kind is StandardEventKind.FINISHED
         assert _nexus_rows(target) == (1,)
         assert observed == [expected]
-        assert v2_observed == ([] if pipeline is None or len(pipeline) == 3 else [
+        assert v2_observed == ([] if len(expected_pipeline) == 3 else [
             (
-                1,
-                pipeline[2],
-                pipeline[2],
+                expected_pipeline[0],
+                expected_pipeline[2],
+                expected_pipeline[2],
                 4,
                 4,
-                8,
+                expected_pipeline[1],
                 ("TransactionalXYESink", "NexusSink"),
             ),
         ])
@@ -2118,13 +2121,13 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             if record.getMessage().startswith("[RUN-PIPELINE]")
         ]
         expected_facts = (
-            [] if pipeline is None or len(pipeline) in (4, 5) else [
-                f"[RUN-PIPELINE] requested-batch={pipeline[0]} "
-                f"effective-batch={pipeline[0]} "
-                f"requested-inflight={pipeline[1]} "
-                f"effective-inflight={pipeline[1]} "
-                f"requested-checkpoint={pipeline[2]} "
-                f"effective-checkpoint={pipeline[2]}"
+            [] if len(expected_pipeline) in (4, 5) else [
+                f"[RUN-PIPELINE] requested-batch={expected_pipeline[0]} "
+                f"effective-batch={expected_pipeline[0]} "
+                f"requested-inflight={expected_pipeline[1]} "
+                f"effective-inflight={expected_pipeline[1]} "
+                f"requested-checkpoint={expected_pipeline[2]} "
+                f"effective-checkpoint={expected_pipeline[2]}"
             ]
         )
         assert facts == expected_facts
@@ -2132,22 +2135,24 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             record.getMessage() for record in caplog.records
             if record.getMessage().startswith("[RUN-PIPELINE-V2]")
         ]
-        if pipeline is None or len(pipeline) == 3:
+        if len(expected_pipeline) == 3:
             assert v2_facts == []
         else:
             assert len(v2_facts) == 1
             assert (
-                f"requested-inflight={pipeline[2]} "
-                f"effective-inflight={pipeline[2]}"
+                f"requested-inflight={expected_pipeline[2]} "
+                f"effective-inflight={expected_pipeline[2]}"
             ) in v2_facts[0]
             assert (
-                f"requested-checkpoint={pipeline[3]} "
-                f"effective-checkpoint={pipeline[3]}"
+                f"requested-checkpoint={expected_pipeline[3]} "
+                f"effective-checkpoint={expected_pipeline[3]}"
             ) in v2_facts[0]
+            staging = (
+                expected_pipeline[4]
+                if len(expected_pipeline) == 5 else 64
+            )
             assert (
-                "requested-staging=64 effective-staging=64"
-                if len(pipeline) == 4
-                else "requested-staging=72 effective-staging=72"
+                f"requested-staging={staging} effective-staging={staging}"
             ) in v2_facts[0]
     finally:
         executor.close(identity)

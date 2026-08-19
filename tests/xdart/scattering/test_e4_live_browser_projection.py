@@ -241,6 +241,52 @@ def test_post_g2_pipeline_matrix_is_exact_private_nonlive_configuration():
             )
 
 
+def test_post_g2_pipeline_v2_absent_default_is_eligibility_bounded():
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    ineligible = (
+        (RunIntent(output_mode="Overwrite", live_mode=True), True),
+        (RunIntent(output_mode="Overwrite", batch_mode=True), True),
+        (RunIntent(output_mode="Append"), True),
+        (RunIntent(
+            output_mode="Overwrite", processing_mode="Int 1D (XYE)",
+        ), True),
+        (RunIntent(output_mode="Overwrite"), False),
+    )
+    for intent, coordinated in ineligible:
+        assert dynamic_output._post_g2_pipeline_v2_choice(
+            intent.freeze(), coordinated=coordinated,
+        ) is None
+
+    legacy = {
+        "writer_batch_size": 1,
+        "reduction_inflight": 4,
+        "checkpoint_frame_cap": 56,
+    }
+    legacy_configuration = RunIntent(
+        output_mode="Overwrite",
+        run_options={"_post_g2_pipeline": legacy},
+    ).freeze()
+    assert dynamic_output._post_g2_pipeline_v2_choice(
+        legacy_configuration, coordinated=True,
+    ) is None
+    assert dynamic_output._post_g2_pipeline_choice(
+        legacy_configuration, coordinated=True,
+    ) == (1, 4, 56)
+
+    choice = dynamic_output._post_g2_pipeline_v2_choice(
+        RunIntent(output_mode="Overwrite").freeze(), coordinated=True,
+    )
+    assert choice is not None
+    assert (
+        choice.writer_settlement_batch_size,
+        choice.nexus_record_batch_size,
+        choice.reduction_inflight,
+        choice.semantic_checkpoint_frame_cap,
+        choice.staging_frame_cap,
+    ) == (1, 8, 8, 16, 64)
+
+
 def test_post_g2_pipeline_four_knob_choice_is_named_bounded_and_nonlive():
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 

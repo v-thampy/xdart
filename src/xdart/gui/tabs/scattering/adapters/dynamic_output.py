@@ -149,7 +149,17 @@ def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
     if legacy is not _MISSING and value is not _MISSING:
         raise ValueError("post-G2 pipeline cannot supply both V1 and V2")
     if value is _MISSING:
-        return None
+        if legacy is not _MISSING:
+            return None
+        if (
+            configuration.live_mode
+            or configuration.batch_mode
+            or configuration.output_mode != "Overwrite"
+            or not coordinated
+            or configuration.processing_mode == "Int 1D (XYE)"
+        ):
+            return None
+        return _PostG2PipelineV2Choice(1, 8, 8, 16, 64)
     if not isinstance(value, Mapping):
         raise TypeError("post-G2 pipeline V2 choice must be one exact mapping")
     fields = set(value)
