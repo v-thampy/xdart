@@ -1111,7 +1111,9 @@ class ScientificView(QtWidgets.QFrame):
         if selected is None:
             self.frame_selector.setCurrentIndex(-1)
         else:
-            for index in range(self.frame_selector.count()):
+            for index in self._label_indices.get(
+                selected.local_frame_label, ()
+            ):
                 if self.frame_selector.itemData(index) is selected:
                     self.frame_selector.setCurrentIndex(index)
                     break

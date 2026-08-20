@@ -560,15 +560,15 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
     _await_ready(controller)
     clear_results = [True, False, True]
     workspace = SimpleNamespace(_context_controller=controller,
-        _shell=SimpleNamespace(scientific=SimpleNamespace(clear_viewer_1d=lambda request:
+        _shell=SimpleNamespace(browser=SimpleNamespace(reconcile_heavy_residency=lambda *_args, **_kwargs: None), scientific=SimpleNamespace(clear_viewer_1d=lambda request:
             viewer._new_viewer_1d_renderer_clear_receipt(request, clear_results.pop(0)))),
         _last_scientific_projection=object(), _preferences=ScientificPreferences(),
         _terminal_close=None, _closing=True, _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
         _close_identity=None, _clear_viewer_2d_renderer=lambda *, close: True)
     workspace._clear_viewer_1d_renderer = partial(ScatteringWorkspace._clear_viewer_1d_renderer, workspace)
-    workspace.__dict__.update(_closed=False, _retain_outgoing_display=False, _source_observation=None,
+    workspace.__dict__.update(_closed=False, _sync_detector_demand=lambda: None, _retain_outgoing_display=False, _source_observation=None,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: SimpleNamespace(
-            processing_mode="1D Viewer", live_mode=False, source_spec=None))), _project_controls=lambda _snapshot: None,
+            processing_mode="1D Viewer", live_mode=False, source_spec=None, run_options={}))), _project_controls=lambda _snapshot: None,
         _start_permitted=lambda: (True, ""), _context_projection=SimpleNamespace(build_shell=lambda **_: object()),
         _shell_revision=0, _date_sorted=False, _auto_last=False, _run_executor=None, _notice_text="",
         **dict.fromkeys(("_controls_readiness", "_progress", "_browser_directory", "_browser_catalog", "_browser_transient_frame")))
@@ -636,7 +636,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch) -
         StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)), _lifecycle=SimpleNamespace(
         active_run_identity=identity, attempt_run_identity=None), _refresh_shell=forbidden,
         _polling_needed=lambda: True, _run_timer=SimpleNamespace(stop=forbidden))
-    ScatteringWorkspace._drain_executor(dispatch)
+    dispatch._clear_presentation_targets = lambda: None; ScatteringWorkspace._drain_executor(dispatch)
     preferences = ScientificPreferences(plot_mode="Overlay")
     owner = SimpleNamespace(
         _preferences=preferences,
@@ -660,7 +660,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch) -
     assert clear_calls == [True]
     enabled = []
     item = SimpleNamespace(setEnabled=enabled.append)
-    view = SimpleNamespace(_processing_mode="Int 2D",
+    view = SimpleNamespace(_processing_mode="Int 2D", detector_controls=SimpleNamespace(setVisible=lambda _value: None), raw_popup_button=SimpleNamespace(setVisible=lambda _value: None), raw_popup_dialog=None,
         plot_mode=SimpleNamespace(findText=lambda value: value,
                                   model=lambda: SimpleNamespace(item=lambda _index: item)),
         image_splitter=SimpleNamespace(setVisible=lambda value: calls.append(("images", value))),
