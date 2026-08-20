@@ -698,7 +698,7 @@ def test_viewer_1d_scope_and_authority_census_stays_bounded() -> None:
     identifiers = [(node.id if isinstance(node, ast.Name) else node.attr) for node in nodes
                    if isinstance(node, (ast.Name, ast.Attribute))]
     expected = {"RLock": 1, "Lock": 0, "HydrationTransport": 2, "_OneDViewerOwner": 1,
-                "Thread": 0, "ThreadPoolExecutor": 4, "Queue": 0, "deque": 0}
+                "Thread": 0, "ThreadPoolExecutor": 4, "Queue": 0, "deque": 2}
     assert {name: identifiers.count(name) for name in expected} == expected
     calls = [(node.func.id if isinstance(node.func, ast.Name) else node.func.attr)
              for node in nodes if isinstance(node, ast.Call)

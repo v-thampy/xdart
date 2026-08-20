@@ -327,6 +327,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _lifecycle=SimpleNamespace(active_run_identity=identity, attempt_run_identity=None),
         _refresh_shell=lambda: calls.append("refresh"), _polling_needed=lambda: True,
         _run_timer=SimpleNamespace(stop=lambda: calls.append("stop")))
+    page._clear_presentation_targets = partial(ScatteringWorkspace._clear_presentation_targets, page)
     page._clear_viewer_2d_renderer = partial(ScatteringWorkspace._clear_viewer_2d_renderer, page)
     command = ShellCommand(ShellCommandKind.SELECT_SCAN, "/retained/result.nxs")
     ScatteringWorkspace._handle_shell_command(page, command)
@@ -349,8 +350,8 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     page._lifecycle.phase, page._lifecycle.reset_permitted = RunPhase.IDLE, False
     page.__dict__.update(
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: SimpleNamespace(
-            processing_mode="2D Viewer", live_mode=False, source_spec=None))),
-        _project_controls=lambda _snapshot: None, _start_permitted=lambda: (True, ""),
+            processing_mode="2D Viewer", live_mode=False, source_spec=None, run_options={}))),
+        _project_controls=lambda _snapshot: None, _start_permitted=lambda: (True, ""), _sync_detector_demand=lambda: None,
         _preferences=SimpleNamespace(slice_pins=()), _retain_outgoing_display=False,
         _source_observation=None,
         _context_projection=SimpleNamespace(build_shell=lambda **_: SimpleNamespace(scientific=retained)),
@@ -359,7 +360,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _date_sorted=False, _auto_last=False, _notice_text="")
     def fail_render(_projection, *, preserve_display=False):
         raise RuntimeError("render")
-    page._shell = SimpleNamespace(apply_state=fail_render)
+    page._shell = SimpleNamespace(browser=SimpleNamespace(reconcile_heavy_residency=lambda *_args, **_kwargs: None), apply_state=fail_render)
     page._notice = lambda text: setattr(page, "_notice_text", text)
     page._last_scientific_projection = retained
     owner_state = (controller.viewer_2d_frame, controller.viewer_2d_context)
@@ -490,12 +491,12 @@ def _fake_scientific(*, failing=False):
     widgets = {name: _widget(events=events, name=name) for name in (
         "previous_frame", "next_frame", "title", "status", "progress",
         "log_scale", "norm", "background", "image_axis", "share_axis", "slice",
-        "slice_center", "slice_width", "pin")}
+        "slice_center", "slice_width", "pin", "detector_controls", "raw_popup_button")}
     view = SimpleNamespace(
         events=events, raw=raw, cake=cake, image_splitter=splitter,
         vertical_splitter=vertical, frame_selector=_selector(events), color_map=object(),
         curve=_pane(events=events, name="curve"), waterfall=_pane(events=events, name="waterfall"),
-        _processing_mode="", _selector_operations=0,
+        _processing_mode="", _selector_operations=0, raw_popup_dialog=None,
         _viewer_2d_payload=np.ones((2, 2)), _frame_keys=(object(),),
         _selected_keys=(object(),), _label_indices={1: [0]},
         _heavy_available=frozenset((object(),)), _trace_history_scope=object(),
@@ -551,7 +552,7 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
     prior = DisplayFrameKey(identity, "viewer-2d", "viewer-2d", 2, 1)
     frame = DisplayFrameKey(identity, "viewer-2d", "viewer-2d", 7, 2)
     state = SimpleNamespace(
-        processing_mode="2D Viewer", heavy=SimpleNamespace(frame=frame, raw=array),
+        processing_mode="2D Viewer", heavy=SimpleNamespace(frame=frame, raw=array, detector_shape=None),
         heavy_available=frozenset((frame,)), color_map="plasma", log_scale=True,
         title="image.npy · frame 7 · NumPy array", status="2D Viewer · NumPy array")
     navigation = SimpleNamespace(frames=(prior, frame), current=frame, selected=(frame,))
