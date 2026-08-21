@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import numpy as np
 from xrd_tools.core.frame_view import FrameView
 from xrd_tools.core.invalid import UINT32_CEILING, saturation_pixels
@@ -14,6 +14,25 @@ __all__ = ["DetectorPreviewProjection", "FramePreview", "read_frame_preview"]
 def _check(condition, message, error=TypeError):
     if not condition:
         raise error(message)
+def _source_projection_matches(locator, projected, *, source_base, artifact):
+    if locator is None or projected is None:
+        return locator is projected
+    stored_text = locator.replace("\\", "/")
+    shown = PurePosixPath(projected.replace("\\", "/"))
+    stored = PurePosixPath(stored_text)
+    drive_absolute = len(stored_text) >= 3 and stored_text[1:3] == ":/"
+    if stored.is_absolute() or drive_absolute:
+        return stored == shown
+    if not shown.is_absolute():
+        return False
+    artifact_path = PurePosixPath(str(artifact).replace("\\", "/"))
+    roots = (source_base, str(artifact_path.parent),
+             str(artifact_path.parent.parent))
+    return any(
+        root is not None
+        and PurePosixPath(root.replace("\\", "/")) / stored == shown
+        for root in roots
+    )
 @dataclass(frozen=True, slots=True)
 class DetectorPreviewProjection:
     mask_available: bool
@@ -85,7 +104,14 @@ class FramePreview:
         _check(type(self.detector_fallback_used) is bool, "detector_fallback_used must be an exact bool")
         _check(self.detector_diagnostic is None or (type(self.detector_diagnostic) is str and bool(self.detector_diagnostic)), "detector_diagnostic must be nonempty or None")
         _check(self.thumbnail is self.view.thumbnail, "thumbnail must be the exact view thumbnail", ValueError)
-        _check(self.raw_locator == self.view.source_path and self.source_frame_index == self.view.source_frame_index, "raw provenance must match the exact view", ValueError)
+        _check(
+            _source_projection_matches(
+                self.raw_locator, self.view.source_path,
+                source_base=self.source_base,
+                artifact=self.read_key.artifact_identity,
+            ) and self.source_frame_index == self.view.source_frame_index,
+            "raw provenance must match the exact view", ValueError,
+        )
         purpose, has_raw = self.read_key.purpose, self.raw is not None
         requested = purpose is HydrationPurpose.FULL or (purpose is HydrationPurpose.PREVIEW and self.thumbnail is None)
         fallback = False
@@ -139,7 +165,7 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
     if type(read_key.frame_identity) is not int or read_key.frame_identity < 0:
         raise TypeError("preview frame identity must be an exact nonnegative integer")
     frame, artifact = read_key.frame_identity, Path(read_key.artifact_identity)
-    with FrameViewReader(artifact, entry=entry, resolve_source=False, target_frame=frame) as reader:
+    with FrameViewReader(artifact, entry=entry, resolve_source=True, target_frame=frame) as reader:
         if not reader.has_frame(frame):
             raise KeyError(f"processed frame {frame} is absent")
         view = reader.read(frame)
@@ -150,7 +176,7 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
         detector_shape = tuple(int(value) for value in shape_values) if shape_values.shape == (2,) and shape_values.dtype.kind in "iu" and np.all(shape_values > 0) else None
     locator, source_index, dataset_path, source_base, source_error = provenance
     extra = {**view.extra, **({"detector_shape": detector_shape} if detector_shape is not None else {})}
-    view = replace(view, source_path=locator, source_frame_index=source_index, extra=extra)
+    view = replace(view, source_frame_index=source_index, extra=extra)
     raw = diagnostic = None
     if read_key.purpose is HydrationPurpose.PREVIEW and view.thumbnail is None:
         diagnostic = "stored thumbnail unavailable"

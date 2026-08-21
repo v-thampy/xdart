@@ -115,7 +115,7 @@ def _instrument_reads(monkeypatch, processed):
 def test_thumbnail_preview_opens_processed_once_and_never_reads_detector(
     tmp_path, monkeypatch
 ):
-    processed, _ = _write_processed(tmp_path, thumbnail=True)
+    processed, raw_path = _write_processed(tmp_path, thumbnail=True)
     counts = _instrument_reads(monkeypatch, processed)
     api = _api()
     purpose = _hydration().HydrationPurpose
@@ -129,6 +129,10 @@ def test_thumbnail_preview_opens_processed_once_and_never_reads_detector(
     assert result.thumbnail is not None
     assert result.raw is None
     assert result.detector_fallback_used is False
+    assert result.raw_locator == "raw/image.tif"
+    assert result.source_base == str(tmp_path)
+    assert (result.view.source_path, result.view.source_frame_index) == (
+        str(raw_path.resolve()), 0)
     for array in (
         result.thumbnail,
         result.view.intensity_1d,
@@ -806,6 +810,9 @@ def test_frame_preview_result_rejects_malformed_fields_and_label_aliases(
         {"raw_locator": 3},
         {"raw_locator": ""},
         {"raw_locator": "/different/raw.tif"},
+        {"view": replace(valid.view, source_path=str(tmp_path / "wrong" / "raw" / "image.tif"))},
+        {"source_frame_index": 1},
+        {"view": replace(valid.view, source_path=valid.raw_locator)},
         {"raw_dataset_path": 3},
         {"source_frame_index": -1},
         {"source_frame_index": True},

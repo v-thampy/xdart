@@ -2372,8 +2372,8 @@ def _demote_browse_publication(browse, label):
     store = browse.publication_store
     publication = store.get(label)
     assert publication is not None
-    demoted = import_module("xdart.modules.frame_publication")
-    store.upsert(demoted._lightweight_publication(publication))
+    assert store.evict_heavy(label)
+    assert store.evict_thumbnail(label)
     view = store.get(label).view
     assert view.raw is None and view.thumbnail is None
 
@@ -2384,6 +2384,9 @@ def test_browse_evicted_frame_rehydrates_b_store_without_second_context(
     controller, acquisition, browse, processed = _adopted_browse(tmp_path)
     transport = acquisition.publication_store.transport
     key = _browse_key(controller, 2)
+    reference = browse.publication_store.get(2)
+    assert reference is not None
+    reference_source = (reference.view.source_path, reference.view.source_frame_index)
     _demote_browse_publication(browse, 2)
 
     light = controller.resolve_projection(
@@ -2409,11 +2412,13 @@ def test_browse_evicted_frame_rehydrates_b_store_without_second_context(
         time.sleep(0.005)
     assert payload is not None
     assert payload.frame_key is key
+    assert (payload.view.source_path, payload.view.source_frame_index) == reference_source
     restored = browse.publication_store.get(2)
     assert restored is not None
     assert restored.scan_key == browse.scan_key
     assert restored.view.thumbnail is not None
     assert restored.view.intensity_1d is not None
+    assert (restored.view.source_path, restored.view.source_frame_index) == reference_source
     # The request landed in B's own store through B's exact context: the
     # acquisition display gained no browse frame.
     assert acquisition.publication_store.artifacts.get(str(processed)) is None
@@ -2426,6 +2431,8 @@ def test_cold_browse_evicted_frame_rehydrates_its_exact_store(
 ):
     controller, browse, processed = _adopted_cold_browse(tmp_path)
     key = _browse_key(controller, 1)
+    reference = read_frame_record(processed, 1).active_view()
+    reference_source = (reference.source_path, reference.source_frame_index)
     assert browse.publication_store.get(1) is None
 
     assert controller.project(key) is None
@@ -2443,10 +2450,12 @@ def test_cold_browse_evicted_frame_rehydrates_its_exact_store(
     payload = controller.project(key)
     assert payload is not None
     assert payload.frame_key is key
+    assert (payload.view.source_path, payload.view.source_frame_index) == reference_source
     restored = browse.publication_store.get(1)
     assert restored is not None
     assert restored.scan_key == browse.scan_key
     assert restored.view.thumbnail is not None
+    assert (restored.view.source_path, restored.view.source_frame_index) == reference_source
     assert browse.requested_path == str(processed)
     assert controller.browse_context is browse
     assert controller.acquisition_context is None
