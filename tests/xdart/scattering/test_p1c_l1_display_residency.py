@@ -575,7 +575,25 @@ def test_real_nine_frame_container_finishes_and_executor_closes(
     assert run is not None
     assert run.completed == 9
     snapshot = run.display.residency_snapshot()
-    assert snapshot.heavy == snapshot.limits.heavy == 8
+    fact, = (
+        value for value in run.resource_facts
+        if isinstance(value, dynamic_output.HeavyResidencyFact)
+    )
+    owner, = run.display.artifacts.values()
+    publications = owner.publications
+    labels = publications.labels()
+    assert labels == tuple(range(9))
+    assert publications.allocation is not None
+    assert (fact.choice, fact.resolution_source,
+            fact.requested_heavy_bound) == ("auto", "environment", 8)
+    assert fact.granted_publication_heavy_count == publications._max_heavy_items
+    assert len(publications._heavy_labels) == min(
+        len(labels), fact.granted_publication_heavy_count)
+    thumbnail_count = sum(map(publications.has_thumbnail, labels))
+    assert thumbnail_count == len(publications._thumb_labels) == min(
+        len(labels), publications._max_thumbnail_items)
+    assert snapshot.limits.heavy == fact.effective_display_count == min(
+        fact.granted_record_heavy_count, fact.granted_publication_heavy_count)
     assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
 
 

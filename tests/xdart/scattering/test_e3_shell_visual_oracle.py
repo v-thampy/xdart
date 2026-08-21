@@ -297,7 +297,7 @@ def test_e3_ui6_compact_shell_continuity_at_review_viewports(
         footer = tuple(
             frame
             for frame in navigation.frames
-            if frame.source_scan == current.source_scan
+            if frame.artifact == current.artifact
         )
         assert tuple(
             shell.scientific.frame_selector.itemData(index)

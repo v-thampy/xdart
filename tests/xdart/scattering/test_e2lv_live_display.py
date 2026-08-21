@@ -199,6 +199,7 @@ def _accepted_admission(
             None if mask is None else mask.tobytes(),
             "tiny-poni",
             None if mask is None else "tiny-mask",
+            "{\"orientation\":3}",
         )
         candidate = OutputCandidate.from_start_capture(
             capture,

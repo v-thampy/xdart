@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Mapping
@@ -679,13 +680,28 @@ def _science_projection(
             "signed science mapping differs from the frozen run configuration"
         )
     if type(assets) is not dict or set(assets) != {
-        "poni_values", "poni_sha256", "mask_sha256",
+        "poni_values", "poni_detector_config_json", "poni_sha256", "mask_sha256",
     }:
         raise TypeError("accepted scientific asset identity is malformed")
     if assets["poni_values"] is not None and type(
         assets["poni_values"]
     ) is not dict:
         raise TypeError("accepted PONI values are malformed")
+    config_text = assets["poni_detector_config_json"]
+    if (assets["poni_values"] is None) != (config_text is None):
+        raise TypeError("accepted PONI and detector config must be paired")
+    if config_text is not None:
+        try:
+            config = json.loads(config_text)
+            canonical = json.dumps(
+                config, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TypeError("accepted detector config is malformed") from exc
+        if (canonical != config_text or type(config) is not dict
+                or type(config.get("orientation")) is not int
+                or config["orientation"] not in range(1, 5)):
+            raise TypeError("accepted detector config is malformed")
     for key in ("poni_sha256", "mask_sha256"):
         digest = assets[key]
         if digest is not None and (

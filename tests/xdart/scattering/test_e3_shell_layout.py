@@ -82,14 +82,14 @@ def test_e3_ui1_has_one_reconciliation_boundary_and_emits_no_command(
         footer = tuple(
             frame
             for frame in state.navigation.frames
-            if frame.source_scan == current.source_scan
+            if frame.artifact == current.artifact
         )
         assert shell.browser.frame_model.frames is state.navigation.frames
         assert tuple(
             shell.scientific.frame_selector.itemData(index)
             for index in range(shell.scientific.frame_selector.count())
         ) == footer
-        assert shell.scientific.progress.text() == "1/2"
+        assert shell.scientific.progress.text() == "1/5"
         assert shell.run_controls.current_mode() == "Int 2D"
         assert shell.controls.profile is not None
     finally:

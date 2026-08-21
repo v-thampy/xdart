@@ -10,7 +10,7 @@ from typing import Any, Callable
 import numpy as np
 from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.scan import SourceKind, SourceSpec
-from xrd_tools.integrate.calibration import load_poni
+from xrd_tools.integrate.calibration import load_detector_calibration
 from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
 from xrd_tools.io.output_path import OVERWRITE_MODE, resolve_output_target
 from xrd_tools.io.output_safety import (
@@ -38,6 +38,8 @@ from .source_metadata import (
     ordered_motor_intersection,
     read_image_motor_metadata,
 )
+
+load_poni = load_detector_calibration
 
 
 class SourceRevisionChanged(ValueError):
@@ -225,6 +227,7 @@ class OutputCandidate:
             "poni_values": (
                 None if accepted.poni is None else accepted.poni.to_dict()
             ),
+            "poni_detector_config_json": accepted.poni_detector_config_json,
             "poni_sha256": accepted.poni_sha256,
             "mask_sha256": accepted.mask_sha256,
         }
@@ -3397,35 +3400,60 @@ def _validate_targets(
             container_directory_mode=type(source) is DirectorySourceSpec,
         )
 def _load_scientific_assets(intent: RunIntent) -> AcceptedScientificAssets:
-    poni, poni_digest = _load_stable_asset(intent.poni_file, load_poni)
+    calibration, poni_digest = _load_stable_asset(
+        intent.poni_file,
+        lambda path, data: load_poni(path, data=data)
+        if load_poni is load_detector_calibration else load_poni(path),
+        max_bytes=1 << 20,
+    )
     mask, mask_digest = _load_stable_asset(
         intent.mask_file,
-        lambda path: np.load(path) if path.suffix == ".npy" else load_mask(path),
+        lambda path, _data: np.load(path) if path.suffix == ".npy" else load_mask(path),
     )
+    poni = None if calibration is None else calibration.poni
     poni_values = None if poni is None else (
         float(poni.dist), float(poni.poni1), float(poni.poni2), float(poni.rot1),
         float(poni.rot2), float(poni.rot3), float(poni.wavelength),
         str(poni.detector),
     )
     accepted = None if mask is None else np.ascontiguousarray(mask)
+    config_json = None if calibration is None else json.dumps(
+        dict(calibration.detector_config), sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    )
     return AcceptedScientificAssets(
         poni_values, None if accepted is None else accepted.dtype.str,
         None if accepted is None else tuple(accepted.shape),
         None if accepted is None else accepted.tobytes(),
-        poni_digest, mask_digest,
+        poni_digest, mask_digest, config_json,
     )
 def _load_stable_asset(
-    path_text: object, loader: Callable[[Path], object],
+    path_text: object, loader: Callable[[Path, bytes], object],
+    *, max_bytes: int | None = None,
 ) -> tuple[object | None, str | None]:
     if type(path_text) is not str or not path_text:
         return None, None
     path = Path(path_text)
+    def observation() -> tuple[tuple[int, ...], bytes]:
+        state = path.stat()
+        with path.open("rb") as stream:
+            payload = stream.read() if max_bytes is None else stream.read(max_bytes + 1)
+        if max_bytes is not None and len(payload) > max_bytes:
+            raise ValueError(f"scientific asset exceeds {max_bytes} bytes: {path}")
+        return (
+            state.st_size, state.st_mtime_ns, state.st_ctime_ns,
+            state.st_dev, state.st_ino,
+        ), payload
     try:
-        before = path.read_bytes()
+        before_state, before = observation()
     except FileNotFoundError:
         return None, None
-    value = loader(path)
-    if path.read_bytes() != before:
+    value = loader(path, before)
+    try:
+        after_state, after = observation()
+    except FileNotFoundError as exc:
+        raise ValueError(f"scientific asset changed while admitted: {path}") from exc
+    if after_state != before_state or after != before:
         raise ValueError(f"scientific asset changed while admitted: {path}")
     return value, hashlib.sha256(before).hexdigest()
 def _external_members(

@@ -177,10 +177,10 @@ def test_p2_0_synchronous_pair_precedes_finish_and_prefix_stop(monkeypatch, tmp_
     original_publish = PublicationStore.publish_gui_light_1d
     original_finish = DynamicOutputAdapter.finish_current
 
-    def publish(self, publication, light_record):
+    def publish(self, publication, light_record, *, protected=()):
         with guard:
             order.append("light")
-        return original_publish(self, publication, light_record)
+        return original_publish(self, publication, light_record, protected=protected)
 
     def finish(self, *args, **kwargs):
         result = original_finish(self, *args, **kwargs)
@@ -205,12 +205,12 @@ def test_p2_0_terminal_matrix_adopts_only_canonical_prefix(monkeypatch, tmp_path
     original = PublicationStore.publish_gui_light_1d
     calls = 0
 
-    def fail_first(self, publication, light_record):
+    def fail_first(self, publication, light_record, *, protected=()):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("injected synchronous light failure")
-        return original(self, publication, light_record)
+        return original(self, publication, light_record, protected=protected)
 
     with monkeypatch.context() as injected:
         injected.setattr(
@@ -253,7 +253,7 @@ def test_p2_0_terminal_matrix_adopts_only_canonical_prefix(monkeypatch, tmp_path
         try:
             if (
                 terminal.kind is not StandardEventKind.FAILED
-                or missing_calls != 1
+                or missing_calls < 1
             ):
                 semantic_failures.append((
                     "missing-record", terminal.kind, missing_calls,

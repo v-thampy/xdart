@@ -225,6 +225,7 @@ def _accepted_admission(
         None,
         "tiny-poni",
         None,
+        "{\"orientation\":3}",
     )
     candidate = OutputCandidate.from_start_capture(capture, assets, ())
     selected = Path(capture.source_capture.source.options["selected_file"])

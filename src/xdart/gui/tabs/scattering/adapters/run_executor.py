@@ -11,7 +11,10 @@ from typing import Any, Callable, Mapping
 import numpy as np
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core.scan import SourceKind
-from xrd_tools.integrate.calibration import load_poni, poni_to_integrator
+from xrd_tools.integrate.calibration import (
+    detector_calibration_to_integrator,
+    load_detector_calibration,
+)
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
@@ -62,6 +65,10 @@ from .target_reservation import (
 from .dynamic_output import DynamicOutputAdapter, HeavyResidencyFact
 
 logger = logging.getLogger(__name__)
+
+# Preserve the established test-injection seam while production remains strict.
+load_poni = load_detector_calibration
+poni_to_integrator = detector_calibration_to_integrator
 
 _CONTAINER_READ_CHUNK_FRAMES = 8
 _SOURCE_PREFETCH_FRAMES = 4
@@ -1237,10 +1244,14 @@ class StandardRunExecutor:
                 run.source = open_source(source_spec)
             admission = None if run.resources is None else run.resources.admission
             assets = None if admission is None else admission.scientific_assets
-            poni = assets.poni if assets is not None else load_poni(configuration.poni_file)
-            if poni is None:
+            calibration = (
+                assets.detector_calibration
+                if assets is not None else load_poni(configuration.poni_file)
+            )
+            if calibration is None:
                 raise ValueError('accepted PONI asset is unavailable')
-            run.scan = run.source.to_scan(poni=poni, integrator=poni_to_integrator(poni), output_path=artifact)
+            poni = getattr(calibration, "poni", calibration)
+            run.scan = run.source.to_scan(poni=poni, integrator=poni_to_integrator(calibration), output_path=artifact)
         except SourceRevisionChanged:
             discard_source()
             raise

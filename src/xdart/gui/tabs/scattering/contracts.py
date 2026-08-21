@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from enum import Enum
+import json
 import math
 import os
 from pathlib import Path
@@ -760,13 +761,14 @@ class AcceptedScientificAssets:
     mask_bytes: bytes | None
     poni_sha256: str | None
     mask_sha256: str | None
+    poni_detector_config_json: str | None = None
 
     def __post_init__(self) -> None:
         values = self.poni_values
         if values is not None and not (
                 type(values) is tuple and len(values) == 8
                 and all(type(value) is float and math.isfinite(value) for value in values[:7])
-                and type(values[7]) is str):
+                and values[0] > 0 and values[6] >= 0 and type(values[7]) is str):
             raise TypeError("accepted PONI is invalid")
         parts = self.mask_dtype, self.mask_shape, self.mask_bytes
         if any(value is not None for value in parts) and not (
@@ -777,11 +779,33 @@ class AcceptedScientificAssets:
         if not all(value is None or type(value) is str
                    for value in (self.poni_sha256, self.mask_sha256)):
             raise TypeError("accepted scientific assets are invalid")
+        config_text = self.poni_detector_config_json
+        if (values is None) != (config_text is None):
+            raise TypeError("accepted PONI and detector config must be paired")
+        if config_text is not None:
+            try:
+                config = json.loads(config_text)
+                canonical = json.dumps(
+                    config, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise TypeError("accepted detector config is invalid") from exc
+            orientation = config.get("orientation") if type(config) is dict else None
+            if (canonical != config_text or type(orientation) is not int
+                    or orientation not in range(1, 5)):
+                raise TypeError("accepted detector config is not canonical")
 
     @property
     def poni(self) -> object | None:
         from xrd_tools.core.containers import PONI
         return None if self.poni_values is None else PONI(*self.poni_values)
+
+    @property
+    def detector_calibration(self) -> object | None:
+        from xrd_tools.core.geometry.diffractometer import DetectorCalibration
+        return None if self.poni_values is None else DetectorCalibration(
+            self.poni, json.loads(self.poni_detector_config_json),
+        )
 
     @property
     def mask(self) -> np.ndarray | None:

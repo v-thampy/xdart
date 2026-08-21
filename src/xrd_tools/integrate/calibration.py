@@ -4,7 +4,7 @@ Calibration helpers bridging ``xrd_tools`` containers and pyFAI.
 
 from __future__ import annotations
 
-import logging
+import inspect, json, logging, math, os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from pyFAI.detectors import Detector
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
     from pyFAI.integrator.fiber import FiberIntegrator
+    from xrd_tools.core.geometry.diffractometer import DetectorCalibration
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,91 @@ def load_poni(path: Path | str) -> PONI:
         wavelength=0.0 if wl is None else float(wl),
         detector=str(detector_name or ""),
     )
+
+
+def load_detector_calibration(
+    path: Path | str, *, data: bytes | None = None,
+) -> DetectorCalibration:
+    """Strictly load a bounded PONI 2.x file without losing detector config."""
+    from pyFAI.detectors import ALL_DETECTORS
+    from pyFAI.io.ponifile import PoniFile
+    from xrd_tools.core.geometry.diffractometer import DetectorCalibration
+
+    if data is None:
+        with open(_as_path(path), "rb") as stream:
+            data = stream.read((1 << 20) + 1)
+    if not data or len(data) > (1 << 20):
+        raise ValueError("PONI must be nonempty and no larger than 1 MiB")
+    text = data.decode("utf-8", errors="strict")
+    allowed = {"poni_version", "detector", "detector_config", "distance", "dist", "poni1",
+               "poni2", "rot1", "rot2", "rot3", "wavelength"}
+    raw: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line: raise ValueError("malformed noncomment PONI line")
+        key, value = line.split(":", 1)
+        key = key.strip().casefold()
+        if not key or key in raw or key not in allowed: raise ValueError("duplicate or unsupported PONI key")
+        raw[key] = value.strip()
+    if "distance" in raw and "dist" in raw: raise ValueError("duplicate PONI distance")
+    def no_duplicate_json(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs): raise ValueError("duplicate detector-config key")
+        return result
+    try:
+        version = float(raw["poni_version"])
+        config = json.loads(raw["detector_config"], object_pairs_hook=no_duplicate_json,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid PONI version or detector config") from exc
+    if version not in {2.0, 2.1} or type(config) is not dict: raise ValueError(
+        "only configured PONI 2 and 2.1 are supported")
+    if version == 2.1 and "orientation" not in config: raise ValueError("PONI 2.1 requires detector orientation")
+    config.setdefault("orientation", 3)
+    if type(config["orientation"]) is not int or config["orientation"] not in range(1, 5):
+        raise ValueError("detector orientation must be an integer from 1 through 4")
+    json.dumps(config, allow_nan=False)
+    name = raw.get("detector", "").strip()
+    unsafe_name = (not name or any(mark in name for mark in ("\0", "/", "\\", "://"))
+                   or len(name) > 1 and name[0].isalpha() and name[1] == ":"
+                   or os.path.exists(name))
+    folded = name.casefold()
+    detector_class = (ALL_DETECTORS.get(folded) or ALL_DETECTORS.get(
+        folded.replace(" ", "_")) or ALL_DETECTORS.get(folded.replace(" ", "")))
+    if unsafe_name or detector_class is None: raise ValueError("detector must be a simple registered name")
+    constructor_keys = set(inspect.getfullargspec(detector_class).args) - {"self"}
+    if not set(config) <= constructor_keys | {"binning"} or any(
+        token in key.casefold() for key in config for token in
+        ("spline", "file", "path", "uri", "url")
+    ): raise ValueError("detector configuration contains an unsafe key")
+    def pathlike(value) -> bool:
+        if type(value) is str:
+            return True
+        items = value.values() if type(value) is dict else value if type(value) is list else ()
+        return any(pathlike(item) for item in items)
+    if pathlike(config): raise ValueError("detector configuration contains a path-like value")
+    mapping = dict(raw, poni_version=version, detector=name, detector_config=config)
+    pf = PoniFile(mapping)
+    detector = pf.detector
+    values = (pf.dist, pf.poni1, pf.poni2, pf.rot1, pf.rot2, pf.rot3)
+    wavelength = 0.0 if pf.wavelength is None else float(pf.wavelength)
+    try: geometry = tuple(float(value) for value in values)
+    except (TypeError, ValueError) as exc: raise ValueError("PONI geometry is incomplete") from exc
+    if not all(map(math.isfinite, (*geometry, wavelength))) or geometry[0] <= 0 or wavelength < 0: raise ValueError(
+        "PONI geometry is non-finite or out of range")
+    poni = PONI(*geometry, wavelength, detector.__class__.__name__)
+    calibration = DetectorCalibration(poni, detector.get_config())
+    normalized = dict(calibration.detector_config)
+    json.dumps(normalized, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if any(key not in normalized or json.dumps(normalized[key], sort_keys=True) != json.dumps(value, sort_keys=True) for key, value in config.items()): raise ValueError(
+        "detector configuration did not survive construction")
+    rebuilt = detector_calibration_to_integrator(calibration).detector
+    identity = lambda item: (type(item), item.shape, item.max_shape, item.pixel1,
+        item.pixel2, int(item.orientation),
+        DetectorCalibration(poni, item.get_config()).to_json())
+    if identity(detector) != identity(rebuilt): raise ValueError("detector configuration did not survive reconstruction")
+    return calibration
 
 
 def save_poni(poni: PONI, path: Path | str) -> None:
@@ -282,6 +368,7 @@ __all__ = [
     "get_detector",
     "get_detector_mask",
     "load_poni",
+    "load_detector_calibration",
     "poni_to_fiber_integrator",
     "poni_to_integrator",
     "save_poni",
