@@ -144,6 +144,96 @@ def test_thumbnail_preview_opens_processed_once_and_never_reads_detector(
         assert array.flags.writeable is False
 
 
+def test_raw_absent_thumbnail_preview_keeps_portable_projection(
+    tmp_path, monkeypatch
+):
+    processed, raw_path = _write_processed(tmp_path, thumbnail=True)
+    raw_path.unlink()
+    counts = _instrument_reads(monkeypatch, processed)
+    result = _api().read_frame_preview(
+        _read_key(processed, _hydration().HydrationPurpose.PREVIEW)
+    )
+
+    assert counts == {"processed": 1, "detector": 0, "detector_paths": []}
+    assert result.thumbnail is not None and result.raw is None
+    assert result.detector_diagnostic is None
+    assert (result.raw_locator, result.source_base) == (
+        "raw/image.tif", str(tmp_path)
+    )
+    assert (result.view.source_path, result.view.source_frame_index) == (
+        "raw/image.tif", 0
+    )
+    assert result.view.intensity_1d.flags.writeable is False
+    assert result.view.intensity_2d.flags.writeable is False
+
+
+def test_flattened_basename_preview_uses_exact_resolver_winner(
+    tmp_path, monkeypatch
+):
+    processed, raw_path = _write_processed(tmp_path, thumbnail=True)
+    first = processed.parent / raw_path.name
+    raw_path.replace(first)
+    counts = _instrument_reads(monkeypatch, processed)
+    api = _api()
+    result = api.read_frame_preview(
+        _read_key(processed, _hydration().HydrationPurpose.PREVIEW)
+    )
+
+    assert counts == {"processed": 1, "detector": 0, "detector_paths": []}
+    assert result.thumbnail is not None and result.raw is None
+    assert result.raw_locator == "raw/image.tif"
+    assert result.source_base == str(tmp_path)
+    assert result.view.source_path == str(first.resolve())
+    assert api._source_projection_matches(
+        result.raw_locator,
+        result.view.source_path,
+        source_base=result.source_base,
+        artifact=processed,
+    ) == (True, False)
+
+    later = processed.parent.parent / first.name
+    shutil.copy2(first, later)
+    assert api._source_projection_matches(
+        result.raw_locator,
+        str(later.resolve()),
+        source_base=result.source_base,
+        artifact=processed,
+    ) == (False, False)
+
+    weak_raw = np.ones((2, 2))
+    weak_raw.setflags(write=False)
+    with pytest.raises(ValueError, match="raw provenance"):
+        replace(
+            result,
+            read_key=_read_key(processed, _hydration().HydrationPurpose.FULL),
+            raw=weak_raw,
+            detector_diagnostic=None,
+        )
+
+
+def test_symlinked_project_preview_uses_canonical_resolver_truth(
+    tmp_path, monkeypatch
+):
+    real = tmp_path / "real"
+    alias = tmp_path / "alias"
+    real.mkdir()
+    try:
+        alias.symlink_to(real, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink unavailable: {error}")
+    processed, raw_path = _write_processed(alias, thumbnail=True)
+    counts = _instrument_reads(monkeypatch, processed)
+    result = _api().read_frame_preview(
+        _read_key(processed, _hydration().HydrationPurpose.PREVIEW)
+    )
+
+    assert counts == {"processed": 1, "detector": 0, "detector_paths": []}
+    assert result.thumbnail is not None and result.raw is None
+    assert result.raw_locator == "raw/image.tif"
+    assert result.source_base == str(alias)
+    assert result.view.source_path == str(raw_path.resolve())
+
+
 def test_no_thumbnail_preview_never_reads_detector_and_reports_missing_thumbnail(
     tmp_path, monkeypatch
 ):
@@ -685,17 +775,19 @@ def _preview_result(
     )
 
 
-def test_frame_preview_accepts_complete_purpose_truth_table():
+def test_frame_preview_accepts_complete_purpose_truth_table(tmp_path):
     purpose = _hydration().HydrationPurpose
     assert _preview_result(purpose.ONE_D).raw is None
     assert _preview_result(purpose.PREVIEW, thumbnail=True).raw is None
     assert _preview_result(
         purpose.PREVIEW, diagnostic="stored thumbnail unavailable"
     ).detector_diagnostic
+    raw_path = tmp_path / "image.tif"
+    tifffile.imwrite(raw_path, np.ones((2, 2), dtype=np.uint16))
     assert _preview_result(
         purpose.FULL,
         raw=True,
-        locator="/raw/image.tif",
+        locator=str(raw_path.resolve()),
         source_index=0,
     ).raw is not None
     assert _preview_result(
@@ -812,7 +904,6 @@ def test_frame_preview_result_rejects_malformed_fields_and_label_aliases(
         {"raw_locator": "/different/raw.tif"},
         {"view": replace(valid.view, source_path=str(tmp_path / "wrong" / "raw" / "image.tif"))},
         {"source_frame_index": 1},
-        {"view": replace(valid.view, source_path=valid.raw_locator)},
         {"raw_dataset_path": 3},
         {"source_frame_index": -1},
         {"source_frame_index": True},
@@ -825,6 +916,66 @@ def test_frame_preview_result_rejects_malformed_fields_and_label_aliases(
     for changes in malformed:
         with pytest.raises((TypeError, ValueError)):
             replace(valid, **changes)
+
+
+def test_projection_guard_requires_exact_first_winner_and_native_spelling(
+    tmp_path, monkeypatch
+):
+    later_root = tmp_path / "later"
+    processed, later_raw = _write_processed(later_root, thumbnail=True)
+    first_root = tmp_path / "first"
+    first_raw = first_root / "raw" / later_raw.name
+    first_raw.parent.mkdir(parents=True)
+    shutil.copy2(later_raw, first_raw)
+    with h5py.File(processed, "r+") as handle:
+        handle["entry"].attrs["source_base"] = str(first_root)
+
+    api = _api()
+    purpose = _hydration().HydrationPurpose
+    valid = api.read_frame_preview(_read_key(processed, purpose.PREVIEW))
+    assert valid.view.source_path == str(first_raw.resolve())
+    with pytest.raises(ValueError, match="raw provenance"):
+        replace(
+            valid,
+            view=replace(valid.view, source_path=str(later_raw.resolve())),
+        )
+
+    monkeypatch.setattr(
+        api,
+        "resolve_source_master",
+        lambda *args, **kwargs: Path("C:/project/raw/image.tif"),
+    )
+    native_spelling = replace(
+        valid,
+        view=replace(valid.view, source_path="C:/project/raw/image.tif"),
+    )
+    assert native_spelling.view.source_path == "C:/project/raw/image.tif"
+
+    def resolver_failure(*args, **kwargs):
+        raise OSError("resolver unavailable")
+
+    monkeypatch.setattr(api, "resolve_source_master", resolver_failure)
+    with pytest.raises(ValueError, match="raw provenance"):
+        replace(valid, view=replace(valid.view, source_path=valid.raw_locator))
+    monkeypatch.undo()
+
+    with pytest.raises(ValueError, match="raw provenance"):
+        replace(valid, raw_locator="raw/../raw/image.tif")
+    with pytest.raises(ValueError, match="raw provenance"):
+        replace(valid, source_frame_index=1)
+
+    weak_raw = np.ones((2, 2))
+    weak_raw.setflags(write=False)
+    weak_locator = "absent/unique-image.tif"
+    with pytest.raises(ValueError, match="raw provenance"):
+        replace(
+            valid,
+            read_key=_read_key(processed, purpose.FULL),
+            view=replace(valid.view, source_path=weak_locator),
+            raw=weak_raw,
+            raw_locator=weak_locator,
+            detector_diagnostic=None,
+        )
 
 
 def test_preview_value_fields_and_scientific_import_boundary_are_exact():

@@ -16,23 +16,27 @@ def _check(condition, message, error=TypeError):
         raise error(message)
 def _source_projection_matches(locator, projected, *, source_base, artifact):
     if locator is None or projected is None:
-        return locator is projected
+        return locator is projected, False
     stored_text = locator.replace("\\", "/")
-    shown = PurePosixPath(projected.replace("\\", "/"))
+    projected_text = projected.replace("\\", "/")
     stored = PurePosixPath(stored_text)
-    drive_absolute = len(stored_text) >= 3 and stored_text[1:3] == ":/"
-    if stored.is_absolute() or drive_absolute:
-        return stored == shown
-    if not shown.is_absolute():
-        return False
-    artifact_path = PurePosixPath(str(artifact).replace("\\", "/"))
-    roots = (source_base, str(artifact_path.parent),
-             str(artifact_path.parent.parent))
-    return any(
-        root is not None
-        and PurePosixPath(root.replace("\\", "/")) / stored == shown
-        for root in roots
-    )
+    if ".." in stored.parts:
+        return False, False
+    try:
+        strong = resolve_source_master(
+            locator, scan_file=artifact, source_base=source_base,
+            allow_basename_fallbacks=False,
+        )
+        if strong is not None:
+            return str(strong).replace("\\", "/") == projected_text, True
+        weak = resolve_source_master(
+            locator, scan_file=artifact, source_base=source_base,
+        )
+    except Exception:
+        return False, False
+    if weak is not None:
+        return str(weak).replace("\\", "/") == projected_text, False
+    return stored_text == projected_text, False
 @dataclass(frozen=True, slots=True)
 class DetectorPreviewProjection:
     mask_available: bool
@@ -104,12 +108,15 @@ class FramePreview:
         _check(type(self.detector_fallback_used) is bool, "detector_fallback_used must be an exact bool")
         _check(self.detector_diagnostic is None or (type(self.detector_diagnostic) is str and bool(self.detector_diagnostic)), "detector_diagnostic must be nonempty or None")
         _check(self.thumbnail is self.view.thumbnail, "thumbnail must be the exact view thumbnail", ValueError)
+        projection = _source_projection_matches(
+            self.raw_locator, self.view.source_path,
+            source_base=self.source_base,
+            artifact=self.read_key.artifact_identity,
+        )
         _check(
-            _source_projection_matches(
-                self.raw_locator, self.view.source_path,
-                source_base=self.source_base,
-                artifact=self.read_key.artifact_identity,
-            ) and self.source_frame_index == self.view.source_frame_index,
+            projection[0]
+            and self.source_frame_index == self.view.source_frame_index
+            and (self.raw is None or projection[1]),
             "raw provenance must match the exact view", ValueError,
         )
         purpose, has_raw = self.read_key.purpose, self.raw is not None

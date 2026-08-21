@@ -2469,6 +2469,43 @@ def test_cold_browse_evicted_frame_rehydrates_its_exact_store(
     assert transport.worker is None or not transport.worker.is_alive()
 
 
+def test_cold_browse_raw_absent_thumbnail_rehydrates(monkeypatch, tmp_path):
+    controller, browse, processed = _adopted_cold_browse(tmp_path)
+    key = _browse_key(controller, 1)
+    raw_path = tmp_path / "raw" / "image.tif"
+    raw_path.unlink()
+    assert browse.publication_store.get(1) is None
+    counts = _instrument_reads(monkeypatch, processed)
+
+    assert controller.project(key) is None
+    transport = controller._browse_hydration_owner.transport
+    assert transport is not None
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if transport.queued_token is None and transport.active_token is None:
+            break
+        time.sleep(0.005)
+
+    payload = controller.project(key)
+    assert payload is not None and payload.frame_key is key
+    assert payload.view.thumbnail is not None
+    assert (payload.view.source_path, payload.view.source_frame_index) == (
+        "raw/image.tif", 0
+    )
+    restored = browse.publication_store.get(1)
+    assert restored is not None and restored.view.thumbnail is not None
+    assert restored.view.intensity_1d is not None
+    assert (restored.view.source_path, restored.view.source_frame_index) == (
+        "raw/image.tif", 0
+    )
+    assert counts["processed"] == 1 and counts["detector"] == 0
+    assert transport.counters()[HydrationOutcome.HYDRATED] >= 1
+
+    receipt = controller.close()
+    assert receipt.cleanup_status.value == "cleaned"
+    assert transport.retains_gate(browse.commit_gate) is False
+
+
 def test_cold_browse_no_thumbnail_exact_read_terminalizes_once(
     monkeypatch, tmp_path
 ):
