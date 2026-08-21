@@ -5,7 +5,8 @@ product default. This factory constructs the real ``ScatteringWorkspace`` with
 its production services and returns a typed ``PageHandle`` whose ports map the
 page truthfully — Open/Run/Stop and write-mode changes dispatch through the
 page's single command owner, run activity comes from the coordinator phase,
-application menus mount onto the page's own Config/Help hosts, and close uses
+application menus mount onto the page's own Config/Help hosts, activity joins
+run and page-operation ownership, and close uses
 ``close_workspace()``'s cleanup receipt (CLEANED is authoritatively CLEAN).
 Capabilities the page has no surface for
 (slice pin, settings I/O) are absent so the host disables those actions. The
@@ -59,18 +60,25 @@ class _WorkspaceMenus:
 
 @dataclass(frozen=True, slots=True)
 class _WorkspaceActivity:
-    """Truthful run activity from the one lifecycle owner's phase."""
+    """Truthful activity from the lifecycle and page-operation owners."""
 
     lifecycle: object
+    operation: object
 
     def active(self) -> bool:
         from xdart.gui.tabs.scattering.state_machine import RunPhase
 
         try:
             phase = self.lifecycle.phase
+            operation_owned = self.operation.owned
         except Exception:
             return True
-        return phase not in (RunPhase.IDLE, RunPhase.FAILED, RunPhase.CLOSED)
+        if type(operation_owned) is not bool:
+            return True
+        return (
+            phase not in (RunPhase.IDLE, RunPhase.FAILED, RunPhase.CLOSED)
+            or operation_owned
+        )
 
 
 @dataclass(slots=True)
@@ -319,6 +327,6 @@ def build_scattering_workspace(
         open_folder=_WorkspaceOpenFolder(widget),
         run_control=_WorkspaceRunControl(widget),
         write_mode=_WorkspaceWriteMode(widget),
-        activity=_WorkspaceActivity(lifecycle),
+        activity=_WorkspaceActivity(lifecycle, widget._operation_slot),
         app_menus=_WorkspaceMenus(widget),
     )

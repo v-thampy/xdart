@@ -33,6 +33,7 @@ from xrd_tools.sources.selection import (
 from xdart.utils.browse import browse_start_dir, remember_browse_path
 from .advanced_editor import AdvancedSettingsDialog
 from .adapters.browse_loader import BrowseLoader
+from .adapters.external_operation import OperationSlot
 from .browser_catalog import (
     BrowserCatalogEntry,
     DirectoryModifiedCache,
@@ -124,6 +125,10 @@ from .performance_diagnostics import (
     PerformanceDiagnosticsDialog,
     PerformanceDiagnosticsValues,
     performance_diagnostics_error,
+)
+from .operation_values import (
+    OperationContextStamp,
+    OperationIdentity,
 )
 from .start_outcomes import (
     RecoveryFailure,
@@ -457,6 +462,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browse_loader=self._browse_loader,
             projection=self._context_projection,
         )
+        self._operation_slot = OperationSlot()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -499,6 +505,36 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._request_observation(initial)
         self._request_browser_catalog()
         self._browser_catalog_timer.start()
+
+    def _operation_context_stamp(
+        self, revision: int | None = None
+    ) -> OperationContextStamp:
+        if revision is None:
+            revision = self._intents.snapshot().revision
+        selection = self._context_controller.selection
+        return OperationContextStamp(
+            revision,
+            None if selection is None else selection.context_token,
+            None if selection is None else selection.display_generation,
+        )
+
+    def _observe_operation_stamp(self, revision: int | None = None) -> None:
+        slot = getattr(self, "_operation_slot", None)
+        if slot is None:
+            return
+        slot.observe_stamp(
+            ScatteringWorkspace._operation_context_stamp(self, revision)
+        )
+
+    def _begin_operation(
+        self, frozen: object, body: Callable[..., object]
+    ) -> OperationIdentity | None:
+        identity = self._operation_slot._begin(
+            frozen, self._operation_context_stamp(), body
+        )
+        if identity is not None:
+            self._ensure_timer()
+        return identity
 
     @property
     def _admission(self) -> AdmissionToken | None:
@@ -562,6 +598,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or self._lifecycle.active_run_identity
                 or self._lifecycle.attempt_run_identity
             )
+
+        operation_slot = getattr(self, "_operation_slot", None)
+        try:
+            operation_close = (
+                None if operation_slot is None else operation_slot.close()
+            )
+            operation_clean = (
+                operation_slot is None
+                or operation_close.cleanup_status is CleanupStatus.CLEANED
+            )
+        except Exception:
+            operation_clean = False
 
         if (not self._clear_viewer_1d_renderer(close=True)
                 or not self._clear_viewer_2d_renderer(close=True)
@@ -673,6 +721,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         components_clean = (
             admission_clean
+            and operation_clean
             and browse.cleanup_status is CleanupStatus.CLEANED
             and executor_clean
             and not self._close_source_pending
@@ -760,6 +809,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._closed = True
 
     def _handle_shell_command(self, command: object) -> None:
+        ScatteringWorkspace._observe_operation_stamp(self)
         if (
             self._closing
             or self._closed
@@ -1613,6 +1663,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._batch_latest_frame = None
                 changed = True
 
+        operation_slot = getattr(self, "_operation_slot", None)
+        operation_identity = (
+            None
+            if operation_slot is None
+            else operation_slot.current_identity
+        )
+        if operation_identity is not None:
+            ScatteringWorkspace._observe_operation_stamp(self)
+            operation_slot.poll(operation_identity)
+
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
         )
@@ -1803,6 +1863,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
 
     def _polling_needed(self) -> bool:
+        operation_slot = getattr(self, "_operation_slot", None)
+        try:
+            if operation_slot is not None and operation_slot.owned:
+                return True
+        except Exception:
+            return True
         if (
             self._admission is not None
             or getattr(self._context_controller, "viewer_1d_loading", False)
@@ -3196,6 +3262,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._cancel_observation()
             self._request_observation(current)
         self._retry_deferred_gi_motor_default()
+        ScatteringWorkspace._observe_operation_stamp(self, current.revision)
 
     def _choose_directory_dialog(
         self,

@@ -242,9 +242,31 @@ def test_activity_maps_every_run_phase_truthfully():
     from xdart.gui.tabs.scattering.state_machine import RunPhase
 
     quiet = {RunPhase.IDLE, RunPhase.FAILED, RunPhase.CLOSED}
+    operation = SimpleNamespace(owned=False)
     for phase in RunPhase:
-        port = _WorkspaceActivity(SimpleNamespace(phase=phase))
+        port = _WorkspaceActivity(SimpleNamespace(phase=phase), operation)
         assert port.active() is (phase not in quiet), phase
+
+
+def test_activity_includes_operation_owner_and_fails_closed():
+    from types import SimpleNamespace
+
+    from xdart.gui.pages.scattering_workspace import _WorkspaceActivity
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    lifecycle = SimpleNamespace(phase=RunPhase.IDLE)
+    assert _WorkspaceActivity(
+        lifecycle, SimpleNamespace(owned=False)
+    ).active() is False
+    assert _WorkspaceActivity(
+        lifecycle, SimpleNamespace(owned=True)
+    ).active() is True
+    assert _WorkspaceActivity(
+        SimpleNamespace(), SimpleNamespace(owned=False)
+    ).active() is True
+    assert _WorkspaceActivity(
+        lifecycle, SimpleNamespace(owned="unknown")
+    ).active() is True
 
 
 def test_close_receipt_maps_cleanup_status_authoritatively():
