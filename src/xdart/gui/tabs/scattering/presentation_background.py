@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from threading import Lock
 import numpy as np
 
+from xrd_tools.core.metadata import resolve_monitor_norm
 from xrd_tools.reduction.background import (
     DisplayBackgroundPlan, DisplayBackgroundResult, run_display_background,
 )
@@ -19,11 +20,16 @@ def _immutable_copy(array: np.ndarray) -> np.ndarray:
     return copied
 
 
-def prepare_background_plan(payloads, domain: str, current):
-    """Freeze exact selected payload identities without retaining them."""
-    if domain not in {"raw", "integrated_1d", "integrated_2d"} or not payloads:
+def prepare_background_plan(payloads, domain: str, current, *,
+                            contributor_count=None, norm_channel: str = ""):
+    """Freeze contributors separately from every exact renderer target."""
+    if (domain not in {"raw", "integrated_1d", "integrated_2d"} or not payloads
+            or type(norm_channel) is not str):
         return None
-    contributors, units, keys, identities = [], [], [], []
+    count = len(payloads) if contributor_count is None else contributor_count
+    if type(count) is not int or not 1 <= count <= len(payloads):
+        return None
+    items, units, identities = [], [], []
     for payload in payloads:
         view, frame = payload.view, payload.frame_key
         if domain == "raw":
@@ -41,9 +47,12 @@ def prepare_background_plan(payloads, domain: str, current):
                          (f"{y_axis.label}\0{y_axis.unit}",
                           f"{x_axis.label}\0{x_axis.unit}"))
         if any(type(array) is not np.ndarray for array in item):
-            return None
-        contributors.append(item); units.append(row_units); keys.append(id(frame))
+            items.append(None); units.append(row_units); identities.append(""); continue
+        items.append(item); units.append(row_units)
         identities.append(f"{frame.source_scan}\0{frame.artifact}\0{frame.local_frame_label}\0{id(frame)}")
+    contributors = items[:count]
+    if any(item is None for item in contributors):
+        return None
     try:
         current_index = next(index for index, payload in enumerate(payloads)
                              if payload.frame_key is current)
@@ -54,13 +63,36 @@ def prepare_background_plan(payloads, domain: str, current):
         for item in contributors[1:]))
     try:
         plan = DisplayBackgroundPlan(
-            domain, tuple(identities), tuple(item[0].shape for item in contributors),
+            domain, tuple(identities[:count]), tuple(item[0].shape for item in contributors),
             tuple(tuple(axis.shape for axis in item[1:]) for item in contributors),
-            tuple(units), differing)
+            tuple(units[:count]), differing)
     except (TypeError, ValueError):
         return None
-    indices = tuple(range(len(contributors))) if domain == "integrated_1d" else (current_index,)
-    return plan, tuple(contributors), tuple(keys[index] for index in indices), indices
+    indices = tuple(range(len(items))) if domain == "integrated_1d" else (current_index,)
+    keys, targets, facts = [], [], []
+    for index in indices:
+        item = items[index]
+        if item is None:
+            if index < count: return None
+            continue
+        divisor = 1.0
+        if domain == "integrated_1d" and norm_channel:
+            resolved = resolve_monitor_norm(payloads[index].view.metadata_numeric, norm_channel)
+            if resolved is None:
+                if index < count: return None
+                continue
+            divisor = float(resolved)
+        if domain == "integrated_1d" and units[index] != plan.axis_units[0]:
+            return None
+        frame = payloads[index].frame_key
+        keys.append(id(frame)); targets.append(
+            (*item, divisor) if domain == "integrated_1d" else item)
+        facts.append((id(frame), item[0].shape,
+                      tuple(axis.shape for axis in item[1:]), units[index], divisor))
+    if not targets:
+        return None
+    return (plan, tuple(contributors), tuple(keys), tuple(targets),
+            (norm_channel, tuple(facts)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,17 +170,25 @@ class PresentationBackgroundOwner:
         self, plan: DisplayBackgroundPlan,
         contributors: tuple[tuple[np.ndarray, ...], ...],
         *, stamp: OperationContextStamp, active_key: tuple[object, ...],
-        projection_keys: tuple[int, ...], projection_indices: tuple[int, ...],
+        projection_keys: tuple[int, ...], projection_indices: tuple[int, ...] = (),
+        projection_shapes: tuple[tuple[int, ...], ...] = (),
     ) -> int | None:
         if (type(plan) is not DisplayBackgroundPlan
                 or type(stamp) is not OperationContextStamp
                 or type(active_key) is not tuple
                 or type(projection_keys) is not tuple
                 or type(projection_indices) is not tuple
-                or len(projection_keys) != len(projection_indices)
-                or not projection_indices
-                or any(type(index) is not int or index < 0
-                       or index >= len(contributors) for index in projection_indices)):
+                or type(projection_shapes) is not tuple):
+            return None
+        if projection_shapes:
+            if (projection_indices or len(projection_keys) != len(projection_shapes)
+                    or any(type(shape) is not tuple or not shape
+                           or any(type(part) is not int or part <= 0 for part in shape)
+                           for shape in projection_shapes)):
+                return None
+        elif (len(projection_keys) != len(projection_indices) or not projection_indices
+              or any(type(index) is not int or index < 0
+                     or index >= len(contributors) for index in projection_indices)):
             return None
         try:
             plan.__post_init__(); stamp.__post_init__()
@@ -167,8 +207,9 @@ class PresentationBackgroundOwner:
             x = (0 if plan.domain == "raw" else
                  8 * shape[0] if plan.domain == "integrated_1d" else
                  8 * (shape[0] + shape[1]))
-            projection_shapes = tuple(plan.value_shapes[index]
-                                      for index in projection_indices)
+            if not projection_shapes:
+                projection_shapes = tuple(plan.value_shapes[index]
+                                          for index in projection_indices)
             d_bytes = 8 * sum(int(np.prod(item)) for item in projection_shapes)
             q = c_bytes + (32 + 8 * int(plan.differing_grid_1d)) * v + x + d_bytes + 589_824
         except (TypeError, ValueError, OverflowError):
@@ -236,7 +277,11 @@ class PresentationBackgroundOwner:
         try:
             for target, shape in zip(targets, shapes, strict=True):
                 source = target[0]
-                if type(source) is not np.ndarray or source.shape != shape:
+                divisor = target[2] if result.domain == "integrated_1d" and len(target) == 3 else None
+                if (type(source) is not np.ndarray or source.shape != shape
+                        or result.domain == "integrated_1d"
+                        and (type(divisor) is not float or not np.isfinite(divisor)
+                             or divisor <= 0.0)):
                     raise ValueError("display target changed shape")
                 owner = np.empty(shape, dtype=np.float64)
                 flat = owner.reshape(-1); source_flat = source.reshape(-1)
@@ -249,6 +294,8 @@ class PresentationBackgroundOwner:
                         np.subtract(source_flat[start:stop], background, out=flat[start:stop])
                 else:
                     np.subtract(source, result.values, out=owner, casting="unsafe")
+                if result.domain == "integrated_1d":
+                    np.divide(owner, divisor, out=owner)
                 owner.setflags(write=False); displayed.append(owner)
         except BaseException:
             return False

@@ -708,7 +708,7 @@ class ContextController:
         )
 
     def project_background_contributors(
-        self,
+        self, pins=(),
     ) -> tuple[StandardDisplayPayload, ...]:
         if self._closed:
             return ()
@@ -716,6 +716,7 @@ class ContextController:
             self._projection,
             self._browse_hydration_owner,
             self._viewer_1d,
+            pins=pins,
         )
 
     def reseed_background_projection(self) -> None:

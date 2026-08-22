@@ -109,6 +109,7 @@ from .shell_projection import (
     share_plot_axis_for_image,
 )
 from .scientific_axes import (
+    resolve_norm_presentation,
     slice_recipe_axes_compatible,
     slice_region_orientation,
 )
@@ -552,10 +553,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _background_domain(mode: str) -> str | None:
         return {"Int 1D": "integrated_1d", "Int 2D": "integrated_2d", "1D Viewer": "integrated_1d", "2D Viewer": "raw"}.get(mode)
 
-    def _background_key(self, plan, stamp, mode: str, keys) -> tuple[object, ...]:
+    def _background_key(self, plan, stamp, mode: str, target_facts) -> tuple[object, ...]:
         return (stamp.context_token, stamp.display_generation, plan.domain, mode,
                 "raw" if plan.domain == "raw" else "integrated",
-                plan.contributor_ids, plan.value_shapes, plan.axis_shapes, keys)
+                plan.contributor_ids, plan.value_shapes, plan.axis_shapes, target_facts)
 
     def _background_action(self) -> None:
         owner, slot = self._background_owner, self._operation_slot
@@ -567,17 +568,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell(); return
         mode = self._intents.snapshot().thaw().processing_mode
         domain = self._background_domain(mode)
-        payloads = self._context_controller.project_background_contributors()
+        controller = self._context_controller; selected = controller.navigation.selected
+        payloads = controller.project_background_contributors(self._preferences.slice_pins)
+        norm_channel = resolve_norm_presentation(
+            controller.norm_aggregate, self._preferences.norm_channel, selected)[2]
         prepared = None if domain is None else prepare_background_plan(
-            payloads, domain, self._context_controller.navigation.current)
+            payloads, domain, controller.navigation.current,
+            contributor_count=len(selected), norm_channel=norm_channel)
         if prepared is None:
             self._notice("Select at least one display frame before setting background.")
             self._refresh_shell(); return
-        plan, contributors, keys, indices = prepared
+        plan, contributors, keys, targets, target_facts = prepared
         stamp = self._operation_context_stamp()
-        active_key = self._background_key(plan, stamp, mode, keys)
+        active_key = self._background_key(plan, stamp, mode, target_facts)
         reservation = owner.reserve(plan, contributors, stamp=stamp,
-            active_key=active_key, projection_keys=keys, projection_indices=indices)
+            active_key=active_key, projection_keys=keys,
+            projection_shapes=tuple(target[0].shape for target in targets))
         if reservation is None:
             self._notice("Display background exceeds its standalone 512 MiB workspace.")
             self._refresh_shell(); return
@@ -600,12 +606,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Display background cancelled." if terminal.status is OperationTerminalStatus.CANCELLED
                          else "Display background was not adopted."); return True
         mode = self._intents.snapshot().thaw().processing_mode
+        controller = self._context_controller; selected = controller.navigation.selected
+        norm_channel = resolve_norm_presentation(
+            controller.norm_aggregate, self._preferences.norm_channel, selected)[2]
         prepared = prepare_background_plan(
-            self._context_controller.project_background_contributors(),
-            receipt.domain, self._context_controller.navigation.current)
+            controller.project_background_contributors(self._preferences.slice_pins),
+            receipt.domain, controller.navigation.current,
+            contributor_count=len(selected), norm_channel=norm_channel)
         valid = prepared is not None and self._background_key(
-            prepared[0], self._operation_context_stamp(), mode, prepared[2]) == receipt.active_key
-        targets = () if not valid else tuple(prepared[1][index] for index in prepared[3])
+            prepared[0], self._operation_context_stamp(), mode, prepared[4]) == receipt.active_key
+        targets = () if not valid else prepared[3]
         if not valid or not self._background_owner.promote(receipt, targets):
             self._background_owner.abort(receipt.reservation, "ADOPTION_FAILED")
             self._notice("Display background context changed before adoption."); return True
@@ -2838,6 +2848,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return True
         else:
             return False
+        background = self._background_owner.projection()
+        if (background is not None and background[0] == "integrated_1d"
+                and (updates.get("norm_channel", self._preferences.norm_channel)
+                     != self._preferences.norm_channel
+                     or updates.get("slice_pins", self._preferences.slice_pins)
+                     != self._preferences.slice_pins)):
+            self._release_display_background()
         self._preferences = replace(self._preferences, **updates)
         return True
 

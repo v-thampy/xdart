@@ -1034,18 +1034,26 @@ class _ContextRuntime:
 
     def project_background_contributors(
         self, projection: ContextProjection, browse_hydration_owner=None,
-        viewer_1d_owner=None,
+        viewer_1d_owner=None, *, pins=(),
     ) -> tuple[StandardDisplayPayload, ...]:
-        """Resolve one exact selected-only snapshot outside the redraw path."""
-        if self._pending_replacement is not None or self._selection is None:
+        """Resolve selected contributors followed by owned pin-only targets."""
+        if (self._pending_replacement is not None or self._selection is None
+                or type(pins) is not tuple):
             return ()
-        frames = self.navigation.selected
+        selected = self.navigation.selected
+        frames = list(selected)
         if not frames:
             return ()
+        owned = self._selected_frame_by_id(); frame_ids = {id(frame) for frame in frames}
+        for pin in pins:
+            if (type(pin) is SlicePin and owned.get(id(pin.frame)) is pin.frame
+                    and id(pin.frame) not in frame_ids):
+                frames.append(pin.frame); frame_ids.add(id(pin.frame))
         payloads: list[StandardDisplayPayload] = []
-        for frame in frames:
+        for index, frame in enumerate(frames):
             try:
-                request = self.project_request(frame, require_complete=True)
+                request = self.project_request(
+                    frame, require_complete=index < len(selected))
                 payload = self.resolve_projection(
                     projection, request, browse_hydration_owner,
                     viewer_1d_owner,

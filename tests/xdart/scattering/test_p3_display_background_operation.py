@@ -15,6 +15,7 @@ from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.adapters.external_operation import OperationSlot
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.context_projection import _apply_presentation_background
+from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
 from xdart.gui.tabs.scattering.operation_values import (
     OperationContextStamp, OperationTerminalStatus,
 )
@@ -25,14 +26,16 @@ from xdart.gui.tabs.scattering.presentation_background import (
 )
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import (
-    FrameNavigationProjection, ShellCommand, ShellCommandKind,
+    FrameNavigationProjection, ShellCommand, ShellCommandKind, SlicePin,
 )
 from xrd_tools.reduction import DisplayBackgroundPlan
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
-from tests.xdart.scattering.test_e3_context_contract import _acquisition
+from tests.xdart.scattering.test_e3_context_contract import (
+    _acquisition, _running_controller, _view,
+)
 
 
 def _inputs():
@@ -94,13 +97,15 @@ def _renderer_roles(view) -> tuple[tuple[str, object], ...]:
     return tuple(roles)
 
 
-def _active_page_background():
+def _active_page_background(mode="Int 2D"):
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
         sources=FilesystemSourceAdapter())
     identity, acquisition = _acquisition()
     page._context_controller._runtime.adopt_acquisition(identity, acquisition)
+    if mode != "Int 2D":
+        page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, mode)
     page._refresh_shell()
     page._handle_shell_command(ShellCommand(ShellCommandKind.SET_BACKGROUND))
     worker = page._operation_slot._worker
@@ -163,7 +168,7 @@ def test_owner_exact_accounting_bytes_roots_zero_copy_stage_and_d_once(monkeypat
     r_roots = (id(_root(owner._result.values)), id(_root(owner._result.finite_counts)),
                *(id(_root(axis)) for axis in owner._result.axes))
     assert owner._contributors == () and len(set(r_roots)) == 3
-    assert owner.promote(receipt, contributors)
+    assert owner.promote(receipt, tuple((*item, 1.0) for item in contributors))
     projection = owner.projection(); assert projection is not None
     displayed = tuple(value for _key, value in projection[1])
     np.testing.assert_allclose(displayed[0], [97.0, np.nan, 0.0], equal_nan=True)
@@ -305,7 +310,7 @@ def test_pre_adoption_context_membership_and_shape_drift_release_exact_roots(
             axis_2d_y=replace(payload.view.axis_2d_y, values=np.arange(3.0)))
         monkeypatch.setattr(
             page._context_controller, "project_background_contributors",
-            lambda: (replace(payload, view=changed),))
+            lambda *_args: (replace(payload, view=changed),))
     try:
         page._drain_executor(); qapp.processEvents()
         _assert_background_released(page._background_owner)
@@ -339,6 +344,41 @@ def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: st
             page.close_workspace()
         _assert_background_released(page._background_owner)
         if entry in {"selection", "context"}: assert delegated == ["RELEASED"]
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_active_1d_background_revokes_on_normalization_edit() -> None:
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter())
+    shell = make_shell_projection(frame_count=2, selected_index=1,
+                                  plot_mode="Overlay")
+    state = replace(shell.scientific, processing_mode="Int 1D")
+    contributors = tuple((trace.intensity, trace.axis.values)
+                         for trace in state.traces)
+    plan = DisplayBackgroundPlan(
+        "integrated_1d", tuple(f"trace-{index}" for index in range(2)),
+        tuple(item[0].shape for item in contributors),
+        tuple((item[1].shape,) for item in contributors),
+        tuple(("Q\0Å⁻¹",) for _item in contributors))
+    owner = page._background_owner
+    key = ("context", 1, "integrated_1d", "Int 1D")
+    reservation = owner.reserve(
+        plan, contributors, stamp=OperationContextStamp(0, "context", 1),
+        active_key=key, projection_keys=tuple(id(trace.frame) for trace in state.traces),
+        projection_indices=(0, 1))
+    receipt = owner.run_and_stage(reservation, lambda: False)
+    assert owner.promote(receipt, tuple((*item, 1.0) for item in contributors))
+    try:
+        page._shell.scientific.expect_display_background(key)
+        active = _apply_presentation_background(state, owner.projection())
+        page._shell.scientific.reconcile(
+            active, shell.navigation, completed=2, total=2, detail="Ready")
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_NORM_CHANNEL, "monitor"))
+        _assert_background_released(owner)
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -394,7 +434,7 @@ def test_1d_renderer_uses_reused_d_with_baseline_role_parity(plot_mode: str) -> 
         active_key=key, projection_keys=tuple(id(trace.frame) for trace in selected),
         projection_indices=tuple(range(len(selected))))
     receipt = owner.run_and_stage(reservation, lambda: False)
-    assert owner.promote(receipt, contributors)
+    assert owner.promote(receipt, tuple((*item, 1.0) for item in contributors))
     projection = owner.projection(); assert projection is not None
     d_ids = tuple(id(value) for _frame, value in projection[1])
     expected = tuple(value for _frame, value in projection[1])
@@ -427,6 +467,68 @@ def test_1d_renderer_uses_reused_d_with_baseline_role_parity(plot_mode: str) -> 
         assert _renderer_roles(view) == off_roles
     finally:
         view.close(); qapp.processEvents()
+
+
+def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -> None:
+    axis = np.arange(3.0)
+    background = np.array([2.0, 4.0, 6.0])
+    source = np.array([10.0, 20.0, 30.0])
+    plan = DisplayBackgroundPlan(
+        "integrated_1d", ("background",), ((3,),), (((3,),),),
+        (("q\0A^-1",),))
+    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reservation = _reserve(owner, plan, ((background, axis),), keys=(11,), indices=(0,))
+    receipt = owner.run_and_stage(reservation, lambda: False)
+    assert owner.promote(receipt, ((source, axis, 2.0),))
+    displayed = owner.projection()[1][0][1]
+    np.testing.assert_allclose(displayed, (source - background) / 2.0)
+
+    refused = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reservation = _reserve(refused, plan, ((background, axis),), keys=(11,), indices=(0,))
+    receipt = refused.run_and_stage(reservation, lambda: False)
+    assert not refused.promote(receipt, ((source, axis, None),))
+
+    controller, _lifecycle, _executor, _loader, _acquisition_context = _running_controller()
+    frame = controller.navigation.current; assert frame is not None
+    view = replace(_view(1, 1.0), metadata_numeric={"monitor": 2.0})
+    monitored = StandardDisplayPayload(0, frame, "monitored", view)
+    prepared = prepare_background_plan(
+        (monitored,), "integrated_1d", monitored.frame_key,
+        contributor_count=1, norm_channel="monitor")
+    assert prepared is not None
+    assert prepared[3][0][2] == 2.0
+    assert prepared[4] == ("monitor", ((id(monitored.frame_key), (2,), ((2,),),
+                                        ("q\0A^-1",), 2.0),))
+    assert prepare_background_plan(
+        (replace(monitored, view=_view(1, 1.0)),), "integrated_1d", frame,
+        contributor_count=1, norm_channel="monitor") is None
+
+
+def test_background_censuses_pin_only_target_separately_from_contributors() -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = _running_controller()
+    first = controller.navigation.current; assert first is not None
+    display = acquisition.publication_store
+    delta = display.append_navigation("run.a", "/out/a.nxs", 2)
+    second = delta.appended
+    view = _view(2, 4.0)
+    display.put_payload(StandardDisplayPayload(
+        0, second, "Standard · run.a · frame 2", view))
+    assert controller.accept_navigation(
+        delta, plot_mode="Overlay", follow_latest=False)
+    assert controller.select_navigation(first, (first,))
+    payloads = controller.project_background_contributors(
+        (SlicePin(second, "Q", 0.5, 1.0),))
+    assert tuple(payload.frame_key for payload in payloads) == (first, second)
+    payloads = tuple(
+        replace(payload, view=_view(index, float(index + 2)))
+        for index, payload in enumerate(payloads, 1))
+    prepared = prepare_background_plan(
+        payloads, "integrated_1d", first, contributor_count=1)
+    assert prepared is not None
+    plan, contributors, keys, targets, target_facts = prepared
+    assert len(plan.contributor_ids) == len(contributors) == 1
+    assert keys == (id(first), id(second))
+    assert len(targets) == len(target_facts[1]) == 2
 
 
 @pytest.mark.parametrize("domain", ("raw", "integrated_2d"))
@@ -598,7 +700,7 @@ def test_ast_has_one_public_runner_edge_and_no_hot_path_or_peer_worker() -> None
         "FrameRecordStore", "integrate_1d", "integrate_2d"))
     assert all(name not in owner for name in ("Thread(", "Queue(", "Timer(", "cache"))
     assert page.count("PresentationBackgroundOwner(capacity_bytes=536_870_912)") == 1
-    assert page.count("project_background_contributors()") == 2
+    assert page.count("project_background_contributors(") == 2
     tree = ast.parse(page)
     refresh = next(node for node in ast.walk(tree)
                    if isinstance(node, ast.FunctionDef) and node.name == "_refresh_shell")
