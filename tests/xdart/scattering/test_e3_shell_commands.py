@@ -5,6 +5,7 @@ import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.shell_values import (
+    FrameSelectionIntent,
     ShellCommand,
     ShellCommandKind,
 )
@@ -102,21 +103,20 @@ def test_e3_ui2_browser_multi_selection_carries_exact_frame_keys_once(
 
     assert len(commands) == 1
     assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
-    # Overlay decouples focus from membership: the browser reports the newly
-    # focused key plus the literal highlighted membership, each as the exact
-    # catalog object.  Accumulating visits into plot membership is the page's
-    # job.
+    # Overlay decouples a visit operand from highlighted and accumulated
+    # membership.  The page, not this command, accumulates visited traces.
     assert commands[0].frame is catalog[1]
+    assert commands[0].intent is FrameSelectionIntent.VISIT
+    assert len(commands[0].frames) == 1
+    assert commands[0].frames[0] is catalog[1]
     highlighted = tuple(
         index.data(QtCore.Qt.ItemDataRole.UserRole)
         for index in selection.selectedRows()
     )
-    assert len(commands[0].frames) == len(highlighted)
+    assert len(highlighted) == 2
     assert all(
-        actual is expected
-        for actual, expected in zip(
-            commands[0].frames, highlighted, strict=True
-        )
+        actual is catalog[index]
+        for index, actual in enumerate(highlighted)
     )
 
 

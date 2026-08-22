@@ -1753,7 +1753,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             prow.setSpacing(5)
             for spec in producers:
                 btn = ActionButton(spec)
-                btn.setText(_ACTION_LABELS.get(spec.action, spec.label))
+                btn.setText(spec.label if spec.label == "Cancel Calibration" else _ACTION_LABELS.get(spec.action, spec.label))
                 btn.actionRequested.connect(self.controlActionRequested)
                 prow.addWidget(btn, 1)
             self.experiment_card.add_row(row)

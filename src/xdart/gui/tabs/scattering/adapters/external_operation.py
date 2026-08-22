@@ -7,6 +7,9 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 from ..events import CleanupStatus, detached_exception_strings
+from ..experiment_authoring import (
+    CalibrationRequest, prepare_calibration_request, run_calibration,
+)
 from ..operation_values import (
     OperationCleanupReceipt, OperationContextStamp, OperationIdentity,
     OperationProgress, OperationTerminal, OperationTerminalStatus,
@@ -32,6 +35,7 @@ class OperationSlot:
         self._terminal: OperationTerminal | None = None
         self._stale = False
         self._close_cancel_accepted = False
+        self._cancel_sealed = False
         self._clean_receipt: OperationCleanupReceipt | None = None
 
     @property
@@ -43,6 +47,35 @@ class OperationSlot:
     def current_identity(self) -> OperationIdentity | None:
         with self._lock:
             return self._identity
+
+    def begin_calibrate(
+        self, request: object, stamp: OperationContextStamp
+    ) -> OperationIdentity | None:
+        if type(request) is not CalibrationRequest:
+            return None
+        try:
+            fresh = prepare_calibration_request(request.final_path)
+        except (OSError, ValueError):
+            return None
+        if fresh != request:
+            return None
+        return self._begin(request, stamp, self._run_calibrate)
+
+    def _run_calibrate(self, request, identity, cancelled, publish):
+        return run_calibration(
+            request, identity, cancelled, publish, self._seal_publication
+        )
+
+    def _seal_publication(self, identity: OperationIdentity) -> bool:
+        with self._lock:
+            event = self._cancel_event
+            if (
+                self._identity is not identity or self._terminal is not None
+                or self._cancel_sealed or event is None or event.is_set()
+            ):
+                return False
+            self._cancel_sealed = True
+            return True
 
     def _begin(self, frozen: object, stamp: OperationContextStamp,
                body: Callable[..., object]) -> OperationIdentity | None:
@@ -81,6 +114,7 @@ class OperationSlot:
             self._terminal = None
             self._stale = False
             self._close_cancel_accepted = False
+            self._cancel_sealed = False
             self._clean_receipt = None
             try:
                 worker.start()
@@ -145,6 +179,7 @@ class OperationSlot:
             if (
                 self._identity is not identity
                 or self._terminal is not None
+                or self._cancel_sealed
                 or event is None
                 or event.is_set()
             ):
@@ -165,6 +200,7 @@ class OperationSlot:
             event = self._cancel_event
             if (
                 self._terminal is None
+                and not self._cancel_sealed
                 and event is not None
                 and not event.is_set()
             ):
@@ -264,6 +300,7 @@ class OperationSlot:
         self._terminal = None
         self._stale = False
         self._close_cancel_accepted = False
+        self._cancel_sealed = False
 
     @staticmethod
     def _join_state(worker: Thread, started: bool) -> tuple[bool, bool]:

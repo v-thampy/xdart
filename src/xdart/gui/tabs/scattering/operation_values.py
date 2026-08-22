@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from enum import Enum
 
 from .events import CleanupStatus
@@ -72,6 +72,7 @@ class OperationTerminal:
     identity: OperationIdentity
     status: OperationTerminalStatus
     diagnostic: str = ""
+    payload: object | None = None
 
     def __post_init__(self) -> None:
         _invalid(
@@ -85,7 +86,8 @@ class OperationTerminal:
             or (
                 self.status is not OperationTerminalStatus.FAILED
                 and bool(self.diagnostic)
-            ),
+            )
+            or (self.payload is not None and (not is_dataclass(self.payload) or isinstance(self.payload, type) or not vars(type(self.payload))["__dataclass_params__"].frozen)),
             "operation terminal is invalid",
         )
         self.identity.__post_init__()

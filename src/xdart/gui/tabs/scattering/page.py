@@ -61,6 +61,7 @@ from .controls_projection import (
     EditRefusal,
     EditResult,
     OUTPUT_MODE,
+    PONI_FILE,
     SOURCE_DIRECTORY,
     SOURCE_FILE,
     GI_MOTOR,
@@ -98,6 +99,7 @@ from .events import (
     RunIdentity,
     detached_exception_strings,
 )
+from .experiment_authoring import CalibrationResult, prepare_calibration_request, resolve_calibration_executable
 from .shell_projection import (
     ScientificPreferences,
     share_plot_axis_for_image,
@@ -127,8 +129,8 @@ from .performance_diagnostics import (
     performance_diagnostics_error,
 )
 from .operation_values import (
-    OperationContextStamp,
-    OperationIdentity,
+    OperationContextStamp, OperationIdentity, OperationTerminalStatus,
+    OperationUpdate,
 )
 from .start_outcomes import (
     RecoveryFailure,
@@ -463,6 +465,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             projection=self._context_projection,
         )
         self._operation_slot = OperationSlot()
+        self._calibration_identity: OperationIdentity | None = None; self._calibration_revision: int | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -535,6 +538,71 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if identity is not None:
             self._ensure_timer()
         return identity
+
+    def _calibrate_action(self) -> None:
+        slot, identity = self._operation_slot, self._calibration_identity
+        if identity is not None and slot.current_identity is identity:
+            accepted = slot.cancel(identity)
+            self._notice("Cancelling calibration…" if accepted else "Calibration cancellation was not accepted.")
+            self._refresh_shell(); return
+        if not self._commit_focused_control_edit_for_run(): return
+        phase = self._lifecycle.phase
+        permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
+        if self._closing or self._closed or self._admission_state is not None or slot.owned or not permitted:
+            self._notice("Calibration is unavailable while another operation is active.")
+            self._refresh_shell(); return
+        if resolve_calibration_executable() is None:
+            self._notice("Calibration is unavailable: pyFAI-calib2 is not on PATH.")
+            self._refresh_shell(); return
+        snapshot = self._intents.snapshot(); start = browse_start_dir("", fallback=snapshot.thaw().project_root)
+        try:
+            selected = (self._control_path_chooser(PONI_FILE, "", start) if self._control_path_chooser is not None else QtWidgets.QFileDialog.getSaveFileName(self, "Save detector calibration", start, "PONI calibration (*.poni)")[0])
+        except Exception as error:
+            self._error_notice("Calibration chooser failed", error); return
+        if type(selected) is not str or not selected: return
+        phase = self._lifecycle.phase
+        if self._closing or self._closed or self._admission_state is not None or slot.owned or phase not in {RunPhase.IDLE, RunPhase.FAILED} or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted:
+            self._notice("Calibration context changed while choosing output."); return
+        snapshot = self._intents.snapshot(); intent = snapshot.thaw()
+        try:
+            request = prepare_calibration_request(selected, current_poni=str(intent.poni_file or ""), current_mask=str(intent.mask_file or ""))
+        except (OSError, ValueError) as error:
+            self._notice(str(error)); self._refresh_shell(); return
+        remember_browse_path(request.final_path); self._notice(f"Preparing {os.path.basename(request.final_path)}…")
+        identity = slot.begin_calibrate(request, self._operation_context_stamp(snapshot.revision))
+        if identity is None:
+            self._notice("Calibration operation was not started."); return
+        self._calibration_identity, self._calibration_revision = identity, snapshot.revision
+        self._notice(f"Calibrating {os.path.basename(request.final_path)}…")
+        self._refresh_shell(); self._ensure_timer()
+    def _consume_calibration_update(self, update: object) -> bool:
+        if type(update) is not OperationUpdate or update.identity is not self._calibration_identity: return False
+        if update.terminal is None:
+            if update.progress is not None: self._notice(f"Calibration: {update.progress.stage}…")
+            return True
+        terminal, revision = update.terminal, self._calibration_revision
+        self._calibration_identity = self._calibration_revision = None
+        if terminal.status is not OperationTerminalStatus.RETURNED:
+            self._notice("Calibration cancelled." if terminal.status is OperationTerminalStatus.CANCELLED else f"Calibration failed: {terminal.diagnostic}")
+            return True
+        result = terminal.payload
+        valid = (type(result) is CalibrationResult and result.published and result.proof is not None and result.final_state is not None and os.path.normcase(os.path.normpath(result.final_state.path)) == os.path.normcase(os.path.normpath(result.request.final_path)))
+        if not valid:
+            self._notice("Calibration returned without exact publication proof."); return True
+        snapshot = self._intents.snapshot()
+        if update.stale or revision is None or snapshot.revision != revision:
+            self._notice("Calibration was published but context changed; PONI was not adopted.")
+            return True
+        reduced = reduce_control_edit(snapshot, PONI_FILE, result.request.final_path)
+        if isinstance(reduced, (EditRefusal, EditNoChange)):
+            self._notice("Calibration was published but could not be adopted."); return True
+        try: committed = self._intents.commit(reduced, expected_revision=revision)
+        except Exception as error:
+            self._error_notice("Calibration adoption failed", error); return True
+        if type(committed) is IntentCommitAccepted:
+            self._reconcile_snapshot(snapshot, committed.snapshot); self._notice(f"Calibration adopted: {result.request.final_path}")
+        else: self._notice("Calibration was published but its edit was superseded.")
+        return True
 
     @property
     def _admission(self) -> AdmissionToken | None:
@@ -817,6 +885,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return
         kind = command.kind
+        operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity
+        operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
+        if self._operation_slot.owned and operation_locked and not operation_cancel: self._notice("Experiment operation is still active."); self._refresh_shell(); return
         if kind is ShellCommandKind.RUN_ACTION:
             self._run_action()
             return
@@ -905,6 +976,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._choose_control_path(command.path)
             return
         if kind is ShellCommandKind.CONTROL_ACTION:
+            if command.value == "calibrate": self._calibrate_action(); return
             if command.value == "advanced_processing":
                 self._edit_advanced_settings()
                 return
@@ -1671,7 +1743,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if operation_identity is not None:
             ScatteringWorkspace._observe_operation_stamp(self)
-            operation_slot.poll(operation_identity)
+            update = operation_slot.poll(operation_identity)
+            if update is not None: changed = self._consume_calibration_update(update) or changed
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
@@ -1981,6 +2054,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                        if viewer_1d else self._context_controller.viewer_2d_cleanup_pending)
             blocked = (self._closing or self._closed
                        or cleanup
+                       or self._operation_slot.owned
                        or self._context_controller.browse_pending
                        or self._lifecycle.active_run_identity is not None
                        or self._lifecycle.attempt_run_identity is not None
@@ -2148,6 +2222,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if current is not None and current.source == source
                 else self._sources.project_motor_knowledge(source, None)
             )
+        operation_identity = self._operation_slot.current_identity
+        calibration_active = (operation_identity is self._calibration_identity and not self._closing and not self._closed)
+        phase = self._lifecycle.phase; calibrate_dependency_available = resolve_calibration_executable() is not None
+        calibrate_available = (
+            not self._closing and not self._closed
+            and self._admission_state is None
+            and (phase is RunPhase.IDLE or phase is RunPhase.FAILED
+                 and self._lifecycle.reset_permitted)
+            and calibrate_dependency_available
+        )
         controls = project_controls(
             snapshot,
             observation,
@@ -2157,6 +2241,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ),
             source_mode_override=self._source_mode,
             detector_summary_override=self._detector_summary_text,
+            calibrate_available=calibrate_available,
+            calibrate_dependency_available=calibrate_dependency_available,
+            operation_busy=operation_identity is not None,
+            calibration_active=calibration_active,
         )
         project_key = (
             str(intent.project_root or ""),
@@ -2184,6 +2272,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _start_permitted(self) -> tuple[bool, str]:
         if self._closing or self._closed:
             return False, "Workspace is closing"
+        if self._operation_slot.owned:
+            return False, "Experiment operation is still active"
         if self._run_executor is None or self._pipeline is None:
             return False, "Execution is unavailable"
         admission = self._admission_state

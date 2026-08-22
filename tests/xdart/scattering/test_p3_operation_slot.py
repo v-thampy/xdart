@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -37,6 +38,11 @@ from xrd_tools.session.run_configuration import RunIntent
 @dataclass(frozen=True, slots=True)
 class _Job:
     label: str = "job"
+
+
+@dataclass
+class _MutablePayload:
+    value: int = 1
 
 
 class _HeldOperationOwner:
@@ -217,6 +223,33 @@ def test_foreign_and_late_poll_cancel_are_inert() -> None:
     assert slot.poll(identity) is None and slot.cancel(identity) is False
 
 
+def test_publication_seal_linearizes_cancel_and_close_on_the_common_lock() -> None:
+    slot = OperationSlot()
+    identity, release = _start_held(slot)
+    assert slot._seal_publication(OperationIdentity(identity.serial)) is False
+    assert slot._seal_publication(identity) is True
+    assert slot._seal_publication(identity) is False
+    assert slot.cancel(identity) is False
+    pending = slot.close()
+    assert pending.cleanup_status is CleanupStatus.CLEANUP_PENDING
+    assert pending.cancel_accepted is False
+    worker = slot._worker; release.set(); worker.join(2)
+    assert slot.close().terminal.status is OperationTerminalStatus.RETURNED
+
+
+def test_terminal_payload_is_one_detached_frozen_dataclass() -> None:
+    identity = OperationIdentity(1)
+    payload = _Job("proof")
+    assert OperationTerminal(
+        identity, OperationTerminalStatus.RETURNED, payload=payload
+    ).payload is payload
+    for invalid in (_MutablePayload(), _Job, object()):
+        with pytest.raises((TypeError, ValueError)):
+            OperationTerminal(
+                identity, OperationTerminalStatus.RETURNED, payload=invalid
+            )
+
+
 def test_context_aba_latches_stale_and_preserves_terminal_truth() -> None:
     slot = OperationSlot()
     identity, release = _start_held(slot)
@@ -306,7 +339,7 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
     assert page_text.count("ThreadPoolExecutor(max_workers=1)") == 2
     assert page_text.count("deque(maxlen=1)") == 1
     assert page_text.count("ScatteringWorkspace._observe_operation_stamp") == 3
-    assert "begin_calibrate" not in page_text and "begin_mask" not in page_text
+    assert page_text.count("begin_calibrate(") == 1 and "begin_mask" not in page_text
     assert all(name not in slot_text for name in ("numpy", "h5py", "pyFAI"))
     value_types = (OperationCleanupReceipt, OperationContextStamp,
                    OperationIdentity, OperationProgress, OperationTerminal,

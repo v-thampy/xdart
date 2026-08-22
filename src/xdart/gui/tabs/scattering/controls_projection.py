@@ -89,6 +89,10 @@ def project_controls(
     advanced_editor_available: bool = False,
     source_mode_override: str | None = None,
     detector_summary_override: str | None = None,
+    calibrate_available: bool = False,
+    calibrate_dependency_available: bool = False,
+    operation_busy: bool = False,
+    calibration_active: bool = False,
 ) -> ControlPanelRenderState:
     intent = snapshot.thaw()
     raw_motor = intent.gi.incidence_motor
@@ -114,7 +118,7 @@ def project_controls(
         motor_choices=motor_choices,
         source_mode=source_mode_override,
     )
-    unlocked = phase in {RunPhase.IDLE, RunPhase.FAILED}
+    unlocked = phase in {RunPhase.IDLE, RunPhase.FAILED} and not operation_busy
     processing_mode = str(intent.processing_mode or "")
     tool = tool_from_mode_text(processing_mode)
     viewer = tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER}
@@ -220,15 +224,31 @@ def project_controls(
         "Loaded-result reintegration is not available in this workspace yet."
     )
     operation_unavailable = "No vNext operation service is mounted."
+    calibrate_enabled = calibration_active or (
+        calibrate_available and unlocked
+    )
+    calibrate_reason = (
+        "Cancel the standalone PONI calibration."
+        if calibration_active
+        else "Launch standalone pyFAI calibration to create a PONI file."
+        if calibrate_enabled
+        else "Another experiment operation owns the common slot."
+        if operation_busy
+        else "Controls are locked during the active run."
+        if phase not in {RunPhase.IDLE, RunPhase.FAILED}
+        else "pyFAI-calib2 is unavailable on PATH."
+        if not calibrate_dependency_available
+        else "Calibration is unavailable in the current workspace state."
+    )
     actions = {
         SectionId.EXPERIMENT: (
             ControlActionSpec(
                 ControlAction.CALIBRATE,
-                "Calibrate",
+                "Cancel Calibration" if calibration_active else "Calibrate",
                 SectionId.EXPERIMENT,
-                False,
-                operation_unavailable,
-                False,
+                calibrate_enabled,
+                calibrate_reason,
+                True,
             ),
             ControlActionSpec(
                 ControlAction.MAKE_MASK,

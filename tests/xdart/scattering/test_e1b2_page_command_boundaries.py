@@ -946,7 +946,7 @@ def test_cold_frame_refresh_catches_up_distinct_acquisition_owner_before_paint(
 
     executor = _Executor()
     page, _, identity = _active_page(executor)
-    configuration = RunIntent().freeze()
+    configuration = RunIntent(output_mode="Overwrite").freeze()
     _, acquisition = _acquisition(
         configuration=configuration,
         identity=identity,
