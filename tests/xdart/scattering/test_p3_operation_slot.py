@@ -129,6 +129,9 @@ def test_held_runner_returns_immediately_and_uses_one_common_worker() -> None:
     QtCore.QTimer.singleShot(0, heartbeat.set)
     slot = OperationSlot()
     identity, release = _start_held(slot)
+    worker = slot._worker
+    peer = slot._begin(_Job("peer"), OperationContextStamp(0), _held_body(Event(), release))
+    assert peer is None and slot._worker is worker
     assert slot._worker is not None and slot._worker.is_alive()
     assert not release.is_set()
     qapp.processEvents()
@@ -339,7 +342,7 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
     assert page_text.count("ThreadPoolExecutor(max_workers=1)") == 2
     assert page_text.count("deque(maxlen=1)") == 1
     assert page_text.count("ScatteringWorkspace._observe_operation_stamp") == 3
-    assert page_text.count("begin_calibrate(") == 1 and "begin_mask" not in page_text
+    assert page_text.count("begin_calibrate(") == page_text.count("begin_mask(") == 1
     assert all(name not in slot_text for name in ("numpy", "h5py", "pyFAI"))
     value_types = (OperationCleanupReceipt, OperationContextStamp,
                    OperationIdentity, OperationProgress, OperationTerminal,

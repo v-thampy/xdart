@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import is_dataclass
+import os, stat; from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
 
 from ..events import CleanupStatus, detached_exception_strings
 from ..experiment_authoring import (
     CalibrationRequest, prepare_calibration_request, run_calibration,
+    MaskRequest, resolve_mask_executable, run_mask,
 )
 from ..operation_values import (
     OperationCleanupReceipt, OperationContextStamp, OperationIdentity,
@@ -65,6 +67,26 @@ class OperationSlot:
         return run_calibration(
             request, identity, cancelled, publish, self._seal_publication
         )
+
+    def begin_mask(
+        self, request: object, stamp: OperationContextStamp
+    ) -> OperationIdentity | None:
+        if type(request) is not MaskRequest:
+            return None
+        try:
+            request.__post_init__(); source = Path(request.source_path)
+            state = source.lstat(); valid = (
+                source.resolve(strict=True) == source
+                and stat.S_ISREG(state.st_mode) and os.access(source, os.R_OK)
+                and not os.path.lexists(request.final_path)
+                and Path(request.executable).stem.casefold() == "pyfai-drawmask" and resolve_mask_executable(request.executable) == request.executable
+            )
+        except (OSError, ValueError):
+            return None
+        return self._begin(request, stamp, self._run_mask) if valid else None
+
+    def _run_mask(self, request, identity, cancelled, publish):
+        return run_mask(request, identity, cancelled, publish, self._seal_publication)
 
     def _seal_publication(self, identity: OperationIdentity) -> bool:
         with self._lock:

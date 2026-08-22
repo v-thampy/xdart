@@ -60,6 +60,7 @@ from .controls_projection import (
     EditNoChange,
     EditRefusal,
     EditResult,
+    MASK_FILE,
     OUTPUT_MODE,
     PONI_FILE,
     SOURCE_DIRECTORY,
@@ -99,7 +100,10 @@ from .events import (
     RunIdentity,
     detached_exception_strings,
 )
-from .experiment_authoring import CalibrationResult, prepare_calibration_request, resolve_calibration_executable
+from .experiment_authoring import (
+    CalibrationResult, MaskResult, prepare_calibration_request,
+    prepare_mask_request, resolve_calibration_executable, resolve_mask_executable,
+)
 from .shell_projection import (
     ScientificPreferences,
     share_plot_axis_for_image,
@@ -466,6 +470,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         self._operation_slot = OperationSlot()
         self._calibration_identity: OperationIdentity | None = None; self._calibration_revision: int | None = None
+        self._mask_identity: OperationIdentity | None = None; self._mask_revision: int | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -602,6 +607,64 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if type(committed) is IntentCommitAccepted:
             self._reconcile_snapshot(snapshot, committed.snapshot); self._notice(f"Calibration adopted: {result.request.final_path}")
         else: self._notice("Calibration was published but its edit was superseded.")
+        return True
+
+    def _mask_action(self) -> None:
+        slot, identity = self._operation_slot, self._mask_identity
+        if identity is not None and slot.current_identity is identity:
+            accepted = slot.cancel(identity); self._notice("Cancelling mask…" if accepted else "Mask cancellation was not accepted.")
+            self._refresh_shell(); return
+        if not self._commit_focused_control_edit_for_run(): return
+        phase = self._lifecycle.phase
+        permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
+        if self._closing or self._closed or self._admission_state is not None or slot.owned or not permitted:
+            self._notice("Mask creation is unavailable while another operation is active."); self._refresh_shell(); return
+        if resolve_mask_executable() is None:
+            self._notice("Mask creation is unavailable: pyFAI-drawmask is not on PATH."); self._refresh_shell(); return
+        snapshot = self._intents.snapshot(); start = browse_start_dir("", fallback=snapshot.thaw().project_root)
+        try:
+            selected = (self._control_path_chooser(MASK_FILE, "", start) if self._control_path_chooser is not None else QtWidgets.QFileDialog.getOpenFileName(self, "Choose TIFF for mask", start, "TIFF image (*.tif *.tiff)")[0])
+        except Exception as error:
+            self._error_notice("Mask chooser failed", error); return
+        if type(selected) is not str or not selected: return
+        phase = self._lifecycle.phase
+        if self._closing or self._closed or self._admission_state is not None or slot.owned or phase not in {RunPhase.IDLE, RunPhase.FAILED} or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted:
+            self._notice("Mask context changed while choosing input."); return
+        snapshot = self._intents.snapshot(); intent = snapshot.thaw()
+        try: request = prepare_mask_request(selected, current_poni=str(intent.poni_file or ""), current_mask=str(intent.mask_file or ""))
+        except (OSError, ValueError) as error:
+            self._notice(str(error)); self._refresh_shell(); return
+        remember_browse_path(request.source_path); self._notice(f"Preparing {os.path.basename(request.source_path)}…")
+        identity = slot.begin_mask(request, self._operation_context_stamp(snapshot.revision))
+        if identity is None:
+            self._notice("Mask operation was not started."); return
+        self._mask_identity, self._mask_revision = identity, snapshot.revision
+        self._notice(f"Making {os.path.basename(request.final_path)}…"); self._refresh_shell(); self._ensure_timer()
+    def _consume_mask_update(self, update: object) -> bool:
+        if type(update) is not OperationUpdate or update.identity is not self._mask_identity: return False
+        if update.terminal is None:
+            if update.progress is not None: self._notice(f"Mask: {update.progress.stage}…")
+            return True
+        terminal, revision = update.terminal, self._mask_revision
+        self._mask_identity = self._mask_revision = None
+        if terminal.status is not OperationTerminalStatus.RETURNED:
+            self._notice("Mask cancelled." if terminal.status is OperationTerminalStatus.CANCELLED else f"Mask failed: {terminal.diagnostic}"); return True
+        result = terminal.payload
+        valid = (type(result) is MaskResult and result.published and result.proof is not None and result.final_state is not None and os.path.normcase(os.path.normpath(result.final_state.path)) == os.path.normcase(os.path.normpath(result.request.final_path)))
+        if not valid:
+            self._notice("Mask returned without exact publication proof."); return True
+        snapshot = self._intents.snapshot()
+        if update.stale or revision is None or snapshot.revision != revision:
+            self._notice("Mask was published but context changed; mask was not adopted."); return True
+        reduced = reduce_control_edit(snapshot, MASK_FILE, result.request.final_path)
+        if isinstance(reduced, (EditRefusal, EditNoChange)):
+            self._notice("Mask was published but could not be adopted."); return True
+        try: committed = self._intents.commit(reduced, expected_revision=revision)
+        except Exception as error:
+            self._error_notice("Mask adoption failed", error); return True
+        if type(committed) is IntentCommitAccepted:
+            self._reconcile_snapshot(snapshot, committed.snapshot); self._notice(f"Mask adopted: {result.request.final_path}")
+        else: self._notice("Mask was published but its edit was superseded.")
         return True
 
     @property
@@ -885,7 +948,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return
         kind = command.kind
-        operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity
+        operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and ((command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity) or (command.value == "make_mask" and self._operation_slot.current_identity is self._mask_identity))
         operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
         if self._operation_slot.owned and operation_locked and not operation_cancel: self._notice("Experiment operation is still active."); self._refresh_shell(); return
         if kind is ShellCommandKind.RUN_ACTION:
@@ -977,6 +1040,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if kind is ShellCommandKind.CONTROL_ACTION:
             if command.value == "calibrate": self._calibrate_action(); return
+            if command.value == "make_mask": self._mask_action(); return
             if command.value == "advanced_processing":
                 self._edit_advanced_settings()
                 return
@@ -1744,7 +1808,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if operation_identity is not None:
             ScatteringWorkspace._observe_operation_stamp(self)
             update = operation_slot.poll(operation_identity)
-            if update is not None: changed = self._consume_calibration_update(update) or changed
+            if update is not None: changed = self._consume_calibration_update(update) or self._consume_mask_update(update) or changed
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
@@ -2224,7 +2288,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         operation_identity = self._operation_slot.current_identity
         calibration_active = (operation_identity is self._calibration_identity and not self._closing and not self._closed)
-        phase = self._lifecycle.phase; calibrate_dependency_available = resolve_calibration_executable() is not None
+        mask_active = (operation_identity is self._mask_identity and not self._closing and not self._closed)
+        phase = self._lifecycle.phase; calibrate_dependency_available = resolve_calibration_executable() is not None; mask_dependency_available = resolve_mask_executable() is not None
         calibrate_available = (
             not self._closing and not self._closed
             and self._admission_state is None
@@ -2232,6 +2297,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                  and self._lifecycle.reset_permitted)
             and calibrate_dependency_available
         )
+        mask_available = (not self._closing and not self._closed and self._admission_state is None
+            and (phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted)
+            and mask_dependency_available)
         controls = project_controls(
             snapshot,
             observation,
@@ -2245,6 +2313,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             calibrate_dependency_available=calibrate_dependency_available,
             operation_busy=operation_identity is not None,
             calibration_active=calibration_active,
+            mask_available=mask_available,
+            mask_dependency_available=mask_dependency_available,
+            mask_active=mask_active,
         )
         project_key = (
             str(intent.project_root or ""),

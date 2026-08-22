@@ -93,6 +93,9 @@ def project_controls(
     calibrate_dependency_available: bool = False,
     operation_busy: bool = False,
     calibration_active: bool = False,
+    mask_available: bool = False,
+    mask_dependency_available: bool = False,
+    mask_active: bool = False,
 ) -> ControlPanelRenderState:
     intent = snapshot.thaw()
     raw_motor = intent.gi.incidence_motor
@@ -240,6 +243,20 @@ def project_controls(
         if not calibrate_dependency_available
         else "Calibration is unavailable in the current workspace state."
     )
+    mask_enabled = mask_active or (mask_available and unlocked)
+    mask_reason = (
+        "Cancel the standalone mask operation."
+        if mask_active
+        else "Choose an explicit TIFF and create its beside-source EDF mask."
+        if mask_enabled
+        else "Another experiment operation owns the common slot."
+        if operation_busy
+        else "Controls are locked during the active run."
+        if phase not in {RunPhase.IDLE, RunPhase.FAILED}
+        else "pyFAI-drawmask is unavailable on PATH."
+        if not mask_dependency_available
+        else "Mask creation is unavailable in the current workspace state."
+    )
     actions = {
         SectionId.EXPERIMENT: (
             ControlActionSpec(
@@ -252,11 +269,11 @@ def project_controls(
             ),
             ControlActionSpec(
                 ControlAction.MAKE_MASK,
-                "Make Mask",
+                "Cancel Mask" if mask_active else "Make Mask",
                 SectionId.EXPERIMENT,
-                False,
-                operation_unavailable,
-                False,
+                mask_enabled,
+                mask_reason,
+                True,
             ),
         ),
         SectionId.PROCESSING: (

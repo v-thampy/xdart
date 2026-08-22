@@ -117,7 +117,7 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
 # Descriptive hover tooltips for the producer/inspector action buttons.
 _ACTION_TOOLTIPS: dict[ControlAction, str] = {
     ControlAction.CALIBRATE: "Run pyFAI calibration to produce a PONI (detector geometry) file.",
-    ControlAction.MAKE_MASK: "Build a detector mask from the current frame.",
+    ControlAction.MAKE_MASK: "Build a detector mask from a chosen TIFF image.",
     ControlAction.REFINE_GEOMETRY: "Refine the diffractometer geometry from the loaded scan.",
     ControlAction.ADVANCED_PROCESSING: "Open the advanced integration settings (full parameter tree).",
     ControlAction.REINTEGRATE_1D: "Re-integrate the loaded scan to 1D with the current settings.",
@@ -1753,7 +1753,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             prow.setSpacing(5)
             for spec in producers:
                 btn = ActionButton(spec)
-                btn.setText(spec.label if spec.label == "Cancel Calibration" else _ACTION_LABELS.get(spec.action, spec.label))
+                btn.setText(spec.label if spec.label.startswith("Cancel ") else _ACTION_LABELS.get(spec.action, spec.label))
                 btn.actionRequested.connect(self.controlActionRequested)
                 prow.addWidget(btn, 1)
             self.experiment_card.add_row(row)
