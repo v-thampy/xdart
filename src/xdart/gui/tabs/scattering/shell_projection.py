@@ -59,7 +59,6 @@ class ScientificPreferences:
     q_range: tuple[float, float] = (0.0, 10.0)
     chi_range: tuple[float, float] = (-180.0, 180.0)
     plot_options: ScientificPlotOptions = ScientificPlotOptions()
-    background_set: bool = False
     detector_mode: str = "thumbnail"
     detector_available: bool = False
     detector_pending: bool = False
@@ -394,7 +393,7 @@ def build_scientific_projection(
         q_range=preferences.q_range,
         chi_range=preferences.chi_range,
         plot_options=preferences.plot_options,
-        background_set=preferences.background_set,
+        background_set=False,
         status=status or ("Loading frame…" if retain else ""),
         retain_display=retain,
         live_update=phase in {

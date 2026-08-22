@@ -707,6 +707,21 @@ class ContextController:
             viewer_1d_owner=self._viewer_1d,
         )
 
+    def project_background_contributors(
+        self,
+    ) -> tuple[StandardDisplayPayload, ...]:
+        if self._closed:
+            return ()
+        return self._runtime.project_background_contributors(
+            self._projection,
+            self._browse_hydration_owner,
+            self._viewer_1d,
+        )
+
+    def reseed_background_projection(self) -> None:
+        if not self._closed:
+            self._runtime.reseed_background_projection()
+
     def commit_navigation_projection(
         self,
         presented_frames: tuple[DisplayFrameKey, ...],

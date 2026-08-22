@@ -64,6 +64,41 @@ class ProjectionRequest:
             raise TypeError("context projection request is invalid")
 
 
+def _apply_presentation_background(
+    state: ScientificProjection, projection,
+) -> ScientificProjection:
+    if projection is None:
+        return replace(state, background_set=False)
+    try:
+        domain, rows, _active_key = projection
+        values = dict(rows)
+    except (TypeError, ValueError):
+        return replace(state, background_set=False)
+    if domain == "integrated_1d":
+        def substitute(trace):
+            value = values.get(id(trace.frame))
+            return (replace(trace, intensity=value)
+                    if type(value) is np.ndarray
+                    and value.shape == trace.intensity.shape else trace)
+        return replace(
+            state, traces=tuple(substitute(trace) for trace in state.traces),
+            pinned_traces=tuple(replace(item, trace=substitute(item.trace))
+                                for item in state.pinned_traces),
+            background_set=True)
+    heavy = state.heavy
+    if heavy is None:
+        return replace(state, background_set=True)
+    value = values.get(id(heavy.frame))
+    if type(value) is not np.ndarray:
+        return replace(state, background_set=True)
+    if domain == "raw" and heavy.raw is not None and value.shape == heavy.raw.shape:
+        heavy = replace(heavy, raw=value)
+    elif (domain == "integrated_2d" and heavy.cake is not None
+          and value.shape == heavy.cake.shape):
+        heavy = replace(heavy, cake=value)
+    return replace(state, heavy=heavy, background_set=True)
+
+
 def _terminal_timing_tooltip(progress: ProgressProjection) -> str:
     timing = progress.terminal_timing
     if timing is None:
@@ -339,6 +374,7 @@ class ContextProjection:
         source_count_is_files: bool = False,
         source_count_includes_immediate: bool = False,
         norm_aggregate: object = None,
+        presentation_background=None,
     ) -> ShellProjection:
         """Build the one complete shell value; retain no input or output."""
 
@@ -422,6 +458,13 @@ class ContextProjection:
         if viewer_1d_selected:
             viewer_scientific = _viewer_1d_scientific(
                 viewer_navigation, payloads, resident_frames, preferences, notice)
+        scientific = (viewer_scientific if viewer_selected else
+            build_scientific_projection(
+                payloads, navigation, resident_frames, preferences, notice,
+                phase, processing_mode=intent.processing_mode,
+                norm_aggregate=norm_aggregate))
+        scientific = _apply_presentation_background(
+            scientific, presentation_background)
         return ShellProjection(
             revision,
             build_browser_projection(
@@ -434,10 +477,7 @@ class ContextProjection:
                 catalog=browser_catalog,
                 transient_frame=browser_transient_frame,
             ),
-            (viewer_scientific if viewer_selected else build_scientific_projection(
-                payloads, navigation, resident_frames, preferences, notice,
-                phase, processing_mode=intent.processing_mode,
-                norm_aggregate=norm_aggregate)),
+            scientific,
             viewer_navigation if viewer_selected else navigation,
             controls,
             run,

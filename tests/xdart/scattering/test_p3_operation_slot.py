@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, is_dataclass
 import os
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -28,11 +29,13 @@ from xdart.gui.tabs.scattering.operation_values import (
     OperationUpdate,
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
 from xdart.gui.tabs.scattering.controls_projection import project_controls
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.readiness import ControlAction, SectionId
 from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.reduction import DisplayBackgroundPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +104,30 @@ def _release_and_poll(slot: OperationSlot, identity, release):
     assert update is not None
     assert update.terminal.status is OperationTerminalStatus.RETURNED
     return update
+
+
+def _background():
+    axis = np.arange(3.0)
+    values = np.array([1.0, 2.0, 3.0])
+    plan = DisplayBackgroundPlan(
+        "integrated_1d", ("source",), ((3,),), (((3,),),), (("q",),))
+    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reservation = owner.reserve(
+        plan, ((values, axis),), stamp=OperationContextStamp(0, "context", 1),
+        active_key=("context", 1, "integrated_1d"),
+        projection_keys=(1,), projection_indices=(0,))
+    assert reservation == 1
+    return owner, plan, reservation
+
+
+def _arrays_free(value) -> bool:
+    if isinstance(value, np.ndarray): return False
+    if is_dataclass(value) and not isinstance(value, type):
+        return all(_arrays_free(getattr(value, member.name)) for member in fields(value))
+    if isinstance(value, (tuple, list, dict)):
+        items = value.items() if isinstance(value, dict) else value
+        return all(_arrays_free(item) for item in items)
+    return True
 
 
 def test_page_close_waits_for_held_operation_owner() -> None:
@@ -296,6 +323,75 @@ def test_terminal_delivery_and_effect_are_exactly_once_after_close() -> None:
     receipt = closed.close()
     assert receipt.terminal is not None and receipt.identity is identity2
     assert closed.close() is receipt and closed.poll(identity2) is None
+
+
+def test_background_slot_values_are_array_free_and_stage_exact_result() -> None:
+    owner, plan, reservation = _background()
+    slot = OperationSlot()
+    identity = slot.begin_background(
+        plan, OperationContextStamp(0, "context", 1), owner, reservation)
+    assert type(identity) is OperationIdentity
+    worker = slot._worker; assert worker is not None
+    worker.join(2); assert not worker.is_alive()
+    assert owner.phase == "STAGED" and owner._result is not None
+    assert _arrays_free(slot._frozen) and _arrays_free(slot._progress)
+    assert _arrays_free(slot._terminal) and _arrays_free(slot._abort_fact)
+    staged = owner._result
+    update = slot.poll(identity)
+    assert update is not None and update.terminal.payload.result_identity == staged.result_identity
+    assert owner.phase == "STAGED" and slot.owned is False
+    assert _arrays_free(update) and _arrays_free(slot.close())
+    owner.abort(reservation, "TEST_RELEASE")
+
+
+def test_clear_while_reserved_remains_pending_until_worker_relinquishes(
+    monkeypatch,
+) -> None:
+    from xdart.gui.tabs.scattering import presentation_background as owner_module
+
+    owner, plan, reservation = _background()
+    entered, release = Event(), Event()
+    runner = owner_module.run_display_background
+    def held(*args, **kwargs):
+        entered.set(); assert release.wait(2); return runner(*args, **kwargs)
+    monkeypatch.setattr(owner_module, "run_display_background", held)
+    slot = OperationSlot()
+    identity = slot.begin_background(
+        plan, OperationContextStamp(0, "context", 1), owner, reservation)
+    assert type(identity) is OperationIdentity and entered.wait(2)
+    roots = owner._contributors
+    assert not owner.release() and owner.phase == "CLEANUP_PENDING"
+    assert owner._contributors is roots and slot.cancel(identity)
+    release.set(); worker = slot._worker; worker.join(2)
+    update = slot.poll(identity)
+    assert update.terminal.status is OperationTerminalStatus.CANCELLED
+    assert owner.phase == "RELEASED" and owner._contributors == ()
+
+
+def test_post_stage_terminal_construction_failure_finalizes_outside_lock(
+    monkeypatch,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import external_operation as slot_module
+
+    owner, plan, reservation = _background()
+    slot, finalized = OperationSlot(), []
+    real_finalize = owner.finalize
+    def observe(token, outcome):
+        outside = slot._lock.acquire(blocking=False)
+        if outside: slot._lock.release()
+        finalized.append((token, outcome, outside)); real_finalize(token, outcome)
+    owner.finalize = observe
+    def refuse_terminal(*_args, **_kwargs):
+        raise MemoryError("terminal allocation failed")
+    monkeypatch.setattr(slot_module, "OperationTerminal", refuse_terminal)
+    identity = slot.begin_background(
+        plan, OperationContextStamp(0, "context", 1), owner, reservation)
+    worker = slot._worker; worker.join(2)
+    assert owner.phase == "STAGED"
+    assert slot._terminal is None and slot._abort_fact[0] == "ABORTED_WITHOUT_TERMINAL"
+    assert slot.poll(identity) is None
+    assert finalized == [(reservation, "ABORTED_WITHOUT_TERMINAL", True)]
+    assert owner.phase == "RELEASED" and not slot.owned
 
 
 def test_real_page_timer_polling_and_close_include_operation_owner() -> None:

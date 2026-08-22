@@ -136,6 +136,8 @@ from .operation_values import (
     OperationContextStamp, OperationIdentity, OperationTerminalStatus,
     OperationUpdate,
 )
+from .presentation_background import (DisplayBackgroundTransferReceipt,
+    PresentationBackgroundOwner, prepare_background_plan)
 from .start_outcomes import (
     RecoveryFailure,
     StartCapture,
@@ -469,6 +471,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             projection=self._context_projection,
         )
         self._operation_slot = OperationSlot()
+        self._background_owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+        self._background_identity: OperationIdentity | None = None
         self._calibration_identity: OperationIdentity | None = None; self._calibration_revision: int | None = None
         self._mask_identity: OperationIdentity | None = None; self._mask_revision: int | None = None
 
@@ -543,6 +547,84 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if identity is not None:
             self._ensure_timer()
         return identity
+
+    @staticmethod
+    def _background_domain(mode: str) -> str | None:
+        return {"Int 1D": "integrated_1d", "Int 2D": "integrated_2d", "1D Viewer": "integrated_1d", "2D Viewer": "raw"}.get(mode)
+
+    def _background_key(self, plan, stamp, mode: str, keys) -> tuple[object, ...]:
+        return (stamp.context_token, stamp.display_generation, plan.domain, mode,
+                "raw" if plan.domain == "raw" else "integrated",
+                plan.contributor_ids, plan.value_shapes, plan.axis_shapes, keys)
+
+    def _background_action(self) -> None:
+        owner, slot = self._background_owner, self._operation_slot
+        if owner.phase in {"RESERVED", "STAGED", "ACTIVE", "CLEANUP_PENDING"}:
+            self._release_display_background(); self._notice("Clearing display background…")
+            self._refresh_shell(); return
+        if slot.owned:
+            self._notice("Display background is unavailable while another operation is active.")
+            self._refresh_shell(); return
+        mode = self._intents.snapshot().thaw().processing_mode
+        domain = self._background_domain(mode)
+        payloads = self._context_controller.project_background_contributors()
+        prepared = None if domain is None else prepare_background_plan(
+            payloads, domain, self._context_controller.navigation.current)
+        if prepared is None:
+            self._notice("Select at least one display frame before setting background.")
+            self._refresh_shell(); return
+        plan, contributors, keys, indices = prepared
+        stamp = self._operation_context_stamp()
+        active_key = self._background_key(plan, stamp, mode, keys)
+        reservation = owner.reserve(plan, contributors, stamp=stamp,
+            active_key=active_key, projection_keys=keys, projection_indices=indices)
+        if reservation is None:
+            self._notice("Display background exceeds its standalone 512 MiB workspace.")
+            self._refresh_shell(); return
+        identity = slot.begin_background(plan, stamp, owner, reservation)
+        if identity is None:
+            owner.abort(reservation, "START_REFUSED")
+            self._notice("Display background operation was not started."); return
+        self._background_identity = identity
+        self._notice("Computing display background…"); self._refresh_shell(); self._ensure_timer()
+
+    def _consume_background_update(self, update: object) -> bool:
+        if type(update) is not OperationUpdate or update.identity is not self._background_identity:
+            return False
+        if update.terminal is None:
+            if update.progress is not None: self._notice("Display background: aggregate…")
+            return True
+        self._background_identity = None; terminal = update.terminal; receipt = terminal.payload
+        if (update.stale or terminal.status is not OperationTerminalStatus.RETURNED
+                or type(receipt) is not DisplayBackgroundTransferReceipt):
+            self._notice("Display background cancelled." if terminal.status is OperationTerminalStatus.CANCELLED
+                         else "Display background was not adopted."); return True
+        mode = self._intents.snapshot().thaw().processing_mode
+        prepared = prepare_background_plan(
+            self._context_controller.project_background_contributors(),
+            receipt.domain, self._context_controller.navigation.current)
+        valid = prepared is not None and self._background_key(
+            prepared[0], self._operation_context_stamp(), mode, prepared[2]) == receipt.active_key
+        targets = () if not valid else tuple(prepared[1][index] for index in prepared[3])
+        if not valid or not self._background_owner.promote(receipt, targets):
+            self._background_owner.abort(receipt.reservation, "ADOPTION_FAILED")
+            self._notice("Display background context changed before adoption."); return True
+        self._context_controller.reseed_background_projection()
+        self._notice("Display background set."); return True
+
+    def _release_display_background(self) -> bool:
+        prior = self._background_owner.phase
+        projection = self._background_owner.projection(); receipt = None
+        if projection is not None:
+            self._last_scientific_projection = None
+            receipt = self._shell.scientific.release_display_background(projection[2])
+        if self._background_owner.release(receipt):
+            if prior not in {"EMPTY", "RELEASED"}: self._context_controller.reseed_background_projection()
+            self._background_identity = None; return True
+        identity = self._background_identity
+        if identity is not None and self._operation_slot.current_identity is identity:
+            self._operation_slot.cancel(identity)
+        self._ensure_timer(); return False
 
     def _calibrate_action(self) -> None:
         slot, identity = self._operation_slot, self._calibration_identity
@@ -1063,6 +1145,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 "is mounted."
             )
             return
+        if kind is ShellCommandKind.SET_BACKGROUND:
+            self._background_action()
+            return
         if kind in {
             ShellCommandKind.SET_PROCESSING_MODE,
             ShellCommandKind.SET_BATCH,
@@ -1507,6 +1592,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _clear_presentation_targets(self) -> None:
         getattr(self, "_presentation_targets", []).clear()
         self._presentation_run_identity = None
+        if hasattr(self, "_background_owner"):
+            self._release_display_background()
 
     def _presentation_pacing_active(self, identity: RunIdentity) -> bool:
         controller = self._context_controller
@@ -1808,7 +1895,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if operation_identity is not None:
             ScatteringWorkspace._observe_operation_stamp(self)
             update = operation_slot.poll(operation_identity)
-            if update is not None: changed = self._consume_calibration_update(update) or self._consume_mask_update(update) or changed
+            if update is not None: changed = self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or changed
+            elif operation_identity is self._background_identity and not operation_slot.owned:
+                self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
@@ -2034,6 +2123,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _set_detector_mode(self, mode: str) -> bool:
         if mode == "thumbnail":
+            if self._preferences.detector_mode != mode: self._release_display_background()
             self._context_controller.clear_full_raw()
             self._detector_demand_frame = None
             self._preferences = replace(
@@ -2052,6 +2142,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 detector_diagnostic=reason,
             )
             return False
+        if self._preferences.detector_mode != mode: self._release_display_background()
         self._detector_demand_frame = None
         self._preferences = replace(
             self._preferences, detector_mode=mode,
@@ -2089,11 +2180,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         resident, pending, diagnostic = controller.full_raw_status()
         if self._preferences.detector_mode == "full" and not resident and not pending:
             diagnostic = diagnostic or "Full Raw detector pixels unavailable."
-        self._preferences = replace(
-            self._preferences, detector_available=available,
-            detector_pending=pending,
-            detector_diagnostic=diagnostic or reason,
-        )
+        current = self._preferences
+        state = (available, pending, diagnostic or reason)
+        if state != (current.detector_available, current.detector_pending, current.detector_diagnostic):
+            self._preferences = replace(current, detector_available=state[0], detector_pending=state[1], detector_diagnostic=state[2])
 
     def _refresh_shell(
         self,
@@ -2225,6 +2315,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 source_count_includes_immediate
             ),
             norm_aggregate=self._context_controller.norm_aggregate,
+            presentation_background=self._background_owner.projection(),
         )
         try:
             choice, _ = heavy_residency_choice(intent.run_options)
@@ -2238,6 +2329,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             apply_options = {"preserve_display": preserve_display}
             if preserve_scientific:
                 apply_options["preserve_scientific"] = True
+            self._shell.scientific.expect_display_background(
+                self._background_owner.active_key)
             self._shell.apply_state(projection, **apply_options)
         except Exception as error:
             if viewer:
@@ -2396,6 +2489,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     and not self._clear_viewer_1d_renderer(close=True)):
                 self._notice("1D Viewer cleanup remains pending")
                 return
+            if value != candidate.processing_mode: self._release_display_background()
             candidate.processing_mode = value
         elif kind is ShellCommandKind.SET_BATCH:
             if type(value) is not bool:
@@ -2713,10 +2807,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else:
                 return False
             updates["plot_options"] = replace(options, **option_updates)
-        elif kind is ShellCommandKind.SET_BACKGROUND:
-            updates["background_set"] = (
-                not self._preferences.background_set
-            )
         elif kind is ShellCommandKind.SET_DATE_SORT:
             requested = bool(value)
             changed = requested != self._date_sorted

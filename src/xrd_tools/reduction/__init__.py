@@ -14,6 +14,8 @@ __all__ = [
     "CancelToken",
     "BoundOutputSinkGraph",
     "CompositeSink",
+    "DisplayBackgroundPlan",
+    "DisplayBackgroundResult",
     "FlushPolicy",
     "Frame",
     "FrameSource",
@@ -45,6 +47,7 @@ __all__ = [
     "prepare_gi_freeze",
     "bind_dynamic_output_sink",
     "run_reduction",
+    "run_display_background",
     "requires_active_xye_output",
     "classify_output_sink_graph",
     "supports_durable_xye_receipts",
@@ -102,10 +105,14 @@ _STRICTNESS_EXPORTS = {
     "GIAllDummyError",
 }
 
+_BACKGROUND_EXPORTS = {"DisplayBackgroundPlan", "DisplayBackgroundResult", "run_display_background"}
+
 
 def __getattr__(name: str) -> Any:
     if name == "FlushPolicy":
         value = getattr(import_module("xrd_tools.reduction.cadence"), name)
+    elif name in _BACKGROUND_EXPORTS:
+        value = getattr(import_module("xrd_tools.reduction.background"), name)
     elif name in _CORE_EXPORTS:
         value = getattr(import_module("xrd_tools.reduction.core"), name)
     elif name in _STRICTNESS_EXPORTS:

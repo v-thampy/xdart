@@ -17,6 +17,11 @@ from ..operation_values import (
     OperationProgress, OperationTerminal, OperationTerminalStatus,
     OperationUpdate,
 )
+from ..presentation_background import PresentationBackgroundOwner
+from xrd_tools.reduction.background import DisplayBackgroundPlan
+
+class _BackgroundPreterminalAbort(RuntimeError):
+    pass
 
 class OperationSlot:
     """Own at most one joinable worker and its detached latest state."""
@@ -39,6 +44,9 @@ class OperationSlot:
         self._close_cancel_accepted = False
         self._cancel_sealed = False
         self._clean_receipt: OperationCleanupReceipt | None = None
+        self._finalize_hook: Callable[[str], None] | None = None; self._finalized = False
+        self._terminal_committed = False
+        self._abort_fact: tuple[str, str, str, str] | None = None
 
     @property
     def owned(self) -> bool:
@@ -88,6 +96,27 @@ class OperationSlot:
     def _run_mask(self, request, identity, cancelled, publish):
         return run_mask(request, identity, cancelled, publish, self._seal_publication)
 
+    def begin_background(self, plan: object, stamp: OperationContextStamp,
+                         owner: object, reservation: object) -> OperationIdentity | None:
+        if (type(plan) is not DisplayBackgroundPlan
+                or type(owner) is not PresentationBackgroundOwner
+                or type(reservation) is not int or reservation < 1):
+            return None
+        def body(_plan, identity, cancelled, publish):
+            publish("aggregate", 0, len(plan.contributor_ids))
+            try:
+                receipt = owner.run_and_stage(reservation, cancelled.is_set)
+            except InterruptedError:
+                return OperationTerminal(identity, OperationTerminalStatus.CANCELLED)
+            publish("aggregate", len(plan.contributor_ids), len(plan.contributor_ids))
+            try:
+                return OperationTerminal(identity, OperationTerminalStatus.RETURNED,
+                                         payload=receipt)
+            except BaseException as error:
+                raise _BackgroundPreterminalAbort(str(error)) from error
+        return self._begin(plan, stamp, body,
+            finalize=lambda outcome: owner.finalize(reservation, outcome))
+
     def _seal_publication(self, identity: OperationIdentity) -> bool:
         with self._lock:
             event = self._cancel_event
@@ -100,13 +129,12 @@ class OperationSlot:
             return True
 
     def _begin(self, frozen: object, stamp: OperationContextStamp,
-               body: Callable[..., object]) -> OperationIdentity | None:
-        """Start one private frozen body; busy/closed/malformed is inert."""
-
+               body: Callable[..., object], finalize: Callable[[str], None] | None = None
+               ) -> OperationIdentity | None:
         if (
             not self._is_frozen_dataclass(frozen)
             or type(stamp) is not OperationContextStamp
-            or not callable(body)
+            or not callable(body) or finalize is not None and not callable(finalize)
         ):
             return None
         try:
@@ -138,13 +166,17 @@ class OperationSlot:
             self._close_cancel_accepted = False
             self._cancel_sealed = False
             self._clean_receipt = None
+            self._finalize_hook = finalize; self._finalized = False
+            self._terminal_committed = False; self._abort_fact = None
             try:
                 worker.start()
             except BaseException as error:
                 self._terminal = self._failed(identity, error)
             else:
                 self._worker_started = True
-            return identity
+            hook = self._take_finalize_locked("START_FAILED") if not self._worker_started else None
+        self._invoke_finalize(hook, "START_FAILED")
+        return identity
 
     def observe_stamp(self, stamp: object) -> None:
         valid = type(stamp) is OperationContextStamp
@@ -185,15 +217,25 @@ class OperationSlot:
                 return OperationUpdate(identity, progress=progress, stale=self._stale)
             terminal = self._terminal
             if terminal is None:
-                return None
-            update = OperationUpdate(
-                identity,
-                progress=progress,
-                terminal=terminal,
-                stale=self._stale,
-            )
-            self._retire_locked()
-            return update
+                if self._abort_fact is None:
+                    return None
+                hook = self._take_finalize_locked("ABORTED_WITHOUT_TERMINAL")
+                self._retire_locked()
+                update = None
+            else:
+                update = OperationUpdate(
+                    identity,
+                    progress=progress,
+                    terminal=terminal,
+                    stale=self._stale,
+                )
+                outcome = ("STALE" if self._stale else
+                           "TRANSFERRED" if terminal.status is OperationTerminalStatus.RETURNED
+                           else terminal.status.value.upper())
+                hook = self._take_finalize_locked(outcome)
+                self._retire_locked()
+        self._invoke_finalize(hook, "ABORTED_WITHOUT_TERMINAL" if update is None else outcome)
+        return update
 
     def cancel(self, identity: object) -> bool:
         with self._lock:
@@ -247,36 +289,76 @@ class OperationSlot:
                     stale=self._stale)
             terminal = self._terminal
             if terminal is None:
-                return OperationCleanupReceipt(identity,
-                    CleanupStatus.CLEANUP_PENDING,
-                    self._close_cancel_accepted, worker_identity,
-                    stale=self._stale)
-            receipt = OperationCleanupReceipt(identity, CleanupStatus.CLEANED,
-                self._close_cancel_accepted, worker_identity, terminal,
-                self._stale)
-            self._retire_locked()
-            self._clean_receipt = receipt
-            return receipt
+                if self._abort_fact is not None:
+                    hook = self._take_finalize_locked("ABORTED_WITHOUT_TERMINAL")
+                    self._retire_locked()
+                    receipt = OperationCleanupReceipt(None, CleanupStatus.CLEANED)
+                    self._clean_receipt = receipt
+                else:
+                    return OperationCleanupReceipt(identity,
+                        CleanupStatus.CLEANUP_PENDING,
+                        self._close_cancel_accepted, worker_identity,
+                        stale=self._stale)
+            else:
+                receipt = OperationCleanupReceipt(identity, CleanupStatus.CLEANED,
+                    self._close_cancel_accepted, worker_identity, terminal,
+                    self._stale)
+                outcome = ("STALE" if self._stale else
+                           "TRANSFERRED" if terminal.status is OperationTerminalStatus.RETURNED
+                           else terminal.status.value.upper())
+                hook = self._take_finalize_locked(outcome)
+                self._retire_locked()
+                self._clean_receipt = receipt
+        self._invoke_finalize(hook, "ABORTED_WITHOUT_TERMINAL" if terminal is None else outcome)
+        return receipt
 
     def _run(self, identity: OperationIdentity, frozen: object,
              cancel_event: Event, body: Callable[..., object]) -> None:
         def publish(stage: object, completed: object, total: object) -> None:
             self._publish(identity, stage, completed, total)
 
+        terminal = None
         try:
             candidate = body(frozen, identity, cancel_event, publish)
-            if (
-                type(candidate) is not OperationTerminal
-                or candidate.identity is not identity
-            ):
-                raise ValueError("operation body returned an invalid terminal")
-            candidate.__post_init__()
-            terminal = candidate
         except BaseException as error:
-            terminal = self._failed(identity, error)
-        with self._lock:
-            if self._identity is identity and self._terminal is None:
-                self._terminal = terminal
+            if type(error) is _BackgroundPreterminalAbort:
+                self._record_abort_without_terminal(identity, error); return
+            try:
+                terminal = self._failed(identity, error)
+            except BaseException as terminal_error:
+                self._record_abort_without_terminal(identity, terminal_error)
+                return
+        else:
+            try:
+                if (
+                    type(candidate) is not OperationTerminal
+                    or candidate.identity is not identity
+                ):
+                    raise ValueError("operation body returned an invalid terminal")
+                candidate.__post_init__()
+                terminal = candidate
+            except BaseException as error:
+                self._record_abort_without_terminal(identity, error)
+                return
+        try:
+            with self._lock:
+                if self._identity is identity and self._terminal is None:
+                    self._terminal = terminal
+                    self._terminal_committed = True
+        except BaseException as error:
+            self._record_abort_without_terminal(identity, error)
+
+    def _record_abort_without_terminal(self, identity: OperationIdentity,
+                                       error: BaseException) -> None:
+        module, name, message = detached_exception_strings(error)
+        try:
+            with self._lock:
+                if self._identity is identity and not self._terminal_committed:
+                    self._abort_fact = (
+                        "ABORTED_WITHOUT_TERMINAL", module, name, message)
+                    self._terminal = None
+        except BaseException:
+            pass
 
     def _publish(self, identity: OperationIdentity, stage: object,
                  completed: object, total: object) -> None:
@@ -323,6 +405,22 @@ class OperationSlot:
         self._stale = False
         self._close_cancel_accepted = False
         self._cancel_sealed = False
+        self._finalize_hook = None; self._finalized = False
+        self._terminal_committed = False; self._abort_fact = None
+
+    def _take_finalize_locked(self, outcome: str):
+        if self._finalized or self._finalize_hook is None:
+            return None
+        self._finalized = True; return self._finalize_hook
+
+    @staticmethod
+    def _invoke_finalize(hook, outcome: str) -> None:
+        if hook is None:
+            return
+        try:
+            hook(outcome)
+        except BaseException:
+            return
 
     @staticmethod
     def _join_state(worker: Thread, started: bool) -> tuple[bool, bool]:

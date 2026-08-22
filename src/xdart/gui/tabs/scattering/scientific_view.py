@@ -34,6 +34,7 @@ from .scientific_plot_options import (
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
+from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .shell_widgets import (
     _axis_presentation,
     aggregate_traces,
@@ -251,6 +252,7 @@ class ScientificView(QtWidgets.QFrame):
         self._waterfall_render_contract: tuple[object, ...] | None = None
         self._processing_mode = ""
         self._viewer_2d_payload = None
+        self._expected_background_key = self._rendered_background_key = None
         self.raw_popup_dialog = None
         self.raw_popup_image = None
         self._rendered_image_axis: str | None = None
@@ -370,6 +372,29 @@ class ScientificView(QtWidgets.QFrame):
         """Exact 1-D rows accepted by the last successful reconciliation."""
 
         return self._trace_history_keys
+
+    def expect_display_background(self, active_key) -> None:
+        key = active_key if type(active_key) is tuple else None
+        if key != self._expected_background_key:
+            self._rendered_trace_keys = (); self._rendered_plot_mode = ""
+            self._waterfall_source_keys = (); self._waterfall_render_contract = None
+        self._expected_background_key = key
+
+    def release_display_background(self, active_key):
+        if active_key != self._rendered_background_key: return DisplayBackgroundRendererReleaseReceipt(active_key, False)
+        domain = active_key[2]
+        try:
+            if domain == "raw":
+                self._scrub_detector_pane(self.raw); self._viewer_2d_payload = None
+                if self.raw_popup_image is not None: self._scrub_detector_pane(self.raw_popup_image)
+            elif domain == "integrated_2d":
+                self.cake.clear(); self._rendered_cake_x_axis = self._rendered_cake_y_axis = self._rendered_cake_axis_key = self._rendered_image_axis = None
+            else:
+                self.curve.clear(); self.waterfall.clear(); self._trace_history_by_identity.clear(); self._pinned_trace_by_id.clear()
+                self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
+            self._rendered_background_key = self._expected_background_key = None
+        except Exception: return DisplayBackgroundRendererReleaseReceipt(active_key, False)
+        return DisplayBackgroundRendererReleaseReceipt(active_key, True)
 
     def _make_top_bar(self) -> QtWidgets.QHBoxLayout:
         row = QtWidgets.QHBoxLayout()
@@ -649,6 +674,8 @@ class ScientificView(QtWidgets.QFrame):
         total: int,
         detail: str,
     ) -> None:
+        self.background.setText(("Clear" if state.background_set else "Set") + " " + {"Int 1D": "1D", "1D Viewer": "1D", "Int 2D": "2D", "2D Viewer": "Raw"}.get(state.processing_mode, "BG") + " BG")
+        self._rendered_background_key = self._expected_background_key if state.background_set else None
         if state.processing_mode == "2D Viewer":
             self._processing_mode = "2D Viewer"
             if state.heavy is None:
@@ -757,9 +784,6 @@ class ScientificView(QtWidgets.QFrame):
         )
         if replace_presentation:
             self.title.setText(state.title)
-        self.background.setText(
-            "Clear BG" if state.background_set else "Set BG"
-        )
         self._heavy_available = state.heavy_available
         self._plot_mode = state.plot_mode
         self._single_mode = state.plot_mode == "Single"
@@ -1723,13 +1747,13 @@ class ScientificView(QtWidgets.QFrame):
             self._processing_mode = normalized
             for widget in (
                 self.image_splitter, self.raw, self.cake, self.norm,
-                self.background, self.image_axis,
+                self.image_axis,
                 getattr(self, "plot_axis", self.image_axis),
                 self.share_axis, self.slice, self.slice_center,
                 self.slice_width, self.pin,
             ):
                 widget.setVisible(False)
-            self.vertical_splitter.widget(1).setVisible(True)
+            self.background.setVisible(True); self.vertical_splitter.widget(1).setVisible(True)
             self.vertical_splitter.setSizes([0, 1])
             self._set_share_link(False)
             return
@@ -1742,8 +1766,7 @@ class ScientificView(QtWidgets.QFrame):
             ):
                 widget.setVisible(False)
             self._set_share_link(False)
-            self.raw.setVisible(True)
-            self.image_splitter.setVisible(True)
+            for widget in (self.raw, self.image_splitter, self.background): widget.setVisible(True)
             return
         has_2d = normalized != "Int 1D"
         prior_has_2d = self._processing_mode not in {"Int 1D", "1D Viewer"}

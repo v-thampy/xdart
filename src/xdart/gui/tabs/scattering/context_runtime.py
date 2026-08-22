@@ -1032,6 +1032,34 @@ class _ContextRuntime:
         self._pending_trace_projection = pending
         return tuple(payloads)
 
+    def project_background_contributors(
+        self, projection: ContextProjection, browse_hydration_owner=None,
+        viewer_1d_owner=None,
+    ) -> tuple[StandardDisplayPayload, ...]:
+        """Resolve one exact selected-only snapshot outside the redraw path."""
+        if self._pending_replacement is not None or self._selection is None:
+            return ()
+        frames = self.navigation.selected
+        if not frames:
+            return ()
+        payloads: list[StandardDisplayPayload] = []
+        for frame in frames:
+            try:
+                request = self.project_request(frame, require_complete=True)
+                payload = self.resolve_projection(
+                    projection, request, browse_hydration_owner,
+                    viewer_1d_owner,
+                )
+            except (RuntimeError, TypeError):
+                return ()
+            if type(payload) is not StandardDisplayPayload:
+                return ()
+            payloads.append(payload)
+        return tuple(payloads)
+
+    def reseed_background_projection(self) -> None:
+        self._reset_trace_projection()
+
     def commit_navigation_projection(
         self,
         presented_frames: tuple[DisplayFrameKey, ...],
