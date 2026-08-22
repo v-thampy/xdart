@@ -2833,6 +2833,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             return True
         elif kind is ShellCommandKind.CLEAR_1D:
+            background = self._background_owner.projection()
+            if (background is not None and background[0] == "integrated_1d"
+                    and not self._release_display_background()):
+                return False
             if viewer_1d or getattr(controller, "viewer_1d_owned", False):
                 return self._clear_viewer_1d_renderer(close=True)
             self._shell.browser.cancel_pending_frame_selection()

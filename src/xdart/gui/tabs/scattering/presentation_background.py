@@ -284,14 +284,14 @@ class PresentationBackgroundOwner:
                              or divisor <= 0.0)):
                     raise ValueError("display target changed shape")
                 owner = np.empty(shape, dtype=np.float64)
-                flat = owner.reshape(-1); source_flat = source.reshape(-1)
+                flat = owner.reshape(-1)
                 if result.domain == "integrated_1d" and not np.array_equal(
                         target[1], result.axes[0]):
                     for start in range(0, flat.size, _BLOCK):
                         stop = min(flat.size, start + _BLOCK)
                         background = np.interp(target[1][start:stop], result.axes[0],
                                                result.values, left=np.nan, right=np.nan)
-                        np.subtract(source_flat[start:stop], background, out=flat[start:stop])
+                        np.subtract(source[start:stop], background, out=flat[start:stop])
                 else:
                     np.subtract(source, result.values, out=owner, casting="unsafe")
                 if result.domain == "integrated_1d":

@@ -115,6 +115,32 @@ def _active_page_background(mode="Int 2D"):
     return qapp, page, acquisition
 
 
+def _seed_page_1d_background(page: ScatteringWorkspace) -> PresentationBackgroundOwner:
+    shell = make_shell_projection(frame_count=2, selected_index=1,
+                                  plot_mode="Overlay")
+    state = replace(shell.scientific, processing_mode="Int 1D")
+    contributors = tuple((trace.intensity, trace.axis.values)
+                         for trace in state.traces)
+    plan = DisplayBackgroundPlan(
+        "integrated_1d", tuple(f"trace-{index}" for index in range(2)),
+        tuple(item[0].shape for item in contributors),
+        tuple((item[1].shape,) for item in contributors),
+        tuple(("Q\0Å⁻¹",) for _item in contributors))
+    owner = page._background_owner
+    key = ("context", 1, "integrated_1d", "Int 1D")
+    reservation = owner.reserve(
+        plan, contributors, stamp=OperationContextStamp(0, "context", 1),
+        active_key=key, projection_keys=tuple(id(trace.frame) for trace in state.traces),
+        projection_indices=(0, 1))
+    receipt = owner.run_and_stage(reservation, lambda: False)
+    assert owner.promote(receipt, tuple((*item, 1.0) for item in contributors))
+    page._shell.scientific.expect_display_background(key)
+    active = _apply_presentation_background(state, owner.projection())
+    page._shell.scientific.reconcile(
+        active, shell.navigation, completed=2, total=2, detail="Ready")
+    return owner
+
+
 def test_parent_red_empty_selection_refuses_set_background() -> None:
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = ScatteringWorkspace(
@@ -186,6 +212,27 @@ def test_owner_exact_accounting_bytes_roots_zero_copy_stage_and_d_once(monkeypat
     assert owner.release(DisplayBackgroundRendererReleaseReceipt(
         receipt.active_key, True)) and owner.phase == "RELEASED"
     _assert_background_released(owner)
+
+
+def test_noncontiguous_image_target_uses_only_the_charged_d_root() -> None:
+    background = np.arange(12.0).reshape(3, 4)
+    y_axis, x_axis = np.arange(3.0), np.arange(4.0)
+    plan = DisplayBackgroundPlan(
+        "integrated_2d", ("image",), ((3, 4),), (((3,), (4,)),),
+        (("q\0A^-1", "chi\0degree"),))
+    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reservation = _reserve(
+        owner, plan, ((background, y_axis, x_axis),), keys=(11,), indices=(0,))
+    receipt = owner.run_and_stage(reservation, lambda: False)
+    source = (np.arange(12.0).reshape(4, 3).T + 20.0)
+    source_before = source.copy()
+    assert not source.flags.c_contiguous
+    assert owner.promote(receipt, ((source, y_axis, x_axis),))
+    displayed = owner.projection()[1][0][1]
+    np.testing.assert_allclose(displayed, source - owner._result.values)
+    np.testing.assert_array_equal(source, source_before)
+    assert displayed.base is None and not np.shares_memory(displayed, source)
+    assert owner.active_bytes == receipt.retained_bytes + displayed.nbytes
 
 
 def test_q_equality_passes_and_one_byte_over_refuses_before_copy(monkeypatch) -> None:
@@ -353,32 +400,48 @@ def test_active_1d_background_revokes_on_normalization_edit() -> None:
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
         sources=FilesystemSourceAdapter())
-    shell = make_shell_projection(frame_count=2, selected_index=1,
-                                  plot_mode="Overlay")
-    state = replace(shell.scientific, processing_mode="Int 1D")
-    contributors = tuple((trace.intensity, trace.axis.values)
-                         for trace in state.traces)
-    plan = DisplayBackgroundPlan(
-        "integrated_1d", tuple(f"trace-{index}" for index in range(2)),
-        tuple(item[0].shape for item in contributors),
-        tuple((item[1].shape,) for item in contributors),
-        tuple(("Q\0Å⁻¹",) for _item in contributors))
-    owner = page._background_owner
-    key = ("context", 1, "integrated_1d", "Int 1D")
-    reservation = owner.reserve(
-        plan, contributors, stamp=OperationContextStamp(0, "context", 1),
-        active_key=key, projection_keys=tuple(id(trace.frame) for trace in state.traces),
-        projection_indices=(0, 1))
-    receipt = owner.run_and_stage(reservation, lambda: False)
-    assert owner.promote(receipt, tuple((*item, 1.0) for item in contributors))
+    owner = _seed_page_1d_background(page)
     try:
-        page._shell.scientific.expect_display_background(key)
-        active = _apply_presentation_background(state, owner.projection())
-        page._shell.scientific.reconcile(
-            active, shell.navigation, completed=2, total=2, detail="Ready")
         page._handle_shell_command(ShellCommand(
             ShellCommandKind.SET_NORM_CHANNEL, "monitor"))
         _assert_background_released(owner)
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+@pytest.mark.parametrize("viewer_owned", (False, True))
+def test_clear_1d_releases_active_background_before_target_clear(
+    monkeypatch, viewer_owned: bool,
+) -> None:
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter())
+    page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, "Int 1D")
+    owner, order = _seed_page_1d_background(page), []
+    release = page._release_display_background
+
+    def observed_release():
+        order.append(("release", owner.phase))
+        return release()
+
+    monkeypatch.setattr(page, "_release_display_background", observed_release)
+    if viewer_owned:
+        monkeypatch.setattr(
+            type(page._context_controller), "viewer_1d_owned",
+            property(lambda _self: True),
+        )
+        monkeypatch.setattr(
+            page, "_clear_viewer_1d_renderer",
+            lambda *, close=False: order.append(("clear", owner.phase, close)) or True,
+        )
+    try:
+        page._handle_shell_command(ShellCommand(ShellCommandKind.CLEAR_1D))
+        _assert_background_released(owner)
+        assert order[0] == ("release", "ACTIVE")
+        if viewer_owned:
+            assert order[1] == ("clear", "RELEASED", True)
+        assert page._shell.scientific.background.text() == "Set 1D BG"
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -705,3 +768,7 @@ def test_ast_has_one_public_runner_edge_and_no_hot_path_or_peer_worker() -> None
     refresh = next(node for node in ast.walk(tree)
                    if isinstance(node, ast.FunctionDef) and node.name == "_refresh_shell")
     assert "project_background_contributors" not in ast.unparse(refresh)
+    owner_tree = ast.parse(owner)
+    promote = next(node for node in ast.walk(owner_tree)
+                   if isinstance(node, ast.FunctionDef) and node.name == "promote")
+    assert "source.reshape" not in ast.unparse(promote)
