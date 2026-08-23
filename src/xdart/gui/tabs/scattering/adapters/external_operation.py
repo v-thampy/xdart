@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import is_dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, is_dataclass
+import json
 import os, stat; from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
@@ -19,9 +21,21 @@ from ..operation_values import (
 )
 from ..presentation_background import PresentationBackgroundOwner
 from xrd_tools.reduction.background import DisplayBackgroundPlan
+from xrd_tools.io.output_transaction import TargetSnapshot
+from xrd_tools.reduction import ReintegratePlan, ReintegrateProgress, ReintegrateResult, run_reintegrate
+from xrd_tools.reduction.reintegrate import ReintegrateCancelled
 
 class _BackgroundPreterminalAbort(RuntimeError):
     pass
+
+@dataclass(frozen=True, slots=True)
+class _ReintegrateRequest:
+    target: str
+    entry: str
+    expected_target_snapshot: TargetSnapshot
+    expected_labels: tuple[int, ...]
+    dimension: str
+    preparation_json: str
 
 class OperationSlot:
     """Own at most one joinable worker and its detached latest state."""
@@ -116,6 +130,54 @@ class OperationSlot:
                 raise _BackgroundPreterminalAbort(str(error)) from error
         return self._begin(plan, stamp, body,
             finalize=lambda outcome: owner.finalize(reservation, outcome))
+
+    def begin_reintegrate(self, *, target: str, entry: str,
+                          expected_target_snapshot: TargetSnapshot,
+                          expected_labels: tuple[int, ...], dimension: str,
+                          preparation_values: Mapping[str, object],
+                          stamp: OperationContextStamp) -> OperationIdentity | None:
+        valid = (type(target) is str and bool(target) and type(entry) is str and bool(entry)
+                 and type(expected_target_snapshot) is TargetSnapshot and expected_target_snapshot.exists
+                 and type(expected_labels) is tuple and bool(expected_labels)
+                 and expected_labels == tuple(sorted(set(expected_labels)))
+                 and all(type(value) is int and value >= 0 for value in expected_labels)
+                 and type(dimension) is str and dimension in {"1d", "2d"}
+                 and isinstance(preparation_values, Mapping))
+        if not valid: return None
+        try:
+            preparation_json = json.dumps(preparation_values, sort_keys=True,
+                separators=(",", ":"), allow_nan=False)
+            detached = json.loads(preparation_json)
+            if type(detached) is not dict or detached != preparation_values: return None
+        except (TypeError, ValueError, OverflowError): return None
+        request = _ReintegrateRequest(target, entry, expected_target_snapshot,
+            expected_labels, dimension, preparation_json)
+        return self._begin(request, stamp, self._run_reintegrate_request)
+
+    def _run_reintegrate_request(self, request, identity, cancelled, publish):
+        publish("prepare", 0, 1)
+        try:
+            plan = ReintegratePlan.from_artifact(request.target, entry=request.entry,
+                dimension=request.dimension, preparation=json.loads(request.preparation_json),
+                expected_target_snapshot=request.expected_target_snapshot,
+                expected_labels=request.expected_labels, cancel_token=cancelled)
+        except ReintegrateCancelled:
+            return OperationTerminal(identity, OperationTerminalStatus.CANCELLED)
+        publish("prepare", 1, 1); headless_revision = 0
+        def progress(value):
+            nonlocal headless_revision
+            try:
+                if (type(value) is not ReintegrateProgress
+                        or value.operation_identity != plan.operation_identity
+                        or value.revision <= headless_revision): return
+                headless_revision = value.revision
+                publish(value.stage, value.completed, value.total)
+            except BaseException: return
+        result = run_reintegrate(plan, cancel_token=cancelled, progress_cb=progress)
+        if type(result) is not ReintegrateResult:
+            raise TypeError("reintegration runner returned an invalid result")
+        return OperationTerminal(identity, OperationTerminalStatus.RETURNED,
+                                 payload=result)
 
     def _seal_publication(self, identity: OperationIdentity) -> bool:
         with self._lock:

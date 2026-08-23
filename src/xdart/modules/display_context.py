@@ -1270,6 +1270,9 @@ class BrowseContext(_WriteOnceIdentity):
     calibration_identity: str = ""
     mask_identity: str = ""
     result_identity: str = ""
+    target_entry: str = ""
+    loaded_labels: tuple[int, ...] = ()
+    target_snapshot: object = None
 
     _IDENTITY_FIELDS = frozenset({
         "context_token", "load_generation", "operation", "requested_path",
@@ -1277,6 +1280,7 @@ class BrowseContext(_WriteOnceIdentity):
         "viewer_rows_2d", "publication_store", "record_store",
         # E6-NORM-N1: the aggregate travels with the context, write-once.
         "norm_aggregate",
+        "target_entry", "loaded_labels", "target_snapshot",
         # §10.2: one gate, created with the context and mutated only through
         # its own methods — never replaceable by assignment.
         "commit_gate",

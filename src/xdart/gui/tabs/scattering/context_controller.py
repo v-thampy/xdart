@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import namedtuple
 from dataclasses import replace
 import os
+from pathlib import Path
 from threading import RLock, get_ident
 
 from xdart.modules.display_context import (
@@ -19,6 +20,7 @@ from xdart.modules.display_context import (
     Viewer1DContext,
 )
 from xrd_tools.io.viewer_1d import Viewer1DFormatPolicy
+from xrd_tools.io.output_transaction import TargetSnapshot
 from xrd_tools.io.viewer_2d import (
     CATALOG_RESERVATION, Viewer2DFormatPolicy,
     viewer_2d_memory_ledger, viewer_2d_selected_ledger,
@@ -439,6 +441,24 @@ class ContextController:
     @property
     def browse_pending(self) -> bool:
         return self._browse_request is not None or self._cleanup_receipt is not None
+
+    def capture_reintegrate_browse(self):
+        context, selection = self._runtime.browse_context, self._runtime.selection
+        request = None if context is None else context.load_request
+        labels = () if context is None else context.loaded_labels
+        stable = (not self._closed and self._close is None and self._cleanup_receipt is None and self._browse_request is None and type(context) is BrowseContext and context.loaded and not context.invalidated and not context.released and type(request) is BrowseLoadRequest and request is context.operation and type(selection) is DisplaySelection and selection.kind is ContextKind.BROWSE and selection.names(context) and request.source_path == context.requested_path == selection.source_path and type(context.target_entry) is str and bool(context.target_entry) and type(context.target_snapshot) is TargetSnapshot and context.target_snapshot.exists and type(labels) is tuple and bool(labels) and labels == tuple(sorted(set(labels))) and tuple(context.frame_ids) == labels and all(type(value) is int and value >= 0 for value in labels))
+        return (context, request, selection, context.requested_path, context.target_entry, context.target_snapshot, labels) if stable else None
+
+    def invalidate_reintegrate_browse(self, context, request, selection, target, entry, snapshot, labels) -> bool:
+        current = self.capture_reintegrate_browse()
+        if current is None or current[0] is not context or current[1] is not request or current[2] is not selection or current[3:] != (target, entry, snapshot, labels): return False
+        self._runtime.invalidate_browse(); return True
+
+    def reload_reintegrate_browse(self, request, target):
+        context, selection = self._runtime.browse_context, self._runtime.selection
+        if (type(request) is not BrowseLoadRequest or type(target) is not str or type(context) is not BrowseContext or context.load_request is not request or context.requested_path != target or not context.invalidated or context.released or type(selection) is not DisplaySelection or not selection.names(context) or self._browse_request is not None): return None
+        try: return self.begin_browse(target)
+        except RuntimeError: return None
 
     @property
     def browse_preview_polling_needed(self) -> bool:
@@ -1306,6 +1326,7 @@ class ContextController:
             or not source_path
         ):
             raise RuntimeError("Browse is not allowed in the current lifecycle")
+        source_path = str(Path(source_path).resolve())
         generation = self._load_generation + 1
         request = BrowseLoadRequest(
             new_context_token(ContextKind.BROWSE),
@@ -1397,6 +1418,12 @@ class ContextController:
             or not candidate.matches(
                 request.token, request.load_generation
             )
+            or not candidate.loaded
+            or type(candidate.target_snapshot) is not TargetSnapshot
+            or not candidate.target_snapshot.exists
+            or type(candidate.target_entry) is not str or not candidate.target_entry
+            or candidate.loaded_labels != tuple(candidate.frame_ids)
+            or not candidate.loaded_labels
         ):
             self._browse_request = None
             receipt = self._retain_cancel(request)

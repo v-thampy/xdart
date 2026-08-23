@@ -16,6 +16,7 @@ from xrd_tools.core.energy import (
 )
 from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io import ProcessedScan, iter_frame_records
+from xrd_tools.io.output_transaction import TargetSnapshot, capture_target_snapshot
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.scan_norm import (
     empty_norm_aggregate,
@@ -586,6 +587,12 @@ class BrowseLoader:
         scan_key: str,
         cancelled: Event,
     ) -> BrowseContext | None:
+        path = Path(request.source_path).resolve()
+        if str(path) != request.source_path:
+            raise ValueError("processed browse target must be canonical")
+        before = capture_target_snapshot(path)
+        if type(before) is not TargetSnapshot or not before.exists:
+            raise ValueError("processed browse target is unavailable")
         scan = self._open_scan(request.source_path)
         records = FrameRecordStore(max_items=self._max_items)
         publications = PublicationStore(max_items=self._max_items)
@@ -629,23 +636,9 @@ class BrowseLoader:
             return None
         if not labels:
             raise ValueError("processed browse artifact has no frames")
-        context = BrowseContext(
-            context_token=request.token,
-            load_generation=request.load_generation,
-            operation=request,
-            requested_path=request.source_path,
-            scan_key=scan_key,
-            scan=scan,
-            frame=None,
-            frame_ids=labels,
-            frames={},
-            viewer_rows_1d={},
-            viewer_rows_2d={},
-            publication_store=publications,
-            record_store=records,
-            norm_aggregate=next_norm_revision(draft),
-        )
-        context.adopt_load_request(request)
+        if tuple(labels) != tuple(sorted(set(labels))):
+            records.clear(); publications.clear()
+            raise ValueError("processed frame labels must be strictly increasing")
         persisted = read_provenance(request.source_path)
         provenance = (
             persisted.get("config", {})
@@ -662,6 +655,20 @@ class BrowseLoader:
         wavelength_m = _persisted_wavelength_m(scan)
         if wavelength_m is not None:
             presentation["wavelength_m"] = wavelength_m
+        after = capture_target_snapshot(path)
+        if type(after) is not TargetSnapshot or not after.exists or after != before:
+            records.clear(); publications.clear()
+            raise ValueError("processed browse target changed during load")
+        context = BrowseContext(
+            context_token=request.token, load_generation=request.load_generation,
+            operation=request, requested_path=request.source_path,
+            scan_key=scan_key, scan=scan, frame=None, frame_ids=labels, frames={},
+            viewer_rows_1d={}, viewer_rows_2d={}, publication_store=publications,
+            record_store=records, norm_aggregate=next_norm_revision(draft),
+            target_entry=getattr(scan, "entry", "entry"),
+            loaded_labels=tuple(labels), target_snapshot=after,
+        )
+        context.adopt_load_request(request)
         context.stamp_provenance(
             calibration=json.dumps(
                 presentation,

@@ -103,6 +103,8 @@ def project_controls(
     mask_available: bool = False,
     mask_dependency_available: bool = False,
     mask_active: bool = False,
+    reintegrate_available: bool = False,
+    reintegrate_active: bool = False,
 ) -> ControlPanelRenderState:
     intent = snapshot.thaw()
     raw_motor = intent.gi.incidence_motor
@@ -230,8 +232,17 @@ def project_controls(
                           reason=("1D Viewer" if tool is Tool.XYE_VIEWER
                                   else "2D Viewer") + " has no acquisition authority.")
                   for candidate in fields]
-    reintegration_unavailable = (
-        "Loaded-result reintegration is not available in this workspace yet."
+    reintegrate_enabled = reintegrate_active or (reintegrate_available and unlocked)
+    reintegration_reason = (
+        "Cancel the active Reintegrate 1-D operation."
+        if reintegrate_active else
+        "Replaces selected 1-D results using current 1-D integration settings and core request; calibration, mask, threshold, Background, geometry, and shared GI facts come from the loaded artifact, not current shared-science controls."
+        if reintegrate_enabled else
+        "Another experiment operation owns the common slot."
+        if operation_busy else
+        "Controls are locked during the active run."
+        if not unlocked else
+        "Load one stable processed Browse artifact to Reintegrate 1-D."
     )
     operation_unavailable = "No vNext operation service is mounted."
     calibrate_enabled = calibration_active or (
@@ -286,18 +297,18 @@ def project_controls(
         SectionId.PROCESSING: (
             ControlActionSpec(
                 ControlAction.REINTEGRATE_1D,
-                "Reintegrate 1D",
+                "Cancel Reintegrate 1-D" if reintegrate_active else "Reintegrate 1-D",
                 SectionId.PROCESSING,
-                False,
-                reintegration_unavailable,
-                False,
+                reintegrate_enabled,
+                reintegration_reason,
+                True,
             ),
             ControlActionSpec(
                 ControlAction.REINTEGRATE_2D,
                 "Reintegrate 2D",
                 SectionId.PROCESSING,
                 False,
-                reintegration_unavailable,
+                "Reintegrate 2-D is introduced in P3-5.",
                 False,
             ),
             ControlActionSpec(

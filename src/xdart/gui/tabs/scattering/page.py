@@ -23,6 +23,8 @@ from xrd_tools.session.intent_store import (
     RunIntentSnapshot,
 )
 from xrd_tools.session.run_configuration import heavy_residency_choice
+from xrd_tools.reduction import ReintegrateResult
+from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
@@ -476,6 +478,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._background_identity: OperationIdentity | None = None
         self._calibration_identity: OperationIdentity | None = None; self._calibration_revision: int | None = None
         self._mask_identity: OperationIdentity | None = None; self._mask_revision: int | None = None
+        self._reintegrate_identity: OperationIdentity | None = None
+        self._reintegrate_request: object | None = None
+        self._reintegrate_target: str | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -759,6 +764,66 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         else: self._notice("Mask was published but its edit was superseded.")
         return True
 
+    @staticmethod
+    def _reintegrate_1d_preparation(intent) -> dict[str, object]:
+        bai = jsonable_run_value(intent.bai_1d_args, path="reintegrate.selected_plan.bai_args")
+        if type(bai) is not dict: raise ValueError("current 1-D integration settings are malformed")
+        bai.pop("gi_mode_1d", None); mode = intent.gi.mode_1d; workers = intent.max_cores
+        if type(mode) is not str or mode not in {"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"}: raise ValueError("current 1-D mode is unsupported")
+        if type(workers) is not int or workers < 1: raise ValueError("current core request is invalid")
+        return {"api_version": 1,
+            "selected_plan": {"version": 1, "dimension": "1d", "bai_args": bai, "gi_mode": mode},
+            "requested_shared_science": {"version": 1, "kind": "persisted_target"},
+            "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": None,
+                                "requests": {"workers": workers}}}
+
+    def _reload_after_reintegrate(self, request, target) -> None:
+        if self._context_controller.reload_reintegrate_browse(request, target) is None:
+            self._request_browser_catalog()
+
+    def _reintegrate_1d_action(self) -> None:
+        slot, active = self._operation_slot, self._reintegrate_identity
+        if active is not None and slot.current_identity is active:
+            accepted = slot.cancel(active); self._notice("Cancelling Reintegrate 1-D…" if accepted else "Reintegrate cancellation was not accepted."); self._refresh_shell(); return
+        if not self._commit_focused_control_edit_for_run(): return
+        phase = self._lifecycle.phase; permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
+        captured = self._context_controller.capture_reintegrate_browse()
+        if self._closing or self._closed or self._admission_state is not None or slot.owned or not permitted or captured is None:
+            self._notice("Reintegrate 1-D requires one stable loaded Browse context."); self._refresh_shell(); return
+        snapshot = self._intents.snapshot()
+        try: preparation = self._reintegrate_1d_preparation(snapshot.thaw())
+        except (TypeError, ValueError) as error: self._notice(str(error)); self._refresh_shell(); return
+        stamp = self._operation_context_stamp(snapshot.revision); recaptured = self._context_controller.capture_reintegrate_browse(); current = self._intents.snapshot()
+        try: current_preparation = self._reintegrate_1d_preparation(current.thaw())
+        except (TypeError, ValueError): current_preparation = None
+        same_browse = (recaptured is not None and recaptured[0] is captured[0] and recaptured[1] is captured[1] and recaptured[2] is captured[2] and recaptured[3:] == captured[3:])
+        if current.revision != snapshot.revision or current_preparation != preparation or not same_browse or not self._context_controller.invalidate_reintegrate_browse(*captured):
+            self._notice("Reintegrate context changed before dispatch."); self._refresh_shell(); return
+        context, request, _selection, target, entry, target_snapshot, labels = captured
+        identity = slot.begin_reintegrate(target=target, entry=entry,
+            expected_target_snapshot=target_snapshot, expected_labels=labels,
+            dimension="1d", preparation_values=preparation, stamp=stamp)
+        if identity is None:
+            self._reload_after_reintegrate(request, target); self._notice("Reintegrate 1-D was not started; Browse is reloading."); self._refresh_shell(); return
+        self._reintegrate_identity, self._reintegrate_request, self._reintegrate_target = identity, request, target
+        self._notice("Reintegrating 1-D from authenticated loaded artifact science…"); self._refresh_shell(); self._ensure_timer()
+
+    def _consume_reintegrate_update(self, update: object) -> bool:
+        if type(update) is not OperationUpdate or update.identity is not self._reintegrate_identity: return False
+        if update.terminal is None:
+            if update.progress is not None: self._notice(f"Reintegrate 1-D: {update.progress.stage} {update.progress.completed}/{update.progress.total}…")
+            return True
+        terminal, request, target = update.terminal, self._reintegrate_request, self._reintegrate_target
+        self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = None
+        result = terminal.payload
+        if terminal.status is OperationTerminalStatus.RETURNED and type(result) is ReintegrateResult:
+            self._notice(f"Reintegrate 1-D {result.disposition.lower()}; reloading persisted results.")
+        elif terminal.status is OperationTerminalStatus.CANCELLED: self._notice("Reintegrate 1-D cancelled; reloading persisted results.")
+        else: self._notice(f"Reintegrate 1-D failed: {terminal.diagnostic}")
+        if request is not None and target is not None: self._reload_after_reintegrate(request, target)
+        else: self._request_browser_catalog()
+        return True
+
     @property
     def _admission(self) -> AdmissionToken | None:
         state = self._admission_state
@@ -831,6 +896,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 operation_slot is None
                 or operation_close.cleanup_status is CleanupStatus.CLEANED
             )
+            if operation_clean:
+                self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = None
         except Exception:
             operation_clean = False
 
@@ -1040,7 +1107,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return
         kind = command.kind
-        operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and ((command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity) or (command.value == "make_mask" and self._operation_slot.current_identity is self._mask_identity))
+        operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and ((command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity) or (command.value == "make_mask" and self._operation_slot.current_identity is self._mask_identity) or (command.value == "reintegrate_1d" and self._operation_slot.current_identity is self._reintegrate_identity))
         operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
         if self._operation_slot.owned and operation_locked and not operation_cancel: self._notice("Experiment operation is still active."); self._refresh_shell(); return
         if kind is ShellCommandKind.RUN_ACTION:
@@ -1133,6 +1200,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if kind is ShellCommandKind.CONTROL_ACTION:
             if command.value == "calibrate": self._calibrate_action(); return
             if command.value == "make_mask": self._mask_action(); return
+            if command.value == "reintegrate_1d": self._reintegrate_1d_action(); return
             if command.value == "advanced_processing":
                 self._edit_advanced_settings()
                 return
@@ -1905,9 +1973,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if operation_identity is not None:
             ScatteringWorkspace._observe_operation_stamp(self)
             update = operation_slot.poll(operation_identity)
-            if update is not None: changed = self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or changed
+            if update is not None: changed = self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or self._consume_reintegrate_update(update) or changed
             elif operation_identity is self._background_identity and not operation_slot.owned:
                 self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True
+            elif operation_identity is self._reintegrate_identity and not operation_slot.owned:
+                request, target = self._reintegrate_request, self._reintegrate_target; self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = None
+                if request is not None and target is not None: self._reload_after_reintegrate(request, target)
+                self._notice("Reintegrate 1-D failed before terminal publication."); changed = True
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
@@ -2392,6 +2464,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         operation_identity = self._operation_slot.current_identity
         calibration_active = (operation_identity is self._calibration_identity and not self._closing and not self._closed)
         mask_active = (operation_identity is self._mask_identity and not self._closing and not self._closed)
+        reintegrate_active = (operation_identity is self._reintegrate_identity and not self._closing and not self._closed)
         phase = self._lifecycle.phase; calibrate_dependency_available = resolve_calibration_executable() is not None; mask_dependency_available = resolve_mask_executable() is not None
         calibrate_available = (
             not self._closing and not self._closed
@@ -2419,6 +2492,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             mask_available=mask_available,
             mask_dependency_available=mask_dependency_available,
             mask_active=mask_active,
+            reintegrate_available=(not self._closing and not self._closed and self._admission_state is None and self._context_controller.capture_reintegrate_browse() is not None),
+            reintegrate_active=reintegrate_active,
         )
         project_key = (
             str(intent.project_root or ""),
