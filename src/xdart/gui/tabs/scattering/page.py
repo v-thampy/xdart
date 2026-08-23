@@ -2462,9 +2462,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 else self._sources.project_motor_knowledge(source, None)
             )
         operation_identity = self._operation_slot.current_identity
-        calibration_active = (operation_identity is self._calibration_identity and not self._closing and not self._closed)
-        mask_active = (operation_identity is self._mask_identity and not self._closing and not self._closed)
-        reintegrate_active = (operation_identity is self._reintegrate_identity and not self._closing and not self._closed)
+        operation_active = (operation_identity is not None and not self._closing and not self._closed)
+        calibration_active = operation_active and operation_identity is self._calibration_identity
+        mask_active = operation_active and operation_identity is self._mask_identity
+        reintegrate_active = operation_active and operation_identity is self._reintegrate_identity
         phase = self._lifecycle.phase; calibrate_dependency_available = resolve_calibration_executable() is not None; mask_dependency_available = resolve_mask_executable() is not None
         calibrate_available = (
             not self._closing and not self._closed
@@ -2492,7 +2493,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             mask_available=mask_available,
             mask_dependency_available=mask_dependency_available,
             mask_active=mask_active,
-            reintegrate_available=(not self._closing and not self._closed and self._admission_state is None and self._context_controller.capture_reintegrate_browse() is not None),
+            reintegrate_available=(not self._closing and not self._closed
+                and self._admission_state is None
+                and (phase is RunPhase.IDLE or phase is RunPhase.FAILED
+                     and self._lifecycle.reset_permitted)
+                and self._context_controller.capture_reintegrate_browse() is not None),
             reintegrate_active=reintegrate_active,
         )
         project_key = (

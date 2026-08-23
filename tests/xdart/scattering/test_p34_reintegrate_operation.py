@@ -171,10 +171,15 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
 
 def test_parent_red_stable_loaded_browse_enables_reintegrate_1d_start(tmp_path, monkeypatch, qapp):
     from xrd_tools.session.readiness import ControlAction, SectionId
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
     page, store, _seed, _context = _loaded_page(tmp_path, monkeypatch, qapp)
-    actions = {a.action: a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}
-    assert actions[ControlAction.REINTEGRATE_1D].enabled
-    assert not actions[ControlAction.REINTEGRATE_2D].enabled; page.close_workspace()
+    projected = page._project_controls(store.snapshot()).profile; actions = {a.action: a for a in projected.actions_for(SectionId.PROCESSING)}; experiment = {a.action: a for a in projected.actions_for(SectionId.EXPERIMENT)}
+    assert actions[ControlAction.REINTEGRATE_1D].enabled and actions[ControlAction.REINTEGRATE_1D].label == "Reintegrate 1-D"
+    assert not actions[ControlAction.REINTEGRATE_2D].enabled and experiment[ControlAction.CALIBRATE].label == "Calibrate" and experiment[ControlAction.MAKE_MASK].label == "Make Mask"
+    page._lifecycle._phase = RunPhase.FAILED; page._lifecycle._owners_closed = False; actions = {a.action: a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}
+    assert not actions[ControlAction.REINTEGRATE_1D].enabled
+    page._lifecycle._owners_closed = True; actions = {a.action: a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}
+    assert actions[ControlAction.REINTEGRATE_1D].enabled; page.close_workspace()
 def test_browse_snapshot_brackets_complete_load_and_refuses_drift(tmp_path, monkeypatch):
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest, BrowseLoadStatus
