@@ -31,6 +31,13 @@ from .controls_editing import (
 )
 from .controls_inventory import (
     AVERAGE_SCAN,
+    BACKGROUND_DIRECTORY,
+    BACKGROUND_FILE,
+    BACKGROUND_FILTER,
+    BACKGROUND_MATCH,
+    BACKGROUND_METADATA_KEY,
+    BACKGROUND_NORMALIZE,
+    BACKGROUND_SCALE,
     BACKGROUND_TYPE,
     GI_ENABLED,
     GI_MOTOR,
@@ -403,6 +410,13 @@ def _threshold_auto_fields(
 
 __all__ = [
     "AVERAGE_SCAN",
+    "BACKGROUND_DIRECTORY",
+    "BACKGROUND_FILE",
+    "BACKGROUND_FILTER",
+    "BACKGROUND_MATCH",
+    "BACKGROUND_METADATA_KEY",
+    "BACKGROUND_NORMALIZE",
+    "BACKGROUND_SCALE",
     "AdvancedSettingsValues",
     "BACKGROUND_TYPE",
     "EditNoChange",

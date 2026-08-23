@@ -16,6 +16,8 @@ __all__ = [
     "CompositeSink",
     "DisplayBackgroundPlan",
     "DisplayBackgroundResult",
+    "FrameBackgroundPlan",
+    "FrameBackgroundResult",
     "FlushPolicy",
     "Frame",
     "FrameSource",
@@ -48,6 +50,7 @@ __all__ = [
     "bind_dynamic_output_sink",
     "run_reduction",
     "run_display_background",
+    "resolve_frame_background",
     "requires_active_xye_output",
     "classify_output_sink_graph",
     "supports_durable_xye_receipts",
@@ -106,6 +109,7 @@ _STRICTNESS_EXPORTS = {
 }
 
 _BACKGROUND_EXPORTS = {"DisplayBackgroundPlan", "DisplayBackgroundResult", "run_display_background"}
+_BACKGROUND_EXPORTS.update({"FrameBackgroundPlan", "FrameBackgroundResult", "resolve_frame_background"})
 
 
 def __getattr__(name: str) -> Any:

@@ -27,7 +27,7 @@ Layout written (per the v2 schema)::
 """
 from __future__ import annotations
 
-import logging
+import logging, hashlib, json, re
 import os
 from pathlib import Path
 import uuid
@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 #: default maximum thumbnail edge, matches the GUI's preview budget
 THUMBNAIL_MAX = 256
+_MAX_BACKGROUND_DESCRIPTOR_BYTES = 262_144
 
 __all__ = [
     "THUMBNAIL_MAX",
@@ -66,6 +67,7 @@ __all__ = [
     "harvest_frame_records",
     "write_frame_source_ref",
     "write_thumbnail",
+    "write_background_dependency", "read_background_dependency",
     "drop_integrated_rows",
     "legacy_to_canonical_1d",
     "legacy_to_canonical_2d",
@@ -396,6 +398,46 @@ def _nxcollection(parent: h5py.Group, name: str) -> h5py.Group:
     return grp
 
 
+def _background_require(condition, message): return condition or (_ for _ in ()).throw(ValueError(message))
+def _background_pair(descriptor_bytes, fingerprint) -> tuple[bytes, str]:
+    _background_require(type(descriptor_bytes) is bytes and 0 < len(descriptor_bytes) <= _MAX_BACKGROUND_DESCRIPTOR_BYTES and type(fingerprint) is str and len(fingerprint) == 64 and fingerprint == fingerprint.lower() and all(value in "0123456789abcdef" for value in fingerprint), "background dependency pair is malformed")
+    text = descriptor_bytes.decode("utf-8", errors="replace"); _background_require(text.encode() == descriptor_bytes, "background descriptor is not UTF-8"); value = json.loads(text); canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
+    _background_require(type(value) is dict and canonical == descriptor_bytes and hashlib.sha256(descriptor_bytes).hexdigest() == fingerprint, "background descriptor fingerprint/canonical form differs")
+    from xrd_tools.reduction.background import FrameBackgroundPlan, _MEMBER, _frame, _tag, _untag, compile_filter
+    hex64 = lambda item: type(item) is str and len(item) == 64 and item == item.lower() and all(char in "0123456789abcdef" for char in item); path = lambda item: type(item) is str and bool(item) and not item.startswith("//") and len(item.encode()) <= 4096 and os.path.abspath(os.path.normpath(item)) == item; state = lambda item: type(item) is list and len(item) == 6 and all(type(part) is int for part in item) and item[2] & 0o170000 == 0o100000 and 0 <= item[3] <= 256 * 1024 ** 2
+    plan = FrameBackgroundPlan.from_mapping(value.get("policy")); _background_require(plan.mode != "None", "background descriptor policy is inactive"); policy = plan.to_mapping(); mode = plan.mode; raw_fact = value.get("frame_fact")
+    _background_require(type(raw_fact) is list and len(raw_fact) == 6 and type(raw_fact[4]) is list and type(raw_fact[5]) is list and all(type(row) is list and len(row) == 2 and type(row[1]) is list for row in raw_fact[5]), "background frame_fact schema is invalid")
+    fact = (raw_fact[0], raw_fact[1], raw_fact[2], raw_fact[3], tuple(raw_fact[4]), tuple((row[0], tuple(row[1])) for row in raw_fact[5])); _frame(fact, persisted=True)
+    expected_names = tuple(sorted(set(key for key in (policy["metadata_key"], policy["normalization_key"]) if key))); _background_require(tuple(row[0] for row in fact[5]) == expected_names, "background frame_fact policy projection differs")
+    def items(raw): _background_require(type(raw) is list and all(type(row) is list and len(row) == 2 and type(row[1]) is list for row in raw), "background metadata_items schema is invalid"); return _frame((0, "/x", None, 0, (1, 1), tuple((row[0], tuple(row[1])) for row in raw)), persisted=True)[5]
+    def decoded(raw, shape): _background_require(type(raw) is dict and set(raw) == {"shape", "dtype", "sha256"} and type(raw["shape"]) is list and all(type(part) is int for part in raw["shape"]) and tuple(raw["shape"]) == shape and hex64(raw["sha256"]) and type(raw["dtype"]) is str and len(raw["dtype"]) == 3 and raw["dtype"][0] in "<>=|" and raw["dtype"][1] in "iuf" and raw["dtype"][2] in "1248", "background decoded fact is malformed"); dtype = np.dtype(raw["dtype"]); _background_require(dtype.str == raw["dtype"] and 1 <= dtype.itemsize <= 8, "background decoded dtype is malformed")
+    def metadata_source(raw): _background_require(raw is None or type(raw) is dict and set(raw) == {"locator", "state", "sha256"} and path(raw["locator"]) and state(raw["state"]) and hex64(raw["sha256"]), "background metadata source is malformed")
+    positive = lambda tagged: type(number := _untag(tagged)) is float and np.isfinite(number) and number > 0 and _tag(number) == tagged
+    keys = {"Single BG File": {"version", "mode", "policy", "frame_fact", "source", "metadata_items", "metadata_source", "decoded", "result_sha256"}, "Series Average": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "normalization", "result_sha256"}, "BG Directory": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "metadata_items", "metadata_source", "decoded", "result_sha256"}}; _background_require(value.get("mode") == mode and type(value.get("version")) is int and value["version"] == 1 and set(value) == keys[mode] and hex64(value["result_sha256"]), "background descriptor schema is invalid"); shape = fact[4]
+    if mode == "Single BG File":
+        source = value["source"]; _background_require(type(source) is dict and set(source) == {"locator", "state", "sha256", "hdf", "decoded"} and path(source["locator"]) and source["locator"] == policy["locator"] and state(source["state"]) and hex64(source["sha256"]), "background source fact is malformed"); decoded(source["decoded"], shape); hdf = source["hdf"]
+        _background_require((hdf is None) == (policy["dataset_path"] is None) and (hdf is None or type(hdf) is dict and set(hdf) == {"dataset_path", "frame_index", "shape", "dtype"} and hdf["dataset_path"] == policy["dataset_path"] and type(hdf["frame_index"]) is int and hdf["frame_index"] == policy["frame_index"] and type(hdf["shape"]) is list and len(hdf["shape"]) in {2, 3} and all(type(part) is int and part > 0 for part in hdf["shape"]) and tuple(hdf["shape"][-2:]) == shape and (len(hdf["shape"]) == 2 and hdf["frame_index"] == 0 or len(hdf["shape"]) == 3 and 0 <= hdf["frame_index"] < hdf["shape"][0]) and type(hdf["dtype"]) is str and decoded({"shape": hdf["shape"][-2:], "dtype": hdf["dtype"], "sha256": "0" * 64}, shape) is None), "background HDF proof is malformed"); projected = items(value["metadata_items"]); norm = policy["normalization_key"]; _background_require(value["decoded"] == source["decoded"] and tuple(row[0] for row in projected) == tuple(key for key in (norm,) if key) and bool(projected) == (value["metadata_source"] is not None) and (norm is None or positive(dict(fact[5])[norm]) and positive(dict(projected)[norm])), "background Single projection differs"); metadata_source(value["metadata_source"])
+    else:
+        manifest = value["manifest"]; _background_require(len(descriptor_bytes) <= 16_384 and type(manifest) is dict and set(manifest) == {"version", "count", "receipt_bytes", "sha256"} and type(manifest["version"]) is int and manifest["version"] == 1 and type(manifest["count"]) is int and 1 <= manifest["count"] <= 10_000 and type(manifest["receipt_bytes"]) is int and manifest["count"] <= manifest["receipt_bytes"] <= min(64 * 1024 ** 2, manifest["count"] * 16_384) and hex64(manifest["sha256"]) and path(value["selected"]), "background manifest is invalid")
+        if mode == "Series Average":
+            normalization = value["normalization"]; _background_require(value["selected"] == policy["locator"] and type(normalization) is dict and set(normalization) == {"target", "denominator"} and all(type(normalization[key]) is list and len(normalization[key]) == 2 for key in normalization), "background Series normalization is malformed"); numbers = tuple(_untag(tuple(normalization[key])) for key in ("target", "denominator")); _background_require(all(_tag(number) == tuple(normalization[key]) and type(number) is float and np.isfinite(number) and number > 0 for key, number in zip(("target", "denominator"), numbers)) and tuple(normalization["target"]) == dict(fact[5]).get(policy["normalization_key"], _tag(1.0)) and (policy["normalization_key"] is not None or tuple(normalization["denominator"]) == _tag(1.0)), "background Series normalization is malformed")
+        else:
+            decoded(value["decoded"], shape); projected = items(value["metadata_items"]); metadata_source(value["metadata_source"]); allowed = expected_names if policy["match_rule"] == "Metadata Key" else tuple(key for key in (policy["normalization_key"],) if key); selected = Path(value["selected"]); target_match = _MEMBER.match(Path(fact[1]).stem); selected_match = _MEMBER.match(selected.stem); norm = policy["normalization_key"]; _background_require(selected.parent == Path(policy["locator"]) and value["selected"] != fact[1] and selected.suffix.casefold() in {".cbf", ".edf", ".img", ".mar3450", ".raw", ".tif", ".tiff"} and compile_filter(policy["filename_filter"])(selected.name) and tuple(row[0] for row in projected) == allowed and bool(projected) == (value["metadata_source"] is not None) and (norm is None or positive(dict(fact[5])[norm]) and positive(dict(projected)[norm])) and (policy["match_rule"] != "Metadata Key" or dict(projected)[policy["metadata_key"]] == dict(fact[5])[policy["metadata_key"]]) and (policy["match_rule"] != "Scan Root + Frame Number" or target_match and selected_match and int(selected_match.group(2)) == int(target_match.group(2)) and re.search(rf"(?:^|[_-]){re.escape(target_match.group(1))}(?:$|[_-])", selected_match.group(1), re.IGNORECASE)), "background Directory projection differs")
+    return descriptor_bytes, fingerprint
+def read_background_dependency(frame_group: h5py.Group) -> tuple[bytes, str] | None:
+    if "background_dependency" not in frame_group: return None
+    link = frame_group.get("background_dependency", getlink=True); _background_require(isinstance(link, h5py.HardLink), "background dependency link is not direct"); child = frame_group["background_dependency"]; nx_class = child.attrs.get("NX_class") if isinstance(child, h5py.Group) else None; nx_class = nx_class.decode("utf-8", errors="strict") if isinstance(nx_class, bytes) else nx_class
+    _background_require(isinstance(child, h5py.Group) and nx_class == "NXcollection", "background dependency collection is malformed"); names = iter(child); observed = (next(names, None), next(names, None), next(names, None)); _background_require(set(observed[:2]) == {"descriptor_json", "fingerprint"} and observed[2] is None, "background dependency collection is malformed")
+    def scalar(name, limit): link = child.get(name, getlink=True); dataset = child[name] if isinstance(link, h5py.HardLink) else None; encoding = h5py.check_string_dtype(dataset.dtype) if isinstance(dataset, h5py.Dataset) else None; _background_require(isinstance(dataset, h5py.Dataset) and dataset.shape == () and not dataset.is_virtual and dataset.id.get_create_plist().get_external_count() == 0 and dataset.dtype.kind == "S" and encoding is not None and encoding.encoding == "utf-8" and 0 < dataset.dtype.itemsize <= limit and dataset.id.get_storage_size() == dataset.dtype.itemsize, "background dependency scalar is malformed"); value = dataset[()]; _background_require(isinstance(value, bytes), "background dependency scalar is not bounded UTF-8"); return value.decode("utf-8", errors="strict"), dataset.dtype.itemsize
+    values = (scalar("descriptor_json", _MAX_BACKGROUND_DESCRIPTOR_BYTES), scalar("fingerprint", 64)); _background_require(values[0][1] == len(values[0][0].encode()) and values[1][1] == 64, "background dependency scalar length differs")
+    return _background_pair(values[0][0].encode("utf-8"), values[1][0])
+def write_background_dependency(frame_group: h5py.Group, descriptor_bytes: bytes | None, fingerprint: str | None) -> None:
+    if descriptor_bytes is None and fingerprint is None: _background_require("background_dependency" not in frame_group, "background dependency is unexpectedly present"); return
+    pair = _background_pair(descriptor_bytes, fingerprint)
+    if "background_dependency" in frame_group:
+        _background_require(read_background_dependency(frame_group) == pair, "background dependency changed for an existing frame"); return
+    child = _nxcollection(frame_group, "background_dependency")
+    child.create_dataset("descriptor_json", data=pair[0], dtype=h5py.string_dtype(encoding="utf-8", length=len(pair[0]))); child.create_dataset("fingerprint", data=pair[1].encode(), dtype=h5py.string_dtype(encoding="utf-8", length=64))
 def ensure_frames_container(entry_grp: h5py.Group) -> h5py.Group:
     """``entry/frames`` as an NXcollection (create-if-missing — re-creating
     would clobber per-frame groups from previous batches)."""
@@ -489,7 +531,8 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                        mask_baked: bool = True, thumbnail_mask=None,
                        source_path=None, source_frame_index: int = 0,
                        timestamp=None, source_base=None,
-                       source_snapshot=None) -> h5py.Group:
+                       source_snapshot=None, background_dependency_bytes=None,
+                       background_dependency_fingerprint=None) -> h5py.Group:
     """Write one complete per-frame record group (idempotent per key).
 
     Per the v2 schema, per-frame groups carry *only* metadata + thumbnail —
@@ -512,6 +555,7 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                                source_snapshot=source_snapshot)
     if timestamp is not None and "timestamp" not in fg:
         fg["timestamp"] = str(timestamp)
+    write_background_dependency(fg, background_dependency_bytes, background_dependency_fingerprint)
     return fg
 
 
@@ -521,7 +565,8 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                          mask_baked: bool = True, thumbnail_mask=None,
                          source_path=None, source_frame_index: int = 0,
                          timestamp=None, source_base=None,
-                         source_snapshot=None) -> h5py.Group:
+                         source_snapshot=None, background_dependency_bytes=None,
+                         background_dependency_fingerprint=None) -> h5py.Group:
     """Replace one direct per-frame record through an atomic sibling stage."""
     if not frame_key or "/" in frame_key:
         raise ValueError(
@@ -546,6 +591,8 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
             timestamp=timestamp,
             source_base=source_base,
             source_snapshot=source_snapshot,
+            background_dependency_bytes=background_dependency_bytes,
+            background_dependency_fingerprint=background_dependency_fingerprint,
         )
         if frame_key in frames_grp:
             frames_grp.move(frame_key, backup)

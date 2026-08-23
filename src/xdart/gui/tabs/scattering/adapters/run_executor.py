@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core.scan import SourceKind
+from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.integrate.calibration import (
     detector_calibration_to_integrator,
     load_detector_calibration,
@@ -51,6 +52,7 @@ from ..events import (
     ExecutorStartFailed, RunIdentity, detach_exception,
 )
 from ..output_preflight import (
+    _background_frame_fact, _merge_background_binding,
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     execution_plan_values, materialize_deferred_output,
@@ -77,6 +79,95 @@ _LIVE_DIRECTORY_POLL_S = 0.1
 
 _SOURCE_SUBMISSION_END = object()
 
+
+def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
+                                      *, cancelled, retryable=False, frame_fact=None) -> bool:
+    """The sole immediate-pre-submit Background array insertion seam."""
+    if type(plan) is not FrameBackgroundPlan: raise TypeError("Background plan must be exact")
+    frame.background = None; frame.background_dependency_bytes = None
+    frame.background_dependency_fingerprint = None
+    if plan.mode == "None": return True
+    fact = binding[1] if binding is not None else frame_fact
+    if fact is None: raise RuntimeError("Background resolution lost its frame fact")
+    result = resolve_frame_background(plan, fact, cancelled=cancelled)
+    if result.disposition == "RETRYABLE" and retryable: return False
+    if result.disposition == "CANCELLED": raise RuntimeError("admission cancelled")
+    if result.disposition != "RESOLVED" or result.background is None:
+        raise SourceRevisionChanged("Background dependency is not presently resolvable")
+    pair = result.descriptor_bytes, result.fingerprint
+    if binding is not None:
+        if pair != binding[2:]: raise SourceRevisionChanged("Background dependency changed after qualification")
+        pair = binding[2], binding[3]
+    frame.background = result.background
+    frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
+    return True
+
+
+def _qualify_background_bindings(configuration, scan, item, decision, policy,
+                                  prior, stop_signal):
+    plan = configuration.background
+    if plan.mode == "None": return prior
+    requirements = policy.allocation.requirements
+    shape = requirements.height, requirements.width
+    selector = None if item.descriptor is None else item.descriptor.dataset_path
+    if not prior and configuration.output_mode == "Append":
+        labels = tuple(range(item.source_stamp.first_label,
+            item.source_stamp.first_label + item.source_stamp.frame_count))
+        skipped = tuple(label for label in labels if label not in decision.labels)
+        if skipped:
+            from xrd_tools.io.record_writer import _read_persisted_background_bindings
+            prior = _read_persisted_background_bindings(item.target, skipped, requirements.background_binding_bytes)
+    bindings = ()
+    for existing in prior:
+        bindings = _merge_background_binding(bindings, existing,
+            limit=requirements.background_binding_bytes)
+    frames = {int(frame.index): frame for frame in scan.frames}
+    for label in (() if configuration.live_mode else decision.labels):
+        frame = frames.get(label)
+        if frame is None: raise ValueError("Background qualification lost an admitted frame")
+        fact = _background_frame_fact(frame, plan, shape, selector)
+        expected = next((value for value in bindings if value[0] == label), None)
+        try:
+            if not _resolve_background_before_submit(frame, plan, expected,
+                    cancelled=stop_signal, retryable=configuration.live_mode, frame_fact=fact):
+                raise SourceRevisionChanged("Live Background dependency is retryable")
+            binding = (label, fact, frame.background_dependency_bytes,
+                       frame.background_dependency_fingerprint)
+            bindings = _merge_background_binding(bindings, binding,
+                limit=requirements.background_binding_bytes)
+        finally:
+            frame.background = None; frame.background_dependency_bytes = None
+            frame.background_dependency_fingerprint = None
+    return bindings
+
+
+def _background_ready(run, output, frame) -> bool:
+    plan = run.configuration.background
+    if plan.mode == "None": return _resolve_background_before_submit(frame, plan, None, cancelled=run.stop_signal)
+    while True:
+        binding = output.background_binding(int(frame.index))
+        if binding is None:
+            if not run.configuration.live_mode:
+                raise RuntimeError("admitted Background binding is absent")
+            item, requirements = output.background_admission_context()
+            selector = None if item.descriptor is None else item.descriptor.dataset_path
+            fact = _background_frame_fact(
+                frame, plan, (requirements.height, requirements.width), selector)
+            try:
+                if not _resolve_background_before_submit(
+                        frame, plan, None, cancelled=run.stop_signal,
+                        retryable=True, frame_fact=fact):
+                    run.stop_signal.wait(_LIVE_DIRECTORY_POLL_S); continue
+                binding = output.admit_background_binding((int(frame.index), fact,
+                    frame.background_dependency_bytes, frame.background_dependency_fingerprint)); frame.background_dependency_bytes, frame.background_dependency_fingerprint = binding[2:]
+            except BaseException:
+                frame.background = None; frame.background_dependency_bytes = None
+                frame.background_dependency_fingerprint = None
+                raise
+            return True
+        if _resolve_background_before_submit(frame, plan, binding,
+                cancelled=run.stop_signal, retryable=run.configuration.live_mode): return True
+        run.stop_signal.wait(_LIVE_DIRECTORY_POLL_S)
 _QUARTILE_STAGE_NAMES = (
     "reducer_compute",
     "source_read",
@@ -328,6 +419,7 @@ class _StandardRun:
     gui_thread_id: int = field(default_factory=get_ident)
     command_failure: DetachedDiagnostic | None = None
     resource_facts: list[Any] = field(default_factory=list)
+    pending_partition_count: int = 1
 
     def __post_init__(self) -> None:
         self.perf_quartiles_enabled = (
@@ -1215,10 +1307,6 @@ class StandardRunExecutor:
         )
         if predecessor is not None:
             self._settle_predecessor(run, output, predecessor)
-        # Establish the item identity before validation/open.  A failure at any
-        # later construction seam must be reported against this artifact, not
-        # the previously completed one.
-        run.artifact = artifact
         cancelled = lambda: run.stop_requested
 
         def discard_source() -> None:
@@ -1286,6 +1374,19 @@ class StandardRunExecutor:
             npt = int(configuration.bai_1d_args.get("npt", 0))
         except (TypeError, ValueError):
             npt = 0
+        if item is None or decision is None:
+            raise RuntimeError("dynamic output requires one admitted output")
+        output = run.output
+        if output is None:
+            output = DynamicOutputAdapter(configuration); run.output = output
+        preparation = output.prepare_admission(
+            run.scan, plan, item, decision, run.stop_signal,
+            qualify=lambda policy, prior: _qualify_background_bindings(
+                configuration, run.scan, item, decision, policy, prior,
+                run.stop_signal))
+        if configuration.output_mode == "Overwrite" and not target_state_matches(preparation.effective):
+            raise RuntimeError(f"output target changed after Background qualification: {item.target}")
+        run.artifact = artifact
         run.display.set_factories(FrameRecordStore, PublicationStore)
         if not run.display.configured:
             descriptor_bytes = (
@@ -1302,7 +1403,7 @@ class StandardRunExecutor:
                 None,
             )
             run.display.configure(
-                partition_count=1,
+                partition_count=run.pending_partition_count,
                 npt=npt,
                 frame_bytes=(
                     descriptor_bytes
@@ -1313,6 +1414,8 @@ class StandardRunExecutor:
         mask = None if assets is None else assets.mask
         owner = run.display.artifacts.get(str(artifact))
         if owner is None:
+            if configuration.live_mode and run.display.artifacts:
+                run.display.admit_additional_partition()
             owner = run.display.add_artifact(
                 artifact,
                 str(
@@ -1353,20 +1456,11 @@ class StandardRunExecutor:
         run_provenance = configuration.as_provenance()
         if admission is not None:
             run_provenance['scientific_signature'] = admission.candidate.processing_mapping()
-        if item is None or decision is None:
-            raise RuntimeError("dynamic output requires one admitted output")
         if run.stop_requested:
             discard_source()
             raise RuntimeError("admission cancelled")
-        output = run.output
-        if output is None:
-            output = DynamicOutputAdapter(configuration)
-            run.output = output
         run.session, created = output.activate(
-            run.scan,
-            plan,
-            item,
-            decision,
+            preparation,
             record_store=run.records,
             run_provenance=run_provenance,
             cancelled=cancelled,
@@ -1518,23 +1612,7 @@ class StandardRunExecutor:
             if deferred.live:
                 return self._execute_live_directory(run, receipt, deferred)
             return self._execute_deferred_directory(run, receipt, deferred)
-        try:
-            npt = int(run.configuration.bai_1d_args.get("npt", 0))
-        except (TypeError, ValueError):
-            npt = 0
-        frame_bytes = max(
-            (
-                output.item.descriptor.frame_bytes or 0
-                for output in outputs
-                if output.item.descriptor is not None
-            ),
-            default=0,
-        )
-        run.display.configure(
-            partition_count=len(outputs),
-            npt=npt,
-            frame_bytes=frame_bytes or None,
-        )
+        run.pending_partition_count = max(1, len(outputs))
         run.total = sum(output.item.source_stamp.frame_count for output in outputs)
         run.files_discovered = receipt.directory_discovered_file_count
         output_file_counts, unowned_files = _eager_directory_file_counts(
@@ -1562,12 +1640,6 @@ class StandardRunExecutor:
             if run.stop_requested:
                 stopped = True
                 break
-            if (
-                run.configuration.output_mode == "Overwrite"
-                and not target_state_matches(decision)
-            ):
-                raise RuntimeError(f'output target changed after admission: {item.target}')
-            run.artifact = item.target
             run.current_total = item.source_stamp.frame_count
             run.current_file_total = (
                 output_file_count
@@ -1742,26 +1814,11 @@ class StandardRunExecutor:
                             raise RuntimeError(
                                 "Live output target changed after JIT"
                             )
-                        if (
-                            configuration.output_mode == "Overwrite"
-                            and not target_state_matches(decision)
-                        ):
-                            raise RuntimeError(
-                                "output target changed after Live admission: "
-                                f"{decision.item.target}"
-                            )
-
                         item = decision.item
-                        run.artifact = item.target
                         run.current_file_total = len(group.physical_paths)
                         run.current_files_incremental = (
                             item.source_spec.kind is SourceKind.TIFF_SERIES
                         )
-                        if (
-                            run.display.artifacts
-                            and str(item.target) not in run.display.artifacts
-                        ):
-                            run.display.admit_additional_partition()
                         try:
                             self._construct(
                                 run,
@@ -1845,15 +1902,7 @@ class StandardRunExecutor:
         session = None if resources is None else resources.directory_session
         if session is None:
             raise RuntimeError("deferred directory run lost its index session")
-        try:
-            npt = int(run.configuration.bai_1d_args.get("npt", 0))
-        except (TypeError, ValueError):
-            npt = 0
-        run.display.configure(
-            partition_count=len(deferred.entries),
-            npt=npt,
-            frame_bytes=None,
-        )
+        run.pending_partition_count = max(1, len(deferred.entries))
         run.files_discovered = deferred.discovered_file_count
         run.files_skipped = 0
         claimed_files: set[Path] = set()
@@ -1916,14 +1965,6 @@ class StandardRunExecutor:
                 continue
             run.files_skipped += skipped_files
             item = decision.item
-            if (
-                run.configuration.output_mode == "Overwrite"
-                and not target_state_matches(decision)
-            ):
-                raise RuntimeError(
-                    f"output target changed after admission: {item.target}"
-                )
-            run.artifact = item.target
             run.current_total = item.source_stamp.frame_count
             run.total += run.current_total
             run.current_file_total = _claim_output_physical_files(
@@ -2035,6 +2076,7 @@ class StandardRunExecutor:
                     break
                 runtime = run.context_runtime
                 submit_started = monotonic()
+                if not _background_ready(run, output, frame): break
                 if not (
                     output.submit(frame)
                     if runtime is None
@@ -2162,6 +2204,7 @@ class StandardRunExecutor:
                     frame = run.frames_by_label[label]
                     image = source.load_frame(label)
                     observed_fallbacks += 1
+                    if not _background_ready(run, output, frame): break
                     runtime = run.context_runtime
                     accepted = (
                         output.submit(frame, image)
@@ -2202,6 +2245,8 @@ class StandardRunExecutor:
                     if not accepting.is_set() or run.stop_requested:
                         accepting.clear()
                         return
+                    if not _background_ready(run, output, frame):
+                        accepting.clear(); return
                     runtime = run.context_runtime
                     submit_started = monotonic()
                     accepted = (

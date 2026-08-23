@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
 from xrd_tools.core.scan import SourceSpec
+from xrd_tools.core.filters import compile_filter
+from xrd_tools.reduction.background import FrameBackgroundPlan
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
     IntentRecaptureRequired,
@@ -20,6 +22,15 @@ from xrd_tools.sources.selection import DirectorySourceSpec
 from .contracts import SourceSelection
 from .detector_projection import poni_saturation_ceiling
 from .controls_inventory import (
+    BACKGROUND_DIRECTORY,
+    BACKGROUND_EDIT_PATHS,
+    BACKGROUND_FILE,
+    BACKGROUND_FILTER,
+    BACKGROUND_MATCH,
+    BACKGROUND_METADATA_KEY,
+    BACKGROUND_NORMALIZE,
+    BACKGROUND_SCALE,
+    BACKGROUND_TYPE,
     GI_1D_AXES,
     GI_2D_AXES,
     GI_ENABLED,
@@ -395,6 +406,8 @@ def reduce_control_edit(
 
     if type(path) is not tuple or not all(type(part) is str for part in path):
         return EditRefusal("Unknown control.")
+    if path in BACKGROUND_EDIT_PATHS:
+        return _reduce_background_edit(snapshot, path, value)
     if path in INT_PATHS:
         return _reduce_integration_edit(snapshot, path, value)
     if path in SOURCE_EDIT_PATHS:
@@ -455,6 +468,67 @@ def reduce_control_edit(
         # same exclusivity holds in both directions.
         candidate.threshold.mask_saturation = not parsed
         canonicalize_threshold_intent(candidate)
+    return candidate
+
+
+def _reduce_background_edit(
+    snapshot: RunIntentSnapshot, path: tuple[str, ...], value: object,
+) -> EditResult:
+    intent = snapshot.thaw(); plan = intent.background
+    try:
+        if path == BACKGROUND_TYPE:
+            if type(value) is not str or value not in {
+                "None", "Single BG File", "Series Average", "BG Directory"}:
+                return EditRefusal("Choose a supported Background mode.")
+            desired = replace(plan, mode=value, locator=None,
+                dataset_path=None, frame_index=None,
+                match_rule=("Scan Root + Frame Number" if value == "BG Directory" else None),
+                metadata_key=None, filename_filter="", scale=1.0, normalization_key=None)
+        elif path in {BACKGROUND_FILE, BACKGROUND_DIRECTORY}:
+            if type(value) is not str or not value.strip():
+                return EditRefusal("A Background path is required.")
+            if path == BACKGROUND_FILE:
+                if plan.mode not in {"Single BG File", "Series Average"}:
+                    return EditRefusal("Choose a file-based Background mode first.")
+                if Path(value).suffix.casefold() not in {
+                    ".cbf", ".edf", ".img", ".mar3450", ".raw", ".tif", ".tiff"}:
+                    return EditRefusal("Mounted Background supports detector-image files only.")
+            elif plan.mode != "BG Directory":
+                return EditRefusal("Choose BG Directory before selecting its folder.")
+            desired = replace(plan, locator=str(Path(value).expanduser().absolute()))
+        elif path == BACKGROUND_MATCH:
+            if plan.mode != "BG Directory" or value not in {
+                "Scan Root + Frame Number", "Metadata Key"}:
+                return EditRefusal("Choose a supported Background match rule.")
+            desired = replace(plan, match_rule=str(value),
+                              metadata_key=None if value != "Metadata Key" else plan.metadata_key)
+        elif path == BACKGROUND_METADATA_KEY:
+            if plan.mode != "BG Directory" or plan.match_rule != "Metadata Key" \
+                    or type(value) is not str or not value.strip() or len(value.encode()) > 256:
+                return EditRefusal("A bounded metadata key is required for Metadata Key matching.")
+            desired = replace(plan, metadata_key=value.strip())
+        elif path == BACKGROUND_FILTER:
+            if plan.mode != "BG Directory" or type(value) is not str:
+                return EditRefusal("Background Filter is available only for BG Directory.")
+            compile_filter(value); desired = replace(plan, filename_filter=value.strip())
+        elif path == BACKGROUND_SCALE:
+            if type(value) is bool:
+                return EditRefusal("Background Scale must be finite.")
+            parsed = float(value)
+            if not math.isfinite(parsed): return EditRefusal("Background Scale must be finite.")
+            desired = replace(plan, scale=parsed)
+        else:
+            if type(value) is not str:
+                return EditRefusal("Background normalization must be a metadata key or None.")
+            normalized = value.strip()
+            key = None if normalized.casefold() == "none" else normalized
+            if key is not None and (not key or len(key.encode()) > 256):
+                return EditRefusal("Background normalization key is invalid.")
+            desired = replace(plan, normalization_key=key)
+    except (TypeError, ValueError, OverflowError):
+        return EditRefusal("Background value is invalid.")
+    if desired == plan: return EditNoChange()
+    candidate = snapshot.thaw(); candidate.background = desired
     return candidate
 
 

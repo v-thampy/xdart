@@ -85,11 +85,14 @@ class SessionResourceRequirements:
     npt_azim: int = 0
     sigma_1d: int = 0
     sigma_2d: int = 0
+    resolver_background_bytes: int = 0
     worker_background_bytes: int = 0
+    background_binding_bytes: int = 0
     def __post_init__(self) -> None:
         for n in ("height", "width", "native_itemsize"):
             _int(n, getattr(self, n), low=1)
-        for n in ("background_bytes", "worker_background_bytes",
+        for n in ("background_bytes", "resolver_background_bytes",
+                  "worker_background_bytes", "background_binding_bytes",
                   "npt_1d", "npt_rad", "npt_azim"):
             _int(n, getattr(self, n))
         _int("modes_1d", self.modes_1d, high=MAX_MODES_1D)
@@ -177,7 +180,9 @@ def _mode_counts(plan, one_d, two_d) -> tuple[int, int]:
             _declared_modes(plan, extra, "enabled_modes_2d",
                             two_d is not None, MAX_MODES_2D))
 def requirements_from(descriptor, plan, *, background_bytes: int = 0,
-                     worker_background_bytes: int = 0
+                     resolver_background_bytes: int = 0,
+                     worker_background_bytes: int = 0,
+                     background_binding_bytes: int = 0,
                      ) -> SessionResourceRequirements:
     """Combine a pixel-free descriptor with the plan; duck-typed, stdlib-only."""
     shape = tuple(getattr(descriptor, "frame_shape", None) or ())
@@ -192,7 +197,9 @@ def requirements_from(descriptor, plan, *, background_bytes: int = 0,
         height=int(shape[-2]), width=int(shape[-1]),
         native_itemsize=int(dtype.itemsize),
         background_bytes=background_bytes,
+        resolver_background_bytes=resolver_background_bytes,
         worker_background_bytes=worker_background_bytes,
+        background_binding_bytes=background_binding_bytes,
         modes_1d=modes_1d, modes_2d=modes_2d,
         npt_1d=int(getattr(one_d, "npt", 0) or 0),
         npt_rad=int(getattr(two_d, "npt_rad", 0) or 0),
@@ -205,6 +212,8 @@ def _categories(req: SessionResourceRequirements, counts: dict, *,
     (``F``).  Staging/records/publication are never a union."""
     P = req.native_frame_bytes if detector else 0
     G = req.background_bytes if detector else 0
+    R = req.resolver_background_bytes if detector else 0
+    Bmap = req.background_binding_bytes if detector else 0
     T = req.thumbnail_bytes if detector else 0
     per_worker = (8 * req.pixels + 4 * req.pixels + req.worker_background_bytes
                   if detector else 0)
@@ -213,15 +222,16 @@ def _categories(req: SessionResourceRequirements, counts: dict, *,
     return {
         # +1 is the producer-held frame; in-flight views ALIAS it, charged once.
         "source_native": owner + (counts["queue_depth"] + 1
-                                  + counts["reduction_inflight"]) * P,
-        "staging": counts["staging_items"] * (P + G + A1 + A2 + T),
+                                  + counts["reduction_inflight"]) * P
+                         + (counts["reduction_inflight"] + 1) * G,
+        "staging": counts["staging_items"] * (P + A1 + A2 + T),
         "records": (counts["record_items"] * A1
                     + counts["record_heavy_items"] * A2),
         "publication": (counts["publication_items"] * A1
-                        + counts["publication_heavy_items"] * (P + G + A2)
+                        + counts["publication_heavy_items"] * (P + A2)
                         + counts["thumbnail_items"] * T),
         "worker": (counts["workers"] * (INTEGRATOR_RESERVE_BYTES + per_worker)
-                   + counts["reduction_inflight"] * (A1 + A2)),
+                   + counts["reduction_inflight"] * (A1 + A2) + R + Bmap),
     }
 def _minimum_counts(req: SessionResourceRequirements) -> dict:
     return {name: low for name, (low, _unit) in _tunables(req).items()}
@@ -237,13 +247,13 @@ def _tunables(req: SessionResourceRequirements) -> dict:
     A1, A2 = req.result_1d_bytes, req.result_2d_bytes
     return {
         "workers": (1, INTEGRATOR_RESERVE_BYTES + 12 * req.pixels
-                    + req.worker_background_bytes + P + A1 + A2),
-        "reduction_inflight": (1, P + A1 + A2),
+                    + req.worker_background_bytes + P + G + A1 + A2),
+        "reduction_inflight": (1, P + G + A1 + A2),
         "queue_depth": (1, P),
         "owner_block_bytes": (P, P),
-        "staging_items": (1, P + G + A1 + A2 + T),
+        "staging_items": (1, P + A1 + A2 + T),
         "record_heavy_items": (1, A2),
-        "publication_heavy_items": (1, P + G + A2),
+        "publication_heavy_items": (1, P + A2),
         "thumbnail_items": (1, T),
         "record_items": (1, A1),
         "publication_items": (1, A1),

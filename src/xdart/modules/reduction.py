@@ -32,7 +32,7 @@ from xrd_tools.core.metadata import (
     resolve_monitor_norm,
 )
 from xrd_tools.reduction import (
-    Frame,
+    Frame, FrameBackgroundPlan,
     FrameReduction,
     GIMode,
     Integration1DPlan,
@@ -1237,6 +1237,7 @@ def open_live_scan_session(
     dynamic_nexus_checkpoint: bool = False,
     dynamic_nexus_checkpoint_threshold: int | None = None,
     _headless_scan: Scan | None = None,
+    _background_plan=None,
 ):
     """Open a public :class:`xrd_tools.session.ScanSession` over xdart live
     frames (4f-bridge).
@@ -1352,7 +1353,19 @@ def open_live_scan_session(
             frame_shape=tuple(getattr(image, "shape", ())),
             dtype=getattr(image, "dtype", None),
         )
-        actual_requirements = requirements_from(descriptor, plan)
+        supplied = policy.allocation.requirements
+        terms = (supplied.background_bytes, supplied.resolver_background_bytes, supplied.worker_background_bytes, supplied.background_binding_bytes)
+        if _background_plan is None and terms != (0, 0, 0, 0): raise ValueError("active allocation requires an exact Background plan")
+        background = FrameBackgroundPlan() if _background_plan is None else _background_plan
+        if type(background) is not FrameBackgroundPlan: raise TypeError("Background plan must be exact")
+        D = int(np.prod(descriptor.frame_shape)); expected = ((0, 0, 0, 0) if background.mode == "None" else (8*D, 25*D if background.mode == "Series Average" else 8*D, 8*D, 64*1024**2))
+        if terms != expected: raise ValueError("explicit allocation has invalid Background resource terms")
+        actual_requirements = requirements_from(descriptor, plan,
+            background_bytes=supplied.background_bytes,
+            resolver_background_bytes=supplied.resolver_background_bytes,
+            worker_background_bytes=supplied.worker_background_bytes,
+            background_binding_bytes=supplied.background_binding_bytes,
+        )
         if resolve_session_policy(
             actual_requirements,
             allocation=policy.allocation,

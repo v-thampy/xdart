@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 import json
@@ -739,9 +740,11 @@ class AdmittedOutput:
     labels: tuple[int, ...]
     fact: OutputFact
     reason: str = ""
+    background_bindings: tuple[tuple[int, tuple[object, ...], bytes, str], ...] = ()
 
     def __post_init__(self) -> None:
         labels, state = self.labels, self.fact.target_state
+        bindings = self.background_bindings
         if not (type(self.item) is PlannedOutput
                 and type(self.disposition) is OutputDisposition
                 and type(labels) is tuple and labels == tuple(sorted(set(labels)))
@@ -750,7 +753,14 @@ class AdmittedOutput:
                 and (type(state) is bool or type(state) is tuple
                      and len(state) == 5
                      and all(type(value) is int and value >= 0 for value in state))
-                and type(self.reason) is str):
+                and type(self.reason) is str
+                and type(bindings) is tuple
+                and all(type(value) is tuple and len(value) == 4 and type(value[0]) is int
+                        and type(value[1]) is tuple and len(value[1]) == 6
+                        and type(value[2]) is bytes and 0 < len(value[2]) <= 262_144
+                        and type(value[3]) is str and hashlib.sha256(value[2]).hexdigest() == value[3]
+                        for value in bindings)
+                and tuple(value[0] for value in bindings) == tuple(sorted(set(value[0] for value in bindings)))):
             raise TypeError("admitted output is invalid")
 
 @dataclass(frozen=True, slots=True)

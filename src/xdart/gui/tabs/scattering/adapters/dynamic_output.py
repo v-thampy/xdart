@@ -6,7 +6,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
 from types import SimpleNamespace
 from typing import Any
 
@@ -63,7 +63,7 @@ from xrd_tools.session.run_configuration import heavy_residency_choice
 from xrd_tools.session.display_logic import xye_prefix_for_unit
 
 from ..contracts import AdmittedOutput, PlannedOutput, SourceExecutionStamp
-from ..output_preflight import source_snapshots
+from ..output_preflight import _background_resource_terms, _merge_background_binding, source_snapshots
 
 
 _MISSING = object()
@@ -329,6 +329,10 @@ class HeavyResidencyFact:
             f"effective-display={self.effective_display_count}")
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedAdmission:
+    owner: object; scan: object; plan: object; item: PlannedOutput
+    provisional: AdmittedOutput; effective: AdmittedOutput; stop_signal: Event; context: tuple[object, ...]; resources: tuple[object, ...]; identity: object; consumed: bool = False
 def _heavy_resolution_source(bound: int | None, env: dict[str, str]) -> str:
     if bound is not None: return "ui"
     raw = env.get("XDART_HEAVY_WINDOW")
@@ -350,13 +354,11 @@ def _light_policy_layout(
     configuration, plan, item, scan, write_labels, *, heavy_request=None,
     reduction_inflight=None, staging_frame_cap=None,
     semantic_checkpoint_frame_cap=None, unsafe_unfunded_staging=False,
-    env=None,
+    env=None, accepted_allocation=None,
 ):
-    if not write_labels:
-        raise ValueError("dynamic light-1D mount has no admitted write frame")
     try:
         frame = next(value for value in scan.frames
-                     if int(value.index) == int(write_labels[0]))
+                     if not write_labels or int(value.index) == int(write_labels[0]))
     except StopIteration:
         raise ValueError("dynamic light-1D write frame is absent from the Scan")
     descriptor = item.descriptor
@@ -367,11 +369,14 @@ def _light_policy_layout(
         if frame.image is None:
             frame.load_image()
         shape, native_dtype = frame.image.shape, frame.image.dtype
+    pixels = int(np.prod(shape)); G, R, Bw, Bmap = _background_resource_terms(configuration.background, pixels)
     requirements = requirements_from(SimpleNamespace(
-        frame_shape=tuple(shape), dtype=np.dtype(native_dtype)), plan)
+        frame_shape=tuple(shape), dtype=np.dtype(native_dtype)), plan,
+        background_bytes=G, resolver_background_bytes=R,
+        worker_background_bytes=Bw, background_binding_bytes=Bmap)
     requested = max(1, int(configuration.max_cores))
     requests = {}
-    if _direct_eiger_candidate(item, write_labels):
+    if _direct_eiger_candidate(item, range(item.source_stamp.frame_count)):
         from xrd_tools.sources.eiger_direct_chunk import (
             direct_chunk_workspace_bytes,
         )
@@ -400,7 +405,7 @@ def _light_policy_layout(
     frozen_env = dict(os.environ) if env is None else dict(env)
     policy = resolve_session_policy(
         requirements, requested_workers=requested, requests=requests or None,
-        env=frozen_env,
+        allocation=accepted_allocation, env=frozen_env,
     )
     if (
         reduction_inflight is None
@@ -410,7 +415,8 @@ def _light_policy_layout(
         policy = resolve_session_policy(
             requirements, envelope_bytes=policy.allocation.envelope_bytes,
             requested_workers=requested,
-            requests={**requests, "reduction_inflight": 16}, env=frozen_env,
+            requests={**requests, "reduction_inflight": 16},
+            allocation=accepted_allocation, env=frozen_env,
         )
     allocation = policy.allocation
     if (
@@ -477,7 +483,7 @@ def _light_policy_layout(
         retained_rows, unfunded_bytes, projected_bytes = (
             _unsafe_unfunded_staging_projection(
                 allocation,
-                frame_count=len(write_labels),
+                frame_count=item.source_stamp.frame_count,
                 checkpoint=staging_frame_cap - 8,
             )
         )
@@ -734,6 +740,7 @@ def _science_projection(
         "threshold": values["threshold"],
         "poni_values": values["poni_values"],
         "accepted_scientific_assets": assets,
+        **({"background": values["background"]} if "background" in values else {}),
     }
 
 
@@ -912,6 +919,13 @@ class DynamicOutputAdapter:
             else tuple(self._current["persisted_prefix_labels"])
         )
 
+    def background_binding(self, label: int): return None if self._current is None else next((value for value in self._current["background_bindings"] if value[0] == int(label)), None)
+    def background_admission_context(self):
+        return (self._current["item"], self._current["policy"].allocation.requirements) if self._current is not None else (_ for _ in ()).throw(RuntimeError("Background admission lost its active graph"))
+    def admit_background_binding(self, binding):
+        graph = self._current if self._current is not None else (_ for _ in ()).throw(RuntimeError("Background binding lost its active graph"))
+        limit = graph["policy"].allocation.requirements.background_binding_bytes; merged = _merge_background_binding(graph["background_bindings"], binding, limit=limit); graph["background_bindings"] = merged; return next(value for value in merged if value[0] == binding[0])
+
     def predecessor_owner(self, item: PlannedOutput):
         graph = self._current
         if graph is None or graph.get("display_owner") is None:
@@ -932,6 +946,9 @@ class DynamicOutputAdapter:
         graph = self._current
         if graph is None or graph.get("display_owner") is not owner:
             raise RuntimeError("dynamic predecessor identity changed")
+        if graph.get("dormant"):
+            if graph["session"] is not None or graph["accounting"] is not None or any(getattr(owner, name) is not None for name in ("light_lease", "light_slot", "light_hooks", "light_retry_token", "light_unsubscribe")): raise RuntimeError("dormant predecessor still owns runtime roots")
+            graph["background_bindings"] = (); self._current = None; return
         session = graph["session"]
         if (
             session.is_running
@@ -952,7 +969,7 @@ class DynamicOutputAdapter:
         graph = self._current
         if graph is None or graph.get("display_owner") is not owner:
             raise RuntimeError("dynamic predecessor identity changed")
-        return self._finish_transition(graph)
+        return SimpleNamespace(failed=False, error=None) if graph.get("dormant") else self._finish_transition(graph)
 
     def _revision(self, graph: dict[str, Any], item: PlannedOutput) -> int:
         exact = item.source_stamp.execution_identity_v1
@@ -963,7 +980,44 @@ class DynamicOutputAdapter:
             revisions[exact] = value
         return int(value)
 
+    def prepare_admission(self, scan, plan, item: PlannedOutput,
+                          decision: AdmittedOutput, stop_signal: Event, *, qualify):
+        """Freeze the final allocation and array-free Background bindings."""
+        if type(item) is not PlannedOutput or type(decision) is not AdmittedOutput \
+                or decision.item is not item or type(stop_signal) is not Event or not callable(qualify):
+            raise TypeError("dynamic admission preparation inputs are not exact")
+        if stop_signal.is_set(): raise RuntimeError("admission cancelled")
+        env = dict(os.environ); frame_count = _supported_lineage_frame_count(item.source_stamp)
+        pipeline_v2 = _post_g2_pipeline_v2_choice(self.configuration, coordinated=True)
+        pipeline = (_post_g2_pipeline_choice(self.configuration, coordinated=True)
+                    if pipeline_v2 is None else None)
+        diagnostics = _post_g2_output_diagnostics_choice(self.configuration, pipeline_v2=pipeline_v2)
+        unsafe = _unsafe_unfunded_staging_requested(
+            pipeline_v2, run_options=self.configuration.run_options, env=env,
+            frame_count=frame_count)
+        if unsafe and not (getattr(item.descriptor, "kind", None) is SourceKind.EIGER_MASTER
+                           and item.descriptor.finalized and item.descriptor.frame_shape is not None
+                           and item.descriptor.dtype is not None):
+            raise ValueError("unsafe unfunded staging requires one finalized descriptor-complete Eiger master")
+        _choice, heavy = heavy_residency_choice(self.configuration.run_options)
+        key = _target_key(item.target); graph = self._graphs.get(key)
+        dormant = self._current if graph is None and self._current is not None and self._current.get("dormant") and self._current["target"] == key and self._current["lineage"] == _stable_lineage(item) else None; authority = graph if graph is not None else dormant; accepted = None if authority is None else authority["policy"].allocation
+        policy, layout, rows, ceiling, first = _light_policy_layout(
+            self.configuration, plan, item, scan, decision.labels, heavy_request=heavy,
+            reduction_inflight=(pipeline_v2.reduction_inflight if pipeline_v2 else
+                                None if pipeline is None else pipeline[1]),
+            staging_frame_cap=(pipeline_v2.staging_frame_cap if pipeline_v2 else None),
+            semantic_checkpoint_frame_cap=(pipeline_v2.semantic_checkpoint_frame_cap if pipeline_v2 else None),
+            unsafe_unfunded_staging=unsafe, env=env, accepted_allocation=accepted)
+        prior = () if authority is None else authority["background_bindings"]
+        if authority is not None and policy.allocation is not authority["policy"].allocation: raise RuntimeError("Live allocation identity changed")
+        bindings = qualify(policy, prior)
+        effective = replace(decision, background_bindings=bindings)
+        prepared = _PreparedAdmission(self, scan, plan, item, decision, effective, stop_signal,
+            (pipeline_v2, pipeline, diagnostics, env, unsafe, heavy), (policy, layout, rows, ceiling, first), None)
+        object.__setattr__(prepared, "identity", prepared); return prepared
     def activate(self, *args, cancelled=lambda: False, **kwargs):
+        if len(args) != 1 or type(args[0]) is not _PreparedAdmission: raise TypeError("activation requires one prepared admission")
         with self._command_lock:
             if self._activating:
                 raise RuntimeError("dynamic output activation is already active")
@@ -1005,10 +1059,7 @@ class DynamicOutputAdapter:
 
     def _activate_owned(
         self,
-        scan,
-        plan,
-        item: PlannedOutput,
-        decision: AdmittedOutput,
+        preparation: _PreparedAdmission,
         *,
         record_store,
         run_provenance,
@@ -1025,6 +1076,15 @@ class DynamicOutputAdapter:
         on_checkpoint_recoverable=None,
         resource_fact_sink=None,
     ):
+        if type(preparation) is not _PreparedAdmission or preparation.owner is not self \
+                or preparation.identity is not preparation or preparation.consumed or preparation.stop_signal.is_set():
+            raise RuntimeError("dynamic admission preparation identity is invalid or consumed")
+        object.__setattr__(preparation, "consumed", True)
+        scan, plan, item, decision = (preparation.scan, preparation.plan,
+                                      preparation.item, preparation.effective)
+        pipeline_v2, pipeline, output_diagnostics, resource_env, \
+            unsafe_unfunded_staging, heavy_request = preparation.context
+        policy, layout, requested_rows, ceiling, first_write_frame = preparation.resources
         if type(run_provenance) is not dict:
             raise TypeError("dynamic output requires exact run provenance")
         mount_values = (
@@ -1033,38 +1093,7 @@ class DynamicOutputAdapter:
             on_checkpoint_recoverable,
         )
         pipeline_coordinated = all(value is not None for value in mount_values)
-        pipeline_v2 = _post_g2_pipeline_v2_choice(
-            self.configuration, coordinated=pipeline_coordinated,
-        )
-        pipeline = (
-            _post_g2_pipeline_choice(
-                self.configuration, coordinated=pipeline_coordinated,
-            ) if pipeline_v2 is None else None
-        )
-        output_diagnostics = _post_g2_output_diagnostics_choice(
-            self.configuration,
-            pipeline_v2=pipeline_v2,
-        )
-        resource_env = dict(os.environ)
         frame_count = _supported_lineage_frame_count(item.source_stamp)
-        unsafe_unfunded_staging = _unsafe_unfunded_staging_requested(
-            pipeline_v2,
-            run_options=self.configuration.run_options,
-            env=resource_env,
-            frame_count=frame_count,
-        )
-        if unsafe_unfunded_staging:
-            descriptor = item.descriptor
-            if not (
-                getattr(descriptor, "kind", None) is SourceKind.EIGER_MASTER
-                and getattr(descriptor, "finalized", False)
-                and getattr(descriptor, "frame_shape", None) is not None
-                and getattr(descriptor, "dtype", None) is not None
-            ):
-                raise ValueError(
-                    "unsafe unfunded staging requires one finalized, "
-                    "descriptor-complete Eiger master"
-                )
         science_identity = science_fingerprint(_science_projection(
             self.configuration,
             run_provenance.get("scientific_signature"),
@@ -1095,6 +1124,8 @@ class DynamicOutputAdapter:
                 raise ValueError(
                     "same target cannot change its exact output lineage"
                 )
+            if graph["policy"].allocation is not policy.allocation:
+                raise RuntimeError("prepared allocation identity changed")
             revision = self._revision(graph, item)
             intent = _append_intent(
                 self.configuration,
@@ -1125,6 +1156,7 @@ class DynamicOutputAdapter:
             graph["scan"] = scan
             graph["item"] = item
             graph["write_labels"] = write_labels
+            graph["background_bindings"] = decision.background_bindings
             self._arm(graph, write_labels, revision)
             self._current = graph
             if cancelled():
@@ -1147,7 +1179,7 @@ class DynamicOutputAdapter:
         coordinated = any(value is not None for value in mount_values)
         if coordinated and any(value is None for value in mount_values):
             raise TypeError("dynamic GUI light mount requires one exact graph")
-        policy = layout = lease = hooks = slot = None
+        lease = hooks = slot = None
         session = None
 
         preflight = None
@@ -1163,17 +1195,21 @@ class DynamicOutputAdapter:
             self._pending_preflights.append(preflight)
             preflight_snapshot = preflight.snapshot
             persisted_prefix_labels = tuple(preflight_snapshot.skip_labels)
+            if self.configuration.background.mode != "None" and persisted_prefix_labels:
+                from xrd_tools.io.record_writer import _validate_persisted_background_bindings
+                _validate_persisted_background_bindings(target, decision.background_bindings, persisted_prefix_labels)
             if preflight_snapshot.disposition is AppendDisposition.SKIP:
                 preflight.complete_noop()
                 self._release_construction_custody(
                     preflight=preflight,
                 )
                 self._current = {
-                    "session": None,
-                    "sink": None,
-                    "accounting": None,
+                    "session": None, "sink": None, "accounting": None,
+                    "dormant": True, "target": key, "lineage": lineage, "item": item, "display_owner": display_owner, "stop_requested": False,
                     "write_labels": (),
                     "persisted_prefix_labels": persisted_prefix_labels,
+                    "policy": policy,
+                    "background_bindings": decision.background_bindings,
                 }
                 return None, False
 
@@ -1186,35 +1222,15 @@ class DynamicOutputAdapter:
                 preflight.snapshot.write_labels
             )
             if coordinated:
-                choice, heavy_request = heavy_residency_choice(
+                choice, _prepared_heavy_request = heavy_residency_choice(
                     self.configuration.run_options
-                )
-                policy, layout, requested_rows, ceiling, first_write_frame = \
-                    _light_policy_layout(
-                        self.configuration, plan, item, scan, write_labels,
-                        heavy_request=heavy_request,
-                        reduction_inflight=(
-                            pipeline_v2.reduction_inflight
-                            if pipeline_v2 is not None else
-                            (None if pipeline is None else pipeline[1])
-                        ),
-                        staging_frame_cap=(
-                            pipeline_v2.staging_frame_cap
-                            if pipeline_v2 is not None else None
-                        ),
-                        semantic_checkpoint_frame_cap=(
-                            pipeline_v2.semantic_checkpoint_frame_cap
-                            if pipeline_v2 is not None else None
-                        ),
-                        unsafe_unfunded_staging=unsafe_unfunded_staging,
-                        env=resource_env,
                 )
                 allocation = policy.allocation
                 if unsafe_unfunded_staging:
                     retained, unfunded_bytes, projected_bytes = (
                         _unsafe_unfunded_staging_projection(
                             allocation,
-                            frame_count=len(write_labels),
+                            frame_count=frame_count,
                             checkpoint=(
                                 pipeline_v2.semantic_checkpoint_frame_cap
                             ),
@@ -1388,6 +1404,7 @@ class DynamicOutputAdapter:
                 accounting=accounting,
                 xye_receipt_boundary=xye,
                 policy=policy,
+                _background_plan=self.configuration.background,
                 dynamic_nexus_checkpoint=bool(
                     nexus is not None
                     and policy is not None
@@ -1453,6 +1470,8 @@ class DynamicOutputAdapter:
                 "transition": None,
                 "stop_requested": False,
                 "projection_pending": False,
+                "policy": policy,
+                "background_bindings": decision.background_bindings,
             }
             self._graphs[key] = graph
             self._current = graph

@@ -33,8 +33,10 @@ from xrd_tools.io.nexus import (
     write_stitched,
 )
 from xrd_tools.io.nexus_record import (
+    _background_pair,
     ensure_frames_container,
     quantize_thumbnail,
+    read_background_dependency,
     replace_frame_record,
     stamp_source_base,
     validate_source_base,
@@ -63,6 +65,29 @@ from xrd_tools.io.schema import (
     mode_subgroup_name,
 )
 from xrd_tools.session import ResultMode, StageReceipt, get_pool
+
+
+def _iter_persisted_background_bindings(path, labels):
+    from xrd_tools.reduction.background import _frame
+    nested = lambda value: tuple(nested(item) for item in value) if isinstance(value, list) else value
+    with h5py.File(path, "r") as handle:
+        frames = handle.get("entry/frames")
+        for label in tuple(int(value) for value in labels):
+            frame = None if not isinstance(frames, h5py.Group) else frames.get(f"frame_{label:04d}")
+            pair = None if not isinstance(frame, h5py.Group) else read_background_dependency(frame)
+            if pair is None: raise ValueError("persisted Background dependency is absent")
+            try: fact = _frame(nested(json.loads(pair[0])["frame_fact"]), persisted=True)
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+                raise ValueError("persisted Background frame fact is malformed") from error
+            if fact[0] != label: raise ValueError("persisted Background label differs")
+            yield label, fact, pair[0], pair[1]
+def _read_persisted_background_bindings(path, labels, limit):
+    bindings = []; charge = 0
+    for binding in _iter_persisted_background_bindings(path, labels):
+        charge += 1024 + len(json.dumps(binding[1], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) + len(binding[2]) + 64; charge <= limit or (_ for _ in ()).throw(ValueError("persisted Background dependency exceeds allocation")); bindings.append(binding)
+    return tuple(bindings)
+def _validate_persisted_background_bindings(path, bindings, labels) -> None:
+    for observed in _iter_persisted_background_bindings(path, labels): observed == next((value for value in bindings if value[0] == observed[0]), None) or (_ for _ in ()).throw(ValueError("persisted Background dependency changed after qualification"))
 
 
 class WriterPhase(str, Enum):
@@ -105,6 +130,8 @@ class RecordWrite:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     write_frame_record: bool = True
     replace_existing: bool = False
+    background_dependency_bytes: bytes | None = None
+    background_dependency_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         def exact_bool(value: Any, name: str) -> bool:
@@ -125,6 +152,10 @@ class RecordWrite:
             self, "source_frame_index",
             exact_nonnegative_int(self.source_frame_index, "source_frame_index"),
         )
+        if self.background_dependency_bytes is not None or self.background_dependency_fingerprint is not None:
+            pair = _background_pair(self.background_dependency_bytes, self.background_dependency_fingerprint); json.loads(pair[0])["frame_fact"][0] == self.label or (_ for _ in ()).throw(ValueError("Background dependency label differs from RecordWrite"))
+            object.__setattr__(self, "background_dependency_bytes", pair[0])
+            object.__setattr__(self, "background_dependency_fingerprint", pair[1])
         object.__setattr__(
             self, "thumbnail_mask_baked",
             exact_bool(self.thumbnail_mask_baked, "thumbnail_mask_baked"),
@@ -242,6 +273,7 @@ class _ExpectedFrameRow:
     source_frame_index: int | None
     source_snapshot: tuple[tuple[str, Any], ...]
     timestamp: str | None
+    background_dependency: tuple[bytes, str] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -836,6 +868,8 @@ class NexusRecordWriter:
             source_frame_index,
             tuple(sorted(record.source_snapshot.items())),
             timestamp,
+            (None if record.background_dependency_bytes is None else
+             (record.background_dependency_bytes, record.background_dependency_fingerprint)),
         )
 
     def _remember_frame_row(self, record: RecordWrite) -> None:
@@ -969,6 +1003,9 @@ class NexusRecordWriter:
                 f"existing frame {int(record.label)} complete source fact "
                 "does not match the mode-only write"
             )
+        frame = self._entry_group().get(f"frames/frame_{int(record.label):04d}")
+        if not isinstance(frame, h5py.Group) or read_background_dependency(frame) != self._expected_frame_row(record).background_dependency:
+            raise WriterStateError("existing frame background dependency does not match the mode-only write")
 
     def _remember_written_rows(self, records: tuple[RecordWrite, ...]) -> None:
         for record in records:
@@ -1139,6 +1176,8 @@ class NexusRecordWriter:
             expected_children.add("source")
         if expected.timestamp is not None:
             expected_children.add("timestamp")
+        if expected.background_dependency is not None:
+            expected_children.add("background_dependency")
         evidence.text(
             f"{role}/children",
             json.dumps(sorted(expected_children)),
@@ -1241,6 +1280,11 @@ class NexusRecordWriter:
                 expected.timestamp,
                 self._text_value(frame["timestamp"][()]),
             )
+        observed_background = read_background_dependency(frame)
+        if observed_background != expected.background_dependency:
+            raise WriterStateError(f"durability readback mismatch for {role}/background_dependency")
+        if observed_background is not None:
+            evidence.text(f"{role}/background_dependency", expected.background_dependency[1], observed_background[1])
 
     def _frame_row_digest(self, label: int) -> tuple[str, int]:
         """Digest the complete persisted provenance row without retaining data."""
@@ -2032,6 +2076,10 @@ class NexusRecordWriter:
             if record.source_path is not None:
                 relative_source_path(record.source_path, self.source_base)
             frame = entry.get(f"frames/frame_{int(record.label):04d}")
+            expected_background = (None if record.background_dependency_bytes is None else
+                (record.background_dependency_bytes, record.background_dependency_fingerprint))
+            if isinstance(frame, h5py.Group) and read_background_dependency(frame) != expected_background:
+                raise WriterStateError("existing frame Background dependency changed")
             if record.replace_existing and not isinstance(frame, h5py.Group):
                 raise WriterStateError(
                     f"explicit replacement requires existing frame label "
@@ -2214,6 +2262,8 @@ class NexusRecordWriter:
                             timestamp=record.timestamp,
                             source_base=self.source_base,
                             source_snapshot=record.source_snapshot,
+                            background_dependency_bytes=record.background_dependency_bytes,
+                            background_dependency_fingerprint=record.background_dependency_fingerprint,
                         )
                 self._remember_written_rows(batch)
             self._bump("prepare_rows", len(batch))

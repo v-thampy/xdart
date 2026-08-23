@@ -2128,6 +2128,11 @@ class NexusSink:
     ) -> RecordWrite:
         thumb, mask_baked = reduction.thumbnail, reduction._thumbnail_mask_baked
         path = getattr(frame, "source_path", None)
+        dependency = (getattr(frame, "background_dependency_bytes", None),
+                      getattr(frame, "background_dependency_fingerprint", None))
+        configuration = self._run_configuration or {}; active = configuration.get("background") if "background" in configuration else None
+        if active is not None and (None in dependency or __import__("json").loads(dependency[0])["policy"] != active): raise ValueError("active Background policy requires its exact frame dependency")
+        if active is None and any(value is not None for value in dependency): raise ValueError("inactive Background policy forbids a frame dependency")
         return RecordWrite(
             label=int(frame.index),
             result_1d=result_1d,
@@ -2148,6 +2153,8 @@ class NexusSink:
             ),
             write_frame_record=bool(getattr(reduction, "write_frame_record", True)),
             replace_existing=replace_existing,
+            background_dependency_bytes=dependency[0],
+            background_dependency_fingerprint=dependency[1],
         )
 
     def replace(self, frame: Frame, reduction: FrameReduction):

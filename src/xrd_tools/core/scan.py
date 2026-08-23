@@ -158,9 +158,18 @@ class ScanFrame:
     loader: ImageLoader | None = None
     geometry: FrameGeometry | None = None
     source_identity: str | None = None
+    background_dependency_bytes: bytes | None = None
+    background_dependency_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         self.metadata = dict(self.metadata or {})
+        if (self.background_dependency_bytes is None) != (
+            self.background_dependency_fingerprint is None
+        ) or self.background_dependency_bytes is not None and (
+            type(self.background_dependency_bytes) is not bytes
+            or type(self.background_dependency_fingerprint) is not str
+        ):
+            raise TypeError("background dependency pair is invalid")
         if self.source_path is not None and not isinstance(self.source_path, Path):
             self.source_path = Path(self.source_path)
 

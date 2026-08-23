@@ -79,6 +79,7 @@ _PROCESSING_COMPARED_FIELDS: tuple[tuple[str, str], ...] = (
     ("error_model_1d", "1D error model"),
     ("error_model_2d", "2D error model"),
     ("gi_incidence", "GI incidence angle"),
+    ("background_policy", "Background"),
 )
 
 
@@ -111,6 +112,7 @@ class ProcessingConfigSignature:
     error_model_1d: object = _UNSET
     error_model_2d: object = _UNSET
     gi_incidence: object = _UNSET
+    background_policy: tuple[tuple[str, object], ...] | None = None
 
     @property
     def display_mode(self) -> str:
@@ -157,6 +159,12 @@ def _mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     return {}
+
+def _background_policy(value: object):
+    if value is None: return None
+    from xrd_tools.reduction.background import FrameBackgroundPlan
+    plan = value if type(value) is FrameBackgroundPlan else FrameBackgroundPlan.from_mapping(dict(value))
+    return None if plan.mode == "None" else tuple(sorted(plan.to_mapping().items()))
 
 
 def _is_empty_value(value: Any) -> bool:
@@ -286,6 +294,7 @@ def processing_config_from_args(
     *,
     gi_enabled: bool | None = None,
     gi_config: Mapping[str, Any] | None = None,
+    background_policy: object = None,
 ) -> ProcessingConfigSignature:
     """Return the data-shape/axis signature for an integration setup."""
 
@@ -348,6 +357,7 @@ def processing_config_from_args(
         error_model_2d=_str_or_unset(a2, ("error_model",)),
         gi_incidence=_num_or_unset(
             gic, ("th_val", "incidence", "incident_angle", "incidence_angle")),
+        background_policy=_background_policy(background_policy),
     )
 
 
@@ -368,6 +378,7 @@ def processing_config_from_mapping(
         _mapping(config.get("bai_2d_args")),
         gi_enabled=gi_enabled,
         gi_config=_mapping(config.get("gi_config")),
+        background_policy=config.get("background"),
     )
 
 
@@ -391,6 +402,7 @@ def processing_config_from_scan(
         _mapping(getattr(scan, "bai_2d_args", {}) or {}),
         gi_enabled=bool(getattr(scan, "gi", False)),
         gi_config=_mapping(getattr(scan, "gi_config", {}) or {}),
+        background_policy=getattr(getattr(scan, "run_configuration", None), "background", getattr(scan, "background", None)),
     )
 
 
@@ -1202,7 +1214,12 @@ BOUND_CONTROL_PATHS: tuple[tuple[str, ...], ...] = (
     *INTEGRATOR_BACKED_CONTROL_PATHS,
     ("BG", "bg_type"),
     ("BG", "File"),
+    ("BG", "Directory"),
+    ("BG", "Match"),
+    ("BG", "Metadata Key"),
+    ("BG", "Filter"),
     ("BG", "Scale"),
+    ("BG", "Normalize"),
 )
 
 
@@ -1629,11 +1646,20 @@ def build_bound_control_state(
     if not nexus and source_type != "Single Image":
         add(SectionId.PROCESSING, "Average Scan", ("Signal", "series_average"),
             kind=ControlFieldKind.BOOL)
-    add(SectionId.PROCESSING, "Background", ("BG", "bg_type"),
-        kind=ControlFieldKind.COMBO)
-    if str(values.get(("BG", "bg_type"), "None")) != "None":
-        add(SectionId.PROCESSING, "BG File", ("BG", "File"), browse=True)
+    bg_mode = str(values.get(("BG", "bg_type"), "None"))
+    add(SectionId.PROCESSING, "Background", ("BG", "bg_type"), kind=ControlFieldKind.COMBO)
+    if bg_mode in {"Single BG File", "Series Average"}:
+        add(SectionId.PROCESSING, "Source File" if bg_mode == "Single BG File" else "Series Member",
+            ("BG", "File"), browse=True)
+    elif bg_mode == "BG Directory":
+        add(SectionId.PROCESSING, "Directory", ("BG", "Directory"), browse=True)
+        add(SectionId.PROCESSING, "Match", ("BG", "Match"), kind=ControlFieldKind.COMBO)
+        if str(values.get(("BG", "Match"), "")) == "Metadata Key":
+            add(SectionId.PROCESSING, "Metadata Key", ("BG", "Metadata Key"))
+        add(SectionId.PROCESSING, "Filename Filter", ("BG", "Filter"))
+    if bg_mode != "None":
         add(SectionId.PROCESSING, "Scale", ("BG", "Scale"))
+        add(SectionId.PROCESSING, "Normalize", ("BG", "Normalize"))
 
     return BoundControlState(fields=tuple(fields))
 

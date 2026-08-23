@@ -655,6 +655,56 @@ def inspect_output(
     )
 
 
+def _background_frame_fact(frame, plan, shape, selector=None) -> tuple[object, ...]:
+    """Freeze one bounded, array-free target fact for Background qualification."""
+    path = str(Path(frame.source_path).resolve(strict=False))
+    keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
+    items = []
+    for key in keys:
+        matches = (value for name, value in frame.metadata.items() if type(name) is str and name.casefold() == key.casefold())
+        value = next(matches, items)
+        if value is items or next(matches, items) is not items: raise ValueError("target Background metadata is absent or ambiguous")
+        value = value.item() if isinstance(value, np.generic) else value
+        if type(value) is bool: tagged = ("bool", value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and (not isinstance(value, int) or abs(value) <= float.fromhex("0x1.fffffffffffffp+1023")) and np.isfinite(numeric := float(value)):
+            tagged = ("number", numeric.hex())
+        elif type(value) is str and len(value) <= 4085 and len(value.encode("utf-8")) <= 4085: tagged = ("text", value)
+        elif type(value) is bytes and len(value) <= 2042: tagged = ("bytes", value.hex())
+        else: raise ValueError("target Background metadata scalar is unsupported")
+        if len(json.dumps(tagged, separators=(",", ":")).encode()) > 4096: raise ValueError("target Background scalar exceeds cap")
+        items.append((key, tagged))
+    fact = (int(frame.index), path, selector, int(frame.source_frame_index or 0), tuple(shape), tuple(items))
+    if len(json.dumps(fact, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) > 24_576:
+        raise ValueError("target Background frame fact exceeds cap")
+    return fact
+
+
+def _merge_background_binding(bindings, binding, *, limit: int):
+    """Insert one immutable binding with exact cumulative retained charge."""
+    label, fact, descriptor, fingerprint = binding
+    if hashlib.sha256(descriptor).hexdigest() != fingerprint or len(descriptor) > 262_144:
+        raise ValueError("Background dependency is malformed")
+    prior = next((value for value in bindings if value[0] == label), None)
+    if prior is not None:
+        if prior != binding: raise ValueError("Background dependency changed for an admitted label")
+        return bindings
+    charge = sum(1024 + len(json.dumps(value[1], ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode()) + len(value[2]) + 64 for value in bindings)
+    charge += 1024 + len(json.dumps(fact, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode()) + len(descriptor) + 64
+    if charge > limit: raise ValueError("Background binding map exceeds its allocation")
+    return tuple(sorted((*bindings, binding), key=lambda value: value[0]))
+
+
+def _background_resource_terms(plan, pixels: int) -> tuple[int, int, int, int]:
+    from xrd_tools.reduction import FrameBackgroundPlan
+    if type(plan) is not FrameBackgroundPlan or type(pixels) is not int or pixels <= 0:
+        raise TypeError("Background resource inputs are not exact")
+    if plan.mode == "None": return 0, 0, 0, 0
+    return 8 * pixels, (25 if plan.mode == "Series Average" else 8) * pixels, \
+        8 * pixels, 64 * 1024 ** 2
+
+
 def _directory_candidate_groups(
     plan: RunCandidatePlan,
 ) -> tuple[tuple[Candidate, ...], ...]:

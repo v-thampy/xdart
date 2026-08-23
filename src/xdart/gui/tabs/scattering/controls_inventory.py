@@ -45,6 +45,16 @@ SOURCE_META = ("Signal", "meta_ext")
 SOURCE_ENERGY = ("Source", "energy_preference")
 AVERAGE_SCAN = ("Signal", "series_average")
 BACKGROUND_TYPE = ("BG", "bg_type")
+BACKGROUND_FILE = ("BG", "File")
+BACKGROUND_DIRECTORY = ("BG", "Directory")
+BACKGROUND_MATCH = ("BG", "Match")
+BACKGROUND_METADATA_KEY = ("BG", "Metadata Key")
+BACKGROUND_FILTER = ("BG", "Filter")
+BACKGROUND_SCALE = ("BG", "Scale")
+BACKGROUND_NORMALIZE = ("BG", "Normalize")
+BACKGROUND_EDIT_PATHS = frozenset({BACKGROUND_TYPE, BACKGROUND_FILE,
+    BACKGROUND_DIRECTORY, BACKGROUND_MATCH, BACKGROUND_METADATA_KEY,
+    BACKGROUND_FILTER, BACKGROUND_SCALE, BACKGROUND_NORMALIZE})
 
 INT_1D_AXIS = ("Int1D", "axis")
 INT_1D_POINTS = ("Int1D", "points")
@@ -151,7 +161,14 @@ def bound_values(
         THRESHOLD_MAX: intent.threshold.threshold_max,
         MASK_SATURATION: intent.threshold.mask_saturation,
         AVERAGE_SCAN: False,
-        BACKGROUND_TYPE: "None",
+        BACKGROUND_TYPE: intent.background.mode,
+        BACKGROUND_FILE: intent.background.locator or "",
+        BACKGROUND_DIRECTORY: intent.background.locator or "",
+        BACKGROUND_MATCH: intent.background.match_rule or "Scan Root + Frame Number",
+        BACKGROUND_METADATA_KEY: intent.background.metadata_key or "",
+        BACKGROUND_FILTER: intent.background.filename_filter,
+        BACKGROUND_SCALE: intent.background.scale,
+        BACKGROUND_NORMALIZE: intent.background.normalization_key or "None",
     }
     values.update(source_values(intent.source_spec, source_mode=source_mode))
     values.update(integration_values(intent))
@@ -178,6 +195,7 @@ def bound_values(
             "Series Average",
             "BG Directory",
         ),
+        BACKGROUND_MATCH: ("Scan Root + Frame Number", "Metadata Key"),
     }
     if intent.gi.enabled:
         choices.update({
@@ -387,7 +405,6 @@ def truthful_field(field: ControlFormField) -> ControlFormField:
     reasons = {
         SOURCE_ENERGY: "Energy-source selection is not available in vNext yet.",
         AVERAGE_SCAN: "Series averaging has no vNext execution owner yet.",
-        BACKGROUND_TYPE: "Background subtraction has no vNext execution owner yet.",
     }
     reason = (
         "Use Choose source to replace this exact complete source."

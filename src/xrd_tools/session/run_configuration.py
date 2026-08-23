@@ -39,6 +39,11 @@ _SCHEMA_VERSION = 1
 _FrozenValue = tuple[Any, ...]
 
 
+def _default_background():
+    from xrd_tools.reduction.background import FrameBackgroundPlan
+    return FrameBackgroundPlan()
+
+
 def _float_token(value: float) -> str:
     value = float(value)
     if math.isnan(value):
@@ -778,6 +783,7 @@ class FrozenRunConfiguration:
     threshold: FrozenThresholdPolicy
     poni_file: str = ""
     mask_file: str = ""
+    background: Any = field(default_factory=_default_background)
     project_root: str = ""
     save_path: str = ""
     _bai_1d_args: _FrozenValue = field(
@@ -799,6 +805,9 @@ class FrozenRunConfiguration:
     fingerprint: str = field(init=False, compare=False)
 
     def __post_init__(self) -> None:
+        from xrd_tools.reduction.background import FrameBackgroundPlan
+        if type(self.background) is not FrameBackgroundPlan:
+            raise TypeError("background must be a FrameBackgroundPlan")
         generation = int(self.generation)
         if generation < 1:
             raise ValueError("generation must be at least 1")
@@ -824,7 +833,7 @@ class FrozenRunConfiguration:
     def _content_fingerprint_value(self) -> tuple[Any, ...]:
         """Canonical content identity, deliberately excluding generation."""
 
-        return (
+        value = (
             "xdart-frozen-run-configuration",
             _SCHEMA_VERSION,
             (
@@ -870,6 +879,9 @@ class FrozenRunConfiguration:
             self._poni_values,
             self._run_options,
         )
+        if self.background.mode != "None":
+            value += (("background", _freeze_value(self.background.to_mapping())),)
+        return value
 
     @property
     def identity(self) -> tuple[int, str]:
@@ -958,7 +970,7 @@ class FrozenRunConfiguration:
         return jsonable_run_value(self._provenance_values(), path="provenance")
 
     def _provenance_values(self) -> dict[str, Any]:
-        return {
+        values = {
             "schema_version": _SCHEMA_VERSION,
             "generation": int(self.generation),
             "fingerprint": self.fingerprint,
@@ -979,6 +991,9 @@ class FrozenRunConfiguration:
             "bai_2d_args": self.bai_2d_args,
             "run_options": self.run_options,
         }
+        if self.background.mode != "None":
+            values["background"] = self.background.to_mapping()
+        return values
 
     def native_int_snapshot(self) -> dict[str, Any]:
         """Return a reduction snapshot dictionary derived from this frozen configuration."""
@@ -1013,12 +1028,16 @@ class RunIntent:
     poni_file: str = ""
     poni_values: Mapping[Any, Any] | None = None
     mask_file: str = ""
+    background: Any = field(default_factory=_default_background)
     project_root: str = ""
     save_path: str = ""
     run_options: dict[Any, Any] = field(default_factory=dict)
     generation: int = 0
 
     def __post_init__(self) -> None:
+        from xrd_tools.reduction.background import FrameBackgroundPlan
+        if type(self.background) is not FrameBackgroundPlan:
+            raise TypeError("background must be a FrameBackgroundPlan")
         self.bai_1d_args = dict(self.bai_1d_args or {})
         self.bai_2d_args = dict(self.bai_2d_args or {})
         self.run_options = dict(self.run_options or {})
@@ -1086,6 +1105,7 @@ class RunIntent:
             threshold=self.threshold.freeze(),
             poni_file=str(self.poni_file or ""),
             mask_file=str(self.mask_file or ""),
+            background=self.background,
             project_root=str(self.project_root or ""),
             save_path=str(self.save_path or ""),
             _bai_1d_args=_mapping_value(self.bai_1d_args),
@@ -1172,6 +1192,7 @@ class RunIntent:
                 else _detached_value(dict(self.poni_values))
             ),
             mask_file=self.mask_file,
+            background=self.background,
             project_root=self.project_root,
             save_path=self.save_path,
             run_options=_detached_value(dict(self.run_options or {})),
@@ -1200,6 +1221,7 @@ class RunIntent:
             poni_file=value.poni_file,
             poni_values=value.poni_values,
             mask_file=value.mask_file,
+            background=value.background,
             project_root=value.project_root,
             save_path=value.save_path,
             run_options=value.run_options,
