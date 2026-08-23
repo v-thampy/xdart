@@ -72,6 +72,7 @@ from xrd_tools.reduction import (
     StrictPolicy,
     bind_dynamic_output_sink,
 )
+from xrd_tools.reduction.core import _cancel_requested, _request_cancel
 from .dynamic_accounting import (
     DynamicAttemptState,
     DynamicRunAccounting,
@@ -374,6 +375,7 @@ class ScanSession:
         executor_workers: int | None = None,
         _accounting_only: bool = False,
     ) -> None:
+        _cancel_requested(cancel_token)
         self._lock = threading.RLock()
         self._frame_cbs: list[Callable[[FrameEvent], None]] = []
         self._checkpoint_cbs: list[Callable[[CheckpointRecoveryEvent], None]] = []
@@ -686,7 +688,18 @@ class ScanSession:
         declared, caller_pool = _executor_request(executor, executor_workers)
         if inflight_max is not None:
             _int("inflight_max", inflight_max, low=1)
-        requirements = requirements_from(source.container_descriptor(), plan)
+        descriptor = source.container_descriptor()
+        shape, dtype = getattr(descriptor, "frame_shape", None), getattr(descriptor, "dtype", None)
+        if type(shape) is not tuple or len(shape) != 2 or any(type(value) is not int or value <= 0 for value in shape) or not isinstance(dtype, np.dtype) or dtype.kind not in "iuf": raise ValueError("source descriptor shape/dtype must be exact supported native facts")
+        names = ("background_bytes", "resolver_background_bytes",
+                 "worker_background_bytes", "background_binding_bytes")
+        background_declared = tuple(hasattr(descriptor, name) for name in names)
+        if any(background_declared) and not all(background_declared):
+            raise ValueError("source descriptor must declare all four Background resources or none")
+        terms = ({name: getattr(descriptor, name) for name in names}
+                 if all(background_declared) else {name: 0 for name in names})
+        if any(type(value) is not int or value < 0 for value in terms.values()): raise ValueError("source Background resource declarations must be exact nonnegative integers")
+        requirements = requirements_from(descriptor, plan, **terms)
         prior = self._policy
         # A cadence-only SessionPolicy(allocation=None) is NOT explicit.
         explicit = None if prior is None else prior.allocation
@@ -848,7 +861,7 @@ class ScanSession:
             self._dynamic_stop_requested = True
         if xye is not None and not self._session.drain():
             raise RuntimeError("dynamic Stop could not drain its accepted prefix")
-        self._session.cancel_token.cancel()
+        _request_cancel(self._session.cancel_token)
         self._emit_state()
 
     def finish(self, *, raise_on_failure: bool = True,
@@ -938,11 +951,13 @@ class ScanSession:
         boundary = self._dynamic_boundary
         owner = self._dynamic_owner_token
         failed = bool(result.failed)
-        stopped = bool(self._dynamic_stop_requested or result.cancelled)
+        stopped = bool(self._dynamic_stop_requested or result.cancelled or _cancel_requested(self._session.cancel_token) and (self._dynamic_nexus_sink is None or self._dynamic_nexus_sink._transaction is None or not self._dynamic_nexus_sink._transaction.snapshot().writer_succeeded))
+        if stopped and not result.cancelled: result = replace(result, cancelled=True); self._dynamic_frozen_result = result
 
         if not failed and self._dynamic_finish_seal is None:
             try:
                 self._event_sink.flush(force=True)
+                if _cancel_requested(self._session.cancel_token) and (self._dynamic_nexus_sink is None or self._dynamic_nexus_sink._transaction is None or not self._dynamic_nexus_sink._transaction.snapshot().writer_succeeded): stopped = True; result = replace(result, cancelled=True); self._dynamic_frozen_result = result
                 self._dynamic_finish_seal = boundary.prepare_session_finish(
                     self, owner, stopped=stopped,
                 )
@@ -950,6 +965,7 @@ class ScanSession:
                 result = self._mark_dynamic_failure(error)
                 failed = True
 
+        if not failed and not stopped and _cancel_requested(self._session.cancel_token) and (self._dynamic_nexus_sink is None or self._dynamic_nexus_sink._transaction is None or not self._dynamic_nexus_sink._transaction.snapshot().writer_succeeded): result = self._mark_dynamic_failure(RuntimeError("dynamic settlement cancelled before commit")); failed = True
         if failed:
             value = self._settle_dynamic_graph(result, failed=True)
             if value is not None and value.disposition is NexusTerminalDisposition.COMMITTED:
@@ -1308,7 +1324,7 @@ class ScanSession:
             raise RuntimeError("same-run continuation cannot overlap submission")
         if (
             self._dynamic_stop_requested
-            or self._session.cancel_token.cancelled
+            or _cancel_requested(self._session.cancel_token)
             or self._session.is_paused
             or not self._session.is_running
         ):

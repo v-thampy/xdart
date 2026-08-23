@@ -1082,6 +1082,8 @@ class DynamicOutputAdapter:
         object.__setattr__(preparation, "consumed", True)
         scan, plan, item, decision = (preparation.scan, preparation.plan,
                                       preparation.item, preparation.effective)
+        if _target_key(item.target) != _target_key(item.group.target):
+            raise ValueError("planned output target differs from its canonical group target")
         pipeline_v2, pipeline, output_diagnostics, resource_env, \
             unsafe_unfunded_staging, heavy_request = preparation.context
         policy, layout, requested_rows, ceiling, first_write_frame = preparation.resources
@@ -1107,7 +1109,7 @@ class DynamicOutputAdapter:
             raise ValueError(
                 "dynamic output science identity changed within one run"
             )
-        target = Path(item.target)
+        target = Path(item.group.target)
         key = _target_key(target)
         lineage = _stable_lineage(item)
         labels = tuple(range(
@@ -1188,7 +1190,9 @@ class DynamicOutputAdapter:
             if cancelled():
                 raise RuntimeError("admission cancelled")
             try:
-                preflight = prepare_append_preflight(target, intent)
+                preflight = prepare_append_preflight(
+                    target, intent, file_lock=self._command_lock,
+                )
             except AppendPreflightCleanupError as error:
                 self._pending_preflights.append(error.owner)
                 raise
@@ -1325,11 +1329,13 @@ class DynamicOutputAdapter:
                 )
                 if self.configuration.output_mode == "Append":
                     nexus = NexusSink(
-                        target, append_preflight=preflight, **sink_values,
+                        target, append_preflight=preflight,
+                        file_lock=self._command_lock, **sink_values,
                     )
                 else:
                     nexus = NexusSink(
-                        target, same_run_intent=intent, **sink_values,
+                        target, same_run_intent=intent,
+                        file_lock=self._command_lock, **sink_values,
                     )
                 if pipeline_v2 is not None:
                     nexus._configure_writer_batch_size(

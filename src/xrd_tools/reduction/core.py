@@ -85,9 +85,11 @@ from xrd_tools.io.output_transaction import (
     OwnerToken,
     StreamSeedMode,
     StreamTerminal,
+    TargetSnapshot,
     TransactionPhase,
     TransactionSnapshot,
     XyeSnapshot,
+    capture_target_snapshot,
     get_output_transaction_coordinator,
 )
 logger = logging.getLogger(__name__)
@@ -270,6 +272,11 @@ def poni_to_fiber_integrator(*args: Any, **kwargs: Any) -> Any:
 
     return _impl(*args, **kwargs)
 
+_REINTEGRATE_SCAN_MARKER = object()
+def _accepted_reintegrate_fi(scan: Any) -> Any | None:
+    from xrd_tools.integrate.gid import _xrd_fiber_integrator_type
+    return scan.integrator if scan.extra.get("_reintegrate_marker") is _REINTEGRATE_SCAN_MARKER and type(scan.integrator) is _xrd_fiber_integrator_type() else None
+
 
 def integrate_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
     from xrd_tools.integrate.single import integrate_1d as _impl
@@ -339,6 +346,25 @@ class CancelToken:
 
     def cancel(self) -> None:
         self.cancelled = True
+
+
+def _cancel_requested(token: Any | None) -> bool:
+    """Query an exact Event or the bounded legacy cancellation protocol."""
+    if token is None:
+        return False
+    if type(token) is threading.Event:
+        return token.is_set()
+    cancelled, cancel = getattr(token, "cancelled", None), getattr(token, "cancel", None)
+    if type(cancelled) is not bool or not callable(cancel): raise TypeError("cancellation token must expose exact bool cancelled and callable cancel")
+    return cancelled
+
+
+def _request_cancel(token: Any) -> None:
+    """Request cancellation without wrapping or replacing caller identity."""
+    if type(token) is threading.Event:
+        token.set()
+    else:
+        _cancel_requested(token); token.cancel()
 
 
 # Architecture-v2 canonical aliases: the reduction-facing names resolve to
@@ -1392,6 +1418,7 @@ class NexusSink:
         default=None, init=False, repr=False,
     )
     _existing_append_pending: bool = field(default=False, init=False, repr=False)
+    _replacement: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
     _perf_nexus_write: float = field(default=0.0, init=False, repr=False)
     _perf_nexus_flush: float = field(default=0.0, init=False, repr=False)
     _perf_nexus_enabled: bool = field(default=False, init=False, repr=False)
@@ -1428,6 +1455,26 @@ class NexusSink:
         sink._existing_append_intent = intent
         sink._existing_append_prefix = committed_prefix
         sink._existing_append_pending = True
+        return sink
+
+    @classmethod
+    def for_existing_replacement(
+        cls, path: Path | str, *, expected_target_snapshot: TargetSnapshot,
+        dimension: str, labels: tuple[int, ...], audit_bytes: bytes,
+        selected_plan: Mapping[str, Any], selected_gi_mode: str | None,
+        cancel_token: threading.Event | None = None, **sink_values: Any,
+    ) -> "NexusSink":
+        """Bind one selected-dimension rewrite to an admitted existing target."""
+        if type(expected_target_snapshot) is not TargetSnapshot or cancel_token is not None and type(cancel_token) is not threading.Event: raise TypeError("replacement requires exact target/cancellation objects")
+        if any(name in sink_values for name in (
+            "overwrite", "append_preflight", "same_run_intent",
+            "allow_unbound_same_run",
+        )):
+            raise ValueError("existing replacement owns its output policy")
+        sink = cls(path, overwrite=False, **sink_values)
+        sink._replacement = (
+            expected_target_snapshot, dimension, tuple(labels), bytes(audit_bytes), dict(selected_plan), selected_gi_mode, cancel_token,
+        )
         return sink
 
     @property
@@ -1589,14 +1636,14 @@ class NexusSink:
                 self._transaction.commit_stream(self._attempt, lease=self._lease)
             self._release_terminal_lease()
         else:
-            if writer is not None and writer.phase.value != "aborted":
+            if writer is not None and writer.phase.value not in {"aborted", "finished"}:
                 writer.abort()
             if self._attempt is None:
                 self._settle_unstarted_transaction()
             else:
                 snapshot = self._transaction.abort_stream(
                     self._attempt, lease=self._lease,
-                    retain_partial=bool(writer and writer.written_labels),
+                    retain_partial=bool(writer and writer.written_labels and self._replacement is None),
                 )
                 if snapshot.partial_path:
                     warnings.warn(f"writer abort preserved non-final data at {snapshot.partial_path}", RuntimeWarning, stacklevel=2)
@@ -1671,9 +1718,15 @@ class NexusSink:
                 target_owner=target_owner,
                 owners=owners,
             )
-        self._transaction = transaction
-        self._lease = lease
-        self._transaction_owners = (transaction_owner, target_owner, owners)
+            self._transaction, self._lease = transaction, lease
+            self._transaction_owners = (transaction_owner, target_owner, owners)
+            if self._replacement is not None:
+                try:
+                    if capture_target_snapshot(self.path) != self._replacement[0]: raise ValueError("TARGET_SNAPSHOT_CHANGED")
+                except BaseException as primary:
+                    try: self._settle_unstarted_transaction()
+                    except BaseException as cleanup: raise primary from cleanup
+                    self._scan = self._plan = None; raise
         try:
             if self.same_run_intent is not None:
                 if transaction.admission.snapshot.exists and not self.overwrite:
@@ -1740,6 +1793,7 @@ class NexusSink:
         self._primary_mode_1d, self._primary_mode_2d = _plan_mode_keys(plan)
         append_decision = self._prepare_transaction()
         try:
+            replacement = self._replacement
             writer = NexusRecordWriter(
                 self.path,
                 entry=self.entry,
@@ -1756,12 +1810,17 @@ class NexusSink:
                 ),
                 append_decision=append_decision,
                 fast_regenerable=self._fast_regenerable,
+                replacement_dimension=None if replacement is None else replacement[1],
+                replacement_labels=None if replacement is None else replacement[2],
+                replacement_audit=None if replacement is None else replacement[3],
+                replacement_selected_plan=None if replacement is None else replacement[4],
+                replacement_gi_mode=None if replacement is None else replacement[5],
             )
             self._writer = writer
             if self._session_facade is not None:
                 writer.bind_session(self._session_facade)
             writer.begin(
-                metadata=scan.to_metadata(),
+                metadata=None if replacement is not None else scan.to_metadata(),
                 primary_mode_1d=self._primary_mode_1d,
                 primary_mode_2d=self._primary_mode_2d,
             )
@@ -2028,6 +2087,8 @@ class NexusSink:
                 (ResultMode.two_d(mode_2d), drop_2d),
             ) if dropped
         )
+        if self._replacement is not None:
+            reduction.write_frame_record = False
         record = self._write_frame_record(
             frame, reduction,
             result_1d=None if drop_1d else result_1d,
@@ -2128,6 +2189,13 @@ class NexusSink:
     ) -> RecordWrite:
         thumb, mask_baked = reduction.thumbnail, reduction._thumbnail_mask_baked
         path = getattr(frame, "source_path", None)
+        source_snapshot = self._source_snapshots.get(str(path), {})
+        if self._replacement is not None:
+            fact = getattr(frame, "source_identity", None)
+            if not isinstance(fact, Mapping) or int(fact.get("label", -1)) != int(frame.index):
+                raise ValueError("replacement frame lost its detached source fact")
+            frame.source_frame_index = int(fact["frame_index"])
+            source_snapshot = {key: value for key, value in fact["snapshot"].items() if value is not None}; path = fact["path"]
         dependency = (getattr(frame, "background_dependency_bytes", None),
                       getattr(frame, "background_dependency_fingerprint", None))
         configuration = self._run_configuration or {}; active = configuration.get("background") if "background" in configuration else None
@@ -2144,7 +2212,7 @@ class NexusSink:
             mask_baked=mask_baked,
             source_path=path,
             source_frame_index=int(getattr(frame, "source_frame_index", None) or 0),
-            source_snapshot=self._source_snapshots.get(str(path), {}),
+            source_snapshot=source_snapshot,
             timestamp=(getattr(frame, "metadata", None) or {}).get("timestamp"),
             metadata=dict(
                 getattr(reduction, "metadata", None)
@@ -2194,6 +2262,7 @@ class NexusSink:
             }
 
     def _writer_finalization(self, writer: NexusRecordWriter) -> WriterFinalization:
+        if self._replacement is not None: return WriterFinalization()
         scan = self._scan
         plan = self._plan
         if scan is None:
@@ -2287,6 +2356,11 @@ class NexusSink:
             self._scan = None
             self._plan = None
             return self._abort_composed()
+        if self._replacement is not None and (getattr(result, "cancelled", False)
+                or not writer._row_cursors.get(f"integrated_{self._replacement[1]}", {})):
+            self._scan = None
+            self._plan = None
+            return self._abort_composed()
         if getattr(result, "cancelled", False) and not writer.written_labels:
             self._scan = None
             self._plan = None
@@ -2308,6 +2382,7 @@ class NexusSink:
         # provenance/metadata here would create a second authority for it.
         if writer.phase.value != "active":
             writer.finish()
+            if self._replacement is not None and self._replacement[6] is not None and self._replacement[6].is_set(): self._scan = self._plan = None; return self._abort_composed()
             snapshot = self._transaction.commit_stream(
                 self._attempt, lease=self._lease,
             )
@@ -2326,6 +2401,7 @@ class NexusSink:
                 raise primary from cleanup
             raise
         writer.finish(finalization)
+        if self._replacement is not None and self._replacement[6] is not None and self._replacement[6].is_set(): self._scan = self._plan = None; return self._abort_composed()
         snapshot = self._transaction.commit_stream(
             self._attempt, lease=self._lease,
         )
@@ -2559,7 +2635,7 @@ class ReductionSession:
     chunk_size: int = 1
     clear_frame_images: bool = False
     progress_cb: ProgressCallback | None = None
-    cancel_token: CancelToken | None = None
+    cancel_token: Any | None = None
     executor: Any | None = None
     gi_freeze_mode: str | None = None
     # Execution policy.  "chunked" (default) keeps the existing
@@ -2702,12 +2778,12 @@ class ReductionSession:
 
     def _is_cancelled(self) -> bool:
         with self._state_lock:
-            return self._cancelled or self.cancel_token.cancelled
+            return self._cancelled or _cancel_requested(self.cancel_token)
 
     def _terminal_state(self) -> tuple[bool, BaseException | None]:
         with self._state_lock:
             return (
-                self._cancelled or self.cancel_token.cancelled,
+                self._cancelled or _cancel_requested(self.cancel_token),
                 self._failure,
             )
 
@@ -2744,7 +2820,10 @@ class ReductionSession:
         bind_run_mask = getattr(self._sink, "_bind_run_saturation_mask", None)
         if callable(bind_run_mask):
             bind_run_mask(self._run_saturation_mask)
-        self.cancel_token = self.cancel_token or CancelToken()
+        if self.cancel_token is None:
+            self.cancel_token = CancelToken()
+        else:
+            _cancel_requested(self.cancel_token)
         self._freeze_policy = _normalize_gi_freeze_mode(self.gi_freeze_mode)
         self._output_path = _sink_path(self._sink) or (
             self.scan.output_path if isinstance(self.scan.output_path, Path) else None
@@ -2762,6 +2841,7 @@ class ReductionSession:
                 self.scan.frames[0] if self.scan.frames else None,
                 self.plan.gi,
             )
+            fi = _accepted_reintegrate_fi(self.scan)
             if self._freeze_policy in {"first_frame", "scout_union"}:
                 self._apply_gi_freeze(self._freeze_policy)
         else:
@@ -3021,7 +3101,7 @@ class ReductionSession:
             if receipt is not None and receipt[0] == _TICKET_ACCEPTED:
                 self._record_failure(exc)
                 self._mark_cancelled()
-                self.cancel_token.cancel()
+                _request_cancel(self.cancel_token)
                 ticket.complete_wake()
             else:
                 self._reject_publication(ticket, exc, label)
@@ -3434,7 +3514,7 @@ class ReductionSession:
                 if q.unfinished_tasks == 0:
                     return True
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or self.cancel_token.cancelled:
+                if remaining <= 0 or _cancel_requested(self.cancel_token):
                     return False
                 q.all_tasks_done.wait(min(poll, remaining))
 
@@ -3523,7 +3603,7 @@ class ReductionSession:
                     # cancel token so the worker unblocks at its next check, and
                     # flag the result as failed so the caller gets a loud error
                     # rather than a silent hang.
-                    self.cancel_token.cancel()
+                    _request_cancel(self.cancel_token)
                     self._mark_cancelled()
                     self._record_failure(TimeoutError(
                             f"ReductionSession.finish(): writer thread did not "
@@ -3626,7 +3706,7 @@ class ReductionSession:
             self.plan,
             self.scan,
             freeze_policy=freeze_policy,
-            fi=None,
+            fi=_accepted_reintegrate_fi(self.scan),
             initial_incident_angle=self._initial_incident_angle,
             warned_monitor_keys=self._warned_monitor_keys,
             run_saturation_mask=self._run_saturation_mask,
@@ -3729,7 +3809,7 @@ class ReductionSession:
         )
         pending: list[tuple[Frame, Any]] = []
         for frame, raw_image in zip(chunk, chunk_images):
-            if self.cancel_token.cancelled:
+            if _cancel_requested(self.cancel_token):
                 self._mark_cancelled()
                 break
             raw_image = self._prime_saturation_mask(frame, raw_image)
@@ -3829,7 +3909,7 @@ class ReductionSession:
                     frame.image = None
                     frame.background = None
                     _clear_source_frame_image(self.source, frame.index)
-                if self.cancel_token.cancelled:
+                if _cancel_requested(self.cancel_token):
                     self._mark_cancelled()
                     _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
                     break
@@ -3988,7 +4068,7 @@ def run_reduction(
             for chunk_frames, chunk_images in _iter_reduction_chunks(
                     session.source, session.scan, chunk_size):
                 for frame, image in zip(chunk_frames, chunk_images):
-                    if session.cancel_token.cancelled:
+                    if _cancel_requested(session.cancel_token):
                         stop = True
                         break
                     if not session.submit(frame, image):
@@ -4434,7 +4514,6 @@ class _ReductionIntegratorProvider:
             self._local.fi = fi
         return fi
 
-
 def _coerce_executor(executor: Any | None):
     if executor is None or executor is False:
         return None, False
@@ -4616,13 +4695,13 @@ def _reduce_frame(
     run_saturation_mask: _RunSaturationMask | None = None,
     strict: StrictPolicy | None = None,
 ) -> FrameReduction:
-    if cancel_token is not None and cancel_token.cancelled:
+    if _cancel_requested(cancel_token):
         raise _ReductionCancelled
     if raw_image is not None:
         frame.image = np.asarray(raw_image)
     raw_image_arr = np.asarray(frame.load_image())  # pre-float: integer dtype for the saturation ceiling
     image = raw_image_arr.astype(float)
-    if cancel_token is not None and cancel_token.cancelled:
+    if _cancel_requested(cancel_token):
         raise _ReductionCancelled
     if image.ndim != 2:
         raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")

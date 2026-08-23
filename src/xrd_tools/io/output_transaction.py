@@ -451,6 +451,11 @@ def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot
     )
 
 
+def capture_target_snapshot(path: Path | str) -> TargetSnapshot:
+    """Return one stable, content-sensitive observation without ownership."""
+    return _capture_target(os.path.realpath(os.fspath(path)))
+
+
 def _identity(snapshot: TargetSnapshot) -> _FileIdentity | None:
     if not snapshot.exists or snapshot.device is None or snapshot.inode is None:
         return None
@@ -3664,6 +3669,7 @@ __all__ = [
     "TargetChanged",
     "TargetLease",
     "TargetSnapshot",
+    "capture_target_snapshot",
     "TransactionPhase",
     "TransactionSnapshot",
     "TransactionStateError",

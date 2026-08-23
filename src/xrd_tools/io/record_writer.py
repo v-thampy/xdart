@@ -45,6 +45,8 @@ from xrd_tools.io.append import (
     AppendDecision,
     AppendDisposition,
     commit_append_lineage,
+    decode_replacement_lineage,
+    _replacement_hard_group,
     stage_append_lineage,
 )
 from xrd_tools.io.output_transaction import (
@@ -292,6 +294,70 @@ _SOURCE_SNAPSHOT_ATTRIBUTES = (
     ("dataset_path", "dataset_path"),
     ("self_contained", "self_contained"),
 )
+_REPLACEMENT_STATE_KEYS, _REPLACEMENT_EXECUTION_KEYS = {"path", "size", "mtime_ns", "ctime_ns", "device", "inode"}, {"path", "size", "mtime_ns", "ctime_ns", "device", "inode", "adapter_id", "frame_count", "first_label", "member_stamps", "external_members", "dependency_files", "admitted_motor_values", "metadata_sources"}
+def _validate_replacement_execution(value: Any) -> Mapping[str, Any]:
+    def state(item: Any, role: str) -> Mapping[str, Any]:
+        (None if type(item) is dict and set(item) == _REPLACEMENT_STATE_KEYS and type(item["path"]) is str and os.path.isabs(item["path"]) and all(type(item[key]) is int and item[key] >= 0 for key in _REPLACEMENT_STATE_KEYS - {"path"}) else (_ for _ in ()).throw(WriterStateError(f"replacement {role} state is malformed"))); return item
+    if type(value) is not dict or set(value) != _REPLACEMENT_EXECUTION_KEYS or type(value["adapter_id"]) is not str or not value["adapter_id"] or any(type(value[key]) is not int or value[key] < 0 for key in ("frame_count", "first_label")) or any(type(value[key]) is not list for key in ("member_stamps", "external_members", "dependency_files", "admitted_motor_values", "metadata_sources")): raise WriterStateError("replacement source_execution is absent or malformed")
+    state({key: value[key] for key in _REPLACEMENT_STATE_KEYS}, "source"); [state(item, "member") for item in value["member_stamps"]]; [state(item, "dependency") for item in value["dependency_files"]]
+    if any(type(item) is not dict or set(item) != {"file", "dataset", "first", "stop", "epoch"} or type(item["dataset"]) is not str or not item["dataset"].startswith("/") or any(type(item[key]) is not int or item[key] < 0 for key in ("first", "stop", "epoch")) or item["stop"] <= item["first"] for item in value["external_members"]): raise WriterStateError("replacement external member is malformed")
+    [state(item["file"], "external member") for item in value["external_members"]]
+    if any(type(item) is not dict or set(item) != {"source_path", "motor", "value"} or type(item["source_path"]) is not str or not os.path.isabs(item["source_path"]) or type(item["motor"]) is not str or not item["motor"] or item["motor"] == "Manual" or type(item["value"]) is not float or not np.isfinite(item["value"]) for item in value["admitted_motor_values"]): raise WriterStateError("replacement motor value is malformed")
+    for item in value["metadata_sources"]:
+        (None if type(item) is dict and set(item) == {"source_path", "metadata_file"} and type(item["source_path"]) is str and os.path.isabs(item["source_path"]) and (item["metadata_file"] is None or state(item["metadata_file"], "metadata") is item["metadata_file"]) else (_ for _ in ()).throw(WriterStateError("replacement metadata source is malformed")))
+    if len({item["path"] for item in value["dependency_files"]}) != len(value["dependency_files"]) or value["admitted_motor_values"] and ([item["source_path"] for item in value["admitted_motor_values"]] != [item["path"] for item in value["member_stamps"]] or len({item["motor"] for item in value["admitted_motor_values"]}) != 1) or value["metadata_sources"] and (value["adapter_id"] != "tiff_series" or [item["source_path"] for item in value["metadata_sources"]] != [item["path"] for item in value["member_stamps"]]): raise WriterStateError("replacement source_execution member alignment is malformed")
+    return value
+def _replacement_scalar(value: Any, role: str) -> Any:
+    try: return value.decode("utf-8", errors="strict") if isinstance(value, bytes) else value.item() if isinstance(value, np.generic) else value
+    except UnicodeDecodeError as error: raise WriterStateError(f"{role} is not UTF-8") from error
+def _replacement_dtype_signature(dtype): dtype = np.dtype(dtype); string, vlen, enum, reference = h5py.check_string_dtype(dtype), h5py.check_vlen_dtype(dtype), h5py.check_enum_dtype(dtype), h5py.check_ref_dtype(dtype); token = lambda value: None if value is None else ("dtype", np.dtype(value).str, np.dtype(value).descr) if isinstance(value, np.dtype) else ("type", value.__module__, value.__qualname__) if isinstance(value, type) else (type(value).__module__, type(value).__qualname__, repr(value)); return (dtype.str, dtype.descr, None if string is None else (string.encoding, string.length), token(vlen), tuple(sorted((enum or {}).items())), token(reference))
+def _replacement_atom(value): value = value.item() if isinstance(value, np.generic) else value; return ("bytes", value.hex()) if isinstance(value, bytes) else ("text", value) if isinstance(value, str) else ("array", _replacement_value_signature(value)) if isinstance(value, np.ndarray) else ("reference", type(value).__module__, type(value).__qualname__, bool(value), hash(value) if value else None) if isinstance(value, h5py.Reference) else ("value", type(value).__module__, type(value).__qualname__, repr(value))
+def _replacement_value_signature(value, dtype=None): value = np.asarray(value); payload = json.dumps([_replacement_atom(item) for item in value.ravel()], ensure_ascii=False, separators=(",", ":")).encode() if value.dtype.kind in "OU" else value.tobytes(order="C"); return (_replacement_dtype_signature(value.dtype if dtype is None else dtype), value.shape, payload)
+def _replacement_json_node(parent, path, role, *, required=True):
+    node = _replacement_hard_group(parent, path, h5py.Dataset); info = None if node is None else h5py.check_string_dtype(node.dtype)
+    if node is None: return None if not required else (_ for _ in ()).throw(ValueError(f"{role} is absent or not a local scalar"))
+    raw = _replacement_scalar(node[()], role); value = json.loads(raw)
+    (None if node.shape == () and node.maxshape == () and node.chunks is None and node.compression is None and info is not None and info.encoding == "utf-8" and info.length is None and raw == json.dumps(value, sort_keys=True, separators=(",", ":")) else (_ for _ in ()).throw(ValueError(f"{role} is noncanonical"))); return value
+def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "entry", rows: Mapping[str, Mapping[int, int]] | None = None, context: tuple[str, Mapping[str, Any] | None, Mapping[str, Any]] | None = None, metadata_keys: tuple[str, ...] = (), include_geometry: bool = False) -> Mapping[str, Any]:
+    label, group = int(label), _replacement_hard_group(handle, entry); frames = _replacement_hard_group(group, "frames"); frame_name = f"frame_{label:04d}"; frame = _replacement_hard_group(frames, frame_name); source = _replacement_hard_group(frame, "source"); path_node = _replacement_hard_group(source, "path", h5py.Dataset); index_node = _replacement_hard_group(source, "frame_index", h5py.Dataset)
+    if not isinstance(source, h5py.Group) or set(source) != {"path", "frame_index"} or set(source.attrs) - {"NX_class", *(attr for _key, attr in _SOURCE_SNAPSHOT_ATTRIBUTES)} or _replacement_scalar(source.attrs.get("NX_class"), "replacement source class") != "NXcollection" or type(source.get("path", getlink=True)) is not h5py.HardLink or type(source.get("frame_index", getlink=True)) is not h5py.HardLink or not isinstance(path_node, h5py.Dataset) or path_node.shape != () or path_node.maxshape != () or path_node.chunks is not None or path_node.compression is not None or dict(path_node.attrs) or (encoding := h5py.check_string_dtype(path_node.dtype)) is None or encoding.encoding != "utf-8" or not isinstance(index_node, h5py.Dataset) or index_node.shape != () or index_node.maxshape != () or index_node.chunks is not None or index_node.compression is not None or dict(index_node.attrs) or index_node.dtype.kind not in "iu": raise WriterStateError(f"replacement frame {label} has no exact source fact")
+    path, index = _replacement_scalar(path_node[()], "replacement source path"), _replacement_scalar(index_node[()], "replacement source index")
+    if type(path) is not str or not path or type(index) is not int or index < 0: raise WriterStateError(f"replacement frame {label} source fact is malformed")
+    snapshot = {}
+    for key, attr in _SOURCE_SNAPSHOT_ATTRIBUTES:
+        value = None if attr not in source.attrs else _replacement_scalar(source.attrs[attr], f"source {attr}")
+        if value is not None and (key in {"size", "mtime_ns", "frame_count"} and (type(value) is not int or value < 0) or key == "self_contained" and type(value) is not bool or key not in {"size", "mtime_ns", "frame_count", "self_contained"} and type(value) is not str): raise WriterStateError(f"replacement source {attr} is malformed")
+        snapshot[key] = value
+    def indexed(name: str, columns: tuple[str, ...]) -> Mapping[str, Any]:
+        if not columns: return MappingProxyType({})
+        table = _replacement_hard_group(group, name)
+        if not isinstance(table, h5py.Group) or _replacement_hard_group(table, "frame_index", h5py.Dataset) is None: return MappingProxyType({})
+        if rows is None:
+            labels = tuple(int(value) for value in np.asarray(table["frame_index"][()]).ravel())
+            (None if labels.count(label) == 1 and len(labels) == len(set(labels)) else (_ for _ in ()).throw(WriterStateError(f"replacement {name} inventory is malformed"))); row = labels.index(label)
+        else:
+            row = rows.get(name, {}).get(label); (None if row is not None and int(table["frame_index"][row]) == label else (_ for _ in ()).throw(WriterStateError(f"replacement {name} cursor changed")))
+        values = {}
+        for column in columns:
+            node = _replacement_hard_group(table, column, h5py.Dataset)
+            if not isinstance(node, h5py.Dataset): raise WriterStateError(f"replacement {name}/{column} is absent")
+            try: value = node[row]
+            except (IndexError, TypeError, ValueError) as error: raise WriterStateError(f"replacement {name} row is malformed") from error
+            if np.asarray(value).shape == (): values[str(column)] = _replacement_scalar(value, f"replacement {column}")
+        return MappingProxyType(values)
+    if context is None:
+        config = _replacement_hard_group(handle, f"{entry}/reduction/config"); node = _replacement_hard_group(config, "source_execution", h5py.Dataset)
+        try: execution = json.loads(_replacement_scalar(node[()], "source_execution")); source_base, _lineage_bytes, lineage = decode_replacement_lineage(handle, entry=entry)
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error: raise WriterStateError("replacement source context is absent or malformed") from error
+        context = (source_base, lineage, _validate_replacement_execution(execution))
+    source_base, lineage, execution = context
+    try: background = read_background_dependency(frame)
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error: raise WriterStateError("replacement Background fact is malformed") from error
+    return MappingProxyType({"label": label, "path": path, "frame_index": index,
+        "snapshot": MappingProxyType(snapshot), "source_base": source_base,
+        "source_execution": execution, "append_lineage": lineage,
+        "metadata": indexed("scan_data", metadata_keys), "geometry": indexed("per_frame_geometry", ("rot1", "rot2", "rot3", "incident_angle") if include_geometry else ()),
+        "background_dependency": background})
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,6 +557,11 @@ class NexusRecordWriter:
         transaction_binding: WriterTransactionBinding | None = None,
         append_decision: AppendDecision | None = None,
         fast_regenerable: bool = False,
+        replacement_dimension: str | None = None,
+        replacement_labels: tuple[int, ...] | None = None,
+        replacement_audit: bytes | None = None,
+        replacement_selected_plan: Mapping[str, Any] | None = None,
+        replacement_gi_mode: str | None = None,
     ) -> None:
         if flush_every is not None and int(flush_every) <= 0:
             raise ValueError(f"flush_every must be > 0 or None; got {flush_every}")
@@ -511,8 +582,13 @@ class NexusRecordWriter:
         self._transaction_binding = transaction_binding
         self._fast_regenerable = fast_regenerable
         self._append_decision = append_decision
+        replacement_values = (replacement_dimension, replacement_labels, replacement_audit, replacement_selected_plan)
+        if any(value is not None for value in replacement_values) and (not all(value is not None for value in replacement_values) or transaction_binding is None or fast_regenerable): raise ValueError("selected-dimension replacement configuration is incomplete or unbound")
+        self._replacement_configuration = None if replacement_dimension is None else (replacement_dimension, tuple(replacement_labels), bytes(replacement_audit), dict(replacement_selected_plan), replacement_gi_mode)
+        self._replacement_labels: tuple[int, ...] = ()
+        self._replacement_read_context = self._replacement_manifest = self._replacement_expected = None
         if append_decision is not None and (
-            append_decision.disposition is not AppendDisposition.WRITE
+            self._replacement_configuration is not None or append_decision.disposition is not AppendDisposition.WRITE
         ):
             raise ValueError("writer requires a WRITE Append decision")
         if append_decision is not None and transaction_binding is None:
@@ -707,14 +783,14 @@ class NexusRecordWriter:
 
     @contextmanager
     def _boundary(self):
-        if self._in_boundary:
-            raise WriterStateError("concurrent or re-entrant writer boundary")
-        self._in_boundary = True
-        try:
-            with (nullcontext() if self.file_lock is None else self.file_lock):
+        with (nullcontext() if self.file_lock is None else self.file_lock):
+            if self._in_boundary:
+                raise WriterStateError("concurrent or re-entrant writer boundary")
+            self._in_boundary = True
+            try:
                 yield
-        finally:
-            self._in_boundary = False
+            finally:
+                self._in_boundary = False
 
     def _authorize_transaction_mutation(self) -> None:
         self._invalidate_checkpoint_recovery()
@@ -845,7 +921,7 @@ class NexusRecordWriter:
         source_path = None
         source_frame_index = None
         if record.source_path is not None:
-            source_path = relative_source_path(record.source_path, self.source_base)
+            source_path = str(record.source_path) if self._replacement_configuration is not None else relative_source_path(record.source_path, self.source_base)
             source_frame_index = int(record.source_frame_index)
         timestamp = None if record.timestamp is None else str(record.timestamp)
         thumbnail_mask = None
@@ -951,15 +1027,15 @@ class NexusRecordWriter:
 
     def _authoritative_source_fact(self, label: int) -> _PersistedSourceFact:
         label = int(label)
-        frame = self._entry_group().get(f"frames/frame_{label:04d}")
-        source = frame.get("source") if isinstance(frame, h5py.Group) else None
+        frame = _replacement_hard_group(self._entry_group(), f"frames/frame_{label:04d}") if self._replacement_configuration is not None else self._entry_group().get(f"frames/frame_{label:04d}")
+        source = (_replacement_hard_group(frame, "source") if self._replacement_configuration is not None else frame.get("source")) if isinstance(frame, h5py.Group) else None
         if source is None:
             return _PersistedSourceFact(False, None, None, ())
         if not isinstance(source, h5py.Group):
             raise WriterStateError(f"existing frame {label} source is not a group")
         try:
-            stored_path = source["path"][()]
-            stored_frame_index = source["frame_index"][()]
+            stored_path = (_replacement_hard_group(source, "path", h5py.Dataset) if self._replacement_configuration is not None else source["path"])[()]
+            stored_frame_index = (_replacement_hard_group(source, "frame_index", h5py.Dataset) if self._replacement_configuration is not None else source["frame_index"])[()]
         except (KeyError, TypeError, ValueError, OSError) as error:
             raise WriterStateError(
                 f"existing frame {label} has malformed source identity"
@@ -994,6 +1070,10 @@ class NexusRecordWriter:
             snapshot.append((key, value))
         return _PersistedSourceFact(True, path, frame_index, tuple(snapshot))
 
+    def _detach_replacement_fact(self, label: int, *, metadata_keys=(), include_geometry=False) -> Mapping[str, Any]:
+        self._require_active()
+        with self._boundary():
+            return _decode_replacement_fact(self._h5, int(label), entry=self.entry, rows=self._row_cursors, context=self._replacement_read_context, metadata_keys=metadata_keys, include_geometry=include_geometry)
     def _verify_supplied_source_identity(self, record: RecordWrite) -> None:
         """Require complete source-fact equality for a mode-only sibling."""
         expected = self._expected_source_fact(record)
@@ -1003,7 +1083,7 @@ class NexusRecordWriter:
                 f"existing frame {int(record.label)} complete source fact "
                 "does not match the mode-only write"
             )
-        frame = self._entry_group().get(f"frames/frame_{int(record.label):04d}")
+        frame = _replacement_hard_group(self._entry_group(), f"frames/frame_{int(record.label):04d}") if self._replacement_configuration is not None else self._entry_group().get(f"frames/frame_{int(record.label):04d}")
         if not isinstance(frame, h5py.Group) or read_background_dependency(frame) != self._expected_frame_row(record).background_dependency:
             raise WriterStateError("existing frame background dependency does not match the mode-only write")
 
@@ -1342,6 +1422,24 @@ class NexusRecordWriter:
         walk(frame, frame.name)
         return digest.hexdigest(), read_bytes
 
+    def _replacement_manifest_digest(self, exclude, handle=None) -> str:
+        digest = hashlib.sha256(b"xrd-tools-replacement-manifest-v1\0"); root = self._h5 if handle is None else handle; config = _replacement_hard_group(root, f"{self.entry}/reduction/config"); config_prefix = "" if config is None else f"{config.name.rstrip('/')}/"
+        def update(role, value): payload = value if isinstance(value, bytes) else repr(value).encode(); digest.update(len(role).to_bytes(8, "big") + role.encode() + len(payload).to_bytes(8, "big") + payload)
+        def walk(group, prefix, active=()):
+            for name in sorted(group.attrs): update(f"{prefix}@{name}", _replacement_value_signature(group.attrs[name], group.attrs.get_id(name).dtype))
+            for name in sorted(group):
+                path = f"{group.name.rstrip('/')}/{name}"
+                if path in exclude: continue
+                link = group.get(name, getlink=True); role = f"{prefix}/{name}"; update(f"{role}@link", (type(link).__name__, getattr(link, "filename", None), getattr(link, "path", None)))
+                if type(link) is not h5py.HardLink: continue
+                child = group.get(name)
+                if isinstance(child, h5py.Group): update(role, b"group"); (None if any(child.id == owner for owner in (*active, group.id)) else walk(child, role, (*active, group.id)))
+                elif isinstance(child, h5py.Dataset):
+                    update(f"{role}@layout", (_replacement_dtype_signature(child.dtype), child.shape, child.maxshape, child.chunks, child.compression, child.compression_opts))
+                    if config_prefix and child.ndim == 0 and child.name.startswith(config_prefix): update(role, _replacement_value_signature(child[()], child.dtype))
+                    for attr in sorted(child.attrs): update(f"{role}@{attr}", _replacement_value_signature(child.attrs[attr], child.attrs.get_id(attr).dtype))
+                else: raise WriterStateError(f"unsupported replacement manifest node {role}")
+        walk(root, "file"); return digest.hexdigest()
     def _verify_indexed_row(
         self,
         evidence: _EvidenceBuilder,
@@ -1821,15 +1919,14 @@ class NexusRecordWriter:
     def reset_operation_vector(self) -> None:
         self._vector = {name: 0 for name in _VECTOR_FIELDS}
 
-    def _load_cursor_from(self, entry: h5py.Group, name: str) -> dict[int, int]:
-        group = entry.get(name)
+    def _load_cursor_from(self, entry: h5py.Group, name: str, *, local_hard=False) -> dict[int, int]:
+        group = _replacement_hard_group(entry, name) if local_hard else entry.get(name)
         if group is None:
             return {}
-        if not isinstance(group, h5py.Group) or "frame_index" not in group:
+        labels_node = _replacement_hard_group(group, "frame_index", h5py.Dataset) if local_hard else group.get("frame_index")
+        if not isinstance(group, h5py.Group) or not isinstance(labels_node, h5py.Dataset):
             raise WriterStateError(f"{name} has no indexed frame_index")
-        if not isinstance(group["frame_index"], h5py.Dataset):
-            raise WriterStateError(f"{name}/frame_index is not a dataset")
-        labels = [int(x) for x in np.asarray(group["frame_index"][()]).ravel()]
+        labels = [int(x) for x in np.asarray(labels_node[()]).ravel()]
         if len(labels) != len(set(labels)):
             raise WriterStateError(f"{name}/frame_index contains duplicate labels")
         self._bump("frame_index_scan_rows", len(labels))
@@ -1840,7 +1937,11 @@ class NexusRecordWriter:
 
     def _validate_existing_contract(self) -> dict[str, dict[int, int]]:
         with h5py.File(self.target, "r") as h5:
-            entry = h5.get(self.entry)
+            entry = _replacement_hard_group(h5, self.entry) if self._replacement_configuration is not None else h5.get(self.entry)
+            if self._replacement_configuration is not None:
+                dimension = self._replacement_configuration[0]; root = entry.name if isinstance(entry, h5py.Group) else f"/{self.entry.strip('/')}"; excluded = (f"{root}/integrated_{dimension}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}"); config = _replacement_hard_group(entry, "reduction/config"); (None if isinstance(entry, h5py.Group) and isinstance(config, h5py.Group) else (_ for _ in ()).throw(WriterStateError("replacement entry/config is not local"))); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = config.get("gi_config", getlink=True); (None if gi_link is None or type(gi_link) is h5py.HardLink else (_ for _ in ()).throw(WriterStateError("replacement GI config is not local"))); gi_values = _replacement_json_node(config, "gi_config", "replacement GI config", required=False)
+                gi_values = {} if gi_values is None else gi_values
+                gi_name = f"gi_mode_{dimension}"; (None if type(gi_values) is dict else (_ for _ in ()).throw(WriterStateError("replacement GI config is malformed"))); self._replacement_manifest = excluded, self._replacement_manifest_digest(excluded, h5), gi_name, self._replacement_node_signature(gi_node), json.dumps({key: value for key, value in gi_values.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode()
             if entry is None:
                 return {
                     name: {} for name in (
@@ -1854,33 +1955,34 @@ class NexusRecordWriter:
                 ("integrated_1d", self._primary_mode_1d),
                 ("integrated_2d", self._primary_mode_2d),
             ):
-                group = entry.get(name)
+                group = _replacement_hard_group(entry, name) if self._replacement_configuration is not None else entry.get(name)
                 if group is None:
                     continue
                 existing = group.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)
                 if isinstance(existing, bytes):
                     existing = existing.decode("utf-8", errors="replace")
-                if str(existing) != requested:
+                if self._replacement_configuration is None and str(existing) != requested:
                     raise ValueError(
                         f"{name} primary mode {existing!r} != requested "
                         f"{requested!r}; sparse writes cannot reinterpret "
                         "untouched rows"
                     )
             cursors = {
-                name: self._load_cursor_from(entry, name)
+                name: self._load_cursor_from(entry, name, local_hard=self._replacement_configuration is not None)
                 for name in (
                     "integrated_1d", "integrated_2d", "scan_data",
                     "per_frame_geometry",
                 )
             }
             for name in ("integrated_1d", "integrated_2d"):
-                group = entry.get(name)
+                group = _replacement_hard_group(entry, name) if self._replacement_configuration is not None else entry.get(name)
                 if group is None:
                     continue
-                for child_name, child in group.items():
+                for child_name in group:
+                    child = _replacement_hard_group(group, child_name) if self._replacement_configuration is not None else group.get(child_name)
                     if isinstance(child, h5py.Group):
                         nested = f"{name}/{child_name}"
-                        cursors[nested] = self._load_cursor_from(entry, nested)
+                        cursors[nested] = self._load_cursor_from(entry, nested, local_hard=self._replacement_configuration is not None)
             return cursors
 
     def begin(
@@ -1890,6 +1992,7 @@ class NexusRecordWriter:
         primary_mode_1d: str = DEFAULT_MODE_KEY,
         primary_mode_2d: str = DEFAULT_MODE_KEY,
     ) -> None:
+        if self._replacement_configuration is not None and metadata is not None: raise WriterStateError("replacement begin forbids metadata mutation")
         if self.phase is not WriterPhase.NEW:
             raise WriterStateError(f"begin requires NEW, got {self.phase.value}")
         self._primary_mode_1d = str(primary_mode_1d or DEFAULT_MODE_KEY)
@@ -1947,8 +2050,9 @@ class NexusRecordWriter:
                 # provenance names the logical record, never that temporary
                 # implementation detail; an Append also refreshes a relocated
                 # legacy file's path to its current truthful location.
-                self._h5.attrs["file_name"] = str(self.target.resolve())
-                if self.complete_record and self.source_base:
+                if self._replacement_configuration is None:
+                    self._h5.attrs["file_name"] = str(self.target.resolve())
+                if self._replacement_configuration is None and self.complete_record and self.source_base:
                     stamp_source_base(self._entry_group(), self.source_base)
                 if self._append_decision is not None:
                     stage_append_lineage(
@@ -1971,7 +2075,21 @@ class NexusRecordWriter:
                         "per_frame_geometry",
                     ):
                         self._row_cursors[name] = self._load_cursor(name)
+                if self._replacement_configuration is not None:
+                    config = _replacement_hard_group(self._h5, f"{self.entry}/reduction/config"); node = _replacement_hard_group(config, "source_execution", h5py.Dataset)
+                    try: execution = json.loads(_replacement_scalar(node[()], "source_execution"))
+                    except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+                        raise WriterStateError("replacement source_execution is absent or malformed") from error
+                    execution = _validate_replacement_execution(execution)
+                    source_base, _raw, lineage = decode_replacement_lineage(self._h5, entry=self.entry)
+                    self._replacement_read_context = (source_base, lineage, execution)
             self.phase = WriterPhase.ACTIVE
+            if self._replacement_configuration is not None:
+                dimension, labels, audit, selected, gi_mode = self._replacement_configuration
+                self._reset_selected_dimension(
+                    dimension, labels, audit, selected_plan=selected,
+                    selected_gi_mode=gi_mode,
+                )
         except BaseException as exc:
             self._pending_owner = "begin"
             self.phase = WriterPhase.PARTIAL
@@ -1981,12 +2099,46 @@ class NexusRecordWriter:
         if self.phase is not WriterPhase.ACTIVE:
             raise WriterStateError(f"writer requires ACTIVE, got {self.phase.value}")
 
+    def _reset_selected_dimension(self, dimension: str, labels: tuple[int, ...], audit_bytes: bytes, *, selected_plan: Mapping[str, Any], selected_gi_mode: str | None) -> None:
+        self._require_active(); (None if dimension in {"1d", "2d"} else (_ for _ in ()).throw(ValueError("replacement dimension must be '1d' or '2d'")))
+        labels = tuple(labels); (None if labels and labels == tuple(sorted(set(labels))) and all(type(label) is int and label >= 0 for label in labels) else (_ for _ in ()).throw(ValueError("replacement labels must be ascending unique nonnegative ints")))
+        if type(audit_bytes) is not bytes: raise TypeError("replacement audit must be exact bytes")
+        top = f"integrated_{dimension}"
+        with self._boundary():
+            entry = self._entry_group()
+            if tuple(self._load_cursor_from(entry, top, local_hard=True)) != labels: raise WriterStateError("replacement label inventory changed")
+            root = entry.name; excluded = (f"{root}/{top}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}")
+            frozen = self._replacement_manifest
+            if frozen is None or frozen[0] != excluded or self._replacement_manifest_digest(excluded) != frozen[1]: raise WriterStateError("replacement opener changed preserved artifact")
+            config = _replacement_hard_group(entry, "reduction/config"); gi_config = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = None if config is None else config.get("gi_config", getlink=True)
+            if (gi_link is not None and type(gi_link) is not h5py.HardLink) or self._replacement_node_signature(gi_config) != frozen[3]: raise WriterStateError("replacement opener changed physical GI config")
+            self._authorize_transaction_mutation(); del entry[top]
+            bai_name = f"bai_{dimension}_args"; (config.__delitem__(bai_name) if bai_name in config else None); config.create_dataset(bai_name, data=json.dumps(dict(selected_plan), sort_keys=True, separators=(",", ":")))
+            gi_name, gi_values = f"gi_mode_{dimension}", {}
+            if gi_config is not None:
+                try: raw = _replacement_scalar(gi_config[()], "replacement GI config"); gi_values = json.loads(raw); del config["gi_config"]
+                except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error: raise WriterStateError("replacement GI config is malformed") from error
+                if not isinstance(gi_config, h5py.Dataset) or gi_config.shape != () or type(gi_values) is not dict or raw != json.dumps(gi_values, sort_keys=True, separators=(",", ":")): raise WriterStateError("replacement GI config is noncanonical")
+            staged_preserved = json.dumps({key: value for key, value in gi_values.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode(); (None if frozen[2] == gi_name and staged_preserved == frozen[4] else (_ for _ in ()).throw(WriterStateError("replacement opener changed sibling GI config"))); gi_preserved = frozen[4]; gi_values.pop(gi_name, None); gi_values.update({} if selected_gi_mode is None else {gi_name: str(selected_gi_mode)})
+            if gi_values: config.create_dataset("gi_config", data=json.dumps(gi_values, sort_keys=True, separators=(",", ":")))
+            stored_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); stored_gi = {} if stored_node is None else json.loads(_replacement_scalar(stored_node[()], "replacement GI config")); stored_signature = self._replacement_node_signature(stored_node); (None if json.dumps({key: value for key, value in stored_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode() == gi_preserved and (None if stored_signature is None else stored_signature[:-1]) == (None if frozen[3] is None else frozen[3][:-1]) else (_ for _ in ()).throw(WriterStateError("replacement changed sibling GI config")))
+            audit_name = f"dimension_replacement_{dimension}"; (config.__delitem__(audit_name) if audit_name in config else None); config.create_dataset(audit_name, data=audit_bytes.decode("utf-8"))
+            self._row_cursors = {name: cursor for name, cursor in self._row_cursors.items() if name != top and not name.startswith(f"{top}/")}; self._row_cursors[top] = {}
+            self._replacement_labels = labels; self._replacement_manifest = frozen; self._replacement_expected = (bai_name, self._replacement_node_signature(config.get(bai_name)), "gi_config", self._replacement_node_signature(config.get("gi_config")), audit_name, self._replacement_node_signature(config.get(audit_name)), gi_name, gi_preserved)
+    def _replacement_node_signature(self, node): return None if node is None else (_replacement_dtype_signature(node.dtype), node.shape, node.maxshape, node.chunks, node.compression, node.compression_opts, tuple((name, _replacement_value_signature(node.attrs[name], node.attrs.get_id(name).dtype)) for name in sorted(node.attrs)), _replacement_value_signature(node[()], node.dtype)) if isinstance(node, h5py.Dataset) else ("invalid",)
+    def _verify_replacement_manifest(self) -> None:
+        entry, selected_expected = self._entry_group(), self._replacement_expected; excluded, manifest_expected, _gi_name, gi_original, _gi_preserved = self._replacement_manifest
+        if self._replacement_manifest_digest(excluded) != manifest_expected: raise WriterStateError("replacement final verification changed preserved artifact")
+        config = _replacement_hard_group(entry, "reduction/config"); bai, bai_expected, gi, gi_expected, audit, audit_expected, gi_name, gi_preserved = selected_expected; nodes = {name: _replacement_hard_group(config, name, h5py.Dataset) for name in (bai, gi, audit)}
+        if config is None or any(config.get(name, getlink=True) is not None and type(config.get(name, getlink=True)) is not h5py.HardLink for name in nodes): raise WriterStateError("replacement selected science/audit link changed")
+        raw_gi = {} if nodes[gi] is None else json.loads(_replacement_scalar(nodes[gi][()], "replacement GI config")); gi_signature = self._replacement_node_signature(nodes[gi]); preserved = json.dumps({key: value for key, value in raw_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode()
+        if self._replacement_node_signature(nodes[bai]) != bai_expected or gi_signature != gi_expected or self._replacement_node_signature(nodes[audit]) != audit_expected or preserved != gi_preserved or (None if gi_signature is None else gi_signature[:-1]) != (None if gi_original is None else gi_original[:-1]): raise WriterStateError("replacement selected science/audit final verification changed")
     def _verify_cursor(self, name: str, label: int) -> None:
         cursor = self._row_cursors[name]
         row = cursor.get(label)
         if row is None:
             return
-        group = self._entry_group().get(name)
+        group = _replacement_hard_group(self._entry_group(), name) if self._replacement_configuration is not None else self._entry_group().get(name)
         if (group is None or row < 0 or row >= group["frame_index"].shape[0]
                 or int(group["frame_index"][row]) != label):
             raise WriterStateError(
@@ -2017,6 +2169,8 @@ class NexusRecordWriter:
         labels = [int(record.label) for record in records]
         if len(labels) != len(set(labels)):
             raise ValueError(f"dirty batch contains duplicate labels: {labels}")
+        if self._replacement_labels and (any(label not in self._replacement_labels for label in labels) or any(record.write_frame_record or self._replacement_configuration[0] == "1d" and record.result_2d is not None or self._replacement_configuration[0] == "2d" and record.result_1d is not None for record in records)):
+            raise WriterStateError("replacement write escaped its frozen label inventory")
         one_d = [record for record in records if record.result_1d is not None]
         two_d = [record for record in records if record.result_2d is not None]
         groups_1d: dict[str, list[RecordWrite]] = {}
@@ -2040,7 +2194,7 @@ class NexusRecordWriter:
             ("integrated_1d", groups_1d), ("integrated_2d", groups_2d),
         ):
             if any(name != top for name in groups):
-                if entry.get(top) is None and top not in groups:
+                if (_replacement_hard_group(entry, top) if self._replacement_configuration is not None else entry.get(top)) is None and top not in groups:
                     raise ValueError(
                         f"named modes require an established {top} primary group"
                     )
@@ -2056,7 +2210,7 @@ class NexusRecordWriter:
                 results_2d=[r.result_2d for r in grouped],
                 group_name_2d=name, allow_rebuild=False,
             )
-        existing_scan_data = self._entry_group().get("scan_data")
+        existing_scan_data = _replacement_hard_group(self._entry_group(), "scan_data") if self._replacement_configuration is not None else self._entry_group().get("scan_data")
         existing_columns = (
             {str(name) for name in existing_scan_data if name != "frame_index"}
             if existing_scan_data is not None else None
@@ -2073,9 +2227,9 @@ class NexusRecordWriter:
                     raise ValueError(
                         "record thumbnail_mask shape must equal thumbnail shape"
                     )
-            if record.source_path is not None:
+            if record.source_path is not None and self._replacement_configuration is None:
                 relative_source_path(record.source_path, self.source_base)
-            frame = entry.get(f"frames/frame_{int(record.label):04d}")
+            frame = _replacement_hard_group(entry, f"frames/frame_{int(record.label):04d}") if self._replacement_configuration is not None else entry.get(f"frames/frame_{int(record.label):04d}")
             expected_background = (None if record.background_dependency_bytes is None else
                 (record.background_dependency_bytes, record.background_dependency_fingerprint))
             if isinstance(frame, h5py.Group) and read_background_dependency(frame) != expected_background:
@@ -2246,7 +2400,7 @@ class NexusRecordWriter:
                     self._entry_group().attrs.setdefault(
                         "default", "integrated_1d",
                     )
-                if self.complete_record:
+                if self.complete_record and any(record.write_frame_record for record in batch):
                     frames = ensure_frames_container(self._entry_group())
                     for record in batch:
                         if not record.write_frame_record:
@@ -2539,6 +2693,7 @@ class NexusRecordWriter:
     def _drop_mode_row(self, label: int, mode: ResultMode) -> None:
         """Remove one exact indexed result row without disturbing GI siblings."""
         label = int(label)
+        if self._replacement_configuration is not None and mode.kind != self._replacement_configuration[0]: raise WriterStateError("replacement publication drop escaped its selected dimension")
         group_name = self._mode_cursor_name(mode.kind, mode.key)
         cursor = self._row_cursors.setdefault(group_name, {})
         group = self._entry_group().get(group_name)
@@ -2888,7 +3043,7 @@ class NexusRecordWriter:
 
     def extend_append(self, decision: AppendDecision) -> None:
         self._require_active()
-        if (self._append_decision is None
+        if (self._replacement_configuration is not None or self._append_decision is None
                 or decision.disposition is not AppendDisposition.WRITE):
             raise WriterStateError("Append extension requires one active Append writer")
         if decision.skip_labels != self._append_decision.skip_labels:
@@ -2915,7 +3070,7 @@ class NexusRecordWriter:
     def adopt_append(self, decision: AppendDecision) -> None:
         """Bind first lineage to an already-owned, still-empty live writer."""
         self._require_active()
-        if (self._append_decision is not None
+        if (self._replacement_configuration is not None or self._append_decision is not None
                 or decision.disposition is not AppendDisposition.WRITE):
             raise WriterStateError(
                 "Append adoption requires one unbound active writer")
@@ -2964,7 +3119,7 @@ class NexusRecordWriter:
         if self.phase is WriterPhase.PARTIAL and self._pending_owner == "write":
             raise WriterStateError("an indeterminate write requires abort")
         if self.phase is WriterPhase.ACTIVE:
-            self._finalization = finalization or WriterFinalization()
+            (None if self._replacement_configuration is None or finalization in (None, WriterFinalization()) else (_ for _ in ()).throw(WriterStateError("replacement finish forbids finalization mutation"))); self._finalization = finalization or WriterFinalization()
             self._finish_step = 0
         elif finalization is not None and finalization != self._finalization:
             raise WriterStateError("retry must use the frozen finalization values")
@@ -3004,13 +3159,8 @@ class NexusRecordWriter:
                             )
                         self._stream_terminal = terminal
 
-                    steps = (
-                        ("metadata", lambda: self._write_finalization(self._finalization)),
-                        ("flush", self._flush_handle),
-                        ("checkpoint", self._seal_checkpoint_and_receipts),
-                        ("close", self._close_handle),
-                        ("terminal", seal_terminal),
-                    )
+                    steps = (("metadata", lambda: self._write_finalization(self._finalization)), ("flush", self._flush_handle)) + ((("verify", self._verify_replacement_manifest),) if self._replacement_configuration is not None else ())
+                    steps += (("checkpoint", self._seal_checkpoint_and_receipts), ("close", self._close_handle), ("terminal", seal_terminal))
                 while self._finish_step < len(steps):
                     owner, action = steps[self._finish_step]
                     self._pending_owner = owner

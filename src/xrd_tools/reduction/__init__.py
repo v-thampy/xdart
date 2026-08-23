@@ -60,6 +60,7 @@ __all__ = [
     "MissingNormalizationError",
     "GIAllDummyError",
 ]
+__all__ += ["ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"]
 
 _CORE_EXPORTS = {
     "CancelToken",
@@ -110,6 +111,7 @@ _STRICTNESS_EXPORTS = {
 
 _BACKGROUND_EXPORTS = {"DisplayBackgroundPlan", "DisplayBackgroundResult", "run_display_background"}
 _BACKGROUND_EXPORTS.update({"FrameBackgroundPlan", "FrameBackgroundResult", "resolve_frame_background"})
+_REINTEGRATE_EXPORTS = {"ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"}
 
 
 def __getattr__(name: str) -> Any:
@@ -117,6 +119,8 @@ def __getattr__(name: str) -> Any:
         value = getattr(import_module("xrd_tools.reduction.cadence"), name)
     elif name in _BACKGROUND_EXPORTS:
         value = getattr(import_module("xrd_tools.reduction.background"), name)
+    elif name in _REINTEGRATE_EXPORTS:
+        value = getattr(import_module("xrd_tools.reduction.reintegrate"), name)
     elif name in _CORE_EXPORTS:
         value = getattr(import_module("xrd_tools.reduction.core"), name)
     elif name in _STRICTNESS_EXPORTS:

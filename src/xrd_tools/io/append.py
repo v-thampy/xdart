@@ -26,6 +26,7 @@ from .schema import (
 )
 LINEAGE_DATASET = "append_lineage"
 LINEAGE_VERSION = 1
+def _replacement_hard_group(root, path, kind=h5py.Group): parts = tuple(part for part in str(path).split("/") if part); walk = lambda current, rest: current if not rest else None if rest[0] in {".", ".."} or not isinstance(current, h5py.Group) or type(current.get(rest[0], getlink=True)) is not h5py.HardLink else walk(current.get(rest[0]), rest[1:]); value = walk(root, parts); return value if parts and isinstance(value, kind) else None
 class AppendDisposition(str, Enum):
     WRITE = "write"
     SKIP = "skip"
@@ -597,6 +598,42 @@ def _read_lineage(entry: h5py.Group) -> dict[str, Any]:
         raise ValueError("Append lineage is not an object")
     return value
 
+
+def decode_replacement_lineage(handle: h5py.File, *, entry: str = "entry") -> tuple[str, bytes | None, Mapping[str, Any] | None]:
+    """Decode the persisted source base and optional final lineage once."""
+    if not isinstance(handle, h5py.File) or not handle.id.valid:
+        raise TypeError("replacement lineage requires an open h5py.File")
+    group = _replacement_hard_group(handle, entry)
+    if not isinstance(group, h5py.Group):
+        raise ValueError(f"foreign or missing entry {entry!r}")
+    source_base = _decode(group.attrs.get(SOURCE_BASE_ATTR, ""))
+    if type(source_base) is not str:
+        raise ValueError("processed source base requires exact decoded text")
+    config = _replacement_hard_group(group, "reduction/config")
+    if not isinstance(config, h5py.Group): raise ValueError("malformed replacement Append lineage")
+    link = config.get(LINEAGE_DATASET, getlink=True)
+    if link is None: return source_base, None, None
+    dataset = _replacement_hard_group(config, LINEAGE_DATASET, h5py.Dataset); info = None if dataset is None else h5py.check_string_dtype(dataset.dtype)
+    if not isinstance(dataset, h5py.Dataset) or dataset.shape != () or dataset.maxshape != () or dataset.chunks is not None or dataset.compression is not None or info is None or info.encoding != "utf-8" or info.length is not None: raise ValueError("malformed replacement Append lineage")
+    raw = _decode(dataset[()])
+    if type(raw) is not str:
+        raise ValueError("replacement Append lineage requires UTF-8 text")
+    value = json.loads(raw)
+    if type(value) is not dict:
+        raise ValueError("replacement Append lineage is not an object")
+    expected = {"version", "state", "entry", "source_base", "source_identity",
+                "science_fingerprint", "modes", "epochs"}
+    if (raw != _json(value) or set(value) != expected or value.get("version") != LINEAGE_VERSION
+            or value.get("state") != "committed" or type(value.get("entry")) is not str or value["entry"] != entry or (lineage_group := _replacement_hard_group(handle, value["entry"])) is None or lineage_group.name != group.name
+            or value.get("source_base") != _normalize_base(source_base)
+            or any(type(value.get(key)) is not str for key in
+                   ("source_identity", "science_fingerprint"))
+            or type(value.get("modes")) is not list
+            or not value["modes"] or any(type(mode) is not str for mode in value["modes"])):
+        raise ValueError("replacement Append lineage identity is malformed")
+    _lineage_labels(value)
+    return source_base, raw.encode("utf-8"), value
+
 def _member_extends(
     prior: list[dict[str, Any]],
     current: list[dict[str, Any]],
@@ -864,6 +901,12 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
             return begin_same_run_lineage(intent)
 
         with h5py.File(target, "r") as handle:
+            config = handle.get(f"{intent.entry}/reduction/config")
+            if isinstance(config, h5py.Group) and any(
+                f"dimension_replacement_{dimension}" in config
+                for dimension in ("1d", "2d")
+            ):
+                raise ValueError("DIMENSION_REPLACEMENT_APPEND_UNSUPPORTED")
             current = decode_committed_append_prefix(handle, entry=intent.entry)
         if committed_prefix is not None:
             observed_lineage = json.loads(committed_prefix.lineage_json)
@@ -1087,6 +1130,7 @@ __all__ = [
     "begin_same_run_lineage",
     "commit_append_lineage",
     "decode_committed_append_prefix",
+    "decode_replacement_lineage",
     "extend_same_run_lineage",
     "prepare_append_preflight",
     "qualify_append",

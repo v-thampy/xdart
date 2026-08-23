@@ -100,6 +100,31 @@ class _TraceLock(AbstractContextManager):
         return False
 
 
+def test_borrowed_lock_precedes_boundary_reentrancy_check(tmp_path):
+    """The borrowed lock owns inspection as well as mutation of the guard."""
+    rw = _api(); trace: list[str] = []
+    writer = rw.NexusRecordWriter(tmp_path / "boundary-order.nexus", file_lock=_TraceLock(trace))
+    class GuardProbe:
+        def __bool__(self): assert trace == ["lock-enter"]; return False
+    probe = GuardProbe(); writer._in_boundary = probe
+
+    class GuardLock(_TraceLock):
+        def __enter__(self):
+            assert writer._in_boundary is probe
+            return super().__enter__()
+
+        def __exit__(self, *exc):
+            assert writer._in_boundary is False
+            return super().__exit__(*exc)
+
+    writer.file_lock = GuardLock(trace)
+    with writer._boundary():
+        assert writer._in_boundary is True
+        trace.append("body")
+    assert writer._in_boundary is False
+    assert trace == ["lock-enter", "body", "lock-exit"]
+
+
 class _TracePool:
     def __init__(self, trace: list[str], *, fail_resume: bool = False) -> None:
         self.trace = trace
