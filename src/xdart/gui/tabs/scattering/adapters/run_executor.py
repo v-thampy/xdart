@@ -1307,6 +1307,10 @@ class StandardRunExecutor:
         )
         if predecessor is not None:
             self._settle_predecessor(run, output, predecessor)
+        # Establish the item identity before validation/open.  A failure at any
+        # later construction seam must be reported against this artifact, not
+        # the previously completed one.
+        run.artifact = artifact
         cancelled = lambda: run.stop_requested
 
         def discard_source() -> None:
@@ -1386,7 +1390,6 @@ class StandardRunExecutor:
                 run.stop_signal))
         if configuration.output_mode == "Overwrite" and not target_state_matches(preparation.effective):
             raise RuntimeError(f"output target changed after Background qualification: {item.target}")
-        run.artifact = artifact
         run.display.set_factories(FrameRecordStore, PublicationStore)
         if not run.display.configured:
             descriptor_bytes = (

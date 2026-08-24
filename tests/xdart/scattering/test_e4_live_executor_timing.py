@@ -584,15 +584,15 @@ def test_failed_session_does_not_report_unfinalized_artifact(
 def test_second_eager_construct_failure_keeps_new_artifact_pending(
     monkeypatch,
 ) -> None:
-    configuration = RunIntent().freeze()
+    configuration = RunIntent(poni_file="accepted.poni", save_path="initial.nexus").freeze()
     identity = RunIdentity.from_configuration(configuration)
 
     def item(name: str, count: int):
-            return SimpleNamespace(
-                target=Path(name),
-                source_spec=SimpleNamespace(kind=SourceKind.NEXUS_STACK),
-                descriptor=None,
-                source_stamp=SimpleNamespace(
+        return SimpleNamespace(
+            target=Path(name),
+            source_spec=SimpleNamespace(kind=SourceKind.NEXUS_STACK),
+            descriptor=None,
+            source_stamp=SimpleNamespace(
                 frame_count=count,
                 members=(),
                 external_members=(),
@@ -617,29 +617,45 @@ def test_second_eager_construct_failure_keeps_new_artifact_pending(
         None,
         None,
         Path("initial.nexus"),
+        capture=SimpleNamespace(),
         resources=SimpleNamespace(
             admission=receipt,
             directory_session=None,
         ),
     )
     executor = StandardRunExecutor()
-    constructs = 0
+    real_construct = executor._construct
+    drift = executor_module.SourceRevisionChanged("second source changed")
+    validations = []
 
-    def construct(current, *, item, labels, decision) -> None:
-        nonlocal constructs
-        constructs += 1
-        assert current.artifact == item.target
-        if constructs == 2:
-            assert current.current_total == 2
-            assert current.current_completed == 0
-            assert current.current_published == 0
-            raise RuntimeError("second construct failed")
+    def construct(current, *, item, labels, decision):
+        if item is first:
+            current.artifact = item.target
+            current.current_completed = 0
+            current.current_published = 0
+            return current
+        assert item is second
+        current.current_completed = 0
+        current.current_published = 0
+        return real_construct(
+            current,
+            item=item,
+            labels=labels,
+            decision=decision,
+        )
+
+    def reject_second(attempted, *, cancelled):
+        validations.append(attempted)
+        assert cancelled() is False
+        raise drift
 
     def execute_current(current, *, construct=False) -> bool:
         assert construct is False
         current.completed += current.current_total
         current.current_completed = current.current_total
         current.current_published = current.current_total
+        if current.artifact not in current.artifacts:
+            current.artifacts.append(current.artifact)
         return False
 
     monkeypatch.setattr(
@@ -654,8 +670,8 @@ def test_second_eager_construct_failure_keeps_new_artifact_pending(
     )
     monkeypatch.setattr(
         executor_module,
-        "target_state_matches",
-        lambda _decision: True,
+        "validate_planned_source",
+        reject_second,
     )
     monkeypatch.setattr(executor, "_construct", construct)
     monkeypatch.setattr(executor, "_execute_current", execute_current)
@@ -674,6 +690,11 @@ def test_second_eager_construct_failure_keeps_new_artifact_pending(
 
     assert event.kind is StandardEventKind.FAILED
     assert event.artifact == "second.nexus"
+    assert len(validations) == 1 and validations[0] is second
+    assert event.primary is not None
+    assert event.primary.type_qualname == type(drift).__qualname__
+    assert event.primary.message == str(drift)
+    assert event.artifacts == ("first.nexus",)
     assert (event.completed, event.total) == (5, 7)
     assert (event.artifact_completed, event.artifact_total) == (0, 2)
     assert (
