@@ -403,6 +403,258 @@ def _find_eiger_external_link_paths(
     return [f"/{entry}/data/{k}" for k in ext_keys]
 
 
+class _NexusDatasetOwnerSlot:
+    """One explicit close authority during binding-to-stack promotion."""
+
+    __slots__ = ("owner",)
+
+    def __init__(self) -> None:
+        self.owner: Any | None = None
+
+
+class _ResolvedNexusStack:
+    """Captured detector datasets with retry-visible Dataset-ID custody."""
+
+    __slots__ = (
+        "entry_group", "paths", "_datasets", "state",
+        "_dependency_dataset", "_dependency_file", "_cleanup_failed",
+    )
+
+    def __init__(self, entry_group: h5py.Group) -> None:
+        self.entry_group = entry_group
+        self.paths: list[str] = []
+        self._datasets: list[h5py.Dataset] = []
+        self.state = "BINDING_OWNS_DATASET_IDS"
+        self._dependency_dataset: h5py.Dataset | None = None
+        self._dependency_file: h5py.File | None = None
+        self._cleanup_failed = False
+
+    def append(self, path: str, dataset: h5py.Dataset) -> None:
+        self.paths.append(str(path))
+        self._datasets.append(dataset)
+
+    def close(self) -> None:
+        if self.state in {"CLOSED", "STACK_OWNS_DATASET_IDS"}:
+            return
+        try:
+            self.close_dependency_dataset()
+        except BaseException:
+            self._cleanup_failed = True
+            self.state = "BINDING_OWNS_DATASET_IDS"
+            raise
+        failure = None
+        for dataset in self._datasets:
+            try:
+                if dataset.id.valid:
+                    type(self)._close_dataset_id(dataset)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            self._cleanup_failed = True
+            self.state = "BINDING_OWNS_DATASET_IDS"
+            raise failure
+        self._cleanup_failed = False
+        self.state = "CLOSED"
+
+    def into_nexus_image_stack(
+        self, h5f: h5py.File, *, owner_slot: _NexusDatasetOwnerSlot,
+    ) -> "NexusImageStack":
+        if (owner_slot.owner is not self
+                or self.state != "BINDING_OWNS_DATASET_IDS"
+                or self._dependency_dataset is not None
+                or self._dependency_file is not None or self._cleanup_failed):
+            raise RuntimeError("detector binding has no transfer authority")
+        self.state = "TRANSFER_IN_PROGRESS"
+        try:
+            stack = NexusImageStack._from_bound_datasets(
+                h5f, list(self.paths), list(self._datasets),
+            )
+            owner_slot.owner = stack
+        except BaseException:
+            self.state = "BINDING_OWNS_DATASET_IDS"
+            raise
+        self.state = "STACK_OWNS_DATASET_IDS"
+        return stack
+
+    def open_dependency_dataset(self, selector: Any) -> h5py.Dataset:
+        if self._dependency_dataset is not None or self._dependency_file is not None:
+            raise RuntimeError("a dependency Dataset is already owned")
+        if type(selector) is tuple and len(selector) == 2:
+            file_name, name = selector
+        else:
+            name = getattr(selector, "dset_name", selector)
+            file_name = getattr(selector, "file_name", ".")
+        master = Path(self.entry_group.file.filename).resolve()
+        candidate = Path(str(file_name))
+        if str(file_name) in {"", "."}:
+            owner = self.entry_group.file
+            owns_owner = False
+        else:
+            if not candidate.is_absolute():
+                candidate = master.parent / candidate
+            candidate = candidate.resolve()
+            owns_owner = candidate != master
+            owner = (h5py.File(candidate, "r") if owns_owner
+                     else self.entry_group.file)
+            if owns_owner:
+                self._dependency_file = owner
+        try:
+            value = owner[str(name)]
+            if not isinstance(value, h5py.Dataset):
+                raise TypeError(f"dependency {name!r} is not a Dataset")
+            self._dependency_dataset = value
+            return value
+        except BaseException as primary:
+            try:
+                self.close_dependency_dataset()
+            except BaseException as cleanup:
+                raise cleanup from primary
+            raise
+
+    def close_dependency_dataset(self) -> None:
+        try:
+            dataset = self._dependency_dataset
+            if dataset is not None:
+                if dataset.id.valid:
+                    type(self)._close_dataset_id(dataset)
+                self._dependency_dataset = None
+            owner = self._dependency_file
+            if owner is not None:
+                type(self)._close_dependency_file(owner)
+                self._dependency_file = None
+        except BaseException:
+            self._cleanup_failed = True
+            raise
+        self._cleanup_failed = False
+
+    @staticmethod
+    def _close_dataset_id(dataset: h5py.Dataset) -> None:
+        if dataset.id.valid:
+            dataset.id.close()
+
+    @staticmethod
+    def _close_dependency_file(owner: h5py.File) -> None:
+        owner.close()
+
+
+def _bind_nexus_stack_from_entry(
+    entry_group: h5py.Group, *, declared_entry_name: str,
+    prefer_apstools_flat: bool, owner_slot: _NexusDatasetOwnerSlot,
+) -> _ResolvedNexusStack:
+    """Resolve detector datasets relative to one captured entry group."""
+    if not isinstance(entry_group, h5py.Group):
+        raise TypeError("captured entry must be an HDF5 Group")
+    binding = _ResolvedNexusStack(entry_group)
+    owner_slot.owner = binding
+
+    def hard(group: h5py.Group, name: str) -> Any:
+        link = group.get(name, getlink=True)
+        if link is None:
+            return None
+        if not isinstance(link, (h5py.HardLink, h5py.ExternalLink)):
+            raise ValueError("detector indirection is unsupported")
+        return group[name]
+
+    def direct(path: str) -> Any:
+        current: Any = entry_group
+        for component in path.split("/"):
+            if not isinstance(current, h5py.Group):
+                return None
+            current = hard(current, component)
+            if current is None:
+                return None
+        return current
+
+    def acquire(selector: str, dataset: Any) -> None:
+        if not isinstance(dataset, h5py.Dataset):
+            raise TypeError(f"{selector} is not a Dataset")
+        binding.append(selector, dataset)
+        rank = int(dataset.ndim)
+        if rank == 2 and len(binding._datasets) == 1:
+            return
+        if rank != 3:
+            raise UnsupportedDetectorRankError(
+                f"{selector} has rank {rank}; detector data must be 2-D or 3-D"
+            )
+        first = binding._datasets[0]
+        first_shape = tuple(first.shape if first.ndim == 2 else first.shape[1:])
+        if tuple(dataset.shape[1:]) != first_shape:
+            raise ValueError("Inconsistent per-frame shapes across segments")
+        if np.dtype(dataset.dtype) != np.dtype(first.dtype):
+            raise ValueError("Inconsistent detector dtypes across segments")
+
+    try:
+        from xrd_tools.io.processed_scan_id import (
+            ProcessedXdartInputError, is_processed_xdart_entry,
+        )
+        data_group = direct("data")
+        external_names: list[str] = []
+        if isinstance(data_group, h5py.Group):
+            for name in sorted(data_group.keys()):
+                link = data_group.get(name, getlink=True)
+                if isinstance(link, h5py.ExternalLink) and name.startswith("data_"):
+                    external_names.append(name)
+        if external_names:
+            for name in external_names:
+                acquire(
+                    f"/{declared_entry_name}/data/{name}", data_group[name],
+                )
+            return binding
+
+        candidates: list[tuple[str, Any]] = []
+        for relative in ("instrument/detector/data", "data/data"):
+            value = direct(relative)
+            if isinstance(value, h5py.Dataset) and value.ndim in (2, 3):
+                candidates.append((f"/{declared_entry_name}/{relative}", value))
+                break
+        if not candidates and isinstance(data_group, h5py.Group):
+            for name in data_group.keys():
+                value = hard(data_group, name)
+                marker = value.attrs.get("signal_type", "") if isinstance(value, h5py.Dataset) else ""
+                if isinstance(marker, bytes):
+                    marker = marker.decode("utf-8", errors="replace")
+                if (isinstance(value, h5py.Dataset) and value.ndim in (2, 3)
+                        and str(marker) == "detector"):
+                    candidates.append((f"/{declared_entry_name}/data/{name}", value))
+                    break
+        instrument = direct("instrument")
+        if not candidates and isinstance(instrument, h5py.Group):
+            for name in instrument.keys():
+                subgroup = hard(instrument, name)
+                if isinstance(subgroup, h5py.Group):
+                    value = hard(subgroup, "data")
+                    if isinstance(value, h5py.Dataset) and value.ndim in (2, 3):
+                        candidates.append((
+                            f"/{declared_entry_name}/instrument/{name}/data", value,
+                        ))
+                        break
+        if not candidates:
+            if is_processed_xdart_entry(entry_group):
+                raise ProcessedXdartInputError("processed xdart entry has no raw detector")
+            best: tuple[str, h5py.Dataset] | None = None
+            def visit(name: str, value: Any) -> None:
+                nonlocal best
+                if isinstance(value, h5py.Dataset) and value.ndim in (2, 3):
+                    size = int(np.prod(value.shape))
+                    if best is None or size > int(np.prod(best[1].shape)):
+                        best = (f"/{declared_entry_name}/{name}", value)
+            entry_group.visititems(visit)
+            if best is not None:
+                candidates.append(best)
+        if not candidates:
+            raise KeyError("captured entry has no detector dataset")
+        for selector, dataset in candidates:
+            acquire(selector, dataset)
+        return binding
+    except BaseException as primary:
+        try:
+            binding.close()
+        except BaseException as cleanup:
+            raise cleanup from primary
+        raise
+
+
 class NexusImageStack:
     """Read-only 3D image stack spanning one or more h5py datasets.
 
@@ -446,10 +698,25 @@ class NexusImageStack:
         # F6: a SINGLE 2-D detector dataset is a one-frame stack (the finder /
         # classifier already accept ndim >= 2); normalize it to (1, H, W) here
         # instead of raising.  Multi-segment (Eiger links) stays strict-3D.
+        dsets = [h5f[p] for p in paths]
+        self._initialize_bound(h5f, paths, dsets)
+
+    @classmethod
+    def _from_bound_datasets(
+        cls, h5f: h5py.File, paths: list[str], datasets: list[h5py.Dataset],
+    ) -> "NexusImageStack":
+        value = cls.__new__(cls)
+        value._initialize_bound(h5f, paths, datasets)
+        return value
+
+    def _initialize_bound(
+        self, h5f: h5py.File, paths: list[str], datasets: list[h5py.Dataset],
+    ) -> None:
+        if not paths or len(paths) != len(datasets):
+            raise ValueError("NexusImageStack requires aligned bound datasets")
         squeeze2d = False
         dsets = []
-        for p in paths:
-            obj = h5f[p]
+        for p, obj in zip(paths, datasets, strict=True):
             if not isinstance(obj, h5py.Dataset):
                 raise TypeError(f"{p} is not a Dataset (got {type(obj).__name__})")
             if obj.ndim == 2 and len(paths) == 1:
@@ -465,7 +732,7 @@ class NexusImageStack:
                             else {d.shape[1:] for d in dsets})
         if len(per_frame_shapes) > 1:
             raise ValueError(
-                f"Inconsistent per-frame shapes across segments: "
+                "Inconsistent per-frame shapes across segments: "
                 f"{per_frame_shapes}"
             )
         # Offsets[i] = global index where segment i starts.
@@ -620,7 +887,7 @@ class NexusImageStack:
         for dataset in tuple(getattr(self, "_dsets", ())):
             try:
                 if dataset.id.valid:
-                    dataset.id.close()
+                    _ResolvedNexusStack._close_dataset_id(dataset)
             except BaseException as exc:
                 if failure is None:
                     failure = exc

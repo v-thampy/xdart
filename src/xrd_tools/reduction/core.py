@@ -1366,6 +1366,7 @@ class NexusSink:
     allow_unbound_same_run: bool = False
     incremental_finalization: bool = False
     durable_fsync: bool = True
+    rollback_until_commit: bool = False
     _writer: NexusRecordWriter | None = field(default=None, init=False, repr=False)
     _transaction: Any | None = field(default=None, init=False, repr=False)
     _lease: Any | None = field(default=None, init=False, repr=False)
@@ -1508,6 +1509,8 @@ class NexusSink:
             self.path = Path(self.path)
         if type(self.durable_fsync) is not bool:
             raise TypeError("Nexus durable_fsync must be an exact bool")
+        if type(self.rollback_until_commit) is not bool:
+            raise TypeError("Nexus rollback_until_commit must be an exact bool")
         if not self.durable_fsync and self.append_preflight is not None:
             raise ValueError(
                 "diagnostic no-fsync is unavailable for Append"
@@ -1534,7 +1537,7 @@ class NexusSink:
         config = self._run_configuration or {}
         self._fast_regenerable = bool(
             self.overwrite and config.get("output_mode") == "Overwrite"
-            and config.get("live_mode") is False)
+            and config.get("live_mode") is False and not self.rollback_until_commit)
         if self.source_execution_provenance is not None:
             self._source_execution = jsonable_run_value(
                 self.source_execution_provenance,
@@ -1643,7 +1646,7 @@ class NexusSink:
             else:
                 snapshot = self._transaction.abort_stream(
                     self._attempt, lease=self._lease,
-                    retain_partial=bool(writer and writer.written_labels and self._replacement is None),
+                    retain_partial=bool(writer and writer.written_labels and self._replacement is None and not self.rollback_until_commit),
                 )
                 if snapshot.partial_path:
                     warnings.warn(f"writer abort preserved non-final data at {snapshot.partial_path}", RuntimeWarning, stacklevel=2)
@@ -1810,6 +1813,7 @@ class NexusSink:
                 ),
                 append_decision=append_decision,
                 fast_regenerable=self._fast_regenerable,
+                defer_epoch_durability=self.rollback_until_commit,
                 replacement_dimension=None if replacement is None else replacement[1],
                 replacement_labels=None if replacement is None else replacement[2],
                 replacement_audit=None if replacement is None else replacement[3],
@@ -1905,6 +1909,7 @@ class NexusSink:
                 ),
                 append_decision=decision,
                 fast_regenerable=self._fast_regenerable,
+                defer_epoch_durability=self.rollback_until_commit,
             )
             self._writer = writer
             if self._session_facade is not None:
@@ -2290,6 +2295,9 @@ class NexusSink:
                 config["source_execution"] = copy.deepcopy(
                     self._source_execution,
                 )
+            average = (scan.extra or {}).get("average_scan_provenance")
+            if average is not None:
+                config["average_scan_v1"] = copy.deepcopy(average)
         geometry = scan.geometry if self.complete_record else None
         return WriterFinalization(
             scan_data=scan_data,
@@ -2307,6 +2315,9 @@ class NexusSink:
             stitched_1d=(scan.extra or {}).get("stitched_1d"),
             stitched_2d=(scan.extra or {}).get("stitched_2d"),
             stitched_provenance=(scan.extra or {}).get("stitched_provenance"),
+            average_finite_counts=(scan.extra or {}).get(
+                "average_finite_counts",
+            ),
         )
 
     def truncate_epoch(self, written_labels) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import fabio
@@ -31,6 +32,15 @@ SUPPORTED_EXTS = {".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450",
 # sources.discover, sources.registry._image_is_candidate) — .nexus is
 # output-only and must never be discovered as a raw input (P4/OUT-1).
 _HDF5_READ_EXTS = {".h5", ".hdf5", ".nxs", NEW_OUTPUT_SUFFIX}
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorImageLayout:
+    """Pixel-free layout facts for one detector image container."""
+
+    shape: tuple[int, int]
+    dtype: str
+    frame_count: int
 
 # Established detector layouts for headerless binary frames.  This table is a
 # headless I/O capability shared by the GUI and every FrameSource; matching is
@@ -116,6 +126,58 @@ def infer_raw_detector_shape(
         shape[0], shape[1], path, payload_bytes,
     )
     return shape
+
+
+def read_detector_image_layout(
+    path: Path | str,
+    *,
+    detector_shape: tuple[int, int] | None = None,
+    detector: str | tuple[int, int] | None = None,
+    raw_dtype: str = "int32",
+    raw_header_skip: int = 0,
+) -> DetectorImageLayout:
+    """Read only detector header/layout facts, never a pixel allocation."""
+    selected = Path(path)
+    suffix = selected.suffix.lower()
+    if suffix in {".tif", ".tiff"}:
+        import tifffile
+
+        with tifffile.TiffFile(selected) as handle:
+            pages = handle.pages
+            if not pages:
+                raise ValueError("detector layout has no frames")
+            first = pages[0]
+            shape = tuple(int(value) for value in first.shape)
+            dtype = np.dtype(first.dtype)
+            frame_count = len(pages)
+    elif suffix == ".raw":
+        dtype = np.dtype(raw_dtype)
+        shape_value = detector_shape or resolve_detector_shape(detector)
+        if shape_value is None:
+            shape_value = infer_raw_detector_shape(
+                selected, raw_dtype=dtype.str, raw_header_skip=raw_header_skip,
+            )
+        if shape_value is None:
+            raise ValueError("raw detector layout requires an exact shape")
+        shape = tuple(int(value) for value in shape_value)
+        header = int(raw_header_skip)
+        expected = header + int(shape[0]) * int(shape[1]) * int(dtype.itemsize)
+        if header < 0 or selected.stat().st_size != expected:
+            raise ValueError("raw detector layout does not match the exact file size")
+        frame_count = 1
+    else:
+        image = fabio.openheader(selected)
+        try:
+            shape = tuple(int(value) for value in image.shape)
+            dtype = np.dtype(image.dtype)
+            frame_count = int(getattr(image, "nframes", 1))
+        finally:
+            image.close()
+    if len(shape) != 2 or any(value <= 0 for value in shape):
+        raise ValueError("detector image layout must be exactly two-dimensional")
+    if frame_count <= 0:
+        raise ValueError("detector image layout has an invalid frame count")
+    return DetectorImageLayout((shape[0], shape[1]), dtype.str, frame_count)
 
 
 def get_detector_mask(detector_name: str) -> np.ndarray | None:

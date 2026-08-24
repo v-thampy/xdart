@@ -27,6 +27,15 @@ from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.run_plan import RunCandidatePlan
 from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.execution_graph import (
+    PreparedSourceExecutionGraph,
+    SourceRevisionChanged,
+    freeze_source_execution_graph,
+    qualify_source_execution_graph,
+    source_snapshots_projection,
+    validate_source_execution_graph,
+    validate_source_aliases as _validate_source_aliases_shared,
+)
 from .contracts import (
     AcceptedScientificAssets, AdmittedMetadataSource,
     AdmittedMotorValue, AdmittedOutput, AdmissionReceipt,
@@ -40,10 +49,6 @@ from .source_metadata import (
 )
 
 load_poni = load_detector_calibration
-
-
-class SourceRevisionChanged(ValueError):
-    """Exact source bytes/dependencies drifted during one admitted attempt."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,50 +133,14 @@ def validate_source_aliases(
 ) -> ValidatedSourceAliases:
     """Prove every raw alias and target twice in deterministic order."""
 
-    if type(stamp) is not SourceExecutionStamp:
-        raise TypeError("source alias validation requires an execution stamp")
-    is_cancelled = _not_cancelled if cancelled is None else cancelled
-    targets = stamp.canonical_targets
-    for sweep in range(2):
-        for binding in stamp.source_aliases:
-            if is_cancelled():
-                raise RuntimeError("admission cancelled")
-            try:
-                resolved = _resolve_source_alias(binding.raw_path)
-            except (OSError, RuntimeError) as error:
-                raise SourceRevisionChanged(
-                    f"source alias is unavailable: {binding.raw_path}"
-                ) from error
-            if _resolved_source_key(resolved) != _resolved_source_key(
-                binding.resolved_path
-            ):
-                raise SourceRevisionChanged(
-                    (
-                        "source candidate changed after admission: "
-                        if binding.candidate_owner_id is not None
-                        else "source alias retargeted after admission: "
-                    )
-                    + binding.raw_path
-                )
-            expected = targets[binding.target_id]
-            try:
-                current = _capture_canonical_source_target(resolved)
-            except OSError as error:
-                raise SourceRevisionChanged(
-                    f"source target is unavailable: {binding.resolved_path}"
-                ) from error
-            if current != expected.state:
-                raise SourceRevisionChanged(
-                    "source target changed after admission: "
-                    f"{binding.resolved_path}"
-                )
-            if sweep == 0 and binding.candidate_owner_id is not None:
-                if _candidate_owner_id(binding.raw_path) != binding.candidate_owner_id:
-                    raise SourceRevisionChanged(
-                        "source candidate owner changed after admission: "
-                        f"{binding.raw_path}"
-                    )
-    return ValidatedSourceAliases(stamp.execution_identity_v1, targets)
+    identity, targets = _validate_source_aliases_shared(
+        stamp,
+        cancelled=cancelled,
+        resolve_alias=_resolve_source_alias,
+        capture_target=_capture_canonical_source_target,
+        candidate_owner_id=_candidate_owner_id,
+    )
+    return ValidatedSourceAliases(identity, targets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2565,8 +2534,9 @@ def _validate_deferred_entry_states(
         # raw alias binding.  Run that proof before the older deferred-state
         # fences so no alias drift can be classified without its frozen
         # raw-to-resolved identity reaching the central validator.
-        validate_source_aliases(item.source_stamp, cancelled=is_cancelled)
-        _validate_tiff_metadata_selection(item, cancelled=is_cancelled)
+        validate_source_execution_graph(
+            _prepared_source_execution(item), cancelled=is_cancelled,
+        )
     topologies = entry._protected_topology or tuple(
         _topology_from_captured_state(value)
         for value in entry.protected_states
@@ -2623,46 +2593,6 @@ def _validate_deferred_entry_states(
             raise SourceRevisionChanged(
                 "source dependency escaped admitted revision: "
                 f"{state.path}"
-            )
-
-
-def _validate_tiff_metadata_selection(
-    item: PlannedOutput,
-    *,
-    cancelled: Callable[[], bool],
-) -> None:
-    """Keep nullable/selected TIFF metadata authoritative until decision."""
-
-    stamp = item.source_stamp
-    if not stamp.metadata_sources:
-        return
-    options = dict(item.source_spec.options)
-    metadata_format = options.get("metadata_format", "auto")
-    meta_dir = options.get("meta_dir")
-    for metadata in stamp.metadata_sources:
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        observed = read_image_motor_metadata(
-            metadata.source_path,
-            metadata_format,
-            meta_dir=meta_dir,
-        )
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        current = observed.source_path
-        expected = metadata.metadata_file
-        if (
-            (expected is None) != (current is None)
-            or (
-                expected is not None
-                and current is not None
-                and _raw_source_key(expected.path)
-                != _raw_source_key(current)
-            )
-        ):
-            raise SourceRevisionChanged(
-                "TIFF metadata source changed before output decision: "
-                f"{metadata.source_path}"
             )
 
 
@@ -2983,42 +2913,13 @@ def _series_item(
 ) -> PlannedOutput:
     if source.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
         return _container_item(configuration, source, cancelled=cancelled)
-    options = dict(source.options)
-    members = tuple(Path(value) for value in options.get("files", ()))
-    members = members or (Path(options.get("selected_file") or source.uri),)
-    states = _capture_source_states(members, cancelled)
-    name = str(options.get("scan_name") or members[0].stem)
-    target = _resolved_generated_target(configuration.save_path, name)
-    motor_names = None
-    admitted: tuple[AdmittedMotorValue, ...] = ()
-    metadata_sources: tuple[AdmittedMetadataSource, ...] = ()
-    if source.kind is SourceKind.TIFF_SERIES:
-        metadata_format = options.get("metadata_format", "auto")
-        motor_names, admitted, metadata_sources = _tiff_motor_knowledge(
-            members,
-            states,
-            metadata_format,
-            _selected_tiff_gi_motor(configuration),
-            meta_dir=options.get("meta_dir"),
-            cancelled=cancelled,
-        )
-        source = _execution_tiff_source(source, states, admitted)
-    stamp = SourceExecutionStamp(
-        states[0],
-        "tiff_series",
-        len(states),
-        1,
-        states,
-        admitted_motor_values=admitted,
-        metadata_sources=metadata_sources,
+    graph = qualify_source_execution_graph(
+        source, selected_motor=_selected_tiff_gi_motor(configuration),
+        cancelled=cancelled,
     )
-    return PlannedOutput(
-        source,
-        members[0],
-        target,
-        stamp,
-        motor_names=motor_names,
-    )
+    return PlannedOutput(graph.execution_source, Path(graph.source_path),
+        _resolved_generated_target(configuration.save_path, graph.group_key),
+        graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names)
 
 
 def _container_item(
@@ -3027,64 +2928,13 @@ def _container_item(
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
 ) -> PlannedOutput:
-    path = Path(source.uri).expanduser()
-    state = _capture_source_states((path,), cancelled)[0]
-    owner = candidate_owner(path)
-    if owner is None or source.kind not in owner.kinds:
-        raise ValueError(f"selected container has no compatible owner: {path}")
-    result = owner.probe(path)
-    current_owner = candidate_owner(path)
-    if (
-        not state.matches_disk()
-        or current_owner is None
-        or current_owner.id != owner.id
-    ):
-        raise SourceRevisionChanged(
-            f"source candidate changed during admission: {path}"
-        )
-    descriptor = result.descriptor
-    if (
-        result.state is not ProbeState.READY
-        or descriptor is None
-        or descriptor.frame_count < 1
-        or descriptor.kind is SourceKind.PROCESSED_NEXUS
-    ):
-        reason = result.reason or result.state.value
-        raise ValueError(f"selected container is not ready: {path}: {reason}")
-    normalized = SourceSpec(
-        path,
-        descriptor.kind,
-        entry=descriptor.resolved_entry or descriptor.requested_entry,
-    )
-    name = descriptor.scan_name or path.stem.removesuffix("_master")
-    target = _resolved_generated_target(configuration.save_path, name)
-    external_members = _external_members(
-        path,
-        state,
-        descriptor,
+    graph = qualify_source_execution_graph(
+        source, selected_motor=_selected_tiff_gi_motor(configuration),
         cancelled=cancelled,
     )
-    stamp = SourceExecutionStamp(
-        state,
-        owner.id,
-        descriptor.frame_count,
-        0,
-        external_members=external_members,
-        dependency_files=_selected_dependency_files(
-            path,
-            state,
-            descriptor,
-            external_members,
-            cancelled=cancelled,
-        ),
-    )
-    return PlannedOutput(
-        normalized,
-        path,
-        target,
-        stamp,
-        descriptor=descriptor,
-    )
+    return PlannedOutput(graph.execution_source, Path(graph.source_path),
+        _resolved_generated_target(configuration.save_path, graph.group_key),
+        graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names)
 
 
 def _uses_eager_directory_descriptors(
@@ -3156,6 +3006,7 @@ def _directory_items(
             spec = SourceSpec(
                 candidate.path.parent, SourceKind.TIFF_SERIES,
                 options={
+                    "selected_file": str(candidate.path),
                     "files": tuple(value.path for value in states),
                     "scan_name": name,
                     "metadata_format": metadata_format,
@@ -3170,14 +3021,13 @@ def _directory_items(
                 cancelled=cancelled,
             )
             spec = _execution_tiff_source(spec, states, admitted)
-            stamp = SourceExecutionStamp(
-                states[0],
-                "tiff_series",
-                len(states),
-                1,
-                states,
-                admitted_motor_values=admitted,
-                metadata_sources=metadata_sources,
+            graph = freeze_source_execution_graph(
+                spec, spec, source_path=candidate.path, group_key=name,
+                file=states[0], adapter_id="tiff_series",
+                frame_count=len(states), first_label=1,
+                detector_shape=None, native_dtype=None, members=states,
+                admitted_motor_values=admitted, metadata_sources=metadata_sources,
+                motor_names=motor_names,
             )
         else:
             consumed.add(candidate.path)
@@ -3245,12 +3095,18 @@ def _directory_items(
             )
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            stamp = SourceExecutionStamp(
-                state,
-                candidate.adapter_id, descriptor.frame_count, 0,
-                external_members=external_members,
-                dependency_files=dependency_files,
+            graph = freeze_source_execution_graph(
+                spec, spec, source_path=candidate.path, group_key=name,
+                file=state, adapter_id=candidate.adapter_id,
+                frame_count=descriptor.frame_count, first_label=0,
+                detector_shape=tuple(descriptor.frame_shape),
+                native_dtype=np.dtype(descriptor.dtype).str,
+                descriptor=descriptor, external_members=external_members,
+                dependency_files=dependency_files, motor_names=descriptor.motor_names,
             )
+        spec, stamp, descriptor, motor_names = (
+            graph.execution_source, graph.stamp, graph.descriptor, graph.motor_names,
+        )
         output_request = configuration.save_path
         if not output_root.suffix:
             try:
@@ -3296,87 +3152,31 @@ def validate_planned_source(
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
     is_cancelled = _not_cancelled if cancelled is None else cancelled
-    validate_source_aliases(item.source_stamp, cancelled=is_cancelled)
-    _validate_tiff_metadata_selection(item, cancelled=is_cancelled)
-    import h5py
-    for external in item.source_stamp.external_members:
-        if is_cancelled():
-            raise RuntimeError("admission cancelled")
-        state = external.file
-        path = Path(state.path)
-        try:
-            with h5py.File(path, "r") as handle:
-                if external.dataset not in handle:
-                    raise ValueError(
-                        "external source dataset changed: "
-                        f"{path}:{external.dataset}"
-                    )
-        except SourceRevisionChanged:
-            raise
-        except OSError as error:
-            try:
-                validate_source_aliases(
-                    item.source_stamp,
-                    cancelled=is_cancelled,
-                )
-            except SourceRevisionChanged as drift:
-                raise drift from error
-            raise
-        if is_cancelled():
-            raise RuntimeError("admission cancelled")
-def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
+    validate_source_execution_graph(
+        _prepared_source_execution(item), cancelled=is_cancelled,
+    )
+def _prepared_source_execution(item: PlannedOutput) -> PreparedSourceExecutionGraph:
+    descriptor = item.descriptor
     stamp = item.source_stamp
-    if stamp.members:
-        values = {
-            state.path: {
-                "adapter_id": stamp.adapter_id,
-                **state.as_dict(),
-                "frame_count": 1,
-                "self_contained": True,
-            }
-            for state in stamp.members
-        }
-        for metadata in stamp.metadata_sources:
-            state = metadata.metadata_file
-            if state is not None:
-                values[state.path] = {
-                    "adapter_id": "image_metadata",
-                    **state.as_dict(),
-                    "frame_count": 0,
-                    "self_contained": True,
-                    "source_role": "image_metadata",
-                }
-        return values
+    return freeze_source_execution_graph(
+        item.source_spec, item.source_spec, source_path=item.source_path,
+        group_key=item.group.group_key, file=stamp.file,
+        adapter_id=stamp.adapter_id, frame_count=stamp.frame_count,
+        first_label=stamp.first_label,
+        detector_shape=None if descriptor is None else tuple(descriptor.frame_shape),
+        native_dtype=None if descriptor is None else np.dtype(descriptor.dtype).str,
+        members=stamp.members, external_members=stamp.external_members,
+        dependency_files=stamp.dependency_files,
+        admitted_motor_values=stamp.admitted_motor_values,
+        metadata_sources=stamp.metadata_sources, descriptor=descriptor,
+        motor_names=item.group.motor_names,
+    )
 
-    value: dict[str, Any] = {
-        "adapter_id": stamp.adapter_id,
-        **stamp.file.as_dict(),
-        "frame_count": stamp.frame_count,
-    }
-    if item.descriptor is not None:
-        value.update(
-            dataset_path=item.descriptor.dataset_path,
-            self_contained=item.descriptor.self_contained,
-        )
-    values = {str(item.source_path): value}
-    for external in stamp.external_members:
-        state = external.file
-        values[state.path] = {
-            "adapter_id": stamp.adapter_id,
-            **state.as_dict(),
-            "frame_count": external.stop - external.first,
-            "dataset_path": external.dataset,
-            "self_contained": True,
-        }
-    for state in stamp.dependency_files:
-        values[state.path] = {
-            "adapter_id": "hdf5_dependency",
-            **state.as_dict(),
-            "frame_count": 0,
-            "self_contained": True,
-            "source_role": "detector_dependency",
-        }
-    return values
+
+def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
+    return source_snapshots_projection(
+        _prepared_source_execution(item), writer=False
+    )
 def execution_plan_values(
     configuration: FrozenRunConfiguration, detector_mask: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:

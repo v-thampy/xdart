@@ -58,6 +58,7 @@ __all__ = [
     "bluesky_per_frame_table",
     "bluesky_scalar_metadata",
     "find_detector_signal_dataset",
+    "validate_average_container_metadata_inputs",
 ]
 
 # The entry attribute xdart stamps on its own processed files.  A Bluesky file
@@ -122,7 +123,8 @@ def _scalar(ds: h5py.Dataset) -> Any:
 # ---------------------------------------------------------------------------
 
 def resolve_nxentry(h5: h5py.File | h5py.Group,
-                    entry_hint: str = "entry") -> h5py.Group | None:
+                    entry_hint: str = "entry", *,
+                    exact_hint: bool = False) -> h5py.Group | None:
     """Return the NXentry group, resolved by ``NX_class`` rather than name.
 
     Prefers ``entry_hint`` when it exists and is an NXentry (or any group);
@@ -134,6 +136,12 @@ def resolve_nxentry(h5: h5py.File | h5py.Group,
         if _nx_class(h5) == "NXentry":
             return h5
     root = h5.file if isinstance(h5, h5py.Group) else h5
+    if exact_hint:
+        link = root.get(entry_hint, getlink=True)
+        if not isinstance(link, h5py.HardLink):
+            return None
+        value = root.get(entry_hint)
+        return value if isinstance(value, h5py.Group) else None
     hint = root.get(entry_hint)
     if isinstance(hint, h5py.Group) and _nx_class(hint) in ("NXentry", ""):
         # honor the hint when it is an NXentry (or class-less but named 'entry')
@@ -246,7 +254,9 @@ def _parse_motors_yaml(entry: h5py.Group) -> list[str]:
     return names
 
 
-def bluesky_motor_names(entry: h5py.Group) -> list[str]:
+def bluesky_motor_names(
+    entry: h5py.Group, *, skip_advisory_if_authoritative: bool = False,
+) -> list[str]:
     """Authoritative scan-motor names: the group children of
     ``entry/instrument/positioners`` (real NXpositioner groups).
 
@@ -257,14 +267,17 @@ def bluesky_motor_names(entry: h5py.Group) -> list[str]:
     names: list[str] = []
     if isinstance(pos, h5py.Group):
         names = [name for name in pos if isinstance(pos.get(name), h5py.Group)]
-    parsed = _parse_motors_yaml(entry)
+    parsed = ([] if names and skip_advisory_if_authoritative
+              else _parse_motors_yaml(entry))
     if parsed and set(parsed) - set(names):
         logger.debug("Bluesky metadata/motors %s not all present as positioners %s",
                      parsed, names)
     return names or parsed
 
 
-def bluesky_all_motor_names(entry: h5py.Group) -> list[str]:
+def bluesky_all_motor_names(
+    entry: h5py.Group, scanned_motor_names: Iterable[str] | None = None,
+) -> list[str]:
     """EVERY motor present in the scan — scanned AND held-fixed.
 
     :func:`bluesky_motor_names` returns only the SCANNED motors (the
@@ -277,7 +290,8 @@ def bluesky_all_motor_names(entry: h5py.Group) -> list[str]:
     companion sub-signals (:data:`_MOTOR_COMPANION_SUFFIXES`) so scaler counters,
     the detector, the timer and the limit/dial field-spray are all excluded.
     """
-    names = list(bluesky_motor_names(entry))
+    names = list(bluesky_motor_names(entry) if scanned_motor_names is None
+                 else scanned_motor_names)
     seen = set(names)
     base = _baseline_group(entry)
     if isinstance(base, h5py.Group):
@@ -388,7 +402,18 @@ def _first_numeric(ds: h5py.Dataset) -> float | None:
     return float(arr[0]) if arr.size else None
 
 
-def bluesky_positioner_values(entry: h5py.Group) -> dict[str, float]:
+def _bounded_first_numeric(ds: h5py.Dataset) -> float | None:
+    """Read exactly one already-admitted fixed numeric element."""
+    try:
+        value = ds[()] if ds.shape == () else ds[0]
+        return float(value)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def bluesky_positioner_values(
+    entry: h5py.Group, *, bounded: bool = False,
+) -> dict[str, float]:
     """Constant value of each positioner from ``positioners/<motor>/value``.
 
     Returns ``{motor: first_value}`` for every ``NXpositioner`` group child of
@@ -406,7 +431,7 @@ def bluesky_positioner_values(entry: h5py.Group) -> dict[str, float]:
             continue
         ds = grp.get("value")
         if isinstance(ds, h5py.Dataset):
-            val = _first_numeric(ds)
+            val = (_bounded_first_numeric(ds) if bounded else _first_numeric(ds))
             if val is not None:
                 out[name] = val
     return out
@@ -417,7 +442,9 @@ def _baseline_group(entry: h5py.Group) -> h5py.Group | None:
     return base if isinstance(base, h5py.Group) else None
 
 
-def bluesky_baseline_values(entry: h5py.Group) -> dict[str, float]:
+def bluesky_baseline_values(
+    entry: h5py.Group, *, bounded: bool = False,
+) -> dict[str, float]:
     """RAW baseline-stream constants: ``{signal: value_start}`` for every signal
     in ``entry/instrument/bluesky/streams/baseline`` (``value_start`` preferred,
     else ``value_end``/``value``).
@@ -438,18 +465,20 @@ def bluesky_baseline_values(entry: h5py.Group) -> dict[str, float]:
             for field in ("value_start", "value_end", "value"):
                 ds = obj.get(field)
                 if isinstance(ds, h5py.Dataset):
-                    val = _first_numeric(ds)
+                    val = (_bounded_first_numeric(ds) if bounded else _first_numeric(ds))
                     if val is not None:
                         out[name] = val
                         break
         elif isinstance(obj, h5py.Dataset):
-            val = _first_numeric(obj)
+            val = (_bounded_first_numeric(obj) if bounded else _first_numeric(obj))
             if val is not None:
                 out[name] = val
     return out
 
 
-def _baseline_motor_value(entry: h5py.Group, motor: str) -> float | None:
+def _baseline_motor_value(
+    entry: h5py.Group, motor: str, *, bounded: bool = False,
+) -> float | None:
     """``value_start`` of a motor's USER-POSITION baseline signal, or *None*.
 
     Tries the authoritative motor name then the readback aliases — the motor
@@ -465,20 +494,21 @@ def _baseline_motor_value(entry: h5py.Group, motor: str) -> float | None:
                    f"{motor}_readback"):
         grp = base.get(signal)
         if isinstance(grp, h5py.Dataset):          # flat, no start/end split
-            return _first_numeric(grp)
+            return (_bounded_first_numeric(grp) if bounded else _first_numeric(grp))
         if not isinstance(grp, h5py.Group):
             continue
         start = None
         for field in ("value_start", "value_end", "value"):
             ds = grp.get(field)
             if isinstance(ds, h5py.Dataset):
-                start = _first_numeric(ds)
+                start = (_bounded_first_numeric(ds) if bounded else _first_numeric(ds))
                 if start is not None:
                     break
         if start is None:
             continue
         end_ds = grp.get("value_end")
-        end = _first_numeric(end_ds) if isinstance(end_ds, h5py.Dataset) else None
+        end = ((_bounded_first_numeric(end_ds) if bounded else _first_numeric(end_ds))
+               if isinstance(end_ds, h5py.Dataset) else None)
         if end is not None and abs(end - start) > 1e-9 * max(1.0, abs(start)):
             logger.debug("Bluesky baseline motor %r moved during scan "
                          "(value_start=%g, value_end=%g); using value_start",
@@ -487,8 +517,10 @@ def _baseline_motor_value(entry: h5py.Group, motor: str) -> float | None:
     return None
 
 
-def bluesky_fixed_motor_values(entry: h5py.Group,
-                               exclude: Iterable[str] = ()) -> dict[str, float]:
+def bluesky_fixed_motor_values(
+    entry: h5py.Group, exclude: Iterable[str] = (), *,
+    motor_names: Iterable[str] | None = None, bounded: bool = False,
+) -> dict[str, float]:
     """Constant per-scan values for FIXED positioner motors (not scanned per
     frame).
 
@@ -503,12 +535,13 @@ def bluesky_fixed_motor_values(entry: h5py.Group,
     surfaced because only motor names are considered.
     """
     skip = {str(x) for x in exclude}
-    pos_vals = bluesky_positioner_values(entry)
+    pos_vals = bluesky_positioner_values(entry, bounded=bounded)
     out: dict[str, float] = {}
-    for motor in bluesky_all_motor_names(entry):
+    for motor in (bluesky_all_motor_names(entry) if motor_names is None
+                  else motor_names):
         if motor in skip:
             continue
-        val = _baseline_motor_value(entry, motor)
+        val = _baseline_motor_value(entry, motor, bounded=bounded)
         if val is None:
             val = pos_vals.get(motor)
         if val is not None:
@@ -536,8 +569,10 @@ def bluesky_eiger_count_time(entry: h5py.Group) -> float:
     return float(np.nan)
 
 
-def bluesky_constant_metadata(entry: h5py.Group,
-                              exclude: Iterable[str] = ()) -> dict[str, float]:
+def bluesky_constant_metadata(
+    entry: h5py.Group, exclude: Iterable[str] = (), *,
+    motor_names: Iterable[str] | None = None, bounded: bool = False,
+) -> dict[str, float]:
     """Per-scan CONSTANT metadata columns to broadcast across every frame.
 
     The fixed (non-scanned) motor positions (:func:`bluesky_fixed_motor_values`)
@@ -549,7 +584,9 @@ def bluesky_constant_metadata(entry: h5py.Group,
     are skipped so a scanned column always wins.
     """
     skip = {str(x) for x in exclude}
-    out: dict[str, float] = dict(bluesky_fixed_motor_values(entry, exclude=skip))
+    out: dict[str, float] = dict(bluesky_fixed_motor_values(
+        entry, exclude=skip, motor_names=motor_names, bounded=bounded,
+    ))
     if "eiger_count_time" not in skip:
         ct = bluesky_eiger_count_time(entry)
         if np.isfinite(ct):
@@ -597,6 +634,264 @@ def bluesky_energy_kev(entry: h5py.Group) -> float:
         except Exception:
             logger.warning("Could not read Bluesky eiger_cam_photon_energy", exc_info=True)
     return float(np.nan)
+
+
+# ---------------------------------------------------------------------------
+# Average-only bounded metadata admission
+# ---------------------------------------------------------------------------
+
+_AVERAGE_METADATA_CHUNK_CAP = 1 << 20
+_AVERAGE_METADATA_NAME_BYTES = 1 << 20
+_AVERAGE_METADATA_NAME_COUNT = {
+    "positioners": 256, "baseline": 4096, "configuration": 256, "data": 4096,
+}
+
+
+def _average_hard_path(entry: h5py.Group, path: str) -> Any:
+    current: Any = entry
+    for component in path.split("/"):
+        if not isinstance(current, h5py.Group):
+            return None
+        link = current.get(component, getlink=True)
+        if link is None:
+            return None
+        if not isinstance(link, h5py.HardLink):
+            raise ValueError("AVERAGE_METADATA_INDIRECTION_UNSUPPORTED")
+        current = current.get(component)
+    return current
+
+
+def _average_catalog(
+    entry: h5py.Group, path: str, role: str, aggregate: list[int],
+) -> h5py.Group | None:
+    value = _average_hard_path(entry, path)
+    if value is None:
+        return None
+    if not isinstance(value, h5py.Group):
+        raise ValueError("AVERAGE_METADATA_INPUT_UNBOUNDED")
+    names = tuple(value.keys())
+    if len(names) > _AVERAGE_METADATA_NAME_COUNT[role]:
+        raise ValueError("AVERAGE_METADATA_CATALOG_TOO_LARGE")
+    for name in names:
+        encoded = str(name).encode("utf-8")
+        if len(encoded) > 256:
+            raise ValueError("AVERAGE_METADATA_CATALOG_TOO_LARGE")
+        aggregate[0] += len(encoded)
+        if aggregate[0] > _AVERAGE_METADATA_NAME_BYTES:
+            raise ValueError("AVERAGE_METADATA_CATALOG_TOO_LARGE")
+    return value
+
+
+def _average_fixed_numeric_dataset(
+    value: Any, *, scalar_only: bool = False,
+) -> h5py.Dataset:
+    if not isinstance(value, h5py.Dataset):
+        raise ValueError("AVERAGE_METADATA_INPUT_UNBOUNDED")
+    dtype = value.dtype
+    metadata = getattr(dtype, "metadata", None)
+    has_vlen = isinstance(metadata, dict) and metadata.get("vlen") is not None
+    itemsize = getattr(dtype, "itemsize", None)
+    if (getattr(dtype, "fields", None) is not None
+            or getattr(dtype, "subdtype", None) is not None
+            or has_vlen
+            or type(getattr(dtype, "kind", None)) is not str
+            or getattr(dtype, "kind", None) not in {"f", "i", "u", "b"}
+            or type(itemsize) is not int or not 1 <= itemsize <= 8):
+        raise ValueError("AVERAGE_METADATA_INPUT_UNBOUNDED")
+    if bool(value.is_virtual):
+        raise ValueError("AVERAGE_METADATA_VIRTUAL_UNSUPPORTED")
+    if value.external:
+        raise ValueError("AVERAGE_METADATA_INDIRECTION_UNSUPPORTED")
+    if value.chunks is not None:
+        logical = itemsize
+        for extent in value.chunks:
+            logical *= int(extent)
+        if logical > _AVERAGE_METADATA_CHUNK_CAP:
+            raise ValueError("AVERAGE_METADATA_CHUNK_TOO_LARGE")
+    shape = tuple(int(item) for item in value.shape)
+    if scalar_only:
+        valid_shape = shape == () or shape == (1,)
+    else:
+        valid_shape = len(shape) == 1 and shape[0] >= 1
+    if not valid_shape:
+        raise ValueError("AVERAGE_METADATA_INPUT_UNBOUNDED")
+    return value
+
+
+def _average_direct_name(value: str) -> str:
+    if (type(value) is not str or not value or value in {".", ".."}
+            or "/" in value or "\0" in value):
+        raise ValueError("AVERAGE_METADATA_MOTOR_NAME_INVALID")
+    if len(value.encode("utf-8")) > 256:
+        raise ValueError("AVERAGE_METADATA_CATALOG_TOO_LARGE")
+    return value
+
+
+def _average_manifest_motor_names(
+    manifest: h5py.Dataset | None,
+) -> tuple[str, ...]:
+    """Strict direct names from one already-bounded Average manifest."""
+    if manifest is None:
+        return ()
+    try:
+        text = _to_str(_scalar(manifest))
+    except Exception:
+        return ()
+    names: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            names.append(
+                _average_direct_name(line[2:].strip().strip("'\""))
+            )
+    return tuple(names)
+
+
+def _average_default_counter_names(entry: h5py.Group) -> tuple[str, ...]:
+    """Select canonical counters case-insensitively, preserving source names."""
+    data = _average_hard_path(entry, "data")
+    if data is None:
+        return ()
+    if not isinstance(data, h5py.Group):
+        raise ValueError("AVERAGE_METADATA_INPUT_UNBOUNDED")
+    observed = tuple(str(name) for name in data.keys())
+    selected: list[str] = []
+    for canonical in _DEFAULT_BLUESKY_COUNTERS:
+        matches = tuple(name for name in observed if name.casefold() == canonical)
+        if len(matches) > 1:
+            raise ValueError("AVERAGE_METADATA_COUNTER_AMBIGUOUS")
+        selected.extend(matches)
+    return tuple(selected)
+
+
+def validate_average_container_metadata_inputs(
+    entry: h5py.Group, *, policy: str = "average_bounded_v1",
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Admit every metadata route before an Average payload read.
+
+    The returned pair is ``(scanned_motor_names, all_motor_names)``.  It is
+    retained by the graph and passed unchanged to the descriptor and streaming
+    provider, eliminating per-row YAML/catalog work.
+    """
+    if policy != "average_bounded_v1" or not isinstance(entry, h5py.Group):
+        raise ValueError("unsupported Average metadata policy")
+    aggregate = [0]
+    positioners = _average_catalog(
+        entry, "instrument/positioners", "positioners", aggregate,
+    )
+    baseline = _average_catalog(
+        entry, "instrument/bluesky/streams/baseline", "baseline", aggregate,
+    )
+    configuration = _average_catalog(
+        entry, _EIGER_CONFIG_BASE, "configuration", aggregate,
+    )
+    data = _average_catalog(entry, "data", "data", aggregate)
+
+    authoritative_scanned: list[str] = []
+    if positioners is not None:
+        for name in positioners.keys():
+            direct_name = _average_direct_name(str(name))
+            group = _average_hard_path(
+                entry, f"instrument/positioners/{direct_name}",
+            )
+            if not isinstance(group, h5py.Group):
+                continue
+            authoritative_scanned.append(direct_name)
+            value = _average_hard_path(
+                entry, f"instrument/positioners/{direct_name}/value",
+            )
+            if value is not None:
+                _average_fixed_numeric_dataset(value)
+    manifest = None
+    if not authoritative_scanned:
+        observed_manifest = _average_hard_path(
+            entry, "instrument/bluesky/metadata/motors",
+        )
+        if observed_manifest is not None:
+            if not isinstance(observed_manifest, h5py.Dataset):
+                raise ValueError("AVERAGE_METADATA_INPUT_UNBOUNDED")
+            dtype = observed_manifest.dtype
+            if bool(observed_manifest.is_virtual):
+                raise ValueError("AVERAGE_METADATA_VIRTUAL_UNSUPPORTED")
+            if observed_manifest.external:
+                raise ValueError("AVERAGE_METADATA_INDIRECTION_UNSUPPORTED")
+            if observed_manifest.chunks is not None and (
+                    int(getattr(dtype, "itemsize", 0))
+                    * int(np.prod(observed_manifest.chunks))) > _AVERAGE_METADATA_CHUNK_CAP:
+                raise ValueError("AVERAGE_METADATA_CHUNK_TOO_LARGE")
+            if (observed_manifest.shape != ()
+                    or getattr(dtype, "kind", None) not in {"S", "U"}
+                    or int(getattr(dtype, "itemsize", 0)) > (1 << 16)):
+                raise ValueError("AVERAGE_METADATA_INPUT_UNBOUNDED")
+            manifest = observed_manifest
+    scanned_tuple = (tuple(authoritative_scanned) if authoritative_scanned
+                     else _average_manifest_motor_names(manifest))
+    if len(scanned_tuple) > 256:
+        raise ValueError("AVERAGE_METADATA_CATALOG_TOO_LARGE")
+
+    if baseline is not None:
+        for name in baseline.keys():
+            direct_name = _average_direct_name(str(name))
+            obj = _average_hard_path(
+                entry,
+                f"instrument/bluesky/streams/baseline/{direct_name}",
+            )
+            if isinstance(obj, h5py.Dataset):
+                _average_fixed_numeric_dataset(obj)
+            elif isinstance(obj, h5py.Group):
+                for field in ("value_start", "value_end", "value"):
+                    value = _average_hard_path(
+                        entry,
+                        f"instrument/bluesky/streams/baseline/{direct_name}/{field}",
+                    )
+                    if value is not None:
+                        _average_fixed_numeric_dataset(value, scalar_only=True)
+
+    all_names = tuple(
+        _average_direct_name(str(name))
+        for name in bluesky_all_motor_names(
+            entry, scanned_motor_names=scanned_tuple,
+        )
+    )
+    if len(all_names) > 256:
+        raise ValueError("AVERAGE_METADATA_CATALOG_TOO_LARGE")
+
+    if data is not None:
+        relevant = set(scanned_tuple) | set(_average_default_counter_names(entry)) | {
+            _BLUESKY_COUNT_TIME_COL, "EPOCH",
+        }
+        for name in relevant:
+            value = _average_hard_path(entry, f"data/{name}")
+            if value is not None:
+                _average_fixed_numeric_dataset(value)
+
+    if configuration is not None:
+        for device in configuration.keys():
+            _average_direct_name(str(device))
+            device_data = _average_hard_path(
+                entry, f"{_EIGER_CONFIG_BASE}/{device}/data",
+            )
+            if device_data is None:
+                continue
+            if not isinstance(device_data, h5py.Group):
+                raise ValueError("AVERAGE_METADATA_INPUT_UNBOUNDED")
+            for field in (
+                "eiger_cam_wavelength", "eiger_cam_photon_energy",
+                "eiger_cam_acquire_time", "eiger_cam_acquire_period",
+            ):
+                value = _average_hard_path(
+                    entry, f"{_EIGER_CONFIG_BASE}/{device}/data/{field}",
+                )
+                if value is not None:
+                    _average_fixed_numeric_dataset(value, scalar_only=True)
+
+    for field in ("energy", "wavelength"):
+        value = _average_hard_path(
+            entry, f"instrument/monochromator/{field}",
+        )
+        if value is not None:
+            _average_fixed_numeric_dataset(value, scalar_only=True)
+    return scanned_tuple, tuple(all_names)
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,8 @@ array([1, 2, 3, 4, 5])
 from __future__ import annotations
 
 import logging
+import hashlib
+import struct
 from collections import namedtuple
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -69,6 +71,7 @@ __all__ = [
     "Integrated1D",
     "Integrated2D",
     "get_frames",
+    "get_average_finite_counts",
     "get_1d",
     "get_2d",
     "get_thumbnail",
@@ -271,6 +274,166 @@ def get_frames(
         return _all_frame_index(e) if union else _frame_index(e)
 
 
+def get_average_finite_counts(
+    scan_file: str | Path,
+    *,
+    entry: str = "entry",
+    max_bytes: int = 268_435_456,
+):
+    """Read and authenticate the optional Average per-pixel count map.
+    The caller opts into the full-resolution allocation explicitly.  Layout
+    and the complete modeled Python-owned peak are checked before that owner
+    is allocated; values are then read and authenticated in bounded row slabs.
+    """
+    from xrd_tools.io.nexus_record import _average_count_chunks
+    from xrd_tools.io.schema import detect_capabilities
+    from xrd_tools.reduction.average import (
+        AverageFiniteCounts,
+        AverageFiniteCountsEvidence,
+    )
+    if type(entry) is not str or not entry or "/" in entry or entry in {".", ".."}:
+        raise ValueError("Average count entry must be one exact group component")
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive non-Boolean integer")
+    with h5py.File(Path(scan_file), "r") as handle:
+        entry_group = _entry(handle, entry)
+        if "average_finite_counts" not in detect_capabilities(entry_group):
+            raise ValueError(
+                f"selected entry {entry!r} has no Average count capability",
+            )
+        frames_link = entry_group.get("frames", getlink=True)
+        frames = entry_group.get("frames")
+        frame_link = (
+            None if not isinstance(frames, h5py.Group)
+            else frames.get("frame_0001", getlink=True)
+        )
+        frame = (
+            None if not isinstance(frames, h5py.Group)
+            else frames.get("frame_0001")
+        )
+        if (
+            type(frames_link) is not h5py.HardLink
+            or not isinstance(frames, h5py.Group)
+            or set(frames) != {"frame_0001"}
+            or type(frame_link) is not h5py.HardLink
+            or not isinstance(frame, h5py.Group)
+            or "source" in frame
+        ):
+            raise ValueError(
+                "Average count capability requires sole source-free frame 1",
+            )
+        dataset_link = frame.get("finite_counts", getlink=True)
+        dataset = frame.get("finite_counts")
+        attr_names = {
+            "average_scan_policy",
+            "contributor_extent",
+            "finite_counts_sha256",
+            "finite_counts_min",
+            "finite_counts_max",
+            "finite_counts_zero_count",
+        }
+        if (
+            type(dataset_link) is not h5py.HardLink
+            or not isinstance(dataset, h5py.Dataset)
+            or dataset.dtype != np.dtype("<u4")
+            or dataset.ndim != 2
+            or any(int(value) <= 0 for value in dataset.shape)
+            or dataset.is_virtual
+            or dataset.external is not None
+            or dataset.compression != "gzip"
+            or dataset.compression_opts != 1
+            or dataset.shuffle is not True
+            or dataset.fletcher32 is not False
+            or set(dataset.attrs) != attr_names
+        ):
+            raise ValueError("Average finite-count dataset schema or codec is invalid")
+        shape = tuple(int(value) for value in dataset.shape)
+        chunks = _average_count_chunks(shape)
+        if dataset.chunks != chunks:
+            raise ValueError("Average finite-count chunk layout is invalid")
+        def scalar(name: str, dtype: str):
+            value = dataset.attrs[name]
+            if (
+                np.asarray(value).shape != ()
+                or dataset.attrs.get_id(name).dtype != np.dtype(dtype)
+            ):
+                raise ValueError(f"Average finite-count attribute {name} is invalid")
+            return value
+        policy_raw = scalar("average_scan_policy", "S15")
+        extent_raw = scalar("contributor_extent", "<u4")
+        digest_raw = scalar("finite_counts_sha256", "S64")
+        minimum_raw = scalar("finite_counts_min", "<u4")
+        maximum_raw = scalar("finite_counts_max", "<u4")
+        zero_raw = scalar("finite_counts_zero_count", "<u8")
+        try:
+            policy = bytes(policy_raw).decode("ascii", errors="strict")
+            expected_digest = bytes(digest_raw).decode("ascii", errors="strict")
+        except (TypeError, UnicodeDecodeError) as error:
+            raise ValueError("Average finite-count text attributes are invalid") from error
+        extent = int(extent_raw)
+        minimum = int(minimum_raw)
+        maximum = int(maximum_raw)
+        zero_count = int(zero_raw)
+        evidence = AverageFiniteCountsEvidence(
+            policy,
+            extent,
+            shape,
+            "<u4",
+            expected_digest,
+            minimum,
+            maximum,
+            zero_count,
+            chunks,
+            "gzip",
+            1,
+            True,
+            False,
+        )
+        count_bytes = 4 * shape[0] * shape[1]
+        slab_bytes = 4 * chunks[0] * shape[1]
+        if count_bytes + 4 * slab_bytes > max_bytes:
+            raise ValueError("Average finite-count read exceeds the byte budget")
+        owner = np.empty(shape, dtype="<u4", order="C")
+        digest = hashlib.sha256(b"xdart.average-finite-counts.v1\0")
+        digest.update(struct.pack("<QQQ", shape[0], shape[1], extent))
+        observed_min = extent
+        observed_max = 0
+        observed_zero = 0
+        for start in range(0, shape[0], chunks[0]):
+            stop = min(shape[0], start + chunks[0])
+            slab = np.asarray(dataset[start:stop])
+            if slab.dtype != np.dtype("<u4") or slab.shape != (stop - start, shape[1]):
+                raise ValueError("Average finite-count slab is invalid")
+            owner[start:stop] = slab
+            digest.update(slab.tobytes(order="C"))
+            observed_min = min(observed_min, int(slab.min()))
+            observed_max = max(observed_max, int(slab.max()))
+            observed_zero += int(np.count_nonzero(slab == 0))
+        if digest.hexdigest() != expected_digest:
+            raise ValueError("Average finite-count digest is invalid")
+        if (
+            observed_min != minimum
+            or observed_max != maximum
+            or observed_zero != zero_count
+            or observed_max > extent
+            or observed_zero >= shape[0] * shape[1]
+        ):
+            raise ValueError("Average finite-count census or extent is invalid")
+        return AverageFiniteCounts._from_owned_array(evidence, owner)
+def _read_average_lineage(scan_file: str | Path, *, entry: str = "entry"):
+    """Return one detached, authenticated committed source-lineage snapshot."""
+    from xrd_tools.io.append import _source_from_dict, decode_replacement_lineage
+    with h5py.File(Path(scan_file), "r") as handle:
+        source_base, _raw, lineage = decode_replacement_lineage(handle, entry=entry)
+    if lineage is None or lineage.get("state") != "committed":
+        raise ValueError("Average lineage is absent or not committed")
+    epochs = lineage.get("epochs")
+    if type(epochs) is not list or len(epochs) != 1:
+        raise ValueError("Average lineage requires one committed epoch")
+    epoch = epochs[0]
+    if type(epoch) is not dict or epoch.get("labels") != [1] or type(epoch.get("source")) is not dict:
+        raise ValueError("Average lineage has invalid labels or source")
+    return source_base, _source_from_dict(epoch["source"])
 def get_1d(
     scan_file: str | Path,
     frame=None,

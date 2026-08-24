@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 import json
+import math
 import os, stat; from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
@@ -25,9 +26,11 @@ from xrd_tools.io.output_transaction import TargetSnapshot
 from xrd_tools.reduction import ReintegratePlan, ReintegrateProgress, ReintegrateResult, run_reintegrate
 from xrd_tools.reduction.reintegrate import ReintegrateCancelled
 
-class _BackgroundPreterminalAbort(RuntimeError):
-    pass
-
+def _average_scan_recipe(*args, **kwargs): from xrd_tools.reduction.average import AverageScanRecipe as owner; return owner(*args, **kwargs)
+def _run_average_scan(*args, **kwargs): from xrd_tools.reduction.average import run_average_scan as owner; return owner(*args, **kwargs)
+AverageScanRecipe = _average_scan_recipe; run_average_scan = _run_average_scan
+def detector_calibration_to_integrator(*args, **kwargs): from xrd_tools.integrate.calibration import detector_calibration_to_integrator as owner; return owner(*args, **kwargs)
+class _BackgroundPreterminalAbort(RuntimeError): pass
 @dataclass(frozen=True, slots=True)
 class _ReintegrateRequest:
     target: str
@@ -36,7 +39,188 @@ class _ReintegrateRequest:
     expected_labels: tuple[int, ...]
     dimension: str
     preparation_json: str
-
+@dataclass(frozen=True, slots=True)
+class _AverageRequest:
+    source_syntax: tuple[object, ...]; target: str; target_was_path: bool
+    entry: str; source_base: str; source_base_was_path: bool
+    output_mode: str; live_mode: bool; save_xye: bool; batch_mode: bool
+    reduction_syntax: str; poni_file: str; mask_file: str
+    background_syntax: str | None; numeric_metadata_keys: tuple[str, ...] | None
+    invariant_metadata_keys: tuple[str, ...]; envelope_bytes: int | None
+    resource_requests: tuple[tuple[str, int], ...]; resource_env: tuple[tuple[str, str], ...]
+def _json_snapshot(value: object) -> str: return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+def _bounded_json_snapshot(value: object) -> str:
+    count = [0]
+    def detached(item, depth=0):
+        count[0] += 1
+        if count[0] > 4096 or depth > 8: raise ValueError
+        if item is None or type(item) in {bool, int, str}: return item
+        from xrd_tools.reduction.core import GI1DMode, GI2DMode
+        if type(item) in {GI1DMode, GI2DMode}: return item.value
+        if type(item) is float and math.isfinite(item): return item
+        if is_dataclass(item) and not isinstance(item, type):
+            return {field.name: detached(getattr(item, field.name), depth + 1)
+                    for field in fields(item)}
+        if isinstance(item, Mapping):
+            if len(item) > 4096: raise ValueError
+            if any(type(key) is not str or not key for key in item): raise TypeError
+            return {key: detached(child, depth + 1)
+                    for key, child in item.items()}
+        if type(item) in {list, tuple}:
+            if len(item) > 4096: raise ValueError
+            return tuple(detached(child, depth + 1) for child in item)
+        raise TypeError
+    text = _json_snapshot(detached(value))
+    if len(text.encode("utf-8")) > 65_536: raise ValueError
+    return text
+def _average_source_syntax(source: object) -> tuple[object, ...] | None:
+    from xrd_tools.core.scan import SourceSpec
+    if type(source) is not SourceSpec: return None
+    options = source.options
+    allowed = {
+        "selected_file", "files", "pattern", "scan_name", "metadata_format",
+        "meta_dir", "selection_mode", "detector", "detector_shape",
+        "raw_dtype", "raw_header_skip", "admitted_motor_values",
+    }
+    if len(options) > 64 or any(type(key) is not str or key not in allowed for key in options): return None
+    selection_mode = options.get("selection_mode")
+    if selection_mode not in {None, "single_image"}: return None
+    if selection_mode == "single_image":
+        files, selected = options.get("files"), options.get("selected_file")
+        if (type(files) is not tuple or len(files) != 1
+                or type(files[0]) is not str or not files[0]
+                or type(selected) is not str or selected != files[0]): return None
+    names = (
+        "selected_file", "pattern", "scan_name", "metadata_format",
+        "meta_dir", "selection_mode", "detector", "detector_shape",
+        "raw_dtype", "raw_header_skip",
+    )
+    count = [0]
+    def detached(value, depth=0):
+        count[0] += 1
+        if count[0] > 4096 or depth > 8: raise ValueError
+        if value is None or type(value) in {bool, int, str}: return value
+        if type(value) is float and math.isfinite(value): return value
+        if isinstance(value, Path): return str(value)
+        if type(value) in {list, tuple}:
+            return tuple(detached(item, depth + 1) for item in value)
+        raise TypeError
+    try:
+        values = tuple(detached(options.get(name)) for name in names)
+        if len(_json_snapshot(values).encode("utf-8")) > 65_536: return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    path = lambda value: (str(value), isinstance(value, Path)) if value is not None else (None, False)
+    uri, uri_path = path(source.uri); metadata_uri, metadata_path = path(source.metadata_uri)
+    result = (uri, uri_path, source.kind.value, metadata_uri, metadata_path, source.entry, *values)
+    try:
+        if len(_json_snapshot(result).encode("utf-8")) > 65_536: return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result
+def _average_source_from_syntax(value: tuple[object, ...]):
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    if type(value) is not tuple or len(value) != 16: raise ValueError("AVERAGE_SOURCE_UNREPRESENTABLE")
+    uri, uri_path, kind, metadata_uri, metadata_path, entry, *parts = value
+    names = (
+        "selected_file", "pattern", "scan_name", "metadata_format",
+        "meta_dir", "selection_mode", "detector", "detector_shape",
+        "raw_dtype", "raw_header_skip",
+    )
+    options = {name: item for name, item in zip(names, parts, strict=True) if item is not None}
+    return SourceSpec(Path(uri) if uri_path else uri, SourceKind(kind),
+        Path(metadata_uri) if metadata_path else metadata_uri, entry, options)
+def _average_reduction_from_syntax(text: str):
+    from xrd_tools.reduction import GIMode, Integration1DPlan, Integration2DPlan, ReductionPlan
+    value = json.loads(text)
+    if type(value) is not dict: raise ValueError("AVERAGE_REDUCTION_UNREPRESENTABLE")
+    def integration(owner, row):
+        if row is None: return None
+        if type(row) is not dict: raise ValueError("AVERAGE_REDUCTION_UNREPRESENTABLE")
+        for name in ("radial_range", "azimuth_range"):
+            if row.get(name) is not None: row[name] = tuple(row[name])
+        return owner(**row)
+    gi = value.get("gi")
+    return ReductionPlan(
+        integration_1d=integration(Integration1DPlan, value.get("integration_1d")),
+        integration_2d=integration(Integration2DPlan, value.get("integration_2d")),
+        gi=None if gi is None else GIMode(**gi), mask=None,
+        threshold_min=value.get("threshold_min"),
+        threshold_max=value.get("threshold_max"),
+        mask_saturation=value.get("mask_saturation", False),
+        extra=value.get("extra", {}),
+    )
+def _average_background_from_syntax(text: str | None):
+    if text is None: return None
+    from xrd_tools.reduction.background import FrameBackgroundPlan
+    value = json.loads(text)
+    if type(value) is not dict: raise ValueError("AVERAGE_BACKGROUND_UNREPRESENTABLE")
+    return FrameBackgroundPlan(**value)
+def _average_calibration(request: _AverageRequest):
+    from .. import output_preflight
+    from xrd_tools.session.experiment_state import CalibrationState, FactStatus, MaskState, PoniValues
+    assets = output_preflight._load_scientific_assets(request)
+    if request.poni_file and assets.poni_values is None: raise ValueError("AVERAGE_CALIBRATION_UNAVAILABLE")
+    if request.mask_file and assets.mask_bytes is None: raise ValueError("AVERAGE_MASK_UNAVAILABLE")
+    config = None
+    if assets.poni_values is not None:
+        text = assets.poni_detector_config_json
+        try:
+            if type(text) is not str or len(text.encode("utf-8")) > 65_536: raise ValueError
+            config = json.loads(text)
+            if (type(config) is not dict or _json_snapshot(config) != text
+                    or type(config.get("orientation")) is not int
+                    or config["orientation"] not in range(1, 5)): raise ValueError
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as error:
+            raise ValueError("AVERAGE_DETECTOR_CONFIG_UNREPRESENTABLE") from error
+    values = None
+    if assets.poni_values is not None:
+        try:
+            values = PoniValues(*assets.poni_values[:7])
+        except (TypeError, ValueError, OverflowError) as error: raise ValueError("AVERAGE_CALIBRATION_UNREPRESENTABLE") from error
+    mask_state = MaskState.absent()
+    if assets.mask_bytes is not None:
+        try:
+            import numpy as np
+            dtype = np.dtype(assets.mask_dtype)
+            shape = assets.mask_shape
+            if (type(shape) is not tuple or not shape
+                    or any(type(item) is not int or item <= 0 for item in shape)
+                    or math.prod(shape) * dtype.itemsize != len(assets.mask_bytes)): raise ValueError
+            np.frombuffer(assets.mask_bytes, dtype=dtype).reshape(shape)
+            mask_state = MaskState(request.mask_file, assets.mask_sha256 or "", dtype.str, shape, FactStatus.PRESENT)
+        except (TypeError, ValueError, OverflowError) as error: raise ValueError("AVERAGE_MASK_UNREPRESENTABLE") from error
+    state = (CalibrationState(mask=mask_state) if values is None else
+        CalibrationState(values, assets.poni_values[7], config, "",
+            assets.poni_sha256 or "", request.poni_file, mask_state, FactStatus.PRESENT))
+    if values is None: return state
+    try:
+        from xrd_tools.core import PONI
+        from xrd_tools.core.geometry import DetectorCalibration
+        accepted = assets.detector_calibration
+        reconstructed = DetectorCalibration(PONI(values.dist, values.poni1, values.poni2,
+            values.rot1, values.rot2, values.rot3, values.wavelength_m, state.detector_id),
+            dict(state.detector_config))
+        def truth(calibration):
+            detector = detector_calibration_to_integrator(calibration).detector
+            reported = detector.get_config(); shape = tuple(detector.shape); maximum = tuple(detector.max_shape)
+            normalized = DetectorCalibration(calibration.poni, reported).to_json()
+            return (type(detector), shape, maximum, float(detector.pixel1),
+                float(detector.pixel2), int(detector.orientation), normalized)
+        accepted_truth = truth(accepted); reconstructed_truth = truth(reconstructed)
+        expected_shape = tuple(config["max_shape"])
+        valid = (accepted_truth == reconstructed_truth
+            and accepted_truth[0].__module__.startswith("pyFAI.detectors")
+            and accepted_truth[0].__name__.casefold() == state.detector_id.casefold()
+            and len(expected_shape) == 2
+            and all(type(item) is int and item > 0 for item in expected_shape)
+            and accepted_truth[1] == accepted_truth[2] == expected_shape
+            and accepted_truth[3] > 0 and accepted_truth[4] > 0
+            and all(math.isfinite(value) for value in accepted_truth[3:5])
+            and accepted_truth[5] == config["orientation"])
+    except BaseException as error: raise ValueError("AVERAGE_DETECTOR_CONFIG_UNREPRESENTABLE") from error
+    if not valid: raise ValueError("AVERAGE_DETECTOR_CONFIG_UNREPRESENTABLE")
+    return state
 class OperationSlot:
     """Own at most one joinable worker and its detached latest state."""
 
@@ -178,6 +362,128 @@ class OperationSlot:
             raise TypeError("reintegration runner returned an invalid result")
         return OperationTerminal(identity, OperationTerminalStatus.RETURNED,
                                  payload=result)
+
+    def begin_average(self, source: object, target: object, reduction: object, *,
+                      entry: str = "entry", source_base: object = None,
+                      output_mode: str = "Overwrite", live_mode: bool = False,
+                      save_xye: bool = False, batch_mode: bool = False,
+                      poni_file: str = "", mask_file: str = "",
+                      background: object | None = None,
+                      numeric_metadata_keys: tuple[str, ...] | None = None,
+                      invariant_metadata_keys: tuple[str, ...] = (),
+                      envelope_bytes: int | None = None,
+                      resource_requests: Mapping[str, int] | None = None,
+                      resource_env: Mapping[str, str] | None = None,
+                      stamp: OperationContextStamp) -> OperationIdentity | None:
+        from xrd_tools.reduction import ReductionPlan; from xrd_tools.reduction.background import FrameBackgroundPlan
+        syntax = _average_source_syntax(source)
+        pathlike = lambda value: isinstance(value, (str, Path)) and bool(str(value))
+        if (syntax is None or not pathlike(target)
+                or not (source_base is None or pathlike(source_base))
+                or type(reduction) is not ReductionPlan or reduction.mask is not None
+                or type(entry) is not str or not entry
+                or any(type(value) is not bool for value in (live_mode, save_xye, batch_mode))
+                or type(output_mode) is not str
+                or type(poni_file) is not str or type(mask_file) is not str
+                or background is not None and type(background) is not FrameBackgroundPlan
+                or numeric_metadata_keys is not None and type(numeric_metadata_keys) is not tuple
+                or type(invariant_metadata_keys) is not tuple
+                or envelope_bytes is not None and (type(envelope_bytes) is not int or envelope_bytes <= 0)):
+            return None
+        try:
+            if (numeric_metadata_keys is not None
+                    and len(numeric_metadata_keys) > 64
+                    or len(invariant_metadata_keys) > 64
+                    or any(type(value) is not str or not value for value in (numeric_metadata_keys or ()))
+                    or any(type(value) is not str or not value for value in invariant_metadata_keys)
+                    or resource_requests is not None and (not isinstance(resource_requests, Mapping) or len(resource_requests) > 64)
+                    or resource_env is not None and (not isinstance(resource_env, Mapping) or len(resource_env) > 64)):
+                return None
+            requests = {} if resource_requests is None else dict(resource_requests)
+            environment = {} if resource_env is None else dict(resource_env)
+            if ("owner_block_bytes" in requests
+                    or any(type(key) is not str or type(value) is not int or type(value) is bool for key, value in requests.items())
+                    or any(type(key) is not str or type(value) is not str for key, value in environment.items())):
+                return None
+            reduction_syntax = _bounded_json_snapshot(reduction)
+            background_syntax = None if background is None else _bounded_json_snapshot(background)
+            _bounded_json_snapshot((
+                entry, str(target), None if source_base is None else str(source_base),
+                output_mode, poni_file, mask_file, numeric_metadata_keys,
+                invariant_metadata_keys, tuple(sorted(requests.items())),
+                tuple(sorted(environment.items())),
+            ))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        request = _AverageRequest(
+            syntax, str(target), isinstance(target, Path), entry,
+            "" if source_base is None else str(source_base),
+            isinstance(source_base, Path), output_mode, live_mode, save_xye,
+            batch_mode, reduction_syntax, poni_file, mask_file,
+            background_syntax, numeric_metadata_keys, invariant_metadata_keys,
+            envelope_bytes, tuple(sorted(requests.items())),
+            tuple(sorted(environment.items())),
+        )
+        return self._begin(request, stamp, self._run_average_request)
+
+    def _run_average_request(self, request, identity, cancelled, publish):
+        publish("prepare", 0, 1)
+        calibration = _average_calibration(request)
+        source = _average_source_from_syntax(request.source_syntax)
+        reduction = _average_reduction_from_syntax(request.reduction_syntax)
+        background = _average_background_from_syntax(request.background_syntax)
+        recipe = AverageScanRecipe(
+            source, Path(request.target) if request.target_was_path else request.target,
+            reduction, entry=request.entry,
+            source_base=(Path(request.source_base) if request.source_base_was_path
+                         else request.source_base),
+            output_mode=request.output_mode, live_mode=request.live_mode,
+            save_xye=request.save_xye, batch_mode=request.batch_mode,
+            calibration=calibration, background=background,
+            numeric_metadata_keys=request.numeric_metadata_keys,
+            invariant_metadata_keys=request.invariant_metadata_keys,
+            envelope_bytes=request.envelope_bytes,
+            resource_requests=dict(request.resource_requests),
+            resource_env=dict(request.resource_env),
+        )
+        publish("prepare", 1, 1)
+        from xrd_tools.reduction.average import AverageScanProgress, AverageScanResult, _committed_average_mismatch
+        headless_revision = -1; headless_identity = None
+        def progress(value):
+            nonlocal headless_revision, headless_identity
+            try:
+                if (type(value) is not AverageScanProgress or headless_identity is not None
+                        and value.operation_identity != headless_identity or value.revision <= headless_revision): return
+                headless_identity = value.operation_identity
+                headless_revision = value.revision
+                publish(value.stage, value.completed, value.total)
+            except BaseException: return
+        result = run_average_scan(
+            recipe, cancel_token=cancelled, progress_cb=progress,
+            publication_gate=lambda: self._seal_publication(identity),
+        )
+        if type(result) is not AverageScanResult or headless_identity is not None and result.operation_identity != headless_identity:
+            raise TypeError("Average runner returned an invalid result")
+        if result.disposition == "COMMITTED":
+            mismatch = _committed_average_mismatch(result, request.target, request.entry)
+            if mismatch is not None:
+                return OperationTerminal(
+                    identity, OperationTerminalStatus.FAILED,
+                    f"AVERAGE_COMMIT_VERIFICATION_FAILED: {mismatch}",
+                    payload=result,
+                )
+        if result.disposition in {"COMMITTED", "REFUSED"}:
+            return OperationTerminal(identity, OperationTerminalStatus.RETURNED,
+                                     payload=result)
+        if result.disposition == "CANCELLED":
+            return OperationTerminal(identity, OperationTerminalStatus.CANCELLED,
+                                     payload=result)
+        if result.disposition == "ABORTED":
+            return OperationTerminal(
+                identity, OperationTerminalStatus.FAILED,
+                f"{result.diagnostic_code}: {result.diagnostic}", payload=result,
+            )
+        raise RuntimeError("Average runner retained settlement unexpectedly")
 
     def _seal_publication(self, identity: OperationIdentity) -> bool:
         with self._lock:

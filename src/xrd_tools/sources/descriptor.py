@@ -391,6 +391,8 @@ def describe_container_from_open(
     size: int | None = None,
     mtime_ns: int | None = None,
     adapter_id: str | None = None,
+    resolved_entry_group: Any = None,
+    prevalidated_motor_names: tuple[tuple[str, ...], tuple[str, ...]] | None = None,
 ) -> ContainerDescriptor:
     """Build a :class:`ContainerDescriptor` from an ALREADY-OPEN container.
 
@@ -399,6 +401,19 @@ def describe_container_from_open(
     :class:`~xrd_tools.sources.discover.Candidate`) is given, its
     path/size/mtime/adapter identity is recorded on the descriptor.
     """
+    if resolved_entry_group is not None:
+        from xrd_tools.io.nexus import _NexusDatasetOwnerSlot
+        slot = _NexusDatasetOwnerSlot()
+        descriptor, binding = _describe_container_from_open_with_binding(
+            h5f, path=path, entry=entry,
+            resolved_entry_group=resolved_entry_group,
+            prevalidated_motor_names=prevalidated_motor_names,
+            owner_slot=slot, candidate=candidate, size=size,
+            mtime_ns=mtime_ns, adapter_id=adapter_id,
+        )
+        binding.close()
+        return descriptor
+
     from xrd_tools.io.bluesky_nexus import is_bluesky_nxwriter, resolve_nxentry
     from xrd_tools.io.image import _is_eiger_master
     from xrd_tools.io.nexus import (
@@ -560,6 +575,104 @@ def describe_container_from_open(
         chunks=facts["chunks"], compression=facts["compression"], is_2d=facts["is_2d"],
         self_contained=_stack_is_self_contained(h5f, paths),
         wavelength=wavelength, **common)
+
+
+def _describe_container_from_open_with_binding(
+    h5f: Any,
+    *,
+    path: str | Path,
+    entry: str,
+    resolved_entry_group: Any,
+    prevalidated_motor_names: tuple[tuple[str, ...], tuple[str, ...]] | None,
+    owner_slot: Any,
+    candidate: Any = None,
+    size: int | None = None,
+    mtime_ns: int | None = None,
+    adapter_id: str | None = None,
+) -> tuple[ContainerDescriptor, Any]:
+    """Build exact-entry descriptor facts and retain the captured binding."""
+    import h5py
+
+    from xrd_tools.io.nexus import (
+        _bind_nexus_stack_from_entry, _read_energy, _read_wavelength,
+    )
+    from xrd_tools.io.image import _is_eiger_master
+    from xrd_tools.io.processed_scan_id import is_processed_xdart_entry
+
+    selected = Path(path)
+    if candidate is not None:
+        size, mtime_ns, adapter_id = (
+            candidate.size, candidate.mtime_ns, candidate.adapter_id,
+        )
+    if not isinstance(resolved_entry_group, h5py.Group):
+        raise TypeError("resolved entry group is invalid")
+    if prevalidated_motor_names is None or len(prevalidated_motor_names) != 2:
+        raise TypeError("exact descriptor requires prevalidated motor tuples")
+    scanned, all_names = prevalidated_motor_names
+    if type(scanned) is not tuple or type(all_names) is not tuple:
+        raise TypeError("prevalidated motor names must be exact tuples")
+    if is_processed_xdart_entry(resolved_entry_group):
+        raise ValueError("processed xdart entry cannot be an Average source")
+    binding = _bind_nexus_stack_from_entry(
+        resolved_entry_group, declared_entry_name=entry,
+        prefer_apstools_flat=False, owner_slot=owner_slot,
+    )
+    try:
+        datasets = tuple(binding._datasets)
+        first = datasets[0]
+        squeeze = len(datasets) == 1 and first.ndim == 2
+        shape = tuple(int(value) for value in first.shape)
+        frame_shape = shape if squeeze else shape[1:]
+        lengths = (1,) if squeeze else tuple(int(value.shape[0]) for value in datasets)
+        frame_count = sum(lengths)
+        dataset_shape = ((1, *frame_shape) if squeeze else
+                         (frame_count, *frame_shape))
+        root_creator = h5f.attrs.get("creator", "")
+        if isinstance(root_creator, bytes):
+            root_creator = root_creator.decode("utf-8", errors="replace")
+        is_bluesky = bool(
+            str(root_creator) == "NXWriter"
+            or resolved_entry_group.get("instrument/bluesky") is not None
+        )
+        finalized = (not is_bluesky) or "end_time" in resolved_entry_group
+        wavelength = None
+        try:
+            raw = _read_wavelength(
+                resolved_entry_group, _read_energy(resolved_entry_group),
+            )
+            wavelength = float(raw) if _finite(raw) else None
+        except Exception:
+            pass
+        resolved = resolved_entry_group.name.strip("/").split("/")[-1] or entry
+        kind = (SourceKind.EIGER_MASTER if _is_eiger_master(selected)
+                else SourceKind.NEXUS_STACK)
+        descriptor = ContainerDescriptor(
+            path=selected, size=size, mtime_ns=mtime_ns, adapter_id=adapter_id,
+            state=(ProbeState.READY if finalized else ProbeState.IN_PROGRESS),
+            reason=("detector dataset present" if finalized
+                    else "NXWriter run not yet finalized (no end_time)"),
+            kind=kind, scan_name=_scan_name(selected), requested_entry=entry,
+            resolved_entry=resolved, dataset_path=binding.paths[0],
+            segment_paths=(tuple(binding.paths) if len(binding.paths) > 1 else ()),
+            frame_count=frame_count, frame_shape=tuple(frame_shape),
+            dtype=np.dtype(first.dtype), dataset_shape=tuple(dataset_shape),
+            chunks=(tuple(int(value) for value in first.chunks)
+                    if first.chunks else None),
+            compression=_filter_summary(first), is_2d=squeeze,
+            self_contained=all(
+                Path(value.file.filename).resolve() == selected.resolve()
+                for value in datasets
+            ),
+            wavelength=wavelength, motor_names=all_names,
+            is_bluesky=is_bluesky, finalized=finalized,
+        )
+        return descriptor, binding
+    except BaseException as primary:
+        try:
+            binding.close()
+        except BaseException as cleanup:
+            raise cleanup from primary
+        raise
 
 
 def describe_container(

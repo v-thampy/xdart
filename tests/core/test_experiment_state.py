@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,7 @@ def _calibration(
     *,
     wavelength_m: float = 1.0e-10,
     mask: MaskState | None = None,
-    detector_config: dict[str, float] | None = None,
+    detector_config: Mapping[str, object] | None = None,
 ) -> CalibrationState:
     return CalibrationState(
         values=PoniValues(
@@ -62,7 +63,7 @@ def _state(
     revision: int = 3,
     wavelength_m: float = 1.1e-10,
     evidence: dict[str, float] | None = None,
-    detector_config: dict[str, float] | None = None,
+    detector_config: Mapping[str, object] | None = None,
     notes: tuple[str, ...] | list[str] = ("imported", "reviewed"),
 ) -> ExperimentState:
     return ExperimentState(
@@ -190,6 +191,85 @@ def test_components_are_deeply_immutable() -> None:
         state.energy.evidence["late"] = 1.5e-10  # type: ignore[index]
     with pytest.raises(TypeError):
         state.calibration.detector_config["pixel1"] = 1.0  # type: ignore[index]
+
+
+def test_nested_detector_config_is_deeply_immutable_and_roundtrips_exactly() -> None:
+    config = {
+        "max_shape": [2167, 2070],
+        "orientation": 3,
+        "geometry": {
+            "corners": [[0, 0], [2166, 2069]],
+            "labels": ["fast", None, True, 2, 1.5],
+        },
+    }
+    expected = json.loads(json.dumps(config, sort_keys=True, separators=(",", ":")))
+    state = _state(detector_config=config)
+    before = state.scientific_content(); fingerprint = state.content_fingerprint
+    config["max_shape"][0] = 1
+    config["geometry"]["corners"][0][0] = 99
+    config["geometry"]["labels"].append("late")
+    frozen = state.calibration.detector_config
+    assert before["calibration"]["detector_config"] == expected
+    assert frozen["max_shape"] == (2167, 2070)
+    assert frozen["geometry"]["corners"] == ((0, 0), (2166, 2069))
+    with pytest.raises(TypeError):
+        frozen["geometry"]["labels"][0] = "changed"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        frozen["geometry"]["new"] = 1  # type: ignore[index]
+    assert state.scientific_content() == before and state.content_fingerprint == fingerprint
+    assert fingerprint == __import__("hashlib").sha256(json.dumps(
+        before, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()
+    restored = ExperimentState.from_provenance(state.to_provenance())
+    assert restored == state and restored.calibration.detector_config is not frozen
+    assert restored.scientific_content() == before
+    assert restored.content_fingerprint == fingerprint
+
+
+def test_detector_config_json_contract_rejects_invalid_and_over_limit_values() -> None:
+    class I(int): pass
+    class F(float): pass
+    class S(str): pass
+    cycle = {}; cycle["self"] = cycle
+    too_deep: object = 0
+    for _ in range(8): too_deep = [too_deep]
+    byte_overhead = len(json.dumps(
+        {"value": ""}, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode())
+    exact_bytes = "x" * (65_536 - byte_overhead)
+    invalid = (
+        cycle, [1], {1: "value"}, {"": 1}, {"nested": {"": 1}},
+        {S("key"): 1}, {"value": I(1)}, {"value": F(1.0)}, {"value": S("x")},
+        {"value": object()},
+        {"value": float("nan")}, {"value": float("inf")},
+        {"value": too_deep}, {"values": [None] * 4095},
+        {"value": exact_bytes + "x"},
+    )
+    for config in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            _calibration(detector_config=config)  # type: ignore[arg-type]
+    boundary: object = 0
+    for _ in range(7): boundary = [boundary]
+    for config in (
+        {"value": boundary}, {"values": [None] * 4094},
+        {"value": exact_bytes},
+    ):
+        accepted = _calibration(detector_config=config)
+        assert json.loads(json.dumps(dict(accepted.detector_config))) == config
+    assert len(json.dumps(
+        {"value": exact_bytes}, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode()) == 65_536
+    shared = ["same"]
+    aliased = _calibration(detector_config={"left": shared, "right": shared})
+    shared.append("late")
+    assert aliased.detector_config["left"] == aliased.detector_config["right"] == ("same",)
+    expanded = [None] * 2047
+    with pytest.raises(ValueError):
+        _calibration(detector_config={"left": expanded, "right": expanded})
+    assert ExperimentState.from_provenance(_state(
+        detector_config={"left": ["same"], "right": ["same"]},
+    ).to_provenance()).calibration.detector_config == aliased.detector_config
 
 
 def test_energy_status_cannot_hide_evidence_or_an_unqualified_selection() -> None:

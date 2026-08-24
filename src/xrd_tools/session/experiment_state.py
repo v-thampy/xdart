@@ -58,6 +58,78 @@ def _mapping(value: Any, name: str) -> Mapping[str, Any]:
         raise ValueError(f"{name} is missing or malformed")
     return value
 
+_JSON_DEPTH_LIMIT = 8
+_JSON_NODE_LIMIT = 4096
+_JSON_BYTE_LIMIT = 65536
+
+
+def _freeze_json_mapping(values: Mapping[str, object], name: str) -> Mapping[str, object]:
+    """Defensively freeze one bounded canonical-JSON object.
+
+    Containers are charged by expanded occurrence, so sharing an acyclic input
+    object cannot evade the node bound.  Only the active ancestor chain is used
+    for cycle detection, which keeps ordinary shared subtrees valid.
+    """
+    if not isinstance(values, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    count = 0
+    active: set[int] = set()
+
+    def freeze(value: object, *, depth: int) -> object:
+        nonlocal count
+        count += 1
+        if count > _JSON_NODE_LIMIT:
+            raise ValueError(f"{name} exceeds the JSON value occurrence limit")
+        if value is None or type(value) in {bool, int, str}:
+            return value
+        if type(value) is float:
+            if not math.isfinite(value):
+                raise ValueError(f"{name} contains a non-finite float")
+            return value
+        container = isinstance(value, Mapping) or type(value) in {list, tuple}
+        if not container:
+            raise TypeError(f"{name} contains a non-JSON value")
+        if depth > _JSON_DEPTH_LIMIT:
+            raise ValueError(f"{name} exceeds the container depth limit")
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{name} contains a cycle")
+        active.add(identity)
+        try:
+            if isinstance(value, Mapping):
+                rows: dict[str, object] = {}
+                for key, item in value.items():
+                    if type(key) is not str:
+                        raise TypeError(f"{name} keys must be exact strings")
+                    if not key:
+                        raise ValueError(f"{name} keys must be non-empty")
+                    rows[key] = freeze(item, depth=depth + 1)
+                return MappingProxyType(dict(sorted(rows.items())))
+            return tuple(freeze(item, depth=depth + 1) for item in value)
+        finally:
+            active.remove(identity)
+
+    frozen = freeze(values, depth=1)
+    assert isinstance(frozen, Mapping)
+    thawed = _thaw_json(frozen)
+    try:
+        encoded = json.dumps(
+            thawed, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} cannot be encoded as canonical JSON") from exc
+    if len(encoded) > _JSON_BYTE_LIMIT:
+        raise ValueError(f"{name} exceeds the canonical JSON byte limit")
+    return frozen
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_thaw_json(item) for item in value]
+    return value
+
 @dataclass(frozen=True, slots=True)
 class PoniValues:
     dist: float
@@ -101,7 +173,7 @@ class MaskState:
 class CalibrationState:
     values: PoniValues | None = None
     detector_id: str = ""
-    detector_config: Mapping[str, float] = field(default_factory=dict)
+    detector_config: Mapping[str, object] = field(default_factory=dict)
     value_fingerprint: str = ""
     source_sha256: str = ""
     source_uri: str = ""
@@ -111,7 +183,7 @@ class CalibrationState:
         object.__setattr__(self, "status", FactStatus(self.status))
         for name in ("detector_id", "value_fingerprint", "source_sha256", "source_uri"):
             object.__setattr__(self, name, _text(getattr(self, name), name))
-        object.__setattr__(self, "detector_config", _finite_map(
+        object.__setattr__(self, "detector_config", _freeze_json_mapping(
             self.detector_config, "detector_config"
         ))
         if self.values is not None and not isinstance(self.values, PoniValues):
@@ -301,7 +373,7 @@ class ExperimentState:
                     "wavelength_m": values.wavelength_m,
                 },
                 "detector_id": calibration.detector_id,
-                "detector_config": dict(calibration.detector_config),
+                "detector_config": _thaw_json(calibration.detector_config),
                 "value_fingerprint": calibration.value_fingerprint,
                 "source_sha256": calibration.source_sha256,
                 "source_uri": calibration.source_uri,

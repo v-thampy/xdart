@@ -1189,3 +1189,181 @@ def test_raw_frame_path_keeps_legacy_snapshot_and_provenance_shape(
         prepared=(None, False),
     )
     assert captured["source_snapshot"] == snapshots[raw_key]
+
+
+def _p36_tiff_graph(root: Path, *, conflict: bool = False):
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.sources.execution_graph import AdmittedMetadataSource, SourceFileState, freeze_source_execution_graph
+    root.mkdir(parents=True, exist_ok=True)
+    image = root / "scan_0001.tif"; sidecar = root / "scan_0001.txt"
+    fabio.tifimage.TifImage(data=np.arange(4, dtype="u2").reshape(2, 2)).write(str(image))
+    sidecar.write_text("# Counters\nI0 = 2\n# Motors\n\n"
+                       "User: p36, time: Mon Jan 15 10:30:00 2024  # Temp\n")
+    image_state = SourceFileState.capture(image); metadata_state = SourceFileState.capture(sidecar)
+    if conflict: metadata_state = replace(metadata_state, path=image_state.path)
+    source = SourceSpec(root, SourceKind.TIFF_SERIES, options={
+        "selected_file": str(image), "files": (str(image),), "pattern": "scan_*.tif",
+        "scan_name": "scan", "metadata_format": "txt"})
+    return freeze_source_execution_graph(
+        source, source, source_path=image, group_key="scan",
+        file=image_state, adapter_id="tiff_series", frame_count=1, first_label=1,
+        detector_shape=None, native_dtype=None,
+        members=(image_state,),
+        metadata_sources=(AdmittedMetadataSource(image_state.path, metadata_state),),
+    )
+
+
+def test_shared_source_graph_direct_and_ordinary_projections_are_byte_exact(
+    tmp_path, monkeypatch,
+):
+    from xdart.gui.tabs.scattering import contracts, output_preflight
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.sources import execution_graph as graph_api
+    graph = _p36_tiff_graph(tmp_path)
+    item = PlannedOutput(graph.execution_source, Path(graph.source_path),
+        tmp_path / "out.nxs", graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names)
+    assert contracts.SourceExecutionStamp is graph_api.SourceExecutionStamp
+    assert contracts.SourceFileState is graph_api.SourceFileState
+    assert graph_api.source_execution_projection(graph) == graph.stamp.as_dict()
+    assert graph_api.source_execution_identity_v1_projection(graph) == graph.stamp.execution_identity_v1.as_dict()
+    payload = graph_api.source_graph_payload(graph)
+    assert payload["source_execution"] == graph.stamp.as_dict()
+    assert payload["reader_binding"] is None
+    assert graph_api.source_snapshots_projection(graph, writer=False) == output_preflight.source_snapshots(item)
+    assert graph_api.source_snapshots_projection(graph, writer=True) == dynamic_output._writer_source_snapshots(item)
+    assert graph_api.stable_lineage_projection(graph, target=item.target) == dynamic_output._stable_lineage(item)
+    assert graph_api.append_source_from_execution_graph(graph, generation=3) == dynamic_output._append_source(graph.stamp, item, generation=3)
+    qualified, frozen = [], []
+    real_qualify = output_preflight.qualify_source_execution_graph
+    real_freeze = output_preflight.freeze_source_execution_graph
+    def qualify(source, **kwargs):
+        qualified.append(source.kind); return real_qualify(source, **kwargs)
+    def freeze(*args, **kwargs):
+        frozen.append(kwargs["adapter_id"]); return real_freeze(*args, **kwargs)
+    monkeypatch.setattr(output_preflight, "qualify_source_execution_graph", qualify)
+    monkeypatch.setattr(output_preflight, "freeze_source_execution_graph", freeze)
+    monkeypatch.setattr(output_preflight, "SourceExecutionStamp", lambda *_a, **_k: pytest.fail("GUI constructed source stamp"))
+    monkeypatch.setattr(output_preflight, "PreparedSourceExecutionGraph", lambda *_a, **_k: pytest.fail("GUI constructed source graph"))
+    config = output_preflight.OutputCandidate(graph.execution_source, "", "", str(tmp_path / "outputs"), "{}", "p36")
+    direct = output_preflight._series_item(config, graph.execution_source)
+    container = tmp_path / "ordinary.nxs"
+    with h5py.File(container, "w") as handle:
+        entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
+        image = data.create_dataset("image", data=np.ones((1, 2, 2), dtype="u2"))
+        image.attrs["signal_type"] = "detector"
+    container_source = SourceSpec(container, SourceKind.NEXUS_STACK)
+    container_item = output_preflight._container_item(replace(config, source=container_source), container_source)
+    from xrd_tools.sources.adapters import candidate_owner
+    from xrd_tools.sources.discover import Candidate
+    from xrd_tools.sources.run_plan import RunCandidatePlan
+    from xrd_tools.sources.selection import DirectorySourceSpec
+    state = Path(graph.source_path).stat(); owner = candidate_owner(Path(graph.source_path))
+    plan = RunCandidatePlan(0, (Candidate(Path(graph.source_path), owner.id,
+        state.st_size, state.st_mtime_ns),), tmp_path, False, None)
+    directory = output_preflight._directory_items(output_preflight.OutputCandidate(
+        DirectorySourceSpec(tmp_path, suffixes=(".tif",), metadata_format="txt"),
+        "", "", str(tmp_path / "directory"), "{}", "p36",
+    ), plan)
+    assert qualified == [SourceKind.TIFF_SERIES, SourceKind.NEXUS_STACK]
+    assert len(directory) == 1 and frozen == ["tiff_series"]
+    output_preflight.validate_planned_source(directory[0])
+    assert frozen == ["tiff_series", "tiff_series"] and direct.source_stamp.adapter_id == "tiff_series" and container_item.source_stamp.adapter_id != "tiff_series"
+
+
+def test_duplicate_snapshot_conflict_refuses_without_changing_valid_append_hashes(
+    tmp_path,
+):
+    from xrd_tools.sources.execution_graph import (
+        append_source_from_execution_graph,
+        source_snapshots_projection,
+    )
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xdart.gui.tabs.scattering.output_preflight import source_snapshots
+
+    valid = _p36_tiff_graph(tmp_path / "valid")
+    item = PlannedOutput(valid.execution_source, Path(valid.source_path),
+                         tmp_path / "valid.nxs", valid.stamp)
+    before = append_source_from_execution_graph(valid, generation=1)
+    before_snapshots = source_snapshots(item)
+    before_writer = dynamic_output._writer_source_snapshots(item)
+    before_lineage = dynamic_output._stable_lineage(item)
+    assert source_snapshots_projection(valid, writer=True) == before_writer
+    with pytest.raises(ValueError, match="conflict|state"):
+        _p36_tiff_graph(tmp_path / "conflict", conflict=True)
+    after = append_source_from_execution_graph(valid, generation=1)
+    assert before == after and before.digest == after.digest
+    assert source_snapshots(item) == before_snapshots
+    assert dynamic_output._writer_source_snapshots(item) == before_writer
+    assert dynamic_output._stable_lineage(item) == before_lineage
+
+
+def test_average_lineage_and_provenance_match_exact_ordinary_projections(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.provenance import read_provenance
+    from xrd_tools.io import AppendIntent, science_fingerprint
+    from xrd_tools.reduction import AverageScanRecipe, Integration1DPlan, ReductionPlan
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.reduction import core as reduction_core
+    from xrd_tools.sources.execution_graph import (
+        append_source_from_execution_graph,
+        source_execution_projection,
+        source_snapshots_projection,
+        stable_lineage_projection,
+    )
+    from xdart.gui.tabs.scattering import output_preflight
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    graph = _p36_tiff_graph(tmp_path / "gráph")
+    target = tmp_path / "average.nxs"
+    item = PlannedOutput(graph.execution_source, Path(graph.source_path),
+                         target, graph.stamp)
+    append = append_source_from_execution_graph(graph, generation=1)
+    assert append.extent == 1 and append.generation == 1
+    assert append.image_members[0].source_start == 0
+    assert append.image_members[0].source_stop == 1
+    assert append.image_members[0].ordinal == 0
+    assert source_execution_projection(graph) == graph.stamp.as_dict()
+    snapshots = source_snapshots_projection(graph, writer=True)
+    assert set(snapshots) == {
+        graph.stamp.members[0].path,
+        graph.stamp.metadata_sources[0].metadata_file.path,
+    }
+    lineage = stable_lineage_projection(graph, target=target)
+    assert lineage[0:2] == ("tiff_series", "scan")
+    assert source_execution_projection(graph) == item.source_stamp.as_dict()
+    assert source_snapshots_projection(graph, writer=False) == output_preflight.source_snapshots(item)
+    assert snapshots == dynamic_output._writer_source_snapshots(item)
+    assert lineage == dynamic_output._stable_lineage(item)
+    assert append == dynamic_output._append_source(item.source_stamp, item, generation=1)
+    canonical = lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str).encode("utf-8")
+    assert canonical(source_execution_projection(graph)) == canonical(item.source_stamp.as_dict())
+    assert "gráph".encode() in canonical(source_execution_projection(graph))
+    prepared = __import__("xrd_tools.sources.execution_graph", fromlist=["x"]).qualify_source_execution_graph(
+        graph.execution_source, reader_binding="average_closed_v1",
+    )
+    captured = {}; real_sink = average_module.NexusSink
+    def sink(*args, **kwargs):
+        captured.update(kwargs); return real_sink(*args, **kwargs)
+    monkeypatch.setattr(average_module, "NexusSink", sink)
+    monkeypatch.setattr(reduction_core, "integrate_1d", lambda _image, _ai, *, npt, **_k:
+        IntegrationResult1D(np.arange(npt, dtype=float), np.ones(npt), None, "q_A^-1"))
+    result = average_module.run_average_scan(AverageScanRecipe(
+        graph.execution_source, target,
+        ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
+        numeric_metadata_keys=("I0",),
+    ))
+    assert result.disposition == "COMMITTED"
+    expected_execution = source_execution_projection(prepared)
+    expected_snapshots = source_snapshots_projection(prepared, writer=True)
+    expected_append = append_source_from_execution_graph(prepared, generation=1)
+    ordinary_intent = AppendIntent("entry", "",
+        science_fingerprint(stable_lineage_projection(prepared, target=target)),
+        result.science_identity, ("1d:default",), expected_append, (1,))
+    assert captured["source_execution_provenance"] == expected_execution
+    assert captured["source_snapshots_provenance"] == expected_snapshots
+    assert captured["same_run_intent"] == ordinary_intent
+    assert read_provenance(target)["config"]["source_execution"] == expected_execution

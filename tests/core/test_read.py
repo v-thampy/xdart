@@ -775,3 +775,160 @@ def test_strong_provenance_rejects_basename_recovery_fallback(tmp_path):
     # Capability identity is stricter: a same-basename decoy cannot authorize
     # raw-dependent analysis for this processed record.
     assert resolved_raw_source(record, frame=1) is None
+
+
+def test_count_reader_rejects_wrong_entry_extent_overcount_and_all_zero_map(
+    tmp_path,
+):
+    """The parent RED is the public capability/API assertion below."""
+    import hashlib
+    import struct
+    import xrd_tools.io as public_io
+    from xrd_tools.io.schema import CAPABILITIES
+
+    capability = CAPABILITIES.get("average_finite_counts")
+    reader = getattr(public_io, "get_average_finite_counts", None)
+    assert capability is not None and (
+        capability.location,
+        capability.marker,
+        capability.kind,
+        callable(reader),
+    ) == ("frames/frame_0001", "finite_counts", "dataset", True)
+
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.io import record_writer as rw
+    from xrd_tools.reduction import AverageFiniteCounts, AverageFiniteCountsEvidence
+
+    values = np.array([[3, 2, 0], [1, 3, 2]], dtype="<u4")
+    extent = 3
+    digest = hashlib.sha256(
+        b"xdart.average-finite-counts.v1\0"
+        + struct.pack("<QQQ", *values.shape, extent)
+        + values.tobytes(order="C")
+    ).hexdigest()
+    evidence = AverageFiniteCountsEvidence(
+        "average_scan_v1", extent, values.shape, "<u4", digest,
+        0, 3, 1, values.shape, "gzip", 1, True, False,
+    )
+    result = IntegrationResult1D(
+        radial=np.arange(3, dtype=float), intensity=np.ones(3),
+        sigma=None, unit="q_A^-1",
+    )
+    target = tmp_path / "reader.nxs"
+    writer = rw.NexusRecordWriter(target, atomic=True, overwrite=True)
+    writer.begin()
+    writer.write(rw.RecordWrite(label=1, result_1d=result))
+    writer.finish(rw.WriterFinalization(
+        average_finite_counts=AverageFiniteCounts(evidence, values),
+    ))
+    with h5py.File(target, "r+") as handle:
+        other = handle.create_group("other")
+        other.attrs["NX_class"] = "NXentry"
+
+    reopened = reader(target)
+    assert reopened.evidence == evidence
+    np.testing.assert_array_equal(reopened.values, values)
+    with pytest.raises(ValueError, match="entry|capability"):
+        reader(target, entry="other")
+    with pytest.raises(ValueError, match="positive|Boolean|integer"):
+        reader(target, max_bytes=True)
+    count_bytes = values.nbytes
+    slab_bytes = 4 * min(values.shape[0], max(
+        1, min(count_bytes, max(4 * values.shape[1], 4 << 20))
+        // (4 * values.shape[1]),
+    )) * values.shape[1]
+    modeled = count_bytes + 4 * slab_bytes
+    np.testing.assert_array_equal(reader(target, max_bytes=modeled).values, values)
+    with pytest.raises(ValueError, match="large|bytes|budget"):
+        reader(target, max_bytes=modeled - 1)
+
+    def copied(name):
+        changed = tmp_path / f"bad-{name}.nxs"
+        changed.write_bytes(target.read_bytes())
+        return changed
+
+    # Every schema/evidence mutation below is isolated from valid bytes.  In
+    # particular, the stale-digest row retains the valid census and the census
+    # rows retain valid data and digest, so neither check can hide the other.
+    changed = copied("digest")
+    with h5py.File(changed, "r+") as handle:
+        handle["entry/frames/frame_0001/finite_counts"][0, 0] = 2
+    with pytest.raises(ValueError, match="invalid|digest|sha"):
+        reader(changed)
+    for attr, value, reason in (
+        ("finite_counts_min", np.uint32(1), "invalid|minimum|census"),
+        ("finite_counts_max", np.uint32(2), "invalid|maximum|census"),
+        ("finite_counts_zero_count", np.uint64(2), "invalid|zero|census"),
+    ):
+        changed = copied(attr)
+        with h5py.File(changed, "r+") as handle:
+            handle["entry/frames/frame_0001/finite_counts"].attrs.modify(attr, value)
+        with pytest.raises(ValueError, match=reason):
+            reader(changed)
+    for name, mutate in (
+        ("missing-attr", lambda attrs: attrs.__delitem__("average_scan_policy")),
+        ("wrong-policy", lambda attrs: attrs.modify(
+            "average_scan_policy", np.bytes_(b"average_scan_v2"))),
+        ("extra-attr", lambda attrs: attrs.__setitem__("unexpected", np.uint32(1))),
+        ("wrong-extent-type", lambda attrs: (
+            attrs.__delitem__("contributor_extent"),
+            attrs.create("contributor_extent", np.float64(extent)))),
+    ):
+        changed = copied(name)
+        with h5py.File(changed, "r+") as handle:
+            mutate(handle["entry/frames/frame_0001/finite_counts"].attrs)
+        with pytest.raises(ValueError, match="invalid|attribute|policy|schema"):
+            reader(changed)
+
+    def recreated(name, data, **creation):
+        changed = copied(name)
+        with h5py.File(changed, "r+") as handle:
+            parent = handle["entry/frames/frame_0001"]
+            attrs = dict(parent["finite_counts"].attrs)
+            del parent["finite_counts"]
+            node = parent.create_dataset("finite_counts", data=data, **creation)
+            for key, value in attrs.items():
+                node.attrs.create(key, value, dtype=value.dtype)
+        with pytest.raises(ValueError, match="invalid|dtype|shape|chunk|codec|compression"):
+            reader(changed)
+
+    valid_creation = {"chunks": values.shape, "compression": "gzip",
+                      "compression_opts": 1, "shuffle": True, "fletcher32": False}
+    recreated("dtype", values.astype("<u8"), **valid_creation)
+    recreated("shape", values.reshape(1, 2, 3), chunks=(1, 2, 3),
+              compression="gzip", compression_opts=1, shuffle=True, fletcher32=False)
+    recreated("chunks", values, chunks=(1, values.shape[1]),
+              compression="gzip", compression_opts=1, shuffle=True, fletcher32=False)
+    for name, updates in (
+        ("compression", {"compression": None, "compression_opts": None}),
+        ("level", {"compression_opts": 2}),
+        ("shuffle", {"shuffle": False}),
+        ("fletcher", {"fletcher32": True}),
+    ):
+        recreated(name, values, **{**valid_creation, **updates})
+
+    def corrupt(name, changed_values, changed_extent, match):
+        changed = copied(name)
+        with h5py.File(changed, "r+") as handle:
+            node = handle["entry/frames/frame_0001/finite_counts"]
+            node[...] = changed_values
+            updated = hashlib.sha256(
+                b"xdart.average-finite-counts.v1\0"
+                + struct.pack("<QQQ", *changed_values.shape, changed_extent)
+                + np.asarray(changed_values, dtype="<u4").tobytes(order="C")
+            ).hexdigest()
+            node.attrs.modify("contributor_extent", np.uint64(changed_extent))
+            node.attrs.modify("finite_counts_sha256", np.bytes_(updated))
+            node.attrs.modify("finite_counts_min", np.uint32(changed_values.min()))
+            node.attrs.modify("finite_counts_max", np.uint32(changed_values.max()))
+            node.attrs.modify(
+                "finite_counts_zero_count",
+                np.uint64(np.count_nonzero(changed_values == 0)),
+            )
+        with pytest.raises(ValueError, match=match):
+            reader(changed)
+
+    corrupt("extent", values.copy(), 0, "extent")
+    over = values.copy(); over[0, 0] = 4
+    corrupt("over", over, 3, "extent|count")
+    corrupt("zero", np.zeros_like(values), 3, "zero")

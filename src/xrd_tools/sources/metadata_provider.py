@@ -143,7 +143,10 @@ class BlueskyMetadataProvider(MetadataProvider):
 
     def __init__(self, entry_grp: Any, *, frame_count: int,
                  wavelength: float | None = None,
-                 wavelength_unit: WavelengthUnit | None = None) -> None:
+                 wavelength_unit: WavelengthUnit | None = None,
+                 scanned_motor_names: tuple[str, ...] | None = None,
+                 all_motor_names: tuple[str, ...] | None = None) -> None:
+        _validate_prequalified_motor_pair(scanned_motor_names, all_motor_names)
         self._entry = entry_grp          # live h5py group; dropped after build
         self._frame_count = int(frame_count)
         self._wavelength = wavelength
@@ -151,6 +154,12 @@ class BlueskyMetadataProvider(MetadataProvider):
         self._table: dict[str, np.ndarray] | None = None
         self._motors: dict[str, np.ndarray] | None = None
         self._constants: dict[str, float] | None = None
+        self._scanned_motor_names = scanned_motor_names
+        self._all_motor_names = all_motor_names
+        self._counter_names = None
+        if scanned_motor_names is not None:
+            from xrd_tools.io.bluesky_nexus import _average_default_counter_names
+            self._counter_names = _average_default_counter_names(entry_grp)
 
     def frame_count(self) -> int | None:
         return self._frame_count
@@ -180,8 +189,13 @@ class BlueskyMetadataProvider(MetadataProvider):
         )
 
         data = entry.get("data")
+        scanned = (tuple(bluesky_motor_names(entry))
+                   if self._scanned_motor_names is None
+                   else self._scanned_motor_names)
+        counters = (_DEFAULT_BLUESKY_COUNTERS if self._counter_names is None
+                    else self._counter_names)
         names = tuple(dict.fromkeys(
-            (*bluesky_motor_names(entry), *_DEFAULT_BLUESKY_COUNTERS,
+            (*scanned, *counters,
              _BLUESKY_COUNT_TIME_COL, "EPOCH")
         ))
         per_frame_names: set[str] = set()
@@ -202,7 +216,11 @@ class BlueskyMetadataProvider(MetadataProvider):
                     out[str(name)] = float(dataset[pos])
                 except (TypeError, ValueError, OSError):
                     continue
-        constants = bluesky_constant_metadata(entry, exclude=per_frame_names)
+        constants = bluesky_constant_metadata(
+            entry, exclude=per_frame_names,
+            motor_names=self._all_motor_names,
+            bounded=self._all_motor_names is not None,
+        )
         for name, value in constants.items():
             out.setdefault(str(name), float(value))
         return out
@@ -282,6 +300,15 @@ class BlueskyMetadataProvider(MetadataProvider):
         return out
 
 
+def _validate_prequalified_motor_pair(scanned, all_names) -> None:
+    pair = (scanned, all_names)
+    if any(value is not None for value in pair) and any(
+        type(value) is not tuple or any(type(name) is not str for name in value)
+        for value in pair
+    ):
+        raise TypeError("prevalidated motor names must be paired exact tuples")
+
+
 def metadata_provider_for_open_entry(
     entry_grp: Any,
     *,
@@ -289,6 +316,8 @@ def metadata_provider_for_open_entry(
     wavelength: float | None = None,
     wavelength_unit: WavelengthUnit | None = None,
     is_bluesky: bool | None = None,
+    scanned_motor_names: tuple[str, ...] | None = None,
+    all_motor_names: tuple[str, ...] | None = None,
 ) -> MetadataProvider:
     """Build the right provider for an OPEN entry group.
 
@@ -299,6 +328,7 @@ def metadata_provider_for_open_entry(
     ``wavelength_unit`` is the caller's explicit unit declaration for
     ``wavelength`` (R3-P1) — retained as value-only provider state.
     """
+    _validate_prequalified_motor_pair(scanned_motor_names, all_motor_names)
     if entry_grp is None:
         return EmptyMetadataProvider(
             wavelength=wavelength, wavelength_unit=wavelength_unit)
@@ -311,6 +341,8 @@ def metadata_provider_for_open_entry(
     if is_bluesky:
         return BlueskyMetadataProvider(
             entry_grp, frame_count=frame_count, wavelength=wavelength,
-            wavelength_unit=wavelength_unit)
+            wavelength_unit=wavelength_unit,
+            scanned_motor_names=scanned_motor_names,
+            all_motor_names=all_motor_names)
     return EmptyMetadataProvider(
         wavelength=wavelength, wavelength_unit=wavelength_unit)

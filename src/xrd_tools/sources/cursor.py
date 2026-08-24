@@ -39,6 +39,7 @@ import numpy as np
 from xrd_tools.core.energy import WavelengthUnit
 from xrd_tools.sources.descriptor import (
     ContainerDescriptor,
+    _describe_container_from_open_with_binding,
     describe_container_from_open,
 )
 from xrd_tools.sources.probe import ProbeState
@@ -55,6 +56,11 @@ __all__ = [
     "ContainerNotReadyError",
     "open_container_cursor",
 ]
+
+
+def _HDF5_FILE_OPEN(*args, **kwargs):
+    import h5py
+    return h5py.File(*args, **kwargs)
 
 
 class CursorClosedError(RuntimeError):
@@ -104,7 +110,20 @@ class ContainerCursor:
     """A context-managed, single-handle cursor over one NeXus/Eiger container."""
 
     def __init__(self, path: str | Path, *, entry: str = "entry",
-                 candidate: Any = None) -> None:
+                 candidate: Any = None,
+                 metadata_input_policy: str | None = None,
+                 expected_scanned_motor_names: tuple[str, ...] | None = None,
+                 expected_all_motor_names: tuple[str, ...] | None = None) -> None:
+        if metadata_input_policy not in (None, "average_bounded_v1"):
+            raise ValueError("container metadata input policy is unsupported")
+        pair = (expected_scanned_motor_names, expected_all_motor_names)
+        if ((metadata_input_policy is None and any(value is not None for value in pair))
+                or (metadata_input_policy is not None and any(
+                    type(value) is not tuple
+                    or any(type(name) is not str for name in value)
+                    for value in pair
+                ))):
+            raise TypeError("Average metadata policy requires two exact motor tuples")
         self._path = Path(path)
         self._entry = entry
         self._candidate = candidate
@@ -115,6 +134,10 @@ class ContainerCursor:
         self._provider: MetadataProvider | None = None
         self._opened = False
         self._closed = False
+        self._metadata_input_policy = metadata_input_policy
+        self._expected_scanned_motor_names = expected_scanned_motor_names
+        self._expected_all_motor_names = expected_all_motor_names
+        self._opening_stack_owner: Any = None
 
     # -- lifecycle ------------------------------------------------------------
     def __enter__(self) -> "ContainerCursor":
@@ -130,20 +153,55 @@ class ContainerCursor:
         if self._candidate is not None:
             self._reject_if_stale()
 
-        import h5py
-
         from xrd_tools.io.bluesky_nexus import resolve_nxentry
         from xrd_tools.io.nexus import NexusImageStack
 
         try:
-            self._h5 = h5py.File(self._path, "r")
+            self._h5 = _HDF5_FILE_OPEN(
+                self._path, "r", **(
+                    {"rdcc_nbytes": 1 << 20}
+                    if self._metadata_input_policy == "average_bounded_v1" else {}
+                ),
+            )
         except Exception:
             self._closed = True
             raise
         try:
-            self._descriptor = describe_container_from_open(
-                self._h5, path=self._path, entry=self._entry,
-                candidate=self._candidate)
+            if self._metadata_input_policy == "average_bounded_v1":
+                from xrd_tools.io.bluesky_nexus import (
+                    validate_average_container_metadata_inputs,
+                )
+                from xrd_tools.io.nexus import _NexusDatasetOwnerSlot
+                entry_group = resolve_nxentry(
+                    self._h5, self._entry, exact_hint=True,
+                )
+                if entry_group is None:
+                    raise ValueError(f"requested entry {self._entry!r} is unavailable")
+                pair = validate_average_container_metadata_inputs(
+                    entry_group, policy="average_bounded_v1",
+                )
+                if (pair[0] != self._expected_scanned_motor_names
+                        or pair[1] != self._expected_all_motor_names):
+                    from xrd_tools.sources.execution_graph import SourceRevisionChanged
+                    raise SourceRevisionChanged("Average motor catalog changed")
+                self._entry_grp = entry_group
+                self._opening_stack_owner = _NexusDatasetOwnerSlot()
+                self._descriptor, binding = _describe_container_from_open_with_binding(
+                    self._h5, path=self._path, entry=self._entry,
+                    resolved_entry_group=entry_group,
+                    prevalidated_motor_names=pair,
+                    owner_slot=self._opening_stack_owner,
+                    candidate=self._candidate,
+                )
+                stack = binding.into_nexus_image_stack(
+                    self._h5, owner_slot=self._opening_stack_owner,
+                )
+                self._stack = stack
+                self._opening_stack_owner.owner = None
+            else:
+                self._descriptor = describe_container_from_open(
+                    self._h5, path=self._path, entry=self._entry,
+                    candidate=self._candidate)
             # A finalized-link gap has no dataset to bind, so an open cursor
             # must return the typed retry-later result.  An NXWriter file may
             # legitimately expose a complete detector stack before it writes
@@ -164,22 +222,25 @@ class ContainerCursor:
                 raise err(
                     f"{self._path} is not a readable detector container: "
                     f"{self._descriptor.reason}")
-            try:
-                self._entry_grp = resolve_nxentry(self._h5, self._entry)
-            except Exception:
-                self._entry_grp = None
+            if self._metadata_input_policy != "average_bounded_v1":
+                try:
+                    self._entry_grp = resolve_nxentry(self._h5, self._entry)
+                except Exception:
+                    self._entry_grp = None
             # Build the read stack over the SAME open handle only when a detector
             # dataset was resolved; NexusImageStack takes ownership of the file.
             paths = self._resolved_paths(self._descriptor)
-            if paths:
+            if paths and self._metadata_input_policy != "average_bounded_v1":
                 self._stack = NexusImageStack(self._h5, list(paths))
             # Revalidate the FULL identity AFTER inspection: a path/stamp/owner/
             # removal race during the open must fail closed, never return a
             # usable cursor attributed to a stale owner.
             if self._candidate is not None:
                 self._check_identity(when="after inspection")
-        except Exception:
-            self.close()
+        except BaseException as error:
+            if (self._metadata_input_policy != "average_bounded_v1"
+                    and isinstance(error, Exception)):
+                self.close()
             raise
         self._opened = True
         return self
@@ -189,6 +250,9 @@ class ContainerCursor:
 
     def close(self) -> None:
         """Idempotent close — runs on success, Stop, error, and abandonment."""
+        if self._metadata_input_policy == "average_bounded_v1":
+            self._close_average()
+            return
         if self._closed:
             return
         self._closed = True
@@ -215,6 +279,30 @@ class ContainerCursor:
                 h5.close()
             except Exception:
                 pass
+
+    def _close_average(self) -> None:
+        if self._closed:
+            return
+        if self._provider is not None:
+            self._provider.mark_source_closed()
+        slot_owner = (None if self._opening_stack_owner is None
+                      else self._opening_stack_owner.owner)
+        owner = self._stack if self._stack is not None else slot_owner
+        try:
+            if owner is not None:
+                owner.close()
+            if self._stack is None and self._h5 is not None:
+                self._h5.close()
+        except BaseException as exc:
+            raise OSError(f"AVERAGE_SOURCE_CLEANUP_FAILED: {exc}") from exc
+        self._stack = None
+        if self._opening_stack_owner is not None:
+            self._opening_stack_owner.owner = None
+        self._h5 = None
+        self._entry_grp = None
+        self._provider = None
+        self._opened = False
+        self._closed = True
 
     @property
     def closed(self) -> bool:
@@ -256,7 +344,9 @@ class ContainerCursor:
                 self._entry_grp, frame_count=desc.frame_count,
                 wavelength=desc.wavelength,
                 wavelength_unit=WavelengthUnit.ANGSTROM,
-                is_bluesky=desc.is_bluesky)
+                is_bluesky=desc.is_bluesky,
+                scanned_motor_names=self._expected_scanned_motor_names,
+                all_motor_names=self._expected_all_motor_names)
         return self._provider
 
     def metadata_for(self, frame_index: int) -> Any:

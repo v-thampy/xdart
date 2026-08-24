@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ProcessedXdartInputError",
+    "is_processed_xdart_entry",
     "is_processed_xdart_file",
     "is_processed_xdart_path",
 ]
@@ -52,6 +53,19 @@ class ProcessedXdartInputError(ValueError):
     ``except Exception`` handling still catches it, while a caller that wants to
     *skip a processed candidate and continue* can catch it by type.
     """
+
+
+def is_processed_xdart_entry(entry: h5py.Group) -> bool:
+    """Classify one already-resolved entry without reacquiring it by name."""
+    try:
+        if not isinstance(entry, h5py.Group):
+            return False
+        if any(group in entry for group in _PROCESSED_RESULT_GROUPS):
+            return True
+        return _attr_str(entry.attrs.get(SCHEMA_NAME_ATTR)) in ACCEPTED_SCHEMA_NAMES
+    except Exception:
+        logger.debug("is_processed_xdart_entry: traversal error", exc_info=True)
+        return False
 
 
 def _attr_str(value: object) -> str:
@@ -88,12 +102,7 @@ def is_processed_xdart_file(f: h5py.File, entry: str = "entry") -> bool:
             from xrd_tools.io.bluesky_nexus import resolve_nxentry
             grp = resolve_nxentry(f, entry)
         if isinstance(grp, h5py.Group):
-            for group in _PROCESSED_RESULT_GROUPS:
-                if group in grp:
-                    return True
-            stamp = _attr_str(grp.attrs.get(SCHEMA_NAME_ATTR))
-            if stamp in ACCEPTED_SCHEMA_NAMES:
-                return True
+            return is_processed_xdart_entry(grp)
     except Exception:
         logger.debug("is_processed_xdart_file: traversal error", exc_info=True)
     return False

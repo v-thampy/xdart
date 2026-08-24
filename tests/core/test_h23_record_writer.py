@@ -1358,3 +1358,130 @@ def test_retained_v2_2d_writer_transposes_exactly_once(tmp_path):
         h5.close()
     with h5py.File(target, "r") as h5:
         np.testing.assert_allclose(h5["entry/integrated_2d/intensity"][0], result.intensity.T)
+
+
+def _average_counts(values: np.ndarray, extent: int):
+    import struct
+    from xrd_tools.reduction import AverageFiniteCounts, AverageFiniteCountsEvidence
+
+    array = np.ascontiguousarray(values, dtype="<u4")
+    height, width = array.shape
+    digest = hashlib.sha256()
+    digest.update(b"xdart.average-finite-counts.v1\0")
+    digest.update(struct.pack("<QQQ", height, width, extent))
+    digest.update(array.tobytes(order="C"))
+    cap = min(4 * height * width, max(4 * width, 4 << 20))
+    rows = min(height, max(1, cap // (4 * width)))
+    evidence = AverageFiniteCountsEvidence(
+        policy="average_scan_v1", contributor_extent=extent,
+        shape=array.shape, dtype="<u4", sha256=digest.hexdigest(),
+        minimum=int(array.min()), maximum=int(array.max()),
+        zero_count=int(np.count_nonzero(array == 0)), chunks=(rows, width),
+        compression="gzip", compression_opts=1, shuffle=True,
+        fletcher32=False,
+    )
+    return AverageFiniteCounts(evidence, array)
+
+
+def test_average_h23_persists_reopens_and_proves_nonuniform_count_map(tmp_path):
+    rw = _api()
+    from xrd_tools.io import get_1d, get_average_finite_counts
+    from tests.core.test_h23_c3_composition_append import _bound_writer, _release
+
+    counts = _average_counts(np.array([[3, 2, 0], [1, 3, 2]]), 3)
+    (writer, transaction, attempt, lease, owners, _pool, _facade, target) = (
+        _bound_writer(tmp_path, prior=None, complete_record=True))
+    writer.write(rw.RecordWrite(
+        label=1, result_1d=_r1(4.0, n=3), result_2d=_r2(5.0, nq=2, nchi=3),
+    ))
+    assert "average_finite_counts" not in rw.RecordWrite.__dataclass_fields__
+    writer.flush(force=True)
+    ordinary = writer._durable_frame_proofs[1]
+    outcome = writer.finish(rw.WriterFinalization(average_finite_counts=counts))
+    assert outcome.phase is rw.WriterPhase.FINISHED
+    assert set(writer._durable_frame_proofs) == {1}
+    assert writer._durable_frame_proofs[1] != ordinary
+    assert type(writer._durable_frame_proofs[1]) is not type(ordinary)
+    assert transaction.commit_stream(attempt, lease=lease).phase.value == "committed"
+    _release(transaction, lease, owners)
+
+    reopened = get_average_finite_counts(target)
+    assert reopened.evidence == counts.evidence
+    assert reopened.values.flags.c_contiguous and not reopened.values.flags.writeable
+    np.testing.assert_array_equal(reopened.values, counts.values)
+    with h5py.File(target, "r") as handle:
+        node = handle["entry/frames/frame_0001/finite_counts"]
+        assert node.dtype == np.dtype("<u4") and node.shape == (2, 3)
+        assert node.chunks == (2, 3)
+        assert node.compression == "gzip" and node.compression_opts == 1
+        assert node.shuffle and not node.fletcher32
+        assert not node.is_virtual and node.external is None
+        assert set(node.attrs) == {
+            "average_scan_policy", "contributor_extent",
+            "finite_counts_sha256", "finite_counts_min",
+            "finite_counts_max", "finite_counts_zero_count",
+        }
+        assert "source" not in handle["entry/frames/frame_0001"]
+        assert handle["entry/integrated_2d/intensity"].shape == (1, 3, 2)
+    mode_only = rw.NexusRecordWriter(
+        target, atomic=True, overwrite=False, flush_every=None,
+    )
+    mode_only.begin()
+    mode_only.write(rw.RecordWrite(
+        label=1, result_1d=_r1(9.0, n=3), write_frame_record=False,
+    ))
+    assert mode_only.finish().phase is rw.WriterPhase.FINISHED
+    preserved = get_average_finite_counts(target)
+    assert preserved.evidence == counts.evidence
+    np.testing.assert_array_equal(preserved.values, counts.values)
+    np.testing.assert_array_equal(
+        get_1d(target, frame=1).intensity, _r1(9.0, n=3).intensity,
+    )
+    prior_target = target.read_bytes()
+    refusing = rw.NexusRecordWriter(
+        target, atomic=True, overwrite=False, flush_every=None,
+    )
+    refusing.begin()
+    before_refusal = refusing.operation_vector()
+    with pytest.raises(
+        rw.WriterStateError,
+        match="AVERAGE_FINITE_COUNTS_REPLACEMENT_REQUIRES_AVERAGE_FINALIZATION",
+    ):
+        refusing.write(rw.RecordWrite(label=1, result_1d=_r1(11.0, n=3)))
+    assert refusing.operation_vector() == before_refusal
+    refusing.abort()
+    assert target.read_bytes() == prior_target
+
+
+def test_count_write_or_proof_failure_restores_prior_target(tmp_path, monkeypatch):
+    rw = _api()
+    counts = _average_counts(np.array([[2, 1], [1, 2]]), 2)
+    original_write = rw.write_average_finite_counts
+    original_verify = rw.NexusRecordWriter._verify_dirty_evidence
+    for failure in ("write", "proof"):
+        target = tmp_path / f"average-{failure}-rollback.nxs"
+        _seed_target(target, 2)
+        before = target.read_bytes()
+        writer = rw.NexusRecordWriter(
+            target, atomic=True, overwrite=True, flush_every=None,
+        )
+        writer.begin()
+        writer.write(rw.RecordWrite(label=1, result_1d=_r1(7.0, n=3)))
+        writer.flush(force=True)
+        if failure == "write":
+            monkeypatch.setattr(
+                rw, "write_average_finite_counts",
+                lambda *_a, **_k: (_ for _ in ()).throw(OSError("injected count write failure")),
+            )
+        else:
+            monkeypatch.setattr(rw, "write_average_finite_counts", original_write)
+            def fail_proof(owner):
+                node = owner._entry_group()["frames/frame_0001/finite_counts"]
+                assert node.shape == (2, 2) and node.dtype == np.dtype("<u4")
+                raise OSError("injected count proof failure")
+            monkeypatch.setattr(rw.NexusRecordWriter, "_verify_dirty_evidence", fail_proof)
+        with pytest.raises(rw.WriterIncomplete):
+            writer.finish(rw.WriterFinalization(average_finite_counts=counts))
+        writer.abort()
+        assert target.read_bytes() == before
+        monkeypatch.setattr(rw.NexusRecordWriter, "_verify_dirty_evidence", original_verify)

@@ -13,7 +13,7 @@ import numpy as np
 
 from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec
 from xrd_tools.io.image import count_frames, find_image_files, read_image
-from xrd_tools.io.metadata import read_image_metadata
+from xrd_tools.io.metadata import read_image_metadata, read_image_metadata_observed
 from xrd_tools.sources.base import BaseFrameSource
 
 
@@ -81,11 +81,15 @@ class ImageFileSource(BaseFrameSource):
             )
         )
 
-    def metadata_for(self, index: int) -> Mapping[str, Any]:
+    def metadata_for(
+        self, index: int, *, max_input_bytes: int | None = None,
+    ) -> Mapping[str, Any]:
         if self.metadata_format is None:
             return {}
-        return read_image_metadata(self.path, self.metadata_format,
-                                   meta_dir=self.meta_dir)
+        return read_image_metadata(
+            self.path, self.metadata_format, meta_dir=self.meta_dir,
+            max_input_bytes=max_input_bytes,
+        )
 
     def frame_for(self, index: int) -> ScanFrame:
         return ScanFrame(
@@ -124,6 +128,7 @@ class TiffSeriesSource(BaseFrameSource):
         self.raw_dtype = str(raw_dtype)
         self.raw_header_skip = int(raw_header_skip)
         self._admitted_motor_by_index: dict[int, tuple[str, float]] = {}
+        self._observed_metadata_sources: dict[int, Path | None] = {}
         snapshots = tuple(admitted_motor_values)
         if snapshots:
             if len(snapshots) != len(self.files):
@@ -234,15 +239,20 @@ class TiffSeriesSource(BaseFrameSource):
             preserve_dtype=True,
         ))
 
-    def metadata_for(self, index: int) -> Mapping[str, Any]:
+    def metadata_for(
+        self, index: int, *, max_input_bytes: int | None = None,
+    ) -> Mapping[str, Any]:
         path = self._path_for(index)
-        metadata = (
-            {}
-            if self.metadata_format is None
-            else dict(read_image_metadata(
-                path, self.metadata_format, meta_dir=self.meta_dir
-            ))
-        )
+        if self.metadata_format is None:
+            metadata = {}
+            self._observed_metadata_sources[int(index)] = None
+        else:
+            observed = read_image_metadata_observed(
+                path, self.metadata_format, meta_dir=self.meta_dir,
+                max_input_bytes=max_input_bytes,
+            )
+            metadata = dict(observed.values)
+            self._observed_metadata_sources[int(index)] = observed.source_path
         admitted = self._admitted_motor_by_index.get(int(index))
         if admitted is not None:
             motor, value = admitted

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import configparser
 import logging
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ImageMetadataRead",
+    "MetadataInputTooLarge",
+    "MetadataScratchCleanupFailed",
     "read_txt_metadata",
     "read_pdi_metadata",
     "read_image_metadata",
@@ -22,6 +26,14 @@ __all__ = [
 ]
 
 MetadataValue = int | float | str
+
+
+class MetadataInputTooLarge(ValueError):
+    """A selected metadata input exceeded its admitted byte bound."""
+
+
+class MetadataScratchCleanupFailed(RuntimeError):
+    """A bounded SPEC snapshot could not be closed or removed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,16 +231,20 @@ def _looks_like_text(text: str) -> bool:
     return bad <= max(4, n // 20)   # tolerate ~5% + a small fixed slack
 
 
-def _read_structured_metadata(path: Path | str) -> tuple[dict[str, MetadataValue], int]:
+def _read_structured_metadata(
+    path: Path | str, *, _snapshot_bytes: bytes | None = None,
+) -> tuple[dict[str, MetadataValue], int]:
     """Read a generic structured sidecar with replacement decoding."""
     path = Path(path)
     try:
         # BL-3: cap size (a metadata sidecar is small) before reading.
-        if path.stat().st_size > _AUTO_SIDECAR_MAX_BYTES:
+        if _snapshot_bytes is None and path.stat().st_size > _AUTO_SIDECAR_MAX_BYTES:
             logger.debug("_read_structured_metadata: %s over %d bytes; skipping",
                          path, _AUTO_SIDECAR_MAX_BYTES)
             return {}, 0
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = (path.read_text(encoding="utf-8", errors="replace")
+                if _snapshot_bytes is None else
+                _snapshot_bytes.decode("utf-8", errors="replace"))
     except Exception:
         logger.warning("_read_structured_metadata: failed to read %s", path, exc_info=True)
         return {}, 0
@@ -320,6 +336,7 @@ def _find_sidecar(image_path: Path, ext: str) -> Path | None:
 
 def _parse_structured_sidecar_if_plausible(
     path: Path, *, min_pairs: int = _STRUCTURED_SIDECAR_MIN_PAIRS,
+    _snapshot_bytes: bytes | None = None,
 ) -> dict[str, MetadataValue] | None:
     """Parse a structured ``name=value`` sidecar if it yields ``>= min_pairs``.
 
@@ -327,13 +344,37 @@ def _parse_structured_sidecar_if_plausible(
     companion isn't mistaken for metadata).  An EXPLICIT ``meta_format`` passes
     ``min_pairs=1`` — a 1–2 field sidecar the user asked for must not be silently
     dropped (BL-3)."""
-    metadata, pair_count = _read_structured_metadata(path)
+    metadata, pair_count = _read_structured_metadata(
+        path, _snapshot_bytes=_snapshot_bytes,
+    )
     if pair_count >= min_pairs:
         return metadata
     return None
 
 
-def _read_auto_candidate_metadata(path: Path) -> dict[str, MetadataValue] | None:
+def _bounded_metadata_snapshot(path: Path, limit: int | None) -> bytes | None:
+    if limit is None:
+        return None
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("max_input_bytes must be a positive integer")
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        payload = stream.read(limit + 1)
+        after = os.fstat(stream.fileno())
+    revision = lambda value: (
+        int(value.st_size), int(value.st_mtime_ns), int(value.st_ctime_ns),
+        int(value.st_dev), int(value.st_ino),
+    )
+    if revision(before) != revision(after):
+        raise OSError(f"metadata input changed during bounded read: {path}")
+    if len(payload) > limit:
+        raise MetadataInputTooLarge(f"metadata input exceeds {limit} bytes: {path}")
+    return payload
+
+
+def _read_auto_candidate_metadata(
+    path: Path, *, max_input_bytes: int | None = None,
+) -> dict[str, MetadataValue] | None:
     """Try the appropriate parser for an auto-discovered sidecar."""
     ext = path.suffix.lower().lstrip(".")
 
@@ -343,7 +384,8 @@ def _read_auto_candidate_metadata(path: Path) -> dict[str, MetadataValue] | None
     # routes the same way so a pathological/accidentally-huge companion cannot pin
     # memory or stall per-frame discovery (a real .pdi/.txt sidecar is a few KB).
     try:
-        if path.stat().st_size > _AUTO_SIDECAR_MAX_BYTES:
+        if (max_input_bytes is None
+                and path.stat().st_size > _AUTO_SIDECAR_MAX_BYTES):
             logger.warning(
                 "auto metadata: skipping oversize sidecar %s (> %d-byte cap)",
                 path, _AUTO_SIDECAR_MAX_BYTES)
@@ -351,20 +393,27 @@ def _read_auto_candidate_metadata(path: Path) -> dict[str, MetadataValue] | None
     except OSError:
         return None
 
+    snapshot = _bounded_metadata_snapshot(path, max_input_bytes)
     if ext == "txt":
-        metadata = read_txt_metadata(path)       # SSRL # Counters / # Motors
+        metadata = read_txt_metadata(
+            path, _snapshot_bytes=snapshot,
+        )       # SSRL # Counters / # Motors
         if metadata:
             return metadata
         # BL-3: the SSRL .txt parser returns {} for a generic name=value .txt,
         # which would let a WORSE candidate latch — fall back to the structured
         # parser so a plausible generic .txt still wins.
-        return _parse_structured_sidecar_if_plausible(path)
+        return _parse_structured_sidecar_if_plausible(
+            path, _snapshot_bytes=snapshot,
+        )
 
     if ext == "pdi":
-        metadata = read_pdi_metadata(path)
+        metadata = read_pdi_metadata(path, _snapshot_bytes=snapshot)
         return metadata or None
 
-    return _parse_structured_sidecar_if_plausible(path)
+    return _parse_structured_sidecar_if_plausible(
+        path, _snapshot_bytes=snapshot,
+    )
 
 
 def _auto_cache_key(image_path: Path) -> tuple[Path, str]:
@@ -428,24 +477,32 @@ def _auto_sidecar_from_cache(image_path: Path) -> Path | None:
 
 
 def _discover_auto_sidecar(
-    image_path: Path,
+    image_path: Path, *, max_input_bytes: int | None = None,
 ) -> tuple[Path, str, str, dict[str, MetadataValue]] | None:
     for candidate, convention, suffix in _iter_auto_sidecar_candidates(image_path):
-        metadata = _read_auto_candidate_metadata(candidate)
+        metadata = _read_auto_candidate_metadata(
+            candidate, max_input_bytes=max_input_bytes,
+        )
         if metadata is not None:
             return candidate, convention, suffix, metadata
     return None
 
 
-def _read_auto_metadata_observed(image_path: Path) -> ImageMetadataRead:
+def _read_auto_metadata_observed(
+    image_path: Path, *, max_input_bytes: int | None = None,
+) -> ImageMetadataRead:
     cached_sidecar = _auto_sidecar_from_cache(image_path)
     if cached_sidecar is not None:
-        metadata = _read_auto_candidate_metadata(cached_sidecar)
+        metadata = _read_auto_candidate_metadata(
+            cached_sidecar, max_input_bytes=max_input_bytes,
+        )
         if metadata is not None:
             return ImageMetadataRead(metadata, cached_sidecar)
         _AUTO_SIDECAR_CACHE.pop(_auto_cache_key(image_path), None)
 
-    discovered = _discover_auto_sidecar(image_path)
+    discovered = _discover_auto_sidecar(
+        image_path, max_input_bytes=max_input_bytes,
+    )
     if discovered is None:
         logger.debug("read_image_metadata: no auto sidecar found for %s", image_path)
         return ImageMetadataRead({}, None)
@@ -530,7 +587,9 @@ def _extract_scan_info(image_path: Path) -> tuple[str | None, int | None, int]:
 # ---------------------------------------------------------------------------
 
 
-def read_txt_metadata(path: Path | str) -> dict[str, float]:
+def read_txt_metadata(
+    path: Path | str, *, _snapshot_bytes: bytes | None = None,
+) -> dict[str, float]:
     """Read an SSRL ``.txt`` sidecar metadata file.
 
     The file contains two single-line sections introduced by ``# Counters``
@@ -551,7 +610,8 @@ def read_txt_metadata(path: Path | str) -> dict[str, float]:
     """
     path = Path(path)
     try:
-        data = path.read_text()
+        data = (path.read_text() if _snapshot_bytes is None else
+                _snapshot_bytes.decode("utf-8", errors="replace"))
 
         counters_match = re.search(r"# Counters\n(.*)\n", data)
         motors_match = re.search(r"# Motors\n(.*)\n", data)
@@ -573,7 +633,9 @@ def read_txt_metadata(path: Path | str) -> dict[str, float]:
         return {}
 
 
-def read_pdi_metadata(path: Path | str) -> dict[str, float]:
+def read_pdi_metadata(
+    path: Path | str, *, _snapshot_bytes: bytes | None = None,
+) -> dict[str, float]:
     """Read a Pilatus Detector Image (``.pdi``) sidecar metadata file.
 
     Two format variants are tried in order:
@@ -602,7 +664,8 @@ def read_pdi_metadata(path: Path | str) -> dict[str, float]:
     """
     path = Path(path)
     try:
-        data = path.read_text().replace("\n", ";")
+        data = (path.read_text() if _snapshot_bytes is None else
+                _snapshot_bytes.decode("utf-8", errors="replace")).replace("\n", ";")
 
         # --- counters & motors ---
         try:
@@ -666,6 +729,8 @@ def read_image_metadata(
     image_path: Path | str,
     meta_format: str | None = "txt",
     meta_dir: Path | str | None = None,
+    *,
+    max_input_bytes: int | None = None,
 ) -> dict[str, MetadataValue]:
     """Unified metadata reader for SSRL detector image sidecar files.
 
@@ -699,6 +764,7 @@ def read_image_metadata(
             image_path,
             meta_format=meta_format,
             meta_dir=meta_dir,
+            max_input_bytes=max_input_bytes,
         ).values
     )
 
@@ -707,6 +773,8 @@ def read_image_metadata_observed(
     image_path: Path | str,
     meta_format: str | None = "txt",
     meta_dir: Path | str | None = None,
+    *,
+    max_input_bytes: int | None = None,
 ) -> ImageMetadataRead:
     """Read image metadata and report the exact accepted metadata file.
 
@@ -728,7 +796,9 @@ def read_image_metadata_observed(
     )
 
     if meta_format_norm == "auto":
-        return _read_auto_metadata_observed(image_path)
+        return _read_auto_metadata_observed(
+            image_path, max_input_bytes=max_input_bytes,
+        )
 
     if meta_format_norm in ("txt", "pdi"):
         sidecar = _find_sidecar(image_path, meta_format_norm)
@@ -740,8 +810,14 @@ def read_image_metadata_observed(
             )
             return ImageMetadataRead({}, None)
         if meta_format_norm == "txt":
-            return ImageMetadataRead(read_txt_metadata(sidecar), sidecar)
-        return ImageMetadataRead(read_pdi_metadata(sidecar), sidecar)
+            snapshot = _bounded_metadata_snapshot(sidecar, max_input_bytes)
+            return ImageMetadataRead(
+                read_txt_metadata(sidecar, _snapshot_bytes=snapshot), sidecar,
+            )
+        snapshot = _bounded_metadata_snapshot(sidecar, max_input_bytes)
+        return ImageMetadataRead(
+            read_pdi_metadata(sidecar, _snapshot_bytes=snapshot), sidecar,
+        )
 
     if meta_format_norm == "spec":
         # Normalise empty-string to None for downstream "use default
@@ -752,6 +828,7 @@ def read_image_metadata_observed(
         return _read_spec_metadata_observed(
             image_path,
             search_dir=search_dir,
+            max_input_bytes=max_input_bytes,
         )
 
     # Any other value is treated as a generic structured-sidecar extension.
@@ -764,7 +841,10 @@ def read_image_metadata_observed(
     # sidecar (the AUTO min-pairs=3 plausibility gate does NOT apply here; before
     # this, 1-2-pair explicit sidecars were silently dropped with a misleading
     # "unknown meta_format" warning).
-    metadata = _parse_structured_sidecar_if_plausible(sidecar, min_pairs=1)
+    snapshot = _bounded_metadata_snapshot(sidecar, max_input_bytes)
+    metadata = _parse_structured_sidecar_if_plausible(
+        sidecar, min_pairs=1, _snapshot_bytes=snapshot,
+    )
     if metadata is not None:
         return ImageMetadataRead(metadata, sidecar)
     logger.warning("read_image_metadata: %s (format %r) had no readable "
@@ -780,6 +860,8 @@ def read_image_metadata_observed(
 def _read_spec_metadata_observed(
     image_path: Path,
     search_dir: Path | None = None,
+    *,
+    max_input_bytes: int | None = None,
 ) -> ImageMetadataRead:
     """Extract per-image counters and motor positions from a SPEC file.
 
@@ -853,23 +935,87 @@ def _read_spec_metadata_observed(
             )
             return ImageMetadataRead({}, None)
 
-        sf = SpecFile(str(spec_file))
-        scan = sf[f"{scan_number}.1"]
-        npts = scan.data.shape[1]
-        img_idx = min(image_number, npts - 1)
+        snapshot = _bounded_metadata_snapshot(spec_file, max_input_bytes)
+        if snapshot is None:
+            sf = SpecFile(str(spec_file))
+            scan = sf[f"{scan_number}.1"]
+            npts = scan.data.shape[1]
+            img_idx = min(image_number, npts - 1)
+            counters = {label: float(scan.data_column_by_name(label)[img_idx])
+                        for label in scan.labels}
+            motors = {name: float(scan.motor_position_by_name(name))
+                      for name in scan.motor_names}
+            return ImageMetadataRead({**counters, **motors}, spec_file)
 
-        counters: dict[str, float] = {
-            label: float(scan.data_column_by_name(label)[img_idx])
-            for label in scan.labels
-        }
-        motors: dict[str, float] = {
-            name: float(scan.motor_position_by_name(name))
-            for name in scan.motor_names
-        }
+        scratch_handle = None
+        scratch = None
+        parser = None
+        primary: BaseException | None = None
+        result: ImageMetadataRead | None = None
+        cleanup_error: BaseException | None = None
+        try:
+            scratch_handle = tempfile.NamedTemporaryFile(
+                prefix="xdart-spec-", delete=False,
+            )
+            scratch = Path(scratch_handle.name)
+            scratch_handle.write(snapshot)
+            scratch_handle.close()
+            parser = SpecFile(str(scratch))
+            scan = parser[f"{scan_number}.1"]
+            npts = scan.data.shape[1]
+            img_idx = min(image_number, npts - 1)
+            counters = {label: float(scan.data_column_by_name(label)[img_idx])
+                        for label in scan.labels}
+            motors = {name: float(scan.motor_position_by_name(name))
+                      for name in scan.motor_names}
+            result = ImageMetadataRead({**counters, **motors}, spec_file)
+        except BaseException as exc:
+            primary = exc
+        finally:
+            if parser is not None:
+                try:
+                    parser.close()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            if scratch_handle is not None and not scratch_handle.closed:
+                try:
+                    scratch_handle.close()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            if scratch is not None:
+                try:
+                    scratch.unlink()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+        if primary is not None:
+            if cleanup_error is not None:
+                failure = MetadataScratchCleanupFailed(
+                    f"SPEC snapshot close/unlink failed: {cleanup_error}"
+                )
+                failure.__cause__ = cleanup_error
+                raise primary from failure
+            if not isinstance(primary, Exception):
+                raise primary
+            logger.warning(
+                "_read_spec_metadata: failed to parse bounded snapshot for %s",
+                image_path, exc_info=primary,
+            )
+            return ImageMetadataRead({}, spec_file)
+        if cleanup_error is not None:
+            raise MetadataScratchCleanupFailed(
+                f"SPEC snapshot close/unlink failed: {cleanup_error}"
+            ) from cleanup_error
+        assert result is not None
+        return result
 
-        return ImageMetadataRead({**counters, **motors}, spec_file)
-
-    except Exception:
+    except (MetadataInputTooLarge, MetadataScratchCleanupFailed):
+        raise
+    except Exception as error:
+        if isinstance(error.__cause__, MetadataScratchCleanupFailed):
+            raise
         logger.warning(
             "_read_spec_metadata: failed to read SPEC metadata for %s",
             image_path,

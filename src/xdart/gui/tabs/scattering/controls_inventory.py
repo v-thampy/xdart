@@ -160,7 +160,6 @@ def bound_values(
         THRESHOLD_MIN: intent.threshold.threshold_min,
         THRESHOLD_MAX: intent.threshold.threshold_max,
         MASK_SATURATION: intent.threshold.mask_saturation,
-        AVERAGE_SCAN: False,
         BACKGROUND_TYPE: intent.background.mode,
         BACKGROUND_FILE: intent.background.locator or "",
         BACKGROUND_DIRECTORY: intent.background.locator or "",
@@ -171,6 +170,15 @@ def bound_values(
         BACKGROUND_NORMALIZE: intent.background.normalization_key or "None",
     }
     values.update(source_values(intent.source_spec, source_mode=source_mode))
+    average = intent.run_options.get("series_average", False)
+    if (
+        type(intent.source_spec) is SourceSpec
+        and not intent.live_mode
+        and intent.output_mode == "Overwrite"
+        and intent.processing_mode != "Int 1D (XYE)"
+        and type(average) is bool
+    ):
+        values[AVERAGE_SCAN] = average
     values.update(integration_values(intent))
     choices: dict[tuple[str, ...], tuple[str, ...]] = {
         SOURCE_TYPE: (
@@ -404,7 +412,6 @@ def truthful_field(field: ControlFormField) -> ControlFormField:
         return field
     reasons = {
         SOURCE_ENERGY: "Energy-source selection is not available in vNext yet.",
-        AVERAGE_SCAN: "Series averaging has no vNext execution owner yet.",
     }
     reason = (
         "Use Choose source to replace this exact complete source."

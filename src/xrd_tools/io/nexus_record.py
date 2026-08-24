@@ -27,7 +27,7 @@ Layout written (per the v2 schema)::
 """
 from __future__ import annotations
 
-import logging, hashlib, json, re
+import logging, hashlib, json, re, struct
 import os
 from pathlib import Path
 import uuid
@@ -68,6 +68,7 @@ __all__ = [
     "write_frame_source_ref",
     "write_thumbnail",
     "write_background_dependency", "read_background_dependency",
+    "write_average_finite_counts",
     "drop_integrated_rows",
     "legacy_to_canonical_1d",
     "legacy_to_canonical_2d",
@@ -77,6 +78,60 @@ __all__ = [
 ]
 
 
+_AVERAGE_COUNT_PREFIX = b"xdart.average-finite-counts.v1\0"
+def _average_count_chunks(shape: tuple[int, int]) -> tuple[int, int]:
+    height, width = shape; count_bytes = 4 * height * width
+    cap = min(count_bytes, max(4 * width, 4 << 20))
+    return min(height, max(1, cap // (4 * width))), width
+def _average_count_digest(values: np.ndarray, contributor_extent: int, *, rows: int) -> str:
+    height, width = values.shape
+    digest = hashlib.sha256(_AVERAGE_COUNT_PREFIX)
+    digest.update(struct.pack("<QQQ", height, width, contributor_extent))
+    for start in range(0, height, rows):
+        slab = np.ascontiguousarray(values[start:start + rows], dtype="<u4")
+        digest.update(slab.tobytes(order="C"))
+    return digest.hexdigest()
+def write_average_finite_counts(entry_grp: h5py.Group, counts) -> h5py.Dataset:
+    """Write the sole Average count map under the already-written frame 1."""
+    from xrd_tools.reduction.average import AverageFiniteCounts, AverageFiniteCountsEvidence
+    if type(counts) is not AverageFiniteCounts: raise ValueError("average finite-count finalization value is invalid")
+    evidence = counts.evidence
+    if type(evidence) is not AverageFiniteCountsEvidence: raise ValueError("average finite-count evidence is invalid")
+    values = counts.values
+    expected_chunks = _average_count_chunks(evidence.shape)
+    if evidence.chunks != expected_chunks: raise ValueError("average finite-count chunk evidence is invalid")
+    observed_digest = _average_count_digest(values, evidence.contributor_extent, rows=expected_chunks[0])
+    if observed_digest != evidence.sha256: raise ValueError("average finite-count digest is invalid")
+    frames = entry_grp.get("frames")
+    frame = None if not isinstance(frames, h5py.Group) else frames.get("frame_0001")
+    if not isinstance(frame, h5py.Group): raise ValueError("Average finalization requires exactly frame 1")
+    if "source" in frame: raise ValueError("Average frame 1 must not have a singular source")
+    if "finite_counts" in frame: del frame["finite_counts"]
+    dataset = frame.create_dataset(
+        "finite_counts", data=values, dtype="<u4", chunks=expected_chunks,
+        compression="gzip", compression_opts=1, shuffle=True, fletcher32=False,
+    )
+    dataset.attrs.create(
+        "average_scan_policy", np.bytes_(b"average_scan_v1"), dtype="S15",
+    )
+    dataset.attrs.create(
+        "contributor_extent", np.uint32(evidence.contributor_extent),
+        dtype="<u4",
+    )
+    dataset.attrs.create(
+        "finite_counts_sha256", np.bytes_(evidence.sha256.encode("ascii")),
+        dtype="S64",
+    )
+    dataset.attrs.create(
+        "finite_counts_min", np.uint32(evidence.minimum), dtype="<u4",
+    )
+    dataset.attrs.create(
+        "finite_counts_max", np.uint32(evidence.maximum), dtype="<u4",
+    )
+    dataset.attrs.create(
+        "finite_counts_zero_count", np.uint64(evidence.zero_count), dtype="<u8",
+    )
+    return dataset
 # Legacy GUI dict keys (``LiveFrame.gi_1d`` / ``gi_2d``) -> canonical on-disk
 # mode keys (the same vocabulary as GI*Mode.value and FrameEvent.mode_key).
 _LEGACY_TO_CANONICAL_1D = {

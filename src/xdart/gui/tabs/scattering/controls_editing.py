@@ -22,6 +22,7 @@ from xrd_tools.sources.selection import DirectorySourceSpec
 from .contracts import SourceSelection
 from .detector_projection import poni_saturation_ceiling
 from .controls_inventory import (
+    AVERAGE_SCAN,
     BACKGROUND_DIRECTORY,
     BACKGROUND_EDIT_PATHS,
     BACKGROUND_FILE,
@@ -406,6 +407,25 @@ def reduce_control_edit(
 
     if type(path) is not tuple or not all(type(part) is str for part in path):
         return EditRefusal("Unknown control.")
+    if path == AVERAGE_SCAN:
+        if type(value) is not bool:
+            return EditRefusal("Average Scan requires true or false.")
+        intent = snapshot.thaw()
+        if value and (
+            type(intent.source_spec) is not SourceSpec
+            or intent.live_mode
+            or intent.output_mode != "Overwrite"
+            or intent.processing_mode == "Int 1D (XYE)"
+        ):
+            return EditRefusal(
+                "Average Scan requires a finite image source, Overwrite "
+                "output, non-Live execution, and NeXus output."
+            )
+        current = intent.run_options.get("series_average", False)
+        if type(current) is bool and current is value:
+            return EditNoChange()
+        intent.run_options["series_average"] = value
+        return intent
     if path in BACKGROUND_EDIT_PATHS:
         return _reduce_background_edit(snapshot, path, value)
     if path in INT_PATHS:

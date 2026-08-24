@@ -49,6 +49,9 @@ _EXPORTS = {
     "get_angles": ("xrd_tools.io.spec", "get_angles"),
     "get_1d": ("xrd_tools.io.read", "get_1d"),
     "get_2d": ("xrd_tools.io.read", "get_2d"),
+    "get_average_finite_counts": (
+        "xrd_tools.io.read", "get_average_finite_counts",
+    ),
     "get_detector_mask": ("xrd_tools.io.image", "get_detector_mask"),
     "get_energy_and_UB": ("xrd_tools.io.spec", "get_energy_and_UB"),
     "get_from_spec_file": ("xrd_tools.io.spec", "get_from_spec_file"),

@@ -97,7 +97,6 @@ def test_production_projection_supplies_source_and_integration_inventory() -> No
         ("Mask", "min"),
         ("Mask", "max"),
         ("MaskSat", "mask_sentinel"),
-        ("Signal", "series_average"),
         ("BG", "bg_type"),
     }
     assert required <= fields.keys()
@@ -120,8 +119,8 @@ def test_production_projection_supplies_source_and_integration_inventory() -> No
     assert fields[("Int2D", "azim_auto")].value is False
     assert fields[("Int2D", "azim_low")].value == -90.0
     assert fields[("Int2D", "azim_high")].value == 90.0
-    assert fields[("Signal", "series_average")].enabled is False
-    assert fields[("BG", "bg_type")].enabled is False
+    assert ("Signal", "series_average") not in fields
+    assert fields[("BG", "bg_type")].enabled is True
     actions = state.profile.actions_for(SectionId.PROCESSING)
     assert tuple(action.action for action in actions) == (
         ControlAction.REINTEGRATE_1D,

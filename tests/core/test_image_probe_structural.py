@@ -379,3 +379,123 @@ def test_tiff_change_during_header_probe_is_provisional(
     assert "changed" in (result.reason or "").lower()
     assert target_stats >= 2
     assert decoder_calls == []
+
+
+def test_tiff_layout_is_header_only_and_precedes_exact_allocation(
+    tmp_path, monkeypatch,
+):
+    """Average layout discovery reads metadata, never detector pixels."""
+    import tifffile
+    from xrd_tools.io import image as image_io
+
+    path = tmp_path / "layout_0001.tif"
+    tifffile.imwrite(path, np.arange(30, dtype=np.uint16).reshape(5, 6))
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("pixel")
+        raise AssertionError("pixel decoder entered during layout probe")
+
+    monkeypatch.setattr(image_io, "read_image", forbidden)
+    monkeypatch.setattr("fabio.open", forbidden)
+    monkeypatch.setattr(tifffile, "imread", forbidden)
+    monkeypatch.setattr(tifffile.TiffPage, "asarray", forbidden)
+    layout = image_io.read_detector_image_layout(path)
+    assert (layout.shape, layout.dtype, layout.frame_count) == (
+        (5, 6), "<u2", 1,
+    )
+    assert calls == []
+
+    raw = tmp_path / "image.raw"
+    raw.write_bytes(np.arange(12, dtype="<u2").tobytes())
+    raw_layout = image_io.read_detector_image_layout(
+        raw, detector_shape=(3, 4), raw_dtype="<u2",
+    )
+    assert (raw_layout.shape, raw_layout.dtype, raw_layout.frame_count) == (
+        (3, 4), "<u2", 1,
+    )
+    with pytest.raises(ValueError, match="layout|size"):
+        image_io.read_detector_image_layout(
+            raw, detector_shape=(4, 4), raw_dtype="<u2",
+        )
+    assert calls == []
+
+    from xrd_tools.reduction import AverageScanRecipe, ReductionPlan
+    from xrd_tools.reduction import average
+    from xrd_tools.sources import execution_graph
+    from xrd_tools.sources.selection import image_series_spec
+
+    root = tmp_path / "series"; root.mkdir()
+    members = (root / "scan_0001.tif", root / "scan_0002.tif")
+    for index, member in enumerate(members):
+        tifffile.imwrite(member, np.full((5, 6), index, dtype=np.uint16))
+    events = []
+    real_layout = execution_graph.read_detector_image_layout
+    real_requirements = average.requirements_from
+    real_resolve = average.resolve_session_policy
+    real_native = execution_graph._AverageSourceReadWindow.read_native
+
+    monkeypatch.setattr(
+        execution_graph, "read_detector_image_layout",
+        lambda member, **kwargs: events.append(("layout", Path(member).name))
+        or real_layout(member, **kwargs),
+    )
+    monkeypatch.setattr(
+        average, "requirements_from",
+        lambda *args, **kwargs: events.append(("requirements", None))
+        or real_requirements(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        average, "resolve_session_policy",
+        lambda *args, **kwargs: events.append(("allocation", None))
+        or real_resolve(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        execution_graph._AverageSourceReadWindow, "read_native",
+        lambda *_a, **_k: pytest.fail("detector pixel read during preparation"),
+    )
+    plan = average.prepare_average_scan(AverageScanRecipe(
+        image_series_spec(members[0], metadata_format=None),
+        tmp_path / "average.nxs", ReductionPlan(),
+    ))
+    assert plan.detector_shape == (5, 6) and plan.native_dtype == "<u2"
+    kinds = [item[0] for item in events]
+    assert [item for item in events if item[0] == "layout"] == [
+        ("layout", "scan_0001.tif"), ("layout", "scan_0002.tif"),
+        ("layout", "scan_0001.tif"), ("layout", "scan_0002.tif"),
+        ("layout", "scan_0001.tif"), ("layout", "scan_0002.tif"),
+    ]
+    assert max(i for i, kind in enumerate(kinds) if kind == "layout") < kinds.index("requirements")
+    assert kinds.index("requirements") < kinds.index("allocation")
+
+    monkeypatch.setattr(execution_graph._AverageSourceReadWindow,
+                        "read_native", real_native)
+    tifffile.imwrite(members[1], np.zeros((4, 6), dtype=np.uint16))
+    events.clear()
+    with pytest.raises(ValueError, match="layout|shape"):
+        average.prepare_average_scan(AverageScanRecipe(
+            image_series_spec(members[0], metadata_format=None),
+            tmp_path / "mismatch.nxs", ReductionPlan(),
+        ))
+    assert "allocation" not in [item[0] for item in events]
+
+    tifffile.imwrite(members[1], np.zeros((5, 6), dtype=np.float32))
+    events.clear()
+    with pytest.raises(ValueError, match="layout|dtype"):
+        average.prepare_average_scan(AverageScanRecipe(
+            image_series_spec(members[0], metadata_format=None),
+            tmp_path / "dtype-mismatch.nxs", ReductionPlan(),
+        ))
+    assert "allocation" not in [item[0] for item in events]
+
+    multi_root = tmp_path / "multi"; multi_root.mkdir()
+    multipage = multi_root / "scan_0001.tif"
+    tifffile.imwrite(multipage, np.zeros((5, 6), dtype=np.uint16))
+    tifffile.imwrite(multipage, np.ones((5, 6), dtype=np.uint16), append=True)
+    events.clear()
+    with pytest.raises(ValueError, match="one frame|frame count"):
+        average.prepare_average_scan(AverageScanRecipe(
+            image_series_spec(multipage, metadata_format=None),
+            tmp_path / "multipage.nxs", ReductionPlan(),
+        ))
+    assert "allocation" not in [item[0] for item in events]

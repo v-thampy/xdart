@@ -463,6 +463,9 @@ CAPABILITIES = MappingProxyType({
     "frames_record": CapabilityAttr(
         "frames", "", "group",
         "per-frame record groups (thumbnails, source refs, timestamps)"),
+    "average_finite_counts": CapabilityAttr(
+        "finite_counts", "frames/frame_0001", "dataset",
+        "Average Scan per-pixel finite-contributor count map"),
     "per_frame_geometry": CapabilityAttr(
         "per_frame_geometry", "", "group",
         "derived diffractometer rotations + incident angle per frame"),

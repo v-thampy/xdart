@@ -11,6 +11,7 @@ from numbers import Integral
 import os
 from pathlib import Path
 import shutil
+import struct
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 import uuid
@@ -33,6 +34,7 @@ from xrd_tools.io.nexus import (
     write_stitched,
 )
 from xrd_tools.io.nexus_record import (
+    _average_count_chunks,
     _background_pair,
     ensure_frames_container,
     quantize_thumbnail,
@@ -40,6 +42,7 @@ from xrd_tools.io.nexus_record import (
     replace_frame_record,
     stamp_source_base,
     validate_source_base,
+    write_average_finite_counts,
 )
 from xrd_tools.io.append import (
     AppendDecision,
@@ -227,6 +230,7 @@ class WriterFinalization:
     stitched_1d: Any | None = None
     stitched_2d: Any | None = None
     stitched_provenance: Mapping[str, Any] | str | None = None
+    average_finite_counts: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +429,13 @@ class _DurableFrameProof:
     digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class _DurableAverageFrameProof:
+    """Detached scalar proof for frame 1 plus its bounded count-map evidence."""
+    label: int
+    digest: str
+    count_digest: str
+    evidence: Any
 class _EvidenceBuilder:
     def __init__(self, *, observed_only: bool = False) -> None:
         self._observed_only = bool(observed_only)
@@ -557,6 +568,7 @@ class NexusRecordWriter:
         transaction_binding: WriterTransactionBinding | None = None,
         append_decision: AppendDecision | None = None,
         fast_regenerable: bool = False,
+        defer_epoch_durability: bool = False,
         replacement_dimension: str | None = None,
         replacement_labels: tuple[int, ...] | None = None,
         replacement_audit: bytes | None = None,
@@ -581,6 +593,8 @@ class NexusRecordWriter:
         self._opener = opener
         self._transaction_binding = transaction_binding
         self._fast_regenerable = fast_regenerable
+        if type(defer_epoch_durability) is not bool: raise TypeError("defer_epoch_durability must be an exact bool")
+        self._defer_epoch_durability = defer_epoch_durability
         self._append_decision = append_decision
         replacement_values = (replacement_dimension, replacement_labels, replacement_audit, replacement_selected_plan)
         if any(value is not None for value in replacement_values) and (not all(value is not None for value in replacement_values) or transaction_binding is None or fast_regenerable): raise ValueError("selected-dimension replacement configuration is incomplete or unbound")
@@ -638,7 +652,9 @@ class NexusRecordWriter:
         self._durable_absence_proofs: dict[
             tuple[str, int], _DurableAbsenceProof
         ] = {}
-        self._durable_frame_proofs: dict[int, _DurableFrameProof] = {}
+        self._durable_frame_proofs: dict[
+            int, _DurableFrameProof | _DurableAverageFrameProof
+        ] = {}
 
     @property
     def active_path(self) -> Path | None:
@@ -1232,11 +1248,13 @@ class NexusRecordWriter:
             digest=evidence.observed_hexdigest(),
         )
 
-    def _verify_frame_row(
-        self,
-        evidence: _EvidenceBuilder,
-        expected: _ExpectedFrameRow,
-    ) -> None:
+    def _expected_frame_children(self, expected: _ExpectedFrameRow) -> set[str]: return {name for name, value in (("thumbnail", expected.thumbnail), ("thumbnail_mask", expected.thumbnail_mask), ("source", expected.source_path), ("timestamp", expected.timestamp), ("background_dependency", expected.background_dependency)) if value is not None}
+
+    def _verify_frame_row(self, evidence: _EvidenceBuilder, expected: _ExpectedFrameRow) -> None: self._verify_frame_row_with_children(evidence, expected, self._expected_frame_children(expected))
+
+    def _verify_average_frame_row(self, evidence: _EvidenceBuilder, expected: _ExpectedFrameRow) -> None: children = self._expected_frame_children(expected); children.add("finite_counts"); self._verify_frame_row_with_children(evidence, expected, children)
+
+    def _verify_frame_row_with_children(self, evidence: _EvidenceBuilder, expected: _ExpectedFrameRow, expected_children: set[str]) -> None:
         role = f"{self.entry}/frames/frame_{expected.label:04d}"
         frame = self._entry_group().get(f"frames/frame_{expected.label:04d}")
         if not isinstance(frame, h5py.Group):
@@ -1247,17 +1265,6 @@ class NexusRecordWriter:
             raise WriterStateError(
                 f"durability readback mismatch for {role}/source complete fact"
             )
-        expected_children = set()
-        if expected.thumbnail is not None:
-            expected_children.add("thumbnail")
-        if expected.thumbnail_mask is not None:
-            expected_children.add("thumbnail_mask")
-        if expected.source_path is not None:
-            expected_children.add("source")
-        if expected.timestamp is not None:
-            expected_children.add("timestamp")
-        if expected.background_dependency is not None:
-            expected_children.add("background_dependency")
         evidence.text(
             f"{role}/children",
             json.dumps(sorted(expected_children)),
@@ -1371,6 +1378,14 @@ class NexusRecordWriter:
         frame = self._entry_group().get(f"frames/frame_{int(label):04d}")
         if not isinstance(frame, h5py.Group):
             raise WriterStateError(f"durable frame proof lost label {label}")
+        return self._frame_row_digest_nodes(frame, frame)
+
+    def _average_frame_row_digest(self, label: int) -> tuple[str, int]:
+        frame = self._entry_group().get(f"frames/frame_{int(label):04d}")
+        if not isinstance(frame, h5py.Group): raise WriterStateError(f"durable frame proof lost label {label}")
+        return self._frame_row_digest_nodes(frame, (name for name in frame if name != "finite_counts"))
+
+    def _frame_row_digest_nodes(self, frame: h5py.Group, root_names) -> tuple[str, int]:
         digest = hashlib.sha256(b"xrd-tools-frame-row-v1\0")
         read_bytes = 0
 
@@ -1387,17 +1402,17 @@ class NexusRecordWriter:
                 return value.item()
             return value
 
-        def walk(group: h5py.Group, prefix: str) -> None:
+        def walk(group: h5py.Group, prefix: str, names) -> None:
             nonlocal read_bytes
             for name in sorted(group.attrs):
                 value = scalar(group.attrs[name])
                 update(f"{prefix}@{name}", repr(value).encode("utf-8"))
-            for name in sorted(group):
+            for name in sorted(names):
                 child = group[name]
                 role = f"{prefix}/{name}"
                 if isinstance(child, h5py.Group):
                     update(role, b"group")
-                    walk(child, role)
+                    walk(child, role, child)
                     continue
                 if not isinstance(child, h5py.Dataset):
                     raise WriterStateError(f"unsupported frame proof node {role}")
@@ -1419,9 +1434,123 @@ class NexusRecordWriter:
                         f"{role}@{attr_name}", repr(value).encode("utf-8"),
                     )
 
-        walk(frame, frame.name)
+        walk(frame, frame.name, root_names)
         return digest.hexdigest(), read_bytes
 
+    def _verify_average_finite_counts(
+        self,
+        expected,
+    ) -> tuple[str, int]:
+        from xrd_tools.reduction.average import AverageFiniteCountsEvidence
+        if type(expected) is not AverageFiniteCountsEvidence:
+            raise WriterStateError("Average count proof has invalid evidence")
+        entry = self._entry_group()
+        frames = entry.get("frames")
+        frame = None if not isinstance(frames, h5py.Group) else frames.get(
+            "frame_0001",
+        )
+        if (
+            not isinstance(frame, h5py.Group)
+            or "source" in frame
+            or set(self._append_written_labels) != {1}
+        ):
+            raise WriterStateError(
+                "Average count proof requires sole source-free frame 1",
+            )
+        link = frame.get("finite_counts", getlink=True)
+        dataset = frame.get("finite_counts")
+        expected_attrs = {
+            "average_scan_policy",
+            "contributor_extent",
+            "finite_counts_sha256",
+            "finite_counts_min",
+            "finite_counts_max",
+            "finite_counts_zero_count",
+        }
+        if (
+            type(link) is not h5py.HardLink
+            or not isinstance(dataset, h5py.Dataset)
+            or dataset.dtype != np.dtype("<u4")
+            or dataset.shape != expected.shape
+            or dataset.chunks != _average_count_chunks(expected.shape)
+            or dataset.compression != "gzip"
+            or dataset.compression_opts != 1
+            or dataset.shuffle is not True
+            or dataset.fletcher32 is not False
+            or dataset.is_virtual
+            or dataset.external is not None
+            or set(dataset.attrs) != expected_attrs
+        ):
+            raise WriterStateError("Average count durability schema is invalid")
+        def scalar_attr(name: str, dtype: str):
+            value = dataset.attrs[name]
+            if (
+                np.asarray(value).shape != ()
+                or dataset.attrs.get_id(name).dtype != np.dtype(dtype)
+            ):
+                raise WriterStateError(
+                    f"Average count attribute {name} is invalid",
+                )
+            return value
+        policy = scalar_attr("average_scan_policy", "S15")
+        extent = scalar_attr("contributor_extent", "<u4")
+        sha256 = scalar_attr("finite_counts_sha256", "S64")
+        minimum = scalar_attr("finite_counts_min", "<u4")
+        maximum = scalar_attr("finite_counts_max", "<u4")
+        zero_count = scalar_attr("finite_counts_zero_count", "<u8")
+        try:
+            policy_text = bytes(policy).decode("ascii")
+            digest_text = bytes(sha256).decode("ascii")
+        except (TypeError, UnicodeDecodeError) as error:
+            raise WriterStateError("Average count text evidence is invalid") from error
+        scalar_observed = (
+            policy_text,
+            int(extent),
+            digest_text,
+            int(minimum),
+            int(maximum),
+            int(zero_count),
+        )
+        scalar_expected = (
+            expected.policy,
+            expected.contributor_extent,
+            expected.sha256,
+            expected.minimum,
+            expected.maximum,
+            expected.zero_count,
+        )
+        if scalar_observed != scalar_expected:
+            raise WriterStateError("Average count scalar evidence changed")
+        height, width = expected.shape
+        rows = expected.chunks[0]
+        digest = hashlib.sha256(b"xdart.average-finite-counts.v1\0")
+        digest.update(struct.pack(
+            "<QQQ", height, width, expected.contributor_extent,
+        ))
+        observed_min = expected.contributor_extent
+        observed_max = 0
+        observed_zero = 0
+        read_bytes = 0
+        for start in range(0, height, rows):
+            slab = np.asarray(dataset[start:start + rows])
+            if slab.dtype != np.dtype("<u4") or slab.ndim != 2:
+                raise WriterStateError("Average count slab is invalid")
+            digest.update(slab.tobytes(order="C"))
+            observed_min = min(observed_min, int(slab.min()))
+            observed_max = max(observed_max, int(slab.max()))
+            observed_zero += int(np.count_nonzero(slab == 0))
+            read_bytes += int(slab.nbytes)
+        observed_digest = digest.hexdigest()
+        if (
+            observed_digest != expected.sha256
+            or observed_min != expected.minimum
+            or observed_max != expected.maximum
+            or observed_zero != expected.zero_count
+            or observed_max > expected.contributor_extent
+            or observed_zero >= height * width
+        ):
+            raise WriterStateError("Average count durability census is invalid")
+        return observed_digest, read_bytes
     def _replacement_manifest_digest(self, exclude, handle=None) -> str:
         digest = hashlib.sha256(b"xrd-tools-replacement-manifest-v1\0"); root = self._h5 if handle is None else handle; config = _replacement_hard_group(root, f"{self.entry}/reduction/config"); config_prefix = "" if config is None else f"{config.name.rstrip('/')}/"
         def update(role, value): payload = value if isinstance(value, bytes) else repr(value).encode(); digest.update(len(role).to_bytes(8, "big") + role.encode() + len(payload).to_bytes(8, "big") + payload)
@@ -1531,13 +1660,14 @@ class NexusRecordWriter:
         int,
         int,
         dict[tuple[str, int], _DurableModeProof],
-        dict[int, _DurableFrameProof],
+        dict[int, _DurableFrameProof | _DurableAverageFrameProof],
     ]:
         aggregate = _EvidenceBuilder()
         read_bytes = 0
         mode_proofs: dict[tuple[str, int], _DurableModeProof] = {}
-        frame_proofs: dict[int, _DurableFrameProof] = {}
-
+        frame_proofs: dict[
+            int, _DurableFrameProof | _DurableAverageFrameProof
+        ] = {}
         def absorb(role: str, evidence: _EvidenceBuilder) -> None:
             nonlocal read_bytes
             digest = evidence.hexdigest()
@@ -1585,6 +1715,21 @@ class NexusRecordWriter:
             + len(self._dirty_indexed)
         )
         return aggregate.hexdigest(), read_bytes, rows, mode_proofs, frame_proofs
+
+    def _verify_average_dirty_evidence(self, counts):
+        dirty, labels = self._dirty_frames, tuple(sorted(self._dirty_frames))
+        if labels not in ((), (1,)): raise WriterStateError("Average count proof requires exact frame 1")
+        self._dirty_frames = {}
+        try: digest, read_bytes, rows, mode_proofs, frame_proofs = self._verify_dirty_evidence()
+        finally: self._dirty_frames = dirty
+        expected = getattr(counts, "evidence", None); prior = self._durable_frame_proofs.get(1); evidence = _EvidenceBuilder()
+        if labels: self._verify_average_frame_row(evidence, dirty[1])
+        elif type(prior) not in (_DurableFrameProof, _DurableAverageFrameProof): raise WriterStateError("Average count proof requires retained frame 1")
+        frame_digest, frame_bytes = self._average_frame_row_digest(1)
+        if not labels and frame_digest != prior.digest: raise WriterStateError("Average count proof changed retained frame 1")
+        count_digest, count_bytes = self._verify_average_finite_counts(expected); aggregate = _EvidenceBuilder(); aggregate.text("ordinary-dirty", digest, digest); semantic = evidence.hexdigest() if labels else prior.digest; aggregate.text("frame:1", semantic, semantic); aggregate.text("average-counts:1", expected.sha256, count_digest)
+        frame_proofs[1] = _DurableAverageFrameProof(1, frame_digest, count_digest, expected)
+        return aggregate.hexdigest(), read_bytes + evidence.read_bytes + frame_bytes + count_bytes, rows + len(labels) + 1, mode_proofs, frame_proofs
 
     def _reverify_durable_mode_proof(
         self,
@@ -1829,7 +1974,11 @@ class NexusRecordWriter:
                         digest,
                     )
                     read_bytes += evidence.read_bytes
-                for label in sorted(self._durable_frame_proofs):
+                frame_labels = sorted(self._durable_frame_proofs)
+                average_proof = self._durable_frame_proofs.get(1)
+                if isinstance(average_proof, _DurableAverageFrameProof):
+                    frame_labels.remove(1)
+                for label in frame_labels:
                     proof = self._durable_frame_proofs[label]
                     observed, observed_bytes = self._frame_row_digest(label)
                     if observed != proof.digest:
@@ -1838,6 +1987,16 @@ class NexusRecordWriter:
                         )
                     aggregate.text(f"frame:{label}", proof.digest, observed)
                     read_bytes += observed_bytes
+                if isinstance(average_proof, _DurableAverageFrameProof):
+                    observed, observed_bytes = self._average_frame_row_digest(1)
+                    if observed != average_proof.digest:
+                        raise WriterStateError("durable frame proof changed for label 1")
+                    aggregate.text("frame:1", average_proof.digest, observed)
+                    count_digest, count_bytes = self._verify_average_finite_counts(average_proof.evidence)
+                    if count_digest != average_proof.count_digest:
+                        raise WriterStateError("durable Average count proof changed")
+                    aggregate.text("average-counts:1", average_proof.count_digest, count_digest)
+                    read_bytes += observed_bytes + count_bytes
                 after = self._descriptor_stat_tuple(descriptor)
                 if after != before:
                     raise WriterStateError(
@@ -1949,6 +2108,7 @@ class NexusRecordWriter:
                         "per_frame_geometry",
                     )
                 }
+            if self._replacement_configuration is None and entry.get("frames/frame_0001/finite_counts", getlink=True) is not None: self.write_batch = self._write_batch_preserving_average_counts
             if self.complete_record and self.source_base:
                 validate_source_base(entry, self.source_base)
             for name, requested in (
@@ -2294,6 +2454,11 @@ class NexusRecordWriter:
     def write(self, record: RecordWrite) -> None:
         self.write_batch((record,))
 
+    def _write_batch_preserving_average_counts(self, records: Iterable[RecordWrite]) -> None:
+        self._require_active(); batch = tuple(records)
+        if any(int(record.label) == 1 and record.write_frame_record for record in batch): raise WriterStateError("AVERAGE_FINITE_COUNTS_REPLACEMENT_REQUIRES_AVERAGE_FINALIZATION")
+        NexusRecordWriter.write_batch(self, batch)
+
     def write_batch(self, records: Iterable[RecordWrite]) -> None:
         self._require_active()
         batch = tuple(records)
@@ -2510,18 +2675,18 @@ class NexusRecordWriter:
         revoke = getattr(self._facade, "revoke_checkpoint_recovery", None)
         if callable(revoke): revoke()
 
-    def _seal_checkpoint_and_receipts(self, *, publish_receipts: bool = True) -> None:
+    def _seal_checkpoint_and_receipts(self, *, publish_receipts: bool = True, verified=None) -> None:
         batch = self._current_receipts() if publish_receipts else ()
         dropped = self._current_publication_drops() if publish_receipts else ()
         (digest, read_bytes, rows, mode_proofs,
-         frame_proofs) = self._verify_dirty_evidence()
+         frame_proofs) = self._verify_dirty_evidence() if verified is None else verified
         binding = self._transaction_binding
         # A dynamic same-run lineage facade cannot publish additive H10
         # durability until H23 has committed that rollback-capable epoch.  It
         # still receives the exact verified batch below, but owns it only as a
         # pending overlay.  Static R7 facades lack this opt-in and retain the
         # existing immediate irreversible-floor contract.
-        defer_epoch = bool(
+        defer_epoch = self._defer_epoch_durability or bool(
             self._facade is not None
             and getattr(self._facade, "defer_epoch_durability", False)
         )
@@ -2964,6 +3129,10 @@ class NexusRecordWriter:
         if finalization.diffractometer is not None:
             write_diffractometer(self._entry_group(), finalization.diffractometer)
         self._write_detector_values(finalization)
+        if finalization.average_finite_counts is not None:
+            write_average_finite_counts(
+                self._entry_group(), finalization.average_finite_counts,
+            )
         if finalization.stitched_1d is not None or finalization.stitched_2d is not None:
             write_stitched(
                 self._entry_group(),
@@ -3123,15 +3292,17 @@ class NexusRecordWriter:
             self._finish_step = 0
         elif finalization is not None and finalization != self._finalization:
             raise WriterStateError("retry must use the frozen finalization values")
+        def checkpoint(*, publish_receipts=True):
+            counts = self._finalization.average_finite_counts
+            verified = None if counts is None else self._verify_average_dirty_evidence(counts)
+            self._seal_checkpoint_and_receipts(publish_receipts=publish_receipts, verified=verified)
         try:
             with self._boundary():
                 if self._transaction_binding is None:
                     steps = (
                         ("metadata", lambda: self._write_finalization(self._finalization)),
                         ("flush", self._flush_handle),
-                        ("checkpoint", lambda: self._seal_checkpoint_and_receipts(
-                            publish_receipts=False,
-                        )),
+                        ("checkpoint", lambda: checkpoint(publish_receipts=False)),
                         ("close", self._close_handle),
                         ("replace", self._replace_target),
                         ("resume", self._resume_pool),
@@ -3160,7 +3331,7 @@ class NexusRecordWriter:
                         self._stream_terminal = terminal
 
                     steps = (("metadata", lambda: self._write_finalization(self._finalization)), ("flush", self._flush_handle)) + ((("verify", self._verify_replacement_manifest),) if self._replacement_configuration is not None else ())
-                    steps += (("checkpoint", self._seal_checkpoint_and_receipts), ("close", self._close_handle), ("terminal", seal_terminal))
+                    steps += (("checkpoint", checkpoint), ("close", self._close_handle), ("terminal", seal_terminal))
                 while self._finish_step < len(steps):
                     owner, action = steps[self._finish_step]
                     self._pending_owner = owner

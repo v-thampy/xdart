@@ -15,8 +15,6 @@ import numpy as np
 from xdart.modules.reduction import open_headless_scan_session
 from xrd_tools.io import (
     AppendDisposition,
-    AppendExternalMember,
-    AppendImageMember,
     AppendIntent,
     AppendPreflightCleanupError,
     AppendPreflightState,
@@ -61,9 +59,19 @@ from xrd_tools.core.staging import (
 )
 from xrd_tools.session.run_configuration import heavy_residency_choice
 from xrd_tools.session.display_logic import xye_prefix_for_unit
+from xrd_tools.sources.execution_graph import (
+    append_source_from_execution_graph,
+    source_execution_projection,
+    source_snapshots_projection,
+    stable_lineage_projection,
+)
 
 from ..contracts import AdmittedOutput, PlannedOutput, SourceExecutionStamp
-from ..output_preflight import _background_resource_terms, _merge_background_binding, source_snapshots
+from ..output_preflight import (
+    _background_resource_terms,
+    _merge_background_binding,
+    _prepared_source_execution,
+)
 
 
 _MISSING = object()
@@ -558,35 +566,8 @@ def _target_key(path: Path | str) -> str:
 
 
 def _stable_lineage(item: PlannedOutput) -> tuple[object, ...]:
-    identity = item.source_stamp.execution_identity_v1
-    aliases = tuple(
-        (
-            value.raw_path,
-            value.resolved_path,
-            value.target_id,
-            value.roles,
-            value.candidate_owner_id,
-        )
-        for value in identity.aliases
-        if "source_file" in value.roles
-    )
-    primary_targets = {value.target_id for value in identity.aliases
-                       if "source_file" in value.roles}
-    targets = tuple(
-        (
-            value.target_id,
-            value.resolved_path,
-            value.roles,
-        )
-        for value in identity.targets
-        if value.target_id in primary_targets
-    )
-    return (
-        item.group.adapter_key,
-        item.group.group_key,
-        _target_key(item.group.target),
-        aliases,
-        targets,
+    return stable_lineage_projection(
+        _prepared_source_execution(item), target=item.group.target,
     )
 
 
@@ -596,66 +577,10 @@ def _append_source(
     *,
     generation: int,
 ) -> AppendSource:
-    image_members = ()
-    if stamp.members:
-        if len(stamp.members) != stamp.frame_count:
-            raise ValueError(
-                "flat-series Append requires one exact member per frame"
-            )
-        image_members = tuple(
-            AppendImageMember(
-                path=value.path,
-                size=value.size,
-                mtime_ns=value.mtime_ns,
-                source_start=ordinal,
-                source_stop=ordinal + 1,
-                ordinal=ordinal,
-            )
-            for ordinal, value in enumerate(stamp.members)
-        )
-    external_members = tuple(
-        AppendExternalMember(
-            path=value.file.path,
-            dataset_path=value.dataset,
-            size=value.file.size,
-            mtime_ns=value.file.mtime_ns,
-            source_start=value.first,
-            source_stop=value.stop,
-            ordinal=value.epoch,
-        )
-        for value in stamp.external_members
-    )
-    descriptor = item.descriptor
-    dataset_paths = ()
-    if descriptor is not None and not external_members:
-        dataset_paths = tuple(dict.fromkeys(
-            value
-            for value in (
-                descriptor.dataset_path,
-                *descriptor.segment_paths,
-            )
-            if value
-        ))
-    if (
-        descriptor is not None
-        and descriptor.kind.value == "eiger_master"
-        and not external_members
-    ):
-        raise ValueError(
-            "Eiger Append requires exact external dataset/range facts"
-        )
-    return AppendSource(
-        path=stamp.path,
-        adapter_id=stamp.adapter_id,
-        size=stamp.size,
-        mtime_ns=stamp.mtime_ns,
-        extent=stamp.frame_count,
-        digest=science_fingerprint(stamp.execution_identity_v1.as_dict()),
-        dataset_paths=dataset_paths,
-        image_members=image_members,
-        external_members=external_members,
-        generation=int(generation),
-    )
+    graph = _prepared_source_execution(item)
+    if stamp is not item.source_stamp:
+        raise ValueError("Append source stamp must be the admitted item stamp")
+    return append_source_from_execution_graph(graph, generation=generation)
 
 
 def _mode_tokens(configuration) -> tuple[str, ...]:
@@ -790,18 +715,9 @@ def preview_append_decision(
 def _writer_source_snapshots(
     item: PlannedOutput,
 ) -> dict[str, dict[str, Any]]:
-    allowed = {
-        "adapter_id", "size", "mtime_ns", "frame_count",
-        "dataset_path", "self_contained",
-    }
-    return {
-        path: {
-            key: value
-            for key, value in snapshot.items()
-            if key in allowed and value is not None
-        }
-        for path, snapshot in source_snapshots(item).items()
-    }
+    return source_snapshots_projection(
+        _prepared_source_execution(item), writer=True,
+    )
 
 
 class DynamicOutputAdapter:
@@ -1321,7 +1237,9 @@ class DynamicOutputAdapter:
                     incremental_finalization=True,
                     source_base=self.configuration.project_root or None,
                     run_configuration_provenance=run_provenance,
-                    source_execution_provenance=item.source_stamp.as_dict(),
+                    source_execution_provenance=source_execution_projection(
+                        _prepared_source_execution(item)
+                    ),
                     source_snapshots_provenance=(
                         _writer_source_snapshots(item)
                     ),

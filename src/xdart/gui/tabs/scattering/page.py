@@ -481,6 +481,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._reintegrate_identity: OperationIdentity | None = None
         self._reintegrate_request: object | None = None
         self._reintegrate_target: str | None = None; self._reintegrate_dimension: str | None = None
+        self._average_identity: OperationIdentity | None = None
+        self._average_revision: int | None = None
+        self._average_target: str | None = None
+        self._average_entry: str | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -540,9 +544,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         slot = getattr(self, "_operation_slot", None)
         if slot is None:
             return
-        slot.observe_stamp(
-            ScatteringWorkspace._operation_context_stamp(self, revision)
-        )
+        average = getattr(self, "_average_identity", None)
+        if average is not None and slot.current_identity is average:
+            if revision is None:
+                revision = self._intents.snapshot().revision
+            stamp = OperationContextStamp(revision)
+        else:
+            stamp = ScatteringWorkspace._operation_context_stamp(
+                self, revision
+            )
+        slot.observe_stamp(stamp)
 
     def _begin_operation(
         self, frozen: object, body: Callable[..., object]
@@ -820,6 +831,96 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         else: self._request_browser_catalog()
         return True
 
+    def _consume_average_update(self, update: object) -> bool:
+        if type(update) is not OperationUpdate or update.identity is not self._average_identity:
+            return False
+        if update.terminal is None:
+            if update.progress is not None:
+                self._notice(f"Average: {update.progress.stage} {update.progress.completed}/{update.progress.total}…")
+            return True
+        target, entry, revision = self._average_target, self._average_entry, self._average_revision
+        self._average_identity = self._average_revision = self._average_target = self._average_entry = None
+        if update.stale or revision != self._intents.revision:
+            return True
+        terminal = update.terminal; result = terminal.payload
+        from xrd_tools.reduction.average import AverageScanResult
+        if type(result) is not AverageScanResult:
+            self._notice(f"Average failed: {terminal.diagnostic or 'invalid terminal result'}"); return True
+        if terminal.status is OperationTerminalStatus.FAILED:
+            shown = (f"{result.diagnostic_code}: {result.diagnostic}"
+                     if result.disposition == "ABORTED" else
+                     f"Average failed: {terminal.diagnostic}")
+            self._notice(shown); return True
+        if result.disposition == "REFUSED":
+            self._notice(f"{result.diagnostic_code}: {result.diagnostic}"); return True
+        if result.disposition == "CANCELLED":
+            self._notice("Average cancelled."); return True
+        if result.disposition != "COMMITTED" or terminal.status is not OperationTerminalStatus.RETURNED:
+            self._notice("Average returned an invalid terminal disposition."); return True
+        if result.target != target or result.entry != entry:
+            self._notice("Average terminal target mismatch; Browse was not reloaded."); return True
+        self._context_controller.begin_browse(target); self._request_browser_catalog()
+        return True
+
+    def _average_action(self, snapshot: RunIntentSnapshot) -> None:
+        slot = self._operation_slot
+        intent = snapshot.thaw()
+        source = intent.source_spec
+        phase = self._lifecycle.phase
+        if (self._closing or self._closed or self._admission_state is not None or slot.owned
+                or phase not in {RunPhase.IDLE, RunPhase.FAILED}
+                or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted
+                or type(source) is not SourceSpec or not intent.save_path
+                or intent.output_mode != "Overwrite" or intent.live_mode
+                or intent.processing_mode == "Int 1D (XYE)"):
+            self._notice("Average requires one finite image source, Overwrite NeXus output, non-Live execution, and an idle workspace."); self._refresh_shell(); return
+        try:
+            from pathlib import Path
+            from .output_preflight import _resolved_generated_target
+            from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args
+            gi = intent.gi; manual = gi.incidence_motor == "Manual"
+            threshold = intent.threshold
+            reduction = build_native_int_reduction_plan_from_args(
+                intent.bai_1d_args, intent.bai_2d_args, gi_enabled=gi.enabled,
+                gi_incident_angle=gi.th_val if gi.enabled and manual else None,
+                incidence_motor=None if manual else gi.incidence_motor,
+                tilt_angle=gi.tilt_angle, sample_orientation=gi.sample_orientation,
+                integrate_2d=not ("1D" in intent.processing_mode and "2D" not in intent.processing_mode),
+                threshold_min=threshold.threshold_min if threshold.apply_threshold else None,
+                threshold_max=threshold.threshold_max if threshold.apply_threshold else None,
+                mask_saturation=threshold.mask_saturation,
+            )
+            options = source.options
+            syntactic_name = options.get("scan_name")
+            if syntactic_name is not None and (
+                type(syntactic_name) is not str or not syntactic_name
+            ):
+                raise ValueError("Average source scan name is invalid.")
+            name = syntactic_name or Path(str(
+                options.get("selected_file") or source.uri
+            )).stem
+            if not name:
+                raise ValueError("Average source scan name is empty.")
+            generated = _resolved_generated_target(intent.save_path, name)
+            target = os.path.abspath(os.path.expanduser(str(generated)))
+        except (TypeError, ValueError, OverflowError) as error:
+            self._notice(str(error)); self._refresh_shell(); return
+        if self._intents.revision != snapshot.revision:
+            self._notice("Average context changed before dispatch."); self._refresh_shell(); return
+        identity = slot.begin_average(
+            source, target, reduction, source_base=intent.project_root or None,
+            output_mode=intent.output_mode, live_mode=intent.live_mode,
+            save_xye=False, batch_mode=intent.batch_mode,
+            poni_file=intent.poni_file, mask_file=intent.mask_file,
+            background=intent.background, resource_requests={"workers": intent.max_cores},
+            stamp=OperationContextStamp(snapshot.revision),
+        )
+        if identity is None:
+            self._notice("Average operation was not started."); self._refresh_shell(); return
+        self._average_identity, self._average_revision = identity, snapshot.revision
+        self._average_target, self._average_entry = target, "entry"
+        self._notice("Averaging the finite source…"); self._refresh_shell(); self._ensure_timer()
+
     @property
     def _admission(self) -> AdmissionToken | None:
         state = self._admission_state
@@ -894,6 +995,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             if operation_clean:
                 self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
+                self._average_identity = self._average_revision = self._average_target = self._average_entry = None
         except Exception:
             operation_clean = False
 
@@ -1110,6 +1212,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._run_action()
             return
         if kind is ShellCommandKind.STOP:
+            average = self._average_identity
+            if average is not None and self._operation_slot.current_identity is average:
+                accepted = self._operation_slot.cancel(average)
+                self._notice("Cancelling Average…" if accepted else "Average cancellation was not accepted.")
+                self._refresh_shell(); return
             self._stop_run()
             return
         if kind is ShellCommandKind.MENU:
@@ -1263,6 +1370,28 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._refresh_shell()
                 self._ensure_timer()
             return
+        snapshot = self._intents.snapshot()
+        stored_average = snapshot.thaw().run_options.get(
+            "series_average", False
+        )
+        if type(stored_average) is not bool:
+            self._notice("Average Scan must be stored as true or false.")
+            self._refresh_shell()
+            return
+        if stored_average:
+            if not self._commit_focused_control_edit_for_run():
+                return
+            snapshot = self._intents.snapshot()
+            stored_average = snapshot.thaw().run_options.get(
+                "series_average", False
+            )
+            if type(stored_average) is not bool:
+                self._notice("Average Scan must be stored as true or false.")
+                self._refresh_shell()
+                return
+            if stored_average:
+                self._average_action(snapshot)
+                return
         intent = self._intents.snapshot().thaw()
         tool = tool_from_mode_text(intent.processing_mode)
         if tool is Tool.XYE_VIEWER:
@@ -1284,6 +1413,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("1D Viewer cleanup remains pending")
             return
         if not self._commit_focused_control_edit_for_run():
+            return
+        snapshot = self._intents.snapshot()
+        average = snapshot.thaw().run_options.get("series_average", False)
+        if type(average) is not bool:
+            self._notice("Average Scan must be stored as true or false.")
+            self._refresh_shell()
+            return
+        if average:
+            self._average_action(snapshot)
             return
         self._begin_run()
 
@@ -1969,13 +2107,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if operation_identity is not None:
             ScatteringWorkspace._observe_operation_stamp(self)
             update = operation_slot.poll(operation_identity)
-            if update is not None: changed = self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or self._consume_reintegrate_update(update) or changed
+            if update is not None: changed = self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or self._consume_reintegrate_update(update) or self._consume_average_update(update) or changed
             elif operation_identity is self._background_identity and not operation_slot.owned:
                 self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True
             elif operation_identity is self._reintegrate_identity and not operation_slot.owned:
                 request, target = self._reintegrate_request, self._reintegrate_target; shown = {"1d": "1-D", "2d": "2-D"}.get(self._reintegrate_dimension, "operation"); self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
                 if request is not None and target is not None: self._reload_after_reintegrate(request, target)
                 self._notice(f"Reintegrate {shown} failed before terminal publication."); changed = True
+            elif operation_identity is self._average_identity and not operation_slot.owned:
+                self._average_identity = self._average_revision = self._average_target = self._average_entry = None
+                self._notice("Average failed before terminal publication."); changed = True
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)

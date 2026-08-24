@@ -61,6 +61,12 @@ __all__ = [
     "GIAllDummyError",
 ]
 __all__ += ["ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"]
+__all__ += [
+    "AverageContributor", "AverageFiniteCounts", "AverageFiniteCountsEvidence",
+    "AverageScanPlan", "AverageScanProgress", "AverageScanRecipe",
+    "AverageScanResult", "AverageScanRunner", "iter_average_contributors",
+    "prepare_average_scan", "run_average_scan",
+]
 
 _CORE_EXPORTS = {
     "CancelToken",
@@ -112,6 +118,12 @@ _STRICTNESS_EXPORTS = {
 _BACKGROUND_EXPORTS = {"DisplayBackgroundPlan", "DisplayBackgroundResult", "run_display_background"}
 _BACKGROUND_EXPORTS.update({"FrameBackgroundPlan", "FrameBackgroundResult", "resolve_frame_background"})
 _REINTEGRATE_EXPORTS = {"ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"}
+_AVERAGE_EXPORTS = {
+    "AverageContributor", "AverageFiniteCounts", "AverageFiniteCountsEvidence",
+    "AverageScanPlan", "AverageScanProgress", "AverageScanRecipe",
+    "AverageScanResult", "AverageScanRunner", "iter_average_contributors",
+    "prepare_average_scan", "run_average_scan",
+}
 
 
 def __getattr__(name: str) -> Any:
@@ -121,6 +133,8 @@ def __getattr__(name: str) -> Any:
         value = getattr(import_module("xrd_tools.reduction.background"), name)
     elif name in _REINTEGRATE_EXPORTS:
         value = getattr(import_module("xrd_tools.reduction.reintegrate"), name)
+    elif name in _AVERAGE_EXPORTS:
+        value = getattr(import_module("xrd_tools.reduction.average"), name)
     elif name in _CORE_EXPORTS:
         value = getattr(import_module("xrd_tools.reduction.core"), name)
     elif name in _STRICTNESS_EXPORTS:
