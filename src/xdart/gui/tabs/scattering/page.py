@@ -480,7 +480,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._mask_identity: OperationIdentity | None = None; self._mask_revision: int | None = None
         self._reintegrate_identity: OperationIdentity | None = None
         self._reintegrate_request: object | None = None
-        self._reintegrate_target: str | None = None
+        self._reintegrate_target: str | None = None; self._reintegrate_dimension: str | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -765,14 +765,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return True
 
     @staticmethod
-    def _reintegrate_1d_preparation(intent) -> dict[str, object]:
-        bai = jsonable_run_value(intent.bai_1d_args, path="reintegrate.selected_plan.bai_args")
-        if type(bai) is not dict: raise ValueError("current 1-D integration settings are malformed")
-        bai.pop("gi_mode_1d", None); mode = intent.gi.mode_1d; workers = intent.max_cores
-        if type(mode) is not str or mode not in {"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"}: raise ValueError("current 1-D mode is unsupported")
+    def _reintegrate_preparation(intent, dimension) -> dict[str, object]:
+        bai = jsonable_run_value(getattr(intent, f"bai_{dimension}_args"), path="reintegrate.selected_plan.bai_args") if type(dimension) is str and dimension in {"1d", "2d"} else (_ for _ in ()).throw(ValueError("Reintegrate dimension is unsupported")); (None if type(bai) is dict else (_ for _ in ()).throw(ValueError("current integration settings are malformed")))
+        bai.pop(f"gi_mode_{dimension}", None); mode = getattr(intent.gi, f"mode_{dimension}"); workers = intent.max_cores
+        if type(mode) is not str or mode not in ({"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"} if dimension == "1d" else {"qip_qoop", "q_chi", "exit_angles"}): raise ValueError("current integration mode is unsupported")
         if type(workers) is not int or workers < 1: raise ValueError("current core request is invalid")
         return {"api_version": 1,
-            "selected_plan": {"version": 1, "dimension": "1d", "bai_args": bai, "gi_mode": mode},
+            "selected_plan": {"version": 1, "dimension": dimension, "bai_args": bai, "gi_mode": mode},
             "requested_shared_science": {"version": 1, "kind": "persisted_target"},
             "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": None,
                                 "requests": {"workers": workers}}}
@@ -781,20 +780,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if self._context_controller.reload_reintegrate_browse(request, target) is None:
             self._request_browser_catalog()
 
-    def _reintegrate_1d_action(self) -> None:
+    def _reintegrate_action(self, dimension) -> None:
         slot, active = self._operation_slot, self._reintegrate_identity
-        if active is not None and slot.current_identity is active:
-            accepted = slot.cancel(active); self._notice("Cancelling Reintegrate 1-D…" if accepted else "Reintegrate cancellation was not accepted."); self._refresh_shell(); return
+        if active is not None and slot.current_identity is active and self._reintegrate_dimension != dimension: self._refresh_shell(); return
+        if active is not None and slot.current_identity is active and self._reintegrate_dimension == dimension: accepted = slot.cancel(active); self._notice(f"Cancelling Reintegrate {dimension[0]}-D…" if accepted else "Reintegrate cancellation was not accepted."); self._refresh_shell(); return
         if not self._commit_focused_control_edit_for_run(): return
         phase = self._lifecycle.phase; permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
         captured = self._context_controller.capture_reintegrate_browse()
         if self._closing or self._closed or self._admission_state is not None or slot.owned or not permitted or captured is None:
-            self._notice("Reintegrate 1-D requires one stable loaded Browse context."); self._refresh_shell(); return
+            self._notice(f"Reintegrate {dimension[0]}-D requires one stable loaded Browse context."); self._refresh_shell(); return
         snapshot = self._intents.snapshot()
-        try: preparation = self._reintegrate_1d_preparation(snapshot.thaw())
+        try: preparation = self._reintegrate_preparation(snapshot.thaw(), dimension)
         except (TypeError, ValueError) as error: self._notice(str(error)); self._refresh_shell(); return
         stamp = self._operation_context_stamp(snapshot.revision); recaptured = self._context_controller.capture_reintegrate_browse(); current = self._intents.snapshot()
-        try: current_preparation = self._reintegrate_1d_preparation(current.thaw())
+        try: current_preparation = self._reintegrate_preparation(current.thaw(), dimension)
         except (TypeError, ValueError): current_preparation = None
         same_browse = (recaptured is not None and recaptured[0] is captured[0] and recaptured[1] is captured[1] and recaptured[2] is captured[2] and recaptured[3:] == captured[3:])
         if current.revision != snapshot.revision or current_preparation != preparation or not same_browse or not self._context_controller.invalidate_reintegrate_browse(*captured):
@@ -802,24 +801,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         context, request, _selection, target, entry, target_snapshot, labels = captured
         identity = slot.begin_reintegrate(target=target, entry=entry,
             expected_target_snapshot=target_snapshot, expected_labels=labels,
-            dimension="1d", preparation_values=preparation, stamp=stamp)
+            dimension=dimension, preparation_values=preparation, stamp=stamp)
         if identity is None:
-            self._reload_after_reintegrate(request, target); self._notice("Reintegrate 1-D was not started; Browse is reloading."); self._refresh_shell(); return
-        self._reintegrate_identity, self._reintegrate_request, self._reintegrate_target = identity, request, target
-        self._notice("Reintegrating 1-D from authenticated loaded artifact science…"); self._refresh_shell(); self._ensure_timer()
+            self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None; self._reload_after_reintegrate(request, target); self._notice(f"Reintegrate {dimension[0]}-D was not started; Browse is reloading."); self._refresh_shell(); return
+        self._reintegrate_identity, self._reintegrate_request, self._reintegrate_target, self._reintegrate_dimension = identity, request, target, dimension
+        self._notice(f"Reintegrating {dimension[0]}-D from authenticated loaded artifact science…"); self._refresh_shell(); self._ensure_timer()
 
     def _consume_reintegrate_update(self, update: object) -> bool:
         if type(update) is not OperationUpdate or update.identity is not self._reintegrate_identity: return False
         if update.terminal is None:
-            if update.progress is not None: self._notice(f"Reintegrate 1-D: {update.progress.stage} {update.progress.completed}/{update.progress.total}…")
+            if update.progress is not None: self._notice(f"Reintegrate {self._reintegrate_dimension[0]}-D: {update.progress.stage} {update.progress.completed}/{update.progress.total}…")
             return True
         terminal, request, target = update.terminal, self._reintegrate_request, self._reintegrate_target
-        self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = None
+        shown = {"1d": "1-D", "2d": "2-D"}.get(self._reintegrate_dimension, "operation"); self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
         result = terminal.payload
-        if terminal.status is OperationTerminalStatus.RETURNED and type(result) is ReintegrateResult:
-            self._notice(f"Reintegrate 1-D {result.disposition.lower()}; reloading persisted results.")
-        elif terminal.status is OperationTerminalStatus.CANCELLED: self._notice("Reintegrate 1-D cancelled; reloading persisted results.")
-        else: self._notice(f"Reintegrate 1-D failed: {terminal.diagnostic}")
+        self._notice(f"Reintegrate {shown} {result.disposition.lower()}; reloading persisted results." if terminal.status is OperationTerminalStatus.RETURNED and type(result) is ReintegrateResult else f"Reintegrate {shown} cancelled; reloading persisted results." if terminal.status is OperationTerminalStatus.CANCELLED else f"Reintegrate {shown} failed: {terminal.diagnostic}")
         if request is not None and target is not None: self._reload_after_reintegrate(request, target)
         else: self._request_browser_catalog()
         return True
@@ -897,7 +893,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or operation_close.cleanup_status is CleanupStatus.CLEANED
             )
             if operation_clean:
-                self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = None
+                self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
         except Exception:
             operation_clean = False
 
@@ -1107,7 +1103,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return
         kind = command.kind
-        operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and ((command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity) or (command.value == "make_mask" and self._operation_slot.current_identity is self._mask_identity) or (command.value == "reintegrate_1d" and self._operation_slot.current_identity is self._reintegrate_identity))
+        operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and ((command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity) or (command.value == "make_mask" and self._operation_slot.current_identity is self._mask_identity) or (command.value == f"reintegrate_{self._reintegrate_dimension}" and self._operation_slot.current_identity is self._reintegrate_identity))
         operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
         if self._operation_slot.owned and operation_locked and not operation_cancel: self._notice("Experiment operation is still active."); self._refresh_shell(); return
         if kind is ShellCommandKind.RUN_ACTION:
@@ -1200,7 +1196,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if kind is ShellCommandKind.CONTROL_ACTION:
             if command.value == "calibrate": self._calibrate_action(); return
             if command.value == "make_mask": self._mask_action(); return
-            if command.value == "reintegrate_1d": self._reintegrate_1d_action(); return
+            if command.value in {"reintegrate_1d", "reintegrate_2d"}: self._reintegrate_action(command.value[-2:]); return
             if command.value == "advanced_processing":
                 self._edit_advanced_settings()
                 return
@@ -1977,9 +1973,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             elif operation_identity is self._background_identity and not operation_slot.owned:
                 self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True
             elif operation_identity is self._reintegrate_identity and not operation_slot.owned:
-                request, target = self._reintegrate_request, self._reintegrate_target; self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = None
+                request, target = self._reintegrate_request, self._reintegrate_target; shown = {"1d": "1-D", "2d": "2-D"}.get(self._reintegrate_dimension, "operation"); self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
                 if request is not None and target is not None: self._reload_after_reintegrate(request, target)
-                self._notice("Reintegrate 1-D failed before terminal publication."); changed = True
+                self._notice(f"Reintegrate {shown} failed before terminal publication."); changed = True
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
@@ -2498,7 +2494,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and (phase is RunPhase.IDLE or phase is RunPhase.FAILED
                      and self._lifecycle.reset_permitted)
                 and self._context_controller.capture_reintegrate_browse() is not None),
-            reintegrate_active=reintegrate_active,
+            reintegrate_active=reintegrate_active, reintegrate_dimension=self._reintegrate_dimension,
         )
         project_key = (
             str(intent.project_root or ""),

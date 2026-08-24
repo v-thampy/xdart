@@ -105,6 +105,7 @@ def project_controls(
     mask_active: bool = False,
     reintegrate_available: bool = False,
     reintegrate_active: bool = False,
+    reintegrate_dimension: str | None = None,
 ) -> ControlPanelRenderState:
     intent = snapshot.thaw()
     raw_motor = intent.gi.incidence_motor
@@ -232,18 +233,11 @@ def project_controls(
                           reason=("1D Viewer" if tool is Tool.XYE_VIEWER
                                   else "2D Viewer") + " has no acquisition authority.")
                   for candidate in fields]
-    reintegrate_enabled = reintegrate_active or (reintegrate_available and unlocked)
-    reintegration_reason = (
-        "Cancel the active Reintegrate 1-D operation."
-        if reintegrate_active else
-        "Replaces selected 1-D results using current 1-D integration settings and core request; calibration, mask, threshold, Background, geometry, and shared GI facts come from the loaded artifact, not current shared-science controls."
-        if reintegrate_enabled else
-        "Another experiment operation owns the common slot."
-        if operation_busy else
-        "Controls are locked during the active run."
-        if not unlocked else
-        "Load one stable processed Browse artifact to Reintegrate 1-D."
-    )
+    reintegrate_1d_active = reintegrate_active and reintegrate_dimension == "1d"; reintegrate_2d_active = reintegrate_active and reintegrate_dimension == "2d"
+    reintegrate_1d_enabled = reintegrate_1d_active or (reintegrate_available and unlocked); reintegrate_2d_enabled = reintegrate_2d_active or (reintegrate_available and unlocked)
+    def reintegrate_reason(label, active, enabled):
+        return f"Cancel the active Reintegrate {label} operation." if active else f"Replaces selected {label} results using current {label} integration settings and core request; calibration, mask, threshold, Background, geometry, and shared GI facts come from the loaded artifact, not current shared-science controls." if enabled else "Another experiment operation owns the common slot." if operation_busy else "Controls are locked during the active run." if not unlocked else f"Load one stable processed Browse artifact to Reintegrate {label}."
+    reintegration_reason = reintegrate_reason("1-D", reintegrate_1d_active, reintegrate_1d_enabled); reintegration_2d_reason = reintegrate_reason("2-D", reintegrate_2d_active, reintegrate_2d_enabled)
     operation_unavailable = "No vNext operation service is mounted."
     calibrate_enabled = calibration_active or (
         calibrate_available and unlocked
@@ -297,19 +291,19 @@ def project_controls(
         SectionId.PROCESSING: (
             ControlActionSpec(
                 ControlAction.REINTEGRATE_1D,
-                "Cancel Reintegrate 1-D" if reintegrate_active else "Reintegrate 1-D",
+                "Cancel Reintegrate 1-D" if reintegrate_1d_active else "Reintegrate 1-D",
                 SectionId.PROCESSING,
-                reintegrate_enabled,
+                reintegrate_1d_enabled,
                 reintegration_reason,
                 True,
             ),
             ControlActionSpec(
                 ControlAction.REINTEGRATE_2D,
-                "Reintegrate 2D",
+                "Cancel Reintegrate 2-D" if reintegrate_2d_active else "Reintegrate 2-D",
                 SectionId.PROCESSING,
-                False,
-                "Reintegrate 2-D is introduced in P3-5.",
-                False,
+                reintegrate_2d_enabled,
+                reintegration_2d_reason,
+                True,
             ),
             ControlActionSpec(
                 ControlAction.ADVANCED_PROCESSING,

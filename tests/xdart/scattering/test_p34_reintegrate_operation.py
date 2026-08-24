@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import copy, inspect, json, os, statistics, subprocess, sys, threading, time
+import copy, hashlib, inspect, json, os, statistics, subprocess, sys, threading, time
 from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +39,12 @@ def _join(slot, identity):
     worker = slot._worker; assert worker is not None; worker.join(20); assert not worker.is_alive()
     update = slot.poll(identity); assert update is not None and update.terminal is not None
     return update
+def _resolved_2d(workers=1): return {"api_version":1,"selected_plan":{"version":1,"dimension":"2d","bai_args":{},"gi_mode":"qip_qoop"},"requested_shared_science":{"version":1,"kind":"persisted_target"},"resource_policy":{"version":1,"kind":"resolve","envelope_bytes":None,"requests":{"workers":workers}}}
+def _tree_manifest(path, root):
+    from tests.core.h5sig import h5_content_signature; signature=h5_content_signature(path)
+    with __import__("h5py").File(path,"r") as handle: return {name:(type(link).__name__,getattr(link,"filename",None),getattr(link,"path",None),value) for name,value in signature.items() if (name==root or name.startswith(root+"/")) for link in (handle.get(name,getlink=True),)}
+def _audit(path):
+    with __import__("h5py").File(path,"r") as handle: return json.loads(handle["entry/reduction/config/dimension_replacement_2d"].asstr()[()])
 
 def test_ordinary_output_routes_group_target_through_one_borrowed_lock(tmp_path):
     from xdart.gui.tabs.scattering.adapters import dynamic_output
@@ -175,11 +181,11 @@ def test_parent_red_stable_loaded_browse_enables_reintegrate_1d_start(tmp_path, 
     page, store, _seed, _context = _loaded_page(tmp_path, monkeypatch, qapp)
     projected = page._project_controls(store.snapshot()).profile; actions = {a.action: a for a in projected.actions_for(SectionId.PROCESSING)}; experiment = {a.action: a for a in projected.actions_for(SectionId.EXPERIMENT)}
     assert actions[ControlAction.REINTEGRATE_1D].enabled and actions[ControlAction.REINTEGRATE_1D].label == "Reintegrate 1-D"
-    assert not actions[ControlAction.REINTEGRATE_2D].enabled and experiment[ControlAction.CALIBRATE].label == "Calibrate" and experiment[ControlAction.MAKE_MASK].label == "Make Mask"
+    assert actions[ControlAction.REINTEGRATE_2D].enabled and actions[ControlAction.REINTEGRATE_2D].label == "Reintegrate 2-D" and experiment[ControlAction.CALIBRATE].label == "Calibrate" and experiment[ControlAction.MAKE_MASK].label == "Make Mask"
     page._lifecycle._phase = RunPhase.FAILED; page._lifecycle._owners_closed = False; actions = {a.action: a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}
-    assert not actions[ControlAction.REINTEGRATE_1D].enabled
+    assert not actions[ControlAction.REINTEGRATE_1D].enabled and not actions[ControlAction.REINTEGRATE_2D].enabled
     page._lifecycle._owners_closed = True; actions = {a.action: a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}
-    assert actions[ControlAction.REINTEGRATE_1D].enabled; page.close_workspace()
+    assert actions[ControlAction.REINTEGRATE_1D].enabled and actions[ControlAction.REINTEGRATE_2D].enabled; page.close_workspace()
 def test_browse_snapshot_brackets_complete_load_and_refuses_drift(tmp_path, monkeypatch):
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest, BrowseLoadStatus
@@ -254,12 +260,18 @@ def test_reintegrate_gui_owner_import_writer_and_snapshot_frequency_census():
 
 def test_reintegrate_request_accepts_exact_dimensions_but_p34b_gui_is_1d_only(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.adapters.external_operation import OperationSlot
-    from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationIdentity
+    from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationIdentity, OperationTerminal, OperationTerminalStatus, OperationUpdate
+    from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
     from xrd_tools.session.readiness import ControlAction, SectionId; from xrd_tools.reduction import reintegrate as core
     slot=OperationSlot(); seen=[]; monkeypatch.setattr(slot,"_begin",lambda value,stamp,body: seen.append(value) or object())
     kwargs=dict(target="/target",entry="entry",expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64),expected_labels=(1,),preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}),stamp=OperationContextStamp(0))
     assert slot.begin_reintegrate(dimension="1d",**kwargs) is not None and slot.begin_reintegrate(dimension="2d",**kwargs) is not None and slot.begin_reintegrate(dimension="3d",**kwargs) is None and tuple(f.name for f in fields(type(seen[0]))) == ("target","entry","expected_target_snapshot","expected_labels","dimension","preparation_json")
-    page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); rid=OperationIdentity(77); page._operation_slot._identity=rid; page._reintegrate_identity=rid; captured=page._context_controller.capture_reintegrate_browse(); assert captured is not None and page._context_controller.invalidate_reintegrate_browse(*captured); actions={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}; assert actions[ControlAction.REINTEGRATE_1D].enabled and actions[ControlAction.REINTEGRATE_1D].label=="Cancel Reintegrate 1-D" and not actions[ControlAction.REINTEGRATE_2D].enabled and 'if command.value == "reintegrate_2d"' not in inspect.getsource(page._handle_shell_command); page._operation_slot._identity=None; page._reintegrate_identity=None; page.close_workspace()
+    page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); calls=[]; monkeypatch.setattr(page,"_reintegrate_action",calls.append); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_1d")); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_2d")); assert calls==["1d","2d"]
+    rid=OperationIdentity(77); page._operation_slot._identity=rid; page._reintegrate_identity=rid; captured=page._context_controller.capture_reintegrate_browse(); assert captured is not None and page._context_controller.invalidate_reintegrate_browse(*captured)
+    for dimension,matching,other in (("1d",ControlAction.REINTEGRATE_1D,ControlAction.REINTEGRATE_2D),("2d",ControlAction.REINTEGRATE_2D,ControlAction.REINTEGRATE_1D)):
+        page._reintegrate_dimension=dimension; actions={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}; assert actions[matching].enabled and actions[matching].label==f"Cancel Reintegrate {dimension[0]}-D" and not actions[other].enabled
+    page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_1d")); assert calls==["1d","2d"]; page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_2d")); assert calls==["1d","2d","2d"]
+    assert page._consume_reintegrate_update(OperationUpdate(rid,terminal=OperationTerminal(rid,OperationTerminalStatus.CANCELLED))) and all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension")); page._operation_slot._identity=None; page.close_workspace()
 
 def test_persisted_target_resolves_after_authenticated_inventory_and_matches_explicit_recipe(tmp_path, monkeypatch):
     from xrd_tools.io.output_transaction import capture_target_snapshot; from xrd_tools.reduction import ReintegratePlan, reintegrate as module
@@ -272,11 +284,51 @@ def test_persisted_target_resolves_after_authenticated_inventory_and_matches_exp
 
 def test_gui_persisted_science_disclosure_and_no_shared_control_override(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.operation_values import OperationIdentity
-    page,store,seeded,_context=_loaded_page(tmp_path,monkeypatch,qapp); plain=page._reintegrate_1d_preparation(store.snapshot().thaw()); assert plain["selected_plan"]["bai_args"]=={}; candidate=store.snapshot().thaw(); candidate.bai_1d_args={"radial_range":(.1,1.)}; candidate.max_cores=2; store.commit(candidate,expected_revision=store.revision); captured={}
-    monkeypatch.setattr(page._operation_slot,"begin_reintegrate",lambda **kw: captured.update(kw) or OperationIdentity(91)); page._reintegrate_1d_action()
+    page,store,seeded,_context=_loaded_page(tmp_path,monkeypatch,qapp); plain=page._reintegrate_preparation(store.snapshot().thaw(),"1d"); assert plain["selected_plan"]["bai_args"]=={}; candidate=store.snapshot().thaw(); candidate.bai_1d_args={"radial_range":(.1,1.)}; candidate.max_cores=2; store.commit(candidate,expected_revision=store.revision); captured={}
+    monkeypatch.setattr(page._operation_slot,"begin_reintegrate",lambda **kw: captured.update(kw) or OperationIdentity(91)); page._reintegrate_action("1d")
     prep=captured["preparation_values"]; assert prep["requested_shared_science"]=={"version":1,"kind":"persisted_target"} and prep["selected_plan"]["bai_args"]=={"radial_range":[.1,1.]} and prep["selected_plan"]["gi_mode"]==candidate.gi.mode_1d and prep["resource_policy"]["requests"]=={"workers":2}
     shown=json.dumps(prep); assert seeded.preparation["requested_shared_science"]["accepted_scientific_assets"]["poni_sha256"] not in shown and "loaded artifact" in page._notice_text and captured["dimension"]=="1d"; page._reintegrate_identity=None; page.close_workspace()
 
+def test_parent_red_stable_loaded_browse_enables_reintegrate_2d_start(tmp_path, monkeypatch, qapp):
+    from xrd_tools.session.readiness import ControlAction, SectionId; page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); action={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}[ControlAction.REINTEGRATE_2D]; assert action.enabled and action.label=="Reintegrate 2-D"; page.close_workspace()
+def test_reintegrate_2d_uses_exact_existing_worker_builder_and_runner(tmp_path, monkeypatch, qapp):
+    from xdart.gui.tabs.scattering.adapters import external_operation as module; from xdart.gui.tabs.scattering.operation_values import OperationTerminalStatus; from xrd_tools.reduction import ReintegrateResult, reintegrate as core
+    page,_store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); seen=[]; plan=SimpleNamespace(operation_identity="a"*64); result=core._value(ReintegrateResult,"COMMITTED",(2,),(2,),(),(),"b"*64,"a"*64,"c"*64,None)
+    build=lambda target,**kw:(seen.append(("build",threading.current_thread().name,target,kw)),plan)[1]; run=lambda got,**kw:(seen.append(("run",got,kw)),kw["progress_cb"](core._progress(plan.operation_identity,"write",1,1,1)),result)[2]
+    monkeypatch.setattr(module.ReintegratePlan,"from_artifact",staticmethod(build)); monkeypatch.setattr(module,"run_reintegrate",run); page._reintegrate_action("2d"); identity=page._reintegrate_identity; assert identity is not None and page._reintegrate_dimension=="2d"; update=_join(page._operation_slot,identity)
+    assert update.terminal.status is OperationTerminalStatus.RETURNED and [row[0] for row in seen]==["build","run"] and seen[0][1].startswith("scattering-operation-") and seen[0][3]["dimension"]=="2d" and seen[1][1] is plan and seen[0][3]["cancel_token"] is seen[1][2]["cancel_token"] and update.progress.identity is identity; assert page._consume_reintegrate_update(update) and page._reintegrate_dimension is None; page.close_workspace()
+def test_direct_and_gui_scheduled_2d_match_after_reopen_and_preserve_1d(tmp_path, monkeypatch, qapp):
+    from xdart.gui.tabs.scattering.adapters import external_operation; from xdart.gui.tabs.scattering.operation_values import OperationTerminalStatus; from xrd_tools.io.output_transaction import StreamTerminal, capture_target_snapshot; from xrd_tools.reduction import ReintegratePlan, run_reintegrate, reintegrate as module
+    seed=_seed_existing(tmp_path,labels=(0,1,2),append=True); direct_path=tmp_path/"direct.nxs"; gui_path=tmp_path/"gui.nxs"; direct_path.write_bytes(seed.target.read_bytes()); gui_path.write_bytes(seed.target.read_bytes()); before=(_tree_manifest(direct_path,"entry/integrated_1d"),_tree_manifest(gui_path,"entry/integrated_1d")); request=_resolved_2d()
+    direct_plan=ReintegratePlan.from_artifact(direct_path,entry="entry",dimension="2d",preparation=copy.deepcopy(request),expected_target_snapshot=capture_target_snapshot(direct_path),expected_labels=seed.labels); plans=[]; real_build=ReintegratePlan.from_artifact
+    def build(target,**kw): plans.append((copy.deepcopy(kw["preparation"]),real_build(target,**kw))); return plans[-1][1]
+    bound=[]; real_bind=module._ReintegrateFrameSource.bind_allocation
+    def bind(owner,allocation): bound.append((owner.plan.resource_allocation,allocation)); return real_bind(owner,allocation)
+    monkeypatch.setattr(external_operation.ReintegratePlan,"from_artifact",staticmethod(build)); monkeypatch.setattr(module._ReintegrateFrameSource,"bind_allocation",bind); _stub_integrators(monkeypatch); direct=run_reintegrate(direct_plan); gui_seed=copy.copy(seed); gui_seed.target=gui_path; page,_store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp,seed=gui_seed); page._reintegrate_action("2d"); identity=page._reintegrate_identity; update=_join(page._operation_slot,identity); gui=update.terminal.payload; assert page._consume_reintegrate_update(update)
+    gui_plan=plans[0][1]; da,ga=direct_plan.resource_allocation,gui_plan.resource_allocation; canonical=lambda value:json.dumps(value,sort_keys=True,separators=(",",":"),allow_nan=False).encode(); assert canonical(plans[0][0])==canonical(request) and da is not ga and da==ga and da.origin==ga.origin=="automatic" and da.requirements is not ga.requirements and da.requirements==ga.requirements and len(bound)==2 and all(left is right for left,right in bound) and {id(left) for left,_right in bound}=={id(da),id(ga)}
+    assert update.terminal.status is OperationTerminalStatus.RETURNED and (direct.input_labels,direct.committed_labels,direct.publication_dropped_labels)==(gui.input_labels,gui.committed_labels,gui.publication_dropped_labels)==(seed.labels,seed.labels,()) and module._plain(direct_plan.selected_plan)==module._plain(gui_plan.selected_plan) and module._plain(direct_plan.requested_shared_science)==module._plain(gui_plan.requested_shared_science) and direct_plan.rollback_policy==gui_plan.rollback_policy=="ROLLBACK_ON_STOP" and direct_plan.session_policy.flush==gui_plan.session_policy.flush and direct.science_identity==gui.science_identity and direct.operation_identity!=gui.operation_identity
+    assert _tree_manifest(direct_path,"entry/integrated_2d")==_tree_manifest(gui_path,"entry/integrated_2d") and _tree_manifest(direct_path,"entry/integrated_1d")==before[0]==before[1]==_tree_manifest(gui_path,"entry/integrated_1d"); audits=(_audit(direct_path),_audit(gui_path)); results=(direct,gui); plans_only=(direct_plan,gui_plan)
+    for audit,result,plan in zip(audits,results,plans_only): assert audit["operation_identity"]==plan.operation_identity==result.operation_identity and result.audit_identity==hashlib.sha256(json.dumps(audit,sort_keys=True,separators=(",",":")).encode()).hexdigest() and audit["append_lineage_action"]=="preserved_append_disabled" and len(audit["append_lineage_sha256"])==64 and audit["selected_gi_mode"] is None and type(result.commit_identity) is StreamTerminal
+    independent=[dict(value) for value in audits]; [value.pop("operation_identity") for value in independent]; assert independent[0]==independent[1] and direct.audit_identity!=gui.audit_identity and direct.commit_identity!=gui.commit_identity and direct.commit_identity.target!=gui.commit_identity.target; page.close_workspace()
+def test_reintegrate_dimensions_share_one_slot_cancel_terminal_and_reload(tmp_path, monkeypatch, qapp):
+    from xdart.gui.tabs.scattering.adapters import external_operation as module; from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminalStatus; from xrd_tools.reduction.reintegrate import ReintegrateCancelled; from xrd_tools.session.readiness import ControlAction, SectionId
+    page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); entered=threading.Event(); tokens=[]
+    def cancelled(_target,**kw): tokens.append(kw["cancel_token"]); entered.set(); kw["cancel_token"].wait(2); raise ReintegrateCancelled()
+    monkeypatch.setattr(module.ReintegratePlan,"from_artifact",staticmethod(cancelled)); page._reintegrate_action("2d"); identity=page._reintegrate_identity; request=page._reintegrate_request; target=page._reintegrate_target; reloads=[]; real_reload=page._context_controller.reload_reintegrate_browse; monkeypatch.setattr(page._context_controller,"reload_reintegrate_browse",lambda got_request,got_target:(reloads.append((got_request,got_target)),real_reload(got_request,got_target))[1]); assert entered.wait(2) and page._operation_slot.owned and page._reintegrate_dimension=="2d"
+    actions={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}; assert actions[ControlAction.REINTEGRATE_2D].enabled and actions[ControlAction.REINTEGRATE_2D].label=="Cancel Reintegrate 2-D" and not actions[ControlAction.REINTEGRATE_1D].enabled; page._reintegrate_action("1d"); assert not tokens[0].is_set(); page._reintegrate_action("2d"); assert tokens[0].is_set()
+    update=_join(page._operation_slot,identity); assert update.terminal.status is OperationTerminalStatus.CANCELLED and page._consume_reintegrate_update(update) and reloads==[(request,target)] and all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension")) and page._context_controller._browse_request is not request
+    outcome=_wait(page._context_controller.poll_browse); assert outcome is not None; page._reintegrate_dimension="2d"; monkeypatch.setattr(page._operation_slot,"begin_reintegrate",lambda **_kw:None); page._reintegrate_action("2d"); assert all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension"))
+    foreign=OperationIdentity(101); page._operation_slot._identity=foreign; actions={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}; assert not actions[ControlAction.REINTEGRATE_1D].enabled and not actions[ControlAction.REINTEGRATE_2D].enabled; page._operation_slot._identity=None; page._reintegrate_identity=foreign; page._reintegrate_request=object(); page._reintegrate_target="/target"; page._reintegrate_dimension="1d"; page.close_workspace(); assert all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension"))
+def test_reintegrate_2d_uses_only_accepted_runtime_route_and_keeps_gui_result_free(tmp_path, monkeypatch, qapp):
+    from xdart.gui.tabs.scattering import page as page_module; from xdart.gui.tabs.scattering.adapters import external_operation; from xrd_tools.io.output_transaction import StreamTerminal; from xrd_tools.reduction import ReintegrateResult; from xrd_tools.session.policy import SessionResourceAllocation
+    seed=_seed_existing(tmp_path,name="g05"); page,_store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp,seed=seed); before={path.name for path in seed.target.parent.iterdir()}; calls=[]
+    def forbidden(*_a,**_k): raise AssertionError("forbidden GUI persistence route")
+    for name in ("swap_reintegrated_groups","finalize_reintegrated_groups","write_integrated_stack","NexusSink","NexusRecordWriter","REINTEGRATE_SHADOW_SUFFIX"): monkeypatch.setattr(page_module,name,forbidden,raising=False)
+    real_build,real_run=external_operation.ReintegratePlan.from_artifact,external_operation.run_reintegrate
+    def build(*args,**kwargs): calls.append("build"); return real_build(*args,**kwargs)
+    def run(*args,**kwargs): calls.append("run"); return real_run(*args,**kwargs)
+    monkeypatch.setattr(external_operation.ReintegratePlan,"from_artifact",staticmethod(build)); monkeypatch.setattr(external_operation,"run_reintegrate",run); _stub_integrators(monkeypatch); page._reintegrate_action("2d"); update=_join(page._operation_slot,page._reintegrate_identity); result=update.terminal.payload; assert page._consume_reintegrate_update(update)
+    assert calls==["build","run"] and type(result) is ReintegrateResult and type(result.commit_identity) is StreamTerminal and before=={path.name for path in seed.target.parent.iterdir()} and not any(type(value) in {ReintegrateResult,SessionResourceAllocation} for value in vars(page).values()) and not any("__reint" in path.name for path in seed.target.parent.iterdir()); page.close_workspace()
 def test_p34b_production_browse_reload_performance_probe(monkeypatch):
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest, BrowseLoadStatus
