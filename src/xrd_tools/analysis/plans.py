@@ -1004,6 +1004,8 @@ def run_roi_signals(
     total = len(all_frames)
     cancelled = False
     static_mask = None          # resolved lazily on the first frame (uniform shape)
+    mask_resolution_attempted = False
+    mask_resolved = False
 
     for done, f in enumerate(all_frames, start=1):
         if should_cancel is not None and should_cancel():
@@ -1019,8 +1021,10 @@ def run_roi_signals(
                 row[n] = float("nan")
             no_raw.append(f)
         else:
-            if mask is not None and static_mask is None:
+            if mask is not None and not mask_resolution_attempted:
+                mask_resolution_attempted = True
                 static_mask = _resolve_static_mask(mask, img.shape)
+                mask_resolved = static_mask is not None
             frame_mask = invalid_pixel_mask(img, mask_saturation=mask_saturation)
             if static_mask is not None and static_mask.shape == img.shape:
                 frame_mask = frame_mask | static_mask
@@ -1050,7 +1054,12 @@ def run_roi_signals(
         series={n: np.asarray(v, dtype=float) for n, v in series.items()},
         frames=np.asarray(done_frames),
         valid_counts={n: np.asarray(v) for n, v in counts.items()},
-        diagnostics={"no_raw_frames": no_raw, "cancelled": cancelled},
+        diagnostics={
+            "no_raw_frames": no_raw,
+            "cancelled": cancelled,
+            "mask_resolution_attempted": mask_resolution_attempted,
+            "mask_resolved": mask_resolved,
+        },
     )
     return AnalysisResult(
         kind="roi_stats", payload=payload,
