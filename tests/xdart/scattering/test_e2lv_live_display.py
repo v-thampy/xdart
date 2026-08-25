@@ -188,7 +188,6 @@ def _accepted_admission(
         *,
         cancelled,
         session_owner,
-        targets_owner,
     ) -> AdmissionReceipt:
         del session_owner
         assert not cancelled()
@@ -227,7 +226,6 @@ def _accepted_admission(
             ),
             motor_names=(),
         )
-        targets_owner((target,))
         return AdmissionReceipt(
             capture.request_id,
             capture.intent_snapshot.revision,
