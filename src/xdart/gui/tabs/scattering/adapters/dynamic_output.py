@@ -340,7 +340,7 @@ class HeavyResidencyFact:
 @dataclass(frozen=True, slots=True)
 class _PreparedAdmission:
     owner: object; scan: object; plan: object; item: PlannedOutput
-    provisional: AdmittedOutput; effective: AdmittedOutput; stop_signal: Event; context: tuple[object, ...]; resources: tuple[object, ...]; identity: object; consumed: bool = False
+    provisional: AdmittedOutput; effective: AdmittedOutput; stop_signal: Event; context: tuple[object, ...]; resources: tuple[object, ...] | None; identity: object; consumed: bool = False; dormant_noop: bool = False
 def _heavy_resolution_source(bound: int | None, env: dict[str, str]) -> str:
     if bound is not None: return "ui"
     raw = env.get("XDART_HEAVY_WINDOW")
@@ -837,9 +837,14 @@ class DynamicOutputAdapter:
 
     def background_binding(self, label: int): return None if self._current is None else next((value for value in self._current["background_bindings"] if value[0] == int(label)), None)
     def background_admission_context(self):
-        return (self._current["item"], self._current["policy"].allocation.requirements) if self._current is not None else (_ for _ in ()).throw(RuntimeError("Background admission lost its active graph"))
+        graph = self._current
+        if graph is None or graph.get("policy") is None:
+            raise RuntimeError("Background admission lost its active graph")
+        return graph["item"], graph["policy"].allocation.requirements
     def admit_background_binding(self, binding):
         graph = self._current if self._current is not None else (_ for _ in ()).throw(RuntimeError("Background binding lost its active graph"))
+        if graph.get("policy") is None:
+            raise RuntimeError("Background binding lost its active graph")
         limit = graph["policy"].allocation.requirements.background_binding_bytes; merged = _merge_background_binding(graph["background_bindings"], binding, limit=limit); graph["background_bindings"] = merged; return next(value for value in merged if value[0] == binding[0])
 
     def predecessor_owner(self, item: PlannedOutput):
@@ -917,7 +922,23 @@ class DynamicOutputAdapter:
             raise ValueError("unsafe unfunded staging requires one finalized descriptor-complete Eiger master")
         _choice, heavy = heavy_residency_choice(self.configuration.run_options)
         key = _target_key(item.target); graph = self._graphs.get(key)
-        dormant = self._current if graph is None and self._current is not None and self._current.get("dormant") and self._current["target"] == key and self._current["lineage"] == _stable_lineage(item) else None; authority = graph if graph is not None else dormant; accepted = None if authority is None else authority["policy"].allocation
+        dormant_noop = (
+            graph is None
+            and self.configuration.output_mode == "Append"
+            and not self.configuration.live_mode
+            and self.configuration.background.mode == "None"
+            and not decision.labels
+        )
+        if dormant_noop:
+            effective = replace(decision, background_bindings=())
+            prepared = _PreparedAdmission(
+                self, scan, plan, item, decision, effective, stop_signal,
+                (pipeline_v2, pipeline, diagnostics, env, unsafe, heavy),
+                None, None, dormant_noop=True,
+            )
+            object.__setattr__(prepared, "identity", prepared)
+            return prepared
+        dormant = self._current if graph is None and self._current is not None and self._current.get("dormant") and self._current.get("policy") is not None and self._current["target"] == key and self._current["lineage"] == _stable_lineage(item) else None; authority = graph if graph is not None else dormant; accepted = None if authority is None else authority["policy"].allocation
         policy, layout, rows, ceiling, first = _light_policy_layout(
             self.configuration, plan, item, scan, decision.labels, heavy_request=heavy,
             reduction_inflight=(pipeline_v2.reduction_inflight if pipeline_v2 else
@@ -1002,7 +1023,24 @@ class DynamicOutputAdapter:
             raise ValueError("planned output target differs from its canonical group target")
         pipeline_v2, pipeline, output_diagnostics, resource_env, \
             unsafe_unfunded_staging, heavy_request = preparation.context
-        policy, layout, requested_rows, ceiling, first_write_frame = preparation.resources
+        if preparation.dormant_noop:
+            if preparation.resources is not None:
+                raise RuntimeError("dormant Append no-op preparation is invalid")
+            policy = layout = first_write_frame = None
+            requested_rows = ceiling = 0
+            if (
+                self.configuration.output_mode != "Append"
+                or self.configuration.live_mode
+                or self.configuration.background.mode != "None"
+                or preparation.provisional.labels
+                or decision.labels
+                or decision.background_bindings
+            ):
+                raise RuntimeError("dormant Append no-op preparation changed")
+        else:
+            if preparation.resources is None:
+                raise RuntimeError("dynamic admission preparation lost resources")
+            policy, layout, requested_rows, ceiling, first_write_frame = preparation.resources
         if type(run_provenance) is not dict:
             raise TypeError("dynamic output requires exact run provenance")
         mount_values = (
@@ -1035,6 +1073,8 @@ class DynamicOutputAdapter:
         if tuple(int(frame.index) for frame in scan.frames) != labels:
             raise ValueError("dynamic output requires the complete exact Scan")
         graph = self._graphs.get(key)
+        if preparation.dormant_noop and graph is not None:
+            raise RuntimeError("dormant Append no-op acquired an active graph")
         if graph is not None:
             if cancelled():
                 raise RuntimeError("admission cancelled")
@@ -1115,6 +1155,13 @@ class DynamicOutputAdapter:
             self._pending_preflights.append(preflight)
             preflight_snapshot = preflight.snapshot
             persisted_prefix_labels = tuple(preflight_snapshot.skip_labels)
+            if (
+                preparation.dormant_noop
+                and preflight_snapshot.disposition is not AppendDisposition.SKIP
+            ):
+                raise RuntimeError(
+                    "dormant Append no-op changed under the locked preflight"
+                )
             if self.configuration.background.mode != "None" and persisted_prefix_labels:
                 from xrd_tools.io.record_writer import _validate_persisted_background_bindings
                 _validate_persisted_background_bindings(target, decision.background_bindings, persisted_prefix_labels)

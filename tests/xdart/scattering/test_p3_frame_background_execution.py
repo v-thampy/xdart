@@ -113,6 +113,141 @@ def test_batch_prequalifies_array_free_map_before_effects(monkeypatch, tmp_path:
     assert route_source.index("prepare_admission(") < route_source.index("run.display.configure(")
 
 
+def test_exact_append_noop_defers_policy_to_locked_skip(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.io import (
+        AppendDisposition,
+        AppendPreflightState,
+    )
+
+    configuration, scan, plan, item, decision = _composition(
+        tmp_path,
+        count=1,
+        output_mode="Append",
+        processing_mode="Int 1D",
+    )
+    configuration = replace(
+        configuration,
+        background=FrameBackgroundPlan(),
+    )
+    decision = replace(decision, labels=())
+    calls = SimpleNamespace(layout=0, qualify=0, sink=0, session=0)
+
+    def unexpected_layout(*args, **kwargs):
+        calls.layout += 1
+        raise AssertionError("exact Append no-op sized source resources")
+
+    def unexpected_qualify(*args, **kwargs):
+        calls.qualify += 1
+        raise AssertionError("exact Append no-op qualified Background")
+
+    monkeypatch.setattr(
+        dynamic_output,
+        "_light_policy_layout",
+        unexpected_layout,
+    )
+
+    class Preflight:
+        def __init__(self, disposition):
+            self.disposition = disposition
+            self.state = AppendPreflightState.RESERVED
+
+        @property
+        def snapshot(self):
+            return SimpleNamespace(
+                disposition=self.disposition,
+                skip_labels=(1,) if self.disposition is AppendDisposition.SKIP else (),
+                write_labels=() if self.disposition is AppendDisposition.SKIP else (1,),
+                state=self.state,
+            )
+
+        def complete_noop(self):
+            assert self.disposition is AppendDisposition.SKIP
+            self.state = AppendPreflightState.NOOP
+            return self.snapshot
+
+        def abort(self):
+            self.state = AppendPreflightState.ABORTED
+            return self.snapshot
+
+        def retry_cleanup(self):
+            return self.snapshot
+
+    dispositions = iter((AppendDisposition.SKIP, AppendDisposition.WRITE))
+    preflights = []
+
+    def preflight(*args, **kwargs):
+        value = Preflight(next(dispositions))
+        preflights.append(value)
+        return value
+
+    monkeypatch.setattr(dynamic_output, "prepare_append_preflight", preflight)
+    monkeypatch.setattr(
+        dynamic_output,
+        "NexusSink",
+        lambda *args, **kwargs: (
+            setattr(calls, "sink", calls.sink + 1),
+            (_ for _ in ()).throw(AssertionError("no-op opened a Nexus sink")),
+        )[1],
+    )
+    monkeypatch.setattr(
+        dynamic_output,
+        "open_headless_scan_session",
+        lambda *args, **kwargs: (
+            setattr(calls, "session", calls.session + 1),
+            (_ for _ in ()).throw(AssertionError("no-op opened a session")),
+        )[1],
+    )
+
+    adapter = dynamic_output.DynamicOutputAdapter(configuration)
+    stop = Event()
+    preparation = adapter.prepare_admission(
+        scan,
+        plan,
+        item,
+        decision,
+        stop,
+        qualify=unexpected_qualify,
+    )
+    assert preparation.dormant_noop and preparation.resources is None
+    assert preparation.effective.background_bindings == ()
+    assert calls.layout == calls.qualify == 0
+    active, created = adapter.activate(
+        preparation,
+        record_store=object(),
+        run_provenance=_provenance(configuration),
+    )
+    assert active is None and not created
+    assert adapter.persisted_prefix_labels == (1,)
+    assert preflights[0].state is AppendPreflightState.NOOP
+    with __import__("pytest").raises(RuntimeError, match="active graph"):
+        adapter.background_admission_context()
+    with __import__("pytest").raises(RuntimeError, match="active graph"):
+        adapter.admit_background_binding(_binding())
+
+    second = adapter.prepare_admission(
+        scan,
+        plan,
+        item,
+        decision,
+        stop,
+        qualify=unexpected_qualify,
+    )
+    assert second.dormant_noop and second.resources is None
+    with __import__("pytest").raises(RuntimeError, match="locked preflight"):
+        adapter.activate(
+            second,
+            record_store=object(),
+            run_provenance=_provenance(configuration),
+        )
+    assert preflights[1].state is AppendPreflightState.ABORTED
+    assert adapter._pending_preflights == []
+    assert calls.layout == calls.qualify == calls.sink == calls.session == 0
+
+
 def test_all_routes_use_one_pre_submit_resolver_outside_command_lock(monkeypatch, tmp_path: Path) -> None:
     from xdart.gui.tabs.scattering.adapters import dynamic_output, run_executor as module
     event = Event(); seen = []
