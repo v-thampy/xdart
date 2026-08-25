@@ -16,6 +16,7 @@ class ToolsView(QtWidgets.QFrame):
         ("∧ Peak Fitting", "peak_fitting"),
         ("≈ Phase Fitting", "phase_fitting"),
         ("▤ Plot Metadata", "plot_metadata"),
+        ("▣ ROI Statistics", "roi_statistics"),
     )
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:

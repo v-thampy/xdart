@@ -55,8 +55,11 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         selected frame, or ``None``.  Called on :meth:`refresh_pattern`.
     """
 
-    def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None):
+    def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None,
+                 vnext_submit=None):
         super().__init__(parent)
+        self._vnext = callable(vnext_submit)
+        self._vnext_submit = vnext_submit
         self._analysis_context = analysis_context
         self._provider = (
             analysis_context.current_pattern_tuple
@@ -74,6 +77,11 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.setWindowTitle("Phase Fitting")
         self.resize(600, 860)
         self._build_ui()
+        if self._vnext:
+            self.texture_combo.setCurrentIndex(0); self.texture_combo.setEnabled(False)
+            self.texture_combo.setToolTip("P3_7_PHASE_TEXTURE_UNAVAILABLE")
+            self.batch_btn.setEnabled(False)
+            self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
@@ -214,6 +222,25 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
 
     # ---- phases (CIF) ---------------------------------------------------
     def _add_cif(self):
+        if self._vnext:
+            if len(self._phases) >= 8:
+                self.status.setText("PHASE_COUNT_LIMIT_EXCEEDED"); return
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Choose CIF", "", "CIF files (*.cif);;All files (*)")
+            if not path:
+                return
+            if any(path == existing for existing, _name in self._phases):
+                self.status.setText("Duplicate CIF path ignored."); return
+            base = os.path.splitext(os.path.basename(path))[0] or "phase"
+            if len(base.encode("utf-8")) > 256:
+                self.status.setText("PHASE_NAME_LIMIT_EXCEEDED"); return
+            used = {name for _path, name in self._phases}; name = base; suffix = 2
+            while name in used:
+                name = f"{base}_{suffix}"; suffix += 1
+            if len(name.encode("utf-8")) > 256:
+                self.status.setText("PHASE_NAME_LIMIT_EXCEEDED"); return
+            self._phases.append((path, name)); self.cif_list.addItem(name)
+            return
         try:
             from xrd_tools.analysis.phase import PhaseModel  # noqa: F401
             import pymatgen  # noqa: F401  CIF parsing backend
@@ -264,6 +291,9 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
 
     def refresh_pattern(self):
         """Re-grab the active frame's pattern, draw it, reset the fit/trend."""
+        if self._vnext:
+            self._vnext_submit("reload", None)
+            return
         self._clear_fit()
         self.reset_param_trend()
         data = None
@@ -356,7 +386,26 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         inp = AnalysisInput(label="current", x=x, y=y, x_unit=self._x_label)
         return inp, PhaseFitAnalyzer(plan, phases=phases)
 
+    def vnext_fit_values(self):
+        try: lattice = float(self.lattice_pct.text()) / 100.0
+        except ValueError: lattice = 0.05
+        try: minimum = float(self.min_intensity.text())
+        except ValueError: minimum = 5.0
+        return {
+            "cif_paths": tuple(path for path, _name in self._phases),
+            "phase_names": tuple(name for _path, name in self._phases),
+            "expected_hashes": (None,) * len(self._phases),
+            "prefit_background": _BACKGROUNDS[self.bkg_combo.currentIndex()][1],
+            "phase_profile": _PROFILES[self.profile_combo.currentIndex()][1],
+            "lattice_pct": lattice, "min_intensity": minimum,
+            "max_nfev": (int(self.max_nfev.value())
+                          if self.max_nfev.value() > 0 else None),
+        }
+
     def _do_fit(self):
+        if self._vnext:
+            self._vnext_submit("fit", self.vnext_fit_values())
+            return
         if self._x is None or self._y is None:
             self.refresh_pattern()
             if self._x is None:
@@ -373,6 +422,50 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
                 f"Phase fit failed: {outcome.message if outcome else 'no result'}")
             return
         self._draw_outcome(outcome)
+
+    def set_vnext_trace(self, trace):
+        self._clear_fit(); self._show_pattern(
+            trace.axis, trace.intensity, trace.axis_unit or trace.label)
+        self.status.setText("Displayed trace captured. Add CIFs and click Fit.")
+
+    def set_vnext_result(self, result):
+        self.plot.clear()
+        self.plot.plot(self._x, self._y, pen=pg.mkPen((210, 210, 220), width=1),
+                       name="data")
+        fit_x = self._x[np.isfinite(self._x) & np.isfinite(self._y)]
+        from xdart.gui.tabs.scattering.analysis_mount import (
+            render_fit_projection, render_table_rows)
+        render_fit_projection(self.plot, self.resid_plot, fit_x, result,
+            tuple((receipt.phase_name, values) for receipt, values in zip(
+                result.cif_receipts, result.phase_components, strict=True)))
+        for index, receipt in enumerate(result.cif_receipts):
+            item = self.cif_list.item(index)
+            if item is not None:
+                item.setText(receipt.phase_name)
+                item.setToolTip("\n".join(map(str, (receipt.lexical_path,
+                    receipt.resolved_path, receipt.byte_count, receipt.sha256,
+                    receipt.expected_sha256, receipt.pre_state,
+                    receipt.post_state, receipt.receipt_fingerprint))))
+        lattice = dict(result.lattice_parameters)
+        rows = [(name, value, ", ".join(f"{key}={number}"
+                 for key, number in lattice.get(name, ())), "phase", "")
+                for name, value in result.phase_fractions]
+        rows += [(name, value, "", "parameter", error) for name, value, error
+                 in zip(result.parameter_names, result.parameter_values,
+                        result.parameter_stderr, strict=True)]
+        render_table_rows(self.table,
+            ["Name", "Value", "Lattice", "Kind", "StdErr"], rows)
+        detail = "; ".join(result.diagnostics)
+        self.status.setText((result.message or result.code) +
+            (f"; wavelength={result.wavelength_angstrom}" if result.wavelength_angstrom else "") +
+            (f"; {detail}" if detail else ""))
+        self.status.setToolTip("\n".join((result.plan_fingerprint,
+            result.policy_fingerprint, result.result_fingerprint)))
+
+    def closeEvent(self, event):
+        if self._vnext:
+            self._vnext_submit("close", None)
+        super().closeEvent(event)
 
     def _draw_outcome(self, outcome, auto=False):
         overlay = outcome.overlay

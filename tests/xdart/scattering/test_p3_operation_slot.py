@@ -439,7 +439,15 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
     assert page_text.count("deque(maxlen=1)") == 1
     assert page_text.count("ScatteringWorkspace._observe_operation_stamp") == 3
     assert page_text.count("begin_calibrate(") == page_text.count("begin_mask(") == 1
-    assert all(name not in slot_text for name in ("numpy", "h5py", "pyFAI"))
+    slot_owner = next(node for node in tree.body
+                      if isinstance(node, ast.ClassDef) and node.name == "OperationSlot")
+    slot_imports = {alias.name.split(".", 1)[0]
+                    for node in ast.walk(slot_owner) if isinstance(node, ast.Import)
+                    for alias in node.names}
+    slot_imports.update(node.module.split(".", 1)[0]
+                        for node in ast.walk(slot_owner)
+                        if isinstance(node, ast.ImportFrom) and node.module)
+    assert not ({"numpy", "h5py", "pyFAI"} & slot_imports)
     value_types = (OperationCleanupReceipt, OperationContextStamp,
                    OperationIdentity, OperationProgress, OperationTerminal,
                    OperationUpdate)

@@ -60,8 +60,11 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         fits what the user is looking at.
     """
 
-    def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None):
+    def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None,
+                 vnext_submit=None):
         super().__init__(parent)
+        self._vnext = callable(vnext_submit)
+        self._vnext_submit = vnext_submit
         self._analysis_context = analysis_context
         self._provider = (
             analysis_context.current_pattern_tuple
@@ -86,6 +89,11 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.setWindowTitle("Peak Fitting")
         self.resize(560, 820)
         self._build_ui()
+        if self._vnext:
+            self.live_check.setChecked(False); self.live_check.setEnabled(False)
+            self.live_check.setToolTip("P3_7_LIVE_FITTING_UNAVAILABLE")
+            self.batch_btn.setEnabled(False)
+            self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
@@ -345,6 +353,9 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
 
     def refresh_pattern(self):
         """Re-grab the active frame's pattern, draw the raw data, reset the fit."""
+        if self._vnext:
+            self._vnext_submit("reload", None)
+            return
         self._clear_fit()
         # Reload starts a fresh vs-frame trend — but NOT while a live run is
         # accumulating (don't discard the user's live trend on a manual Reload).
@@ -567,7 +578,29 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             out["fit_kwargs"] = {"max_nfev": int(nfev)}
         return out
 
+    def vnext_fit_values(self):
+        bounds = self._fit_range() if self._x is not None else None
+        centers = tuple(self._manual_centers(*bounds) or ()) if bounds else ()
+        smin, smax = self._line_float(self.adv_sigma_min), self._line_float(self.adv_sigma_max)
+        fraction = self._line_float(self.adv_fraction)
+        return {
+            "selection_mode": "auto" if self.auto_check.isChecked() else "count",
+            "n_peaks": len(centers) or int(self.npeaks_spin.value()),
+            "model": _MODELS[self.model_combo.currentIndex()][1],
+            "background": _BACKGROUNDS[self.bkg_combo.currentIndex()][1],
+            "fit_bounds": bounds, "manual_centers": centers,
+            "sigma_init": self._line_float(self.adv_sigma_init),
+            "sigma_bounds": ((smin, smax) if smin is not None and smax is not None else None),
+            "center_bounds_delta": self._line_float(self.adv_center_delta),
+            "fraction_init": 0.5 if fraction is None else fraction,
+            "max_nfev": (int(self.adv_maxfev.value())
+                          if self.adv_maxfev.value() > 0 else None),
+        }
+
     def _do_fit(self):
+        if self._vnext:
+            self._vnext_submit("fit", self.vnext_fit_values())
+            return
         if self._x is None or self._y is None:
             self.refresh_pattern()
             if self._x is None:
@@ -582,6 +615,36 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
                 f"Fit failed: {outcome.message if outcome else 'no result'}")
             return
         self._draw_outcome(outcome, auto=self.auto_check.isChecked())
+
+    def set_vnext_trace(self, trace):
+        self._clear_fit(); self._show_pattern(
+            trace.axis, trace.intensity, trace.axis_unit or trace.label)
+        self.status.setText("Displayed trace captured. Click Fit.")
+
+    def set_vnext_result(self, result):
+        self.plot.clear()
+        self.plot.plot(self._x, self._y, pen=None, symbol="o", symbolSize=4,
+                       symbolBrush=(210, 210, 220), name="data")
+        mask = np.isfinite(self._x) & np.isfinite(self._y)
+        bounds = self.vnext_fit_values()["fit_bounds"]
+        if bounds is not None: mask &= (self._x >= bounds[0]) & (self._x <= bounds[1])
+        fit_x = self._x[mask]
+        from xdart.gui.tabs.scattering.analysis_mount import (
+            render_fit_projection, render_table_rows)
+        render_fit_projection(self.plot, self.resid_plot, fit_x, result)
+        render_table_rows(self.table, ["Parameter", "Value", "StdErr"],
+            tuple(zip(result.parameter_names, result.parameter_values,
+                      result.parameter_stderr, strict=True)))
+        detail = "; ".join(result.diagnostics)
+        self.status.setText(result.code if result.fit_success is None else
+                            (result.message or result.code) + (f"; {detail}" if detail else ""))
+        self.status.setToolTip("\n".join((result.plan_fingerprint,
+            result.policy_fingerprint, result.result_fingerprint)))
+
+    def closeEvent(self, event):
+        if self._vnext:
+            self._vnext_submit("close", None)
+        super().closeEvent(event)
 
     def _draw_outcome(self, outcome, auto=False):
         # data over the FULL pattern (context); the analyzer's Overlay traces

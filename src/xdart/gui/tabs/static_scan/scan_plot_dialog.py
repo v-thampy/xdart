@@ -91,8 +91,13 @@ class ScanPlotDialog(QtWidgets.QDialog):
     """Plot scan metadata columns vs each other, overlaid, with normalization."""
 
     def __init__(self, default_uri=None, mask_provider=None, lock_provider=None,
-                 parent=None):
+                 parent=None, *, vnext_submit=None):
         super().__init__(parent)
+        self._vnext = callable(vnext_submit)
+        self._vnext_submit = vnext_submit
+        self._vnext_rendering = False
+        self._vnext_table_result = None
+        self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
         self._table = {}
         self._columns = []
         self._positioner_names = []         # scanned-motor names (X-default hint)
@@ -135,7 +140,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # Source — the shared scan-source widget (File/Directory, kind-adaptive,
         # SPEC scan + optional images + raw-reachable gating).
         from .scan_source_widget import ScanSourceWidget
-        self.source_widget = ScanSourceWidget(mode="roi", parent=self)
+        self.source_widget = ScanSourceWidget(
+            mode="vnext_analysis" if self._vnext else "roi", parent=self)
         lay.addWidget(self.source_widget)
 
         # Axes row: X / Normalize combos (Y is the multi-select below).
@@ -210,7 +216,13 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.norm_combo.currentIndexChanged.connect(self._redraw)
         self.y_list.itemChanged.connect(self._redraw)
         self.r_list.itemChanged.connect(self._redraw)
-        self.source_widget.sigSourceChanged.connect(self._on_source_selected)
+        if self._vnext:
+            self.source_widget.sigExternalSyntaxChanged.connect(
+                lambda value: self._vnext_submit("metadata", value))
+            self.save_btn.setEnabled(False)
+            self.save_btn.setToolTip("P3_7_EXPORT_UNAVAILABLE")
+        else:
+            self.source_widget.sigSourceChanged.connect(self._on_source_selected)
         self.roi_btn.clicked.connect(self._open_roi_dialog)
         self.save_btn.clicked.connect(self._save_csv)
         self.log_btn.toggled.connect(self._redraw)
@@ -480,7 +492,25 @@ class ScanPlotDialog(QtWidgets.QDialog):
         right-axis toggle is never a silent no-op."""
         return set(self._checked_in(self.r_list))
 
+    def vnext_plot_values(self):
+        """Capture controls only; table/normalization science stays headless."""
+        right = tuple(self._checked_in(self.r_list))
+        accepted = () if self._vnext_scan_request is None else self._vnext_scan_request[3]
+        requested = tuple(dict.fromkeys((*self._checked_y(), *right)))
+        if len(requested) == len(accepted) and set(requested) == set(accepted): requested = accepted
+        return (self.x_combo.currentText() or None, requested,
+                self.norm_combo.currentData(), right, self.log_btn.isChecked(),
+                self._vnext_table_result, self._vnext_roi_result)
+
     def _redraw(self):
+        if self._vnext:
+            if self._vnext_rendering: return
+            values = self.vnext_plot_values()
+            current = (getattr(values[5], "table_fingerprint", ""), getattr(values[6], "result_fingerprint", None), *values[:3])
+            if self._vnext_scan_result is not None and current == self._vnext_scan_request:
+                self.set_vnext_scan_result(self._vnext_scan_result); return
+            if values[5] is not None: self._vnext_submit("scan_plot", values)
+            return
         self.plot.clear()
         self.right_vb.clear()
         if self.legend is not None:
@@ -637,6 +667,9 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self.r_list.blockSignals(False)
 
     def _open_roi_dialog(self):
+        if self._vnext:
+            self._vnext_submit("roi_preview", self._vnext_table_result)
+            return
         if not self._raw_reachable or self._source_spec is None:
             self.status.setText(
                 "Raw frames aren't reachable for this scan — ROI plotting is "
@@ -793,7 +826,92 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # live) and whose done-callback then signals into a destroyed widget.
         if hasattr(self, "source_widget"):
             self.source_widget.shutdown_probe_worker()
+        if self._vnext:
+            self._vnext_submit("close", None)
         super().closeEvent(event)
+
+    def set_vnext_metadata(self, result):
+        """Render only detached table columns and headless-selected defaults."""
+        if self._roi_dialog is not None:
+            self._roi_dialog.close(); self._roi_dialog.deleteLater()
+            self._roi_dialog = None
+        self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
+        self._vnext_table_result = result; self._vnext_rendering = True
+        try:
+            table = {}
+            for column in result.columns:
+                if column.numeric is not None:
+                    table[column.name] = column.numeric
+            self._table = table; self._columns = list(table)
+            for widget in (self.x_combo, self.norm_combo, self.y_list, self.r_list):
+                widget.blockSignals(True); widget.clear()
+            self.x_combo.addItems(self._columns)
+            self.norm_combo.addItem("None", None)
+            for name in self._columns:
+                self.norm_combo.addItem(name, name)
+                self.y_list.addItem(_checkable_item(name))
+                self.r_list.addItem(_checkable_item(name))
+            selected = result.selected_scanned_positioner or (
+                "frame_index" if "frame_index" in table else None)
+            if selected is not None: self.x_combo.setCurrentText(selected)
+            self.status.setText(result.code)
+            self.roi_btn.setEnabled(result.receipt is not None)
+        finally:
+            for widget in (self.x_combo, self.norm_combo, self.y_list, self.r_list):
+                widget.blockSignals(False)
+            self._vnext_rendering = False
+
+    def clear_vnext_metadata(self):
+        if self._roi_dialog is not None:
+            self._roi_dialog.close(); self._roi_dialog.deleteLater()
+            self._roi_dialog = None
+        self._vnext_table_result = self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
+        self._table = {}; self._columns = []; self._vnext_rendering = True
+        for widget in (self.x_combo, self.norm_combo, self.y_list, self.r_list):
+            widget.clear()
+        self.plot.clear(); self.right_vb.clear(); self.roi_btn.setEnabled(False)
+        self._vnext_rendering = False
+
+    def set_vnext_scan_result(self, result, request=None):
+        self._vnext_scan_result = result
+        if request is not None: self._vnext_scan_request = request
+        self._vnext_rendering = True
+        try:
+            self.plot.clear(); self.right_vb.clear()
+            if self.legend is not None: self.legend.clear()
+            right = set(self.vnext_plot_values()[3]); any_right = False
+            if result.x is not None:
+                for index, (name, identity, values) in enumerate(zip(
+                        result.trace_names, result.original_identities,
+                        result.traces, strict=True)):
+                    color = CURVE_PENS[index % len(CURVE_PENS)]
+                    pen = pg.mkPen(color, width=3)
+                    if identity in right:
+                        add_right_series(self.right_vb, self.legend, result.x,
+                            values, pen=pen, name=name, symbol="o",
+                            symbol_size=7, symbol_brush=color); any_right = True
+                    else:
+                        self.plot.plot(result.x, values, pen=pen, symbol="o",
+                            symbolSize=7, symbolBrush=color, name=name)
+                self.plot.setLabel("bottom", result.x_name)
+            self.plot.setLogMode(x=False, y=self.log_btn.isChecked())
+            self.right_axis.setVisible(any_right); self.right_vb.setVisible(any_right)
+            label = (f"value / {result.normalization}"
+                     if result.normalization else "value")
+            self.plot.setLabel("left", label)
+            if any_right: self.right_axis.setLabel(f"{label} (right)")
+            self.status.setText(result.code)
+        finally:
+            self._vnext_rendering = False
+
+    def set_vnext_roi_result(self, result):
+        self._vnext_roi_result = result
+        existing = {self.y_list.item(i).text() for i in range(self.y_list.count())}
+        for name in result.signal_names:
+            if name not in existing:
+                self.y_list.addItem(_checkable_item(name))
+                self.r_list.addItem(_checkable_item(name)); existing.add(name)
+        self.status.setText(result.code)
 
     def _csv_columns(self):
         """Every 1-D column of the assembled table — including non-numeric (e.g.

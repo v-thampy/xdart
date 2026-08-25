@@ -113,11 +113,15 @@ class ScanSourceWidget(QtWidgets.QWidget):
     sigDirectoryDone = QtCore.Signal(object)
     #: emitted with the latest accepted, immutable DirectoryObservation.
     sigDirectoryChanged = QtCore.Signal(object)
+    #: bounded value syntax for the vNext headless-operation owner.
+    sigExternalSyntaxChanged = QtCore.Signal(object)
 
     def __init__(self, mode="roi", parent=None, *, async_probe=False):
         super().__init__(parent)
         self._mode = mode
         self._controls_source = mode == "controls_source"
+        self._external_execution = mode == "vnext_analysis"
+        self._external_candidates = ()
         self._allow_grouping = mode in ("stitch", "rsm")
         self._async_probe = bool(async_probe)
         self._probe_generation = 0
@@ -300,6 +304,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self.kind_label.setVisible(not self.dir_check.isChecked())
         self.kind_label.setText("")            # stale until a file is chosen
         self.path_edit.clear()
+        self._external_candidates = ()
         self._set_candidates([])
 
     # ---- picking --------------------------------------------------------
@@ -334,6 +339,13 @@ class ScanSourceWidget(QtWidgets.QWidget):
         """(Re)compute the candidate scan specs for the current path/mode and
         repopulate the Scan selector."""
         path = self.path_edit.text().strip()
+        if self._external_execution:
+            self._external_candidates = ()
+            self.scan_combo.blockSignals(True); self.scan_combo.clear()
+            self.scan_combo.blockSignals(False)
+            self.scan_label.setVisible(False); self.scan_combo.setVisible(False)
+            self.sigExternalSyntaxChanged.emit(self.external_source_syntax())
+            return
         if not path:
             self._set_candidates([])
             return
@@ -593,6 +605,9 @@ class ScanSourceWidget(QtWidgets.QWidget):
                 repr(sorted((k, repr(v)) for k, v in opts.items())))
 
     def _emit_selection(self):
+        if self._external_execution:
+            self.sigExternalSyntaxChanged.emit(self.external_source_syntax())
+            return
         spec = self._build_spec()
         if spec is None:
             self._cancel_pending_probe()
@@ -867,6 +882,42 @@ class ScanSourceWidget(QtWidgets.QWidget):
             self.sigDirectoryChanged.emit(result)
 
     # ---- public API for consumers --------------------------------------
+    def set_external_candidates(self, candidates):
+        """Project headless candidates with an explicit no-selection row."""
+        from xrd_tools.analysis.scan_operations import CandidateProjection
+
+        projections = tuple(candidates)
+        if (not projections or len(projections) > 256
+                or any(type(value) is not CandidateProjection
+                       for value in projections)):
+            raise ValueError("external candidate syntax is invalid")
+        self._cancel_pending_probe(); self._candidates = []
+        self._external_candidates = tuple(value.source_spec for value in projections)
+        self.scan_combo.blockSignals(True); self.scan_combo.clear()
+        self.scan_combo.addItem("Choose a scan…", None)
+        for spec in self._external_candidates:
+            self.scan_combo.addItem(self._candidate_label(spec), spec)
+        self.scan_combo.setCurrentIndex(0)
+        self.scan_combo.blockSignals(False)
+        self.scan_label.setVisible(True); self.scan_combo.setVisible(True)
+        self._set_dot(False, text="headless")
+        self.sigExternalSyntaxChanged.emit(self.external_source_syntax())
+
+    def external_source_syntax(self):
+        if not self._external_execution:
+            return None
+        if self._external_candidates:
+            index = self.scan_combo.currentIndex() - 1
+            return (("exact", self._external_candidates[index])
+                    if 0 <= index < len(self._external_candidates) else None)
+        path = self.path_edit.text().strip()
+        if not path:
+            return None
+        if self.dir_check.isChecked():
+            return ("directory", path,
+                    _DIR_KINDS[self.dir_kind_combo.currentIndex()][1])
+        return ("exact", path)
+
     def set_uri(self, uri):
         """Programmatically load a file path (e.g. the dialog's default scan)."""
         if not uri:

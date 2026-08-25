@@ -48,6 +48,11 @@ class _AverageRequest:
     background_syntax: str | None; numeric_metadata_keys: tuple[str, ...] | None
     invariant_metadata_keys: tuple[str, ...]; envelope_bytes: int | None
     resource_requests: tuple[tuple[str, int], ...]; resource_env: tuple[tuple[str, str], ...]
+@dataclass(frozen=True, slots=True)
+class _ScanPlotRequest:
+    plan: object
+    table: object
+    roi_result: object | None
 def _json_snapshot(value: object) -> str: return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 def _bounded_json_snapshot(value: object) -> str:
     count = [0]
@@ -484,6 +489,104 @@ class OperationSlot:
                 f"{result.diagnostic_code}: {result.diagnostic}", payload=result,
             )
         raise RuntimeError("Average runner retained settlement unexpectedly")
+
+    @staticmethod
+    def _analysis_terminal(identity, result, expected):
+        if type(result) is not expected:
+            raise TypeError("analysis runner returned an invalid result")
+        disposition = getattr(result.disposition, "value", None)
+        if disposition in {"completed", "refused"}:
+            status = OperationTerminalStatus.RETURNED
+        elif disposition == "cancelled":
+            status = OperationTerminalStatus.CANCELLED
+        else:
+            raise TypeError("analysis runner retained settlement unexpectedly")
+        return OperationTerminal(identity, status, payload=result)
+
+    def begin_metadata(self, plan: object, stamp: OperationContextStamp):
+        from xrd_tools.analysis.scan_operations import MetadataTablePlan
+        return (self._begin(plan, stamp, self._run_metadata)
+                if type(plan) is MetadataTablePlan else None)
+
+    def _run_metadata(self, plan, identity, cancelled, publish):
+        from xrd_tools.analysis.scan_operations import (
+            MetadataTableResult, run_metadata_table,
+        )
+        result = run_metadata_table(
+            plan, cancel_token=cancelled,
+            progress_callback=lambda done, total: publish("metadata", done, total))
+        return self._analysis_terminal(identity, result, MetadataTableResult)
+
+    def begin_scan_plot(self, plan: object, table: object, roi_result: object,
+                        stamp: OperationContextStamp):
+        from xrd_tools.analysis.scan_operations import (
+            RoiScanResult, ScanPlotPlan, MetadataTableResult,
+        )
+        if (type(plan) is not ScanPlotPlan or type(table) is not MetadataTableResult
+                or roi_result is not None and type(roi_result) is not RoiScanResult):
+            return None
+        return self._begin(_ScanPlotRequest(plan, table, roi_result), stamp,
+                           self._run_scan_plot)
+
+    def _run_scan_plot(self, request, identity, cancelled, publish):
+        from xrd_tools.analysis.scan_operations import ScanPlotResult, run_scan_plot
+        result = run_scan_plot(
+            request.plan, request.table, roi_result=request.roi_result,
+            cancel_token=cancelled,
+            progress_callback=lambda done, total: publish("scan_plot", done, total))
+        return self._analysis_terminal(identity, result, ScanPlotResult)
+
+    def begin_roi_preview(self, plan: object, stamp: OperationContextStamp):
+        from xrd_tools.analysis.scan_operations import RoiPreviewPlan
+        return (self._begin(plan, stamp, self._run_roi_preview)
+                if type(plan) is RoiPreviewPlan else None)
+
+    def _run_roi_preview(self, plan, identity, cancelled, publish):
+        from xrd_tools.analysis.scan_operations import RoiPreviewResult, run_roi_preview
+        result = run_roi_preview(
+            plan, cancel_token=cancelled,
+            progress_callback=lambda done, total: publish("roi_preview", done, total))
+        return self._analysis_terminal(identity, result, RoiPreviewResult)
+
+    def begin_roi_scan(self, plan: object, stamp: OperationContextStamp):
+        from xrd_tools.analysis.scan_operations import RoiScanPlan
+        return (self._begin(plan, stamp, self._run_roi_scan)
+                if type(plan) is RoiScanPlan else None)
+
+    def _run_roi_scan(self, plan, identity, cancelled, publish):
+        from xrd_tools.analysis.scan_operations import RoiScanResult, run_roi_scan
+        result = run_roi_scan(
+            plan, cancel_token=cancelled,
+            progress_callback=lambda done, total: publish("roi_scan", done, total))
+        return self._analysis_terminal(identity, result, RoiScanResult)
+
+    def begin_peak_fit(self, plan: object, stamp: OperationContextStamp):
+        from xrd_tools.analysis.display_fit_operations import DisplayedPeakFitPlan
+        return (self._begin(plan, stamp, self._run_peak_fit)
+                if type(plan) is DisplayedPeakFitPlan else None)
+
+    def _run_peak_fit(self, plan, identity, cancelled, publish):
+        from xrd_tools.analysis.display_fit_operations import (
+            DisplayedPeakFitResult, run_displayed_peak_fit,
+        )
+        result = run_displayed_peak_fit(
+            plan, cancel_token=cancelled,
+            progress_callback=lambda done, total: publish("peak_fit", done, total))
+        return self._analysis_terminal(identity, result, DisplayedPeakFitResult)
+
+    def begin_phase_fit(self, plan: object, stamp: OperationContextStamp):
+        from xrd_tools.analysis.display_fit_operations import DisplayedPhaseFitPlan
+        return (self._begin(plan, stamp, self._run_phase_fit)
+                if type(plan) is DisplayedPhaseFitPlan else None)
+
+    def _run_phase_fit(self, plan, identity, cancelled, publish):
+        from xrd_tools.analysis.display_fit_operations import (
+            DisplayedPhaseFitResult, run_displayed_phase_fit,
+        )
+        result = run_displayed_phase_fit(
+            plan, cancel_token=cancelled,
+            progress_callback=lambda done, total: publish("phase_fit", done, total))
+        return self._analysis_terminal(identity, result, DisplayedPhaseFitResult)
 
     def _seal_publication(self, identity: OperationIdentity) -> bool:
         with self._lock:

@@ -485,6 +485,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._average_revision: int | None = None
         self._average_target: str | None = None
         self._average_entry: str | None = None
+        self._metadata_dialog = self._scan_roi_dialog = None
+        self._peak_dialog = self._phase_dialog = None
+        self._metadata_generation = self._scan_roi_generation = 0
+        self._peak_generation = self._phase_generation = 0
+        self._analysis_identity = None; self._analysis_kind = None
+        self._analysis_target = None
+        self._analysis_generation = None; self._analysis_anchor = None
+        self._analysis_fingerprint = ""; self._analysis_request = None
+        self._roi_preview_binding = None
+        self._metadata_result = self._scan_roi_result = None
+        self._peak_result = self._phase_result = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -545,7 +556,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if slot is None:
             return
         average = getattr(self, "_average_identity", None)
-        if average is not None and slot.current_identity is average:
+        analysis = getattr(self, "_analysis_identity", None)
+        context_free_analysis = (
+            analysis is not None and slot.current_identity is analysis
+            and getattr(self, "_analysis_kind", None) in {
+                "metadata", "scan_plot", "roi_preview", "roi_scan"})
+        if (average is not None and slot.current_identity is average
+                or context_free_analysis):
             if revision is None:
                 revision = self._intents.snapshot().revision
             stamp = OperationContextStamp(revision)
@@ -564,6 +581,320 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if identity is not None:
             self._ensure_timer()
         return identity
+
+    def _analysis_generation_for(self, kind: str) -> int:
+        return (self._metadata_generation if kind == "metadata" else
+                self._scan_roi_generation if kind in {"scan_roi", "scan_plot", "roi_preview", "roi_scan"} else
+                self._peak_generation if kind == "peak" else self._phase_generation)
+
+    def _current_analysis_request(self, kind, target):
+        from .analysis_mount import (analysis_request_facts,
+            metadata_plan_from_syntax, phase_wavelength_angstrom, scan_plot_plan)
+        try:
+            if kind == "metadata":
+                if target == "metadata":
+                    current = self._context_controller.navigation.current
+                    if current is None: return None
+                    from xrd_tools.analysis.scan_operations import MetadataTablePlan
+                    plan = MetadataTablePlan(current.artifact)
+                else:
+                    dialog = self._scan_roi_dialog
+                    if dialog is None: return None
+                    plan = metadata_plan_from_syntax(
+                        dialog.source_widget.external_source_syntax())
+                return None if plan is None else analysis_request_facts(plan)
+            dialog = self._scan_roi_dialog
+            if kind == "scan_plot" and dialog is not None:
+                x, y, norm, right, log, table, roi = dialog.vnext_plot_values()
+                if table is None: return None
+                return analysis_request_facts(scan_plot_plan(x, y, norm),
+                    table=table, roi=roi, render=(right, log))
+            if kind in {"roi_preview", "roi_scan"} and dialog is not None:
+                table = dialog._vnext_table_result
+                if table is None: return None
+                if kind == "roi_preview":
+                    if not table.labels: return None
+                    from xrd_tools.analysis.scan_operations import RoiPreviewPlan
+                    return analysis_request_facts(RoiPreviewPlan.from_table(
+                        table, label=table.labels[0]))
+                picker = dialog._roi_dialog
+                binding = self._roi_preview_binding
+                if (picker is None or binding is None or binding[0] is not table
+                        or binding[-1] is not picker): return None
+                from xrd_tools.analysis.scan_operations import RoiScanPlan
+                plan = RoiScanPlan.from_table(table,
+                    signals=tuple(picker.roi_signals()),
+                    mask_saturation=picker.mask_saturated())
+                return analysis_request_facts(
+                    plan, picker=(*binding[1:-1], id(picker)))
+            if kind in {"peak", "phase"}:
+                dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
+                trace, anchor = self._capture_analysis_trace(kind)
+                if dialog is None or trace is None or anchor is None: return None
+                values = dialog.vnext_fit_values()
+                if kind == "peak":
+                    from xrd_tools.analysis import DisplayedPeakFitPlan
+                    plan = DisplayedPeakFitPlan(trace, **values)
+                else:
+                    from xrd_tools.analysis import DisplayedPhaseFitPlan
+                    wavelength = phase_wavelength_angstrom(
+                        self._context_controller, anchor.frame)
+                    plan = DisplayedPhaseFitPlan(
+                        trace, wavelength_angstrom=wavelength, **values)
+                return analysis_request_facts(plan)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return None
+
+    def _begin_analysis(self, kind, plan, generation, *, target=None,
+                        request=None, anchor=None, table=None, roi=None):
+        from .analysis_mount import (analysis_request_facts,
+            analysis_start_allowed, display_anchor_matches)
+        target = kind if target is None else target
+        request = analysis_request_facts(plan) if request is None else request
+        if (not analysis_start_allowed(self)
+                or request != self._current_analysis_request(kind, target)):
+            return None
+        fit = kind in {"peak", "phase"}; fingerprint = (
+            plan.trace.trace_fingerprint if fit else "")
+        if fit and not display_anchor_matches(
+                self, anchor, fingerprint, generation): return None
+        stamp = (self._operation_context_stamp() if fit else
+                 OperationContextStamp(self._intents.snapshot().revision))
+        names = {"metadata": "begin_metadata", "roi_preview": "begin_roi_preview",
+                 "roi_scan": "begin_roi_scan", "peak": "begin_peak_fit",
+                 "phase": "begin_phase_fit"}
+        identity = (self._operation_slot.begin_scan_plot(plan, table, roi, stamp)
+                    if kind == "scan_plot" else
+                    getattr(self._operation_slot, names[kind])(plan, stamp))
+        if identity is None: return None
+        self._analysis_kind, self._analysis_generation = kind, generation
+        self._analysis_target, self._analysis_identity = target, identity
+        self._analysis_anchor, self._analysis_fingerprint = anchor, fingerprint
+        self._analysis_request = request; self._ensure_timer()
+        self._notice(f"Running {kind.replace('_', ' ')}…"); return identity
+
+    def _capture_analysis_trace(self, kind):
+        from .analysis_mount import capture_display_anchor, displayed_trace_input
+        current = self._context_controller.navigation.current
+        projection = self._last_scientific_projection
+        if current is None or projection is None: return None, None
+        try: trace = displayed_trace_input(projection, current)
+        except (TypeError, ValueError): return None, None
+        generation = self._analysis_generation_for(kind)
+        anchor = capture_display_anchor(self, trace.trace_fingerprint, generation)
+        return (trace, anchor) if anchor is not None else (None, None)
+
+    def _analysis_dialog_closed(self, target, dialog):
+        field = f"_{target}_dialog"
+        if getattr(self, field, None) is not dialog: return
+        setattr(self, field, None)
+        if target == "scan_roi": self._roi_preview_binding = None
+        generation = f"_{target}_generation"
+        setattr(self, generation, getattr(self, generation) + 1)
+        if self._analysis_target == target:
+            from .analysis_mount import cancel_owned
+            cancel_owned(self._operation_slot, self._analysis_identity)
+
+    def _open_analysis_mount(self, target, *, focus_roi=False):
+        field = f"_{target}_dialog"; dialog = getattr(self, field)
+        if dialog is None:
+            if target == "metadata":
+                from .analysis_mount import MetadataResultDialog
+                dialog = MetadataResultDialog(self)
+            elif target == "scan_roi":
+                from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+                dialog = ScanPlotDialog(parent=self, vnext_submit=self._scan_analysis_action)
+            elif target == "peak":
+                from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+                dialog = PeakFitDialog(parent=self, vnext_submit=self._peak_analysis_action)
+            else:
+                from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+                dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
+            dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            setattr(self, field, dialog)
+            dialog.finished.connect(lambda _value, t=target, d=dialog:
+                                    self._analysis_dialog_closed(t, d))
+        dialog.show(); dialog.raise_(); dialog.activateWindow()
+        if target in {"peak", "phase"}: self._refresh_fit_trace(target)
+        elif target == "metadata" and self._metadata_result is None:
+            self._metadata_from_current()
+        elif target == "scan_roi" and focus_roi:
+            dialog.status.setText("Choose a source, then Plot ROI.")
+
+    def _metadata_from_current(self):
+        current = self._context_controller.navigation.current
+        if current is None:
+            self._notice("Select a retained frame first."); return
+        from xrd_tools.analysis.scan_operations import MetadataTablePlan
+        self._begin_analysis("metadata", MetadataTablePlan(current.artifact),
+                             self._metadata_generation)
+
+    def _scan_analysis_action(self, action, value):
+        if action == "close":
+            self._analysis_dialog_closed("scan_roi", self._scan_roi_dialog); return
+        if action == "metadata":
+            from .analysis_mount import analysis_request_facts, metadata_plan_from_syntax
+            plan = metadata_plan_from_syntax(value)
+            if plan is not None:
+                self._begin_analysis("metadata", plan, self._scan_roi_generation,
+                    target="scan_roi", request=analysis_request_facts(plan))
+            return
+        if action == "scan_plot" and value:
+            from .analysis_mount import analysis_request_facts, scan_plot_plan
+            x, y, norm, right, log, table, roi = value
+            plan = scan_plot_plan(x, y, norm)
+            request = analysis_request_facts(
+                plan, table=table, roi=roi, render=(right, log))
+            self._begin_analysis("scan_plot", plan, self._scan_roi_generation,
+                target="scan_roi", request=request, table=table, roi=roi); return
+        if action == "roi_preview" and value is not None and value.labels:
+            from .analysis_mount import analysis_request_facts
+            from xrd_tools.analysis.scan_operations import RoiPreviewPlan
+            plan = RoiPreviewPlan.from_table(value, label=value.labels[0])
+            self._begin_analysis("roi_preview", plan, self._scan_roi_generation,
+                target="scan_roi", request=analysis_request_facts(plan))
+
+    def _refresh_fit_trace(self, kind):
+        trace, _anchor = self._capture_analysis_trace(kind)
+        dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
+        if trace is None or dialog is None:
+            self._notice("Select one displayed 1-D trace first."); return None
+        dialog.set_vnext_trace(trace); return trace
+
+    def _peak_analysis_action(self, action, values):
+        if action == "close":
+            self._analysis_dialog_closed("peak", self._peak_dialog); return
+        if action == "reload": self._refresh_fit_trace("peak"); return
+        if action != "fit": return
+        trace, anchor = self._capture_analysis_trace("peak")
+        if trace is None: return
+        from xrd_tools.analysis import DisplayedPeakFitPlan
+        from .analysis_mount import analysis_request_facts
+        plan = DisplayedPeakFitPlan(trace, **values)
+        self._begin_analysis("peak", plan, self._peak_generation, anchor=anchor,
+                             request=analysis_request_facts(plan))
+
+    def _phase_analysis_action(self, action, values):
+        if action == "close":
+            self._analysis_dialog_closed("phase", self._phase_dialog); return
+        if action == "reload": self._refresh_fit_trace("phase"); return
+        if action != "fit": return
+        trace, anchor = self._capture_analysis_trace("phase")
+        from .analysis_mount import phase_wavelength_angstrom
+        wavelength = (None if anchor is None else phase_wavelength_angstrom(
+            self._context_controller, anchor.frame))
+        if trace is None: return
+        from xrd_tools.analysis import DisplayedPhaseFitPlan
+        plan = DisplayedPhaseFitPlan(trace, wavelength_angstrom=wavelength, **values)
+        from .analysis_mount import analysis_request_facts
+        self._begin_analysis("phase", plan, self._phase_generation, anchor=anchor,
+                             request=analysis_request_facts(plan))
+
+    def _roi_analysis_signals(self, table, picker, signals):
+        binding = self._roi_preview_binding
+        if (not signals or self._scan_roi_dialog is None
+                or self._scan_roi_dialog._vnext_table_result is not table
+                or self._scan_roi_dialog._roi_dialog is not picker
+                or binding is None or binding[0] is not table
+                or binding[-1] is not picker): return
+        from .analysis_mount import analysis_request_facts
+        from xrd_tools.analysis.scan_operations import RoiScanPlan
+        plan = RoiScanPlan.from_table(table, signals=tuple(signals),
+                                     mask_saturation=picker.mask_saturated())
+        self._begin_analysis("roi_scan", plan, self._scan_roi_generation,
+            target="scan_roi", request=analysis_request_facts(
+                plan, picker=(*binding[1:-1], id(picker))))
+
+    def _consume_analysis_update(self, update):
+        if type(update) is not OperationUpdate or update.identity is not self._analysis_identity:
+            return False
+        if update.terminal is None:
+            if update.progress is not None:
+                self._notice(f"Analysis: {update.progress.stage} {update.progress.completed}/{update.progress.total}")
+            return True
+        kind, target = self._analysis_kind, self._analysis_target
+        request = self._analysis_request
+        current = self._analysis_generation == self._analysis_generation_for(target)
+        current = bool(current and request is not None
+                       and request == self._current_analysis_request(kind, target))
+        if kind in {"peak", "phase"}:
+            from .analysis_mount import display_anchor_matches
+            current = current and display_anchor_matches(
+                self, self._analysis_anchor, self._analysis_fingerprint,
+                self._analysis_generation)
+        terminal_payload = update.terminal.payload
+        from xrd_tools.analysis.scan_operations import AnalysisDisposition
+        if (current and kind == "metadata" and target == "scan_roi"
+                and getattr(terminal_payload, "disposition", None)
+                    is AnalysisDisposition.REFUSED
+                and getattr(terminal_payload, "code", "") == "SOURCE_SELECTION_REQUIRED"
+                and self._scan_roi_dialog is not None):
+            candidates = getattr(terminal_payload, "candidates", ())
+            self._analysis_identity = self._analysis_kind = self._analysis_target = None
+            self._analysis_generation = self._analysis_anchor = self._analysis_request = None
+            self._analysis_fingerprint = ""
+            self._roi_preview_binding = None
+            self._scan_roi_dialog.clear_vnext_metadata()
+            if candidates: self._scan_roi_dialog.source_widget.set_external_candidates(candidates)
+            self._notice("Choose one headless-qualified source."); return True
+        from .analysis_mount import (analysis_result_matches,
+            retention_admission, terminal_adoption)
+        payload, diagnostic = terminal_adoption(update, current=current)
+        if payload is not None and not analysis_result_matches(payload, request):
+            payload, diagnostic = None, "P3_7_ANALYSIS_RESULT_IDENTITY_MISMATCH"
+        self._analysis_identity = self._analysis_kind = self._analysis_target = None
+        self._analysis_generation = self._analysis_anchor = self._analysis_request = None
+        self._analysis_fingerprint = ""
+        if payload is None:
+            self._notice(diagnostic); return True
+        retained = {"metadata": self._metadata_result,
+                    "scan_roi": self._scan_roi_result,
+                    "peak": self._peak_result, "phase": self._phase_result}
+        if kind == "metadata": retained["scan_roi"] = None
+        replacing = "metadata" if kind == "metadata" else (
+            "scan_roi" if kind in {"scan_plot", "roi_preview", "roi_scan"} else kind)
+        admitted, reason = retention_admission(retained, replacing, payload)
+        if not admitted:
+            self._notice(reason); return True
+        if kind == "metadata":
+            self._roi_preview_binding = None
+            self._metadata_result = payload; self._scan_roi_result = None
+            if target == "metadata":
+                if self._metadata_dialog is not None: self._metadata_dialog.adopt_result(payload)
+                if self._scan_roi_dialog is not None: self._scan_roi_dialog.clear_vnext_metadata()
+            elif self._scan_roi_dialog is not None:
+                self._scan_roi_dialog.set_vnext_metadata(payload)
+        elif kind == "scan_plot":
+            self._scan_roi_result = payload
+            if self._scan_roi_dialog is not None: self._scan_roi_dialog.set_vnext_scan_result(payload, request[2])
+        elif kind == "roi_preview":
+            self._scan_roi_result = payload
+            if self._scan_roi_dialog is not None and payload.image is not None:
+                from xdart.gui.tabs.static_scan.roi_select_dialog import RoiSelectDialog
+                old = self._scan_roi_dialog._roi_dialog
+                if old is not None: old.close(); old.deleteLater()
+                table = self._scan_roi_dialog._vnext_table_result
+                picker = RoiSelectDialog(payload.image, parent=self._scan_roi_dialog)
+                picker.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                self._scan_roi_dialog._roi_dialog = picker
+                self._roi_preview_binding = (table, payload.receipt,
+                    payload.table_fingerprint, payload.result_fingerprint,
+                    payload.label, tuple(payload.labels), picker)
+                picker.sigCompute.connect(lambda signals, t=table, p=picker:
+                                          self._roi_analysis_signals(t, p, signals))
+                picker.show(); picker.raise_(); picker.activateWindow()
+        elif kind == "roi_scan":
+            self._scan_roi_result = payload
+            if self._scan_roi_dialog is not None:
+                self._scan_roi_dialog.set_vnext_roi_result(payload)
+        elif kind == "peak":
+            self._peak_result = payload
+            if self._peak_dialog is not None: self._peak_dialog.set_vnext_result(payload)
+        else:
+            self._phase_result = payload
+            if self._phase_dialog is not None: self._phase_dialog.set_vnext_result(payload)
+        self._notice(""); return True
 
     @staticmethod
     def _background_domain(mode: str) -> str | None:
@@ -969,6 +1300,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         first = not self._closing
         if first:
             self._closing = True
+            for dialog in (self._metadata_dialog, self._scan_roi_dialog,
+                           self._peak_dialog, self._phase_dialog):
+                if dialog is not None: dialog.close()
             ScatteringWorkspace._clear_presentation_targets(self)
             self._clear_live_source_refresh()
             self._shell.browser.cancel_pending_frame_selection()
@@ -1205,6 +1539,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return
         kind = command.kind
+        if kind in {ShellCommandKind.SHOW_METADATA, ShellCommandKind.LAUNCH_TOOL,
+                    ShellCommandKind.ANALYSIS_ACTION}:
+            from .analysis_mount import mount_target
+            target = mount_target(kind, command.value)
+            if target is not None:
+                self._open_analysis_mount(
+                    target, focus_roi=str(command.value) in {"roi_statistics", "roi_stats"})
+                return
         operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and ((command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity) or (command.value == "make_mask" and self._operation_slot.current_identity is self._mask_identity) or (command.value == f"reintegrate_{self._reintegrate_dimension}" and self._operation_slot.current_identity is self._reintegrate_identity))
         operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
         if self._operation_slot.owned and operation_locked and not operation_cancel: self._notice("Experiment operation is still active."); self._refresh_shell(); return
@@ -2107,7 +2449,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if operation_identity is not None:
             ScatteringWorkspace._observe_operation_stamp(self)
             update = operation_slot.poll(operation_identity)
-            if update is not None: changed = self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or self._consume_reintegrate_update(update) or self._consume_average_update(update) or changed
+            if update is not None: changed = self._consume_analysis_update(update) or self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or self._consume_reintegrate_update(update) or self._consume_average_update(update) or changed
             elif operation_identity is self._background_identity and not operation_slot.owned:
                 self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True
             elif operation_identity is self._reintegrate_identity and not operation_slot.owned:
@@ -2117,6 +2459,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             elif operation_identity is self._average_identity and not operation_slot.owned:
                 self._average_identity = self._average_revision = self._average_target = self._average_entry = None
                 self._notice("Average failed before terminal publication."); changed = True
+            elif operation_identity is self._analysis_identity and not operation_slot.owned:
+                self._analysis_identity = self._analysis_kind = self._analysis_target = None
+                self._analysis_generation = self._analysis_anchor = self._analysis_request = None
+                self._analysis_fingerprint = ""
+                self._notice("Analysis failed before terminal publication."); changed = True
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
