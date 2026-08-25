@@ -963,6 +963,186 @@ def test_p37b_dialog_and_app_close_cancel_without_abandoning_source_cleanup(
         release.set(); _close_page(page, qapp)
 
 
+def test_p37b_close_reopen_reuses_only_self_contained_metadata_and_discharges_transient_results(
+        qapp) -> None:
+    page = _page(); table = _table(fingerprint="reopen-table")
+    try:
+        page._metadata_result = table; page._open_analysis_mount("metadata")
+        metadata = page._metadata_dialog
+        assert metadata.table.rowCount() == len(table.labels)
+        metadata.close(); qapp.processEvents()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        assert page._metadata_dialog is None and page._metadata_result is table; page._open_analysis_mount("metadata")
+        assert (page._metadata_dialog is not metadata
+                and page._metadata_dialog.table.rowCount() == len(table.labels))
+
+        page._open_analysis_mount("scan_roi"); scan_dialog = page._scan_roi_dialog
+        assert scan_dialog._vnext_table_result is table
+        scan = ScanPlotResult(
+            AnalysisDisposition.COMPLETED, "OK",
+            table_fingerprint=table.table_fingerprint, x_name="motor",
+            x=np.arange(3.0), trace_names=("signal",),
+            original_identities=("signal",), traces=(np.arange(3.0),),
+            storage_bytes=64)
+        page._scan_roi_result = scan
+        scan_dialog.set_vnext_scan_result(
+            scan, (table.table_fingerprint, None, "motor", ("signal",), None))
+        page._roi_preview_binding = (object(),)
+        scan_dialog.close(); qapp.processEvents()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        assert page._scan_roi_result is page._roi_preview_binding is None
+        assert page._metadata_result is table
+        page._open_analysis_mount("scan_roi")
+        assert page._scan_roi_dialog._vnext_table_result is table
+        assert (page._scan_roi_dialog._vnext_scan_result is
+                page._scan_roi_dialog._vnext_roi_result is None)
+
+        for target, field in (("peak", "_peak_result"),
+                              ("phase", "_phase_result")):
+            page._open_analysis_mount(target)
+            dialog = getattr(page, f"_{target}_dialog")
+            setattr(page, field, SimpleNamespace(storage_bytes=32))
+            dialog.close(); qapp.processEvents()
+            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+            assert getattr(page, field) is None; page._open_analysis_mount(target)
+            assert (getattr(page, f"_{target}_dialog") is not dialog
+                    and getattr(page, field) is None)
+    finally:
+        _close_page(page, qapp)
+
+
+def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after_admission(
+        monkeypatch, qapp) -> None:
+    from xdart.gui.tabs.scattering.analysis_mount import analysis_request_facts
+
+    page = _page(); serial = 200
+    try:
+        page._open_analysis_mount("scan_roi"); dialog = page._scan_roi_dialog
+        table = replace(_table(fingerprint="retained-table"),
+                        storage_bytes=64 << 20)
+        page._metadata_result = table; dialog.set_vnext_metadata(table)
+        dialog._vnext_rendering = True
+        try: _check_item(dialog.r_list, "signal")
+        finally: dialog._vnext_rendering = False
+
+        def consume(kind, payload, request, *, target="scan_roi"):
+            nonlocal serial
+            serial += 1; identity = OperationIdentity(serial)
+            page._analysis_identity = identity; page._analysis_kind = kind
+            page._analysis_target = target
+            page._analysis_generation = page._analysis_generation_for(target)
+            page._analysis_request = request
+            return page._consume_analysis_update(_returned(identity, payload))
+
+        monkeypatch.setattr(page, "_current_analysis_request",
+                            lambda _kind, _target: page._analysis_request)
+        scan_request = ("scan_plot", (), (table.table_fingerprint, None,
+                        "motor", ("signal",), None))
+        scan = ScanPlotResult(
+            AnalysisDisposition.COMPLETED, "OK",
+            table_fingerprint=table.table_fingerprint, x_name="motor",
+            x=np.arange(3.0), trace_names=("signal",),
+            original_identities=("signal",), traces=(np.arange(3.0),),
+            storage_bytes=64 << 20)
+        assert consume("scan_plot", scan, scan_request)
+        old_items = tuple(dialog.plot.listDataItems()); old_right = tuple(
+            dialog.right_vb.addedItems); old_request = dialog._vnext_scan_request
+
+        roi_request = ("roi_scan", (), (table.receipt,
+                       table.table_fingerprint, table.labels, ("roi",)))
+        over_roi = RoiScanResult(
+            AnalysisDisposition.COMPLETED, "OK", receipt=table.receipt,
+            table_fingerprint=table.table_fingerprint,
+            requested_labels=table.labels, completed_labels=table.labels,
+            signal_names=("roi",), signal_values=(np.ones(3),),
+            valid_counts=(np.ones(3, dtype=int),), storage_bytes=(64 << 20) + 1)
+        assert consume("roi_scan", over_roi, roi_request)
+        assert page._scan_roi_result is dialog._vnext_scan_result is scan
+        assert dialog._vnext_scan_request is old_request
+        assert (tuple(dialog.plot.listDataItems()), tuple(dialog.right_vb.addedItems)) == (
+            old_items, old_right)
+
+        roi = replace(over_roi, storage_bytes=64 << 20)
+        assert consume("roi_scan", roi, roi_request)
+        assert page._scan_roi_result is dialog._vnext_roi_result is roi
+        assert dialog._vnext_scan_result is dialog._vnext_scan_request is None
+        assert not dialog.plot.listDataItems() and not dialog.right_vb.addedItems
+        retained = (page._metadata_result, page._scan_roi_result,
+                    dialog._vnext_table_result, dialog._vnext_scan_result,
+                    dialog._vnext_roi_result)
+        unique = {id(value): value for value in retained if value is not None}
+        assert sum(value.storage_bytes for value in unique.values()) == 128 << 20
+
+        assert consume("scan_plot", scan, scan_request)
+        assert (page._scan_roi_result is dialog._vnext_scan_result is scan
+                and dialog._vnext_roi_result is None)
+        preview_request = ("roi_preview", (), (table.receipt,
+                           table.table_fingerprint, table.labels, table.labels[0]))
+        preview = RoiPreviewResult(
+            AnalysisDisposition.COMPLETED, "OK", receipt=table.receipt,
+            table_fingerprint=table.table_fingerprint, labels=table.labels,
+            label=table.labels[0], image=np.ones((3, 3)),
+            result_fingerprint="retained-preview", storage_bytes=64 << 20)
+        assert consume("roi_preview", preview, preview_request)
+        picker = dialog._roi_dialog; binding = page._roi_preview_binding; destroyed = []
+        picker.destroyed.connect(lambda *_args: destroyed.append(True))
+
+        page._peak_result = SimpleNamespace(storage_bytes=64 << 20)
+        over_table = replace(_table(fingerprint="over-table"),
+                             storage_bytes=(64 << 20) + 1)
+        over_facts = analysis_request_facts(
+            MetadataTablePlan(over_table.receipt.source_spec))
+        assert consume("metadata", over_table, over_facts)
+        assert page._scan_roi_result is preview and page._roi_preview_binding is binding
+        assert dialog._roi_dialog is picker and not destroyed
+        page._peak_result = None
+
+        replacement = replace(_table(fingerprint="replacement-table"),
+                              storage_bytes=64 << 20)
+        replacement_facts = analysis_request_facts(
+            MetadataTablePlan(replacement.receipt.source_spec))
+        assert consume("metadata", replacement, replacement_facts)
+        assert page._metadata_result is dialog._vnext_table_result is replacement
+        assert page._scan_roi_result is page._roi_preview_binding is None
+        assert dialog._roi_dialog is None
+        assert not dialog.plot.listDataItems() and not dialog.right_vb.addedItems
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        qapp.processEvents()
+        assert destroyed == [True]
+
+        page._scan_roi_result = scan
+        dialog.set_vnext_scan_result(scan, scan_request[2])
+        old_metadata = page._metadata_result
+        refused = MetadataTableResult(
+            AnalysisDisposition.REFUSED, "SOURCE_SELECTION_REQUIRED",
+            candidates=(CandidateProjection(
+                SourceSpec("/tmp/candidate.nxs", SourceKind.PROCESSED_NEXUS),
+                "candidate", 1),))
+        assert consume("metadata", refused, ("metadata", (), ()),
+                       target="scan_roi")
+        assert page._metadata_result is old_metadata
+        assert page._scan_roi_result is page._roi_preview_binding is None
+        assert dialog._vnext_table_result is dialog._vnext_scan_result is None
+        assert not dialog.plot.listDataItems() and not dialog.right_vb.addedItems
+
+        dialog.set_vnext_metadata(replacement)
+        page._scan_roi_result = scan
+        dialog.set_vnext_scan_result(scan, scan_request[2])
+        page._open_analysis_mount("metadata")
+        standalone = replace(_table(fingerprint="standalone-table"),
+                             storage_bytes=64 << 20)
+        standalone_facts = analysis_request_facts(
+            MetadataTablePlan(standalone.receipt.source_spec))
+        assert consume("metadata", standalone, standalone_facts,
+                       target="metadata")
+        assert page._metadata_result is standalone
+        assert page._scan_roi_result is None
+        assert dialog._vnext_table_result is None
+        assert not dialog.plot.listDataItems() and not dialog.right_vb.addedItems
+    finally:
+        _close_page(page, qapp)
+
+
 def test_p37b_gui_retention_cap_refuses_new_adoption_without_silent_eviction() -> None:
     from xdart.gui.tabs.scattering.analysis_mount import retention_admission
 

@@ -689,16 +689,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         field = f"_{target}_dialog"
         if getattr(self, field, None) is not dialog: return
         setattr(self, field, None)
-        if target == "scan_roi": self._roi_preview_binding = None
         generation = f"_{target}_generation"
         setattr(self, generation, getattr(self, generation) + 1)
         if self._analysis_target == target:
             from .analysis_mount import cancel_owned
             cancel_owned(self._operation_slot, self._analysis_identity)
+        if target == "scan_roi":
+            self._roi_preview_binding = self._scan_roi_result = None
+        elif target == "peak": self._peak_result = None
+        elif target == "phase": self._phase_result = None
 
     def _open_analysis_mount(self, target, *, focus_roi=False):
         field = f"_{target}_dialog"; dialog = getattr(self, field)
-        if dialog is None:
+        created = dialog is None
+        if created:
             if target == "metadata":
                 from .analysis_mount import MetadataResultDialog
                 dialog = MetadataResultDialog(self)
@@ -717,10 +721,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                                     self._analysis_dialog_closed(t, d))
         dialog.show(); dialog.raise_(); dialog.activateWindow()
         if target in {"peak", "phase"}: self._refresh_fit_trace(target)
-        elif target == "metadata" and self._metadata_result is None:
-            self._metadata_from_current()
-        elif target == "scan_roi" and focus_roi:
-            dialog.status.setText("Choose a source, then Plot ROI.")
+        elif target == "metadata":
+            if created and self._metadata_result is not None:
+                dialog.adopt_result(self._metadata_result)
+            elif self._metadata_result is None: self._metadata_from_current()
+        elif target == "scan_roi":
+            if created and self._metadata_result is not None:
+                dialog.set_vnext_metadata(self._metadata_result)
+            if focus_roi and dialog._vnext_table_result is None:
+                dialog.status.setText("Choose a source, then Plot ROI.")
 
     def _metadata_from_current(self):
         current = self._context_controller.navigation.current
@@ -834,7 +843,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._analysis_identity = self._analysis_kind = self._analysis_target = None
             self._analysis_generation = self._analysis_anchor = self._analysis_request = None
             self._analysis_fingerprint = ""
-            self._roi_preview_binding = None
+            self._roi_preview_binding = self._scan_roi_result = None
             self._scan_roi_dialog.clear_vnext_metadata()
             if candidates: self._scan_roi_dialog.source_widget.set_external_candidates(candidates)
             self._notice("Choose one headless-qualified source."); return True
@@ -857,6 +866,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         admitted, reason = retention_admission(retained, replacing, payload)
         if not admitted:
             self._notice(reason); return True
+        if kind in {"scan_plot", "roi_preview", "roi_scan"}:
+            self._roi_preview_binding = None
+            if self._scan_roi_dialog is not None:
+                self._scan_roi_dialog._retire_vnext_result()
         if kind == "metadata":
             self._roi_preview_binding = None
             self._metadata_result = payload; self._scan_roi_result = None

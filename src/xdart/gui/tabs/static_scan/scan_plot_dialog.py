@@ -830,12 +830,23 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._vnext_submit("close", None)
         super().closeEvent(event)
 
+    def _retire_vnext_result(self):
+        picker = self._roi_dialog
+        if picker is not None:
+            picker.close(); picker.deleteLater(); self._roi_dialog = None
+        self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
+        self._vnext_rendering = True
+        try:
+            self.plot.clear(); self.right_vb.clear()
+            if self.legend is not None: self.legend.clear()
+            self.right_axis.setVisible(False); self.right_vb.setVisible(False)
+            self.status.setText("")
+        finally:
+            self._vnext_rendering = False
+
     def set_vnext_metadata(self, result):
         """Render only detached table columns and headless-selected defaults."""
-        if self._roi_dialog is not None:
-            self._roi_dialog.close(); self._roi_dialog.deleteLater()
-            self._roi_dialog = None
-        self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
+        self._retire_vnext_result()
         self._vnext_table_result = result; self._vnext_rendering = True
         try:
             table = {}
@@ -862,10 +873,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._vnext_rendering = False
 
     def clear_vnext_metadata(self):
-        if self._roi_dialog is not None:
-            self._roi_dialog.close(); self._roi_dialog.deleteLater()
-            self._roi_dialog = None
-        self._vnext_table_result = self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
+        self._retire_vnext_result(); self._vnext_table_result = None
         self._table = {}; self._columns = []; self._vnext_rendering = True
         for widget in (self.x_combo, self.norm_combo, self.y_list, self.r_list):
             widget.clear()
