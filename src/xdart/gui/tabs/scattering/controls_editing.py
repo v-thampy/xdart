@@ -463,6 +463,22 @@ def reduce_control_edit(
             return EditRefusal("Threshold minimum cannot exceed maximum.")
     candidate = snapshot.thaw()
     _install_value(candidate, path, parsed)
+    prior_default_save_path = (
+        str(Path(str(intent.project_root)).expanduser() / "xdart_processed_data")
+        if str(intent.project_root or "").strip()
+        else ""
+    )
+    if (
+        path == PROJECT_ROOT
+        and str(parsed).strip()
+        and (
+            not str(intent.save_path or "").strip()
+            or str(intent.save_path) == prior_default_save_path
+        )
+    ):
+        candidate.save_path = str(
+            Path(str(parsed)).expanduser() / "xdart_processed_data"
+        )
     if path == GI_ENABLED:
         _normalize_gi_units(
             candidate,

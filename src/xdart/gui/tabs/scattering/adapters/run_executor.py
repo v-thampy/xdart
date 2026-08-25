@@ -404,6 +404,7 @@ class _StandardRun:
     resources: RunResources | None = None
     display: RunDisplayState = field(init=False)
     context_runtime: AcquisitionRuntime | None = None
+    unpublished_display_retired: bool = False
     frames_by_label: dict[int, Any] = field(default_factory=dict)
     perf_enabled: bool = field(init=False)
     perf_quartiles_enabled: bool = field(init=False)
@@ -762,6 +763,12 @@ class StandardRunExecutor:
         token = AdmissionToken(capture.request_id, capture.intent_snapshot.revision)
         with self._lock:
             active = self._active
+            if (
+                active is not None
+                and active.unpublished_display_retired
+            ):
+                self._active = None
+                active = None
             if self._admission is not None or (
                 active is not None and not active.closed
             ):
@@ -1286,6 +1293,7 @@ class StandardRunExecutor:
         self._project_new_durable(run, output)
         if getattr(result, "failed", False):
             raise RuntimeError(result.error or "predecessor settlement failed")
+        run.display.mark_hydration_closed(predecessor)
         if not run.display.release_light_1d(
             predecessor, reason="lineage-replaced",
         ):
@@ -1564,6 +1572,7 @@ class StandardRunExecutor:
         work_elapsed = max(0.0, monotonic() - started_at)
         cleanup_started_at = monotonic()
         receipt = self._cleanup(run, primary)
+        receipt = self._release_unpublished_terminal(run, receipt)
         completed, total = _terminal_durable_progress(run)
         elapsed = max(0.0, monotonic() - started_at)
         cleanup_elapsed = max(
@@ -1585,6 +1594,43 @@ class StandardRunExecutor:
             cleanup_elapsed=cleanup_elapsed,
             core_count=core_count,
         )
+
+    def _release_unpublished_terminal(
+        self,
+        run: _StandardRun,
+        receipt: ExecutorClosed,
+    ) -> ExecutorClosed:
+        """Retire a clean run whose display identity was never published."""
+
+        runtime = run.context_runtime
+        if (
+            receipt.cleanup_status is not CleanupStatus.CLEANED
+            or runtime is not None and runtime.context is not None
+        ):
+            return receipt
+        stage = "unpublished_runtime.retire"
+        try:
+            if runtime is not None:
+                runtime.retire()
+            stage = "unpublished_display.retire"
+            display_clean = run.display.retire(
+                join_timeout=self._join_timeout
+            )
+        except BaseException as error:
+            with run.cleanup_lock:
+                run.cleanup_failures.append(detach_exception(
+                    error, stage,
+                ))
+                run.cleanup_status = CleanupStatus.CLEANUP_PENDING
+                return self._receipt(run)
+        if not display_clean:
+            with run.cleanup_lock:
+                run.cleanup_status = CleanupStatus.CLEANUP_PENDING
+                return self._receipt(run)
+        with self._lock:
+            if self._active is run:
+                run.unpublished_display_retired = True
+        return receipt
 
     def _execute_admitted(self, run: _StandardRun) -> bool:
         receipt = None if run.resources is None else run.resources.admission
@@ -2055,6 +2101,12 @@ class StandardRunExecutor:
                 run.frames_by_label.clear()
                 if run.artifact not in run.artifacts:
                     run.artifacts.append(run.artifact)
+                owner = run.display.artifacts.get(str(run.artifact))
+                if owner is None:
+                    raise RuntimeError(
+                        "persisted-prefix display artifact is missing"
+                    )
+                run.display.mark_hydration_closed(owner)
                 stopped = bool(run.stop_requested)
                 if settle is not None:
                     settle(stopped)
@@ -2093,8 +2145,11 @@ class StandardRunExecutor:
             session_error: BaseException | None = None
             projection_error: BaseException | None = None
             result = None
+            finished_current = not (
+                retain_session and not run.stop_requested
+            )
             try:
-                if retain_session and not run.stop_requested:
+                if not finished_current:
                     result = output.commit_epoch()
                 else:
                     result = output.finish_current()
@@ -2136,6 +2191,11 @@ class StandardRunExecutor:
                 raise RuntimeError(
                     result.error or "scattering reduction failed"
                 )
+            if finished_current:
+                owner = run.display.artifacts.get(str(run.artifact))
+                if owner is None:
+                    raise RuntimeError("finished display artifact is missing")
+                run.display.mark_hydration_closed(owner)
             run.current_published = max(
                 run.current_published, run.current_completed,
             )
@@ -2562,7 +2622,14 @@ class StandardRunExecutor:
             else:
                 if output is not None:
                     try:
+                        finalized = (
+                            output.finalized_display_owners()
+                            if isinstance(output, DynamicOutputAdapter)
+                            else ()
+                        )
                         self._project_new_durable(run, output)
+                        for owner in finalized:
+                            run.display.mark_hydration_closed(owner)
                     except Exception as error:
                         run.cleanup_failures.append(detach_exception(
                             error, 'dynamic_output.project'

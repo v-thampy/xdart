@@ -3,13 +3,12 @@
 Opt-in coexistence mount: the legacy static page remains registered and the
 product default. This factory constructs the real ``ScatteringWorkspace`` with
 its production services and returns a typed ``PageHandle`` whose ports map the
-page truthfully — Open/Run/Stop and write-mode changes dispatch through the
-page's single command owner, run activity comes from the coordinator phase,
-application menus mount onto the page's own Config/Help hosts, activity joins
-run and page-operation ownership, and close uses
+page truthfully — Open/Run/Stop, profile persistence, slice pinning, and
+write-mode changes dispatch through the page's single command owner; run
+activity comes from the coordinator phase, application menus mount onto the
+page's own Config/Help hosts, activity joins run and page-operation ownership,
+and close uses
 ``close_workspace()``'s cleanup receipt (CLEANED is authoritatively CLEAN).
-Capabilities the page has no surface for
-(slice pin, settings I/O) are absent so the host disables those actions. The
 file-dialog choosers are ported unchanged from the live-verified opt-in
 launcher.
 """
@@ -17,6 +16,7 @@ launcher.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING
 
 from .handle import AppMenuHosts, PageHandle
@@ -154,6 +154,28 @@ class _WorkspaceWriteMode:
         value = "Append" if current == "Overwrite" else "Overwrite"
         _dispatch(self.widget, "SET_OUTPUT_POLICY", value)
         return ActionCompleted(f"write-mode-{value.casefold()}")
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceSettings:
+    widget: "ScatteringWorkspace"
+
+    def load(self):
+        _dispatch(self.widget, "MENU", "Config:Load")
+        return ActionCompleted("profile-load-requested")
+
+    def save(self):
+        _dispatch(self.widget, "MENU", "Config:Save")
+        return ActionCompleted("profile-save-requested")
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceSlicePin:
+    widget: "ScatteringWorkspace"
+
+    def pin(self):
+        _dispatch(self.widget, "PIN_SLICE")
+        return ActionCompleted("slice-pin-requested")
 
 
 def _control_path_chooser(widget):
@@ -298,7 +320,10 @@ def build_scattering_workspace(
     key = SCATTERING_PAGE_KEY
     intents = services.run_intents.store_for(key)
     if intents is None:
-        intents = RunIntentStore(RunIntent(output_mode="Overwrite"))
+        intents = RunIntentStore(RunIntent(
+            output_mode="Overwrite",
+            max_cores=min(max(1, (os.cpu_count() or 1) - 1), 4),
+        ))
     executor = services.execution.executor_for(key)
     if executor is None:
         executor = StandardRunExecutor()
@@ -330,8 +355,10 @@ def build_scattering_workspace(
         widget=widget,
         close=_WorkspaceCloser(widget),
         open_folder=_WorkspaceOpenFolder(widget),
+        settings_io=_WorkspaceSettings(widget),
         run_control=_WorkspaceRunControl(widget),
         write_mode=_WorkspaceWriteMode(widget),
+        slice_pin=_WorkspaceSlicePin(widget),
         activity=_WorkspaceActivity(lifecycle, widget._operation_slot),
         app_menus=_WorkspaceMenus(widget),
     )

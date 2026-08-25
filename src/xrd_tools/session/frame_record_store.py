@@ -777,6 +777,34 @@ class FrameRecordStore:
                 return frozenset()
             return frozenset(self._persisted_modes.get(label, set()))
 
+    def recoverable_mode_labels(
+        self,
+        labels: Iterable[int | str],
+        dimension: str,
+    ) -> frozenset[int | str]:
+        """Labels with a persisted/checkpoint-recoverable mode in one dimension.
+
+        This is a read-only batch fact for display admission.  It does not
+        imply that a payload is resident in RAM: terminal acquisition preview
+        reads use the persisted artifact directly, while an open checkpoint
+        still requires its separately carried hydration authority.
+        """
+        if dimension not in {"1d", "2d"}:
+            raise ValueError("dimension must be '1d' or '2d'")
+        requested = tuple(labels)
+        with self._lock:
+            return frozenset(
+                label
+                for label in requested
+                if any(
+                    key[0] == dimension
+                    for key in (
+                        self._persisted_modes.get(label, set())
+                        | self._checkpoint_recoverable.get(label, set())
+                    )
+                )
+            )
+
     def has_heavy_payload(self, label: int | str) -> bool:
         with self._lock:
             record = self._records.get(label)

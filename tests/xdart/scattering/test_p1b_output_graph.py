@@ -1555,7 +1555,11 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
     # Durable display projection is acknowledged independently per graph and
     # only after its callback succeeds. A partial callback failure must retain
     # B without replaying already-applied A on cleanup re-entry.
-    from xrd_tools.session import DynamicFrameIdentity, ResultMode
+    from xrd_tools.session import (
+        DynamicFrameIdentity,
+        DynamicRunState,
+        ResultMode,
+    )
 
     projection_adapter = dynamic_output.DynamicOutputAdapter(
         RunIntent().freeze()
@@ -1663,6 +1667,11 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
             return SimpleNamespace(
                 discovered=(self.key,),
                 durable=durable,
+                state=(
+                    DynamicRunState.FINISHED
+                    if self.settled[0]
+                    else DynamicRunState.ACTIVE
+                ),
             )
 
     class FinishSession:
@@ -1748,23 +1757,30 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
     cleanup_run.display.configure(
         partition_count=2, npt=2, frame_bytes=48,
     )
-    cleanup_run.display.add_artifact(
+    owner_a = cleanup_run.display.add_artifact(
         projection_a,
         "projection-a",
         mask=None,
         mask_saturation=False,
         measurement_mode="Standard",
     )
-    cleanup_run.display.add_artifact(
+    owner_b = cleanup_run.display.add_artifact(
         projection_b,
         "projection-b",
         mask=None,
         mask_saturation=False,
         measurement_mode="Standard",
     )
+    cleanup_graph_a["display_owner"] = owner_a
+    cleanup_graph_b["display_owner"] = owner_b
     cleanup_executor = StandardRunExecutor()
     original_failure = detach_exception(
         RuntimeError("injected original run failure"), "run",
+    )
+    assert cleanup_adapter.finalized_display_owners() == ()
+    assert (owner_a.hydration_closed, owner_b.hydration_closed) == (
+        False,
+        False,
     )
 
     first_cleanup = cleanup_executor._cleanup(
@@ -1785,6 +1801,13 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
     assert cleanup_adapter.projections == [
         (str(projection_a), (7,), (7,)),
     ]
+    assert cleanup_adapter.finalized_display_owners() == (owner_a,)
+    assert (owner_a.hydration_closed, owner_b.hydration_closed) == (
+        True,
+        False,
+    )
+    assert cleanup_graph_a["transition"] is None
+    assert cleanup_graph_b["transition"] == "finish"
 
     second_cleanup = cleanup_executor._cleanup(cleanup_run)
     stable_cleanup = (
@@ -1793,6 +1816,9 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
         tuple(cleanup_graph_a["settled_labels"]),
         tuple(cleanup_graph_b["settled_labels"]),
         tuple(cleanup_adapter.projections),
+        owner_a.hydration_closed,
+        owner_b.hydration_closed,
+        cleanup_adapter.finalized_display_owners(),
     )
     third_cleanup = cleanup_executor._cleanup(cleanup_run)
     assert second_cleanup.cleanup_status is CleanupStatus.CLEANED
@@ -1812,6 +1838,16 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
         (str(projection_a), (7,), ()),
         (str(projection_b), (11,), (11,)),
     ]
+    assert cleanup_adapter.finalized_display_owners() == (
+        owner_a,
+        owner_b,
+    )
+    assert (owner_a.hydration_closed, owner_b.hydration_closed) == (
+        True,
+        True,
+    )
+    assert cleanup_graph_a["transition"] is None
+    assert cleanup_graph_b["transition"] is None
     assert third_cleanup.cleanup_status is CleanupStatus.CLEANED
     assert stable_cleanup == (
         cleanup_run.completed,
@@ -1819,6 +1855,9 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
         tuple(cleanup_graph_a["settled_labels"]),
         tuple(cleanup_graph_b["settled_labels"]),
         tuple(cleanup_adapter.projections),
+        owner_a.hydration_closed,
+        owner_b.hydration_closed,
+        cleanup_adapter.finalized_display_owners(),
     )
 
     # Enter the same collision through the public vNext executor. Holding the

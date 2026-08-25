@@ -29,6 +29,7 @@ from tests.xdart.scattering.test_e2lv_r4_2_boundaries import (
     _integrated_record,
 )
 from tests.xdart.scattering.test_e3_context_contract import _browse
+from xdart.gui.tabs.scattering.acquisition_runtime import AcquisitionRuntime
 from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
 from xdart.gui.tabs.scattering.adapters.run_executor import (
     StandardRunExecutor,
@@ -524,6 +525,111 @@ def test_real_pending_retirement_keeps_a_active(
     assert executor._active is historical
     assert executor._retirement is not None
     assert executor._retirement.run_identity is historical.identity
+
+
+def _assert_clean_precontext_failure_needs_no_foreign_retirement_proof(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    armed_live: bool,
+) -> None:
+    selected = image_series_spec(tmp_path / "raw_0001.tif")
+    intent = RunIntent(
+        source_spec=selected,
+        poni_file=str(tmp_path / "calibration.poni"),
+        save_path=str(tmp_path / "failed.nxs"),
+        output_mode="Overwrite",
+    )
+    configuration = intent.freeze()
+    identity = RunIdentity.from_configuration(configuration)
+    capture = SourceCapture(RequestId(70), 1, selected)
+    run = _StandardRun(
+        configuration,
+        identity,
+        None,
+        None,
+        None,
+        None,
+        tmp_path / "failed.nxs",
+        capture=capture,
+    )
+    runtime = None
+    if armed_live:
+        runtime = AcquisitionRuntime()
+        runtime._arm_live()
+        run.context_runtime = runtime
+    executor = StandardRunExecutor()
+    executor._active = run
+    monkeypatch.setattr(
+        executor,
+        "_execute_admitted",
+        lambda _run: (_ for _ in ()).throw(
+            RuntimeError("pre-context construction failed")
+        ),
+    )
+
+    executor._run(run)
+
+    terminal, = executor.drain_events()
+    assert terminal.kind is StandardEventKind.FAILED
+    assert terminal.cleanup_status is CleanupStatus.CLEANED
+    assert executor._active is run
+    assert run.unpublished_display_retired is True
+    if runtime is not None:
+        assert runtime._live_terminal is True
+        assert runtime._live_retired is True
+    assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+
+    snapshot = RunIntentStore(intent).snapshot()
+    request = RequestId(71)
+    start = StartCapture(
+        request,
+        1,
+        snapshot,
+        SourceCapture(request, 1, selected),
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "build_admission_receipt",
+        lambda capture, **_kwargs: admission_for(capture),
+    )
+    token = executor.begin_admission(start)
+    _wait_thread(
+        lambda: type(executor.poll_admission(token)) is AdmissionReceipt
+    )
+    admitted = executor.poll_admission(token)
+    assert type(admitted) is AdmissionReceipt
+    assert executor._active is None
+    assert (
+        admitted.display_retirement
+        is _retirement_api().NO_DISPLAY_RETIREMENT
+    )
+    assert (
+        executor.release_admission(token).cleanup_status
+        is CleanupStatus.CLEANED
+    )
+
+
+def test_clean_precontext_failure_needs_no_foreign_retirement_proof(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _assert_clean_precontext_failure_needs_no_foreign_retirement_proof(
+        tmp_path,
+        monkeypatch,
+        armed_live=False,
+    )
+
+
+def test_clean_armed_live_precontext_failure_retires_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _assert_clean_precontext_failure_needs_no_foreign_retirement_proof(
+        tmp_path,
+        monkeypatch,
+        armed_live=True,
+    )
 
 
 

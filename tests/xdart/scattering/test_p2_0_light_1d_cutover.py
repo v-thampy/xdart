@@ -23,12 +23,15 @@ from tests.xdart.scattering.test_p1c_l1_display_residency import (
 from xdart.gui.tabs.scattering.adapters import dynamic_output, run_executor
 from xdart.gui.tabs.scattering.adapters.dynamic_output import DynamicOutputAdapter
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+from xdart.gui.tabs.scattering.context_projection import (
+    ContextProjection, ProjectionRequest,
+)
 from xdart.gui.tabs.scattering.display_runtime import (
     DetectorHydrationOutcome, DisplayArtifact, RunDisplayState,
 )
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
 from xdart.gui.tabs.scattering.events import CleanupStatus
-from xdart.modules.display_context import HydrationRequest
+from xdart.modules.display_context import DisplaySelection, HydrationRequest
 from xdart.modules.frame_publication import PublicationStore
 from xrd_tools.session import (
     DynamicRunState, HydrationPurpose, HydrationReadKey, HydrationScope,
@@ -908,6 +911,168 @@ def test_p2_0_preview_preserves_pair_and_light_miss_stays_array_free(monkeypatch
         "demotion": (True, 1, True, True, True),
         "identity": (True, True, True, True),
     }
+
+
+def test_terminal_int2d_acquisition_projection_rehydrates_evicted_cake(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "64")
+    executor, identity, run, artifact, _target, terminal = _terminal_run(
+        tmp_path, frames=65, processing_mode="Int 2D",
+    )
+    transport = run.display.transport
+    submitted: list[tuple[HydrationRequest, bool]] = []
+    real_submit = transport.submit_detached
+
+    def counted_submit(request, *, closed=False):
+        submitted.append((request, closed))
+        return real_submit(request, closed=closed)
+
+    monkeypatch.setattr(transport, "submit_detached", counted_submit)
+    try:
+        assert terminal.kind is StandardEventKind.FINISHED
+        keys = run.display.catalog_snapshot().entries
+        key = keys[0]
+        context = run.context_runtime.context
+        assert context is not None
+        selection = DisplaySelection.for_context(context, 71)
+        request = ProjectionRequest(identity, selection, key)
+        projection = ContextProjection()
+
+        assert artifact.hydration_closed is True
+        assert not artifact.records.has_heavy_payload(0)
+        assert artifact.publications.heavy_labels() == tuple(range(1, 65))
+        assert tuple(
+            item.local_frame_label
+            for item in run.display._residency._heavy
+        ) == tuple(range(1, 65))
+        assert artifact.records.persisted_modes(0) == frozenset((
+            ("1d", "default"), ("2d", "default"),
+        ))
+
+        # Production ContextProjection passes closed=False.  The display owner
+        # must nevertheless know that terminal cleanup has made persisted
+        # reads authoritative, and 1-D lease completeness must not disguise a
+        # missing persisted 2-D cake.
+        assert projection.project(
+            context,
+            request,
+            selection,
+            identity,
+            {id(key): key},
+        ) is None
+        assert len(submitted) == 1
+        assert submitted[0][0].purpose is HydrationPurpose.PREVIEW
+        assert submitted[0][1] is True
+        _wait_transport_idle(transport, context.commit_gate)
+
+        recovered = projection.project(
+            context,
+            request,
+            selection,
+            identity,
+            {id(key): key},
+        )
+        assert recovered is not None
+        assert recovered.view.intensity_1d is not None
+        assert recovered.view.intensity_2d is not None
+        assert recovered.view.axis_2d_x is not None
+        assert recovered.view.axis_2d_x.values is not None
+        assert recovered.view.axis_2d_y is not None
+        assert recovered.view.axis_2d_y.values is not None
+        assert len(submitted) == 1
+        assert frozenset(artifact.publications.heavy_labels()) == frozenset(
+            (*range(1, 64), 0),
+        )
+        assert frozenset(
+            item.local_frame_label
+            for item in run.display._residency._heavy
+        ) == frozenset((*range(1, 64), 0))
+        assert run.display.residency_snapshot().heavy == 64
+
+        # The opposite boundary uses the same nearest-window victim in both
+        # owners: restoring label 64 evicts the now-distant label 0, without
+        # underfilling the 64-frame heavy grant.
+        last_key = keys[64]
+        last_selection = DisplaySelection.for_context(context, 72)
+        last_request = ProjectionRequest(identity, last_selection, last_key)
+        assert projection.project(
+            context,
+            last_request,
+            last_selection,
+            identity,
+            {id(last_key): last_key},
+        ) is None
+        assert len(submitted) == 2
+        assert submitted[-1][0].label == 64
+        assert submitted[-1][1] is True
+        _wait_transport_idle(transport, context.commit_gate)
+        restored = projection.project(
+            context,
+            last_request,
+            last_selection,
+            identity,
+            {id(last_key): last_key},
+        )
+        assert restored is not None
+        assert restored.view.intensity_2d is not None
+        assert frozenset(artifact.publications.heavy_labels()) == frozenset(
+            range(1, 65),
+        )
+        assert frozenset(
+            item.local_frame_label
+            for item in run.display._residency._heavy
+        ) == frozenset(range(1, 65))
+        assert run.display.residency_snapshot().heavy == 64
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+
+
+def test_terminal_int1d_acquisition_projection_keeps_light_pair_without_read(
+    monkeypatch, tmp_path,
+) -> None:
+    executor, identity, run, artifact, _target, terminal = _terminal_run(
+        tmp_path, processing_mode="Int 1D",
+    )
+    transport = run.display.transport
+    submitted: list[HydrationRequest] = []
+    real_submit = transport.submit_detached
+
+    def counted_submit(request, *, closed=False):
+        submitted.append(request)
+        return real_submit(request, closed=closed)
+
+    monkeypatch.setattr(transport, "submit_detached", counted_submit)
+    try:
+        assert terminal.kind is StandardEventKind.FINISHED
+        key = run.display.catalog_snapshot().entries[0]
+        context = run.context_runtime.context
+        assert context is not None
+        selection = DisplaySelection.for_context(context, 72)
+        request = ProjectionRequest(identity, selection, key)
+
+        # Int1D's publication base is already a thumbnail shell: the retained
+        # byte-native pair is its complete visible payload.
+        artifact.records.release_heavy(0)
+        assert not artifact.records.has_heavy_payload(0)
+        assert artifact.records.persisted_modes(0) == frozenset((
+            ("1d", "default"),
+        ))
+        projected = ContextProjection().project(
+            context,
+            request,
+            selection,
+            identity,
+            {id(key): key},
+        )
+        assert projected is not None
+        assert projected.view.intensity_1d is not None
+        assert projected.view.intensity_2d is None
+        assert submitted == []
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+
+
 def test_p2_0_close_and_replacement_retain_exact_cleanup_custody(monkeypatch, tmp_path) -> None:
     ledger: dict[str, object] = {}
     with monkeypatch.context() as staged_case:

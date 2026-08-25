@@ -1680,6 +1680,32 @@ class PublicationStore:
                 complete.append(label)
             return frozenset(complete)
 
+    def complete_2d_labels(
+        self, labels: Iterable[int | str],
+    ) -> frozenset[int | str]:
+        """Return labels whose resident base publication has complete 2-D.
+
+        Unlike :meth:`complete_labels`, this deliberately ignores the
+        separately retained light-1D pair.  It is the array-free batch oracle
+        used when a persisted 2-D mode makes cake residency mandatory.
+        """
+        requested = tuple(labels)
+        with self._lock:
+            return frozenset(
+                label
+                for label in requested
+                if (
+                    (publication := self._items.get(label)) is not None
+                    and bool(publication.record.results_2d)
+                    and all(
+                        view.has_2d
+                        and view.axis_2d_x.values is not None
+                        and view.axis_2d_y.values is not None
+                        for view in publication.record.results_2d.values()
+                    )
+                )
+            )
+
     def has_heavy_payload(self, label: int | str) -> bool:
         with self._lock:
             publication = self._items.get(label)
@@ -1777,6 +1803,16 @@ class PublicationStore:
     def labels(self) -> tuple[int | str, ...]:
         with self._lock:
             return tuple(self._items)
+
+    def heavy_labels(self) -> tuple[int | str, ...]:
+        """The exact current tier-0 heavy order, without composing views."""
+        with self._lock:
+            return tuple(self._heavy_labels)
+
+    def has_heavy_residency(self, label: int | str) -> bool:
+        """Whether ``label`` currently occupies the tier-0 heavy budget."""
+        with self._lock:
+            return label in self._heavy_labels
 
     def snapshot(self) -> Mapping[int | str, FramePublication]:
         with self._lock:

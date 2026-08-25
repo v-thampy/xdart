@@ -7,6 +7,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import math
 import os
+from pathlib import Path
+import tempfile
 import time
 from typing import Any, Callable
 import weakref
@@ -21,6 +23,10 @@ from xrd_tools.session.intent_store import (
     IntentRecaptureRequired,
     RunIntentStore,
     RunIntentSnapshot,
+)
+from xrd_tools.session.run_intent_profile import (
+    dump_run_intent_profile,
+    load_run_intent_profile,
 )
 from xrd_tools.session.run_configuration import heavy_residency_choice
 from xrd_tools.reduction import ReintegrateResult
@@ -160,12 +166,19 @@ from .workspace_shell import ScatteringWorkspaceShell
 _NO_DELIBERATE_MANUAL = object()
 _NO_AUTOMATIC_GI_MOTOR = object()
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
+_DEFAULT_LIVE_PLOT_INTERVAL_MS = 250
 _LIVE_PLOT_INTERVAL_ENV = "XDART_LIVE_PLOT_INTERVAL_MS"
 _UNSAFE_UNFUNDED_STAGING_ENV = (
     "XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC"
 )
 _UNSAFE_UNFUNDED_STAGING_KEY = (
     "_post_g2_unfunded_staging_diagnostic_v1"
+)
+_NEXUS_ONLY_PERFORMANCE_KEYS = (
+    "_post_g2_pipeline",
+    "_post_g2_pipeline_v2",
+    "_post_g2_output_diagnostics_v1",
+    _UNSAFE_UNFUNDED_STAGING_KEY,
 )
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _LIVE_SOURCE_REFRESH_PHASES = frozenset({
@@ -181,11 +194,21 @@ def _live_plot_interval_ms() -> int:
     try:
         value = int(os.environ.get(
             _LIVE_PLOT_INTERVAL_ENV,
-            str(_LIVE_EVENT_DRAIN_INTERVAL_MS),
+            str(_DEFAULT_LIVE_PLOT_INTERVAL_MS),
         ))
     except (TypeError, ValueError):
-        value = _LIVE_EVENT_DRAIN_INTERVAL_MS
+        value = _DEFAULT_LIVE_PLOT_INTERVAL_MS
     return max(_LIVE_EVENT_DRAIN_INTERVAL_MS, value)
+
+
+def _drop_nexus_only_performance_options(intent: object) -> None:
+    """Keep XYE-only GUI intents free of private NeXus pipeline controls."""
+
+    run_options = getattr(intent, "run_options", None)
+    if type(run_options) is not dict:
+        raise TypeError("run options must be one mutable mapping")
+    for key in _NEXUS_ONLY_PERFORMANCE_KEYS:
+        run_options.pop(key, None)
 
 
 def _slice_pins_for_plot_axis(
@@ -338,6 +361,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ]
             | None
         ) = None,
+        profile_path_chooser: (
+            Callable[[str, str], str | None] | None
+        ) = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -394,6 +420,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._presentation_run_identity: RunIdentity | None = None
         self._live_plot_interval_ms = _live_plot_interval_ms()
         self._last_live_plot_at: float | None = None
+        self._scientific_repaint_pending = False
         self._quartile_refresh_identity: RunIdentity | None = None
         self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
         self._browser_directory_chooser = (
@@ -410,6 +437,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else self._choose_viewer_1d_dialog)
         self._control_path_chooser = control_path_chooser
         self._source_selection_chooser = source_selection_chooser
+        self._profile_path_chooser = (
+            profile_path_chooser
+            if profile_path_chooser is not None
+            else self._choose_profile_path_dialog
+        )
         self._advanced_dialog: AdvancedSettingsDialog | None = None
         self._advanced_settings_editor = (
             advanced_settings_editor
@@ -1575,6 +1607,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._stop_run()
             return
         if kind is ShellCommandKind.MENU:
+            if command.value == "Config:Save":
+                self._save_run_intent_profile()
+                return
+            if command.value == "Config:Load":
+                self._load_run_intent_profile()
+                return
             if command.value == "Config:Performance Diagnostics…":
                 self._edit_performance_diagnostics()
                 return
@@ -1825,6 +1863,150 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._reconcile_snapshot(snapshot, result.snapshot)
         return False
 
+    def _profile_action_permitted(self) -> bool:
+        phase = self._lifecycle.phase
+        return (
+            not self._closing
+            and not self._closed
+            and self._admission_state is None
+            and not self._operation_slot.owned
+            and (
+                phase is RunPhase.IDLE
+                or phase is RunPhase.FAILED
+                and self._lifecycle.reset_permitted
+            )
+        )
+
+    def _choose_profile_path_dialog(
+        self,
+        action: str,
+        start_directory: str,
+    ) -> str | None:
+        file_filter = "XDART profiles (*.json);;All files (*)"
+        if action == "save":
+            selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save scattering profile",
+                start_directory,
+                file_filter,
+            )
+        elif action == "load":
+            selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Load scattering profile",
+                start_directory,
+                file_filter,
+            )
+        else:  # pragma: no cover - private callers are closed above
+            raise ValueError("profile action must be 'save' or 'load'")
+        return selected or None
+
+    def _choose_run_intent_profile_path(self, action: str) -> Path | None:
+        intent = self._intents.snapshot().thaw()
+        start_directory = browse_start_dir(
+            "",
+            fallback=intent.project_root,
+        )
+        try:
+            selected = self._profile_path_chooser(action, start_directory)
+        except Exception as error:
+            self._error_notice("Profile chooser failed", error)
+            return None
+        if type(selected) is not str or not selected:
+            return None
+        path = Path(selected).expanduser()
+        if action == "save" and not path.suffix:
+            path = path.with_suffix(".json")
+        return path
+
+    @staticmethod
+    def _write_profile_atomically(path: Path, text: str) -> None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except Exception:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _save_run_intent_profile(self) -> None:
+        if not self._profile_action_permitted():
+            self._notice("Profiles can be saved only while the workspace is idle.")
+            self._refresh_shell()
+            return
+        if not self._commit_focused_control_edit_for_run():
+            return
+        path = self._choose_run_intent_profile_path("save")
+        if path is None:
+            return
+        if not self._profile_action_permitted():
+            self._notice("Profile save cancelled because the workspace became active.")
+            self._refresh_shell()
+            return
+        try:
+            text = dump_run_intent_profile(
+                self._intents.snapshot().thaw()
+            )
+            self._write_profile_atomically(path, text)
+        except Exception as error:
+            self._error_notice("Profile save failed", error)
+            return
+        remember_browse_path(path)
+        self._notice(f"Profile saved: {path.name}")
+        self._refresh_shell()
+
+    def _load_run_intent_profile(self) -> None:
+        if not self._profile_action_permitted():
+            self._notice("Profiles can be loaded only while the workspace is idle.")
+            self._refresh_shell()
+            return
+        path = self._choose_run_intent_profile_path("load")
+        if path is None:
+            return
+        if not self._profile_action_permitted():
+            self._notice("Profile load cancelled because the workspace became active.")
+            self._refresh_shell()
+            return
+        prior = self._intents.snapshot()
+        try:
+            candidate = load_run_intent_profile(
+                path.read_text(encoding="utf-8")
+            )
+            if candidate.processing_mode == "Int 1D (XYE)":
+                _drop_nexus_only_performance_options(candidate)
+        except Exception as error:
+            self._error_notice("Profile load failed", error)
+            return
+        if not self._profile_action_permitted():
+            self._notice("Profile load cancelled because the workspace became active.")
+            self._refresh_shell()
+            return
+        try:
+            result = self._intents.commit(
+                candidate,
+                expected_revision=prior.revision,
+            )
+        except Exception as error:
+            self._error_notice("Profile load commit failed", error)
+            return
+        if type(result) is IntentCommitAccepted:
+            remember_browse_path(path)
+            self._notice(f"Profile loaded: {path.name}")
+        else:
+            self._notice("Profile load superseded; review current values.")
+        self._reconcile_snapshot(prior, result.snapshot)
+
     def _reduce_page_control_edit(
         self,
         snapshot: RunIntentSnapshot,
@@ -2027,6 +2209,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._active_batch_mode = outcome.configuration.batch_mode
             self._run_frame_seen = False
             self._last_live_plot_at = None
+            self._scientific_repaint_pending = False
             self._quartile_refresh_identity = (
                 outcome.run_identity
                 if os.environ.get(
@@ -2319,6 +2502,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._follow_processed_artifact(current)
 
         force_scientific = changed
+        frame_presentation_changed = False
 
         executor = self._run_executor
         events: tuple[StandardRunEvent, ...] = ()
@@ -2411,7 +2595,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         )
                     else:
                         changed = True
-                        force_scientific = True
+                        frame_presentation_changed = True
                     if not self._active_batch_mode:
                         self._follow_processed_artifact(frame)
                 continue
@@ -2462,32 +2646,45 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if operation_identity is not None:
             ScatteringWorkspace._observe_operation_stamp(self)
             update = operation_slot.poll(operation_identity)
-            if update is not None: changed = self._consume_analysis_update(update) or self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or self._consume_reintegrate_update(update) or self._consume_average_update(update) or changed
+            if update is not None:
+                operation_changed = self._consume_analysis_update(update) or self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or self._consume_reintegrate_update(update) or self._consume_average_update(update)
+                changed = operation_changed or changed
+                force_scientific = operation_changed or force_scientific
             elif operation_identity is self._background_identity and not operation_slot.owned:
-                self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True
+                self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True; force_scientific = True
             elif operation_identity is self._reintegrate_identity and not operation_slot.owned:
                 request, target = self._reintegrate_request, self._reintegrate_target; shown = {"1d": "1-D", "2d": "2-D"}.get(self._reintegrate_dimension, "operation"); self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
                 if request is not None and target is not None: self._reload_after_reintegrate(request, target)
-                self._notice(f"Reintegrate {shown} failed before terminal publication."); changed = True
+                self._notice(f"Reintegrate {shown} failed before terminal publication."); changed = True; force_scientific = True
             elif operation_identity is self._average_identity and not operation_slot.owned:
                 self._average_identity = self._average_revision = self._average_target = self._average_entry = None
-                self._notice("Average failed before terminal publication."); changed = True
+                self._notice("Average failed before terminal publication."); changed = True; force_scientific = True
             elif operation_identity is self._analysis_identity and not operation_slot.owned:
                 self._analysis_identity = self._analysis_kind = self._analysis_target = None
                 self._analysis_generation = self._analysis_anchor = self._analysis_request = None
                 self._analysis_fingerprint = ""
-                self._notice("Analysis failed before terminal publication."); changed = True
+                self._notice("Analysis failed before terminal publication."); changed = True; force_scientific = True
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
         )
         if advanced_presentation:
             changed = True
+            frame_presentation_changed = True
+        if self._scientific_repaint_pending:
+            last_plot = self._last_live_plot_at
+            if (
+                last_plot is None
+                or time.monotonic() - last_plot
+                >= self._live_plot_interval_ms / 1000.0
+            ):
+                changed = True
+                force_scientific = True
         if changed:
             preserve_scientific = False
             last_plot = self._last_live_plot_at
             if (
-                advanced_presentation
+                frame_presentation_changed
                 and not force_scientific
                 and self._live_plot_interval_ms
                 > _LIVE_EVENT_DRAIN_INTERVAL_MS
@@ -2497,6 +2694,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 preserve_scientific = True
             if preserve_scientific:
+                self._scientific_repaint_pending = True
                 self._refresh_event_shell(preserve_scientific=True)
             else:
                 self._refresh_event_shell()
@@ -2681,6 +2879,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or self._context_controller.viewer_2d_loading
             or self._context_controller.browse_pending
             or self._context_controller.browse_preview_polling_needed
+            or self._scientific_repaint_pending
         ):
             return True
         if self._lifecycle.phase not in {
@@ -2921,6 +3120,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             return
         if not preserve_scientific:
+            self._scientific_repaint_pending = False
             scientific, heavy = (
                 projection.scientific,
                 projection.scientific.heavy,
@@ -3078,6 +3278,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return
             if value != candidate.processing_mode: self._release_display_background()
             candidate.processing_mode = value
+            if value == "Int 1D (XYE)":
+                _drop_nexus_only_performance_options(candidate)
         elif kind is ShellCommandKind.SET_BATCH:
             if type(value) is not bool:
                 return
@@ -3527,28 +3729,32 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell()
             return
         candidate = snapshot.thaw()
-        candidate.run_options.pop("_post_g2_pipeline", None)
-        candidate.run_options["_post_g2_pipeline_v2"] = (
-            values.pipeline_mapping()
-        )
-        candidate.run_options["_post_g2_output_diagnostics_v1"] = (
-            values.output_diagnostics_mapping()
-        )
-        candidate.run_options.pop(_UNSAFE_UNFUNDED_STAGING_KEY, None)
-        unsafe_unfunded_staging = (
-            os.environ.get(_UNSAFE_UNFUNDED_STAGING_ENV, "").strip() == "1"
-            and (
-                values.checkpoint,
-                values.staging_frame_cap,
-            ) == (10_000, 10_008)
-        )
-        if unsafe_unfunded_staging:
-            candidate.run_options[_UNSAFE_UNFUNDED_STAGING_KEY] = {
-                "mode": "UNSAFE_UNFUNDED",
-                "checkpoint": 10_000,
-                "staging_frame_cap": 10_008,
-                "max_frames": 3_621,
-            }
+        unsafe_unfunded_staging = False
+        if candidate.processing_mode == "Int 1D (XYE)":
+            _drop_nexus_only_performance_options(candidate)
+        else:
+            candidate.run_options.pop("_post_g2_pipeline", None)
+            candidate.run_options["_post_g2_pipeline_v2"] = (
+                values.pipeline_mapping()
+            )
+            candidate.run_options["_post_g2_output_diagnostics_v1"] = (
+                values.output_diagnostics_mapping()
+            )
+            candidate.run_options.pop(_UNSAFE_UNFUNDED_STAGING_KEY, None)
+            unsafe_unfunded_staging = (
+                os.environ.get(_UNSAFE_UNFUNDED_STAGING_ENV, "").strip() == "1"
+                and (
+                    values.checkpoint,
+                    values.staging_frame_cap,
+                ) == (10_000, 10_008)
+            )
+            if unsafe_unfunded_staging:
+                candidate.run_options[_UNSAFE_UNFUNDED_STAGING_KEY] = {
+                    "mode": "UNSAFE_UNFUNDED",
+                    "checkpoint": 10_000,
+                    "staging_frame_cap": 10_008,
+                    "max_frames": 3_621,
+                }
         try:
             result = self._intents.commit(
                 candidate, expected_revision=snapshot.revision,
@@ -3569,11 +3775,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             os.environ["XDART_PERF_QUARTILES"] = "1"
         else:
             os.environ.pop("XDART_PERF_QUARTILES", None)
+        xye_only = candidate.processing_mode == "Int 1D (XYE)"
         notice = (
-            "Performance diagnostics applied: pipeline and output values "
+            "Performance diagnostics applied: plot cadence is active now."
+            if xye_only
+            else "Performance diagnostics applied: pipeline and output values "
             "take effect on the next run; plot cadence is active now."
         )
-        if not values.durable_fsync:
+        if not xye_only and not values.durable_fsync:
             notice += (
                 " Diagnostic fsync is off: crash or power-loss persistence "
                 "is not guaranteed."
@@ -3582,7 +3791,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             notice += (
                 " Within-run quartile timing is enabled for the next run."
             )
-        if values.staging_frame_cap > 64:
+        if not xye_only and values.staging_frame_cap > 64:
             notice += (
                 f" Staging cap {values.staging_frame_cap} can increase memory "
                 "with frame count and is subject to exact resource admission."

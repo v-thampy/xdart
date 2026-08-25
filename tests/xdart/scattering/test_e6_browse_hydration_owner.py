@@ -138,6 +138,69 @@ def test_cold_browse_binds_owned_owner_before_projection_without_attachment(
     assert controller._browse_hydration_owner is owner
 
 
+def _assert_browse_hydration_retains_nearest_complete_window(
+    controller,
+    browse,
+    owner,
+) -> None:
+    from xdart.gui.tabs.scattering.display_runtime import (
+        publication_needs_hydration,
+    )
+
+    labels = tuple(range(1, 10))
+    store = browse.publication_store
+    store.set_max_heavy_items(3)
+    assert store.complete_labels(labels) == frozenset((7, 8, 9))
+
+    first = _browse_key(controller, 1)
+    assert controller.project(first) is None
+    _settle_transport(owner.transport)
+    assert store.complete_labels(labels) == frozenset((1, 7, 8))
+    first_payload = controller.project(first)
+    assert first_payload is not None
+    assert first_payload.view.intensity_2d is not None
+
+    sixth = _browse_key(controller, 6)
+    assert controller.project(sixth) is None
+    _settle_transport(owner.transport)
+    assert store.complete_labels(labels) == frozenset((6, 7, 8))
+    assert publication_needs_hydration(store.get(7), None) is False
+    seventh = _browse_key(controller, 7)
+    payload = controller.project(seventh)
+    assert payload is not None
+    assert payload.view.intensity_2d is not None
+    assert owner.transport.active_token is None
+    assert owner.transport.queued_token is None
+
+
+def test_cold_browse_hydration_retains_nearest_complete_window(tmp_path):
+    controller, browse, _processed = _adopted_cold_browse(
+        tmp_path,
+        labels=tuple(range(1, 10)),
+        loader_max=9,
+    )
+    owner = _bound_owner(controller)
+    _assert_browse_hydration_retains_nearest_complete_window(
+        controller,
+        browse,
+        owner,
+    )
+
+
+def test_warm_browse_hydration_retains_nearest_complete_window(tmp_path):
+    controller, _acquisition, browse, _processed = _adopted_browse(
+        tmp_path,
+        labels=tuple(range(1, 10)),
+    )
+    owner = _bound_owner(controller)
+    assert owner.owns_transport is False
+    _assert_browse_hydration_retains_nearest_complete_window(
+        controller,
+        browse,
+        owner,
+    )
+
+
 def test_warm_browse_binds_borrowed_owner_before_projection(tmp_path):
     controller, acquisition, browse, _processed = _adopted_browse(tmp_path)
     owner = _bound_owner(controller)

@@ -72,7 +72,7 @@ class RunDisplayResidency:
         has_heavy = (
             incoming_heavy
             or records.has_heavy_payload(key.local_frame_label)
-            or publications.has_heavy_payload(key.local_frame_label)
+            or publications.has_heavy_residency(key.local_frame_label)
         )
         if has_heavy:
             self._touch(self._heavy, key)
@@ -85,9 +85,14 @@ class RunDisplayResidency:
         ):
             self._touch(self._thumbnails, key)
 
-    def enforce(self, *, protected=()) -> None:
+    def enforce(
+        self,
+        *,
+        protected=(),
+        heavy_victim: DisplayFrameKey | None = None,
+    ) -> None:
         """Apply the cap trims (demotion-only store operations)."""
-        self._trim_heavy(protected)
+        self._trim_heavy(protected, preferred=heavy_victim)
         self._trim(
             self._thumbnails,
             self.limits.thumbnails,
@@ -226,16 +231,64 @@ class RunDisplayResidency:
             if candidate in armed:
                 self._heavy_candidates[candidate] = None
 
-    def _trim_heavy(self, protected=()) -> None:
-        while len(self._heavy) > self.limits.heavy and self._heavy_candidates:
-            key = next(iter(self._heavy_candidates))
-            if key in protected:
-                self._heavy_candidates.pop(key, None)
-                continue
-            removed = self._evict_heavy(key)
-            self._heavy_candidates.pop(key, None)
+    def _trim_heavy(
+        self,
+        protected=(),
+        *,
+        preferred: DisplayFrameKey | None = None,
+    ) -> None:
+        if (
+            len(self._heavy) > self.limits.heavy
+            and preferred is not None
+            and preferred in self._heavy
+            and preferred not in protected
+        ):
+            publication_demoted = self._publication_heavy_missing(preferred)
+            removed = self._evict_heavy(preferred)
             if removed:
+                self._heavy_candidates.pop(preferred, None)
+                self._heavy.pop(preferred, None)
+            elif publication_demoted:
+                # The publication owner has already selected this victim but
+                # the record side is not durable yet.  Preserve and rearm the
+                # exact victim for the durability retry; evicting a second
+                # key here would split the two owners and underfill the cap.
+                self._rearm_heavy_key(preferred)
+                return
+            else:
+                self._heavy_candidates.pop(preferred, None)
+
+        while len(self._heavy) > self.limits.heavy and self._heavy_candidates:
+            key = next(
+                (
+                    candidate
+                    for candidate in self._heavy_candidates
+                    if candidate not in protected
+                ),
+                None,
+            )
+            if key is None:
+                return
+            publication_demoted = self._publication_heavy_missing(key)
+            removed = self._evict_heavy(key)
+            if removed:
+                self._heavy_candidates.pop(key, None)
                 self._heavy.pop(key, None)
+            elif publication_demoted:
+                # Local publication trimming ran before record durability.
+                # Wait for the owner rearm instead of demoting another frame.
+                return
+            else:
+                self._heavy_candidates.pop(key, None)
+
+    def _publication_heavy_missing(self, key: DisplayFrameKey) -> bool:
+        stores = self._stores.get(key)
+        return bool(
+            stores is not None
+            and not stores.publications.has_heavy_residency(
+                key.local_frame_label
+            )
+        )
 
     def _evict_heavy(self, key: DisplayFrameKey) -> bool:
         stores = self._stores.get(key)
@@ -244,7 +297,7 @@ class RunDisplayResidency:
         label = key.local_frame_label
         publication_done = (
             stores.publications.get(label) is None
-            or not stores.publications.has_heavy_payload(label)
+            or not stores.publications.has_heavy_residency(label)
             or stores.publications.evict_heavy(label)
         )
         if not publication_done:

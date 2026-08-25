@@ -48,8 +48,10 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
     lifecycle=PageLifecycle.EXIT_ONLY,
     capabilities=frozenset({
         PageCapability.OPEN_FOLDER,
+        PageCapability.SETTINGS_PERSISTENCE,
         PageCapability.RUN_CONTROL,
         PageCapability.WRITE_MODE_TOGGLE,
+        PageCapability.SLICE_PIN,
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
     }),

@@ -122,6 +122,11 @@ class DisplayArtifact:
     saturation_mask: np.ndarray | None = None
     saturation_mask_seeded: bool = False
     wavelength_m: float | None = None
+    #: Monotonic authority that this artifact's output/checkpoint owner has
+    #: finished and its final durable projection was applied.  This belongs to
+    #: the artifact (not the overall GUI phase): prior directory artifacts may
+    #: be terminal while the run continues with a later artifact.
+    hydration_closed: bool = False
     #: The per-artifact whole-scan normalization aggregate (E6-NORM-N1).
     #: ``None`` until the first successful live retain; assigned only at the
     #: successful tail of :meth:`RunDisplayState.retain_frame`, so revision 0
@@ -337,6 +342,19 @@ class RunDisplayState:
     def bind_checkpoint_hydration(self, owner: DisplayArtifact) -> None:
         owner.records._bind_checkpoint_hydration_lineage(
             str(owner.artifact), self.identity)
+
+    def mark_hydration_closed(self, owner: DisplayArtifact) -> None:
+        """Publish one artifact's monotonic terminal hydration authority."""
+        with self._lock:
+            if self.artifacts.get(str(owner.artifact)) is not owner:
+                raise ValueError("display hydration owner is foreign")
+            owner.hydration_closed = True
+
+    def mark_all_hydration_closed(self) -> None:
+        """Close hydration for every artifact after terminal output drain."""
+        with self._lock:
+            for owner in self.artifacts.values():
+                owner.hydration_closed = True
 
     @staticmethod
     def _checkpoint_authority(owner: DisplayArtifact):
@@ -758,6 +776,7 @@ class RunDisplayState:
         with self._lock:
             art = self.artifacts.get(key.artifact)
             if self._retired or art is None or self.catalog.resolve(key) is not key: return None
+            closed = bool(closed or art.hydration_closed)
             required, checkpoint_token, checkpoint_gate = (
                 (False, None, None) if closed else self._checkpoint_authority(art))
             if required and checkpoint_token is None: return None
@@ -789,6 +808,57 @@ class RunDisplayState:
     ) -> DisplayFrameKey | None:
         return self.catalog.resolve(frame)
 
+    def complete_frame_keys(
+        self, frames: tuple[DisplayFrameKey, ...],
+    ) -> frozenset[DisplayFrameKey]:
+        """Return acquisition frames complete for their persisted dimensions.
+
+        Light-1D composition remains complete for an Int1D artifact.  When the
+        same label has a recoverable persisted/checkpoint 2-D mode, however,
+        the base publication must also carry complete resident 2-D arrays.
+        The batch store queries avoid materialising every retained light pair
+        during the GUI's navigation-residency projection.
+        """
+        if type(frames) is not tuple:
+            return frozenset()
+        with self._lock:
+            grouped: dict[
+                str, tuple[DisplayArtifact, list[tuple[DisplayFrameKey, int | str]]]
+            ] = {}
+            for frame in frames:
+                if type(frame) is not DisplayFrameKey:
+                    continue
+                owner = self.artifacts.get(frame.artifact)
+                if (
+                    owner is None
+                    or owner.source_scan != frame.source_scan
+                    or self.catalog.resolve(frame) is not frame
+                ):
+                    continue
+                group = grouped.get(frame.artifact)
+                if group is None:
+                    group = (owner, [])
+                    grouped[frame.artifact] = group
+                group[1].append((frame, frame.local_frame_label))
+
+            resident: list[DisplayFrameKey] = []
+            for owner, candidates in grouped.values():
+                labels = tuple(label for _frame, label in candidates)
+                complete = owner.publications.complete_labels(labels)
+                require_2d = owner.records.recoverable_mode_labels(
+                    complete, "2d",
+                )
+                complete_2d = owner.publications.complete_2d_labels(
+                    require_2d,
+                )
+                accepted = (complete - require_2d) | complete_2d
+                resident.extend(
+                    frame
+                    for frame, label in candidates
+                    if label in accepted
+                )
+            return frozenset(resident)
+
     def project(
         self,
         frame: DisplayFrameKey,
@@ -816,6 +886,13 @@ class RunDisplayState:
                 else artifact_owner.publications.get(key.local_frame_label)
             )
             detector_outcome = self._detector_outcomes.get(key)
+            effective_closed = bool(
+                closed
+                or (
+                    artifact_owner is not None
+                    and artifact_owner.hydration_closed
+                )
+            )
         if artifact_owner is None:
             return self._qualified_payload(
                 payload,
@@ -825,13 +902,17 @@ class RunDisplayState:
         needs_hydration = publication_needs_hydration(
             publication,
             detector_outcome,
+        ) or _artifact_2d_needs_hydration(
+            artifact_owner,
+            key.local_frame_label,
+            publication,
         )
         if needs_hydration and require_complete:
             self._request_preview(
                 artifact_owner,
                 key,
                 selection_generation,
-                closed,
+                effective_closed,
                 owner,
                 commit_gate,
             )
@@ -846,7 +927,7 @@ class RunDisplayState:
             artifact_owner,
             key,
             publication,
-            closed=closed,
+            closed=effective_closed,
         )
         return self._qualified_payload(
             payload,
@@ -980,6 +1061,10 @@ class RunDisplayState:
             or commit_gate is None
         ):
             return
+        with self._lock:
+            if self.artifacts.get(str(art.artifact)) is not art:
+                return
+            closed = bool(closed or art.hydration_closed)
         try:
             scope = HydrationScope(*owner.as_tuple())
             read_key = HydrationReadKey(
@@ -1087,6 +1172,7 @@ class RunDisplayState:
         gate = request.commit_gate
         stores = request.stores
         event: StandardRunEvent | None = None
+        heavy_victim: DisplayFrameKey | None = None
         with self._lock:
             if self._retired:
                 return HydrationOutcome.CANCELLED
@@ -1143,7 +1229,7 @@ class RunDisplayState:
                     if not checkpoint_entered:
                         return HydrationOutcome.OWNER_MISMATCH
                 if acquisition_target:
-                    event = self._commit_acquisition_locked(
+                    event, heavy_victim = self._commit_acquisition_locked(
                         art, key, prepared
                     )
                 else:
@@ -1159,7 +1245,10 @@ class RunDisplayState:
                 # commit — it is logged and the next commit's enforce retries
                 # the identical trims over current state.
                 try:
-                    self._residency.enforce(protected=self._raw_lru)
+                    self._residency.enforce(
+                        protected=self._raw_lru,
+                        heavy_victim=heavy_victim,
+                    )
                 except Exception:
                     logger.exception(
                         "display residency cap enforcement failed; the next "
@@ -1175,13 +1264,18 @@ class RunDisplayState:
         art: DisplayArtifact,
         key: DisplayFrameKey,
         prepared: PreparedHydrationCommit,
-    ) -> StandardRunEvent | None:
+    ) -> tuple[
+        StandardRunEvent | None,
+        DisplayFrameKey | None,
+    ]:
         preview = prepared.preview
         if prepared.token.read_key.purpose is HydrationPurpose.FULL:
             presentation_generation = self._full_demand[6]
-            if preview.raw is None: return None
+            if preview.raw is None:
+                return None, None
             publication = art.publications.install_raw(key.local_frame_label, preview.raw, mask_baked=_projection_masks_values(prepared.projection))
-            if publication is None: return None
+            if publication is None:
+                return None, None
             payload = self.payloads.get(key)
             if payload is None:
                 self.put_payload(replace(self._payload_from_publication(art, key, publication, closed=prepared.closed), selection_generation=presentation_generation))
@@ -1191,7 +1285,16 @@ class RunDisplayState:
                 self.payloads[key] = payload
             self._raw_lru.pop(key, None); self._raw_lru[key] = None
             while len(self._raw_lru) > 8: self._evict_raw_key_locked(next(iter(self._raw_lru)))
-            return StandardRunEvent(self.identity, StandardEventKind.DISPLAY_READY, artifact=key.artifact, frame_key=key, selection_generation=presentation_generation)
+            return (
+                StandardRunEvent(
+                    self.identity,
+                    StandardEventKind.DISPLAY_READY,
+                    artifact=key.artifact,
+                    frame_key=key,
+                    selection_generation=presentation_generation,
+                ),
+                None,
+            )
         presentation_generation = prepared.token.presentation_generation
         view = preview.view
         if preview.raw is not None:
@@ -1239,7 +1342,13 @@ class RunDisplayState:
             raw_status="ready" if preview.raw is not None else "thumbnail" if view.thumbnail is not None else "missing",
             scan_key=art.source_scan,
         )
-        protected = self._protected_raw_labels_locked(art, candidate)
+        raw_protected = self._protected_raw_labels_locked(art, candidate)
+        heavy_before = frozenset(art.publications.heavy_labels())
+        protected = _hydration_locality_protection(
+            art.publications,
+            key.local_frame_label,
+            protected=raw_protected,
+        )
         residency = self._residency.capture(key)
         try:
             self._residency.observe(
@@ -1270,6 +1379,23 @@ class RunDisplayState:
         except BaseException:
             self._residency.restore(residency)
             raise
+        heavy_after = frozenset(art.publications.heavy_labels())
+        victim_label = next(
+            (
+                label
+                for label in heavy_before
+                if label not in heavy_after
+            ),
+            None,
+        )
+        heavy_victim = (
+            None
+            if victim_label is None
+            else self.catalog.resolve_exact(
+                str(art.artifact),
+                victim_label,
+            )
+        )
         if detector_outcome is not None:
             self._detector_outcomes[key] = detector_outcome
         payload = replace(
@@ -1282,12 +1408,15 @@ class RunDisplayState:
             selection_generation=presentation_generation,
         )
         self.put_payload(payload)
-        return StandardRunEvent(
-            self.identity,
-            StandardEventKind.DISPLAY_READY,
-            artifact=key.artifact,
-            frame_key=key,
-            selection_generation=presentation_generation,
+        return (
+            StandardRunEvent(
+                self.identity,
+                StandardEventKind.DISPLAY_READY,
+                artifact=key.artifact,
+                frame_key=key,
+                selection_generation=presentation_generation,
+            ),
+            heavy_victim,
         )
 
     def _commit_browse_locked(
@@ -1315,7 +1444,11 @@ class RunDisplayState:
                 record=record,
                 source_identity=source_identity,
                 scan_key=prepared.request.owner.scan_key,
-            )
+            ),
+            protected=_hydration_locality_protection(
+                store,
+                prepared.request.label,
+            ),
         )
         # The Browse repaint hint: no DisplayFrameKey exists at this seam, so
         # the event carries the artifact identity and the exact presentation
@@ -1404,6 +1537,61 @@ def _without_light_1d(publication: FramePublication) -> FramePublication:
             active_mode_2d=publication.record.active_mode_2d,
         ),
         raw_ref=None,
+    )
+
+
+def _hydration_locality_protection(
+    store: PublicationStore,
+    label: int | str,
+    *,
+    protected: tuple[int | str, ...] | frozenset[int | str] = (),
+) -> frozenset[int | str]:
+    """Coordinate one target-local heavy victim for Browse or acquisition."""
+    retained = store.labels()
+    heavy = frozenset(store.heavy_labels())
+    mandatory = frozenset(protected)
+    try:
+        # Browse admission requires strictly increasing labels.  Sorting the
+        # retained shells recovers artifact ordinal order, including gaps in
+        # the current heavy window.  Acquisition uses the same label contract.
+        ordered = tuple(sorted(set(retained) | {label}))
+    except TypeError:
+        return mandatory | {label}
+    target_ordinal = ordered.index(label)
+    ranked = tuple(
+        (abs(ordinal - target_ordinal), ordinal, candidate)
+        for ordinal, candidate in enumerate(ordered)
+        if candidate in heavy
+        and candidate != label
+        and candidate not in mandatory
+    )
+    if not ranked:
+        return mandatory | {label}
+    victim = max(ranked)[2]
+    return frozenset((heavy - {victim}) | mandatory | {label})
+
+
+def _publication_has_complete_2d(
+    publication: FramePublication | None,
+) -> bool:
+    if publication is None or not publication.record.results_2d:
+        return False
+    return all(
+        view.has_2d
+        and view.axis_2d_x.values is not None
+        and view.axis_2d_y.values is not None
+        for view in publication.record.results_2d.values()
+    )
+
+
+def _artifact_2d_needs_hydration(
+    owner: DisplayArtifact,
+    label: int | str,
+    publication: FramePublication | None,
+) -> bool:
+    return bool(
+        owner.records.recoverable_mode_labels((label,), "2d")
+        and not _publication_has_complete_2d(publication)
     )
 
 

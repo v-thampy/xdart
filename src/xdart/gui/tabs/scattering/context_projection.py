@@ -321,30 +321,13 @@ class ContextProjection:
         if type(context) is not AcquisitionContext:
             return frozenset()
         display = context.publication_store
-        grouped: dict[
-            PublicationStore, list[tuple[DisplayFrameKey, int | str]]
-        ] = {}
-        for frame in frames:
-            try:
-                owner = display.artifacts.get(frame.artifact)
-                if owner is not None:
-                    grouped.setdefault(owner.publications, []).append(
-                        (frame, frame.local_frame_label)
-                    )
-            except Exception:
-                continue
-        resident: list[DisplayFrameKey] = []
-        for store, candidates in grouped.items():
-            try:
-                complete = store.complete_labels(
-                    tuple(label for _frame, label in candidates)
-                )
-            except Exception:
-                continue
-            resident.extend(
-                frame for frame, label in candidates if label in complete
-            )
-        return frozenset(resident)
+        complete = getattr(display, "complete_frame_keys", None)
+        if not callable(complete):
+            return frozenset()
+        try:
+            return complete(frames)
+        except Exception:
+            return frozenset()
 
     def build_shell(
         self,

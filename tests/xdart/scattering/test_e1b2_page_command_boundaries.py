@@ -195,6 +195,8 @@ def _paced_frame_events(page, executor, identity, count):
 
 def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    monkeypatch.setenv("XDART_PERF", "")
+    monkeypatch.setenv("XDART_PERF_QUARTILES", "")
     monkeypatch.delenv("XDART_PERF", raising=False)
     monkeypatch.delenv("XDART_PERF_QUARTILES", raising=False)
     monkeypatch.delenv(
@@ -332,6 +334,87 @@ def test_performance_diagnostics_fresh_default_is_tuned_tuple(
         _dispose(page, qapp)
 
 
+def test_xye_mode_drops_only_private_nexus_performance_options(
+        qapp: QtWidgets.QApplication) -> None:
+    nexus_only = {
+        "_post_g2_pipeline": {"legacy": "stale"},
+        "_post_g2_pipeline_v2": {"pipeline": "stale"},
+        "_post_g2_output_diagnostics_v1": {"save_xye": False},
+        "_post_g2_unfunded_staging_diagnostic_v1": {"mode": "stale"},
+    }
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(Path("frame_0001.tif")),
+            poni_file="calibration.poni",
+            save_path="output.nxs",
+            output_mode="Overwrite",
+            run_options={**nexus_only, "unrelated": "preserved"},
+        )),
+        lifecycle=ScatteringCoordinator(),
+        sources=_Sources(),
+        executor=_Executor(),
+    )
+    try:
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PROCESSING_MODE, "Int 1D (XYE)",
+        ))
+
+        intent = page._intents.snapshot().thaw()
+        assert intent.processing_mode == "Int 1D (XYE)"
+        assert intent.run_options == {"unrelated": "preserved"}
+    finally:
+        _dispose(page, qapp)
+
+
+def test_xye_performance_dialog_applies_cadence_without_nexus_options(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    monkeypatch.setenv("XDART_PERF", "")
+    monkeypatch.setenv("XDART_PERF_QUARTILES", "")
+    monkeypatch.delenv("XDART_PERF", raising=False)
+    monkeypatch.delenv("XDART_PERF_QUARTILES", raising=False)
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(Path("frame_0001.tif")),
+            poni_file="calibration.poni",
+            save_path="output.nxs",
+            output_mode="Overwrite",
+            processing_mode="Int 1D (XYE)",
+            run_options={
+                "_post_g2_pipeline_v2": {"pipeline": "stale"},
+                "_post_g2_output_diagnostics_v1": {"save_xye": False},
+                "unrelated": "preserved",
+            },
+        )),
+        lifecycle=ScatteringCoordinator(),
+        sources=_Sources(),
+        executor=_Executor(),
+    )
+    page._performance_diagnostics_editor = lambda *_args: (
+        PerformanceDiagnosticsValues(
+            1, 8, 8, 16, 375,
+            save_xye=False,
+            durable_fsync=False,
+            staging_frame_cap=64,
+            quartile_telemetry=True,
+        )
+    )
+    try:
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU, "Config:Performance Diagnostics…",
+        ))
+
+        intent = page._intents.snapshot().thaw()
+        assert intent.processing_mode == "Int 1D (XYE)"
+        assert intent.run_options == {"unrelated": "preserved"}
+        assert page._live_plot_interval_ms == 375
+        assert os.environ["XDART_PERF_QUARTILES"] == "1"
+        assert "plot cadence is active now" in page._notice_text
+        assert "pipeline and output" not in page._notice_text
+        assert "fsync" not in page._notice_text
+    finally:
+        _dispose(page, qapp)
+
+
 def test_performance_diagnostics_reject_invalid_coupled_values(
         qapp: QtWidgets.QApplication, monkeypatch) -> None:
     monkeypatch.delenv("XDART_PERF", raising=False)
@@ -353,7 +436,7 @@ def test_performance_diagnostics_reject_invalid_coupled_values(
         ))
         assert page._intents.snapshot().revision == initial.revision
         assert "batching bounds" in page._notice_text.lower()
-        assert page._live_plot_interval_ms == 125
+        assert page._live_plot_interval_ms == 250
         assert "XDART_PERF" not in os.environ
 
         page._performance_diagnostics_editor = lambda *_args: (
@@ -482,18 +565,33 @@ def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) ->
 
 
 @pytest.mark.parametrize(
-    ("plot_interval_ms", "expected_light_refreshes"),
-    ((125, (False, False, False)), (375, (False, True, False))),
+    (
+        "plot_mode",
+        "plot_interval_ms",
+        "expected_light_refreshes",
+        "expected_follow_latest",
+    ),
+    (
+        ("Single", 125, (False, False, False), False),
+        ("Single", 375, (False, True, False), False),
+        ("Overlay", 375, (False, True, False), True),
+    ),
 )
-def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
+def test_auto_last_paces_eight_frame_burst_to_same_drain_latest(
         qapp: QtWidgets.QApplication, monkeypatch,
+        plot_mode: str,
         plot_interval_ms: int,
-        expected_light_refreshes: tuple[bool, bool, bool]) -> None:
+        expected_light_refreshes: tuple[bool, bool, bool],
+        expected_follow_latest: bool) -> None:
     monkeypatch.setenv(
         "XDART_LIVE_PLOT_INTERVAL_MS", str(plot_interval_ms),
     )
     executor = _Executor()
     page, _, identity = _active_page(executor)
+    page._preferences = replace(
+        page._preferences,
+        plot_mode=plot_mode,
+    )
     events = _paced_frame_events(page, executor, identity, 24)
     now = [0.0]
     monkeypatch.setattr(
@@ -538,7 +636,7 @@ def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
         )
         assert page._progress.completed == 8
         assert page._artifact_progress["/out/a.nxs"].published == 8
-        assert accepted_follow_latest == [False] * 8
+        assert accepted_follow_latest == [expected_follow_latest] * 8
         assert paints == [(8, expected_light_refreshes[0])]
         assert tuple(page._presentation_targets) == ()
 
@@ -558,7 +656,7 @@ def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
         ) == tuple(range(1, 17))
         assert page._progress.completed == 16
         assert page._artifact_progress["/out/a.nxs"].published == 16
-        assert accepted_follow_latest == [False] * 16
+        assert accepted_follow_latest == [expected_follow_latest] * 16
         assert paints == [
             (8, expected_light_refreshes[0]),
             (16, expected_light_refreshes[1]),
@@ -583,12 +681,74 @@ def test_single_auto_last_paces_eight_frame_burst_to_same_drain_latest(
             for frame in page._context_controller.navigation.frames
         ) == tuple(range(1, 25))
         assert page._progress.completed == 24
-        assert accepted_follow_latest == [False] * 24
+        assert accepted_follow_latest == [expected_follow_latest] * 24
         assert paints == [
             (8, expected_light_refreshes[0]),
             (16, expected_light_refreshes[1]),
             (24, expected_light_refreshes[2]),
         ]
+        if plot_mode == "Overlay":
+            assert page._context_controller.navigation.selected == (
+                page._context_controller.navigation.frames
+            )
+    finally:
+        _dispose(page, qapp)
+
+
+@pytest.mark.parametrize("plot_mode", ("Single", "Overlay"))
+def test_live_plot_cadence_repaints_suppressed_frame_after_quiet_deadline(
+        qapp: QtWidgets.QApplication, monkeypatch,
+        plot_mode: str) -> None:
+    monkeypatch.setenv("XDART_LIVE_PLOT_INTERVAL_MS", "250")
+    executor = _Executor()
+    page, _, identity = _active_page(executor)
+    page._preferences = replace(page._preferences, plot_mode=plot_mode)
+    events = _paced_frame_events(page, executor, identity, 16)
+    now = [0.0]
+    monkeypatch.setattr(
+        page_module, "time", SimpleNamespace(monotonic=lambda: now[0]),
+        raising=False,
+    )
+    page._last_live_plot_at = None
+    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
+    paints: list[tuple[int | None, bool]] = []
+
+    def record_paint(*, preserve_scientific=False, **_kwargs):
+        current = page._context_controller.navigation.current
+        paints.append((
+            None if current is None else current.local_frame_label,
+            preserve_scientific,
+        ))
+        if not preserve_scientific:
+            page._scientific_repaint_pending = False
+            page._last_live_plot_at = now[0]
+
+    monkeypatch.setattr(page, "_refresh_shell", record_paint)
+    try:
+        executor.events.extend(events[:8])
+        page._drain_executor()
+        assert paints == [(8, False)]
+        assert page._scientific_repaint_pending is False
+
+        now[0] = 0.125
+        executor.events.extend(events[8:])
+        page._drain_executor()
+        assert paints == [(8, False), (16, True)]
+        assert page._scientific_repaint_pending is True
+
+        now[0] = 0.249
+        page._drain_executor()
+        assert paints == [(8, False), (16, True)]
+        assert page._scientific_repaint_pending is True
+
+        now[0] = 0.250
+        page._drain_executor()
+        assert paints == [(8, False), (16, True), (16, False)]
+        assert page._scientific_repaint_pending is False
+
+        now[0] = 0.500
+        page._drain_executor()
+        assert paints == [(8, False), (16, True), (16, False)]
     finally:
         _dispose(page, qapp)
 

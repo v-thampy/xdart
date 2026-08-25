@@ -248,14 +248,26 @@ def test_workspace_uses_real_controls_and_one_cas_per_valid_edit(qapp: QtWidgets
         assert store.commit_calls == 1
         assert store.snapshot().revision == 1
         assert store.snapshot().thaw().project_root == "/project"
+        assert store.snapshot().thaw().save_path == (
+            "/project/xdart_processed_data"
+        )
 
         controls.fieldValueChanged.emit(PROJECT_ROOT, "/project")
         assert store.commit_calls == 1
+        controls.fieldValueChanged.emit(PROJECT_ROOT, "/next-project")
+        assert store.commit_calls == 2
+        assert store.snapshot().thaw().save_path == (
+            "/next-project/xdart_processed_data"
+        )
+        controls.fieldValueChanged.emit(SAVE_PATH, "/custom-output")
+        controls.fieldValueChanged.emit(PROJECT_ROOT, "/third-project")
+        assert store.commit_calls == 4
+        assert store.snapshot().thaw().save_path == "/custom-output"
         controls.fieldDraftChanged.emit(GI_ORIENTATION, "4.5")
-        assert store.commit_calls == 1
+        assert store.commit_calls == 4
         assert "integer" in shell.scientific.status.text().lower()
         controls.fieldValueChanged.emit(GI_ORIENTATION, "4.5")
-        assert store.commit_calls == 1
+        assert store.commit_calls == 4
     finally:
         workspace.close_workspace()
 

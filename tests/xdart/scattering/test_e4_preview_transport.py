@@ -1645,10 +1645,13 @@ def test_enforce_failure_never_unpublishes_a_sealed_commit(
     original_enforce = state._residency.enforce
     broken = {"active": True}
 
-    def failing_enforce():
+    def failing_enforce(*, protected=(), heavy_victim=None):
         if broken["active"]:
             raise RuntimeError("injected persistent enforce failure")
-        return original_enforce()
+        return original_enforce(
+            protected=protected,
+            heavy_victim=heavy_victim,
+        )
 
     monkeypatch.setattr(state._residency, "enforce", failing_enforce)
     events.clear()

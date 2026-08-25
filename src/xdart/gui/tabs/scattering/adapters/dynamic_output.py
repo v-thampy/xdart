@@ -835,6 +835,38 @@ class DynamicOutputAdapter:
             else tuple(self._current["persisted_prefix_labels"])
         )
 
+    def finalized_display_owners(self) -> tuple[object, ...]:
+        """Display owners whose output graphs are terminal and quiescent."""
+
+        with self._command_lock:
+            candidates = tuple(
+                (
+                    graph.get("display_owner"),
+                    graph.get("session"),
+                    graph.get("accounting"),
+                    graph.get("transition"),
+                )
+                for graph in self._graphs.values()
+                if graph.get("display_owner") is not None
+            )
+        terminal = {
+            DynamicRunState.FINISHED,
+            DynamicRunState.STOPPED,
+            DynamicRunState.ABORTED,
+        }
+        owners: list[object] = []
+        for owner, session, accounting, transition in candidates:
+            if (
+                session is not None
+                and accounting is not None
+                and transition is None
+                and not session.is_running
+                and accounting.snapshot().state in terminal
+                and all(owner is not prior for prior in owners)
+            ):
+                owners.append(owner)
+        return tuple(owners)
+
     def background_binding(self, label: int): return None if self._current is None else next((value for value in self._current["background_bindings"] if value[0] == int(label)), None)
     def background_admission_context(self):
         graph = self._current

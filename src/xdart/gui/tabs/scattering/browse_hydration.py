@@ -20,6 +20,7 @@ from xrd_tools.session.hydration import (
 from .browse_values import BrowseCleanupReceipt, BrowseLoadRequest
 from .display_runtime import (
     DetectorHydrationOutcome,
+    _hydration_locality_protection,
     publication_needs_hydration,
 )
 from .events import CleanupStatus
@@ -214,7 +215,11 @@ class _BrowseHydrationOwner:
                     record=record,
                     source_identity=source_identity,
                     scan_key=request.owner.scan_key,
-                )
+                ),
+                protected=_hydration_locality_protection(
+                    self._store,
+                    request.label,
+                ),
             )
             if (
                 detector_unavailable

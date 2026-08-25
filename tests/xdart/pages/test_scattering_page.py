@@ -64,15 +64,13 @@ def test_scattering_descriptor_declares_the_frozen_adoption_ports():
     assert page.order == 1
     assert page.capabilities == frozenset({
         PageCapability.OPEN_FOLDER,
+        PageCapability.SETTINGS_PERSISTENCE,
         PageCapability.RUN_CONTROL,
         PageCapability.WRITE_MODE_TOGGLE,
+        PageCapability.SLICE_PIN,
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
     })
-    # Slice pin and settings I/O stay absent: the page has no such surface,
-    # so the host disables those actions rather than claiming them.
-    assert PageCapability.SLICE_PIN not in page.capabilities
-    assert PageCapability.SETTINGS_PERSISTENCE not in page.capabilities
 
 
 def test_default_selection_without_optin_is_the_legacy_page():
@@ -165,28 +163,30 @@ def test_host_mounts_the_real_workspace_on_explicit_optin(
         # Idle page: activity is truthfully quiet.
         assert window.page_handle.activity.active() is False
         handle = window.page_handle
-        # Frozen adoption ports are present and functional; Append is held
-        # through a PRESENT write-mode port whose refusal carries the
-        # scattering owner's human-facing constant — asserted through the
-        # exact host shortcut so the status bar shows the same sentence.
-        from xdart.gui.pages.values import ActionAccepted, ActionRefused
-        from xdart.gui.tabs.scattering.output_values import (
-            APPEND_UNAVAILABLE as SCATTERING_APPEND_UNAVAILABLE,
-        )
+        # Frozen adoption ports are present and functional.  H23 now owns
+        # Append, so the host shortcut must reach the page's write-mode owner.
+        from xdart.gui.pages.values import ActionAccepted, ActionCompleted
         assert handle.open_folder is not None
-        refusal = window._shortcut_toggle_write_mode()
-        assert refusal == ActionRefused(SCATTERING_APPEND_UNAVAILABLE)
-        assert refusal.reason == (
-            "Append is deferred to H23 shared output transaction support.")
-        assert window.statusBar().currentMessage() == refusal.reason
+        changed = window._shortcut_toggle_write_mode()
+        assert changed == ActionCompleted("write-mode-append")
+        assert handle.widget._intents.snapshot().thaw().output_mode == "Append"
         # Run/Stop dispatch through the page's one command owner; an idle
         # sourceless page refuses via notice and stays quiet — no thread.
         assert type(handle.run_control.run_pause()) is ActionAccepted
         assert type(handle.run_control.stop()) is ActionAccepted
         assert handle.activity.active() is False
-        # Unsupported ports stay absent (actions disabled by the host).
-        assert handle.slice_pin is None
-        assert handle.settings_io is None
+        assert handle.slice_pin is not None
+        assert handle.settings_io is not None
+        assert window.actionPinSliceCut.isEnabled()
+        assert window.actionLoadSettings.isEnabled()
+        assert window.actionSaveSettings.isEnabled()
+        handle.widget._profile_path_chooser = lambda *_args: None
+        assert window._shortcut_load_settings().detail == (
+            "profile-load-requested"
+        )
+        assert window._shortcut_save_settings().detail == (
+            "profile-save-requested"
+        )
         # The page notice channel is bridged to the host status presenter.
         window.main_widget.noticeChanged.emit("bridge probe notice")
         assert window.statusBar().currentMessage() == "bridge probe notice"
@@ -410,6 +410,88 @@ def _build_mounted_workspace(store, status):
     return build_scattering_workspace(services, None)
 
 
+def test_mounted_profile_ports_roundtrip_one_next_run_intent(
+        qapp, isolated_settings, tmp_path):
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+
+    profile = tmp_path / "beamtime-profile.json"
+    initial = RunIntent(
+        project_root=str(tmp_path / "project"),
+        save_path=str(tmp_path / "project" / "xdart_processed_data"),
+        output_mode="Overwrite",
+        processing_mode="Int 1D (XYE)",
+        batch_mode=True,
+        max_cores=4,
+        run_options={
+            "_post_g2_pipeline_v2": {"pipeline": "stale"},
+            "_post_g2_output_diagnostics_v1": {"save_xye": False},
+            "unrelated": "preserved",
+        },
+    )
+    store = RunIntentStore(initial)
+    status = SimpleNamespaceStatus()
+    handle = _build_mounted_workspace(store, status)
+    handle.widget._profile_path_chooser = (
+        lambda _action, _start: str(profile)
+    )
+    try:
+        assert handle.settings_io is not None
+        assert handle.settings_io.save().detail == "profile-save-requested"
+        assert profile.is_file()
+        assert '"schema": "xdart.run-intent-profile"' in (
+            profile.read_text(encoding="utf-8")
+        )
+        assert store.revision == 0
+
+        prior = store.snapshot()
+        changed = prior.thaw()
+        changed.processing_mode = "Int 2D"
+        changed.batch_mode = False
+        changed.max_cores = 1
+        store.commit(changed, expected_revision=prior.revision)
+        assert handle.settings_io.load().detail == "profile-load-requested"
+
+        loaded = store.snapshot().thaw()
+        assert store.revision == 2
+        assert loaded.processing_mode == "Int 1D (XYE)"
+        assert loaded.batch_mode is True
+        assert loaded.max_cores == 4
+        assert loaded.run_options == {"unrelated": "preserved"}
+        assert any("Profile saved:" in message for message in status.messages)
+        assert any("Profile loaded:" in message for message in status.messages)
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_mounted_profile_load_is_fail_closed_on_malformed_json(
+        qapp, isolated_settings, tmp_path):
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+
+    profile = tmp_path / "malformed.json"
+    profile.write_text("{not-json", encoding="utf-8")
+    store = RunIntentStore(RunIntent(output_mode="Overwrite", max_cores=4))
+    before = store.snapshot()
+    status = SimpleNamespaceStatus()
+    handle = _build_mounted_workspace(store, status)
+    handle.widget._profile_path_chooser = (
+        lambda _action, _start: str(profile)
+    )
+    try:
+        assert handle.settings_io is not None
+        handle.settings_io.load()
+        assert store.snapshot() == before
+        assert store.revision == before.revision
+        assert any("Profile load failed:" in message for message in status.messages)
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
 def test_mounted_control_path_chooser_uses_page_start_and_commits(
         qapp, isolated_settings, tmp_path, monkeypatch):
     from xrd_tools.session.intent_store import RunIntentStore
@@ -579,6 +661,9 @@ def test_default_fallback_seeds_an_admittable_overwrite_intent(
     try:
         intent = handle.widget._intents.snapshot().thaw()
         assert intent.output_mode == "Overwrite"
+        assert intent.max_cores == min(
+            max(1, (os.cpu_count() or 1) - 1), 4,
+        )
     finally:
         assert handle.close().status is PageCleanup.CLEAN
         handle.widget.deleteLater()
