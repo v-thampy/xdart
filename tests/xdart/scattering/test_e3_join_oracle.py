@@ -23,6 +23,9 @@ from xdart.gui.tabs.scattering.adapters import (
     browse_loader as browse_module,
 )
 from xdart.gui.tabs.scattering.adapters import (
+    dynamic_output as output_module,
+)
+from xdart.gui.tabs.scattering.adapters import (
     run_executor as executor_module,
 )
 from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
@@ -64,7 +67,7 @@ from tests.xdart.scattering.test_e2lv_live_display import (
 )
 
 
-_PRODUCTION_SINK = executor_module.NexusSink
+_PRODUCTION_SINK = output_module.NexusSink
 
 
 def _wait(
@@ -243,7 +246,7 @@ def _mount(
         facts.append(("sink-open", current_thread().name))
         return _PRODUCTION_SINK(*args, **kwargs)
 
-    monkeypatch.setattr(executor_module, "NexusSink", sink_factory)
+    monkeypatch.setattr(output_module, "NexusSink", sink_factory)
 
     def open_scan(source):
         browse_facts.append(("open-scan", current_thread().name))
