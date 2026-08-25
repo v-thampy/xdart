@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from threading import Event, current_thread
 from types import SimpleNamespace
@@ -16,13 +17,9 @@ from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.contracts import (
     AcceptedScientificAssets,
-    AdmittedMetadataSource,
     AdmittedOutput,
     AdmissionReceipt,
     OutputFact,
-    PlannedOutput,
-    SourceFileState,
-    SourceExecutionStamp,
 )
 from xdart.gui.tabs.scattering.context_controller import ContextController
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
@@ -33,6 +30,7 @@ from xdart.gui.tabs.scattering.display_values import (
 from xdart.gui.tabs.scattering.output_preflight import (
     OutputCandidate,
     OutputDisposition,
+    _series_item,
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.state_machine import RunPhase
@@ -146,8 +144,13 @@ class _Integrator:
 
 
 class _Source:
-    def __init__(self, selected: Path, labels: tuple[int, ...]) -> None:
-        self._selected = selected
+    def __init__(
+        self,
+        members: tuple[Path, ...],
+        labels: tuple[int, ...],
+    ) -> None:
+        self._members = members
+        self._selected = members[0]
         self._labels = labels
 
     def to_scan(self, *, poni, integrator, output_path):
@@ -158,10 +161,12 @@ class _Source:
                     label,
                     image=np.arange(8, dtype=np.uint32).reshape(2, 4)
                     + label,
-                    source_path=self._selected,
-                    source_frame_index=label,
+                    source_path=member,
+                    source_frame_index=0,
                 )
-                for label in self._labels
+                for member, label in zip(
+                    self._members, self._labels, strict=True
+                )
             ],
             poni=poni,
             integrator=integrator,
@@ -172,9 +177,9 @@ class _Source:
         return None
 
 
-def _write_tiff(path: Path) -> None:
+def _write_tiff(path: Path, *, offset: int = 0) -> None:
     fabio.tifimage.TifImage(
-        data=np.arange(8, dtype=np.uint16).reshape(2, 4)
+        data=np.arange(8, dtype=np.uint16).reshape(2, 4) + offset
     ).write(str(path))
 
 
@@ -191,13 +196,20 @@ def _accepted_admission(
     ) -> AdmissionReceipt:
         del session_owner
         assert not cancelled()
+        configuration = capture.intent_snapshot.thaw()
+        poni_bytes = Path(configuration.poni_file).read_bytes()
+        mask_bytes = None if mask is None else mask.tobytes()
         assets = AcceptedScientificAssets(
             (0.1, 0.01, 0.01, 0.0, 0.0, 0.0, 1e-10, "Tiny"),
             None if mask is None else str(mask.dtype),
             None if mask is None else mask.shape,
-            None if mask is None else mask.tobytes(),
-            "tiny-poni",
-            None if mask is None else "tiny-mask",
+            mask_bytes,
+            hashlib.sha256(poni_bytes).hexdigest(),
+            (
+                None
+                if mask_bytes is None
+                else hashlib.sha256(mask_bytes).hexdigest()
+            ),
             "{\"orientation\":3}",
         )
         candidate = OutputCandidate.from_start_capture(
@@ -205,26 +217,17 @@ def _accepted_admission(
             assets,
             (),
         )
-        selected = Path(
-            capture.source_capture.source.options["selected_file"]
-        )
-        state = SourceFileState.capture(selected)
-        target = Path(capture.intent_snapshot.thaw().save_path)
-        item = PlannedOutput(
+        item = _series_item(
+            candidate,
             candidate.source,
-            selected,
-            target,
-            SourceExecutionStamp(
-                state,
-                "tiff_series",
-                len(labels),
-                labels[0],
-                (state,),
-                metadata_sources=(
-                    AdmittedMetadataSource(state.path, None),
-                ),
-            ),
-            motor_names=(),
+            cancelled=cancelled,
+        )
+        assert labels == tuple(
+            range(
+                item.source_stamp.first_label,
+                item.source_stamp.first_label
+                + item.source_stamp.frame_count,
+            )
         )
         return AdmissionReceipt(
             capture.request_id,
@@ -260,8 +263,12 @@ def _standard_page(
     Path,
 ]:
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    selected = tmp_path / "tiny_0001.tif"
-    _write_tiff(selected)
+    members = tuple(
+        tmp_path / f"tiny_{label:04d}.tif" for label in labels
+    )
+    for member, label in zip(members, labels, strict=True):
+        _write_tiff(member, offset=label)
+    selected = members[0]
     poni = tmp_path / "tiny.poni"
     poni.write_text("accepted through immutable test assets")
     output = tmp_path / "tiny.nxs"
@@ -273,7 +280,7 @@ def _standard_page(
     monkeypatch.setattr(
         executor_module,
         "open_source",
-        lambda _spec: _Source(selected, labels),
+        lambda _spec: _Source(members, labels),
     )
     monkeypatch.setattr(
         executor_module,
@@ -410,7 +417,7 @@ def test_latest_qualified_selection_wins_over_slow_evicted_reload(
             qapp,
             lambda: (
                 shell.scientific.frame_selector.currentData() is second
-                and shell.scientific.title.text() == "tiny_0001.tif"
+                and shell.scientific.title.text() == "tiny_0002.tif"
             ),
             timeout=10.0,
             diagnostic=lambda: (
@@ -426,7 +433,7 @@ def test_latest_qualified_selection_wins_over_slow_evicted_reload(
             qapp.processEvents()
             time.sleep(0.002)
         assert set(reads[:2]) == {1, 2}
-        assert shell.scientific.title.text() == "tiny_0001.tif"
+        assert shell.scientific.title.text() == "tiny_0002.tif"
         assert shell.scientific.frame_selector.currentData() is second
     finally:
         release_frame_one.set()
@@ -750,7 +757,7 @@ def test_historical_selection_moves_within_current_scan_footer(
             qapp,
             lambda: (
                 shell.scientific.frame_selector.currentData() is fourth
-                and shell.scientific.title.text() == "tiny_0001.tif"
+                and shell.scientific.title.text() == "tiny_0004.tif"
             ),
         )
 

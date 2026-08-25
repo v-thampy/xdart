@@ -112,12 +112,12 @@ class _RecordingIntegrator(_Integrator):
 class _RecordingSource:
     def __init__(
         self,
-        selected: Path,
+        members: tuple[Path, ...],
         labels: tuple[int, ...],
         scan_name: str,
         facts: list[tuple[str, str]],
     ) -> None:
-        self._selected = selected
+        self._members = members
         self._labels = labels
         self._scan_name = scan_name
         self._facts = facts
@@ -132,12 +132,14 @@ class _RecordingSource:
                     label,
                     image=(
                         np.arange(24, dtype=np.uint32).reshape(4, 6)
-                        + ordinal
+                        + ordinal - 1
                     ),
-                    source_path=self._selected,
+                    source_path=member,
                     source_frame_index=0,
                 )
-                for ordinal, label in enumerate(self._labels, 1)
+                for ordinal, (member, label) in enumerate(
+                    zip(self._members, self._labels, strict=True), 1
+                )
             ],
             poni=poni,
             integrator=integrator,
@@ -212,10 +214,17 @@ def _mount(
     processed = project / "processed"
     raw.mkdir(parents=True)
     processed.mkdir(parents=True)
-    selected = raw / "run.with.dots_0001.tif"
-    fabio.tifimage.TifImage(
-        data=np.arange(24, dtype=np.uint16).reshape(4, 6)
-    ).write(str(selected))
+    members = tuple(
+        raw / f"run.with.dots_{label:04d}.tif" for label in labels
+    )
+    for ordinal, member in enumerate(members, 1):
+        fabio.tifimage.TifImage(
+            data=(
+                np.arange(24, dtype=np.uint16).reshape(4, 6)
+                + ordinal - 1
+            )
+        ).write(str(member))
+    selected = members[0]
     poni = project / "detector.poni"
     poni.write_text("accepted through immutable test assets")
     output = processed / "run.with.dots.nxs"
@@ -231,7 +240,7 @@ def _mount(
         executor_module,
         "open_source",
         lambda _spec: _RecordingSource(
-            selected, labels, scan_name, facts
+            members, labels, scan_name, facts
         ),
     )
     monkeypatch.setattr(
