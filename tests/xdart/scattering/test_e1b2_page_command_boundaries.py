@@ -1210,6 +1210,82 @@ def test_run_click_preserves_outgoing_paint_until_a_frame_arrives(
         _dispose(page, qapp)
 
 
+def test_settled_browse_payload_cannot_release_new_run_paint_hold(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """A resident outgoing Browse frame is not the new run's first paint."""
+
+    from tests.xdart.scattering.test_e3_context_contract import (
+        _acquisition,
+        _browse,
+    )
+    from xdart.modules.display_context import ContextKind, new_context_token
+
+    executor = _Executor()
+    page, lifecycle, incoming_identity = _active_page(executor)
+    controller = page._context_controller
+    runtime = controller._runtime
+    outgoing_identity = RunIdentity(
+        incoming_identity.generation,
+        f"{incoming_identity.fingerprint}-browse",
+    )
+    runtime._run_identity = outgoing_identity
+    request, browse = _browse(
+        new_context_token(ContextKind.BROWSE),
+        1,
+        scan_key="terminal",
+    )
+    runtime.adopt_browse(browse, request)
+    shell = _shell(page)
+    try:
+        page._refresh_shell()
+        outgoing = controller.navigation.current
+        assert outgoing is not None
+        assert outgoing.run_identity is outgoing_identity
+        assert lifecycle.active_run_identity is incoming_identity
+        outgoing_title = shell.scientific.title.text()
+        outgoing_raw = np.array(
+            shell.scientific.raw.image.image,
+            copy=True,
+        )
+
+        page._retain_outgoing_display = True
+        page._refresh_shell(preserve_display=True)
+        assert page._retain_outgoing_display is True
+        assert shell.scientific.title.text() == outgoing_title
+        np.testing.assert_array_equal(
+            shell.scientific.raw.image.image,
+            outgoing_raw,
+        )
+
+        runtime.clear_browse(select_acquisition=False)
+        configuration = RunIntent(
+            output_mode="Overwrite",
+            processing_mode="Int 2D",
+        ).freeze()
+        assert configuration.identity == (
+            incoming_identity.generation,
+            incoming_identity.fingerprint,
+        )
+        _, acquisition = _acquisition(
+            configuration=configuration,
+            identity=incoming_identity,
+        )
+        runtime.adopt_acquisition(incoming_identity, acquisition)
+        page._refresh_shell()
+        incoming = controller.navigation.current
+        assert incoming is not None
+        assert incoming.run_identity is incoming_identity
+        assert controller.run_identity is incoming_identity
+        assert page._retain_outgoing_display is False
+        assert not np.array_equal(
+            shell.scientific.raw.image.image,
+            outgoing_raw,
+        )
+    finally:
+        _dispose(page, qapp)
+
+
 def test_historical_frame_disables_auto_last_and_reenable_selects_latest(
     qapp: QtWidgets.QApplication,
     monkeypatch,

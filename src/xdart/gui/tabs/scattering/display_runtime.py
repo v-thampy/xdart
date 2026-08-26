@@ -77,6 +77,7 @@ from .display_residency import (
     DisplayResidencySnapshot,
     RunDisplayResidency,
 )
+from .browse_values import canonical_browse_source_identity
 from .events import RunIdentity
 from .hydration_transport import HydrationTransport, PreparedHydrationCommit
 
@@ -1434,9 +1435,23 @@ class RunDisplayState:
                     or _projection_masks_values(prepared.projection)
                 ),
             )
-        record = FrameRecord.from_view(view)
-        source_identity = (
-            f"{view.source_path or ''}#{view.source_frame_index}"
+        prior = store.get(prepared.request.label)
+        prior_record = None if prior is None else prior.record
+        record = FrameRecord.from_view(
+            view,
+            mode_1d=(
+                prior_record.active_mode_1d
+                if prior_record is not None and prior_record.results_1d
+                else DEFAULT_MODE_KEY
+            ),
+            mode_2d=(
+                prior_record.active_mode_2d
+                if prior_record is not None and prior_record.results_2d
+                else DEFAULT_MODE_KEY
+            ),
+        )
+        source_identity = canonical_browse_source_identity(
+            view, prepared.request.read_key.artifact_identity,
         )
         store.upsert(
             FramePublication(
@@ -1612,6 +1627,44 @@ def publication_needs_hydration(
     )
 
 
+def browse_publication_needs_hydration(
+    publication: FramePublication | None,
+    detector_outcome: DetectorHydrationOutcome | None,
+) -> bool:
+    """Require only Browse's active scientific modes plus one detector preview.
+
+    A light Browse record deliberately carries array-free shells for inactive
+    named 2-D modes.  Those shells preserve topology but must not make the
+    current frame hydrate forever.
+    """
+
+    if publication is None or publication.record.is_empty:
+        return True
+    record = publication.record
+    active_1d = record.view_1d()
+    if record.results_1d and (
+        active_1d is None
+        or active_1d.axis_1d is None
+        or active_1d.axis_1d.values is None
+        or active_1d.intensity_1d is None
+    ):
+        return True
+    active_2d = record.view_2d()
+    if record.results_2d and (
+        active_2d is None
+        or not active_2d.has_2d
+        or active_2d.axis_2d_x.values is None
+        or active_2d.axis_2d_y.values is None
+    ):
+        return True
+    return bool(
+        publication.view.raw is None
+        and publication.view.thumbnail is None
+        and detector_outcome
+        is not DetectorHydrationOutcome.DETECTOR_UNAVAILABLE
+    )
+
+
 def project_detector_values(
     image: object,
     mask: np.ndarray | None,
@@ -1656,6 +1709,7 @@ def project_frame_detector_values(
 __all__ = [
     "CATALOG_MAX_ITEMS",
     "DetectorHydrationOutcome",
+    "browse_publication_needs_hydration",
     "DisplayArtifact",
     "RunDisplayState",
     "THUMBNAIL_MAX_ITEMS",

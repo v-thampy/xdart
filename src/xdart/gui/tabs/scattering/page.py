@@ -3191,8 +3191,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         resident_frames = self._context_controller.resident_frame_keys
         current = navigation.current
+        replacement_identity = (
+            self._lifecycle.active_run_identity
+            or self._lifecycle.attempt_run_identity
+        )
         replacement_ready = (
-            current is not None
+            replacement_identity is not None
+            and self._context_controller.run_identity is replacement_identity
+            and current is not None
+            and current.run_identity is replacement_identity
             and any(
                 payload.frame_key is current for payload in payloads
             )

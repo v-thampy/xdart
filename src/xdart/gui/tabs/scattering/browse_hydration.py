@@ -8,7 +8,7 @@ from threading import Lock
 
 from xdart.modules.display_context import BrowseContext, HydrationRequest
 from xdart.modules.frame_publication import FramePublication
-from xrd_tools.core import FrameRecord
+from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord
 from xrd_tools.session.hydration import (
     HydrationCompletion,
     HydrationOutcome,
@@ -17,11 +17,15 @@ from xrd_tools.session.hydration import (
     HydrationScope,
 )
 
-from .browse_values import BrowseCleanupReceipt, BrowseLoadRequest
+from .browse_values import (
+    BrowseCleanupReceipt,
+    BrowseLoadRequest,
+    canonical_browse_source_identity,
+)
 from .display_runtime import (
     DetectorHydrationOutcome,
     _hydration_locality_protection,
-    publication_needs_hydration,
+    browse_publication_needs_hydration,
 )
 from .events import CleanupStatus
 from .hydration_transport import (
@@ -134,7 +138,7 @@ class _BrowseHydrationOwner:
                     HydrationOutcome.HYDRATED,
                     HydrationOutcome.ALREADY_RESIDENT,
                 }
-                or publication_needs_hydration(publication, None)
+                or browse_publication_needs_hydration(publication, None)
             ):
                 self._terminalize(read_key)
         self._repaints.put(None)
@@ -206,9 +210,25 @@ class _BrowseHydrationOwner:
             view = preview.view
             if preview.raw is not None:
                 view = replace(view, raw=preview.raw)
-            record = FrameRecord.from_view(view)
+            prior = self._store.get(request.label)
+            prior_record = None if prior is None else prior.record
+            record = FrameRecord.from_view(
+                view,
+                mode_1d=(
+                    prior_record.active_mode_1d
+                    if prior_record is not None and prior_record.results_1d
+                    else DEFAULT_MODE_KEY
+                ),
+                mode_2d=(
+                    prior_record.active_mode_2d
+                    if prior_record is not None and prior_record.results_2d
+                    else DEFAULT_MODE_KEY
+                ),
+            )
             detector_unavailable = view.raw is None and view.thumbnail is None
-            source_identity = f"{view.source_path or ''}#{view.source_frame_index}"
+            source_identity = canonical_browse_source_identity(
+                view, self._artifact,
+            )
             committed = self._store.upsert(
                 FramePublication(
                     view,
@@ -223,7 +243,7 @@ class _BrowseHydrationOwner:
             )
             if (
                 detector_unavailable
-                or publication_needs_hydration(committed, None)
+                or browse_publication_needs_hydration(committed, None)
             ):
                 self._terminalize(request.read_key)
         finally:

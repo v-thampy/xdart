@@ -14,6 +14,7 @@ from xrd_tools.core.energy import (
     WavelengthUnit,
     canonical_wavelength_m,
 )
+from xrd_tools.core.staging import browse_publication_max_items
 from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io import ProcessedScan, iter_frame_records
 from xrd_tools.io.output_transaction import TargetSnapshot, capture_target_snapshot
@@ -30,6 +31,7 @@ from ..browse_values import (
     BrowseLoadRequest,
     BrowseLoadStatus,
     canonical_browse_scan_key,
+    canonical_browse_source_identity,
 )
 from ..events import CleanupStatus, DetachedDiagnostic, detach_exception
 
@@ -37,6 +39,12 @@ from ..events import CleanupStatus, DetachedDiagnostic, detach_exception
 _CLEANUP_PENDING = "pending"
 _CLEANUP_IN_PROGRESS = "in_progress"
 _CLEANUP_CLEANED = "cleaned"
+
+
+def _iter_browse_records(source: str):
+    """Read every cheap 1-D row while deferring current-frame heavy pixels."""
+
+    yield from iter_frame_records(source, include_heavy=False)
 
 
 @dataclass(slots=True)
@@ -59,11 +67,13 @@ class BrowseLoader:
     def __init__(
         self,
         *,
-        max_items: int = 512,
+        max_items: int | None = None,
         join_timeout: float = 5.0,
         open_scan=ProcessedScan,
-        read_records=iter_frame_records,
+        read_records=_iter_browse_records,
     ) -> None:
+        if max_items is None:
+            max_items = browse_publication_max_items()
         if type(max_items) is not int or max_items < 1:
             raise ValueError("browse retention must be positive")
         self._max_items = max_items
@@ -595,7 +605,10 @@ class BrowseLoader:
             raise ValueError("processed browse target is unavailable")
         scan = self._open_scan(request.source_path)
         records = FrameRecordStore(max_items=self._max_items)
-        publications = PublicationStore(max_items=self._max_items)
+        publications = PublicationStore(
+            max_items=self._max_items,
+            retain_1d_on_eviction=True,
+        )
         labels: list[int] = []
         first = None
         # E6-NORM-N1: ONE revision-0 draft folded once per accepted record in
@@ -613,7 +626,9 @@ class BrowseLoader:
                 raise TypeError("processed frame labels must be integers")
             view = record.active_view()
             draft = fold_norm_metadata(draft, view.metadata_numeric)
-            source = f"{view.source_path or request.source_path}#{record.label}"
+            source = canonical_browse_source_identity(
+                view, request.source_path,
+            )
             records.upsert(
                 record, source_identity=source, persisted=True
             )

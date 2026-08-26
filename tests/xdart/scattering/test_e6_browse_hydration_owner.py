@@ -150,12 +150,14 @@ def _assert_browse_hydration_retains_nearest_complete_window(
     labels = tuple(range(1, 10))
     store = browse.publication_store
     store.set_max_heavy_items(3)
-    assert store.complete_labels(labels) == frozenset((7, 8, 9))
+    # Browse initially retains every cheap 1-D row and no eager cakes.  Heavy
+    # residency is populated only by exact current-frame preview hydration.
+    assert store.complete_labels(labels) == frozenset()
 
     first = _browse_key(controller, 1)
     assert controller.project(first) is None
     _settle_transport(owner.transport)
-    assert store.complete_labels(labels) == frozenset((1, 7, 8))
+    assert store.complete_labels(labels) == frozenset((1,))
     first_payload = controller.project(first)
     assert first_payload is not None
     assert first_payload.view.intensity_2d is not None
@@ -163,7 +165,20 @@ def _assert_browse_hydration_retains_nearest_complete_window(
     sixth = _browse_key(controller, 6)
     assert controller.project(sixth) is None
     _settle_transport(owner.transport)
+    assert store.complete_labels(labels) == frozenset((1, 6))
+    seventh = _browse_key(controller, 7)
+    assert controller.project(seventh) is None
+    _settle_transport(owner.transport)
+    assert store.complete_labels(labels) == frozenset((1, 6, 7))
+    eighth = _browse_key(controller, 8)
+    assert controller.project(eighth) is None
+    _settle_transport(owner.transport)
     assert store.complete_labels(labels) == frozenset((6, 7, 8))
+    for label in labels:
+        light = store.get(label)
+        assert light is not None
+        assert light.record.results_1d
+        assert all(view.has_1d for view in light.record.results_1d.values())
     assert publication_needs_hydration(store.get(7), None) is False
     seventh = _browse_key(controller, 7)
     payload = controller.project(seventh)
@@ -171,6 +186,13 @@ def _assert_browse_hydration_retains_nearest_complete_window(
     assert payload.view.intensity_2d is not None
     assert owner.transport.active_token is None
     assert owner.transport.queued_token is None
+
+    # Tier-2 Browse eviction drops the thumbnail but not the full 1-D row.
+    assert store.evict_thumbnail(1) is True
+    evicted = store.get(1)
+    assert evicted is not None and evicted.view.thumbnail is None
+    assert evicted.record.results_1d
+    assert all(view.has_1d for view in evicted.record.results_1d.values())
 
 
 def test_cold_browse_hydration_retains_nearest_complete_window(tmp_path):
@@ -185,6 +207,30 @@ def test_cold_browse_hydration_retains_nearest_complete_window(tmp_path):
         browse,
         owner,
     )
+
+
+def test_cold_one_d_only_browse_hydrates_stored_thumbnail_once(tmp_path):
+    controller, browse, _processed = _adopted_cold_browse(
+        tmp_path,
+        labels=(1,),
+        loader_max=1,
+        thumbnails=True,
+        two_d=False,
+    )
+    owner = _bound_owner(controller)
+    key = _browse_key(controller, 1)
+    initial = browse.publication_store.get(1)
+    assert initial is not None and initial.view.has_1d
+    assert initial.record.results_2d == {}
+    assert initial.view.thumbnail is None
+
+    assert controller.project(key) is None
+    _settle_transport(owner.transport)
+    assert controller.poll_browse_preview() is True
+    hydrated = owner.transport.counters()[HydrationOutcome.HYDRATED]
+    payload = controller.project(key)
+    assert payload is not None and payload.view.thumbnail is not None
+    assert owner.transport.counters()[HydrationOutcome.HYDRATED] == hydrated
 
 
 def test_warm_browse_hydration_retains_nearest_complete_window(tmp_path):

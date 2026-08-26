@@ -34,7 +34,7 @@ from .context_values import (
 )
 from .controls_readiness import ControlsReadinessProjection
 from .display_values import DisplayFrameKey, StandardDisplayPayload
-from .display_runtime import publication_needs_hydration
+from .display_runtime import browse_publication_needs_hydration
 from .events import RunIdentity
 from .shell_projection import (
     ScientificPreferences, build_browser_projection,
@@ -315,7 +315,7 @@ class ContextProjection:
             return frozenset(
                 frame
                 for frame in frames
-                if not publication_needs_hydration(
+                if not browse_publication_needs_hydration(
                     store.get(frame.local_frame_label),
                     _browse_detector_outcome(
                         context,
@@ -545,7 +545,7 @@ class ContextProjection:
             return None
         if (
             request.require_complete
-            and publication_needs_hydration(
+            and browse_publication_needs_hydration(
                 publication,
                 _browse_detector_outcome(
                     context, label, browse_hydration_owner
@@ -609,7 +609,7 @@ class ContextProjection:
             and publication.scan_key != context.scan_key
         ):
             return TerminalMiss(BrowseMissReason.FOREIGN)
-        if publication is not None and not publication_needs_hydration(
+        if publication is not None and not browse_publication_needs_hydration(
             publication,
             _browse_detector_outcome(context, label, owner),
         ):
@@ -655,12 +655,17 @@ def _browse_payload(
     )
     if record is not None:
         light_view = record.active_view()
-        view = replace(
-            view,
-            axis_1d=light_view.axis_1d,
-            intensity_1d=light_view.intensity_1d,
-            sigma_1d=light_view.sigma_1d,
-        )
+        # Browse's headless record store may have thinned an old, persisted
+        # row under its independent heavy bound.  Never let that missing copy
+        # erase the complete cheap 1-D projection retained by the publication
+        # store for Overlay/Waterfall.
+        if light_view.has_1d:
+            view = replace(
+                view,
+                axis_1d=light_view.axis_1d,
+                intensity_1d=light_view.intensity_1d,
+                sigma_1d=light_view.sigma_1d,
+            )
     measurement, motor = _browse_measurement(context, publication)
     return StandardDisplayPayload(
         generation,

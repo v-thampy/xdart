@@ -93,6 +93,7 @@ def _write_processed(
     *,
     labels: tuple[int, ...] = (1, 2, 3),
     thumbnails: bool = True,
+    two_d: bool = True,
     raw_dtype=np.uint16,
 ) -> tuple[Path, Path]:
     """One real processed container + one real raw master, portable layout."""
@@ -110,7 +111,7 @@ def _write_processed(
         )
         for label in labels
     ]
-    two_d = [
+    two_d_results = [
         IntegrationResult2D(
             radial=np.array([0.1, 0.2, 0.3]),
             azimuthal=np.array([-1.0, 1.0]),
@@ -126,7 +127,7 @@ def _write_processed(
             entry,
             frame_indices=list(labels),
             results_1d=one_d,
-            results_2d=two_d,
+            results_2d=two_d_results if two_d else None,
         )
         base = stamp_source_base(entry, root)
         for label in labels:
@@ -2328,6 +2329,7 @@ def _adopted_cold_browse(
     labels=(1, 2, 3),
     loader_max=1,
     thumbnails=True,
+    two_d=True,
 ):
     from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
     from xdart.gui.tabs.scattering.context_controller import ContextController
@@ -2337,6 +2339,7 @@ def _adopted_cold_browse(
         tmp_path,
         labels=labels,
         thumbnails=thumbnails,
+        two_d=two_d,
     )
     loader = BrowseLoader(max_items=loader_max)
     controller = ContextController(

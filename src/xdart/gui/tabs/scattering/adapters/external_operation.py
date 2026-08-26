@@ -213,7 +213,11 @@ def _average_calibration(request: _AverageRequest):
             return (type(detector), shape, maximum, float(detector.pixel1),
                 float(detector.pixel2), int(detector.orientation), normalized)
         accepted_truth = truth(accepted); reconstructed_truth = truth(reconstructed)
-        expected_shape = tuple(config["max_shape"])
+        expected_shape = tuple(
+            config["max_shape"]
+            if "max_shape" in config
+            else accepted_truth[2]
+        )
         valid = (accepted_truth == reconstructed_truth
             and accepted_truth[0].__module__.startswith("pyFAI.detectors")
             and accepted_truth[0].__name__.casefold() == state.detector_id.casefold()

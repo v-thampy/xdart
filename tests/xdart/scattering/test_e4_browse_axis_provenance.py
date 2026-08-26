@@ -58,7 +58,9 @@ def _project_browse(context, *, identity: RunIdentity | None = None):
         1,
         1,
     )
-    request = ProjectionRequest(identity, selection, frame)
+    # This oracle exercises the retained 1-D trace/wavelength projection; the
+    # independently hydrated current-frame cake is not part of its contract.
+    request = ProjectionRequest(identity, selection, frame, False)
     return ContextProjection().project(
         context,
         request,

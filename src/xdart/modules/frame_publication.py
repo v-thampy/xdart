@@ -526,7 +526,56 @@ def _publication_has_full_payload(publication: FramePublication) -> bool:
     return False
 
 
-def _semilight_publication(publication: FramePublication) -> FramePublication:
+def _browse_evicted_publication(
+    publication: FramePublication,
+    *,
+    thumbnail: np.ndarray | None,
+) -> FramePublication:
+    """Drop detector/cake arrays while retaining Browse's cheap 1-D record."""
+
+    def thin(view: FrameView) -> FrameView:
+        return replace(
+            view,
+            intensity_2d=None,
+            sigma_2d=None,
+            raw=None,
+            thumbnail=thumbnail,
+        )
+
+    record = FrameRecord(
+        label=publication.record.label,
+        results_1d={
+            mode: thin(view)
+            for mode, view in publication.record.results_1d.items()
+        },
+        results_2d={
+            mode: thin(view)
+            for mode, view in publication.record.results_2d.items()
+        },
+        active_mode_1d=publication.record.active_mode_1d,
+        active_mode_2d=publication.record.active_mode_2d,
+    )
+    view = (
+        thin(publication.view)
+        if record.is_empty
+        else record.active_view()
+    )
+    return replace(
+        publication,
+        view=view,
+        record=record,
+        raw_ref=None,
+        raw_status="thumbnail" if thumbnail is not None else "evicted",
+        metadata_raw=view.metadata_raw,
+        metadata_numeric=view.metadata_numeric,
+    )
+
+
+def _semilight_publication(
+    publication: FramePublication,
+    *,
+    retain_1d: bool = False,
+) -> FramePublication:
     """Tier-1 eviction (D2): drop the heavy arrays but KEEP the thumbnail.
 
     A ~256 KB thumbnail per frame keeps scroll-back instantly paintable
@@ -534,6 +583,11 @@ def _semilight_publication(publication: FramePublication) -> FramePublication:
     payload rehydrates in the background; thumbnails have their own,
     much larger bound (tier 2)."""
     view = publication.view
+    if retain_1d:
+        return _browse_evicted_publication(
+            publication,
+            thumbnail=view.thumbnail,
+        )
     thumb_view = FrameView(
         label=view.label,
         two_d_kind=view.two_d_kind,
@@ -562,9 +616,15 @@ def _semilight_publication(publication: FramePublication) -> FramePublication:
     )
 
 
-def _lightweight_publication(publication: FramePublication) -> FramePublication:
+def _lightweight_publication(
+    publication: FramePublication,
+    *,
+    retain_1d: bool = False,
+) -> FramePublication:
     """Tier-2 eviction: metadata/diagnostics-only (no arrays at all)."""
     view = publication.view
+    if retain_1d:
+        return _browse_evicted_publication(publication, thumbnail=None)
     light_view = FrameView(
         label=view.label,
         two_d_kind=view.two_d_kind,
@@ -738,6 +798,7 @@ class PublicationStore:
         max_items: int | None = DEFAULT_PUBLICATION_MAX_ITEMS,
         max_heavy_items=_AUTO_HEAVY_WINDOW,
         max_thumbnail_items: int | None = 512,
+        retain_1d_on_eviction: bool = False,
     ) -> None:
         if max_heavy_items is _AUTO_HEAVY_WINDOW:
             from xrd_tools.core import heavy_window
@@ -748,11 +809,14 @@ class PublicationStore:
             raise ValueError("max_heavy_items must be non-negative or None")
         if max_thumbnail_items is not None and max_thumbnail_items < 0:
             raise ValueError("max_thumbnail_items must be non-negative or None")
+        if type(retain_1d_on_eviction) is not bool:
+            raise TypeError("retain_1d_on_eviction must be an exact bool")
         self._lock = RLock()
         self._generation = 0
         self._max_items = max_items
         self._max_heavy_items = max_heavy_items
         self._max_thumbnail_items = max_thumbnail_items
+        self._retain_1d_on_eviction = retain_1d_on_eviction
         self.allocation: Any = None
         self._light_1d = None
         self._items: dict[int | str, FramePublication] = {}
@@ -1753,7 +1817,10 @@ class PublicationStore:
                 )
             ):
                 return False
-            self._items[label] = _semilight_publication(publication)
+            self._items[label] = _semilight_publication(
+                publication,
+                retain_1d=self._retain_1d_on_eviction,
+            )
             self._drop_heavy_label_locked(label)
             return True
 
@@ -1767,7 +1834,10 @@ class PublicationStore:
                 or not self._thumbnail_evictable_locked(label)
             ):
                 return False
-            self._items[label] = _lightweight_publication(publication)
+            self._items[label] = _lightweight_publication(
+                publication,
+                retain_1d=self._retain_1d_on_eviction,
+            )
             self._drop_heavy_label_locked(label)
             self._drop_thumb_label_locked(label)
             return True
@@ -1926,7 +1996,10 @@ class PublicationStore:
                 publication = self._items.get(label)
                 if publication is None:
                     continue
-                self._items[label] = _semilight_publication(publication)
+                self._items[label] = _semilight_publication(
+                    publication,
+                    retain_1d=self._retain_1d_on_eviction,
+                )
 
         # tier 2: thumbnails have their own, larger bound
         if self._max_thumbnail_items is not None:
@@ -1937,7 +2010,10 @@ class PublicationStore:
                 publication = self._items.get(label)
                 if publication is None:
                     continue
-                self._items[label] = _lightweight_publication(publication)
+                self._items[label] = _lightweight_publication(
+                    publication,
+                    retain_1d=self._retain_1d_on_eviction,
+                )
                 self._drop_heavy_label_locked(label)
 
 

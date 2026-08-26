@@ -5,6 +5,7 @@ from dataclasses import fields, replace
 import json
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 import h5py
 import numpy as np
 import pytest
@@ -84,6 +85,55 @@ def _stub_integrators(monkeypatch):
     monkeypatch.setattr(core, "integrate_1d", one)
     monkeypatch.setattr(core, "integrate_2d", two)
     return calls
+
+
+def test_average_accepts_fixed_eiger_config_without_redundant_max_shape(
+    tmp_path,
+) -> None:
+    poni = tmp_path / "fixed-eiger.poni"
+    poni.write_text(
+        "poni_version: 2.1\n"
+        "Detector: Eiger4M\n"
+        'Detector_config: {"orientation": 3}\n'
+        "Distance: 0.13846912503056505\n"
+        "Poni1: 0.1785781587133659\n"
+        "Poni2: 0.010010979828214216\n"
+        "Rot1: -0.004247048916341726\n"
+        "Rot2: 0.004266506815595174\n"
+        "Rot3: 0.0\n"
+        "Wavelength: 7.293188143129427e-11\n"
+    )
+
+    state = adapter._average_calibration(SimpleNamespace(
+        poni_file=str(poni), mask_file="",
+    ))
+    assert state.detector_id == "Eiger4M"
+    assert dict(state.detector_config) == {"orientation": 3}
+    assert state.values is not None
+
+    from xrd_tools.core import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+
+    values = state.values
+    calibration = DetectorCalibration(
+        PONI(
+            values.dist,
+            values.poni1,
+            values.poni2,
+            values.rot1,
+            values.rot2,
+            values.rot3,
+            values.wavelength_m,
+            state.detector_id,
+        ),
+        dict(state.detector_config),
+    )
+    detector = adapter.detector_calibration_to_integrator(
+        calibration,
+    ).detector
+    assert tuple(detector.shape) == tuple(detector.max_shape) == (2167, 2070)
+    assert detector.pixel1 == detector.pixel2 == 75e-6
+    assert int(detector.orientation) == 3
 
 
 @pytest.fixture

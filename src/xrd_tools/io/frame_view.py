@@ -353,7 +353,9 @@ class FrameViewReader:
             incident_angle=read_scalar("incident_angle"),
         )
 
-    def _thumbnail_for_frame(self, frame: int) -> tuple[np.ndarray | None, bool]:
+    def _thumbnail_for_frame(
+        self, frame: int, *, include_data: bool = True,
+    ) -> tuple[np.ndarray | None, bool]:
         entry = self._entry
         if not self.include_thumbnail or entry is None:
             return None, False
@@ -361,8 +363,10 @@ class FrameViewReader:
         if fg is None or "thumbnail" not in fg:
             return None, False
         thumbnail = fg["thumbnail"]
-        return _dequantize_thumbnail(thumbnail), bool(
-            thumbnail.attrs.get("mask_baked", True))
+        return (
+            _dequantize_thumbnail(thumbnail) if include_data else None,
+            bool(thumbnail.attrs.get("mask_baked", True)),
+        )
 
     def _source_for_frame(self, frame: int) -> tuple[str | None, int | None]:
         entry = self._entry
@@ -390,10 +394,14 @@ class FrameViewReader:
             source_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
         return path, source_idx
 
-    def _common_fields(self, frame: int) -> dict:
+    def _common_fields(
+        self, frame: int, *, include_heavy: bool = True,
+    ) -> dict:
         """Shared per-frame fields (thumbnail/source/metadata/geometry) — the
         same for every mode of one frame."""
-        thumbnail, mask_baked = self._thumbnail_for_frame(frame)
+        thumbnail, mask_baked = self._thumbnail_for_frame(
+            frame, include_data=include_heavy,
+        )
         source_path, source_frame_index = self._source_for_frame(frame)
         metadata_raw = self._metadata_for_frame(frame)
         geometry = self._geometry_for_frame(frame)
@@ -446,7 +454,15 @@ class FrameViewReader:
             **self._common_fields(frame),
         )
 
-    def _view_for(self, frame: int, dim: str, mode: str) -> "FrameView | None":
+    def _view_for(
+        self,
+        frame: int,
+        dim: str,
+        mode: str,
+        *,
+        include_heavy: bool = True,
+        common: dict | None = None,
+    ) -> "FrameView | None":
         """Dimension-pure :class:`FrameView` for one ``(dim, mode)``, or ``None``
         if absent.  Shared per-frame fields are included so a record's per-dim
         views carry them; :class:`FrameRecord` re-projects to dimension-pure."""
@@ -460,19 +476,30 @@ class FrameViewReader:
             return FrameView(
                 label=frame, axis_1d=self._axis_1d_modes.get(mode),
                 intensity_1d=np.asarray(g["intensity"][row]), sigma_1d=sig,
-                **self._common_fields(frame),
+                **(common if common is not None else self._common_fields(frame)),
             )
         g = self._g2_modes.get(mode)
         row = self._row(self._map_2d_modes.get(mode, {}), frame)
         if g is None or row is None:
             return None
-        sig = np.asarray(g["sigma"][row]) if "sigma" in g else None
+        sig = (
+            np.asarray(g["sigma"][row])
+            if include_heavy and "sigma" in g
+            else None
+        )
         return FrameView(
             label=frame, axis_2d_x=self._axis_2d_x_modes.get(mode),
             axis_2d_y=self._axis_2d_y_modes.get(mode),
-            intensity_2d=np.asarray(g["intensity"][row]), sigma_2d=sig,
+            intensity_2d=(
+                np.asarray(g["intensity"][row]) if include_heavy else None
+            ),
+            sigma_2d=sig,
             two_d_kind=self._two_d_kind_modes.get(mode, TwoDKind.Q_CHI),
-            **self._common_fields(frame),
+            **(
+                common
+                if common is not None
+                else self._common_fields(frame, include_heavy=include_heavy)
+            ),
         )
 
     def modes_1d(self) -> tuple:
@@ -493,22 +520,34 @@ class FrameViewReader:
         """True if the file carries the per-mode capability marker."""
         return self._multi_result_modes
 
-    def read_record(self, frame: int) -> FrameRecord:
+    def read_record(
+        self, frame: int, *, include_heavy: bool = True,
+    ) -> FrameRecord:
         """Read every mode of ``frame`` into a multi-result :class:`FrameRecord`.
 
         On a single-mode/old file this is exactly
         ``FrameRecord.from_view(self.read(frame))`` (one ``DEFAULT_MODE_KEY``
-        entry per dimension)."""
+        entry per dimension).  With ``include_heavy=False``, complete 1-D
+        modes and per-frame metadata are retained while 2-D modes become
+        array-free shells and thumbnail pixels are skipped.  This gives
+        long-scan Browse projection its full cheap trace membership without
+        eagerly reading detector/cake payloads that only the current frame
+        needs."""
         frame = int(frame)
+        common = self._common_fields(frame, include_heavy=include_heavy)
         r1d: dict = {}
         r2d: dict = {}
         for m in self.modes_1d():
-            v = self._view_for(frame, "1d", m)
+            v = self._view_for(frame, "1d", m, common=common)
             if v is not None and v.has_1d:
                 r1d[m] = v
         for m in self.modes_2d():
-            v = self._view_for(frame, "2d", m)
-            if v is not None and v.has_2d:
+            v = self._view_for(
+                frame, "2d", m,
+                include_heavy=include_heavy,
+                common=common,
+            )
+            if v is not None and (include_heavy is False or v.has_2d):
                 r2d[m] = v
         a1 = self._primary_mode_1d if self._primary_mode_1d in r1d else next(
             iter(r1d), DEFAULT_MODE_KEY)
@@ -571,8 +610,13 @@ def iter_frame_records(
     entry: str = "entry",
     include_thumbnail: bool = True,
     source_root: str | Path | None = None,
+    include_heavy: bool = True,
 ):
-    """Yield :class:`FrameRecord` objects one at a time from one open reader."""
+    """Yield :class:`FrameRecord` objects one at a time from one open reader.
+
+    ``include_heavy=False`` keeps complete 1-D modes and structural 2-D mode
+    shells while avoiding per-frame 2-D and thumbnail pixel reads.
+    """
 
     with FrameViewReader(
         scan_file, entry=entry, include_thumbnail=include_thumbnail,
@@ -580,7 +624,9 @@ def iter_frame_records(
     ) as reader:
         labels = reader.labels() if frames is None else frames
         for frame in labels:
-            yield reader.read_record(int(frame))
+            yield reader.read_record(
+                int(frame), include_heavy=include_heavy,
+            )
 
 
 def read_frame_records(

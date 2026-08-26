@@ -94,10 +94,31 @@ def canonical_browse_scan_key(source_path: str) -> str:
     return "" if owner is None else str(owner.scan_name(path) or "")
 
 
+def canonical_browse_source_identity(view, artifact_path: str) -> str:
+    """Name one persisted frame identically before and after hydration.
+
+    Processed frame labels are commonly one-based while detector-source frame
+    indices are zero-based.  The latter is the persisted member identity when
+    present; the processed label is only the legacy fallback.
+    """
+
+    if type(artifact_path) is not str or not artifact_path:
+        raise TypeError("browse artifact identity must be a nonempty string")
+    source_path = getattr(view, "source_path", None) or artifact_path
+    source_frame_index = getattr(view, "source_frame_index", None)
+    member = (
+        getattr(view, "label")
+        if source_frame_index is None
+        else source_frame_index
+    )
+    return f"{source_path}#{member}"
+
+
 __all__ = [
     "BrowseLoadOutcome",
     "BrowseLoadRequest",
     "BrowseLoadStatus",
     "BrowseCleanupReceipt",
     "canonical_browse_scan_key",
+    "canonical_browse_source_identity",
 ]

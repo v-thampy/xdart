@@ -99,6 +99,198 @@ def _wait_outcome(
     raise AssertionError("processed browse load did not finish")
 
 
+def test_default_browse_retains_all_651_light_traces(
+    tmp_path, monkeypatch,
+) -> None:
+    """Browse keeps the full 1-D stack while current-frame heavy data hydrates."""
+
+    from tests.xdart.scattering.test_e4_preview_transport import (
+        _write_processed,
+    )
+    from xdart.gui.tabs.scattering.context_projection import _browse_payload
+    from xdart.gui.tabs.scattering.display_runtime import (
+        publication_needs_hydration,
+    )
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.events import RunIdentity
+
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
+    labels = tuple(range(1, 652))
+    processed, _raw = _write_processed(tmp_path, labels=labels)
+    loader = BrowseLoader()
+    context = None
+    try:
+        request = BrowseLoadRequest(
+            new_context_token(ContextKind.BROWSE),
+            1,
+            str(processed.resolve()),
+        )
+        loader.begin(request)
+        outcome = _wait_outcome(loader, request)
+        assert outcome.status is BrowseLoadStatus.READY
+        context = loader.consume(outcome)
+        assert context is not None
+        assert context.loaded_labels == labels
+        assert context.publication_store._max_items >= len(labels)
+        assert context.publication_store.labels() == labels
+        assert context.publication_store._heavy_labels == []
+
+        first = context.publication_store.get(labels[0])
+        last = context.publication_store.get(labels[-1])
+        assert first is not None and last is not None
+        assert first.view.has_1d and last.view.has_1d
+        assert first.source_identity == f"{_raw.resolve()}#0"
+        assert first.view.thumbnail is None and first.view.mask_baked
+        assert first.record.results_2d
+        assert all(
+            not view.has_2d
+            for view in first.record.results_2d.values()
+        )
+        assert publication_needs_hydration(first, None)
+
+        # The independent record-store heavy bound thins this old copy.  It
+        # must not overwrite the complete light publication used by Waterfall.
+        stored = context.record_store.get(labels[0])
+        assert stored is not None and not stored.active_view().has_1d
+        identity = RunIdentity(1, "browse-651-light")
+        frame = DisplayFrameKey(
+            identity,
+            context.scan_key,
+            context.requested_path,
+            labels[0],
+            1,
+        )
+        payload = _browse_payload(context, first, frame, 1)
+        assert payload.view.has_1d
+        assert payload.view.intensity_2d is None
+    finally:
+        if context is not None:
+            loader.release_context(context)
+        loader.close()
+
+
+def test_browse_heavy_hydration_preserves_named_active_modes() -> None:
+    """Light Browse hydration must not invent a default mode for GI data."""
+
+    from dataclasses import replace
+
+    from tests.xdart.scattering.test_e3_context_contract import _browse
+    from xdart.gui.tabs.scattering.browse_hydration import (
+        _BrowseHydrationOwner,
+    )
+    from xdart.gui.tabs.scattering.browse_values import (
+        canonical_browse_source_identity,
+    )
+    from xdart.gui.tabs.scattering.display_runtime import (
+        browse_publication_needs_hydration,
+    )
+    from xdart.gui.tabs.scattering.hydration_transport import (
+        PreparedHydrationCommit,
+    )
+    from xdart.modules.display_context import HydrationRequest
+    from xdart.modules.frame_publication import FramePublication
+    from xrd_tools.core import FrameRecord
+    from xrd_tools.io.frame_preview import FramePreview
+    from xrd_tools.session.hydration import (
+        HydrationOutcome,
+        HydrationPurpose,
+        HydrationReadKey,
+        HydrationScope,
+        HydrationToken,
+    )
+
+    request, browse = _browse(
+        new_context_token(ContextKind.BROWSE),
+        1,
+        scan_key="named-gi",
+    )
+    store = browse.publication_store
+    initial = store.get(1)
+    assert initial is not None
+    full_view = replace(initial.view, source_frame_index=0)
+    light_view = replace(
+        full_view,
+        intensity_2d=None,
+        raw=None,
+        thumbnail=None,
+    )
+    named = FrameRecord(
+        label=1,
+        results_1d={
+            "q_ip": light_view,
+            "q_oop": light_view,
+        },
+        results_2d={
+            "q_ip_q_oop": light_view,
+            "q_chi": light_view,
+        },
+        active_mode_1d="q_ip",
+        active_mode_2d="q_ip_q_oop",
+    )
+    assert store.discard(1) is True
+    store.upsert(FramePublication(
+        light_view,
+        record=named,
+        source_identity=canonical_browse_source_identity(
+            light_view, browse.requested_path,
+        ),
+        scan_key=browse.scan_key,
+    ))
+
+    owner = _BrowseHydrationOwner(browse)
+    hydration_owner = browse.hydration_owner
+    read_key = HydrationReadKey(
+        HydrationScope(*hydration_owner.as_tuple()),
+        browse.requested_path,
+        1,
+        HydrationPurpose.PREVIEW,
+    )
+    token = HydrationToken(read_key, 1)
+    hydration = HydrationRequest(
+        1,
+        HydrationPurpose.PREVIEW,
+        1,
+        hydration_owner,
+        (store,),
+        browse.commit_gate,
+        read_key=read_key,
+        token=token,
+    )
+    view = replace(full_view, raw=None)
+    preview = FramePreview(
+        read_key,
+        view,
+        view.thumbnail,
+        None,
+        view.source_path,
+        None,
+        view.source_frame_index,
+        None,
+    )
+    prepared = PreparedHydrationCommit(
+        hydration,
+        token,
+        None,
+        False,
+        preview,
+        None,
+    )
+    try:
+        assert owner.commit_preview(prepared) is HydrationOutcome.HYDRATED
+        committed = store.get(1)
+        assert committed is not None
+        assert committed.record.active_mode_1d == "q_ip"
+        assert committed.record.active_mode_2d == "q_ip_q_oop"
+        assert set(committed.record.results_1d) == {"q_ip", "q_oop"}
+        assert set(committed.record.results_2d) == {
+            "q_ip_q_oop", "q_chi",
+        }
+        assert committed.record.results_2d["q_chi"].has_2d is False
+        assert browse_publication_needs_hydration(committed, None) is False
+    finally:
+        owner.retire()
+
+
 def test_real_browse_load_is_off_thread_exact_and_independently_owned(
     monkeypatch,
 ):
