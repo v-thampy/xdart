@@ -26,7 +26,80 @@ from .schema import (
 )
 LINEAGE_DATASET = "append_lineage"
 LINEAGE_VERSION = 1
+_MAX_REPLACEMENT_CONFIG_UTF8_BYTES = 262_144
+_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES = 64 << 20
+_MAX_REPLACEMENT_PATH_UTF8_BYTES = 4096
 def _replacement_hard_group(root, path, kind=h5py.Group): parts = tuple(part for part in str(path).split("/") if part); walk = lambda current, rest: current if not rest else None if rest[0] in {".", ".."} or not isinstance(current, h5py.Group) or type(current.get(rest[0], getlink=True)) is not h5py.HardLink else walk(current.get(rest[0]), rest[1:]); value = walk(root, parts); return value if parts and isinstance(value, kind) else None
+def _replacement_utf8_scalar(node, role: str, *, max_bytes: int | None = None) -> str:
+    """Read one canonical replacement string into a finite fixed buffer.
+
+    Science/config scalars use the existing 256-KiB persisted descriptor
+    contract by default.  Callers admitting scalable source/Append lineage use
+    the explicit 64-MiB ceiling instead.  In both cases a foreign vlen scalar
+    never chooses the admission process's allocation size.
+    """
+    ceiling = (_MAX_REPLACEMENT_CONFIG_UTF8_BYTES
+               if max_bytes is None else int(max_bytes))
+    if ceiling < 1:
+        raise ValueError("replacement UTF-8 ceiling must be positive")
+    info = None if not isinstance(node, h5py.Dataset) else h5py.check_string_dtype(node.dtype)
+    try:
+        layout = None if node is None else node.id.get_create_plist().get_layout()
+        external = () if node is None else tuple(node.external or ())
+        local = node is not None and type(node.parent.get(node.name.rsplit("/", 1)[-1], getlink=True)) is h5py.HardLink
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        layout, external, local = None, (), False
+    if (not isinstance(node, h5py.Dataset) or not local or node.shape != ()
+            or node.maxshape != () or layout != h5py.h5d.CONTIGUOUS
+            or node.chunks is not None or node.compression is not None
+            or node.compression_opts is not None or bool(node.shuffle)
+            or bool(node.fletcher32) or node.scaleoffset is not None
+            or external or bool(node.is_virtual) or len(node.attrs) != 0
+            or info is None or info.encoding != "utf-8" or info.length is not None):
+        raise ValueError(f"{role} is absent or not a canonical local scalar")
+    capacity = min(64 << 10, ceiling + 1)
+    while True:
+        destination = np.empty((), dtype=f"S{capacity}")
+        try:
+            node.read_direct(destination)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ValueError(f"{role} could not be read as bounded UTF-8") from error
+        raw = bytes(destination[()])
+        if len(raw) < capacity:
+            break
+        if capacity == ceiling + 1:
+            raise ValueError(f"{role} exceeds the persisted UTF-8 byte ceiling")
+        capacity = min(capacity * 2, ceiling + 1)
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{role} is not UTF-8") from error
+def _replacement_utf8_attribute(owner, name: str, role: str, *, max_bytes: int) -> str:
+    ceiling = int(max_bytes)
+    try:
+        attribute = owner.attrs.get_id(name)
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(f"{role} is absent or malformed") from error
+    info = h5py.check_string_dtype(attribute.dtype)
+    if attribute.shape != () or info is None or info.encoding != "utf-8":
+        raise ValueError(f"{role} is not a UTF-8 scalar")
+    capacity = min(64 << 10, ceiling + 1)
+    while True:
+        destination = np.empty((), dtype=f"S{capacity}")
+        try:
+            attribute.read(destination)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ValueError(f"{role} could not be read as bounded UTF-8") from error
+        raw = bytes(destination[()])
+        if len(raw) < capacity:
+            break
+        if capacity == ceiling + 1:
+            raise ValueError(f"{role} exceeds the persisted UTF-8 byte ceiling")
+        capacity = min(capacity * 2, ceiling + 1)
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{role} is not UTF-8") from error
 class AppendDisposition(str, Enum):
     WRITE = "write"
     SKIP = "skip"
@@ -135,6 +208,14 @@ class AppendSource:
             raise ValueError("source dataset paths may not be empty")
         if self.image_members and self.external_members:
             raise ValueError("image-series and external members are distinct owners")
+        if (
+            self.external_members
+            and self.dataset_paths
+            and len(self.dataset_paths) != len(self.external_members)
+        ):
+            raise ValueError(
+                "external source dataset paths must cover every member"
+            )
         members = self.external_members or self.image_members
         _require_member_partition(members, int(self.extent))
 
@@ -606,18 +687,20 @@ def decode_replacement_lineage(handle: h5py.File, *, entry: str = "entry") -> tu
     group = _replacement_hard_group(handle, entry)
     if not isinstance(group, h5py.Group):
         raise ValueError(f"foreign or missing entry {entry!r}")
-    source_base = _decode(group.attrs.get(SOURCE_BASE_ATTR, ""))
+    source_base = ("" if SOURCE_BASE_ATTR not in group.attrs else
+                   _replacement_utf8_attribute(
+                       group, SOURCE_BASE_ATTR, "processed source base",
+                       max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES,
+                   ))
     if type(source_base) is not str:
         raise ValueError("processed source base requires exact decoded text")
     config = _replacement_hard_group(group, "reduction/config")
     if not isinstance(config, h5py.Group): raise ValueError("malformed replacement Append lineage")
     link = config.get(LINEAGE_DATASET, getlink=True)
     if link is None: return source_base, None, None
-    dataset = _replacement_hard_group(config, LINEAGE_DATASET, h5py.Dataset); info = None if dataset is None else h5py.check_string_dtype(dataset.dtype)
-    if not isinstance(dataset, h5py.Dataset) or dataset.shape != () or dataset.maxshape != () or dataset.chunks is not None or dataset.compression is not None or info is None or info.encoding != "utf-8" or info.length is not None: raise ValueError("malformed replacement Append lineage")
-    raw = _decode(dataset[()])
-    if type(raw) is not str:
-        raise ValueError("replacement Append lineage requires UTF-8 text")
+    dataset = _replacement_hard_group(config, LINEAGE_DATASET, h5py.Dataset)
+    try: raw = _replacement_utf8_scalar(dataset, "replacement Append lineage", max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES)
+    except ValueError as error: raise ValueError("malformed replacement Append lineage") from error
     value = json.loads(raw)
     if type(value) is not dict:
         raise ValueError("replacement Append lineage is not an object")
@@ -1149,11 +1232,14 @@ def prepare_append_preflight(
     )
 
 def _write_lineage(entry: h5py.Group, lineage: Mapping[str, Any]) -> None:
+    payload = _json(lineage)
+    if len(payload.encode("utf-8")) > _MAX_REPLACEMENT_LINEAGE_UTF8_BYTES:
+        raise ValueError("Append lineage exceeds the persisted UTF-8 byte ceiling")
     reduction = entry.require_group("reduction")
     config = reduction.require_group("config")
     if LINEAGE_DATASET in config:
         del config[LINEAGE_DATASET]
-    config.create_dataset(LINEAGE_DATASET, data=_json(lineage))
+    config.create_dataset(LINEAGE_DATASET, data=payload)
 
 def stage_append_lineage(entry: h5py.Group, decision: AppendDecision) -> None:
     if decision.disposition is not AppendDisposition.WRITE or decision.lineage is None:

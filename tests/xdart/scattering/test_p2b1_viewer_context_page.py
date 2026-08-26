@@ -15,6 +15,7 @@ from xdart.gui.tabs.scattering.context_controller import ContextController
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.display_values import RunIdentity, StandardEventKind, StandardRunEvent
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+import xdart.gui.tabs.scattering.page as page_module
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
@@ -586,6 +587,63 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
     assert controller.viewer_1d_context is None
 
 
+def test_catalog_activation_routes_are_gui_thread_zero_io(monkeypatch) -> None:
+    calls = []
+    intent = SimpleNamespace(processing_mode="1D Viewer")
+    controller = SimpleNamespace(
+        viewer_1d_owned=False, viewer_2d_owned=False, selection=None,
+    )
+    page = SimpleNamespace(
+        _closing=False,
+        _closed=False,
+        _context_controller=controller,
+        _operation_slot=SimpleNamespace(
+            owned=False, current_identity=None, observe_stamp=lambda _stamp: None,
+        ),
+        _calibration_identity=None,
+        _mask_identity=None,
+        _reintegrate_identity=None,
+        _reintegrate_dimension=None,
+        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(
+            revision=1, thaw=lambda: intent,
+        )),
+        _open_viewer_1d_paths=lambda paths: calls.append(("xye", paths)),
+        _open_viewer_2d_path=lambda path: calls.append(("tiff", path)),
+        _clear_viewer_1d_renderer=lambda **_kwargs: True,
+        _clear_viewer_2d_renderer=lambda **_kwargs: True,
+        _select_scan=lambda value, **kwargs: calls.append(
+            ("select", value, kwargs)
+        ),
+    )
+    forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("SELECT_SCAN performed GUI-thread filesystem I/O")
+    )
+    monkeypatch.setattr(page_module.os.path, "isdir", forbidden)
+    monkeypatch.setattr(Path, "resolve", forbidden)
+
+    ScatteringWorkspace._handle_shell_command(page, ShellCommand(
+        ShellCommandKind.SELECT_SCAN, "/data/subdir", path=("directory",),
+    ))
+    ScatteringWorkspace._handle_shell_command(page, ShellCommand(
+        ShellCommandKind.SELECT_SCAN, "/data/curve.xye", path=("artifact",),
+    ))
+    intent.processing_mode = "2D Viewer"
+    ScatteringWorkspace._handle_shell_command(page, ShellCommand(
+        ShellCommandKind.SELECT_SCAN, "/data/image.tiff", path=("artifact",),
+    ))
+    intent.processing_mode = "Int 2D"
+    ScatteringWorkspace._handle_shell_command(page, ShellCommand(
+        ShellCommandKind.SELECT_SCAN, "/data/result.nxs", path=("artifact",),
+    ))
+
+    assert calls == [
+        ("select", "/data/subdir", {"is_directory": True}),
+        ("xye", ("/data/curve.xye",)),
+        ("tiff", "/data/image.tiff"),
+        ("select", "/data/result.nxs", {"is_directory": False}),
+    ]
+
+
 def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, tmp_path) -> None:
     calls = []
     paths = ("/opaque/first.xye", "/other/first.xye")
@@ -632,20 +690,34 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(revision=1, thaw=lambda: intent)),
         _open_viewer_1d_paths=lambda value: ordered.append(("open-1d", value)),
         _open_viewer_2d_path=lambda value: ordered.append(("open-2d", value)),
-        _select_scan=lambda value: ordered.append(("select", value)))
+        _select_scan=lambda value, **kwargs: ordered.append(
+            ("select", value, kwargs)
+        ))
     ScatteringWorkspace._handle_shell_command(
-        dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, str(directory)))
-    assert ordered == [("select", str(directory))]
-    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "scan"))
-    assert ordered[-1] == ("open-1d", ("scan",))
+        dispatch, ShellCommand(
+            ShellCommandKind.SELECT_SCAN, str(directory), path=("directory",),
+        ))
+    assert ordered == [("select", str(directory), {"is_directory": True})]
+    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
+        ShellCommandKind.SELECT_SCAN, "scan.xye", path=("artifact",),
+    ))
+    assert ordered[-1] == ("open-1d", ("scan.xye",))
     intent.processing_mode = "2D Viewer"
-    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "image.tif"))
+    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
+        ShellCommandKind.SELECT_SCAN, "image.tif", path=("artifact",),
+    ))
     assert ordered[-1] == ("open-2d", "image.tif")
     intent.processing_mode = "Int 2D"
-    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "scan.nxs"))
+    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
+        ShellCommandKind.SELECT_SCAN, "scan.nxs", path=("artifact",),
+    ))
     assert ordered[-1] == ("clear", True)
-    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "scan.nxs"))
-    assert ordered[-2:] == [("clear", True), ("select", "scan.nxs")]
+    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
+        ShellCommandKind.SELECT_SCAN, "scan.nxs", path=("artifact",),
+    ))
+    assert ordered[-2:] == [
+        ("clear", True), ("select", "scan.nxs", {"is_directory": False}),
+    ]
     identity = RunIdentity(7, "owned")
     dispatch._context_controller.__dict__.update(run_identity=identity, poll_viewer_1d=lambda: False,
         poll_viewer_2d=lambda: False, poll_browse_preview=lambda: False, browse_pending=False, adopt_acquisition=forbidden)

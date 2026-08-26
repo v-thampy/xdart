@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
 from pathlib import Path
 import threading
@@ -16,11 +17,13 @@ from xdart.gui.tabs.scattering.adapters.run_executor import (
     _candidate_file_owners,
     _claim_output_physical_files,
     _eager_directory_file_counts,
+    _session_terminal_commit_identity,
 )
 from xdart.gui.tabs.scattering.acquisition_runtime import AcquisitionRuntime
 from xdart.gui.tabs.scattering.display_values import (
     StandardEventKind,
     StandardRunEvent,
+    standard_event_is_valid,
 )
 from xdart.gui.tabs.scattering.events import (
     CleanupStatus,
@@ -378,6 +381,61 @@ def test_unmeasured_projection_failure_omits_false_zero_timing(
         and "total=unavailable" in message
         for message in messages
     )
+
+
+def test_finished_terminal_event_carries_exact_session_commit_seal() -> None:
+    from xrd_tools.io.output_transaction import StreamTerminal
+
+    configuration = RunIntent().freeze()
+    identity = RunIdentity.from_configuration(configuration)
+    seal = StreamTerminal(
+        "/out/sealed.nexus", 4096, "d" * 64, 7, 1, 2, 3, 4,
+    )
+    session = SimpleNamespace(
+        terminal_result=SimpleNamespace(commit_identity=seal),
+    )
+    run = _StandardRun(
+        configuration,
+        identity,
+        None,
+        None,
+        session,
+        None,
+        Path(seal.target),
+        terminal_commit_identity=_session_terminal_commit_identity(session),
+    )
+    executor = StandardRunExecutor()
+
+    executor._terminal_event(
+        run,
+        StandardEventKind.FINISHED,
+        ExecutorClosed(identity, CleanupStatus.CLEANED),
+        2,
+        2,
+    )
+    event = executor.drain_events()[0]
+
+    assert event.terminal_commit_identity is seal
+    assert standard_event_is_valid(event, identity)
+    assert _session_terminal_commit_identity(
+        session, Path("/out/foreign.nexus"),
+    ) is None
+    assert not standard_event_is_valid(
+        replace(event, artifact="/out/foreign.nexus"), identity,
+    )
+
+    foreign = SimpleNamespace(
+        terminal_result=SimpleNamespace(commit_identity=object()),
+    )
+    assert _session_terminal_commit_identity(foreign) is None
+    legacy = SimpleNamespace(
+        terminal_result=SimpleNamespace(
+            commit_identity=StreamTerminal(
+                seal.target, seal.size, seal.digest, seal.ordinal,
+            ),
+        ),
+    )
+    assert _session_terminal_commit_identity(legacy) is None
 
 
 def test_failed_terminal_folds_a_durably_completed_container_file(

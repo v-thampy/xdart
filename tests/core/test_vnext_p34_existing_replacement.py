@@ -264,6 +264,645 @@ def test_target_snapshot_mismatch_abandons_before_stream_and_releases_lease(tmp_
     retry.begin(Scan("retry", []), ReductionPlan(integration_2d=None))
     assert retry.abort(None).disposition.value == "aborted"
     assert seeded.target.read_bytes() == changed
+
+
+def test_processed_target_transient_replacement_is_refused_before_inspection(
+    tmp_path, monkeypatch,
+):
+    import os
+
+    module = _module()
+    seeded = _seed_existing(tmp_path, name="target-inspection")
+    foreign = _seed_existing(tmp_path, name="target-inspection-foreign")
+    parked = tmp_path / "target-inspection-parked.nxs"
+    original = seeded.target.read_bytes()
+    real_file = module._open_target_hdf
+    swaps = []
+
+    def transient_file(path):
+        if Path(path) != seeded.target or swaps:
+            return real_file(path)
+        os.replace(seeded.target, parked)
+        os.replace(foreign.target, seeded.target)
+        try:
+            handle = real_file(path)
+        finally:
+            os.replace(seeded.target, foreign.target)
+            os.replace(parked, seeded.target)
+        swaps.append(1)
+        return handle
+
+    monkeypatch.setattr(module, "_open_target_hdf", transient_file)
+    with pytest.raises(ValueError, match="TARGET_SNAPSHOT_CHANGED"):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert swaps == [1]
+    assert seeded.target.read_bytes() == original
+
+
+def test_processed_target_transient_replacement_is_refused_before_gi_scout(
+    tmp_path, monkeypatch,
+):
+    import os
+
+    from xrd_tools.reduction import GIMode
+
+    module = _module()
+    gi = GIMode(
+        incidence_motor="theta", mode_1d="q_total", mode_2d="qip_qoop",
+    )
+    seeded = _seed_existing(tmp_path, name="target-scout", gi=gi)
+    foreign = _seed_existing(
+        tmp_path, name="target-scout-foreign", gi=gi,
+    )
+    parked = tmp_path / "target-scout-parked.nxs"
+    original = seeded.target.read_bytes()
+    real_file = module._open_target_hdf
+    opens = []
+
+    def transient_file(path):
+        if Path(path) != seeded.target:
+            return real_file(path)
+        opens.append(1)
+        if len(opens) != 2:
+            return real_file(path)
+        os.replace(seeded.target, parked)
+        os.replace(foreign.target, seeded.target)
+        try:
+            handle = real_file(path)
+        finally:
+            os.replace(seeded.target, foreign.target)
+            os.replace(parked, seeded.target)
+        return handle
+
+    monkeypatch.setattr(module, "_open_target_hdf", transient_file)
+    with pytest.raises(ValueError, match="TARGET_SNAPSHOT_CHANGED"):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert len(opens) == 2
+    assert seeded.target.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "family", ("inventory", "detector", "geometry", "scan"),
+)
+def test_persisted_row_schema_refuses_before_dataset_read(
+    tmp_path, monkeypatch, family,
+):
+    from xrd_tools.reduction import GIMode
+
+    module = _module()
+    gi = None if family not in {"geometry", "scan"} else GIMode(
+        incidence_motor="theta", mode_1d="q_total", mode_2d="qip_qoop",
+    )
+    seeded = _seed_existing(
+        tmp_path, labels=(2,), gi=gi, name=f"bounded-{family}",
+    )
+    guarded = ()
+    with h5py.File(seeded.target, "r+") as handle:
+        if family == "inventory":
+            group = handle["entry/integrated_1d"]
+            del group["frame_index"]
+            group.create_dataset(
+                "frame_index", data=np.asarray([2, 3], dtype=np.int64),
+            )
+            guarded = ("/entry/integrated_1d/frame_index",)
+        elif family == "detector":
+            group = handle["entry/instrument/detector"]
+            del group["detector_shape"]
+            group.create_dataset(
+                "detector_shape", data=np.asarray([5, 7, 9], dtype=np.int64),
+            )
+            guarded = ("/entry/instrument/detector/detector_shape",)
+        elif family == "geometry":
+            group = handle["entry"].create_group("per_frame_geometry")
+            group.create_dataset(
+                "frame_index", data=np.asarray([2, 3], dtype=np.int64),
+            )
+            for name in ("rot1", "rot2", "rot3", "incident_angle"):
+                group.create_dataset(
+                    name, data=np.asarray([0.1, 0.2], dtype=np.float32),
+                )
+            guarded = tuple(
+                f"/entry/per_frame_geometry/{name}"
+                for name in ("frame_index", "rot1", "rot2", "rot3",
+                             "incident_angle")
+            )
+        else:
+            group = handle["entry/scan_data"]
+            del group["frame_index"]
+            del group["theta"]
+            group.create_dataset(
+                "frame_index", data=np.asarray([2, 3], dtype=np.int64),
+            )
+            group.create_dataset(
+                "theta", data=np.asarray([0.2, 0.3], dtype=np.float32),
+            )
+            guarded = ("/entry/scan_data/frame_index", "/entry/scan_data/theta")
+
+    if family == "geometry":
+        shared = copy.deepcopy(seeded.preparation["requested_shared_science"])
+        shared["geometry"] = {
+            "convention": "bounded-test", "mapping_json": "{}",
+            "motor_sources": {},
+        }
+        monkeypatch.setattr(
+            module, "_validated_shared_science",
+            lambda *_a, **_k: copy.deepcopy(shared),
+        )
+        monkeypatch.setattr(module, "_validate_science", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            module, "_canonical_acquisition_selected",
+            lambda _run, _shared, _dimension:
+                copy.deepcopy(seeded.preparation["selected_plan"]),
+        )
+    if family != "detector":
+        import xrd_tools.io.record_writer as writer_module
+        monkeypatch.setattr(writer_module, "_MAX_REPLACEMENT_FRAME_ROWS", 1)
+
+    reads = []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def guarded_getitem(dataset, key):
+        if dataset.name in guarded:
+            reads.append((dataset.name, key))
+            raise AssertionError(f"{family} dataset was materialized")
+        return real_getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    messages = {
+        "inventory": "selected frame inventory is not exact",
+        "detector": "processed detector descriptor is malformed",
+        "geometry": "replacement geometry differs",
+        "scan": "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
+    }
+    with pytest.raises(ValueError, match=messages[family]):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert reads == []
+
+
+@pytest.mark.parametrize(
+    "family", ("config-geometry", "per-frame-geometry", "mask-attrs"),
+)
+def test_replacement_inventory_cardinality_refuses_before_iteration(
+    tmp_path, monkeypatch, family,
+) -> None:
+    from xrd_tools.reduction import GIMode
+
+    module = _module()
+    seeded = _seed_existing(
+        tmp_path, labels=(2,),
+        gi=(GIMode(
+            incidence_motor="theta", mode_1d="q_total",
+            mode_2d="qip_qoop",
+        ) if family == "per-frame-geometry" else None),
+        name=f"excess-{family}",
+    )
+    guarded_group = None
+    guarded_attrs = None
+    with h5py.File(seeded.target, "r+") as handle:
+        if family == "config-geometry":
+            group = handle["entry/reduction/config"].create_group("geometry")
+            for name, value in (
+                ("convention", "test"), ("mapping_json", "{}"),
+                ("motor_sources", "{}"), ("foreign", "foreign"),
+            ):
+                group.create_dataset(name, data=value)
+            guarded_group = group.name
+        elif family == "per-frame-geometry":
+            group = handle["entry"].create_group("per_frame_geometry")
+            group.create_dataset("frame_index", data=np.asarray([2], dtype=np.int64))
+            for name in ("rot1", "rot2", "rot3", "incident_angle"):
+                group.create_dataset(name, data=np.asarray([0.1], dtype=np.float32))
+            group.create_dataset("foreign", data=np.asarray([0.1], dtype=np.float32))
+            guarded_group = group.name
+        else:
+            mask = handle["entry/instrument/detector/mask"]
+            mask.attrs["foreign"] = "foreign"
+            guarded_attrs = mask.name
+
+    if family == "per-frame-geometry":
+        shared = copy.deepcopy(seeded.preparation["requested_shared_science"])
+        shared["geometry"] = {
+            "convention": "bounded-test", "mapping_json": "{}",
+            "motor_sources": {},
+        }
+        monkeypatch.setattr(
+            module, "_validated_shared_science",
+            lambda *_args, **_kwargs: copy.deepcopy(shared),
+        )
+        monkeypatch.setattr(module, "_validate_science", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            module, "_canonical_acquisition_selected",
+            lambda _run, _shared, _dimension:
+                copy.deepcopy(seeded.preparation["selected_plan"]),
+        )
+
+    real_group_iter = h5py.Group.__iter__
+    real_attrs_iter = h5py.AttributeManager.__iter__
+    iterations = []
+
+    def guarded_group_iter(group):
+        if group.name == guarded_group:
+            iterations.append(group.name)
+            raise AssertionError("excess group inventory was iterated")
+        return real_group_iter(group)
+
+    def guarded_attrs_iter(attrs):
+        name = h5py.h5i.get_name(attrs._id).decode()
+        if name == guarded_attrs:
+            iterations.append(name)
+            raise AssertionError("excess attribute inventory was iterated")
+        return real_attrs_iter(attrs)
+
+    monkeypatch.setattr(h5py.Group, "__iter__", guarded_group_iter)
+    monkeypatch.setattr(
+        h5py.AttributeManager, "__iter__", guarded_attrs_iter,
+    )
+    message = (
+        "selected BAI/GI/geometry is malformed"
+        if family == "config-geometry" else
+        "replacement geometry differs"
+        if family == "per-frame-geometry" else
+        "processed detector mask is malformed"
+    )
+    with pytest.raises(ValueError, match=message):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert iterations == []
+
+
+@pytest.mark.parametrize("family", ("untouched-primary", "named-mode"))
+def test_replacement_writer_bounds_every_untouched_cursor_before_effects(
+    tmp_path, monkeypatch, family,
+):
+    from xrd_tools.io.record_writer import (
+        NexusRecordWriter, WriterIncomplete,
+    )
+    from xrd_tools.reduction import NexusSink, Scan
+    import xrd_tools.io.record_writer as writer_module
+
+    module = _module()
+    seeded = _seed_existing(
+        tmp_path, labels=(2,), name=f"bounded-writer-{family}",
+    )
+    with h5py.File(seeded.target, "r+") as handle:
+        top = handle["entry/integrated_2d"]
+        if family == "untouched-primary":
+            del top["frame_index"]
+            node = top.create_dataset(
+                "frame_index", data=np.asarray([2, 3], dtype=np.int64),
+            )
+        else:
+            node = top.create_group("oversized_mode").create_dataset(
+                "frame_index", data=np.asarray([2, 3], dtype=np.int64),
+            )
+        guarded = node.name
+
+    monkeypatch.setattr(writer_module, "_MAX_REPLACEMENT_FRAME_ROWS", 1)
+    plan = module.ReintegratePlan.from_artifact(
+        seeded.target, entry="entry", dimension="1d",
+        preparation=seeded.preparation,
+    )
+    before = seeded.target.read_bytes()
+    sink = NexusSink.for_existing_replacement(
+        seeded.target,
+        expected_target_snapshot=plan.expected_target_snapshot,
+        dimension="1d", labels=plan.labels, audit_bytes=b"{}",
+        selected_plan=plan.selected_plan["bai_args"],
+        selected_gi_mode=plan.selected_plan["gi_mode"],
+        source_base=seeded.target.parent, file_lock=threading.RLock(),
+        flush_every=None,
+    )
+    reads, mutations = [], []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def guarded_getitem(dataset, key):
+        if dataset.name == guarded:
+            reads.append(key)
+            raise AssertionError("oversized untouched cursor was materialized")
+        return real_getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    monkeypatch.setattr(
+        NexusRecordWriter, "_authorize_transaction_mutation",
+        lambda *_args, **_kwargs: mutations.append("mutation"),
+    )
+    with pytest.raises(WriterIncomplete, match="exact bounded int64 vector"):
+        sink.begin(
+            Scan("bounded-cursor", []),
+            module._core_plan(
+                plan.selected_plan, plan.requested_shared_science,
+            ),
+        )
+    assert reads == [] and mutations == []
+    assert sink._transaction_owners is None
+    assert seeded.target.read_bytes() == before
+
+
+def test_replacement_json_schema_refuses_before_read_or_decode(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.io.record_writer as writer_module
+
+    module = _module()
+    seeded = _seed_existing(tmp_path, name="malformed-config-scalar")
+    with h5py.File(seeded.target, "r+") as handle:
+        config = handle["entry/reduction/config"]
+        raw = config["run_configuration"][()]
+        del config["run_configuration"]
+        node = config.create_dataset(
+            "run_configuration", data=np.asarray([raw], dtype=object),
+            dtype=h5py.string_dtype("utf-8"),
+        )
+        guarded = node.name
+
+    reads, decodes = [], []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def guarded_getitem(dataset, key):
+        if dataset.name == guarded:
+            reads.append(key)
+            raise AssertionError("malformed JSON scalar was materialized")
+        return real_getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    real_json = writer_module.json
+    monkeypatch.setattr(writer_module, "json", SimpleNamespace(
+        loads=lambda *_args, **_kwargs: decodes.append("decode"),
+        dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError,
+    ))
+    with pytest.raises(ValueError, match="run configuration"):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert reads == [] and decodes == []
+
+
+def test_replacement_numeric_vlen_metadata_refuses_before_cell_read(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.record_writer import (
+        WriterStateError, _decode_replacement_fact,
+    )
+
+    seeded = _seed_existing(
+        tmp_path, labels=(2,), name="numeric-vlen-metadata",
+    )
+    with h5py.File(seeded.target, "r+") as handle:
+        scan = handle["entry/scan_data"]
+        node = scan.create_dataset(
+            "foreign_vlen", shape=(1,), dtype=h5py.vlen_dtype(np.int64),
+        )
+        node[0] = np.arange(3, dtype=np.int64)
+        guarded = node.name
+
+    reads = []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def guarded_getitem(dataset, key):
+        if dataset.name == guarded:
+            reads.append(key)
+            raise AssertionError("numeric VLEN metadata cell was materialized")
+        return real_getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    with h5py.File(seeded.target, "r") as handle:
+        with pytest.raises(WriterStateError, match="unsupported vlen schema"):
+            _decode_replacement_fact(
+                handle, 2, metadata_keys=("foreign_vlen",),
+            )
+    assert reads == []
+
+
+def test_replacement_config_ceiling_refuses_before_getitem_or_json_decode(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.io.append as append_module
+    import xrd_tools.io.record_writer as writer_module
+
+    module = _module()
+    seeded = _seed_existing(tmp_path, name="oversized-config-scalar")
+    guarded = "/entry/reduction/config/run_configuration"
+    reads, decodes = [], []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def guarded_getitem(dataset, key):
+        if dataset.name == guarded:
+            reads.append(key)
+            raise AssertionError("oversized config scalar used __getitem__")
+        return real_getitem(dataset, key)
+
+    monkeypatch.setattr(append_module, "_MAX_REPLACEMENT_CONFIG_UTF8_BYTES", 64)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    real_json = writer_module.json
+    monkeypatch.setattr(writer_module, "json", SimpleNamespace(
+        loads=lambda *_args, **_kwargs: decodes.append("decode"),
+        dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError,
+    ))
+    with pytest.raises(ValueError, match="UTF-8 byte ceiling"):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert reads == [] and decodes == []
+
+
+def test_replacement_geometry_text_ceiling_refuses_before_getitem(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.io.append as append_module
+
+    module = _module()
+    seeded = _seed_existing(tmp_path, name="oversized-geometry-text")
+    with h5py.File(seeded.target, "r+") as handle:
+        geometry = handle["entry/reduction/config"].create_group("geometry")
+        node = geometry.create_dataset("convention", data="x" * 5000)
+        geometry.create_dataset("mapping_json", data="{}")
+        geometry.create_dataset("motor_sources", data="{}")
+        guarded = node.name
+
+    reads = []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def guarded_getitem(dataset, key):
+        if dataset.name == guarded:
+            reads.append(key)
+            raise AssertionError("oversized geometry text used __getitem__")
+        return real_getitem(dataset, key)
+
+    monkeypatch.setattr(append_module, "_MAX_REPLACEMENT_CONFIG_UTF8_BYTES", 4096)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    with pytest.raises(ValueError, match="UTF-8 byte ceiling"):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert reads == []
+
+
+def test_replacement_source_execution_ceiling_refuses_before_decode(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.io.record_writer as writer_module
+
+    seeded = _seed_existing(tmp_path, labels=(2,), name="oversized-execution")
+    guarded = "/entry/reduction/config/source_execution"
+    reads, oversized_decodes = [], []
+    real_getitem, real_json = h5py.Dataset.__getitem__, writer_module.json
+
+    def guarded_getitem(dataset, key):
+        if dataset.name == guarded:
+            reads.append(key)
+            raise AssertionError("oversized source_execution used __getitem__")
+        return real_getitem(dataset, key)
+
+    def guarded_loads(raw, *args, **kwargs):
+        if isinstance(raw, str) and len(raw.encode("utf-8")) > 64:
+            oversized_decodes.append(len(raw))
+            raise AssertionError("oversized source_execution reached JSON")
+        return real_json.loads(raw, *args, **kwargs)
+
+    monkeypatch.setattr(writer_module, "_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES", 64)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    monkeypatch.setattr(writer_module, "json", SimpleNamespace(
+        loads=guarded_loads, dumps=real_json.dumps,
+        JSONDecodeError=real_json.JSONDecodeError,
+    ))
+    with h5py.File(seeded.target, "r") as handle:
+        with pytest.raises(writer_module.WriterStateError, match="source context"):
+            writer_module._decode_replacement_fact(handle, 2, entry="entry")
+    assert reads == [] and oversized_decodes == []
+
+
+def test_replacement_append_lineage_ceiling_refuses_before_decode(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.io.append as append_module
+
+    module = _module()
+    seeded = _seed_existing(
+        tmp_path, labels=(2,), append=True, name="oversized-lineage",
+    )
+    guarded = "/entry/reduction/config/append_lineage"
+    reads, decodes = [], []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def guarded_getitem(dataset, key):
+        if dataset.name == guarded:
+            reads.append(key)
+            raise AssertionError("oversized Append lineage used __getitem__")
+        return real_getitem(dataset, key)
+
+    monkeypatch.setattr(append_module, "_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES", 64)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    real_json = append_module.json
+    monkeypatch.setattr(append_module, "json", SimpleNamespace(
+        loads=lambda *_args, **_kwargs: decodes.append("decode"),
+        dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError,
+    ))
+    with pytest.raises(ValueError, match="REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert reads == [] and decodes == []
+
+
+def test_provenance_writer_enforces_replacement_read_ceiling(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.io.append as append_module
+    from xrd_tools.core.provenance import write_provenance
+
+    monkeypatch.setattr(append_module, "_MAX_REPLACEMENT_CONFIG_UTF8_BYTES", 32)
+    target = tmp_path / "bounded-provenance.nxs"
+    with h5py.File(target, "w") as handle:
+        with pytest.raises(ValueError, match="persisted UTF-8 byte ceiling"):
+            write_provenance(
+                handle, config={"run_configuration": {"value": "x" * 64}},
+            )
+        config = handle["entry/reduction/config"]
+        assert "run_configuration" not in config
+    geometry_target = tmp_path / "bounded-geometry-provenance.nxs"
+    with h5py.File(geometry_target, "w") as handle:
+        with pytest.raises(ValueError, match="persisted UTF-8 byte ceiling"):
+            write_provenance(handle, config={"geometry": {
+                "convention": "test", "mapping_json": "x" * 64,
+                "motor_sources": {},
+            }})
+        geometry = handle["entry/reduction/config/geometry"]
+        assert "mapping_json" not in geometry
+
+
+def test_processed_mask_byte_ceiling_refuses_before_read(
+    tmp_path, monkeypatch,
+):
+    module = _module()
+    seeded = _seed_existing(tmp_path, name="oversized-persisted-mask")
+    with h5py.File(seeded.target, "r+") as handle:
+        detector = handle["entry/instrument/detector"]
+        del detector["mask"]
+        node = detector.create_dataset(
+            "mask", data=np.arange(5, dtype=np.int64),
+        )
+        node.attrs["description"] = "flat pixel indices, shape (N,)"
+
+    reads = []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def guarded_getitem(dataset, key):
+        if dataset.name == "/entry/instrument/detector/mask":
+            reads.append(key)
+            raise AssertionError("oversized persisted mask was materialized")
+        return real_getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
+    # The 5-index vector is 40 bytes while the detector's expanded bool mask is
+    # 35 bytes, so this isolates the persisted-vector ceiling without a large
+    # test allocation.
+    monkeypatch.setattr(module, "_MAX_PERSISTED_MASK_BYTES", 35)
+    with pytest.raises(ValueError, match="processed detector mask is malformed"):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+    assert reads == []
+
+
+@pytest.mark.parametrize(
+    "indices", (np.asarray([0, 0], dtype=np.int64),
+                np.asarray([1, 0], dtype=np.int64)),
+    ids=("duplicate", "inverted"),
+)
+def test_processed_mask_indices_must_be_strictly_canonical(tmp_path, indices):
+    module = _module()
+    seeded = _seed_existing(
+        tmp_path, name=f"noncanonical-persisted-mask-{indices.tolist()}",
+    )
+    with h5py.File(seeded.target, "r+") as handle:
+        detector = handle["entry/instrument/detector"]
+        del detector["mask"]
+        node = detector.create_dataset("mask", data=indices)
+        node.attrs["description"] = "flat pixel indices, shape (N,)"
+
+    with pytest.raises(ValueError, match="processed detector mask is malformed"):
+        module.ReintegratePlan.from_artifact(
+            seeded.target, entry="entry", dimension="1d",
+            preparation=seeded.preparation,
+        )
+
+
 def test_exact_gapped_inventory_replaces_only_selected_dimension(tmp_path, monkeypatch):
     from xrd_tools.io.output_transaction import OutputTransaction, StreamTerminal
     from xrd_tools.io.record_writer import NexusRecordWriter
@@ -479,6 +1118,204 @@ def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp
             expected_labels=mixed.labels,
         )
         assert module.run_reintegrate(plan).committed_labels == mixed.labels
+def test_hdf_transient_path_replacement_is_refused_before_pixel_decode(
+    tmp_path, monkeypatch,
+):
+    import os
+    import shutil
+
+    from xdart.gui.tabs.scattering.contracts import (
+        SourceExecutionStamp, SourceFileState,
+    )
+    from xrd_tools.sources import cursor as cursor_module
+
+    module = _module()
+    seeded = _seed_existing(tmp_path, name="descriptor-fence")
+    source = seeded.source.resolve()
+    original = source.read_bytes()
+    state = SourceFileState.capture(source)
+    execution = SourceExecutionStamp(state, "nexus_hdf5", 10, 0)
+    fact = {
+        "label": 2, "path": str(source), "frame_index": 2,
+        "source_base": "", "snapshot": {
+            "adapter_id": "nexus_hdf5", "size": state.size,
+            "mtime_ns": state.mtime_ns, "frame_count": 10,
+            "dataset_path": "/entry/instrument/detector/data",
+            "self_contained": True,
+        },
+        "source_execution": execution.as_dict(), "append_lineage": None,
+        "metadata": {}, "geometry": {}, "background_dependency": None,
+    }
+    foreign = tmp_path / "foreign-source.h5"
+    parked = tmp_path / "parked-source.h5"
+    shutil.copy2(source, foreign)
+    real_open = cursor_module._HDF5_FILE_OPEN
+    decodes = []
+
+    def transient_open(path, *args, **kwargs):
+        if Path(path) != source:
+            return real_open(path, *args, **kwargs)
+        os.replace(source, parked)
+        os.replace(foreign, source)
+        try:
+            return real_open(path, *args, **kwargs)
+        finally:
+            os.replace(source, foreign)
+            os.replace(parked, source)
+
+    monkeypatch.setattr(cursor_module, "_HDF5_FILE_OPEN", transient_open)
+    monkeypatch.setattr(
+        cursor_module.ContainerCursor,
+        "read_frame",
+        lambda *_a, **_k: decodes.append(1) or pytest.fail(
+            "foreign HDF5 object reached pixel decode"
+        ),
+    )
+    with pytest.raises(
+        ValueError, match="REPLACEMENT_SOURCE_REVISION_CHANGED",
+    ):
+        module._source_fact(fact, read=True)
+    assert decodes == []
+    assert source.read_bytes() == original
+
+
+def test_hdf_descriptor_mutation_after_decode_is_refused_before_restat(
+    tmp_path, monkeypatch,
+):
+    import os
+
+    from xdart.gui.tabs.scattering.contracts import (
+        SourceExecutionStamp, SourceFileState,
+    )
+    from xrd_tools.sources import cursor as cursor_module
+
+    module = _module()
+    seeded = _seed_existing(tmp_path, name="descriptor-post-fence")
+    source = seeded.source.resolve()
+    original = source.read_bytes()
+    state = SourceFileState.capture(source)
+    execution = SourceExecutionStamp(state, "nexus_hdf5", 10, 0)
+    fact = {
+        "label": 2, "path": str(source), "frame_index": 2,
+        "source_base": "", "snapshot": {
+            "adapter_id": "nexus_hdf5", "size": state.size,
+            "mtime_ns": state.mtime_ns, "frame_count": 10,
+            "dataset_path": "/entry/instrument/detector/data",
+            "self_contained": True,
+        },
+        "source_execution": execution.as_dict(), "append_lineage": None,
+        "metadata": {}, "geometry": {}, "background_dependency": None,
+    }
+    real_read = cursor_module.ContainerCursor.read_frame
+    real_qualified = module._qualified_fact
+    qualified = []
+
+    def mutate_after_read(owner, index):
+        value = real_read(owner, index)
+        observed = source.stat()
+        os.utime(source, ns=(
+            observed.st_atime_ns, observed.st_mtime_ns + 1_000_000,
+        ))
+        return value
+
+    monkeypatch.setattr(
+        cursor_module.ContainerCursor, "read_frame", mutate_after_read,
+    )
+    monkeypatch.setattr(
+        module, "_qualified_fact",
+        lambda value: qualified.append(value) or real_qualified(value),
+    )
+    with pytest.raises(
+        ValueError, match="REPLACEMENT_SOURCE_REVISION_CHANGED",
+    ):
+        module._source_fact(fact, read=True)
+    assert qualified == [fact]
+    assert source.read_bytes() == original
+
+
+def test_external_raw_slot_transient_symlink_retarget_is_refused(
+    tmp_path, monkeypatch,
+):
+    import os
+
+    from xdart.gui.tabs.scattering.contracts import (
+        ExternalSourceState, SourceExecutionStamp, SourceFileState,
+    )
+
+    module = _module()
+    root = tmp_path / "external-slot-binding"
+    root.mkdir()
+    shape = (3, 4)
+    accepted = np.full((1, *shape), 7, dtype=np.uint16)
+    foreign_pixels = np.full((1, *shape), 19, dtype=np.uint16)
+    accepted_raw = root / "accepted.bin"
+    foreign_raw = root / "foreign.bin"
+    slot = root / "detector-slot.bin"
+    accepted_raw.write_bytes(b"\0" * accepted.nbytes)
+    slot.symlink_to(accepted_raw.name)
+    member = root / "member.h5"
+    with h5py.File(member, "w") as handle:
+        dataset = handle.create_group("entry/data").create_dataset(
+            "data", shape=accepted.shape, dtype=accepted.dtype,
+            external=[(str(slot), 0, h5py.h5f.UNLIMITED)],
+        )
+        dataset[...] = accepted
+    foreign_raw.write_bytes(foreign_pixels.tobytes())
+    master = root / "master.h5"
+    with h5py.File(master, "w") as handle:
+        data = handle.create_group("entry/data")
+        data["data_000001"] = h5py.ExternalLink(
+            member.name, "/entry/data/data",
+        )
+
+    master_state = SourceFileState.capture(master)
+    member_state = SourceFileState.capture(member)
+    slot_state = SourceFileState.capture(slot)
+    foreign_state = SourceFileState.capture(foreign_raw)
+    execution = SourceExecutionStamp(
+        master_state, "nexus_hdf5", 1, 0,
+        external_members=(ExternalSourceState(
+            member_state, "/entry/data/data", 0, 1, 0,
+        ),),
+        dependency_files=(slot_state, foreign_state),
+    )
+    fact = {
+        "label": 0, "path": master_state.path, "frame_index": 0,
+        "source_base": "", "snapshot": {
+            "adapter_id": "nexus_hdf5", "size": master_state.size,
+            "mtime_ns": master_state.mtime_ns, "frame_count": 1,
+            "dataset_path": "/entry/data/data_000001",
+            "self_contained": False,
+        },
+        "source_execution": execution.as_dict(), "append_lineage": None,
+        "metadata": {}, "geometry": {}, "background_dependency": None,
+    }
+    real_external_paths = module._hdf_external_paths
+    observations = []
+
+    def transient_external_paths(dataset):
+        observations.append(1)
+        if len(observations) != 2:
+            return real_external_paths(dataset)
+        slot.unlink()
+        slot.symlink_to(foreign_raw.name)
+        try:
+            return real_external_paths(dataset)
+        finally:
+            slot.unlink()
+            slot.symlink_to(accepted_raw.name)
+
+    monkeypatch.setattr(module, "_hdf_external_paths", transient_external_paths)
+    with pytest.raises(
+        ValueError, match="REPLACEMENT_SOURCE_REVISION_CHANGED",
+    ):
+        module._source_fact(fact, read=True)
+    assert len(observations) == 2
+    assert slot.resolve(strict=True) == accepted_raw.resolve(strict=True)
+    assert accepted_raw.read_bytes() == accepted.tobytes()
+    assert foreign_raw.read_bytes() == foreign_pixels.tobytes()
+
+
 def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
     import fabio, tifffile
     from xdart.gui.tabs.scattering.contracts import (
@@ -518,7 +1355,24 @@ def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
     def counted(path): revisions.append(str(Path(path).resolve())); return real_revision(path)
     monkeypatch.setattr(module, "_revision", counted); assert_pixels(selected, pixels + 1)
     assert set(revisions) == {str(Path(series[1].path).resolve())}
-    monkeypatch.setattr(module, "_revision", real_revision); multi = root / "multi.tif"; tifffile.imwrite(multi, pixels); tifffile.imwrite(multi, pixels + 1, append=True); multi_state = SourceFileState.capture(multi); multi_fact = fact(multi, SourceExecutionStamp(multi_state, "image_file", 1, 0))
+    monkeypatch.setattr(module, "_revision", real_revision)
+    injected = root / "injected.tif"
+    tifffile.imwrite(injected, pixels + 99)
+    selected_path = Path(series[1].path)
+    real_open = Path.open
+    with monkeypatch.context() as swap:
+        swap.setattr(
+            Path, "open",
+            lambda self, *args, **kwargs:
+                real_open(injected, *args, **kwargs)
+                if self == selected_path and args and args[0] == "rb"
+                else real_open(self, *args, **kwargs),
+        )
+        with pytest.raises(
+            ValueError, match="REPLACEMENT_SOURCE_REVISION_CHANGED",
+        ):
+            module._source_fact(selected, read=True)
+    multi = root / "multi.tif"; tifffile.imwrite(multi, pixels); tifffile.imwrite(multi, pixels + 1, append=True); multi_state = SourceFileState.capture(multi); multi_fact = fact(multi, SourceExecutionStamp(multi_state, "image_file", 1, 0))
     with pytest.raises(ValueError, match="REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"): module._source_fact(multi_fact, read=True)
     for suffix, image_type in (("edf", fabio.edfimage.EdfImage),
                                ("cbf", fabio.cbfimage.CbfImage)):
@@ -604,6 +1458,53 @@ def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
     assert _preserved_signature(preserved.target) == signature
     with pytest.raises(ValueError, match="REPLACEMENT_SOURCE_FORMAT_UNSUPPORTED"):
         module._source_route(Path("processed.txt"))
+
+
+def test_later_member_layout_mismatch_refuses_before_pixel_decode(
+    tmp_path, monkeypatch,
+):
+    import tifffile
+    import xrd_tools.io.image as image_module
+    from xdart.gui.tabs.scattering.contracts import (
+        SourceExecutionStamp, SourceFileState,
+    )
+
+    expected = tmp_path / "first.tif"
+    mismatched = tmp_path / "later.tif"
+    tifffile.imwrite(expected, np.zeros((5, 7), dtype=np.uint16))
+    tifffile.imwrite(mismatched, np.zeros((3, 4), dtype=np.uint16))
+    states = tuple(SourceFileState.capture(path) for path in (
+        expected, mismatched,
+    ))
+    execution = SourceExecutionStamp(
+        states[0], "tiff_series", 2, 0, members=states,
+    )
+    later = states[1]
+    fact = {
+        "label": 1, "path": later.path, "frame_index": 0,
+        "source_base": "", "snapshot": {
+            "adapter_id": "tiff_series", "size": later.size,
+            "mtime_ns": later.mtime_ns, "frame_count": 1,
+            "dataset_path": None, "self_contained": True,
+        },
+        "source_execution": execution.as_dict(), "append_lineage": None,
+        "metadata": {}, "geometry": {}, "background_dependency": None,
+    }
+    decodes = []
+    monkeypatch.setattr(
+        image_module, "read_image",
+        lambda *_a, **_k: decodes.append(1) or pytest.fail(
+            "mismatched member reached pixel decoder"
+        ),
+    )
+
+    with pytest.raises(
+        ValueError, match="REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
+    ):
+        _module()._source_fact(
+            fact, read=True, expected_shape=(5, 7), expected_dtype="<u2",
+        )
+    assert decodes == []
 def test_shared_science_dimension_audit_and_untouched_manifest(tmp_path, monkeypatch):
     from xrd_tools.core.provenance import read_provenance_from_handle
     from xrd_tools.io.append import AppendDisposition, qualify_append
@@ -916,6 +1817,83 @@ def test_gi_bootstrap_cancel_uses_one_token_and_clears_before_any_output_effect(
     with monkeypatch.context() as patch, pytest.raises(module.ReintegrateCancelled):
         patch.setattr(module, "_source_fact", cancel_source); patch.setattr(core, "_apply_gi_freeze_policy", freeze); module.ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="1d", preparation=seeded.preparation, cancel_token=token)
     assert effects == ["freeze", "raw"] and seeded.target.read_bytes() == before
+
+
+def test_nonhdf_snapshot_copy_cancellation_closes_source_and_tempdir(
+    tmp_path, monkeypatch,
+):
+    module = _module()
+    source = tmp_path / "large-source.tif"
+    source.write_bytes(b"x" * ((2 << 20) + 1))
+    observed = module._revision(source)
+    raw = module.os.path.normcase(module.os.path.normpath(
+        module.os.path.abspath(source)
+    ))
+    revisions = {
+        raw: (observed[0], {}, "source_member", observed),
+    }
+    token = threading.Event()
+    opened = []
+    temporary_roots = []
+    real_open = Path.open
+    real_temporary = module.tempfile.TemporaryDirectory
+
+    class CancellingSource:
+        def __init__(self, stream):
+            self.stream = stream
+            self.closed = False
+        def fileno(self):
+            return self.stream.fileno()
+        def read(self, size=-1):
+            payload = self.stream.read(size)
+            token.set()
+            return payload
+        def close(self):
+            self.closed = True
+            self.stream.close()
+
+    def controlled_open(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if Path(path) == source and mode == "rb":
+            proxy = CancellingSource(stream)
+            opened.append(proxy)
+            return proxy
+        return stream
+
+    def tracked_temporary(*args, **kwargs):
+        owner = real_temporary(*args, **kwargs)
+        temporary_roots.append(Path(owner.name))
+        return owner
+
+    monkeypatch.setattr(Path, "open", controlled_open)
+    monkeypatch.setattr(
+        module.tempfile, "TemporaryDirectory", tracked_temporary,
+    )
+    from xrd_tools.io import image as image_module
+    monkeypatch.setattr(
+        image_module, "read_image",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cancelled snapshot entered the decoder"
+        ),
+    )
+
+    with pytest.raises(module.ReintegrateCancelled):
+        module._decode_nonhdf_source(
+            source, "fabio", {
+                "dataset_path": None,
+                "frame_count": 1,
+                "self_contained": True,
+            }, 0, None, True, token,
+            None, None, revisions,
+        )
+
+    assert len(opened) == 1 and opened[0].closed
+    assert temporary_roots and all(
+        not root.exists() for root in temporary_roots
+    )
+
+
 def test_jit_stub_fields_scrub_on_every_terminal_and_refusal(tmp_path, monkeypatch):
     from xrd_tools.reduction import NexusSink
     module = _module()

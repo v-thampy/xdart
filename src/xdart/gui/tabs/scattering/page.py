@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, Callable
 import weakref
@@ -36,6 +37,10 @@ from xrd_tools.reduction import ReintegrateResult
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.io.viewer_1d import SUPPORTED_VIEWER_1D_SUFFIXES
 from xrd_tools.io.viewer_2d import SUPPORTED_VIEWER_SUFFIXES
+from xrd_tools.io.output_transaction import (
+    StreamTerminal,
+    stream_terminal_object_revision,
+)
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
@@ -135,6 +140,7 @@ from .scientific_plot_options import waterfall_should_be_active
 from .shell_values import (
     ArtifactProgress,
     DirectoryFileProgress,
+    FrameNavigationProjection,
     FrameSelectionIntent,
     ProgressProjection,
     ShellCommand,
@@ -319,11 +325,44 @@ class _ObservationOperation:
 
 
 @dataclass(frozen=True, slots=True)
-class _BrowserCatalogOperation:
+class _BrowserCatalogRequest:
     token: int
     directory: str
     accepted_suffixes: frozenset[str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _BrowserCatalogOperation:
+    request: _BrowserCatalogRequest
+    cancelled: threading.Event
     future: Future[object]
+    @property
+    def token(self) -> int:
+        return self.request.token
+    @property
+    def directory(self) -> str:
+        return self.request.directory
+    @property
+    def accepted_suffixes(self) -> frozenset[str] | None:
+        return self.request.accepted_suffixes
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredMetadata:
+    plan: object
+    request: tuple[object, ...]
+    target: str
+    generation: int
+    candidate: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalBrowseHandoff:
+    request: BrowseLoadRequest
+    artifact: str
+    current_label: int | None
+    selected_labels: tuple[int, ...]
+    commit_identity: StreamTerminal | None = None
 
 
 def _browser_suffixes_for_mode(mode: str) -> frozenset[str] | None:
@@ -333,6 +372,32 @@ def _browser_suffixes_for_mode(mode: str) -> frozenset[str] | None:
     if tool is Tool.IMAGE_VIEWER:
         return SUPPORTED_VIEWER_SUFFIXES
     return None
+
+
+def _terminal_frame_signature(
+    frame: DisplayFrameKey,
+    canonical_by_artifact: dict[str, str],
+) -> tuple[str, int] | None:
+    canonical = canonical_by_artifact.get(frame.artifact)
+    return (
+        None
+        if canonical is None
+        else (canonical, frame.local_frame_label)
+    )
+
+
+def _terminal_identity_for_target(
+    value: object,
+    target: str,
+) -> StreamTerminal | None:
+    """Return an exact writer seal only for its lexical output target."""
+
+    if type(value) is not StreamTerminal or type(target) is not str or not target:
+        return None
+    if stream_terminal_object_revision(value) is None:
+        return None
+    normalized = os.path.normcase(os.path.abspath(os.path.expanduser(target)))
+    return value if value.target == normalized else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +491,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._browser_catalog_operation: (
             _BrowserCatalogOperation | None
         ) = None
+        self._browser_catalog_queued: _BrowserCatalogRequest | None = None
         self._browser_catalog_token = 0
         self._browser_catalog: tuple[BrowserCatalogEntry, ...] = ()
         self._browser_directory_time_cache = DirectoryModifiedCache()
@@ -433,10 +499,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._browser_seen_artifacts: set[str] = set()
         self._browser_transient_frame: DisplayFrameKey | None = None
         self._browser_transient_clear_token: int | None = None
-        self._terminal_browse_request: BrowseLoadRequest | None = None
-        self._terminal_browse_artifact: str | None = None
-        self._terminal_browse_current_label: int | None = None
-        self._terminal_browse_selected_labels: tuple[int, ...] = ()
+        self._terminal_browse_handoff: _TerminalBrowseHandoff | None = None
+        self._terminal_rebind_artifacts: tuple[str, str] | None = None
         self._active_batch_mode = False
         self._run_frame_seen = False
         self._retain_outgoing_display = False
@@ -551,6 +615,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_target = None
         self._analysis_generation = None; self._analysis_anchor = None
         self._analysis_fingerprint = ""; self._analysis_request = None
+        self._analysis_candidate = None
+        self._deferred_metadata: _DeferredMetadata | None = None
         self._roi_preview_binding = None
         self._metadata_result = self._scan_roi_result = None
         self._peak_result = self._phase_result = None
@@ -618,7 +684,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         context_free_analysis = (
             analysis is not None and slot.current_identity is analysis
             and getattr(self, "_analysis_kind", None) in {
-                "metadata", "scan_plot", "roi_preview", "roi_scan"})
+                "metadata", "metadata_requalification", "scan_plot",
+                "roi_preview", "roi_scan"})
         if (average is not None and slot.current_identity is average
                 or context_free_analysis):
             if revision is None:
@@ -641,7 +708,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return identity
 
     def _analysis_generation_for(self, kind: str) -> int:
-        return (self._metadata_generation if kind == "metadata" else
+        return (self._metadata_generation if kind in {
+                    "metadata", "metadata_requalification"} else
                 self._scan_roi_generation if kind in {"scan_roi", "scan_plot", "roi_preview", "roi_scan"} else
                 self._peak_generation if kind == "peak" else self._phase_generation)
 
@@ -649,7 +717,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         from .analysis_mount import (analysis_request_facts,
             metadata_plan_from_syntax, phase_wavelength_angstrom, scan_plot_plan)
         try:
-            if kind == "metadata":
+            if kind in {"metadata", "metadata_requalification"}:
                 if target == "metadata":
                     current = self._context_controller.navigation.current
                     if current is None: return None
@@ -705,7 +773,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return None
 
     def _begin_analysis(self, kind, plan, generation, *, target=None,
-                        request=None, anchor=None, table=None, roi=None):
+                        request=None, anchor=None, table=None, roi=None,
+                        candidate=None):
         from .analysis_mount import (analysis_request_facts,
             analysis_start_allowed, display_anchor_matches)
         target = kind if target is None else target
@@ -719,7 +788,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self, anchor, fingerprint, generation): return None
         stamp = (self._operation_context_stamp() if fit else
                  OperationContextStamp(self._intents.snapshot().revision))
-        names = {"metadata": "begin_metadata", "roi_preview": "begin_roi_preview",
+        names = {"metadata": "begin_metadata",
+                 "metadata_requalification": "begin_metadata_requalification",
+                 "roi_preview": "begin_roi_preview",
                  "roi_scan": "begin_roi_scan", "peak": "begin_peak_fit",
                  "phase": "begin_phase_fit"}
         identity = (self._operation_slot.begin_scan_plot(plan, table, roi, stamp)
@@ -729,8 +800,64 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_kind, self._analysis_generation = kind, generation
         self._analysis_target, self._analysis_identity = target, identity
         self._analysis_anchor, self._analysis_fingerprint = anchor, fingerprint
-        self._analysis_request = request; self._ensure_timer()
+        self._analysis_request = request; self._analysis_candidate = candidate
+        self._ensure_timer()
         self._notice(f"Running {kind.replace('_', ' ')}…"); return identity
+
+    def _submit_metadata(
+        self, plan, generation, *, target="metadata", request=None,
+        candidate=None,
+    ):
+        from .analysis_mount import analysis_request_facts
+        request = analysis_request_facts(plan) if request is None else request
+        if candidate is not None:
+            from xrd_tools.analysis.scan_operations import (
+                MetadataTableRequalificationPlan,
+            )
+            plan = MetadataTableRequalificationPlan(
+                candidate.receipt, candidate.table_fingerprint,
+            )
+        deferred = _DeferredMetadata(
+            plan, request, target, generation, candidate,
+        )
+        if self._operation_slot.owned:
+            self._deferred_metadata = deferred
+            self._notice("Metadata queued…")
+            self._ensure_timer()
+            return None
+        self._deferred_metadata = None
+        kind = (
+            "metadata_requalification" if candidate is not None else "metadata"
+        )
+        return self._begin_analysis(
+            kind, plan, generation, target=target, request=request,
+            candidate=candidate,
+        )
+
+    def _dispatch_deferred_metadata(self) -> bool:
+        deferred = self._deferred_metadata
+        if deferred is None or self._operation_slot.owned:
+            return False
+        self._deferred_metadata = None
+        dialog = getattr(self, f"_{deferred.target}_dialog", None)
+        kind = (
+            "metadata_requalification"
+            if deferred.candidate is not None else "metadata"
+        )
+        if (
+            self._closing or self._closed or dialog is None
+            or deferred.generation
+            != self._analysis_generation_for(deferred.target)
+            or deferred.request
+            != self._current_analysis_request(kind, deferred.target)
+        ):
+            return False
+        identity = self._begin_analysis(
+            kind, deferred.plan, deferred.generation,
+            target=deferred.target, request=deferred.request,
+            candidate=deferred.candidate,
+        )
+        return identity is not None
 
     def _capture_analysis_trace(self, kind):
         from .analysis_mount import capture_display_anchor, displayed_trace_input
@@ -749,6 +876,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         setattr(self, field, None)
         generation = f"_{target}_generation"
         setattr(self, generation, getattr(self, generation) + 1)
+        if (
+            self._deferred_metadata is not None
+            and self._deferred_metadata.target == target
+        ):
+            self._deferred_metadata = None
         if self._analysis_target == target:
             from .analysis_mount import cancel_owned
             cancel_owned(self._operation_slot, self._analysis_identity)
@@ -789,7 +921,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 retained is not None
                 and analysis_result_matches(retained, current_request)
             ):
-                dialog.adopt_result(retained)
+                dialog.clear_result()
+                self._submit_metadata(
+                    None, self._metadata_generation, target="metadata",
+                    request=current_request, candidate=retained,
+                )
             else:
                 self._metadata_result = None
                 dialog.clear_result()
@@ -805,8 +941,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if current is None:
             self._notice("Select a retained frame first."); return
         from xrd_tools.analysis.scan_operations import MetadataTablePlan
-        self._begin_analysis("metadata", MetadataTablePlan(current.artifact),
-                             self._metadata_generation)
+        self._submit_metadata(MetadataTablePlan(current.artifact),
+                              self._metadata_generation)
 
     def _scan_analysis_action(self, action, value):
         if action == "close":
@@ -815,8 +951,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             from .analysis_mount import analysis_request_facts, metadata_plan_from_syntax
             plan = metadata_plan_from_syntax(value)
             if plan is not None:
-                self._begin_analysis("metadata", plan, self._scan_roi_generation,
-                    target="scan_roi", request=analysis_request_facts(plan))
+                self._submit_metadata(
+                    plan, self._scan_roi_generation, target="scan_roi",
+                    request=analysis_request_facts(plan),
+                )
             return
         if action == "scan_plot" and value:
             from .analysis_mount import analysis_request_facts, scan_plot_plan
@@ -911,7 +1049,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             candidates = getattr(terminal_payload, "candidates", ())
             self._analysis_identity = self._analysis_kind = self._analysis_target = None
             self._analysis_generation = self._analysis_anchor = self._analysis_request = None
-            self._analysis_fingerprint = ""
+            self._analysis_fingerprint = ""; self._analysis_candidate = None
             self._roi_preview_binding = self._scan_roi_result = None
             self._scan_roi_dialog.clear_vnext_metadata()
             if candidates: self._scan_roi_dialog.source_widget.set_external_candidates(candidates)
@@ -919,13 +1057,45 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         from .analysis_mount import (analysis_result_matches,
             retention_admission, terminal_adoption)
         payload, diagnostic = terminal_adoption(update, current=current)
-        if payload is not None and not analysis_result_matches(payload, request):
+        candidate = self._analysis_candidate
+        requalification = kind == "metadata_requalification"
+        if requalification:
+            from xrd_tools.analysis.scan_operations import (
+                MetadataTableRequalificationResult, MetadataTableResult,
+            )
+            valid = (
+                type(payload) is MetadataTableRequalificationResult
+                and type(candidate) is MetadataTableResult
+                and payload.receipt == candidate.receipt
+                and payload.table_fingerprint == candidate.table_fingerprint
+                and analysis_result_matches(candidate, request)
+            )
+            if valid:
+                payload = candidate
+                kind = "metadata"
+            else:
+                payload, diagnostic = (
+                    None, diagnostic or "P3_7_ANALYSIS_RESULT_IDENTITY_MISMATCH"
+                )
+        elif payload is not None and not analysis_result_matches(payload, request):
             payload, diagnostic = None, "P3_7_ANALYSIS_RESULT_IDENTITY_MISMATCH"
+        generation = self._analysis_generation
         self._analysis_identity = self._analysis_kind = self._analysis_target = None
         self._analysis_generation = self._analysis_anchor = self._analysis_request = None
-        self._analysis_fingerprint = ""
+        self._analysis_fingerprint = ""; self._analysis_candidate = None
         if payload is None:
             self._notice(diagnostic); return True
+        if kind == "metadata" and self._deferred_metadata is not None:
+            # A newer user request already owns latest-only precedence.  Do
+            # not let this older terminal candidate erase it, either while
+            # chaining or after completing the candidate's requalification.
+            return True
+        if kind == "metadata" and not requalification:
+            self._submit_metadata(
+                None, generation, target=target, request=request,
+                candidate=payload,
+            )
+            return True
         retained = {"metadata": self._metadata_result,
                     "scan_roi": self._scan_roi_result,
                     "peak": self._peak_result, "phase": self._phase_result}
@@ -1200,8 +1370,24 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": None,
                                 "requests": {"workers": workers}}}
 
-    def _reload_after_reintegrate(self, request, target) -> None:
-        if self._context_controller.reload_reintegrate_browse(request, target) is None:
+    def _reload_after_reintegrate(
+        self,
+        request,
+        target,
+        terminal_commit_identity: StreamTerminal | None = None,
+    ) -> None:
+        reloaded = (
+            self._context_controller.reload_reintegrate_browse(
+                request, target,
+            )
+            if terminal_commit_identity is None
+            else self._context_controller.reload_reintegrate_browse(
+                request,
+                target,
+                terminal_commit_identity=terminal_commit_identity,
+            )
+        )
+        if reloaded is None:
             self._request_browser_catalog()
 
     def _reintegrate_action(self, dimension) -> None:
@@ -1231,7 +1417,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         context, request, _selection, target, entry, target_snapshot, labels = captured
         identity = slot.begin_reintegrate(target=target, entry=entry,
             expected_target_snapshot=target_snapshot, expected_labels=labels,
-            dimension=dimension, preparation_values=preparation, stamp=stamp)
+            dimension=dimension, preparation_values=preparation, stamp=stamp,
+            expected_terminal_identity=(
+                request.terminal_commit_identity
+                if stream_terminal_object_revision(
+                    request.terminal_commit_identity,
+                ) is not None
+                else None
+            ))
         if identity is None:
             self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None; self._reload_after_reintegrate(request, target); self._notice(f"Reintegrate {dimension[0]}-D was not started; Browse is reloading."); self._refresh_shell(); return
         self._reintegrate_identity, self._reintegrate_request, self._reintegrate_target, self._reintegrate_dimension = identity, request, target, dimension
@@ -1246,7 +1439,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         shown = {"1d": "1-D", "2d": "2-D"}.get(self._reintegrate_dimension, "operation"); self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
         result = terminal.payload
         self._notice(f"Reintegrate {shown} {result.disposition.lower()}; reloading persisted results." if terminal.status is OperationTerminalStatus.RETURNED and type(result) is ReintegrateResult else f"Reintegrate {shown} cancelled; reloading persisted results." if terminal.status is OperationTerminalStatus.CANCELLED else f"Reintegrate {shown} failed: {terminal.diagnostic}")
-        if request is not None and target is not None: self._reload_after_reintegrate(request, target)
+        committed = (
+            terminal.status is OperationTerminalStatus.RETURNED
+            and type(result) is ReintegrateResult
+            and result.disposition == "COMMITTED"
+        )
+        commit_identity = (
+            _terminal_identity_for_target(result.commit_identity, target)
+            if committed and target is not None
+            else None
+        )
+        if committed and commit_identity is None:
+            self._notice(
+                f"Reintegrate {shown} returned an invalid commit identity; "
+                "Browse was not reloaded."
+            )
+            self._request_browser_catalog()
+            return True
+        if request is not None and target is not None: self._reload_after_reintegrate(
+            request, target, commit_identity,
+        )
         else: self._request_browser_catalog()
         return True
 
@@ -1259,12 +1471,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return True
         target, entry, revision = self._average_target, self._average_entry, self._average_revision
         self._average_identity = self._average_revision = self._average_target = self._average_entry = None
-        if update.stale or revision != self._intents.revision:
-            return True
         terminal = update.terminal; result = terminal.payload
         from xrd_tools.reduction.average import AverageScanResult
         if type(result) is not AverageScanResult:
             self._notice(f"Average failed: {terminal.diagnostic or 'invalid terminal result'}"); return True
+        stale = update.stale or revision != self._intents.revision
         if terminal.status is OperationTerminalStatus.FAILED:
             shown = (f"{result.diagnostic_code}: {result.diagnostic}"
                      if result.disposition == "ABORTED" else
@@ -1278,8 +1489,35 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Average returned an invalid terminal disposition."); return True
         if result.target != target or result.entry != entry:
             self._notice("Average terminal target mismatch; Browse was not reloaded."); return True
-        self._clear_terminal_browse()
-        self._context_controller.begin_browse(target); self._request_browser_catalog()
+        commit_identity = _terminal_identity_for_target(
+            result.commit_identity, target,
+        )
+        if commit_identity is None:
+            self._notice(
+                "Average terminal commit identity mismatch; Browse was not reloaded."
+            )
+            return True
+        if stale:
+            self._notice(
+                "Average committed but context changed; Browse was not reloaded."
+            )
+            self._request_browser_catalog()
+            self._refresh_shell()
+            return True
+        try:
+            self._clear_terminal_browse()
+            self._context_controller.begin_browse(
+                target,
+                terminal_commit_identity=commit_identity,
+            )
+        except Exception as error:
+            self._error_notice(
+                "Average committed; Browse reload deferred", error,
+            )
+            if self._context_controller.browse_pending:
+                self._ensure_timer()
+        self._request_browser_catalog()
+        self._refresh_shell()
         return True
 
     def _average_action(self, snapshot: RunIntentSnapshot) -> None:
@@ -1292,8 +1530,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted
                 or type(source) is not SourceSpec or not intent.save_path
                 or intent.output_mode != "Overwrite" or intent.live_mode
-                or intent.processing_mode == "Int 1D (XYE)"):
-            self._notice("Average requires one finite image source, Overwrite NeXus output, non-Live execution, and an idle workspace."); self._refresh_shell(); return
+                or intent.processing_mode == "Int 1D (XYE)"
+                or tool_from_mode_text(intent.processing_mode)
+                not in {Tool.INT_1D, Tool.INT_2D}):
+            self._notice("Average requires one finite image source, Overwrite NeXus output, non-Live execution, an integration mode, and an idle workspace."); self._refresh_shell(); return
         try:
             from pathlib import Path
             from .output_preflight import _resolved_generated_target
@@ -1389,6 +1629,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         first = not self._closing
         if first:
             self._closing = True
+            self._deferred_metadata = None
             for dialog in (self._metadata_dialog, self._scan_roi_dialog,
                            self._peak_dialog, self._phase_dialog):
                 if dialog is not None: dialog.close()
@@ -1400,12 +1641,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._observation_token += 1
             self._cancel_observation()
             self._browser_catalog_token += 1
-            self._cancel_browser_catalog()
             self._close_identity = (
                 self._context_controller.run_identity
                 or self._lifecycle.active_run_identity
                 or self._lifecycle.attempt_run_identity
             )
+
+        catalog_clean = self._cancel_browser_catalog()
 
         operation_slot = getattr(self, "_operation_slot", None)
         try:
@@ -1533,6 +1775,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         components_clean = (
             admission_clean
             and operation_clean
+            and catalog_clean
             and browse.cleanup_status is CleanupStatus.CLEANED
             and executor_clean
             and not self._close_source_pending
@@ -1697,6 +1940,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_browser_catalog()
             return
         if kind is ShellCommandKind.SHOW_ALL:
+            self._retain_outgoing_display = False
             ScatteringWorkspace._clear_presentation_targets(self)
             self._shell.browser.cancel_pending_frame_selection()
             navigation = self._context_controller.navigation
@@ -1709,10 +1953,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._refresh_shell()
             return
         if kind is ShellCommandKind.SELECT_SCAN:
+            self._retain_outgoing_display = False
             ScatteringWorkspace._clear_presentation_targets(self)
             value = command.value
-            if type(value) is str and value and os.path.isdir(value):
-                self._select_scan(value)
+            if command.path == ("directory",):
+                self._select_scan(value, is_directory=True)
+                return
+            if command.path not in {(), ("artifact",)}:
                 return
             mode = self._intents.snapshot().thaw().processing_mode
             tool = tool_from_mode_text(mode)
@@ -1728,13 +1975,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if self._context_controller.viewer_2d_owned:
                 if not self._clear_viewer_2d_renderer(close=True):
                     return
-            self._select_scan(value)
+            self._select_scan(value, is_directory=False)
             return
         if kind in {
             ShellCommandKind.SELECT_FRAME,
             ShellCommandKind.HYDRATE_FRAME,
             ShellCommandKind.SELECT_BROWSER_FRAMES,
         }:
+            self._retain_outgoing_display = False
             ScatteringWorkspace._clear_presentation_targets(self)
             if kind is not ShellCommandKind.SELECT_BROWSER_FRAMES:
                 self._shell.browser.cancel_pending_frame_selection()
@@ -1820,29 +2068,39 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._ensure_timer()
             return
         snapshot = self._intents.snapshot()
-        stored_average = snapshot.thaw().run_options.get(
+        intent = snapshot.thaw()
+        tool = tool_from_mode_text(intent.processing_mode)
+        stored_average = intent.run_options.get(
             "series_average", False
         )
         if type(stored_average) is not bool:
             self._notice("Average Scan must be stored as true or false.")
             self._refresh_shell()
             return
-        if stored_average:
+        if (
+            stored_average
+            and intent.processing_mode != "Int 1D (XYE)"
+            and tool in {Tool.INT_1D, Tool.INT_2D}
+        ):
             if not self._commit_focused_control_edit_for_run():
                 return
             snapshot = self._intents.snapshot()
-            stored_average = snapshot.thaw().run_options.get(
+            intent = snapshot.thaw()
+            tool = tool_from_mode_text(intent.processing_mode)
+            stored_average = intent.run_options.get(
                 "series_average", False
             )
             if type(stored_average) is not bool:
                 self._notice("Average Scan must be stored as true or false.")
                 self._refresh_shell()
                 return
-            if stored_average:
+            if (
+                stored_average
+                and intent.processing_mode != "Int 1D (XYE)"
+                and tool in {Tool.INT_1D, Tool.INT_2D}
+            ):
                 self._average_action(snapshot)
                 return
-        intent = self._intents.snapshot().thaw()
-        tool = tool_from_mode_text(intent.processing_mode)
         if tool is Tool.XYE_VIEWER:
             self._choose_viewer_1d_files()
             return
@@ -1869,7 +2127,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Average Scan must be stored as true or false.")
             self._refresh_shell()
             return
-        if average:
+        if (
+            average
+            and snapshot.thaw().processing_mode != "Int 1D (XYE)"
+            and tool_from_mode_text(snapshot.thaw().processing_mode)
+            in {Tool.INT_1D, Tool.INT_2D}
+        ):
             self._average_action(snapshot)
             return
         self._begin_run()
@@ -2231,6 +2494,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._ensure_timer()
             return True
+        self._admission_state = replace(
+            state,
+            admission_receipt=result,
+            retirement_receipt=result.display_retirement,
+            retirement_applied=True,
+        )
         if self._intents.snapshot().revision != result.revision:
             self._release_admission(token)
             self._render_start_outcome(
@@ -2309,8 +2578,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return AdmissionReleased(
                 token, CleanupStatus.CLEANUP_PENDING
             )
-        self._retain_outgoing_display = False
-
         released = state.release_receipt
         retirement = state.retirement_receipt
         retirement_applied = state.retirement_applied
@@ -2343,6 +2610,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     retirement
                 )
             )
+
+        # Applied retirement detaches the visible pixels from all context
+        # ownership.  A refused launch must not erase them before another
+        # accepted frame is ready to paint.
+        self._retain_outgoing_display = retirement_applied
 
         state = _AdmissionPageOwner(
             token=token,
@@ -2460,16 +2732,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return any(self._select_presentation_target(identity, frame)
                    for frame in reversed(targets))
 
-    def _select_scan(self, value: object) -> None:
+    def _select_scan(
+        self, value: object, *, is_directory: bool = False,
+    ) -> None:
         if type(value) is not str or not value:
             return
-        terminal_request = self._terminal_browse_request
-        if os.path.isdir(value):
+        if type(is_directory) is not bool:
+            return
+        handoff = self._terminal_browse_handoff
+        terminal_request = None if handoff is None else handoff.request
+        if is_directory:
             self._set_browser_directory(value, explicit=True)
             return
+        normalized = os.path.normcase(os.path.abspath(os.path.expanduser(value)))
         same_terminal_target = (
             terminal_request is not None
-            and str(Path(value).resolve()) == terminal_request.source_path
+            and normalized == terminal_request.source_path
         )
         if (
             (terminal_request is None or same_terminal_target)
@@ -2540,8 +2818,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if frame is not None and frame is not latest:
             self._auto_last = False
-        request = self._terminal_browse_request
-        terminal_artifact = self._terminal_browse_artifact
+        handoff = self._terminal_browse_handoff
+        request = None if handoff is None else handoff.request
+        terminal_artifact = None if handoff is None else handoff.artifact
         current = navigation.current
         selected = navigation.selected
         if (
@@ -2557,9 +2836,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             # Preserve an explicit acquisition-frame choice made while the
             # clean terminal artifact is loading.  Browse settlement maps the
             # accepted labels onto the authenticated persisted context.
-            self._terminal_browse_current_label = current.local_frame_label
-            self._terminal_browse_selected_labels = tuple(
-                candidate.local_frame_label for candidate in selected
+            self._terminal_browse_handoff = _TerminalBrowseHandoff(
+                request, terminal_artifact, current.local_frame_label,
+                tuple(candidate.local_frame_label for candidate in selected),
+                handoff.commit_identity,
             )
         self._refresh_shell()
         self._ensure_timer()
@@ -2567,6 +2847,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _drain_executor(self) -> None:
         if self._closing or self._closed:
             return
+        defer_terminal_science = False
+        terminal_science_complete = False
+        reuse_terminal_science = False
         changed = self._poll_admission()
         poll_viewer_1d = getattr(self._context_controller, "poll_viewer_1d", None)
         if poll_viewer_1d is not None and poll_viewer_1d():
@@ -2582,13 +2865,24 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._error_notice("Browse failed", error)
                 outcome = None
             if outcome is not None:
-                self._settle_terminal_browse(outcome)
+                reuse_terminal_science = self._settle_terminal_browse(
+                    outcome
+                )
                 changed = True
                 detail = getattr(outcome, "detail", "")
                 self._notice(detail)
                 current = self._context_controller.navigation.current
                 if current is not None:
                     self._follow_processed_artifact(current)
+        handoff = self._terminal_browse_handoff
+        if (
+            handoff is not None
+            and not self._context_controller.owns_browse_request(
+                handoff.request
+            )
+        ):
+            self._clear_terminal_browse()
+            changed = True
 
         force_scientific = changed
         frame_presentation_changed = False
@@ -2748,20 +3042,27 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 was_batch = self._active_batch_mode
                 terminal_navigation = self._context_controller.navigation
                 self._accept_terminal_event(event)
-                self._begin_terminal_browse(
+                defer_terminal_science = self._begin_terminal_browse(
                     event,
                     was_batch=was_batch,
                     current=terminal_navigation.current,
                     selected=terminal_navigation.selected,
                 )
+                handoff = self._terminal_browse_handoff
+                terminal_science_complete = (
+                    defer_terminal_science
+                    and handoff is not None
+                    and self._terminal_scientific_matches(
+                        handoff, terminal_navigation,
+                    )
+                )
                 self._retry_deferred_gi_motor_default()
                 # The writer publishes its atomic final path before emitting
                 # the terminal event.  Re-enumerate here so a non-batch run
                 # whose FRAME_READY preceded that rename becomes visible.
-                self._request_browser_catalog()
-                operation = self._browser_catalog_operation
+                catalog_request = self._request_browser_catalog()
                 self._browser_transient_clear_token = (
-                    None if operation is None else operation.token
+                    None if catalog_request is None else catalog_request.token
                 )
                 self._active_batch_mode = False
                 self._run_frame_seen = False
@@ -2793,8 +3094,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             elif operation_identity is self._analysis_identity and not operation_slot.owned:
                 self._analysis_identity = self._analysis_kind = self._analysis_target = None
                 self._analysis_generation = self._analysis_anchor = self._analysis_request = None
-                self._analysis_fingerprint = ""
+                self._analysis_fingerprint = ""; self._analysis_candidate = None
                 self._notice("Analysis failed before terminal publication."); changed = True; force_scientific = True
+
+        if self._dispatch_deferred_metadata():
+            changed = True
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
@@ -2812,9 +3116,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 changed = True
                 force_scientific = True
         if changed:
-            preserve_scientific = False
+            handoff = self._terminal_browse_handoff
+            hold_complete_terminal_science = (
+                handoff is not None
+                and self._context_controller.owns_browse_request(
+                    handoff.request
+                )
+                and self._terminal_scientific_matches(
+                    handoff, self._context_controller.navigation,
+                )
+            )
+            preserve_scientific = (
+                defer_terminal_science
+                or reuse_terminal_science
+                or hold_complete_terminal_science
+            )
             last_plot = self._last_live_plot_at
             if (
+                not preserve_scientific
+                and
                 frame_presentation_changed
                 and not force_scientific
                 and self._live_plot_interval_ms
@@ -2825,8 +3145,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 preserve_scientific = True
             if preserve_scientific:
-                self._scientific_repaint_pending = True
-                self._refresh_event_shell(preserve_scientific=True)
+                if reuse_terminal_science:
+                    self._refresh_event_shell(
+                        preserve_scientific=True,
+                        skip_scientific_projection=True,
+                        rebind_scientific_navigation=True,
+                    )
+                else:
+                    self._scientific_repaint_pending = not (
+                        defer_terminal_science
+                        and terminal_science_complete
+                        or hold_complete_terminal_science
+                    )
+                    self._refresh_event_shell(preserve_scientific=True)
             else:
                 self._refresh_event_shell()
         if not self._polling_needed():
@@ -2908,7 +3239,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         was_batch: bool,
         current: DisplayFrameKey | None,
         selected: tuple[DisplayFrameKey, ...],
-    ) -> None:
+    ) -> bool:
         """Load a clean run's exact published artifact through Browse.
 
         Reintegration deliberately accepts only a stable authenticated Browse
@@ -2917,7 +3248,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         a redundant browser click or weakening the reintegration contract.
         """
 
-        self._clear_terminal_browse()
         controller = self._context_controller
         acquisition = controller.acquisition_context
         selection = controller.selection
@@ -2938,45 +3268,224 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or acquisition.run_configuration.processing_mode
             == "Int 1D (XYE)"
         ):
-            return
+            return False
         try:
-            request = controller.begin_browse(artifact)
+            commit_identity = event.terminal_commit_identity
+            request = (
+                controller.begin_browse(artifact)
+                if commit_identity is None
+                else controller.begin_browse(
+                    artifact,
+                    terminal_commit_identity=commit_identity,
+                )
+            )
         except RuntimeError:
             # The published artifact remains available in the browser.  A
             # transient viewer/cleanup owner must not turn a clean Run terminal
             # into a failure or bypass Browse's normal lifecycle checks.
-            return
-        self._terminal_browse_request = request
+            return False
         # Browse owns the resolved absolute source path, while the output
         # contract deliberately preserves an explicit target's spelling.
         # Retain both exact identities so acquisition-frame choices made while
         # Browse is pending compare against their original artifact spelling.
-        self._terminal_browse_artifact = artifact
-        self._terminal_browse_current_label = (
+        self._terminal_browse_handoff = _TerminalBrowseHandoff(
+            request,
+            artifact,
             current.local_frame_label
             if current is not None and current.artifact == artifact
-            else None
-        )
-        self._terminal_browse_selected_labels = tuple(
-            frame.local_frame_label
-            for frame in selected
-            if frame.artifact == artifact
+            else None,
+            tuple(
+                frame.local_frame_label
+                for frame in selected
+                if frame.artifact == artifact
+            ),
+            request.terminal_commit_identity,
         )
         self._ensure_timer()
+        return True
 
-    def _settle_terminal_browse(self, outcome: object) -> None:
-        request = self._terminal_browse_request
+    def _terminal_scientific_matches(
+        self,
+        handoff: _TerminalBrowseHandoff,
+        navigation: FrameNavigationProjection,
+    ) -> bool:
+        """Whether terminal Browse can reuse the exact painted science."""
+
+        preferences = self._preferences
+        view = self._shell.scientific
+        scientific = self._last_scientific_projection
+        current = navigation.current
+        painted_current = view.navigation_current_key
+        if (
+            preferences.plot_mode not in {"Overlay", "Waterfall"}
+            or preferences.slice_enabled
+            or preferences.slice_pins
+            or preferences.norm_channel.strip()
+            not in {"", "None", "Norm Channel"}
+            or self._background_owner.active_key is not None
+            or scientific is None
+            or scientific.plot_mode != preferences.plot_mode
+            or scientific.slice_pins
+            or scientific.pinned_traces
+            or view.presentation_plot_mode != preferences.plot_mode
+            or current is None
+            or painted_current is None
+        ):
+            return False
+        artifact = handoff.request.source_path
+        canonical_by_artifact = {
+            handoff.artifact: artifact,
+            artifact: artifact,
+        }
+        compared_frames = (
+            current,
+            painted_current,
+            *navigation.frames,
+            *view.navigation_frame_keys,
+            *view.navigation_selected_keys,
+            *navigation.selected,
+            *view.trace_history_keys,
+        )
+        if any(
+            frame.artifact not in canonical_by_artifact
+            for frame in compared_frames
+        ):
+            return False
+        local_frames = tuple(
+            frame
+            for frame in navigation.frames
+            if _terminal_frame_signature(
+                frame, canonical_by_artifact,
+            )[0] == artifact
+        )
+        return (
+            _terminal_frame_signature(
+                current, canonical_by_artifact,
+            )[0] == artifact
+            and _terminal_frame_signature(
+                painted_current, canonical_by_artifact,
+            )
+            == _terminal_frame_signature(current, canonical_by_artifact)
+            and tuple(
+                _terminal_frame_signature(frame, canonical_by_artifact)
+                for frame in view.navigation_frame_keys
+            )
+            == tuple(
+                _terminal_frame_signature(frame, canonical_by_artifact)
+                for frame in local_frames
+            )
+            and tuple(
+                _terminal_frame_signature(frame, canonical_by_artifact)
+                for frame in view.navigation_selected_keys
+            )
+            == tuple(
+                _terminal_frame_signature(frame, canonical_by_artifact)
+                for frame in navigation.selected
+            )
+            and tuple(
+                _terminal_frame_signature(frame, canonical_by_artifact)
+                for frame in view.trace_history_keys
+            )
+            == tuple(
+                _terminal_frame_signature(frame, canonical_by_artifact)
+                for frame in navigation.selected
+            )
+        )
+
+    def _rebind_last_scientific_projection(
+        self,
+        navigation: FrameNavigationProjection,
+        artifact_aliases: tuple[str, str],
+    ) -> bool:
+        scientific = self._last_scientific_projection
+        if (
+            scientific is None
+            or type(artifact_aliases) is not tuple
+            or len(artifact_aliases) != 2
+            or not all(
+                type(value) is str and value
+                for value in artifact_aliases
+            )
+        ):
+            return False
+        source_artifact, browse_artifact = artifact_aliases
+        canonical_by_artifact = {
+            source_artifact: browse_artifact,
+            browse_artifact: browse_artifact,
+        }
+        candidate_frames = navigation.frames
+        scientific_frames = (
+            *((scientific.heavy.frame,) if scientific.heavy is not None else ()),
+            *(trace.frame for trace in scientific.traces),
+            *scientific.heavy_available,
+        )
+        if any(
+            frame.artifact not in canonical_by_artifact
+            for frame in (*candidate_frames, *scientific_frames)
+        ):
+            return False
+        by_signature = {
+            _terminal_frame_signature(frame, canonical_by_artifact): frame
+            for frame in navigation.frames
+        }
+        if len(by_signature) != len(navigation.frames):
+            return False
+
+        def rebound(frame: DisplayFrameKey) -> DisplayFrameKey | None:
+            return by_signature.get(_terminal_frame_signature(
+                frame, canonical_by_artifact,
+            ))
+
+        heavy_frame = (
+            None
+            if scientific.heavy is None
+            else rebound(scientific.heavy.frame)
+        )
+        trace_frames = tuple(rebound(trace.frame) for trace in scientific.traces)
+        available = tuple(rebound(frame) for frame in scientific.heavy_available)
+        if (
+            scientific.heavy is not None and heavy_frame is None
+            or any(frame is None for frame in trace_frames)
+            or any(frame is None for frame in available)
+        ):
+            return False
+        self._last_scientific_projection = replace(
+            scientific,
+            heavy=(
+                None
+                if scientific.heavy is None
+                else replace(scientific.heavy, frame=heavy_frame)
+            ),
+            traces=tuple(
+                replace(trace, frame=frame)
+                for trace, frame in zip(
+                    scientific.traces, trace_frames, strict=True,
+                )
+            ),
+            heavy_available=frozenset(available),
+        )
+        return True
+
+    def _settle_terminal_browse(self, outcome: object) -> bool:
+        handoff = self._terminal_browse_handoff
+        request = None if handoff is None else handoff.request
         if (
             type(outcome) is not BrowseLoadOutcome
             or request is None
             or outcome.request is not request
         ):
-            return
-        current_label = self._terminal_browse_current_label
-        selected_labels = self._terminal_browse_selected_labels
+            return False
+        current_label = handoff.current_label
+        selected_labels = handoff.selected_labels
         self._clear_terminal_browse()
         if outcome.status is not BrowseLoadStatus.READY:
-            return
+            return False
+        captured = self._context_controller.capture_reintegrate_browse()
+        if (
+            captured is None
+            or captured[1] is not request
+        ):
+            return False
         navigation = self._context_controller.navigation
         by_label = {
             frame.local_frame_label: frame for frame in navigation.frames
@@ -2993,17 +3502,37 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         elif current is not None:
             self._context_controller.select_navigation(current, selected)
+        commit_identity = handoff.commit_identity
+        if (
+            request.terminal_commit_identity is not commit_identity
+            or type(commit_identity) is not StreamTerminal
+            or captured[5].size != commit_identity.size
+            or captured[5].digest != commit_identity.digest
+        ):
+            # An ordinary terminal Browse may preserve its exact frame-label
+            # choice, but only a writer-authenticated seal can authorize
+            # zero-copy reuse of the acquisition scientific arrays.
+            return False
+        matches = self._terminal_scientific_matches(
+            handoff, self._context_controller.navigation,
+        )
+        if matches:
+            self._terminal_rebind_artifacts = (
+                handoff.artifact,
+                request.source_path,
+            )
+        return matches
 
     def _clear_terminal_browse(self) -> None:
-        self._terminal_browse_request = None
-        self._terminal_browse_artifact = None
-        self._terminal_browse_current_label = None
-        self._terminal_browse_selected_labels = ()
+        self._terminal_browse_handoff = None
+        self._terminal_rebind_artifacts = None
 
     def _refresh_event_shell(
         self,
         *,
         preserve_scientific: bool = False,
+        skip_scientific_projection: bool = False,
+        rebind_scientific_navigation: bool = False,
     ) -> None:
         started = (
             time.monotonic()
@@ -3011,7 +3540,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else None
         )
         if preserve_scientific:
-            self._refresh_shell(preserve_scientific=True)
+            self._refresh_shell(
+                preserve_scientific=True,
+                skip_scientific_projection=skip_scientific_projection,
+                rebind_scientific_navigation=rebind_scientific_navigation,
+            )
         else:
             self._refresh_shell()
         if started is None:
@@ -3200,12 +3733,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         *,
         preserve_display: bool = False,
         preserve_scientific: bool = False,
+        skip_scientific_projection: bool = False,
+        rebind_scientific_navigation: bool = False,
     ) -> None:
         # The worker can rescope the one mutable acquisition context after its
         # event queue snapshot but before this GUI refresh.  Catch up only an
         # already-selected exact acquisition owner; Browse remains untouched.
         if self._context_controller.synchronize_acquisition_scope():
             preserve_scientific = False
+            skip_scientific_projection = False
+            rebind_scientific_navigation = False
+        if (
+            (skip_scientific_projection or rebind_scientific_navigation)
+            and not preserve_scientific
+        ):
+            raise ValueError(
+                "scientific projection shortcuts require paint preservation"
+            )
         snapshot = self._intents.snapshot()
         intent = snapshot.thaw()
         controls = self._project_controls(snapshot)
@@ -3256,10 +3800,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             RunPhase.RESUMING,
             RunPhase.STOPPING,
         }
-        payloads = self._context_controller.project_navigation(
-            preferences=self._preferences,
-            processing_mode=intent.processing_mode,
-            live_update=live_update,
+        payloads = (
+            ()
+            if skip_scientific_projection
+            else self._context_controller.project_navigation(
+                preferences=self._preferences,
+                processing_mode=intent.processing_mode,
+                live_update=live_update,
+            )
         )
         resident_frames = self._context_controller.resident_frame_keys
         current = navigation.current
@@ -3334,6 +3882,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             norm_aggregate=self._context_controller.norm_aggregate,
             presentation_background=self._background_owner.projection(),
         )
+        rebind_artifacts = (
+            self._terminal_rebind_artifacts
+            if rebind_scientific_navigation
+            else None
+        )
+        if rebind_scientific_navigation:
+            self._terminal_rebind_artifacts = None
         try:
             choice, _ = heavy_residency_choice(intent.run_options)
             self._shell.browser.reconcile_heavy_residency(
@@ -3349,6 +3904,24 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.scientific.expect_display_background(
                 self._background_owner.active_key)
             self._shell.apply_state(projection, **apply_options)
+            if rebind_scientific_navigation:
+                rebound = (
+                    rebind_artifacts is not None
+                    and self._shell.scientific.rebind_navigation(navigation)
+                )
+                rebound = (
+                    rebound
+                    and self._rebind_last_scientific_projection(
+                        navigation, rebind_artifacts,
+                    )
+                    and self._context_controller
+                    .commit_rebound_navigation_projection(
+                        self._shell.scientific.trace_history_keys,
+                        preferences=self._preferences,
+                        processing_mode=intent.processing_mode,
+                    )
+                )
+                self._scientific_repaint_pending = not rebound
         except Exception as error:
             if viewer:
                 self._last_scientific_projection = None
@@ -3511,6 +4084,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         snapshot = self._intents.snapshot()
         candidate = snapshot.thaw()
+        release_outgoing_display = False
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
                 return
@@ -3524,7 +4098,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     and not self._clear_viewer_1d_renderer(close=True)):
                 self._notice("1D Viewer cleanup remains pending")
                 return
-            if value != candidate.processing_mode: self._release_display_background()
+            if value != candidate.processing_mode:
+                release_outgoing_display = True
+                self._retain_outgoing_display = False
+                self._release_display_background()
             candidate.processing_mode = value
             if value == "Int 1D (XYE)":
                 _drop_nexus_only_performance_options(candidate)
@@ -3546,6 +4123,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             candidate, expected_revision=snapshot.revision
         )
         self._reconcile_snapshot(snapshot, result.snapshot)
+        if release_outgoing_display:
+            self._retain_outgoing_display = False
+            self._refresh_shell()
 
     def _choose_viewer_1d_files(self) -> None:
         context = self._context_controller.viewer_1d_context
@@ -3565,6 +4145,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if (type(selected) is not tuple or not selected
                 or any(type(path) is not str or not path for path in selected)):
             return
+        self._retain_outgoing_display = False
         if (self._context_controller.viewer_2d_owned
                 and not self._clear_viewer_2d_renderer(close=True)):
             self._notice("2D Viewer cleanup remains pending"); return
@@ -3623,6 +4204,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _open_viewer_2d_path(self, selected: str) -> None:
         if type(selected) is not str or not selected:
             return
+        self._retain_outgoing_display = False
         if (getattr(self._context_controller, "viewer_1d_owned", False)
                 and not self._clear_viewer_1d_renderer(close=True)):
             self._notice("1D Viewer cleanup remains pending"); return
@@ -3877,6 +4459,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             return True
         elif kind is ShellCommandKind.CLEAR_1D:
+            self._retain_outgoing_display = False
             background = self._background_owner.projection()
             if (background is not None and background[0] == "integrated_1d"
                     and not self._release_display_background()):
@@ -3907,13 +4490,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return True
 
     def _render_start_outcome(self, outcome: object) -> None:
-        self._retain_outgoing_display = False
         if isinstance(outcome, (StartRefused, StartFailed)):
             self._notice(outcome.detail or outcome.reason.value)
         else:
             self._notice("Standard run was not started.")
         self._retry_deferred_gi_motor_default()
-        self._refresh_shell()
+        self._refresh_shell(
+            preserve_display=self._retain_outgoing_display,
+        )
 
     def closeEvent(self, event: QtCore.QEvent) -> None:
         receipt = self.close_workspace()
@@ -4796,38 +5380,51 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if changed or first_seen:
             self._request_browser_catalog()
 
-    def _request_browser_catalog(self) -> None:
+    def _request_browser_catalog(self) -> _BrowserCatalogRequest | None:
         pool = self._browser_catalog_pool
         if (
             pool is None
             or self._closing
             or self._closed
         ):
-            return
+            return None
         self._browser_catalog_token += 1
-        directory = self._browser_directory
-        accepted_suffixes = _browser_suffixes_for_mode(
-            self._intents.snapshot().thaw().processing_mode
+        request = _BrowserCatalogRequest(
+            self._browser_catalog_token,
+            self._browser_directory,
+            _browser_suffixes_for_mode(
+                self._intents.snapshot().thaw().processing_mode
+            ),
         )
+        operation = self._browser_catalog_operation
+        if operation is not None:
+            operation.cancelled.set()
+            operation.future.cancel()
+            self._browser_catalog_queued = request
+            return request
+        self._launch_browser_catalog(request)
+        return request
+
+    def _launch_browser_catalog(
+        self, request: _BrowserCatalogRequest,
+    ) -> None:
+        pool = self._browser_catalog_pool
+        if (
+            pool is None or self._closing or self._closed
+            or self._browser_catalog_operation is not None
+        ):
+            return
+        cancelled = threading.Event()
         future = pool.submit(
             enumerate_processed_artifacts,
-            directory,
-            accepted_suffixes=accepted_suffixes,
+            request.directory,
+            accepted_suffixes=request.accepted_suffixes,
             inspect_directory_contents=self._date_sorted,
             directory_time_cache=self._browser_directory_time_cache,
+            cancelled=cancelled,
         )
-        operation = _BrowserCatalogOperation(
-            self._browser_catalog_token,
-            directory,
-            accepted_suffixes,
-            future,
-        )
-        prior, self._browser_catalog_operation = (
-            self._browser_catalog_operation,
-            operation,
-        )
-        if prior is not None:
-            prior.future.cancel()
+        operation = _BrowserCatalogOperation(request, cancelled, future)
+        self._browser_catalog_operation = operation
         page_ref = weakref.ref(self)
         future.add_done_callback(
             lambda done: ScatteringWorkspace._deliver_browser_catalog(
@@ -4839,7 +5436,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _poll_browser_catalog(self) -> None:
         """Observe idle external deletion/recreation without GUI-thread I/O."""
-        if self._browser_catalog_operation is None:
+        operation = self._browser_catalog_operation
+        if operation is not None and operation.future.done():
+            self._on_browser_catalog(operation, operation.future)
+        elif operation is None and self._browser_catalog_queued is not None:
+            request, self._browser_catalog_queued = (
+                self._browser_catalog_queued, None,
+            )
+            self._launch_browser_catalog(request)
+        elif operation is None:
             self._request_browser_catalog()
 
     @staticmethod
@@ -4869,18 +5474,32 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or type(operation) is not _BrowserCatalogOperation
             or operation is not self._browser_catalog_operation
             or future is not operation.future
-            or operation.token != self._browser_catalog_token
-            or operation.directory != self._browser_directory
-            or operation.accepted_suffixes != _browser_suffixes_for_mode(
-                self._intents.snapshot().thaw().processing_mode
-            )
         ):
             return
+        request = operation.request
         self._browser_catalog_operation = None
+        queued, self._browser_catalog_queued = (
+            self._browser_catalog_queued, None,
+        )
+        current = (
+            not operation.cancelled.is_set()
+            and request.token == self._browser_catalog_token
+            and request.directory == self._browser_directory
+            and request.accepted_suffixes == _browser_suffixes_for_mode(
+                self._intents.snapshot().thaw().processing_mode
+            )
+        )
         try:
             catalog = operation.future.result()
         except Exception as error:
-            self._error_notice("Browser refresh failed", error)
+            if current:
+                self._error_notice("Browser refresh failed", error)
+            if queued is not None:
+                self._launch_browser_catalog(queued)
+            return
+        if queued is not None:
+            self._launch_browser_catalog(queued)
+        if not current:
             return
         if (
             type(catalog) is not tuple
@@ -4895,7 +5514,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         clear_token = self._browser_transient_clear_token
         transient_cleared = (
             clear_token is not None
-            and operation.token >= clear_token
+            and request.token >= clear_token
         )
         if transient_cleared:
             self._browser_transient_frame = None
@@ -4905,13 +5524,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._browser_catalog = catalog
         self._refresh_shell(preserve_scientific=True)
 
-    def _cancel_browser_catalog(self) -> None:
-        operation, self._browser_catalog_operation = (
-            self._browser_catalog_operation,
-            None,
-        )
-        if operation is not None:
-            operation.future.cancel()
+    def _cancel_browser_catalog(self) -> bool:
+        self._browser_catalog_queued = None
+        operation = self._browser_catalog_operation
+        if operation is None:
+            return True
+        operation.cancelled.set()
+        operation.future.cancel()
+        if not operation.future.done():
+            return False
+        self._browser_catalog_operation = None
+        try:
+            operation.future.result()
+        except BaseException:
+            pass
+        return True
 
     def _refuse_preparing(self, token: AdmissionToken) -> None:
         if (

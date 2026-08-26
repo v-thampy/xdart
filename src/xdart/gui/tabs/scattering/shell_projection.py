@@ -114,6 +114,7 @@ def build_browser_projection(
                 entry.artifact,
                 entry.label,
                 entry.artifact,
+                entry.is_directory,
             )
         )
     for frame in navigation.frames:
@@ -135,6 +136,7 @@ def build_browser_projection(
                 frame.artifact,
                 os.path.basename(frame.artifact) or frame.source_scan,
                 frame.artifact,
+                False,
             )
         )
     # Contexts and navigation are display-retention owners, not evidence that

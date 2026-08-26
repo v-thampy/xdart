@@ -22,7 +22,7 @@ from ..operation_values import (
 )
 from ..presentation_background import PresentationBackgroundOwner
 from xrd_tools.reduction.background import DisplayBackgroundPlan
-from xrd_tools.io.output_transaction import TargetSnapshot
+from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot
 from xrd_tools.reduction import ReintegratePlan, ReintegrateProgress, ReintegrateResult, run_reintegrate
 from xrd_tools.reduction.reintegrate import ReintegrateCancelled
 
@@ -36,6 +36,7 @@ class _ReintegrateRequest:
     target: str
     entry: str
     expected_target_snapshot: TargetSnapshot
+    expected_terminal_identity: StreamTerminal | None
     expected_labels: tuple[int, ...]
     dimension: str
     preparation_json: str
@@ -161,10 +162,13 @@ def _average_background_from_syntax(text: str | None):
     value = json.loads(text)
     if type(value) is not dict: raise ValueError("AVERAGE_BACKGROUND_UNREPRESENTABLE")
     return FrameBackgroundPlan(**value)
-def _average_calibration(request: _AverageRequest):
+def _average_calibration(request: _AverageRequest, cancelled=None):
     from .. import output_preflight
     from xrd_tools.session.experiment_state import CalibrationState, FactStatus, MaskState, PoniValues
-    assets = output_preflight._load_scientific_assets(request)
+    assets = output_preflight._load_scientific_assets(
+        request,
+        cancelled=(lambda: False) if cancelled is None else cancelled.is_set,
+    )
     if request.poni_file and assets.poni_values is None: raise ValueError("AVERAGE_CALIBRATION_UNAVAILABLE")
     if request.mask_file and assets.mask_bytes is None: raise ValueError("AVERAGE_MASK_UNAVAILABLE")
     config = None
@@ -331,9 +335,13 @@ class OperationSlot:
                           expected_target_snapshot: TargetSnapshot,
                           expected_labels: tuple[int, ...], dimension: str,
                           preparation_values: Mapping[str, object],
-                          stamp: OperationContextStamp) -> OperationIdentity | None:
+                          stamp: OperationContextStamp,
+                          expected_terminal_identity: StreamTerminal | None = None,
+                          ) -> OperationIdentity | None:
         valid = (type(target) is str and bool(target) and type(entry) is str and bool(entry)
                  and type(expected_target_snapshot) is TargetSnapshot and expected_target_snapshot.exists
+                 and (expected_terminal_identity is None
+                      or type(expected_terminal_identity) is StreamTerminal)
                  and type(expected_labels) is tuple and bool(expected_labels)
                  and expected_labels == tuple(sorted(set(expected_labels)))
                  and all(type(value) is int and value >= 0 for value in expected_labels)
@@ -346,8 +354,11 @@ class OperationSlot:
             detached = json.loads(preparation_json)
             if type(detached) is not dict or detached != preparation_values: return None
         except (TypeError, ValueError, OverflowError): return None
-        request = _ReintegrateRequest(target, entry, expected_target_snapshot,
-            expected_labels, dimension, preparation_json)
+        request = _ReintegrateRequest(
+            target, entry, expected_target_snapshot,
+            expected_terminal_identity, expected_labels, dimension,
+            preparation_json,
+        )
         return self._begin(request, stamp, self._run_reintegrate_request)
 
     def _run_reintegrate_request(self, request, identity, cancelled, publish):
@@ -356,6 +367,7 @@ class OperationSlot:
             plan = ReintegratePlan.from_artifact(request.target, entry=request.entry,
                 dimension=request.dimension, preparation=json.loads(request.preparation_json),
                 expected_target_snapshot=request.expected_target_snapshot,
+                expected_terminal_identity=request.expected_terminal_identity,
                 expected_labels=request.expected_labels, cancel_token=cancelled)
         except ReintegrateCancelled:
             return OperationTerminal(identity, OperationTerminalStatus.CANCELLED)
@@ -440,7 +452,17 @@ class OperationSlot:
 
     def _run_average_request(self, request, identity, cancelled, publish):
         publish("prepare", 0, 1)
-        calibration = _average_calibration(request)
+        try:
+            calibration = _average_calibration(request, cancelled)
+        except RuntimeError as error:
+            if (
+                cancelled.is_set()
+                and error.args == ("admission cancelled",)
+            ):
+                return OperationTerminal(
+                    identity, OperationTerminalStatus.CANCELLED,
+                )
+            raise
         source = _average_source_from_syntax(request.source_syntax)
         reduction = _average_reduction_from_syntax(request.reduction_syntax)
         background = _average_background_from_syntax(request.background_syntax)
@@ -523,6 +545,35 @@ class OperationSlot:
             plan, cancel_token=cancelled,
             progress_callback=lambda done, total: publish("metadata", done, total))
         return self._analysis_terminal(identity, result, MetadataTableResult)
+
+    def begin_metadata_requalification(
+        self, plan: object, stamp: OperationContextStamp,
+    ) -> OperationIdentity | None:
+        from xrd_tools.analysis.scan_operations import (
+            MetadataTableRequalificationPlan,
+        )
+        return (
+            self._begin(plan, stamp, self._run_metadata_requalification)
+            if type(plan) is MetadataTableRequalificationPlan else None
+        )
+
+    def _run_metadata_requalification(
+        self, plan, identity, cancelled, publish,
+    ):
+        from xrd_tools.analysis.scan_operations import (
+            MetadataTableRequalificationResult,
+            run_metadata_table_requalification,
+        )
+        result = run_metadata_table_requalification(
+            plan,
+            cancel_token=cancelled,
+            progress_callback=lambda done, total: publish(
+                "metadata_requalification", done, total
+            ),
+        )
+        return self._analysis_terminal(
+            identity, result, MetadataTableRequalificationResult
+        )
 
     def begin_scan_plot(self, plan: object, table: object, roi_result: object,
                         stamp: OperationContextStamp):

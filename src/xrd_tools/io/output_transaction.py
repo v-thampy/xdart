@@ -303,12 +303,71 @@ class StreamCheckpoint:
 
 @dataclass(frozen=True)
 class StreamTerminal:
-    """Full-content descriptor seal made only after terminal writer close."""
+    """Writer terminal receipt, optionally bound to an exact file object."""
 
     target: str
     size: int
     digest: str
     ordinal: int
+    device: int | None = None
+    inode: int | None = None
+    mtime_ns: int | None = None
+    ctime_ns: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.target) is not str
+            or not self.target
+            or type(self.size) is not int
+            or self.size < 0
+            or type(self.digest) is not str
+            or len(self.digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.digest
+            )
+            or type(self.ordinal) is not int
+            or self.ordinal < 1
+            or not (
+                all(value is None for value in (
+                    self.device, self.inode, self.mtime_ns, self.ctime_ns,
+                ))
+                or all(
+                    type(value) is int and value >= 0
+                    for value in (
+                        self.device,
+                        self.inode,
+                        self.mtime_ns,
+                        self.ctime_ns,
+                    )
+                )
+            )
+        ):
+            raise TypeError("stream terminal seal is invalid")
+
+
+def stream_terminal_object_revision(
+    value: object,
+) -> tuple[int, int, int, int, int] | None:
+    """Return the exact stat identity carried by a modern terminal seal."""
+
+    if type(value) is not StreamTerminal or not all(
+        type(item) is int and item >= 0
+        for item in (
+            value.device,
+            value.inode,
+            value.mtime_ns,
+            value.ctime_ns,
+        )
+    ):
+        return None
+    return (
+        value.device,
+        value.inode,
+        value.size,
+        value.mtime_ns,
+        value.ctime_ns,
+    )
 
 
 @dataclass(frozen=True)
@@ -454,6 +513,52 @@ def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot
 def capture_target_snapshot(path: Path | str) -> TargetSnapshot:
     """Return one stable, content-sensitive observation without ownership."""
     return _capture_target(os.path.realpath(os.fspath(path)))
+
+
+def revalidate_stream_terminal(
+    path: Path | str,
+    terminal: StreamTerminal,
+) -> TargetSnapshot:
+    """Revalidate one writer-bound terminal object without rehashing it."""
+
+    if type(terminal) is not StreamTerminal:
+        raise TypeError("terminal revalidation requires exact StreamTerminal")
+    target = _normalize_target(path)
+    if target != terminal.target:
+        raise TargetChanged("stream terminal target does not match browse path")
+    expected = stream_terminal_object_revision(terminal)
+    if expected is None:
+        raise TargetChanged("stream terminal lacks an exact object revision")
+    try:
+        descriptor = os.open(target, os.O_RDONLY)
+    except OSError as exc:
+        raise TargetChanged(
+            f"stream terminal target is unavailable: {target}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        try:
+            named = os.stat(target)
+        except OSError as exc:
+            raise TargetChanged(
+                f"stream terminal pathname is unavailable: {target}"
+            ) from exc
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if any(
+        _stat_identity(observed) != expected
+        for observed in (before, named, after)
+    ):
+        raise TargetChanged("stream terminal object changed before browse")
+    return TargetSnapshot(
+        True,
+        terminal.size,
+        terminal.mtime_ns,
+        terminal.device,
+        terminal.inode,
+        terminal.digest,
+    )
 
 
 def _identity(snapshot: TargetSnapshot) -> _FileIdentity | None:
@@ -2653,6 +2758,10 @@ class OutputTransaction:
                 int(receipt.snapshot.size or 0),
                 str(receipt.snapshot.digest),
                 terminal_stat.ordinal,
+                terminal_stat.identity.device,
+                terminal_stat.identity.inode,
+                terminal_stat.mtime_ns,
+                terminal_stat.ctime_ns,
             )
 
     def commit_stream_epoch(
@@ -3670,6 +3779,8 @@ __all__ = [
     "TargetLease",
     "TargetSnapshot",
     "capture_target_snapshot",
+    "revalidate_stream_terminal",
+    "stream_terminal_object_revision",
     "TransactionPhase",
     "TransactionSnapshot",
     "TransactionStateError",

@@ -19,6 +19,7 @@ from .shell_values import (
 
 
 _USER_ROLE = int(QtCore.Qt.ItemDataRole.UserRole)
+_DIRECTORY_ROLE = _USER_ROLE + 1
 _ACCUMULATING_PLOT_MODES = frozenset(
     {"Overlay", "Waterfall", "Sum", "Average"}
 )
@@ -541,6 +542,7 @@ class BrowserView(QtWidgets.QFrame):
             for scan in state.scans:
                 item = QtWidgets.QListWidgetItem(scan.label)
                 item.setData(_USER_ROLE, scan.identifier)
+                item.setData(_DIRECTORY_ROLE, scan.is_directory)
                 item.setToolTip(scan.detail)
                 self.scans.addItem(item)
             self._scans = state.scans
@@ -629,6 +631,11 @@ class BrowserView(QtWidgets.QFrame):
             self._emit(
                 ShellCommandKind.SELECT_SCAN,
                 items[0].data(_USER_ROLE),
+                path=(
+                    "directory"
+                    if items[0].data(_DIRECTORY_ROLE)
+                    else "artifact",
+                ),
             )
 
     def _frames_selected(
@@ -835,8 +842,10 @@ class BrowserView(QtWidgets.QFrame):
         self._frame_pointer_current = None
         self._frame_range_anchor = None
 
-    def _emit(self, kind: ShellCommandKind, value=None) -> None:
-        self.commandRequested.emit(ShellCommand(kind, value))
+    def _emit(
+        self, kind: ShellCommandKind, value=None, *, path: tuple[str, ...] = (),
+    ) -> None:
+        self.commandRequested.emit(ShellCommand(kind, value, path=path))
 
 
 def _same_frame_identities(

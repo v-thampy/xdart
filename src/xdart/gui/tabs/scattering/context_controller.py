@@ -20,7 +20,7 @@ from xdart.modules.display_context import (
     Viewer1DContext,
 )
 from xrd_tools.io.viewer_1d import Viewer1DFormatPolicy
-from xrd_tools.io.output_transaction import TargetSnapshot
+from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot
 from xrd_tools.io.viewer_2d import (
     CATALOG_RESERVATION, Viewer2DFormatPolicy,
     viewer_2d_memory_ledger, viewer_2d_selected_ledger,
@@ -442,6 +442,24 @@ class ContextController:
     def browse_pending(self) -> bool:
         return self._browse_request is not None or self._cleanup_receipt is not None
 
+    def owns_browse_request(self, request: BrowseLoadRequest) -> bool:
+        """Whether an exact Browse request is still live in any owner."""
+
+        if type(request) is not BrowseLoadRequest:
+            return False
+        cleanup = self._cleanup_receipt
+        context = self._runtime.browse_context
+        return bool(
+            self._browse_request is request
+            or (cleanup is not None and cleanup.request is request)
+            or (
+                context is not None
+                and context.load_request is request
+                and not context.released
+            )
+            or self._browse_loader.owns_request(request)
+        )
+
     def capture_reintegrate_browse(self):
         context, selection = self._runtime.browse_context, self._runtime.selection
         request = None if context is None else context.load_request
@@ -454,10 +472,20 @@ class ContextController:
         if current is None or current[0] is not context or current[1] is not request or current[2] is not selection or current[3:] != (target, entry, snapshot, labels): return False
         self._runtime.invalidate_browse(); return True
 
-    def reload_reintegrate_browse(self, request, target):
+    def reload_reintegrate_browse(
+        self,
+        request,
+        target,
+        *,
+        terminal_commit_identity: StreamTerminal | None = None,
+    ):
         context, selection = self._runtime.browse_context, self._runtime.selection
         if (type(request) is not BrowseLoadRequest or type(target) is not str or type(context) is not BrowseContext or context.load_request is not request or context.requested_path != target or not context.invalidated or context.released or type(selection) is not DisplaySelection or not selection.names(context) or self._browse_request is not None): return None
-        try: return self.begin_browse(target)
+        try:
+            return self.begin_browse(
+                target,
+                terminal_commit_identity=terminal_commit_identity,
+            )
         except RuntimeError: return None
 
     @property
@@ -751,6 +779,21 @@ class ContextController:
             return False
         return self._runtime.commit_navigation_projection(
             presented_frames
+        )
+
+    def commit_rebound_navigation_projection(
+        self,
+        presented_frames: tuple[DisplayFrameKey, ...],
+        *,
+        preferences: ScientificPreferences,
+        processing_mode: str,
+    ) -> bool:
+        if self._closed:
+            return False
+        return self._runtime.commit_rebound_navigation_projection(
+            presented_frames,
+            preferences=preferences,
+            processing_mode=processing_mode,
         )
 
     def qualify_display_event(
@@ -1311,7 +1354,12 @@ class ContextController:
             raise RuntimeError("Browse cleanup remains pending")
         self._runtime.clear_browse(select_acquisition=False)
 
-    def begin_browse(self, source_path: str) -> BrowseLoadRequest:
+    def begin_browse(
+        self,
+        source_path: str,
+        *,
+        terminal_commit_identity: StreamTerminal | None = None,
+    ) -> BrowseLoadRequest:
         if self.viewer_1d_owned:
             raise RuntimeError("1D Viewer cleanup remains pending")
         if self.viewer_2d_owned:
@@ -1324,14 +1372,34 @@ class ContextController:
             or not self._browse_lifecycle_admissible()
             or type(source_path) is not str
             or not source_path
+            or (
+                terminal_commit_identity is not None
+                and type(terminal_commit_identity) is not StreamTerminal
+            )
         ):
             raise RuntimeError("Browse is not allowed in the current lifecycle")
-        source_path = str(Path(source_path).resolve())
+        if terminal_commit_identity is None:
+            source_path = os.path.normcase(os.path.abspath(os.path.expanduser(
+                source_path
+            )))
+        else:
+            requested = os.path.normcase(os.path.abspath(os.path.expanduser(
+                source_path
+            )))
+            sealed = os.path.normcase(os.path.abspath(os.path.expanduser(
+                terminal_commit_identity.target
+            )))
+            if sealed != terminal_commit_identity.target or requested != sealed:
+                raise RuntimeError(
+                    "Terminal Browse target does not match its writer seal"
+                )
+            source_path = sealed
         generation = self._load_generation + 1
         request = BrowseLoadRequest(
             new_context_token(ContextKind.BROWSE),
             generation,
             source_path,
+            terminal_commit_identity,
         )
         accepted = self._browse_loader.begin(request)
         if accepted is not request:

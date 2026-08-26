@@ -23,7 +23,10 @@ from xdart.gui.tabs.scattering.browser_catalog import (
 from xdart.gui.tabs.scattering.browser_view import BrowserView
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import RunIdentity
-from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.page import (
+    ScatteringWorkspace,
+    _browser_suffixes_for_mode,
+)
 from xdart.gui.tabs.scattering.shell_projection import (
     build_browser_projection,
 )
@@ -603,6 +606,9 @@ def test_browser_catalog_uses_exact_normal_and_viewer_suffix_policies(
     assert labels(SUPPORTED_VIEWER_SUFFIXES) == (
         "..", "image.tif", "nested/", "scan.nexus",
     )
+    assert _browser_suffixes_for_mode("1D Viewer") == SUPPORTED_VIEWER_1D_SUFFIXES
+    assert _browser_suffixes_for_mode("2D Viewer") == SUPPORTED_VIEWER_SUFFIXES
+    assert _browser_suffixes_for_mode("Int 2D") is None
 
 
 def test_deleted_processed_directory_retains_parent_navigation(
@@ -809,6 +815,43 @@ def test_browser_projection_borrows_only_inflight_artifact_keys() -> None:
         )
     )
     assert navigation.frames is keys
+
+
+def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    navigation = FrameNavigationProjection()
+    projected = build_browser_projection(
+        contexts=(),
+        selection=None,
+        navigation=navigation,
+        browser_directory="/out",
+        date_sorted=False,
+        auto_last=True,
+        catalog=(
+            BrowserCatalogEntry("/out/subdir", "subdir/", 2, True),
+            BrowserCatalogEntry("/out/result.nxs", "result.nxs", 1),
+        ),
+    )
+    assert tuple(scan.is_directory for scan in projected.scans) == (True, False)
+
+    browser = BrowserView()
+    commands = []
+    browser.commandRequested.connect(commands.append)
+    try:
+        browser.reconcile(projected, navigation, plot_mode="Single")
+        for row, expected in enumerate(("directory", "artifact")):
+            blocker = QtCore.QSignalBlocker(browser.scans)
+            browser.scans.setCurrentRow(row)
+            del blocker
+            browser._scan_selected()
+            assert commands[-1] == ShellCommand(
+                ShellCommandKind.SELECT_SCAN,
+                projected.scans[row].identifier,
+                path=(expected,),
+            )
+    finally:
+        browser.deleteLater()
+        app.processEvents()
 
 
 def test_authoritative_catalog_does_not_resurrect_historical_navigation(
@@ -1457,6 +1500,146 @@ def test_terminal_transient_is_retained_until_catalog_barrier(
         assert page._browser_transient_clear_token is None
         assert refreshes and refreshes[-1] is True
     finally:
+        page.close_workspace()
+        page.deleteLater()
+        app.processEvents()
+
+
+def test_browser_catalog_cooperatively_stops_mid_enumeration(
+    tmp_path, monkeypatch,
+) -> None:
+    cancelled = Event()
+    stats = []
+
+    class _Entry:
+        path = str(tmp_path / "first.nxs")
+        def stat(self):
+            stats.append(self.path)
+            cancelled.set()
+            return SimpleNamespace(
+                st_mode=browser_catalog_module.stat.S_IFREG,
+                st_mtime_ns=1,
+            )
+
+    class _Scan:
+        def __enter__(self):
+            return iter((_Entry(), _Entry()))
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(browser_catalog_module.os, "scandir", lambda _root: _Scan())
+
+    assert enumerate_processed_artifacts(
+        str(tmp_path), accepted_suffixes=frozenset({".nxs"}),
+        cancelled=cancelled,
+    ) == ()
+    assert stats == [str(tmp_path / "first.nxs")]
+
+
+def test_browser_catalog_active_plus_latest_queued_never_publishes_stale(
+    tmp_path, monkeypatch,
+) -> None:
+    import xdart.gui.tabs.scattering.page as page_module
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    for name in ("a", "b", "c"):
+        (tmp_path / name).mkdir()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(save_path=str(tmp_path))),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+    )
+    entered = Event()
+    release = Event()
+    calls = []
+
+    def wait_for(predicate) -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if predicate():
+                return
+            time.sleep(0.005)
+        raise AssertionError("catalog latest-only handoff did not settle")
+
+    def catalog(directory, **_kwargs):
+        calls.append(directory)
+        if directory.endswith("/a"):
+            entered.set()
+            assert release.wait(timeout=5.0)
+        return (BrowserCatalogEntry(
+            str(Path(directory) / "result.nxs"), Path(directory).name, 1,
+        ),)
+
+    try:
+        wait_for(lambda: page._browser_catalog_operation is None)
+        monkeypatch.setattr(page_module, "enumerate_processed_artifacts", catalog)
+        page._browser_directory = str(tmp_path / "a")
+        page._request_browser_catalog()
+        assert entered.wait(timeout=5.0)
+        page._browser_directory = str(tmp_path / "b")
+        page._request_browser_catalog()
+        page._browser_directory = str(tmp_path / "c")
+        latest = page._request_browser_catalog()
+        assert latest is page._browser_catalog_queued
+        assert latest.directory == str(tmp_path / "c")
+        release.set()
+        wait_for(lambda: page._browser_catalog_operation is None)
+        assert calls == [str(tmp_path / "a"), str(tmp_path / "c")]
+        assert tuple(entry.label for entry in page._browser_catalog) == ("c",)
+    finally:
+        release.set()
+        page.close_workspace()
+        page.deleteLater()
+        app.processEvents()
+
+
+def test_browser_catalog_cancel_is_nonblocking_until_exact_future_retires(
+    tmp_path, monkeypatch,
+) -> None:
+    import xdart.gui.tabs.scattering.page as page_module
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    selected = tmp_path / "blocked"
+    selected.mkdir()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(save_path=str(tmp_path))),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+    )
+    entered = Event()
+    release = Event()
+
+    def wait_for(predicate) -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if predicate():
+                return
+            time.sleep(0.005)
+        raise AssertionError("catalog cancellation did not settle")
+
+    def blocked(_directory, **_kwargs):
+        entered.set()
+        assert release.wait(timeout=5.0)
+        return ()
+
+    try:
+        wait_for(lambda: page._browser_catalog_operation is None)
+        monkeypatch.setattr(page_module, "enumerate_processed_artifacts", blocked)
+        page._browser_directory = str(selected)
+        page._request_browser_catalog()
+        assert entered.wait(timeout=5.0)
+        started = time.monotonic()
+        assert page._cancel_browser_catalog() is False
+        assert time.monotonic() - started < 0.2
+        release.set()
+        wait_for(lambda: (
+            page._browser_catalog_operation is None
+            or page._browser_catalog_operation.future.done()
+        ))
+        assert page._cancel_browser_catalog() is True
+        assert page._browser_catalog_operation is None
+    finally:
+        release.set()
         page.close_workspace()
         page.deleteLater()
         app.processEvents()

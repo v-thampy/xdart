@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from xrd_tools.io.output_transaction import StreamTerminal
+
 from .events import (
     CleanupStatus,
     DetachedDiagnostic,
@@ -26,6 +28,7 @@ class BrowseLoadRequest:
     token: str
     load_generation: int
     source_path: str
+    terminal_commit_identity: StreamTerminal | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -35,6 +38,10 @@ class BrowseLoadRequest:
             or self.load_generation < 1
             or type(self.source_path) is not str
             or not self.source_path
+            or (
+                self.terminal_commit_identity is not None
+                and type(self.terminal_commit_identity) is not StreamTerminal
+            )
         ):
             raise TypeError("browse load request is invalid")
 

@@ -308,6 +308,32 @@ class TestReadImageMetadata:
         assert dict(observed.values) == {}
         assert observed.source_path is None
 
+    def test_observed_metadata_rejects_candidate_created_during_discovery(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        clear_auto_sidecar_cache,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        candidate = image.with_suffix(".txt")
+
+        def create_after_initial_fence(*_args, **_kwargs):
+            candidate.write_text(_TXT_CONTENT, encoding="utf-8")
+            return metadata_module.ImageMetadataRead({}, None)
+
+        monkeypatch.setattr(
+            metadata_module,
+            "_read_auto_metadata_observed",
+            create_after_initial_fence,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="metadata discovery changed during read",
+        ):
+            read_image_metadata_observed(image, meta_format="auto")
+
     def test_unknown_format_returns_empty(self, tmp_path: Path) -> None:
         image = tmp_path / "scan_0001.tif"
         image.touch()

@@ -575,6 +575,66 @@ def test_preparation_metadata_row_drift_refuses_before_key_identity_derivation(t
                      ("execution", "theta"), ("requalify", "theta")]
 
 
+@pytest.mark.parametrize("metadata_format", ("txt", "auto"))
+def test_average_rejects_selected_sidecar_foreign_snapshot_then_restore(
+    tmp_path, monkeypatch, metadata_format,
+) -> None:
+    """The second qualification read must not adopt briefly foreign bytes."""
+
+    from xrd_tools.io import metadata as metadata_io
+    from xrd_tools.sources import execution_graph
+
+    source = _series(tmp_path, (np.ones((2, 2), dtype=np.uint16),))
+    image = Path(source.options["files"][0])
+    _txt(image, counters=(("I0", 2.0),))
+    sidecar = image.with_suffix(".txt")
+    original = sidecar.read_bytes()
+    foreign = original.replace(b"I0 = 2.0", b"I0 = 9.0")
+    assert foreign != original
+    source = SourceSpec(source.uri, source.kind, options={
+        **dict(source.options), "metadata_format": metadata_format,
+    })
+    metadata_io._AUTO_SIDECAR_CACHE.clear()
+    real_snapshot = metadata_io._bounded_metadata_snapshot
+    snapshots = []
+
+    def transient_snapshot(path, limit, *, _with_revision=False):
+        if Path(path) != sidecar:
+            return real_snapshot(
+                path, limit, _with_revision=_with_revision,
+            )
+        snapshots.append(1)
+        if len(snapshots) != 2:
+            return real_snapshot(
+                path, limit, _with_revision=_with_revision,
+            )
+        sidecar.write_bytes(foreign)
+        try:
+            return real_snapshot(
+                path, limit, _with_revision=_with_revision,
+            )
+        finally:
+            sidecar.write_bytes(original)
+
+    adopted = []
+    monkeypatch.setattr(
+        metadata_io, "_bounded_metadata_snapshot", transient_snapshot,
+    )
+    monkeypatch.setattr(
+        execution_graph, "_finite_motors",
+        lambda values: adopted.append(dict(values)) or {},
+    )
+    with pytest.raises(OSError, match="metadata source changed during read"):
+        module.prepare_average_scan(AverageScanRecipe(
+            source, tmp_path / f"average-{metadata_format}.nxs",
+            ReductionPlan(integration_1d=Integration1DPlan(npt=2)),
+            numeric_metadata_keys=("I0",),
+        ))
+    assert snapshots == [1, 1]
+    assert adopted == []
+    assert sidecar.read_bytes() == original
+
+
 def test_metadata_key_domains_refuse_duplicate_and_overlap_before_effects(tmp_path) -> None:
     with pytest.raises(ValueError, match="duplicate|overlap"):
         AverageScanRecipe(_series(tmp_path), tmp_path / "a.nxs", ReductionPlan(), numeric_metadata_keys=("I0", "I0"))
@@ -647,22 +707,133 @@ def test_average_static_mask_decode_is_bound_to_authenticated_bytes(
         _series(tmp_path), tmp_path / "average.nxs", ReductionPlan(),
         calibration=calibration,
     )
-    decode = module._decode_static_mask_bytes
+    decode = module._decode_static_mask_snapshot
     observed = []
 
-    def mutate_then_decode(path, payload):
-        observed.append(payload)
+    def mutate_then_decode(path):
+        observed.append((path, path.read_bytes()))
         write_mask(replacement)
-        return decode(path, payload)
+        return decode(path)
 
-    monkeypatch.setattr(module, "_decode_static_mask_bytes", mutate_then_decode)
+    monkeypatch.setattr(
+        module, "_decode_static_mask_snapshot", mutate_then_decode,
+    )
 
     actual = module._load_static_mask(recipe, expected.shape)
 
-    assert observed == [accepted_payload]
+    assert len(observed) == 1
+    assert observed[0][0] != mask_path
+    assert observed[0][1] == accepted_payload
+    assert not observed[0][0].exists()
     assert hashlib.sha256(mask_path.read_bytes()).hexdigest() != calibration.mask.sha256
     assert not actual.flags.writeable
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_average_static_mask_limit_scales_and_refuses_before_decode(
+    tmp_path, monkeypatch,
+) -> None:
+    large_shape = (4096, 4096)
+    assert module._static_mask_snapshot_limit(large_shape) == (
+        8 * np.prod(large_shape) + module._STATIC_MASK_HEADER_ALLOWANCE_BYTES
+    )
+    assert module._static_mask_snapshot_limit(large_shape) > 64 << 20
+
+    mask_path = tmp_path / "oversize.npy"
+    mask_path.write_bytes(b"five!")
+    calibration = CalibrationState(mask=MaskState(
+        str(mask_path), hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+        np.dtype(bool).str, (1, 1), FactStatus.PRESENT,
+    ))
+    recipe = AverageScanRecipe(
+        _series(tmp_path), tmp_path / "average.nxs", ReductionPlan(),
+        calibration=calibration,
+    )
+    monkeypatch.setattr(module, "_static_mask_snapshot_limit", lambda _shape: 4)
+    monkeypatch.setattr(
+        module, "_qualify_static_mask_snapshot",
+        lambda *_a: pytest.fail("oversize mask reached header qualification"),
+    )
+    monkeypatch.setattr(
+        module, "_decode_static_mask_snapshot",
+        lambda *_a: pytest.fail("oversize mask reached pixel decoder"),
+    )
+
+    with pytest.raises(ValueError, match="AVERAGE_STATIC_MASK_FILE_TOO_LARGE"):
+        module._load_static_mask(recipe, (1, 1))
+
+
+def test_average_static_mask_copy_cancellation_cleans_stream_and_snapshot(
+    tmp_path, monkeypatch,
+) -> None:
+    from threading import Event
+
+    shape = (2048, 1024)
+    mask_path = tmp_path / "cancel-mask.npy"
+    np.save(mask_path, np.zeros(shape, dtype=np.uint8))
+    calibration = CalibrationState(mask=MaskState(
+        str(mask_path),
+        hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+        np.dtype(bool).str,
+        shape,
+        FactStatus.PRESENT,
+    ))
+    recipe = AverageScanRecipe(
+        _series(tmp_path), tmp_path / "average.nxs", ReductionPlan(),
+        calibration=calibration,
+    )
+    token = Event()
+    opened = []
+    temporary_roots = []
+    real_open = Path.open
+    real_temporary = module.tempfile.TemporaryDirectory
+
+    class CancellingSource:
+        def __init__(self, stream):
+            self.stream = stream
+            self.closed = False
+        def read(self, size=-1):
+            payload = self.stream.read(size)
+            token.set()
+            return payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            self.closed = True
+            self.stream.close()
+
+    def controlled_open(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if Path(path) == mask_path and mode == "rb":
+            proxy = CancellingSource(stream)
+            opened.append(proxy)
+            return proxy
+        return stream
+
+    def tracked_temporary(*args, **kwargs):
+        owner = real_temporary(*args, **kwargs)
+        temporary_roots.append(Path(owner.name))
+        return owner
+
+    monkeypatch.setattr(Path, "open", controlled_open)
+    monkeypatch.setattr(
+        module.tempfile, "TemporaryDirectory", tracked_temporary,
+    )
+    monkeypatch.setattr(
+        module, "_decode_static_mask_snapshot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cancelled mask snapshot entered the decoder"
+        ),
+    )
+
+    with pytest.raises(module._AverageCancelled):
+        module._load_static_mask(recipe, shape, token)
+
+    assert len(opened) == 1 and opened[0].closed
+    assert temporary_roots and all(
+        not root.exists() for root in temporary_roots
+    )
 
 
 def test_source_science_and_operation_identity_domains_vary_independently(tmp_path) -> None:

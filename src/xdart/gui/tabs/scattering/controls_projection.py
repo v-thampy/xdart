@@ -152,6 +152,13 @@ def project_controls(
     fields = [
         candidate for candidate in fields
         if candidate.path not in gi_paths and candidate.path != SOURCE_ENERGY
+        and (
+            candidate.path != AVERAGE_SCAN
+            or (
+                tool in {Tool.INT_1D, Tool.INT_2D}
+                and processing_mode != "Int 1D (XYE)"
+            )
+        )
     ]
     gi_fields = ()
     if intent.gi.enabled:

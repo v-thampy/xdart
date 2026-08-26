@@ -26,7 +26,7 @@ __all__ = [
 ]
 
 MetadataValue = int | float | str
-MetadataSourceRevision = tuple[int, int, int, int, int]
+MetadataSourceRevision = tuple[int, int, int, int, int, int]
 
 
 class MetadataInputTooLarge(ValueError):
@@ -49,6 +49,9 @@ class ImageMetadataRead:
     values: Mapping[str, MetadataValue]
     source_path: Path | None
     source_revision: MetadataSourceRevision | None = None
+    discovery_revisions: tuple[
+        tuple[Path, MetadataSourceRevision | None], ...
+    ] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -58,18 +61,139 @@ class ImageMetadataRead:
         )
         if self.source_path is not None:
             object.__setattr__(self, "source_path", Path(self.source_path))
+        discovery_revisions = tuple(
+            (Path(path), revision)
+            for path, revision in self.discovery_revisions
+        )
+        if len({path for path, _revision in discovery_revisions}) != len(
+            discovery_revisions
+        ):
+            raise ValueError("discovery revisions must have unique paths")
+        for _path, observed_revision in discovery_revisions:
+            if observed_revision is not None:
+                _validate_metadata_revision(observed_revision)
+        object.__setattr__(
+            self, "discovery_revisions", discovery_revisions,
+        )
         revision = self.source_revision
         if revision is not None:
             if self.source_path is None:
                 raise ValueError("source_revision requires source_path")
-            if (
-                type(revision) is not tuple
-                or len(revision) != 5
-                or any(type(value) is not int or value < 0 for value in revision)
-            ):
-                raise TypeError(
-                    "source_revision must be five nonnegative exact integers"
+            _validate_metadata_revision(revision)
+
+
+def _validate_metadata_revision(revision: object) -> None:
+    if (
+        type(revision) is not tuple
+        or len(revision) != 6
+        or any(type(value) is not int or value < 0 for value in revision)
+    ):
+        raise TypeError(
+            "metadata revision must be six nonnegative exact integers"
+        )
+
+
+def _lexical_absolute(path: Path | str) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _metadata_discovery_paths(
+    image_path: Path, meta_format: str, meta_dir: Path | str | None,
+) -> tuple[Path, ...]:
+    if meta_format == "spec":
+        candidates = (
+            *((_lexical_absolute(meta_dir),) if meta_dir not in (None, "") else ()),
+            image_path.parent,
+            image_path.parent.parent,
+            image_path.parent.parent.parent,
+        )
+    else:
+        candidates = (image_path.parent,)
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        lexical = _lexical_absolute(candidate)
+        if lexical not in seen:
+            seen.add(lexical)
+            ordered.append(lexical)
+    return tuple(ordered)
+
+
+def _metadata_path_revision(
+    path: Path,
+) -> MetadataSourceRevision | None:
+    try:
+        state = path.stat()
+    except OSError:
+        return None
+    return (
+        int(state.st_mode), int(state.st_dev), int(state.st_ino),
+        int(state.st_size), int(state.st_mtime_ns), int(state.st_ctime_ns),
+    )
+
+
+def _metadata_discovery_revisions(
+    image_path: Path, meta_format: str, meta_dir: Path | str | None,
+) -> tuple[tuple[Path, MetadataSourceRevision | None], ...]:
+    paths = list(_metadata_discovery_paths(
+        image_path, meta_format, meta_dir,
+    ))
+    if meta_format == "auto":
+        paths.extend(
+            candidate
+            for candidate, _convention, _suffix
+            in _iter_auto_sidecar_candidates(image_path)
+        )
+    ordered: list[tuple[Path, MetadataSourceRevision | None]] = []
+    seen: set[Path] = set()
+    for candidate in paths:
+        lexical = _lexical_absolute(candidate)
+        if lexical in seen:
+            continue
+        seen.add(lexical)
+        ordered.append((lexical, _metadata_path_revision(lexical)))
+    return tuple(ordered)
+
+
+def _with_discovery_revisions(
+    result: ImageMetadataRead,
+    discovery_revisions: tuple[
+        tuple[Path, MetadataSourceRevision | None], ...
+    ],
+) -> ImageMetadataRead:
+    if result.source_path is not None:
+        if (
+            result.source_revision is None
+            or _metadata_path_revision(result.source_path)
+            != result.source_revision
+        ):
+            raise OSError(
+                f"metadata source changed during read: {result.source_path}"
+            )
+    combined = (*discovery_revisions, *result.discovery_revisions)
+    ordered: list[tuple[Path, MetadataSourceRevision | None]] = []
+    seen: dict[Path, MetadataSourceRevision | None] = {}
+    for path, revision in combined:
+        if path in seen:
+            if seen[path] != revision:
+                raise OSError(
+                    f"metadata discovery changed during read: {path}"
                 )
+            continue
+        seen[path] = revision
+        ordered.append((path, revision))
+    unique = tuple(ordered)
+    for path, revision in unique:
+        if _metadata_path_revision(path) != revision:
+            raise OSError(
+                f"metadata discovery changed during read: {path}"
+            )
+    return ImageMetadataRead(
+        result.values,
+        result.source_path,
+        result.source_revision,
+        unique,
+    )
 
 _STRUCTURED_SIDECAR_MIN_PAIRS = 3
 _AUTO_SIDECAR_CACHE: dict[tuple[Path, str], tuple[str, str]] = {}
@@ -391,7 +515,7 @@ def _bounded_metadata_snapshot(
     if _with_revision:
         return payload, (
             int(after.st_mode), int(after.st_dev), int(after.st_ino),
-            int(after.st_size), int(after.st_mtime_ns),
+            int(after.st_size), int(after.st_mtime_ns), int(after.st_ctime_ns),
         )
     return payload
 
@@ -421,6 +545,8 @@ def _read_auto_candidate_metadata(
         path, max_input_bytes, _with_revision=True,
     )
     snapshot, revision = (None, None) if observed is None else observed
+    if revision is None:
+        revision = _metadata_path_revision(path)
     if ext == "txt":
         metadata = read_txt_metadata(
             path, _snapshot_bytes=snapshot,
@@ -816,7 +942,7 @@ def read_image_metadata_observed(
     provenance owners that must retain the file actually consumed.
     """
 
-    image_path = Path(image_path)
+    image_path = _lexical_absolute(image_path)
 
     # Normalise case so callers can pass "SPEC" / "Spec" / "spec"
     # interchangeably — xdart's UI surfaces the value as "SPEC" in
@@ -827,10 +953,16 @@ def read_image_metadata_observed(
     meta_format_norm = (
         "auto" if meta_format is None else str(meta_format).strip().lower()
     )
+    discovery_revisions = _metadata_discovery_revisions(
+        image_path, meta_format_norm, meta_dir,
+    )
 
     if meta_format_norm == "auto":
-        return _read_auto_metadata_observed(
-            image_path, max_input_bytes=max_input_bytes,
+        return _with_discovery_revisions(
+            _read_auto_metadata_observed(
+                image_path, max_input_bytes=max_input_bytes,
+            ),
+            discovery_revisions,
         )
 
     if meta_format_norm in ("txt", "pdi"):
@@ -841,21 +973,31 @@ def read_image_metadata_observed(
                 meta_format_norm,
                 image_path,
             )
-            return ImageMetadataRead({}, None)
+            return _with_discovery_revisions(
+                ImageMetadataRead({}, None), discovery_revisions,
+            )
         observed = _bounded_metadata_snapshot(
             sidecar, max_input_bytes, _with_revision=True,
         )
         snapshot, revision = (None, None) if observed is None else observed
+        if revision is None:
+            revision = _metadata_path_revision(sidecar)
         if meta_format_norm == "txt":
-            return ImageMetadataRead(
-                read_txt_metadata(sidecar, _snapshot_bytes=snapshot),
+            return _with_discovery_revisions(
+                ImageMetadataRead(
+                    read_txt_metadata(sidecar, _snapshot_bytes=snapshot),
+                    sidecar,
+                    revision,
+                ),
+                discovery_revisions,
+            )
+        return _with_discovery_revisions(
+            ImageMetadataRead(
+                read_pdi_metadata(sidecar, _snapshot_bytes=snapshot),
                 sidecar,
                 revision,
-            )
-        return ImageMetadataRead(
-            read_pdi_metadata(sidecar, _snapshot_bytes=snapshot),
-            sidecar,
-            revision,
+            ),
+            discovery_revisions,
         )
 
     if meta_format_norm == "spec":
@@ -864,10 +1006,13 @@ def read_image_metadata_observed(
         search_dir = (
             Path(meta_dir) if meta_dir not in (None, "") else None
         )
-        return _read_spec_metadata_observed(
-            image_path,
-            search_dir=search_dir,
-            max_input_bytes=max_input_bytes,
+        return _with_discovery_revisions(
+            _read_spec_metadata_observed(
+                image_path,
+                search_dir=search_dir,
+                max_input_bytes=max_input_bytes,
+            ),
+            discovery_revisions,
         )
 
     # Any other value is treated as a generic structured-sidecar extension.
@@ -875,7 +1020,9 @@ def read_image_metadata_observed(
     if sidecar is None:
         logger.debug("read_image_metadata: no %r sidecar found for %s",
                      meta_format, image_path)
-        return ImageMetadataRead({}, None)
+        return _with_discovery_revisions(
+            ImageMetadataRead({}, None), discovery_revisions,
+        )
     # BL-3: an EXPLICIT format is a deliberate user choice — accept a 1-2 field
     # sidecar (the AUTO min-pairs=3 plausibility gate does NOT apply here; before
     # this, 1-2-pair explicit sidecars were silently dropped with a misleading
@@ -884,14 +1031,22 @@ def read_image_metadata_observed(
         sidecar, max_input_bytes, _with_revision=True,
     )
     snapshot, revision = (None, None) if observed is None else observed
+    if revision is None:
+        revision = _metadata_path_revision(sidecar)
     metadata = _parse_structured_sidecar_if_plausible(
         sidecar, min_pairs=1, _snapshot_bytes=snapshot,
     )
     if metadata is not None:
-        return ImageMetadataRead(metadata, sidecar, revision)
+        return _with_discovery_revisions(
+            ImageMetadataRead(metadata, sidecar, revision),
+            discovery_revisions,
+        )
     logger.warning("read_image_metadata: %s (format %r) had no readable "
                    "key=value fields", sidecar, meta_format)
-    return ImageMetadataRead({}, sidecar, revision)
+    return _with_discovery_revisions(
+        ImageMetadataRead({}, sidecar, revision),
+        discovery_revisions,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1136,7 @@ def _read_spec_metadata_observed(
             spec_file, max_input_bytes, _with_revision=True,
         )
         if observed is None:
+            revision = _metadata_path_revision(spec_file)
             sf = SpecFile(str(spec_file))
             scan = sf[f"{scan_number}.1"]
             npts = scan.data.shape[1]
@@ -989,7 +1145,9 @@ def _read_spec_metadata_observed(
                         for label in scan.labels}
             motors = {name: float(scan.motor_position_by_name(name))
                       for name in scan.motor_names}
-            return ImageMetadataRead({**counters, **motors}, spec_file)
+            return ImageMetadataRead(
+                {**counters, **motors}, spec_file, revision,
+            )
         snapshot, revision = observed
 
         scratch_handle = None
@@ -1068,7 +1226,10 @@ def _read_spec_metadata_observed(
             image_path,
             exc_info=True,
         )
-        return ImageMetadataRead({}, spec_file)
+        return ImageMetadataRead(
+            {}, spec_file,
+            None if spec_file is None else _metadata_path_revision(spec_file),
+        )
 
 
 def _read_spec_metadata(

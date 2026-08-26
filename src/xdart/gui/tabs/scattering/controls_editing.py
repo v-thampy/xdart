@@ -15,7 +15,11 @@ from xrd_tools.session.intent_store import (
     RunIntentSnapshot,
     RunIntentStore,
 )
-from xrd_tools.session.readiness import INTEGRATION_CONTROL_SPECS
+from xrd_tools.session.readiness import (
+    INTEGRATION_CONTROL_SPECS,
+    Tool,
+    tool_from_mode_text,
+)
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
 
@@ -416,10 +420,12 @@ def reduce_control_edit(
             or intent.live_mode
             or intent.output_mode != "Overwrite"
             or intent.processing_mode == "Int 1D (XYE)"
+            or tool_from_mode_text(intent.processing_mode)
+            not in {Tool.INT_1D, Tool.INT_2D}
         ):
             return EditRefusal(
                 "Average Scan requires a finite image source, Overwrite "
-                "output, non-Live execution, and NeXus output."
+                "output, non-Live execution, and an integration mode."
             )
         current = intent.run_options.get("series_average", False)
         if type(current) is bool and current is value:

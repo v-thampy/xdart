@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import os
 
 import numpy as np
 
 from xrd_tools.core import Axis, FrameView
+from xrd_tools.io.output_transaction import (
+    StreamTerminal,
+    stream_terminal_object_revision,
+)
 
 from .events import CleanupStatus, DetachedDiagnostic, RunIdentity, detached_diagnostic_is_valid
 
@@ -212,6 +217,7 @@ class StandardRunEvent:
     files_pending: int = 0
     files_discovered: int = 0
     terminal_timing: StandardTerminalTiming | None = None
+    terminal_commit_identity: StreamTerminal | None = None
 
 @dataclass(frozen=True, slots=True)
 class StandardDisplayPayload:
@@ -270,6 +276,16 @@ def standard_event_is_valid(value: object, identity: RunIdentity) -> bool:
                         StandardEventKind.STOPPED,
                         StandardEventKind.FAILED,
                     }
+                )
+                and (
+                    value.terminal_commit_identity is None
+                    or _stream_terminal_is_valid(
+                        value.terminal_commit_identity,
+                    )
+                    and os.path.normcase(os.path.abspath(value.artifact))
+                    == value.terminal_commit_identity.target
+                    and value.kind is StandardEventKind.FINISHED
+                    and value.cleanup_status is CleanupStatus.CLEANED
                 ))
     except Exception:
         return False
@@ -336,6 +352,21 @@ def display_payload_is_valid(
 
 def _nonnegative_int(value: object) -> bool:
     return type(value) is int and value >= 0
+
+
+def _stream_terminal_is_valid(value: object) -> bool:
+    return (
+        type(value) is StreamTerminal
+        and type(value.target) is str
+        and bool(value.target)
+        and _nonnegative_int(value.size)
+        and type(value.digest) is str
+        and len(value.digest) == 64
+        and all(character in "0123456789abcdef" for character in value.digest)
+        and type(value.ordinal) is int
+        and value.ordinal >= 1
+        and stream_terminal_object_revision(value) is not None
+    )
 
 def _axis_is_valid(value: object) -> bool:
     return value is None or (type(value) is Axis and type(value.label) is str and type(value.unit) is str and _array_is_valid(value.values, 1))

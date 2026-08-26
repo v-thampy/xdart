@@ -31,9 +31,10 @@ from xrd_tools.sources.registry import guess_source_kind, open_source
 from xrd_tools.sources.selection import image_series_spec
 __all__ = [
     "AnalysisDisposition", "AnalysisSourceReceipt", "MetadataColumn", "MetadataTablePlan",
-    "MetadataTableResult", "ScanPlotPlan", "ScanPlotResult", "RoiPreviewPlan",
+    "MetadataTableResult", "MetadataTableRequalificationPlan",
+    "MetadataTableRequalificationResult", "ScanPlotPlan", "ScanPlotResult", "RoiPreviewPlan",
     "RoiPreviewResult", "RoiScanPlan", "RoiScanResult", "run_metadata_table",
-    "run_scan_plot", "run_roi_preview", "run_roi_scan",
+    "run_metadata_table_requalification", "run_scan_plot", "run_roi_preview", "run_roi_scan",
 ]
 _MAX_TABLE_ROWS, _MAX_TABLE_COLUMNS = 100_000, 128
 _MAX_CANDIDATES, _MAX_CANDIDATE_BYTES = 256, 1 << 20
@@ -47,7 +48,7 @@ _CANONICAL_TAGS = {
     bytes: 0x05, Path: 0x06, Enum: 0x07, tuple: 0x08,
     Mapping: 0x09, np.ndarray: 0x0A,
 }
-FileRevision = tuple[int, int, int, int, int]
+FileRevision = tuple[int, int, int, int, int, int]
 class InvalidCanonicalValue(ValueError):
     pass
 class AnalysisDisposition(str, Enum):
@@ -227,7 +228,12 @@ def _path_revision(path: Path) -> FileRevision | None:
         state = Path(path).stat()
     except OSError:
         return None
-    return (state.st_mode, state.st_dev, state.st_ino, state.st_size, state.st_mtime_ns)
+    return (
+        state.st_mode, state.st_dev, state.st_ino, state.st_size,
+        state.st_mtime_ns, state.st_ctime_ns,
+    )
+def _lexical_absolute(path: Path | str) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
 @dataclass(frozen=True, slots=True)
 class CandidateProjection:
     source_spec: SourceSpec
@@ -249,6 +255,9 @@ class AnalysisSourceReceipt:
     labels_digest: str
     catalog_digest: str
     metadata_observation_modes: tuple[str, ...]
+    dependency_revisions: tuple[
+        tuple[Path, Path, FileRevision | None], ...
+    ]
     source_fingerprint: str
 @dataclass(frozen=True, slots=True)
 class MetadataColumn:
@@ -287,6 +296,21 @@ class MetadataTableResult:
     policy_fingerprint: str = ""
     table_fingerprint: str = ""
     storage_bytes: int = 0
+@dataclass(frozen=True, slots=True)
+class MetadataTableRequalificationPlan:
+    receipt: AnalysisSourceReceipt
+    table_fingerprint: str
+    def __post_init__(self) -> None:
+        if type(self.receipt) is not AnalysisSourceReceipt:
+            raise TypeError("metadata requalification requires an exact receipt")
+        if type(self.table_fingerprint) is not str or not self.table_fingerprint:
+            raise ValueError("metadata requalification requires a table fingerprint")
+@dataclass(frozen=True, slots=True)
+class MetadataTableRequalificationResult:
+    disposition: AnalysisDisposition
+    code: str
+    receipt: AnalysisSourceReceipt | None = None
+    table_fingerprint: str = ""
 @dataclass(frozen=True, slots=True)
 class ScanPlotPlan:
     x: str | None = None
@@ -401,7 +425,7 @@ class _Snapshot:
     receipt: AnalysisSourceReceipt
     catalog: tuple[tuple[str, tuple[Any, ...]], ...]
     scanned: tuple[str, ...]
-    revisions: tuple[tuple[Path, FileRevision | None], ...]
+    revisions: tuple[tuple[Path, Path, FileRevision | None], ...]
 def _valid_cancel(token: threading.Event | None) -> bool:
     return token is None or type(token) is threading.Event
 def _notify(callback: Callable[[int, int], None] | None, done: int, total: int) -> None:
@@ -588,7 +612,7 @@ def _snapshot(
     selected_source: Any | None = None,
     selected_revision: FileRevision | None = None,
 ) -> _Snapshot:
-    lexical = Path(spec.uri).expanduser()
+    lexical = _lexical_absolute(spec.uri)
     resolved = lexical.resolve(strict=False)
     current = _path_revision(resolved)
     before = current if selected_revision is None else selected_revision
@@ -624,6 +648,7 @@ def _snapshot(
         value_floor_extra = 0
         modes: list[str] = []
         observed_states: list[Any] = []
+        discovery_states: list[tuple[Path, FileRevision | None]] = []
         member_states: list[tuple[Path, FileRevision | None]] = []
         member_revisions: dict[Path, FileRevision | None] = {}
         raw_facts: list[tuple[int, str | None, int | None, FileRevision | None]] = []
@@ -660,6 +685,10 @@ def _snapshot(
             if observed is not None and observed.source_path is not None and (
                 observed.source_revision is None or _path_revision(observed.source_path) != observed.source_revision
             ): raise _Refusal("SOURCE_REVISION_CHANGED")
+            if observed is not None:
+                discovery_states.extend(
+                    getattr(observed, "discovery_revisions", ())
+                )
             row = {} if observed is None else _metadata_row(observed.values)
             for _label in labels:
                 if cancel_token is not None and cancel_token.is_set():
@@ -688,6 +717,10 @@ def _snapshot(
                 if observed is not None and observed.source_path is not None and (
                     observed.source_revision is None or _path_revision(observed.source_path) != observed.source_revision
                 ): raise _Refusal("SOURCE_REVISION_CHANGED")
+                if observed is not None:
+                    discovery_states.extend(
+                        getattr(observed, "discovery_revisions", ())
+                    )
                 row = {} if observed is None else _metadata_row(observed.values)
                 if admitted_values:
                     admitted_path, motor, value = admitted_values[label - 1]
@@ -745,50 +778,76 @@ def _snapshot(
         post = _path_revision(resolved)
         if before != post:
             raise _Refusal("SOURCE_REVISION_CHANGED")
-        for path, revision in (value for value in observed_states if value is not None):
-            if path is not None and _path_revision(path) != revision:
-                raise _Refusal("SOURCE_REVISION_CHANGED")
-        if any(_path_revision(path) != revision for path, revision in member_states): raise _Refusal("SOURCE_REVISION_CHANGED")
         scanned_value = getattr(source, "scanned_axes", ())
         scanned_value = scanned_value() if callable(scanned_value) else scanned_value
         scanned = tuple(str(value) for value in (scanned_value or ()))
         source_spec_identity = (str(spec.uri), spec.kind, spec.metadata_uri,
                                 spec.entry, dict(spec.options))
+        dependency_revisions = _canonical_dependency_revisions(
+            lexical,
+            resolved,
+            post,
+            tuple(value for value in observed_states
+                  if value is not None and value[0] is not None)
+            + tuple(discovery_states)
+            + tuple(member_states),
+        )
         source_identity = (
-            "analysis-source-v1", source_spec_identity, str(lexical), str(resolved),
+            "analysis-source-v2", source_spec_identity, str(lexical), str(resolved),
             actual_kind, resolved_entry, dict(spec.options).get("scan"), before, post,
             labels, catalog, scanned, tuple(modes), tuple(observed_states),
-            tuple(member_states), tuple(raw_facts),
+            tuple(discovery_states),
+            tuple(member_states), tuple(raw_facts), dependency_revisions,
         )
         fingerprint = _digest(source_identity)
         receipt = AnalysisSourceReceipt(
-            "analysis-source-v1", spec, _digest(source_spec_identity), lexical,
-            resolved, actual_kind, resolved_entry, dict(spec.options).get("scan"),
-            before, post, labels, _digest(labels), _digest(catalog), tuple(modes),
-            fingerprint,
+            schema_version="analysis-source-v2", source_spec=spec,
+            source_spec_digest=_digest(source_spec_identity), lexical_root=lexical,
+            resolved_root=resolved, resolved_kind=actual_kind,
+            resolved_entry=resolved_entry,
+            resolved_scan=dict(spec.options).get("scan"), primary_state=before,
+            primary_post_state=post, labels=labels, labels_digest=_digest(labels),
+            catalog_digest=_digest(catalog), metadata_observation_modes=tuple(modes),
+            dependency_revisions=dependency_revisions,
+            source_fingerprint=fingerprint,
         )
         return _Snapshot(
-            source, receipt, catalog, scanned,
-            tuple(value for value in observed_states if value is not None and value[0] is not None)
-            + tuple(member_states),
+            source, receipt, catalog, scanned, dependency_revisions,
         )
     except BaseException:
         _close(source)
         raise
 def _terminal_fence(snapshot: _Snapshot) -> None:
-    receipt = snapshot.receipt
-    if (
-        _path_revision(receipt.resolved_root) != receipt.primary_post_state
-        or any(
-            _path_revision(path) != revision
-            for path, revision in snapshot.revisions
-        )
-    ):
+    if not _receipt_fence(snapshot.receipt):
         raise _Refusal("SOURCE_REVISION_CHANGED")
+def _source_spec_storage_value(spec: SourceSpec) -> tuple[Any, ...]:
+    return (
+        str(spec.uri), spec.kind, spec.metadata_uri, spec.entry,
+        dict(spec.options),
+    )
+def _receipt_storage_value(receipt: AnalysisSourceReceipt) -> tuple[Any, ...]:
+    return (
+        receipt.schema_version,
+        _source_spec_storage_value(receipt.source_spec),
+        receipt.source_spec_digest,
+        receipt.lexical_root,
+        receipt.resolved_root,
+        receipt.resolved_kind,
+        receipt.resolved_entry,
+        receipt.resolved_scan,
+        receipt.primary_state,
+        receipt.primary_post_state,
+        receipt.labels,
+        receipt.labels_digest,
+        receipt.catalog_digest,
+        receipt.metadata_observation_modes,
+        receipt.dependency_revisions,
+        receipt.source_fingerprint,
+    )
 def _table_storage_value(result: MetadataTableResult) -> tuple[Any, ...]:
     return (
         result.code, result.diagnostics,
-        None if result.receipt is None else result.receipt.source_fingerprint,
+        None if result.receipt is None else _receipt_storage_value(result.receipt),
         result.labels,
         tuple((column.name, column.kind, column.missing,
                column.numeric if column.numeric is not None else column.text)
@@ -796,6 +855,53 @@ def _table_storage_value(result: MetadataTableResult) -> tuple[Any, ...]:
         result.declared_scanned_positioner, result.selected_scanned_positioner,
         result.policy_fingerprint, result.table_fingerprint,
     )
+def _canonical_dependency_revisions(
+    primary_lexical: Path,
+    primary_resolved: Path,
+    primary_revision: FileRevision | None,
+    values: tuple[tuple[Path, FileRevision | None], ...],
+) -> tuple[tuple[Path, Path, FileRevision | None], ...]:
+    root_lexical = _lexical_absolute(primary_lexical)
+    root_resolved = root_lexical.resolve(strict=False)
+    if root_resolved != primary_resolved or _path_revision(root_resolved) != primary_revision:
+        raise _Refusal("SOURCE_REVISION_CHANGED")
+    seen: dict[Path, tuple[Path, FileRevision | None]] = {
+        root_lexical: (root_resolved, primary_revision),
+    }
+    ordered: list[tuple[Path, Path, FileRevision | None]] = []
+    for raw_path, revision in values:
+        lexical = _lexical_absolute(raw_path)
+        resolved = lexical.resolve(strict=False)
+        observation = (resolved, revision)
+        if lexical in seen:
+            if seen[lexical] != observation:
+                raise _Refusal("SOURCE_REVISION_CHANGED")
+            continue
+        if _path_revision(resolved) != revision:
+            raise _Refusal("SOURCE_REVISION_CHANGED")
+        seen[lexical] = observation
+        ordered.append((lexical, resolved, revision))
+    return tuple(ordered)
+def _dependency_matches(
+    lexical: Path, resolved: Path, revision: FileRevision | None,
+) -> bool:
+    try:
+        return (
+            _lexical_absolute(lexical).resolve(strict=False) == resolved
+            and _path_revision(resolved) == revision
+        )
+    except OSError:
+        return False
+def _receipt_dependencies(
+    receipt: AnalysisSourceReceipt,
+) -> tuple[tuple[Path, Path, FileRevision | None], ...]:
+    return (
+        (receipt.lexical_root, receipt.resolved_root, receipt.primary_post_state),
+        *receipt.dependency_revisions,
+    )
+def _receipt_fence(receipt: AnalysisSourceReceipt) -> bool:
+    return all(_dependency_matches(*dependency)
+               for dependency in _receipt_dependencies(receipt))
 def _metadata_table_storage_value(result: MetadataTableResult) -> tuple[Any, ...]:
     return _table_storage_value(result)
 def _columns(
@@ -897,6 +1003,46 @@ def run_metadata_table(
         _close(selected_source)
         if snapshot is not None:
             _close(snapshot.source)
+def run_metadata_table_requalification(
+    plan: MetadataTableRequalificationPlan, *,
+    cancel_token: threading.Event | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> MetadataTableRequalificationResult:
+    if type(plan) is not MetadataTableRequalificationPlan:
+        return MetadataTableRequalificationResult(
+            AnalysisDisposition.REFUSED, "INVALID_REQUALIFICATION_PLAN"
+        )
+    if not _valid_cancel(cancel_token):
+        return MetadataTableRequalificationResult(
+            AnalysisDisposition.REFUSED, "INVALID_CANCEL_TOKEN"
+        )
+    receipt = plan.receipt
+    if receipt.schema_version != "analysis-source-v2":
+        return MetadataTableRequalificationResult(
+            AnalysisDisposition.REFUSED, "SOURCE_IDENTITY_MISMATCH"
+        )
+    revisions = _receipt_dependencies(receipt)
+    total = 2 * len(revisions)
+    completed = 0
+    for _sweep in range(2):
+        for lexical, resolved, revision in revisions:
+            if cancel_token is not None and cancel_token.is_set():
+                return MetadataTableRequalificationResult(
+                    AnalysisDisposition.CANCELLED, "CANCELLED"
+                )
+            if not _dependency_matches(lexical, resolved, revision):
+                return MetadataTableRequalificationResult(
+                    AnalysisDisposition.REFUSED, "SOURCE_REVISION_CHANGED"
+                )
+            completed += 1
+            _notify(progress_callback, completed, total)
+    if cancel_token is not None and cancel_token.is_set():
+        return MetadataTableRequalificationResult(
+            AnalysisDisposition.CANCELLED, "CANCELLED"
+        )
+    return MetadataTableRequalificationResult(
+        AnalysisDisposition.COMPLETED, "OK", receipt, plan.table_fingerprint,
+    )
 def _numeric_column(table: MetadataTableResult, name: str) -> np.ndarray:
     matches = [column for column in table.columns if column.name == name]
     if len(matches) != 1 or matches[0].kind != "numeric" or matches[0].numeric is None:
@@ -1003,7 +1149,7 @@ def _requalify(receipt: AnalysisSourceReceipt) -> _Snapshot:
         "schema_version", "source_spec_digest", "lexical_root", "resolved_root",
         "resolved_kind", "resolved_entry", "resolved_scan", "primary_state",
         "primary_post_state", "labels", "labels_digest", "catalog_digest",
-        "metadata_observation_modes", "source_fingerprint",
+        "metadata_observation_modes", "dependency_revisions", "source_fingerprint",
     )
     if any(
         getattr(snapshot.receipt, name) != getattr(receipt, name)

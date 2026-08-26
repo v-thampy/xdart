@@ -60,7 +60,9 @@ def _real_loader_controller(
     read_records,
     join_timeout: float = 0.05,
 ):
-    monkeypatch.setattr(loader_module, "read_provenance", lambda _path: {})
+    monkeypatch.setattr(
+        loader_module, "read_browse_presentation", lambda _path: ({}, None),
+    )
     _, lifecycle, executor, _, acquisition = _running_controller()
     loader = BrowseLoader(
         join_timeout=join_timeout,
@@ -403,7 +405,9 @@ def test_baseexception_at_browse_worker_boundary_has_one_terminal_outcome(
 
     path = tmp_path / "poison.nxs"
     path.write_bytes(b"poison")
-    monkeypatch.setattr(loader_module, "read_provenance", lambda _path: {})
+    monkeypatch.setattr(
+        loader_module, "read_browse_presentation", lambda _path: ({}, None),
+    )
 
     def fail_open(_path):
         raise WorkerPoison("open poison")

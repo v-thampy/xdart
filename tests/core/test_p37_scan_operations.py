@@ -22,6 +22,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pytest
+import tifffile
 
 import xrd_tools.analysis as analysis
 from xrd_tools.analysis.plans import RoiSignal
@@ -32,6 +33,7 @@ from xrd_tools.io.metadata import ImageMetadataRead
 
 _PUBLIC_RUNNERS = {
     "run_metadata_table",
+    "run_metadata_table_requalification",
     "run_scan_plot",
     "run_roi_preview",
     "run_roi_scan",
@@ -1259,6 +1261,7 @@ def test_p37_metadata_text_numeric_storage_is_detached_and_exactly_charged(
         sidecar_stat.st_ino,
         sidecar_stat.st_size,
         sidecar_stat.st_mtime_ns,
+        sidecar_stat.st_ctime_ns,
     )
     revision = ops._path_revision(sidecar)
     observed_calls = []
@@ -1285,6 +1288,17 @@ def test_p37_metadata_text_numeric_storage_is_detached_and_exactly_charged(
     assert len(observed_calls) == 1
     assert observed_calls[0][1]["max_input_bytes"] > 0
     assert _column_values(_column(result, "label")) == ("old",)
+    assert result.receipt.schema_version == "analysis-source-v2"
+    assert result.receipt.dependency_revisions == (
+        (sidecar, sidecar.resolve(), revision),
+        (tmp_path, tmp_path.resolve(), ops._path_revision(tmp_path)),
+    )
+    stable_requalification = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            result.receipt, result.table_fingerprint,
+        )
+    )
+    _assert_terminal(stable_requalification, "COMPLETED", "OK")
     assert len(result.receipt.source_fingerprint) == 64
     assert result.receipt.source_fingerprint == result.receipt.source_fingerprint.lower()
     assert result.storage_bytes == ops._canonical_charge(
@@ -1362,7 +1376,9 @@ def test_p37_metadata_text_numeric_storage_is_detached_and_exactly_charged(
     absent_revision = _public("run_metadata_table")(observed_plan)
     _assert_terminal(absent_revision, "REFUSED", "SOURCE_REVISION_CHANGED")
 
-    replacement = (revision[0], revision[1], revision[2] + 1, revision[3], revision[4])
+    replacement = (
+        revision[0], revision[1], revision[2] + 1, *revision[3:],
+    )
     real_path_revision = ops._path_revision
     monkeypatch.setattr(
         ops,
@@ -1404,6 +1420,12 @@ def test_p37_metadata_text_numeric_storage_is_detached_and_exactly_charged(
         observed_plan, progress_callback=replace_from_callback,
     )
     _assert_terminal(terminal_race, "REFUSED", "SOURCE_REVISION_CHANGED")
+    sidecar_drift = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            result.receipt, result.table_fingerprint,
+        )
+    )
+    _assert_terminal(sidecar_drift, "REFUSED", "SOURCE_REVISION_CHANGED")
 
     provider = _FakeSource(
         image,
@@ -1519,6 +1541,278 @@ def test_p37_metadata_text_numeric_storage_is_detached_and_exactly_charged(
     )
     assert "Th" not in {column.name for column in tiff_result.columns}
     np.testing.assert_array_equal(_column(tiff_result, "th").numeric, [1.0, 2.0])
+    assert tuple(resolved for _lexical, resolved, _revision in
+                 tiff_result.receipt.dependency_revisions) == tuple(
+                     member.resolve() for member in members
+                 )
+    members[1].write_bytes(b"changed member")
+    member_drift = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            tiff_result.receipt, tiff_result.table_fingerprint,
+        )
+    )
+    _assert_terminal(member_drift, "REFUSED", "SOURCE_REVISION_CHANGED")
+
+
+def test_p37_metadata_receipt_fences_alias_absence_and_two_pass_drift(
+    monkeypatch, tmp_path,
+):
+    ops = _scan_ops()
+    image = tmp_path / "frame.raw"
+    replacement = tmp_path / "replacement.raw"
+    image.write_bytes(b"image")
+    replacement.write_bytes(b"other")
+    alias = tmp_path / "selected.raw"
+    alias.symlink_to(image)
+
+    alias_result = _public("run_metadata_table")(
+        _public("MetadataTablePlan")(
+            SourceSpec(
+                alias, SourceKind.IMAGE_FILE,
+                options={"metadata_format": None},
+            )
+        )
+    )
+    _assert_terminal(alias_result, "COMPLETED", "OK")
+    assert alias_result.receipt.lexical_root == alias
+    assert alias_result.receipt.resolved_root == image.resolve()
+    alias.unlink()
+    alias.symlink_to(replacement)
+    alias_drift = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            alias_result.receipt, alias_result.table_fingerprint,
+        )
+    )
+    _assert_terminal(alias_drift, "REFUSED", "SOURCE_REVISION_CHANGED")
+
+    absent = _public("run_metadata_table")(
+        _public("MetadataTablePlan")(
+            SourceSpec(
+                image, SourceKind.IMAGE_FILE,
+                options={"metadata_format": "txt"},
+            )
+        )
+    )
+    _assert_terminal(absent, "COMPLETED", "OK")
+    assert any(
+        lexical == tmp_path and resolved == tmp_path.resolve()
+        for lexical, resolved, _revision in absent.receipt.dependency_revisions
+    )
+    sidecar = image.with_suffix(".txt")
+    sidecar.write_text(
+        "# Counters\nI0 = 3\n# Motors\nth = 4\n",
+        encoding="utf-8",
+    )
+    appeared = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            absent.receipt, absent.table_fingerprint,
+        )
+    )
+    _assert_terminal(appeared, "REFUSED", "SOURCE_REVISION_CHANGED")
+
+    present = _public("run_metadata_table")(
+        _public("MetadataTablePlan")(
+            SourceSpec(
+                image, SourceKind.IMAGE_FILE,
+                options={"metadata_format": "txt"},
+            )
+        )
+    )
+    _assert_terminal(present, "COMPLETED", "OK")
+    dependency_count = 1 + len(present.receipt.dependency_revisions)
+
+    def mutate_after_first_sweep(completed, total):
+        assert total == 2 * dependency_count
+        if completed == dependency_count:
+            sidecar.write_text(
+                "# Counters\nI0 = 30\n# Motors\nth = 40\n",
+                encoding="utf-8",
+            )
+
+    terminal_drift = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            present.receipt, present.table_fingerprint,
+        ),
+        progress_callback=mutate_after_first_sweep,
+    )
+    _assert_terminal(
+        terminal_drift, "REFUSED", "SOURCE_REVISION_CHANGED",
+    )
+
+
+def test_p37_real_tiff_txt_series_populates_complete_metadata(tmp_path):
+    members = tuple(tmp_path / f"scan_{index:04d}.tif" for index in (1, 2))
+    for index, member in enumerate(members, 1):
+        tifffile.imwrite(member, np.full((3, 4), index, dtype=np.uint16))
+        member.with_suffix(".txt").write_text(
+            f"# Counters\nI0 = {10 * index}\n"
+            f"# Motors\nth = {index / 10}\n"
+            "User: p37, time: Mon Jan 15 10:30:00 2024  # Temp\n",
+            encoding="utf-8",
+        )
+    from xrd_tools.sources.selection import image_series_spec
+    result = _public("run_metadata_table")(
+        _public("MetadataTablePlan")(
+            image_series_spec(members[0], metadata_format="txt")
+        )
+    )
+    _assert_terminal(result, "COMPLETED", "OK")
+    np.testing.assert_allclose(_column(result, "I0").numeric, [10.0, 20.0])
+    np.testing.assert_allclose(_column(result, "th").numeric, [0.1, 0.2])
+
+
+def test_p37_metadata_requalification_rejects_hidden_sidecar_rewrite(tmp_path):
+    member = tmp_path / "scan_0001.tif"
+    sidecar = member.with_suffix(".txt")
+    tifffile.imwrite(member, np.ones((3, 4), dtype=np.uint16))
+    original = (
+        "# Counters\nI0 = 10\n# Motors\nth = 1\n"
+        "User: p37, time: Mon Jan 15 10:30:00 2024  # Temp\n"
+    )
+    replacement = (
+        "# Counters\nI0 = 90\n# Motors\nth = 9\n"
+        "User: p37, time: Mon Jan 15 10:30:00 2024  # Temp\n"
+    )
+    assert len(original.encode("utf-8")) == len(replacement.encode("utf-8"))
+    sidecar.write_text(original, encoding="utf-8")
+
+    from xrd_tools.sources.selection import image_series_spec
+    result = _public("run_metadata_table")(
+        _public("MetadataTablePlan")(
+            image_series_spec(member, metadata_format="txt")
+        )
+    )
+    _assert_terminal(result, "COMPLETED", "OK")
+    admitted = sidecar.stat()
+
+    sidecar.write_text(replacement, encoding="utf-8")
+    os.utime(sidecar, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
+    changed = sidecar.stat()
+    assert (
+        changed.st_dev, changed.st_ino, changed.st_size, changed.st_mtime_ns,
+    ) == (
+        admitted.st_dev, admitted.st_ino, admitted.st_size,
+        admitted.st_mtime_ns,
+    )
+    assert changed.st_ctime_ns != admitted.st_ctime_ns
+
+    requalified = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            result.receipt, result.table_fingerprint,
+        )
+    )
+    _assert_terminal(requalified, "REFUSED", "SOURCE_REVISION_CHANGED")
+
+
+def test_p37_metadata_requalification_rejects_hidden_member_rewrite(tmp_path):
+    members = tuple(tmp_path / f"scan_{index:04d}.tif" for index in (1, 2))
+    for index, member in enumerate(members, 1):
+        tifffile.imwrite(member, np.full((3, 4), index, dtype=np.uint16))
+
+    from xrd_tools.sources.selection import image_series_spec
+    result = _public("run_metadata_table")(
+        _public("MetadataTablePlan")(
+            image_series_spec(members[0], metadata_format=None)
+        )
+    )
+    _assert_terminal(result, "COMPLETED", "OK")
+    member = members[1]
+    admitted = member.stat()
+    payload = member.read_bytes()
+    replacement = payload[:-1] + bytes((payload[-1] ^ 1,))
+
+    member.write_bytes(replacement)
+    os.utime(member, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
+    changed = member.stat()
+    assert (
+        changed.st_dev, changed.st_ino, changed.st_size, changed.st_mtime_ns,
+    ) == (
+        admitted.st_dev, admitted.st_ino, admitted.st_size,
+        admitted.st_mtime_ns,
+    )
+    assert changed.st_ctime_ns != admitted.st_ctime_ns
+
+    requalified = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            result.receipt, result.table_fingerprint,
+        )
+    )
+    _assert_terminal(requalified, "REFUSED", "SOURCE_REVISION_CHANGED")
+
+
+def test_p37_auto_metadata_receipt_tracks_rejected_candidates_and_atomic_absence(
+    monkeypatch, tmp_path,
+):
+    ops = _scan_ops()
+    image = tmp_path / "auto.raw"
+    image.write_bytes(b"pixels")
+    candidate = image.with_suffix(".txt")
+    candidate.write_text("not_metadata=1\n", encoding="utf-8")
+    plan = _public("MetadataTablePlan")(
+        SourceSpec(
+            image, SourceKind.IMAGE_FILE,
+            options={"metadata_format": "auto"},
+        )
+    )
+
+    empty = _public("run_metadata_table")(plan)
+    _assert_terminal(empty, "COMPLETED", "OK")
+    assert candidate in {
+        lexical
+        for lexical, _resolved, _revision
+        in empty.receipt.dependency_revisions
+    }
+    candidate.write_text(
+        "motor=1\ncounter=2\nsample=valid\n", encoding="utf-8",
+    )
+    stale = _public("run_metadata_table_requalification")(
+        _public("MetadataTableRequalificationPlan")(
+            empty.receipt, empty.table_fingerprint,
+        )
+    )
+    _assert_terminal(stale, "REFUSED", "SOURCE_REVISION_CHANGED")
+
+    race_root = tmp_path / "absence-race"
+    race_root.mkdir()
+    raced_image = race_root / "frame.raw"
+    raced_image.write_bytes(b"pixels")
+    raced_sidecar = raced_image.with_suffix(".txt")
+    directory_revision = ops._path_revision(race_root)
+    assert directory_revision is not None
+
+    def create_after_absence(*_args, **_kwargs):
+        raced_sidecar.write_text(
+            "# Counters\nI0 = 3\n# Motors\nth = 4\n",
+            encoding="utf-8",
+        )
+        return ImageMetadataRead(
+            {}, None,
+            discovery_revisions=((race_root, directory_revision),),
+        )
+
+    real_revision = ops._path_revision
+    changed_directory_revision = (
+        *directory_revision[:-1], directory_revision[-1] + 1,
+    )
+    monkeypatch.setattr(
+        ops, "read_image_metadata_observed", create_after_absence,
+    )
+    monkeypatch.setattr(
+        ops, "_path_revision",
+        lambda path: (
+            changed_directory_revision
+            if Path(path) == race_root else real_revision(path)
+        ),
+    )
+    raced = _public("run_metadata_table")(
+        _public("MetadataTablePlan")(
+            SourceSpec(
+                raced_image, SourceKind.IMAGE_FILE,
+                options={"metadata_format": "txt"},
+            )
+        )
+    )
+    _assert_terminal(raced, "REFUSED", "SOURCE_REVISION_CHANGED")
 
 
 def test_p37_roi_preview_and_total_result_obey_byte_and_identity_caps(

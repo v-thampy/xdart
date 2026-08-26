@@ -2,22 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event, Lock, Thread, current_thread
+from threading import Event, Lock, Thread
 
 from xdart.modules.display_context import BrowseContext
 from xdart.modules.frame_publication import FramePublication, PublicationStore
-from xrd_tools.core.energy import (
-    WavelengthUnit,
-    canonical_wavelength_m,
-)
 from xrd_tools.core.staging import browse_publication_max_items
-from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io import ProcessedScan, iter_frame_records
-from xrd_tools.io.output_transaction import TargetSnapshot, capture_target_snapshot
+from xrd_tools.io.browse_presentation import read_browse_presentation
+from xrd_tools.io.output_transaction import (
+    TargetSnapshot,
+    capture_target_snapshot,
+    revalidate_stream_terminal,
+    stream_terminal_object_revision,
+)
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.scan_norm import (
     empty_norm_aggregate,
@@ -362,19 +362,19 @@ class BrowseLoader:
                 and expected is not self._close.request
             ):
                 raise RuntimeError("browse close identity changed")
-            self._queued = None
+            queued = self._queued
+            if queued is not None:
+                queued.cancelled.set()
+                queued.outcome = BrowseLoadOutcome(
+                    queued.request, BrowseLoadStatus.CANCELLED
+                )
+                queued.terminal = True
+                queued.cleanup_state = _CLEANUP_CLEANED
             if operation is not None:
                 operation.cancelled.set()
-                worker = operation.worker
-            else:
-                worker = None
-        if (
-            worker is not None
-            and worker is not current_thread()
-            and worker.ident is not None
-            and worker.is_alive()
-        ):
-            worker.join(timeout=self._join_timeout)
+            elif queued is not None:
+                self._active = queued
+                self._queued = None
         self._progress(retire_cancelled=True)
         with self._lock:
             operation = self._active
@@ -598,12 +598,25 @@ class BrowseLoader:
         cancelled: Event,
     ) -> BrowseContext | None:
         path = Path(request.source_path).resolve()
-        if str(path) != request.source_path:
-            raise ValueError("processed browse target must be canonical")
-        before = capture_target_snapshot(path)
+        canonical_path = str(path)
+        if cancelled.is_set():
+            return None
+        terminal = request.terminal_commit_identity
+        sealed_terminal = (
+            terminal
+            if stream_terminal_object_revision(terminal) is not None
+            else None
+        )
+        before = (
+            capture_target_snapshot(path)
+            if sealed_terminal is None
+            else revalidate_stream_terminal(path, sealed_terminal)
+        )
         if type(before) is not TargetSnapshot or not before.exists:
             raise ValueError("processed browse target is unavailable")
-        scan = self._open_scan(request.source_path)
+        if cancelled.is_set():
+            return None
+        scan = self._open_scan(canonical_path)
         records = FrameRecordStore(max_items=self._max_items)
         publications = PublicationStore(
             max_items=self._max_items,
@@ -617,7 +630,7 @@ class BrowseLoader:
         draft = empty_norm_aggregate(
             (request.token, scan_key, request.source_path)
         )
-        for record in self._read_records(request.source_path):
+        for record in self._read_records(canonical_path):
             if cancelled.is_set():
                 records.clear()
                 publications.clear()
@@ -654,26 +667,23 @@ class BrowseLoader:
         if tuple(labels) != tuple(sorted(set(labels))):
             records.clear(); publications.clear()
             raise ValueError("processed frame labels must be strictly increasing")
-        persisted = read_provenance(request.source_path)
-        provenance = (
-            persisted.get("config", {})
-            if isinstance(persisted, Mapping)
-            else {}
+        presentation, persisted_mask = read_browse_presentation(
+            canonical_path,
         )
-        if not isinstance(provenance, Mapping):
-            provenance = {}
-        presentation = {
-            key: provenance.get(key)
-            for key in ("poni_file", "geometry", "gi")
-            if provenance.get(key) is not None
-        }
-        wavelength_m = _persisted_wavelength_m(scan)
-        if wavelength_m is not None:
-            presentation["wavelength_m"] = wavelength_m
-        after = capture_target_snapshot(path)
+        if cancelled.is_set():
+            records.clear(); publications.clear()
+            return None
+        after = (
+            capture_target_snapshot(path)
+            if sealed_terminal is None
+            else revalidate_stream_terminal(path, sealed_terminal)
+        )
         if type(after) is not TargetSnapshot or not after.exists or after != before:
             records.clear(); publications.clear()
             raise ValueError("processed browse target changed during load")
+        if cancelled.is_set():
+            records.clear(); publications.clear()
+            return None
         context = BrowseContext(
             context_token=request.token, load_generation=request.load_generation,
             operation=request, requested_path=request.source_path,
@@ -691,28 +701,12 @@ class BrowseLoader:
                 separators=(",", ":"),
             ),
             mask=str(
-                provenance.get("mask_file")
+                persisted_mask
                 or getattr(first, "mask_baked", False)
             ),
             result=request.source_path,
         )
         context.mark_loaded()
         return context
-
-
-def _persisted_wavelength_m(scan: object) -> float | None:
-    """Read only explicit Angstrom evidence from the processed artifact."""
-
-    try:
-        metadata = scan.metadata
-    except Exception:
-        return None
-    if not isinstance(metadata, Mapping):
-        return None
-    value = metadata.get("wavelength_A")
-    if type(value) is bool:
-        return None
-    return canonical_wavelength_m(value, WavelengthUnit.ANGSTROM)
-
 
 __all__ = ["BrowseLoader"]

@@ -233,16 +233,18 @@ def load_mask(
         Boolean mask, ``True`` = bad pixel.
     """
     if isinstance(mask, (str, Path)):
-        arr = read_image(Path(mask))
-        bool_mask = np.asarray(arr, dtype=float) != 0.0
-        # read_image returns NaN for bad pixels in some formats;
-        # treat NaN as bad too
-        bool_mask |= np.isnan(arr)
+        # Preserve the source dtype while decoding.  The boolean comparison
+        # already treats NaN as bad, and avoiding the historical float64
+        # promotion keeps the admission bound representative of peak storage.
+        arr = read_image(
+            Path(mask), preserve_dtype=True, exact_frame=True,
+        )
+        bool_mask = np.asarray(arr) != 0
     elif isinstance(mask, np.ndarray):
         if mask.dtype == bool:
             bool_mask = mask.copy()
         else:
-            bool_mask = np.asarray(mask, dtype=float) != 0.0
+            bool_mask = np.asarray(mask) != 0
     else:
         raise TypeError(
             f"mask must be an ndarray or a file path, got {type(mask).__name__}"
@@ -778,9 +780,14 @@ def _read_raw_binary(
     header_skip : int
         Bytes to skip before pixel data.
     """
+    dtype_value = np.dtype(dtype)
+    expected_bytes = int(shape[0]) * int(shape[1]) * dtype_value.itemsize
     with open(path, "rb") as fh:
         fh.seek(header_skip)
-        arr = np.frombuffer(fh.read(), dtype=dtype)
+        payload = fh.read(expected_bytes + 1)
+    if len(payload) != expected_bytes:
+        raise ValueError("raw detector payload does not match the exact shape")
+    arr = np.frombuffer(payload, dtype=dtype_value)
     return arr.reshape(shape)
 
 

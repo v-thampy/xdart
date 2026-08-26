@@ -215,15 +215,12 @@ def analysis_result_matches(payload: object, facts: object) -> bool:
             receipt.source_spec == source if source_spec
             else str(receipt.lexical_root) == str(source)
         )
-        if not (payload.table_fingerprint and selection == "exact"
+        if not (payload.table_fingerprint
+                and receipt.schema_version == "analysis-source-v2"
+                and selection == "exact"
                 and identity_matches and receipt.primary_post_state is not None):
             return False
-        from xrd_tools.analysis.scan_operations import _path_revision
-        try:
-            current_path = Path(source.uri if source_spec else source).expanduser()
-        except (AttributeError, TypeError, ValueError):
-            return False
-        return _path_revision(current_path) == receipt.primary_post_state
+        return True
     if kind == "scan_plot":
         table, roi, x, y, normalization = echo
         return bool(type(payload) is ScanPlotResult

@@ -27,12 +27,15 @@ from xdart.gui.tabs.scattering.display_values import (
 )
 import xdart.gui.tabs.scattering.display_values as display_values_module
 from xdart.gui.tabs.scattering.events import (
-    CleanupStatus, ExecutorAccepted, ExecutorClosed, PreflightAccepted, RunIdentity,
+    CleanupStatus, ExecutorAccepted, ExecutorClosed, ExecutorStartFailed,
+    PreflightAccepted, RunIdentity,
 )
 from xdart.gui.tabs.scattering.display_retirement import (
     DisplayRetirementReceipt,
 )
-from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.page import (
+    ScatteringWorkspace, _TerminalBrowseHandoff,
+)
 import xdart.gui.tabs.scattering.page as page_module
 from xdart.gui.tabs.scattering.performance_diagnostics import (
     PerformanceDiagnosticsDialog,
@@ -1046,6 +1049,7 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
     """A completed Run authenticates its artifact without a second click."""
 
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
+    from xrd_tools.io.output_transaction import StreamTerminal
 
     executor = _Executor()
     page, lifecycle, identity = _active_page(executor)
@@ -1057,12 +1061,24 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
         navigation = page._context_controller.navigation
         assert navigation.current.local_frame_label == 3
 
-        request = BrowseLoadRequest("terminal", 1, "/out/a.nxs")
+        seal = StreamTerminal(
+            "/out/a.nxs", 1024, "d" * 64, 1, 1, 2, 3, 4,
+        )
+        request = BrowseLoadRequest(
+            "terminal", 1, "/out/a.nxs", seal,
+        )
         calls = []
         monkeypatch.setattr(
             page._context_controller,
             "begin_browse",
-            lambda artifact: calls.append(artifact) or request,
+            lambda artifact, *, terminal_commit_identity=None:
+                calls.append((artifact, terminal_commit_identity)) or request,
+        )
+        paints = []
+        monkeypatch.setattr(
+            page, "_refresh_event_shell",
+            lambda *, preserve_scientific=False:
+                paints.append(preserve_scientific),
         )
         terminal = StandardRunEvent(
             identity,
@@ -1071,15 +1087,17 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
             total=3,
             artifact="/out/a.nxs",
             cleanup_status=CleanupStatus.CLEANED,
+            terminal_commit_identity=seal,
         )
         executor.events.append(terminal)
         page._drain_executor()
 
         assert lifecycle.phase is RunPhase.IDLE
-        assert calls == ["/out/a.nxs"]
-        assert page._terminal_browse_request is request
-        assert page._terminal_browse_current_label == 3
-        assert page._terminal_browse_selected_labels == (3,)
+        assert calls == [("/out/a.nxs", seal)]
+        assert page._terminal_browse_handoff == _TerminalBrowseHandoff(
+            request, "/out/a.nxs", 3, (3,), seal,
+        )
+        assert paints == [True]
 
         # None of the terminal cases that lacks an exact clean publication may
         # start the convenience Browse transition.
@@ -1101,7 +1119,124 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
             current=navigation.current,
             selected=navigation.selected,
         )
-        assert calls == ["/out/a.nxs"]
+        assert calls == [("/out/a.nxs", seal)]
+        assert page._terminal_browse_handoff == _TerminalBrowseHandoff(
+            request, "/out/a.nxs", 3, (3,), seal,
+        )
+    finally:
+        _dispose(page, qapp)
+
+
+def test_terminal_frame_signatures_are_zero_io_and_refuse_unknown_spelling(
+    monkeypatch,
+) -> None:
+    """A 651-frame GUI rebind is lexical and refuses unknown aliases."""
+
+    identity = RunIdentity.from_configuration(RunIntent().freeze())
+    frames = tuple(
+        DisplayFrameKey(
+            identity,
+            "scan",
+            "/out/a.nxs" if index % 2 else "/alias/a.nxs",
+            index,
+            index,
+        )
+        for index in range(1, 652)
+    )
+    monkeypatch.setattr(
+        page_module.os.path,
+        "realpath",
+        lambda _value: pytest.fail("terminal GUI rebind performed path I/O"),
+    )
+    canonical_by_artifact = {
+        "/out/a.nxs": "/canonical/a.nxs",
+        "/alias/a.nxs": "/canonical/a.nxs",
+    }
+    signatures = tuple(
+        page_module._terminal_frame_signature(
+            frame, canonical_by_artifact,
+        )
+        for frame in frames
+    )
+
+    assert len(signatures) == 651
+    assert all(signature is not None for signature in signatures)
+    unknown = DisplayFrameKey(
+        identity, "scan", "/unknown/a.nxs", 652, 652,
+    )
+    assert page_module._terminal_frame_signature(
+        unknown, canonical_by_artifact,
+    ) is None
+
+
+def test_terminal_browse_ready_performs_one_normal_scientific_reconcile(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+) -> None:
+    from xdart.gui.tabs.scattering.browse_values import (
+        BrowseLoadOutcome, BrowseLoadRequest, BrowseLoadStatus,
+    )
+
+    executor = _Executor()
+    page, _, _identity = _active_page(executor)
+    controller = page._context_controller
+    request = BrowseLoadRequest("terminal-ready", 1, "/out/a.nxs")
+    page._terminal_browse_handoff = _TerminalBrowseHandoff(
+        request, request.source_path, None, (),
+    )
+    pending = [True]
+    monkeypatch.setattr(
+        type(controller), "browse_pending",
+        property(lambda _self: pending[0]),
+    )
+    monkeypatch.setattr(
+        controller, "poll_browse",
+        lambda: pending.__setitem__(0, False) or BrowseLoadOutcome(
+            request, BrowseLoadStatus.READY,
+        ),
+    )
+    paints = []
+    monkeypatch.setattr(
+        page, "_refresh_event_shell",
+        lambda *, preserve_scientific=False:
+            paints.append(preserve_scientific),
+    )
+    try:
+        page._drain_executor()
+        assert page._terminal_browse_handoff is None
+        assert paints == [False]
+    finally:
+        _dispose(page, qapp)
+
+
+def test_terminal_browse_refusal_retires_exact_handoff_without_outcome(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+) -> None:
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
+
+    executor = _Executor()
+    page, _, _identity = _active_page(executor)
+    controller = page._context_controller
+    request = BrowseLoadRequest("terminal-refused", 1, "/out/a.nxs")
+    page._terminal_browse_handoff = _TerminalBrowseHandoff(
+        request, request.source_path, None, (),
+    )
+    pending = [True]
+    monkeypatch.setattr(
+        type(controller), "browse_pending",
+        property(lambda _self: pending[0]),
+    )
+    monkeypatch.setattr(
+        controller, "poll_browse",
+        lambda: pending.__setitem__(0, False) or None,
+    )
+    monkeypatch.setattr(
+        controller, "owns_browse_request", lambda _request: False,
+    )
+    try:
+        page._drain_executor()
+        assert page._terminal_browse_handoff is None
     finally:
         _dispose(page, qapp)
 
@@ -1146,7 +1281,7 @@ def test_clean_xye_terminal_does_not_browse_unwritten_nexus_target(
 
         assert lifecycle.phase is RunPhase.IDLE
         assert browse_calls == []
-        assert page._terminal_browse_request is None
+        assert page._terminal_browse_handoff is None
         assert not page._context_controller.browse_pending
     finally:
         _dispose(page, qapp)
@@ -1165,9 +1300,9 @@ def test_terminal_browse_marker_survives_catalog_actions_and_clears_on_new_load(
     page, _, _ = _active_page(executor)
     terminal = BrowseLoadRequest("terminal", 1, "/out/a.nxs")
     replacement = BrowseLoadRequest("replacement", 2, "/out/b.nxs")
-    page._terminal_browse_request = terminal
-    page._terminal_browse_current_label = 5
-    page._terminal_browse_selected_labels = (5,)
+    page._terminal_browse_handoff = _TerminalBrowseHandoff(
+        terminal, terminal.source_path, 5, (5,),
+    )
     directory_calls = []
     selected_targets = []
     browse_calls = []
@@ -1186,20 +1321,24 @@ def test_terminal_browse_marker_survives_catalog_actions_and_clears_on_new_load(
         "begin_browse",
         lambda value: browse_calls.append(value) or replacement,
     )
+    monkeypatch.setattr(page, "_refresh_shell", lambda **_kwargs: None)
+    forbidden_probe = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("browser activation performed GUI-thread filesystem I/O")
+    )
+    monkeypatch.setattr(page_module.os.path, "isdir", forbidden_probe)
+    monkeypatch.setattr(Path, "resolve", forbidden_probe)
     try:
-        page._select_scan(str(tmp_path))
+        page._select_scan(str(tmp_path), is_directory=True)
         assert directory_calls == [(str(tmp_path), True)]
-        assert page._terminal_browse_request is terminal
+        assert page._terminal_browse_handoff.request is terminal
 
         page._select_scan(terminal.source_path)
         assert selected_targets == [terminal.source_path]
-        assert page._terminal_browse_request is terminal
+        assert page._terminal_browse_handoff.request is terminal
 
         page._select_scan(replacement.source_path)
         assert browse_calls == [replacement.source_path]
-        assert page._terminal_browse_request is None
-        assert page._terminal_browse_current_label is None
-        assert page._terminal_browse_selected_labels == ()
+        assert page._terminal_browse_handoff is None
     finally:
         _dispose(page, qapp)
 
@@ -1279,6 +1418,63 @@ def test_run_click_preserves_outgoing_paint_until_a_frame_arrives(
         assert executor.start_calls == 1
         assert page._lifecycle.phase is RunPhase.RUNNING
         assert refreshes == [True, True]
+    finally:
+        _dispose(page, qapp)
+
+
+def test_post_retirement_start_refusal_preserves_detached_outgoing_paint(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class _StartRefusalExecutor(_Executor):
+        def start(self, _configuration, _source, run_identity, _admission):
+            self.start_calls += 1
+            self.last_identity = run_identity
+            return ExecutorStartFailed(run_identity, CleanupStatus.CLEANED)
+
+    executor = _StartRefusalExecutor()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
+            poni_file=str(tmp_path / "calibration.poni"),
+            save_path=str(tmp_path / "output.nxs"),
+            output_mode="Overwrite",
+        )),
+        lifecycle=ScatteringCoordinator(),
+        sources=_Sources(),
+        executor=executor,
+    )
+    refreshes: list[bool] = []
+    retirements: list[DisplayRetirementReceipt] = []
+    real_apply = page._context_controller.apply_display_retirement
+
+    def applied(receipt):
+        retirements.append(receipt)
+        return real_apply(receipt)
+
+    monkeypatch.setattr(
+        page._context_controller, "apply_display_retirement", applied,
+    )
+    monkeypatch.setattr(
+        page,
+        "_refresh_shell",
+        lambda *, preserve_display=False: refreshes.append(
+            preserve_display or page._retain_outgoing_display
+        ),
+    )
+    try:
+        _shell(page).commandRequested.emit(
+            ShellCommand(ShellCommandKind.RUN_ACTION)
+        )
+        page._drain_executor()
+
+        assert executor.start_calls == 1
+        assert len(retirements) == 1
+        assert page._lifecycle.phase is RunPhase.FAILED
+        assert page._admission is None
+        assert page._retain_outgoing_display is True
+        assert refreshes and all(refreshes)
     finally:
         _dispose(page, qapp)
 

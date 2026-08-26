@@ -148,6 +148,8 @@ _EXPORTS = {
     "TargetChanged": ("xrd_tools.io.output_transaction", "TargetChanged"),
     "TargetLease": ("xrd_tools.io.output_transaction", "TargetLease"),
     "TargetSnapshot": ("xrd_tools.io.output_transaction", "TargetSnapshot"),
+    "revalidate_stream_terminal": ("xrd_tools.io.output_transaction", "revalidate_stream_terminal"),
+    "stream_terminal_object_revision": ("xrd_tools.io.output_transaction", "stream_terminal_object_revision"),
     "TransactionPhase": ("xrd_tools.io.output_transaction", "TransactionPhase"),
     "TransactionSnapshot": ("xrd_tools.io.output_transaction", "TransactionSnapshot"),
     "TransactionStateError": ("xrd_tools.io.output_transaction", "TransactionStateError"),

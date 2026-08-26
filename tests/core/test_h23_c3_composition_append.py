@@ -2379,6 +2379,56 @@ def test_append_refuses_malformed_earlier_epoch_member_history(tmp_path):
     assert target.read_bytes() == before
 
 
+def test_append_refuses_partial_external_selector_inventory_byte_exact(
+    tmp_path,
+):
+    from dataclasses import replace
+    import xrd_tools.io.append as append_module
+
+    (_Disposition, AppendExternalMember, _AppendIntent, AppendSource,
+     _commit, _qualify) = _append_api()
+    members = tuple(AppendExternalMember(
+        path=str(tmp_path / f"member-{ordinal}.h5"),
+        dataset_path="/entry/data/data", size=10, mtime_ns=20,
+        source_start=ordinal, source_stop=ordinal + 1, ordinal=ordinal,
+    ) for ordinal in range(2))
+    source = AppendSource(
+        path=str(tmp_path / "master.h5"), adapter_id="nexus_hdf5",
+        size=30, mtime_ns=40, extent=2,
+        dataset_paths=("/entry/data/a", "/entry/data/b"),
+        external_members=members,
+    )
+    with pytest.raises(ValueError, match="cover every member"):
+        replace(source, dataset_paths=source.dataset_paths[:1])
+
+    intent = _intent_for_source(tmp_path, source, (0, 1))
+    target = tmp_path / "partial-selector-history.nexus"
+    decision = append_module.qualify_append(target, intent)
+    _seed_target(target, intent.labels, tmp_path)
+    with h5py.File(target, "r+") as handle:
+        append_module.commit_append_lineage(
+            handle["entry"], decision, written_labels=intent.labels,
+        )
+        dataset = handle["entry/reduction/config/append_lineage"]
+        lineage = json.loads(dataset[()].decode())
+        lineage["epochs"][0]["source"]["dataset_paths"] = (
+            lineage["epochs"][0]["source"]["dataset_paths"][:1]
+        )
+        del handle["entry/reduction/config/append_lineage"]
+        handle["entry/reduction/config"].create_dataset(
+            "append_lineage", data=json.dumps(
+                lineage, sort_keys=True, separators=(",", ":"),
+            ),
+        )
+    before = target.read_bytes()
+
+    refused = append_module.qualify_append(target, intent)
+
+    assert refused.disposition is append_module.AppendDisposition.REFUSE
+    assert "cover every member" in refused.reason
+    assert target.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "mutation",
     ("pending", "gap", "foreign_source", "foreign_science", "source_base",

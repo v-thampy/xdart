@@ -1095,6 +1095,38 @@ class _ContextRuntime:
         self._pending_trace_projection = None
         return True
 
+    def commit_rebound_navigation_projection(
+        self,
+        presented_frames: tuple[DisplayFrameKey, ...],
+        *,
+        preferences: object,
+        processing_mode: str,
+    ) -> bool:
+        """Acknowledge a semantically identical terminal-Browse rebind."""
+
+        selected = self.navigation.selected
+        if (
+            self._selection is None
+            or self._selection.kind is not ContextKind.BROWSE
+            or type(presented_frames) is not tuple
+            or len(presented_frames) != len(selected)
+            or any(
+                presented is not expected
+                for presented, expected in zip(
+                    presented_frames, selected, strict=True,
+                )
+            )
+            or getattr(preferences, "plot_mode", None)
+            not in {"Overlay", "Waterfall"}
+        ):
+            return False
+        self._committed_trace_scope = self._trace_projection_scope(
+            preferences, processing_mode,
+        )
+        self._committed_trace_selection = selected
+        self._pending_trace_projection = None
+        return True
+
     def qualify_display_event(
         self,
         projection: ContextProjection,

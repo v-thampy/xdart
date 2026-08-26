@@ -227,6 +227,7 @@ class ScientificView(QtWidgets.QFrame):
         self.setMinimumWidth(300)
         self._heavy_available: frozenset[DisplayFrameKey] = frozenset()
         self._frame_keys: tuple[DisplayFrameKey, ...] = ()
+        self._current_key: DisplayFrameKey | None = None
         self._selected_keys: tuple[DisplayFrameKey, ...] = ()
         self._plot_mode = "Single"
         self._single_mode = True
@@ -373,6 +374,30 @@ class ScientificView(QtWidgets.QFrame):
         """Exact 1-D rows accepted by the last successful reconciliation."""
 
         return self._trace_history_keys
+
+    @property
+    def navigation_frame_keys(self) -> tuple[DisplayFrameKey, ...]:
+        """Exact footer identities owned by the accepted presentation."""
+
+        return self._frame_keys
+
+    @property
+    def navigation_current_key(self) -> DisplayFrameKey | None:
+        """Exact current identity owned by the accepted presentation."""
+
+        return self._current_key
+
+    @property
+    def navigation_selected_keys(self) -> tuple[DisplayFrameKey, ...]:
+        """Exact selected identities owned by the accepted presentation."""
+
+        return self._selected_keys
+
+    @property
+    def presentation_plot_mode(self) -> str:
+        """Plot mode of the accepted trace presentation."""
+
+        return self._rendered_plot_mode
 
     @property
     def trace_row_count(self) -> int:
@@ -976,7 +1001,8 @@ class ScientificView(QtWidgets.QFrame):
         ):
             scrub(widget, "hide")
         for name, value in (
-            ("_viewer_2d_payload", None), ("_frame_keys", ()), ("_selected_keys", ()),
+            ("_viewer_2d_payload", None), ("_frame_keys", ()), ("_current_key", None),
+            ("_selected_keys", ()),
             ("_trace_selection_keys", ()), ("_trace_history_keys", ()), ("_rendered_trace_keys", ()),
             ("_trace_row_count", 0),
             ("_waterfall_y_values", ()), ("_waterfall_source_keys", ()), ("_label_indices", {}),
@@ -1157,6 +1183,113 @@ class ScientificView(QtWidgets.QFrame):
                     self.frame_selector.setCurrentIndex(index)
                     break
         self._frame_keys = frames
+        self._current_key = selected
+
+    def rebind_navigation(
+        self,
+        navigation: FrameNavigationProjection,
+    ) -> bool:
+        """Rebind an identity-distinct but scientifically identical context.
+
+        Terminal Browse creates fresh frame identities for the artifact that
+        the acquisition view has already painted.  Re-key the detached trace
+        ownership and footer without touching any numeric array or plot item.
+        The page admits this path only after canonical artifact, label,
+        selection, and presentation-contract checks.
+        """
+
+        if type(navigation) is not FrameNavigationProjection:
+            raise TypeError("navigation rebind requires an exact projection")
+        current = navigation.current
+        frames = (
+            tuple(
+                frame
+                for frame in navigation.frames
+                if frame.artifact == current.artifact
+            )
+            if current is not None
+            else ()
+        )
+        if (
+            current is None
+            or len(frames) != len(self._frame_keys)
+            or len(navigation.selected) != len(self._trace_history_keys)
+            or any(
+                old.local_frame_label != new.local_frame_label
+                for old, new in zip(self._frame_keys, frames, strict=True)
+            )
+            or any(
+                old.local_frame_label != new.local_frame_label
+                for old, new in zip(
+                    self._trace_history_keys,
+                    navigation.selected,
+                    strict=True,
+                )
+            )
+        ):
+            return False
+        old_traces = tuple(
+            self._trace_history_by_identity.get(id(frame))
+            for frame in self._trace_history_keys
+        )
+        if any(type(trace) is not TraceProjection for trace in old_traces):
+            return False
+        identity_map = {
+            id(old): id(new)
+            for old, new in zip(
+                self._trace_history_keys,
+                navigation.selected,
+                strict=True,
+            )
+        }
+        rebound = tuple(
+            replace(trace, frame=frame)
+            for trace, frame in zip(
+                old_traces, navigation.selected, strict=True,
+            )
+        )
+
+        def rekey(row_key: tuple[object, ...]) -> tuple[object, ...]:
+            if (
+                type(row_key) is tuple
+                and len(row_key) == 2
+                and row_key[0] == "live"
+                and row_key[1] in identity_map
+            ):
+                return ("live", identity_map[row_key[1]])
+            return row_key
+
+        blocker = QtCore.QSignalBlocker(self.frame_selector)
+        self._trace_history_by_identity = {
+            id(trace.frame): trace for trace in rebound
+        }
+        self._trace_history_keys = tuple(trace.frame for trace in rebound)
+        self._trace_selection_keys = navigation.selected
+        self._selected_keys = navigation.selected
+        self._rendered_trace_keys = tuple(
+            rekey(key) for key in self._rendered_trace_keys
+        )
+        self._waterfall_source_keys = tuple(
+            rekey(key) for key in self._waterfall_source_keys
+        )
+        self._rebuild_frames(frames, current)
+        current_index = next(
+            (
+                index
+                for index, frame in enumerate(frames)
+                if frame is current
+            ),
+            None,
+        )
+        self.previous_frame.setEnabled(
+            current_index is not None and current_index > 0
+        )
+        self.next_frame.setEnabled(
+            current_index is not None
+            and current_index < len(frames) - 1
+        )
+        del blocker
+        return True
 
     def _render_traces(
         self,
@@ -1319,22 +1452,12 @@ class ScientificView(QtWidgets.QFrame):
         start = len(self._rendered_trace_keys) if incremental else 0
         if reuse_single:
             trace = traces[0]
-            color = _TRACE_COLORS[0]
             title = trace.title or str(trace.frame.local_frame_label)
             item = existing_items[0]
             item.setData(
                 trace.axis.values,
                 trace.intensity,
                 name=title,
-                pen=pg.mkPen(
-                    color=color,
-                    width=1.4,
-                    style=QtCore.Qt.PenStyle.SolidLine,
-                ),
-                symbol="o",
-                symbolBrush=color,
-                symbolPen=color,
-                symbolSize=4,
                 connect="finite",
             )
             label = self.legend.getLabel(item)

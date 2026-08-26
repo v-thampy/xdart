@@ -114,7 +114,23 @@ def _write_scalar(grp, name: str, value: Any) -> None:
 def _write_json(grp, name: str, payload: Any) -> None:
     """Store ``payload`` as a compact JSON string at ``grp[name]``."""
     text = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
+    from xrd_tools.io.append import (
+        _MAX_REPLACEMENT_CONFIG_UTF8_BYTES,
+        _MAX_REPLACEMENT_LINEAGE_UTF8_BYTES,
+    )
+    ceiling = (_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES
+               if name == "source_execution"
+               else _MAX_REPLACEMENT_CONFIG_UTF8_BYTES)
+    if len(text.encode("utf-8")) > ceiling:
+        raise ValueError(f"provenance config {name!r} exceeds the persisted UTF-8 byte ceiling")
     _write_scalar(grp, name, text)
+
+
+def _write_config_text(grp, name: str, value: str) -> None:
+    from xrd_tools.io.append import _MAX_REPLACEMENT_CONFIG_UTF8_BYTES
+    if len(value.encode("utf-8")) > _MAX_REPLACEMENT_CONFIG_UTF8_BYTES:
+        raise ValueError(f"provenance config {name!r} exceeds the persisted UTF-8 byte ceiling")
+    _write_scalar(grp, name, value)
 
 
 def write_provenance(
@@ -205,7 +221,7 @@ def write_provenance(
                 )
                 for k, v in value.items():
                     if isinstance(v, str):
-                        _write_scalar(geom_grp, k, v)
+                        _write_config_text(geom_grp, k, v)
                     else:
                         _write_json(geom_grp, k, v)
             else:

@@ -12,12 +12,26 @@ import pytest
 import tifffile
 from xdart.gui.tabs.scattering.adapters import external_operation as adapter
 from xdart.gui.tabs.scattering.adapters.external_operation import OperationSlot
-from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationTerminalStatus
+from xdart.gui.tabs.scattering.browse_values import BrowseCleanupReceipt
+from xdart.gui.tabs.scattering.controls_editing import EditRefusal, reduce_control_edit
+from xdart.gui.tabs.scattering.controls_inventory import AVERAGE_SCAN
+from xdart.gui.tabs.scattering.controls_projection import project_controls
+from xdart.gui.tabs.scattering.events import CleanupStatus
+from xdart.gui.tabs.scattering.operation_values import (
+    OperationContextStamp,
+    OperationIdentity,
+    OperationTerminal,
+    OperationTerminalStatus,
+    OperationUpdate,
+)
+from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.reduction import (
     AverageFiniteCountsEvidence, AverageScanRecipe, AverageScanResult,
     Integration1DPlan, Integration2DPlan, ReductionPlan,
 )
+from xrd_tools.session.intent_store import RunIntentStore
+from xrd_tools.session.run_configuration import RunIntent
 
 
 def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageScanResult:
@@ -41,7 +55,10 @@ def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageS
         metadata_denominators=(("I0", 2),) if committed else (), finite_counts=evidence,
         diagnostic_code=code, diagnostic=diagnostic,
         h23_phase="committed" if committed else None,
-        commit_identity=StreamTerminal(target, 1, "d" * 64, 1) if committed else None,
+        commit_identity=(
+            StreamTerminal(target, 1, "d" * 64, 1, 1, 1, 1, 1)
+            if committed else None
+        ),
     )
 
 
@@ -85,6 +102,33 @@ def _stub_integrators(monkeypatch):
     monkeypatch.setattr(core, "integrate_1d", one)
     monkeypatch.setattr(core, "integrate_2d", two)
     return calls
+
+
+def test_average_calibration_admission_cancel_is_a_cancelled_terminal(
+    tmp_path, monkeypatch,
+) -> None:
+    entered = threading.Event()
+
+    def cancelled_admission(_request, cancelled):
+        entered.set()
+        assert cancelled.wait(5)
+        raise RuntimeError("admission cancelled")
+
+    monkeypatch.setattr(adapter, "_average_calibration", cancelled_admission)
+    slot = OperationSlot()
+    identity = slot.begin_average(
+        _source(tmp_path),
+        tmp_path / "cancelled.nxs",
+        ReductionPlan(),
+        stamp=OperationContextStamp(0),
+    )
+    assert identity is not None and entered.wait(5)
+    assert slot.cancel(identity)
+
+    update = _join(slot, identity)
+
+    assert update.terminal.status is OperationTerminalStatus.CANCELLED
+    assert update.terminal.diagnostic == ""
 
 
 def test_average_accepts_fixed_eiger_config_without_redundant_max_shape(
@@ -276,7 +320,8 @@ def test_average_private_request_builds_recipe_and_enumerates_only_on_worker(
     monkeypatch.setattr(TiffSeriesSource, "metadata_for",
                         lambda *_a, **_k: pytest.fail("metadata preceded public runner"))
     real_recipe = AverageScanRecipe
-    def load(intent):
+    def load(intent, *, cancelled):
+        assert callable(cancelled) and not cancelled()
         calls.append(("assets", threading.current_thread().name,
                       intent.poni_file, intent.mask_file))
         entered.set(); assert release.wait(5)
@@ -403,7 +448,8 @@ def test_average_private_request_builds_recipe_and_enumerates_only_on_worker(
     for loaded, rebuild, diagnostic, requested_poni, requested_mask, expected_rebuilds in rows:
         with monkeypatch.context() as patch:
             effects = []
-            def row_load(_intent):
+            def row_load(_intent, *, cancelled):
+                assert callable(cancelled) and not cancelled()
                 effects.append("assets")
                 if isinstance(loaded, BaseException): raise loaded
                 return loaded
@@ -696,14 +742,23 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
 
     page, store = _page(tmp_path, monkeypatch)
     reloads = []; reintegrate_reloads = []; catalog = []; notices = []
-    monkeypatch.setattr(page._context_controller, "begin_browse", lambda value:
-        reloads.append(value))
+    refreshes = []
+    monkeypatch.setattr(
+        page._context_controller,
+        "begin_browse",
+        lambda value, *, terminal_commit_identity=None:
+            reloads.append((value, terminal_commit_identity)),
+    )
     monkeypatch.setattr(
         page._context_controller, "reload_reintegrate_browse",
         lambda *args: reintegrate_reloads.append(args),
     )
     monkeypatch.setattr(page, "_request_browser_catalog", lambda: catalog.append(1))
     monkeypatch.setattr(page, "_notice", lambda value: notices.append(value))
+    monkeypatch.setattr(
+        page, "_refresh_shell",
+        lambda *, preserve_display=False: refreshes.append(preserve_display),
+    )
 
     def arm(identity):
         page._average_identity = identity; page._average_revision = store.revision
@@ -718,7 +773,9 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         patch.setattr(provenance_module, "read_provenance", forbidden)
         patch.setattr(Path, "stat", forbidden); patch.setattr(Path, "open", forbidden)
         assert page._consume_average_update(update)
-    assert reloads == [str(target.resolve())] and catalog == [1] and reintegrate_reloads == []
+    assert reloads == [(
+        str(target.resolve()), committed.commit_identity,
+    )] and catalog == [1] and reintegrate_reloads == [] and refreshes == [False]
     assert all(getattr(page, name) is None for name in (
         "_average_identity", "_average_revision", "_average_target", "_average_entry",
     ))
@@ -754,12 +811,18 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         )
 
     stale, stale_update = scheduled(committed)
-    arm(stale); before_notices = len(notices)
+    arm(stale); before_notices = len(notices); before_catalog = len(catalog)
+    before_refreshes = len(refreshes)
     assert page._consume_average_update(OperationUpdate(
         stale, terminal=stale_update.terminal, stale=True,
     ))
     assert len(reloads) == 1
-    assert len(notices) == before_notices
+    assert len(catalog) == before_catalog + 1
+    assert len(refreshes) == before_refreshes + 1
+    assert len(notices) == before_notices + 1
+    assert notices[-1] == (
+        "Average committed but context changed; Browse was not reloaded."
+    )
 
     from xrd_tools.sources import execution_graph
     entered, release = threading.Event(), threading.Event()
@@ -783,3 +846,153 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     release.set(); terminal = _join(slot, pending_identity)
     assert terminal.terminal.payload.disposition == "COMMITTED"
     page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("mode", "visible", "accepted"),
+    (
+        ("Int 1D", True, True),
+        ("Int 2D", True, True),
+        ("Int 1D (XYE)", False, False),
+        ("1D Viewer", False, False),
+        ("2D Viewer", False, False),
+    ),
+)
+def test_average_control_and_edit_are_integration_mode_only(
+    tmp_path, mode, visible, accepted,
+) -> None:
+    intent = RunIntent(
+        source_spec=_source(tmp_path / mode.replace(" ", "_")),
+        save_path=str(tmp_path / "processed"),
+        output_mode="Overwrite",
+        processing_mode=mode,
+    )
+    snapshot = RunIntentStore(intent).snapshot()
+    projected = project_controls(snapshot, None, RunPhase.IDLE)
+    paths = {
+        field.path
+        for field in projected.bound_controls.fields
+    }
+    assert (AVERAGE_SCAN in paths) is visible
+    edited = reduce_control_edit(snapshot, AVERAGE_SCAN, True)
+    assert (not isinstance(edited, EditRefusal)) is accepted
+
+
+@pytest.mark.parametrize("blocked_by", ("viewer", "browse_cleanup"))
+def test_average_commit_reload_refusal_is_terminally_total(
+    tmp_path, monkeypatch, qapp, blocked_by,
+) -> None:
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
+
+    page, store = _page(tmp_path, monkeypatch)
+    target = str((tmp_path / "committed.nxs").resolve())
+    result = _result("COMMITTED", target)
+    identity = OperationIdentity(1)
+    update = OperationUpdate(
+        identity,
+        terminal=OperationTerminal(
+            identity,
+            OperationTerminalStatus.RETURNED,
+            payload=result,
+        ),
+    )
+    catalogs: list[None] = []
+    refreshes: list[bool] = []
+    notices: list[str] = []
+    timers: list[None] = []
+    monkeypatch.setattr(
+        page, "_request_browser_catalog", lambda: catalogs.append(None),
+    )
+    monkeypatch.setattr(
+        page, "_refresh_shell",
+        lambda *, preserve_display=False: refreshes.append(preserve_display),
+    )
+    monkeypatch.setattr(page, "_notice", notices.append)
+    monkeypatch.setattr(page, "_ensure_timer", lambda: timers.append(None))
+    page._average_identity = identity
+    page._average_revision = store.revision
+    page._average_target = target
+    page._average_entry = "entry"
+    controller = page._context_controller
+    if blocked_by == "viewer":
+        controller._viewer_2d_standalone = object()
+    else:
+        controller._cleanup_receipt = BrowseCleanupReceipt(
+            None, CleanupStatus.CLEANUP_PENDING,
+        )
+    try:
+        assert page._consume_average_update(update)
+        assert catalogs == [None]
+        assert refreshes
+        assert notices == [
+            "Average committed; Browse reload deferred: "
+            + (
+                "2D Viewer cleanup remains pending"
+                if blocked_by == "viewer"
+                else "Browse cleanup remains pending"
+            )
+        ]
+        assert bool(timers) is (blocked_by == "browse_cleanup")
+        assert all(getattr(page, name) is None for name in (
+            "_average_identity", "_average_revision",
+            "_average_target", "_average_entry",
+        ))
+    finally:
+        controller._viewer_2d_standalone = None
+        controller._cleanup_receipt = None
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_average_stale_committed_terminal_reports_without_auto_reload(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
+
+    page, store = _page(tmp_path, monkeypatch)
+    target = str((tmp_path / "stale-committed.nxs").resolve())
+    result = _result("COMMITTED", target)
+    identity = OperationIdentity(91)
+    update = OperationUpdate(
+        identity,
+        terminal=OperationTerminal(
+            identity, OperationTerminalStatus.RETURNED, payload=result,
+        ),
+    )
+    reloads = []
+    catalogs = []
+    notices = []
+    refreshes = []
+    monkeypatch.setattr(
+        page._context_controller, "begin_browse",
+        lambda *_args, **_kwargs: reloads.append(1),
+    )
+    monkeypatch.setattr(
+        page, "_request_browser_catalog", lambda: catalogs.append(1),
+    )
+    monkeypatch.setattr(page, "_notice", notices.append)
+    monkeypatch.setattr(
+        page, "_refresh_shell",
+        lambda *, preserve_display=False: refreshes.append(preserve_display),
+    )
+    page._average_identity = identity
+    page._average_revision = store.revision
+    page._average_target = target
+    page._average_entry = "entry"
+    before = store.snapshot()
+    changed = before.thaw()
+    changed.project_root = str(tmp_path / "changed-context")
+    store.commit(changed, expected_revision=before.revision)
+    try:
+        assert page._consume_average_update(update)
+        assert reloads == []
+        assert catalogs == [1]
+        assert refreshes == [False]
+        assert notices == [
+            "Average committed but context changed; Browse was not reloaded."
+        ]
+        assert all(getattr(page, name) is None for name in (
+            "_average_identity", "_average_revision",
+            "_average_target", "_average_entry",
+        ))
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()

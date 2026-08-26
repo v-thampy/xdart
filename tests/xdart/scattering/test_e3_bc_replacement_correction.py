@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from threading import Event, Lock, Thread
+import time
 
 import numpy as np
 import pytest
@@ -619,6 +620,53 @@ def test_cancelled_active_and_queued_replacement_retire_all_loader_owners(
     finally:
         release_c.set()
         loader.close()
+
+
+def test_close_never_waits_for_blocked_active_browse_and_keeps_latest_identity(
+    tmp_path: Path,
+) -> None:
+    entered = Event()
+    release = Event()
+    active_path = tmp_path / "active.nxs"
+    queued_path = tmp_path / "latest.nxs"
+    active_path.write_bytes(b"active")
+    queued_path.write_bytes(b"latest")
+
+    def blocked_records(_source):
+        entered.set()
+        assert release.wait(timeout=5.0)
+        return iter(())
+
+    loader = BrowseLoader(
+        open_scan=lambda _source: object(), read_records=blocked_records,
+    )
+    active = BrowseLoadRequest("active", 1, str(active_path))
+    latest = BrowseLoadRequest("latest", 2, str(queued_path))
+    worker = None
+    try:
+        loader.begin(active)
+        assert entered.wait(timeout=5.0)
+        loader.begin(latest)
+        worker = loader._worker
+        started = time.monotonic()
+        pending = loader.close(latest)
+        assert time.monotonic() - started < 0.2
+        assert pending.request is latest
+        assert pending.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert worker is not None and worker.is_alive()
+
+        release.set()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        cleaned = loader.close(latest)
+        assert cleaned.request is latest
+        assert cleaned.cleanup_status is CleanupStatus.CLEANED
+        assert loader._active is None and loader._queued is None
+    finally:
+        release.set()
+        if worker is not None:
+            worker.join(timeout=5.0)
+        loader.close(latest if loader.owns_request(latest) else None)
 
 
 def test_cancel_d_during_promotion_cannot_launch_unowned_d(

@@ -2,7 +2,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, fields
 import hashlib, json, math, os
-from io import BytesIO
 from pathlib import Path
 import re, threading, time
 import tempfile
@@ -14,7 +13,7 @@ from xrd_tools.core.provenance import read_provenance
 from xrd_tools.core.scan import Scan, ScanFrame, SourceKind, SourceSpec
 from xrd_tools.core.strictness import GIAllDummyError, MissingNormalizationError, StrictPolicy
 from xrd_tools.io.append import AppendIntent, science_fingerprint
-from xrd_tools.io.image import load_mask
+from xrd_tools.io.image import load_mask, read_detector_image_layout
 from xrd_tools.io.nexus_record import _average_count_chunks, _average_count_digest
 from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot
 from xrd_tools.io.read import _read_average_lineage, get_average_finite_counts, resolve_source_master
@@ -36,7 +35,9 @@ _MAX_CONTRIBUTORS = 1000000
 _READER_BINDING = 'average_closed_v1'
 _JSON_MAX_BYTES, _JSON_MAX_DEPTH, _JSON_MAX_NODES = 1 << 16, 8, 4096
 _METADATA_MAX_KEYS = 64
-_STATIC_MASK_FILE_MAX_BYTES = 64 << 20
+_STATIC_MASK_COPY_CHUNK_BYTES = 1 << 16
+_STATIC_MASK_COMPATIBILITY_FLOOR_BYTES = 64 << 20
+_STATIC_MASK_HEADER_ALLOWANCE_BYTES = 1 << 20
 _STAGES = frozenset({'qualify', 'read', 'average', 'reduce', 'write', 'settle'})
 def _reject(condition: bool, message: str, error=ValueError) -> None:
     if condition:
@@ -464,31 +465,76 @@ def _background_fact(graph: PreparedSourceExecutionGraph, index: int, row: Mappi
             raise ValueError('AVERAGE_BACKGROUND_METADATA_INVALID')
         items.append((key, tagged))
     return (index + 1, str(Path(path).resolve(strict=False)), selector, source_index, graph.detector_shape, tuple(items))
-def _load_static_mask(recipe: AverageScanRecipe, shape: tuple[int, int]) -> np.ndarray | None:
+def _load_static_mask(
+    recipe: AverageScanRecipe, shape: tuple[int, int],
+    token: threading.Event | None = None,
+) -> np.ndarray | None:
     state = recipe.calibration.mask
     if state.status is not FactStatus.PRESENT:
         return None
+    _poll(token)
     path = Path(state.source_uri)
-    with path.open("rb") as stream:
-        payload = stream.read(_STATIC_MASK_FILE_MAX_BYTES + 1)
-    _reject(len(payload) > _STATIC_MASK_FILE_MAX_BYTES,
-            'AVERAGE_STATIC_MASK_FILE_TOO_LARGE')
-    digest = hashlib.sha256(payload).hexdigest()
-    _reject(digest != state.sha256, 'AVERAGE_STATIC_MASK_DIGEST_CHANGED')
-    value = _decode_static_mask_bytes(path, payload)
+    snapshot_limit = _static_mask_snapshot_limit(shape)
+    with tempfile.TemporaryDirectory(prefix="xdart-average-mask-") as root:
+        snapshot = Path(root) / ("mask" + path.suffix)
+        digest = hashlib.sha256()
+        copied = 0
+        with path.open("rb") as source, snapshot.open("xb") as target:
+            while True:
+                _poll(token)
+                payload = source.read(_STATIC_MASK_COPY_CHUNK_BYTES)
+                if not payload:
+                    break
+                copied += len(payload)
+                _reject(copied > snapshot_limit,
+                        'AVERAGE_STATIC_MASK_FILE_TOO_LARGE')
+                digest.update(payload)
+                target.write(payload)
+        _reject(digest.hexdigest() != state.sha256,
+                'AVERAGE_STATIC_MASK_DIGEST_CHANGED')
+        _poll(token)
+        _qualify_static_mask_snapshot(snapshot, shape)
+        _poll(token)
+        value = _decode_static_mask_snapshot(snapshot)
+        _poll(token)
     _reject(value.dtype.str != state.dtype or tuple(value.shape) != tuple(state.shape), 'AVERAGE_STATIC_MASK_SCHEMA_CHANGED')
     _reject(value.dtype != np.dtype(bool) or tuple(value.shape) != shape, 'AVERAGE_STATIC_MASK_SHAPE_INVALID')
     result = np.frombuffer(np.ascontiguousarray(value).tobytes(), dtype=bool).reshape(shape)
     result.setflags(write=False)
     return result
-def _decode_static_mask_bytes(path: Path, payload: bytes) -> np.ndarray:
-    """Decode only the immutable byte snapshot whose digest was accepted."""
+def _static_mask_snapshot_limit(shape: tuple[int, int]) -> int:
+    pixels = int(shape[0]) * int(shape[1])
+    _reject(pixels <= 0, 'AVERAGE_STATIC_MASK_SHAPE_INVALID')
+    return max(
+        _STATIC_MASK_COMPATIBILITY_FLOOR_BYTES,
+        8 * pixels + _STATIC_MASK_HEADER_ALLOWANCE_BYTES,
+    )
+def _qualify_static_mask_snapshot(path: Path, shape: tuple[int, int]) -> None:
     if path.suffix.casefold() == ".npy":
-        return np.load(BytesIO(payload), allow_pickle=False)
-    with tempfile.TemporaryDirectory(prefix="xdart-average-mask-") as root:
-        snapshot = Path(root) / ("mask" + path.suffix)
-        snapshot.write_bytes(payload)
-        return load_mask(snapshot)
+        value = np.load(path, allow_pickle=False, mmap_mode="r")
+        try:
+            observed_shape = tuple(value.shape)
+            dtype = np.dtype(value.dtype)
+        finally:
+            mapping = getattr(value, "_mmap", None)
+            if mapping is not None:
+                mapping.close()
+        frame_count = 1
+    else:
+        layout = read_detector_image_layout(path)
+        observed_shape = tuple(layout.shape)
+        dtype = np.dtype(layout.dtype)
+        frame_count = layout.frame_count
+    _reject(
+        observed_shape != tuple(shape)
+        or frame_count != 1
+        or dtype.kind not in "biuf"
+        or dtype.itemsize > 8,
+        'AVERAGE_STATIC_MASK_SCHEMA_CHANGED',
+    )
+def _decode_static_mask_snapshot(path: Path) -> np.ndarray:
+    """Decode only the immutable file snapshot whose digest was accepted."""
+    return load_mask(path)
 def _row_value(row: Mapping[str, Any], key: str, configured: frozenset[str]) -> Any:
     return _metadata_value(row, key) if key in configured else row.get(key)
 def _canonical_scalar(value: Any) -> bytes:
@@ -523,7 +569,7 @@ def _accumulate_metadata(row: Mapping[str, Any], plan: AverageScanPlan, configur
             _reject(key not in invariants or invariants[key][0] != encoded, 'AVERAGE_INVARIANT_METADATA_CHANGED')
 def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph, window, token: threading.Event | None, progress: Callable[[str, int, int], None]) -> dict[str, Any]:
     shape, extent = (plan.detector_shape, plan.contributor_extent)
-    static = _load_static_mask(plan.recipe, shape)
+    static = _load_static_mask(plan.recipe, shape, token)
     sums = np.zeros(shape, dtype=np.float64)
     counts = np.zeros(shape, dtype=_COUNT_DTYPE)
     numeric = {key: [0.0, 0.0, 0] for key in plan.numeric_metadata_keys}

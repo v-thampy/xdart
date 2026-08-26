@@ -54,7 +54,14 @@ class DirectoryModifiedCache:
             self._generation += 1
             self._entries.clear()
 
-    def modified_ns(self, directory: Path, own_mtime_ns: int) -> int:
+    def modified_ns(
+        self, directory: Path, own_mtime_ns: int, *,
+        cancelled: threading.Event | None = None,
+    ) -> int:
+        if cancelled is not None and type(cancelled) is not threading.Event:
+            raise TypeError("catalog cancellation must be an exact Event")
+        if cancelled is not None and cancelled.is_set():
+            return own_mtime_ns
         path = os.path.normcase(os.path.abspath(os.fspath(directory)))
         now = time.monotonic()
         with self._lock:
@@ -68,11 +75,14 @@ class DirectoryModifiedCache:
                     return effective_mtime_ns
             generation = self._generation
 
-        effective_mtime_ns, cacheable = _directory_modified_ns(
-            directory,
-            own_mtime_ns,
+        effective_mtime_ns, cacheable = (
+            _directory_modified_ns(directory, own_mtime_ns)
+            if cancelled is None
+            else _directory_modified_ns(
+                directory, own_mtime_ns, cancelled=cancelled,
+            )
         )
-        if not cacheable:
+        if not cacheable or cancelled is not None and cancelled.is_set():
             return effective_mtime_ns
         with self._lock:
             # An explicit refresh that landed while scandir was running owns
@@ -109,6 +119,7 @@ def enumerate_processed_artifacts(
     accepted_suffixes: frozenset[str] | None = None,
     inspect_directory_contents: bool = False,
     directory_time_cache: DirectoryModifiedCache | None = None,
+    cancelled: threading.Event | None = None,
 ) -> tuple[BrowserCatalogEntry, ...]:
     """Enumerate regular artifacts accepted by one immutable browser policy."""
 
@@ -116,6 +127,10 @@ def enumerate_processed_artifacts(
         return ()
     if type(inspect_directory_contents) is not bool:
         raise TypeError("directory-content timestamp policy must be boolean")
+    if cancelled is not None and type(cancelled) is not threading.Event:
+        raise TypeError("catalog cancellation must be an exact Event")
+    if cancelled is not None and cancelled.is_set():
+        return ()
     if (
         accepted_suffixes is not None
         and (
@@ -136,57 +151,58 @@ def enumerate_processed_artifacts(
     ):
         raise TypeError("directory timestamp cache must be exact")
     root = Path(os.path.abspath(os.path.expanduser(directory)))
+    directories: list[BrowserCatalogEntry] = []
+    artifacts: list[BrowserCatalogEntry] = []
+    parent_entry = _parent_navigation_entry(root, cancelled=cancelled)
+    if parent_entry is not None:
+        directories.append(parent_entry)
     try:
-        children = tuple(root.iterdir())
+        with os.scandir(root) as children:
+            for entry in children:
+                if cancelled is not None and cancelled.is_set():
+                    return ()
+                child = Path(entry.path)
+                try:
+                    fact = entry.stat()
+                except OSError:
+                    continue
+                if cancelled is not None and cancelled.is_set():
+                    return ()
+                if stat.S_ISDIR(fact.st_mode):
+                    modified_ns = int(fact.st_mtime_ns)
+                    if inspect_directory_contents:
+                        if directory_time_cache is None:
+                            modified_ns, _cacheable = _directory_modified_ns(
+                                child, modified_ns, cancelled=cancelled,
+                            )
+                        else:
+                            modified_ns = directory_time_cache.modified_ns(
+                                child, modified_ns, cancelled=cancelled,
+                            )
+                    if cancelled is not None and cancelled.is_set():
+                        return ()
+                    directories.append(BrowserCatalogEntry(
+                        os.path.abspath(os.fspath(child)),
+                        f"{child.name}/", modified_ns, True,
+                    ))
+                    continue
+                accepted = (
+                    is_readable_output_path(child)
+                    if accepted_suffixes is None
+                    else child.suffix.casefold() in accepted_suffixes
+                )
+                if not accepted or not stat.S_ISREG(fact.st_mode):
+                    continue
+                artifacts.append(BrowserCatalogEntry(
+                    os.path.abspath(os.fspath(child)), child.name,
+                    fact.st_mtime_ns,
+                ))
     except (FileNotFoundError, NotADirectoryError):
-        parent_entry = _parent_navigation_entry(root)
         return () if parent_entry is None else (parent_entry,)
     except OSError:
         return ()
-    directories: list[BrowserCatalogEntry] = []
-    artifacts: list[BrowserCatalogEntry] = []
-    parent_entry = _parent_navigation_entry(root)
-    if parent_entry is not None:
-        directories.append(parent_entry)
-    for child in children:
-        try:
-            fact = child.stat()
-        except OSError:
-            continue
-        if child.is_dir():
-            modified_ns = int(fact.st_mtime_ns)
-            if inspect_directory_contents:
-                if directory_time_cache is None:
-                    modified_ns, _cacheable = _directory_modified_ns(
-                        child,
-                        modified_ns,
-                    )
-                else:
-                    modified_ns = directory_time_cache.modified_ns(
-                        child,
-                        modified_ns,
-                    )
-            directories.append(BrowserCatalogEntry(
-                os.path.abspath(os.fspath(child)),
-                f"{child.name}/",
-                modified_ns,
-                True,
-            ))
-            continue
-        accepted = (
-            is_readable_output_path(child)
-            if accepted_suffixes is None
-            else child.suffix.casefold() in accepted_suffixes
-        )
-        if not accepted or not child.is_file():
-            continue
-        artifacts.append(
-            BrowserCatalogEntry(
-                os.path.abspath(os.fspath(child)),
-                child.name,
-                fact.st_mtime_ns,
-            )
-        )
+    if cancelled is not None and cancelled.is_set():
+        return ()
     parent_entries = tuple(
         entry for entry in directories if entry.label == ".."
     )
@@ -207,6 +223,8 @@ def enumerate_processed_artifacts(
 def _directory_modified_ns(
     directory: Path,
     own_mtime_ns: int,
+    *,
+    cancelled: threading.Event | None = None,
 ) -> tuple[int, bool]:
     """Return newest immediate-child mtime and whether the read is cacheable."""
 
@@ -214,6 +232,8 @@ def _directory_modified_ns(
     try:
         with os.scandir(directory) as children:
             for child in children:
+                if cancelled is not None and cancelled.is_set():
+                    return own_mtime_ns, False
                 try:
                     child_mtime_ns = int(
                         child.stat(follow_symlinks=False).st_mtime_ns
@@ -236,8 +256,10 @@ def _directory_modified_ns(
 
 
 def _parent_navigation_entry(
-    root: Path,
+    root: Path, *, cancelled: threading.Event | None = None,
 ) -> BrowserCatalogEntry | None:
+    if cancelled is not None and cancelled.is_set():
+        return None
     parent = root.parent
     if parent == root:
         return None
@@ -245,7 +267,8 @@ def _parent_navigation_entry(
         parent_fact = parent.stat()
     except OSError:
         return None
-    if not stat.S_ISDIR(parent_fact.st_mode):
+    if (cancelled is not None and cancelled.is_set()
+            or not stat.S_ISDIR(parent_fact.st_mode)):
         return None
     return BrowserCatalogEntry(
         os.fspath(parent),

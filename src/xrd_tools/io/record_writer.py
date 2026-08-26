@@ -47,9 +47,14 @@ from xrd_tools.io.nexus_record import (
 from xrd_tools.io.append import (
     AppendDecision,
     AppendDisposition,
+    _MAX_REPLACEMENT_CONFIG_UTF8_BYTES,
+    _MAX_REPLACEMENT_LINEAGE_UTF8_BYTES,
+    _MAX_REPLACEMENT_PATH_UTF8_BYTES,
     commit_append_lineage,
     decode_replacement_lineage,
     _replacement_hard_group,
+    _replacement_utf8_attribute,
+    _replacement_utf8_scalar,
     stage_append_lineage,
 )
 from xrd_tools.io.output_transaction import (
@@ -193,6 +198,8 @@ class RecordWrite:
                 value = str(value)
                 if not value:
                     raise ValueError(f"source snapshot {key} may not be empty")
+                if len(value.encode("utf-8")) > _MAX_REPLACEMENT_PATH_UTF8_BYTES:
+                    raise ValueError(f"source snapshot {key} exceeds the persisted path byte ceiling")
             snapshot[key] = value
         if snapshot and self.source_path is None:
             raise ValueError("source snapshot requires source_path")
@@ -200,6 +207,10 @@ class RecordWrite:
             raise ValueError(
                 "absent source_path requires source_frame_index to be exactly 0"
             )
+        if (self.source_path is not None
+                and len(str(self.source_path).encode("utf-8"))
+                    > _MAX_REPLACEMENT_PATH_UTF8_BYTES):
+            raise ValueError("source_path exceeds the persisted path byte ceiling")
         object.__setattr__(self, "source_snapshot", MappingProxyType(snapshot))
         if self.thumbnail_mask is not None:
             incoming_mask = np.asarray(self.thumbnail_mask)
@@ -318,18 +329,20 @@ def _replacement_dtype_signature(dtype): dtype = np.dtype(dtype); string, vlen, 
 def _replacement_atom(value): value = value.item() if isinstance(value, np.generic) else value; return ("bytes", value.hex()) if isinstance(value, bytes) else ("text", value) if isinstance(value, str) else ("array", _replacement_value_signature(value)) if isinstance(value, np.ndarray) else ("reference", type(value).__module__, type(value).__qualname__, bool(value), hash(value) if value else None) if isinstance(value, h5py.Reference) else ("value", type(value).__module__, type(value).__qualname__, repr(value))
 def _replacement_value_signature(value, dtype=None): value = np.asarray(value); payload = json.dumps([_replacement_atom(item) for item in value.ravel()], ensure_ascii=False, separators=(",", ":")).encode() if value.dtype.kind in "OU" else value.tobytes(order="C"); return (_replacement_dtype_signature(value.dtype if dtype is None else dtype), value.shape, payload)
 def _replacement_json_node(parent, path, role, *, required=True):
-    node = _replacement_hard_group(parent, path, h5py.Dataset); info = None if node is None else h5py.check_string_dtype(node.dtype)
+    node = _replacement_hard_group(parent, path, h5py.Dataset)
     if node is None: return None if not required else (_ for _ in ()).throw(ValueError(f"{role} is absent or not a local scalar"))
-    raw = _replacement_scalar(node[()], role); value = json.loads(raw)
-    (None if node.shape == () and node.maxshape == () and node.chunks is None and node.compression is None and info is not None and info.encoding == "utf-8" and info.length is None and raw == json.dumps(value, sort_keys=True, separators=(",", ":")) else (_ for _ in ()).throw(ValueError(f"{role} is noncanonical"))); return value
+    raw = _replacement_utf8_scalar(node, role); value = json.loads(raw)
+    (None if raw == json.dumps(value, sort_keys=True, separators=(",", ":")) else (_ for _ in ()).throw(ValueError(f"{role} is noncanonical"))); return value
 def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "entry", rows: Mapping[str, Mapping[int, int]] | None = None, context: tuple[str, Mapping[str, Any] | None, Mapping[str, Any]] | None = None, metadata_keys: tuple[str, ...] = (), include_geometry: bool = False) -> Mapping[str, Any]:
     label, group = int(label), _replacement_hard_group(handle, entry); frames = _replacement_hard_group(group, "frames"); frame_name = f"frame_{label:04d}"; frame = _replacement_hard_group(frames, frame_name); source = _replacement_hard_group(frame, "source"); path_node = _replacement_hard_group(source, "path", h5py.Dataset); index_node = _replacement_hard_group(source, "frame_index", h5py.Dataset)
-    if not isinstance(source, h5py.Group) or set(source) != {"path", "frame_index"} or set(source.attrs) - {"NX_class", *(attr for _key, attr in _SOURCE_SNAPSHOT_ATTRIBUTES)} or _replacement_scalar(source.attrs.get("NX_class"), "replacement source class") != "NXcollection" or type(source.get("path", getlink=True)) is not h5py.HardLink or type(source.get("frame_index", getlink=True)) is not h5py.HardLink or not isinstance(path_node, h5py.Dataset) or path_node.shape != () or path_node.maxshape != () or path_node.chunks is not None or path_node.compression is not None or dict(path_node.attrs) or (encoding := h5py.check_string_dtype(path_node.dtype)) is None or encoding.encoding != "utf-8" or not isinstance(index_node, h5py.Dataset) or index_node.shape != () or index_node.maxshape != () or index_node.chunks is not None or index_node.compression is not None or dict(index_node.attrs) or index_node.dtype.kind not in "iu": raise WriterStateError(f"replacement frame {label} has no exact source fact")
-    path, index = _replacement_scalar(path_node[()], "replacement source path"), _replacement_scalar(index_node[()], "replacement source index")
+    try: source_class = _replacement_utf8_attribute(source, "NX_class", "replacement source class", max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES)
+    except (AttributeError, TypeError, ValueError): source_class = None
+    if not isinstance(source, h5py.Group) or set(source) != {"path", "frame_index"} or set(source.attrs) - {"NX_class", *(attr for _key, attr in _SOURCE_SNAPSHOT_ATTRIBUTES)} or source_class != "NXcollection" or type(source.get("path", getlink=True)) is not h5py.HardLink or type(source.get("frame_index", getlink=True)) is not h5py.HardLink or not isinstance(path_node, h5py.Dataset) or path_node.shape != () or path_node.maxshape != () or path_node.chunks is not None or path_node.compression is not None or len(path_node.attrs) != 0 or (encoding := h5py.check_string_dtype(path_node.dtype)) is None or encoding.encoding != "utf-8" or not isinstance(index_node, h5py.Dataset) or index_node.shape != () or index_node.maxshape != () or index_node.chunks is not None or index_node.compression is not None or len(index_node.attrs) != 0 or index_node.dtype.kind not in "iu": raise WriterStateError(f"replacement frame {label} has no exact source fact")
+    path, index = _replacement_utf8_scalar(path_node, "replacement source path", max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES), _replacement_scalar(index_node[()], "replacement source index")
     if type(path) is not str or not path or type(index) is not int or index < 0: raise WriterStateError(f"replacement frame {label} source fact is malformed")
     snapshot = {}
     for key, attr in _SOURCE_SNAPSHOT_ATTRIBUTES:
-        value = None if attr not in source.attrs else _replacement_scalar(source.attrs[attr], f"source {attr}")
+        value = None if attr not in source.attrs else _read_replacement_source_attribute(source, attr, key)
         if value is not None and (key in {"size", "mtime_ns", "frame_count"} and (type(value) is not int or value < 0) or key == "self_contained" and type(value) is not bool or key not in {"size", "mtime_ns", "frame_count", "self_contained"} and type(value) is not str): raise WriterStateError(f"replacement source {attr} is malformed")
         snapshot[key] = value
     def indexed(name: str, columns: tuple[str, ...]) -> Mapping[str, Any]:
@@ -337,7 +350,7 @@ def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "ent
         table = _replacement_hard_group(group, name)
         if not isinstance(table, h5py.Group) or _replacement_hard_group(table, "frame_index", h5py.Dataset) is None: return MappingProxyType({})
         if rows is None:
-            labels = tuple(int(value) for value in np.asarray(table["frame_index"][()]).ravel())
+            labels = tuple(int(value) for value in _read_replacement_frame_index(_replacement_hard_group(table, "frame_index", h5py.Dataset), f"replacement {name}/frame_index"))
             (None if labels.count(label) == 1 and len(labels) == len(set(labels)) else (_ for _ in ()).throw(WriterStateError(f"replacement {name} inventory is malformed"))); row = labels.index(label)
         else:
             row = rows.get(name, {}).get(label); (None if row is not None and int(table["frame_index"][row]) == label else (_ for _ in ()).throw(WriterStateError(f"replacement {name} cursor changed")))
@@ -360,13 +373,21 @@ def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "ent
                 table, selected, h5py.Dataset,
             )
             if not isinstance(node, h5py.Dataset): raise WriterStateError(f"replacement {name}/{column} is absent")
-            try: value = node[row]
+            info = h5py.check_string_dtype(node.dtype)
+            if info is None and (h5py.check_vlen_dtype(node.dtype) is not None
+                                 or node.dtype.kind == "O"):
+                raise WriterStateError(
+                    f"replacement {column} has an unsupported vlen schema"
+                )
+            if info is not None and info.length is not None and info.length > _MAX_REPLACEMENT_CONFIG_UTF8_BYTES:
+                raise WriterStateError(f"replacement {column} exceeds the persisted UTF-8 byte ceiling")
+            try: value = (_read_replacement_utf8_element(node, int(row), f"replacement {column}") if info is not None and info.length is None else node[row])
             except (IndexError, TypeError, ValueError) as error: raise WriterStateError(f"replacement {name} row is malformed") from error
             if np.asarray(value).shape == (): values[str(selected)] = _replacement_scalar(value, f"replacement {column}")
         return MappingProxyType(values)
     if context is None:
         config = _replacement_hard_group(handle, f"{entry}/reduction/config"); node = _replacement_hard_group(config, "source_execution", h5py.Dataset)
-        try: execution = json.loads(_replacement_scalar(node[()], "source_execution")); source_base, _lineage_bytes, lineage = decode_replacement_lineage(handle, entry=entry)
+        try: execution = json.loads(_replacement_utf8_scalar(node, "source_execution", max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES)); source_base, _lineage_bytes, lineage = decode_replacement_lineage(handle, entry=entry)
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error: raise WriterStateError("replacement source context is absent or malformed") from error
         context = (source_base, lineage, _validate_replacement_execution(execution))
     source_base, lineage, execution = context
@@ -544,6 +565,170 @@ class WriterStateError(RuntimeError):
     pass
 
 
+# Headless vNext replacement supports at most one million persisted frame rows.
+# This value is intentionally independent of GUI admission modules.
+_MAX_REPLACEMENT_FRAME_ROWS = 1_000_000
+
+
+def _read_replacement_frame_index(
+    node: h5py.Dataset | None, role: str, *, require_nonempty: bool = False,
+) -> np.ndarray:
+    length = None if not isinstance(node, h5py.Dataset) or node.ndim != 1 else int(node.shape[0])
+    if (not isinstance(node, h5py.Dataset) or node.ndim != 1
+            or node.dtype != np.dtype(np.int64) or length is None
+            or length > _MAX_REPLACEMENT_FRAME_ROWS
+            or require_nonempty and length < 1):
+        raise WriterStateError(f"{role} is not an exact bounded int64 vector")
+    return np.asarray(node[()])
+
+
+def _read_replacement_utf8_element(
+    node: h5py.Dataset, row: int, role: str,
+) -> str:
+    info = None if not isinstance(node, h5py.Dataset) else h5py.check_string_dtype(node.dtype)
+    try:
+        local = type(node.parent.get(node.name.rsplit("/", 1)[-1], getlink=True)) is h5py.HardLink
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        local = False
+    if (not isinstance(node, h5py.Dataset) or not local or node.ndim != 1
+            or not 0 <= int(row) < int(node.shape[0]) or info is None
+            or info.encoding != "utf-8" or info.length is not None):
+        raise WriterStateError(f"{role} is not a local UTF-8 vector element")
+    ceiling = _MAX_REPLACEMENT_CONFIG_UTF8_BYTES
+    capacity = min(64 << 10, ceiling + 1)
+    while True:
+        destination = np.empty((), dtype=f"S{capacity}")
+        try:
+            node.read_direct(destination, source_sel=np.s_[int(row)])
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise WriterStateError(f"{role} could not be read as bounded UTF-8") from error
+        raw = bytes(destination[()])
+        if len(raw) < capacity:
+            break
+        if capacity == ceiling + 1:
+            raise WriterStateError(f"{role} exceeds the persisted UTF-8 byte ceiling")
+        capacity = min(capacity * 2, ceiling + 1)
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise WriterStateError(f"{role} is not UTF-8") from error
+
+
+def _read_replacement_source_attribute(
+    source: h5py.Group, attr_name: str, key: str,
+) -> Any:
+    role = f"source {attr_name}"
+    try:
+        attribute = source.attrs.get_id(attr_name)
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        raise WriterStateError(f"{role} is malformed") from error
+    if attribute.shape != ():
+        raise WriterStateError(f"{role} is not scalar")
+    if key in {"adapter_id", "dataset_path"}:
+        info = h5py.check_string_dtype(attribute.dtype)
+        if info is None or info.encoding != "utf-8":
+            raise WriterStateError(f"{role} is not UTF-8")
+        destination = np.empty((), dtype=f"S{_MAX_REPLACEMENT_PATH_UTF8_BYTES + 1}")
+        try:
+            attribute.read(destination)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise WriterStateError(f"{role} could not be read as bounded UTF-8") from error
+        raw = bytes(destination[()])
+        if len(raw) > _MAX_REPLACEMENT_PATH_UTF8_BYTES:
+            raise WriterStateError(f"{role} exceeds the persisted path byte ceiling")
+        try:
+            return raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise WriterStateError(f"{role} is not UTF-8") from error
+    expected = np.dtype(bool) if key == "self_contained" else None
+    if ((expected is not None and attribute.dtype != expected)
+            or expected is None and (attribute.dtype.kind not in "iu"
+                                     or attribute.dtype.itemsize > 8)):
+        raise WriterStateError(f"{role} has an invalid scalar dtype")
+    destination = np.empty((), dtype=attribute.dtype)
+    try:
+        attribute.read(destination)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise WriterStateError(f"{role} could not be read") from error
+    return _replacement_scalar(destination[()], role)
+
+
+def _read_replacement_attribute_value(
+    owner: h5py.Group | h5py.Dataset, name: str, role: str,
+) -> Any:
+    try:
+        attribute = owner.attrs.get_id(name)
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        raise WriterStateError(f"{role} is malformed") from error
+    info = h5py.check_string_dtype(attribute.dtype)
+    if info is not None and info.length is None:
+        if info.encoding != "utf-8":
+            raise WriterStateError(f"{role} has an unsupported vlen schema")
+        if attribute.shape != ():
+            cardinality = 1
+            for extent in attribute.shape:
+                cardinality *= int(extent)
+            width = _MAX_REPLACEMENT_PATH_UTF8_BYTES + 1
+            if cardinality * width > _MAX_REPLACEMENT_CONFIG_UTF8_BYTES:
+                raise WriterStateError(f"{role} exceeds the persisted attribute byte ceiling")
+            destination = np.empty(attribute.shape, dtype=f"S{width}")
+            try:
+                attribute.read(destination)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise WriterStateError(f"{role} could not be read as bounded UTF-8") from error
+            raw_values = tuple(bytes(value) for value in destination.ravel())
+            if any(len(value) >= width for value in raw_values):
+                raise WriterStateError(f"{role} exceeds the persisted UTF-8 element ceiling")
+            try:
+                decoded = tuple(value.decode("utf-8", errors="strict") for value in raw_values)
+            except UnicodeDecodeError as error:
+                raise WriterStateError(f"{role} is not UTF-8") from error
+            return np.asarray(decoded, dtype=object).reshape(attribute.shape)
+        ceiling = _MAX_REPLACEMENT_CONFIG_UTF8_BYTES
+        capacity = min(64 << 10, ceiling + 1)
+        while True:
+            destination = np.empty((), dtype=f"S{capacity}")
+            try:
+                attribute.read(destination)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise WriterStateError(f"{role} could not be read as bounded UTF-8") from error
+            raw = bytes(destination[()])
+            if len(raw) < capacity:
+                break
+            if capacity == ceiling + 1:
+                raise WriterStateError(f"{role} exceeds the persisted UTF-8 byte ceiling")
+            capacity = min(capacity * 2, ceiling + 1)
+        try:
+            return raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise WriterStateError(f"{role} is not UTF-8") from error
+    if h5py.check_vlen_dtype(attribute.dtype) is not None or attribute.dtype.kind == "O":
+        raise WriterStateError(f"{role} has an unsupported vlen schema")
+    cardinality = 1
+    for extent in attribute.shape:
+        cardinality *= int(extent)
+    if cardinality * int(attribute.dtype.itemsize) > _MAX_REPLACEMENT_CONFIG_UTF8_BYTES:
+        raise WriterStateError(f"{role} exceeds the persisted attribute byte ceiling")
+    destination = np.empty(attribute.shape, dtype=attribute.dtype)
+    try:
+        attribute.read(destination)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise WriterStateError(f"{role} could not be read") from error
+    return destination[()]
+
+
+def _bounded_replacement_config_text(value: str, role: str) -> str:
+    if type(value) is not str:
+        raise WriterStateError(f"{role} must be exact text")
+    try:
+        size = len(value.encode("utf-8", errors="strict"))
+    except UnicodeEncodeError as error:
+        raise WriterStateError(f"{role} is not UTF-8") from error
+    if size > _MAX_REPLACEMENT_CONFIG_UTF8_BYTES:
+        raise WriterStateError(f"{role} exceeds the persisted UTF-8 byte ceiling")
+    return value
+
+
 class WriterIncomplete(RuntimeError):
     def __init__(self, message: str, outcome: WriterOutcome) -> None:
         super().__init__(message)
@@ -601,6 +786,10 @@ class NexusRecordWriter:
         self.atomic = atomic
         self.flush_every = flush_every
         self.complete_record = bool(complete_record)
+        if (source_base is not None
+                and len(str(source_base).encode("utf-8"))
+                    > _MAX_REPLACEMENT_PATH_UTF8_BYTES):
+            raise ValueError("source_base exceeds the persisted path byte ceiling")
         self.source_base = source_base
         self.file_lock = file_lock
         self._pool = get_pool() if pool is None else pool
@@ -1065,8 +1254,10 @@ class NexusRecordWriter:
         if not isinstance(source, h5py.Group):
             raise WriterStateError(f"existing frame {label} source is not a group")
         try:
-            stored_path = (_replacement_hard_group(source, "path", h5py.Dataset) if self._replacement_configuration is not None else source["path"])[()]
-            stored_frame_index = (_replacement_hard_group(source, "frame_index", h5py.Dataset) if self._replacement_configuration is not None else source["frame_index"])[()]
+            path_node = (_replacement_hard_group(source, "path", h5py.Dataset) if self._replacement_configuration is not None else source["path"])
+            index_node = (_replacement_hard_group(source, "frame_index", h5py.Dataset) if self._replacement_configuration is not None else source["frame_index"])
+            stored_path = (_replacement_utf8_scalar(path_node, f"existing frame {label} source/path", max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES) if self._replacement_configuration is not None else path_node[()])
+            stored_frame_index = index_node[()]
         except (KeyError, TypeError, ValueError, OSError) as error:
             raise WriterStateError(
                 f"existing frame {label} has malformed source identity"
@@ -1085,6 +1276,8 @@ class NexusRecordWriter:
         for key, attr_name in _SOURCE_SNAPSHOT_ATTRIBUTES:
             if attr_name not in source.attrs:
                 value = None
+            elif self._replacement_configuration is not None:
+                value = _read_replacement_source_attribute(source, attr_name, key)
             else:
                 observed = source.attrs[attr_name]
                 if key in {"size", "mtime_ns", "frame_count"}:
@@ -1570,7 +1763,7 @@ class NexusRecordWriter:
         digest = hashlib.sha256(b"xrd-tools-replacement-manifest-v1\0"); root = self._h5 if handle is None else handle; config = _replacement_hard_group(root, f"{self.entry}/reduction/config"); config_prefix = "" if config is None else f"{config.name.rstrip('/')}/"
         def update(role, value): payload = value if isinstance(value, bytes) else repr(value).encode(); digest.update(len(role).to_bytes(8, "big") + role.encode() + len(payload).to_bytes(8, "big") + payload)
         def walk(group, prefix, active=()):
-            for name in sorted(group.attrs): update(f"{prefix}@{name}", _replacement_value_signature(group.attrs[name], group.attrs.get_id(name).dtype))
+            for name in sorted(group.attrs): update(f"{prefix}@{name}", _replacement_value_signature(_read_replacement_attribute_value(group, name, f"replacement manifest {group.name}@{name}"), group.attrs.get_id(name).dtype))
             for name in sorted(group):
                 path = f"{group.name.rstrip('/')}/{name}"
                 if path in exclude: continue
@@ -1580,8 +1773,10 @@ class NexusRecordWriter:
                 if isinstance(child, h5py.Group): update(role, b"group"); (None if any(child.id == owner for owner in (*active, group.id)) else walk(child, role, (*active, group.id)))
                 elif isinstance(child, h5py.Dataset):
                     update(f"{role}@layout", (_replacement_dtype_signature(child.dtype), child.shape, child.maxshape, child.chunks, child.compression, child.compression_opts))
-                    if config_prefix and child.ndim == 0 and child.name.startswith(config_prefix): update(role, _replacement_value_signature(child[()], child.dtype))
-                    for attr in sorted(child.attrs): update(f"{role}@{attr}", _replacement_value_signature(child.attrs[attr], child.attrs.get_id(attr).dtype))
+                    if config_prefix and child.ndim == 0 and child.name.startswith(config_prefix):
+                        ceiling = (_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES if child.name.rsplit("/", 1)[-1] in {"source_execution", "append_lineage"} else _MAX_REPLACEMENT_CONFIG_UTF8_BYTES)
+                        update(role, _replacement_value_signature(_replacement_utf8_scalar(child, f"replacement config {child.name}", max_bytes=ceiling), child.dtype))
+                    for attr in sorted(child.attrs): update(f"{role}@{attr}", _replacement_value_signature(_read_replacement_attribute_value(child, attr, f"replacement manifest {child.name}@{attr}"), child.attrs.get_id(attr).dtype))
                 else: raise WriterStateError(f"unsupported replacement manifest node {role}")
         walk(root, "file"); return digest.hexdigest()
     def _verify_indexed_row(
@@ -2100,7 +2295,8 @@ class NexusRecordWriter:
         labels_node = _replacement_hard_group(group, "frame_index", h5py.Dataset) if local_hard else group.get("frame_index")
         if not isinstance(group, h5py.Group) or not isinstance(labels_node, h5py.Dataset):
             raise WriterStateError(f"{name} has no indexed frame_index")
-        labels = [int(x) for x in np.asarray(labels_node[()]).ravel()]
+        values = (_read_replacement_frame_index(labels_node, f"{name}/frame_index") if local_hard else np.asarray(labels_node[()]).ravel())
+        labels = [int(x) for x in values]
         if len(labels) != len(set(labels)):
             raise WriterStateError(f"{name}/frame_index contains duplicate labels")
         self._bump("frame_index_scan_rows", len(labels))
@@ -2252,7 +2448,7 @@ class NexusRecordWriter:
                         self._row_cursors[name] = self._load_cursor(name)
                 if self._replacement_configuration is not None:
                     config = _replacement_hard_group(self._h5, f"{self.entry}/reduction/config"); node = _replacement_hard_group(config, "source_execution", h5py.Dataset)
-                    try: execution = json.loads(_replacement_scalar(node[()], "source_execution"))
+                    try: execution = json.loads(_replacement_utf8_scalar(node, "source_execution", max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES))
                     except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
                         raise WriterStateError("replacement source_execution is absent or malformed") from error
                     execution = _validate_replacement_execution(execution)
@@ -2278,6 +2474,10 @@ class NexusRecordWriter:
         self._require_active(); (None if dimension in {"1d", "2d"} else (_ for _ in ()).throw(ValueError("replacement dimension must be '1d' or '2d'")))
         labels = tuple(labels); (None if labels and labels == tuple(sorted(set(labels))) and all(type(label) is int and label >= 0 for label in labels) else (_ for _ in ()).throw(ValueError("replacement labels must be ascending unique nonnegative ints")))
         if type(audit_bytes) is not bytes: raise TypeError("replacement audit must be exact bytes")
+        try: audit_text = audit_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error: raise WriterStateError("replacement audit is not UTF-8") from error
+        audit_text = _bounded_replacement_config_text(audit_text, "replacement audit")
+        bai_text = _bounded_replacement_config_text(json.dumps(dict(selected_plan), sort_keys=True, separators=(",", ":")), "replacement selected BAI")
         top = f"integrated_{dimension}"
         with self._boundary():
             entry = self._entry_group()
@@ -2288,25 +2488,25 @@ class NexusRecordWriter:
             config = _replacement_hard_group(entry, "reduction/config"); gi_config = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = None if config is None else config.get("gi_config", getlink=True)
             if (gi_link is not None and type(gi_link) is not h5py.HardLink) or self._replacement_node_signature(gi_config) != frozen[3]: raise WriterStateError("replacement opener changed physical GI config")
             self._authorize_transaction_mutation(); del entry[top]
-            bai_name = f"bai_{dimension}_args"; (config.__delitem__(bai_name) if bai_name in config else None); config.create_dataset(bai_name, data=json.dumps(dict(selected_plan), sort_keys=True, separators=(",", ":")))
+            bai_name = f"bai_{dimension}_args"; (config.__delitem__(bai_name) if bai_name in config else None); config.create_dataset(bai_name, data=bai_text)
             gi_name, gi_values = f"gi_mode_{dimension}", {}
             if gi_config is not None:
-                try: raw = _replacement_scalar(gi_config[()], "replacement GI config"); gi_values = json.loads(raw); del config["gi_config"]
+                try: raw = _replacement_utf8_scalar(gi_config, "replacement GI config"); gi_values = json.loads(raw); del config["gi_config"]
                 except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error: raise WriterStateError("replacement GI config is malformed") from error
                 if not isinstance(gi_config, h5py.Dataset) or gi_config.shape != () or type(gi_values) is not dict or raw != json.dumps(gi_values, sort_keys=True, separators=(",", ":")): raise WriterStateError("replacement GI config is noncanonical")
             staged_preserved = json.dumps({key: value for key, value in gi_values.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode(); (None if frozen[2] == gi_name and staged_preserved == frozen[4] else (_ for _ in ()).throw(WriterStateError("replacement opener changed sibling GI config"))); gi_preserved = frozen[4]; gi_values.pop(gi_name, None); gi_values.update({} if selected_gi_mode is None else {gi_name: str(selected_gi_mode)})
-            if gi_values: config.create_dataset("gi_config", data=json.dumps(gi_values, sort_keys=True, separators=(",", ":")))
-            stored_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); stored_gi = {} if stored_node is None else json.loads(_replacement_scalar(stored_node[()], "replacement GI config")); stored_signature = self._replacement_node_signature(stored_node); (None if json.dumps({key: value for key, value in stored_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode() == gi_preserved and (None if stored_signature is None else stored_signature[:-1]) == (None if frozen[3] is None else frozen[3][:-1]) else (_ for _ in ()).throw(WriterStateError("replacement changed sibling GI config")))
-            audit_name = f"dimension_replacement_{dimension}"; (config.__delitem__(audit_name) if audit_name in config else None); config.create_dataset(audit_name, data=audit_bytes.decode("utf-8"))
+            if gi_values: config.create_dataset("gi_config", data=_bounded_replacement_config_text(json.dumps(gi_values, sort_keys=True, separators=(",", ":")), "replacement GI config"))
+            stored_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); stored_gi = {} if stored_node is None else json.loads(_replacement_utf8_scalar(stored_node, "replacement GI config")); stored_signature = self._replacement_node_signature(stored_node); (None if json.dumps({key: value for key, value in stored_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode() == gi_preserved and (None if stored_signature is None else stored_signature[:-1]) == (None if frozen[3] is None else frozen[3][:-1]) else (_ for _ in ()).throw(WriterStateError("replacement changed sibling GI config")))
+            audit_name = f"dimension_replacement_{dimension}"; (config.__delitem__(audit_name) if audit_name in config else None); config.create_dataset(audit_name, data=audit_text)
             self._row_cursors = {name: cursor for name, cursor in self._row_cursors.items() if name != top and not name.startswith(f"{top}/")}; self._row_cursors[top] = {}
             self._replacement_labels = labels; self._replacement_manifest = frozen; self._replacement_expected = (bai_name, self._replacement_node_signature(config.get(bai_name)), "gi_config", self._replacement_node_signature(config.get("gi_config")), audit_name, self._replacement_node_signature(config.get(audit_name)), gi_name, gi_preserved)
-    def _replacement_node_signature(self, node): return None if node is None else (_replacement_dtype_signature(node.dtype), node.shape, node.maxshape, node.chunks, node.compression, node.compression_opts, tuple((name, _replacement_value_signature(node.attrs[name], node.attrs.get_id(name).dtype)) for name in sorted(node.attrs)), _replacement_value_signature(node[()], node.dtype)) if isinstance(node, h5py.Dataset) else ("invalid",)
+    def _replacement_node_signature(self, node): return None if node is None else (_replacement_dtype_signature(node.dtype), node.shape, node.maxshape, node.chunks, node.compression, node.compression_opts, tuple((name, _replacement_value_signature(_read_replacement_attribute_value(node, name, f"replacement config {node.name}@{name}"), node.attrs.get_id(name).dtype)) for name in sorted(node.attrs)), _replacement_value_signature(_replacement_utf8_scalar(node, f"replacement config {node.name}"), node.dtype)) if isinstance(node, h5py.Dataset) else ("invalid",)
     def _verify_replacement_manifest(self) -> None:
         entry, selected_expected = self._entry_group(), self._replacement_expected; excluded, manifest_expected, _gi_name, gi_original, _gi_preserved = self._replacement_manifest
         if self._replacement_manifest_digest(excluded) != manifest_expected: raise WriterStateError("replacement final verification changed preserved artifact")
         config = _replacement_hard_group(entry, "reduction/config"); bai, bai_expected, gi, gi_expected, audit, audit_expected, gi_name, gi_preserved = selected_expected; nodes = {name: _replacement_hard_group(config, name, h5py.Dataset) for name in (bai, gi, audit)}
         if config is None or any(config.get(name, getlink=True) is not None and type(config.get(name, getlink=True)) is not h5py.HardLink for name in nodes): raise WriterStateError("replacement selected science/audit link changed")
-        raw_gi = {} if nodes[gi] is None else json.loads(_replacement_scalar(nodes[gi][()], "replacement GI config")); gi_signature = self._replacement_node_signature(nodes[gi]); preserved = json.dumps({key: value for key, value in raw_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode()
+        raw_gi = {} if nodes[gi] is None else json.loads(_replacement_utf8_scalar(nodes[gi], "replacement GI config")); gi_signature = self._replacement_node_signature(nodes[gi]); preserved = json.dumps({key: value for key, value in raw_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode()
         if self._replacement_node_signature(nodes[bai]) != bai_expected or gi_signature != gi_expected or self._replacement_node_signature(nodes[audit]) != audit_expected or preserved != gi_preserved or (None if gi_signature is None else gi_signature[:-1]) != (None if gi_original is None else gi_original[:-1]): raise WriterStateError("replacement selected science/audit final verification changed")
     def _verify_cursor(self, name: str, label: int) -> None:
         cursor = self._row_cursors[name]

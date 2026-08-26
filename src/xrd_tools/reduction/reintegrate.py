@@ -1,5 +1,9 @@
-from __future__ import annotations; import hashlib, json, math, os, threading; from collections.abc import Mapping; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Callable, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import TargetSnapshot, capture_target_snapshot; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
+from __future__ import annotations; import hashlib, json, math, os, tempfile, threading; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Callable, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
 _REQUESTS = {"workers", "reduction_inflight", "queue_depth", "owner_block_bytes", "staging_items", "record_heavy_items", "publication_heavy_items", "thumbnail_items", "record_items", "publication_items"}; _STAGES = {"qualify", "read", "reduce", "write", "settle"}
+# Keep headless replacement admission aligned with the GUI's 256 MiB decoded
+# scientific-mask ceiling without importing GUI policy into xrd_tools.  Both
+# the persisted int64 index vector and its expanded bool mask must fit the cap.
+_MAX_PERSISTED_MASK_BYTES = 256 * 1024 ** 2
 class ReintegrateCancelled(RuntimeError): pass
 class _ArtifactInspection(NamedTuple): labels: tuple[int, ...]; detector_shape: tuple[int, int]; native_dtype: str; persisted_shared_science: Mapping[str, Any]; persisted_selected_plan: Mapping[str, Any]; acquisition_fingerprint: str; source_base: str; append_lineage: bytes | None; gi_values: Mapping[int, float]; mask: Any | None; raw_options: Mapping[str, Any] | None
 class _RuntimeOutcome(NamedTuple): disposition: str; committed: tuple[int, ...]; dropped: tuple[int, ...]; diagnostics: tuple[str, ...]; audit: str | None; terminal: Any | None
@@ -70,46 +74,347 @@ def _qualified_fact(fact):
     if lineage is not None:
         matching = tuple(epoch for epoch in lineage["epochs"] if label in epoch["labels"]); _reject(len(matching) != 1, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); epoch_source = matching[0]["source"]; _reject(adapter == "tiff_series" and not 0 <= ordinal < len(epoch_source["image_members"]), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); epoch_state = epoch_source if adapter != "tiff_series" else epoch_source["image_members"][ordinal]; count = 1 if adapter == "tiff_series" else epoch_source["extent"]; _reject(os.path.normcase(os.path.normpath(epoch_state["path"])) != os.path.normcase(os.path.normpath(state["path"])), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); state = epoch_state
     _reject((snapshot["adapter_id"], snapshot["size"], snapshot["mtime_ns"], snapshot["frame_count"]) != (adapter, state["size"], state["mtime_ns"], count), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); return path, execution, raws
-def _hdf_dependencies(datasets, shape, dtype):
+def _admitted_revision(path, revisions):
+    raw = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    admitted = revisions.get(raw)
+    if admitted is None:
+        matching = tuple(
+            value
+            for value in revisions.values()
+            if os.path.normcase(os.path.normpath(value[0])) == raw
+        )
+        admitted = matching[0] if len(matching) == 1 else None
+    _reject(admitted is None, "REPLACEMENT_SOURCE_REVISION_CHANGED")
+    return admitted
+
+
+def _admitted_lexical_revision(path, resolved, revisions):
+    """Return the revision admitted for this exact external-storage slot."""
+
+    raw = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    admitted = revisions.get(raw)
+    _reject(
+        admitted is None
+        or os.path.normcase(os.path.normpath(admitted[0]))
+        != os.path.normcase(os.path.normpath(resolved)),
+        "REPLACEMENT_SOURCE_REVISION_CHANGED",
+    )
+    return admitted
+
+
+def _descriptor_revision(descriptor, admitted):
+    try:
+        observed = os.fstat(descriptor)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError("REPLACEMENT_SOURCE_REVISION_CHANGED") from error
+    _reject(
+        type(descriptor) is not int
+        or (
+            int(observed.st_size),
+            int(observed.st_mtime_ns),
+            int(observed.st_ctime_ns),
+            int(observed.st_dev),
+            int(observed.st_ino),
+        ) != tuple(int(value) for value in admitted[3][1:]),
+        "REPLACEMENT_SOURCE_REVISION_CHANGED",
+    )
+    return admitted[3]
+
+
+def _hdf_handle_revision(handle, path, revisions):
+    admitted = _admitted_revision(path, revisions)
+    try:
+        descriptor = handle.id.get_vfd_handle()
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"
+        ) from error
+    if type(descriptor) is not int:
+        raise ValueError("REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED")
+    return _descriptor_revision(descriptor, admitted)
+
+
+def _hdf_external_paths(dataset):
+    origin = Path(os.path.abspath(os.fsdecode(dataset.file.filename)))
+    return tuple(
+        (
+            str(Path(os.path.abspath(origin.parent / os.fsdecode(filename)))),
+            str((origin.parent / os.fsdecode(filename)).resolve(strict=True)),
+            int(offset),
+            int(size),
+        )
+        for filename, offset, size in (dataset.external or ())
+    )
+
+
+def _read_external_hdf_frame(dataset, index, revisions):
+    """Read one external-storage frame only from admitted file objects."""
+
+    import numpy as np
+
+    dtype = np.dtype(dataset.dtype)
+    frame_shape = tuple(int(value) for value in dataset.shape[1:])
+    frame_bytes = int(np.prod(frame_shape)) * dtype.itemsize
+    logical_start = int(index) * frame_bytes
+    logical_stop = logical_start + frame_bytes
+    total_bytes = int(np.prod(dataset.shape)) * dtype.itemsize
+    _reject(
+        dataset.ndim != 3
+        or not 0 <= int(index) < int(dataset.shape[0])
+        or dataset.chunks is not None
+        or bool(dataset.is_virtual),
+        "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+    )
+    payload = bytearray()
+    logical_cursor = 0
+    for path, resolved, offset, declared_size in _hdf_external_paths(dataset):
+        admitted = _admitted_lexical_revision(path, resolved, revisions)
+        capacity = min(declared_size, total_bytes - logical_cursor)
+        _reject(
+            offset < 0 or capacity < 0,
+            "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+        )
+        segment_stop = logical_cursor + capacity
+        left = max(logical_start, logical_cursor)
+        right = min(logical_stop, segment_stop)
+        if left < right:
+            try:
+                descriptor = os.open(path, os.O_RDONLY)
+            except OSError as error:
+                raise ValueError(
+                    "REPLACEMENT_SOURCE_REVISION_CHANGED"
+                ) from error
+            try:
+                _descriptor_revision(descriptor, admitted)
+                with os.fdopen(os.dup(descriptor), "rb") as source:
+                    source.seek(offset + left - logical_cursor)
+                    chunk = source.read(right - left)
+                _descriptor_revision(descriptor, admitted)
+            finally:
+                os.close(descriptor)
+            _reject(
+                len(chunk) != right - left,
+                "REPLACEMENT_SOURCE_REVISION_CHANGED",
+            )
+            payload.extend(chunk)
+        logical_cursor = segment_stop
+        if logical_cursor >= logical_stop:
+            break
+    _reject(
+        len(payload) != frame_bytes,
+        "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+    )
+    return np.frombuffer(payload, dtype=dtype).reshape(frame_shape).copy()
+
+
+def _hdf_dependencies(datasets, shape, dtype, revisions):
     import h5py, numpy as np; seen, found = set(), set()
     def visit(dataset):
         origin = str(Path(dataset.file.filename).resolve(strict=True)); key = (origin, dataset.name)
         if key in seen: return
-        seen.add(key); _reject(dataset.ndim != 3 or tuple(dataset.shape[1:]) != tuple(shape) or np.dtype(dataset.dtype).str != dtype, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED")
-        for filename, _offset, _size in dataset.external or (): found.add(str((Path(origin).parent / filename).resolve(strict=True)))
-        for source in (dataset.virtual_sources() if dataset.is_virtual else ()):
-            target = str((Path(origin).parent / source.file_name).resolve(strict=True)); found.add(target)
-            with h5py.File(target, "r") as handle: visit(handle[source.dset_name])
+        seen.add(key); found.add(origin)
+        _hdf_handle_revision(dataset.file, origin, revisions)
+        _reject(
+            dataset.ndim != 3
+            or tuple(dataset.shape[1:]) != tuple(shape)
+            or np.dtype(dataset.dtype).str != dtype
+            or bool(dataset.is_virtual),
+            "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+        )
+        for path, resolved, _offset, _size in _hdf_external_paths(dataset):
+            _admitted_lexical_revision(path, resolved, revisions)
+            found.add(resolved)
+        _hdf_handle_revision(dataset.file, origin, revisions)
     [visit(dataset) for dataset in datasets]; return found
-def _source_fact_inner(fact, *, raw_options=None, read=False, token=None):
+def _expected_source_schema(shape, dtype, expected_shape, expected_dtype):
+    if expected_shape is None and expected_dtype is None:
+        return
+    _reject(
+        expected_shape is None
+        or expected_dtype is None
+        or tuple(shape) != tuple(expected_shape)
+        or dtype != expected_dtype,
+        "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
+    )
+@contextmanager
+def _immutable_nonhdf_source(path, revisions, token):
+    raw = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    admitted = revisions.get(raw)
+    _reject(admitted is None, "REPLACEMENT_SOURCE_REVISION_CHANGED")
+    observed = admitted[3]
+    expected = tuple(int(value) for value in observed[1:])
+    _event(token)
+    try:
+        source = Path(path).open("rb")
+    except OSError as error:
+        raise ValueError("REPLACEMENT_SOURCE_REVISION_CHANGED") from error
+    try:
+        before = os.fstat(source.fileno())
+        opened = (
+            int(before.st_size), int(before.st_mtime_ns),
+            int(before.st_ctime_ns), int(before.st_dev), int(before.st_ino),
+        )
+        _reject(opened != expected, "REPLACEMENT_SOURCE_REVISION_CHANGED")
+        with tempfile.TemporaryDirectory(prefix="xdart-reintegrate-source-") as root:
+            snapshot = Path(root) / Path(path).name
+            copied = 0
+            with snapshot.open("wb") as target:
+                while copied < expected[0]:
+                    _event(token)
+                    payload = source.read(min(1 << 20, expected[0] - copied))
+                    _reject(not payload, "REPLACEMENT_SOURCE_REVISION_CHANGED")
+                    target.write(payload)
+                    copied += len(payload)
+                _reject(bool(source.read(1)), "REPLACEMENT_SOURCE_REVISION_CHANGED")
+            after = os.fstat(source.fileno())
+            closed = (
+                int(after.st_size), int(after.st_mtime_ns),
+                int(after.st_ctime_ns), int(after.st_dev), int(after.st_ino),
+            )
+            _reject(closed != expected, "REPLACEMENT_SOURCE_REVISION_CHANGED")
+            _event(token)
+            yield snapshot
+            _event(token)
+    finally:
+        source.close()
+def _decode_nonhdf_source(
+    path, route, snapshot, index, raw_options, read, token,
+    expected_shape, expected_dtype, revisions,
+):
+    import numpy as np
+    _reject(
+        index != 0 or snapshot["dataset_path"] is not None
+        or snapshot["frame_count"] != 1
+        or snapshot["self_contained"] not in {None, True},
+        "REPLACEMENT_RAW_DECODER_UNRECORDED"
+        if route == "raw" else "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
+    )
+    def decode(decode_path):
+        image = None
+        if route == "raw":
+            from xrd_tools.io.image import infer_raw_detector_shape, read_image
+            options = {
+                "raw_dtype": "int32", "raw_header_skip": 0,
+                "detector_shape": None,
+            } if raw_options is None else dict(raw_options)
+            raw_dtype = options.get("raw_dtype")
+            names = {
+                f"{kind}{bits}" for kind in ("int", "uint", "float")
+                for bits in ((8, 16, 32, 64) if kind != "float" else (16, 32, 64))
+            }
+            codes = {
+                f"{end}{kind}{size}" for end in "<>="
+                for kind, sizes in (("i", "1248"), ("u", "1248"), ("f", "248"))
+                for size in sizes
+            } | {"|i1", "|u1"}
+            _reject(
+                set(options) != {"raw_dtype", "raw_header_skip", "detector_shape"}
+                or type(raw_dtype) is not str or raw_dtype not in names | codes
+                or type(options["raw_header_skip"]) is not int
+                or options["raw_header_skip"] < 0
+                or options["detector_shape"] is not None and (
+                    type(options["detector_shape"]) is not tuple
+                    or len(options["detector_shape"]) != 2
+                    or any(type(value) is not int or value <= 0
+                           for value in options["detector_shape"])
+                ),
+                "REPLACEMENT_RAW_DECODER_UNRECORDED",
+            )
+            try:
+                dtype = np.dtype(raw_dtype).str
+                header = options["raw_header_skip"]
+                shape = tuple(
+                    options["detector_shape"]
+                    or infer_raw_detector_shape(
+                        decode_path, raw_dtype=dtype,
+                        raw_header_skip=header,
+                    )
+                    or ()
+                )
+                _reject(
+                    len(shape) != 2
+                    or decode_path.stat().st_size
+                    != header + int(shape[0]) * int(shape[1])
+                    * np.dtype(dtype).itemsize,
+                    "REPLACEMENT_RAW_DECODER_UNRECORDED",
+                )
+                _expected_source_schema(
+                    shape, dtype, expected_shape, expected_dtype,
+                )
+                _event(token)
+                if read:
+                    image = read_image(
+                        decode_path, detector_shape=shape,
+                        raw_dtype=dtype, raw_header_skip=header,
+                        preserve_dtype=True, exact_frame=True,
+                    )
+            except (TypeError, ValueError, OSError) as error:
+                if type(error) is ValueError and str(error).startswith("REPLACEMENT_"):
+                    raise
+                raise ValueError("REPLACEMENT_RAW_DECODER_UNRECORDED") from error
+            return tuple(shape), dtype, image
+        if decode_path.suffix.lower() in {".tif", ".tiff"}:
+            import tifffile
+            with tifffile.TiffFile(decode_path) as handle:
+                shapes = {tuple(page.shape) for page in handle.pages}
+                dtypes = {np.dtype(page.dtype).str for page in handle.pages}
+                _reject(
+                    len(handle.pages) != 1 or len(shapes) != 1
+                    or len(dtypes) != 1,
+                    "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
+                )
+                shape, dtype = shapes.pop(), dtypes.pop()
+        else:
+            import fabio
+            with fabio.openheader(str(decode_path)) as header:
+                _reject(
+                    int(getattr(header, "nframes", 0)) != 1,
+                    "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
+                )
+                shape = tuple(header.shape)
+                dtype = np.dtype(
+                    getattr(header, "dtype", getattr(header, "_dtype", None))
+                ).str
+        _expected_source_schema(shape, dtype, expected_shape, expected_dtype)
+        _event(token)
+        if read:
+            from xrd_tools.io.image import read_image
+            image = read_image(
+                decode_path, frame=0, preserve_dtype=True, exact_frame=True,
+            )
+        return tuple(shape), dtype, image
+    if not read:
+        return decode(path)
+    with _immutable_nonhdf_source(path, revisions, token) as stable:
+        return decode(stable)
+def _source_fact_inner(fact, *, raw_options=None, read=False, token=None,
+                       expected_shape=None, expected_dtype=None):
     import numpy as np; _event(token); path, execution, before = _qualified_fact(fact); route = _source_route(path); snapshot = fact["snapshot"]; index = fact["frame_index"]; image = None
     if route == "hdf5":
         import h5py; source = None if fact["append_lineage"] is None else fact["append_lineage"]["epochs"][-1]["source"]; count = execution["frame_count"] if source is None else source["extent"]; authority = execution["external_members"] if source is None else source["external_members"]; _reject((snapshot["self_contained"] is False) != bool(authority), "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED")
         if authority:
             with h5py.File(path, "r") as handle:
-                parent = str(PurePosixPath(snapshot["dataset_path"]).parent); owner = handle.get(parent); paths = () if not isinstance(owner, h5py.Group) else tuple(f"{parent.rstrip('/')}/{name}" for name in sorted(owner) if type(owner.get(name, getlink=True)).__name__ == "ExternalLink"); links = tuple(handle.get(item, getlink=True) for item in paths); expected = tuple((os.path.normcase(os.path.normpath((v["file"] if source is None else v)["path"])), v["dataset"] if source is None else v["dataset_path"]) for v in authority); actual = tuple((os.path.normcase(os.path.normpath(os.path.abspath(path.parent / link.filename))), link.path) for link in links); ranges = tuple((v["first"], v["stop"]) if source is None else (v["source_start"], v["source_stop"]) for v in authority); selected = tuple(i for i, (start, stop) in enumerate(ranges) if start <= index < stop); recorded_paths = () if source is None else tuple(source["dataset_paths"]); _reject(actual != expected or source is not None and recorded_paths not in {(), paths} or len(selected) != 1 or snapshot["dataset_path"] != paths[0] or source is None and snapshot["frame_count"] != count or snapshot["self_contained"] is not False, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); position = selected[0]; from xrd_tools.io.nexus import NexusImageStack
-                with NexusImageStack(handle, [paths[position]]) as stack: dataset = stack._dsets[0]; start, stop = ranges[position]; shape, dtype = tuple(dataset.shape[1:]), np.dtype(dataset.dtype).str; _reject(dataset.ndim != 3 or dataset.shape[0] != stop - start, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); chosen = (authority[position]["file"] if source is None else authority[position])["path"]; direct = {str(path.resolve(strict=True)), before[os.path.normcase(os.path.normpath(chosen))][0]}; dependencies = {before[os.path.normcase(os.path.normpath(v["path"]))][0] for v in execution["dependency_files"]}; _reject(not {os.path.normcase(os.path.normpath(v)) for v in _hdf_dependencies((dataset,), shape, dtype) - direct} <= {os.path.normcase(os.path.normpath(v)) for v in dependencies}, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); image = np.asarray(stack[index - start]) if read else None
+                _hdf_handle_revision(handle, path, before)
+                parent = str(PurePosixPath(snapshot["dataset_path"]).parent); owner = handle.get(parent); paths = () if not isinstance(owner, h5py.Group) else tuple(f"{parent.rstrip('/')}/{name}" for name in sorted(owner) if type(owner.get(name, getlink=True)).__name__ == "ExternalLink"); links = tuple(handle.get(item, getlink=True) for item in paths); expected = tuple((os.path.normcase(os.path.normpath((v["file"] if source is None else v)["path"])), v["dataset"] if source is None else v["dataset_path"]) for v in authority); actual = tuple((os.path.normcase(os.path.normpath(os.path.abspath(path.parent / link.filename))), link.path) for link in links); ranges = tuple((v["first"], v["stop"]) if source is None else (v["source_start"], v["source_stop"]) for v in authority); selected = tuple(i for i, (start, stop) in enumerate(ranges) if start <= index < stop); recorded_paths = () if source is None else tuple(source["dataset_paths"]); _reject(actual != expected or source is not None and recorded_paths not in {(), paths} or len(selected) != 1 or snapshot["dataset_path"] != paths[0] or source is None and snapshot["frame_count"] != count or snapshot["self_contained"] is not False, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); position = selected[0]
+                dataset = handle[paths[position]]; start, stop = ranges[position]
+                try:
+                    shape, dtype = tuple(dataset.shape[1:]), np.dtype(dataset.dtype).str; _reject(dataset.ndim != 3 or dataset.shape[0] != stop - start, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); chosen = (authority[position]["file"] if source is None else authority[position])["path"]; _hdf_handle_revision(dataset.file, chosen, before); direct = {str(path.resolve(strict=True)), before[os.path.normcase(os.path.normpath(chosen))][0]}; dependencies = {before[os.path.normcase(os.path.normpath(v["path"]))][0] for v in execution["dependency_files"]}; _reject(not {os.path.normcase(os.path.normpath(v)) for v in _hdf_dependencies((dataset,), shape, dtype, before) - direct} <= {os.path.normcase(os.path.normpath(v)) for v in dependencies}, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); _expected_source_schema(shape, dtype, expected_shape, expected_dtype); image = (_read_external_hdf_frame(dataset, index - start, before) if dataset.external else np.asarray(dataset[index - start])) if read else None; _hdf_handle_revision(dataset.file, chosen, before)
+                finally:
+                    if dataset.id.valid: dataset.id.close()
+                _hdf_handle_revision(handle, path, before)
         else:
             from xrd_tools.sources.cursor import ContainerCursor; from xrd_tools.core.scan import SourceKind
             with ContainerCursor(path) as cursor:
-                desc = cursor.descriptor; _reject(desc.kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER} or desc.dataset_path != snapshot["dataset_path"] or source is None and desc.frame_count != snapshot["frame_count"] or desc.frame_count != count or desc.self_contained is not snapshot["self_contained"] or not 0 <= index < desc.frame_count, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); shape, dtype = tuple(desc.frame_shape or ()), np.dtype(desc.dtype).str; selectors = tuple(desc.segment_paths) or ((desc.dataset_path,) if desc.dataset_path else ()); _reject(source is not None and tuple(source["dataset_paths"]) != selectors, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); segments = tuple(cursor._h5[item] for item in selectors); offsets = np.cumsum((0, *(int(item.shape[0]) if item.ndim == 3 else 1 for item in segments))); selected = tuple(i for i in range(len(segments)) if offsets[i] <= index < offsets[i + 1]); _reject(len(selected) != 1, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); dependencies = {before[os.path.normcase(os.path.normpath(v["path"]))][0] for v in execution["dependency_files"]}; discovered = _hdf_dependencies((segments[selected[0]],), shape, dtype) - {str(path.resolve(strict=True))}; _reject(bool(dependencies) or bool(discovered), "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); image = cursor.read_frame(index) if read else None
-    elif route == "raw":
-        from xrd_tools.io.image import infer_raw_detector_shape, read_image
-        _reject(index != 0 or snapshot["dataset_path"] is not None or snapshot["frame_count"] != 1 or snapshot["self_contained"] not in {None, True}, "REPLACEMENT_RAW_DECODER_UNRECORDED"); options = {"raw_dtype": "int32", "raw_header_skip": 0, "detector_shape": None} if raw_options is None else dict(raw_options); raw_dtype = options.get("raw_dtype"); names = {f"{kind}{bits}" for kind in ("int", "uint", "float") for bits in ((8, 16, 32, 64) if kind != "float" else (16, 32, 64))}; codes = {f"{end}{kind}{size}" for end in "<>=" for kind, sizes in (("i", "1248"), ("u", "1248"), ("f", "248")) for size in sizes} | {"|i1", "|u1"}; _reject(set(options) != {"raw_dtype", "raw_header_skip", "detector_shape"} or type(raw_dtype) is not str or raw_dtype not in names | codes or type(options["raw_header_skip"]) is not int or options["raw_header_skip"] < 0 or options["detector_shape"] is not None and (type(options["detector_shape"]) is not tuple or len(options["detector_shape"]) != 2 or any(type(v) is not int or v <= 0 for v in options["detector_shape"])), "REPLACEMENT_RAW_DECODER_UNRECORDED")
-        try: dtype, header = np.dtype(raw_dtype).str, options["raw_header_skip"]; shape = tuple(options["detector_shape"] or infer_raw_detector_shape(path, raw_dtype=dtype, raw_header_skip=header) or ()); _reject(len(shape) != 2, "REPLACEMENT_RAW_DECODER_UNRECORDED"); image = read_image(path, detector_shape=shape, raw_dtype=dtype, raw_header_skip=header, preserve_dtype=True, exact_frame=True) if read else None
-        except (TypeError, ValueError, OSError) as error: raise ValueError("REPLACEMENT_RAW_DECODER_UNRECORDED") from error
+                _hdf_handle_revision(cursor._h5, path, before); desc = cursor.descriptor; _reject(desc.kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER} or desc.dataset_path != snapshot["dataset_path"] or source is None and desc.frame_count != snapshot["frame_count"] or desc.frame_count != count or desc.self_contained is not snapshot["self_contained"] or not 0 <= index < desc.frame_count, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); shape, dtype = tuple(desc.frame_shape or ()), np.dtype(desc.dtype).str; selectors = tuple(desc.segment_paths) or ((desc.dataset_path,) if desc.dataset_path else ()); _reject(source is not None and tuple(source["dataset_paths"]) != selectors, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); segments = tuple(cursor._h5[item] for item in selectors); offsets = np.cumsum((0, *(int(item.shape[0]) if item.ndim == 3 else 1 for item in segments))); selected = tuple(i for i in range(len(segments)) if offsets[i] <= index < offsets[i + 1]); _reject(len(selected) != 1, "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); dependencies = {before[os.path.normcase(os.path.normpath(v["path"]))][0] for v in execution["dependency_files"]}; discovered = _hdf_dependencies((segments[selected[0]],), shape, dtype, before) - {str(path.resolve(strict=True))}; _reject(bool(dependencies) or bool(discovered), "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"); _expected_source_schema(shape, dtype, expected_shape, expected_dtype); image = cursor.read_frame(index) if read else None; _hdf_handle_revision(cursor._h5, path, before)
     else:
-        _reject(index != 0 or snapshot["dataset_path"] is not None or snapshot["frame_count"] != 1 or snapshot["self_contained"] not in {None, True}, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
-        if path.suffix.lower() in {".tif", ".tiff"}:
-            import tifffile
-            with tifffile.TiffFile(path) as handle: shapes, dtypes = {tuple(v.shape) for v in handle.pages}, {np.dtype(v.dtype).str for v in handle.pages}; _reject(len(handle.pages) != 1 or len(shapes) != 1 or len(dtypes) != 1, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); shape, dtype = shapes.pop(), dtypes.pop()
-        else:
-            import fabio
-            with fabio.openheader(str(path)) as header: _reject(int(getattr(header, "nframes", 0)) != 1, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); shape, dtype = tuple(header.shape), np.dtype(getattr(header, "dtype", getattr(header, "_dtype", None))).str
-        if read: from xrd_tools.io.image import read_image; image = read_image(path, frame=0, preserve_dtype=True, exact_frame=True)
+        shape, dtype, image = _decode_nonhdf_source(
+            path, route, snapshot, index, raw_options, read, token,
+            expected_shape, expected_dtype, before,
+        )
     after = _qualified_fact(fact)[2]; _reject(tuple((k, v[3]) for k, v in before.items()) != tuple((k, v[3]) for k, v in after.items()), "REPLACEMENT_SOURCE_REVISION_CHANGED"); _reject(len(shape) != 2 or image is not None and (tuple(image.shape) != tuple(shape) or np.dtype(image.dtype).str != dtype), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); return tuple(shape), dtype, path, image
-def _source_fact(fact, *, raw_options=None, read=False, token=None):
-    try: return _source_fact_inner(fact, raw_options=raw_options, read=read, token=token)
+def _source_fact(fact, *, raw_options=None, read=False, token=None,
+                 expected_shape=None, expected_dtype=None):
+    try: return _source_fact_inner(fact, raw_options=raw_options, read=read, token=token, expected_shape=expected_shape, expected_dtype=expected_dtype)
     except Exception as error: raise (error if isinstance(error, ReintegrateCancelled) or type(error) is ValueError and str(error).startswith("REPLACEMENT_") else ValueError("REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED" if Path(str(fact.get("path", ""))).suffix.lower() in {".h5", ".hdf5", ".nxs", ".cxi"} else "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"))
 def _background_fact(fact, shared, shape, path, token):
     from xrd_tools.reduction.background import FrameBackgroundPlan, _frame, _one, _tag, resolve_frame_background; plan = FrameBackgroundPlan.from_mapping(_plain(shared["background"])); pair = fact["background_dependency"]
@@ -135,7 +440,7 @@ def _fact_projection(selected, shared):
         *monitors,
     }
     return tuple(sorted(key for key in keys if key)), shared["geometry"] is not None
-def _load_fact(fact, shape, dtype, shared, token, raw_options=None): _event(token); path, _execution, _revisions = _qualified_fact(fact); _event(token); background, pair = _background_fact(fact, shared, shape, path, token); _event(token); final_shape, final_dtype, _path, image = _source_fact(fact, raw_options=raw_options, read=True, token=token); _event(token); _reject(final_shape != tuple(shape) or final_dtype != dtype, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); return path, image, background, pair
+def _load_fact(fact, shape, dtype, shared, token, raw_options=None): _event(token); path, _execution, _revisions = _qualified_fact(fact); _event(token); background, pair = _background_fact(fact, shared, shape, path, token); _event(token); final_shape, final_dtype, _path, image = _source_fact(fact, raw_options=raw_options, read=True, token=token, expected_shape=shape, expected_dtype=dtype); _event(token); _reject(final_shape != tuple(shape) or final_dtype != dtype, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); return path, image, background, pair
 def _geometry_fact(fact, shared):
     value = dict(fact["geometry"]); active = shared["geometry"] is not None; _reject(active != bool(value) or active and (set(value) != {"rot1", "rot2", "rot3", "incident_angle"} or any(type(v) is not float or not math.isfinite(v) for v in value.values())), "replacement geometry differs"); return None if not active else __import__("xrd_tools.core.scan", fromlist=["FrameGeometry"]).FrameGeometry(**value)
 def _background_resource_terms(mode: str, shape: tuple[int, int]) -> tuple[int, int, int, int]: pixels = int(shape[0]) * int(shape[1]); _reject(mode not in {"None", "Series Average", "Single BG File", "BG Directory"}, "unsupported Background resource mode"); return (0, 0, 0, 0) if mode == "None" else (8*pixels, 25*pixels, 8*pixels, 64 << 20) if mode == "Series Average" else (8*pixels, 8*pixels, 8*pixels, 64 << 20)
@@ -172,6 +477,82 @@ def _validate_science(selected, shared, dimension):
 def _dimension_audit(*, dimension: str, operation_identity: str, science_identity: str, acquisition_fingerprint: str, requested_shared_science: Mapping[str, Any], selected_plan: Mapping[str, Any], append_lineage: bytes | None): return {"schema_version": 1, "operation": "existing_dimension_replacement", "dimension": dimension, "operation_identity": operation_identity, "science_identity": science_identity, "acquisition_fingerprint": acquisition_fingerprint, "shared_science_fingerprint": science_fingerprint(_plain(requested_shared_science)), "selected_plan": _plain(selected_plan), "selected_gi_mode": selected_plan.get("gi_mode"), "append_lineage_action": ("already_absent" if append_lineage is None else "preserved_append_disabled"), "append_lineage_sha256": (None if append_lineage is None else hashlib.sha256(append_lineage).hexdigest())}
 def _audit_identity(audit: Mapping[str, Any]) -> str: return hashlib.sha256(_canonical(audit)).hexdigest()
 def _scrub_frame(frame): frame.image = frame.background = frame.geometry = frame.source_identity = frame.source_path = frame.loader = frame.mask = None; frame.source_frame_index = frame.normalization_factor = None; frame.background_dependency_bytes = frame.background_dependency_fingerprint = None; frame.metadata.clear()
+
+
+def _target_stat_revision(value):
+    return (
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+        int(value.st_dev),
+        int(value.st_ino),
+    )
+
+
+def _target_object_revision(target: Path, snapshot: TargetSnapshot):
+    """Bind a full-file snapshot to the exact object opened for HDF reads."""
+
+    try:
+        before = target.stat()
+        descriptor = os.open(target, os.O_RDONLY)
+        try:
+            opened = os.fstat(descriptor)
+            after = target.stat()
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise ValueError("TARGET_SNAPSHOT_CHANGED") from error
+    expected = (
+        int(snapshot.size),
+        int(snapshot.mtime_ns),
+        int(snapshot.device),
+        int(snapshot.inode),
+    )
+    revisions = tuple(_target_stat_revision(value) for value in (before, opened, after))
+    _reject(
+        not snapshot.exists
+        or any(
+            (revision[0], revision[1], revision[3], revision[4]) != expected
+            for revision in revisions
+        )
+        or len(set(revisions)) != 1,
+        "TARGET_SNAPSHOT_CHANGED",
+    )
+    return revisions[0]
+
+
+def _target_hdf_fence(handle, target: Path, snapshot: TargetSnapshot, revision):
+    try:
+        descriptor = handle.id.get_vfd_handle()
+        opened = os.fstat(descriptor)
+        named = target.stat()
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise ValueError("TARGET_SNAPSHOT_CHANGED") from error
+    _reject(
+        type(descriptor) is not int
+        or _target_stat_revision(opened) != revision
+        or _target_stat_revision(named) != revision
+        or (
+            revision[0],
+            revision[1],
+            revision[3],
+            revision[4],
+        ) != (
+            int(snapshot.size),
+            int(snapshot.mtime_ns),
+            int(snapshot.device),
+            int(snapshot.inode),
+        ),
+        "TARGET_SNAPSHOT_CHANGED",
+    )
+
+
+def _open_target_hdf(target: Path):
+    import h5py
+
+    return h5py.File(target, "r")
+
+
 def _canonical_acquisition_selected(run, shared, dimension):
     from xrd_tools.reduction.provenance_config import _integration_1d_args, _integration_2d_args
     mode_key = f"gi_mode_{dimension}"; bai_value = run.get(f"bai_{dimension}_args"); _reject(type(bai_value) is not dict, "selected dimension differs from acquisition provenance"); bai = dict(bai_value); recorded_mode = bai.pop(mode_key, None); run_gi = run.get("gi") or {}; active = shared["gi"]["enabled"]; mode = run_gi.get(f"mode_{dimension}") if active else None; _reject(active and recorded_mode != mode, "selected dimension differs from acquisition provenance")
@@ -181,43 +562,109 @@ def _canonical_acquisition_selected(run, shared, dimension):
     except (TypeError, ValueError, KeyError) as error:
         raise ValueError("selected dimension differs from acquisition provenance") from error
     return candidate
-def _inspect_artifact(target: Path, entry: str, dimension: str) -> _ArtifactInspection:
-    import h5py, numpy as np; from xrd_tools.io.record_writer import WriterStateError, _decode_replacement_fact, _replacement_json_node, _replacement_scalar
-    def text(node, expected, role): info = None if not isinstance(node, h5py.Dataset) else h5py.check_string_dtype(node.dtype); _reject(not isinstance(node, h5py.Dataset) or node.shape != () or node.maxshape != () or node.chunks is not None or node.compression is not None or dict(node.attrs) or info is None or info.encoding != "utf-8" or info.length is not None or _replacement_scalar(node[()], role) != expected, f"{role} is noncanonical")
-    with h5py.File(target, "r") as handle:
-        group = _replacement_hard_group(handle, entry); _reject(group is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); top = _replacement_hard_group(group, f"integrated_{dimension}"); index = _replacement_hard_group(top, "frame_index", h5py.Dataset); values = None if index is None else np.asarray(index[()])
-        _reject(values is None or index.ndim != 1 or values.dtype.kind not in "iu", "selected frame inventory is not exact"); labels = tuple(int(x) for x in values); _reject(not labels or any(v < 0 for v in labels) or labels != tuple(sorted(set(labels))), "selected frame inventory is not exact")
+def _inspect_artifact(target: Path, entry: str, dimension: str, snapshot: TargetSnapshot, target_revision) -> _ArtifactInspection:
+    import h5py, numpy as np; from xrd_tools.io.append import _MAX_REPLACEMENT_PATH_UTF8_BYTES, _replacement_utf8_attribute, _replacement_utf8_scalar; from xrd_tools.io.record_writer import WriterStateError, _decode_replacement_fact, _read_replacement_frame_index, _replacement_json_node, _replacement_scalar
+    def text(node, expected, role):
+        try: observed = _replacement_utf8_scalar(node, role)
+        except ValueError: observed = None
+        _reject(observed != expected, f"{role} is noncanonical")
+    with _open_target_hdf(target) as handle:
+        _target_hdf_fence(handle, target, snapshot, target_revision)
+        group = _replacement_hard_group(handle, entry); _reject(group is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); top = _replacement_hard_group(group, f"integrated_{dimension}"); index = _replacement_hard_group(top, "frame_index", h5py.Dataset)
+        try: values = _read_replacement_frame_index(index, "selected frame inventory", require_nonempty=True)
+        except WriterStateError as error: raise ValueError("selected frame inventory is not exact") from error
+        labels = tuple(int(x) for x in values); _reject(not labels or any(v < 0 for v in labels) or labels != tuple(sorted(set(labels))), "selected frame inventory is not exact")
         try: source_base, lineage, _decoded = decode_replacement_lineage(handle, entry=entry)
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
         config = _replacement_hard_group(group, "reduction/config"); _reject(_replacement_hard_group(config, "source_execution", h5py.Dataset) is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); run_node = _replacement_hard_group(config, "run_configuration", h5py.Dataset); run = _replacement_json_node(config, "run_configuration", "run configuration"); text(run_node, _canonical(run).decode(), "run configuration")
-        geom_node = _replacement_hard_group(config, "geometry"); geom_leaves = () if geom_node is None else tuple(_replacement_hard_group(geom_node, name, h5py.Dataset) for name in ("convention", "mapping_json", "motor_sources")); _reject(geom_node is not None and (set(geom_node) != {"convention", "mapping_json", "motor_sources"} or any(node is None for node in geom_leaves)), "selected BAI/GI/geometry is malformed"); geometry = None if geom_node is None else {"convention": _replacement_scalar(geom_leaves[0][()], "geometry convention"), "mapping_json": _replacement_scalar(geom_leaves[1][()], "geometry mapping"), "motor_sources": _replacement_json_node(geom_node, "motor_sources", "geometry motors")}
+        geom_node = _replacement_hard_group(config, "geometry"); geom_keys = {"convention", "mapping_json", "motor_sources"}
+        _reject(geom_node is not None and len(geom_node) != 3, "selected BAI/GI/geometry is malformed")
+        geom_leaves = () if geom_node is None else tuple(_replacement_hard_group(geom_node, name, h5py.Dataset) for name in ("convention", "mapping_json", "motor_sources")); _reject(geom_node is not None and (set(geom_node) != geom_keys or any(node is None for node in geom_leaves)), "selected BAI/GI/geometry is malformed"); geometry = None if geom_node is None else {"convention": _replacement_utf8_scalar(geom_leaves[0], "geometry convention"), "mapping_json": _replacement_utf8_scalar(geom_leaves[1], "geometry mapping"), "motor_sources": _replacement_json_node(geom_node, "motor_sources", "geometry motors")}
         shared = _validated_shared_science(run, geometry=geometry); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_raw = _replacement_json_node(config, "gi_config", "selected GI config", required=False); _reject((gi_raw is None) == shared["gi"]["enabled"] or gi_raw is not None and type(gi_raw) is not dict, "selected GI config is malformed"); gi_cfg = {} if gi_raw is None else gi_raw; source = run.get("source"); _reject(source is not None and type(source) is not dict, "REPLACEMENT_RAW_DECODER_UNRECORDED"); options_missing = source is None or "options" not in source; options = {} if options_missing else source["options"]; _reject(type(options) is not dict, "REPLACEMENT_RAW_DECODER_UNRECORDED"); raw_keys = {"raw_dtype", "raw_header_skip", "detector_shape"}; present_raw_keys = set(options) & raw_keys; _reject(bool(present_raw_keys) and present_raw_keys != raw_keys, "REPLACEMENT_RAW_DECODER_UNRECORDED"); raw = {key: options[key] for key in raw_keys} if present_raw_keys else {}
         if raw: _reject(type(raw["raw_dtype"]) is not str or type(raw["raw_header_skip"]) is not int or raw["raw_header_skip"] < 0 or type(raw["detector_shape"]) is not list or len(raw["detector_shape"]) != 2 or any(type(v) is not int or v <= 0 for v in raw["detector_shape"]), "REPLACEMENT_RAW_DECODER_UNRECORDED")
         raw = None if not raw else MappingProxyType({**raw, "detector_shape": tuple(raw["detector_shape"])})
         mode_key = f"gi_mode_{dimension}"; bai_name = f"bai_{dimension}_args"; bai_node = _replacement_hard_group(config, bai_name, h5py.Dataset); bai_value = _replacement_json_node(config, bai_name, "selected BAI"); physical_node = _replacement_hard_group(config, "gi", h5py.Dataset); physical = _replacement_json_node(config, "gi", "persisted GI truth"); physical_keys = set() if not shared["gi"]["enabled"] else {"gi_mode_1d", "gi_mode_2d", "incidence_motor", "th_val", "sample_orientation", "tilt_angle"}; _reject(type(bai_value) is not dict or type(physical) is not bool or physical != shared["gi"]["enabled"] or set(gi_cfg) != physical_keys or physical and any(gi_cfg[key] != shared["gi"][key] for key in ("incidence_motor", "th_val", "sample_orientation", "tilt_angle")), "selected BAI/GI/geometry is malformed"); text(bai_node, _canonical(bai_value).decode(), "selected BAI"); text(physical_node, _canonical(physical).decode(), "persisted GI truth"); (text(geom_leaves[0], geometry["convention"], "geometry convention"), text(geom_leaves[1], geometry["mapping_json"], "geometry mapping"), text(geom_leaves[2], _canonical(geometry["motor_sources"]).decode(), "geometry motors")) if geometry is not None else None
         bai = dict(bai_value); bai_mode = bai.pop(mode_key, None); gi_mode = gi_cfg.get(mode_key); prior_name = f"dimension_replacement_{dimension}"; prior_node = _replacement_hard_group(config, prior_name, h5py.Dataset); prior = _replacement_json_node(config, prior_name, "prior dimension audit", required=False); _reject(bool(gi_cfg) != (gi_node is not None) or (prior is None) != (prior_node is None), "selected config inventory differs"); text(gi_node, _canonical(gi_cfg).decode(), "selected GI config") if gi_node is not None else None; text(prior_node, _canonical(prior).decode(), "prior dimension audit") if prior_node is not None else None
-        primary = _replacement_scalar(top.attrs.get("primary_mode", "default"), "selected primary mode"); _reject(type(primary) is not str or primary != (gi_mode or "default") or ((bai_mode != gi_mode) if prior is None else bai_mode is not None), "selected GI mode/BAI differs"); selected = {"version": 1, "dimension": dimension, "bai_args": bai, "gi_mode": gi_mode}; _validate_science(selected, shared, dimension); acquisition = _canonical_acquisition_selected(run, shared, dimension)
+        primary = ("default" if "primary_mode" not in top.attrs else _replacement_utf8_attribute(top, "primary_mode", "selected primary mode", max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES)); _reject(type(primary) is not str or primary != (gi_mode or "default") or ((bai_mode != gi_mode) if prior is None else bai_mode is not None), "selected GI mode/BAI differs"); selected = {"version": 1, "dimension": dimension, "bai_args": bai, "gi_mode": gi_mode}; _validate_science(selected, shared, dimension); acquisition = _canonical_acquisition_selected(run, shared, dimension)
         if prior is None: _reject(selected != acquisition, "selected dimension differs from acquisition provenance")
         else:
             _keys(prior, {"schema_version", "operation", "dimension", "operation_identity", "science_identity", "acquisition_fingerprint", "shared_science_fingerprint", "selected_plan", "selected_gi_mode", "append_lineage_action", "append_lineage_sha256"}, "prior dimension audit"); sha = lambda value: type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value); prior_science = _digest({"api_version": 1, "dimension": dimension, "selected_plan": selected, "requested_shared_science": shared}); lineage_hash = None if lineage is None else hashlib.sha256(lineage).hexdigest()
             _reject(prior["schema_version"] != 1 or prior["operation"] != "existing_dimension_replacement" or prior["dimension"] != dimension or prior["selected_plan"] != selected or prior["selected_gi_mode"] != selected["gi_mode"] or not sha(prior["operation_identity"]) or prior["science_identity"] != prior_science or prior["acquisition_fingerprint"] != run.get("fingerprint") or prior["shared_science_fingerprint"] != science_fingerprint(shared) or prior["append_lineage_action"] != ("already_absent" if lineage is None else "preserved_append_disabled") or prior["append_lineage_sha256"] != lineage_hash, "prior dimension audit differs")
         try: first = _decode_replacement_fact(handle, labels[0], entry=entry)
         except WriterStateError as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
-        _reject(raw is None and any(_source_route(Path(path)) == "raw" for path in _decoder_input_paths(first)), "REPLACEMENT_RAW_DECODER_UNRECORDED"); described, dtype, _path, _image = _source_fact(first, raw_options=raw); detector = _replacement_hard_group(group, "instrument/detector/detector_shape", h5py.Dataset); raw_shape = None if detector is None else np.asarray(detector[()]); _reject(raw_shape is not None and (raw_shape.dtype.kind not in "iu" or raw_shape.size != 2 or any(int(v) <= 0 for v in raw_shape.ravel())), "processed detector descriptor is malformed"); shape = described if raw_shape is None else tuple(int(v) for v in raw_shape.ravel()); _reject(shape != described, "processed detector descriptor is malformed")
+        _reject(raw is None and any(_source_route(Path(path)) == "raw" for path in _decoder_input_paths(first)), "REPLACEMENT_RAW_DECODER_UNRECORDED"); described, dtype, _path, _image = _source_fact(first, raw_options=raw); detector = _replacement_hard_group(group, "instrument/detector/detector_shape", h5py.Dataset)
+        _reject(detector is not None and (detector.shape != (2,) or detector.dtype != np.dtype(np.int64)), "processed detector descriptor is malformed")
+        raw_shape = None if detector is None else np.asarray(detector[()]); _reject(raw_shape is not None and (raw_shape.shape != (2,) or raw_shape.dtype != np.dtype(np.int64) or any(int(v) <= 0 for v in raw_shape)), "processed detector descriptor is malformed"); shape = described if raw_shape is None else tuple(int(v) for v in raw_shape); _reject(shape != described, "processed detector descriptor is malformed")
         pfg = _replacement_hard_group(group, "per_frame_geometry"); _reject((shared["geometry"] is None) != (pfg is None), "replacement geometry differs")
-        if pfg is not None: required = {"frame_index", "rot1", "rot2", "rot3", "incident_angle"}; nodes = {key: _replacement_hard_group(pfg, key, h5py.Dataset) for key in required}; rows_node = nodes["frame_index"]; geometry_rows = None if rows_node is None else np.asarray(rows_node[()]); geometry_labels = () if geometry_rows is None else tuple(int(v) for v in geometry_rows); _reject(set(pfg) != required or any(node is None for node in nodes.values()) or geometry_rows is None or rows_node.ndim != 1 or rows_node.dtype != np.dtype(np.int64) or any(v < 0 for v in geometry_labels) or geometry_labels != tuple(sorted(set(geometry_labels))) or not set(labels) <= set(geometry_labels) or any(nodes[key].ndim != 1 or nodes[key].dtype != np.dtype(np.float32) or len(nodes[key]) != len(geometry_labels) or not np.isfinite(np.asarray(nodes[key][()])[[geometry_labels.index(label) for label in labels]]).all() for key in required - {"frame_index"}), "replacement geometry differs")
+        if pfg is not None:
+            _reject(len(pfg) != 5, "replacement geometry differs")
+            required = {"frame_index", "rot1", "rot2", "rot3", "incident_angle"}; nodes = {key: _replacement_hard_group(pfg, key, h5py.Dataset) for key in required}; rows_node = nodes["frame_index"]
+            _reject(set(pfg) != required or any(node is None for node in nodes.values()) or any(nodes[key].ndim != 1 or nodes[key].dtype != np.dtype(np.float32) or nodes[key].shape != rows_node.shape for key in required - {"frame_index"}), "replacement geometry differs")
+            try: geometry_rows = _read_replacement_frame_index(rows_node, "replacement geometry inventory", require_nonempty=True)
+            except WriterStateError as error: raise ValueError("replacement geometry differs") from error
+            geometry_values = {key: np.asarray(nodes[key][()]) for key in required - {"frame_index"}}; geometry_labels = tuple(int(v) for v in geometry_rows); _reject(any(v < 0 for v in geometry_labels) or geometry_labels != tuple(sorted(set(geometry_labels))) or not set(labels) <= set(geometry_labels) or any(value.dtype != np.dtype(np.float32) or not np.isfinite(value[[geometry_labels.index(label) for label in labels]]).all() for value in geometry_values.values()), "replacement geometry differs")
         values = {}; gi = shared.get("gi") or {}; motor = gi.get("resolved_motor") if gi.get("enabled") else None; scan_data = _replacement_hard_group(group, "scan_data")
-        if motor not in {None, "Manual"} and scan_data is not None: rows_node = _replacement_hard_group(scan_data, "frame_index", h5py.Dataset); motor_node = _replacement_hard_group(scan_data, motor, h5py.Dataset); raw_rows = None if rows_node is None else np.asarray(rows_node[()]); data = None if motor_node is None else np.asarray(motor_node[()]); _reject(raw_rows is None or data is None or rows_node.ndim != 1 or raw_rows.dtype.kind not in "iu" or data.ndim != 1 or data.dtype.kind != "f", "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); rows = tuple(int(v) for v in raw_rows); _reject(any(v < 0 for v in rows) or rows != tuple(sorted(set(rows))) or len(data) != len(rows) or not set(labels) <= set(rows), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); values = {label: float(data[rows.index(label)]) for label in labels if math.isfinite(float(data[rows.index(label)]))}
+        if motor not in {None, "Manual"} and scan_data is not None:
+            rows_node = _replacement_hard_group(scan_data, "frame_index", h5py.Dataset); motor_node = _replacement_hard_group(scan_data, motor, h5py.Dataset)
+            _reject(rows_node is None or motor_node is None or motor_node.ndim != 1 or motor_node.dtype != np.dtype(np.float32) or motor_node.shape != rows_node.shape, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+            try: raw_rows = _read_replacement_frame_index(rows_node, "replacement scan inventory", require_nonempty=True)
+            except WriterStateError as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
+            data = np.asarray(motor_node[()]); _reject(data.dtype != np.dtype(np.float32), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); rows = tuple(int(v) for v in raw_rows); _reject(any(v < 0 for v in rows) or rows != tuple(sorted(set(rows))) or len(data) != len(rows) or not set(labels) <= set(rows), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); values = {label: float(data[rows.index(label)]) for label in labels if math.isfinite(float(data[rows.index(label)]))}
         _reject(motor not in {None, "Manual"} and set(values) != set(labels), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
         if motor not in {None, "Manual"} and first["source_execution"]["adapter_id"] == "tiff_series": execution = first["source_execution"]; admitted = execution["admitted_motor_values"]; ordinals = tuple(label - execution["first_label"] for label in labels); _reject(len(admitted) != len(execution["member_stamps"]) or any(not 0 <= ordinal < len(admitted) for ordinal in ordinals) or any(admitted[ordinal]["motor"] != motor or admitted[ordinal]["value"] != values[label] for label, ordinal in zip(labels, ordinals)), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
         mask_node = _replacement_hard_group(group, "instrument/detector/mask", h5py.Dataset); mask = None
-        if mask_node is not None: flat = np.asarray(mask_node[()]); _reject(flat.ndim != 1 or not len(flat) or flat.dtype != np.dtype(np.int64) or mask_node.chunks is not None or mask_node.compression is not None or mask_node.maxshape != mask_node.shape or dict(mask_node.attrs) != {"description": "flat pixel indices, shape (N,)"} or any(int(v) < 0 or int(v) >= shape[0] * shape[1] for v in flat), "processed detector mask is malformed"); mask = np.zeros(shape, dtype=bool); mask.ravel()[flat.astype(np.intp)] = True
+        if mask_node is not None:
+            pixels = int(shape[0]) * int(shape[1])
+            try:
+                layout = mask_node.id.get_create_plist().get_layout()
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                layout = None
+            try:
+                description = (_replacement_utf8_attribute(
+                    mask_node, "description", "processed detector mask description",
+                    max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES,
+                ) if len(mask_node.attrs) == 1
+                and set(mask_node.attrs) == {"description"} else None)
+            except ValueError:
+                description = None
+            _reject(
+                mask_node.ndim != 1
+                or mask_node.shape[0] < 1
+                or mask_node.dtype != np.dtype(np.int64)
+                or mask_node.maxshape != mask_node.shape
+                or layout != h5py.h5d.CONTIGUOUS
+                or mask_node.chunks is not None
+                or mask_node.compression is not None
+                or mask_node.compression_opts is not None
+                or bool(mask_node.shuffle)
+                or bool(mask_node.fletcher32)
+                or mask_node.scaleoffset is not None
+                or mask_node.external is not None
+                or bool(mask_node.is_virtual)
+                or description != "flat pixel indices, shape (N,)"
+                or pixels > _MAX_PERSISTED_MASK_BYTES
+                or mask_node.shape[0] > pixels
+                or mask_node.nbytes > _MAX_PERSISTED_MASK_BYTES,
+                "processed detector mask is malformed",
+            )
+            flat = np.asarray(mask_node[()])
+            _reject(
+                flat.shape != mask_node.shape
+                or flat.dtype != np.dtype(np.int64)
+                or int(flat[0]) < 0
+                or int(flat[-1]) >= pixels
+                or bool(np.any(flat[1:] <= flat[:-1])),
+                "processed detector mask is malformed",
+            )
+            mask = np.zeros(shape, dtype=bool)
+            mask.ravel()[flat.astype(np.intp, copy=False)] = True
+        _target_hdf_fence(handle, target, snapshot, target_revision)
     fingerprint = run.get("fingerprint"); _reject(type(fingerprint) is not str or len(fingerprint) != 64 or any(c not in "0123456789abcdef" for c in fingerprint), "processed acquisition identity is malformed"); return _ArtifactInspection(labels, shape, dtype, shared, selected, fingerprint, source_base, lineage, MappingProxyType(values), mask, raw)
 def _core_plan(selected: Mapping[str, Any], shared: Mapping[str, Any], mask=None):
     from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args; args = dict(selected["bai_args"]); dimension = selected["dimension"]; gi = shared["gi"]; threshold = shared["threshold"]
     if gi["enabled"]: args[f"gi_mode_{dimension}"] = selected["gi_mode"]
     plan = build_native_int_reduction_plan_from_args(args if dimension == "1d" else None, args if dimension == "2d" else None, gi_enabled=gi["enabled"], gi_incident_angle=(gi["th_val"] if gi["enabled"] and gi["resolved_motor"] == "Manual" else None), incidence_motor=(None if not gi["enabled"] or gi["resolved_motor"] == "Manual" else gi["resolved_motor"]), tilt_angle=gi["tilt_angle"], sample_orientation=gi["sample_orientation"], integrate_1d=dimension == "1d", integrate_2d=dimension == "2d", threshold_min=(threshold["threshold_min"] if threshold["apply_threshold"] else None), threshold_max=(threshold["threshold_max"] if threshold["apply_threshold"] else None), mask_saturation=threshold["mask_saturation"]); plan.mask = mask; return plan
-def _prepare_gi_scouts(target, entry, observed, selected, shared, *, cancel_token=None):
+def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, target_revision, *, cancel_token=None):
     _event(cancel_token); gi = shared["gi"]
     if not gi["enabled"] or gi["resolved_motor"] == "Manual": return selected, None
     try: bootstrap = float(observed.gi_values[observed.labels[0]])
@@ -235,7 +682,10 @@ def _prepare_gi_scouts(target, entry, observed, selected, shared, *, cancel_toke
         def load(current, label=label):
             import h5py; from xrd_tools.io.record_writer import _decode_replacement_fact
             prior = holder["frame"]; _scrub_frame(prior) if prior is not None else None; _event(cancel_token)
-            with h5py.File(target, "r") as handle: fact = _decode_replacement_fact(handle, label, entry=entry, metadata_keys=metadata_keys, include_geometry=include_geometry)
+            with _open_target_hdf(target) as handle:
+                _target_hdf_fence(handle, target, snapshot, target_revision)
+                fact = _decode_replacement_fact(handle, label, entry=entry, metadata_keys=metadata_keys, include_geometry=include_geometry)
+                _target_hdf_fence(handle, target, snapshot, target_revision)
             path, image, background, pair = _load_fact(fact, observed.detector_shape, observed.native_dtype, shared, cancel_token, observed.raw_options)
             current.source_path, current.source_frame_index, current.source_identity = path, fact["frame_index"], fact; current.metadata.update(fact["metadata"]); current.background = background; current.geometry = _geometry_fact(fact, shared)
             if pair is not None: current.background_dependency_bytes, current.background_dependency_fingerprint = pair
@@ -273,17 +723,26 @@ class ReintegratePlan:
     @property
     def resource_allocation(self) -> SessionResourceAllocation: return self.session_policy.allocation
     @classmethod
-    def from_artifact(cls, target: str | os.PathLike[str], *, entry: str, dimension: Literal["1d", "2d"], preparation: Mapping[str, object], expected_target_snapshot: TargetSnapshot | None = None, expected_labels: tuple[int, ...] | None = None, cancel_token: threading.Event | None = None) -> ReintegratePlan:
+    def from_artifact(cls, target: str | os.PathLike[str], *, entry: str, dimension: Literal["1d", "2d"], preparation: Mapping[str, object], expected_target_snapshot: TargetSnapshot | None = None, expected_terminal_identity: StreamTerminal | None = None, expected_labels: tuple[int, ...] | None = None, cancel_token: threading.Event | None = None) -> ReintegratePlan:
         _event(cancel_token); preparation = _plain(_freeze(preparation)); _keys(preparation, {"api_version", "selected_plan", "requested_shared_science", "resource_policy"}, "preparation"); selected, shared = preparation["selected_plan"], preparation["requested_shared_science"]; persisted = type(shared) is dict and set(shared) == {"version", "kind"} and type(shared["version"]) is int and shared["version"] == 1 and shared["kind"] == "persisted_target"; _reject(type(preparation["api_version"]) is not int or preparation["api_version"] != 1, "preparation version/dimension")
         if persisted: _validate_persisted_selected(selected, dimension); _reject(type(expected_target_snapshot) is not TargetSnapshot or not expected_target_snapshot.exists or type(expected_labels) is not tuple or not expected_labels or expected_labels != tuple(sorted(set(expected_labels))) or any(type(v) is not int or v < 0 for v in expected_labels), "expected target/labels are malformed")
         else: _validate_science(selected, shared, dimension); _reject(expected_target_snapshot is not None and type(expected_target_snapshot) is not TargetSnapshot or expected_labels is not None and (type(expected_labels) is not tuple or any(type(v) is not int or v < 0 for v in expected_labels)), "expected target/labels are malformed")
-        path = Path(target).resolve(); snapshot = capture_target_snapshot(path)
-        _reject(not snapshot.exists, "replacement target must exist"); _reject(expected_target_snapshot is not None and snapshot != expected_target_snapshot, "TARGET_SNAPSHOT_CHANGED"); _event(cancel_token); observed = _inspect_artifact(path, entry, dimension); _event(cancel_token); labels = tuple(observed.labels)
+        _reject(expected_terminal_identity is not None and type(expected_terminal_identity) is not StreamTerminal, "expected terminal identity is malformed")
+        path = Path(target).resolve()
+        sealed = None
+        if stream_terminal_object_revision(expected_terminal_identity) is not None:
+            sealed = revalidate_stream_terminal(path, expected_terminal_identity)
+            _reject(expected_target_snapshot != sealed, "TARGET_SNAPSHOT_CHANGED")
+            _event(cancel_token)
+        snapshot = capture_target_snapshot(path)
+        if sealed is not None:
+            _reject(revalidate_stream_terminal(path, expected_terminal_identity) != sealed, "TARGET_SNAPSHOT_CHANGED")
+        _reject(not snapshot.exists, "replacement target must exist"); _reject(sealed is None and expected_target_snapshot is not None and snapshot != expected_target_snapshot, "TARGET_SNAPSHOT_CHANGED"); target_revision = _target_object_revision(path, snapshot); _event(cancel_token); observed = _inspect_artifact(path, entry, dimension, snapshot, target_revision); _event(cancel_token); labels = tuple(observed.labels)
         _reject(expected_labels is not None and labels != expected_labels, "EXPECTED_LABELS_CHANGED")
         if persisted: shared = _plain(observed.persisted_shared_science); selected = _resolve_persisted_selected(selected, shared, dimension, observed.mask)
         else: _reject(_plain(observed.persisted_shared_science) != shared, "shared science differs")
         req = _requirements(observed.detector_shape, observed.native_dtype, selected, shared); policy = _policy(req, preparation["resource_policy"])
-        selected, bootstrap = _prepare_gi_scouts(path, entry, observed, selected, shared, cancel_token=cancel_token); _event(cancel_token); _reject(capture_target_snapshot(path) != snapshot, "TARGET_SNAPSHOT_CHANGED"); _event(cancel_token); return _make_plan(str(path), entry, dimension, labels, observed.detector_shape, observed.native_dtype, selected, shared, bootstrap, policy, snapshot=snapshot)
+        selected, bootstrap = _prepare_gi_scouts(path, entry, observed, selected, shared, snapshot, target_revision, cancel_token=cancel_token); _event(cancel_token); _reject(capture_target_snapshot(path) != snapshot or _target_object_revision(path, snapshot) != target_revision, "TARGET_SNAPSHOT_CHANGED"); _event(cancel_token); return _make_plan(str(path), entry, dimension, labels, observed.detector_shape, observed.native_dtype, selected, shared, bootstrap, policy, snapshot=snapshot)
     def as_recipe(self) -> dict[str, object]: return {"schema": "xrd_tools.reintegrate.plan", "version": 1, "plan": _plan_mapping(self)}
     @classmethod
     def from_recipe(cls, recipe: Mapping[str, object]) -> ReintegratePlan:
@@ -390,9 +849,10 @@ class _ExecutionRuntime:
         if self.token is not None and self.token.is_set(): return _RuntimeOutcome("ROLLED_BACK", (), (), (), None, None)
         _event(self.token); self._report("qualify", 0, len(self.plan.labels)); _event(self.token); path = Path(self.plan.target)
         if capture_target_snapshot(path) != self.plan.expected_target_snapshot: raise ValueError("TARGET_SNAPSHOT_CHANGED")
+        target_revision = _target_object_revision(path, self.plan.expected_target_snapshot)
         _event(self.token)
-        from xrd_tools.reduction.core import NexusSink; from xrd_tools.session import DynamicAccountingLimits, DynamicFrameIdentity, DynamicRunAccounting, StageLedger, required_result_modes; from xrd_tools.session.scan_session import ScanSession; inspected = _inspect_artifact(path, self.plan.entry, self.plan.dimension); _event(self.token)
-        if capture_target_snapshot(path) != self.plan.expected_target_snapshot: raise ValueError("TARGET_SNAPSHOT_CHANGED")
+        from xrd_tools.reduction.core import NexusSink; from xrd_tools.session import DynamicAccountingLimits, DynamicFrameIdentity, DynamicRunAccounting, StageLedger, required_result_modes; from xrd_tools.session.scan_session import ScanSession; inspected = _inspect_artifact(path, self.plan.entry, self.plan.dimension, self.plan.expected_target_snapshot, target_revision); _event(self.token)
+        if capture_target_snapshot(path) != self.plan.expected_target_snapshot or _target_object_revision(path, self.plan.expected_target_snapshot) != target_revision: raise ValueError("TARGET_SNAPSHOT_CHANGED")
         _event(self.token)
         if inspected.labels != self.plan.labels or inspected.detector_shape != self.plan.detector_shape or inspected.native_dtype != self.plan.native_dtype or _plain(inspected.persisted_shared_science) != _plain(self.plan.requested_shared_science) or self.plan.gi_bootstrap_incidence is not None and inspected.gi_values.get(self.plan.labels[0]) != self.plan.gi_bootstrap_incidence: raise ValueError("RECIPE_ARTIFACT_FACTS_CHANGED")
         audit = _dimension_audit(dimension=self.plan.dimension, operation_identity=self.plan.operation_identity, science_identity=self.plan.science_identity, acquisition_fingerprint=inspected.acquisition_fingerprint, requested_shared_science=self.plan.requested_shared_science, selected_plan=self.plan.selected_plan, append_lineage=inspected.append_lineage); self.audit = _audit_identity(audit); background = self.plan.requested_shared_science["background"]; run = {} if background["mode"] == "None" else {"background": _plain(background)}

@@ -17,6 +17,10 @@ from xrd_tools.integrate.calibration import (
     load_detector_calibration,
 )
 from xrd_tools.session.frame_record_store import FrameRecordStore
+from xrd_tools.io.output_transaction import (
+    StreamTerminal,
+    stream_terminal_object_revision,
+)
 from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources import open_source
@@ -363,6 +367,25 @@ def _terminal_durable_progress(run) -> tuple[int, int]:
     completed = max(0, int(run.completed))
     return completed, max(int(run.total), completed)
 
+
+def _session_terminal_commit_identity(
+    session: object,
+    artifact: Path | None = None,
+) -> StreamTerminal | None:
+    terminal = getattr(session, "terminal_result", None)
+    commit_identity = getattr(terminal, "commit_identity", None)
+    if type(commit_identity) is not StreamTerminal:
+        return None
+    if stream_terminal_object_revision(commit_identity) is None:
+        return None
+    if (
+        artifact is not None
+        and os.path.normcase(os.path.abspath(str(artifact)))
+        != commit_identity.target
+    ):
+        return None
+    return commit_identity
+
 @dataclass(slots=True)
 class _StandardRun:
     configuration: FrozenRunConfiguration | None
@@ -421,6 +444,7 @@ class _StandardRun:
     command_failure: DetachedDiagnostic | None = None
     resource_facts: list[Any] = field(default_factory=list)
     pending_partition_count: int = 1
+    terminal_commit_identity: StreamTerminal | None = None
 
     def __post_init__(self) -> None:
         self.perf_quartiles_enabled = (
@@ -2192,6 +2216,9 @@ class StandardRunExecutor:
                     result.error or "scattering reduction failed"
                 )
             if finished_current:
+                run.terminal_commit_identity = (
+                    _session_terminal_commit_identity(session, run.artifact)
+                )
                 owner = run.display.artifacts.get(str(run.artifact))
                 if owner is None:
                     raise RuntimeError("finished display artifact is missing")
@@ -2809,6 +2836,12 @@ class StandardRunExecutor:
             artifact_completed=run.current_completed,
             artifact_total=run.current_total,
             terminal_timing=timing,
+            terminal_commit_identity=(
+                run.terminal_commit_identity
+                if kind is StandardEventKind.FINISHED
+                and receipt.cleanup_status is CleanupStatus.CLEANED
+                else None
+            ),
             **_directory_event_fields(
                 run,
                 in_flight_processed=_terminal_in_flight_files(run),

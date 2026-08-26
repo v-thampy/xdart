@@ -112,9 +112,14 @@ class BrowserScan:
     identifier: str
     label: str
     detail: str = ""
+    is_directory: bool = False
 
     def __post_init__(self) -> None:
-        if not self.identifier or not self.label:
+        if (
+            not self.identifier
+            or not self.label
+            or type(self.is_directory) is not bool
+        ):
             raise ValueError("browser scan identity and label are required")
 
 

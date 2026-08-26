@@ -265,10 +265,16 @@ def test_single_compatible_update_reuses_curve_item(
     try:
         _reconcile(view, projection.scientific, projection.navigation)
         item = view.curve.listDataItems()[0]
-        calls = {"clear": 0, "plot": 0, "set_data": 0}
+        calls = {"clear": 0, "plot": 0, "set_data": []}
         original_clear = view.curve.clear
         original_plot = view.curve.plot
         original_set_data = item.setData
+        installed_style = {
+            key: item.opts[key]
+            for key in (
+                "pen", "symbol", "symbolBrush", "symbolPen", "symbolSize",
+            )
+        }
 
         def counted_clear(*args, **kwargs):
             calls["clear"] += 1
@@ -279,7 +285,7 @@ def test_single_compatible_update_reuses_curve_item(
             return original_plot(*args, **kwargs)
 
         def counted_set_data(*args, **kwargs):
-            calls["set_data"] += 1
+            calls["set_data"].append((args, kwargs))
             return original_set_data(*args, **kwargs)
 
         monkeypatch.setattr(view.curve, "clear", counted_clear)
@@ -293,9 +299,20 @@ def test_single_compatible_update_reuses_curve_item(
         )
         _reconcile(view, projection.scientific, next_navigation)
 
-        assert calls == {"clear": 0, "plot": 0, "set_data": 1}
+        assert calls["clear"] == 0
+        assert calls["plot"] == 0
+        assert len(calls["set_data"]) == 1
         assert view.curve.listDataItems() == [item]
         expected = projection.scientific.traces[1]
+        args, kwargs = calls["set_data"][0]
+        assert len(args) == 2
+        assert args[0] is expected.axis.values
+        assert args[1] is expected.intensity
+        assert kwargs == {"name": expected.title, "connect": "finite"}
+        assert all(
+            item.opts[key] is value
+            for key, value in installed_style.items()
+        )
         x_values, y_values = item.getData()
         np.testing.assert_array_equal(x_values, expected.axis.values)
         np.testing.assert_array_equal(y_values, expected.intensity)

@@ -23,10 +23,18 @@ def _wait(call, timeout=20):
         if value is not None: return value
         time.sleep(.005)
     raise AssertionError("timed out waiting for bounded operation")
-def _loaded_page(tmp_path, monkeypatch, qapp, seed=None):
+def _loaded_page(
+    tmp_path, monkeypatch, qapp, seed=None, *, terminal_browse=False,
+):
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
     seeded = seed or _seed_existing(tmp_path)
-    page, store = _page(tmp_path, monkeypatch); request = page._context_controller.begin_browse(str(seeded.target.resolve()))
+    page, store = _page(tmp_path, monkeypatch)
+    request = page._context_controller.begin_browse(
+        str(seeded.target.resolve()),
+        terminal_commit_identity=(
+            seeded.terminal.commit_identity if terminal_browse else None
+        ),
+    )
     outcome = _wait(page._context_controller.poll_browse); assert outcome.request is request and outcome.status is BrowseLoadStatus.READY
     context = page._context_controller.browse_context; assert context is not None and context.loaded
     return page, store, seeded, context
@@ -104,7 +112,7 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
     )
     assert tuple(inspect.signature(ReintegratePlan.from_artifact).parameters) == (
         "target", "entry", "dimension", "preparation", "expected_target_snapshot",
-        "expected_labels", "cancel_token",
+        "expected_terminal_identity", "expected_labels", "cancel_token",
     )
     assert tuple(inspect.signature(ReintegratePlan.from_recipe).parameters) == ("recipe",)
     assert tuple(inspect.signature(ReintegrateRunner).parameters) == ("plan", "cancel_token", "progress_cb")
@@ -123,7 +131,9 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
 
     plan = object.__new__(ReintegratePlan)
     object.__setattr__(plan, "labels", (2, 5)); object.__setattr__(plan, "science_identity", "b" * 64); object.__setattr__(plan, "operation_identity", "c" * 64)
-    terminal = StreamTerminal("/detached", 1, "d" * 64, 1)
+    terminal = StreamTerminal(
+        "/detached", 1, "d" * 64, 1, 1, 1, 1, 1,
+    )
     class Pending:
         primary = None
         def __init__(self): self.custody = True; self.retries = 0
@@ -320,9 +330,10 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         page._drain_executor()
         assert lifecycle.phase.value == "idle"
         assert browse_calls == [target]
-        assert page._terminal_browse_request is not None
-        assert page._terminal_browse_request.source_path == resolved_target
-        assert page._terminal_browse_artifact == target
+        handoff = page._terminal_browse_handoff
+        assert handoff is not None
+        assert handoff.request.source_path == resolved_target
+        assert handoff.artifact == target
         assert page._context_controller.browse_pending
 
         historical = deltas[1].appended
@@ -336,11 +347,10 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
                 frames=(historical,),
             ))
             assert not page._auto_last
-            assert (
-                page._terminal_browse_current_label
-                == historical.local_frame_label
+            assert page._terminal_browse_handoff.current_label == (
+                historical.local_frame_label
             )
-            assert page._terminal_browse_selected_labels == (
+            assert page._terminal_browse_handoff.selected_labels == (
                 historical.local_frame_label,
             )
             if selection_case == "manual-then-auto-last":
@@ -360,9 +370,8 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
                 assert page._context_controller.navigation.selected == (
                     historical,
                 )
-                assert (
-                    page._terminal_browse_current_label
-                    == historical.local_frame_label
+                assert page._terminal_browse_handoff.current_label == (
+                    historical.local_frame_label
                 )
 
         def settled():
@@ -373,8 +382,7 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         assert captured[3] == resolved_target
         assert captured[6] == seeded.labels
         assert captured[5].exists
-        assert page._terminal_browse_request is None
-        assert page._terminal_browse_artifact is None
+        assert page._terminal_browse_handoff is None
         assert not page._context_controller.browse_pending
         navigation = page._context_controller.navigation
         expected_current = (
@@ -439,6 +447,230 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         _dispose(page, qapp)
 
 
+def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
+    tmp_path, monkeypatch, qapp,
+):
+    from xdart.gui.tabs.scattering.browse_values import (
+        BrowseLoadOutcome, BrowseLoadStatus,
+    )
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
+    from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
+    from xrd_tools.io.output_transaction import StreamTerminal
+
+    page, _store, _seeded, context = _loaded_page(
+        tmp_path, monkeypatch, qapp, terminal_browse=True,
+    )
+    try:
+        controller = page._context_controller
+        navigation = controller.navigation
+        assert controller.select_navigation(
+            navigation.frames[-1], navigation.frames,
+        )
+        page._preferences = replace(
+            page._preferences, plot_mode="Waterfall",
+        )
+        view = page._shell.scientific
+
+        def complete_waterfall():
+            page._drain_executor()
+            page._refresh_shell()
+            return (
+                view
+                if view.trace_history_keys
+                == controller.navigation.selected
+                else None
+            )
+
+        view = _wait(complete_waterfall)
+        before = page._last_scientific_projection
+        assert before is not None
+        before_arrays = tuple(id(trace.intensity) for trace in before.traces)
+
+        clones = tuple(
+            DisplayFrameKey(
+                frame.run_identity,
+                frame.source_scan,
+                frame.artifact,
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in controller.navigation.frames
+        )
+        rebound = FrameNavigationProjection(clones, clones[-1], clones)
+        request = context.load_request
+        commit_identity = request.terminal_commit_identity
+        assert type(commit_identity) is StreamTerminal
+        handoff = _TerminalBrowseHandoff(
+            request, clones[-1].artifact,
+            clones[-1].local_frame_label,
+            tuple(frame.local_frame_label for frame in clones),
+            commit_identity,
+        )
+        assert page._terminal_scientific_matches(handoff, rebound)
+
+        controller._runtime._set_browse_navigation(rebound)
+        page._terminal_browse_handoff = handoff
+        assert page._settle_terminal_browse(BrowseLoadOutcome(
+            request, BrowseLoadStatus.READY,
+        ))
+        assert page._terminal_browse_handoff is None
+        monkeypatch.setattr(
+            controller,
+            "project_navigation",
+            lambda **_kwargs: pytest.fail(
+                "terminal rebind rebuilt numeric projections"
+            ),
+        )
+        monkeypatch.setattr(
+            view,
+            "_render_traces",
+            lambda *_args, **_kwargs: pytest.fail(
+                "terminal rebind repainted the waterfall"
+            ),
+        )
+
+        page._refresh_shell(
+            preserve_scientific=True,
+            skip_scientific_projection=True,
+            rebind_scientific_navigation=True,
+        )
+
+        assert view.navigation_frame_keys == clones
+        assert view.navigation_current_key is clones[-1]
+        assert view.navigation_selected_keys == clones
+        assert view.trace_history_keys == clones
+        assert tuple(
+            id(trace.intensity)
+            for trace in page._last_scientific_projection.traces
+        ) == before_arrays
+        assert controller._runtime._committed_trace_selection == clones
+        assert not page._scientific_repaint_pending
+        assert context.loaded_labels == tuple(
+            frame.local_frame_label for frame in clones
+        )
+    finally:
+        page.close_workspace()
+
+
+def test_terminal_browse_same_labels_changed_content_forces_normal_repaint(
+    tmp_path, monkeypatch, qapp,
+):
+    """A path/label match cannot reuse arrays from a different file seal."""
+
+    import numpy as np
+
+    from xdart.gui.tabs.scattering.browse_values import (
+        BrowseLoadOutcome, BrowseLoadStatus,
+    )
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
+    from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
+    from xrd_tools.io.output_transaction import StreamTerminal
+
+    page, _store, _seeded, context = _loaded_page(
+        tmp_path, monkeypatch, qapp, terminal_browse=True,
+    )
+    try:
+        controller = page._context_controller
+        navigation = controller.navigation
+        assert controller.select_navigation(
+            navigation.frames[-1], navigation.frames,
+        )
+        page._preferences = replace(
+            page._preferences, plot_mode="Waterfall",
+        )
+        view = page._shell.scientific
+
+        def complete_waterfall():
+            page._drain_executor()
+            page._refresh_shell()
+            return (
+                page._last_scientific_projection
+                if view.trace_history_keys
+                == controller.navigation.selected
+                else None
+            )
+
+        before = _wait(complete_waterfall)
+        clones = tuple(
+            DisplayFrameKey(
+                frame.run_identity,
+                frame.source_scan,
+                frame.artifact,
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in navigation.frames
+        )
+        rebound = FrameNavigationProjection(clones, clones[-1], clones)
+        request = context.load_request
+        snapshot = context.target_snapshot
+        accepted_commit = request.terminal_commit_identity
+        assert type(accepted_commit) is StreamTerminal
+        changed_digest = (
+            "0" * 64
+            if snapshot.digest != "0" * 64
+            else "1" * 64
+        )
+        handoff = _TerminalBrowseHandoff(
+            request,
+            clones[-1].artifact,
+            clones[-1].local_frame_label,
+            tuple(frame.local_frame_label for frame in clones),
+            StreamTerminal(
+                request.source_path,
+                snapshot.size,
+                changed_digest,
+                accepted_commit.ordinal,
+                accepted_commit.device,
+                accepted_commit.inode,
+                accepted_commit.mtime_ns,
+                accepted_commit.ctime_ns,
+            ),
+        )
+        assert page._terminal_scientific_matches(handoff, rebound)
+
+        stale_arrays = tuple(
+            np.full_like(trace.intensity, -123.0)
+            for trace in before.traces
+        )
+        page._last_scientific_projection = replace(
+            before,
+            traces=tuple(
+                replace(trace, intensity=intensity)
+                for trace, intensity in zip(
+                    before.traces, stale_arrays, strict=True,
+                )
+            ),
+        )
+        controller._runtime._set_browse_navigation(rebound)
+        page._terminal_browse_handoff = handoff
+        assert not page._settle_terminal_browse(BrowseLoadOutcome(
+            request, BrowseLoadStatus.READY,
+        ))
+
+        projection_calls = []
+        original_project = controller.project_navigation
+
+        def project_navigation(**kwargs):
+            value = original_project(**kwargs)
+            projection_calls.append(value)
+            return value
+
+        monkeypatch.setattr(
+            controller, "project_navigation", project_navigation,
+        )
+        page._refresh_shell()
+        assert projection_calls
+        assert all(
+            not np.all(trace.intensity == -123.0)
+            for trace in page._last_scientific_projection.traces
+        )
+    finally:
+        page.close_workspace()
+
+
 def test_xye_loaded_browse_disables_and_refuses_reintegrate(
     tmp_path, monkeypatch, qapp,
 ):
@@ -494,6 +726,282 @@ def test_browse_snapshot_brackets_complete_load_and_refuses_drift(tmp_path, monk
     assert loader.release_context(context).cleanup_status.value == "cleaned"
     snap = real(target); values = iter((snap, replace(snap, digest="0" * 64))); monkeypatch.setattr(module, "capture_target_snapshot", lambda _path: next(values))
     bad = module.BrowseLoader(); bad_request = BrowseLoadRequest("drift", 1, str(target.resolve())); bad.begin(bad_request); refused = _wait(lambda: bad.poll(bad_request)); assert refused.status is BrowseLoadStatus.FAILED and bad.context_for_outcome(refused) is None
+
+
+def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
+    tmp_path, monkeypatch,
+):
+    """Terminal Browse uses two object fences and no redundant SHA pass."""
+
+    import shutil
+
+    from xdart.gui.tabs.scattering.adapters import browse_loader as module
+    from xdart.gui.tabs.scattering.browse_values import (
+        BrowseLoadRequest, BrowseLoadStatus,
+    )
+    from xrd_tools.io import output_transaction as transaction
+
+    seeded = _seed_existing(tmp_path)
+    target = seeded.target.resolve()
+    seal = seeded.terminal.commit_identity
+    real_capture = module.capture_target_snapshot
+    real_revalidate = module.revalidate_stream_terminal
+    real_sha = transaction._sha256_handle
+    full_captures = []
+    revalidations = []
+    hashed_bytes = []
+
+    def capture(path):
+        full_captures.append(threading.current_thread().name)
+        return real_capture(path)
+
+    def revalidate(path, terminal):
+        revalidations.append(threading.current_thread().name)
+        return real_revalidate(path, terminal)
+
+    def sha256_handle(handle):
+        hashed_bytes.append(os.fstat(handle.fileno()).st_size)
+        return real_sha(handle)
+
+    monkeypatch.setattr(module, "capture_target_snapshot", capture)
+    monkeypatch.setattr(module, "revalidate_stream_terminal", revalidate)
+    monkeypatch.setattr(transaction, "_sha256_handle", sha256_handle)
+
+    terminal_loader = module.BrowseLoader()
+    terminal_request = BrowseLoadRequest(
+        "terminal-seal", 1, str(target), seal,
+    )
+    terminal_loader.begin(terminal_request)
+    terminal_outcome = _wait(
+        lambda: terminal_loader.poll(terminal_request),
+    )
+    terminal_context = terminal_loader.consume(terminal_outcome)
+    assert terminal_outcome.status is BrowseLoadStatus.READY
+    assert terminal_context.loaded_labels == seeded.labels
+    assert (
+        terminal_context.target_snapshot.size,
+        terminal_context.target_snapshot.digest,
+    ) == (seal.size, seal.digest)
+    assert full_captures == hashed_bytes == []
+    assert revalidations == ["scattering-browse"] * 2
+    assert terminal_loader.release_context(
+        terminal_context
+    ).cleanup_status.value == "cleaned"
+
+    legacy = type(seal)(seal.target, seal.size, seal.digest, seal.ordinal)
+    full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
+    legacy_loader = module.BrowseLoader()
+    legacy_request = BrowseLoadRequest(
+        "legacy-two-fence", 1, str(target), legacy,
+    )
+    legacy_loader.begin(legacy_request)
+    legacy_outcome = _wait(lambda: legacy_loader.poll(legacy_request))
+    legacy_context = legacy_loader.consume(legacy_outcome)
+    assert legacy_outcome.status is BrowseLoadStatus.READY
+    assert full_captures == ["scattering-browse"] * 2
+    assert revalidations == []
+    assert hashed_bytes == [target.stat().st_size] * 2
+    assert legacy_loader.release_context(
+        legacy_context
+    ).cleanup_status.value == "cleaned"
+
+    full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
+    generic_loader = module.BrowseLoader()
+    generic_request = BrowseLoadRequest(
+        "generic-two-fence", 1, str(target),
+    )
+    generic_loader.begin(generic_request)
+    generic_outcome = _wait(lambda: generic_loader.poll(generic_request))
+    generic_context = generic_loader.consume(generic_outcome)
+    assert generic_outcome.status is BrowseLoadStatus.READY
+    assert full_captures == ["scattering-browse"] * 2
+    assert revalidations == []
+    assert hashed_bytes == [target.stat().st_size] * 2
+    assert generic_loader.release_context(
+        generic_context
+    ).cleanup_status.value == "cleaned"
+
+    original_inode = target.stat().st_ino
+    replacement = target.with_name("byte-identical-replacement.nxs")
+    shutil.copy2(target, replacement)
+    os.replace(replacement, target)
+    assert target.stat().st_ino != original_inode
+    full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
+    opened = []
+
+    def forbidden_open(_path):
+        opened.append(True)
+        raise AssertionError("replaced target reached Browse decoding")
+
+    replaced_loader = module.BrowseLoader(open_scan=forbidden_open)
+    replaced_request = BrowseLoadRequest(
+        "terminal-replaced", 1, str(target), seal,
+    )
+    replaced_loader.begin(replaced_request)
+    replaced_outcome = _wait(
+        lambda: replaced_loader.poll(replaced_request),
+    )
+    assert replaced_outcome.status is BrowseLoadStatus.FAILED
+    assert replaced_loader.context_for_outcome(replaced_outcome) is None
+    assert opened == full_captures == hashed_bytes == []
+    assert revalidations == ["scattering-browse"]
+
+
+def test_terminal_browse_uses_one_targeted_presentation_read(
+    tmp_path, monkeypatch,
+):
+    """Terminal cleanup never performs the old full provenance/metadata pass."""
+
+    from xdart.gui.tabs.scattering.adapters import browse_loader as module
+    from xdart.gui.tabs.scattering.browse_values import (
+        BrowseLoadRequest, BrowseLoadStatus,
+    )
+    from xrd_tools.core import provenance as provenance_module
+    from xrd_tools.io.browse_presentation import read_browse_presentation
+
+    seeded = _seed_existing(tmp_path)
+    target = seeded.target.resolve()
+    expected_presentation, expected_mask = read_browse_presentation(target)
+    calls = []
+
+    def targeted(path):
+        calls.append((str(path), threading.current_thread().name))
+        return read_browse_presentation(path)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("general provenance/metadata traversal is forbidden")
+
+    monkeypatch.setattr(module, "read_browse_presentation", targeted)
+    monkeypatch.setattr(provenance_module, "read_provenance", forbidden)
+    monkeypatch.setattr(
+        module.ProcessedScan,
+        "metadata",
+        property(lambda _scan: forbidden()),
+    )
+    loader = module.BrowseLoader()
+    request = BrowseLoadRequest(
+        "targeted-presentation",
+        1,
+        str(target),
+        seeded.terminal.commit_identity,
+    )
+    loader.begin(request)
+    outcome = _wait(lambda: loader.poll(request))
+    context = loader.consume(outcome)
+    assert outcome.status is BrowseLoadStatus.READY
+    assert calls == [(str(target), "scattering-browse")]
+    assert json.loads(context.calibration_identity) == expected_presentation
+    assert expected_mask is None
+    assert context.mask_identity == "False"
+    assert context.loaded_labels == seeded.labels
+    assert loader.release_context(context).cleanup_status.value == "cleaned"
+
+
+def test_terminal_browse_path_binding_does_not_resolve_on_gui_thread(
+    tmp_path, monkeypatch, qapp,
+):
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
+
+    seeded = _seed_existing(tmp_path)
+    target = str(seeded.target.resolve())
+    page, _store = _page(tmp_path, monkeypatch)
+    main_ident = threading.get_ident()
+    resolve_threads = []
+    real_resolve = Path.resolve
+
+    def tracked_resolve(path, *args, **kwargs):
+        resolve_threads.append(threading.get_ident())
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", tracked_resolve)
+    try:
+        request = page._context_controller.begin_browse(
+            target,
+            terminal_commit_identity=seeded.terminal.commit_identity,
+        )
+        outcome = _wait(page._context_controller.poll_browse)
+        assert outcome.request is request
+        assert outcome.status is BrowseLoadStatus.READY
+        assert main_ident not in resolve_threads
+    finally:
+        page.close_workspace()
+
+
+def test_unsealed_browse_canonicalization_runs_only_on_browse_worker(
+    tmp_path, monkeypatch, qapp,
+):
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
+
+    seeded = _seed_existing(tmp_path)
+    target = str(seeded.target.absolute())
+    page, _store = _page(tmp_path, monkeypatch)
+    main_ident = threading.get_ident()
+    resolve_threads = []
+    real_resolve = Path.resolve
+
+    def tracked_resolve(path, *args, **kwargs):
+        resolve_threads.append(threading.get_ident())
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", tracked_resolve)
+    try:
+        request = page._context_controller.begin_browse(target)
+        assert resolve_threads == []
+        outcome = _wait(page._context_controller.poll_browse)
+        assert outcome.request is request
+        assert outcome.status is BrowseLoadStatus.READY
+        assert resolve_threads
+        assert main_ident not in resolve_threads
+    finally:
+        page.close_workspace()
+
+
+def test_terminal_browse_semantic_seal_reintegrates_from_fresh_full_snapshot(
+    tmp_path, monkeypatch, qapp,
+):
+    from xdart.gui.tabs.scattering.adapters import external_operation
+    from xdart.gui.tabs.scattering.operation_values import (
+        OperationTerminalStatus,
+    )
+
+    page, _store, seeded, context = _loaded_page(
+        tmp_path, monkeypatch, qapp, terminal_browse=True,
+    )
+    request = context.load_request
+    seal = request.terminal_commit_identity
+    full_digest = hashlib.sha256(seeded.target.read_bytes()).hexdigest()
+    assert seal is seeded.terminal.commit_identity
+    assert seal.digest != full_digest
+    built = []
+    real_build = external_operation.ReintegratePlan.from_artifact
+
+    def build(target, **kwargs):
+        plan = real_build(target, **kwargs)
+        built.append((kwargs, plan))
+        return plan
+
+    monkeypatch.setattr(
+        external_operation.ReintegratePlan,
+        "from_artifact",
+        staticmethod(build),
+    )
+    _stub_integrators(monkeypatch)
+    try:
+        page._reintegrate_action("1d")
+        update = _join(page._operation_slot, page._reintegrate_identity)
+        result = update.terminal.payload
+        assert update.terminal.status is OperationTerminalStatus.RETURNED
+        assert result.disposition == "COMMITTED"
+        assert built[0][0]["expected_terminal_identity"] is seal
+        assert built[0][1].expected_target_snapshot.digest == full_digest
+        assert page._consume_reintegrate_update(update)
+        reload_request = page._context_controller._browse_request
+        assert reload_request is not None
+        assert reload_request.terminal_commit_identity is result.commit_identity
+    finally:
+        page.close_workspace()
+
+
 def test_private_request_prepares_plan_only_on_existing_operation_worker(monkeypatch):
     from xdart.gui.tabs.scattering.adapters import external_operation as module
     from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationTerminalStatus
@@ -561,7 +1069,7 @@ def test_reintegrate_request_accepts_exact_dimensions_but_p34b_gui_is_1d_only(tm
     from xrd_tools.session.readiness import ControlAction, SectionId; from xrd_tools.reduction import reintegrate as core
     slot=OperationSlot(); seen=[]; monkeypatch.setattr(slot,"_begin",lambda value,stamp,body: seen.append(value) or object())
     kwargs=dict(target="/target",entry="entry",expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64),expected_labels=(1,),preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}),stamp=OperationContextStamp(0))
-    assert slot.begin_reintegrate(dimension="1d",**kwargs) is not None and slot.begin_reintegrate(dimension="2d",**kwargs) is not None and slot.begin_reintegrate(dimension="3d",**kwargs) is None and tuple(f.name for f in fields(type(seen[0]))) == ("target","entry","expected_target_snapshot","expected_labels","dimension","preparation_json")
+    assert slot.begin_reintegrate(dimension="1d",**kwargs) is not None and slot.begin_reintegrate(dimension="2d",**kwargs) is not None and slot.begin_reintegrate(dimension="3d",**kwargs) is None and tuple(f.name for f in fields(type(seen[0]))) == ("target","entry","expected_target_snapshot","expected_terminal_identity","expected_labels","dimension","preparation_json")
     page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); calls=[]; monkeypatch.setattr(page,"_reintegrate_action",calls.append); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_1d")); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_2d")); assert calls==["1d","2d"]
     rid=OperationIdentity(77); page._operation_slot._identity=rid; page._reintegrate_identity=rid; captured=page._context_controller.capture_reintegrate_browse(); assert captured is not None and page._context_controller.invalidate_reintegrate_browse(*captured)
     for dimension,matching,other in (("1d",ControlAction.REINTEGRATE_1D,ControlAction.REINTEGRATE_2D),("2d",ControlAction.REINTEGRATE_2D,ControlAction.REINTEGRATE_1D)):
@@ -593,6 +1101,49 @@ def test_reintegrate_2d_uses_exact_existing_worker_builder_and_runner(tmp_path, 
     build=lambda target,**kw:(seen.append(("build",threading.current_thread().name,target,kw)),plan)[1]; run=lambda got,**kw:(seen.append(("run",got,kw)),kw["progress_cb"](core._progress(plan.operation_identity,"write",1,1,1)),result)[2]
     monkeypatch.setattr(module.ReintegratePlan,"from_artifact",staticmethod(build)); monkeypatch.setattr(module,"run_reintegrate",run); page._reintegrate_action("2d"); identity=page._reintegrate_identity; assert identity is not None and page._reintegrate_dimension=="2d"; update=_join(page._operation_slot,identity)
     assert update.terminal.status is OperationTerminalStatus.RETURNED and [row[0] for row in seen]==["build","run"] and seen[0][1].startswith("scattering-operation-") and seen[0][3]["dimension"]=="2d" and seen[1][1] is plan and seen[0][3]["cancel_token"] is seen[1][2]["cancel_token"] and update.progress.identity is identity; assert page._consume_reintegrate_update(update) and page._reintegrate_dimension is None; page.close_workspace()
+
+
+def test_default_browse_retains_651_first_middle_last_1d_and_metadata(tmp_path):
+    import h5py
+    import numpy as np
+
+    from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
+    from xdart.gui.tabs.scattering.browse_values import (
+        BrowseLoadRequest, BrowseLoadStatus,
+    )
+
+    labels = tuple(range(651))
+    target, _raw = _write_processed(
+        tmp_path, labels=labels, thumbnails=False, two_d=False,
+    )
+    with h5py.File(target, "r+") as handle:
+        scan_data = handle["entry"].create_group("scan_data")
+        scan_data.create_dataset(
+            "frame_index", data=np.asarray(labels, dtype=np.int64),
+        )
+        scan_data.create_dataset(
+            "monitor", data=np.asarray(labels, dtype=np.float32),
+        )
+
+    loader = BrowseLoader()
+    request = BrowseLoadRequest("retain-651", 1, str(target))
+    loader.begin(request)
+    outcome = _wait(lambda: loader.poll(request))
+    assert outcome.status is BrowseLoadStatus.READY
+    context = loader.consume(outcome)
+    assert context.loaded_labels == labels
+    for label in (0, 325, 650):
+        record = context.record_store.get(label)
+        publication = context.publication_store.get(label)
+        assert record is not None
+        assert publication is not None
+        assert publication.view.intensity_1d is not None
+        assert publication.record.active_view().intensity_1d is not None
+        assert record.active_view().metadata_raw["monitor"] == pytest.approx(label)
+        assert publication.view.metadata_raw["monitor"] == pytest.approx(label)
+    assert loader.release_context(context).cleanup_status.value == "cleaned"
+
+
 def test_direct_and_gui_scheduled_2d_match_after_reopen_and_preserve_1d(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.adapters import external_operation; from xdart.gui.tabs.scattering.operation_values import OperationTerminalStatus; from xrd_tools.io.output_transaction import StreamTerminal, capture_target_snapshot; from xrd_tools.reduction import ReintegratePlan, run_reintegrate, reintegrate as module
     seed=_seed_existing(tmp_path,labels=(0,1,2),append=True); direct_path=tmp_path/"direct.nxs"; gui_path=tmp_path/"gui.nxs"; direct_path.write_bytes(seed.target.read_bytes()); gui_path.write_bytes(seed.target.read_bytes()); before=(_tree_manifest(direct_path,"entry/integrated_1d"),_tree_manifest(gui_path,"entry/integrated_1d")); request=_resolved_2d()
