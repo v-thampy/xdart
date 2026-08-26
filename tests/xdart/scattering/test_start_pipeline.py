@@ -276,7 +276,8 @@ def test_operator_canonicalization_conflict_surfaces_the_race_without_adopting()
     assert isinstance(capture, StartCapture)
     candidate = capture.intent_snapshot.thaw()
     candidate.threshold.apply_threshold = True
-    candidate.threshold.mask_saturation = True  # degenerate: canonicalization must commit
+    candidate.threshold.threshold_min = None
+    # The displayed manual lower bound must materialize in a second commit.
     store.arm()
 
     result = pipeline.apply_operator_decision(capture, candidate)

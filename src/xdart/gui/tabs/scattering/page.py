@@ -28,7 +28,10 @@ from xrd_tools.session.run_intent_profile import (
     dump_run_intent_profile,
     load_run_intent_profile,
 )
-from xrd_tools.session.run_configuration import heavy_residency_choice
+from xrd_tools.session.run_configuration import (
+    FrozenRunConfiguration,
+    heavy_residency_choice,
+)
 from xrd_tools.reduction import ReintegrateResult
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
@@ -47,6 +50,11 @@ from .browser_catalog import (
     DirectoryModifiedCache,
     enumerate_processed_artifacts,
     processed_directory,
+)
+from .browse_values import (
+    BrowseLoadOutcome,
+    BrowseLoadRequest,
+    BrowseLoadStatus,
 )
 from .contracts import (
     AdmissionFailure,
@@ -412,6 +420,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._browser_seen_artifacts: set[str] = set()
         self._browser_transient_frame: DisplayFrameKey | None = None
         self._browser_transient_clear_token: int | None = None
+        self._terminal_browse_request: BrowseLoadRequest | None = None
+        self._terminal_browse_artifact: str | None = None
+        self._terminal_browse_current_label: int | None = None
+        self._terminal_browse_selected_labels: tuple[int, ...] = ()
         self._active_batch_mode = False
         self._run_frame_seen = False
         self._retain_outgoing_display = False
@@ -1172,11 +1184,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if active is not None and slot.current_identity is active and self._reintegrate_dimension != dimension: self._refresh_shell(); return
         if active is not None and slot.current_identity is active and self._reintegrate_dimension == dimension: accepted = slot.cancel(active); self._notice(f"Cancelling Reintegrate {dimension[0]}-D…" if accepted else "Reintegrate cancellation was not accepted."); self._refresh_shell(); return
         if not self._commit_focused_control_edit_for_run(): return
+        snapshot = self._intents.snapshot()
+        if snapshot.thaw().processing_mode == "Int 1D (XYE)":
+            self._notice(
+                f"Reintegrate {dimension[0]}-D is unavailable for XYE-only output."
+            )
+            self._refresh_shell()
+            return
         phase = self._lifecycle.phase; permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
         captured = self._context_controller.capture_reintegrate_browse()
         if self._closing or self._closed or self._admission_state is not None or slot.owned or not permitted or captured is None:
             self._notice(f"Reintegrate {dimension[0]}-D requires one stable loaded Browse context."); self._refresh_shell(); return
-        snapshot = self._intents.snapshot()
         try: preparation = self._reintegrate_preparation(snapshot.thaw(), dimension)
         except (TypeError, ValueError) as error: self._notice(str(error)); self._refresh_shell(); return
         stamp = self._operation_context_stamp(snapshot.revision); recaptured = self._context_controller.capture_reintegrate_browse(); current = self._intents.snapshot()
@@ -1235,6 +1253,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Average returned an invalid terminal disposition."); return True
         if result.target != target or result.entry != entry:
             self._notice("Average terminal target mismatch; Browse was not reloaded."); return True
+        self._clear_terminal_browse()
         self._context_controller.begin_browse(target); self._request_browser_catalog()
         return True
 
@@ -2406,20 +2425,30 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _select_scan(self, value: object) -> None:
         if type(value) is not str or not value:
             return
+        terminal_request = self._terminal_browse_request
         if os.path.isdir(value):
             self._set_browser_directory(value, explicit=True)
             return
-        if self._context_controller.select_browser_target(value):
+        same_terminal_target = (
+            terminal_request is not None
+            and str(Path(value).resolve()) == terminal_request.source_path
+        )
+        if (
+            (terminal_request is None or same_terminal_target)
+            and self._context_controller.select_browser_target(value)
+        ):
             self._notice("")
             self._refresh_shell()
             return
         try:
-            self._context_controller.begin_browse(value)
+            request = self._context_controller.begin_browse(value)
         except Exception as error:
             self._error_notice("Browse refused", error)
             if self._context_controller.browse_pending:
                 self._ensure_timer()
             return
+        if terminal_request is not None and request is not terminal_request:
+            self._clear_terminal_browse()
         self._notice("")
         self._ensure_timer()
 
@@ -2473,6 +2502,27 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if frame is not None and frame is not latest:
             self._auto_last = False
+        request = self._terminal_browse_request
+        terminal_artifact = self._terminal_browse_artifact
+        current = navigation.current
+        selected = navigation.selected
+        if (
+            request is not None
+            and terminal_artifact is not None
+            and current is not None
+            and current.artifact == terminal_artifact
+            and all(
+                candidate.artifact == terminal_artifact
+                for candidate in selected
+            )
+        ):
+            # Preserve an explicit acquisition-frame choice made while the
+            # clean terminal artifact is loading.  Browse settlement maps the
+            # accepted labels onto the authenticated persisted context.
+            self._terminal_browse_current_label = current.local_frame_label
+            self._terminal_browse_selected_labels = tuple(
+                candidate.local_frame_label for candidate in selected
+            )
         self._refresh_shell()
         self._ensure_timer()
 
@@ -2494,6 +2544,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._error_notice("Browse failed", error)
                 outcome = None
             if outcome is not None:
+                self._settle_terminal_browse(outcome)
                 changed = True
                 detail = getattr(outcome, "detail", "")
                 self._notice(detail)
@@ -2622,7 +2673,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._follow_processed_artifact(
                         self._batch_latest_frame
                     )
+                was_batch = self._active_batch_mode
+                terminal_navigation = self._context_controller.navigation
                 self._accept_terminal_event(event)
+                self._begin_terminal_browse(
+                    event,
+                    was_batch=was_batch,
+                    current=terminal_navigation.current,
+                    selected=terminal_navigation.selected,
+                )
                 self._retry_deferred_gi_motor_default()
                 # The writer publishes its atomic final path before emitting
                 # the terminal event.  Re-enumerate here so a non-batch run
@@ -2767,6 +2826,107 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             else ""
         )
+
+    def _begin_terminal_browse(
+        self,
+        event: StandardRunEvent,
+        *,
+        was_batch: bool,
+        current: DisplayFrameKey | None,
+        selected: tuple[DisplayFrameKey, ...],
+    ) -> None:
+        """Load a clean run's exact published artifact through Browse.
+
+        Reintegration deliberately accepts only a stable authenticated Browse
+        context.  A successful run already published that artifact, so follow
+        it through the existing asynchronous BrowseLoader instead of requiring
+        a redundant browser click or weakening the reintegration contract.
+        """
+
+        self._clear_terminal_browse()
+        controller = self._context_controller
+        acquisition = controller.acquisition_context
+        selection = controller.selection
+        artifact = event.artifact
+        if (
+            was_batch
+            or event.kind is not StandardEventKind.FINISHED
+            or event.cleanup_status is not CleanupStatus.CLEANED
+            or self._lifecycle.phase is not RunPhase.IDLE
+            or type(artifact) is not str
+            or not artifact
+            or acquisition is None
+            or selection is None
+            or selection.kind is not ContextKind.ACQUISITION
+            or not selection.names(acquisition)
+            or type(acquisition.run_configuration)
+            is not FrozenRunConfiguration
+            or acquisition.run_configuration.processing_mode
+            == "Int 1D (XYE)"
+        ):
+            return
+        try:
+            request = controller.begin_browse(artifact)
+        except RuntimeError:
+            # The published artifact remains available in the browser.  A
+            # transient viewer/cleanup owner must not turn a clean Run terminal
+            # into a failure or bypass Browse's normal lifecycle checks.
+            return
+        self._terminal_browse_request = request
+        # Browse owns the resolved absolute source path, while the output
+        # contract deliberately preserves an explicit target's spelling.
+        # Retain both exact identities so acquisition-frame choices made while
+        # Browse is pending compare against their original artifact spelling.
+        self._terminal_browse_artifact = artifact
+        self._terminal_browse_current_label = (
+            current.local_frame_label
+            if current is not None and current.artifact == artifact
+            else None
+        )
+        self._terminal_browse_selected_labels = tuple(
+            frame.local_frame_label
+            for frame in selected
+            if frame.artifact == artifact
+        )
+        self._ensure_timer()
+
+    def _settle_terminal_browse(self, outcome: object) -> None:
+        request = self._terminal_browse_request
+        if (
+            type(outcome) is not BrowseLoadOutcome
+            or request is None
+            or outcome.request is not request
+        ):
+            return
+        current_label = self._terminal_browse_current_label
+        selected_labels = self._terminal_browse_selected_labels
+        self._clear_terminal_browse()
+        if outcome.status is not BrowseLoadStatus.READY:
+            return
+        navigation = self._context_controller.navigation
+        by_label = {
+            frame.local_frame_label: frame for frame in navigation.frames
+        }
+        current = by_label.get(current_label)
+        selected = tuple(
+            by_label[label]
+            for label in selected_labels
+            if label in by_label
+        )
+        if self._auto_last:
+            self._context_controller.select_latest_navigation(
+                plot_mode=self._preferences.plot_mode
+            )
+        elif current is not None:
+            if current not in selected:
+                selected = selected + (current,)
+            self._context_controller.select_navigation(current, selected)
+
+    def _clear_terminal_browse(self) -> None:
+        self._terminal_browse_request = None
+        self._terminal_browse_artifact = None
+        self._terminal_browse_current_label = None
+        self._terminal_browse_selected_labels = ()
 
     def _refresh_event_shell(
         self,
@@ -3192,6 +3352,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             mask_active=mask_active,
             reintegrate_available=(not self._closing and not self._closed
                 and self._admission_state is None
+                and intent.processing_mode != "Int 1D (XYE)"
                 and (phase is RunPhase.IDLE or phase is RunPhase.FAILED
                      and self._lifecycle.reset_permitted)
                 and self._context_controller.capture_reintegrate_browse() is not None),

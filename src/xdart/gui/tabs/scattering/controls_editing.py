@@ -442,15 +442,12 @@ def reduce_control_edit(
     if isinstance(parsed, EditRefusal):
         return parsed
     current = _current_value(intent, path)
-    # Design checkpoint 2026-08-04: a touch of any threshold control must NOT
-    # absorb as EditNoChange while the intent's threshold identity differs
-    # from what the panel displays (degenerate booleans OR unmaterialized
-    # displayed defaults) — the same-value edit falls through so the shared
-    # canonicalizer below makes identity match display.  The probe runs on a
-    # detached thawed copy.
+    # A touch of any threshold control must not absorb as EditNoChange while
+    # the active manual band's displayed defaults are still unmaterialized.
+    # The probe runs on a detached thawed copy.
     noncanonical_threshold_touch = (
         path in {
-            MASK_SATURATION, THRESHOLD_ENABLED, THRESHOLD_MIN, THRESHOLD_MAX,
+            THRESHOLD_ENABLED, THRESHOLD_MIN, THRESHOLD_MAX,
         }
         and canonicalize_threshold_intent(snapshot.thaw())
     )
@@ -485,24 +482,16 @@ def reduce_control_edit(
             was_enabled=intent.gi.enabled,
         )
     elif path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        # LV-UI-11: setting a manual bound IS choosing manual thresholding —
-        # the sentinel Auto masking and the manual band are exclusive.  A
-        # CLEARED bound (parsed None) keeps the mode and re-materializes to
-        # the displayed default through the canonicalizer below.
+        # Setting a manual bound chooses manual thresholding.  Saturated-pixel
+        # masking is an independent fact and is deliberately left untouched.
+        # A cleared bound keeps the mode and re-materializes to the displayed
+        # default through the canonicalizer below.
         if parsed is not None:
             candidate.threshold.apply_threshold = True
-            candidate.threshold.mask_saturation = False
-        canonicalize_threshold_intent(candidate)
-    elif path == MASK_SATURATION:
-        # LV-UI-11: the Threshold row's Auto toggle.  ON = mask saturated
-        # pixels, no manual band; OFF = the manual [min, max] band applies
-        # at exactly the displayed defaults.
-        candidate.threshold.apply_threshold = not parsed
         canonicalize_threshold_intent(candidate)
     elif path == THRESHOLD_ENABLED:
-        # Kept for the legacy static_scan binding and programmatic edits; the
-        # same exclusivity holds in both directions.
-        candidate.threshold.mask_saturation = not parsed
+        # Enabling the manual band materializes exactly what its visible
+        # bounds show; disabling it preserves those values for later reuse.
         canonicalize_threshold_intent(candidate)
     return candidate
 
@@ -569,23 +558,21 @@ def _reduce_background_edit(
 
 
 def canonicalize_threshold_intent(intent: RunIntent) -> bool:
-    """THE shared vNext threshold canonicalizer (frozen design checkpoint,
-    2026-08-04): one function makes an intent's threshold identity describe
-    exactly what the panel displays.  Used by BOTH the edit reducer and the
-    start capture; returns True when the intent was changed.
+    """Make the active manual-threshold identity match its displayed bounds.
 
-    - Exclusive booleans: a degenerate pair adopts the displayed Auto fact —
-      ``apply_threshold = not mask_saturation``.
+    Used by both the edit reducer and start capture; returns True when the
+    intent changed.  Manual Threshold and Mask Saturated are independent
+    booleans, so canonicalization never changes either switch.
+
     - Manual mode MATERIALIZES the displayed defaults into the identity:
       missing minimum -> 0.0; missing maximum -> the detector family's
       display default when known, otherwise None (the box renders blank and
       execution stays open-ended above — display and identity agree either
       way).  The ceiling is a display default, not an acquisition fact;
       reduction-time masking keys off the acquired frame's own dtype.
-    - Runs even when the booleans are already exclusive: the defaulted-bound
-      gap (Codex DESIGN_STOP) was a boolean-canonical pair whose cleared
-      bounds stored None while the projection displayed substituted
-      defaults, so the run executed a band the panel never showed.
+    - Runs whenever manual mode is active: cleared bounds stored as None while
+      the projection displays substituted defaults would otherwise make the
+      run execute a band the panel never showed.
     - No min<=max guard here: materialization mirrors the display verbatim,
       and a nonsensical band refuses LOUDLY at freeze
       (``FrozenThresholdPolicy`` validation) instead of being silently
@@ -593,9 +580,6 @@ def canonicalize_threshold_intent(intent: RunIntent) -> bool:
     """
     threshold = intent.threshold
     changed = False
-    if bool(threshold.apply_threshold) == bool(threshold.mask_saturation):
-        threshold.apply_threshold = not bool(threshold.mask_saturation)
-        changed = True
     if threshold.apply_threshold:
         if threshold.threshold_min is None:
             threshold.threshold_min = 0.0

@@ -78,8 +78,8 @@ def test_acquired_sink_is_released_when_session_construction_raises(
             th_val=0.0, tilt_angle=0.0, sample_orientation=1,
         ),
         # This row targets cleanup after sink acquisition, so its forged
-        # configuration must satisfy the execution boundary's canonical
-        # threshold identity and reach the monkeypatched ScanSession.
+        # configuration must satisfy the execution boundary's threshold
+        # shape and reach the monkeypatched ScanSession.
         threshold=SimpleNamespace(apply_threshold=False, threshold_min=None,
                                   threshold_max=None, mask_saturation=True),
         bai_1d_args={}, bai_2d_args={}, max_cores=1,

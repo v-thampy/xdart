@@ -226,7 +226,7 @@ def project_controls(
         2,
     )
     fields.insert(insertion, output)
-    fields = _threshold_auto_fields(fields, intent, unlocked=unlocked)
+    fields = _threshold_fields(fields, intent, unlocked=unlocked)
     fields = [truthful_field(candidate) for candidate in fields]
     if viewer:
         fields = [replace(candidate, enabled=False,
@@ -357,25 +357,23 @@ _MAX_BOUND_SCOPE_CAVEAT = (
 )
 
 
-def _threshold_auto_fields(
+def _threshold_fields(
     fields: list,
     intent,
     *,
     unlocked: bool,
 ) -> list:
-    """LV-UI-11: one Auto control for saturated-pixel masking vs manual band.
+    """Project independent manual-threshold and saturated-mask controls.
 
-    The vNext Threshold row's Auto toggle IS the Mask-Saturated fact, so the
-    separate True=apply Threshold field is not rendered here (the legacy
-    static_scan panel keeps it).  The manual min/max bounds are editable
-    exactly when Auto is off, and display the [0, detector-ceiling] defaults
-    when the intent carries none — the ceiling blank until a valid PONI names
-    a known detector family."""
-    auto_on = bool(intent.threshold.mask_saturation)
+    The Threshold row's compact toggle owns only ``apply_threshold``.  The
+    separate Mask Saturated pill owns only ``mask_saturation``.  Manual bounds
+    are editable exactly while manual thresholding is enabled, and display the
+    [0, detector-ceiling] defaults when the intent carries none — the ceiling
+    stays blank until a valid PONI names a known detector family.
+    """
+    manual_on = bool(intent.threshold.apply_threshold)
     out = []
     for candidate in fields:
-        if candidate.path == THRESHOLD_ENABLED:
-            continue
         if candidate.path in {THRESHOLD_MIN, THRESHOLD_MAX}:
             value = candidate.value
             if value is None:
@@ -397,15 +395,14 @@ def _threshold_auto_fields(
             reason = (
                 "Controls are locked during the active run." + caveat
                 if not unlocked
-                else "Auto masks saturated pixels; turn it off to set "
-                "a manual threshold band." + caveat
-                if auto_on
+                else "Enable Manual Threshold to edit this bound." + caveat
+                if not manual_on
                 else ""
             )
             out.append(replace(
                 candidate,
                 value=value,
-                enabled=unlocked and not auto_on,
+                enabled=unlocked and manual_on,
                 reason=reason,
             ))
             continue

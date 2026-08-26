@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.core import FrameView
 from xrd_tools.session.intent_store import RunIntentStore
@@ -129,11 +129,15 @@ def _active_page(
     executor: _Executor,
     *,
     output_mode: str = "Overwrite",
+    processing_mode: str = "Int 2D",
 ) -> tuple[ScatteringWorkspace, ScatteringCoordinator, RunIdentity]:
     lifecycle = ScatteringCoordinator()
     request = lifecycle.begin_start().request_id
     assert request is not None
-    configuration = RunIntent(output_mode=output_mode).freeze()
+    configuration = RunIntent(
+        output_mode=output_mode,
+        processing_mode=processing_mode,
+    ).freeze()
     identity = lifecycle.preflight_accepted(PreflightAccepted(request, configuration)).run_identity
     assert identity is not None
     assert lifecycle.executor_accepted(ExecutorAccepted(identity)).phase is RunPhase.RUNNING
@@ -144,6 +148,7 @@ def _active_page(
                 poni_file="calibration.poni",
                 save_path="output.nxs",
                 output_mode=output_mode,
+                processing_mode=processing_mode,
             )
         ),
         lifecycle=lifecycle,
@@ -165,11 +170,18 @@ def _shell(page: ScatteringWorkspace) -> ScatteringWorkspaceShell:
     return shell
 
 
-def _paced_frame_events(page, executor, identity, count):
+def _paced_frame_events(
+    page, executor, identity, count, *, processing_mode="Int 2D",
+):
     from tests.xdart.scattering.test_e3_context_contract import _acquisition
 
     _, acquisition = _acquisition(
-        configuration=RunIntent(output_mode="Overwrite").freeze(), identity=identity)
+        configuration=RunIntent(
+            output_mode="Overwrite",
+            processing_mode=processing_mode,
+        ).freeze(),
+        identity=identity,
+    )
     executor.acquisition_context = lambda candidate: acquisition if candidate is identity else None
     acquisition.publication_store.catalog.resize(max(16, count))
     page._context_controller.adopt_acquisition(identity)
@@ -541,7 +553,9 @@ def test_terminal_elapsed_and_split_remain_in_run_status(
         _dispose(page, qapp)
 
 
-def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) -> None:
+def test_pending_failure_cannot_reset_or_launch(
+    qapp: QtWidgets.QApplication,
+) -> None:
     executor = _Executor()
     page, lifecycle, identity = _active_page(executor)
     executor.events.append(StandardRunEvent(identity, StandardEventKind.FAILED,
@@ -553,6 +567,10 @@ def test_pending_failure_cannot_reset_or_launch(qapp: QtWidgets.QApplication) ->
             ShellCommand(ShellCommandKind.RUN_ACTION)
         )
         page._drain_executor()
+        responsive = []
+        QtCore.QTimer.singleShot(0, lambda: responsive.append(True))
+        qapp.processEvents()
+        assert responsive == [True]
         assert lifecycle.phase is RunPhase.FAILED
         assert executor.start_calls == 0
         assert not shell.run_controls.startButton.isEnabled()
@@ -944,6 +962,171 @@ def test_executor_drain_timer_tracks_only_launched_run_lifetime(qapp: QtWidgets.
         assert lifecycle.phase is RunPhase.IDLE
         assert not page._run_timer.isActive()
         assert executor.start_calls == 1
+    finally:
+        _dispose(page, qapp)
+
+
+def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+) -> None:
+    """A completed Run authenticates its artifact without a second click."""
+
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
+
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(executor)
+    try:
+        executor.events.extend(_paced_frame_events(
+            page, executor, identity, 3,
+        ))
+        page._drain_executor()
+        navigation = page._context_controller.navigation
+        assert navigation.current.local_frame_label == 3
+
+        request = BrowseLoadRequest("terminal", 1, "/out/a.nxs")
+        calls = []
+        monkeypatch.setattr(
+            page._context_controller,
+            "begin_browse",
+            lambda artifact: calls.append(artifact) or request,
+        )
+        terminal = StandardRunEvent(
+            identity,
+            StandardEventKind.FINISHED,
+            completed=3,
+            total=3,
+            artifact="/out/a.nxs",
+            cleanup_status=CleanupStatus.CLEANED,
+        )
+        executor.events.append(terminal)
+        page._drain_executor()
+
+        assert lifecycle.phase is RunPhase.IDLE
+        assert calls == ["/out/a.nxs"]
+        assert page._terminal_browse_request is request
+        assert page._terminal_browse_current_label == 3
+        assert page._terminal_browse_selected_labels == (3,)
+
+        # None of the terminal cases that lacks an exact clean publication may
+        # start the convenience Browse transition.
+        page._begin_terminal_browse(
+            replace(terminal, kind=StandardEventKind.STOPPED),
+            was_batch=False,
+            current=navigation.current,
+            selected=navigation.selected,
+        )
+        page._begin_terminal_browse(
+            replace(terminal, cleanup_status=CleanupStatus.CLEANUP_PENDING),
+            was_batch=False,
+            current=navigation.current,
+            selected=navigation.selected,
+        )
+        page._begin_terminal_browse(
+            terminal,
+            was_batch=True,
+            current=navigation.current,
+            selected=navigation.selected,
+        )
+        assert calls == ["/out/a.nxs"]
+    finally:
+        _dispose(page, qapp)
+
+
+def test_clean_xye_terminal_does_not_browse_unwritten_nexus_target(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+) -> None:
+    """XYE-only publishes sidecars, so its planned NeXus path is not Browseable."""
+
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(
+        executor,
+        processing_mode="Int 1D (XYE)",
+    )
+    try:
+        executor.events.extend(_paced_frame_events(
+            page,
+            executor,
+            identity,
+            1,
+            processing_mode="Int 1D (XYE)",
+        ))
+        page._drain_executor()
+        browse_calls = []
+        monkeypatch.setattr(
+            page._context_controller,
+            "begin_browse",
+            lambda artifact: browse_calls.append(artifact),
+        )
+        executor.events.append(StandardRunEvent(
+            identity,
+            StandardEventKind.FINISHED,
+            completed=1,
+            total=1,
+            artifact="/out/planned-but-unwritten.nxs",
+            cleanup_status=CleanupStatus.CLEANED,
+            artifact_completed=1,
+            artifact_total=1,
+        ))
+        page._drain_executor()
+
+        assert lifecycle.phase is RunPhase.IDLE
+        assert browse_calls == []
+        assert page._terminal_browse_request is None
+        assert not page._context_controller.browse_pending
+    finally:
+        _dispose(page, qapp)
+
+
+def test_terminal_browse_marker_survives_catalog_actions_and_clears_on_new_load(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Catalog-only actions do not orphan an active terminal handoff."""
+
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
+
+    executor = _Executor()
+    page, _, _ = _active_page(executor)
+    terminal = BrowseLoadRequest("terminal", 1, "/out/a.nxs")
+    replacement = BrowseLoadRequest("replacement", 2, "/out/b.nxs")
+    page._terminal_browse_request = terminal
+    page._terminal_browse_current_label = 5
+    page._terminal_browse_selected_labels = (5,)
+    directory_calls = []
+    selected_targets = []
+    browse_calls = []
+    monkeypatch.setattr(
+        page,
+        "_set_browser_directory",
+        lambda value, *, explicit: directory_calls.append((value, explicit)),
+    )
+    monkeypatch.setattr(
+        page._context_controller,
+        "select_browser_target",
+        lambda value: selected_targets.append(value) or True,
+    )
+    monkeypatch.setattr(
+        page._context_controller,
+        "begin_browse",
+        lambda value: browse_calls.append(value) or replacement,
+    )
+    try:
+        page._select_scan(str(tmp_path))
+        assert directory_calls == [(str(tmp_path), True)]
+        assert page._terminal_browse_request is terminal
+
+        page._select_scan(terminal.source_path)
+        assert selected_targets == [terminal.source_path]
+        assert page._terminal_browse_request is terminal
+
+        page._select_scan(replacement.source_path)
+        assert browse_calls == [replacement.source_path]
+        assert page._terminal_browse_request is None
+        assert page._terminal_browse_current_label is None
+        assert page._terminal_browse_selected_labels == ()
     finally:
         _dispose(page, qapp)
 

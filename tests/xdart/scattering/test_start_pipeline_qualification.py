@@ -147,19 +147,16 @@ def test_unexpected_freeze_exception_is_closed_invariant_not_a_validation_refusa
     assert executor.calls == []
 
 
-def test_degenerate_threshold_pair_is_canonical_from_capture_through_provenance():
-    """End-to-end LV-UI-11 identity oracle (Codex P1, 2026-08-04): for BOTH
-    degenerate intent pairs, the start capture canonicalizes THROUGH the
-    store, and capture, admission signature, frozen configuration, execution
-    values, fingerprint and writer provenance all describe the SAME canonical
-    pair.  The displayed Auto fact (mask_saturation) wins."""
-    from xdart.gui.tabs.scattering.contracts import threshold_pair_is_canonical
+def test_all_threshold_pairs_remain_exact_through_execution_and_provenance():
+    """Manual thresholding and saturated masking are independent run facts."""
     from xdart.gui.tabs.scattering.output_preflight import (
         OutputCandidate,
         execution_plan_values,
     )
 
-    for apply_flag, mask_flag in ((True, True), (False, False)):
+    for apply_flag, mask_flag in (
+        (False, False), (False, True), (True, False), (True, True),
+    ):
         intent = _intent()
         intent.output_mode = "Overwrite"
         intent.threshold.apply_threshold = apply_flag
@@ -171,88 +168,90 @@ def test_degenerate_threshold_pair_is_canonical_from_capture_through_provenance(
 
         capture = _capture(pipeline)
 
-        # 1. capture: canonicalized through the store, not a local copy.
+        # Capture and store preserve the exact independently chosen pair.
         captured = capture.intent_snapshot.thaw().threshold
-        assert threshold_pair_is_canonical(captured)
         assert captured.mask_saturation is mask_flag
-        assert captured.apply_threshold is (not mask_flag)
+        assert captured.apply_threshold is apply_flag
         stored = store.snapshot().thaw().threshold
-        assert stored.apply_threshold is (not mask_flag)
+        assert stored.apply_threshold is apply_flag
         assert stored.mask_saturation is mask_flag
 
-        canonical_dict = {
-            "apply_threshold": not mask_flag,
+        exact_dict = {
+            "apply_threshold": apply_flag,
             "threshold_min": 1.0,
             "threshold_max": 2.0,
             "mask_saturation": mask_flag,
         }
 
-        # 2. admission signature.
+        # Admission signature.
         candidate = OutputCandidate.from_start_capture(capture)
-        assert candidate.processing_mapping()["threshold"] == canonical_dict
+        assert candidate.processing_mapping()["threshold"] == exact_dict
 
-        # 3. frozen configuration (the store freeze start() performs).
+        # Frozen configuration (the store freeze start() performs).
         result = store.freeze(
             expected_revision=capture.intent_snapshot.revision
         )
         assert isinstance(result, IntentFreezeAccepted)
         configuration = result.configuration
-        assert configuration.threshold.apply_threshold is (not mask_flag)
+        assert configuration.threshold.apply_threshold is apply_flag
         assert configuration.threshold.mask_saturation is mask_flag
 
-        # 4. fingerprint: the signed candidate and the executed
-        # configuration carry one identity.
+        # The signed candidate and executed configuration carry one identity.
         assert candidate.fingerprint == configuration.fingerprint
 
-        # 5. execution values agree with the canonical identity.
+        # Execution uses the band only when requested, and masks saturation
+        # independently.
         _, _, values = execution_plan_values(configuration)
-        if mask_flag:
-            assert values["threshold_min"] is None
-            assert values["threshold_max"] is None
-            assert values["mask_saturation"] is True
-        else:
+        if apply_flag:
             assert values["threshold_min"] == 1.0
             assert values["threshold_max"] == 2.0
-            assert values["mask_saturation"] is False
+        else:
+            assert values["threshold_min"] is None
+            assert values["threshold_max"] is None
+        assert values["mask_saturation"] is mask_flag
 
-        # 6. writer provenance records that same canonical mapping.
-        assert configuration.as_provenance()["threshold"] == canonical_dict
+        # Writer provenance records that same exact mapping.
+        assert configuration.as_provenance()["threshold"] == exact_dict
 
 
-def test_boundaries_refuse_a_degenerate_pair_that_bypassed_capture():
-    """Admission and execution REJECT a degenerate pair instead of silently
-    reinterpreting it — canonicalization has exactly one owner (capture)."""
+def test_direct_admission_and_execution_accept_each_threshold_pair():
+    """No later boundary silently rejects or rewrites either independent fact."""
     import dataclasses
-
-    import pytest
 
     from xdart.gui.tabs.scattering.output_preflight import (
         OutputCandidate,
         execution_plan_values,
     )
 
-    degenerate = _intent()
-    degenerate.output_mode = "Overwrite"
-    degenerate.threshold.apply_threshold = True
-    degenerate.threshold.mask_saturation = True
-
     pipeline, _, _ = _pipeline(RunIntentStore(_intent()))
     capture = _capture(pipeline)
-    bypassed = dataclasses.replace(
-        capture,
-        intent_snapshot=RunIntentStore(degenerate).snapshot(),
-    )
-    with pytest.raises(ValueError, match="degenerate threshold identity"):
-        OutputCandidate.from_start_capture(bypassed)
-
-    with pytest.raises(ValueError, match="degenerate threshold identity"):
-        execution_plan_values(degenerate.freeze())
+    for apply_flag, mask_flag in (
+        (False, False), (False, True), (True, False), (True, True),
+    ):
+        direct = _intent()
+        direct.output_mode = "Overwrite"
+        direct.threshold.apply_threshold = apply_flag
+        direct.threshold.mask_saturation = mask_flag
+        direct.threshold.threshold_min = 1.0
+        direct.threshold.threshold_max = 2.0
+        bypassed = dataclasses.replace(
+            capture,
+            intent_snapshot=RunIntentStore(direct).snapshot(),
+        )
+        candidate = OutputCandidate.from_start_capture(bypassed)
+        assert candidate.processing_mapping()["threshold"][
+            "apply_threshold"
+        ] is apply_flag
+        _, _, values = execution_plan_values(direct.freeze())
+        assert values["mask_saturation"] is mask_flag
 
 
 def _eiger_poni(tmp_path: Path) -> str:
     poni = tmp_path / "eiger.poni"
     poni.write_text(
+        "Poni_version: 2.1\n"
         "Detector: Eiger1M\n"
+        'Detector_config: {"orientation": 1}\n'
         "Distance: 0.2\n"
         "Poni1: 0.1\n"
         "Poni2: 0.2\n"
@@ -303,8 +302,8 @@ def test_defaulted_bounds_materialize_to_exactly_the_displayed_band(tmp_path):
         assert shown[THRESHOLD_MIN] == 0.0
         assert shown[THRESHOLD_MAX] == want_max
 
-        # 2. capture + store: the displayed band is MATERIALIZED through the
-        # store even though the boolean pair was already exclusive.
+        # 2. capture + store: the displayed manual band is MATERIALIZED
+        # through the store without changing either independent switch.
         pipeline, _, _ = _pipeline(store)
         capture = _capture(pipeline)
         captured = capture.intent_snapshot.thaw().threshold

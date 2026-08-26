@@ -47,6 +47,12 @@ from .shell_values import (
 from .state_machine import RunPhase
 
 
+def _scientific_presentation_mode(processing_mode: str) -> str:
+    """Map an output mode onto its existing scientific center layout."""
+
+    return "Int 1D" if processing_mode == "Int 1D (XYE)" else processing_mode
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionRequest:
     run_identity: RunIdentity
@@ -444,7 +450,10 @@ class ContextProjection:
         scientific = (viewer_scientific if viewer_selected else
             build_scientific_projection(
                 payloads, navigation, resident_frames, preferences, notice,
-                phase, processing_mode=intent.processing_mode,
+                phase,
+                processing_mode=_scientific_presentation_mode(
+                    intent.processing_mode
+                ),
                 norm_aggregate=norm_aggregate))
         scientific = _apply_presentation_background(
             scientific, presentation_background)

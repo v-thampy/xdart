@@ -5084,6 +5084,7 @@ def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
             row._low_path: row
             for row in widget.controls_v2.processing_card.body.findChildren(RangeRow)
         }
+        assert not ranges[("Int1D", "radial_low")]._toggle[1].isChecked()
         assert not ranges[("Int1D", "radial_low")]._low.isEnabled()
         assert not ranges[("Int1D", "radial_low")]._high.isEnabled()
         assert not ranges[("Mask", "min")]._low.isEnabled()
@@ -5100,6 +5101,7 @@ def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
             row._low_path: row
             for row in widget.controls_v2.processing_card.body.findChildren(RangeRow)
         }
+        assert ranges[("Int1D", "radial_low")]._toggle[1].isChecked()
         assert ranges[("Int1D", "radial_low")]._low.isEnabled()
         assert ranges[("Int1D", "radial_low")]._high.isEnabled()
         assert ranges[("Mask", "min")]._low.isEnabled()
@@ -5108,14 +5110,12 @@ def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
+def test_controls_panel_v2_manual_range_stays_visibly_checked_while_run_locked(
         qapp, monkeypatch):
-    """The range toggle remains visibly on while disabled during processing.
+    """The active entered-range toggle remains visibly on while run-locked.
 
-    Direct polarity (LV-UI-11 revert): checked = auto (model
-    ``radial_auto=True``, the default).  The logical checked bit already
-    survived the run lock, but the generic ``:disabled`` QSS rule painted the
-    compact QToolButton like an unchecked control.  Require the more-specific
+    Presentation polarity is intentionally inverse to the stored ``*_auto``
+    fact: checked means the adjacent values apply.  Require the specific
     checked+disabled rule in both themes.
     """
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -5125,6 +5125,9 @@ def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
 
     widget = staticWidget()
     try:
+        widget._on_controls_v2_field_changed(
+            ("Int1D", "radial_auto"), False,
+        )
         widget._refresh_controls_v2_profile_now()
         widget._enter_run_state()
 
@@ -5176,15 +5179,14 @@ def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
         panel.deleteLater()
 
 
-def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
-    """LV-UI-11: the vNext projection omits the Threshold enable field, so the
-    row's Auto toggle IS Mask Saturated — checked by default (sentinel masking
-    on, manual bounds asleep), unchecking emits the MaskSat path directly, and
-    the Mask Saturated pill stays visible as a DISPLAY-ONLY mirror (disabled,
-    excluded from edit harvesting)."""
+def test_threshold_and_mask_saturated_are_independent_in_vnext(qapp):
+    """Both switches are editable and each emits only its own exact path."""
     from xrd_tools.session.intent_store import RunIntentStore
     from xrd_tools.session.run_configuration import RunIntent
-    from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
+    from xdart.gui.tabs.scattering.controls_inventory import (
+        MASK_SATURATION,
+        THRESHOLD_ENABLED,
+    )
     from xdart.gui.tabs.scattering.controls_projection import project_controls
     from xdart.gui.tabs.scattering.state_machine import RunPhase
     from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import PillRow, RangeRow
@@ -5198,16 +5200,16 @@ def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
             if tuple(r._low_path) == ("Mask", "min")
         )
         tpath, btn = row._toggle
-        assert tuple(tpath) == MASK_SATURATION
-        assert btn.isChecked()                     # default intent: Auto ON
+        assert tuple(tpath) == THRESHOLD_ENABLED
+        assert not btn.isChecked()                 # manual band is off
         assert not row._low.isEnabled()
         assert not row._high.isEnabled()
 
         emitted = []
         panel.fieldValueChanged.connect(
             lambda p, v: emitted.append((tuple(p), v)))
-        btn.setChecked(False)                      # user selects manual band
-        assert (MASK_SATURATION, False) in emitted
+        btn.setChecked(True)
+        assert (THRESHOLD_ENABLED, True) in emitted
 
         pill_rows = [
             p for p in panel.findChildren(PillRow)
@@ -5218,18 +5220,28 @@ def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
             b for path, b in pill_rows[0]._pills
             if tuple(path) == MASK_SATURATION
         )
-        assert not pill.isEnabled()                # display-only mirror
-        assert pill.isChecked()                    # mirrors the projected fact
-        assert all(
-            tuple(path) != MASK_SATURATION
-            for path, _ in pill_rows[0].current_edits()
+        assert pill.isEnabled()
+        assert pill.isChecked()
+        assert pill.objectName() == "controlsV2PillButton"
+        assert (MASK_SATURATION, True) in pill_rows[0].current_edits()
+        pill.setChecked(False)
+        assert (MASK_SATURATION, False) in emitted
+        pill_top = pill_rows[0].layout().contentsMargins().top()
+        conditioning = next(
+            card
+            for card in panel.processing_card.body.findChildren(SubsectionCard)
+            if card.title.text() == "Conditioning"
+        )
+        assert pill_top == 3
+        assert (
+            conditioning.body_layout.spacing() + pill_top
+            == conditioning.body_layout.contentsMargins().bottom()
         )
 
         # Scope guard (Codex P2): the seeded max is a detector-FAMILY display
         # default, not an acquisition-dtype fact — the RENDERED max-bound
-        # widget must say so in BOTH Auto states (the disabled reason takes
-        # tooltip precedence, so the Auto-on reason carries the caveat too).
-        assert "display default" in row._high.toolTip()   # Auto ON, disabled
+        # widget must say so whether the band is disabled or enabled.
+        assert "display default" in row._high.toolTip()
 
         manual = RunIntent()
         manual.threshold.mask_saturation = False
@@ -5240,8 +5252,17 @@ def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
             r for r in panel.findChildren(RangeRow)
             if tuple(r._low_path) == ("Mask", "min")
         )
-        assert manual_row._high.isEnabled()               # Auto OFF, manual
+        assert manual_row._toggle[1].isChecked()
+        assert manual_row._high.isEnabled()
         assert "display default" in manual_row._high.toolTip()
+        manual_pill = next(
+            b
+            for pills in panel.findChildren(PillRow)
+            for path, b in pills._pills
+            if tuple(path) == MASK_SATURATION
+        )
+        assert manual_pill.isEnabled()
+        assert not manual_pill.isChecked()
     finally:
         panel.close()
         panel.deleteLater()
@@ -5398,10 +5419,8 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
         panel.deleteLater()
 
 
-def test_range_toggle_is_direct_polarity_auto_when_toggled(qapp):
-    """LV-UI-11 (reverts LV-UI-1/1b): the range toggle maps DIRECTLY onto the
-    ``*_auto`` model field — toggled ON = auto range, untoggled = the explicit
-    input bounds.  No presentation-seam inversion remains."""
+def test_range_toggle_presents_manual_on_while_preserving_auto_model(qapp):
+    """A lit range toggle means its boxes apply; storage remains ``*_auto``."""
     from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
 
     emitted = []
@@ -5414,9 +5433,9 @@ def test_range_toggle_is_direct_polarity_auto_when_toggled(qapp):
     row.valueChanged.connect(lambda p, v: emitted.append((tuple(p), v)))
     try:
         btn = row._toggle[1]
-        assert btn.isChecked()                         # auto -> toggled ON
+        assert not btn.isChecked()                     # model is Auto
         assert (("Int1D", "radial_auto"), True) in row.current_edits()
-        btn.setChecked(False)                          # explicit bounds ON
+        btn.setChecked(True)                           # entered bounds ON
         assert emitted == [(("Int1D", "radial_auto"), False)]
         assert (("Int1D", "radial_auto"), False) in row.current_edits()
     finally:
@@ -5424,11 +5443,62 @@ def test_range_toggle_is_direct_polarity_auto_when_toggled(qapp):
         row.deleteLater()
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        ("Int1D", "radial_auto"),
+        ("Int1D", "azim_auto"),
+        ("Int2D", "radial_auto"),
+        ("Int2D", "azim_auto"),
+    ),
+)
+def test_all_integration_range_toggles_invert_only_the_ui_fact(qapp, path):
+    """Every integration range uses lit=manual without changing storage."""
+
+    stem = path[-1].removesuffix("_auto")
+    low_path = (path[0], f"{stem}_low")
+    high_path = (path[0], f"{stem}_high")
+    row = RangeRow(
+        label=stem,
+        low={"path": low_path, "value": 0.0},
+        high={"path": high_path, "value": 5.0},
+        toggle={"path": path, "value": True},
+    )
+    try:
+        button = row._toggle[1]
+        assert not button.isChecked()
+        assert "entered range" in button.toolTip()
+        fields = {
+            low_path: ControlFormField(
+                SectionId.PROCESSING, "Low", low_path, 1.0,
+            ),
+            high_path: ControlFormField(
+                SectionId.PROCESSING, "High", high_path, 4.0,
+            ),
+            path: ControlFormField(
+                SectionId.PROCESSING, "Manual", path, False,
+                kind=ControlFieldKind.BOOL,
+            ),
+        }
+        assert row.apply_fields(fields)
+        assert button.isChecked()
+        assert "entered range" in button.toolTip()
+        assert (path, False) in row.current_edits()
+
+        fields[path] = ControlFormField(
+            SectionId.PROCESSING, "Manual", path, True,
+            kind=ControlFieldKind.BOOL,
+        )
+        assert row.apply_fields(fields)
+        assert not button.isChecked()
+        assert (path, True) in row.current_edits()
+    finally:
+        row.close()
+        row.deleteLater()
+
+
 def test_threshold_toggle_keeps_direct_apply_polarity(qapp):
-    """Legacy static_scan composition: Threshold's ("Mask", "Threshold") enable
-    is True=apply, and the toggle maps directly — toggled ON enables the
-    thresholding and emits True.  (The vNext scattering projection replaces
-    this toggle with the Mask-Saturated Auto toggle; see LV-UI-11.)"""
+    """Threshold's direct enable stays checked exactly when the band applies."""
     from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
 
     emitted = []

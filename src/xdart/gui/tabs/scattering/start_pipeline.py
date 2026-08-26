@@ -286,8 +286,8 @@ class StartPipeline:
         this one revisioned state, so committing the canonical identity here
         is the single point where display, fingerprint, execution values and
         persisted provenance are all made to agree.  It runs on EVERY
-        capture, not only for degenerate boolean pairs: manual mode must
-        also MATERIALIZE the displayed default bounds (a cleared bound
+        capture whenever manual mode is active: it must MATERIALIZE the
+        displayed default bounds (a cleared bound
         stores None while the panel shows the substituted default).  The
         CAS loop itself is hosted by the editing module
         (:func:`commit_canonical_threshold`) so the pipeline never handles

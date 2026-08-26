@@ -42,6 +42,7 @@ def _spaced(base: int, tokens: SpacingTokens) -> int:
 
 PROCESSING_ROW_LABEL_WIDTH = 72
 PROCESSING_ROW_GAP = 5
+PROCESSING_PILL_TOP_MARGIN = 3
 
 
 # Order: Project · Experiment · Source · Processing (instrument config before
@@ -82,9 +83,8 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
     ("GI", "tilt_angle"): "Sample tilt angle in degrees for the grazing geometry.",
     # Processing / conditioning
     ("MaskSat", "mask_sentinel"): (
-        "Auto: mask dead/saturated detector pixels (the detector's saturation "
-        "sentinel). Turn off to set a manual threshold band instead; OFF keeps "
-        "strong saturated Bragg peaks unmasked."),
+        "Mask dead/saturated detector pixels at the detector's saturation "
+        "sentinel. This is independent of the optional manual threshold band."),
     ("Signal", "series_average"): (
         "Average all frames in the series into one frame before integration."),
     ("Mask", "Threshold"): (
@@ -949,18 +949,39 @@ class RangeRow(QtWidgets.QWidget):
         self._high, self._high_path = self._edit(high, lay)
 
         self._toggle = None
+        self._toggle_inverts_model = False
         if toggle is not None:
             btn = QtWidgets.QToolButton()
             btn.setObjectName("controlsV2AutoButton")
             btn.setText("✦")
             btn.setCheckable(True)
-            btn.setChecked(bool(toggle.get("value")))
-            btn.setEnabled(bool(toggle.get("enabled", True)))
-            btn.setToolTip(toggle.get("tooltip", "Auto"))
-            btn.setMinimumWidth(31)
             tpath = tuple(toggle["path"])
+            # Integration stores whether a range is automatic.  The operator
+            # surface speaks the opposite, more useful fact: a lit button
+            # means the adjacent entered bounds are active.  Translate only
+            # at this presentation boundary; Threshold's direct enable fact
+            # and every persisted/science value retain their native polarity.
+            self._toggle_inverts_model = bool(
+                tpath and tpath[-1].endswith("_auto")
+            )
+            checked = bool(toggle.get("value"))
+            if self._toggle_inverts_model:
+                checked = not checked
+            btn.setChecked(checked)
+            btn.setEnabled(bool(toggle.get("enabled", True)))
+            btn.setToolTip(toggle.get(
+                "tooltip",
+                "Use the entered range values. When off, use Auto."
+                if self._toggle_inverts_model else "Enable",
+            ))
+            btn.setMinimumWidth(31)
             btn.toggled.connect(
-                lambda checked, p=tpath: self.valueChanged.emit(p, bool(checked)))
+                lambda checked, p=tpath: self.valueChanged.emit(
+                    p,
+                    not bool(checked)
+                    if self._toggle_inverts_model else bool(checked),
+                )
+            )
             lay.addWidget(btn)
             self._toggle = (tpath, btn)
 
@@ -1028,7 +1049,11 @@ class RangeRow(QtWidgets.QWidget):
     def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
         out = []
         if self._toggle is not None:
-            out.append((self._toggle[0], bool(self._toggle[1].isChecked())))
+            checked = bool(self._toggle[1].isChecked())
+            out.append((
+                self._toggle[0],
+                not checked if self._toggle_inverts_model else checked,
+            ))
         if self._low.isEnabled():
             out.append((
                 tuple(self._low_path),
@@ -1059,12 +1084,20 @@ class RangeRow(QtWidgets.QWidget):
             was_blocked = btn.blockSignals(True)
             try:
                 checked = bool(field.value)
+                if self._toggle_inverts_model:
+                    checked = not checked
                 if btn.isChecked() != checked:
                     btn.setChecked(checked)
             finally:
                 btn.blockSignals(was_blocked)
             btn.setEnabled(bool(field.enabled))
-            btn.setToolTip(_field_tooltip(field.path, field.reason) or "Auto")
+            fallback = (
+                "Use the entered range values. When off, use Auto."
+                if self._toggle_inverts_model else "Enable this range."
+            )
+            btn.setToolTip(
+                _field_tooltip(field.path, field.reason) or fallback
+            )
         return True
 
     def _apply_edit(
@@ -1100,9 +1133,10 @@ class PillRow(QtWidgets.QWidget):
 
     valueChanged = QtCore.Signal(object, object)
 
-    #: Tooltip for a pill that mirrors a fact whose editor lives elsewhere
-    #: (LV-UI-11: Mask Saturated is driven by the Threshold row's Auto toggle).
-    _DISPLAY_ONLY_TOOLTIP = "Set by the Threshold row's Auto toggle."
+    #: Compatibility tooltip for a profile that deliberately mirrors a fact
+    #: whose editor lives elsewhere.  Current vNext controls do not use this
+    #: path: Mask Saturated is an independent editable fact.
+    _DISPLAY_ONLY_TOOLTIP = "Set by another control."
 
     def __init__(
         self,
@@ -1959,9 +1993,20 @@ class ControlsPanelV2(QtWidgets.QWidget):
                     list(pending_pills),
                     display_only_paths=frozenset(display_only_pills),
                 )
+                if any(
+                    field.path in {
+                        ("MaskSat", "mask_sentinel"),
+                        ("Signal", "series_average"),
+                    }
+                    for field in pending_pills
+                ):
+                    row.layout().setContentsMargins(
+                        0, PROCESSING_PILL_TOP_MARGIN, 0, 0
+                    )
                 row.valueChanged.connect(self.fieldValueChanged)
                 sub.add_row(row)
                 pending_pills.clear()
+                display_only_pills.clear()
 
         for field in fields:
             path = field.path
@@ -1988,11 +2033,9 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 consumed.add(path)
                 continue
             # Threshold: (Mask, Threshold)=enable + (Mask, min) + (Mask, max).
-            # LV-UI-11: when the projection omits the Threshold enable (the
-            # vNext scattering page), the row's Auto toggle IS Mask Saturated —
-            # toggled ON masks the saturated sentinel and the manual bounds
-            # sleep, matching the range rows' auto-when-toggled reading.  Its
-            # pill stays visible below as a display-only state indicator.
+            # Older profiles may omit the explicit enable.  Keep their bounded
+            # fallback composition, while current vNext projects both the
+            # direct Threshold enable and independent Mask Saturated pill.
             if path == ("Mask", "min") and ("Mask", "max") in by_path:
                 flush_pills()
                 toggle_field = by_path.get(("Mask", "Threshold"))
@@ -2091,11 +2134,18 @@ class ControlsPanelV2(QtWidgets.QWidget):
                     break
         toggle = None
         if toggle_field is not None:
+            is_auto_fact = bool(
+                toggle_field.path
+                and toggle_field.path[-1].endswith("_auto")
+            )
             toggle = {
                 "path": toggle_field.path,
                 "value": toggle_field.value,
                 "enabled": toggle_field.enabled,
-                "tooltip": toggle_field.reason or "Auto",
+                "tooltip": toggle_field.reason or (
+                    "Use the entered range values. When off, use Auto."
+                    if is_auto_fact else "Enable this range."
+                ),
             }
         row = RangeRow(
             label=label,

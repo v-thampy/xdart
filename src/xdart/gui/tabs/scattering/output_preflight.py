@@ -41,7 +41,6 @@ from .contracts import (
     AdmittedMotorValue, AdmittedOutput, AdmissionReceipt,
     ExternalSourceState, OutputDisposition, OutputFact, PlannedOutput,
     SourceExecutionStamp, SourceFileState, StartCapture,
-    threshold_pair_is_canonical,
 )
 from .source_metadata import (
     ordered_motor_intersection,
@@ -172,13 +171,6 @@ class OutputCandidate:
         gi_motor_choices: tuple[str, ...] | None = None,
     ) -> "OutputCandidate":
         intent = capture.intent_snapshot.thaw()
-        if not threshold_pair_is_canonical(intent.threshold):
-            raise ValueError(
-                "degenerate threshold identity at admission (apply_threshold "
-                "== mask_saturation); the start capture canonicalizes this "
-                "pair — refusing to sign a configuration that would not "
-                "describe its own execution"
-            )
         if (
             str(intent.output_mode).strip().lower() == "append"
             and intent.processing_mode == "Int 1D (XYE)"
@@ -3181,14 +3173,6 @@ def execution_plan_values(
     configuration: FrozenRunConfiguration, detector_mask: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     threshold, gi = configuration.threshold, configuration.gi
-    if not threshold_pair_is_canonical(threshold):
-        raise ValueError(
-            "degenerate threshold identity reached execution "
-            f"(apply_threshold={threshold.apply_threshold}, "
-            f"mask_saturation={threshold.mask_saturation}); the start "
-            "capture canonicalizes this pair — refusing to execute a "
-            "configuration that does not describe its own run"
-        )
     if detector_mask is None and configuration.mask_file:
         path = Path(configuration.mask_file)
         detector_mask = np.load(path) if path.suffix == ".npy" else load_mask(path)

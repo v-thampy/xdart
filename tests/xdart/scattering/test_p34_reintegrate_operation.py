@@ -186,6 +186,194 @@ def test_parent_red_stable_loaded_browse_enables_reintegrate_1d_start(tmp_path, 
     assert not actions[ControlAction.REINTEGRATE_1D].enabled and not actions[ControlAction.REINTEGRATE_2D].enabled
     page._lifecycle._owners_closed = True; actions = {a.action: a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}
     assert actions[ControlAction.REINTEGRATE_1D].enabled and actions[ControlAction.REINTEGRATE_2D].enabled; page.close_workspace()
+
+
+@pytest.mark.parametrize("relative_target", (False, True))
+def test_finished_run_auto_browse_enables_reintegration_without_second_click(
+    tmp_path, monkeypatch, qapp, relative_target,
+):
+    """The published terminal artifact becomes the same authenticated Browse."""
+
+    from tests.xdart.scattering.test_e1b2_page_command_boundaries import (
+        _Executor,
+        _active_page,
+        _dispose,
+    )
+    from tests.xdart.scattering.test_e3_context_contract import _acquisition
+    from xdart.gui.tabs.scattering.display_values import (
+        StandardEventKind,
+        StandardRunEvent,
+    )
+    from xdart.gui.tabs.scattering.events import CleanupStatus
+    from xrd_tools.session.readiness import ControlAction, SectionId
+    from xrd_tools.session.run_configuration import RunIntent
+
+    seeded = _seed_existing(tmp_path)
+    resolved_target = str(seeded.target.resolve())
+    target = (
+        os.path.relpath(resolved_target, Path.cwd())
+        if relative_target
+        else resolved_target
+    )
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(executor)
+    try:
+        configuration = RunIntent(output_mode="Overwrite").freeze()
+        assert configuration.identity == (
+            identity.generation, identity.fingerprint,
+        )
+        _, acquisition = _acquisition(
+            configuration=configuration,
+            identity=identity,
+        )
+        executor.acquisition_context = lambda candidate: (
+            acquisition if candidate is identity else None
+        )
+        page._context_controller.adopt_acquisition(identity)
+        acquisition.publication_store.catalog.resize(16)
+
+        deltas = tuple(
+            acquisition.publication_store.append_navigation(
+                "terminal.run", target, label,
+            )
+            for label in seeded.labels
+        )
+        executor.events.extend(
+            StandardRunEvent(
+                identity,
+                StandardEventKind.FRAME_READY,
+                completed=index,
+                total=len(deltas),
+                artifact=target,
+                frame_key=delta.appended,
+                navigation_delta=delta,
+                artifact_completed=index,
+                artifact_total=len(deltas),
+            )
+            for index, delta in enumerate(deltas, start=1)
+        )
+        page._drain_executor()
+        navigation = page._context_controller.navigation
+        assert navigation.current.local_frame_label == seeded.labels[-1]
+        assert navigation.current.artifact == target
+
+        real_begin = page._context_controller.begin_browse
+        browse_calls = []
+        monkeypatch.setattr(
+            page._context_controller,
+            "begin_browse",
+            lambda artifact: browse_calls.append(artifact)
+            or real_begin(artifact),
+        )
+
+        executor.events.append(StandardRunEvent(
+            identity,
+            StandardEventKind.FINISHED,
+            completed=len(deltas),
+            total=len(deltas),
+            artifact=target,
+            cleanup_status=CleanupStatus.CLEANED,
+            artifact_completed=len(deltas),
+            artifact_total=len(deltas),
+        ))
+        page._drain_executor()
+        assert lifecycle.phase.value == "idle"
+        assert browse_calls == [target]
+        assert page._terminal_browse_request is not None
+        assert page._terminal_browse_request.source_path == resolved_target
+        assert page._terminal_browse_artifact == target
+        assert page._context_controller.browse_pending
+
+        # A deliberate historical-frame choice during the asynchronous
+        # terminal load must survive adoption into the persisted Browse
+        # context; Auto Last no longer owns this selection.
+        from xdart.gui.tabs.scattering.shell_values import (
+            ShellCommand,
+            ShellCommandKind,
+        )
+
+        historical = deltas[1].appended
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SELECT_FRAME,
+            frame=historical,
+            frames=(historical,),
+        ))
+        assert not page._auto_last
+        assert page._terminal_browse_current_label == historical.local_frame_label
+        assert page._terminal_browse_selected_labels == (
+            historical.local_frame_label,
+        )
+
+        def settled():
+            page._drain_executor()
+            return page._context_controller.capture_reintegrate_browse()
+
+        captured = _wait(settled)
+        assert captured[3] == resolved_target
+        assert captured[6] == seeded.labels
+        assert captured[5].exists
+        assert page._terminal_browse_request is None
+        assert page._terminal_browse_artifact is None
+        assert not page._context_controller.browse_pending
+        assert (
+            page._context_controller.navigation.current.local_frame_label
+            == historical.local_frame_label
+        )
+        actions = {
+            action.action: action
+            for action in page._project_controls(
+                page._intents.snapshot()
+            ).profile.actions_for(SectionId.PROCESSING)
+        }
+        assert actions[ControlAction.REINTEGRATE_1D].enabled
+        assert actions[ControlAction.REINTEGRATE_2D].enabled
+    finally:
+        _dispose(page, qapp)
+
+
+def test_xye_loaded_browse_disables_and_refuses_reintegrate(
+    tmp_path, monkeypatch, qapp,
+):
+    """XYE output cannot mutate a retained NeXus Browse context."""
+
+    from xrd_tools.session.readiness import ControlAction, SectionId
+
+    page, store, _seeded, _context = _loaded_page(
+        tmp_path, monkeypatch, qapp,
+    )
+    try:
+        assert page._context_controller.capture_reintegrate_browse() is not None
+        snapshot = store.snapshot()
+        candidate = snapshot.thaw()
+        candidate.processing_mode = "Int 1D (XYE)"
+        accepted = store.commit(
+            candidate, expected_revision=snapshot.revision,
+        )
+        page._reconcile_snapshot(snapshot, accepted.snapshot)
+
+        actions = {
+            action.action: action
+            for action in page._project_controls(
+                store.snapshot()
+            ).profile.actions_for(SectionId.PROCESSING)
+        }
+        assert not actions[ControlAction.REINTEGRATE_1D].enabled
+        assert not actions[ControlAction.REINTEGRATE_2D].enabled
+
+        dispatches = []
+        monkeypatch.setattr(
+            page._operation_slot,
+            "begin_reintegrate",
+            lambda **kwargs: dispatches.append(kwargs),
+        )
+        page._reintegrate_action("1d")
+        assert dispatches == []
+        assert "XYE-only output" in page._notice_text
+        assert page._context_controller.capture_reintegrate_browse() is not None
+    finally:
+        page.close_workspace()
+
+
 def test_browse_snapshot_brackets_complete_load_and_refuses_drift(tmp_path, monkeypatch):
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest, BrowseLoadStatus

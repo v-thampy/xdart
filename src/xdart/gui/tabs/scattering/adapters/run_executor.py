@@ -2655,6 +2655,33 @@ class StandardRunExecutor:
                     run.cleanup_failures.append(detach_exception(error, context))
                 if resources.cleaned:
                     run.resources = None
+            non_display_clean = all(value is None for value in (
+                run.session, run.sink, run.output, run.source, run.resources,
+            ))
+            display_clean = True
+            if (
+                non_display_clean
+                and run.primary is not None
+                and run.completed == 0
+                and not run.display.payloads
+                and not run.display.catalog_snapshot().entries
+            ):
+                # A construction/first-frame failure can leave the display
+                # pointing at a lease and custody slot that lower-layer
+                # settlement has already terminalized.  There is no published
+                # or partial historical display in this exact zero-frame
+                # shape, so retire it here on the executor worker before the
+                # FAILED receipt is emitted.  Any genuinely pending owner
+                # keeps ``display_clean`` false and cleanup remains fail-closed.
+                try:
+                    display_clean = run.display.retire(
+                        join_timeout=self._join_timeout
+                    )
+                except Exception as error:
+                    display_clean = False
+                    run.cleanup_failures.append(detach_exception(
+                        error, 'failed_display.retire'
+                    ))
             if run.output is None:
                 for owner in tuple(run.display.artifacts.values()):
                     if owner.light_lease is None:
@@ -2663,9 +2690,11 @@ class StandardRunExecutor:
                         except Exception as error:
                             run.cleanup_failures.append(detach_exception(
                                 error, 'display_subscription.cancel'))
-            cleaned = all(value is None for value in (
-                run.session, run.sink, run.output, run.source, run.resources,
-            )) and not run.display.light_1d_cleanup_unresolved()
+            cleaned = (
+                non_display_clean
+                and display_clean
+                and not run.display.light_1d_cleanup_unresolved()
+            )
             run.cleanup_status = CleanupStatus.CLEANED if cleaned else CleanupStatus.CLEANUP_PENDING
             if cleaned:
                 run.closed = True

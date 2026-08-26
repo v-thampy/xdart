@@ -92,15 +92,14 @@ def test_production_projection_supplies_source_and_integration_inventory() -> No
         ("Int2D", "azim_auto"),
         ("Int2D", "azim_low"),
         ("Int2D", "azim_high"),
-        # LV-UI-11: no separate ("Mask", "Threshold") enable — the manual
-        # bounds render with Mask Saturated as the row's Auto toggle.
+        ("Mask", "Threshold"),
         ("Mask", "min"),
         ("Mask", "max"),
         ("MaskSat", "mask_sentinel"),
         ("BG", "bg_type"),
     }
     assert required <= fields.keys()
-    assert ("Mask", "Threshold") not in fields
+    assert fields[("Mask", "Threshold")].value is False
     assert fields[("Signal", "inp_type")].value == "Image Directory"
     assert fields[("Signal", "img_dir")].value == "/raw/eiger"
     assert fields[("Signal", "include_subdir")].value is True
@@ -415,116 +414,113 @@ def test_gi_transition_normalizes_units_and_only_incompatible_ranges() -> None:
 
 
 def test_any_manual_threshold_bound_edit_selects_manual_mode() -> None:
-    """LV-UI-11: touching a manual bound IS choosing the manual band — it
-    enables thresholding AND turns the exclusive Auto sentinel masking off,
-    zero included (0 is a legitimate manual lower bound)."""
+    """A bound edit enables its band without changing saturated masking."""
     snapshot = RunIntentStore(_intent()).snapshot()
     changed = reduce_control_edit(snapshot, ("Mask", "max"), "1000")
     assert type(changed) is RunIntent
     assert changed.threshold.threshold_max == 1000.0
     assert changed.threshold.apply_threshold is True
-    assert changed.threshold.mask_saturation is False
+    assert changed.threshold.mask_saturation is True
     assert snapshot.thaw().threshold.apply_threshold is False
 
     zero = reduce_control_edit(snapshot, ("Mask", "min"), "0")
     assert type(zero) is RunIntent
     assert zero.threshold.threshold_min == 0.0
     assert zero.threshold.apply_threshold is True
-    assert zero.threshold.mask_saturation is False
+    assert zero.threshold.mask_saturation is True
 
 
 def _eiger_poni(tmp_path: Path) -> str:
     poni = tmp_path / "eiger.poni"
     poni.write_text(
+        "Poni_version: 2.1\n"
         "Detector: Eiger1M\n"
+        'Detector_config: {"orientation": 1}\n'
         "Distance: 0.2\n"
         "Poni1: 0.1\n"
         "Poni2: 0.2\n"
+        "Rot1: 0.0\n"
+        "Rot2: 0.0\n"
+        "Rot3: 0.0\n"
+        "Wavelength: 1e-10\n"
     )
     return str(poni)
 
 
-def test_auto_toggle_maps_to_the_exclusive_threshold_intent_pair(
+def test_threshold_and_saturation_toggles_are_independent(
     tmp_path: Path,
 ) -> None:
-    """LV-UI-11 mapping (maintainer-confirmed): Auto ON -> mask_saturation
-    True + apply_threshold False; Auto OFF -> manual band applies, seeded to
-    the visible [0, detector-ceiling] defaults on first use."""
-    from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
+    """Either switch changes only its own fact; all four states are valid."""
+    from xdart.gui.tabs.scattering.controls_inventory import (
+        MASK_SATURATION,
+        THRESHOLD_ENABLED,
+    )
 
     intent = _intent()
     intent.poni_file = _eiger_poni(tmp_path)
+    unmasked = reduce_control_edit(
+        RunIntentStore(intent).snapshot(), MASK_SATURATION, False,
+    )
+    assert type(unmasked) is RunIntent
+    assert unmasked.threshold.mask_saturation is False
+    assert unmasked.threshold.apply_threshold is False
+    assert unmasked.threshold.threshold_min is None
+    assert unmasked.threshold.threshold_max is None
+
+    both = reduce_control_edit(
+        RunIntentStore(unmasked).snapshot(), THRESHOLD_ENABLED, True,
+    )
+    assert type(both) is RunIntent
+    assert both.threshold.mask_saturation is False
+    assert both.threshold.apply_threshold is True
+    assert both.threshold.threshold_min == 0.0
+    assert both.threshold.threshold_max == 4294967295.0
+
+    masked_both = reduce_control_edit(
+        RunIntentStore(both).snapshot(), MASK_SATURATION, True,
+    )
+    assert type(masked_both) is RunIntent
+    assert masked_both.threshold.mask_saturation is True
+    assert masked_both.threshold.apply_threshold is True
+
+    masked_only = reduce_control_edit(
+        RunIntentStore(masked_both).snapshot(), THRESHOLD_ENABLED, False,
+    )
+    assert type(masked_only) is RunIntent
+    assert masked_only.threshold.mask_saturation is True
+    assert masked_only.threshold.apply_threshold is False
+    assert masked_only.threshold.threshold_min == 0.0
+    assert masked_only.threshold.threshold_max == 4294967295.0
+
+
+def test_manual_threshold_on_leaves_max_blank_without_known_detector() -> None:
+    from xdart.gui.tabs.scattering.controls_inventory import THRESHOLD_ENABLED
+
     manual = reduce_control_edit(
-        RunIntentStore(intent).snapshot(), MASK_SATURATION, False
+        RunIntentStore(_intent()).snapshot(), THRESHOLD_ENABLED, True,
     )
     assert type(manual) is RunIntent
-    assert manual.threshold.mask_saturation is False
     assert manual.threshold.apply_threshold is True
-    assert manual.threshold.threshold_min == 0.0
-    assert manual.threshold.threshold_max == 4294967295.0
-
-    back = reduce_control_edit(
-        RunIntentStore(manual).snapshot(), MASK_SATURATION, True
-    )
-    assert type(back) is RunIntent
-    assert back.threshold.mask_saturation is True
-    assert back.threshold.apply_threshold is False
-    # The manual bounds survive the round trip for the next manual use.
-    assert back.threshold.threshold_min == 0.0
-    assert back.threshold.threshold_max == 4294967295.0
-
-
-def test_auto_toggle_off_leaves_the_max_blank_without_a_known_detector() -> None:
-    from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
-
-    manual = reduce_control_edit(
-        RunIntentStore(_intent()).snapshot(), MASK_SATURATION, False
-    )
-    assert type(manual) is RunIntent
+    assert manual.threshold.mask_saturation is True
     assert manual.threshold.threshold_min == 0.0
     assert manual.threshold.threshold_max is None
 
 
-def test_degenerate_threshold_pairs_normalize_on_touch() -> None:
-    """Reducer rows (Codex REWORK 2026-08-04): the two EQUAL intent pairs —
-    (apply=True, mask=True) and (apply=False, mask=False), reachable only from
-    pre-LV-UI-11 or programmatic intents — must not absorb a touch of the
-    shown Auto value as EditNoChange: the touch normalizes to the displayed
-    semantics.  The RUN-side identity story (capture canonicalization,
-    admission/fingerprint/provenance agreement, boundary refusals) is the
-    end-to-end oracle in test_start_pipeline_qualification.py."""
+def test_same_value_threshold_touches_preserve_independent_pairs() -> None:
     from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
 
-    both_on = RunIntent()
-    both_on.threshold.apply_threshold = True
-    both_on.threshold.mask_saturation = True
-    both_on.threshold.threshold_min = 5.0
-    both_on.threshold.threshold_max = 1000.0
-    touched = reduce_control_edit(
-        RunIntentStore(both_on).snapshot(), MASK_SATURATION, True
-    )
-    assert type(touched) is RunIntent            # NOT EditNoChange
-    assert touched.threshold.mask_saturation is True
-    assert touched.threshold.apply_threshold is False
-
-    both_off = RunIntent()
-    both_off.threshold.apply_threshold = False
-    both_off.threshold.mask_saturation = False
-    both_off.threshold.threshold_min = 1.0
-    both_off.threshold.threshold_max = 2.0
-    touched = reduce_control_edit(
-        RunIntentStore(both_off).snapshot(), MASK_SATURATION, False
-    )
-    assert type(touched) is RunIntent            # NOT EditNoChange
-    assert touched.threshold.mask_saturation is False
-    assert touched.threshold.apply_threshold is True
-
-    # The exclusive pairs keep EditNoChange for a same-value touch.
-    normal = RunIntent()                          # (apply=False, mask=True)
-    unchanged = reduce_control_edit(
-        RunIntentStore(normal).snapshot(), MASK_SATURATION, True
-    )
-    assert type(unchanged) is EditNoChange
+    for apply_flag, mask_flag in (
+        (False, False), (False, True), (True, False), (True, True),
+    ):
+        intent = RunIntent()
+        intent.threshold.apply_threshold = apply_flag
+        intent.threshold.mask_saturation = mask_flag
+        intent.threshold.threshold_min = 1.0
+        intent.threshold.threshold_max = 2.0
+        unchanged = reduce_control_edit(
+            RunIntentStore(intent).snapshot(), MASK_SATURATION, mask_flag,
+        )
+        assert type(unchanged) is EditNoChange
 
 
 def test_clearing_a_manual_bound_rematerializes_the_displayed_default(
@@ -571,13 +567,10 @@ def test_clearing_a_manual_bound_rematerializes_the_displayed_default(
     assert cleared.threshold.threshold_max is None
 
 
-def test_vnext_threshold_fields_follow_the_auto_masksat_model(
+def test_vnext_threshold_fields_are_independent(
     tmp_path: Path,
 ) -> None:
-    """LV-UI-11 projection: no separate Threshold enable field; the manual
-    bounds are disabled while Auto is on and display the [0, detector-ceiling]
-    defaults; Mask Saturated itself stays projected (the row's Auto toggle and
-    its display-only pill both render from it)."""
+    """Manual bounds follow only their enable; Mask Saturated stays editable."""
     from xdart.gui.tabs.scattering.controls_inventory import (
         MASK_SATURATION,
         THRESHOLD_ENABLED,
@@ -591,14 +584,14 @@ def test_vnext_threshold_fields_follow_the_auto_masksat_model(
         RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
     )
     by_path = {field.path: field for field in state.bound_controls.fields}
-    assert THRESHOLD_ENABLED not in by_path
+    assert by_path[THRESHOLD_ENABLED].value is False
+    assert by_path[THRESHOLD_ENABLED].enabled is True
     assert by_path[MASK_SATURATION].enabled is True
     low, high = by_path[THRESHOLD_MIN], by_path[THRESHOLD_MAX]
     assert low.value == 0.0 and high.value == 4294967295.0
     assert low.enabled is False and high.enabled is False
-    assert "Auto masks saturated pixels" in low.reason
+    assert "Enable Manual Threshold" in low.reason
 
-    intent.threshold.mask_saturation = False
     intent.threshold.apply_threshold = True
     manual_state = project_controls(
         RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
@@ -606,6 +599,8 @@ def test_vnext_threshold_fields_follow_the_auto_masksat_model(
     manual = {f.path: f for f in manual_state.bound_controls.fields}
     assert manual[THRESHOLD_MIN].enabled is True
     assert manual[THRESHOLD_MAX].enabled is True
+    assert manual[MASK_SATURATION].value is True
+    assert manual[MASK_SATURATION].enabled is True
 
 
 def test_vnext_threshold_max_is_blank_until_a_valid_detector(

@@ -229,10 +229,94 @@ def test_native_processing_mode_immediately_owns_mounted_center_layout() -> None
 
     full = project("Int 2D", 1)
     one_d = project("Int 1D", 2)
-    restored = project("Int 2D", 3)
+    xye = project("Int 1D (XYE)", 3)
+    restored = project("Int 2D", 4)
     assert full.scientific.processing_mode == "Int 2D"
     assert one_d.scientific.processing_mode == "Int 1D"
+    assert xye.run.mode == "Int 1D (XYE)"
+    assert xye.scientific.processing_mode == "Int 1D"
     assert restored.scientific.processing_mode == "Int 2D"
+
+
+def test_xye_output_uses_the_existing_int1d_trace_and_center_layout(
+    monkeypatch,
+) -> None:
+    from tests.xdart.scattering.test_e3_context_contract import _view
+    from tests.xdart.scattering.test_p2a1_viewer_context_page import (
+        _fake_scientific,
+    )
+    from xdart.gui.tabs.scattering import shell_projection
+    from xdart.gui.tabs.scattering.display_values import (
+        DisplayFrameKey,
+        StandardDisplayPayload,
+    )
+    from xdart.gui.tabs.scattering.events import RunIdentity
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
+    from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
+
+    identity = RunIdentity(8, "xye-presentation")
+    frame = DisplayFrameKey(identity, "run.xye", "/out/xye.nxs", 1, 1)
+    view = _view(1, 2.0)
+    payload = StandardDisplayPayload(
+        0, frame, "XYE frame 1", view, measurement_mode="Standard",
+    )
+    navigation = FrameNavigationProjection((frame,), frame, (frame,))
+    base = make_shell_projection(plot_mode="Single")
+    allow_cake: list[bool] = []
+    real_trace_projection = shell_projection.trace_projection
+
+    def observe_trace(*args, **kwargs):
+        allow_cake.append(kwargs["allow_cake"])
+        return real_trace_projection(*args, **kwargs)
+
+    monkeypatch.setattr(
+        shell_projection, "trace_projection", observe_trace,
+    )
+    intent = _configured_intent("Int 1D (XYE)")
+    projected = ContextProjection().build_shell(
+        revision=4,
+        controls=base.controls,
+        controls_readiness=base.controls_readiness,
+        phase=RunPhase.IDLE,
+        intent=intent,
+        contexts=(),
+        selection=None,
+        navigation=navigation,
+        payloads=(payload,),
+        resident_frames=frozenset((frame,)),
+        progress=base.progress,
+        preferences=ScientificPreferences(plot_mode="Single"),
+        browser_directory="",
+        date_sorted=False,
+        auto_last=True,
+        executor_available=True,
+        start_permitted=True,
+        start_blocker="",
+        notice="",
+    )
+
+    assert projected.run.mode == "Int 1D (XYE)"
+    assert projected.run.readiness == "Ready · Int 1D (XYE)"
+    assert projected.scientific.processing_mode == "Int 1D"
+    assert len(projected.scientific.traces) == 1
+    assert projected.scientific.traces[0].intensity is view.intensity_1d
+    assert allow_cake and set(allow_cake) == {False}
+
+    mounted = _fake_scientific()
+    ScientificView._apply_processing_layout(
+        mounted, projected.scientific.processing_mode,
+    )
+    assert mounted.image_splitter.hidden
+    assert not mounted.raw_popup_button.hidden
+    assert mounted.detector_controls.hidden
+
+    controls = project_controls(
+        RunIntentStore(intent).snapshot(), None, RunPhase.IDLE,
+    )
+    paths = {field.path for field in controls.bound_controls.fields}
+    assert ("Int1D", "axis") in paths
+    assert ("Mask", "Threshold") in paths
+    assert ("Signal", "series_average") not in paths
 
 
 def test_viewer_1d_authority_identifier_delta_is_frozen() -> None:
