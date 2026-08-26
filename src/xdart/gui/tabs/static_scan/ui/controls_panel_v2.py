@@ -1456,6 +1456,15 @@ class ControlsPanelV2(QtWidgets.QWidget):
             for path in current_fields
         ):
             return False
+        if (
+            self._profile is None
+            or self._profile.section_actions != state.profile.section_actions
+        ):
+            # Action buttons own their projected label, enabled state, tooltip,
+            # and role.  The row-only fast path cannot leave those specs at the
+            # snapshot that constructed them; let the existing full render
+            # reconcile the changed action inventory atomically.
+            return False
         self._profile = state.profile
         self._bound_state = state.bound_controls
         fields_by_path = {

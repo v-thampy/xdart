@@ -516,7 +516,7 @@ def test_terminal_elapsed_and_split_remain_in_run_status(
     try:
         page._drain_executor()
         label = _shell(page).run_controls.readinessLabel
-        assert label.text() == "Complete · 23.41 s"
+        assert label.text() == "Complete · 651 Frames · 23.41 s"
         assert label.toolTip() == (
             "Total: 23.41 s\n"
             "Work: 20.00 s\n"
@@ -548,7 +548,7 @@ def test_terminal_elapsed_and_split_remain_in_run_status(
             "Submit/backpressure is orchestration wait, not pure integration."
         )
         page._refresh_shell()
-        assert label.text() == "Complete · 23.41 s"
+        assert label.text() == "Complete · 651 Frames · 23.41 s"
     finally:
         _dispose(page, qapp)
 

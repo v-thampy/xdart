@@ -188,9 +188,23 @@ def test_parent_red_stable_loaded_browse_enables_reintegrate_1d_start(tmp_path, 
     assert actions[ControlAction.REINTEGRATE_1D].enabled and actions[ControlAction.REINTEGRATE_2D].enabled; page.close_workspace()
 
 
-@pytest.mark.parametrize("relative_target", (False, True))
+@pytest.mark.parametrize(
+    ("relative_target", "selection_case", "plot_mode"),
+    (
+        (False, "all", "Overlay"),
+        (False, "exclude-latest", "Waterfall"),
+        (False, "manual-then-auto-last", "Overlay"),
+        (True, "manual-history", None),
+    ),
+    ids=(
+        "absolute-auto-last-overlay",
+        "absolute-auto-last-waterfall-exclusion",
+        "absolute-manual-then-auto-last-overlay",
+        "relative-manual-history",
+    ),
+)
 def test_finished_run_auto_browse_enables_reintegration_without_second_click(
-    tmp_path, monkeypatch, qapp, relative_target,
+    tmp_path, monkeypatch, qapp, relative_target, selection_case, plot_mode,
 ):
     """The published terminal artifact becomes the same authenticated Browse."""
 
@@ -218,6 +232,10 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
     executor = _Executor()
     page, lifecycle, identity = _active_page(executor)
     try:
+        if plot_mode is not None:
+            page._preferences = replace(
+                page._preferences, plot_mode=plot_mode,
+            )
         configuration = RunIntent(output_mode="Overwrite").freeze()
         assert configuration.identity == (
             identity.generation, identity.fingerprint,
@@ -256,6 +274,29 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         navigation = page._context_controller.navigation
         assert navigation.current.local_frame_label == seeded.labels[-1]
         assert navigation.current.artifact == target
+        if selection_case != "manual-history":
+            assert tuple(
+                frame.local_frame_label
+                for frame in navigation.selected
+                if frame.artifact == target
+            ) == seeded.labels
+
+        from xdart.gui.tabs.scattering.shell_values import (
+            ShellCommand,
+            ShellCommandKind,
+        )
+
+        if selection_case == "exclude-latest":
+            latest = deltas[-1].appended
+            included = tuple(delta.appended for delta in deltas[:-1])
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SELECT_FRAME,
+                frame=latest,
+                frames=included,
+            ))
+            assert page._auto_last
+            assert page._context_controller.navigation.current is latest
+            assert page._context_controller.navigation.selected == included
 
         real_begin = page._context_controller.begin_browse
         browse_calls = []
@@ -284,25 +325,45 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         assert page._terminal_browse_artifact == target
         assert page._context_controller.browse_pending
 
-        # A deliberate historical-frame choice during the asynchronous
-        # terminal load must survive adoption into the persisted Browse
-        # context; Auto Last no longer owns this selection.
-        from xdart.gui.tabs.scattering.shell_values import (
-            ShellCommand,
-            ShellCommandKind,
-        )
-
         historical = deltas[1].appended
-        page._handle_shell_command(ShellCommand(
-            ShellCommandKind.SELECT_FRAME,
-            frame=historical,
-            frames=(historical,),
-        ))
-        assert not page._auto_last
-        assert page._terminal_browse_current_label == historical.local_frame_label
-        assert page._terminal_browse_selected_labels == (
-            historical.local_frame_label,
-        )
+        if selection_case in {"manual-history", "manual-then-auto-last"}:
+            # A deliberate historical-frame choice during the asynchronous
+            # terminal load must survive adoption into the persisted Browse
+            # context unless Auto Last is explicitly re-enabled.
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SELECT_FRAME,
+                frame=historical,
+                frames=(historical,),
+            ))
+            assert not page._auto_last
+            assert (
+                page._terminal_browse_current_label
+                == historical.local_frame_label
+            )
+            assert page._terminal_browse_selected_labels == (
+                historical.local_frame_label,
+            )
+            if selection_case == "manual-then-auto-last":
+                page._handle_shell_command(ShellCommand(
+                    ShellCommandKind.SET_AUTO_LAST,
+                    True,
+                ))
+                assert page._auto_last
+                # Acquisition can follow latest immediately, but the terminal
+                # remap snapshot intentionally remains the last explicit
+                # choice. Settlement must apply Auto Last to the authenticated
+                # Browse identities while retaining that exact membership.
+                assert (
+                    page._context_controller.navigation.current
+                    is deltas[-1].appended
+                )
+                assert page._context_controller.navigation.selected == (
+                    historical,
+                )
+                assert (
+                    page._terminal_browse_current_label
+                    == historical.local_frame_label
+                )
 
         def settled():
             page._drain_executor()
@@ -315,10 +376,44 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         assert page._terminal_browse_request is None
         assert page._terminal_browse_artifact is None
         assert not page._context_controller.browse_pending
-        assert (
-            page._context_controller.navigation.current.local_frame_label
-            == historical.local_frame_label
+        navigation = page._context_controller.navigation
+        expected_current = (
+            historical.local_frame_label
+            if selection_case == "manual-history"
+            else seeded.labels[-1]
         )
+        expected_selected = (
+            (historical.local_frame_label,)
+            if selection_case in {"manual-history", "manual-then-auto-last"}
+            else seeded.labels[:-1]
+            if selection_case == "exclude-latest"
+            else seeded.labels
+        )
+        assert navigation.current.local_frame_label == expected_current
+        assert tuple(
+            frame.local_frame_label for frame in navigation.selected
+        ) == expected_selected
+        if selection_case != "manual-history":
+            def overlay_ready():
+                page._drain_executor()
+                scientific = page._last_scientific_projection
+                if (
+                    scientific is None
+                    or scientific.heavy is None
+                    or len(scientific.traces) != len(expected_selected)
+                ):
+                    return None
+                return scientific
+
+            scientific = _wait(overlay_ready)
+            assert scientific.heavy.frame.local_frame_label == seeded.labels[-1]
+            assert tuple(
+                trace.frame.local_frame_label for trace in scientific.traces
+            ) == expected_selected
+            assert tuple(
+                frame.local_frame_label
+                for frame in page._shell.scientific.trace_history_keys
+            ) == expected_selected
         actions = {
             action.action: action
             for action in page._project_controls(
@@ -327,6 +422,19 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         }
         assert actions[ControlAction.REINTEGRATE_1D].enabled
         assert actions[ControlAction.REINTEGRATE_2D].enabled
+        from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ActionButton
+
+        qapp.processEvents()
+        mounted = {
+            button.spec.action: button
+            for button in page._shell.controls.findChildren(ActionButton)
+            if button.isEnabled()
+        }
+        assert mounted[ControlAction.REINTEGRATE_1D].isEnabled()
+        assert mounted[ControlAction.REINTEGRATE_2D].isEnabled()
+        assert "stable processed Browse artifact" not in (
+            mounted[ControlAction.REINTEGRATE_1D].toolTip()
+        )
     finally:
         _dispose(page, qapp)
 

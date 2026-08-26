@@ -2781,8 +2781,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if event.kind is StandardEventKind.STOPPED
             else "Complete"
         )
+        frame_label = "Frame" if event.completed == 1 else "Frames"
         terminal_detail = (
-            f"{terminal_state} · {timing.elapsed_seconds:.2f} s"
+            f"{terminal_state} · {event.completed} {frame_label} · "
+            f"{timing.elapsed_seconds:.2f} s"
             if timing is not None
             else event.detail
         )
@@ -2913,13 +2915,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             for label in selected_labels
             if label in by_label
         )
-        if self._auto_last:
-            self._context_controller.select_latest_navigation(
-                plot_mode=self._preferences.plot_mode
+        if self._auto_last and navigation.frames:
+            self._context_controller.select_navigation(
+                navigation.frames[-1], selected
             )
         elif current is not None:
-            if current not in selected:
-                selected = selected + (current,)
             self._context_controller.select_navigation(current, selected)
 
     def _clear_terminal_browse(self) -> None:

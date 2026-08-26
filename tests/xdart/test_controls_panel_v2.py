@@ -5179,6 +5179,50 @@ def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
         panel.deleteLater()
 
 
+def test_apply_state_update_refuses_stale_action_button_specs(qapp):
+    """Action enablement and tooltips change without changing field schema."""
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.readiness import ControlAction
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ActionButton
+
+    store = RunIntentStore(RunIntent())
+    disabled = project_controls(
+        store.snapshot(), None, RunPhase.IDLE,
+        reintegrate_available=False,
+    )
+    enabled = project_controls(
+        store.snapshot(), None, RunPhase.IDLE,
+        reintegrate_available=True,
+    )
+    panel = ControlsPanelV2()
+    try:
+        panel.set_state(disabled)
+        before = next(
+            button
+            for button in panel.findChildren(ActionButton)
+            if button.spec.action is ControlAction.REINTEGRATE_1D
+        )
+        assert not before.isEnabled()
+        assert "stable processed Browse artifact" in before.toolTip()
+
+        assert panel.apply_state_update(enabled) is False
+        panel.set_state(enabled)
+        qapp.processEvents()
+        after = next(
+            button
+            for button in panel.findChildren(ActionButton)
+            if button.spec.action is ControlAction.REINTEGRATE_1D
+            and button.isEnabled()
+        )
+        assert "Replaces selected 1-D results" in after.toolTip()
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def test_threshold_and_mask_saturated_are_independent_in_vnext(qapp):
     """Both switches are editable and each emits only its own exact path."""
     from xrd_tools.session.intent_store import RunIntentStore
