@@ -99,7 +99,7 @@ def _source_fact_inner(fact, *, raw_options=None, read=False, token=None):
         try: dtype, header = np.dtype(raw_dtype).str, options["raw_header_skip"]; shape = tuple(options["detector_shape"] or infer_raw_detector_shape(path, raw_dtype=dtype, raw_header_skip=header) or ()); _reject(len(shape) != 2, "REPLACEMENT_RAW_DECODER_UNRECORDED"); image = read_image(path, detector_shape=shape, raw_dtype=dtype, raw_header_skip=header, preserve_dtype=True, exact_frame=True) if read else None
         except (TypeError, ValueError, OSError) as error: raise ValueError("REPLACEMENT_RAW_DECODER_UNRECORDED") from error
     else:
-        _reject(raw_options is not None or index != 0 or snapshot["dataset_path"] is not None or snapshot["frame_count"] != 1 or snapshot["self_contained"] not in {None, True}, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+        _reject(index != 0 or snapshot["dataset_path"] is not None or snapshot["frame_count"] != 1 or snapshot["self_contained"] not in {None, True}, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
         if path.suffix.lower() in {".tif", ".tiff"}:
             import tifffile
             with tifffile.TiffFile(path) as handle: shapes, dtypes = {tuple(v.shape) for v in handle.pages}, {np.dtype(v.dtype).str for v in handle.pages}; _reject(len(handle.pages) != 1 or len(shapes) != 1 or len(dtypes) != 1, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); shape, dtype = shapes.pop(), dtypes.pop()
@@ -117,7 +117,24 @@ def _background_fact(fact, shared, shape, path, token):
     _reject(pair is None, "replacement active Background is absent"); keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key))); items = tuple((key, _tag(_one(fact["metadata"], key))) for key in keys); current = _frame((fact["label"], str(path.resolve(strict=True)), fact["snapshot"]["dataset_path"] or None, fact["frame_index"], tuple(shape), items)); result = resolve_frame_background(plan, current, cancelled=token)
     if result.disposition == "CANCELLED": _event(token); raise RuntimeError("Background returned CANCELLED without requested cancellation")
     _reject(result.disposition != "RESOLVED" or (result.descriptor_bytes, result.fingerprint) != pair, "replacement Background dependency differs"); return result.background, pair
-def _fact_projection(shared): from xrd_tools.reduction.background import FrameBackgroundPlan; plan = FrameBackgroundPlan.from_mapping(_plain(shared["background"])); gi = shared["gi"]; return tuple(sorted({key for key in (gi["resolved_motor"] if gi["enabled"] and gi["resolved_motor"] != "Manual" else None, plan.metadata_key, plan.normalization_key) if key})), shared["geometry"] is not None
+def _fact_projection(selected, shared):
+    from xrd_tools.reduction.background import FrameBackgroundPlan
+    background = FrameBackgroundPlan.from_mapping(_plain(shared["background"]))
+    gi = shared["gi"]
+    reduction = None if selected is None else _core_plan(selected, shared)
+    monitors = () if reduction is None else tuple(
+        item.monitor_key
+        for item in (reduction.integration_1d, reduction.integration_2d)
+        if item is not None and item.monitor_key
+    )
+    keys = {
+        gi["resolved_motor"]
+        if gi["enabled"] and gi["resolved_motor"] != "Manual" else None,
+        background.metadata_key,
+        background.normalization_key,
+        *monitors,
+    }
+    return tuple(sorted(key for key in keys if key)), shared["geometry"] is not None
 def _load_fact(fact, shape, dtype, shared, token, raw_options=None): _event(token); path, _execution, _revisions = _qualified_fact(fact); _event(token); background, pair = _background_fact(fact, shared, shape, path, token); _event(token); final_shape, final_dtype, _path, image = _source_fact(fact, raw_options=raw_options, read=True, token=token); _event(token); _reject(final_shape != tuple(shape) or final_dtype != dtype, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); return path, image, background, pair
 def _geometry_fact(fact, shared):
     value = dict(fact["geometry"]); active = shared["geometry"] is not None; _reject(active != bool(value) or active and (set(value) != {"rot1", "rot2", "rot3", "incident_angle"} or any(type(v) is not float or not math.isfinite(v) for v in value.values())), "replacement geometry differs"); return None if not active else __import__("xrd_tools.core.scan", fromlist=["FrameGeometry"]).FrameGeometry(**value)
@@ -174,8 +191,8 @@ def _inspect_artifact(target: Path, entry: str, dimension: str) -> _ArtifactInsp
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
         config = _replacement_hard_group(group, "reduction/config"); _reject(_replacement_hard_group(config, "source_execution", h5py.Dataset) is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); run_node = _replacement_hard_group(config, "run_configuration", h5py.Dataset); run = _replacement_json_node(config, "run_configuration", "run configuration"); text(run_node, _canonical(run).decode(), "run configuration")
         geom_node = _replacement_hard_group(config, "geometry"); geom_leaves = () if geom_node is None else tuple(_replacement_hard_group(geom_node, name, h5py.Dataset) for name in ("convention", "mapping_json", "motor_sources")); _reject(geom_node is not None and (set(geom_node) != {"convention", "mapping_json", "motor_sources"} or any(node is None for node in geom_leaves)), "selected BAI/GI/geometry is malformed"); geometry = None if geom_node is None else {"convention": _replacement_scalar(geom_leaves[0][()], "geometry convention"), "mapping_json": _replacement_scalar(geom_leaves[1][()], "geometry mapping"), "motor_sources": _replacement_json_node(geom_node, "motor_sources", "geometry motors")}
-        shared = _validated_shared_science(run, geometry=geometry); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_raw = _replacement_json_node(config, "gi_config", "selected GI config", required=False); _reject((gi_raw is None) == shared["gi"]["enabled"] or gi_raw is not None and type(gi_raw) is not dict, "selected GI config is malformed"); gi_cfg = {} if gi_raw is None else gi_raw; source = run.get("source"); _reject(source is not None and type(source) is not dict, "REPLACEMENT_RAW_DECODER_UNRECORDED"); options_missing = source is None or "options" not in source; options = {} if options_missing else source["options"]; _reject(type(options) is not dict, "REPLACEMENT_RAW_DECODER_UNRECORDED"); raw = dict(options) if set(options) & {"raw_dtype", "raw_header_skip", "detector_shape"} else {}
-        if raw: _reject(set(raw) != {"raw_dtype", "raw_header_skip", "detector_shape"} or type(raw["raw_dtype"]) is not str or type(raw["raw_header_skip"]) is not int or raw["raw_header_skip"] < 0 or type(raw["detector_shape"]) is not list or len(raw["detector_shape"]) != 2 or any(type(v) is not int or v <= 0 for v in raw["detector_shape"]), "REPLACEMENT_RAW_DECODER_UNRECORDED")
+        shared = _validated_shared_science(run, geometry=geometry); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_raw = _replacement_json_node(config, "gi_config", "selected GI config", required=False); _reject((gi_raw is None) == shared["gi"]["enabled"] or gi_raw is not None and type(gi_raw) is not dict, "selected GI config is malformed"); gi_cfg = {} if gi_raw is None else gi_raw; source = run.get("source"); _reject(source is not None and type(source) is not dict, "REPLACEMENT_RAW_DECODER_UNRECORDED"); options_missing = source is None or "options" not in source; options = {} if options_missing else source["options"]; _reject(type(options) is not dict, "REPLACEMENT_RAW_DECODER_UNRECORDED"); raw_keys = {"raw_dtype", "raw_header_skip", "detector_shape"}; present_raw_keys = set(options) & raw_keys; _reject(bool(present_raw_keys) and present_raw_keys != raw_keys, "REPLACEMENT_RAW_DECODER_UNRECORDED"); raw = {key: options[key] for key in raw_keys} if present_raw_keys else {}
+        if raw: _reject(type(raw["raw_dtype"]) is not str or type(raw["raw_header_skip"]) is not int or raw["raw_header_skip"] < 0 or type(raw["detector_shape"]) is not list or len(raw["detector_shape"]) != 2 or any(type(v) is not int or v <= 0 for v in raw["detector_shape"]), "REPLACEMENT_RAW_DECODER_UNRECORDED")
         raw = None if not raw else MappingProxyType({**raw, "detector_shape": tuple(raw["detector_shape"])})
         mode_key = f"gi_mode_{dimension}"; bai_name = f"bai_{dimension}_args"; bai_node = _replacement_hard_group(config, bai_name, h5py.Dataset); bai_value = _replacement_json_node(config, bai_name, "selected BAI"); physical_node = _replacement_hard_group(config, "gi", h5py.Dataset); physical = _replacement_json_node(config, "gi", "persisted GI truth"); physical_keys = set() if not shared["gi"]["enabled"] else {"gi_mode_1d", "gi_mode_2d", "incidence_motor", "th_val", "sample_orientation", "tilt_angle"}; _reject(type(bai_value) is not dict or type(physical) is not bool or physical != shared["gi"]["enabled"] or set(gi_cfg) != physical_keys or physical and any(gi_cfg[key] != shared["gi"][key] for key in ("incidence_motor", "th_val", "sample_orientation", "tilt_angle")), "selected BAI/GI/geometry is malformed"); text(bai_node, _canonical(bai_value).decode(), "selected BAI"); text(physical_node, _canonical(physical).decode(), "persisted GI truth"); (text(geom_leaves[0], geometry["convention"], "geometry convention"), text(geom_leaves[1], geometry["mapping_json"], "geometry mapping"), text(geom_leaves[2], _canonical(geometry["motor_sources"]).decode(), "geometry motors")) if geometry is not None else None
         bai = dict(bai_value); bai_mode = bai.pop(mode_key, None); gi_mode = gi_cfg.get(mode_key); prior_name = f"dimension_replacement_{dimension}"; prior_node = _replacement_hard_group(config, prior_name, h5py.Dataset); prior = _replacement_json_node(config, prior_name, "prior dimension audit", required=False); _reject(bool(gi_cfg) != (gi_node is not None) or (prior is None) != (prior_node is None), "selected config inventory differs"); text(gi_node, _canonical(gi_cfg).decode(), "selected GI config") if gi_node is not None else None; text(prior_node, _canonical(prior).decode(), "prior dimension audit") if prior_node is not None else None
@@ -206,7 +223,7 @@ def _prepare_gi_scouts(target, entry, observed, selected, shared, *, cancel_toke
     try: bootstrap = float(observed.gi_values[observed.labels[0]])
     except (KeyError, TypeError, ValueError) as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
     _reject(not math.isfinite(bootstrap), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
-    from xrd_tools.reduction.core import Frame, Scan, _apply_gi_freeze_policy, _gi_1d_freeze_key, _gi_2d_freeze_keys, prepare_gi_freeze; metadata_keys, include_geometry = _fact_projection(shared)
+    from xrd_tools.reduction.core import Frame, Scan, _apply_gi_freeze_policy, _gi_1d_freeze_key, _gi_2d_freeze_keys, prepare_gi_freeze; metadata_keys, include_geometry = _fact_projection(selected, shared)
     class Manifest: scan_manifest = lambda self: [(label, {gi["resolved_motor"]: value}) for label, value in observed.gi_values.items()]
     plan, diagnostic = prepare_gi_freeze(Manifest(), _core_plan(selected, shared, observed.mask), incidence_motor=gi["resolved_motor"])
     _reject(diagnostic.status == "unverifiable", "GI metadata extrema are unverifiable"); missing = _gi_1d_freeze_key(plan) is not None or bool(_gi_2d_freeze_keys(plan))
@@ -297,7 +314,7 @@ class ReintegrateResult:
     disposition: str; input_labels: tuple[int, ...]; committed_labels: tuple[int, ...]; publication_dropped_labels: tuple[int, ...]; diagnostics: tuple[str, ...]; science_identity: str; operation_identity: str; audit_identity: str | None; commit_identity: Any | None
     def __new__(cls, *args, **kwargs): raise TypeError("ReintegrateResult is factory-constructed")
 class _ReintegrateFrameSource:
-    def __init__(self, plan, token=None, raw_options=None): self.plan, self.token, self.raw_options, self.bound_allocation, self._jit, self._fact_reader, self._frames = plan, token, raw_options, None, {}, None, {}; self._metadata_keys, self._include_geometry = _fact_projection(plan.requested_shared_science)
+    def __init__(self, plan, token=None, raw_options=None): self.plan, self.token, self.raw_options, self.bound_allocation, self._jit, self._fact_reader, self._frames = plan, token, raw_options, None, {}, None, {}; self._metadata_keys, self._include_geometry = _fact_projection(getattr(plan, "selected_plan", None), plan.requested_shared_science)
     @property
     def frame_indices(self): return list(self.plan.labels)
     @property

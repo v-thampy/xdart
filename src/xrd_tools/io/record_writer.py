@@ -343,11 +343,26 @@ def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "ent
             row = rows.get(name, {}).get(label); (None if row is not None and int(table["frame_index"][row]) == label else (_ for _ in ()).throw(WriterStateError(f"replacement {name} cursor changed")))
         values = {}
         for column in columns:
-            node = _replacement_hard_group(table, column, h5py.Dataset)
+            shown = str(column)
+            if shown in table:
+                selected = shown
+            else:
+                matches = tuple(
+                    name for name in table
+                    if name != "frame_index" and str(name).casefold() == shown.casefold()
+                )
+                if len(matches) > 1:
+                    raise WriterStateError(
+                        f"replacement {name}/{shown} is ambiguous"
+                    )
+                selected = None if not matches else matches[0]
+            node = None if selected is None else _replacement_hard_group(
+                table, selected, h5py.Dataset,
+            )
             if not isinstance(node, h5py.Dataset): raise WriterStateError(f"replacement {name}/{column} is absent")
             try: value = node[row]
             except (IndexError, TypeError, ValueError) as error: raise WriterStateError(f"replacement {name} row is malformed") from error
-            if np.asarray(value).shape == (): values[str(column)] = _replacement_scalar(value, f"replacement {column}")
+            if np.asarray(value).shape == (): values[str(selected)] = _replacement_scalar(value, f"replacement {column}")
         return MappingProxyType(values)
     if context is None:
         config = _replacement_hard_group(handle, f"{entry}/reduction/config"); node = _replacement_hard_group(config, "source_execution", h5py.Dataset)

@@ -605,8 +605,8 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
         detector_values = dict(calibration.poni.to_dict())
         detector_values['detector_name'] = detector_values.pop('detector', '')
         config = calibration.detector_config
-        detector_values['x_pixel_size'] = config.get('pixel1')
-        detector_values['y_pixel_size'] = config.get('pixel2')
+        detector_values['x_pixel_size'] = config.get('pixel2')
+        detector_values['y_pixel_size'] = config.get('pixel1')
     frame = ScanFrame(1, image=science['average'], metadata=dict(science['metadata']), source_path=None, source_frame_index=0, background=None, mask=science['zero'])
     provenance = {**_science_payload(plan), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators']}
     scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.recipe.target, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})

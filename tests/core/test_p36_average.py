@@ -162,6 +162,26 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
     assert recipe.batch_mode is False and result.finite_counts == finite.evidence
 
 
+def test_average_persists_anisotropic_detector_axes_without_transposition(
+    tmp_path, monkeypatch,
+) -> None:
+    calibration = CalibrationState(
+        PoniValues(0.2, 0.01, 0.02, 0.0, 0.0, 0.0, 1.0e-10),
+        "Detector",
+        {"pixel1": 1.0e-4, "pixel2": 2.0e-4,
+         "max_shape": [2, 2], "orientation": 3},
+        status=FactStatus.PRESENT,
+    )
+    _recipe_value, result, _observed = _public_run(
+        tmp_path, monkeypatch, calibration=calibration,
+    )
+    assert result.disposition == "COMMITTED"
+    with h5py.File(result.target, "r") as handle:
+        detector = handle["entry/instrument/detector"]
+        assert float(detector["x_pixel_size"][()]) == pytest.approx(2.0e-4)
+        assert float(detector["y_pixel_size"][()]) == pytest.approx(1.0e-4)
+
+
 def test_all_nonfinite_and_invariant_mismatch_refuse_without_output(tmp_path, monkeypatch) -> None:
     dead = tmp_path / "dead"; dead.mkdir()
     source = _series(dead, (np.full((2, 2), np.nan),))

@@ -14,9 +14,9 @@ def _r2(value, nq=4, nchi=3):
     from xrd_tools.core.containers import IntegrationResult2D
     data = np.arange(nq * nchi, dtype=float).reshape(nq, nchi) + value
     return IntegrationResult2D(np.linspace(.1, 1., nq), np.linspace(-1., 1., nchi), data, data / 10, "q_A^-1", "chi_deg")
-def _plans(gi=None):
+def _plans(gi=None, monitor=None):
     from xrd_tools.reduction import Integration1DPlan, Integration2DPlan, ReductionPlan
-    one = Integration1DPlan(npt=4, method="numpy"); two = Integration2DPlan(npt_rad=4, npt_azim=3, method="numpy")
+    one = Integration1DPlan(npt=4, method="numpy", monitor_key=monitor); two = Integration2DPlan(npt_rad=4, npt_azim=3, method="numpy", monitor_key=monitor)
     return one, two, ReductionPlan(one, two, gi=gi)
 def _preparation(*, background=None, gi=None, resource_policy=None):
     from xrd_tools.reduction.provenance_config import _integration_1d_args
@@ -57,7 +57,7 @@ def _preparation(*, background=None, gi=None, resource_policy=None):
         },
         "resource_policy": resource_policy,
     }
-def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, name="fixture", background=False, disabled_motor=None, persisted_poni=True, legacy_bai=False, detector_descriptor=True, source_options=True):
+def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, monitor=None, monitor_metadata=None, name="fixture", background=False, disabled_motor=None, persisted_poni=True, legacy_bai=False, detector_descriptor=True, source_options=True):
     from xdart.gui.tabs.scattering.contracts import SourceExecutionStamp, SourceFileState
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.geometry.diffractometer import DetectorCalibration
@@ -76,7 +76,7 @@ def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, name="f
         entry.create_group("instrument/detector").create_dataset(
             "data", data=raw, chunks=(min(2, count), *shape),
         )
-    one, two, core_plan = _plans(gi)
+    one, two, core_plan = _plans(gi, monitor)
     if legacy_bai:
         integration_extra = {
             "dummy": -1.0, "delta_dummy": 0.0,
@@ -149,7 +149,8 @@ def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, name="f
             tuple(labels),
         )
     values = [float(label) / 10 for label in labels]
-    frames = [Frame(label, image=raw[label].copy(), metadata={"theta": value}, source_path=source, source_frame_index=label) for label, value in zip(labels, values)]
+    monitor_source = monitor_metadata or monitor
+    frames = [Frame(label, image=raw[label].copy(), metadata={"theta": value, **({monitor_source: float(label + 1)} if monitor_source else {})}, source_path=source, source_frame_index=label) for label, value in zip(labels, values)]
     if background:
         from xrd_tools.reduction import resolve_frame_background
         for frame in frames: resolved = resolve_frame_background(background_plan, (frame.index, str(source.resolve()), snapshot["dataset_path"], frame.index, shape, ())); frame.background_dependency_bytes, frame.background_dependency_fingerprint = resolved.descriptor_bytes, resolved.fingerprint
@@ -307,7 +308,53 @@ def test_exact_gapped_inventory_replaces_only_selected_dimension(tmp_path, monke
     assert exact.operation_identity != canonical.operation_identity
     assert _module().run_reintegrate(exact).committed_labels == nested.labels
     with h5py.File(nested.target, "r") as handle: assert "entry" not in handle and tuple(handle["outer/entry/integrated_1d/frame_index"][()]) == nested.labels
-def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp_path):
+
+
+def test_reintegrate_detaches_selected_monitor_metadata(tmp_path, monkeypatch):
+    import xrd_tools.reduction.core as core
+
+    from xrd_tools.io.record_writer import WriterStateError, _decode_replacement_fact
+
+    seeded = _seed_existing(
+        tmp_path, name="monitor", monitor="monitor",
+        monitor_metadata="MonItor",
+    )
+    observed = []
+
+    def integrate(image, _integrator, *, normalization_factor=None, **_kwargs):
+        label = int(np.asarray(image).flat[0] // 35)
+        observed.append((label, normalization_factor))
+        return _r1(label + 100)
+
+    monkeypatch.setattr(core, "integrate_1d", integrate)
+    module = _module()
+    with h5py.File(seeded.target, "r") as handle:
+        fact = _decode_replacement_fact(
+            handle, seeded.labels[0], metadata_keys=("monitor",),
+        )
+    assert fact["metadata"] == {"MonItor": pytest.approx(float(seeded.labels[0] + 1))}
+    with h5py.File(seeded.target, "r+") as handle:
+        scan_data = handle["entry/scan_data"]
+        scan_data.create_dataset("MONITOR", data=scan_data["MonItor"][()])
+    with h5py.File(seeded.target, "r") as handle, pytest.raises(
+        WriterStateError, match="ambiguous",
+    ):
+        _decode_replacement_fact(
+            handle, seeded.labels[0], metadata_keys=("monitor",),
+        )
+    with h5py.File(seeded.target, "r+") as handle:
+        del handle["entry/scan_data/MONITOR"]
+    plan = module.ReintegratePlan.from_artifact(
+        seeded.target, entry="entry", dimension="1d",
+        preparation=seeded.preparation,
+    )
+    assert plan.selected_plan["bai_args"]["monitor"] == "monitor"
+    result = module.run_reintegrate(plan)
+    assert result.disposition == "COMMITTED"
+    assert observed == [(label, float(label + 1)) for label in seeded.labels]
+
+
+def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp_path, monkeypatch):
     from xrd_tools.core.provenance import read_provenance_from_handle
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.reduction.provenance_config import (
@@ -358,43 +405,60 @@ def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp
             expected_target_snapshot=capture_target_snapshot(
                 explicit_null.target),
             expected_labels=explicit_null.labels)
-    mixed = _seed_existing(
-        tmp_path, name="production-mixed-decoder", labels=(0, 1),
-        source_options=False,
-    )
     import tifffile
     from xdart.gui.tabs.scattering.contracts import (
         SourceExecutionStamp, SourceFileState,
     )
-    first_image = mixed.target.parent / "first.tif"
-    later_raw = mixed.target.parent / "later.raw"
-    tifffile.imwrite(first_image, mixed.raw[0])
-    later_raw.write_bytes(mixed.raw[1].tobytes())
-    first_state = SourceFileState.capture(first_image)
-    raw_state = SourceFileState.capture(later_raw)
-    execution = SourceExecutionStamp(
-        first_state, "tiff_series", 2, 0,
-        members=(first_state, raw_state),
-    )
-    with h5py.File(mixed.target, "r+") as handle:
-        config = handle["entry/reduction/config"]
-        config["source_execution"][()] = json.dumps(
-            execution.as_dict(), sort_keys=True, separators=(",", ":")
+
+    def mixed_fixture(name, *, raw_first, decoder):
+        mixed = _seed_existing(
+            tmp_path, name=name, labels=(0, 1), source_options=False,
         )
-        for label, path, state in (
-            (0, first_image, first_state),
-            (1, later_raw, raw_state),
-        ):
-            source_group = handle[f"entry/frames/frame_{label:04d}/source"]
-            source_group["path"][()] = str(path)
-            source_group["frame_index"][()] = 0
-            source_group.attrs["adapter_id"] = "tiff_series"
-            source_group.attrs["file_size"] = state.size
-            source_group.attrs["file_mtime_ns"] = state.mtime_ns
-            source_group.attrs["frame_count"] = 1
-            source_group.attrs["self_contained"] = True
-            if "dataset_path" in source_group.attrs:
-                del source_group.attrs["dataset_path"]
+        paths = (
+            mixed.target.parent / ("first.raw" if raw_first else "first.tif"),
+            mixed.target.parent / ("later.tif" if raw_first else "later.raw"),
+        )
+        for path, pixels in zip(paths, mixed.raw, strict=True):
+            if path.suffix == ".raw":
+                path.write_bytes(pixels.tobytes())
+            else:
+                tifffile.imwrite(path, pixels)
+        states = tuple(SourceFileState.capture(path) for path in paths)
+        execution = SourceExecutionStamp(
+            states[0], "tiff_series", 2, 0, members=states,
+        )
+        with h5py.File(mixed.target, "r+") as handle:
+            config = handle["entry/reduction/config"]
+            config["source_execution"][()] = json.dumps(
+                execution.as_dict(), sort_keys=True, separators=(",", ":")
+            )
+            if decoder:
+                run = json.loads(config["run_configuration"].asstr()[()])
+                options = {
+                    "selected_file": str(paths[0]), "files": list(map(str, paths)),
+                    "pattern": "*", "scan_name": name, "metadata_format": None,
+                    "raw_dtype": mixed.raw.dtype.str, "raw_header_skip": 0,
+                    "detector_shape": list(mixed.raw.shape[1:]),
+                }
+                run["source"]["options"] = options
+                run["scientific_signature"]["source"]["options"] = copy.deepcopy(options)
+                config["run_configuration"][()] = json.dumps(
+                    run, sort_keys=True, separators=(",", ":")
+                )
+            for label, path, state in zip(mixed.labels, paths, states, strict=True):
+                source_group = handle[f"entry/frames/frame_{label:04d}/source"]
+                source_group["path"][()] = str(path)
+                source_group["frame_index"][()] = 0
+                source_group.attrs["adapter_id"] = "tiff_series"
+                source_group.attrs["file_size"] = state.size
+                source_group.attrs["file_mtime_ns"] = state.mtime_ns
+                source_group.attrs["frame_count"] = 1
+                source_group.attrs["self_contained"] = True
+                if "dataset_path" in source_group.attrs:
+                    del source_group.attrs["dataset_path"]
+        return mixed
+
+    mixed = mixed_fixture("production-mixed-missing", raw_first=False, decoder=False)
     with pytest.raises(ValueError, match="REPLACEMENT_RAW_DECODER_UNRECORDED"):
         module.ReintegratePlan.from_artifact(
             mixed.target, entry="entry", dimension="1d",
@@ -402,6 +466,19 @@ def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp
             expected_target_snapshot=capture_target_snapshot(mixed.target),
             expected_labels=mixed.labels,
         )
+    _stub_integrators(monkeypatch)
+    for raw_first in (False, True):
+        mixed = mixed_fixture(
+            f"production-mixed-valid-{raw_first}",
+            raw_first=raw_first, decoder=True,
+        )
+        plan = module.ReintegratePlan.from_artifact(
+            mixed.target, entry="entry", dimension="1d",
+            preparation=mixed.preparation,
+            expected_target_snapshot=capture_target_snapshot(mixed.target),
+            expected_labels=mixed.labels,
+        )
+        assert module.run_reintegrate(plan).committed_labels == mixed.labels
 def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
     import fabio, tifffile
     from xdart.gui.tabs.scattering.contracts import (
