@@ -57,7 +57,7 @@ def _preparation(*, background=None, gi=None, resource_policy=None):
         },
         "resource_policy": resource_policy,
     }
-def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, name="fixture", background=False, disabled_motor=None):
+def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, name="fixture", background=False, disabled_motor=None, persisted_poni=True, legacy_bai=False, detector_descriptor=True, source_options=True):
     from xdart.gui.tabs.scattering.contracts import SourceExecutionStamp, SourceFileState
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.geometry.diffractometer import DetectorCalibration
@@ -77,6 +77,18 @@ def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, name="f
             "data", data=raw, chunks=(min(2, count), *shape),
         )
     one, two, core_plan = _plans(gi)
+    if legacy_bai:
+        integration_extra = {
+            "dummy": -1.0, "delta_dummy": 0.0,
+            "correctSolidAngle": True, "safe": True,
+        }
+        one = replace(one, extra=integration_extra)
+        two = replace(
+            two, azimuth_offset=90.0, extra=integration_extra,
+        )
+        core_plan = replace(
+            core_plan, integration_1d=one, integration_2d=two,
+        )
     poni = PONI(.2, .0002, .0003, 0., 0., 0., 1e-10, "Pilatus300kw")
     detector_config = {"max_shape": [5, 7], "orientation": 3}; calibration = DetectorCalibration(poni, detector_config); integrator = detector_calibration_to_integrator(calibration); detector_values = {key: getattr(poni, key) for key in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3")}; detector_values.update(detector_name=poni.detector, x_pixel_size=integrator.detector.pixel2, y_pixel_size=integrator.detector.pixel1)
     poni_file, mask_file = root / "accepted.poni", root / "accepted.mask"
@@ -84,19 +96,43 @@ def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, name="f
     background_plan = FrameBackgroundPlan()
     if background: import fabio; background_path = root / "background.tif"; fabio.tifimage.TifImage(data=np.ones(shape, np.uint16)).write(str(background_path)); background_plan = FrameBackgroundPlan(mode="Single BG File", locator=str(background_path))
     gi_intent = GIIntent(incidence_motor=disabled_motor or "Manual") if gi is None else GIIntent(enabled=True, incidence_motor=gi.incidence_motor or "Manual", th_val=0. if gi.incident_angle is None else gi.incident_angle, sample_orientation=gi.sample_orientation, tilt_angle=gi.tilt_angle, mode_1d=gi.mode_1d.value, mode_2d=gi.mode_2d.value)
+    bai_1d = _integration_1d_args(one, gi)
+    bai_2d = _integration_2d_args(two, gi)
+    if legacy_bai:
+        bai_1d = {
+            "numpoints": one.npt, "unit": one.unit, "method": one.method,
+            "radial_range": None, "azimuth_range": None,
+            "gi_mode_1d": "q_total", "npt_oop": 1000,
+            "dummy": -1.0, "delta_dummy": 0.0,
+            "polarization_factor": None, "correctSolidAngle": True,
+            "safe": True, "chi_offset": 90.0,
+        }
+        bai_2d = {
+            "npt_rad": two.npt_rad, "npt_azim": two.npt_azim,
+            "unit": two.unit, "method": two.method,
+            "radial_range": None, "azimuth_range": None,
+            "gi_mode_2d": "q_chi", "dummy": -1.0,
+            "delta_dummy": 0.0, "polarization_factor": None,
+            "correctSolidAngle": True, "safe": True, "chi_offset": 90.0,
+        }
     intent = RunIntent(
         source_spec=SourceSpec(source, SourceKind.NEXUS_STACK, entry="entry"),
         processing_mode="Int 1D + 2D", output_mode="Overwrite",
-        bai_1d_args=_integration_1d_args(one, gi),
-        bai_2d_args=_integration_2d_args(two, gi), gi=gi_intent,
+        bai_1d_args=bai_1d,
+        bai_2d_args=bai_2d, gi=gi_intent,
         threshold=ThresholdIntent(mask_saturation=False),
         background=background_plan,
-        poni_file=str(poni_file), poni_values=poni.to_dict(),
+        poni_file=str(poni_file),
+        poni_values=poni.to_dict() if persisted_poni else None,
         mask_file=str(mask_file), project_root=str(root), save_path=str(target),
     )
     frozen = intent.freeze(gi_motor_choices=(None if gi is None else [gi_intent.incidence_motor]))
     assets = {"poni_values": poni.to_dict(), "poni_detector_config_json": json.dumps(detector_config, sort_keys=True, separators=(",", ":")), "poni_sha256": hashlib.sha256(poni_file.read_bytes()).hexdigest(), "mask_sha256": hashlib.sha256(mask_file.read_bytes()).hexdigest()}
     provenance = frozen.as_provenance()
+    if source_options is False:
+        provenance["source"].pop("options")
+    elif source_options is None:
+        provenance["source"]["options"] = None
     signed = copy.deepcopy(provenance); signed["accepted_scientific_assets"] = assets
     provenance["scientific_signature"] = signed
     state = SourceFileState.capture(source)
@@ -137,6 +173,9 @@ def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, name="f
         products[frame.index] = product; sink.write(frame, product)
     terminal = sink.finish(ReductionResult("seed", products, len(products)))
     assert type(terminal.commit_identity) is StreamTerminal
+    if not detector_descriptor:
+        with h5py.File(target, "r+") as handle:
+            del handle["entry/instrument/detector/detector_shape"]
     selected_args = _integration_1d_args(one, gi); selected_args.pop("gi_mode_1d", None)
     selected = {"version": 1, "dimension": "1d", "bai_args": selected_args,
                 "gi_mode": None if gi is None else gi.mode_1d.value}
@@ -268,6 +307,101 @@ def test_exact_gapped_inventory_replaces_only_selected_dimension(tmp_path, monke
     assert exact.operation_identity != canonical.operation_identity
     assert _module().run_reintegrate(exact).committed_labels == nested.labels
     with h5py.File(nested.target, "r") as handle: assert "entry" not in handle and tuple(handle["outer/entry/integrated_1d/frame_index"][()]) == nested.labels
+def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp_path):
+    from xrd_tools.core.provenance import read_provenance_from_handle
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+    from xrd_tools.reduction.provenance_config import (
+        _integration_1d_args, _integration_2d_args,
+    )
+    module = _module(); seeded = _seed_existing(
+        tmp_path, name="production-gui", persisted_poni=False,
+        legacy_bai=True, detector_descriptor=False, source_options=False)
+    request = copy.deepcopy(seeded.preparation); request["requested_shared_science"] = {"version": 1, "kind": "persisted_target"}; request["selected_plan"] = {"version": 1, "dimension": "1d", "gi_mode": "q_total", "bai_args": {"numpoints": 4, "unit": "q_A^-1", "method": "numpy", "radial_range": None, "azimuth_range": None, "chi_offset": 90.0, "npt_oop": 1000}}
+    plan = module.ReintegratePlan.from_artifact(
+        seeded.target, entry="entry", dimension="1d", preparation=request,
+        expected_target_snapshot=capture_target_snapshot(seeded.target),
+        expected_labels=seeded.labels)
+    assert plan.detector_shape == seeded.raw.shape[1:]
+    expected_one = {
+        "version": 1, "dimension": "1d", "gi_mode": None,
+        "bai_args": _integration_1d_args(_plans()[0], None),
+    }
+    assert module._plain(plan.selected_plan) == expected_one
+    assert plan.requested_shared_science["poni_values"] == plan.requested_shared_science["accepted_scientific_assets"]["poni_values"]
+    one_result = module.run_reintegrate(plan)
+    assert one_result.committed_labels == seeded.labels
+    two_args = _integration_2d_args(_plans()[1], None)
+    two_args.pop("gi_mode_2d", None)
+    two_request = copy.deepcopy(request)
+    two_request["selected_plan"] = {
+        "version": 1, "dimension": "2d", "bai_args": two_args,
+        "gi_mode": "q_chi",
+    }
+    two_plan = module.ReintegratePlan.from_artifact(
+        seeded.target, entry="entry", dimension="2d",
+        preparation=two_request,
+        expected_target_snapshot=capture_target_snapshot(seeded.target),
+        expected_labels=seeded.labels)
+    two_result = module.run_reintegrate(two_plan)
+    assert two_result.committed_labels == seeded.labels
+    with h5py.File(seeded.target, "r") as handle: run = read_provenance_from_handle(handle)["config"]["run_configuration"]
+    assert run["poni_values"] is None and "options" not in run["source"]
+    conflicting = copy.deepcopy(run); conflicting["poni_values"] = {"conflict": True}; conflicting["scientific_signature"]["poni_values"] = {"conflict": True}
+    with pytest.raises(ValueError, match="accepted scientific assets"): module._validated_shared_science(conflicting)
+    explicit_null = _seed_existing(
+        tmp_path, name="production-null-options", persisted_poni=False,
+        legacy_bai=True, detector_descriptor=False, source_options=None)
+    with pytest.raises(ValueError, match="REPLACEMENT_RAW_DECODER_UNRECORDED"):
+        module.ReintegratePlan.from_artifact(
+            explicit_null.target, entry="entry", dimension="1d",
+            preparation=request,
+            expected_target_snapshot=capture_target_snapshot(
+                explicit_null.target),
+            expected_labels=explicit_null.labels)
+    mixed = _seed_existing(
+        tmp_path, name="production-mixed-decoder", labels=(0, 1),
+        source_options=False,
+    )
+    import tifffile
+    from xdart.gui.tabs.scattering.contracts import (
+        SourceExecutionStamp, SourceFileState,
+    )
+    first_image = mixed.target.parent / "first.tif"
+    later_raw = mixed.target.parent / "later.raw"
+    tifffile.imwrite(first_image, mixed.raw[0])
+    later_raw.write_bytes(mixed.raw[1].tobytes())
+    first_state = SourceFileState.capture(first_image)
+    raw_state = SourceFileState.capture(later_raw)
+    execution = SourceExecutionStamp(
+        first_state, "tiff_series", 2, 0,
+        members=(first_state, raw_state),
+    )
+    with h5py.File(mixed.target, "r+") as handle:
+        config = handle["entry/reduction/config"]
+        config["source_execution"][()] = json.dumps(
+            execution.as_dict(), sort_keys=True, separators=(",", ":")
+        )
+        for label, path, state in (
+            (0, first_image, first_state),
+            (1, later_raw, raw_state),
+        ):
+            source_group = handle[f"entry/frames/frame_{label:04d}/source"]
+            source_group["path"][()] = str(path)
+            source_group["frame_index"][()] = 0
+            source_group.attrs["adapter_id"] = "tiff_series"
+            source_group.attrs["file_size"] = state.size
+            source_group.attrs["file_mtime_ns"] = state.mtime_ns
+            source_group.attrs["frame_count"] = 1
+            source_group.attrs["self_contained"] = True
+            if "dataset_path" in source_group.attrs:
+                del source_group.attrs["dataset_path"]
+    with pytest.raises(ValueError, match="REPLACEMENT_RAW_DECODER_UNRECORDED"):
+        module.ReintegratePlan.from_artifact(
+            mixed.target, entry="entry", dimension="1d",
+            preparation=mixed.preparation,
+            expected_target_snapshot=capture_target_snapshot(mixed.target),
+            expected_labels=mixed.labels,
+        )
 def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
     import fabio, tifffile
     from xdart.gui.tabs.scattering.contracts import (
@@ -359,6 +493,9 @@ def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
             historical = fact(master, eiger_stamp, label=0, index=0, dataset="/entry/data/data_000001", contained=False); historical["snapshot"]["frame_count"] = members[0].stop; historical["source_execution"]["frame_count"] = members[0].stop; historical["source_execution"]["external_members"] = historical["source_execution"]["external_members"][:1]; historical["source_execution"]["dependency_files"] = []
             historical["append_lineage"] = {"epochs": [{"source": append_source(members[:1]), "labels": [0]}, {"source": append_source(members), "labels": [selected_index]}]}
             assert_pixels(historical, np.zeros(shape, np.uint16))
+            legacy = copy.deepcopy(historical); legacy["append_lineage"]["epochs"][-1]["source"]["dataset_paths"] = []; assert_pixels(legacy, np.zeros(shape, np.uint16))
+            mismatch = copy.deepcopy(historical); mismatch["append_lineage"]["epochs"][-1]["source"]["dataset_paths"] = ["/entry/data/not_the_authenticated_links"]
+            with pytest.raises(ValueError, match="REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED"): module._source_fact(mismatch, read=True)
         if segments == 2: Path(members[0].file.path).unlink()
         got = module._source_fact(eiger_fact, read=True)
         assert got[:2] == (shape, "<u2") and int(got[3][0, 0]) == segments - 1

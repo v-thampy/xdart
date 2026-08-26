@@ -586,14 +586,14 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
     assert controller.viewer_1d_context is None
 
 
-def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch) -> None:
+def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, tmp_path) -> None:
     calls = []
     paths = ("/opaque/first.xye", "/other/first.xye")
     context = SimpleNamespace(paths=paths, state=SimpleNamespace(value="ready"))
     controller = SimpleNamespace(viewer_1d_context=None, viewer_1d_owned=False,
         viewer_2d_owned=False, run_identity=None,
         open_viewer_1d=lambda selected: calls.append(("open", selected)) or object())
-    intent = SimpleNamespace(processing_mode="1D Viewer", live_mode=False)
+    intent = SimpleNamespace(processing_mode="1D Viewer", live_mode=False, run_options={})
     forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("foreign seam"))
     page = SimpleNamespace(_context_controller=controller,
         _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
@@ -605,6 +605,8 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch) -
         _error_notice=forbidden, _begin_run=forbidden, _commit_focused_control_edit_for_run=forbidden)
     page._choose_viewer_1d_files = partial(
         _api(ScatteringWorkspace, "_choose_viewer_1d_files"), page)
+    page._open_viewer_1d_paths = partial(
+        _api(ScatteringWorkspace, "_open_viewer_1d_paths"), page)
     ScatteringWorkspace._run_action(page)
     assert calls == ["start", ("choose", "/viewer"), ("open", paths), ("notice", ""), "timer"]
     controller.viewer_1d_context = context
@@ -619,23 +621,42 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch) -
     ScatteringWorkspace._edit_run_strip(page, ShellCommandKind.SET_PROCESSING_MODE, "Int 2D")
     assert intent.processing_mode == "1D Viewer" and calls[-1] == ("notice", "1D Viewer cleanup remains pending")
     ordered, outcomes = [], [False, True]
+    directory = tmp_path / "viewer-folder"; directory.mkdir()
     dispatch = SimpleNamespace(_closing=False, _closed=False,
-        _context_controller=SimpleNamespace(viewer_1d_owned=True, viewer_2d_owned=False),
+        _context_controller=SimpleNamespace(viewer_1d_owned=True, viewer_2d_owned=False, selection=None),
+        _operation_slot=SimpleNamespace(owned=False, current_identity=None, observe_stamp=lambda _stamp: None),
+        _calibration_identity=None, _mask_identity=None,
+        _reintegrate_identity=None, _reintegrate_dimension=None,
         _clear_viewer_1d_renderer=lambda *, close: ordered.append(("clear", close)) or outcomes.pop(0),
         _clear_viewer_2d_renderer=forbidden,
+        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(revision=1, thaw=lambda: intent)),
+        _open_viewer_1d_paths=lambda value: ordered.append(("open-1d", value)),
+        _open_viewer_2d_path=lambda value: ordered.append(("open-2d", value)),
         _select_scan=lambda value: ordered.append(("select", value)))
     ScatteringWorkspace._handle_shell_command(
-        dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "scan"))
-    assert ordered == [("clear", True)]
+        dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, str(directory)))
+    assert ordered == [("select", str(directory))]
     ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "scan"))
-    assert ordered == [("clear", True), ("clear", True), ("select", "scan")]
+    assert ordered[-1] == ("open-1d", ("scan",))
+    intent.processing_mode = "2D Viewer"
+    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "image.tif"))
+    assert ordered[-1] == ("open-2d", "image.tif")
+    intent.processing_mode = "Int 2D"
+    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "scan.nxs"))
+    assert ordered[-1] == ("clear", True)
+    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(ShellCommandKind.SELECT_SCAN, "scan.nxs"))
+    assert ordered[-2:] == [("clear", True), ("select", "scan.nxs")]
     identity = RunIdentity(7, "owned")
     dispatch._context_controller.__dict__.update(run_identity=identity, poll_viewer_1d=lambda: False,
         poll_viewer_2d=lambda: False, poll_browse_preview=lambda: False, browse_pending=False, adopt_acquisition=forbidden)
     dispatch.__dict__.update(_poll_admission=lambda: False, _run_executor=SimpleNamespace(drain_events=lambda: (
         StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)), _lifecycle=SimpleNamespace(
         active_run_identity=identity, attempt_run_identity=None), _refresh_shell=forbidden,
-        _polling_needed=lambda: True, _run_timer=SimpleNamespace(stop=forbidden))
+        _polling_needed=lambda: True, _run_timer=SimpleNamespace(stop=forbidden),
+        _scientific_repaint_pending=False,
+        _retain_outgoing_display=False, _waterfall_candidate_count=0,
+        _shell=SimpleNamespace(scientific=SimpleNamespace(
+            trace_row_count=0, bottom_waterfall_active=False)))
     dispatch._clear_presentation_targets = lambda: None; ScatteringWorkspace._drain_executor(dispatch)
     preferences = ScientificPreferences(plot_mode="Overlay")
     owner = SimpleNamespace(
@@ -646,6 +667,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch) -
         ),
         _shell=SimpleNamespace(browser=SimpleNamespace(
             cancel_pending_frame_selection=lambda: calls.append("cancel"))),
+        _background_owner=SimpleNamespace(projection=lambda: None),
     )
     for command in (ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Average"),
                     ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Sum"),

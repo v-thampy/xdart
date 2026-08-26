@@ -34,6 +34,8 @@ from xrd_tools.session.run_configuration import (
 )
 from xrd_tools.reduction import ReintegrateResult
 from xrd_tools.reduction.provenance_config import jsonable_run_value
+from xrd_tools.io.viewer_1d import SUPPORTED_VIEWER_1D_SUFFIXES
+from xrd_tools.io.viewer_2d import SUPPORTED_VIEWER_SUFFIXES
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
@@ -129,6 +131,7 @@ from .scientific_axes import (
     slice_recipe_axes_compatible,
     slice_region_orientation,
 )
+from .scientific_plot_options import waterfall_should_be_active
 from .shell_values import (
     ArtifactProgress,
     DirectoryFileProgress,
@@ -319,7 +322,17 @@ class _ObservationOperation:
 class _BrowserCatalogOperation:
     token: int
     directory: str
+    accepted_suffixes: frozenset[str] | None
     future: Future[object]
+
+
+def _browser_suffixes_for_mode(mode: str) -> frozenset[str] | None:
+    tool = tool_from_mode_text(mode)
+    if tool is Tool.XYE_VIEWER:
+        return SUPPORTED_VIEWER_1D_SUFFIXES
+    if tool is Tool.IMAGE_VIEWER:
+        return SUPPORTED_VIEWER_SUFFIXES
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,6 +446,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._live_plot_interval_ms = _live_plot_interval_ms()
         self._last_live_plot_at: float | None = None
         self._scientific_repaint_pending = False
+        self._waterfall_candidate_count = 0
         self._quartile_refresh_identity: RunIdentity | None = None
         self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
         self._browser_directory_chooser = (
@@ -766,9 +780,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         dialog.show(); dialog.raise_(); dialog.activateWindow()
         if target in {"peak", "phase"}: self._refresh_fit_trace(target)
         elif target == "metadata":
-            if created and self._metadata_result is not None:
-                dialog.adopt_result(self._metadata_result)
-            elif self._metadata_result is None: self._metadata_from_current()
+            from .analysis_mount import analysis_result_matches
+            current_request = self._current_analysis_request(
+                "metadata", "metadata"
+            )
+            retained = self._metadata_result
+            if (
+                retained is not None
+                and analysis_result_matches(retained, current_request)
+            ):
+                dialog.adopt_result(retained)
+            else:
+                self._metadata_result = None
+                dialog.clear_result()
+                self._metadata_from_current()
         elif target == "scan_roi":
             if created and self._metadata_result is not None:
                 dialog.set_vnext_metadata(self._metadata_result)
@@ -1685,13 +1710,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if kind is ShellCommandKind.SELECT_SCAN:
             ScatteringWorkspace._clear_presentation_targets(self)
+            value = command.value
+            if type(value) is str and value and os.path.isdir(value):
+                self._select_scan(value)
+                return
+            mode = self._intents.snapshot().thaw().processing_mode
+            tool = tool_from_mode_text(mode)
+            if tool is Tool.XYE_VIEWER and type(value) is str and value:
+                self._open_viewer_1d_paths((value,))
+                return
+            if tool is Tool.IMAGE_VIEWER and type(value) is str and value:
+                self._open_viewer_2d_path(value)
+                return
             if (getattr(self._context_controller, "viewer_1d_owned", False)
                     and not self._clear_viewer_1d_renderer(close=True)):
                 return
             if self._context_controller.viewer_2d_owned:
                 if not self._clear_viewer_2d_renderer(close=True):
                     return
-            self._select_scan(command.value)
+            self._select_scan(value)
             return
         if kind in {
             ShellCommandKind.SELECT_FRAME,
@@ -2229,6 +2266,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._run_frame_seen = False
             self._last_live_plot_at = None
             self._scientific_repaint_pending = False
+            self._waterfall_candidate_count = 0
             self._quartile_refresh_identity = (
                 outcome.run_identity
                 if os.environ.get(
@@ -2557,7 +2595,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         executor = self._run_executor
         events: tuple[StandardRunEvent, ...] = ()
+        waterfall_was_active = False
         if executor is not None:
+            scientific_view = self._shell.scientific
+            rendered_trace_count = scientific_view.trace_row_count
+            if self._retain_outgoing_display:
+                pass
+            elif self._scientific_repaint_pending:
+                self._waterfall_candidate_count = max(
+                    self._waterfall_candidate_count,
+                    rendered_trace_count,
+                )
+            else:
+                self._waterfall_candidate_count = rendered_trace_count
+            waterfall_was_active = scientific_view.bottom_waterfall_active
             try:
                 candidate = executor.drain_events()
             except Exception as error:
@@ -2619,6 +2670,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     plot_mode=self._preferences.plot_mode,
                     follow_latest=False if paced else self._auto_last,
                 ):
+                    prior_waterfall_candidate_count = (
+                        self._waterfall_candidate_count
+                    )
+                    self._waterfall_candidate_count += 1
+                    waterfall_boundary_crossed = (
+                        not waterfall_was_active
+                        and not waterfall_should_be_active(
+                            self._preferences.plot_mode,
+                            prior_waterfall_candidate_count,
+                            was_active=False,
+                        )
+                        and waterfall_should_be_active(
+                            self._preferences.plot_mode,
+                            self._waterfall_candidate_count,
+                            was_active=False,
+                        )
+                    )
                     frame = event.navigation_delta.appended
                     first_paced_frame = paced and not self._run_frame_seen
                     self._run_frame_seen = True
@@ -2647,6 +2715,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     else:
                         changed = True
                         frame_presentation_changed = True
+                        force_scientific = (
+                            waterfall_boundary_crossed
+                            or force_scientific
+                        )
                     if not self._active_batch_mode:
                         self._follow_processed_artifact(frame)
                 continue
@@ -3303,6 +3375,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._rendered_image_axis = rendered_axis
             if not preserve_display:
                 self._last_live_plot_at = time.monotonic()
+        if (
+            not preserve_display
+            and not preserve_scientific
+            and not self._shell.browser.frame_selection_pending
+        ):
+            self._waterfall_candidate_count = (
+                self._shell.scientific.trace_row_count
+            )
         self._shell_revision += 1
 
     def _project_controls(
@@ -3473,16 +3553,27 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if not self._clear_viewer_1d_renderer(paths=context.paths):
                 self._notice("1D Viewer cleanup remains pending")
             self._ensure_timer(); return
-        if (self._context_controller.viewer_2d_owned
-                and not self._clear_viewer_2d_renderer(close=True)):
-            self._notice("2D Viewer cleanup remains pending"); return
         try:
             chooser = getattr(self, "_viewer_1d_file_chooser", self._viewer_file_chooser)
             selected = chooser(self._viewer_1d_start_directory())
             selected = tuple(selected) if type(selected) in {tuple, list} else ()
-            if not selected or any(type(path) is not str or not path for path in selected):
-                return
-            request = self._context_controller.open_viewer_1d(selected)
+        except Exception as error:
+            self._error_notice("1D Viewer refused", error); return
+        self._open_viewer_1d_paths(selected)
+
+    def _open_viewer_1d_paths(self, selected: tuple[str, ...]) -> None:
+        if (type(selected) is not tuple or not selected
+                or any(type(path) is not str or not path for path in selected)):
+            return
+        if (self._context_controller.viewer_2d_owned
+                and not self._clear_viewer_2d_renderer(close=True)):
+            self._notice("2D Viewer cleanup remains pending"); return
+        context = self._context_controller.viewer_1d_context
+        if context is not None and context.state.value == "ready":
+            if not self._clear_viewer_1d_renderer(paths=selected):
+                self._notice("1D Viewer cleanup remains pending")
+            self._ensure_timer(); return
+        try: request = self._context_controller.open_viewer_1d(selected)
         except Exception as error:
             self._error_notice("1D Viewer refused", error); return
         if request is not None: self._notice("")
@@ -3515,9 +3606,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return bool(cleared and (not close or self._context_controller.close_viewer_1d()))
 
     def _choose_viewer_2d_file(self, *, reload: bool) -> None:
-        if (getattr(self._context_controller, "viewer_1d_owned", False)
-                and not self._clear_viewer_1d_renderer(close=True)):
-            self._notice("1D Viewer cleanup remains pending"); return
         context = self._context_controller.viewer_2d_context
         if reload:
             selected = None if context is None else context.original_path
@@ -3530,6 +3618,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return
             if selected is None or type(selected) is not str or not selected:
                 return
+        self._open_viewer_2d_path(selected)
+
+    def _open_viewer_2d_path(self, selected: str) -> None:
+        if type(selected) is not str or not selected:
+            return
+        if (getattr(self._context_controller, "viewer_1d_owned", False)
+                and not self._clear_viewer_1d_renderer(close=True)):
+            self._notice("1D Viewer cleanup remains pending"); return
+        context = self._context_controller.viewer_2d_context
         if context is not None and not self._clear_viewer_2d_renderer():
             self._notice("2D Viewer cleanup remains pending")
             return
@@ -4467,17 +4564,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         current_intent = current.thaw()
         prior_source = prior_intent.source_spec
         current_source = current_intent.source_spec
+        catalog_policy_changed = (
+            _browser_suffixes_for_mode(prior_intent.processing_mode)
+            != _browser_suffixes_for_mode(current_intent.processing_mode)
+        )
         if current_source is not None:
             current_mode = source_mode(current_source)
             self._source_mode = current_mode
             self._source_history[current_mode] = current_source
-        if (
+        browser_directory_changed = (
             prior_intent.save_path != current_intent.save_path
             and not self._browser_explicit_directory
-        ):
+        )
+        if browser_directory_changed:
             self._browser_directory = processed_directory(
                 current_intent.save_path
             )
+        if browser_directory_changed or catalog_policy_changed:
             self._browser_catalog = ()
             self._request_browser_catalog()
         self._refresh_shell()
@@ -4703,15 +4806,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         self._browser_catalog_token += 1
         directory = self._browser_directory
+        accepted_suffixes = _browser_suffixes_for_mode(
+            self._intents.snapshot().thaw().processing_mode
+        )
         future = pool.submit(
             enumerate_processed_artifacts,
             directory,
+            accepted_suffixes=accepted_suffixes,
             inspect_directory_contents=self._date_sorted,
             directory_time_cache=self._browser_directory_time_cache,
         )
         operation = _BrowserCatalogOperation(
             self._browser_catalog_token,
             directory,
+            accepted_suffixes,
             future,
         )
         prior, self._browser_catalog_operation = (
@@ -4763,6 +4871,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or future is not operation.future
             or operation.token != self._browser_catalog_token
             or operation.directory != self._browser_directory
+            or operation.accepted_suffixes != _browser_suffixes_for_mode(
+                self._intents.snapshot().thaw().processing_mode
+            )
         ):
             return
         self._browser_catalog_operation = None
@@ -4792,7 +4903,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if catalog == self._browser_catalog and not transient_cleared:
             return
         self._browser_catalog = catalog
-        self._refresh_shell()
+        self._refresh_shell(preserve_scientific=True)
 
     def _cancel_browser_catalog(self) -> None:
         operation, self._browser_catalog_operation = (

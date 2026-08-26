@@ -579,6 +579,32 @@ def test_processed_catalog_includes_parent_and_child_directory_navigation(
     assert catalog[1].artifact == str(root / "nested")
 
 
+def test_browser_catalog_uses_exact_normal_and_viewer_suffix_policies(
+    tmp_path: Path,
+) -> None:
+    from xrd_tools.io.viewer_1d import SUPPORTED_VIEWER_1D_SUFFIXES
+    from xrd_tools.io.viewer_2d import SUPPORTED_VIEWER_SUFFIXES
+
+    root = tmp_path / "mixed"
+    root.mkdir()
+    (root / "nested").mkdir()
+    for name in ("scan.nexus", "curve.xye", "image.tif", "ignored.txt"):
+        (root / name).touch()
+
+    labels = lambda policy: tuple(
+        entry.label for entry in enumerate_processed_artifacts(
+            str(root), accepted_suffixes=policy,
+        )
+    )
+    assert labels(None) == ("..", "nested/", "scan.nexus")
+    assert labels(SUPPORTED_VIEWER_1D_SUFFIXES) == (
+        "..", "curve.xye", "nested/",
+    )
+    assert labels(SUPPORTED_VIEWER_SUFFIXES) == (
+        "..", "image.tif", "nested/", "scan.nexus",
+    )
+
+
 def test_deleted_processed_directory_retains_parent_navigation(
     tmp_path: Path,
 ) -> None:
@@ -1375,6 +1401,7 @@ def test_published_artifact_auto_follows_until_user_opens_folder(
 
 def test_terminal_transient_is_retained_until_catalog_barrier(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     configured = tmp_path / "configured"
@@ -1404,6 +1431,17 @@ def test_terminal_transient_is_retained_until_catalog_barrier(
     )
     try:
         wait_for(lambda: page._browser_catalog_operation is None)
+        refreshes: list[bool] = []
+        refresh_shell = page._refresh_shell
+
+        def record_refresh(*, preserve_scientific=False, **kwargs):
+            refreshes.append(preserve_scientific)
+            return refresh_shell(
+                preserve_scientific=preserve_scientific,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(page, "_refresh_shell", record_refresh)
         page._browser_transient_frame = frame
         page._request_browser_catalog()
         operation = page._browser_catalog_operation
@@ -1417,6 +1455,7 @@ def test_terminal_transient_is_retained_until_catalog_barrier(
         wait_for(lambda: page._browser_catalog_operation is None)
         assert page._browser_transient_frame is None
         assert page._browser_transient_clear_token is None
+        assert refreshes and refreshes[-1] is True
     finally:
         page.close_workspace()
         page.deleteLater()

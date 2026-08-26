@@ -2,8 +2,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, fields
 import hashlib, json, math, os
+from io import BytesIO
 from pathlib import Path
 import re, threading, time
+import tempfile
 from types import SimpleNamespace
 from typing import Any
 import numpy as np
@@ -12,6 +14,7 @@ from xrd_tools.core.provenance import read_provenance
 from xrd_tools.core.scan import Scan, ScanFrame, SourceKind, SourceSpec
 from xrd_tools.core.strictness import GIAllDummyError, MissingNormalizationError, StrictPolicy
 from xrd_tools.io.append import AppendIntent, science_fingerprint
+from xrd_tools.io.image import load_mask
 from xrd_tools.io.nexus_record import _average_count_chunks, _average_count_digest
 from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot
 from xrd_tools.io.read import _read_average_lineage, get_average_finite_counts, resolve_source_master
@@ -33,6 +36,7 @@ _MAX_CONTRIBUTORS = 1000000
 _READER_BINDING = 'average_closed_v1'
 _JSON_MAX_BYTES, _JSON_MAX_DEPTH, _JSON_MAX_NODES = 1 << 16, 8, 4096
 _METADATA_MAX_KEYS = 64
+_STATIC_MASK_FILE_MAX_BYTES = 64 << 20
 _STAGES = frozenset({'qualify', 'read', 'average', 'reduce', 'write', 'settle'})
 def _reject(condition: bool, message: str, error=ValueError) -> None:
     if condition:
@@ -347,6 +351,14 @@ def _source_from_recipe(recipe: AverageScanRecipe) -> SourceSpec:
     source = recipe.source.thaw()
     _reject(type(source) is not SourceSpec, 'Average frozen source did not thaw to SourceSpec', TypeError)
     return source
+def _source_for_requalification(source: SourceSpec,
+                                graph: PreparedSourceExecutionGraph) -> SourceSpec:
+    if (source.kind is SourceKind.NEXUS_STACK
+            and graph.execution_source.kind is SourceKind.EIGER_MASTER):
+        return SourceSpec(source.uri, SourceKind.EIGER_MASTER,
+            metadata_uri=source.metadata_uri, entry=source.entry,
+            options=dict(source.options))
+    return source
 def prepare_average_scan(recipe: AverageScanRecipe, *, cancel_token: threading.Event | None=None) -> AverageScanPlan:
     _reject(type(recipe) is not AverageScanRecipe, 'prepare_average_scan requires an exact recipe', TypeError)
     _cancelled(cancel_token) and (_ for _ in ()).throw(InterruptedError('Average preparation cancelled'))
@@ -365,7 +377,7 @@ def prepare_average_scan(recipe: AverageScanRecipe, *, cancel_token: threading.E
     try: window.__enter__(); first_row = window.complete_metadata_for(0)
     finally: window.__exit__(None, None, None)
     try:
-        requalify_source_execution_graph(source, graph, selected_motor=selected_motor, reader_binding=_READER_BINDING, cancelled=None if cancel_token is None else cancel_token.is_set)
+        requalify_source_execution_graph(_source_for_requalification(source, graph), graph, selected_motor=selected_motor, reader_binding=_READER_BINDING, cancelled=None if cancel_token is None else cancel_token.is_set)
     except SourceRevisionChanged as error:
         raise ValueError('AVERAGE_SOURCE_DRIFT') from error
     reduction = _thaw_reduction(recipe)
@@ -457,14 +469,26 @@ def _load_static_mask(recipe: AverageScanRecipe, shape: tuple[int, int]) -> np.n
     if state.status is not FactStatus.PRESENT:
         return None
     path = Path(state.source_uri)
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as stream:
+        payload = stream.read(_STATIC_MASK_FILE_MAX_BYTES + 1)
+    _reject(len(payload) > _STATIC_MASK_FILE_MAX_BYTES,
+            'AVERAGE_STATIC_MASK_FILE_TOO_LARGE')
+    digest = hashlib.sha256(payload).hexdigest()
     _reject(digest != state.sha256, 'AVERAGE_STATIC_MASK_DIGEST_CHANGED')
-    value = np.load(path, allow_pickle=False)
+    value = _decode_static_mask_bytes(path, payload)
     _reject(value.dtype.str != state.dtype or tuple(value.shape) != tuple(state.shape), 'AVERAGE_STATIC_MASK_SCHEMA_CHANGED')
     _reject(value.dtype != np.dtype(bool) or tuple(value.shape) != shape, 'AVERAGE_STATIC_MASK_SHAPE_INVALID')
     result = np.frombuffer(np.ascontiguousarray(value).tobytes(), dtype=bool).reshape(shape)
     result.setflags(write=False)
     return result
+def _decode_static_mask_bytes(path: Path, payload: bytes) -> np.ndarray:
+    """Decode only the immutable byte snapshot whose digest was accepted."""
+    if path.suffix.casefold() == ".npy":
+        return np.load(BytesIO(payload), allow_pickle=False)
+    with tempfile.TemporaryDirectory(prefix="xdart-average-mask-") as root:
+        snapshot = Path(root) / ("mask" + path.suffix)
+        snapshot.write_bytes(payload)
+        return load_mask(snapshot)
 def _row_value(row: Mapping[str, Any], key: str, configured: frozenset[str]) -> Any:
     return _metadata_value(row, key) if key in configured else row.get(key)
 def _canonical_scalar(value: Any) -> bytes:
@@ -712,7 +736,9 @@ class AverageScanRunner:
             return self._terminal(_error_result(self.plan, error))
         return self._after_source_clean()
     def _source_sweep(self) -> None:
-        try: requalify_source_execution_graph(_source_from_recipe(self.plan.recipe), self._graph, selected_motor=_selected_motor(self.plan.recipe), reader_binding=_READER_BINDING, cancelled=None if self._cancel_token is None else self._cancel_token.is_set)
+        source = _source_for_requalification(
+            _source_from_recipe(self.plan.recipe), self._graph)
+        try: requalify_source_execution_graph(source, self._graph, selected_motor=_selected_motor(self.plan.recipe), reader_binding=_READER_BINDING, cancelled=None if self._cancel_token is None else self._cancel_token.is_set)
         except InterruptedError as error: raise (_AverageCancelled('Average operation cancelled') if _cancelled(self._cancel_token) else error)
         except SourceRevisionChanged as error: raise SourceRevisionChanged('AVERAGE_SOURCE_DRIFT') from error
     def _target_sweep(self, expected: TargetSnapshot) -> None:

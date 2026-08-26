@@ -592,7 +592,7 @@ def test_pending_failure_cannot_reset_or_launch(
     (
         ("Single", 125, (False, False, False), False),
         ("Single", 375, (False, True, False), False),
-        ("Overlay", 375, (False, True, False), True),
+        ("Overlay", 375, (False, False, False), True),
     ),
 )
 def test_auto_last_paces_eight_frame_burst_to_same_drain_latest(
@@ -767,6 +767,79 @@ def test_live_plot_cadence_repaints_suppressed_frame_after_quiet_deadline(
         now[0] = 0.500
         page._drain_executor()
         assert paints == [(8, False), (16, True), (16, False)]
+    finally:
+        _dispose(page, qapp)
+
+
+@pytest.mark.parametrize("pinned_rows", (0, 1))
+def test_overlay_waterfall_boundary_bypasses_cadence_once(
+        qapp: QtWidgets.QApplication, monkeypatch, pinned_rows: int) -> None:
+    monkeypatch.setenv("XDART_LIVE_PLOT_INTERVAL_MS", "250")
+    executor = _Executor()
+    page, _, identity = _active_page(executor)
+    page._preferences = replace(page._preferences, plot_mode="Overlay")
+    events = _paced_frame_events(page, executor, identity, 17)
+    now = [0.0]
+    monkeypatch.setattr(
+        page_module, "time", SimpleNamespace(monotonic=lambda: now[0]),
+        raising=False,
+    )
+    page._last_live_plot_at = None
+    page._shell.scientific._trace_row_count = pinned_rows
+    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
+    paints: list[tuple[int | None, bool]] = []
+
+    def record_paint(*, preserve_scientific=False, **_kwargs):
+        current = page._context_controller.navigation.current
+        paints.append((
+            None if current is None else current.local_frame_label,
+            preserve_scientific,
+        ))
+        if not preserve_scientific:
+            page._scientific_repaint_pending = False
+            page._last_live_plot_at = now[0]
+            trace_count = (
+                len(page._context_controller.navigation.selected) + pinned_rows
+            )
+            page._shell.scientific._trace_row_count = trace_count
+            page._waterfall_candidate_count = trace_count
+            page._shell.scientific._bottom_waterfall_active = (
+                page_module.waterfall_should_be_active(
+                    page._preferences.plot_mode,
+                    trace_count,
+                    was_active=page._shell.scientific._bottom_waterfall_active,
+                )
+            )
+
+    monkeypatch.setattr(page, "_refresh_shell", record_paint)
+    try:
+        before_boundary = 15 - pinned_rows
+        for index, event in enumerate(events[:before_boundary]):
+            now[0] = min(0.100, index / 1000.0)
+            executor.events.append(event)
+            page._drain_executor()
+        assert paints[0] == (1, False)
+        assert paints[-1] == (before_boundary, True)
+        assert page._waterfall_candidate_count == 15
+
+        now[0] = 0.125
+        executor.events.append(events[before_boundary])
+        page._drain_executor()
+        boundary = before_boundary + 1
+        assert paints[-1] == (boundary, False)
+        assert page._scientific_repaint_pending is False
+
+        now[0] = 0.249
+        executor.events.append(events[boundary])
+        page._drain_executor()
+        after_boundary = boundary + 1
+        assert paints[-2:] == [(boundary, False), (after_boundary, True)]
+        assert page._scientific_repaint_pending is True
+
+        now[0] = 0.375
+        page._drain_executor()
+        assert paints[-2:] == [(after_boundary, True), (after_boundary, False)]
+        assert page._scientific_repaint_pending is False
     finally:
         _dispose(page, qapp)
 

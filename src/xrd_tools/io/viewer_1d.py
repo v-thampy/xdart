@@ -17,6 +17,7 @@ import numpy as np
 VIEWER_1D_FD_RESERVE = 32
 _POLICY_ID = "viewer-1d-v1"
 _FORMATS = {".xye": 1, ".csv": 2, ".npy": 3, ".npz": 4}
+SUPPORTED_VIEWER_1D_SUFFIXES = frozenset(_FORMATS)
 _DTYPE_CODES = {
     "|b1": 0x01, "|i1": 0x10, "<i2": 0x11, ">i2": 0x12,
     "<i4": 0x13, ">i4": 0x14, "<i8": 0x15, ">i8": 0x16,
@@ -490,6 +491,7 @@ def viewer_1d_inspection_is_open(inspection):
 
 
 __all__ = [name for name in tuple(globals()) if name.startswith("Viewer1D") or name in {
-    "VIEWER_1D_FD_RESERVE", "inspect_viewer_1d_sources", "decode_viewer_1d_sources",
+    "VIEWER_1D_FD_RESERVE", "SUPPORTED_VIEWER_1D_SUFFIXES",
+    "inspect_viewer_1d_sources", "decode_viewer_1d_sources",
     "close_viewer_1d_sources", "viewer_1d_inspection_is_open",
     "viewer_1d_inspection_ledger"}]

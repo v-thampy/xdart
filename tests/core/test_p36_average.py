@@ -565,6 +565,86 @@ def test_metadata_key_domains_refuse_duplicate_and_overlap_before_effects(tmp_pa
     assert not any((tmp_path / name).exists() for name in ("a.nxs", "b.nxs", "c.nxs"))
 
 
+def test_average_static_mask_loads_authenticated_edf(tmp_path) -> None:
+    fabio = pytest.importorskip("fabio")
+    expected = np.array([[False, True], [True, False]], dtype=bool)
+    mask_path = tmp_path / "mask.edf"
+    fabio.edfimage.EdfImage(data=expected.astype("u1")).write(
+        str(mask_path)
+    )
+    accepted = module.load_mask(mask_path)
+    calibration = CalibrationState(mask=MaskState(
+        str(mask_path),
+        hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+        accepted.dtype.str,
+        accepted.shape,
+        FactStatus.PRESENT,
+    ))
+    recipe = AverageScanRecipe(
+        _series(tmp_path),
+        tmp_path / "average.nxs",
+        ReductionPlan(),
+        calibration=calibration,
+    )
+
+    actual = module._load_static_mask(recipe, expected.shape)
+
+    assert actual is not None
+    assert actual.dtype == np.dtype(bool)
+    assert not actual.flags.writeable
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("suffix", (".npy", ".edf"))
+def test_average_static_mask_decode_is_bound_to_authenticated_bytes(
+    tmp_path, monkeypatch, suffix,
+) -> None:
+    expected = np.array([[False, True], [True, False]], dtype=bool)
+    replacement = np.logical_not(expected)
+    mask_path = tmp_path / f"mask{suffix}"
+
+    def write_mask(value) -> None:
+        if suffix == ".npy":
+            np.save(mask_path, value)
+        else:
+            fabio = pytest.importorskip("fabio")
+            fabio.edfimage.EdfImage(data=value.astype("u1")).write(
+                str(mask_path)
+            )
+
+    write_mask(expected)
+    accepted_payload = mask_path.read_bytes()
+    accepted = (
+        np.load(mask_path, allow_pickle=False)
+        if suffix == ".npy"
+        else module.load_mask(mask_path)
+    )
+    calibration = CalibrationState(mask=MaskState(
+        str(mask_path), hashlib.sha256(accepted_payload).hexdigest(),
+        accepted.dtype.str, accepted.shape, FactStatus.PRESENT,
+    ))
+    recipe = AverageScanRecipe(
+        _series(tmp_path), tmp_path / "average.nxs", ReductionPlan(),
+        calibration=calibration,
+    )
+    decode = module._decode_static_mask_bytes
+    observed = []
+
+    def mutate_then_decode(path, payload):
+        observed.append(payload)
+        write_mask(replacement)
+        return decode(path, payload)
+
+    monkeypatch.setattr(module, "_decode_static_mask_bytes", mutate_then_decode)
+
+    actual = module._load_static_mask(recipe, expected.shape)
+
+    assert observed == [accepted_payload]
+    assert hashlib.sha256(mask_path.read_bytes()).hexdigest() != calibration.mask.sha256
+    assert not actual.flags.writeable
+    np.testing.assert_array_equal(actual, expected)
+
+
 def test_source_science_and_operation_identity_domains_vary_independently(tmp_path) -> None:
     roots = [tmp_path / name for name in ("base", "source")]
     for root in roots: root.mkdir()
@@ -675,10 +755,12 @@ def test_average_lineage_iterators_cover_container_tiff_and_eiger(tmp_path, monk
         data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
         for ordinal, path in enumerate(member_paths, 1):
             data[f"data_{ordinal:06d}"] = h5py.ExternalLink(path.name, "/entry/data/data")
-    sources["eiger"] = SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry")
+    sources["eiger"] = image_series_spec(master, metadata_format=None)
     graphs = {family: execution_graph.qualify_source_execution_graph(
         source, reader_binding="average_closed_v1",
     ) for family, source in sources.items()}
+    assert sources["eiger"].kind is SourceKind.NEXUS_STACK
+    assert graphs["eiger"].execution_source.kind is SourceKind.EIGER_MASTER
 
     observed = []
     _stub_integrators(monkeypatch, observed)

@@ -235,6 +235,7 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_history_scope: tuple[object, ...] | None = None
         self._trace_selection_keys: tuple[DisplayFrameKey, ...] = ()
         self._trace_history_keys: tuple[DisplayFrameKey, ...] = ()
+        self._trace_row_count = 0
         self._trace_history_by_identity: dict[int, TraceProjection] = {}
         self._pinned_trace_scope: tuple[object, ...] | None = None
         self._pinned_trace_by_id: dict[
@@ -373,6 +374,18 @@ class ScientificView(QtWidgets.QFrame):
 
         return self._trace_history_keys
 
+    @property
+    def trace_row_count(self) -> int:
+        """Exact rendered live-plus-pinned row count from the last paint."""
+
+        return self._trace_row_count
+
+    @property
+    def bottom_waterfall_active(self) -> bool:
+        """Whether the last successful paint selected the Waterfall panel."""
+
+        return self._bottom_waterfall_active
+
     def expect_display_background(self, active_key) -> None:
         key = active_key if type(active_key) is tuple else None
         if key != self._expected_background_key:
@@ -392,6 +405,7 @@ class ScientificView(QtWidgets.QFrame):
             else:
                 self.curve.clear(); self.waterfall.clear(); self._trace_history_by_identity.clear(); self._pinned_trace_by_id.clear()
                 self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
+                self._trace_row_count = 0
             self._rendered_background_key = self._expected_background_key = None
         except Exception: return DisplayBackgroundRendererReleaseReceipt(active_key, False)
         return DisplayBackgroundRendererReleaseReceipt(active_key, True)
@@ -964,6 +978,7 @@ class ScientificView(QtWidgets.QFrame):
         for name, value in (
             ("_viewer_2d_payload", None), ("_frame_keys", ()), ("_selected_keys", ()),
             ("_trace_selection_keys", ()), ("_trace_history_keys", ()), ("_rendered_trace_keys", ()),
+            ("_trace_row_count", 0),
             ("_waterfall_y_values", ()), ("_waterfall_source_keys", ()), ("_label_indices", {}),
             ("_heavy_available", frozenset()), ("_trace_history_scope", None), ("_pinned_trace_scope", None),
             ("_rendered_plot_options", None), ("_rendered_overlay_step", None), ("_trace_history_by_identity", {}),
@@ -1156,6 +1171,7 @@ class ScientificView(QtWidgets.QFrame):
             *((("pin", *pin_id), trace) for pin_id, trace in pinned),
             *((("live", id(trace.frame)), trace) for trace in live_traces),
         )
+        self._trace_row_count = len(rows)
         presented_by_id = {
             id(trace.frame): trace.frame
             for _row_key, trace in rows

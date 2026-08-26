@@ -1297,6 +1297,29 @@ def test_duplicate_snapshot_conflict_refuses_without_changing_valid_append_hashe
     assert dynamic_output._writer_source_snapshots(item) == before_writer
     assert dynamic_output._stable_lineage(item) == before_lineage
 
+    master_path = (tmp_path / "eiger_master.h5").absolute()
+    member_path = (tmp_path / "eiger_data_000001.h5").absolute()
+    master_state = SourceFileState(str(master_path), 1, 2, 3, 4, 5)
+    member_state = SourceFileState(str(member_path), 6, 7, 8, 9, 10)
+    external = ExternalSourceState(member_state, "/entry/data/data", 0, 2, 0)
+    descriptor = ContainerDescriptor(
+        master_path, kind=SourceKind.EIGER_MASTER,
+        dataset_path="/entry/data/data_000001",
+        segment_paths=("/entry/data/data_000001",), frame_count=2,
+        frame_shape=(2, 2), dtype=np.dtype("<u2"), self_contained=False,
+    )
+    from xrd_tools.sources.execution_graph import freeze_source_execution_graph
+    source = SourceSpec(master_path, SourceKind.EIGER_MASTER)
+    eiger = freeze_source_execution_graph(
+        source, source, source_path=master_path, group_key="eiger",
+        file=master_state, adapter_id="nexus_hdf5", frame_count=2,
+        first_label=0, detector_shape=(2, 2), native_dtype="<u2",
+        external_members=(external,), descriptor=descriptor,
+    )
+    assert append_source_from_execution_graph(
+        eiger, generation=1,
+    ).dataset_paths == ("/entry/data/data_000001",)
+
 
 def test_average_lineage_and_provenance_match_exact_ordinary_projections(
     tmp_path, monkeypatch,

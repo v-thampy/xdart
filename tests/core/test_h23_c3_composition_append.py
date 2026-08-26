@@ -1638,7 +1638,8 @@ def _append_api():
 
 def _intent(tmp_path: Path, *, extent: int, labels, source_identity="beam/run",
             science="science-v1", source_base=None, member_path=None,
-            generation=0, modes=("1d:default", "2d:default")):
+            generation=0, modes=("1d:default", "2d:default"),
+            dataset_paths=()):
     (_Disposition, AppendExternalMember, AppendIntent, AppendSource,
      _commit, _qualify) = _append_api()
     member_path = member_path or (tmp_path / "member.h5")
@@ -1657,6 +1658,7 @@ def _intent(tmp_path: Path, *, extent: int, labels, source_identity="beam/run",
         size=200 + extent,
         mtime_ns=2_000 + extent,
         extent=extent,
+        dataset_paths=tuple(dataset_paths),
         external_members=(member,),
         generation=generation,
     )
@@ -1668,6 +1670,67 @@ def _intent(tmp_path: Path, *, extent: int, labels, source_identity="beam/run",
         modes=modes,
         source=source,
         labels=tuple(int(x) for x in labels),
+    )
+
+
+def _eiger_append_source(
+    root: Path,
+    extents: tuple[int, ...],
+    *,
+    generation: int,
+):
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.sources.execution_graph import (
+        append_source_from_execution_graph,
+        qualify_source_execution_graph,
+    )
+
+    root.mkdir(parents=True, exist_ok=True)
+    members = []
+    for ordinal, extent in enumerate(extents, 1):
+        member = root / f"scan_data_{ordinal:06d}.h5"
+        if not member.exists():
+            with h5py.File(member, "w") as handle:
+                handle.create_dataset(
+                    "entry/data/data",
+                    data=np.full((extent, 2, 3), ordinal, dtype="u2"),
+                    chunks=(1, 2, 3),
+                )
+        members.append(member)
+    master = root / "scan_master.h5"
+    if not master.exists():
+        with h5py.File(master, "w") as handle:
+            entry = handle.create_group("entry")
+            entry.attrs["NX_class"] = "NXentry"
+            data = entry.create_group("data")
+            data.attrs["NX_class"] = "NXdata"
+    with h5py.File(master, "r+") as handle:
+        data = handle["entry/data"]
+        for ordinal, member in enumerate(members, 1):
+            name = f"data_{ordinal:06d}"
+            if name not in data:
+                data[name] = h5py.ExternalLink(
+                    member.name, "/entry/data/data"
+                )
+    graph = qualify_source_execution_graph(
+        SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry")
+    )
+    return append_source_from_execution_graph(
+        graph, generation=generation
+    )
+
+
+def _intent_for_source(tmp_path: Path, source, labels):
+    (_Disposition, _Member, AppendIntent, _Source,
+     _commit, _qualify) = _append_api()
+    return AppendIntent(
+        entry="entry",
+        source_base=str(tmp_path),
+        source_identity="beam/run",
+        science_fingerprint="science-v1",
+        modes=("1d:default", "2d:default"),
+        source=source,
+        labels=tuple(labels),
     )
 
 
@@ -2158,6 +2221,123 @@ def test_append_writer_lineage_n_to_m_to_k_and_final_noop(tmp_path):
 
     final = qualify(target, _intent(tmp_path, extent=6, labels=tuple(range(6))))
     assert final.disposition is Disposition.SKIP
+
+
+def test_legacy_empty_dataset_paths_normalize_for_same_extent_eiger_skip(
+    tmp_path,
+):
+    from dataclasses import replace
+
+    (Disposition, _Member, _Intent, _Source, commit_lineage,
+     qualify) = _append_api()
+    target = tmp_path / "legacy-eiger-same-extent.nexus"
+    current_source = _eiger_append_source(
+        tmp_path / "same-extent-source", (2,), generation=1
+    )
+    assert current_source.dataset_paths == ("/entry/data/data_000001",)
+    assert current_source.external_members[0].dataset_path == "/entry/data/data"
+    legacy = _intent_for_source(
+        tmp_path,
+        replace(current_source, dataset_paths=(), generation=0),
+        (0, 1),
+    )
+    initial = qualify(target, legacy)
+    assert initial.disposition is Disposition.WRITE
+    _seed_target(target, legacy.labels, tmp_path)
+    with h5py.File(target, "r+") as handle:
+        commit_lineage(handle["entry"], initial, written_labels=legacy.labels)
+    before = target.read_bytes()
+
+    current = _intent_for_source(
+        tmp_path, current_source, (0, 1),
+    )
+    decision = qualify(target, current)
+
+    assert decision.disposition is Disposition.SKIP
+    assert decision.committed_labels == (0, 1)
+    assert decision.write_labels == ()
+    assert target.read_bytes() == before
+
+
+def test_legacy_empty_dataset_paths_normalize_for_eiger_growth_write(tmp_path):
+    from dataclasses import replace
+
+    (Disposition, _Member, _Intent, _Source, commit_lineage,
+     qualify) = _append_api()
+    target = tmp_path / "legacy-eiger-growth.nexus"
+    source_root = tmp_path / "growth-source"
+    initial_source = _eiger_append_source(
+        source_root, (2,), generation=0
+    )
+    legacy = _intent_for_source(
+        tmp_path, replace(initial_source, dataset_paths=()), (0, 1)
+    )
+    initial = qualify(target, legacy)
+    assert initial.disposition is Disposition.WRITE
+    _seed_target(target, legacy.labels, tmp_path)
+    with h5py.File(target, "r+") as handle:
+        commit_lineage(handle["entry"], initial, written_labels=legacy.labels)
+
+    current_source = _eiger_append_source(
+        source_root, (2, 3), generation=1
+    )
+    current = _intent_for_source(
+        tmp_path, current_source, (0, 1, 2, 3, 4),
+    )
+    decision = qualify(target, current)
+
+    assert decision.disposition is Disposition.WRITE
+    assert decision.committed_labels == (0, 1)
+    assert decision.write_labels == (2, 3, 4)
+    assert decision.lineage["epochs"][-1]["source"]["dataset_paths"] == [
+        "/entry/data/data_000001",
+        "/entry/data/data_000002",
+    ]
+
+
+def test_legacy_empty_dataset_paths_refuse_unmatched_eiger_growth_selectors(
+    tmp_path,
+):
+    from dataclasses import replace
+
+    (Disposition, _Member, _Intent, _Source, commit_lineage,
+     qualify) = _append_api()
+    target = tmp_path / "legacy-eiger-selector-mismatch.nexus"
+    source_root = tmp_path / "mismatch-source"
+    initial_source = _eiger_append_source(
+        source_root, (2,), generation=0
+    )
+    legacy = _intent_for_source(
+        tmp_path, replace(initial_source, dataset_paths=()), (0, 1)
+    )
+    initial = qualify(target, legacy)
+    assert initial.disposition is Disposition.WRITE
+    _seed_target(target, legacy.labels, tmp_path)
+    with h5py.File(target, "r+") as handle:
+        commit_lineage(handle["entry"], initial, written_labels=legacy.labels)
+    before = target.read_bytes()
+
+    current_source = _eiger_append_source(
+        source_root, (2, 1), generation=1
+    )
+    mismatched = _intent_for_source(
+        tmp_path,
+        replace(
+            current_source,
+            dataset_paths=(
+                "/entry/data/not-the-authenticated-member",
+                "/entry/data/data_000002",
+            ),
+        ),
+        (0, 1, 2),
+    )
+    decision = qualify(target, mismatched)
+
+    assert decision.disposition is Disposition.REFUSE
+    assert decision.reason == (
+        "legacy empty dataset paths cannot authenticate current selectors"
+    )
+    assert target.read_bytes() == before
 
 
 def test_append_refuses_malformed_earlier_epoch_member_history(tmp_path):

@@ -678,7 +678,7 @@ def append_source_from_execution_graph(value: PreparedSourceExecutionGraph, *, g
         raise ValueError("Eiger Append requires exact external dataset facts")
     return AppendSource(stamp.path, stamp.adapter_id, stamp.size, stamp.mtime_ns,
         stamp.frame_count, science_fingerprint(stamp.execution_identity_v1.as_dict()),
-        value.dataset_paths if not externals else (), images, externals, int(generation))
+        value.dataset_paths, images, externals, int(generation))
 def source_graph_payload(value: PreparedSourceExecutionGraph) -> dict:
     policy_options = {
         key: item for key, item in dict(value.execution_source.options).items()

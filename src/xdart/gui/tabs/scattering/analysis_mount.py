@@ -209,10 +209,21 @@ def analysis_result_matches(payload: object, facts: object) -> bool:
     if kind == "metadata":
         if type(payload) is not MetadataTableResult or payload.receipt is None: return False
         selection, source = echo
-        return bool(payload.table_fingerprint and selection == "exact" and (
-            payload.receipt.source_spec == source if
-            getattr(source, "kind", None) is not None else
-            str(payload.receipt.lexical_root) == str(source)))
+        receipt = payload.receipt
+        source_spec = getattr(source, "kind", None) is not None
+        identity_matches = (
+            receipt.source_spec == source if source_spec
+            else str(receipt.lexical_root) == str(source)
+        )
+        if not (payload.table_fingerprint and selection == "exact"
+                and identity_matches and receipt.primary_post_state is not None):
+            return False
+        from xrd_tools.analysis.scan_operations import _path_revision
+        try:
+            current_path = Path(source.uri if source_spec else source).expanduser()
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return _path_revision(current_path) == receipt.primary_post_state
     if kind == "scan_plot":
         table, roi, x, y, normalization = echo
         return bool(type(payload) is ScanPlotResult
@@ -261,6 +272,11 @@ class MetadataResultDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         self.table = QtWidgets.QTableWidget(0, 0, self); self.status = QtWidgets.QLabel("")
         layout.addWidget(self.table); layout.addWidget(self.status)
+    def clear_result(self) -> None:
+        self.table.clear()
+        self.table.setRowCount(0)
+        self.table.setColumnCount(0)
+        self.status.clear()
     def adopt_result(self, result: object) -> None:
         columns = tuple(getattr(result, "columns", ()))
         labels = tuple(getattr(result, "labels", ()))

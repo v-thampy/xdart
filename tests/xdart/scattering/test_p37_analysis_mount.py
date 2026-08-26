@@ -94,21 +94,34 @@ def _source(path: str = "/tmp/input.nxs"):
     )
 
 
-def _receipt(path="/tmp/input.nxs", *, fingerprint="source-fp", labels=(1, 2, 3)):
+def _file_revision(path):
+    state = Path(path).stat()
+    return (
+        state.st_mode, state.st_dev, state.st_ino, state.st_size,
+        state.st_mtime_ns,
+    )
+
+
+def _receipt(path="/tmp/input.nxs", *, fingerprint="source-fp", labels=(1, 2, 3),
+             primary_post_state=None):
     spec = path if type(path) is SourceSpec else SourceSpec(
         path, SourceKind.PROCESSED_NEXUS)
     state = (0, 0, 0, 1, 1)
+    post_state = state if primary_post_state is None else primary_post_state
     return AnalysisSourceReceipt(
         "analysis-source-v1", spec, "spec-digest", Path(str(spec.uri)),
-        Path(str(spec.uri)), spec.kind, spec.entry, None, state, state,
+        Path(str(spec.uri)), spec.kind, spec.entry, None, state, post_state,
         tuple(labels), "labels-digest", "catalog-digest", ("persisted",),
         fingerprint,
     )
 
 
 def _table(path="/tmp/input.nxs", *, fingerprint="table-fp",
-           source_fingerprint="source-fp"):
-    receipt = _receipt(path, fingerprint=source_fingerprint)
+           source_fingerprint="source-fp", primary_post_state=None):
+    receipt = _receipt(
+        path, fingerprint=source_fingerprint,
+        primary_post_state=primary_post_state,
+    )
     frame = np.array([1.0, 2.0, 3.0])
     motor = np.array([10.0, 11.0, 12.0])
     signal = np.array([4.0, 5.0, 6.0])
@@ -325,6 +338,81 @@ def test_p37b_metadata_direct_and_scheduled_results_match_and_render_detached(
         assert metadata_dialog.table.rowCount() == len(current.labels)
     finally:
         _close_page(page, qapp)
+
+
+def test_metadata_button_requeries_after_current_artifact_changes(
+        monkeypatch, qapp) -> None:
+    from tests.xdart.scattering.test_e1b2_page_command_boundaries import (
+        _Executor,
+        _active_page,
+        _dispose,
+        _paced_frame_events,
+    )
+
+    executor = _Executor()
+    page, _, identity = _active_page(executor)
+    try:
+        events = _paced_frame_events(page, executor, identity, 1)
+        executor.events.extend(events)
+        page._drain_executor()
+        current = page._context_controller.navigation.current
+        assert current is not None
+
+        stale = _table("/tmp/stale-metadata.nxs")
+        page._metadata_result = stale
+        from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog
+        dialog = MetadataResultDialog(page)
+        page._metadata_dialog = dialog
+        dialog.adopt_result(stale)
+        assert dialog.table.rowCount() == len(stale.labels)
+        assert dialog.table.columnCount() == len(stale.columns)
+        assert dialog.status.text() == stale.code
+        launches = []
+        monkeypatch.setattr(
+            page,
+            "_begin_analysis",
+            lambda kind, plan, generation, **kwargs:
+                launches.append((kind, plan, generation, kwargs)),
+        )
+
+        page._open_analysis_mount("metadata")
+
+        assert len(launches) == 1
+        assert launches[0][0] == "metadata"
+        assert str(launches[0][1].source) == current.artifact
+        assert page._metadata_result is None
+        assert page._metadata_dialog is dialog
+        assert dialog.table.rowCount() == 0
+        assert dialog.table.columnCount() == 0
+        assert dialog.status.text() == ""
+    finally:
+        _dispose(page, qapp)
+
+
+def test_metadata_reuse_rejects_same_path_replacement_and_preserves_source_spec(
+        tmp_path) -> None:
+    import xdart.gui.tabs.scattering.analysis_mount as mount
+
+    artifact = tmp_path / "scan.nxs"
+    artifact.write_bytes(b"first revision")
+    source = SourceSpec(
+        artifact, SourceKind.PROCESSED_NEXUS, entry="entry",
+        options={"scan": "7"},
+    )
+    table = _table(source, primary_post_state=_file_revision(artifact))
+    facts = mount.analysis_request_facts(MetadataTablePlan(source))
+
+    assert mount.analysis_result_matches(table, facts)
+    changed_options = replace(source, options={"scan": "8"})
+    changed_facts = mount.analysis_request_facts(MetadataTablePlan(changed_options))
+    assert not mount.analysis_result_matches(table, changed_facts)
+
+    artifact.write_bytes(b"a distinct replacement revision")
+    assert not mount.analysis_result_matches(table, facts)
+    assert not mount.analysis_result_matches(
+        replace(table, receipt=replace(table.receipt, primary_post_state=None)),
+        facts,
+    )
 
 
 def test_p37b_source_widget_external_mode_does_zero_discovery_probe_or_io(
@@ -690,7 +778,7 @@ def test_p37b_phase_captures_paths_only_and_preserves_q_refusal_cif_receipts(
 
 
 def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
-        monkeypatch, qapp) -> None:
+        monkeypatch, qapp, tmp_path) -> None:
     import xdart.gui.tabs.scattering.analysis_mount as mount
 
     frame = _frame(); gate = SimpleNamespace(cancelled=False)
@@ -714,11 +802,16 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
     gate.cancelled = False; selection.display_generation = 5
     assert not mount.display_anchor_matches(anchor_page, real_anchor, "trace-fp", 3)
 
-    table = _table(); receipt = table.receipt; trace = _trace()
+    artifact = tmp_path / "input.nxs"
+    artifact.write_bytes(b"stable metadata artifact")
+    table = _table(
+        artifact, primary_post_state=_file_revision(artifact),
+    )
+    receipt = table.receipt; trace = _trace()
     assert receipt is not None
     signal = RoiSignal(RoiSpec.full_frame("roi"), name="roi")
     plans = {
-        "metadata": MetadataTablePlan("/tmp/input.nxs"),
+        "metadata": MetadataTablePlan(artifact),
         "scan_plot": ScanPlotPlan("motor", ("signal",), None),
         "roi_preview": RoiPreviewPlan.from_table(table, label=1),
         "roi_scan": RoiScanPlan.from_table(

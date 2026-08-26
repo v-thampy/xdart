@@ -106,15 +106,30 @@ def processed_directory(save_path: str) -> str:
 def enumerate_processed_artifacts(
     directory: str,
     *,
+    accepted_suffixes: frozenset[str] | None = None,
     inspect_directory_contents: bool = False,
     directory_time_cache: DirectoryModifiedCache | None = None,
 ) -> tuple[BrowserCatalogEntry, ...]:
-    """Enumerate regular NeXus artifacts without opening their contents."""
+    """Enumerate regular artifacts accepted by one immutable browser policy."""
 
     if type(directory) is not str or not directory:
         return ()
     if type(inspect_directory_contents) is not bool:
         raise TypeError("directory-content timestamp policy must be boolean")
+    if (
+        accepted_suffixes is not None
+        and (
+            type(accepted_suffixes) is not frozenset
+            or not accepted_suffixes
+            or any(
+                type(item) is not str
+                or not item.startswith(".")
+                or item != item.casefold()
+                for item in accepted_suffixes
+            )
+        )
+    ):
+        raise TypeError("browser suffix policy must be an immutable lowercase set")
     if (
         directory_time_cache is not None
         and type(directory_time_cache) is not DirectoryModifiedCache
@@ -158,10 +173,12 @@ def enumerate_processed_artifacts(
                 True,
             ))
             continue
-        if (
-            not is_readable_output_path(child)
-            or not child.is_file()
-        ):
+        accepted = (
+            is_readable_output_path(child)
+            if accepted_suffixes is None
+            else child.suffix.casefold() in accepted_suffixes
+        )
+        if not accepted or not child.is_file():
             continue
         artifacts.append(
             BrowserCatalogEntry(

@@ -312,15 +312,31 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     identity = RunIdentity(2, "delayed")
     controller = SimpleNamespace(
         viewer_2d_owned=True, viewer_2d_frame=object(), run_identity=identity,
+        selection=None,
         poll_viewer_2d=lambda: False, poll_browse_preview=lambda: False,
         browse_pending=False, adopt_acquisition=lambda value: calls.append(("adopt", value)),
         begin_viewer_2d_renderer_clear=lambda: clear_request,
         acknowledge_viewer_2d_renderer_clear=lambda receipt: calls.append(("ack", receipt)) or receipt == "positive",
         close_viewer_2d=lambda: calls.append("close") or True)
-    scientific = SimpleNamespace(clear_viewer_2d=lambda _request: "forged")
+    scientific = SimpleNamespace(
+        clear_viewer_2d=lambda _request: "forged",
+        trace_row_count=0,
+        bottom_waterfall_active=False,
+    )
     page = SimpleNamespace(
         _closing=False, _closed=False, _context_controller=controller,
         _shell=SimpleNamespace(scientific=scientific),
+        _retain_outgoing_display=False,
+        _scientific_repaint_pending=False,
+        _waterfall_candidate_count=0,
+        _operation_slot=SimpleNamespace(
+            owned=False, current_identity=None,
+            observe_stamp=lambda _stamp: None,
+        ),
+        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(
+            revision=0,
+            thaw=lambda: SimpleNamespace(processing_mode="Int 2D"),
+        )),
         _last_scientific_projection=object(),
         _select_scan=lambda value: calls.append(value), _poll_admission=lambda: False,
         _run_executor=SimpleNamespace(drain_events=lambda: (StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)),
@@ -354,8 +370,9 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _project_controls=lambda _snapshot: None, _start_permitted=lambda: (True, ""), _sync_detector_demand=lambda: None,
         _preferences=SimpleNamespace(slice_pins=()), _retain_outgoing_display=False,
         _source_observation=None,
-        _context_projection=SimpleNamespace(build_shell=lambda **_: SimpleNamespace(scientific=retained)),
-        _shell_revision=0, _controls_readiness=None, _progress=None,
+            _context_projection=SimpleNamespace(build_shell=lambda **_: SimpleNamespace(scientific=retained)),
+            _background_owner=SimpleNamespace(projection=lambda: None),
+            _shell_revision=0, _controls_readiness=None, _progress=None,
         _browser_directory=None, _browser_catalog=None, _browser_transient_frame=None,
         _date_sorted=False, _auto_last=False, _notice_text="")
     def fail_render(_projection, *, preserve_display=False):

@@ -136,6 +136,52 @@ def test_average_accepts_fixed_eiger_config_without_redundant_max_shape(
     assert int(detector.orientation) == 3
 
 
+def test_average_accepts_variable_binning_detector_shape(tmp_path) -> None:
+    poni = tmp_path / "rayonix.poni"
+    poni.write_text(
+        "poni_version: 2.1\n"
+        "Detector: RayonixMx225\n"
+        'Detector_config: {"pixel1": 7.3242e-05, "pixel2": 7.3242e-05, "orientation": 3}\n'
+        "Distance: 0.17939120815373186\n"
+        "Poni1: 0.22358886498597383\n"
+        "Poni2: 0.11322186872581771\n"
+        "Rot1: 0.0005767109589810191\n"
+        "Rot2: 0.000644934300335509\n"
+        "Rot3: 0.0\n"
+        "Wavelength: 9.762535309700809e-11\n"
+    )
+
+    state = adapter._average_calibration(SimpleNamespace(
+        poni_file=str(poni), mask_file="",
+    ))
+    assert state.detector_id == "RayonixMx225"
+
+    from xrd_tools.core import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+
+    values = state.values
+    assert values is not None
+    detector = adapter.detector_calibration_to_integrator(
+        DetectorCalibration(
+            PONI(
+                values.dist,
+                values.poni1,
+                values.poni2,
+                values.rot1,
+                values.rot2,
+                values.rot3,
+                values.wavelength_m,
+                state.detector_id,
+            ),
+            dict(state.detector_config),
+        ),
+    ).detector
+    assert tuple(detector.shape) == (3072, 3072)
+    assert tuple(detector.max_shape) == (6144, 6144)
+    assert all(current <= maximum for current, maximum in
+               zip(detector.shape, detector.max_shape, strict=True))
+
+
 @pytest.fixture
 def qapp():
     from pyqtgraph.Qt import QtWidgets
