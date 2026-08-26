@@ -250,6 +250,82 @@ def test_overlay_footer_moves_anchor_without_mutating_accumulator() -> None:
         _dispose(view)
 
 
+def test_single_compatible_update_reuses_curve_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(
+        frame_count=2,
+        selected_index=0,
+        heavy_indices=(0, 1),
+        plot_mode="Single",
+    )
+    frames = projection.navigation.frames
+    try:
+        _reconcile(view, projection.scientific, projection.navigation)
+        item = view.curve.listDataItems()[0]
+        calls = {"clear": 0, "plot": 0, "set_data": 0}
+        original_clear = view.curve.clear
+        original_plot = view.curve.plot
+        original_set_data = item.setData
+
+        def counted_clear(*args, **kwargs):
+            calls["clear"] += 1
+            return original_clear(*args, **kwargs)
+
+        def counted_plot(*args, **kwargs):
+            calls["plot"] += 1
+            return original_plot(*args, **kwargs)
+
+        def counted_set_data(*args, **kwargs):
+            calls["set_data"] += 1
+            return original_set_data(*args, **kwargs)
+
+        monkeypatch.setattr(view.curve, "clear", counted_clear)
+        monkeypatch.setattr(view.curve, "plot", counted_plot)
+        monkeypatch.setattr(item, "setData", counted_set_data)
+
+        next_navigation = FrameNavigationProjection(
+            frames,
+            frames[1],
+            (frames[1],),
+        )
+        _reconcile(view, projection.scientific, next_navigation)
+
+        assert calls == {"clear": 0, "plot": 0, "set_data": 1}
+        assert view.curve.listDataItems() == [item]
+        expected = projection.scientific.traces[1]
+        x_values, y_values = item.getData()
+        np.testing.assert_array_equal(x_values, expected.axis.values)
+        np.testing.assert_array_equal(y_values, expected.intensity)
+        assert item.name() == expected.title
+        assert view.legend.getLabel(item).text == expected.title
+
+        changed_axis = replace(
+            expected.axis,
+            label="2theta",
+            unit="2th_deg",
+        )
+        _reconcile(
+            view,
+            replace(
+                projection.scientific,
+                plot_axis="2theta",
+                traces=tuple(
+                    replace(trace, axis=changed_axis)
+                    for trace in projection.scientific.traces
+                ),
+            ),
+            next_navigation,
+        )
+        assert calls["clear"] == 1
+        assert calls["plot"] == 1
+        assert view.curve.listDataItems()[0] is not item
+    finally:
+        _dispose(view)
+
+
 def test_share_axis_links_both_directions_survives_repaint_and_unlinks() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     view = ScientificView()

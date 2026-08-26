@@ -1225,6 +1225,7 @@ class ScientificView(QtWidgets.QFrame):
             self._axis_key(trace.axis)
             for trace in traces
         }
+        prior_trace_axis_key = self._rendered_trace_axis_key
         self._rendered_trace_axis_key = (
             next(iter(axis_keys))
             if len(axis_keys) == 1
@@ -1286,8 +1287,45 @@ class ScientificView(QtWidgets.QFrame):
             self._rendered_trace_keys
         ):
             incremental = False
+        reuse_single = (
+            not incremental
+            and state.plot_mode == "Single"
+            and len(keys) == 1
+            and keys[0][0] == "live"
+            and len(existing_items) == 1
+            and len(self._rendered_trace_keys) == 1
+            and self._rendered_plot_mode == "Single"
+            and state.plot_options == self._rendered_plot_options
+            and self._rendered_trace_axis_key == prior_trace_axis_key
+            and not state.share_axis
+            and self.bottom_stack.currentWidget() is self.curve
+        )
         start = len(self._rendered_trace_keys) if incremental else 0
-        if not incremental:
+        if reuse_single:
+            trace = traces[0]
+            color = _TRACE_COLORS[0]
+            title = trace.title or str(trace.frame.local_frame_label)
+            item = existing_items[0]
+            item.setData(
+                trace.axis.values,
+                trace.intensity,
+                name=title,
+                pen=pg.mkPen(
+                    color=color,
+                    width=1.4,
+                    style=QtCore.Qt.PenStyle.SolidLine,
+                ),
+                symbol="o",
+                symbolBrush=color,
+                symbolPen=color,
+                symbolSize=4,
+                connect="finite",
+            )
+            label = self.legend.getLabel(item)
+            if label is not None:
+                label.setText(title)
+            start = 1
+        elif not incremental:
             self.curve.clear()
             legend = self.curve.getPlotItem().legend
             self.legend = (
