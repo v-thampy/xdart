@@ -120,10 +120,11 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
         lambda ceiling, first, **kwargs: detector_masks.append(np.array(first, copy=True))
         or real_detector_mask(ceiling, first, **kwargs),
     )
-    monkeypatch.setattr(module, "resolve_frame_background", lambda *_a, **_k: background_order.append(len(background_order)) or SimpleNamespace(
-        disposition="RESOLVED", background=np.array([[1.0, 2.0], [1.0, 10.0]]),
-        descriptor_bytes=b"bg", fingerprint="b" * 64,
-    ))
+    monkeypatch.setattr(
+        module, "resolve_frame_background",
+        lambda *_a, **_k: background_order.append(len(background_order))
+        or pytest.fail("inactive Average invoked the background resolver"),
+    )
     reduction = ReductionPlan(
         integration_1d=Integration1DPlan(npt=4, monitor_key="I0"),
         threshold_max=50.0, mask_saturation=True,
@@ -148,7 +149,7 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
     assert finite.evidence.contributor_extent == 3
     assert len(observed) == 1 and observed[0][0] == "1d"
     mean, mask, normalization = observed[0][1:]
-    np.testing.assert_allclose(mean, [[np.nan, 14.0], [np.nan, 6.0]], equal_nan=True)
+    np.testing.assert_allclose(mean, [[np.nan, 16.0], [np.nan, 16.0]], equal_nan=True)
     np.testing.assert_array_equal(mask, finite.values == 0)
     assert normalization == pytest.approx(2.0)
     assert read_order == [0, 0, 1, 2]
@@ -156,10 +157,123 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
                               (1, {"max_input_bytes": 65536}),
                               (2, {"max_input_bytes": 65536}),
                               (3, {"max_input_bytes": 65536})]
-    assert background_order == [0, 1, 2]
+    assert background_order == []
     assert len(detector_masks) == 1
     np.testing.assert_array_equal(detector_masks[0], frames[0])
     assert recipe.batch_mode is False and result.finite_counts == finite.evidence
+
+
+@pytest.mark.parametrize(
+    ("dtype", "rows", "limits", "mask_saturation"),
+    (
+        pytest.param(
+            "<u2",
+            (
+                ((1, 65535, 7), (9, 11, 13)),
+                ((5, 6, 8), (10, 12, 14)),
+                ((4, 7, 9), (11, 13, 15)),
+            ),
+            (5.0, None), True, id="u2",
+        ),
+        pytest.param(
+            "<u4",
+            (
+                ((0, 4294967294, 3), (4, 5, 6)),
+                ((1, 8, 4), (5, 6, 7)),
+                ((2, 9, 5), (6, 7, 8)),
+            ),
+            (None, 100.0), False, id="u4",
+        ),
+        pytest.param(
+            "<u8",
+            (
+                ((2**53 + 1, 2**53 + 3, 2**53 + 5),
+                 (2**53 + 7, 2**53 + 9, 2**53 + 11)),
+                ((2**53 + 13, 2**53 + 15, 2**53 + 17),
+                 (2**53 + 19, 2**53 + 21, 2**53 + 23)),
+                ((2**53 + 25, 2**53 + 27, 2**53 + 29),
+                 (2**53 + 31, 2**53 + 33, 2**53 + 35)),
+            ),
+            (None, None), False, id="u8-above-binary64-integer-precision",
+        ),
+        pytest.param(
+            "<i8",
+            (
+                ((-10, -5, 0), (5, 10, 100)),
+                ((-9, -4, 1), (6, 11, 90)),
+                ((-8, -3, 2), (7, 12, 80)),
+            ),
+            (-5.0, 50.0), False, id="signed",
+        ),
+        pytest.param(
+            "<f8",
+            (
+                ((np.nan, -np.inf, np.inf), (-4.0, 0.0, 4.0)),
+                ((-5.0, -3.0, 3.0), (-2.0, 1.0, 5.0)),
+                ((-6.0, -1.0, 2.0), (-3.0, np.nan, 6.0)),
+            ),
+            (-5.0, 5.0), False, id="float-nonfinite",
+        ),
+    ),
+)
+def test_average_where_out_accumulator_is_bit_exact(
+    tmp_path, monkeypatch, dtype, rows, limits, mask_saturation,
+) -> None:
+    frames = tuple(np.asarray(row, dtype=dtype) for row in rows)
+    source = _series(tmp_path, frames)
+    static_mask = np.array(
+        ((False, False, True), (False, True, False)), dtype=bool,
+    )
+    mask_path = tmp_path / "static-mask.npy"
+    np.save(mask_path, static_mask)
+    calibration = CalibrationState(mask=MaskState(
+        str(mask_path), hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+        np.dtype(bool).str, static_mask.shape, FactStatus.PRESENT,
+    ))
+    minimum, maximum = limits
+    reduction = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=3),
+        threshold_min=minimum, threshold_max=maximum,
+        mask_saturation=mask_saturation,
+    )
+
+    _recipe, result, observed = _public_run(
+        tmp_path, monkeypatch, source=source, reduction=reduction,
+        calibration=calibration, numeric_metadata_keys=(),
+    )
+
+    assert result.disposition == "COMMITTED" and len(observed) == 1
+    actual = observed[0][1]
+    actual_counts = module.get_average_finite_counts(result.target).values
+    detector_mask = module.detector_value_mask(
+        None, frames[0], enabled=mask_saturation,
+    )
+    expected = np.zeros(frames[0].shape, dtype=np.float64)
+    expected_counts = np.zeros(frames[0].shape, dtype="<u4")
+    for native in frames:
+        conditioned = native.astype(np.float64, copy=True)
+        invalid = np.zeros(native.shape, dtype=bool)
+        if minimum is not None:
+            np.logical_or(invalid, native < minimum, out=invalid)
+        if maximum is not None:
+            np.logical_or(invalid, native > maximum, out=invalid)
+        np.logical_or(invalid, static_mask, out=invalid)
+        if detector_mask is not None:
+            np.logical_or(invalid, detector_mask, out=invalid)
+        np.logical_or(invalid, ~np.isfinite(conditioned), out=invalid)
+        valid = ~invalid
+        expected[valid] += conditioned[valid]
+        expected_counts[valid] += np.uint32(1)
+    zero = expected_counts == 0
+    np.divide(expected, expected_counts, out=expected, where=~zero)
+    expected[zero] = np.nan
+
+    np.testing.assert_array_equal(actual_counts, expected_counts)
+    np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+    finite = np.isfinite(expected)
+    np.testing.assert_array_equal(
+        actual[finite].view(np.uint64), expected[finite].view(np.uint64),
+    )
 
 
 def test_average_persists_anisotropic_detector_axes_without_transposition(
@@ -294,6 +408,79 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     assert operation_identities[0] != operation_identities[1]
     assert accepted[0].science_identity == accepted[1].science_identity
     assert accepted[0].metadata_denominators == accepted[1].metadata_denominators
+
+
+def test_average_background_none_is_canonical_and_active_refuses_pre_effect(
+    tmp_path, monkeypatch,
+) -> None:
+    source = _series(tmp_path, (np.ones((2, 2), dtype="u2"),))
+    target = tmp_path / "average.nxs"
+    reduction = ReductionPlan(integration_1d=Integration1DPlan(npt=3))
+    omitted = AverageScanRecipe(source, target, reduction)
+    explicit = AverageScanRecipe(
+        source, target, reduction, background=FrameBackgroundPlan(),
+    )
+    assert omitted == explicit
+    assert omitted.background is explicit.background is None
+    assert module._recipe_payload(omitted) == module._recipe_payload(explicit)
+    assert module._recipe_payload(explicit)["background"] is None
+    plans = tuple(module.prepare_average_scan(recipe)
+                  for recipe in (omitted, explicit))
+    assert plans[0].allocation == plans[1].allocation
+    assert plans[0].science_identity == plans[1].science_identity
+    assert plans[0].operation_identity == plans[1].operation_identity
+    assert module._science_payload(plans[0])["background"] is None
+
+    active = AverageScanRecipe(
+        source, target, reduction,
+        background=FrameBackgroundPlan(
+            mode="Single BG File",
+            locator=str(source.options["files"][0]),
+        ),
+    )
+    effects = []
+
+    def forbidden(name):
+        return lambda *_args, **_kwargs: (
+            effects.append(name), pytest.fail(f"active background reached {name}")
+        )[1]
+
+    with monkeypatch.context() as patch:
+        for name in (
+            "_source_from_recipe", "qualify_source_execution_graph",
+            "open_source_execution_graph", "_average_allocation",
+            "capture_target_snapshot", "_background_fact",
+            "resolve_frame_background",
+        ):
+            patch.setattr(module, name, forbidden(name))
+        with pytest.raises(
+            ValueError,
+            match="^AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED$",
+        ):
+            module.prepare_average_scan(active)
+        refused = module.run_average_scan(active)
+    assert (refused.disposition, refused.diagnostic_code) == (
+        "REFUSED", "AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED",
+    )
+    assert effects == [] and not target.exists()
+
+    run_configuration = []
+    integrations = []
+    real_sink = module.NexusSink
+
+    def sink(*args, **kwargs):
+        run_configuration.append(dict(kwargs["run_configuration_provenance"]))
+        return real_sink(*args, **kwargs)
+
+    _stub_integrators(monkeypatch, integrations)
+    monkeypatch.setattr(module, "NexusSink", sink)
+    committed = module.run_average_scan(explicit)
+    assert committed.disposition == "COMMITTED" and len(integrations) == 1
+    assert len(run_configuration) == 1
+    assert "background" not in run_configuration[0]
+    from xrd_tools.core.provenance import read_provenance
+    persisted = read_provenance(target)["config"]["average_scan_v1"]
+    assert persisted["background"] is None
 
 
 def test_post_admission_source_drift_rolls_back_prior_target(tmp_path, monkeypatch) -> None:
@@ -439,8 +626,10 @@ def test_recipe_deep_snapshot_survives_all_caller_mutation(tmp_path) -> None:
     )
     variant = replace(recipe, calibration=variant_calibration)
     assert module._recipe_payload(variant) != before
-    prepared = module.prepare_average_scan(recipe)
-    variant_prepared = module.prepare_average_scan(variant)
+    prepared = module.prepare_average_scan(replace(recipe, background=None))
+    variant_prepared = module.prepare_average_scan(
+        replace(variant, background=None),
+    )
     assert tuple(module._science_payload(prepared)["calibration"]
                  ["detector_config"]["nested"]["labels"]) == ("fast", True, None)
     assert prepared.science_identity != variant_prepared.science_identity
@@ -573,6 +762,74 @@ def test_preparation_metadata_row_drift_refuses_before_key_identity_derivation(t
         runner = module.AverageScanRunner(plan); runner._graph = runner._fresh_graph(); runner._source_sweep()
     assert calls == [("prepare", "theta"), ("requalify", "theta"),
                      ("execution", "theta"), ("requalify", "theta")]
+
+
+def test_average_tiff_fence_is_aligned_and_nexus_segment_lookup_is_binary(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.io.nexus import NexusImageStack
+    from xrd_tools.sources import execution_graph
+
+    source = _series(tmp_path)
+    for path in source.options["files"]:
+        _txt(path, counters=(("I0", 1.0),))
+    source = SourceSpec(source.uri, source.kind, options={
+        **dict(source.options), "metadata_format": "txt",
+    })
+    graph = execution_graph.qualify_source_execution_graph(
+        source, reader_binding="average_closed_v1",
+    )
+
+    class IndexedOnly(tuple):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            raise AssertionError("TIFF metadata inventory was scanned")
+
+    metadata = IndexedOnly(graph.stamp.metadata_sources)
+    object.__setattr__(graph.stamp, "metadata_sources", metadata)
+    matched = []
+    real_match = execution_graph.SourceFileState.matches_disk
+
+    def matches(state):
+        matched.append(state.path)
+        return real_match(state)
+
+    monkeypatch.setattr(
+        execution_graph.SourceFileState, "matches_disk", matches,
+    )
+    module._validate_contributor(graph, 2, None)
+    assert metadata.iterations == 0
+    assert matched == [
+        graph.stamp.members[2].path,
+        graph.stamp.metadata_sources[2].metadata_file.path,
+    ]
+
+    class CountedOffsets:
+        def __init__(self, values):
+            self.values = values
+            self.reads = 0
+
+        def __len__(self):
+            return len(self.values)
+
+        def __getitem__(self, index):
+            self.reads += 1
+            return self.values[index]
+
+    stack = NexusImageStack.__new__(NexusImageStack)
+    offsets = CountedOffsets(tuple(range(652)))
+    stack._offsets = offsets
+    stack._dsets = (None,) * 651
+    for index in (0, 325, 650):
+        offsets.reads = 0
+        assert stack._locate(index) == (index, 0)
+        assert offsets.reads <= 12
+    offsets.reads = 0
+    with pytest.raises(IndexError):
+        stack._locate(651)
+    assert offsets.reads <= 12
 
 
 @pytest.mark.parametrize("metadata_format", ("txt", "auto"))
@@ -954,6 +1211,25 @@ def test_average_lineage_iterators_cover_container_tiff_and_eiger(tmp_path, monk
     assert graphs["eiger"].execution_source.kind is SourceKind.EIGER_MASTER
 
     observed = []
+    routed = []
+    validated = []
+    real_route = module._external_contributor_route
+    real_validate = module._validate_contributor
+
+    def route(graph):
+        value = real_route(graph)
+        if value:
+            routed.append(tuple((item.first, item.stop) for item in value))
+        return value
+
+    def validate(graph, index, token, external_member=None):
+        if graph.stamp.external_members:
+            validated.append((index, None if external_member is None
+                              else external_member.first))
+        return real_validate(graph, index, token, external_member)
+
+    monkeypatch.setattr(module, "_external_contributor_route", route)
+    monkeypatch.setattr(module, "_validate_contributor", validate)
     _stub_integrators(monkeypatch, observed)
     rows = {}
     for family, source in sources.items():
@@ -982,6 +1258,112 @@ def test_average_lineage_iterators_cover_container_tiff_and_eiger(tmp_path, monk
             member.first, member.stop, member.file.size, member.file.mtime_ns,
         ) for index in range(member.first, member.stop))
     assert rows["eiger"] == tuple(expected)
+    assert routed == [((0, 2), (2, 5))]
+    assert validated == [
+        (index, 0 if index < 2 else 2)
+        for index in range(5) for _fence in range(2)
+    ]
+
+
+def test_651_frame_inactive_average_has_exact_serial_cadence(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.sources import execution_graph
+
+    source_path = tmp_path / "651.nxs"
+    with h5py.File(source_path, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        detector = entry.create_group("instrument/detector")
+        detector.create_dataset(
+            "data", data=np.arange(651, dtype="u2").reshape(651, 1, 1),
+            chunks=(1, 1, 1),
+        )
+    source = SourceSpec(
+        source_path, SourceKind.NEXUS_STACK, entry="entry",
+    )
+    recipe = AverageScanRecipe(
+        source, tmp_path / "average-651.nxs",
+        ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
+        background=FrameBackgroundPlan(),
+    )
+    counts = {
+        "prepare_qualify": 0, "execution_qualify": 0,
+        "requalify": 0, "read_native": 0, "metadata": 0,
+        "contributor_fence": 0, "background_fact": 0,
+        "background_resolver": 0,
+    }
+    integrations = []
+    real_prepare = module.qualify_source_execution_graph
+    real_execution = module._source_graph_owner.qualify_source_execution_graph
+    real_requalify = module.requalify_source_execution_graph
+    real_read = execution_graph._AverageSourceReadWindow.read_native
+    real_metadata = execution_graph._AverageSourceReadWindow.complete_metadata_for
+    real_fence = module._validate_contributor
+
+    def prepare_qualify(*args, **kwargs):
+        counts["prepare_qualify"] += 1
+        return real_prepare(*args, **kwargs)
+
+    def execution_qualify(*args, **kwargs):
+        counts["execution_qualify"] += 1
+        return real_execution(*args, **kwargs)
+
+    def requalify(*args, **kwargs):
+        counts["requalify"] += 1
+        return real_requalify(*args, **kwargs)
+
+    def read_native(window, index):
+        counts["read_native"] += 1
+        return real_read(window, index)
+
+    def metadata(window, index):
+        counts["metadata"] += 1
+        return real_metadata(window, index)
+
+    def fence(graph, index, token, external_member=None):
+        counts["contributor_fence"] += 1
+        return real_fence(graph, index, token, external_member)
+
+    def forbidden(name):
+        def call(*_args, **_kwargs):
+            counts[name] += 1
+            pytest.fail(f"inactive Average invoked {name}")
+        return call
+
+    _stub_integrators(monkeypatch, integrations)
+    monkeypatch.setattr(
+        module, "qualify_source_execution_graph", prepare_qualify,
+    )
+    monkeypatch.setattr(
+        module._source_graph_owner, "qualify_source_execution_graph",
+        execution_qualify,
+    )
+    monkeypatch.setattr(module, "requalify_source_execution_graph", requalify)
+    monkeypatch.setattr(
+        execution_graph._AverageSourceReadWindow, "read_native", read_native,
+    )
+    monkeypatch.setattr(
+        execution_graph._AverageSourceReadWindow,
+        "complete_metadata_for", metadata,
+    )
+    monkeypatch.setattr(module, "_validate_contributor", fence)
+    monkeypatch.setattr(
+        module, "_background_fact", forbidden("background_fact"),
+    )
+    monkeypatch.setattr(
+        module, "resolve_frame_background",
+        forbidden("background_resolver"),
+    )
+    result = module.run_average_scan(recipe)
+    assert result.disposition == "COMMITTED"
+    assert len(integrations) == 1
+    assert counts == {
+        "prepare_qualify": 1, "execution_qualify": 1,
+        "requalify": 3, "read_native": 651, "metadata": 1,
+        "contributor_fence": 1302, "background_fact": 0,
+        "background_resolver": 0,
+    }
 
 
 def test_average_contributor_fields_are_exact_per_logical_frame_and_family(tmp_path) -> None:

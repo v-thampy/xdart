@@ -221,6 +221,63 @@ class TraceProjection:
             raise TypeError("trace epoch must be a finite float or None")
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class BrowseTraceSnapshot:
+    """Already-planned sparse Browse rows and their full logical extent."""
+
+    logical_frames: tuple[DisplayFrameKey, ...]
+    display_frames: tuple[DisplayFrameKey, ...]
+    logical_positions: tuple[int, ...]
+    logical_epochs: tuple[float, ...] | None = None
+    plot_mode: str = "Single"
+    waterfall_active: bool = False
+    stacked_options_applied: bool = False
+    science_contract: tuple[object, ...] = ()
+
+    def __post_init__(self) -> None:
+        logical = self.logical_frames
+        display = self.display_frames
+        positions = self.logical_positions
+        if (
+            type(logical) is not tuple
+            or not logical
+            or any(type(frame) is not DisplayFrameKey for frame in logical)
+            or len({id(frame) for frame in logical}) != len(logical)
+            or type(display) is not tuple
+            or not display
+            or len(display) > 256
+            or any(type(frame) is not DisplayFrameKey for frame in display)
+            or type(positions) is not tuple
+            or len(positions) != len(display)
+            or any(type(position) is not int for position in positions)
+            or self.logical_epochs is not None
+            and (
+                type(self.logical_epochs) is not tuple
+                or len(self.logical_epochs) != len(logical)
+                or any(
+                    type(value) is not float or not np.isfinite(value)
+                    for value in self.logical_epochs
+                )
+            )
+            or self.plot_mode not in {"Single", "Overlay", "Waterfall"}
+            or type(self.waterfall_active) is not bool
+            or type(self.stacked_options_applied) is not bool
+            or self.stacked_options_applied
+            != (self.plot_mode in {"Overlay", "Waterfall"})
+            or type(self.science_contract) is not tuple
+        ):
+            raise TypeError("Browse trace snapshot is invalid")
+        previous = 0
+        for frame, position in zip(display, positions, strict=True):
+            if (
+                position <= previous
+                or position > len(logical)
+                or logical[position - 1] is not frame
+            ):
+                raise ValueError("Browse trace positions changed ownership")
+            previous = position
+
+
 @dataclass(frozen=True, slots=True)
 class SlicePin:
     """One scan-qualified immutable slice recipe owned by the page."""
@@ -376,6 +433,7 @@ class ScientificProjection:
     detector_available: bool = False
     detector_pending: bool = False
     detector_diagnostic: str = ""
+    browse_trace_snapshot: BrowseTraceSnapshot | None = None
 
     def __post_init__(self) -> None:
         if self.detector_mode not in {"thumbnail", "full"}:
@@ -384,6 +442,34 @@ class ScientificProjection:
             raise TypeError("detector availability must be boolean")
         if type(self.detector_diagnostic) is not str:
             raise TypeError("detector diagnostic must be text")
+        if (
+            self.browse_trace_snapshot is not None
+            and type(self.browse_trace_snapshot) is not BrowseTraceSnapshot
+        ):
+            raise TypeError("Browse trace snapshot must be exact")
+
+    @property
+    def browse_science_contract(self) -> tuple[object, ...]:
+        """All presentation facts that affect copied Browse trace meaning."""
+
+        return (
+            self.processing_mode,
+            self.measurement_mode,
+            self.gi_mode_1d,
+            self.gi_mode_2d,
+            self.norm_identity,
+            self.norm_revision,
+            self.norm_channel,
+            self.plot_axis,
+            self.plot_mode,
+            self.share_axis,
+            self.slice_enabled,
+            self.slice_center,
+            self.slice_width,
+            tuple(pin.projection_id for pin in self.slice_pins),
+            self.plot_options,
+            self.color_map,
+        )
 
 
 @dataclass(frozen=True, slots=True)

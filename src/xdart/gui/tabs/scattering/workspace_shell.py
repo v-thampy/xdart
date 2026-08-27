@@ -221,6 +221,7 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         *,
         preserve_display: bool = False,
         preserve_scientific: bool = False,
+        replace_scientific_on_failure: bool = False,
     ) -> None:
         """Reconcile passive state with independently retainable plot paint."""
 
@@ -291,13 +292,18 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                         if artifact_progress is not None
                         else len(local_frames)
                     )
-                    self.scientific.reconcile(
-                        state.scientific,
-                        state.navigation,
-                        completed=local_completed,
-                        total=local_total,
-                        detail=state.progress.detail,
-                    )
+                    try:
+                        self.scientific.reconcile(
+                            state.scientific,
+                            state.navigation,
+                            completed=local_completed,
+                            total=local_total,
+                            detail=state.progress.detail,
+                        )
+                    except Exception:
+                        if replace_scientific_on_failure:
+                            self.replace_scientific_with_blank()
+                        raise
             controls = _shell_controls(state.controls)
             if not self.controls.apply_state_update(controls):
                 self.controls.set_state(controls)
@@ -309,6 +315,39 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
             self._revision = state.revision
         finally:
             self._reconciling = False
+
+    def replace_scientific_with_blank(self) -> ScientificView:
+        """Abandon a partially-mutated paint as one whole view object."""
+
+        old = self.scientific
+        sizes = self.splitter.sizes()
+        fresh = ScientificView()
+        fresh.commandRequested.connect(self._forward)
+        index = self.splitter.indexOf(old)
+        if index != 1:
+            fresh.commandRequested.disconnect(self._forward)
+            fresh.deleteLater()
+            raise RuntimeError("scientific view left its exact splitter slot")
+        replaced = self.splitter.replaceWidget(index, fresh)
+        if replaced is not old:
+            fresh.commandRequested.disconnect(self._forward)
+            fresh.deleteLater()
+            raise RuntimeError("scientific view replacement lost ownership")
+        self.scientific = fresh
+        self.splitter.setStretchFactor(1, 3)
+        if sizes:
+            self.splitter.setSizes(sizes)
+        try:
+            old.commandRequested.disconnect(self._forward)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            old.clear_workspace()
+        except Exception:
+            pass
+        old.setParent(None)
+        old.deleteLater()
+        return fresh
 
     def _reconcile_run_strip(self, state: RunStripProjection) -> None:
         blockers = [

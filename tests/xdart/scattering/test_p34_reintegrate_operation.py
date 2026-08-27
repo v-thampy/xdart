@@ -29,6 +29,12 @@ def _loaded_page(
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
     seeded = seed or _seed_existing(tmp_path)
     page, store = _page(tmp_path, monkeypatch)
+    if terminal_browse:
+        from tests.xdart.scattering.test_e3_context_contract import _acquisition
+        identity, acquisition = _acquisition()
+        page._context_controller._runtime.adopt_acquisition(
+            identity, acquisition,
+        )
     request = page._context_controller.begin_browse(
         str(seeded.target.resolve()),
         terminal_commit_identity=(
@@ -99,7 +105,8 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
     assert tuple(field.name for field in fields(ReintegratePlan)) == (
         "api_version", "target", "entry", "expected_target_snapshot", "dimension",
         "labels", "detector_shape", "native_dtype", "selected_plan",
-        "requested_shared_science", "gi_bootstrap_incidence", "session_policy",
+        "requested_shared_science", "gi_bootstrap_incidence",
+        "retained_mask_bytes", "mask_decode_bytes", "session_policy",
         "rollback_policy", "science_identity", "operation_identity",
     )
     assert set(field.name for field in fields(ReintegrateProgress)) == {
@@ -158,12 +165,21 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
         def __exit__(self, *_args): trace.append("lock-exit")
     writer = object.__new__(record_writer.NexusRecordWriter)
     writer.phase = record_writer.WriterPhase.ACTIVE; writer.file_lock = TraceLock(); writer._in_boundary = False; writer._h5 = object(); writer.entry = "entry"; writer._row_cursors = {}; writer._replacement_read_context = None
-    fact = {"label": 7, "path": "/raw", "frame_index": 0, "snapshot": {"mtime_ns": 1}, "metadata": {}, "geometry": {}, "background_dependency": None}
+    execution = {}
+    fact = {
+        "label": 7, "path": "/raw", "frame_index": 0,
+        "snapshot": {"mtime_ns": 1}, "metadata": {}, "geometry": {},
+        "background_dependency": None, "source_execution": execution,
+        "append_lineage": None, "source_base": "/",
+    }
     monkeypatch.setattr(record_writer, "_decode_replacement_fact", lambda *_a, **_k: trace.append("detach") or fact)
     marker = object(); monkeypatch.setattr(module, "_load_fact", lambda *_a, **_k: trace.append("raw") or (Path("/raw"), marker, None, None))
     shared = {"background": {"version": 1, "mode": "None"}, "gi": {"enabled": False, "resolved_motor": "Manual"}, "geometry": None}
     source_plan = SimpleNamespace(requested_shared_science=shared, labels=(7,), detector_shape=(2, 2), native_dtype="<u2", resource_allocation=None)
-    frame = Frame(7); source = module._ReintegrateFrameSource(source_plan); source._frames = {7: frame}; source.bind_fact_reader(writer._detach_replacement_fact)
+    topology = SimpleNamespace(
+        execution=execution, lineage=None, source_base="/",
+    )
+    frame = Frame(7); source = module._ReintegrateFrameSource(source_plan, topology=topology); source._frames = {7: frame}; source.bind_fact_reader(writer._detach_replacement_fact)
     assert source.prepare(frame)[0] is marker and trace == ["lock-enter", "detach", "lock-exit", "raw"]
     runtime_source = inspect.getsource(module._ExecutionRuntime.run)
     assert runtime_source.index("self.source.prepare(frame)") < runtime_source.index("self.session._session.drain()") and "with " not in runtime_source
@@ -447,13 +463,196 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         _dispose(page, qapp)
 
 
-def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
+def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
     tmp_path, monkeypatch, qapp,
 ):
     from xdart.gui.tabs.scattering.browse_values import (
         BrowseLoadOutcome, BrowseLoadStatus,
     )
     from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
+    from xdart.gui.tabs.scattering.shell_values import (
+        FrameNavigationProjection, ShellCommandKind,
+    )
+    from xrd_tools.io.output_transaction import StreamTerminal
+
+    page, _store, _seeded, context = _loaded_page(
+        tmp_path, monkeypatch, qapp, terminal_browse=True,
+    )
+    try:
+        controller = page._context_controller
+        original = controller.navigation
+        latest = original.frames[-1]
+        synthetic = tuple(
+            DisplayFrameKey(
+                latest.run_identity,
+                latest.source_scan,
+                latest.artifact,
+                10_000 + index,
+                10_000 + index,
+            )
+            for index in range(64)
+        )
+        expanded = FrameNavigationProjection(
+            (*synthetic, latest), latest, (latest,),
+        )
+        controller._runtime._set_browse_navigation(expanded)
+        page._preferences = replace(page._preferences, plot_mode="Single")
+        view = page._shell.scientific
+
+        def complete_single():
+            page._drain_executor()
+            page._refresh_shell()
+            projection = page._last_scientific_projection
+            return (
+                projection
+                if projection is not None
+                and view.navigation_frame_keys == expanded.frames
+                and view.navigation_current_key is latest
+                and view.navigation_selected_keys == (latest,)
+                and view.trace_history_keys == (latest,)
+                and len(projection.traces) == 1
+                and projection.heavy is not None
+                and projection.heavy.frame is latest
+                else None
+            )
+
+        before = _wait(complete_single)
+        before_history = view.trace_history_projections
+        before_items = tuple(view.curve.listDataItems())
+        assert len(before_history) == len(before_items) == 1
+        before_axis = before.traces[0].axis.values
+        before_intensity = before.traces[0].intensity
+        before_raw = view.raw.canvas.displayed_image
+        before_cake = view.cake.canvas.displayed_image
+        before_raw_widget = view.raw
+        before_cake_widget = view.cake
+        before_bottom = view.bottom_stack.currentWidget()
+        preference_before = page._preferences
+
+        clones = tuple(
+            DisplayFrameKey(
+                frame.run_identity,
+                frame.source_scan,
+                frame.artifact,
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in expanded.frames
+        )
+        rebound = FrameNavigationProjection(
+            clones, clones[-1], (clones[-1],),
+        )
+        request = context.load_request
+        commit_identity = request.terminal_commit_identity
+        assert type(commit_identity) is StreamTerminal
+        handoff = _TerminalBrowseHandoff(
+            request,
+            latest.run_identity,
+            latest.artifact,
+            latest.local_frame_label,
+            (latest.local_frame_label,),
+            commit_identity,
+        )
+        assert page._terminal_scientific_matches(handoff, rebound)
+        controller._runtime._set_browse_navigation(rebound)
+        page._terminal_browse_handoff = handoff
+        assert page._settle_terminal_browse(BrowseLoadOutcome(
+            request, BrowseLoadStatus.READY,
+        ))
+
+        controller._runtime._committed_trace_scope = ("stale",)
+        controller._runtime._committed_trace_selection = (clones[-1],)
+        controller._runtime._pending_trace_projection = object()
+        monkeypatch.setattr(
+            controller,
+            "project_navigation",
+            lambda **_kwargs: pytest.fail(
+                "terminal Single rebind rebuilt numeric projections"
+            ),
+        )
+        monkeypatch.setattr(
+            view,
+            "_render_traces",
+            lambda *_args, **_kwargs: pytest.fail(
+                "terminal Single rebind repainted traces"
+            ),
+        )
+        monkeypatch.setattr(
+            before_items[0],
+            "setData",
+            lambda *_args, **_kwargs: pytest.fail(
+                "terminal Single rebind replaced trace arrays"
+            ),
+        )
+        for renderer, description in (
+            (view.raw, "raw"),
+            (view.cake, "cake"),
+            (view.waterfall, "waterfall"),
+        ):
+            monkeypatch.setattr(
+                renderer,
+                "render",
+                lambda *_args, _description=description, **_kwargs: pytest.fail(
+                    f"terminal Single rebind repainted {_description}"
+                ),
+            )
+
+        page._refresh_shell(
+            preserve_scientific=True,
+            skip_scientific_projection=True,
+            rebind_scientific_navigation=True,
+        )
+
+        after = page._last_scientific_projection
+        assert after is not None
+        assert view.navigation_frame_keys == clones
+        assert view.navigation_current_key is clones[-1]
+        assert view.navigation_selected_keys == (clones[-1],)
+        assert view.trace_history_keys == (clones[-1],)
+        assert len(view.trace_history_projections) == 1
+        assert len(after.traces) == 1
+        assert after.traces[0].frame is clones[-1]
+        assert after.traces[0].axis.values is before_axis
+        assert after.traces[0].intensity is before_intensity
+        assert after.heavy is not None and after.heavy.frame is clones[-1]
+        assert after.heavy_available == frozenset((clones[-1],))
+        assert view.heavy_available_keys == after.heavy_available
+        assert all(
+            any(frame is owned for owned in clones)
+            for frame in view.heavy_available_keys
+        )
+        assert tuple(view.curve.listDataItems()) == before_items
+        assert view.raw is before_raw_widget
+        assert view.cake is before_cake_widget
+        assert view.raw.canvas.displayed_image is before_raw
+        assert view.cake.canvas.displayed_image is before_cake
+        assert view.bottom_stack.currentWidget() is before_bottom
+        assert page._preferences is preference_before
+        assert controller._runtime._committed_trace_scope is None
+        assert controller._runtime._committed_trace_selection == ()
+        assert controller._runtime._pending_trace_projection is None
+        assert not page._scientific_repaint_pending
+        commands = []
+        view.commandRequested.disconnect()
+        view.commandRequested.connect(commands.append)
+        view._frame_selected(view.frame_selector.currentIndex())
+        assert len(commands) == 1
+        assert commands[0].kind is ShellCommandKind.SELECT_FRAME
+        assert commands[0].frame is clones[-1]
+        assert commands[0].frames == (clones[-1],)
+    finally:
+        page.close_workspace()
+
+
+def test_terminal_browse_single_rebind_refuses_multi_selected_or_foreign(
+    tmp_path, monkeypatch, qapp,
+):
+    from xdart.gui.tabs.scattering.browse_values import (
+        BrowseLoadOutcome, BrowseLoadStatus,
+    )
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.events import RunIdentity
     from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
     from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
     from xrd_tools.io.output_transaction import StreamTerminal
@@ -463,7 +662,135 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
     )
     try:
         controller = page._context_controller
+        original = controller.navigation
+        latest = original.frames[-1]
+        assert controller.select_navigation(latest, (latest,))
+        page._preferences = replace(page._preferences, plot_mode="Single")
+        view = page._shell.scientific
+
+        def complete_single():
+            page._refresh_shell()
+            projection = page._last_scientific_projection
+            return (
+                projection
+                if projection is not None
+                and view.trace_history_keys == (latest,)
+                and projection.heavy is not None
+                else None
+            )
+
+        before = _wait(complete_single)
+        clones = tuple(
+            DisplayFrameKey(
+                frame.run_identity,
+                frame.source_scan,
+                frame.artifact,
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in original.frames
+        )
+        valid = FrameNavigationProjection(
+            clones, clones[-1], (clones[-1],),
+        )
+        request = context.load_request
+        commit_identity = request.terminal_commit_identity
+        assert type(commit_identity) is StreamTerminal
+        handoff = _TerminalBrowseHandoff(
+            request,
+            latest.run_identity,
+            latest.artifact,
+            latest.local_frame_label,
+            (latest.local_frame_label,),
+            commit_identity,
+        )
+        assert page._terminal_scientific_matches(handoff, valid)
+
+        foreign_identity = RunIdentity(
+            latest.run_identity.generation,
+            latest.run_identity.fingerprint,
+        )
+        foreign = tuple(
+            DisplayFrameKey(
+                foreign_identity,
+                frame.source_scan,
+                frame.artifact,
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in clones
+        )
+        assert not page._terminal_scientific_matches(
+            handoff,
+            FrameNavigationProjection(foreign, foreign[-1], (foreign[-1],)),
+        )
+
+        page._last_scientific_projection = replace(
+            before,
+            heavy=replace(before.heavy, frame=original.frames[0]),
+        )
+        assert not page._terminal_scientific_matches(handoff, valid)
+        page._last_scientific_projection = replace(
+            before,
+            traces=(replace(before.traces[0], frame=original.frames[0]),),
+        )
+        assert not page._terminal_scientific_matches(handoff, valid)
+        page._last_scientific_projection = before
+
+        multiple = FrameNavigationProjection(
+            clones, clones[-1], (clones[-2], clones[-1]),
+        )
+        page._terminal_browse_handoff = replace(
+            handoff,
+            selected_labels=(
+                clones[-2].local_frame_label,
+                clones[-1].local_frame_label,
+            ),
+        )
+        controller._runtime._set_browse_navigation(multiple)
+        assert not page._settle_terminal_browse(BrowseLoadOutcome(
+            request, BrowseLoadStatus.READY,
+        ))
+        assert page._terminal_rebind_artifacts is None
+        projected = []
+        original_project = controller.project_navigation
+
+        def project_navigation(**kwargs):
+            result = original_project(**kwargs)
+            projected.append(result)
+            return result
+
+        monkeypatch.setattr(
+            controller, "project_navigation", project_navigation,
+        )
+        page._refresh_shell()
+        assert projected
+    finally:
+        page.close_workspace()
+
+
+def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
+    tmp_path, monkeypatch, qapp,
+):
+    import numpy as np
+
+    from xdart.gui.tabs.scattering.browse_values import (
+        BrowseLoadOutcome, BrowseLoadStatus,
+    )
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.events import RunIdentity
+    from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
+    from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
+    from xrd_tools.io.output_transaction import StreamTerminal
+    from pyqtgraph.Qt import QtCore
+
+    page, _store, _seeded, context = _loaded_page(
+        tmp_path, monkeypatch, qapp, terminal_browse=True,
+    )
+    try:
+        controller = page._context_controller
         navigation = controller.navigation
+        run_identity = navigation.current.run_identity
         assert controller.select_navigation(
             navigation.frames[-1], navigation.frames,
         )
@@ -475,6 +802,10 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
         def complete_waterfall():
             page._drain_executor()
             page._refresh_shell()
+            if page._shell.scientific is not view:
+                raise AssertionError(
+                    f"initial cache paint replaced its view: {page._notice_text}"
+                )
             return (
                 view
                 if view.trace_history_keys
@@ -485,7 +816,24 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
         view = _wait(complete_waterfall)
         before = page._last_scientific_projection
         assert before is not None
-        before_arrays = tuple(id(trace.intensity) for trace in before.traces)
+        before_history = view.trace_history_projections
+        assert before_history
+        before_axis_arrays = tuple(trace.axis.values for trace in before.traces)
+        before_intensity_arrays = tuple(trace.intensity for trace in before.traces)
+        before_axis_values = tuple(array.copy() for array in before_axis_arrays)
+        before_intensity_values = tuple(
+            array.copy() for array in before_intensity_arrays
+        )
+        preference_before = page._preferences
+        bottom_widget = view.bottom_stack.currentWidget()
+        waterfall_plot = view.waterfall.plot
+        waterfall_image = view.waterfall.image
+        combo_blocker = QtCore.QSignalBlocker(view.plot_axis)
+        if view.plot_axis.findData("q_ip") < 0:
+            view.plot_axis.addItem("Qᵢₚ (Å⁻¹)", "q_ip")
+        view.plot_axis.setCurrentIndex(view.plot_axis.findData("q_ip"))
+        del combo_blocker
+        assert view.plot_axis.currentData() == "q_ip"
 
         clones = tuple(
             DisplayFrameKey(
@@ -502,10 +850,36 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
         commit_identity = request.terminal_commit_identity
         assert type(commit_identity) is StreamTerminal
         handoff = _TerminalBrowseHandoff(
-            request, clones[-1].artifact,
+            request, clones[-1].run_identity, clones[-1].artifact,
             clones[-1].local_frame_label,
             tuple(frame.local_frame_label for frame in clones),
             commit_identity,
+        )
+        foreign_identity = RunIdentity(
+            run_identity.generation,
+            run_identity.fingerprint,
+        )
+        assert foreign_identity == run_identity
+        assert foreign_identity is not run_identity
+        foreign_clones = tuple(
+            DisplayFrameKey(
+                foreign_identity,
+                frame.source_scan,
+                frame.artifact,
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in clones
+        )
+        foreign_navigation = FrameNavigationProjection(
+            foreign_clones, foreign_clones[-1], foreign_clones,
+        )
+        assert not page._terminal_scientific_matches(
+            handoff, foreign_navigation,
+        )
+        assert not page._terminal_scientific_rebind_authorized(
+            foreign_navigation,
+            (run_identity, handoff.artifact, request.source_path),
         )
         assert page._terminal_scientific_matches(handoff, rebound)
 
@@ -515,36 +889,99 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
             request, BrowseLoadStatus.READY,
         ))
         assert page._terminal_browse_handoff is None
-        monkeypatch.setattr(
-            controller,
-            "project_navigation",
-            lambda **_kwargs: pytest.fail(
-                "terminal rebind rebuilt numeric projections"
-            ),
-        )
-        monkeypatch.setattr(
-            view,
-            "_render_traces",
-            lambda *_args, **_kwargs: pytest.fail(
-                "terminal rebind repainted the waterfall"
-            ),
-        )
-
+        # Cache-backed Browse receipts deliberately cannot zero-copy rebind
+        # acquisition arrays.  The first terminal rebind attempt must retain
+        # the coherent old paint and schedule the copied-cache fallback.
         page._refresh_shell(
             preserve_scientific=True,
             skip_scientific_projection=True,
             rebind_scientific_navigation=True,
         )
+        assert page._scientific_repaint_pending
+
+        def complete_copied_fallback():
+            page._drain_executor()
+            page._refresh_shell()
+            current_view = page._shell.scientific
+            if current_view is not view:
+                raise AssertionError(
+                    f"cache fallback replaced its view: {page._notice_text}"
+                )
+            projection = page._last_scientific_projection
+            snapshot = (
+                None if projection is None
+                else projection.browse_trace_snapshot
+            )
+            return (
+                projection
+                if snapshot is not None
+                and snapshot.logical_frames == clones
+                and view.trace_history_keys == clones
+                and not page._scientific_repaint_pending
+                else None
+            )
+
+        after = _wait(complete_copied_fallback)
 
         assert view.navigation_frame_keys == clones
         assert view.navigation_current_key is clones[-1]
         assert view.navigation_selected_keys == clones
         assert view.trace_history_keys == clones
-        assert tuple(
-            id(trace.intensity)
-            for trace in page._last_scientific_projection.traces
-        ) == before_arrays
-        assert controller._runtime._committed_trace_selection == clones
+        assert after.browse_trace_snapshot is not None
+        assert after.browse_trace_snapshot.logical_positions == tuple(
+            range(1, len(clones) + 1)
+        )
+        assert view.trace_row_count == len(clones)
+        assert all(
+            trace.axis.values is not old
+            and not trace.axis.values.flags.writeable
+            and np.array_equal(trace.axis.values, values, equal_nan=True)
+            for trace, old, values in zip(
+                after.traces,
+                before_axis_arrays,
+                before_axis_values,
+                strict=True,
+            )
+        )
+        after_history = view.trace_history_projections
+        assert all(
+            old.intensity is not new.intensity
+            and np.array_equal(
+                new.intensity, values, equal_nan=True,
+            )
+            for old, new, values in zip(
+                before_history,
+                after_history,
+                before_intensity_values,
+                strict=True,
+            )
+        )
+        assert all(
+            trace.intensity is not old
+            and not trace.intensity.flags.writeable
+            and np.array_equal(trace.intensity, values, equal_nan=True)
+            for trace, old, values in zip(
+                after.traces,
+                before_intensity_arrays,
+                before_intensity_values,
+                strict=True,
+            )
+        )
+        assert page._preferences is preference_before
+        assert view.bottom_stack.currentWidget() is bottom_widget
+        assert view.waterfall.plot is waterfall_plot
+        assert view.waterfall.image is waterfall_image
+        assert view.plot_axis.currentData() == "Q"
+        active_plot = (
+            view.waterfall.plot if bottom_widget is view.waterfall else view.curve
+        )
+        bottom_axis = active_plot.getAxis("bottom")
+        assert bottom_axis.labelText == "Q"
+        assert bottom_axis.labelUnits == "Å⁻¹"
+        # Cache-backed repaint owns its logical selection in the immutable
+        # BrowseTraceSnapshot; it must not populate the legacy projection-lane
+        # commit cache as a side effect.
+        assert controller._runtime._committed_trace_selection == ()
         assert not page._scientific_repaint_pending
         assert context.loaded_labels == tuple(
             frame.local_frame_label for frame in clones
@@ -615,6 +1052,7 @@ def test_terminal_browse_same_labels_changed_content_forces_normal_repaint(
         )
         handoff = _TerminalBrowseHandoff(
             request,
+            clones[-1].run_identity,
             clones[-1].artifact,
             clones[-1].local_frame_label,
             tuple(frame.local_frame_label for frame in clones),
@@ -1033,10 +1471,12 @@ def test_direct_and_gui_scheduled_1d_match_after_reopen(tmp_path, monkeypatch):
     with h5py.File(first.target) as a, h5py.File(second.target) as b: assert np.array_equal(a["entry/integrated_1d/intensity"], b["entry/integrated_1d/intensity"]) and np.array_equal(a["entry/integrated_2d/intensity"], b["entry/integrated_2d/intensity"])
 def test_browse_invalidation_terminal_reload_and_foreign_stale_refusal(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminal, OperationTerminalStatus, OperationUpdate; from xrd_tools.reduction import ReintegrateResult, reintegrate as core; page, _store, _seed, context = _loaded_page(tmp_path, monkeypatch, qapp); controller = page._context_controller
+    owner = controller._browse_hydration_owner; assert owner is not None
+    with owner._one_d_lane._lock: owner._one_d_lane._ready_pending = True
     captured = controller.capture_reintegrate_browse(); assert captured[0] is context and controller.invalidate_reintegrate_browse(*captured)
     request, target = context.load_request, context.requested_path; foreign = replace(request, token=request.token + "-foreign"); assert foreign is not request and controller.reload_reintegrate_browse(foreign, target) is None and controller.browse_context is context and context.invalidated and not context.released
     rid = OperationIdentity(77); result = core._value(ReintegrateResult, "COMMITTED", (1,), (1,), (), (), "b"*64, "a"*64, "c"*64, None); page._reintegrate_identity, page._reintegrate_request, page._reintegrate_target = rid, request, target; assert page._consume_reintegrate_update(OperationUpdate(rid, terminal=OperationTerminal(rid, OperationTerminalStatus.RETURNED, payload=result), stale=True))
-    assert result.disposition == "COMMITTED" and page._reintegrate_identity is None and controller._browse_request is not None and controller._browse_request is not request and context.released; page.close_workspace()
+    assert result.disposition == "COMMITTED" and page._reintegrate_identity is None and controller._browse_request is not None and controller._browse_request is not request and context.released and owner._one_d_lane._closed; page.close_workspace()
 def test_same_event_cancels_prepare_and_run_without_false_terminal(monkeypatch):
     from xdart.gui.tabs.scattering.adapters import external_operation as module
     from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationTerminalStatus
@@ -1103,7 +1543,7 @@ def test_reintegrate_2d_uses_exact_existing_worker_builder_and_runner(tmp_path, 
     assert update.terminal.status is OperationTerminalStatus.RETURNED and [row[0] for row in seen]==["build","run"] and seen[0][1].startswith("scattering-operation-") and seen[0][3]["dimension"]=="2d" and seen[1][1] is plan and seen[0][3]["cancel_token"] is seen[1][2]["cancel_token"] and update.progress.identity is identity; assert page._consume_reintegrate_update(update) and page._reintegrate_dimension is None; page.close_workspace()
 
 
-def test_default_browse_retains_651_first_middle_last_1d_and_metadata(tmp_path):
+def test_default_browse_retains_651_scalar_catalog_without_eager_rows(tmp_path):
     import h5py
     import numpy as np
 
@@ -1132,15 +1572,14 @@ def test_default_browse_retains_651_first_middle_last_1d_and_metadata(tmp_path):
     assert outcome.status is BrowseLoadStatus.READY
     context = loader.consume(outcome)
     assert context.loaded_labels == labels
+    assert len(context.record_store) == 0
+    assert len(context.publication_store) == 0
+    assert context.browse_1d_cache.resident_keys == ()
     for label in (0, 325, 650):
-        record = context.record_store.get(label)
-        publication = context.publication_store.get(label)
-        assert record is not None
-        assert publication is not None
-        assert publication.view.intensity_1d is not None
-        assert publication.record.active_view().intensity_1d is not None
-        assert record.active_view().metadata_raw["monitor"] == pytest.approx(label)
-        assert publication.view.metadata_raw["monitor"] == pytest.approx(label)
+        row = context.scalar_catalog.row(label)
+        assert row is not None
+        assert row.active_mode_1d in row.modes_1d
+        assert row.metadata_raw["monitor"] == pytest.approx(label)
     assert loader.release_context(context).cleanup_status.value == "cleaned"
 
 

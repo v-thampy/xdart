@@ -12,8 +12,9 @@ from typing import Callable
 
 from ..events import CleanupStatus, detached_exception_strings
 from ..experiment_authoring import (
-    CalibrationRequest, prepare_calibration_request, run_calibration,
-    MaskRequest, resolve_mask_executable, run_mask,
+    AssetValidationRequest, AssetValidationResult, CalibrationRequest,
+    MaskRequest, mask_terminal_result_valid, resolve_mask_executable,
+    run_calibration, run_mask, validate_authored_asset,
 )
 from ..operation_values import (
     OperationCleanupReceipt, OperationContextStamp, OperationIdentity,
@@ -278,10 +279,8 @@ class OperationSlot:
         if type(request) is not CalibrationRequest:
             return None
         try:
-            fresh = prepare_calibration_request(request.final_path)
-        except (OSError, ValueError):
-            return None
-        if fresh != request:
+            request.__post_init__()
+        except ValueError:
             return None
         return self._begin(request, stamp, self._run_calibrate)
 
@@ -308,7 +307,41 @@ class OperationSlot:
         return self._begin(request, stamp, self._run_mask) if valid else None
 
     def _run_mask(self, request, identity, cancelled, publish):
-        return run_mask(request, identity, cancelled, publish, self._seal_publication)
+        terminal = run_mask(
+            request, identity, cancelled, publish, self._seal_publication,
+        )
+        if not mask_terminal_result_valid(terminal, request):
+            raise ValueError("mask operation returned an invalid terminal")
+        return terminal
+
+    def begin_asset_validation(
+        self, request: object, stamp: OperationContextStamp,
+    ) -> OperationIdentity | None:
+        if type(request) is not AssetValidationRequest:
+            return None
+        try:
+            request.__post_init__()
+        except ValueError:
+            return None
+        return self._begin(request, stamp, self._run_asset_validation)
+
+    @staticmethod
+    def _run_asset_validation(request, identity, cancelled, publish):
+        if cancelled.is_set():
+            return OperationTerminal(identity, OperationTerminalStatus.CANCELLED)
+        publish("validate", 0, 1)
+        result = validate_authored_asset(request)
+        if type(result) is not AssetValidationResult:
+            raise TypeError("asset validator returned an invalid result")
+        result.__post_init__()
+        if result.request is not request:
+            raise ValueError("asset validator returned an inexact request")
+        if cancelled.is_set():
+            return OperationTerminal(identity, OperationTerminalStatus.CANCELLED)
+        publish("validate", 1, 1)
+        return OperationTerminal(
+            identity, OperationTerminalStatus.RETURNED, payload=result,
+        )
 
     def begin_background(self, plan: object, stamp: OperationContextStamp,
                          owner: object, reservation: object) -> OperationIdentity | None:

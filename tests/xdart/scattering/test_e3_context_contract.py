@@ -53,6 +53,8 @@ from xdart.modules.display_context import (
 )
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core import Axis, FrameRecord, FrameView
+from xrd_tools.io import Browse1DCache, FrameScalarCatalog, FrameScalarRow
+from xrd_tools.io.output_transaction import TargetSnapshot
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
@@ -224,6 +226,11 @@ def _browse(
             scan_key=scan_key,
         )
     )
+    catalog = FrameScalarCatalog(
+        request.source_path,
+        "entry",
+        (FrameScalarRow(1),),
+    )
     context = BrowseContext(
         context_token=context_token,
         load_generation=generation,
@@ -232,12 +239,17 @@ def _browse(
         scan_key=scan_key,
         scan=object(),
         frame=None,
-        frame_ids=[1],
+        frame_ids=catalog.labels,
         frames={},
         viewer_rows_1d={},
         viewer_rows_2d={},
         publication_store=publications,
         record_store=records,
+        scalar_catalog=catalog,
+        browse_1d_cache=Browse1DCache(1 << 20),
+        target_entry=catalog.entry,
+        loaded_labels=catalog.labels,
+        target_snapshot=TargetSnapshot(True, 1, 1, 1, 1, "a" * 64),
     )
     context.adopt_load_request(request)
     context.mark_loaded()
@@ -322,6 +334,11 @@ class _BrowsePort:
         )
 
     def release_context(self, context):
+        cache = context.browse_1d_cache
+        if cache is not None:
+            context.invalidate()
+            cache.close()
+            context.detach_browse_1d_cache(cache)
         context.release()
         if context.record_store is not None:
             context.record_store.clear()

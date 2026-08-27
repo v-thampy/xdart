@@ -18,6 +18,8 @@ from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions, ShellC
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.modules.display_context import ContextKind, Viewer2DRendererClearReceipt
 from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome
+from xrd_tools.session.intent_store import RunIntentStore
+from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.session.scan_norm import ScanNormAggregate
 from xrd_tools.session.viewer_1d import _new_viewer_1d_renderer_clear_receipt
 
@@ -73,6 +75,11 @@ class _Mount:
         self.choice2 = str(self.image)
         self.page = SimpleNamespace(
             _closing=False, _closed=False, _context_controller=self.controller,
+            _batch_terminal_presentation=None,
+            _terminal_browse_handoff=None,
+            _terminal_browse_presentation=None,
+            _intents=RunIntentStore(RunIntent(processing_mode="Int 2D")),
+            _experiment_operation_busy=lambda: False,
             _shell=SimpleNamespace(scientific=self.renderer, browser=SimpleNamespace(
                 cancel_pending_frame_selection=lambda: self.events.append("cancel-browser"))),
             _last_scientific_projection=None, _presentation_targets=[],
@@ -83,7 +90,10 @@ class _Mount:
             _ensure_timer=lambda: self.events.append("timer"),
             _refresh_shell=lambda: self.events.append("refresh"))
         for name in ("_viewer_1d_start_directory", "_viewer_2d_start_directory",
-                     "_clear_viewer_1d_renderer", "_clear_viewer_2d_renderer", "_select_scan"):
+                     "_clear_viewer_1d_renderer", "_clear_viewer_2d_renderer",
+                     "_retire_batch_terminal_presentation",
+                     "_open_viewer_1d_paths", "_open_viewer_2d_path",
+                     "_select_scan"):
             setattr(self.page, name, partial(getattr(ScatteringWorkspace, name), self.page))
 
     def wait(self, dimension):

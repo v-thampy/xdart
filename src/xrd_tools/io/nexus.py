@@ -33,6 +33,7 @@ Performance features:
 
 from __future__ import annotations
 
+from bisect import bisect_right
 import json
 import logging
 import os
@@ -106,11 +107,50 @@ def warn_if_newer_schema(entry_grp, path="") -> None:
     looked at it, so a v3 file hit today's readers with opaque downstream
     KeyErrors or silently missing features.  Absent/old stamps pass silently
     (back-compat); only a newer stamp warns."""
-    try:
-        ver = int(entry_grp.attrs.get(
-            SCHEMA_VERSION_ATTR, PROCESSED_SCHEMA_VERSION))
-    except (TypeError, ValueError):
+    encoded_name = SCHEMA_VERSION_ATTR.encode("utf-8")
+    if not h5py.h5a.exists(entry_grp.id, encoded_name):
         return
+    attr_id = type_id = space_id = None
+    try:
+        attr_id = entry_grp.attrs.get_id(SCHEMA_VERSION_ATTR)
+        type_id = attr_id.get_type()
+        space_id = attr_id.get_space()
+        if (
+            space_id.get_simple_extent_type() != h5py.h5s.SCALAR
+            or type_id.get_class() != h5py.h5t.INTEGER
+            or not 1 <= type_id.get_size() <= 8
+            or type_id.get_sign() not in {
+                h5py.h5t.SGN_NONE, h5py.h5t.SGN_2,
+            }
+        ):
+            raise ValueError(
+                "ssrl_schema_version must be one scalar fixed-size signed "
+                "or unsigned integer of 1 to 8 bytes"
+            )
+        dtype = attr_id.dtype
+        if (
+            not isinstance(dtype, np.dtype)
+            or dtype.fields is not None
+            or dtype.subdtype is not None
+            or dtype.kind not in {"i", "u"}
+            or dtype.itemsize != type_id.get_size()
+        ):
+            raise ValueError(
+                "ssrl_schema_version integer representation is invalid"
+            )
+        owner = np.empty((), dtype=dtype)
+        attr_id.read(owner)
+        ver = int(owner[()])
+    except ValueError:
+        raise
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError) as error:
+        raise ValueError(
+            "ssrl_schema_version attribute could not be safely read"
+        ) from error
+    finally:
+        for owned_id in (space_id, type_id, attr_id):
+            if owned_id is not None:
+                owned_id.close()
     if ver > PROCESSED_SCHEMA_VERSION:
         warnings.warn(
             f"{path or 'file'} has ssrl_schema_version={ver}, newer than the "
@@ -909,14 +949,11 @@ class NexusImageStack:
     # ── Internals ───────────────────────────────────────────────────────
     def _locate(self, i: int) -> tuple[int, int]:
         """Return ``(segment_index, local_index)`` for global frame ``i``."""
-        # Linear scan: there are typically <20 Eiger files in a scan,
-        # so a Python-level loop is faster than bisect's overhead.
         offs = self._offsets
-        for seg in range(len(self._dsets)):
-            if i < offs[seg + 1]:
-                return seg, i - offs[seg]
-        # Unreachable if bounds-checked at the caller.
-        raise IndexError(i)
+        seg = bisect_right(offs, i) - 1
+        if not 0 <= seg < len(self._dsets) or i >= offs[seg + 1]:
+            raise IndexError(i)
+        return seg, i - offs[seg]
 
     def _read_range(self, start: int, stop: int) -> np.ndarray:
         if start >= stop:

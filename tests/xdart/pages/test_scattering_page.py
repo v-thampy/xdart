@@ -13,13 +13,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from threading import current_thread
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
 pytest.importorskip("pyqtgraph")
-from pyqtgraph import QtWidgets
+from pyqtgraph import QtCore, QtWidgets
 
 from xdart.gui.pages.catalog import (
     BUILTIN_PAGES,
@@ -262,6 +263,15 @@ def test_activity_includes_operation_owner_and_fails_closed():
         lifecycle, SimpleNamespace(owned=True)
     ).active() is True
     assert _WorkspaceActivity(
+        lifecycle, SimpleNamespace(owned=False), lambda: True,
+    ).active() is True
+    assert _WorkspaceActivity(
+        lifecycle, SimpleNamespace(owned=False), lambda: False,
+    ).active() is False
+    assert _WorkspaceActivity(
+        lifecycle, SimpleNamespace(owned=False), lambda: "unknown",
+    ).active() is True
+    assert _WorkspaceActivity(
         SimpleNamespace(), SimpleNamespace(owned=False)
     ).active() is True
     assert _WorkspaceActivity(
@@ -388,7 +398,7 @@ class _ExactProvider:
         return self.value
 
 
-def _build_mounted_workspace(store, status):
+def _build_mounted_workspace(store, status, parent=None):
     from xdart.gui.pages.scattering_workspace import (
         SCATTERING_PAGE_KEY,
         build_scattering_workspace,
@@ -407,7 +417,7 @@ def _build_mounted_workspace(store, status):
         execution_profile=ExecutionProfile.TEST,
         diagnostics=DiagnosticIdentity("tests.scattering.mounted-chooser"),
     ).for_page(SCATTERING_PAGE_KEY)
-    return build_scattering_workspace(services, None)
+    return build_scattering_workspace(services, parent)
 
 
 def test_mounted_profile_ports_roundtrip_one_next_run_intent(
@@ -534,6 +544,142 @@ def test_mounted_control_path_chooser_uses_page_start_and_commits(
     finally:
         assert handle.close().status is PageCleanup.CLEAN
         handle.widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_mounted_authoring_source_chooser_is_distinct_and_asset_specific(
+        qapp, isolated_settings, tmp_path, monkeypatch):
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+
+    start = tmp_path / "source-root"
+    start.mkdir()
+    tiff = start / "source.tiff"
+    tiff.write_bytes(b"fixture")
+    calls = []
+
+    def choose(_parent, title, directory, file_filter):
+        calls.append((title, directory, file_filter))
+        return str(tiff), file_filter
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", choose)
+    handle = _build_mounted_workspace(
+        RunIntentStore(RunIntent(project_root=str(start))),
+        SimpleNamespaceStatus(),
+    )
+    try:
+        page = handle.widget
+        assert page._authoring_source_chooser is not page._control_path_chooser
+        assert page._authoring_source_chooser("poni", str(start)) == str(tiff)
+        assert page._authoring_source_chooser("mask", str(start)) == str(tiff)
+        assert calls[0][0] == "Choose calibration source image"
+        assert "*.h5" in calls[0][2] and "*.nexus" in calls[0][2]
+        assert calls[1][0] == "Choose TIFF for mask"
+        assert calls[1][2] == "TIFF image (*.tif *.tiff)"
+        assert [item[1] for item in calls] == [str(start), str(start)]
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_mounted_popup_choose_another_keeps_modal_focus_and_validates_off_gui(
+        qapp, isolated_settings, tmp_path, monkeypatch):
+    from xdart.gui.tabs.scattering.adapters import external_operation
+    from xdart.gui.tabs.scattering.experiment_authoring import (
+        AuthoredAssetCandidate, qualify_calibration_candidate,
+    )
+    from xdart.gui.tabs.scattering.operation_values import OperationUpdate
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from tests.xdart.scattering.test_p3_calibrate_operation import _PONI
+
+    root = tmp_path / "authoring-root"
+    root.mkdir()
+    alternate = root / "existing.poni"
+    alternate.write_text(_PONI, encoding="utf-8")
+    host = QtWidgets.QWidget()
+    store = RunIntentStore(RunIntent(project_root=str(root)))
+    status = SimpleNamespaceStatus()
+    handle = _build_mounted_workspace(store, status, host)
+    page = handle.widget
+    chooser_calls, worker_threads = [], []
+    real_validate = external_operation.validate_authored_asset
+
+    def validate(request):
+        worker_threads.append(current_thread().name)
+        return real_validate(request)
+
+    def choose(parent, title, start, file_filter):
+        owner = page._authored_asset_owner
+        assert owner is not None
+        assert owner.dialog.isVisible()
+        assert (owner.dialog.windowModality()
+                is QtCore.Qt.WindowModality.WindowModal)
+        assert owner.dialog.parent() is page
+        chooser_calls.append((parent, title, start, file_filter))
+        return str(alternate), file_filter
+
+    monkeypatch.setattr(external_operation, "validate_authored_asset", validate)
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", choose)
+    try:
+        host.show()
+        page.show()
+        qapp.processEvents()
+        stamp = page._operation_context_stamp(store.revision)
+        page._queue_authored_asset_confirmation(
+            "poni", stamp, str(root), (), expected_shape=None,
+        )
+        owner = page._authored_asset_owner
+        assert owner is not None and owner.queued
+        page._show_queued_authored_asset_confirmation()
+        qapp.processEvents()
+        assert owner.dialog.paths.count() == 1
+        assert owner.dialog.selected_path is None
+        owner.dialog.choose_button.setFocus()
+        owner.dialog.choose_button.click()
+        assert chooser_calls == [(
+            host, "Choose PONI calibration", str(root),
+            "PONI files (*.poni);;All files (*)",
+        )]
+        assert store.snapshot().thaw().poni_file == ""
+        identity = page._asset_validation_identity
+        worker = page._operation_slot._worker
+        assert identity is not None and worker is not None
+        worker.join(3)
+        assert not worker.is_alive()
+        page._operation_slot.observe_stamp(page._operation_context_stamp())
+        update = page._operation_slot.poll(identity)
+        assert type(update) is OperationUpdate
+        assert page._consume_asset_validation_update(update)
+        assert worker_threads and worker_threads[0].startswith(
+            "scattering-operation-"
+        )
+        assert store.snapshot().thaw().poni_file == str(alternate)
+
+        revision = store.revision
+        admitted = qualify_calibration_candidate(str(alternate))
+        candidate = AuthoredAssetCandidate(
+            "poni", admitted.path, admitted.proof, admitted.proof.state,
+        )
+        stamp = page._operation_context_stamp(revision)
+        page._queue_authored_asset_confirmation(
+            "poni", stamp, str(root), (candidate,), expected_shape=None,
+        )
+        owner = page._authored_asset_owner
+        assert owner is not None
+        page._show_queued_authored_asset_confirmation()
+        qapp.processEvents()
+        assert owner.dialog.selected_path == str(alternate)
+        owner.dialog.cancel_button.click()
+        qapp.processEvents()
+        assert store.revision == revision
+        assert store.snapshot().thaw().poni_file == str(alternate)
+        assert alternate.read_text(encoding="utf-8") == _PONI
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        page.deleteLater()
+        host.deleteLater()
         qapp.processEvents()
 
 

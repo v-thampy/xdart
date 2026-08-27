@@ -18,6 +18,7 @@ from xrd_tools.io.nexus import (
     open_nexus_writer,
     read_scan,
     read_scan_metadata,
+    warn_if_newer_schema,
 )
 from xrd_tools.reduction import (
     Frame,
@@ -94,6 +95,107 @@ def test_current_or_older_schema_is_silent(tmp_path, version):
         read_scan_metadata(p)
         with FrameViewReader(p):
             pass
+
+
+def test_schema_version_accepts_only_bounded_scalar_hdf5_integers(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.io.nexus as nexus_module
+
+    for dtype in (
+        np.dtype("i1"), np.dtype("u1"), np.dtype("i2"), np.dtype("u2"),
+        np.dtype("i4"), np.dtype("u4"), np.dtype("i8"), np.dtype("u8"),
+    ):
+        path = tmp_path / f"valid-{dtype.str.replace('|', '')}.nxs"
+        with h5py.File(path, "w") as handle:
+            entry = handle.create_group("entry")
+            entry.attrs.create(
+                "ssrl_schema_version",
+                np.asarray(PROCESSED_SCHEMA_VERSION, dtype=dtype)[()],
+                dtype=dtype,
+            )
+        with h5py.File(path, "r") as handle:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("error", RuntimeWarning)
+                warn_if_newer_schema(handle["entry"], str(path))
+
+    newer = tmp_path / "valid-newer-uint64.nxs"
+    with h5py.File(newer, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs.create(
+            "ssrl_schema_version",
+            np.uint64(PROCESSED_SCHEMA_VERSION + 1),
+            dtype=np.dtype("u8"),
+        )
+    with h5py.File(newer, "r") as handle:
+        with pytest.warns(RuntimeWarning, match="newer"):
+            warn_if_newer_schema(handle["entry"], str(newer))
+
+    def low_level_attribute(entry, kind):
+        scalar = h5py.h5s.create(h5py.h5s.SCALAR)
+        space = scalar
+        if kind == "null":
+            space = h5py.h5s.create(h5py.h5s.NULL)
+        if kind == "oversized":
+            type_id = h5py.h5t.STD_I64LE.copy()
+            type_id.set_size(16)
+        elif kind == "bitfield":
+            type_id = h5py.h5t.STD_B8LE.copy()
+        elif kind == "vlen":
+            type_id = h5py.h5t.vlen_create(h5py.h5t.NATIVE_INT32)
+        else:
+            type_id = h5py.h5t.STD_I32LE.copy()
+        attr_id = h5py.h5a.create(
+            entry.id, b"ssrl_schema_version", type_id, space,
+        )
+        attr_id.close()
+        type_id.close()
+        if space is not scalar:
+            space.close()
+        scalar.close()
+
+    def high_level_attribute(entry, kind):
+        if kind == "array":
+            value = np.asarray([PROCESSED_SCHEMA_VERSION], dtype=np.int64)
+        elif kind == "float":
+            value = np.float64(PROCESSED_SCHEMA_VERSION)
+        elif kind == "bool":
+            value = np.bool_(True)
+        elif kind == "string":
+            value = str(PROCESSED_SCHEMA_VERSION)
+        elif kind == "fixed-string":
+            value = np.bytes_(str(PROCESSED_SCHEMA_VERSION))
+        elif kind == "compound":
+            value = np.asarray(
+                (PROCESSED_SCHEMA_VERSION, 0),
+                dtype=np.dtype([("version", "<i4"), ("padding", "<i4")]),
+            )[()]
+        elif kind == "reference":
+            value = entry.create_dataset("version", data=1).ref
+        else:
+            raise AssertionError(kind)
+        entry.attrs["ssrl_schema_version"] = value
+
+    cases = (
+        "array", "float", "bool", "string", "fixed-string", "compound",
+        "reference", "null", "oversized", "bitfield", "vlen",
+    )
+    for kind in cases:
+        path = tmp_path / f"invalid-{kind}.nxs"
+        with h5py.File(path, "w") as handle:
+            entry = handle.create_group("entry")
+            if kind in {"null", "oversized", "bitfield", "vlen"}:
+                low_level_attribute(entry, kind)
+            else:
+                high_level_attribute(entry, kind)
+        with h5py.File(path, "r") as handle, monkeypatch.context() as patch:
+            def forbidden(*_args, **_kwargs):
+                raise AssertionError("unsafe schema value was materialized")
+
+            patch.setattr(type(handle["entry"].attrs), "get", forbidden)
+            patch.setattr(nexus_module.np, "empty", forbidden)
+            with pytest.raises(ValueError, match="ssrl_schema_version"):
+                warn_if_newer_schema(handle["entry"], str(path))
 
 
 # ── S6: SWMR-write refusal ──────────────────────────────────────────────────

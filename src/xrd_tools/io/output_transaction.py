@@ -600,6 +600,7 @@ def _descriptor_content_receipt(
     *,
     durable_fsync: bool = True,
     evidence_digest: str | None = None,
+    expected_stat: tuple[int, int, int, int, int] | None = None,
 ) -> _ObjectReceipt:
     """Seal exact descriptor identity, hashing unless evidence is supplied."""
     if type(durable_fsync) is not bool:
@@ -607,6 +608,10 @@ def _descriptor_content_receipt(
     if durable_fsync:
         os.fsync(descriptor)
     before = os.fstat(descriptor)
+    if expected_stat is not None and _stat_identity(before) != expected_stat:
+        raise TargetChanged(
+            f"{role} descriptor changed before content verification: {path}"
+        )
     if evidence_digest is None:
         offset = os.lseek(descriptor, 0, os.SEEK_CUR)
         os.lseek(descriptor, 0, os.SEEK_SET)
@@ -616,7 +621,13 @@ def _descriptor_content_receipt(
     else:
         digest = _require_evidence_digest(evidence_digest)
     after = os.fstat(descriptor)
-    if _stat_identity(before) != _stat_identity(after):
+    if (
+        _stat_identity(before) != _stat_identity(after)
+        or (
+            expected_stat is not None
+            and _stat_identity(after) != expected_stat
+        )
+    ):
         raise TargetChanged(f"{role} mutated while sealing descriptor {path}")
     snapshot = TargetSnapshot(
         True,
@@ -636,7 +647,13 @@ def _descriptor_content_receipt(
         observed = os.stat(path)
     except FileNotFoundError as exc:
         raise TargetChanged(f"{role} pathname disappeared: {path}") from exc
-    if _stat_identity(observed) != _stat_identity(after):
+    if (
+        _stat_identity(observed) != _stat_identity(after)
+        or (
+            expected_stat is not None
+            and _stat_identity(observed) != expected_stat
+        )
+    ):
         raise TargetChanged(f"{role} pathname did not match sealed descriptor {path}")
     return receipt
 
@@ -695,7 +712,9 @@ def _descriptor_stream_stat_receipt(
         _stat_identity(named),
         _stat_identity(last),
     }
-    if len(identities) != 1:
+    if len(identities) != 1 or (
+        expected_stat is not None and identities != {expected_stat}
+    ):
         raise TargetChanged(
             f"{role} descriptor/path identity changed during seal: {path}"
         )
@@ -2713,20 +2732,39 @@ class OutputTransaction:
                 raise TransactionStateError(
                     f"terminal seal requires EXECUTING, got {self._phase.value}"
                 )
-            descriptor = os.open(self._admission.target, os.O_RDONLY)
+            descriptor: int | None = None
+            receipt: _ObjectReceipt | None = None
+            terminal_stat: _StreamStatReceipt | None = None
+            terminal: StreamTerminal | None = None
+            failure: BaseException | None = None
             try:
+                descriptor = os.open(self._admission.target, os.O_RDONLY)
+                expected_stat = _stat_identity(os.fstat(descriptor))
+                if self._durable_fsync:
+                    os.fsync(descriptor)
+                if _stat_identity(os.fstat(descriptor)) != expected_stat:
+                    raise TargetChanged(
+                        "stream terminal descriptor changed during fsync"
+                    )
                 checkpoint = self._stream_checkpoint if self._fast_regenerable else None
                 if self._fast_regenerable and (
                     checkpoint is None or not self._stream_checkpoint_fresh
-                    or not _stream_stat_matches(self._admission.target, checkpoint)
+                    or expected_stat != (
+                        checkpoint.identity.device,
+                        checkpoint.identity.inode,
+                        checkpoint.size,
+                        checkpoint.mtime_ns,
+                        checkpoint.ctime_ns,
+                    )
                 ):
                     raise TargetChanged("fast stream terminal lost its close checkpoint")
                 receipt = _descriptor_content_receipt(
                     descriptor, Path(self._admission.target), "stream-terminal",
-                    durable_fsync=self._durable_fsync,
+                    durable_fsync=False,
                     evidence_digest=(
                         None if checkpoint is None else checkpoint.evidence_digest
                     ),
+                    expected_stat=expected_stat,
                 )
                 terminal_stat = _descriptor_stream_stat_receipt(
                     descriptor,
@@ -2738,31 +2776,47 @@ class OutputTransaction:
                     ),
                     ordinal=self._coordinator._next_ordinal(),
                     role="stream-terminal",
-                    durable_fsync=self._durable_fsync,
+                    expected_stat=expected_stat,
+                    durable_fsync=False,
                 )
-            except (OSError, TransactionStateError, TargetChanged) as exc:
-                self._phase = TransactionPhase.INTEGRITY_HOLD
-                if isinstance(exc, TargetChanged):
-                    raise
-                raise TargetChanged("stream terminal content seal failed") from exc
+                reservation = self._stream_reservation
+                if reservation is None or receipt.identity != reservation.identity:
+                    raise TargetChanged("stream terminal seal names a foreign inode")
+                terminal = StreamTerminal(
+                    receipt.path,
+                    int(receipt.snapshot.size or 0),
+                    str(receipt.snapshot.digest),
+                    terminal_stat.ordinal,
+                    terminal_stat.identity.device,
+                    terminal_stat.identity.inode,
+                    terminal_stat.mtime_ns,
+                    terminal_stat.ctime_ns,
+                )
+            except BaseException as exc:
+                failure = exc
             finally:
-                os.close(descriptor)
-            reservation = self._stream_reservation
-            if reservation is None or receipt.identity != reservation.identity:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except BaseException as exc:
+                        if failure is None or (
+                            isinstance(failure, Exception)
+                            and not isinstance(exc, Exception)
+                        ):
+                            failure = exc
+            if failure is not None:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
-                raise TargetChanged("stream terminal seal names a foreign inode")
+                if isinstance(failure, TargetChanged):
+                    raise failure
+                if not isinstance(failure, Exception):
+                    raise failure
+                raise TargetChanged("stream terminal content seal failed") from failure
+            if receipt is None or terminal_stat is None or terminal is None:
+                self._phase = TransactionPhase.INTEGRITY_HOLD
+                raise TargetChanged("stream terminal content seal failed")
             self._stream_terminal_receipt = receipt
             self._stream_terminal_stat = terminal_stat
-            return StreamTerminal(
-                receipt.path,
-                int(receipt.snapshot.size or 0),
-                str(receipt.snapshot.digest),
-                terminal_stat.ordinal,
-                terminal_stat.identity.device,
-                terminal_stat.identity.inode,
-                terminal_stat.mtime_ns,
-                terminal_stat.ctime_ns,
-            )
+            return terminal
 
     def commit_stream_epoch(
         self,
@@ -3049,6 +3103,10 @@ class OutputTransaction:
             self._require_stream(attempt, lease)
             if self._stream_committed:
                 return self.retry_cleanup(self._ensure_cleanup_token())
+            if self._phase is TransactionPhase.INTEGRITY_HOLD:
+                raise TransactionStateError(
+                    "stream commit refused while integrity hold is active"
+                )
             failures: list[BaseException] = []
             with (
                 nullcontext()

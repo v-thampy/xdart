@@ -40,6 +40,7 @@ from .acquisition_runtime import (
     TerminalPauseFailure,
 )
 from .browse_hydration import _BrowseHydrationOwner
+from .browse_1d_target_plan import Browse1DRuntimeProjection
 from .browse_preview import (
     browse_preview_polling_needed,
     browse_preview_repaint_ready,
@@ -460,6 +461,31 @@ class ContextController:
             or self._browse_loader.owns_request(request)
         )
 
+    def reintegrate_reload_retryable(
+        self, request: BrowseLoadRequest, target: str,
+    ) -> bool:
+        """Whether one deferred reload still names the selected exact context."""
+
+        context = self._runtime.browse_context
+        selection = self._runtime.selection
+        return bool(
+            type(request) is BrowseLoadRequest
+            and type(target) is str
+            and target
+            and self._close is None
+            and self._browse_request is None
+            and type(context) is BrowseContext
+            and context.load_request is request
+            and context.operation is request
+            and context.requested_path == target == request.source_path
+            and context.invalidated
+            and not context.released
+            and type(selection) is DisplaySelection
+            and selection.kind is ContextKind.BROWSE
+            and selection.names(context)
+            and selection.source_path == target
+        )
+
     def capture_reintegrate_browse(self):
         context, selection = self._runtime.browse_context, self._runtime.selection
         request = None if context is None else context.load_request
@@ -754,6 +780,61 @@ class ContextController:
             browse_hydration_owner=self._browse_hydration_owner,
             viewer_1d_owner=self._viewer_1d,
         )
+
+    def project_browse_1d_cache(
+        self,
+        *,
+        preferences: ScientificPreferences,
+        was_waterfall_active: bool,
+    ) -> Browse1DRuntimeProjection | None:
+        """Expose the planned cache projection without crossing into Qt."""
+
+        if self._closed:
+            return None
+        return self._runtime.project_browse_1d_cache(
+            self._browse_hydration_owner,
+            preferences=preferences,
+            was_waterfall_active=was_waterfall_active,
+        )
+
+    def request_current_browse_preview(self) -> StandardDisplayPayload | None:
+        """Trigger/resolve only the exact current Browse detector preview."""
+
+        if self._closed:
+            return None
+        selection = self._runtime.selection
+        current = self._runtime.navigation.current
+        if (
+            selection is None
+            or selection.kind is not ContextKind.BROWSE
+            or current is None
+        ):
+            return None
+        try:
+            request = self._runtime.project_request(
+                current,
+                require_complete=True,
+            )
+            return self._runtime.resolve_projection(
+                self._projection,
+                request,
+                self._browse_hydration_owner,
+                self._viewer_1d,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return None
+
+    def browse_1d_plan_is_current(self, plan: object) -> bool:
+        if self._closed:
+            return False
+        return self._runtime.browse_1d_plan_is_current(
+            self._browse_hydration_owner,
+            plan,
+        )
+
+    def capture_norm_aggregate_for_refresh(self) -> None:
+        if not self._closed:
+            self._runtime.capture_norm_aggregate_for_refresh()
 
     def project_background_contributors(
         self, pins=(),
@@ -1413,7 +1494,8 @@ class ContextController:
                 and self._runtime.selection.names(browse)
             )
             receipt = self._release_browse(
-                browse, preserve_pending_repaint=True
+                browse,
+                preserve_pending_repaint=not browse.invalidated,
             )
             if (
                 type(receipt) is not BrowseCleanupReceipt

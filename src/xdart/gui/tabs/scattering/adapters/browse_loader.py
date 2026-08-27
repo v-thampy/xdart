@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock, Thread
+from time import monotonic
+from typing import Callable
 
 from xdart.modules.display_context import BrowseContext
-from xdart.modules.frame_publication import FramePublication, PublicationStore
+from xdart.modules.frame_publication import PublicationStore
 from xrd_tools.core.staging import browse_publication_max_items
-from xrd_tools.io import ProcessedScan, iter_frame_records
+from xrd_tools.io import (
+    Browse1DCache,
+    FrameScalarCatalog,
+    FrameScalarRow,
+    FrameViewReader,
+    ProcessedScan,
+    iter_frame_records,
+)
+from xrd_tools.io.browse_1d_cache import Browse1DCachePhase
 from xrd_tools.io.browse_presentation import read_browse_presentation
 from xrd_tools.io.output_transaction import (
     TargetSnapshot,
@@ -30,8 +42,8 @@ from ..browse_values import (
     BrowseLoadOutcome,
     BrowseLoadRequest,
     BrowseLoadStatus,
+    BrowseLoadTiming,
     canonical_browse_scan_key,
-    canonical_browse_source_identity,
 )
 from ..events import CleanupStatus, DetachedDiagnostic, detach_exception
 
@@ -39,6 +51,7 @@ from ..events import CleanupStatus, DetachedDiagnostic, detach_exception
 _CLEANUP_PENDING = "pending"
 _CLEANUP_IN_PROGRESS = "in_progress"
 _CLEANUP_CLEANED = "cleaned"
+_DEFAULT_RECORD_READER = object()
 
 
 def _iter_browse_records(source: str):
@@ -53,10 +66,22 @@ class _BrowseOperation:
 
     request: BrowseLoadRequest
     cancelled: Event
+    perf_enabled: bool = False
     worker: Thread | None = None
     outcome: BrowseLoadOutcome | None = None
     context: BrowseContext | None = None
     terminal: bool = False
+    # The exact worker-side reader is attached before __enter__ and remains
+    # strongly owned here until its retryable close succeeds.  It is never
+    # closed while BrowseLoader._lock is held.
+    reader: object | None = None
+    reader_entered: bool = False
+    reader_cleanup_in_progress: bool = False
+    # A newly allocated cache remains operation-owned until it is transferred
+    # into the exact loaded context.  Failed/cancelled construction therefore
+    # retains one retryable cleanup owner instead of leaking a cache.
+    cache: Browse1DCache | None = None
+    cache_cleanup_in_progress: bool = False
     cleanup_failures: list[DetachedDiagnostic] = field(default_factory=list)
     cleanup_state: str = _CLEANUP_PENDING
 
@@ -70,7 +95,11 @@ class BrowseLoader:
         max_items: int | None = None,
         join_timeout: float = 5.0,
         open_scan=ProcessedScan,
-        read_records=_iter_browse_records,
+        read_records=_DEFAULT_RECORD_READER,
+        open_reader=FrameViewReader,
+        open_cache=Browse1DCache,
+        clock: Callable[[], float] = monotonic,
+        perf_enabled: Callable[[], bool] | None = None,
     ) -> None:
         if max_items is None:
             max_items = browse_publication_max_items()
@@ -79,11 +108,310 @@ class BrowseLoader:
         self._max_items = max_items
         self._join_timeout = float(join_timeout)
         self._open_scan = open_scan
-        self._read_records = read_records
+        # Omitted/default construction is the scalar-only production path.
+        # Explicit read_records remains a compatibility seam for old focused
+        # tests; it is projected to the same scalar catalog and never fills a
+        # GUI publication/record store.
+        self._read_records = (
+            None if read_records is _DEFAULT_RECORD_READER else read_records
+        )
+        if self._read_records is not None and not callable(self._read_records):
+            raise TypeError("browse legacy record reader must be callable")
+        if not callable(open_reader):
+            raise TypeError("browse scalar reader factory must be callable")
+        self._open_reader = open_reader
+        if not callable(open_cache):
+            raise TypeError("browse 1-D cache factory must be callable")
+        self._open_cache = open_cache
+        if not callable(clock):
+            raise TypeError("browse worker clock must be callable")
+        if perf_enabled is not None and not callable(perf_enabled):
+            raise TypeError("browse performance gate must be callable")
+        self._clock = clock
+        self._perf_enabled = (
+            perf_enabled
+            if perf_enabled is not None
+            else lambda: (
+                bool(os.environ.get("XDART_PERF"))
+                or os.environ.get(
+                    "XDART_PERF_QUARTILES", ""
+                ).strip() == "1"
+            )
+        )
         self._lock = Lock()
         self._active: _BrowseOperation | None = None
         self._queued: _BrowseOperation | None = None
         self._close: BrowseCleanupReceipt | None = None
+
+    def _perf_requested(self) -> bool:
+        try:
+            return bool(self._perf_enabled())
+        except BaseException:
+            return False
+
+    def _timing_now(self) -> float | None:
+        try:
+            value = float(self._clock())
+        except BaseException:
+            return None
+        return value if math.isfinite(value) else None
+
+    def _attach_reader(
+        self, operation: _BrowseOperation, reader: object,
+    ) -> None:
+        """Publish worker reader custody before any reader-side open."""
+
+        with self._lock:
+            if (
+                self._active is not operation
+                or operation.reader is not None
+                or operation.reader_cleanup_in_progress
+                or operation.terminal
+            ):
+                raise RuntimeError("browse scalar reader admission raced")
+            operation.reader = reader
+
+    def _discard_unentered_reader(
+        self, operation: _BrowseOperation, reader: object,
+    ) -> None:
+        """Drop a reader whose failure-total __enter__ did not return."""
+
+        with self._lock:
+            if (
+                operation.reader is not reader
+                or operation.reader_entered
+                or operation.reader_cleanup_in_progress
+            ):
+                raise RuntimeError("browse unentered reader custody drifted")
+            operation.reader = None
+
+    def _close_operation_reader(
+        self,
+        operation: _BrowseOperation,
+        *,
+        attempts: int,
+    ) -> bool:
+        """Retryably close one exact reader, always outside the loader lock."""
+
+        if type(attempts) is not int or attempts < 1:
+            raise ValueError("browse reader close attempts must be positive")
+        with self._lock:
+            reader = operation.reader
+            if reader is None:
+                return True
+            if (
+                not operation.reader_entered
+                or operation.reader_cleanup_in_progress
+            ):
+                return False
+            operation.reader_cleanup_in_progress = True
+        caught: BaseException | None = None
+        for _attempt in range(attempts):
+            try:
+                reader.__exit__(None, None, None)
+            except BaseException as error:
+                caught = error
+                continue
+            with self._lock:
+                if operation.reader is not reader:
+                    operation.reader_cleanup_in_progress = False
+                    raise RuntimeError("browse reader close custody drifted")
+                operation.reader = None
+                operation.reader_entered = False
+                operation.reader_cleanup_in_progress = False
+                operation.cleanup_failures.clear()
+            return True
+        assert caught is not None
+        diagnostic = detach_exception(caught, "browse.reader_close")
+        with self._lock:
+            if operation.reader is reader:
+                operation.reader_cleanup_in_progress = False
+                operation.cleanup_failures[:] = [diagnostic]
+        return False
+
+    def _attach_cache(
+        self, operation: _BrowseOperation, cache: Browse1DCache,
+    ) -> None:
+        """Publish exact cache custody before context construction."""
+
+        if type(cache) is not Browse1DCache:
+            raise TypeError("browse worker requires an exact Browse1DCache")
+        with self._lock:
+            if (
+                self._active is not operation
+                or operation.cache is not None
+                or operation.cache_cleanup_in_progress
+                or operation.terminal
+            ):
+                raise RuntimeError("browse 1-D cache admission raced")
+            operation.cache = cache
+
+    @staticmethod
+    def _settle_cache(cache: Browse1DCache) -> None:
+        """Recover and close one exact cache without a loader/context lock."""
+
+        if type(cache) is not Browse1DCache:
+            raise TypeError("browse cleanup requires an exact Browse1DCache")
+        cache.recover()
+        cache.close()
+        if cache.phase is not Browse1DCachePhase.CLOSED:
+            raise RuntimeError("browse 1-D cache close did not settle")
+
+    def _close_operation_cache(
+        self,
+        operation: _BrowseOperation,
+        *,
+        attempts: int,
+    ) -> bool:
+        """Retryably settle one operation-owned cache outside the loader lock."""
+
+        if type(attempts) is not int or attempts < 1:
+            raise ValueError("browse cache close attempts must be positive")
+        with self._lock:
+            cache = operation.cache
+            if cache is None:
+                return True
+            if operation.cache_cleanup_in_progress:
+                return False
+            operation.cache_cleanup_in_progress = True
+        caught: BaseException | None = None
+        for _attempt in range(attempts):
+            try:
+                self._settle_cache(cache)
+            except BaseException as error:
+                caught = error
+                continue
+            with self._lock:
+                if operation.cache is not cache:
+                    operation.cache_cleanup_in_progress = False
+                    raise RuntimeError("browse cache close custody drifted")
+                operation.cache = None
+                operation.cache_cleanup_in_progress = False
+                operation.cleanup_failures.clear()
+            return True
+        assert caught is not None
+        diagnostic = detach_exception(caught, "browse.cache_close")
+        with self._lock:
+            if operation.cache is cache:
+                operation.cache_cleanup_in_progress = False
+                operation.cleanup_failures[:] = [diagnostic]
+        return False
+
+    def _transfer_cache_to_context(
+        self,
+        operation: _BrowseOperation,
+        context: BrowseContext,
+        cache: Browse1DCache,
+    ) -> None:
+        """Transfer the exact cache from operation custody to one context."""
+
+        if context.browse_1d_cache is not cache:
+            raise RuntimeError("browse context cache identity changed")
+        with self._lock:
+            if (
+                self._active is not operation
+                or operation.cache is not cache
+                or operation.cache_cleanup_in_progress
+                or operation.terminal
+            ):
+                raise RuntimeError("browse cache transfer custody drifted")
+            operation.cache = None
+
+    def _catalog_from_reader(
+        self,
+        operation: _BrowseOperation,
+        canonical_path: str,
+        cancelled: Event,
+    ) -> FrameScalarCatalog:
+        reader = self._open_reader(
+            canonical_path,
+            resolve_source=False,
+        )
+        self._attach_reader(operation, reader)
+        if cancelled.is_set():
+            self._discard_unentered_reader(operation, reader)
+            raise InterruptedError("Browse scalar catalog read cancelled")
+        try:
+            entered = reader.__enter__()
+        except BaseException:
+            # FrameViewReader.__enter__ is failure-total and closes its own
+            # partially opened HDF graph before propagating.
+            self._discard_unentered_reader(operation, reader)
+            raise
+        if entered is not reader:
+            # A foreign context-manager replacement is not the object this
+            # operation admitted and cannot become its close authority.
+            with self._lock:
+                if operation.reader is reader:
+                    operation.reader_entered = True
+            self._close_operation_reader(operation, attempts=2)
+            raise RuntimeError("browse scalar reader changed identity")
+        with self._lock:
+            if operation.reader is not reader:
+                raise RuntimeError("browse scalar reader custody drifted")
+            operation.reader_entered = True
+        try:
+            catalog = reader.read_scalar_catalog(cancelled=cancelled.is_set)
+            if type(catalog) is not FrameScalarCatalog:
+                raise TypeError(
+                    "browse scalar reader returned a foreign catalog"
+                )
+        except BaseException:
+            if not self._close_operation_reader(operation, attempts=2):
+                raise RuntimeError(
+                    "browse scalar reader cleanup remains pending"
+                )
+            raise
+        if not self._close_operation_reader(operation, attempts=2):
+            raise RuntimeError("browse scalar reader cleanup remains pending")
+        return catalog
+
+    def _catalog_from_legacy_records(
+        self,
+        canonical_path: str,
+        entry: str,
+        cancelled: Event,
+    ) -> FrameScalarCatalog:
+        """Project the explicit legacy injection seam to scalar rows only."""
+
+        rows: list[FrameScalarRow] = []
+        assert self._read_records is not None
+        for record in self._read_records(canonical_path):
+            if cancelled.is_set():
+                raise InterruptedError("Browse scalar catalog read cancelled")
+            if type(record.label) is not int:
+                raise TypeError("processed frame labels must be integers")
+            view = record.active_view()
+            modes_1d = tuple(record.results_1d)
+            modes_2d = tuple(record.results_2d)
+            rows.append(FrameScalarRow(
+                label=record.label,
+                metadata_raw=view.metadata_raw,
+                geometry=None,
+                source_path=(
+                    None
+                    if view.source_path is None
+                    else str(view.source_path)
+                ),
+                source_frame_index=(
+                    None
+                    if view.source_frame_index is None
+                    else int(view.source_frame_index)
+                ),
+                has_thumbnail=view.thumbnail is not None,
+                mask_baked=bool(view.mask_baked),
+                modes_1d=modes_1d,
+                modes_2d=modes_2d,
+                active_mode_1d=record.active_mode_1d,
+                active_mode_2d=record.active_mode_2d,
+                two_d_kinds=tuple(
+                    (mode, record.results_2d[mode].two_d_kind)
+                    for mode in modes_2d
+                ),
+            ))
+        if cancelled.is_set():
+            raise InterruptedError("Browse scalar catalog read cancelled")
+        return FrameScalarCatalog(canonical_path, str(entry), tuple(rows))
 
     @property
     def _context(self) -> BrowseContext | None:
@@ -122,7 +450,9 @@ class BrowseLoader:
             else:
                 if operation.cancelled.is_set():
                     raise RuntimeError("browse cleanup remains pending")
-                self._queued = _BrowseOperation(request, Event())
+                self._queued = _BrowseOperation(
+                    request, Event(), self._perf_requested()
+                )
                 operation.cancelled.set()
         if launch:
             self._launch(request)
@@ -191,9 +521,17 @@ class BrowseLoader:
                 or outcome.request is not operation.request
                 or operation.cancelled.is_set()
                 or operation.cleanup_state != _CLEANUP_PENDING
+                or operation.reader is not None
+                or operation.cache is not None
             ):
                 return None
-            return operation.context
+            context = operation.context
+            if context is not None and (
+                type(context.scalar_catalog) is not FrameScalarCatalog
+                or type(context.browse_1d_cache) is not Browse1DCache
+            ):
+                return None
+            return context
 
     def consume(self, outcome: BrowseLoadOutcome) -> BrowseContext | None:
         self._progress()
@@ -206,6 +544,8 @@ class BrowseLoader:
                 or outcome.request is not operation.request
                 or operation.cancelled.is_set()
                 or operation.cleanup_state != _CLEANUP_PENDING
+                or operation.reader is not None
+                or operation.cache is not None
             ):
                 return None
             context = (
@@ -213,6 +553,11 @@ class BrowseLoader:
                 if outcome.status is BrowseLoadStatus.READY
                 else None
             )
+            if context is not None and (
+                type(context.scalar_catalog) is not FrameScalarCatalog
+                or type(context.browse_1d_cache) is not Browse1DCache
+            ):
+                return None
             operation.context = None
             if self._close is None:
                 next_operation = self._queued
@@ -275,6 +620,8 @@ class BrowseLoader:
                     and self._close is None
                     and operation.terminal
                     and operation.context is None
+                    and operation.reader is None
+                    and operation.cache is None
                     and operation.cleanup_state == _CLEANUP_CLEANED
                     and (
                         operation.worker is None
@@ -317,11 +664,20 @@ class BrowseLoader:
                 request, CleanupStatus.CLEANUP_PENDING
             )
         try:
+            if not context.released and not context.invalidated:
+                # Withdraw hydration/publication authority before closing the
+                # cache it would otherwise still be allowed to mutate.
+                context.invalidate()
+            cache = context.browse_1d_cache
+            if cache is not None:
+                if type(cache) is not Browse1DCache:
+                    raise TypeError(
+                        "Browse context owns a foreign 1-D cache"
+                    )
+                self._settle_cache(cache)
+                context.detach_browse_1d_cache(cache)
             if not context.released:
                 context.release()
-            store = context.record_store
-            if store is not None and len(store):
-                store.clear()
         except BaseException as error:
             return BrowseCleanupReceipt(
                 request,
@@ -399,7 +755,9 @@ class BrowseLoader:
     ) -> None:
         fresh = operation is None
         if fresh:
-            operation = _BrowseOperation(request, Event())
+            operation = _BrowseOperation(
+                request, Event(), self._perf_requested()
+            )
         assert operation is not None
         with self._lock:
             if fresh:
@@ -447,6 +805,38 @@ class BrowseLoader:
                     raise
 
     def _progress(self, *, retire_cancelled: bool = False) -> None:
+        with self._lock:
+            operation = self._active
+            has_reader = bool(
+                operation is not None
+                and operation.terminal
+                and operation.reader is not None
+            )
+        if has_reader:
+            assert operation is not None
+            self._close_operation_reader(operation, attempts=1)
+            with self._lock:
+                if (
+                    self._active is operation
+                    and operation.reader is not None
+                ):
+                    return
+        with self._lock:
+            operation = self._active
+            has_cache = bool(
+                operation is not None
+                and operation.terminal
+                and operation.cache is not None
+            )
+        if has_cache:
+            assert operation is not None
+            self._close_operation_cache(operation, attempts=1)
+            with self._lock:
+                if (
+                    self._active is operation
+                    and operation.cache is not None
+                ):
+                    return
         context = None
         with self._lock:
             operation = self._active
@@ -506,6 +896,9 @@ class BrowseLoader:
                 return
             if (
                 operation.context is not None
+                or operation.reader is not None
+                or operation.cache is not None
+                or operation.cache_cleanup_in_progress
                 or operation.cleanup_state == _CLEANUP_IN_PROGRESS
                 or (
                     operation.worker is not None
@@ -541,6 +934,15 @@ class BrowseLoader:
         context = None
         status = BrowseLoadStatus.READY
         detail = ""
+        worker_started = (
+            self._timing_now() if operation.perf_enabled else None
+        )
+        timing_fields: dict[str, object] | None = (
+            {"valid": True}
+            if operation.perf_enabled and worker_started is not None
+            else None
+        )
+        timing = None
         with self._lock:
             admitted = (
                 self._active is operation
@@ -563,7 +965,11 @@ class BrowseLoader:
                 detail = "Processed browse artifact is unavailable."
             elif not cancelled.is_set():
                 context = self._read_context(
-                    request, scan_key, cancelled
+                    request,
+                    scan_key,
+                    cancelled,
+                    _timing=timing_fields,
+                    _operation=operation,
                 )
                 if context is None:
                     status = BrowseLoadStatus.CANCELLED
@@ -577,7 +983,35 @@ class BrowseLoader:
                 ).message
         if cancelled.is_set():
             status = BrowseLoadStatus.CANCELLED
-        outcome = BrowseLoadOutcome(request, status, detail)
+        if status is BrowseLoadStatus.READY and context is not None:
+            ended = (
+                None
+                if timing_fields is None or worker_started is None
+                else self._timing_now()
+            )
+            try:
+                timing = (
+                    None
+                    if (
+                        ended is None
+                        or not bool(timing_fields.get("valid"))
+                    )
+                    else BrowseLoadTiming(
+                        str(timing_fields["canonical_path"]),
+                        str(timing_fields["seal_mode"]),
+                        float(timing_fields["initial_seal_s"]),
+                        float(timing_fields["scan_open_s"]),
+                        float(timing_fields["record_iteration_s"]),
+                        int(timing_fields["record_count"]),
+                        float(timing_fields["presentation_read_s"]),
+                        float(timing_fields["final_seal_s"]),
+                        float(timing_fields["context_build_s"]),
+                        max(0.0, ended - worker_started),
+                    )
+                )
+            except BaseException:
+                timing = None
+        outcome = BrowseLoadOutcome(request, status, detail, timing)
         with self._lock:
             if self._active is not operation:
                 orphan = context
@@ -596,9 +1030,35 @@ class BrowseLoader:
         request: BrowseLoadRequest,
         scan_key: str,
         cancelled: Event,
+        *,
+        _timing: dict[str, object] | None = None,
+        _operation: _BrowseOperation | None = None,
     ) -> BrowseContext | None:
+        def stage_start() -> float | None:
+            if _timing is None or not bool(_timing.get("valid")):
+                return None
+            started = self._timing_now()
+            if started is None:
+                _timing["valid"] = False
+            return started
+
+        def stage_finish(name: str, started: float | None) -> None:
+            if (
+                _timing is None
+                or started is None
+                or not bool(_timing.get("valid"))
+            ):
+                return
+            ended = self._timing_now()
+            if ended is None:
+                _timing["valid"] = False
+                return
+            _timing[name] = max(0.0, ended - started)
+
         path = Path(request.source_path).resolve()
         canonical_path = str(path)
+        if _timing is not None:
+            _timing["canonical_path"] = canonical_path
         if cancelled.is_set():
             return None
         terminal = request.terminal_commit_identity
@@ -607,106 +1067,151 @@ class BrowseLoader:
             if stream_terminal_object_revision(terminal) is not None
             else None
         )
+        if _timing is not None:
+            _timing["seal_mode"] = (
+                "terminal" if sealed_terminal is not None else "snapshot"
+            )
+        started = stage_start()
         before = (
             capture_target_snapshot(path)
             if sealed_terminal is None
             else revalidate_stream_terminal(path, sealed_terminal)
         )
+        stage_finish("initial_seal_s", started)
         if type(before) is not TargetSnapshot or not before.exists:
             raise ValueError("processed browse target is unavailable")
         if cancelled.is_set():
             return None
+        started = stage_start()
         scan = self._open_scan(canonical_path)
+        stage_finish("scan_open_s", started)
         records = FrameRecordStore(max_items=self._max_items)
         publications = PublicationStore(
             max_items=self._max_items,
             retain_1d_on_eviction=True,
         )
-        labels: list[int] = []
-        first = None
         # E6-NORM-N1: ONE revision-0 draft folded once per accepted record in
-        # this sole pass; the single advance happens only after the complete
-        # noncancelled, nonempty pass and travels with the ready context.
+        # this sole scalar pass; the single advance happens only after the
+        # complete noncancelled, nonempty pass and travels with the context.
         draft = empty_norm_aggregate(
             (request.token, scan_key, request.source_path)
         )
-        for record in self._read_records(canonical_path):
+        started = stage_start()
+        if self._read_records is None and type(_operation) is not _BrowseOperation:
+            raise RuntimeError(
+                "production scalar Browse requires its operation owner"
+            )
+        catalog = (
+            self._catalog_from_reader(
+                _operation, canonical_path, cancelled,
+            )
+            if self._read_records is None
+            else self._catalog_from_legacy_records(
+                canonical_path,
+                str(getattr(scan, "entry", "entry")),
+                cancelled,
+            )
+        )
+        if type(catalog) is not FrameScalarCatalog:
+            raise TypeError("Browse requires an exact FrameScalarCatalog")
+        if catalog.artifact_path != canonical_path:
+            raise ValueError("Browse scalar catalog changed artifact identity")
+        target_entry = str(getattr(scan, "entry", "entry"))
+        if catalog.entry != target_entry:
+            raise ValueError("Browse scalar catalog changed entry identity")
+        labels = catalog.labels
+        for row in catalog.rows:
             if cancelled.is_set():
-                records.clear()
-                publications.clear()
                 return None
-            if type(record.label) is not int:
-                raise TypeError("processed frame labels must be integers")
-            view = record.active_view()
-            draft = fold_norm_metadata(draft, view.metadata_numeric)
-            source = canonical_browse_source_identity(
-                view, request.source_path,
-            )
-            records.upsert(
-                record, source_identity=source, persisted=True
-            )
-            publications.upsert(
-                FramePublication(
-                    view,
-                    record=record,
-                    source_identity=source,
-                    scan_key=scan_key,
-                )
-            )
-            labels.append(record.label)
-            if first is None:
-                first = view
+            draft = fold_norm_metadata(draft, row.metadata_numeric)
+        stage_finish("record_iteration_s", started)
+        if _timing is not None:
+            _timing["record_count"] = len(labels)
         # Cancellation may arrive as the iterator reports exhaustion after its
         # final yield.  Recheck before the one revision bump/context publish.
         if cancelled.is_set():
-            records.clear()
-            publications.clear()
             return None
         if not labels:
             raise ValueError("processed browse artifact has no frames")
-        if tuple(labels) != tuple(sorted(set(labels))):
-            records.clear(); publications.clear()
-            raise ValueError("processed frame labels must be strictly increasing")
+        started = stage_start()
         presentation, persisted_mask = read_browse_presentation(
             canonical_path,
         )
+        stage_finish("presentation_read_s", started)
         if cancelled.is_set():
-            records.clear(); publications.clear()
             return None
+        started = stage_start()
         after = (
             capture_target_snapshot(path)
             if sealed_terminal is None
             else revalidate_stream_terminal(path, sealed_terminal)
         )
+        stage_finish("final_seal_s", started)
         if type(after) is not TargetSnapshot or not after.exists or after != before:
-            records.clear(); publications.clear()
             raise ValueError("processed browse target changed during load")
         if cancelled.is_set():
-            records.clear(); publications.clear()
             return None
-        context = BrowseContext(
-            context_token=request.token, load_generation=request.load_generation,
-            operation=request, requested_path=request.source_path,
-            scan_key=scan_key, scan=scan, frame=None, frame_ids=labels, frames={},
-            viewer_rows_1d={}, viewer_rows_2d={}, publication_store=publications,
-            record_store=records, norm_aggregate=next_norm_revision(draft),
-            target_entry=getattr(scan, "entry", "entry"),
-            loaded_labels=tuple(labels), target_snapshot=after,
-        )
-        context.adopt_load_request(request)
-        context.stamp_provenance(
-            calibration=json.dumps(
-                presentation,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            mask=str(
-                persisted_mask
-                or getattr(first, "mask_baked", False)
-            ),
-            result=request.source_path,
-        )
-        context.mark_loaded()
+        started = stage_start()
+        cache = self._open_cache()
+        if type(cache) is not Browse1DCache:
+            raise TypeError("browse worker returned a foreign 1-D cache")
+        operation_owned = type(_operation) is _BrowseOperation
+        attached = False
+        try:
+            if operation_owned:
+                self._attach_cache(_operation, cache)
+                attached = True
+            if cancelled.is_set():
+                raise InterruptedError("Browse context construction cancelled")
+            context = BrowseContext(
+                context_token=request.token,
+                load_generation=request.load_generation,
+                operation=request,
+                requested_path=request.source_path,
+                scan_key=scan_key,
+                scan=scan,
+                frame=None,
+                frame_ids=labels,
+                frames={},
+                viewer_rows_1d={},
+                viewer_rows_2d={},
+                publication_store=publications,
+                record_store=records,
+                norm_aggregate=next_norm_revision(draft),
+                scalar_catalog=catalog,
+                browse_1d_cache=cache,
+                target_entry=target_entry,
+                loaded_labels=labels,
+                target_snapshot=after,
+            )
+            context.adopt_load_request(request)
+            context.stamp_provenance(
+                calibration=json.dumps(
+                    presentation,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                mask=str(
+                    persisted_mask
+                    or catalog.rows[0].mask_baked
+                ),
+                result=request.source_path,
+            )
+            context.mark_loaded()
+            if cancelled.is_set():
+                raise InterruptedError("Browse context construction cancelled")
+            if operation_owned:
+                self._transfer_cache_to_context(_operation, context, cache)
+        except BaseException as error:
+            if attached:
+                if not self._close_operation_cache(_operation, attempts=2):
+                    raise RuntimeError(
+                        "browse 1-D cache cleanup remains pending"
+                    ) from error
+            else:
+                self._settle_cache(cache)
+            raise
+        stage_finish("context_build_s", started)
         return context
 
 __all__ = ["BrowseLoader"]

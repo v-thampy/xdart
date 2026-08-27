@@ -29,6 +29,22 @@ _EXPORTS = {
     "AppendSourceGraphRefused": ("xrd_tools.io.append", "AppendSourceGraphRefused"),
     "apply_rotation": ("xrd_tools.io.image", "apply_rotation"),
     "begin_same_run_lineage": ("xrd_tools.io.append", "begin_same_run_lineage"),
+    "Browse1DCache": ("xrd_tools.io.browse_1d_cache", "Browse1DCache"),
+    "Browse1DCacheOperation": (
+        "xrd_tools.io.browse_1d_cache", "Browse1DCacheOperation",
+    ),
+    "Browse1DLabelStoreReceipt": (
+        "xrd_tools.io.browse_1d_cache", "Browse1DLabelStoreReceipt",
+    ),
+    "Browse1DLabelStoreCustodyError": (
+        "xrd_tools.io.browse_1d_cache", "Browse1DLabelStoreCustodyError",
+    ),
+    "Browse1DRowKey": (
+        "xrd_tools.io.browse_1d_cache", "Browse1DRowKey",
+    ),
+    "browse_1d_row_name": (
+        "xrd_tools.io.browse_1d_cache", "browse_1d_row_name",
+    ),
     "classify_image_source": ("xrd_tools.io.image_source", "classify_image_source"),
     "CleanupIncomplete": ("xrd_tools.io.output_transaction", "CleanupIncomplete"),
     "CleanupToken": ("xrd_tools.io.output_transaction", "CleanupToken"),
@@ -45,6 +61,10 @@ _EXPORTS = {
     "find_nexus_image_dataset": ("xrd_tools.io.nexus", "find_nexus_image_dataset"),
     "frame_record_write_parts": ("xrd_tools.io.nexus", "frame_record_write_parts"),
     "FramePreview": ("xrd_tools.io.frame_preview", "FramePreview"),
+    "Frame1DModeRows": ("xrd_tools.io.frame_view", "Frame1DModeRows"),
+    "Frame1DRows": ("xrd_tools.io.frame_view", "Frame1DRows"),
+    "FrameScalarCatalog": ("xrd_tools.io.frame_view", "FrameScalarCatalog"),
+    "FrameScalarRow": ("xrd_tools.io.frame_view", "FrameScalarRow"),
     "FrameViewReader": ("xrd_tools.io.frame_view", "FrameViewReader"),
     "get_angles": ("xrd_tools.io.spec", "get_angles"),
     "get_1d": ("xrd_tools.io.read", "get_1d"),

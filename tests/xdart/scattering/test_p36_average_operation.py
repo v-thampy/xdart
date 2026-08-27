@@ -131,6 +131,82 @@ def test_average_calibration_admission_cancel_is_a_cancelled_terminal(
     assert update.terminal.diagnostic == ""
 
 
+def test_average_page_accepts_only_exact_cancelled_payload_status_pairs(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
+
+    page, store = _page(tmp_path, monkeypatch)
+    target = str((tmp_path / "average.nxs").resolve())
+    cancelled = _result("CANCELLED", target)
+    refused = _result("REFUSED", target)
+    committed = _result("COMMITTED", target)
+    malformed = object.__new__(AverageScanResult)
+    reloads = []
+    clears = []
+    catalogs = []
+    notices = []
+    monkeypatch.setattr(
+        page._context_controller,
+        "begin_browse",
+        lambda *args, **kwargs: reloads.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        page, "_clear_terminal_browse", lambda: clears.append(None),
+    )
+    monkeypatch.setattr(
+        page, "_request_browser_catalog", lambda: catalogs.append(None),
+    )
+    monkeypatch.setattr(page, "_notice", notices.append)
+    rows = (
+        (OperationTerminalStatus.CANCELLED, None, "Average cancelled."),
+        (
+            OperationTerminalStatus.CANCELLED,
+            cancelled,
+            "Average cancelled.",
+        ),
+        (
+            OperationTerminalStatus.RETURNED,
+            cancelled,
+            "Average failed: invalid terminal result",
+        ),
+        (
+            OperationTerminalStatus.CANCELLED,
+            refused,
+            "Average failed: invalid terminal result",
+        ),
+        (
+            OperationTerminalStatus.CANCELLED,
+            committed,
+            "Average failed: invalid terminal result",
+        ),
+        (
+            OperationTerminalStatus.CANCELLED,
+            malformed,
+            "Average failed: invalid terminal result",
+        ),
+    )
+    try:
+        for token, (status, payload, expected_notice) in enumerate(rows, 1):
+            identity = OperationIdentity(100 + token)
+            page._average_identity = identity
+            page._average_revision = store.revision
+            page._average_target = target
+            page._average_entry = "entry"
+            assert page._consume_average_update(OperationUpdate(
+                identity,
+                terminal=OperationTerminal(identity, status, payload=payload),
+            ))
+            assert notices[-1] == expected_notice
+            assert all(getattr(page, name) is None for name in (
+                "_average_identity", "_average_revision",
+                "_average_target", "_average_entry",
+            ))
+        assert reloads == clears == catalogs == []
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
 def test_average_accepts_fixed_eiger_config_without_redundant_max_shape(
     tmp_path,
 ) -> None:
@@ -224,6 +300,52 @@ def test_average_accepts_variable_binning_detector_shape(tmp_path) -> None:
     assert tuple(detector.max_shape) == (6144, 6144)
     assert all(current <= maximum for current, maximum in
                zip(detector.shape, detector.max_shape, strict=True))
+
+
+def test_average_active_background_is_a_stable_pre_source_refusal(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.reduction.background import FrameBackgroundPlan
+    from xrd_tools.session.experiment_state import CalibrationState
+
+    source = _source(tmp_path)
+    target = tmp_path / "active-background.nxs"
+    effects = []
+
+    def forbidden(name):
+        return lambda *_args, **_kwargs: (
+            effects.append(name), pytest.fail(f"active background reached {name}")
+        )[1]
+
+    monkeypatch.setattr(
+        adapter, "_average_calibration",
+        lambda *_args, **_kwargs: CalibrationState(),
+    )
+    for name in (
+        "_source_from_recipe", "qualify_source_execution_graph",
+        "open_source_execution_graph", "_average_allocation",
+        "capture_target_snapshot", "_background_fact",
+        "resolve_frame_background",
+    ):
+        monkeypatch.setattr(average_module, name, forbidden(name))
+    slot = OperationSlot()
+    identity = slot.begin_average(
+        source, target, ReductionPlan(),
+        background=FrameBackgroundPlan(
+            mode="Single BG File",
+            locator=str(source.options["selected_file"]),
+        ),
+        stamp=OperationContextStamp(0),
+    )
+    assert identity is not None
+    update = _join(slot, identity)
+    result = update.terminal.payload
+    assert update.terminal.status is OperationTerminalStatus.RETURNED
+    assert (result.disposition, result.diagnostic_code) == (
+        "REFUSED", "AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED",
+    )
+    assert effects == [] and not target.exists()
 
 
 @pytest.fixture

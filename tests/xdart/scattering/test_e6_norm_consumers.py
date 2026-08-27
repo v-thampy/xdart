@@ -1501,7 +1501,7 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
     assert len(capture_calls) == 1
     assert _enclosing_functions(
         trees["context_runtime"], set(capture_calls)
-    ) == ["project_navigation"]
+    ) == ["capture_norm_aggregate_for_refresh"]
     gate_calls = _name_loads(
         trees["context_runtime"], "accepts_norm_aggregate"
     )

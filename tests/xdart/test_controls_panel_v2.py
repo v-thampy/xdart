@@ -5179,8 +5179,12 @@ def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
         panel.deleteLater()
 
 
-def test_apply_state_update_refuses_stale_action_button_specs(qapp):
-    """Action enablement and tooltips change without changing field schema."""
+def test_apply_state_update_updates_action_buttons_in_place_until_schema_changes(
+    qapp,
+):
+    """Action state changes preserve identity; ordered schema changes rebuild."""
+    from dataclasses import replace
+
     from xrd_tools.session.intent_store import RunIntentStore
     from xrd_tools.session.readiness import ControlAction
     from xrd_tools.session.run_configuration import RunIntent
@@ -5205,11 +5209,18 @@ def test_apply_state_update_refuses_stale_action_button_specs(qapp):
             for button in panel.findChildren(ActionButton)
             if button.spec.action is ControlAction.REINTEGRATE_1D
         )
+        row_before = panel.findChildren(FormRow)[0]
+        editor_before = row_before.editor
         assert not before.isEnabled()
         assert "stable processed Browse artifact" in before.toolTip()
+        calibrate_before = next(
+            button
+            for button in panel.findChildren(ActionButton)
+            if button.spec.action is ControlAction.CALIBRATE
+        )
+        assert calibrate_before.text() == "⌖ Calibrate"
 
-        assert panel.apply_state_update(enabled) is False
-        panel.set_state(enabled)
+        assert panel.apply_state_update(enabled) is True
         qapp.processEvents()
         after = next(
             button
@@ -5217,7 +5228,33 @@ def test_apply_state_update_refuses_stale_action_button_specs(qapp):
             if button.spec.action is ControlAction.REINTEGRATE_1D
             and button.isEnabled()
         )
+        assert after is before
+        assert panel.findChildren(FormRow)[0] is row_before
+        assert row_before.editor is editor_before
         assert "Replaces selected 1-D results" in after.toolTip()
+
+        active = project_controls(
+            store.snapshot(), None, RunPhase.IDLE,
+            operation_busy=True,
+            calibration_active=True,
+            reintegrate_available=True,
+        )
+        assert panel.apply_state_update(active) is True
+        assert next(
+            button
+            for button in panel.findChildren(ActionButton)
+            if button.spec.action is ControlAction.CALIBRATE
+        ) is calibrate_before
+        assert calibrate_before.text() == "Cancel Calibration"
+
+        actions = dict(active.profile.section_actions)
+        processing = actions[SectionId.PROCESSING]
+        actions[SectionId.PROCESSING] = tuple(reversed(processing))
+        reordered = replace(
+            active,
+            profile=replace(active.profile, section_actions=actions),
+        )
+        assert panel.apply_state_update(reordered) is False
     finally:
         panel.close()
         panel.deleteLater()

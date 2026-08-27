@@ -49,6 +49,7 @@ from .shell_widgets import (
 )
 from .shell_values import (
     AxisProjection,
+    BrowseTraceSnapshot,
     FrameNavigationProjection,
     ScientificPlotOptions,
     ScientificProjection,
@@ -246,6 +247,7 @@ class ScientificView(QtWidgets.QFrame):
         self._rendered_plot_mode = ""
         self._rendered_plot_options: ScientificPlotOptions | None = None
         self._rendered_overlay_step: float | None = None
+        self._rendered_browse_science_contract: tuple[object, ...] | None = None
         self._bottom_waterfall_active = False
         self._waterfall_y_values: tuple[float, ...] = ()
         self._waterfall_y_label = "Frame #"
@@ -376,6 +378,20 @@ class ScientificView(QtWidgets.QFrame):
         return self._trace_history_keys
 
     @property
+    def trace_history_projections(self) -> tuple[TraceProjection, ...]:
+        """Exact retained trace rows in their rendered navigation order."""
+
+        rows = tuple(
+            self._trace_history_by_identity.get(id(frame))
+            for frame in self._trace_history_keys
+        )
+        return (
+            rows
+            if all(type(row) is TraceProjection for row in rows)
+            else ()
+        )
+
+    @property
     def navigation_frame_keys(self) -> tuple[DisplayFrameKey, ...]:
         """Exact footer identities owned by the accepted presentation."""
 
@@ -392,6 +408,12 @@ class ScientificView(QtWidgets.QFrame):
         """Exact selected identities owned by the accepted presentation."""
 
         return self._selected_keys
+
+    @property
+    def heavy_available_keys(self) -> frozenset[DisplayFrameKey]:
+        """Exact heavy-payload frame identities retained by the view."""
+
+        return self._heavy_available
 
     @property
     def presentation_plot_mode(self) -> str:
@@ -416,6 +438,7 @@ class ScientificView(QtWidgets.QFrame):
         if key != self._expected_background_key:
             self._rendered_trace_keys = (); self._rendered_plot_mode = ""
             self._waterfall_source_keys = (); self._waterfall_render_contract = None
+            self._rendered_browse_science_contract = None
         self._expected_background_key = key
 
     def release_display_background(self, active_key):
@@ -431,6 +454,7 @@ class ScientificView(QtWidgets.QFrame):
                 self.curve.clear(); self.waterfall.clear(); self._trace_history_by_identity.clear(); self._pinned_trace_by_id.clear()
                 self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
                 self._trace_row_count = 0
+                self._rendered_browse_science_contract = None
             self._rendered_background_key = self._expected_background_key = None
         except Exception: return DisplayBackgroundRendererReleaseReceipt(active_key, False)
         return DisplayBackgroundRendererReleaseReceipt(active_key, True)
@@ -796,7 +820,12 @@ class ScientificView(QtWidgets.QFrame):
             fallback="Default",
         )
         self.log_scale.setChecked(state.log_scale)
-        if not state.retain_display:
+        replace_presentation = bool(
+            state.browse_trace_snapshot is not None
+            or state.heavy is not None
+            or not state.retain_display
+        )
+        if replace_presentation:
             self._reconcile_axis_choices(state)
         self._set_data_combo(self.image_axis, state.image_axis)
         self._set_data_combo(self.plot_axis, state.plot_axis)
@@ -816,11 +845,8 @@ class ScientificView(QtWidgets.QFrame):
         explanation = state.detector_diagnostic if not state.detector_available else ""
         self.detector_full.setToolTip(explanation)
         self.raw_popup_button.setToolTip(explanation or "Show exact-current raw image")
-        if not state.retain_display:
+        if replace_presentation:
             self.image_axis.setEnabled(state.measurement_mode != "GI")
-        replace_presentation = (
-            state.heavy is not None or not state.retain_display
-        )
         if replace_presentation:
             self.title.setText(state.title)
         self._heavy_available = state.heavy_available
@@ -880,7 +906,10 @@ class ScientificView(QtWidgets.QFrame):
                     self._rendered_cake_x_axis = None
                     self._rendered_cake_y_axis = None
                     self._rendered_image_axis = None
-            elif state.retain_display:
+            elif (
+                state.retain_display
+                and state.browse_trace_snapshot is None
+            ):
                 # A qualified hydration is pending.  Keep the last accepted
                 # title/images/traces together until its exact result arrives.
                 pass
@@ -1009,6 +1038,7 @@ class ScientificView(QtWidgets.QFrame):
             ("_heavy_available", frozenset()), ("_trace_history_scope", None), ("_pinned_trace_scope", None),
             ("_rendered_plot_options", None), ("_rendered_overlay_step", None), ("_trace_history_by_identity", {}),
             ("_pinned_trace_by_id", {}), ("_rendered_plot_mode", ""), ("_bottom_waterfall_active", False),
+            ("_rendered_browse_science_contract", None),
             ("_waterfall_render_contract", None), ("_rendered_image_axis", None), ("_rendered_cake_axis_key", None),
             ("_rendered_cake_x_axis", None), ("_rendered_cake_y_axis", None), ("_rendered_trace_axis_key", None),
         ):
@@ -1188,6 +1218,8 @@ class ScientificView(QtWidgets.QFrame):
     def rebind_navigation(
         self,
         navigation: FrameNavigationProjection,
+        *,
+        heavy_available: frozenset[DisplayFrameKey],
     ) -> bool:
         """Rebind an identity-distinct but scientifically identical context.
 
@@ -1210,10 +1242,18 @@ class ScientificView(QtWidgets.QFrame):
             if current is not None
             else ()
         )
+        frame_by_id = {id(frame): frame for frame in frames}
         if (
             current is None
+            or type(heavy_available) is not frozenset
             or len(frames) != len(self._frame_keys)
             or len(navigation.selected) != len(self._trace_history_keys)
+            or not any(frame is current for frame in heavy_available)
+            or any(
+                type(frame) is not DisplayFrameKey
+                or frame_by_id.get(id(frame)) is not frame
+                for frame in heavy_available
+            )
             or any(
                 old.local_frame_label != new.local_frame_label
                 for old, new in zip(self._frame_keys, frames, strict=True)
@@ -1266,6 +1306,7 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_history_keys = tuple(trace.frame for trace in rebound)
         self._trace_selection_keys = navigation.selected
         self._selected_keys = navigation.selected
+        self._heavy_available = heavy_available
         self._rendered_trace_keys = tuple(
             rekey(key) for key in self._rendered_trace_keys
         )
@@ -1291,6 +1332,96 @@ class ScientificView(QtWidgets.QFrame):
         del blocker
         return True
 
+    def reconcile_rebound_trace_axis(
+        self,
+        prior_traces: tuple[TraceProjection, ...],
+        rebound: ScientificProjection,
+        navigation: FrameNavigationProjection,
+    ) -> bool:
+        """Repair trace-axis controls without repainting accepted science."""
+
+        if (
+            type(prior_traces) is not tuple
+            or not prior_traces
+            or any(type(trace) is not TraceProjection for trace in prior_traces)
+            or type(rebound) is not ScientificProjection
+            or type(navigation) is not FrameNavigationProjection
+            or not rebound.traces
+        ):
+            return False
+        current_traces = self.trace_history_projections
+        if (
+            len(prior_traces) != len(current_traces)
+            or len(current_traces) != len(navigation.selected)
+        ):
+            return False
+        axis_keys = tuple(self._axis_key(trace.axis) for trace in current_traces)
+        if (
+            any(key is None for key in axis_keys)
+            or len(set(axis_keys)) != 1
+            or self._rendered_trace_axis_key != axis_keys[0]
+            or any(
+                new.frame is not frame
+                or self._trace_history_keys[index] is not frame
+                or old.axis is not new.axis
+                or old.axis.values is not new.axis.values
+                or old.intensity is not new.intensity
+                for index, (old, new, frame) in enumerate(zip(
+                    prior_traces,
+                    current_traces,
+                    navigation.selected,
+                    strict=True,
+                ))
+            )
+        ):
+            return False
+        retained_by_frame = {
+            id(trace.frame): trace for trace in current_traces
+        }
+        if any(
+            (retained := retained_by_frame.get(id(trace.frame))) is None
+            or retained.frame is not trace.frame
+            or retained.axis is not trace.axis
+            or retained.intensity is not trace.intensity
+            for trace in rebound.traces
+        ):
+            return False
+        axis_key = axis_keys[0]
+        plot_choices = self._plot_axis_choices(rebound, axis_key)
+        plot_choice = next(
+            (
+                value
+                for _label, value in plot_choices
+                if canonical_axis_key(value) == axis_key
+            ),
+            None,
+        )
+        if plot_choice is None:
+            return False
+        active_plot = (
+            self.waterfall.plot
+            if (
+                self._bottom_waterfall_active
+                and self.bottom_stack.currentWidget() is self.waterfall
+            )
+            else self.curve
+            if (
+                not self._bottom_waterfall_active
+                and self.bottom_stack.currentWidget() is self.curve
+            )
+            else None
+        )
+        if active_plot is None:
+            return False
+        blocker = QtCore.QSignalBlocker(self.plot_axis)
+        self._replace_combo_choices(self.plot_axis, plot_choices)
+        self._set_data_combo(self.plot_axis, plot_choice)
+        axis = current_traces[0].axis
+        label, unit = _axis_presentation(axis.label, axis.unit)
+        active_plot.setLabel("bottom", label, units=unit)
+        del blocker
+        return self.plot_axis.currentData() == plot_choice
+
     def _render_traces(
         self,
         state: ScientificProjection,
@@ -1298,34 +1429,81 @@ class ScientificView(QtWidgets.QFrame):
         *,
         live_update: bool,
     ) -> None:
+        browse_snapshot = state.browse_trace_snapshot
+        if browse_snapshot is not None:
+            if (
+                type(browse_snapshot) is not BrowseTraceSnapshot
+                or not browse_snapshot.science_contract
+                or browse_snapshot.science_contract
+                != state.browse_science_contract
+                or browse_snapshot.plot_mode != state.plot_mode
+                or state.slice_enabled
+                or state.slice_pins
+                or state.pinned_traces
+                or tuple(trace.frame for trace in state.traces)
+                != browse_snapshot.display_frames
+                or any(
+                    not any(owned is frame for owned in navigation.frames)
+                    for frame in browse_snapshot.logical_frames
+                )
+            ):
+                raise ValueError("Browse trace snapshot changed presentation scope")
+            compatible_single = bool(
+                browse_snapshot.plot_mode == "Single"
+                and self._rendered_plot_mode == "Single"
+                and self._rendered_browse_science_contract
+                == browse_snapshot.science_contract
+            )
+            # Stacked receipts are whole replacements.  A compatible Single
+            # receipt reseeds semantic history but retains its one mounted item
+            # so the normal setData path can update it in place.
+            self._trace_history_by_identity.clear()
+            if not compatible_single:
+                self._rendered_trace_keys = ()
+                self._rendered_plot_mode = ""
+            self._waterfall_source_keys = ()
+            self._waterfall_render_contract = None
+        else:
+            self._rendered_browse_science_contract = None
         live_traces = self._merge_trace_history(state, navigation)
         pinned = self._merge_pinned_trace_history(state)
         rows = (
             *((("pin", *pin_id), trace) for pin_id, trace in pinned),
             *((("live", id(trace.frame)), trace) for trace in live_traces),
         )
-        self._trace_row_count = len(rows)
-        presented_by_id = {
-            id(trace.frame): trace.frame
-            for _row_key, trace in rows
-        }
-        self._trace_history_keys = tuple(
-            frame
-            for frame in navigation.selected
-            if presented_by_id.get(id(frame)) is frame
-        )
+        if browse_snapshot is None:
+            self._trace_row_count = len(rows)
+            presented_by_id = {
+                id(trace.frame): trace.frame
+                for _row_key, trace in rows
+            }
+            self._trace_history_keys = tuple(
+                frame
+                for frame in navigation.selected
+                if presented_by_id.get(id(frame)) is frame
+            )
+        else:
+            self._trace_row_count = len(browse_snapshot.logical_frames)
+            self._trace_history_keys = browse_snapshot.logical_frames
+            self._trace_selection_keys = browse_snapshot.logical_frames
         self._bottom_waterfall_active = (
-            state.plot_mode == "Waterfall"
+            browse_snapshot.waterfall_active
+            if browse_snapshot is not None
+            else state.plot_mode == "Waterfall"
             if state.processing_mode == "1D Viewer"
             else waterfall_should_be_active(
                 state.plot_mode, len(rows),
-                was_active=self._bottom_waterfall_active))
+                was_active=self._bottom_waterfall_active)
+        )
         waterfall_scope = rows
         stacked_selection = (
-            state.plot_mode in {"Overlay", "Waterfall"}
+            browse_snapshot.stacked_options_applied
+            if browse_snapshot is not None
+            else state.plot_mode in {"Overlay", "Waterfall"}
             or (state.plot_mode == "Single" and len(rows) > 1)
         )
-        if ((stacked_selection or self._bottom_waterfall_active)
+        if (browse_snapshot is None
+                and (stacked_selection or self._bottom_waterfall_active)
                 and state.processing_mode != "1D Viewer"):
             start_index = state.plot_options.waterfall_start - 1
             stop_index = state.plot_options.waterfall_stop or None
@@ -1340,7 +1518,7 @@ class ScientificView(QtWidgets.QFrame):
                 state.color_map,
                 state.norm_channel,
             )
-            if self._skip_live_waterfall(
+            if browse_snapshot is None and self._skip_live_waterfall(
                 source_keys,
                 render_contract,
                 live_update=live_update,
@@ -1350,7 +1528,8 @@ class ScientificView(QtWidgets.QFrame):
                 if self._share_link_on:
                     self._schedule_curve_under_cake()
                 return
-            rows = self._bounded_waterfall_rows(rows)
+            if browse_snapshot is None:
+                rows = self._bounded_waterfall_rows(rows)
         rows = tuple(
             (
                 row_key,
@@ -1390,16 +1569,33 @@ class ScientificView(QtWidgets.QFrame):
             intensity,
             state.plot_options.intensity_scale,
         )
+        position_by_key = (
+            {
+                row_key: float(position)
+                for (row_key, _trace), position in zip(
+                    rows,
+                    browse_snapshot.logical_positions,
+                    strict=True,
+                )
+            }
+            if browse_snapshot is not None
+            else {
+                row_key: float(index + 1)
+                for index, (row_key, _trace) in enumerate(waterfall_scope)
+            }
+        )
         if self._bottom_waterfall_active and self._render_waterfall(
             traces,
             row_keys=keys,
             waterfall_scope=waterfall_scope,
-            position_by_key={
-                row_key: float(index + 1)
-                for index, (row_key, _trace) in enumerate(waterfall_scope)
-            },
+            position_by_key=position_by_key,
             y_axis_choice=state.plot_options.waterfall_y_axis,
             color_map=state.color_map,
+            logical_epochs=(
+                None
+                if browse_snapshot is None
+                else browse_snapshot.logical_epochs
+            ),
         ):
             self.bottom_stack.setCurrentWidget(self.waterfall)
             self.legend.setVisible(False)
@@ -1409,6 +1605,11 @@ class ScientificView(QtWidgets.QFrame):
             self._rendered_overlay_step = None
             self._waterfall_source_keys = source_keys
             self._waterfall_render_contract = render_contract
+            self._rendered_browse_science_contract = (
+                browse_snapshot.science_contract
+                if browse_snapshot is not None
+                else None
+            )
             if self._share_link_on:
                 self._schedule_curve_under_cake()
             return
@@ -1514,6 +1715,11 @@ class ScientificView(QtWidgets.QFrame):
         self._rendered_plot_mode = state.plot_mode
         self._rendered_plot_options = state.plot_options
         self._rendered_overlay_step = overlay_step
+        self._rendered_browse_science_contract = (
+            browse_snapshot.science_contract
+            if browse_snapshot is not None
+            else None
+        )
 
     def _merge_trace_history(
         self,
@@ -1539,11 +1745,11 @@ class ScientificView(QtWidgets.QFrame):
             ),
         )
         selected = navigation.selected
-        same_scope = (
-            not (state.processing_mode == "1D Viewer"
-                 and state.plot_mode == "Single")
-            and scope == self._trace_history_scope
+        viewer_single = (
+            state.processing_mode == "1D Viewer"
+            and state.plot_mode == "Single"
         )
+        same_scope = scope == self._trace_history_scope
         if not same_scope:
             self._trace_history_by_identity.clear()
             self._rendered_trace_keys = ()
@@ -1552,6 +1758,11 @@ class ScientificView(QtWidgets.QFrame):
             self._rendered_overlay_step = None
             self._waterfall_source_keys = ()
             self._waterfall_render_contract = None
+        elif viewer_single:
+            # Viewer Single is exact-current science, so its semantic history
+            # is reseeded for each navigation step.  Its compatible rendered
+            # item remains mounted for the setData reuse path below.
+            self._trace_history_by_identity.clear()
         selected_by_id = {id(frame): frame for frame in selected}
         for trace in state.traces:
             frame = trace.frame
@@ -1660,6 +1871,7 @@ class ScientificView(QtWidgets.QFrame):
         position_by_key: dict[tuple[object, ...], float],
         y_axis_choice: str,
         color_map: str,
+        logical_epochs: tuple[float, ...] | None = None,
     ) -> bool:
         if not traces:
             return False
@@ -1682,6 +1894,7 @@ class ScientificView(QtWidgets.QFrame):
             row_keys,
             position_by_key,
             y_axis_choice,
+            logical_epochs,
         )
         if y_values.shape != (rows.shape[0],):
             return False
@@ -1714,6 +1927,7 @@ class ScientificView(QtWidgets.QFrame):
         row_keys,
         position_by_key: dict[tuple[object, ...], float],
         y_axis_choice: str,
+        logical_epochs: tuple[float, ...] | None = None,
     ) -> tuple[np.ndarray, str]:
         positions = np.asarray(
             [position_by_key[row_key] for row_key in row_keys],
@@ -1721,6 +1935,21 @@ class ScientificView(QtWidgets.QFrame):
         )
         if y_axis_choice == "Frame #":
             return positions, y_axis_choice
+        if logical_epochs is not None:
+            if not logical_epochs:
+                return positions, "Frame #"
+            baseline = min(logical_epochs)
+            values = np.asarray(
+                [
+                    logical_epochs[int(position_by_key[row_key]) - 1]
+                    - baseline
+                    for row_key in row_keys
+                ],
+                dtype=float,
+            )
+            if y_axis_choice == "Time (minutes)":
+                values /= 60.0
+            return values, y_axis_choice
         epochs = {
             row_key: trace.epoch
             for row_key, trace in waterfall_scope
@@ -1763,49 +1992,47 @@ class ScientificView(QtWidgets.QFrame):
                 return
 
     def _reconcile_axis_choices(self, state: ScientificProjection) -> None:
+        native_key = (
+            None
+            if not state.traces
+            else self._axis_key(state.traces[0].axis)
+        )
+        plot_choices = self._plot_axis_choices(state, native_key)
         if state.measurement_mode == "GI":
-            native_choices = _GI_PLOT_AXIS_CHOICES.get(
-                state.gi_mode_1d,
-                _GI_PLOT_AXIS_CHOICES["q_total"],
-            )
-            plot_choices = (
-                native_choices
-                if state.processing_mode == "Int 1D"
-                else self._merged_axis_choices(
-                    native_choices,
-                    _GI_CAKE_PLOT_AXIS_CHOICES.get(
-                        state.gi_mode_2d,
-                        (),
-                    ),
-                )
-            )
             image_choices = _GI_IMAGE_AXIS_CHOICES.get(
                 state.gi_mode_2d,
                 _GI_IMAGE_AXIS_CHOICES["q_chi"],
             )
         else:
-            native_key = (
-                None
-                if not state.traces
-                else self._axis_key(state.traces[0].axis)
-            )
-            plot_choices = (
-                (
-                    ("χ (°)", "chi"),
-                )
-                if (
-                    state.processing_mode == "Int 1D"
-                    and native_key == "chi_deg"
-                )
-                else (
-                    _STANDARD_PLOT_AXIS_CHOICES[:2]
-                    if state.processing_mode == "Int 1D"
-                    else _STANDARD_PLOT_AXIS_CHOICES
-                )
-            )
             image_choices = _STANDARD_IMAGE_AXIS_CHOICES
         self._replace_combo_choices(self.plot_axis, plot_choices)
         self._replace_combo_choices(self.image_axis, image_choices)
+
+    def _plot_axis_choices(
+        self,
+        state: ScientificProjection,
+        native_key: str | None,
+    ) -> tuple[tuple[str, str], ...]:
+        if state.measurement_mode == "GI":
+            native_choices = _GI_PLOT_AXIS_CHOICES.get(
+                state.gi_mode_1d,
+                _GI_PLOT_AXIS_CHOICES["q_total"],
+            )
+            return (
+                native_choices
+                if state.processing_mode == "Int 1D"
+                else self._merged_axis_choices(
+                    native_choices,
+                    _GI_CAKE_PLOT_AXIS_CHOICES.get(state.gi_mode_2d, ()),
+                )
+            )
+        if state.processing_mode == "Int 1D" and native_key == "chi_deg":
+            return (("χ (°)", "chi"),)
+        return (
+            _STANDARD_PLOT_AXIS_CHOICES[:2]
+            if state.processing_mode == "Int 1D"
+            else _STANDARD_PLOT_AXIS_CHOICES
+        )
 
     @staticmethod
     def _merged_axis_choices(

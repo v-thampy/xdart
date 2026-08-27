@@ -64,6 +64,7 @@ class _WorkspaceActivity:
 
     lifecycle: object
     operation: object
+    pending: object | None = None
 
     def active(self) -> bool:
         from xdart.gui.tabs.scattering.state_machine import RunPhase
@@ -71,13 +72,17 @@ class _WorkspaceActivity:
         try:
             phase = self.lifecycle.phase
             operation_owned = self.operation.owned
+            pending_owned = (
+                False if self.pending is None else self.pending()
+            )
         except Exception:
             return True
-        if type(operation_owned) is not bool:
+        if (type(operation_owned) is not bool
+                or type(pending_owned) is not bool):
             return True
         return (
             phase not in (RunPhase.IDLE, RunPhase.FAILED, RunPhase.CLOSED)
-            or operation_owned
+            or operation_owned or pending_owned
         )
 
 
@@ -218,6 +223,30 @@ def _control_path_chooser(widget):
     return choose
 
 
+def _authoring_source_chooser(widget):
+    """Dedicated source chooser for standalone Calibrate and Make Mask."""
+    from pyqtgraph.Qt import QtWidgets
+
+    def choose(asset, start_directory):
+        if asset == "poni":
+            title = "Choose calibration source image"
+            file_filter = (
+                "Calibration sources (*.tif *.tiff *.h5 *.hdf5 *.nxs "
+                "*.nexus *.edf *.cbf *.img *.mar3450 *.raw);;All files (*)"
+            )
+        elif asset == "mask":
+            title = "Choose TIFF for mask"
+            file_filter = "TIFF image (*.tif *.tiff)"
+        else:
+            return None
+        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            widget, title, start_directory, file_filter,
+        )
+        return selected or None
+
+    return choose
+
+
 def _source_selection_chooser(widget):
     """Source chooser (directory/single/series) from the live launcher."""
     from pathlib import Path
@@ -340,6 +369,7 @@ def build_scattering_workspace(
         sources=sources,
         executor=executor,
         control_path_chooser=_control_path_chooser(parent),
+        authoring_source_chooser=_authoring_source_chooser(parent),
         source_selection_chooser=_source_selection_chooser(parent),
         parent=parent,
     )
@@ -359,6 +389,9 @@ def build_scattering_workspace(
         run_control=_WorkspaceRunControl(widget),
         write_mode=_WorkspaceWriteMode(widget),
         slice_pin=_WorkspaceSlicePin(widget),
-        activity=_WorkspaceActivity(lifecycle, widget._operation_slot),
+        activity=_WorkspaceActivity(
+            lifecycle, widget._operation_slot,
+            widget._experiment_operation_busy,
+        ),
         app_menus=_WorkspaceMenus(widget),
     )

@@ -14,6 +14,16 @@ from xrd_tools.session.hydration import (
 from xrd_tools.session.scan_norm import (
     ScanNormAggregate, accepts_norm_aggregate)
 
+from .browse_1d_projection import (
+    Browse1DProjectionOutcome,
+    Browse1DProjectionStatus,
+)
+from .browse_1d_target_plan import (
+    Browse1DRuntimeProjection,
+    Browse1DTargetPlan,
+    Browse1DTargetPlanStatus,
+    plan_browse_1d_targets,
+)
 from .browse_hydration import _BrowseHydrationOwner
 from .browse_preview import qualified_event_frame
 from .browse_values import BrowseLoadRequest
@@ -113,6 +123,7 @@ class _ContextRuntime:
         self._pending_trace_projection: _PendingTraceProjection | None = None
         self._browse_pass: _BrowseProjectionPass | None = None
         self._norm_aggregate: ScanNormAggregate | None = None
+        self._norm_capture_scope: tuple[object, object, object] | None = None
 
     @property
     def norm_aggregate(self) -> ScanNormAggregate | None:
@@ -927,7 +938,7 @@ class _ContextRuntime:
         browse_hydration_owner=None,
         viewer_1d_owner=None,
     ) -> tuple[StandardDisplayPayload, ...]:
-        self._capture_norm_aggregate()
+        self._consume_norm_capture_for_projection()
         payloads: list[StandardDisplayPayload] = []
         navigation = self.navigation
         selected = navigation.selected
@@ -1032,6 +1043,222 @@ class _ContextRuntime:
         self._pending_trace_projection = pending
         return tuple(payloads)
 
+    def project_browse_1d_cache(
+        self,
+        browse_hydration_owner,
+        *,
+        preferences: object,
+        was_waterfall_active: bool,
+    ) -> Browse1DRuntimeProjection:
+        """Project the one planned sparse cache scope for display adoption.
+
+        This method does not touch the legacy trace ledger or display state.
+        A COMPLETE return retains its exact cache borrows for the caller;
+        INCOMPLETE starts only the already-planned sparse row read.
+        """
+
+        self._consume_norm_capture_for_projection()
+        browse = self._browse
+        selection = self._selection
+        navigation = self._browse_navigation
+        owner = browse_hydration_owner
+        planned = plan_browse_1d_targets(
+            browse,
+            selection,
+            navigation,
+            preferences,
+            self._browse_frame_by_id,
+            current_selection=self._selection,
+            current_navigation=self._browse_navigation,
+            was_waterfall_active=was_waterfall_active,
+        )
+        if planned.status is not Browse1DTargetPlanStatus.PLANNED:
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                diagnostic=planned.diagnostic,
+            )
+        plan = planned.plan
+        if (
+            type(plan) is not Browse1DTargetPlan
+            or not self._browse_1d_plan_is_current(
+                browse, selection, navigation, owner, plan,
+            )
+        ):
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                diagnostic="Browse 1-D runtime scope is stale",
+            )
+        try:
+            projected = owner.project_1d(
+                browse,
+                selection,
+                navigation,
+                plan.display_targets,
+                current_selection=self._selection,
+            )
+        except BaseException as error:
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                plan=plan,
+                diagnostic=f"{type(error).__name__}: {error}"[:512],
+            )
+        if type(projected) is not Browse1DProjectionOutcome:
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                plan=plan,
+                diagnostic="Browse 1-D projector returned a foreign result",
+            )
+        bundle = projected.borrow_bundle
+        current = self._browse_1d_plan_is_current(
+            browse, selection, navigation, owner, plan,
+        )
+        aligned = (
+            projected.status is not Browse1DProjectionStatus.COMPLETE
+            or len(projected.payloads) == len(plan.display_targets)
+            and all(
+                payload.frame_key is frame
+                and payload.selection_generation
+                == selection.display_generation
+                for payload, frame in zip(
+                    projected.payloads,
+                    plan.display_targets,
+                    strict=True,
+                )
+            )
+        )
+        if not current or not aligned:
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                plan=plan,
+                borrow_bundle=bundle,
+                diagnostic="Browse 1-D projection completed outside its scope",
+            )
+        if projected.status is Browse1DProjectionStatus.COMPLETE:
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.COMPLETE,
+                plan,
+                projected.payloads,
+                bundle,
+            )
+        if projected.status is Browse1DProjectionStatus.REFUSED:
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                plan=plan,
+                borrow_bundle=bundle,
+                diagnostic=projected.diagnostic,
+            )
+        if bundle is not None:
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                plan=plan,
+                borrow_bundle=bundle,
+                diagnostic="Incomplete Browse projection retained borrow custody",
+            )
+        try:
+            submission = owner.submit_1d(
+                browse,
+                selection,
+                plan.display_targets,
+            )
+        except BaseException as error:
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                plan=plan,
+                diagnostic=f"{type(error).__name__}: {error}"[:512],
+            )
+        if (
+            type(submission) is not object
+            or not self._browse_1d_plan_is_current(
+                browse, selection, navigation, owner, plan,
+            )
+        ):
+            return Browse1DRuntimeProjection(
+                Browse1DProjectionStatus.REFUSED,
+                plan=plan,
+                diagnostic="Browse 1-D hydration admission was refused or stale",
+            )
+        return Browse1DRuntimeProjection(
+            Browse1DProjectionStatus.INCOMPLETE,
+            plan=plan,
+            submission_identity=submission,
+            diagnostic=projected.diagnostic,
+        )
+
+    def _browse_1d_plan_is_current(
+        self,
+        browse,
+        selection,
+        navigation,
+        owner,
+        plan,
+    ) -> bool:
+        """Requalify exact runtime identities without reading any store."""
+
+        return bool(
+            self._pending_replacement is None
+            and type(browse) is BrowseContext
+            and browse is self._browse
+            and type(selection) is DisplaySelection
+            and selection is self._selection
+            and selection.kind is ContextKind.BROWSE
+            and navigation is self._browse_navigation
+            and type(owner) is _BrowseHydrationOwner
+            and owner.names(browse)
+            and type(plan) is Browse1DTargetPlan
+            and plan.selection is selection
+            and plan.navigation is navigation
+            and all(
+                self._browse_frame_by_id.get(id(frame)) is frame
+                for frame in plan.logical_frames
+            )
+            and all(
+                self._browse_frame_by_id.get(id(frame)) is frame
+                for frame in plan.display_targets
+            )
+            and browse.loaded
+            and not browse.invalidated
+            and not browse.released
+            and not browse.commit_gate.cancelled
+        )
+
+    def browse_1d_plan_is_current(
+        self,
+        browse_hydration_owner,
+        plan: object,
+    ) -> bool:
+        """Requalify one detached plan immediately before presentation."""
+
+        return self._browse_1d_plan_is_current(
+            self._browse,
+            self._selection,
+            self._browse_navigation,
+            browse_hydration_owner,
+            plan,
+        )
+
+    def capture_norm_aggregate_for_refresh(self) -> None:
+        """Capture once for the frozen selection used by one shell refresh."""
+
+        self._capture_norm_aggregate()
+        self._norm_capture_scope = (
+            self._selection,
+            self._browse,
+            self._acquisition,
+        )
+
+    def _consume_norm_capture_for_projection(self) -> None:
+        scope = (self._selection, self._browse, self._acquisition)
+        held = self._norm_capture_scope
+        if (
+            held is None
+            or any(
+                prior is not current
+                for prior, current in zip(held, scope, strict=True)
+            )
+        ):
+            self.capture_norm_aggregate_for_refresh()
+        self._norm_capture_scope = None
+
     def project_background_contributors(
         self, projection: ContextProjection, browse_hydration_owner=None,
         viewer_1d_owner=None, *, pins=(),
@@ -1105,6 +1332,7 @@ class _ContextRuntime:
         """Acknowledge a semantically identical terminal-Browse rebind."""
 
         selected = self.navigation.selected
+        plot_mode = getattr(preferences, "plot_mode", None)
         if (
             self._selection is None
             or self._selection.kind is not ContextKind.BROWSE
@@ -1116,10 +1344,17 @@ class _ContextRuntime:
                     presented_frames, selected, strict=True,
                 )
             )
-            or getattr(preferences, "plot_mode", None)
-            not in {"Overlay", "Waterfall"}
+            or plot_mode not in {"Single", "Overlay", "Waterfall"}
         ):
             return False
+        if plot_mode == "Single":
+            if (
+                len(selected) != 1
+                or self.navigation.current is not selected[0]
+            ):
+                return False
+            self._reset_trace_projection()
+            return True
         self._committed_trace_scope = self._trace_projection_scope(
             preferences, processing_mode,
         )

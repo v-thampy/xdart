@@ -22,6 +22,7 @@ from .browse_values import (
     BrowseLoadRequest,
     canonical_browse_source_identity,
 )
+from .browse_1d_hydration import Browse1DHydrationLane
 from .display_runtime import (
     DetectorHydrationOutcome,
     _hydration_locality_protection,
@@ -61,6 +62,7 @@ class _BrowseHydrationOwner:
         #: OBJECT; bounded by one-active plus one-latest-queued.
         self._borrowed_tickets: list[_HydrationTicket] = []
         self._owns_transport = borrowed_transport is None
+        self._one_d_lane = Browse1DHydrationLane(browse)
         self.transport = (
             HydrationTransport(
                 self.commit_preview,
@@ -187,6 +189,35 @@ class _BrowseHydrationOwner:
                 else None
             )
 
+    def submit_1d(self, browse, selection, frames):
+        """Submit exact planned Browse frames to the dedicated 1-D lane."""
+
+        if not self.names(browse):
+            return None
+        return self._one_d_lane.submit(selection, frames)
+
+    def project_1d(
+        self,
+        browse,
+        selection,
+        navigation,
+        frames,
+        *,
+        current_selection,
+    ):
+        """Acquire one exact cache projection without detector hydration."""
+
+        from .browse_1d_projection import project_browse_1d
+
+        return project_browse_1d(
+            browse,
+            self._one_d_lane,
+            selection,
+            navigation,
+            frames,
+            current_selection=current_selection,
+        )
+
     def commit_preview(
         self, prepared: PreparedHydrationCommit
     ) -> HydrationOutcome:
@@ -210,20 +241,40 @@ class _BrowseHydrationOwner:
             view = preview.view
             if preview.raw is not None:
                 view = replace(view, raw=preview.raw)
-            prior = self._store.get(request.label)
-            prior_record = None if prior is None else prior.record
+            from xrd_tools.io import FrameScalarCatalog, FrameScalarRow
+
+            catalog = self._browse.scalar_catalog
+            scalar_row = (
+                None
+                if type(catalog) is not FrameScalarCatalog
+                else catalog.row(view.label)
+            )
+            if type(scalar_row) is not FrameScalarRow:
+                raise RuntimeError(
+                    "Browse preview has no exact scalar catalog row"
+                )
+            mode_1d = scalar_row.active_mode_1d
+            mode_2d = scalar_row.active_mode_2d
+            if view.has_1d and (
+                type(mode_1d) is not str
+                or not mode_1d
+                or mode_1d not in scalar_row.modes_1d
+            ):
+                raise RuntimeError(
+                    "Browse preview has no exact active 1-D mode"
+                )
+            if view.has_2d and (
+                type(mode_2d) is not str
+                or not mode_2d
+                or mode_2d not in scalar_row.modes_2d
+            ):
+                raise RuntimeError(
+                    "Browse preview has no exact active 2-D mode"
+                )
             record = FrameRecord.from_view(
                 view,
-                mode_1d=(
-                    prior_record.active_mode_1d
-                    if prior_record is not None and prior_record.results_1d
-                    else DEFAULT_MODE_KEY
-                ),
-                mode_2d=(
-                    prior_record.active_mode_2d
-                    if prior_record is not None and prior_record.results_2d
-                    else DEFAULT_MODE_KEY
-                ),
+                mode_1d=(mode_1d if view.has_1d else DEFAULT_MODE_KEY),
+                mode_2d=(mode_2d if view.has_2d else DEFAULT_MODE_KEY),
             )
             detector_unavailable = view.raw is None and view.thumbnail is None
             source_identity = canonical_browse_source_identity(
@@ -276,6 +327,7 @@ class _BrowseHydrationOwner:
             self._complete(settled.result())
 
     def consume_repaint(self) -> bool:
+        one_d_repaint = self._one_d_lane.consume_repaint()
         if not self._owns_transport:
             self._observe_borrowed()
         consumed = False
@@ -283,19 +335,24 @@ class _BrowseHydrationOwner:
             try:
                 self._repaints.get_nowait()
             except Empty:
-                return consumed
+                return consumed or one_d_repaint
             consumed = True
 
     def polling_needed(self) -> bool:
+        one_d_pending = self._one_d_lane.polling_needed()
         if not self._owns_transport:
             # Never the shared worker: unrelated acquisition reads must not
             # keep this page awake.  Only this owner's own outstanding read
             # or an unconsumed wake does.
             with self._terminal_lock:
                 awaiting = bool(self._borrowed_tickets)
-            return awaiting or not self._repaints.empty()
+            return (
+                awaiting
+                or not self._repaints.empty()
+                or one_d_pending
+            )
         worker = self.transport.worker
-        return (
+        return one_d_pending or (
             (worker is not None and worker.is_alive())
             or not self._repaints.empty()
         )
@@ -321,6 +378,12 @@ class _BrowseHydrationOwner:
             else None
         )
         if not self._owns(browse):
+            return BrowseCleanupReceipt(
+                request, CleanupStatus.CLEANUP_PENDING
+            )
+        if not self._one_d_lane.release(
+            preserve_pending_repaint=preserve_pending_repaint,
+        ):
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )

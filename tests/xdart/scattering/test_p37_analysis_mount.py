@@ -8,6 +8,7 @@ from pathlib import Path
 import struct
 import sys
 from threading import Event
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -403,6 +404,8 @@ def test_metadata_button_requeries_after_current_artifact_changes(
             lambda kind, plan, generation, **kwargs:
                 launches.append((kind, plan, generation, kwargs)),
         )
+        import xdart.gui.tabs.scattering.analysis_mount as mount
+        monkeypatch.setattr(mount, "analysis_start_allowed", lambda _page: True)
 
         page._open_analysis_mount("metadata")
 
@@ -416,6 +419,246 @@ def test_metadata_button_requeries_after_current_artifact_changes(
         assert dialog.status.text() == ""
     finally:
         _dispose(page, qapp)
+
+
+def test_metadata_first_click_survives_viewer_cleanup_with_same_dialog(
+    monkeypatch, qapp,
+) -> None:
+    from tests.xdart.scattering.test_e3_context_contract import _browse
+    from xdart.modules.display_context import ContextKind, new_context_token
+
+    page = _page()
+    request, browse = _browse(
+        new_context_token(ContextKind.BROWSE), 1, scan_key="loaded-nexus",
+    )
+    page._context_controller._runtime.adopt_browse(browse, request)
+    page._refresh_shell()
+    held = [True]
+    controller_type = type(page._context_controller)
+    monkeypatch.setattr(
+        controller_type,
+        "viewer_2d_cleanup_pending",
+        property(lambda _controller: held[0]),
+    )
+    launches = []
+    identity = OperationIdentity(45)
+    monkeypatch.setattr(
+        page._operation_slot,
+        "begin_metadata",
+        lambda plan, stamp: launches.append((plan, stamp)) or identity,
+    )
+    try:
+        page._shell.browser.metadata.click()
+        qapp.processEvents()
+
+        dialog = page._metadata_dialog
+        deferred = page._deferred_metadata
+        assert dialog is not None and dialog.isVisible()
+        assert deferred is not None and deferred.dialog is dialog
+        assert deferred.generation == page._metadata_generation
+        assert deferred.request == page._current_analysis_request(
+            "metadata", "metadata",
+        )
+        assert launches == []
+        assert page._polling_needed()
+
+        held[0] = False
+        page._drain_executor()
+
+        assert page._metadata_dialog is dialog and dialog.isVisible()
+        assert len(launches) == 1
+        assert page._analysis_identity is identity
+        assert page._deferred_metadata is None
+        page._drain_executor()
+        assert len(launches) == 1
+    finally:
+        _close_page(page, qapp)
+
+
+def test_raw_tiff_viewer_metadata_click_uses_auto_sidecar_plan(
+    monkeypatch, qapp, tmp_path,
+) -> None:
+    tifffile = pytest.importorskip("tifffile")
+    image = tmp_path / "scan_0001.TIFF"
+    tifffile.imwrite(image, np.ones((3, 4), dtype=np.uint16))
+    image.with_suffix(".txt").write_text(
+        "# Counters\nI0 = 10\n"
+        "# Motors\nth = 0.1\n"
+        "User: p37, time: Mon Jan 15 10:30:00 2024  # Temp\n",
+        encoding="utf-8",
+    )
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(processing_mode="2D Viewer")),
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    captured_plans = []
+    begin_metadata = page._operation_slot.begin_metadata
+
+    def begin(plan, stamp):
+        captured_plans.append(plan)
+        return begin_metadata(plan, stamp)
+
+    monkeypatch.setattr(page._operation_slot, "begin_metadata", begin)
+
+    def wait_for(predicate) -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            page._drain_executor()
+            if predicate():
+                return
+            time.sleep(0.005)
+        raise AssertionError("TIFF metadata operation did not settle")
+
+    try:
+        page._open_viewer_2d_path(str(image))
+        wait_for(lambda: page._context_controller.viewer_2d_frame is not None)
+        current = page._context_controller.navigation.current
+        assert current is not None
+        assert current.source_scan == current.artifact == "viewer-2d"
+        assert page._context_controller.viewer_2d_context.original_path == str(
+            image
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                page._context_controller,
+                "owns_frame",
+                lambda _frame: False,
+            )
+            assert page._metadata_plan_for_current() is None
+        owner = page._context_controller._viewer_2d
+        context = owner.context
+        assert context is not None
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                owner,
+                "context",
+                replace(
+                    context,
+                    original_path=str(tmp_path / "stale.TIFF"),
+                ),
+            )
+            assert page._metadata_plan_for_current() is None
+
+        page._shell.browser.metadata.click()
+        qapp.processEvents()
+
+        assert len(captured_plans) == 1
+        plan = captured_plans[0]
+        assert plan.source == str(image)
+        assert plan.metadata_format == "auto"
+        from xdart.gui.tabs.scattering.analysis_mount import (
+            analysis_request_facts,
+        )
+        request = analysis_request_facts(plan)
+        assert request is not None
+        assert request[1][-1] == "auto"
+        assert page._analysis_request == request
+        wait_for(lambda: page._metadata_result is not None)
+
+        result = page._metadata_result
+        assert result is not None
+        columns = {column.name: column for column in result.columns}
+        np.testing.assert_allclose(columns["I0"].numeric, [10.0])
+        np.testing.assert_allclose(columns["th"].numeric, [0.1])
+        assert page._metadata_dialog is not None
+        headers = tuple(
+            page._metadata_dialog.table.horizontalHeaderItem(index).text()
+            for index in range(page._metadata_dialog.table.columnCount())
+        )
+        assert "I0" in headers and "th" in headers
+    finally:
+        _close_page(page, qapp)
+
+    from tests.xdart.scattering.test_e3_context_contract import _browse
+    from xdart.modules.display_context import ContextKind, new_context_token
+
+    processed = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(processing_mode="2D Viewer")),
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    request, browse = _browse(
+        new_context_token(ContextKind.BROWSE),
+        1,
+        scan_key="processed-metadata",
+    )
+    try:
+        processed._context_controller._runtime.adopt_browse(browse, request)
+        processed_plan = processed._metadata_plan_for_current()
+        assert processed_plan is not None
+        assert str(processed_plan.source).endswith(".nxs")
+        assert processed_plan.metadata_format is None
+        processed_request = processed._current_analysis_request(
+            "metadata", "metadata",
+        )
+        assert processed_request is not None
+        assert processed_request[1][-1] is None
+    finally:
+        _close_page(processed, qapp)
+
+
+@pytest.mark.parametrize("stale", ("dialog", "generation", "request", "denied"))
+def test_deferred_metadata_permanent_or_stale_state_drops_without_launch(
+    stale, monkeypatch, qapp,
+) -> None:
+    from xdart.gui.tabs.scattering.analysis_mount import (
+        MetadataResultDialog,
+        analysis_request_facts,
+    )
+
+    page = _page()
+    original_slot = page._operation_slot
+    original_dialog = None
+    replacement_dialog = None
+    try:
+        page._open_analysis_mount("metadata")
+        original_dialog = page._metadata_dialog
+        plan = MetadataTablePlan("/tmp/exact.nxs")
+        exact = analysis_request_facts(plan)
+        changed = analysis_request_facts(MetadataTablePlan("/tmp/changed.nxs"))
+        current = [exact]
+        launches = []
+        slot = SimpleNamespace(
+            owned=True,
+            begin_metadata=lambda candidate, stamp:
+                launches.append((candidate, stamp)) or OperationIdentity(46),
+        )
+        page._operation_slot = slot
+        monkeypatch.setattr(
+            page, "_current_analysis_request",
+            lambda _kind, _target: current[0],
+        )
+        assert page._submit_metadata(
+            plan, page._metadata_generation, request=exact,
+        ) is None
+        deferred = page._deferred_metadata
+        assert deferred is not None
+
+        slot.owned = False
+        if stale == "dialog":
+            replacement_dialog = MetadataResultDialog(page)
+            page._metadata_dialog = replacement_dialog
+        elif stale == "generation":
+            page._metadata_generation += 1
+        elif stale == "request":
+            current[0] = changed
+        else:
+            page._admission_state = object()
+
+        assert page._dispatch_deferred_metadata()
+        assert page._deferred_metadata is None
+        assert launches == []
+    finally:
+        page._operation_slot = original_slot
+        page._admission_state = None
+        if replacement_dialog is not None:
+            replacement_dialog.close()
+            replacement_dialog.deleteLater()
+        if original_dialog is not None:
+            page._metadata_dialog = original_dialog
+        _close_page(page, qapp)
 
 
 def test_busy_shared_slot_keeps_only_latest_metadata_request(

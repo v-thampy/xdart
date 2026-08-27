@@ -9,13 +9,14 @@ import numpy as np
 import pytest
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xrd_tools.core import FrameView
+from xrd_tools.core import FrameRecord, FrameView
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
 from xdart.gui.tabs.scattering.contracts import (
     SourceCapture, SourceObservation, SourceObservationRequest, SourceObservationStatus,
 )
+from xdart.gui.tabs.scattering.browser_catalog import BrowserCatalogEntry
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import (
     DisplayFrameKey,
@@ -48,6 +49,8 @@ from xdart.gui.tabs.scattering.shell_values import (
 )
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
+from xdart.modules.display_context import ContextKind
+from xdart.modules.frame_publication import FramePublication
 from tests.xdart.scattering._admission import (
     ImmediateAdmission,
     admission_for,
@@ -90,6 +93,7 @@ class _Executor(ImmediateAdmission):
         self.stop_error: Exception | None = None
         self.start_calls = 0
         self.last_identity: RunIdentity | None = None
+        self.last_configuration = None
 
     def begin_admission(self, capture):
         token = super().begin_admission(capture)
@@ -109,6 +113,7 @@ class _Executor(ImmediateAdmission):
     def start(self, _configuration, _source, run_identity, _admission):
         self.start_calls += 1
         self.last_identity = run_identity
+        self.last_configuration = _configuration
         return ExecutorAccepted(run_identity)
 
     def stop(self, _run_identity) -> None:
@@ -206,6 +211,62 @@ def _paced_frame_events(
         )
         for index, delta in enumerate(deltas, start=1)
     )
+
+
+def _batch_display(
+    page: ScatteringWorkspace,
+    executor: _Executor,
+    identity: RunIdentity,
+    *,
+    configuration=None,
+) -> tuple[DisplayNavigationDelta, ...]:
+    from tests.xdart.scattering.test_e3_context_contract import (
+        _acquisition, _view,
+    )
+
+    configuration = configuration or RunIntent(
+        output_mode="Overwrite", processing_mode="Int 2D",
+    ).freeze()
+    _, acquisition = _acquisition(
+        configuration=configuration, identity=identity,
+    )
+    executor.acquisition_context = (
+        lambda candidate: acquisition if candidate is identity else None
+    )
+    controller = page._context_controller
+    controller.adopt_acquisition(identity)
+    display = acquisition.publication_store
+    first = display.catalog_snapshot().entries[0]
+    assert controller.select_navigation(first, (first,))
+    page._refresh_shell()
+
+    owner = display.artifacts[first.artifact]
+    deltas = [DisplayNavigationDelta(first)]
+    for label in (2, 3):
+        view = _view(label, float(label))
+        record = FrameRecord.from_view(view)
+        publication = FramePublication(
+            view,
+            record=record,
+            source_identity=f"{view.source_path}#{label}",
+            scan_key=first.source_scan,
+        )
+        delta = display.append_navigation(
+            first.source_scan, first.artifact, label,
+        )
+        display.retain_frame(
+            owner,
+            delta.appended,
+            record,
+            publication,
+            source_identity=publication.source_identity,
+            frame_mask_qualified=False,
+        )
+        display.put_payload(StandardDisplayPayload(
+            0, delta.appended, f"Standard · run.a · frame {label}", view,
+        ))
+        deltas.append(delta)
+    return tuple(deltas)
 
 
 def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
@@ -1077,8 +1138,12 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
         paints = []
         monkeypatch.setattr(
             page, "_refresh_event_shell",
-            lambda *, preserve_scientific=False:
-                paints.append(preserve_scientific),
+            lambda *, preserve_scientific=False,
+            skip_scientific_projection=False:
+                paints.append((
+                    preserve_scientific,
+                    skip_scientific_projection,
+                )),
         )
         terminal = StandardRunEvent(
             identity,
@@ -1095,9 +1160,9 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
         assert lifecycle.phase is RunPhase.IDLE
         assert calls == [("/out/a.nxs", seal)]
         assert page._terminal_browse_handoff == _TerminalBrowseHandoff(
-            request, "/out/a.nxs", 3, (3,), seal,
+            request, identity, "/out/a.nxs", 3, (3,), seal,
         )
-        assert paints == [True]
+        assert paints == [(True, True)]
 
         # None of the terminal cases that lacks an exact clean publication may
         # start the convenience Browse transition.
@@ -1121,7 +1186,7 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
         )
         assert calls == [("/out/a.nxs", seal)]
         assert page._terminal_browse_handoff == _TerminalBrowseHandoff(
-            request, "/out/a.nxs", 3, (3,), seal,
+            request, identity, "/out/a.nxs", 3, (3,), seal,
         )
     finally:
         _dispose(page, qapp)
@@ -1178,11 +1243,11 @@ def test_terminal_browse_ready_performs_one_normal_scientific_reconcile(
     )
 
     executor = _Executor()
-    page, _, _identity = _active_page(executor)
+    page, _, identity = _active_page(executor)
     controller = page._context_controller
     request = BrowseLoadRequest("terminal-ready", 1, "/out/a.nxs")
     page._terminal_browse_handoff = _TerminalBrowseHandoff(
-        request, request.source_path, None, (),
+        request, identity, request.source_path, None, (),
     )
     pending = [True]
     monkeypatch.setattr(
@@ -1216,11 +1281,11 @@ def test_terminal_browse_refusal_retires_exact_handoff_without_outcome(
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
 
     executor = _Executor()
-    page, _, _identity = _active_page(executor)
+    page, _, identity = _active_page(executor)
     controller = page._context_controller
     request = BrowseLoadRequest("terminal-refused", 1, "/out/a.nxs")
     page._terminal_browse_handoff = _TerminalBrowseHandoff(
-        request, request.source_path, None, (),
+        request, identity, request.source_path, None, (),
     )
     pending = [True]
     monkeypatch.setattr(
@@ -1297,11 +1362,11 @@ def test_terminal_browse_marker_survives_catalog_actions_and_clears_on_new_load(
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
 
     executor = _Executor()
-    page, _, _ = _active_page(executor)
+    page, _, identity = _active_page(executor)
     terminal = BrowseLoadRequest("terminal", 1, "/out/a.nxs")
     replacement = BrowseLoadRequest("replacement", 2, "/out/b.nxs")
     page._terminal_browse_handoff = _TerminalBrowseHandoff(
-        terminal, terminal.source_path, 5, (5,),
+        terminal, identity, terminal.source_path, 5, (5,),
     )
     directory_calls = []
     selected_targets = []
@@ -1418,6 +1483,158 @@ def test_run_click_preserves_outgoing_paint_until_a_frame_arrives(
         assert executor.start_calls == 1
         assert page._lifecycle.phase is RunPhase.RUNNING
         assert refreshes == [True, True]
+    finally:
+        _dispose(page, qapp)
+
+
+@pytest.mark.parametrize(
+    "refresh_options",
+    ({"preserve_scientific": True}, {"preserve_display": True}),
+)
+def test_explicit_paint_preservation_skips_scientific_projection(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+    refresh_options: dict[str, bool],
+) -> None:
+    executor = _Executor()
+    page, _, identity = _active_page(executor)
+    _paced_frame_events(page, executor, identity, 1)
+    controller = page._context_controller
+    page._refresh_shell()
+    projection = page._last_scientific_projection
+    assert projection is not None
+    raw = _shell(page).scientific.raw.image.image
+    cake = _shell(page).scientific.cake.image.image
+    project_calls = []
+    commit_calls = []
+    monkeypatch.setattr(
+        controller,
+        "project_navigation",
+        lambda **_options: project_calls.append(True) or (),
+    )
+    monkeypatch.setattr(
+        controller,
+        "commit_navigation_projection",
+        lambda *_args, **_options: commit_calls.append(True),
+    )
+    try:
+        page._refresh_shell(**refresh_options)
+
+        assert project_calls == []
+        assert commit_calls == []
+        assert page._last_scientific_projection is projection
+        assert _shell(page).scientific.raw.image.image is raw
+        assert _shell(page).scientific.cake.image.image is cake
+    finally:
+        _dispose(page, qapp)
+
+
+def test_directory_selection_updates_browser_without_clearing_science(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    executor = _Executor()
+    page, _, identity = _active_page(executor)
+    _paced_frame_events(page, executor, identity, 1)
+    page._browser_catalog = (
+        BrowserCatalogEntry("/old/out.nxs", "out.nxs", 1),
+    )
+    page._refresh_shell()
+    shell = _shell(page)
+    browser = shell.browser
+    assert browser.scans.count() == 1
+    old_directory_text = browser.directory_label.text()
+    old_directory_path = browser.directory_label.toolTip()
+    scientific = shell.scientific
+    current = page._context_controller.navigation.current
+    assert current is not None
+    traces = scientific.curve.listDataItems()
+    assert len(traces) == 1
+    trace = traces[0]
+    raw = scientific.raw.image.image
+    cake = scientific.cake.image.image
+    trace_x, trace_y = trace.xData, trace.yData
+    projection = page._last_scientific_projection
+    bottom = scientific.bottom_stack.currentWidget()
+    background_owner = page._background_owner
+    expected_background = scientific._expected_background_key
+    rendered_background = scientific._rendered_background_key
+    page._retain_outgoing_display = True
+    page._presentation_run_identity = identity
+    page._presentation_targets.append(current)
+    catalog_requests = []
+    monkeypatch.setattr(
+        page,
+        "_request_browser_catalog",
+        lambda: catalog_requests.append(page._browser_directory),
+    )
+    try:
+        shell.commandRequested.emit(ShellCommand(
+            ShellCommandKind.SELECT_SCAN,
+            value=str(tmp_path),
+            path=("directory",),
+        ))
+
+        assert page._browser_directory == str(tmp_path)
+        assert page._browser_catalog == ()
+        assert catalog_requests == [str(tmp_path)]
+        assert browser.directory_label.toolTip() == str(tmp_path)
+        assert browser.directory_label.toolTip() != old_directory_path
+        assert browser.directory_label.text()
+        assert browser.directory_label.text() != old_directory_text
+        assert browser.scans.count() == 0
+        assert page._retain_outgoing_display is True
+        assert page._presentation_run_identity is identity
+        assert tuple(page._presentation_targets) == (current,)
+        assert page._last_scientific_projection is projection
+        assert scientific.bottom_stack.currentWidget() is bottom
+        assert scientific.raw.image.image is raw
+        assert scientific.cake.image.image is cake
+        assert scientific.curve.listDataItems()[0] is trace
+        assert trace.xData is trace_x
+        assert trace.yData is trace_y
+        assert page._background_owner is background_owner
+        assert scientific._expected_background_key is expected_background
+        assert scientific._rendered_background_key is rendered_background
+    finally:
+        _dispose(page, qapp)
+
+
+@pytest.mark.parametrize(
+    ("event_index", "expected_selection_rebuilds"),
+    ((0, 0), (1, 1)),
+)
+def test_single_first_paced_frame_skips_only_exact_selection_rebuild(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+    event_index: int,
+    expected_selection_rebuilds: int,
+) -> None:
+    executor = _Executor()
+    page, _, identity = _active_page(executor)
+    page._preferences = replace(page._preferences, plot_mode="Single")
+    events = _paced_frame_events(page, executor, identity, 2)
+    controller = page._context_controller
+    selection_rebuilds = []
+    select_navigation = controller.select_navigation
+
+    def select(current, selected):
+        selection_rebuilds.append((current, selected))
+        return select_navigation(current, selected)
+
+    monkeypatch.setattr(controller, "select_navigation", select)
+    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
+    monkeypatch.setattr(page, "_refresh_event_shell", lambda **_options: None)
+    frame = events[event_index].navigation_delta.appended
+    try:
+        executor.events.append(events[event_index])
+        page._drain_executor()
+
+        assert len(selection_rebuilds) == expected_selection_rebuilds
+        assert controller.navigation.current is frame
+        assert controller.navigation.selected == (frame,)
+        assert page._run_frame_seen is True
     finally:
         _dispose(page, qapp)
 
@@ -1694,6 +1911,7 @@ def test_noop_append_display_ready_replaces_outgoing_paint_while_running(
         for label in range(1, 6)
     )
     runtime = page._context_controller._runtime
+    runtime._run_identity = identity
     runtime._acquisition_navigation = FrameNavigationProjection(
         frames, frames[-1], (frames[-1],),
     )
@@ -1840,121 +2058,951 @@ def test_noop_append_display_ready_replaces_outgoing_paint_while_running(
         _dispose(page, qapp)
 
 
-def test_batch_run_defers_frame_paints_and_follows_latest_at_terminal(
+def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
     qapp: QtWidgets.QApplication,
+    tmp_path: Path,
     monkeypatch,
 ) -> None:
     executor = _Executor()
-    page, lifecycle, identity = _active_page(executor)
-    frame = DisplayFrameKey(identity, "scan", "output.nxs", 7, 1)
-    delta = DisplayNavigationDelta(frame)
-    refreshes: list[None] = []
-    followed: list[DisplayFrameKey] = []
-    monkeypatch.setattr(
-        page._context_controller,
-        "accept_navigation",
-        lambda *_args, **_kwargs: True,
+    lifecycle = ScatteringCoordinator()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
+            poni_file=str(tmp_path / "calibration.poni"),
+            save_path=str(tmp_path / "output.nxs"),
+            output_mode="Overwrite",
+            processing_mode="Int 2D",
+        )),
+        lifecycle=lifecycle,
+        sources=_Sources(),
+        executor=executor,
     )
-    monkeypatch.setattr(page, "_follow_processed_artifact", followed.append)
-    monkeypatch.setattr(
-        page, "_refresh_shell", lambda: refreshes.append(None)
-    )
-    page._active_batch_mode = True
     try:
-        executor.events.append(
-            StandardRunEvent(
+        shell = _shell(page)
+        assert shell.run_controls.startButton.isEnabled()
+        assert not shell.run_controls.batchButton.isChecked()
+        shell.run_controls.batchButton.click()
+        assert page._intents.snapshot().thaw().batch_mode
+        shell.run_controls.startButton.click()
+        page._drain_executor()
+
+        identity = lifecycle.active_run_identity
+        assert identity is not None
+        assert executor.start_calls == 1
+        assert executor.last_configuration is not None
+        assert executor.last_configuration.batch_mode
+        assert page._active_batch_mode
+        assert page._batch_terminal_presentation is None
+        assert page._retain_outgoing_display
+
+        deltas = _batch_display(
+            page,
+            executor,
+            identity,
+            configuration=executor.last_configuration,
+        )
+        controller = page._context_controller
+        scientific = shell.scientific
+        calls = {
+            "project": 0,
+            "qualify": 0,
+            "commit": 0,
+            "reconcile": 0,
+            "sync_detector": 0,
+            "request_full": 0,
+            "traces": 0,
+            "raw": 0,
+            "cake": 0,
+            "waterfall": 0,
+        }
+        real_project = controller.project_navigation
+        real_qualify = controller.qualify_display_event
+        real_commit = controller.commit_navigation_projection
+        real_reconcile = scientific.reconcile
+        real_sync_detector = page._sync_detector_demand
+        real_request_full = controller.request_full_current
+        real_traces = scientific._render_traces
+        real_raw = scientific.raw.render
+        real_cake = scientific.cake.render
+        real_waterfall = scientific.waterfall.render
+
+        def project(**options):
+            calls["project"] += 1
+            return real_project(**options)
+
+        def qualify(event):
+            calls["qualify"] += 1
+            return real_qualify(event)
+
+        def commit(frames):
+            calls["commit"] += 1
+            return real_commit(frames)
+
+        def reconcile(*args, **options):
+            calls["reconcile"] += 1
+            return real_reconcile(*args, **options)
+
+        def sync_detector():
+            calls["sync_detector"] += 1
+            return real_sync_detector()
+
+        def request_full():
+            calls["request_full"] += 1
+            return real_request_full()
+
+        def render_traces(*args, **options):
+            calls["traces"] += 1
+            return real_traces(*args, **options)
+
+        def render_raw(*args, **options):
+            calls["raw"] += 1
+            return real_raw(*args, **options)
+
+        def render_cake(*args, **options):
+            calls["cake"] += 1
+            return real_cake(*args, **options)
+
+        def render_waterfall(*args, **options):
+            calls["waterfall"] += 1
+            return real_waterfall(*args, **options)
+
+        monkeypatch.setattr(controller, "project_navigation", project)
+        monkeypatch.setattr(controller, "qualify_display_event", qualify)
+        monkeypatch.setattr(controller, "commit_navigation_projection", commit)
+        monkeypatch.setattr(scientific, "reconcile", reconcile)
+        monkeypatch.setattr(page, "_sync_detector_demand", sync_detector)
+        monkeypatch.setattr(controller, "request_full_current", request_full)
+        monkeypatch.setattr(scientific, "_render_traces", render_traces)
+        monkeypatch.setattr(scientific.raw, "render", render_raw)
+        monkeypatch.setattr(scientific.cake, "render", render_cake)
+        monkeypatch.setattr(scientific.waterfall, "render", render_waterfall)
+
+        for completed, delta in enumerate(deltas, start=1):
+            executor.events.append(StandardRunEvent(
                 identity,
                 StandardEventKind.FRAME_READY,
-                completed=1,
-                total=1,
-                artifact=frame.artifact,
-                frame_key=frame,
+                completed=completed,
+                total=len(deltas),
+                artifact=delta.appended.artifact,
+                detail=f"Batch {completed}/{len(deltas)}",
+                frame_key=delta.appended,
                 navigation_delta=delta,
+            ))
+            page._drain_executor()
+            assert page._active_batch_mode
+            assert page._batch_latest_frame is delta.appended
+            assert shell.browser._committed_current is delta.appended
+            assert shell.run_controls.readinessLabel.full_text() == (
+                f"Batch {completed}/{len(deltas)}"
             )
-        )
-        page._drain_executor()
+            if completed == 1:
+                page._handle_shell_command(ShellCommand(
+                    ShellCommandKind.SET_CORES, 2,
+                ))
+                assert page._active_batch_mode
+                assert page._batch_latest_frame is delta.appended
 
-        assert followed == []
-        # Batch FRAME_READY refreshes scan-local progress while preserving the
-        # outgoing scientific paint; follow/paint remains terminal-owned.
-        assert refreshes == [None]
+        assert calls == {
+            "project": 0,
+            "qualify": 0,
+            "commit": 0,
+            "reconcile": 0,
+            "sync_detector": 0,
+            "request_full": 0,
+            "traces": 0,
+            "raw": 0,
+            "cake": 0,
+            "waterfall": 0,
+        }
+        assert page._batch_terminal_presentation is None
         assert lifecycle.phase is RunPhase.RUNNING
-
-        executor.events.append(
-            StandardRunEvent(
-                identity,
-                StandardEventKind.FINISHED,
-                completed=1,
-                total=1,
-                artifact=frame.artifact,
-                cleanup_status=CleanupStatus.CLEANED,
-            )
-        )
-        page._drain_executor()
-
-        assert followed == [frame]
-        assert refreshes == [None, None]
-        assert lifecycle.phase is RunPhase.IDLE
-        assert page._active_batch_mode is False
     finally:
         _dispose(page, qapp)
 
 
-def test_batch_frame_survives_unrelated_refresh_until_terminal(
+@pytest.mark.parametrize(
+    ("plot_mode", "detector_mode"),
+    (
+        ("Single", "thumbnail"),
+        ("Overlay", "thumbnail"),
+        ("Waterfall", "full"),
+    ),
+)
+def test_batch_run_projects_only_exact_latest_frame_at_terminal(
     qapp: QtWidgets.QApplication,
     monkeypatch,
+    plot_mode: str,
+    detector_mode: str,
 ) -> None:
     executor = _Executor()
     page, lifecycle, identity = _active_page(executor)
-    shell = _shell(page)
-    frame = DisplayFrameKey(identity, "scan", "output.nxs", 7, 1)
-    applied: list[bool] = []
-    apply_state = shell.apply_state
-
-    def record_apply(state, *, preserve_display=False):
-        apply_state(state, preserve_display=preserve_display)
-        applied.append(preserve_display)
-
-    monkeypatch.setattr(shell, "apply_state", record_apply)
-    monkeypatch.setattr(
-        page._context_controller,
-        "accept_navigation",
-        lambda *_args, **_kwargs: True,
-    )
-    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
-    page._active_batch_mode = True
-    page._retain_outgoing_display = True
     try:
-        executor.events.append(StandardRunEvent(
-            identity,
-            StandardEventKind.FRAME_READY,
-            completed=1,
-            total=1,
-            artifact=frame.artifact,
-            frame_key=frame,
-            navigation_delta=DisplayNavigationDelta(frame),
-        ))
-        page._drain_executor()
-        assert applied == [True]
+        deltas = _batch_display(page, executor, identity)
+        page._browser_catalog_timer.stop()
+        initial_catalog = page._browser_catalog_operation
+        if initial_catalog is not None:
+            try:
+                initial_catalog.future.result(timeout=5.0)
+            except BaseException:
+                pass
+            page._on_browser_catalog(
+                initial_catalog, initial_catalog.future,
+            )
+        assert page._browser_catalog_operation is None
+        assert page._browser_catalog_queued is None
+        catalog_futures = []
 
-        # A readiness/browser callback may refresh controls while the batch is
-        # running; it must not expose the deferred frame or clear old paint.
-        page._refresh_shell()
-        assert applied == [True, True]
+        def submit_catalog(*_args, **_kwargs):
+            future = page_module.Future()
+            assert future.set_running_or_notify_cancel()
+            catalog_futures.append(future)
+            return future
 
+        assert page._browser_catalog_pool is not None
+        monkeypatch.setattr(
+            page._browser_catalog_pool, "submit", submit_catalog,
+        )
+        controller = page._context_controller
+        shell = _shell(page)
+        scientific = shell.scientific
+        browser = shell.browser
+        old_projection = page._last_scientific_projection
+        old_raw = scientific.raw.image.image
+        old_cake = scientific.cake.image.image
+        old_items = tuple(scientific.curve.listDataItems())
+        assert old_projection is not None
+        assert old_raw is not None and old_cake is not None
+        assert len(old_items) == 1
+        old_item = old_items[0]
+        old_x, old_y = old_item.xData, old_item.yData
+
+        calls = {
+            "project": 0,
+            "commit": 0,
+            "reconcile": 0,
+            "traces": 0,
+            "raw": 0,
+            "cake": 0,
+            "waterfall": 0,
+            "sync_detector": 0,
+            "clear_full": 0,
+            "request_full": 0,
+        }
+        real_sync_detector = page._sync_detector_demand
+        real_project = controller.project_navigation
+        real_commit = controller.commit_navigation_projection
+        real_reconcile = scientific.reconcile
+        real_traces = scientific._render_traces
+        real_raw = scientific.raw.render
+        real_cake = scientific.cake.render
+        real_waterfall = scientific.waterfall.render
+
+        def project(**options):
+            calls["project"] += 1
+            return real_project(**options)
+
+        def sync_detector():
+            calls["sync_detector"] += 1
+            return real_sync_detector()
+
+        def commit(frames):
+            calls["commit"] += 1
+            return real_commit(frames)
+
+        def reconcile(*args, **options):
+            calls["reconcile"] += 1
+            return real_reconcile(*args, **options)
+
+        def render_traces(*args, **options):
+            calls["traces"] += 1
+            return real_traces(*args, **options)
+
+        def render_raw(*args, **options):
+            calls["raw"] += 1
+            return real_raw(*args, **options)
+
+        def render_cake(*args, **options):
+            calls["cake"] += 1
+            return real_cake(*args, **options)
+
+        def render_waterfall(*args, **options):
+            calls["waterfall"] += 1
+            return real_waterfall(*args, **options)
+
+        def clear_full():
+            calls["clear_full"] += 1
+            return True
+
+        def request_full():
+            calls["request_full"] += 1
+            return None
+
+        monkeypatch.setattr(controller, "project_navigation", project)
+        monkeypatch.setattr(
+            page, "_sync_detector_demand", sync_detector,
+        )
+        monkeypatch.setattr(
+            controller, "commit_navigation_projection", commit,
+        )
+        monkeypatch.setattr(scientific, "reconcile", reconcile)
+        monkeypatch.setattr(scientific, "_render_traces", render_traces)
+        monkeypatch.setattr(scientific.raw, "render", render_raw)
+        monkeypatch.setattr(scientific.cake, "render", render_cake)
+        monkeypatch.setattr(scientific.waterfall, "render", render_waterfall)
+        monkeypatch.setattr(controller, "clear_full_raw", clear_full)
+        monkeypatch.setattr(
+            controller, "request_full_current", request_full,
+        )
+
+        page._preferences = replace(
+            page._preferences,
+            plot_mode=plot_mode,
+            detector_mode=detector_mode,
+        )
+        selection = controller.selection
+        assert selection is not None
+        page._browser_directory = os.path.dirname(
+            deltas[0].appended.artifact
+        )
+        page._active_batch_mode = True
+        page._retain_outgoing_display = True
+        for completed, delta in enumerate(deltas, start=1):
+            frame = delta.appended
+            executor.events.append(StandardRunEvent(
+                identity,
+                StandardEventKind.FRAME_READY,
+                completed=completed,
+                total=3,
+                artifact=frame.artifact,
+                detail=f"Batch {completed}/3",
+                frame_key=frame,
+                navigation_delta=delta,
+            ))
+            page._drain_executor()
+            visible = browser.frame_model.frames
+            expected = tuple(
+                item.appended for item in deltas[:completed]
+            )
+            assert len(visible) == completed
+            assert all(
+                shown is target
+                for shown, target in zip(visible, expected, strict=True)
+            )
+            assert browser._committed_current is frame
+            assert page._progress.completed == completed
+            assert shell.run_controls.readinessLabel.full_text() == (
+                f"Batch {completed}/3"
+            )
+
+        # Exercise an otherwise ordinary control refresh and the acquisition
+        # rescope catch-up branch without replacing the production refresh.
+        with monkeypatch.context() as scoped:
+            synchronized = []
+            scoped.setattr(
+                controller,
+                "synchronize_acquisition_scope",
+                lambda: synchronized.append(True) or True,
+            )
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SET_CORES, 2,
+            ))
+            assert synchronized == [True]
+        assert page._intents.snapshot().thaw().max_cores == 2
+
+        assert calls == {
+            "project": 0,
+            "commit": 0,
+            "reconcile": 0,
+            "traces": 0,
+            "raw": 0,
+            "cake": 0,
+            "waterfall": 0,
+            "sync_detector": 0,
+            "clear_full": 0,
+            "request_full": 0,
+        }
+        assert page._last_scientific_projection is old_projection
+        assert scientific.raw.image.image is old_raw
+        assert scientific.cake.image.image is old_cake
+        assert tuple(scientific.curve.listDataItems()) == (old_item,)
+        assert old_item.xData is old_x and old_item.yData is old_y
+        assert page._retain_outgoing_display is True
+        assert lifecycle.phase is RunPhase.RUNNING
+
+        third = deltas[-1].appended
         executor.events.append(StandardRunEvent(
             identity,
             StandardEventKind.FINISHED,
-            completed=1,
-            total=1,
-            artifact=frame.artifact,
+            completed=3,
+            total=3,
+            artifact=third.artifact,
+            detail="Complete · 3 Frames",
             cleanup_status=CleanupStatus.CLEANED,
         ))
         page._drain_executor()
 
         assert lifecycle.phase is RunPhase.IDLE
+        assert page._active_batch_mode is False
+        assert page._batch_latest_frame is None
         assert page._retain_outgoing_display is False
-        assert applied[-1] is False
+        terminal_owner = page._batch_terminal_presentation
+        assert terminal_owner is not None
+        assert terminal_owner.run_identity is identity
+        assert terminal_owner.frame is third
+        assert terminal_owner.painted
+        assert not terminal_owner.awaiting_full_raw
+        navigation = controller.navigation
+        assert navigation.current is third
+        assert navigation.selected == (third,)
+        assert controller.selection is not None
+        assert controller.selection.kind is ContextKind.ACQUISITION
+        assert page._terminal_browse_handoff is None
+        assert not controller.browse_pending
+        assert calls["project"] == 1
+        assert calls["commit"] == 1
+        assert calls["reconcile"] == 1
+        assert calls["traces"] == 1
+        assert calls["raw"] == 1
+        assert calls["cake"] == 1
+        assert calls["sync_detector"] == 0
+        assert calls["clear_full"] == 0
+        assert calls["request_full"] == 0
+        if detector_mode == "full":
+            assert page._detector_scope_owner is selection.owner
+            assert page._detector_demand_frame is third
+        # Batch terminal intentionally projects one exact final frame.  A
+        # Waterfall preference therefore remains a one-trace curve rather
+        # than activating the multi-row waterfall renderer.
+        assert calls["waterfall"] == 0
+        assert not scientific.bottom_waterfall_active
+        assert scientific.navigation_current_key is third
+        assert scientific.trace_history_keys == (third,)
+        assert scientific.trace_row_count == 1
+
+        # Batch terminal issues one first-seen refresh followed by the exact
+        # terminal catalog request.  Settle both real futures; the final
+        # catalog-only refresh may update Browser/status and clear the
+        # transient row, but must not project science or demand pixels again.
+        terminal_counts = calls.copy()
+        clear_token = page._browser_transient_clear_token
+        first_catalog = page._browser_catalog_operation
+        assert clear_token is not None and first_catalog is not None
+        assert catalog_futures == [first_catalog.future]
+        first_catalog.future.set_result(())
+        qapp.processEvents()
+        final_catalog = page._browser_catalog_operation
+        assert final_catalog is not None
+        assert final_catalog.request.token == clear_token
+        assert catalog_futures == [
+            first_catalog.future, final_catalog.future,
+        ]
+        final_catalog.future.set_result(())
+        qapp.processEvents()
+
+        assert page._browser_catalog_operation is None
+        assert page._browser_transient_frame is None
+        assert page._browser_transient_clear_token is None
+        assert browser.frame_model.rowCount() == 0
+        assert shell.run_controls.readinessLabel.full_text() == (
+            "Complete · 3 Frames"
+        )
+        assert calls == terminal_counts
+
+        # The painted receipt remains available only to suppress an exact
+        # duplicate terminal DISPLAY_READY.  It must not hold later ordinary
+        # scientific preference edits behind the Batch projection fence.
+        before_edit = calls.copy()
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PLOT_OPTION,
+            not page._preferences.plot_options.show_legend,
+            ("other", "legend"),
+        ))
+        assert page._batch_terminal_presentation is terminal_owner
+        assert not page._active_batch_mode
+        assert page._batch_latest_frame is None
+        assert calls["project"] == before_edit["project"] + 1
+        assert calls["commit"] == before_edit["commit"] + 1
+        assert calls["reconcile"] == before_edit["reconcile"] + 1
+        assert calls["traces"] == before_edit["traces"] + 1
+    finally:
+        _dispose(page, qapp)
+
+
+@pytest.mark.parametrize("plot_mode", ("Overlay", "Waterfall"))
+def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+    plot_mode: str,
+) -> None:
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(executor)
+    try:
+        deltas = _batch_display(page, executor, identity)
+        controller = page._context_controller
+        shell = _shell(page)
+        scientific = shell.scientific
+        old_projection = page._last_scientific_projection
+        old_raw = scientific.raw.image.image
+        old_cake = scientific.cake.image.image
+        old_items = tuple(scientific.curve.listDataItems())
+        assert old_projection is not None
+        assert old_raw is not None and old_cake is not None
+        assert len(old_items) == 1
+
+        calls = {
+            "project": 0,
+            "qualify": 0,
+            "request": 0,
+            "reconcile": 0,
+            "waterfall": 0,
+        }
+        real_project = controller.project_navigation
+        real_qualify = controller.qualify_display_event
+        real_reconcile = scientific.reconcile
+        real_waterfall = scientific.waterfall.render
+
+        def project(**options):
+            calls["project"] += 1
+            return real_project(**options)
+
+        def qualify(event):
+            calls["qualify"] += 1
+            return real_qualify(event)
+
+        def request_full():
+            calls["request"] += 1
+            return object()
+
+        def reconcile(*args, **options):
+            calls["reconcile"] += 1
+            return real_reconcile(*args, **options)
+
+        def render_waterfall(*args, **options):
+            calls["waterfall"] += 1
+            return real_waterfall(*args, **options)
+
+        monkeypatch.setattr(controller, "project_navigation", project)
+        monkeypatch.setattr(controller, "qualify_display_event", qualify)
+        monkeypatch.setattr(controller, "request_full_current", request_full)
+        monkeypatch.setattr(
+            controller, "full_raw_status", lambda: (False, False, None),
+        )
+        monkeypatch.setattr(scientific, "reconcile", reconcile)
+        monkeypatch.setattr(scientific.waterfall, "render", render_waterfall)
+        monkeypatch.setattr(page, "_request_browser_catalog", lambda: None)
+
+        page._preferences = replace(
+            page._preferences,
+            plot_mode=plot_mode,
+            detector_mode="full",
+        )
+        page._active_batch_mode = True
+        page._retain_outgoing_display = True
+        for completed, delta in enumerate(deltas, start=1):
+            executor.events.append(StandardRunEvent(
+                identity,
+                StandardEventKind.FRAME_READY,
+                completed=completed,
+                total=len(deltas),
+                artifact=delta.appended.artifact,
+                frame_key=delta.appended,
+                navigation_delta=delta,
+            ))
+        page._drain_executor()
+        third = deltas[-1].appended
+
+        # Active hydration wakeups are inert before a terminal latch exists.
+        selection = controller.selection
+        assert selection is not None
+        exact_ready = StandardRunEvent(
+            identity,
+            StandardEventKind.DISPLAY_READY,
+            artifact=third.artifact,
+            frame_key=third,
+            selection_generation=selection.display_generation,
+        )
+        executor.events.append(exact_ready)
+        page._drain_executor()
+        assert calls["qualify"] == 0
+
+        executor.events.append(StandardRunEvent(
+            identity,
+            StandardEventKind.FINISHED,
+            completed=3,
+            total=3,
+            artifact=third.artifact,
+            detail="Complete · 3 Frames",
+            cleanup_status=CleanupStatus.CLEANED,
+        ))
+        page._drain_executor()
+
+        owner = page._batch_terminal_presentation
+        assert owner is not None
+        assert owner.frame is third
+        assert owner.awaiting_full_raw
+        assert owner.full_request_attempted
+        assert not owner.painted
+        assert page._active_batch_mode
+        assert page._batch_latest_frame is third
+        assert calls == {
+            "project": 0,
+            "qualify": 0,
+            "request": 1,
+            "reconcile": 0,
+            "waterfall": 0,
+        }
+        assert page._last_scientific_projection is old_projection
+        assert scientific.raw.image.image is old_raw
+        assert scientific.cake.image.image is old_cake
+        assert tuple(scientific.curve.listDataItems()) == old_items
+
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_CORES, 3,
+        ))
+        assert page._batch_terminal_presentation is owner
+        assert page._active_batch_mode
+        assert calls == {
+            "project": 0,
+            "qualify": 0,
+            "request": 1,
+            "reconcile": 0,
+            "waterfall": 0,
+        }
+
+        foreign_identity = RunIdentity(
+            identity.generation + 1, f"{identity.fingerprint}-foreign",
+        )
+        wrong_frame = deltas[0].appended
+        executor.events.extend((
+            StandardRunEvent(
+                foreign_identity,
+                StandardEventKind.DISPLAY_READY,
+                artifact=third.artifact,
+                frame_key=third,
+                selection_generation=selection.display_generation,
+            ),
+            StandardRunEvent(
+                identity,
+                StandardEventKind.DISPLAY_READY,
+                artifact=wrong_frame.artifact,
+                frame_key=wrong_frame,
+                selection_generation=selection.display_generation,
+            ),
+        ))
+        page._drain_executor()
+        assert calls["qualify"] == 0
+        assert page._batch_terminal_presentation is owner
+
+        executor.events.append(replace(
+            exact_ready,
+            selection_generation=selection.display_generation + 1,
+        ))
+        page._drain_executor()
+        assert calls["qualify"] == 1
+        assert page._batch_terminal_presentation is owner
+
+        executor.events.append(exact_ready)
+        page._drain_executor()
+        painted = page._batch_terminal_presentation
+        assert painted is not None
+        assert painted.frame is third
+        assert painted.painted
+        assert not painted.awaiting_full_raw
+        assert not page._active_batch_mode
+        assert page._batch_latest_frame is None
+        assert calls == {
+            "project": 1,
+            "qualify": 2,
+            "request": 1,
+            "reconcile": 1,
+            "waterfall": 0,
+        }
+        assert lifecycle.phase is RunPhase.IDLE
+        assert controller.navigation.current is third
+        assert controller.navigation.selected == (third,)
+        assert scientific.trace_history_keys == (third,)
+        assert scientific.trace_row_count == 1
+        assert not scientific.bottom_waterfall_active
+
+        executor.events.extend((exact_ready, exact_ready))
+        page._drain_executor()
+        assert page._batch_terminal_presentation is painted
+        assert calls == {
+            "project": 1,
+            "qualify": 2,
+            "request": 1,
+            "reconcile": 1,
+            "waterfall": 0,
+        }
+    finally:
+        _dispose(page, qapp)
+
+
+def test_batch_terminal_accepts_absolute_latest_after_prefix_exceeds_capacity(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+) -> None:
+    from tests.xdart.scattering.test_e3_context_contract import _view
+
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(executor)
+    try:
+        deltas = _batch_display(page, executor, identity)
+        acquisition = executor.acquisition_context(identity)
+        assert acquisition is not None
+        display = acquisition.publication_store
+        retired = display.catalog.resize(2)
+        assert retired == (deltas[0].appended,)
+        page._context_controller.adopt_acquisition(identity)
+        assert tuple(
+            frame.work_ordinal
+            for frame in page._context_controller.navigation.frames
+        ) == (2, 3)
+
+        view = _view(4, 4.0)
+        record = FrameRecord.from_view(view)
+        live = display.append_navigation("run.a", "/out/a.nxs", 4)
+        owner = display.artifacts[live.appended.artifact]
+        publication = FramePublication(
+            view,
+            record=record,
+            source_identity=f"{view.source_path}#4",
+            scan_key=live.appended.source_scan,
+        )
+        display.retain_frame(
+            owner,
+            live.appended,
+            record,
+            publication,
+            source_identity=publication.source_identity,
+            frame_mask_qualified=False,
+        )
+        display.put_payload(StandardDisplayPayload(
+            0, live.appended, "Standard · run.a · frame 4", view,
+        ))
+        assert live.appended.work_ordinal == 4
+
+        controller = page._context_controller
+        projects = []
+        real_project = controller.project_navigation
+
+        def project(**options):
+            projects.append(options)
+            return real_project(**options)
+
+        monkeypatch.setattr(controller, "project_navigation", project)
+        monkeypatch.setattr(page, "_request_browser_catalog", lambda: None)
+        page._preferences = replace(
+            page._preferences,
+            plot_mode="Overlay",
+            detector_mode="thumbnail",
+        )
+        page._active_batch_mode = True
+        page._retain_outgoing_display = True
+        executor.events.append(StandardRunEvent(
+            identity,
+            StandardEventKind.FRAME_READY,
+            completed=4,
+            total=4,
+            artifact=live.appended.artifact,
+            frame_key=live.appended,
+            navigation_delta=live,
+        ))
+        page._drain_executor()
+        assert projects == []
+        assert page._batch_latest_frame is live.appended
+
+        executor.events.append(StandardRunEvent(
+            identity,
+            StandardEventKind.FINISHED,
+            completed=4,
+            total=4,
+            artifact=live.appended.artifact,
+            detail="Complete · 4 Frames",
+            cleanup_status=CleanupStatus.CLEANED,
+        ))
+        page._drain_executor()
+
+        terminal = page._batch_terminal_presentation
+        assert terminal is not None
+        assert terminal.frame is live.appended
+        assert terminal.painted
+        assert not page._active_batch_mode
+        assert page._batch_latest_frame is None
+        assert len(projects) == 1
+        assert lifecycle.phase is RunPhase.IDLE
+        assert controller.navigation.current is live.appended
+        assert controller.navigation.selected == (live.appended,)
+        assert _shell(page).scientific.trace_history_keys == (live.appended,)
+    finally:
+        _dispose(page, qapp)
+
+
+@pytest.mark.parametrize(
+    "terminal_case", ("zero", "owned_historical", "request_refused"),
+)
+def test_batch_terminal_without_exact_latest_preserves_prior_science(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+    terminal_case: str,
+) -> None:
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(executor)
+    try:
+        deltas = _batch_display(page, executor, identity)
+        controller = page._context_controller
+        shell = _shell(page)
+        scientific = shell.scientific
+        browser = shell.browser
+        old_projection = page._last_scientific_projection
+        old_raw = scientific.raw.image.image
+        old_cake = scientific.cake.image.image
+        old_items = tuple(scientific.curve.listDataItems())
+        assert old_projection is not None
+        assert old_raw is not None and old_cake is not None
+        assert len(old_items) == 1
+        old_item = old_items[0]
+        old_x, old_y = old_item.xData, old_item.yData
+        if terminal_case == "zero":
+            controller._runtime._acquisition_navigation = (
+                FrameNavigationProjection()
+            )
+
+        calls = {
+            "project": 0,
+            "reconcile": 0,
+            "clear_full": 0,
+            "request_full": 0,
+        }
+        real_project = controller.project_navigation
+        real_reconcile = scientific.reconcile
+
+        def project(**options):
+            calls["project"] += 1
+            return real_project(**options)
+
+        def reconcile(*args, **options):
+            calls["reconcile"] += 1
+            return real_reconcile(*args, **options)
+
+        def clear_full():
+            calls["clear_full"] += 1
+            return True
+
+        def request_full():
+            calls["request_full"] += 1
+            return None
+
+        monkeypatch.setattr(controller, "project_navigation", project)
+        monkeypatch.setattr(scientific, "reconcile", reconcile)
+        monkeypatch.setattr(controller, "clear_full_raw", clear_full)
+        monkeypatch.setattr(
+            controller, "request_full_current", request_full,
+        )
+        if terminal_case == "request_refused":
+            monkeypatch.setattr(
+                controller,
+                "full_raw_status",
+                lambda: (False, False, None),
+            )
+        page._preferences = replace(
+            page._preferences, detector_mode="full",
+        )
+        detector_preferences = page._preferences
+        selection = controller.selection
+        assert selection is not None
+        detector_owner = selection.owner
+        detector_frame = deltas[0].appended
+        page._detector_scope_owner = detector_owner
+        page._detector_demand_frame = detector_frame
+        page._browser_directory = os.path.dirname(
+            deltas[0].appended.artifact
+        )
+        page._active_batch_mode = True
+        page._retain_outgoing_display = True
+        if terminal_case in {"owned_historical", "request_refused"}:
+            for completed, delta in enumerate(deltas, start=1):
+                frame = delta.appended
+                executor.events.append(StandardRunEvent(
+                    identity,
+                    StandardEventKind.FRAME_READY,
+                    completed=completed,
+                    total=3,
+                    artifact=frame.artifact,
+                    detail=f"Batch {completed}/3",
+                    frame_key=frame,
+                    navigation_delta=delta,
+                ))
+                page._drain_executor()
+                assert browser._committed_current is frame
+                assert page._progress.completed == completed
+                assert shell.run_controls.readinessLabel.full_text() == (
+                    f"Batch {completed}/3"
+                )
+            if terminal_case == "owned_historical":
+                # This is an exact owned member, but not the terminal event's
+                # exact latest frame.  Membership alone must never qualify it.
+                page._batch_latest_frame = deltas[0].appended
+            completed = total = 3
+            artifact = deltas[-1].appended.artifact
+        else:
+            completed = total = 0
+            artifact = "/out/a.nxs"
+        executor.events.append(StandardRunEvent(
+            identity,
+            StandardEventKind.FINISHED,
+            completed=completed,
+            total=total,
+            artifact=artifact,
+            detail=f"Complete · {completed} Frames",
+            cleanup_status=CleanupStatus.CLEANED,
+        ))
+        page._drain_executor()
+
+        assert lifecycle.phase is RunPhase.IDLE
+        assert page._active_batch_mode is True
+        assert page._batch_latest_frame is None
+        terminal_owner = page._batch_terminal_presentation
+        assert terminal_owner is not None
+        assert terminal_owner.run_identity is identity
+        assert terminal_owner.frame is None
+        assert page._retain_outgoing_display is True
+        assert calls == {
+            "project": 0,
+            "reconcile": 0,
+            "clear_full": 0,
+            "request_full": (
+                1 if terminal_case == "request_refused" else 0
+            ),
+        }
+        assert browser.frame_model.rowCount() == (
+            0 if terminal_case == "zero" else 3
+        )
+        assert browser._committed_current is (
+            None
+            if terminal_case == "zero"
+            else deltas[-1].appended
+        )
+        assert shell.run_controls.readinessLabel.full_text() == (
+            f"Complete · {completed} Frames"
+        )
+        if terminal_case == "request_refused":
+            assert not page._preferences.detector_pending
+            assert "refused" in page._preferences.detector_diagnostic.lower()
+            assert "refused" in page._notice_text.lower()
+        else:
+            assert page._preferences is detector_preferences
+        assert page._detector_scope_owner is detector_owner
+        assert page._detector_demand_frame is (
+            deltas[-1].appended
+            if terminal_case == "request_refused"
+            else detector_frame
+        )
+        assert page._last_scientific_projection is old_projection
+        assert scientific.raw.image.image is old_raw
+        assert scientific.cake.image.image is old_cake
+        assert tuple(scientific.curve.listDataItems()) == (old_item,)
+        assert old_item.xData is old_x and old_item.yData is old_y
     finally:
         _dispose(page, qapp)
 

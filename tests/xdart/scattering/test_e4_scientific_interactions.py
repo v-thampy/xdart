@@ -343,6 +343,101 @@ def test_single_compatible_update_reuses_curve_item(
         _dispose(view)
 
 
+def test_viewer_single_steady_scope_reuses_exact_curve_then_axis_rebuilds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(
+        frame_count=2,
+        selected_index=0,
+        heavy_indices=(),
+        plot_mode="Single",
+    )
+    frames = projection.navigation.frames
+    traces = projection.scientific.traces
+    first_navigation = FrameNavigationProjection(
+        frames,
+        frames[0],
+        (frames[0],),
+    )
+    first = replace(
+        projection.scientific,
+        processing_mode="1D Viewer",
+        heavy=None,
+        heavy_available=frozenset(),
+        traces=(traces[0],),
+    )
+    plot_calls = []
+    original_plot = view.curve.plot
+
+    def counted_plot(*args, **kwargs):
+        plot_calls.append((args, kwargs))
+        return original_plot(*args, **kwargs)
+
+    monkeypatch.setattr(view.curve, "plot", counted_plot)
+    try:
+        _reconcile(view, first, first_navigation)
+        item = view.curve.listDataItems()[0]
+        clear_calls = []
+        set_data_calls = []
+        original_clear = view.curve.clear
+        original_set_data = item.setData
+
+        def counted_clear(*args, **kwargs):
+            clear_calls.append((args, kwargs))
+            return original_clear(*args, **kwargs)
+
+        def counted_set_data(*args, **kwargs):
+            set_data_calls.append((args, kwargs))
+            return original_set_data(*args, **kwargs)
+
+        monkeypatch.setattr(view.curve, "clear", counted_clear)
+        monkeypatch.setattr(item, "setData", counted_set_data)
+
+        next_navigation = FrameNavigationProjection(
+            frames,
+            frames[1],
+            (frames[1],),
+        )
+        second = replace(first, traces=(traces[1],))
+        _reconcile(view, second, next_navigation)
+
+        assert len(plot_calls) == 1
+        assert clear_calls == []
+        assert len(set_data_calls) == 1
+        assert view.curve.listDataItems() == [item]
+        assert view.trace_history_projections == (traces[1],)
+        assert view._trace_history_keys == (frames[1],)
+        x_values, y_values = item.getData()
+        np.testing.assert_array_equal(x_values, traces[1].axis.values)
+        np.testing.assert_array_equal(y_values, traces[1].intensity)
+
+        changed_axis = replace(
+            traces[1].axis,
+            label="2theta",
+            unit="2th_deg",
+        )
+        changed_trace = replace(traces[1], axis=changed_axis)
+        _reconcile(
+            view,
+            replace(
+                second,
+                plot_axis="2theta",
+                traces=(changed_trace,),
+            ),
+            next_navigation,
+        )
+
+        assert len(clear_calls) == 1
+        assert len(plot_calls) == 2
+        assert view.curve.listDataItems()[0] is not item
+        assert view.trace_history_projections == (changed_trace,)
+        assert view._trace_history_keys == (frames[1],)
+    finally:
+        _dispose(view)
+
+
 def test_share_axis_links_both_directions_survives_repaint_and_unlinks() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     view = ScientificView()

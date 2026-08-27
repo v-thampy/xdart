@@ -31,7 +31,13 @@ def _owners(api, prefix: str = "owner"):
     }
 
 
-def _prepared(tmp_path: Path, *, prior: bytes | None = b"prior"):
+def _prepared(
+    tmp_path: Path,
+    *,
+    prior: bytes | None = b"prior",
+    durable_fsync: bool = True,
+    fast_regenerable: bool = False,
+):
     api = _api()
     target = tmp_path / "result.nexus"
     if prior is not None:
@@ -43,6 +49,8 @@ def _prepared(tmp_path: Path, *, prior: bytes | None = b"prior"):
         target,
         transaction_owner=transaction_owner,
         target_owner=target_owner,
+        durable_fsync=durable_fsync,
+        fast_regenerable=fast_regenerable,
     )
     owners = _owners(api)
     lease = transaction.acquire_lease(
@@ -171,6 +179,45 @@ class _DepthPool:
         self.depth -= 1
 
 
+class _TerminalInterruption(BaseException):
+    pass
+
+
+def _executing_stream(
+    tmp_path: Path,
+    *,
+    durable_fsync: bool = True,
+    fast_regenerable: bool = False,
+    content: bytes = b"AAAA",
+):
+    prepared = _prepared(
+        tmp_path,
+        durable_fsync=durable_fsync,
+        fast_regenerable=fast_regenerable,
+    )
+    (
+        _api_module,
+        target,
+        _coordinator,
+        transaction,
+        transaction_owner,
+        target_owner,
+        _owners_by_role,
+        lease,
+    ) = prepared
+    attempt = transaction.begin_stream(
+        admission=transaction.admission,
+        transaction_owner=transaction_owner,
+        target_owner=target_owner,
+        lease=lease,
+        pool=_DepthPool(),
+        file_lock=threading.RLock(),
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    target.write_bytes(content)
+    return prepared, attempt
+
+
 def _execute(
     transaction,
     write,
@@ -188,6 +235,261 @@ def _execute(
         lease=lease,
         pool=pool or _Pool(),
     )
+
+
+@pytest.mark.parametrize(
+    ("durable_fsync", "expected_fsyncs"),
+    ((True, 1), (False, 0)),
+    ids=("durable", "diagnostic"),
+)
+def test_stream_terminal_composes_one_optional_fsync_and_one_exact_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_fsync: bool,
+    expected_fsyncs: int,
+) -> None:
+    (prepared, attempt) = _executing_stream(
+        tmp_path,
+        durable_fsync=durable_fsync,
+    )
+    api, _target, _coordinator, transaction, *_rest, lease = prepared
+    fsyncs: list[int] = []
+    helper_calls: list[
+        tuple[str, bool, tuple[int, int, int, int, int] | None]
+    ] = []
+    real_content = api._descriptor_content_receipt
+    real_stat = api._descriptor_stream_stat_receipt
+
+    def content_receipt(*args, **kwargs):
+        helper_calls.append((
+            "content",
+            kwargs.get("durable_fsync"),
+            kwargs.get("expected_stat"),
+        ))
+        return real_content(*args, **kwargs)
+
+    def stat_receipt(*args, **kwargs):
+        helper_calls.append((
+            "stat",
+            kwargs.get("durable_fsync"),
+            kwargs.get("expected_stat"),
+        ))
+        return real_stat(*args, **kwargs)
+
+    monkeypatch.setattr(api.os, "fsync", fsyncs.append)
+    monkeypatch.setattr(api, "_descriptor_content_receipt", content_receipt)
+    monkeypatch.setattr(api, "_descriptor_stream_stat_receipt", stat_receipt)
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+
+    assert len(fsyncs) == expected_fsyncs
+    assert [call[:2] for call in helper_calls] == [
+        ("content", False),
+        ("stat", False),
+    ]
+    assert helper_calls[0][2] is not None
+    assert helper_calls[0][2] == helper_calls[1][2]
+    assert terminal.size == 4
+
+
+def test_stream_terminal_refuses_same_length_mutation_during_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    prior_receipt = transaction._stream_terminal_receipt
+    prior_stat = transaction._stream_terminal_stat
+    accepted = target.stat()
+    real_fsync = api.os.fsync
+    real_close = api.os.close
+
+    def fsync_then_mutate(descriptor: int) -> None:
+        real_fsync(descriptor)
+        writer = os.open(target, os.O_WRONLY)
+        try:
+            os.write(writer, b"BBBB")
+        finally:
+            real_close(writer)
+        os.utime(
+            target,
+            ns=(accepted.st_atime_ns, accepted.st_mtime_ns),
+        )
+
+    monkeypatch.setattr(api.os, "fsync", fsync_then_mutate)
+    with pytest.raises(api.TargetChanged, match="changed during fsync"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is prior_receipt
+    assert transaction._stream_terminal_stat is prior_stat
+    assert target.read_bytes() == b"BBBB"
+
+
+def test_stream_terminal_refuses_same_length_mutation_between_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    prior_receipt = transaction._stream_terminal_receipt
+    prior_stat = transaction._stream_terminal_stat
+    accepted = target.stat()
+    real_stat_receipt = api._descriptor_stream_stat_receipt
+
+    def mutate_between_receipts(*args, **kwargs):
+        target.write_bytes(b"BBBB")
+        os.utime(
+            target,
+            ns=(accepted.st_atime_ns, accepted.st_mtime_ns),
+        )
+        return real_stat_receipt(*args, **kwargs)
+
+    monkeypatch.setattr(
+        api,
+        "_descriptor_stream_stat_receipt",
+        mutate_between_receipts,
+    )
+    with pytest.raises(api.TargetChanged, match="descriptor|seal"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is prior_receipt
+    assert transaction._stream_terminal_stat is prior_stat
+    with pytest.raises(api.TransactionStateError, match="integrity hold"):
+        transaction.commit_stream(attempt, lease=lease)
+
+
+def test_stream_terminal_constructor_failure_retains_prior_pair_and_holds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, _target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    prior_receipt = transaction._stream_terminal_receipt
+    prior_stat = transaction._stream_terminal_stat
+
+    def fail_constructor(*_args, **_kwargs):
+        raise RuntimeError("terminal constructor fault")
+
+    monkeypatch.setattr(api, "StreamTerminal", fail_constructor)
+    with pytest.raises(api.TargetChanged, match="content seal failed") as raised:
+        transaction.seal_stream_terminal(attempt, lease=lease)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is prior_receipt
+    assert transaction._stream_terminal_stat is prior_stat
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    (KeyboardInterrupt, SystemExit, _TerminalInterruption),
+)
+def test_stream_terminal_constructor_base_exception_holds_then_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, _target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    prior_receipt = transaction._stream_terminal_receipt
+    prior_stat = transaction._stream_terminal_stat
+
+    def interrupt_constructor(*_args, **_kwargs):
+        raise failure_type("terminal constructor interruption")
+
+    monkeypatch.setattr(api, "StreamTerminal", interrupt_constructor)
+    with pytest.raises(failure_type, match="constructor interruption"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is prior_receipt
+    assert transaction._stream_terminal_stat is prior_stat
+    with pytest.raises(api.TransactionStateError, match="integrity hold"):
+        transaction.commit_stream(attempt, lease=lease)
+
+
+def test_stream_terminal_close_failure_retains_prior_pair_and_holds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, _target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    prior_receipt = transaction._stream_terminal_receipt
+    prior_stat = transaction._stream_terminal_stat
+    real_close = api.os.close
+
+    def close_then_fail(descriptor: int) -> None:
+        real_close(descriptor)
+        raise OSError("descriptor close fault")
+
+    monkeypatch.setattr(api.os, "close", close_then_fail)
+    with pytest.raises(api.TargetChanged, match="content seal failed") as raised:
+        transaction.seal_stream_terminal(attempt, lease=lease)
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is prior_receipt
+    assert transaction._stream_terminal_stat is prior_stat
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    (KeyboardInterrupt, SystemExit, _TerminalInterruption),
+)
+def test_stream_terminal_close_base_exception_holds_then_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, _target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    prior_receipt = transaction._stream_terminal_receipt
+    prior_stat = transaction._stream_terminal_stat
+    real_close = api.os.close
+
+    def close_then_interrupt(descriptor: int) -> None:
+        real_close(descriptor)
+        raise failure_type("terminal close interruption")
+
+    monkeypatch.setattr(api.os, "close", close_then_interrupt)
+    with pytest.raises(failure_type, match="close interruption"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is prior_receipt
+    assert transaction._stream_terminal_stat is prior_stat
+    with pytest.raises(api.TransactionStateError, match="integrity hold"):
+        transaction.commit_stream(attempt, lease=lease)
+
+
+def test_stream_terminal_token_failure_retains_prior_pair_and_holds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, _target, coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    prior_receipt = transaction._stream_terminal_receipt
+    prior_stat = transaction._stream_terminal_stat
+
+    def fail_token() -> int:
+        raise RuntimeError("terminal token fault")
+
+    monkeypatch.setattr(coordinator, "_next_ordinal", fail_token)
+    with pytest.raises(api.TargetChanged, match="content seal failed") as raised:
+        transaction.seal_stream_terminal(attempt, lease=lease)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is prior_receipt
+    assert transaction._stream_terminal_stat is prior_stat
 
 
 def test_public_tokens_snapshots_and_outcomes_are_immutable_values(

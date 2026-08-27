@@ -1,8 +1,9 @@
 """Focused standalone-Make-Mask operation oracle."""
 from __future__ import annotations
 import os, stat, subprocess
+from dataclasses import fields
 from pathlib import Path
-from threading import Event
+from threading import Event, current_thread
 from types import SimpleNamespace
 import numpy as np
 import pytest
@@ -10,9 +11,10 @@ import tifffile
 from PIL import Image
 from fabio.edfimage import EdfImage
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 from xdart.gui.tabs.scattering import experiment_authoring as authoring
 from xdart.gui.tabs.scattering import page as page_module
+from xdart.gui.tabs.scattering.adapters import external_operation
 from xdart.gui.tabs.scattering.adapters.external_operation import OperationSlot
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.contracts import SourceFileState
@@ -20,9 +22,10 @@ from xdart.gui.tabs.scattering.controls_inventory import MASK_FILE
 from xdart.gui.tabs.scattering.controls_projection import project_controls
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
-from xdart.gui.tabs.scattering.events import RunIdentity
+from xdart.gui.tabs.scattering.events import CleanupStatus, RunIdentity
 from xdart.gui.tabs.scattering.experiment_authoring import (
-    MaskProof, MaskRequest, MaskResult, prepare_mask_request, run_mask,
+    AssetValidationRequest, AuthoredAssetCandidate, MaskProof, MaskRequest,
+    MaskResult, prepare_mask_request, run_mask,
 )
 from xdart.gui.tabs.scattering.operation_values import (
     OperationContextStamp, OperationIdentity, OperationTerminal,
@@ -69,9 +72,21 @@ def _install_process(monkeypatch, mask=None, *, code=0, hook=None, missing=False
 def _direct(request: MaskRequest, *, seal=lambda _identity: True, cancelled=None):
     progress = []; cancelled = Event() if cancelled is None else cancelled
     terminal = run_mask(request, OperationIdentity(1), cancelled, lambda *value: progress.append(value), seal)
-    assert type(terminal.payload) is MaskResult; return terminal, progress
+    assert type(terminal.payload) is MaskResult
+    assert authoring.mask_terminal_result_valid(terminal, request)
+    return terminal, progress
 def _close(page, qapp):
     page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def _forge(value, **changes):
+    forged = object.__new__(type(value))
+    for field in fields(value):
+        object.__setattr__(
+            forged, field.name,
+            changes.get(field.name, getattr(value, field.name)),
+        )
+    return forged
 
 def test_parent_red_make_mask_command_uses_explicit_tiff_chooser(
     tmp_path, monkeypatch
@@ -79,22 +94,22 @@ def test_parent_red_make_mask_command_uses_explicit_tiff_chooser(
     binary = tmp_path / "bin" / "pyFAI-drawmask"; binary.parent.mkdir()
     binary.write_text("fixture"); binary.chmod(0o700); monkeypatch.setenv("PATH", str(binary.parent))
     source = tmp_path / "chosen.tiff"; source.write_bytes(b"explicit TIFF"); chosen = []
-    def chooser(path, _current, _start): chosen.append(path); return str(source)
+    def chooser(asset, _start): chosen.append(asset); return str(source)
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     store = RunIntentStore(RunIntent(project_root=str(tmp_path)))
-    page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(), control_path_chooser=chooser)
+    page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(), authoring_source_chooser=chooser)
     command = ShellCommand(ShellCommandKind.CONTROL_ACTION, "make_mask")
     try:
         monkeypatch.setattr(page._operation_slot, "begin_mask", lambda *_args: None); page._handle_shell_command(command)
-        assert chosen == [MASK_FILE]
+        assert chosen == ["mask"]
     finally: _close(page, qapp)
 
 def test_page_focus_selected_assets_cancel_and_projection_are_exact(tmp_path, monkeypatch, qapp) -> None:
     _binary(tmp_path, monkeypatch); source = _tiff(tmp_path / "selected.tiff", np.ones((2, 4), dtype=np.uint16))
     poni, mask = tmp_path / "current.poni", tmp_path / "current-mask.edf"; chosen = []
-    def chooser(path, current, start): chosen.append((path, current, start)); return str(source)
+    def chooser(asset, start): chosen.append((asset, start)); return str(source)
     store = RunIntentStore(RunIntent(project_root=str(tmp_path), poni_file=str(poni), mask_file=str(mask)))
-    page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(), control_path_chooser=chooser)
+    page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(), authoring_source_chooser=chooser)
     displayed = DisplayFrameKey(RunIdentity(8, "displayed"), "scan", str(tmp_path / "displayed.nxs"), 7, 1)
     page._context_controller._runtime._acquisition_navigation = FrameNavigationProjection((displayed,), displayed, (displayed,))
     real_prepare, prepared, begun = page_module.prepare_mask_request, [], []; identity = OperationIdentity(9)
@@ -107,7 +122,7 @@ def test_page_focus_selected_assets_cancel_and_projection_are_exact(tmp_path, mo
         monkeypatch.setattr(page, "_commit_focused_control_edit_for_run", lambda: False); page._handle_shell_command(command)
         assert chosen == [] and begun == []
         monkeypatch.setattr(page, "_commit_focused_control_edit_for_run", lambda: True); page._handle_shell_command(command)
-        assert len(chosen) == 1 and chosen[0][:2] == (MASK_FILE, "") and Path(chosen[0][2]).is_dir()
+        assert len(chosen) == 1 and chosen[0][0] == "mask" and Path(chosen[0][1]).is_dir()
         assert prepared == [(str(source), str(poni), str(mask))]
         assert len(begun) == 1 and begun[0][0].source_path == str(source) and begun[0][0].source_path != displayed.artifact
         assert type(begun[0][1]) is OperationContextStamp and page._mask_identity is identity
@@ -125,7 +140,11 @@ def test_page_focus_selected_assets_cancel_and_projection_are_exact(tmp_path, mo
 def test_request_canonicalizes_alias_and_begin_revalidates_fixed_facts(tmp_path, monkeypatch) -> None:
     binary = _binary(tmp_path, monkeypatch); source = _tiff(tmp_path / "source.tif", np.ones((2, 2), dtype=np.uint8))
     alias = tmp_path / "alias.tiff"; alias.symlink_to(source); request = prepare_mask_request(str(alias))
-    assert request == MaskRequest(str(source.resolve()), str(tmp_path / "source-mask.edf"), str(binary))
+    assert request == MaskRequest(
+        str(source.resolve()), str(tmp_path / "source-mask.edf"), str(binary),
+        SourceFileState.capture(binary), SourceFileState.capture(source),
+        str(tmp_path), authoring._directory_identity(tmp_path),
+    )
     alias.unlink(); alias.symlink_to(tmp_path / "missing.tif"); assert request.source_path == str(source.resolve())
     with pytest.raises(ValueError, match="unavailable"): prepare_mask_request(str(alias))
     wrong = tmp_path / "source.png"; wrong.write_bytes(b"x")
@@ -133,7 +152,12 @@ def test_request_canonicalizes_alias_and_begin_revalidates_fixed_facts(tmp_path,
     slot, calls = OperationSlot(), []
     monkeypatch.setattr(slot, "_begin", lambda *args: calls.append(args) or OperationIdentity(9)); monkeypatch.setenv("PATH", "")
     assert slot.begin_mask(request, OperationContextStamp(0)) == OperationIdentity(9) and len(calls) == 1
-    forged = MaskRequest(request.source_path, request.final_path, str(tmp_path / "other")); (tmp_path / "other").write_text("x"); (tmp_path / "other").chmod(0o700)
+    other = tmp_path / "other"; other.write_text("x"); other.chmod(0o700)
+    forged = MaskRequest(
+        request.source_path, request.final_path, str(other),
+        SourceFileState.capture(other), request.source_state,
+        request.source_directory, request.directory_identity,
+    )
     assert slot.begin_mask(forged, OperationContextStamp(0)) is None
     Path(request.final_path).write_text("foreign"); assert slot.begin_mask(request, OperationContextStamp(0)) is None and len(calls) == 1
     assert Path(request.final_path).read_text() == "foreign" and slot.owned is False
@@ -221,6 +245,7 @@ def test_bool_int_uint_float_public_truth_private_launch_and_publication(tmp_pat
     assert np.array_equal(load_mask(request.final_path), expected)
     assert result.proof.coercion_policy == "zero-false-real-nonzero-true-nan-true-v1"
     assert result.proof.source_sha256 == result.proof.staged_sha256 and stat.S_IMODE(Path(request.final_path).stat().st_mode) == 0o600
+    assert result.final_state == SourceFileState.capture(Path(request.final_path))
     assert not Path(result.cwd).exists()
 
 @pytest.mark.parametrize("bad", (
@@ -259,14 +284,106 @@ def test_drift_foreign_nonzero_and_missing_output_are_zero_effect(tmp_path, monk
     terminal, _ = _direct(request, seal=seal); assert terminal.status is OperationTerminalStatus.FAILED and not terminal.payload.published
     if failure == "foreign": assert Path(request.final_path).read_bytes() == b"foreign"
     else: assert not Path(request.final_path).exists()
+
+
+@pytest.mark.parametrize("phase", ("prelaunch", "postprocess"))
+def test_mask_parent_rename_and_symlink_swap_is_zero_effect(
+    tmp_path, monkeypatch, phase,
+) -> None:
+    source_dir = tmp_path / "source-dir"
+    source_dir.mkdir()
+    request = _request(source_dir, monkeypatch)
+    moved = tmp_path / "moved-dir"
+
+    def swap(*_args):
+        source_dir.rename(moved)
+        source_dir.symlink_to(moved, target_is_directory=True)
+
+    if phase == "prelaunch":
+        swap()
+        calls = _install_process(
+            monkeypatch, np.ones((2, 4), dtype=np.uint8),
+            hook=lambda *_args: pytest.fail("child launched"),
+        )
+    else:
+        calls = _install_process(
+            monkeypatch, np.ones((2, 4), dtype=np.uint8), hook=swap,
+        )
+    terminal, _progress = _direct(request)
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert not terminal.payload.published
+    assert not Path(request.final_path).exists()
+    assert len(calls) == (0 if phase == "prelaunch" else 1)
 def test_link_time_foreign_final_wins_without_open_or_cleanup(tmp_path, monkeypatch) -> None:
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8)); real_link = authoring._link
-    def race(source, final):
-        if Path(final) == Path(request.final_path): Path(final).write_bytes(b"foreign"); raise FileExistsError(final)
-        return real_link(source, final)
+    def race(source, final, **options):
+        if options.get("dst_dir_fd") is not None:
+            Path(request.final_path).write_bytes(b"foreign")
+            raise FileExistsError(final)
+        return real_link(source, final, **options)
     monkeypatch.setattr(authoring, "_link", race); terminal, _ = _direct(request)
     assert terminal.status is OperationTerminalStatus.FAILED and not terminal.payload.published
     assert Path(request.final_path).read_bytes() == b"foreign"
+
+
+def test_executable_replacement_after_qualification_refuses_before_popen(
+    tmp_path, monkeypatch,
+) -> None:
+    request = _request(tmp_path, monkeypatch)
+    calls = _install_process(
+        monkeypatch, np.ones((2, 4), dtype=np.uint8),
+    )
+    real_qualify = authoring._qualify_tiff
+    replaced = []
+
+    def replace_after_qualification(path, state):
+        result = real_qualify(path, state)
+        if Path(path) != Path(request.source_path) and not replaced:
+            executable = Path(request.executable)
+            executable.unlink()
+            executable.write_text("replacement")
+            executable.chmod(0o700)
+            replaced.append(True)
+        return result
+
+    monkeypatch.setattr(authoring, "_qualify_tiff", replace_after_qualification)
+    terminal, _progress = _direct(request)
+    assert replaced == [True]
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert "immediately before launch" in terminal.diagnostic
+    assert calls == []
+    assert not Path(request.final_path).exists()
+
+
+def test_link_time_parent_swap_cannot_redirect_publication_and_cleans_admitted_parent(
+    tmp_path, monkeypatch,
+) -> None:
+    source_dir = tmp_path / "source-dir"
+    source_dir.mkdir()
+    request = _request(source_dir, monkeypatch)
+    _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    real_link = authoring._link
+    admitted = tmp_path / "admitted-parent"
+    replacement = tmp_path / "replacement-parent"
+    swapped = []
+
+    def swap_at_publication(source, final, **options):
+        if options.get("dst_dir_fd") is not None and not swapped:
+            source_dir.rename(admitted)
+            replacement.mkdir()
+            source_dir.symlink_to(replacement, target_is_directory=True)
+            swapped.append(True)
+        return real_link(source, final, **options)
+
+    monkeypatch.setattr(authoring, "_link", swap_at_publication)
+    terminal, _progress = _direct(request)
+    assert swapped == [True]
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert not terminal.payload.published
+    assert terminal.payload.recovery_path == ""
+    assert not (replacement / Path(request.final_path).name).exists()
+    assert not (admitted / Path(request.final_path).name).exists()
+    assert not tuple(admitted.glob(".xdart-mask-*"))
 def test_stage_mode_failure_keeps_exact_cleanup_custody(tmp_path, monkeypatch) -> None:
     request = _request(tmp_path, monkeypatch); real_chmod = authoring.os.chmod
     def fail_stage(path, mode):
@@ -294,11 +411,182 @@ def test_cancel_seal_and_platform_child_signals_are_exact(tmp_path, monkeypatch)
     monkeypatch.setattr(authoring, "_WINDOWS", True); assert authoring._signal_child(process, kill=True) == "" and calls[-1] == "kill"
 
 def _published(tmp_path: Path, serial=1):
-    tmp_path.mkdir(exist_ok=True); source, final, executable = (tmp_path / name for name in ("source.tif", "source-mask.edf", "pyFAI-drawmask"))
-    source.write_bytes(b"tiff"); final.write_bytes(b"edf"); executable.write_bytes(b"x")
-    request = MaskRequest(str(source), str(final), str(executable)); state = SourceFileState.capture(final)
-    proof = MaskProof(state, (1, 1), "<u2", "|u1", "a", "a", "b", "zero-false-real-nonzero-true-nan-true-v1")
-    return OperationIdentity(serial), MaskResult(request, str(final), proof, state, 0, (str(executable), str(source)), str(tmp_path), True)
+    tmp_path.mkdir(exist_ok=True)
+    source = _tiff(
+        tmp_path / "source.tif", np.ones((1, 1), dtype=np.uint16),
+    )
+    final = tmp_path / "source-mask.edf"
+    EdfImage(data=np.ones((1, 1), dtype=np.uint8)).write(str(final))
+    final.chmod(0o600)
+    executable = tmp_path / "pyFAI-drawmask"
+    executable.write_bytes(b"x")
+    request = MaskRequest(
+        str(source), str(final), str(executable),
+        SourceFileState.capture(executable), SourceFileState.capture(source),
+        str(tmp_path), authoring._directory_identity(tmp_path),
+    )
+    state = SourceFileState.capture(final)
+    source_sha = authoring._asset_digest(source, authoring._TIFF_LIMIT)[0]
+    mask_sha = authoring._asset_digest(final, authoring._MASK_LIMIT)[0]
+    proof = MaskProof(
+        state, (1, 1), np.dtype("u2").str, np.dtype("u1").str,
+        source_sha, source_sha, mask_sha,
+        "zero-false-real-nonzero-true-nan-true-v1",
+    )
+    return OperationIdentity(serial), MaskResult(
+        request, str(final), proof, state, 0,
+        (str(executable), str(source)), str(tmp_path), True,
+    )
+
+
+def test_mask_proof_nested_facts_and_terminal_payload_matrix_are_strict(
+    tmp_path,
+) -> None:
+    identity, result = _published(tmp_path)
+    proof = result.proof
+    assert proof is not None
+    invalid = (
+        _forge(proof, state=_forge(proof.state, path="relative.edf")),
+        _forge(proof, shape=(0, 1)),
+        _forge(proof, source_dtype="<c16"),
+        _forge(proof, mask_dtype="|O"),
+        _forge(proof, source_sha256="0" * 63),
+        _forge(proof, staged_sha256="1" * 64),
+        _forge(proof, mask_sha256="g" * 64),
+        _forge(proof, coercion_policy="inverse-v1"),
+    )
+    for forged in invalid:
+        with pytest.raises(ValueError, match="mask proof"):
+            forged.__post_init__()
+        forged_result = _forge(result, proof=forged)
+        returned = OperationTerminal(
+            identity, OperationTerminalStatus.RETURNED,
+            payload=forged_result,
+        )
+        assert not authoring.mask_terminal_result_valid(
+            returned, result.request,
+        )
+
+    good = OperationTerminal(
+        identity, OperationTerminalStatus.RETURNED, payload=result,
+    )
+    assert authoring.mask_terminal_result_valid(good, result.request)
+    for status in OperationTerminalStatus:
+        diagnostic = "boom" if status is OperationTerminalStatus.FAILED else ""
+        empty = OperationTerminal(identity, status, diagnostic)
+        assert not authoring.mask_terminal_result_valid(empty, result.request)
+        payload = (_forge(result, diagnostic=diagnostic)
+                   if diagnostic else result)
+        terminal = OperationTerminal(
+            identity, status, diagnostic, payload,
+        )
+        assert authoring.mask_terminal_result_valid(
+            terminal, result.request,
+        ) is (status is OperationTerminalStatus.RETURNED)
+
+    for changes in (
+        {"exit_code": 7},
+        {"argv": ()},
+        {"cwd": str(tmp_path / "foreign")},
+        {"diagnostic": "unpaired"},
+        {"published": False},
+        {"recovery_path": str(tmp_path), "recovery_class": ""},
+    ):
+        forged = _forge(result, **changes)
+        assert not authoring.mask_terminal_result_valid(
+            OperationTerminal(
+                identity, OperationTerminalStatus.RETURNED, payload=forged,
+            ),
+            result.request,
+        )
+    for state_changes in (
+        {"device": proof.state.device + 1},
+        {"inode": proof.state.inode + 1},
+        {"size": proof.state.size + 1},
+        {"mtime_ns": proof.state.mtime_ns + 1},
+        {"ctime_ns": result.final_state.ctime_ns + 1},
+        {"path": str(tmp_path / "foreign-private.edf")},
+    ):
+        changed_state = _forge(proof.state, **state_changes)
+        forged_proof = _forge(proof, state=changed_state)
+        forged = _forge(result, proof=forged_proof)
+        assert not authoring.mask_terminal_result_valid(
+            OperationTerminal(
+                identity, OperationTerminalStatus.RETURNED, payload=forged,
+            ),
+            result.request,
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("shape", (1, 2)),
+        ("source_dtype", np.dtype("u1").str),
+        ("mask_dtype", np.dtype("u2").str),
+        ("source_sha256", "0" * 64),
+        ("mask_sha256", "0" * 64),
+    ),
+)
+def test_forged_current_generated_mask_proof_never_adopts(
+    tmp_path, qapp, field, value,
+) -> None:
+    store = RunIntentStore(RunIntent())
+    page = ScatteringWorkspace(
+        intents=store, lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    try:
+        identity, result = _published(tmp_path, 50)
+        proof = result.proof
+        changes = {field: value}
+        if field == "source_sha256":
+            changes["staged_sha256"] = value
+        forged_proof = _forge(proof, **changes)
+        forged = _forge(result, proof=forged_proof)
+        _queue_published_mask(page, store, identity, forged)
+        owner = page._authored_asset_owner
+        assert owner is not None
+        page._show_queued_authored_asset_confirmation()
+        owner.dialog.accept_button.click()
+        update = _finish_mask_validation(page)
+        assert update.terminal.status is OperationTerminalStatus.FAILED
+        assert store.snapshot().thaw().mask_file == ""
+        assert Path(result.request.final_path).exists()
+    finally:
+        _close(page, qapp)
+
+
+def _queue_published_mask(page, store, identity, result, *, stale=False):
+    stamp = page._operation_context_stamp(store.revision)
+    page._mask_identity = identity
+    page._mask_revision = store.revision
+    page._mask_stamp = stamp
+    page._mask_request = result.request
+    update = OperationUpdate(
+        identity,
+        terminal=OperationTerminal(
+            identity, OperationTerminalStatus.RETURNED, payload=result,
+        ),
+        stale=stale,
+    )
+    assert page._consume_mask_update(update)
+
+
+def _finish_mask_validation(page):
+    identity = page._asset_validation_identity
+    assert type(identity) is OperationIdentity
+    worker = page._operation_slot._worker
+    assert worker is not None
+    worker.join(3)
+    assert not worker.is_alive()
+    page._operation_slot.observe_stamp(page._operation_context_stamp())
+    update = page._operation_slot.poll(identity)
+    assert type(update) is OperationUpdate
+    assert page._consume_asset_validation_update(update)
+    return update
+
+
 def test_timer_poll_dispatches_exact_mask_update(tmp_path, monkeypatch, qapp) -> None:
     page = ScatteringWorkspace(intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter())
     identity, result = _published(tmp_path); update = OperationUpdate(identity, terminal=OperationTerminal(identity, OperationTerminalStatus.RETURNED, payload=result))
@@ -312,29 +600,375 @@ def test_timer_poll_dispatches_exact_mask_update(tmp_path, monkeypatch, qapp) ->
         page._drain_executor()
         assert len(observed) == 1 and polled == [identity] and consumed == [update]
     finally: _close(page, qapp)
-def test_page_exactly_one_mask_cas_and_stale_foreign_duplicate_are_inert(tmp_path, monkeypatch, qapp) -> None:
-    store = RunIntentStore(RunIntent()); page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter())
-    identity, result = _published(tmp_path); page._mask_identity, page._mask_revision = identity, store.revision
-    real_reduce, calls = page_module.reduce_control_edit, []
-    monkeypatch.setattr(page_module, "reduce_control_edit", lambda *args: calls.append(args) or real_reduce(*args))
-    update = OperationUpdate(identity, terminal=OperationTerminal(identity, OperationTerminalStatus.RETURNED, payload=result))
+
+
+def test_mask_confirmation_accept_cancel_and_choose_alternate_are_transactional(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    alternate = tmp_path / "alternate.edf"
+    EdfImage(data=np.zeros((1, 1), dtype=np.uint8)).write(str(alternate))
+    chooser_calls = []
+
+    def chooser(control, current, start):
+        chooser_calls.append((control, current, start))
+        return str(alternate)
+
+    store = RunIntentStore(RunIntent())
+    page = ScatteringWorkspace(
+        intents=store, lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(), control_path_chooser=chooser,
+    )
+    threads = []
+    real_validate = external_operation.validate_authored_asset
+
+    def counted(request):
+        threads.append(current_thread().name)
+        return real_validate(request)
+
+    monkeypatch.setattr(external_operation, "validate_authored_asset", counted)
     try:
-        assert page._consume_calibration_update(update) is False and page._consume_mask_update(update) is True
-        assert len(calls) == 1 and calls[0][1:] == (MASK_FILE, result.request.final_path)
-        assert store.snapshot().thaw().mask_file == result.request.final_path and page._consume_mask_update(update) is False
-        foreign = OperationIdentity(2); assert page._consume_mask_update(OperationUpdate(foreign, terminal=OperationTerminal(foreign, OperationTerminalStatus.RETURNED))) is False
-        identity2, result2 = _published(tmp_path / "revision", 3); page._mask_identity, page._mask_revision = identity2, store.revision
-        snapshot = store.snapshot(); changed = snapshot.thaw(); changed.poni_file = str(tmp_path / "new.poni"); store.commit(changed, expected_revision=snapshot.revision)
-        revision = OperationUpdate(identity2, terminal=OperationTerminal(identity2, OperationTerminalStatus.RETURNED, payload=result2))
-        assert page._consume_mask_update(revision) is True and len(calls) == 1 and store.snapshot().thaw().mask_file == result.request.final_path
-        identity3, result3 = _published(tmp_path / "stale", 4); page._mask_identity, page._mask_revision = identity3, store.revision
-        stale = OperationUpdate(identity3, terminal=OperationTerminal(identity3, OperationTerminalStatus.RETURNED, payload=result3), stale=True)
-        assert page._consume_mask_update(stale) is True and len(calls) == 1 and Path(result3.request.final_path).exists()
-        identity4, result4 = _published(tmp_path / "race", 5); page._mask_identity, page._mask_revision = identity4, store.revision; raced = str(tmp_path / "raced.edf")
-        def racing(snapshot, path, value):
-            candidate = real_reduce(snapshot, path, value); incumbent = store.snapshot().thaw(); incumbent.mask_file = raced
-            store.commit(incumbent, expected_revision=snapshot.revision); calls.append((snapshot, path, value)); return candidate
-        monkeypatch.setattr(page_module, "reduce_control_edit", racing)
-        race = OperationUpdate(identity4, terminal=OperationTerminal(identity4, OperationTerminalStatus.RETURNED, payload=result4))
-        assert page._consume_mask_update(race) is True and store.snapshot().thaw().mask_file == raced and len(calls) == 2
-    finally: _close(page, qapp)
+        identity, result = _published(tmp_path / "accept", 1)
+        _queue_published_mask(page, store, identity, result)
+        owner = page._authored_asset_owner
+        assert owner is not None and owner.asset == "mask" and owner.queued
+        assert owner.dialog.full_path.text() == result.request.final_path
+        assert store.snapshot().thaw().mask_file == ""
+        page._show_queued_authored_asset_confirmation()
+        owner.dialog.accept_button.click()
+        _finish_mask_validation(page)
+        assert threads[-1].startswith("scattering-operation-")
+        assert store.snapshot().thaw().mask_file == result.request.final_path
+
+        identity2, result2 = _published(tmp_path / "cancel", 2)
+        _queue_published_mask(page, store, identity2, result2)
+        owner = page._authored_asset_owner
+        assert owner is not None
+        page._show_queued_authored_asset_confirmation()
+        owner.dialog.cancel_button.click()
+        qapp.processEvents()
+        assert store.snapshot().thaw().mask_file == result.request.final_path
+        assert Path(result2.request.final_path).exists()
+
+        identity3, result3 = _published(tmp_path / "alternate", 3)
+        _queue_published_mask(page, store, identity3, result3)
+        owner = page._authored_asset_owner
+        assert owner is not None
+        page._show_queued_authored_asset_confirmation()
+        owner.dialog.choose_button.click()
+        _finish_mask_validation(page)
+        assert chooser_calls == [(
+            MASK_FILE, result.request.final_path,
+            str(Path(result3.request.source_path).parent),
+        )]
+        assert store.snapshot().thaw().mask_file == str(alternate)
+        assert Path(result3.request.final_path).exists()
+        assert threads[-1].startswith("scattering-operation-")
+    finally:
+        _close(page, qapp)
+
+
+@pytest.mark.parametrize("moment", ("popup", "accept"))
+@pytest.mark.parametrize("drift", ("source", "parent"))
+def test_mask_source_custody_survives_through_popup_and_accept(
+    tmp_path, monkeypatch, qapp, moment, drift,
+) -> None:
+    source_dir = tmp_path / "source-dir"
+    identity, result = _published(source_dir, 30)
+    store = RunIntentStore(RunIntent())
+    page = ScatteringWorkspace(
+        intents=store, lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    try:
+        _queue_published_mask(page, store, identity, result)
+        owner = page._authored_asset_owner
+        assert owner is not None
+        if moment == "accept":
+            page._show_queued_authored_asset_confirmation()
+
+        source = Path(result.request.source_path)
+        if drift == "source":
+            source.unlink()
+            _tiff(source, np.zeros((1, 1), dtype=np.uint16))
+        else:
+            moved = tmp_path / "moved-source-dir"
+            source_dir.rename(moved)
+            source_dir.symlink_to(moved, target_is_directory=True)
+
+        if moment == "popup":
+            page._show_queued_authored_asset_confirmation()
+        else:
+            owner.dialog.accept_button.click()
+        assert page._authored_asset_owner is None
+        assert page._asset_validation_identity is None
+        assert store.snapshot().thaw().mask_file == ""
+    finally:
+        _close(page, qapp)
+
+
+def test_real_published_mask_proof_survives_cleanup_and_is_adoptable(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    request = _request(tmp_path, monkeypatch)
+    _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    terminal, _progress = _direct(request)
+    result = terminal.payload
+    assert result.final_state == SourceFileState.capture(Path(request.final_path))
+    store = RunIntentStore(RunIntent())
+    page = ScatteringWorkspace(
+        intents=store, lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    try:
+        _queue_published_mask(page, store, terminal.identity, result)
+        owner = page._authored_asset_owner
+        assert owner is not None
+        page._show_queued_authored_asset_confirmation()
+        owner.dialog.accept_button.click()
+        update = _finish_mask_validation(page)
+        assert update.terminal.status is OperationTerminalStatus.RETURNED
+        assert store.snapshot().thaw().mask_file == request.final_path
+    finally:
+        _close(page, qapp)
+
+
+def test_busy_single_mask_popup_suppresses_escape_and_close_until_exact_cleanup(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    entered, release = Event(), Event()
+    real_validate = external_operation.validate_authored_asset
+
+    def held(request):
+        entered.set()
+        assert release.wait(3)
+        return real_validate(request)
+
+    monkeypatch.setattr(external_operation, "validate_authored_asset", held)
+    store = RunIntentStore(RunIntent())
+    page = ScatteringWorkspace(
+        intents=store, lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    destroyed = []
+    try:
+        page.show()
+        qapp.processEvents()
+        identity, result = _published(tmp_path, 81)
+        _queue_published_mask(page, store, identity, result)
+        owner = page._authored_asset_owner
+        assert owner is not None and len(owner.candidates) == 1
+        dialog = owner.dialog
+        dialog.destroyed.connect(lambda *_args: destroyed.append(True))
+        page._show_queued_authored_asset_confirmation()
+        qapp.processEvents()
+        assert dialog.isVisible()
+        assert (dialog.windowModality()
+                is QtCore.Qt.WindowModality.WindowModal)
+        assert dialog.parent() is page
+        assert dialog.accept_button.hasFocus()
+        dialog.accept_button.click()
+        assert entered.wait(2) and dialog._busy
+        assert not any((dialog.accept_button.isEnabled(),
+                        dialog.choose_button.isEnabled(),
+                        dialog.cancel_button.isEnabled()))
+
+        QtTest.QTest.keyClick(dialog, QtCore.Qt.Key.Key_Escape)
+        qapp.processEvents()
+        assert page._authored_asset_owner is owner and dialog.isVisible()
+        dialog.close()
+        qapp.processEvents()
+        assert page._authored_asset_owner is owner and dialog.isVisible()
+        assert store.snapshot().thaw().mask_file == ""
+        assert Path(result.request.final_path).exists()
+
+        snapshot = store.snapshot()
+        changed = snapshot.thaw()
+        changed.project_root = str(tmp_path / "context-drift")
+        store.commit(changed, expected_revision=snapshot.revision)
+        release.set()
+        update = _finish_mask_validation(page)
+        assert update.stale
+        assert page._authored_asset_owner is None
+        assert page._operation_slot.owned is False
+        assert page._experiment_operation_busy() is False
+        assert page._consume_asset_validation_update(update) is False
+        assert store.snapshot().thaw().mask_file == ""
+        assert Path(result.request.final_path).exists()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete,
+        )
+        qapp.processEvents()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete,
+        )
+        assert destroyed == [True]
+    finally:
+        release.set()
+        _close(page, qapp)
+
+
+def test_busy_delete_later_autonomously_closes_after_worker_join(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    entered, release = Event(), Event()
+    real_validate = external_operation.validate_authored_asset
+
+    def held(request):
+        result = real_validate(request)
+        entered.set()
+        assert release.wait(3)
+        return result
+
+    monkeypatch.setattr(external_operation, "validate_authored_asset", held)
+    store = RunIntentStore(RunIntent())
+    page = ScatteringWorkspace(
+        intents=store, lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    slot = page._operation_slot
+    page_destroyed = []
+    page.destroyed.connect(lambda *_args: page_destroyed.append(True))
+    try:
+        identity, result = _published(tmp_path, 91)
+        _queue_published_mask(page, store, identity, result)
+        owner = page._authored_asset_owner
+        assert owner is not None
+        dialog = owner.dialog
+        page._show_queued_authored_asset_confirmation()
+        dialog.accept_button.click()
+        assert entered.wait(2)
+        validation_identity = owner.validation_identity
+        worker = page._operation_slot._worker
+        assert validation_identity is not None and worker is not None
+        page.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete,
+        )
+        qapp.processEvents()
+        assert page_destroyed == []
+        assert page._closing and not page._closed
+        assert page._terminal_close is None
+        assert page._deferred_delete_pending
+        assert page._deferred_delete_retry_timer.isActive()
+        assert slot._clean_receipt is None
+        assert slot._close_cancel_accepted
+        assert slot._cancel_event is not None
+        assert slot._cancel_event.is_set()
+        assert page._authored_asset_owner is None
+        assert slot.owned
+        assert slot.current_identity is validation_identity
+        assert worker.is_alive()
+        assert store.snapshot().thaw().mask_file == ""
+        assert Path(result.request.final_path).exists()
+
+        release.set()
+        for _attempt in range(300):
+            worker.join(0.01)
+            QtTest.QTest.qWait(10)
+            qapp.processEvents()
+            QtCore.QCoreApplication.sendPostedEvents(
+                None, QtCore.QEvent.Type.DeferredDelete,
+            )
+            qapp.processEvents()
+            if page_destroyed:
+                break
+        assert page_destroyed == [True], (
+            page._closed,
+            page._deferred_delete_pending,
+            page._deferred_delete_reposted,
+            page._deferred_delete_retry_timer.isActive(),
+            slot.owned,
+            slot._clean_receipt,
+        )
+        assert not worker.is_alive()
+        operation_receipt = slot._clean_receipt
+        assert operation_receipt is not None
+        assert operation_receipt.cleanup_status is CleanupStatus.CLEANED
+        assert operation_receipt.identity is validation_identity
+        assert operation_receipt.terminal is not None
+        assert (operation_receipt.terminal.status
+                is OperationTerminalStatus.CANCELLED)
+        assert slot.owned is False
+        assert slot._worker is None
+        assert store.snapshot().thaw().mask_file == ""
+        assert Path(result.request.final_path).exists()
+    finally:
+        release.set()
+        if not page_destroyed:
+            page.close_workspace()
+            page.deleteLater()
+            qapp.processEvents()
+
+
+def test_failed_published_mask_terminal_preserves_output_and_recovery_without_adoption(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    request = _request(tmp_path, monkeypatch)
+    _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    monkeypatch.setattr(
+        authoring, "_cleanup", lambda stage, *_args: str(stage),
+    )
+    terminal, _progress = _direct(request)
+    result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert result.published and result.recovery_path
+    assert result.recovery_class == "qualified-private-candidate"
+    assert Path(request.final_path).exists()
+    assert Path(result.recovery_path).exists()
+    assert authoring.mask_terminal_result_valid(terminal, request)
+
+    prior = str(tmp_path / "prior-mask.edf")
+    store = RunIntentStore(RunIntent(mask_file=prior))
+    page = ScatteringWorkspace(
+        intents=store, lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    try:
+        stamp = page._operation_context_stamp(store.revision)
+        page._mask_identity = terminal.identity
+        page._mask_revision = store.revision
+        page._mask_stamp = stamp
+        page._mask_request = request
+        assert page._consume_mask_update(OperationUpdate(
+            terminal.identity, terminal=terminal,
+        ))
+        assert page._authored_asset_owner is None
+        assert store.revision == 0
+        assert store.snapshot().thaw().mask_file == prior
+        assert Path(request.final_path).exists()
+        assert Path(result.recovery_path).exists()
+        assert "failed" in page._notice_text.lower()
+    finally:
+        _close(page, qapp)
+
+
+def test_mask_stale_and_context_drift_preserve_field_and_published_file(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    prior = str(tmp_path / "prior.edf")
+    store = RunIntentStore(RunIntent(mask_file=prior))
+    page = ScatteringWorkspace(
+        intents=store, lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    try:
+        identity, result = _published(tmp_path / "stale", 4)
+        _queue_published_mask(page, store, identity, result, stale=True)
+        assert page._authored_asset_owner is None
+        assert store.snapshot().thaw().mask_file == prior
+        assert Path(result.request.final_path).exists()
+
+        identity2, result2 = _published(tmp_path / "drift", 5)
+        _queue_published_mask(page, store, identity2, result2)
+        owner = page._authored_asset_owner
+        assert owner is not None
+        snapshot = store.snapshot()
+        changed = snapshot.thaw()
+        changed.project_root = str(tmp_path / "other")
+        store.commit(changed, expected_revision=snapshot.revision)
+        page._show_queued_authored_asset_confirmation()
+        assert page._authored_asset_owner is None
+        assert store.snapshot().thaw().mask_file == prior
+        assert Path(result2.request.final_path).exists()
+    finally:
+        _close(page, qapp)

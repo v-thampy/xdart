@@ -1249,6 +1249,18 @@ class BrowseContext(_WriteOnceIdentity):
     #: module never imports the value's own module or an array library; the
     #: consumer boundary validates the exact type.
     norm_aggregate: object = None
+    #: Immutable array-free persisted-frame inventory owned while this Browse
+    #: context is live.  Its concrete type is admitted by the worker-side
+    #: loader; this import-pure ownership module validates only the exact
+    #: shared labels object and scalar label shape.  Unlike identity fields,
+    #: this lifecycle payload is detached after every owned store clears.
+    scalar_catalog: object = None
+    #: Bounded resident 1-D row cache owned by this Browse lifecycle.  The
+    #: worker-side loader admits its exact concrete type; this import-pure
+    #: module only requires one non-None payload while loaded.  External
+    #: cleanup must close and detach it before :meth:`release` can clear the
+    #: remaining sparse stores and scalar catalog.
+    browse_1d_cache: object = None
     #: This context's commit authority (§9.2.4).  Created with the context and
     #: cancelled by its own lifecycle — one per owner, not a new authority.
     commit_gate: CommitGate = field(default_factory=CommitGate)
@@ -1286,6 +1298,17 @@ class BrowseContext(_WriteOnceIdentity):
         "commit_gate",
     })
 
+    def __setattr__(self, name, value):
+        if (
+            name in {"scalar_catalog", "browse_1d_cache", "loaded"}
+            and getattr(self, name, _UNSET) is not _UNSET
+        ):
+            raise DisplayContextError(
+                f"BrowseContext.{name} is loader-owned lifecycle state and "
+                "cannot be reassigned"
+            )
+        super().__setattr__(name, value)
+
     def __post_init__(self):
         operation = self.operation
         if operation is not None:
@@ -1296,6 +1319,8 @@ class BrowseContext(_WriteOnceIdentity):
                     "a browse receipt must carry its own context token and "
                     f"load generation: receipt=({token!r}, {generation!r}) "
                     f"context=({self.context_token!r}, {self.load_generation!r})")
+        if self.loaded:
+            self._validate_scalar_catalog()
 
     @property
     def commit_epoch(self) -> int:
@@ -1365,8 +1390,56 @@ class BrowseContext(_WriteOnceIdentity):
         self.mask_identity = str(mask or "")
         self.result_identity = str(result or "")
 
+    def _validate_scalar_catalog(self) -> None:
+        catalog = self.scalar_catalog
+        if catalog is None:
+            raise DisplayContextError(
+                "a loaded Browse context requires its scalar catalog"
+            )
+        labels = getattr(catalog, "labels", _UNSET)
+        if (
+            type(labels) is not tuple
+            or not labels
+            or self.frame_ids is not labels
+            or self.loaded_labels is not labels
+        ):
+            raise DisplayContextError(
+                "Browse frame_ids and loaded_labels must be the exact "
+                "scalar-catalog labels tuple"
+            )
+        previous = -1
+        for label in labels:
+            if type(label) is not int or label < 0 or label <= previous:
+                raise DisplayContextError(
+                    "Browse scalar-catalog labels must be exact strictly "
+                    "increasing nonnegative integers"
+                )
+            previous = label
+        if self.browse_1d_cache is None:
+            raise DisplayContextError(
+                "a loaded Browse context requires its 1-D row cache"
+            )
+
+    def detach_browse_1d_cache(self, expected) -> None:
+        """Detach the exact externally closed cache before payload release."""
+
+        if not self.invalidated:
+            raise DisplayContextError(
+                "a live Browse context cannot detach its 1-D cache"
+            )
+        if expected is None or self.browse_1d_cache is not expected:
+            raise DisplayContextError(
+                "Browse 1-D cache cleanup identity changed"
+            )
+        object.__setattr__(self, "browse_1d_cache", None)
+
     def mark_loaded(self) -> None:
-        self.loaded = True
+        if self.invalidated or self.released:
+            raise DisplayContextError(
+                "an invalidated Browse context cannot be marked loaded"
+            )
+        self._validate_scalar_catalog()
+        object.__setattr__(self, "loaded", True)
 
     def display_bindings(self) -> DisplayBindings:
         return DisplayBindings(
@@ -1390,7 +1463,7 @@ class BrowseContext(_WriteOnceIdentity):
         Idempotent.
         """
         self.invalidated = True
-        self.loaded = False
+        object.__setattr__(self, "loaded", False)
         # §9.2.7 — commit authority goes FIRST.  A read already in flight may
         # finish reading; it may insert into nothing.
         self.commit_gate.cancel()
@@ -1405,12 +1478,26 @@ class BrowseContext(_WriteOnceIdentity):
         """
         if self.released:
             return
+        if self.browse_1d_cache is not None:
+            raise DisplayContextError(
+                "Browse 1-D cache must be closed and detached before release"
+            )
         # Invalidate FIRST: whatever happens to the payload, no completion may
         # be admitted from here on.  ``released`` is set only once every owned
         # container is actually empty, so a failed release is retried by the
         # run-end projection instead of being recorded as done.
         self.invalidate()
-        for owned in (self.publication_store, self.frames, self.frame_ids,
-                      self.viewer_rows_1d, self.viewer_rows_2d):
+        for owned in (
+            self.publication_store,
+            self.record_store,
+            self.frames,
+            self.frame_ids,
+            self.viewer_rows_1d,
+            self.viewer_rows_2d,
+        ):
             _clear(owned)
+        # This is deliberately the final payload detachment.  If any clear
+        # above fails, the exact catalog remains owned for a retry and the
+        # context is not falsely reported released.
+        object.__setattr__(self, "scalar_catalog", None)
         self.released = True

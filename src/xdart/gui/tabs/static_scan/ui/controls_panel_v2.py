@@ -202,7 +202,11 @@ class ActionButton(QtWidgets.QPushButton):
 
     def apply_spec(self, spec: ControlActionSpec) -> None:
         self._spec = spec
-        self.setText(spec.label)
+        self.setText(
+            spec.label
+            if spec.label.startswith("Cancel ")
+            else _ACTION_LABELS.get(spec.action, spec.label)
+        )
         self.setEnabled(bool(spec.enabled))
         self.setToolTip(spec.reason or _ACTION_TOOLTIPS.get(spec.action, ""))
         self.setProperty("productionReady", bool(spec.production_ready))
@@ -1456,14 +1460,49 @@ class ControlsPanelV2(QtWidgets.QWidget):
             for path in current_fields
         ):
             return False
-        if (
-            self._profile is None
-            or self._profile.section_actions != state.profile.section_actions
-        ):
-            # Action buttons own their projected label, enabled state, tooltip,
-            # and role.  The row-only fast path cannot leave those specs at the
-            # snapshot that constructed them; let the existing full render
-            # reconcile the changed action inventory atomically.
+        if self._profile is None:
+            return False
+        current_action_schema = tuple(
+            (
+                section,
+                len(actions),
+                tuple(spec.action for spec in actions),
+            )
+            for section, actions in self._profile.section_actions.items()
+        )
+        next_action_schema = tuple(
+            (
+                section,
+                len(actions),
+                tuple(spec.action for spec in actions),
+            )
+            for section, actions in state.profile.section_actions.items()
+        )
+        if current_action_schema != next_action_schema:
+            return False
+
+        mounted_specs = (
+            tuple(self._experiment_producers(state.profile))
+            if state.bound_controls.fields_for(SectionId.EXPERIMENT)
+            else ()
+        ) + state.profile.actions_for(SectionId.PROCESSING)
+        expected_actions: dict[
+            tuple[SectionId, ControlAction], ControlActionSpec
+        ] = {}
+        for spec in mounted_specs:
+            key = (spec.section, spec.action)
+            if key in expected_actions:
+                return False
+            expected_actions[key] = spec
+        mounted_actions: dict[
+            tuple[SectionId, ControlAction], ActionButton
+        ] = {}
+        for button in self.findChildren(ActionButton):
+            key = (button.spec.section, button.spec.action)
+            if key in mounted_actions:
+                return False
+            mounted_actions[key] = button
+        if mounted_actions.keys() != expected_actions.keys():
             return False
         self._profile = state.profile
         self._bound_state = state.bound_controls
@@ -1495,6 +1534,9 @@ class ControlsPanelV2(QtWidgets.QWidget):
             if not row.apply_field(field):
                 return False
             updated += 1
+
+        for key, spec in expected_actions.items():
+            mounted_actions[key].apply_spec(spec)
 
         if fields_by_path and not updated:
             return False
@@ -1796,7 +1838,6 @@ class ControlsPanelV2(QtWidgets.QWidget):
             prow.setSpacing(5)
             for spec in producers:
                 btn = ActionButton(spec)
-                btn.setText(spec.label if spec.label.startswith("Cancel ") else _ACTION_LABELS.get(spec.action, spec.label))
                 btn.actionRequested.connect(self.controlActionRequested)
                 prow.addWidget(btn, 1)
             self.experiment_card.add_row(row)

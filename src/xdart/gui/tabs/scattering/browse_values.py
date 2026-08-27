@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 from pathlib import Path
 
 from xrd_tools.io.output_transaction import StreamTerminal
@@ -21,6 +22,47 @@ class BrowseLoadStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     SUPERSEDED = "superseded"
+
+
+@dataclass(frozen=True, slots=True)
+class BrowseLoadTiming:
+    """One request-owned aggregate of the terminal Browse worker tail."""
+
+    canonical_path: str
+    seal_mode: str
+    initial_seal_s: float
+    scan_open_s: float
+    record_iteration_s: float
+    record_count: int
+    presentation_read_s: float
+    final_seal_s: float
+    context_build_s: float
+    worker_total_s: float
+
+    def __post_init__(self) -> None:
+        durations = (
+            self.initial_seal_s,
+            self.scan_open_s,
+            self.record_iteration_s,
+            self.presentation_read_s,
+            self.final_seal_s,
+            self.context_build_s,
+            self.worker_total_s,
+        )
+        if (
+            type(self.canonical_path) is not str
+            or not self.canonical_path
+            or self.seal_mode not in {"terminal", "snapshot"}
+            or type(self.record_count) is not int
+            or self.record_count < 0
+            or not all(
+                type(value) is float
+                and math.isfinite(value)
+                and value >= 0.0
+                for value in durations
+            )
+        ):
+            raise TypeError("browse load timing is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,12 +92,17 @@ class BrowseLoadOutcome:
     request: BrowseLoadRequest
     status: BrowseLoadStatus
     detail: str = ""
+    timing: BrowseLoadTiming | None = None
 
     def __post_init__(self) -> None:
         if (
             type(self.request) is not BrowseLoadRequest
             or type(self.status) is not BrowseLoadStatus
             or type(self.detail) is not str
+            or (
+                self.timing is not None
+                and type(self.timing) is not BrowseLoadTiming
+            )
         ):
             raise TypeError("browse load outcome is invalid")
 
@@ -125,6 +172,7 @@ __all__ = [
     "BrowseLoadOutcome",
     "BrowseLoadRequest",
     "BrowseLoadStatus",
+    "BrowseLoadTiming",
     "BrowseCleanupReceipt",
     "canonical_browse_scan_key",
     "canonical_browse_source_identity",

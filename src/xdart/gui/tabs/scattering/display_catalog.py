@@ -72,6 +72,123 @@ class DisplayCatalogIndex:
         )
         return DisplayNavigationDelta(key, retired)
 
+    def seed_at_work_ordinal(
+        self,
+        source_scan: str,
+        artifact: str,
+        local_frame_label: int,
+        work_ordinal: int,
+    ) -> DisplayNavigationDelta:
+        """Install one persisted key at its exact absolute run ordinal."""
+
+        return self.seed_many_at_work_ordinals((
+            (source_scan, artifact, local_frame_label, work_ordinal),
+        ))[0]
+
+    def seed_many_at_work_ordinals(
+        self,
+        rows: tuple[tuple[str, str, int, int], ...],
+    ) -> tuple[DisplayNavigationDelta, ...]:
+        """Atomically install one preflighted persisted navigation prefix."""
+
+        if type(rows) is not tuple:
+            raise TypeError("persisted navigation rows must be an exact tuple")
+        validated: list[tuple[str, str, int, int]] = []
+        seen: set[tuple[str, int]] = set()
+        for row in rows:
+            if type(row) is not tuple or len(row) != 4:
+                raise TypeError("persisted navigation row is invalid")
+            source_scan, artifact, local_frame_label, work_ordinal = row
+            self._validate_seed_fields(
+                source_scan,
+                artifact,
+                local_frame_label,
+                work_ordinal,
+            )
+            value_key = (artifact, local_frame_label)
+            if value_key in seen:
+                raise ValueError(
+                    "persisted navigation prefix contains a duplicate key"
+                )
+            seen.add(value_key)
+            validated.append(row)
+
+        entries = deque(self._entries)
+        exact = dict(self._exact)
+        by_value = dict(self._by_value)
+        work_high_water = self._work_ordinal
+        deltas: list[DisplayNavigationDelta] = []
+        changed = False
+        for source_scan, artifact, local_frame_label, work_ordinal in validated:
+            value_key = (artifact, local_frame_label)
+            existing = by_value.get(value_key)
+            if existing is not None:
+                if existing.source_scan != source_scan:
+                    raise ValueError("persisted key source scan conflicts")
+                if existing.work_ordinal != work_ordinal:
+                    raise ValueError("persisted key work ordinal conflicts")
+                deltas.append(DisplayNavigationDelta(existing, ()))
+                continue
+            if work_ordinal <= work_high_water:
+                raise ValueError(
+                    "persisted work ordinal must advance high-water"
+                )
+            key = DisplayFrameKey(
+                self.identity,
+                source_scan,
+                artifact,
+                local_frame_label,
+                work_ordinal,
+            )
+            changed = True
+            work_high_water = work_ordinal
+            entries.append(key)
+            exact[id(key)] = key
+            by_value[value_key] = key
+            retired: tuple[DisplayFrameKey, ...] = ()
+            if len(entries) > self.max_items:
+                oldest = entries.popleft()
+                exact.pop(id(oldest), None)
+                oldest_value = (
+                    oldest.artifact,
+                    oldest.local_frame_label,
+                )
+                if by_value.get(oldest_value) is oldest:
+                    by_value.pop(oldest_value, None)
+                retired = (oldest,)
+            deltas.append(DisplayNavigationDelta(key, retired))
+
+        if changed:
+            self._entries = entries
+            self._exact = exact
+            self._by_value = by_value
+            self._work_ordinal = work_high_water
+        return tuple(deltas)
+
+    @staticmethod
+    def _validate_seed_fields(
+        source_scan: str,
+        artifact: str,
+        local_frame_label: int,
+        work_ordinal: int,
+    ) -> None:
+        if type(source_scan) is not str or not source_scan:
+            raise TypeError(
+                "persisted source scan must be a nonempty exact string"
+            )
+        if type(artifact) is not str or not artifact:
+            raise TypeError(
+                "persisted artifact must be a nonempty exact string"
+            )
+        if type(local_frame_label) is not int:
+            raise TypeError(
+                "persisted local frame label must be an exact integer"
+            )
+        if type(work_ordinal) is not int:
+            raise TypeError("persisted work ordinal must be an exact integer")
+        if work_ordinal < 1:
+            raise ValueError("persisted work ordinal must be positive")
+
     def resolve(
         self, frame: DisplayFrameKey
     ) -> DisplayFrameKey | None:

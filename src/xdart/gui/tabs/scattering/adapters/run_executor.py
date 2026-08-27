@@ -1448,6 +1448,7 @@ class StandardRunExecutor:
             )
         mask = None if assets is None else assets.mask
         owner = run.display.artifacts.get(str(artifact))
+        newly_adopted_owner = owner is None
         if owner is None:
             if configuration.live_mode and run.display.artifacts:
                 run.display.admit_additional_partition()
@@ -1522,7 +1523,10 @@ class StandardRunExecutor:
         run.current_published = run.current_completed
         run.current_epoch_published = 0
         self._seed_persisted_prefix_navigation(
-            run, owner, persisted_prefix_labels,
+            run,
+            owner,
+            persisted_prefix_labels,
+            newly_adopted=newly_adopted_owner,
         )
         if run.session is not None and run.display_projection_worker is None:
             self._start_display_projection(run)
@@ -1537,14 +1541,32 @@ class StandardRunExecutor:
         run: _StandardRun,
         owner: DisplayArtifact,
         labels: tuple[int, ...],
+        *,
+        newly_adopted: bool,
     ) -> None:
+        if type(newly_adopted) is not bool:
+            raise TypeError("persisted-prefix adoption flag must be exact")
+        if not newly_adopted:
+            return
+        if type(labels) is not tuple:
+            raise TypeError("persisted prefix labels must be an exact tuple")
+        if len(labels) != run.current_completed:
+            raise ValueError("persisted prefix cardinality changed")
+        if any(type(label) is not int for label in labels):
+            raise TypeError("persisted prefix labels must be exact integers")
         capacity = run.display.navigation_capacity
-        for label in labels[-capacity:]:
-            run.display.seed_navigation(
+        retained = labels[-capacity:]
+        absolute_base = run.completed + len(labels) - len(retained)
+        rows = tuple(
+            (
                 owner.source_scan,
                 str(owner.artifact),
-                int(label),
+                label,
+                absolute_base + offset,
             )
+            for offset, label in enumerate(retained, start=1)
+        )
+        run.display.seed_navigation_prefix_at_work_ordinals(rows)
 
     def _adopt_acquisition_context(
         self, run: _StandardRun, owner: DisplayArtifact, *, source_path: str

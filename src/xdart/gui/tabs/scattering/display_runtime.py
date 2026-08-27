@@ -647,6 +647,39 @@ class RunDisplayState:
                 source_scan, artifact, local_frame_label,
             ).appended
 
+    def seed_navigation_at_work_ordinal(
+        self,
+        source_scan: str,
+        artifact: str,
+        local_frame_label: int,
+        work_ordinal: int,
+    ) -> DisplayFrameKey:
+        """Install one payload-free persisted key at an absolute ordinal."""
+
+        return self.seed_navigation_prefix_at_work_ordinals((
+            (source_scan, artifact, local_frame_label, work_ordinal),
+        ))[0]
+
+    def seed_navigation_prefix_at_work_ordinals(
+        self,
+        rows: tuple[tuple[str, str, int, int], ...],
+    ) -> tuple[DisplayFrameKey, ...]:
+        """Install one exact persisted prefix after all-row preflight."""
+
+        with self._lock:
+            deltas = self.catalog.seed_many_at_work_ordinals(rows)
+            retired = tuple(
+                key
+                for delta in deltas
+                for key in delta.retired
+            )
+            for key in retired:
+                self._frame_mask_qualified.discard(key)
+                self._detector_outcomes.pop(key, None)
+                self._evict_raw_key_locked(key)
+            self._residency.retire_navigation(retired)
+            return tuple(delta.appended for delta in deltas)
+
     @property
     def navigation_capacity(self) -> int:
         return self.catalog.max_items

@@ -92,7 +92,9 @@ def _copy_calibration(value: CalibrationState) -> CalibrationState:
     return CalibrationState(copied_values, value.detector_id, dict(value.detector_config), value.value_fingerprint, value.source_sha256, value.source_uri, copied_mask, value.status)
 def _copy_background(value: FrameBackgroundPlan | None) -> FrameBackgroundPlan | None:
     if value is None: return None
-    _reject(type(value) is not FrameBackgroundPlan, 'Average background must be an exact FrameBackgroundPlan', TypeError); return FrameBackgroundPlan(**{item.name: getattr(value, item.name) for item in fields(FrameBackgroundPlan)})
+    _reject(type(value) is not FrameBackgroundPlan, 'Average background must be an exact FrameBackgroundPlan', TypeError)
+    if value.mode == 'None': return None
+    return FrameBackgroundPlan(**{item.name: getattr(value, item.name) for item in fields(FrameBackgroundPlan)})
 def _absolute(value: str | Path, *, optional: bool=False) -> str | None:
     if optional and (value is None or str(value) == ''): return None
     _reject(not isinstance(value, (str, Path)) or not str(value), 'Average path is empty or invalid'); return os.path.abspath(os.path.expanduser(str(value)))
@@ -363,6 +365,8 @@ def _source_for_requalification(source: SourceSpec,
 def prepare_average_scan(recipe: AverageScanRecipe, *, cancel_token: threading.Event | None=None) -> AverageScanPlan:
     _reject(type(recipe) is not AverageScanRecipe, 'prepare_average_scan requires an exact recipe', TypeError)
     _cancelled(cancel_token) and (_ for _ in ()).throw(InterruptedError('Average preparation cancelled'))
+    _reject(recipe.background is not None,
+            'AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED')
     _reject(recipe.live_mode, 'AVERAGE_LIVE_TERMINALITY_UNSUPPORTED')
     _reject(recipe.output_mode != 'Overwrite', 'AVERAGE_APPEND_UNSUPPORTED')
     _reject(recipe.save_xye, 'AVERAGE_NEXUS_REQUIRED')
@@ -427,17 +431,51 @@ def _error_result(plan: AverageScanPlan, error: BaseException, *, h23: bool=Fals
         message = _diagnostic(error)
         code = message.split('(', 1)[0] if message.startswith('AVERAGE_') else 'AVERAGE_EXECUTION_FAILED' if not h23 else 'AVERAGE_H23_FAILED'
     return _result(plan, 'ABORTED' if h23 else 'REFUSED', code=code, diagnostic=_diagnostic(error), denominators=denominators)
-def _validate_contributor(graph: PreparedSourceExecutionGraph, index: int, token: threading.Event | None) -> None:
+def _external_contributor_route(
+    graph: PreparedSourceExecutionGraph,
+) -> tuple[object, ...]:
+    """Validate the ordered HDF member intervals once for a serial pass."""
+
+    stamp = graph.stamp
+    if stamp.members or not stamp.external_members:
+        return ()
+    prior_stop = 0
+    prior_epoch = -1
+    for member in stamp.external_members:
+        if (member.first < prior_stop or member.stop > stamp.frame_count
+                or member.epoch <= prior_epoch):
+            raise SourceRevisionChanged(
+                'Average external-member interval route changed')
+        prior_stop = member.stop
+        prior_epoch = member.epoch
+    return stamp.external_members
+
+
+def _validate_contributor(
+    graph: PreparedSourceExecutionGraph, index: int,
+    token: threading.Event | None, external_member=None,
+) -> None:
     _poll(token)
     stamp = graph.stamp
     states = []
     if stamp.members:
-        states.append(stamp.members[index])
-        states.extend((item.metadata_file for item in stamp.metadata_sources if item.source_path == stamp.members[index].path and item.metadata_file is not None))
+        member = stamp.members[index]
+        states.append(member)
+        if stamp.metadata_sources:
+            metadata = stamp.metadata_sources[index]
+            if metadata.source_path != member.path:
+                raise SourceRevisionChanged(
+                    'Average TIFF metadata route changed')
+            if metadata.metadata_file is not None:
+                states.append(metadata.metadata_file)
     else:
         states.append(stamp.file)
         states.extend(stamp.dependency_files)
-        states.extend((item.file for item in stamp.external_members if item.first <= index < item.stop))
+        if external_member is not None:
+            if not (external_member.first <= index < external_member.stop):
+                raise SourceRevisionChanged(
+                    'Average external-member interval route changed')
+            states.append(external_member.file)
     if any((not state.matches_disk() for state in states)):
         raise SourceRevisionChanged('Average contributor source changed')
     _poll(token)
@@ -569,19 +607,35 @@ def _accumulate_metadata(row: Mapping[str, Any], plan: AverageScanPlan, configur
             _reject(key not in invariants or invariants[key][0] != encoded, 'AVERAGE_INVARIANT_METADATA_CHANGED')
 def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph, window, token: threading.Event | None, progress: Callable[[str, int, int], None]) -> dict[str, Any]:
     shape, extent = (plan.detector_shape, plan.contributor_extent)
+    _reject(plan.recipe.background is not None,
+            'AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED')
+    external_route = _external_contributor_route(graph)
     static = _load_static_mask(plan.recipe, shape, token)
     sums = np.zeros(shape, dtype=np.float64)
     counts = np.zeros(shape, dtype=_COUNT_DTYPE)
     numeric = {key: [0.0, 0.0, 0] for key in plan.numeric_metadata_keys}
     invariants: dict[str, tuple[bytes, Any]] = {}
     configured = frozenset(_configured_roles(_thaw_reduction(plan.recipe)))
+    needs_metadata = bool(
+        plan.numeric_metadata_keys or plan.invariant_metadata_keys
+    )
     detector_mask = None
-    background_plan = plan.recipe.background or FrameBackgroundPlan()
+    conditioned = working = valid = None
+    external_cursor = 0
     for index in range(extent):
-        _validate_contributor(graph, index, token)
+        while (external_cursor < len(external_route)
+               and index >= external_route[external_cursor].stop):
+            external_cursor += 1
+        external_member = (
+            external_route[external_cursor]
+            if external_cursor < len(external_route)
+            and external_route[external_cursor].first <= index
+            else None
+        )
+        _validate_contributor(graph, index, token, external_member)
         native = np.asarray(window.read_native(index))
-        row = window.complete_metadata_for(index)
-        _validate_contributor(graph, index, token)
+        row = window.complete_metadata_for(index) if needs_metadata else None
+        _validate_contributor(graph, index, token, external_member)
         _reject(native.ndim != 2 or tuple(native.shape) != shape or native.dtype.str != plan.native_dtype or (native.dtype.kind not in 'iuf') or (native.dtype.itemsize > 8), 'AVERAGE_CONTRIBUTOR_LAYOUT_CHANGED')
         progress('read', index + 1, extent)
         if index == 0:
@@ -589,32 +643,39 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
             if mask is not None:
                 detector_mask = np.frombuffer(np.ascontiguousarray(mask, dtype=bool).tobytes(), dtype=bool).reshape(shape)
                 detector_mask.setflags(write=False)
-        background = resolve_frame_background(background_plan, _background_fact(graph, index, row, background_plan), cancelled=token)
-        if background.disposition == 'CANCELLED':
-            raise _AverageCancelled('Average Background resolution cancelled')
-        _reject(background.disposition != 'RESOLVED', 'AVERAGE_BACKGROUND_' + background.disposition)
-        conditioned = native.astype(np.float64, copy=True)
-        working = np.zeros(shape, dtype=bool)
+            del mask
+            conditioned = np.empty(shape, dtype=np.float64)
+            working = np.empty(shape, dtype=bool)
+            valid = np.empty(shape, dtype=bool)
+        np.copyto(conditioned, native, casting='unsafe')
+        working.fill(False)
         if plan.recipe.threshold_min is not None:
-            np.logical_or(working, native < plan.recipe.threshold_min, out=working)
+            np.less(native, plan.recipe.threshold_min, out=valid)
+            np.logical_or(working, valid, out=working)
         if plan.recipe.threshold_max is not None:
-            np.logical_or(working, native > plan.recipe.threshold_max, out=working)
-        if background.background is not None:
-            _reject(tuple(background.background.shape) != shape, 'AVERAGE_BACKGROUND_SHAPE_CHANGED')
-            np.subtract(conditioned, background.background, out=conditioned)
+            np.greater(native, plan.recipe.threshold_max, out=valid)
+            np.logical_or(working, valid, out=working)
         if static is not None:
             np.logical_or(working, static, out=working)
         if detector_mask is not None:
             np.logical_or(working, detector_mask, out=working)
-        np.logical_or(working, ~np.isfinite(conditioned), out=working)
-        valid = ~working
+        np.isfinite(conditioned, out=valid)
+        np.logical_not(valid, out=valid)
+        np.logical_or(working, valid, out=working)
+        np.logical_not(working, out=valid)
         with np.errstate(over='ignore', invalid='ignore'):
             np.add(sums, conditioned, out=sums, where=valid)
-        _reject(not np.isfinite(sums[valid]).all(), 'AVERAGE_PIXEL_SUM_OVERFLOW')
-        counts[valid] += np.uint32(1)
-        _accumulate_metadata(row, plan, configured, numeric, invariants, index == 0)
+        working.fill(True)
+        np.isfinite(sums, out=working, where=valid)
+        _reject(not bool(working.all()), 'AVERAGE_PIXEL_SUM_OVERFLOW')
+        np.add(counts, np.uint32(1), out=counts, where=valid)
+        if needs_metadata:
+            _accumulate_metadata(
+                row, plan, configured, numeric, invariants, index == 0,
+            )
         progress('average', index + 1, extent)
-        del native, row, conditioned, working, valid, background
+        del native, row
+    del conditioned, working, valid
     zero = counts == 0
     _reject(bool(zero.all()), 'AVERAGE_ALL_PIXELS_INVALID')
     np.divide(sums, counts, out=sums, where=~zero)
@@ -666,7 +727,10 @@ def _append_intent(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph) -
     modes = required_result_modes(_derived_reduction(plan.recipe))
     return AppendIntent(plan.recipe.entry, plan.recipe.source_base or '', science_fingerprint(stable_lineage_projection(graph, target=plan.recipe.target)), plan.science_identity, tuple((f'{item.kind}:{item.key}' for item in modes)), append_source_from_execution_graph(graph, generation=1), (1,))
 def _average_sink(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph):
-    return NexusSink(plan.recipe.target, entry=plan.recipe.entry, overwrite=True, source_base=plan.recipe.source_base, run_configuration_provenance=_recipe_payload(plan.recipe), source_execution_provenance=source_execution_projection(graph), source_snapshots_provenance=source_snapshots_projection(graph, writer=True), same_run_intent=_append_intent(plan, graph), rollback_until_commit=True)
+    run_configuration = _recipe_payload(plan.recipe)
+    if plan.recipe.background is None:
+        run_configuration.pop('background')
+    return NexusSink(plan.recipe.target, entry=plan.recipe.entry, overwrite=True, source_base=plan.recipe.source_base, run_configuration_provenance=run_configuration, source_execution_provenance=source_execution_projection(graph), source_snapshots_provenance=source_snapshots_projection(graph, writer=True), same_run_intent=_append_intent(plan, graph), rollback_until_commit=True)
 def _resolved_lineage_path(stored: str, artifact: str | Path, source_base: str) -> str:
     value = resolve_source_master(stored, scan_file=artifact, source_base=source_base, allow_basename_fallbacks=True)
     _reject(value is None, 'Average lineage source is unavailable')
@@ -915,7 +979,7 @@ class AverageScanRunner:
         return False
 def run_average_scan(recipe: AverageScanRecipe, *, cancel_token: threading.Event | None=None, progress_cb: Callable[[AverageScanProgress], object] | None=None, publication_gate: Callable[[], bool] | None=None) -> AverageScanResult:
     _reject(type(recipe) is not AverageScanRecipe, 'run_average_scan requires an exact recipe', TypeError)
-    for condition, code in ((recipe.live_mode, 'AVERAGE_LIVE_TERMINALITY_UNSUPPORTED'), (recipe.output_mode != 'Overwrite', 'AVERAGE_APPEND_UNSUPPORTED'), (recipe.save_xye, 'AVERAGE_NEXUS_REQUIRED')):
+    for condition, code in ((recipe.background is not None, 'AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED'), (recipe.live_mode, 'AVERAGE_LIVE_TERMINALITY_UNSUPPORTED'), (recipe.output_mode != 'Overwrite', 'AVERAGE_APPEND_UNSUPPORTED'), (recipe.save_xye, 'AVERAGE_NEXUS_REQUIRED')):
         if condition:
             return _recipe_refusal(recipe, code)
     try:

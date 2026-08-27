@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 import math
 import sys
-from typing import Iterable
+from threading import RLock
+from types import MappingProxyType
+from typing import Callable, Iterable, Mapping
+from weakref import ReferenceType, ref
 
 import h5py
 import numpy as np
@@ -20,6 +26,13 @@ from xrd_tools.core.frame_view import (
     axis_from_unit,
     numeric_metadata,
     two_d_kind_from_units,
+)
+from xrd_tools.core.physical_memory import (
+    PhysicalRootAuthority,
+    PhysicalRootExchange,
+    PhysicalRootExchangePhase,
+    PhysicalRootLease,
+    physical_root_fact,
 )
 from xrd_tools.io.read import _decode
 from xrd_tools.io.schema import (
@@ -49,6 +62,447 @@ _MAX_SOURCE_PATH_BYTES = 4096
 _MAX_1D_ROW_BYTES = 64 * 1024 * 1024
 _MAX_2D_ROW_BYTES = 64 * 1024 * 1024
 _MAX_ATTRIBUTE_BYTES = 256
+_MAX_READER_RETAINED_BYTES = 64 * 1024 * 1024
+# Scalar catalogs deliberately have a tighter Python-object projection budget
+# than persisted numerical stacks.  100k rows and two million scalar facts
+# comfortably cover a 651-frame scan even at the full 256-column metadata
+# ceiling, while refusing object-heap amplification from a million-row file.
+_MAX_SCALAR_CATALOG_ROWS = 100_000
+_MAX_SCALAR_CATALOG_FACTS = 2_000_000
+_SCALAR_CATALOG_FIXED_FACTS_PER_ROW = 12
+# A 1-D row projection is a caller-owned Python/NumPy graph, not a streaming
+# iterator.  Keep its label/membership graph bounded independently of HDF row
+# width, and cap unique result roots/bytes at the established 64 MiB analysis
+# payload ceiling.  651 frames across all five named GI 1-D modes, 1000 points,
+# and intensity+sigma occupies about 52 MiB and remains admitted.
+_MAX_1D_RESULT_LABELS = 100_000
+_MAX_1D_RESULT_MEMBERSHIPS = 100_000
+_MAX_1D_RESULT_ROOTS = 200_256
+_MAX_1D_RESULT_BYTES = 64 * 1024 * 1024
+
+
+_SCALAR_METADATA_TYPES = (type(None), bool, int, float, str)
+
+
+def _frozen_scalar_metadata(
+    value: Mapping[str, object],
+) -> tuple[Mapping[str, object], Mapping[str, float]]:
+    """Validate and freeze one recursively scalar metadata projection."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError("metadata_raw must be a mapping")
+    raw: dict[str, object] = {}
+    for key, item in value.items():
+        if type(key) is not str or not key:
+            raise TypeError("metadata_raw keys must be exact nonempty strings")
+        if type(item) not in _SCALAR_METADATA_TYPES:
+            raise TypeError(
+                "metadata_raw values must be exact scalar builtins or None"
+            )
+        raw[key] = item
+    numeric: dict[str, float] = {}
+    for key, item in raw.items():
+        try:
+            number = float(item)
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            numeric[key] = number
+    return MappingProxyType(raw), MappingProxyType(numeric)
+
+
+def _exact_mode_tuple(value: object, *, role: str) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{role} must be an exact tuple")
+    result: list[str] = []
+    for mode in value:
+        if type(mode) is not str or not mode:
+            raise TypeError(f"{role} entries must be exact nonempty strings")
+        if mode in result:
+            raise ValueError(f"{role} contains a duplicate mode")
+        result.append(mode)
+    return tuple(result)
+
+
+def _validate_scalar_catalog_projection(
+    *,
+    label_count: int,
+    metadata_column_count: int,
+    mode_membership_count: int,
+    axis_descriptor_count: int = 0,
+) -> None:
+    """Refuse a scalar graph whose Python-object projection is excessive."""
+
+    for role, value in (
+        ("label_count", label_count),
+        ("metadata_column_count", metadata_column_count),
+        ("mode_membership_count", mode_membership_count),
+        ("axis_descriptor_count", axis_descriptor_count),
+    ):
+        if type(value) is not int or value < 0:
+            raise TypeError(f"{role} must be an exact nonnegative integer")
+    if label_count > _MAX_SCALAR_CATALOG_ROWS:
+        raise ValueError("Frame scalar catalog row projection exceeds limit")
+    projected = (
+        label_count
+        * (_SCALAR_CATALOG_FIXED_FACTS_PER_ROW + metadata_column_count)
+        + mode_membership_count
+        + 4 * axis_descriptor_count
+    )
+    if projected > _MAX_SCALAR_CATALOG_FACTS:
+        raise ValueError("Frame scalar catalog fact projection exceeds limit")
+
+
+def _validate_1d_result_projection(
+    *,
+    label_count: int,
+    membership_count: int,
+    root_count: int,
+    projected_bytes: int,
+) -> None:
+    """Refuse an excessive eager 1-D result graph before row allocation."""
+
+    for role, value in (
+        ("label_count", label_count),
+        ("membership_count", membership_count),
+        ("root_count", root_count),
+        ("projected_bytes", projected_bytes),
+    ):
+        if type(value) is not int or value < 0:
+            raise TypeError(f"{role} must be an exact nonnegative integer")
+    if label_count > _MAX_1D_RESULT_LABELS:
+        raise ValueError("Frame 1-D result label projection exceeds limit")
+    if membership_count > _MAX_1D_RESULT_MEMBERSHIPS:
+        raise ValueError("Frame 1-D result membership projection exceeds limit")
+    if root_count > _MAX_1D_RESULT_ROOTS:
+        raise ValueError("Frame 1-D result root projection exceeds limit")
+    if projected_bytes > _MAX_1D_RESULT_BYTES:
+        raise ValueError("Frame 1-D result byte projection exceeds limit")
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FrameScalarRow:
+    """Array-free immutable catalog facts for one persisted frame."""
+
+    label: int
+    metadata_raw: Mapping[str, object] = field(default_factory=dict)
+    metadata_numeric: Mapping[str, float] = field(init=False)
+    geometry: FrameGeometry | None = None
+    source_path: str | None = None
+    source_frame_index: int | None = None
+    has_thumbnail: bool = False
+    mask_baked: bool = False
+    modes_1d: tuple[str, ...] = ()
+    modes_2d: tuple[str, ...] = ()
+    active_mode_1d: str | None = None
+    active_mode_2d: str | None = None
+    two_d_kinds: tuple[tuple[str, TwoDKind], ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.label) is not int or self.label < 0:
+            raise TypeError("label must be an exact nonnegative integer")
+        raw, numeric = _frozen_scalar_metadata(self.metadata_raw)
+        object.__setattr__(self, "metadata_raw", raw)
+        object.__setattr__(self, "metadata_numeric", numeric)
+
+        geometry = self.geometry
+        if geometry is not None:
+            if type(geometry) is not FrameGeometry or geometry.poni is not None:
+                raise TypeError("geometry must be an exact array-free FrameGeometry")
+            for name in ("rot1", "rot2", "rot3", "incident_angle"):
+                scalar = getattr(geometry, name)
+                if scalar is not None and type(scalar) is not float:
+                    raise TypeError(
+                        "geometry values must be exact floats or None"
+                    )
+                if scalar is not None and not math.isfinite(scalar):
+                    raise ValueError(
+                        "geometry values must be finite floats or None"
+                    )
+
+        if self.source_path is not None:
+            if type(self.source_path) is not str or not self.source_path:
+                raise TypeError("source_path must be an exact nonempty string or None")
+            if len(self.source_path.encode("utf-8")) > _MAX_SOURCE_PATH_BYTES:
+                raise ValueError("source_path exceeds the scalar path limit")
+        if self.source_frame_index is not None and (
+            type(self.source_frame_index) is not int
+            or self.source_frame_index < 0
+        ):
+            raise TypeError(
+                "source_frame_index must be an exact nonnegative integer or None"
+            )
+        if type(self.has_thumbnail) is not bool or type(self.mask_baked) is not bool:
+            raise TypeError("thumbnail facts must be exact booleans")
+
+        modes_1d = _exact_mode_tuple(self.modes_1d, role="modes_1d")
+        modes_2d = _exact_mode_tuple(self.modes_2d, role="modes_2d")
+        object.__setattr__(self, "modes_1d", modes_1d)
+        object.__setattr__(self, "modes_2d", modes_2d)
+        for active, modes, role in (
+            (self.active_mode_1d, modes_1d, "active_mode_1d"),
+            (self.active_mode_2d, modes_2d, "active_mode_2d"),
+        ):
+            if active is not None and (
+                type(active) is not str or active not in modes
+            ):
+                raise ValueError(f"{role} must be None or a present exact mode")
+
+        if type(self.two_d_kinds) is not tuple:
+            raise TypeError("two_d_kinds must be an exact tuple")
+        kinds: list[tuple[str, TwoDKind]] = []
+        for index, item in enumerate(self.two_d_kinds):
+            if (
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                or type(item[1]) is not TwoDKind
+            ):
+                raise TypeError(
+                    "two_d_kinds entries must be exact (mode, TwoDKind) tuples"
+                )
+            if index >= len(modes_2d) or item[0] != modes_2d[index]:
+                raise ValueError("two_d_kinds must align exactly with modes_2d")
+            kinds.append(item)
+        if len(kinds) != len(modes_2d):
+            raise ValueError("two_d_kinds must cover every 2-D mode")
+        object.__setattr__(self, "two_d_kinds", tuple(kinds))
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FrameScalarCatalog:
+    """Stable array-free scalar inventory for one processed artifact."""
+
+    artifact_path: str
+    entry: str
+    rows: tuple[FrameScalarRow, ...]
+    axes_1d: tuple[tuple[str, str, str, bool], ...] = ()
+    labels: tuple[int, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.artifact_path) is not str or not self.artifact_path:
+            raise TypeError("artifact_path must be an exact nonempty string")
+        if type(self.entry) is not str or not self.entry:
+            raise TypeError("entry must be an exact nonempty string")
+        if type(self.rows) is not tuple:
+            raise TypeError("rows must be an exact tuple")
+        labels: list[int] = []
+        previous = -1
+        for row in self.rows:
+            if type(row) is not FrameScalarRow:
+                raise TypeError("catalog rows must be exact FrameScalarRow objects")
+            if row.label <= previous:
+                raise ValueError("catalog row labels must be strictly increasing")
+            labels.append(row.label)
+            previous = row.label
+        object.__setattr__(self, "labels", tuple(labels))
+
+        if type(self.axes_1d) is not tuple:
+            raise TypeError("axes_1d must be an exact tuple")
+        axes_1d: list[tuple[str, str, str, bool]] = []
+        axis_modes: list[str] = []
+        for descriptor in self.axes_1d:
+            if (
+                type(descriptor) is not tuple
+                or len(descriptor) != 4
+                or type(descriptor[0]) is not str
+                or not descriptor[0]
+                or type(descriptor[1]) is not str
+                or not descriptor[1]
+                or type(descriptor[2]) is not str
+                or type(descriptor[3]) is not bool
+            ):
+                raise TypeError(
+                    "axes_1d entries must be exact "
+                    "(mode, label, unit, log) tuples"
+                )
+            if descriptor[0] in axis_modes:
+                raise ValueError("axes_1d contains a duplicate mode")
+            axes_1d.append(descriptor)
+            axis_modes.append(descriptor[0])
+        for row in self.rows:
+            if any(mode not in axis_modes for mode in row.modes_1d):
+                raise ValueError("axes_1d must describe every row 1-D mode")
+        object.__setattr__(self, "axes_1d", tuple(axes_1d))
+
+    def row(self, label: int) -> FrameScalarRow | None:
+        """Return one exact label by callback-free integer bisection."""
+
+        if type(label) is not int or label < 0:
+            raise TypeError("label must be an exact nonnegative integer")
+        index = bisect_left(self.labels, label)
+        if index == len(self.labels) or self.labels[index] != label:
+            return None
+        return self.rows[index]
+
+
+def _exact_readonly_float64_vector(
+    value: object,
+    *,
+    role: str,
+    points: int | None = None,
+) -> np.ndarray:
+    if (
+        type(value) is not np.ndarray
+        or value.dtype != np.dtype(np.float64)
+        or value.ndim != 1
+        or not value.flags.c_contiguous
+        or (points is not None and value.shape != (points,))
+    ):
+        raise TypeError(f"{role} must be an exact C float64 vector")
+    if value.flags.writeable:
+        value.setflags(write=False)
+    if value.flags.writeable:
+        raise ValueError(f"{role} must be read-only")
+    return value
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Frame1DModeRows:
+    """Immutable rows for one persisted 1-D result mode."""
+
+    mode: str
+    axis: Axis
+    labels: tuple[int, ...]
+    intensity_rows: tuple[np.ndarray, ...]
+    sigma_rows: tuple[np.ndarray, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.mode) is not str or not self.mode:
+            raise TypeError("mode must be an exact nonempty string")
+        axis = self.axis
+        if (
+            type(axis) is not Axis
+            or type(axis.label) is not str
+            or not axis.label
+            or type(axis.unit) is not str
+            or type(axis.log) is not bool
+            or axis.values is None
+        ):
+            raise TypeError("axis must be an exact sampled Axis")
+        axis_values = _exact_readonly_float64_vector(
+            axis.values, role="axis values",
+        )
+        points = int(axis_values.size)
+
+        if type(self.labels) is not tuple:
+            raise TypeError("labels must be an exact tuple")
+        labels: list[int] = []
+        previous = -1
+        for label in self.labels:
+            if type(label) is not int or label < 0:
+                raise TypeError("labels must contain exact nonnegative integers")
+            if label <= previous:
+                raise ValueError("labels must be strictly increasing")
+            labels.append(label)
+            previous = label
+
+        if (
+            type(self.intensity_rows) is not tuple
+            or len(self.intensity_rows) != len(labels)
+        ):
+            raise ValueError("intensity_rows must align exactly with labels")
+        intensity_rows = tuple(
+            _exact_readonly_float64_vector(
+                row, role="intensity row", points=points,
+            )
+            for row in self.intensity_rows
+        )
+
+        sigma_rows = self.sigma_rows
+        if sigma_rows is not None:
+            if type(sigma_rows) is not tuple or len(sigma_rows) != len(labels):
+                raise ValueError("sigma_rows must align exactly with labels")
+            sigma_rows = tuple(
+                _exact_readonly_float64_vector(
+                    row, role="sigma row", points=points,
+                )
+                for row in sigma_rows
+            )
+
+        object.__setattr__(self, "labels", tuple(labels))
+        object.__setattr__(self, "intensity_rows", intensity_rows)
+        object.__setattr__(self, "sigma_rows", sigma_rows)
+
+    def row(
+        self, label: int,
+    ) -> tuple[np.ndarray, np.ndarray | None] | None:
+        """Return exact row arrays by callback-free integer bisection."""
+
+        if type(label) is not int or label < 0:
+            raise TypeError("label must be an exact nonnegative integer")
+        index = bisect_left(self.labels, label)
+        if index == len(self.labels) or self.labels[index] != label:
+            return None
+        sigma = None if self.sigma_rows is None else self.sigma_rows[index]
+        return self.intensity_rows[index], sigma
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Frame1DRows:
+    """Immutable requested-label projection of all persisted 1-D modes."""
+
+    artifact_path: str
+    entry: str
+    labels: tuple[int, ...]
+    modes: tuple[Frame1DModeRows, ...]
+    primary_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.artifact_path) is not str or not self.artifact_path:
+            raise TypeError("artifact_path must be an exact nonempty string")
+        if type(self.entry) is not str or not self.entry:
+            raise TypeError("entry must be an exact nonempty string")
+        if type(self.labels) is not tuple or not self.labels:
+            raise TypeError("labels must be a nonempty exact tuple")
+        labels: list[int] = []
+        previous = -1
+        for label in self.labels:
+            if type(label) is not int or label < 0:
+                raise TypeError("labels must contain exact nonnegative integers")
+            if label <= previous:
+                raise ValueError("labels must be strictly increasing")
+            labels.append(label)
+            previous = label
+        if type(self.modes) is not tuple:
+            raise TypeError("modes must be an exact tuple")
+        modes: list[Frame1DModeRows] = []
+        mode_names: list[str] = []
+        for mode_rows in self.modes:
+            if type(mode_rows) is not Frame1DModeRows:
+                raise TypeError("modes must contain exact Frame1DModeRows")
+            if mode_rows.mode in mode_names:
+                raise ValueError("modes contains a duplicate mode")
+            for label in mode_rows.labels:
+                index = bisect_left(labels, label)
+                if index == len(labels) or labels[index] != label:
+                    raise ValueError("mode labels must be selected labels")
+            modes.append(mode_rows)
+            mode_names.append(mode_rows.mode)
+        primary = self.primary_mode
+        if primary is not None and (
+            type(primary) is not str or primary not in mode_names
+        ):
+            raise ValueError("primary_mode must be None or a present exact mode")
+        object.__setattr__(self, "labels", tuple(labels))
+        object.__setattr__(self, "modes", tuple(modes))
+
+    def mode(self, name: str) -> Frame1DModeRows | None:
+        if type(name) is not str or not name:
+            raise TypeError("mode name must be an exact nonempty string")
+        for mode_rows in self.modes:
+            if mode_rows.mode == name:
+                return mode_rows
+        return None
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _Frame1DReadModePlan:
+    mode: str
+    group: h5py.Group
+    axis: Axis
+    rows: tuple[tuple[int, int], ...]
+    has_sigma: bool
 
 
 def _direct_dataset(group: h5py.Group, name: str) -> h5py.Dataset | None:
@@ -239,7 +693,12 @@ def _qualify_vector(
     return dataset
 
 
-def _read_numeric_vector(dataset: object, *, role: str) -> np.ndarray:
+def _read_numeric_vector(
+    dataset: object,
+    *,
+    role: str,
+    bundle: "_ReaderArrayBundle | None" = None,
+) -> np.ndarray:
     qualified = _qualify_vector(
         dataset,
         role=role,
@@ -247,7 +706,23 @@ def _read_numeric_vector(dataset: object, *, role: str) -> np.ndarray:
         max_bytes=_MAX_1D_ROW_BYTES,
         numeric=True,
     )
-    return np.asarray(qualified[()])
+    if bundle is None:
+        return np.asarray(qualified[()], dtype=np.float64, order="C")
+    return bundle.read_hdf(
+        qualified,
+        role=role,
+        validator=lambda value: _qualify_vector(
+            value,
+            role=role,
+            max_items=_MAX_AXIS_POINTS,
+            max_bytes=_MAX_1D_ROW_BYTES,
+            numeric=True,
+        ),
+        selection=None,
+        final_dtype=np.dtype(np.float64),
+        transform="numeric-float64",
+        retain=True,
+    )
 
 
 def _qualify_frame_index(group: h5py.Group, dataset: object) -> h5py.Dataset:
@@ -282,7 +757,12 @@ def _qualify_1d_stack(
 
 
 def _read_1d_row(
-    group: h5py.Group, name: str, row: int, *, points: int,
+    group: h5py.Group,
+    name: str,
+    row: int,
+    *,
+    points: int,
+    bundle: "_ReaderArrayBundle | None" = None,
 ) -> np.ndarray:
     dataset = _qualify_1d_stack(
         group,
@@ -292,7 +772,20 @@ def _read_1d_row(
     )
     if not 0 <= int(row) < int(dataset.shape[0]):
         raise ValueError(f"{group.name}/{name} row is out of range")
-    return np.asarray(dataset[int(row)])
+    if bundle is None:
+        return np.asarray(dataset[int(row)], dtype=np.float64, order="C")
+    role = f"{group.name}/{name}"
+    return bundle.read_hdf(
+        dataset,
+        role=role,
+        validator=lambda value: _qualify_1d_stack(
+            group, value, points=points, role=name,
+        ),
+        selection=int(row),
+        final_dtype=np.dtype(np.float64),
+        transform="numeric-float64",
+        retain=False,
+    )
 
 
 def _qualify_2d_stack(
@@ -328,6 +821,7 @@ def _read_2d_row(
     *,
     q_points: int,
     chi_points: int,
+    bundle: "_ReaderArrayBundle | None" = None,
 ) -> np.ndarray:
     dataset = _qualify_2d_stack(
         group,
@@ -338,7 +832,24 @@ def _read_2d_row(
     )
     if not 0 <= int(row) < int(dataset.shape[0]):
         raise ValueError(f"{group.name}/{name} row is out of range")
-    return np.asarray(dataset[int(row)])
+    if bundle is None:
+        return np.asarray(dataset[int(row)], dtype=np.float64, order="C")
+    role = f"{group.name}/{name}"
+    return bundle.read_hdf(
+        dataset,
+        role=role,
+        validator=lambda value: _qualify_2d_stack(
+            group,
+            value,
+            q_points=q_points,
+            chi_points=chi_points,
+            role=name,
+        ),
+        selection=int(row),
+        final_dtype=np.dtype(np.float64),
+        transform="numeric-float64",
+        retain=False,
+    )
 
 
 def _bounded_utf8_item(
@@ -383,6 +894,7 @@ def _scan_data_items(
     frame_index = _direct_dataset(group, "frame_index")
     rows = int(frame_index.shape[0]) if isinstance(frame_index, h5py.Dataset) else 0
     total_fixed_bytes = 0
+    fixed_objects: set[int] = set()
     items: list[tuple[str, h5py.Dataset]] = []
     for key in group:
         if key == "frame_index":
@@ -395,7 +907,15 @@ def _scan_data_items(
             raise ValueError(f"{group.name}/{key} has an unsupported dtype")
         byte_count = _dataset_bytes(item)
         if byte_count is not None:
-            total_fixed_bytes += byte_count
+            try:
+                address = int(h5py.h5o.get_info(item.id).addr)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{group.name}/{key} object identity is unavailable"
+                ) from error
+            if address not in fixed_objects:
+                fixed_objects.add(address)
+                total_fixed_bytes += byte_count
             if total_fixed_bytes > _MAX_SCAN_DATA_BYTES:
                 raise ValueError(f"{group.name} materialized columns exceed limit")
         items.append((str(key), item))
@@ -411,27 +931,112 @@ def _scan_data_scalar(dataset: h5py.Dataset, row: int, *, role: str):
 
 
 def _scan_data_column(
-    dataset: h5py.Dataset, *, role: str, allowance_bytes: int,
+    dataset: h5py.Dataset,
+    *,
+    role: str,
+    allowance_bytes: int,
+    bundle: "_ReaderArrayBundle | None" = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> tuple[np.ndarray, int]:
     if type(allowance_bytes) is not int or allowance_bytes < 0:
         raise ValueError(f"{role} has no remaining materialization allowance")
     if h5py.check_string_dtype(dataset.dtype) is None:
-        logical_bytes = int(dataset.size) * int(dataset.dtype.itemsize)
-        if logical_bytes > allowance_bytes:
-            raise ValueError(f"{role} materialized bytes exceed allowance")
-        value = np.asarray(dataset[()])
+        if bundle is None:
+            logical_bytes = int(dataset.size) * int(dataset.dtype.itemsize)
+            if logical_bytes > allowance_bytes:
+                raise ValueError(f"{role} materialized bytes exceed allowance")
+            value = np.asarray(dataset[()])
+        else:
+            # Qualify this scientific role and consult the exact physical
+            # object cache before charging the caller's remaining logical
+            # allowance.  A second hard-link name costs no new storage/read.
+            bundle._callback(
+                _qualify_vector,
+                dataset,
+                role=role,
+                max_items=_MAX_PERSISTED_FRAME_ROWS,
+                max_bytes=_MAX_SCAN_DATA_BYTES,
+                numeric=False,
+            )
+            key = bundle.cache_key(
+                dataset,
+                selection=None,
+                final_dtype=dataset.dtype,
+                transform="native",
+            )
+            cached = bundle.cached(key)
+            if cached is not None:
+                return cached, 0
+            logical_bytes = int(dataset.size) * int(dataset.dtype.itemsize)
+            if logical_bytes > allowance_bytes:
+                raise ValueError(f"{role} materialized bytes exceed allowance")
+            value = bundle.read_hdf(
+                dataset,
+                role=role,
+                validator=lambda candidate: _qualify_vector(
+                    candidate,
+                    role=role,
+                    max_items=_MAX_PERSISTED_FRAME_ROWS,
+                    max_bytes=_MAX_SCAN_DATA_BYTES,
+                    numeric=False,
+                ),
+                selection=None,
+                final_dtype=dataset.dtype,
+                transform="native",
+                retain=True,
+            )
         return value, logical_bytes
+    cache_key = None
+    if bundle is not None:
+        # Repeat role qualification before consulting the physical cache.
+        # Logical allowance is charged only for a cache miss.
+        bundle._callback(
+            _qualify_vector,
+            dataset,
+            role=role,
+            max_items=_MAX_PERSISTED_FRAME_ROWS,
+            max_bytes=_MAX_SCAN_DATA_BYTES,
+            numeric=False,
+        )
+        cache_key = bundle.cache_key(
+            dataset,
+            selection=None,
+            final_dtype=np.dtype(object),
+            transform="bounded-utf8-object",
+        )
+        cached = bundle.cached(cache_key)
+        if cached is not None:
+            return cached, 0
     rows = int(dataset.shape[0])
     pointer_bytes = rows * int(np.dtype(object).itemsize)
     minimum = pointer_bytes + rows * 64
     if minimum > allowance_bytes:
         raise ValueError(f"{role} retained object bytes exceed limit")
-    values = np.empty((rows,), dtype=object)
+    values = (
+        np.empty((rows,), dtype=object)
+        if bundle is None
+        else bundle.allocate_cached(
+            cache_key,
+            (rows,),
+            np.dtype(object),
+            role=role,
+        )
+    )
     total = pointer_bytes
     for row in range(int(dataset.shape[0])):
+        if checkpoint is not None:
+            checkpoint()
         if total + 64 > allowance_bytes:
             raise ValueError(f"{role} retained object bytes exceed limit")
-        value = _bounded_utf8_item(dataset, row, role=role)
+        value = (
+            _bounded_utf8_item(dataset, row, role=role)
+            if bundle is None
+            else bundle._callback(
+                _bounded_utf8_item, dataset, row, role=role,
+            )
+        )
+        if checkpoint is not None:
+            checkpoint()
         retained_bytes = max(64, int(sys.getsizeof(value)))
         if total + retained_bytes > allowance_bytes:
             raise ValueError(f"{role} retained object bytes exceed limit")
@@ -469,7 +1074,10 @@ def _bounded_utf8_scalar(
 
 
 def _read_thumbnail(
-    frame_group: h5py.Group, thumbnail: h5py.Dataset,
+    frame_group: h5py.Group,
+    thumbnail: h5py.Dataset,
+    *,
+    bundle: "_ReaderArrayBundle | None" = None,
 ) -> np.ndarray:
     """Qualify and hydrate one bounded local thumbnail and optional mask."""
 
@@ -511,11 +1119,67 @@ def _read_thumbnail(
         ):
             raise ValueError(f"{frame_group.name}/thumbnail_mask is not bounded")
 
-    values = np.asarray(thumbnail[()], dtype=float)
+    if bundle is None:
+        values = np.asarray(thumbnail[()])
+    else:
+        values = bundle.read_hdf(
+            thumbnail,
+            role=thumbnail.name,
+            validator=lambda value: value
+            if (
+                isinstance(value, h5py.Dataset)
+                and value.ndim == 2
+                and all(1 <= int(part) <= 256 for part in value.shape)
+                and value.dtype in {np.dtype(np.uint8), np.dtype(np.uint16)}
+                and int(value.size) * int(value.dtype.itemsize)
+                <= 256 * 256 * 2
+            )
+            else (_ for _ in ()).throw(
+                ValueError(f"{thumbnail.name} is not a bounded thumbnail")
+            ),
+            selection=None,
+            final_dtype=thumbnail.dtype,
+            transform="thumbnail-native",
+            retain=False,
+        )
     scale = 65535.0 if thumbnail.dtype == np.dtype(np.uint16) else 255.0
-    result = vmin + (values / scale) * (vmax - vmin)
+    if bundle is None:
+        result = vmin + (values.astype(np.float64) / scale) * (vmax - vmin)
+    else:
+        result = bundle.allocate(
+            tuple(int(part) for part in values.shape),
+            np.dtype(np.float64),
+            role=f"{thumbnail.name} decoded thumbnail",
+        )
+        np.multiply(
+            values,
+            (vmax - vmin) / scale,
+            out=result,
+            casting="unsafe",
+        )
+        np.add(result, vmin, out=result)
     if mask is not None:
-        invalid = np.asarray(mask[()], dtype=bool)
+        if bundle is None:
+            invalid = np.asarray(mask[()], dtype=bool)
+        else:
+            invalid = bundle.read_hdf(
+                mask,
+                role=mask.name,
+                validator=lambda value: value
+                if (
+                    isinstance(value, h5py.Dataset)
+                    and value.shape == thumbnail.shape
+                    and value.dtype == np.dtype(bool)
+                    and value.ndim == 2
+                )
+                else (_ for _ in ()).throw(
+                    ValueError(f"{mask.name} is not a bounded thumbnail mask")
+                ),
+                selection=None,
+                final_dtype=np.dtype(bool),
+                transform="thumbnail-mask",
+                retain=False,
+            )
         result[invalid] = np.nan
     return result
 
@@ -529,7 +1193,12 @@ def _decode_kind(value, x_unit: str | None, y_unit: str | None) -> TwoDKind:
     return two_d_kind_from_units(x_unit, y_unit)
 
 
-def _frame_map(group: h5py.Group | None, target_frame: int | None = None) -> dict[int, int]:
+def _frame_map(
+    group: h5py.Group | None,
+    target_frame: int | None = None,
+    *,
+    bundle: "_ReaderArrayBundle | None" = None,
+) -> dict[int, int]:
     if group is None:
         return {}
     inventory = _required_direct_dataset(
@@ -562,7 +1231,20 @@ def _frame_map(group: h5py.Group | None, target_frame: int | None = None) -> dic
         if len(rows) > 1:
             raise ValueError(f"{group.name}/frame_index contains duplicate labels")
         return {} if not rows else {target: rows[0]}
-    labels = [int(v) for v in np.asarray(dataset[()]).ravel()]
+    values = (
+        np.asarray(dataset[()])
+        if bundle is None
+        else bundle.read_hdf(
+            dataset,
+            role=f"{group.name}/frame_index",
+            validator=lambda value: _qualify_frame_index(group, value),
+            selection=None,
+            final_dtype=dataset.dtype,
+            transform="native",
+            retain=True,
+        )
+    )
+    labels = [int(v) for v in values.ravel()]
     if len(labels) != len(set(labels)):
         raise ValueError(f"{group.name}/frame_index contains duplicate labels")
     return {label: row for row, label in enumerate(labels)}
@@ -575,6 +1257,630 @@ def _dataset_unit(group: h5py.Group | None, name: str) -> str | None:
     return _bounded_text_attr(
         dataset, "units", role=f"{dataset.name} units",
     )
+
+
+class _ReaderCachePhase(Enum):
+    CLOSED = "closed"
+    OPENING = "opening"
+    OPEN = "open"
+    BUILDING = "building"
+    PREPARING = "preparing"
+    STAGED_PENDING = "staged-pending"
+    COMMITTING = "committing"
+    ACCEPT_PENDING = "accept-pending"
+    ACCEPTING = "accepting"
+    PUBLISHING = "publishing"
+    ROLLING_BACK = "rolling-back"
+    CLOSE_ADMITTED = "close-admitted"
+    CLOSE_STAGED = "close-staged"
+    CLOSE_COMMITTING = "close-committing"
+    CLOSE_ACCEPTING = "close-accepting"
+    CLOSE_AUTHORITY = "close-authority"
+    CLOSE_HDF = "close-hdf"
+    BLOCKED = "blocked"
+
+
+class _ReaderCacheDirection(Enum):
+    ACCEPTED = "accepted"
+    ROLLED_BACK = "rolled-back"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+class _ReaderCacheMarker:
+    pass
+
+
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+class _ReaderBundleOwner:
+    pass
+
+
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+class _ReaderCacheDriver:
+    pass
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _ReaderCacheEntry:
+    array: np.ndarray
+    lease: PhysicalRootLease
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _ReaderPendingArray:
+    key: tuple[object, ...]
+    value: np.ndarray
+    semantic: object
+    retain: bool
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _ReaderCacheJournal:
+    marker: _ReaderCacheMarker
+    owner_ref: ReferenceType[_ReaderBundleOwner] | None
+    driver_ref: ReferenceType[_ReaderCacheDriver] | None
+    exchange: PhysicalRootExchange | None
+    prior: "_ReaderCacheState"
+    plan: tuple[_ReaderPendingArray, ...]
+    pending_scan_data_columns: Mapping[str, np.ndarray] | None
+    candidate_entries: Mapping[tuple[object, ...], _ReaderCacheEntry] | None
+    candidate_scan_data_columns: Mapping[str, np.ndarray] | None
+    transient_leases: tuple[PhysicalRootLease, ...]
+    builder_factory: object
+    intent: _ReaderCacheDirection | None
+    opening: bool
+    close_h5: h5py.File | None
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _ReaderCacheState:
+    generation: int
+    phase: _ReaderCachePhase
+    open_token: object | None
+    entries: Mapping[tuple[object, ...], _ReaderCacheEntry]
+    scan_data_columns: Mapping[str, np.ndarray] | None
+    journal: _ReaderCacheJournal | None
+    terminal_evidence: tuple[ReferenceType[_ReaderCacheMarker], ...]
+    terminal_directions: tuple[_ReaderCacheDirection, ...]
+
+
+def _reader_marker_direction(
+    state: _ReaderCacheState,
+    marker: _ReaderCacheMarker,
+) -> _ReaderCacheDirection | None:
+    if len(state.terminal_evidence) != len(state.terminal_directions):
+        raise RuntimeError("FrameView reader-cache terminal evidence is inconsistent")
+    for marker_ref, direction in zip(
+        state.terminal_evidence,
+        state.terminal_directions,
+        strict=True,
+    ):
+        if marker_ref() is marker:
+            return direction
+    return None
+
+
+def _reader_terminal_evidence_with(
+    state: _ReaderCacheState,
+    marker: _ReaderCacheMarker,
+    direction: _ReaderCacheDirection,
+) -> tuple[
+    tuple[ReferenceType[_ReaderCacheMarker], ...],
+    tuple[_ReaderCacheDirection, ...],
+]:
+    refs: list[ReferenceType[_ReaderCacheMarker]] = []
+    live: list[_ReaderCacheMarker] = []
+    directions: list[_ReaderCacheDirection] = []
+    found: _ReaderCacheDirection | None = None
+    if len(state.terminal_evidence) != len(state.terminal_directions):
+        raise RuntimeError("FrameView reader-cache terminal evidence is inconsistent")
+    for marker_ref, prior_direction in zip(
+        state.terminal_evidence,
+        state.terminal_directions,
+        strict=True,
+    ):
+        candidate = marker_ref()
+        if candidate is None:
+            continue
+        if any(candidate is previous for previous in live):
+            continue
+        live.append(candidate)
+        refs.append(marker_ref)
+        directions.append(prior_direction)
+        if candidate is marker:
+            found = prior_direction
+    if found is not None and found is not direction:
+        raise RuntimeError("FrameView reader-cache terminal direction changed")
+    if found is None:
+        refs.append(ref(marker))
+        directions.append(direction)
+    return tuple(refs), tuple(directions)
+
+
+def _reader_cache_state_with(
+    state: _ReaderCacheState,
+    *,
+    phase: _ReaderCachePhase | None = None,
+    open_token: object | None = None,
+    replace_open_token: bool = False,
+    entries: Mapping[tuple[object, ...], _ReaderCacheEntry] | None = None,
+    scan_data_columns: Mapping[str, np.ndarray] | None = None,
+    replace_scan_data_columns: bool = False,
+    journal: _ReaderCacheJournal | None = None,
+    replace_journal: bool = False,
+    terminal_evidence: tuple[ReferenceType[_ReaderCacheMarker], ...] | None = None,
+    terminal_directions: tuple[_ReaderCacheDirection, ...] | None = None,
+) -> _ReaderCacheState:
+    return _ReaderCacheState(
+        state.generation + 1,
+        state.phase if phase is None else phase,
+        open_token if replace_open_token else state.open_token,
+        state.entries if entries is None else entries,
+        (
+            scan_data_columns
+            if replace_scan_data_columns
+            else state.scan_data_columns
+        ),
+        journal if replace_journal else state.journal,
+        (
+            state.terminal_evidence
+            if terminal_evidence is None
+            else terminal_evidence
+        ),
+        (
+            state.terminal_directions
+            if terminal_directions is None
+            else terminal_directions
+        ),
+    )
+
+
+def _reader_cache_journal_with(
+    journal: _ReaderCacheJournal,
+    *,
+    owner_ref: ReferenceType[_ReaderBundleOwner] | None = None,
+    replace_owner_ref: bool = False,
+    driver_ref: ReferenceType[_ReaderCacheDriver] | None = None,
+    replace_driver_ref: bool = False,
+    exchange: PhysicalRootExchange | None = None,
+    replace_exchange: bool = False,
+    plan: tuple[_ReaderPendingArray, ...] | None = None,
+    pending_scan_data_columns: Mapping[str, np.ndarray] | None = None,
+    replace_pending_scan_data_columns: bool = False,
+    candidate_entries: Mapping[
+        tuple[object, ...], _ReaderCacheEntry
+    ] | None = None,
+    replace_candidate_entries: bool = False,
+    candidate_scan_data_columns: Mapping[str, np.ndarray] | None = None,
+    replace_candidate_scan_data_columns: bool = False,
+    transient_leases: tuple[PhysicalRootLease, ...] | None = None,
+    intent: _ReaderCacheDirection | None = None,
+    replace_intent: bool = False,
+) -> _ReaderCacheJournal:
+    return _ReaderCacheJournal(
+        journal.marker,
+        owner_ref if replace_owner_ref else journal.owner_ref,
+        driver_ref if replace_driver_ref else journal.driver_ref,
+        exchange if replace_exchange else journal.exchange,
+        journal.prior,
+        journal.plan if plan is None else plan,
+        (
+            pending_scan_data_columns
+            if replace_pending_scan_data_columns
+            else journal.pending_scan_data_columns
+        ),
+        (
+            candidate_entries
+            if replace_candidate_entries
+            else journal.candidate_entries
+        ),
+        (
+            candidate_scan_data_columns
+            if replace_candidate_scan_data_columns
+            else journal.candidate_scan_data_columns
+        ),
+        (
+            journal.transient_leases
+            if transient_leases is None
+            else transient_leases
+        ),
+        journal.builder_factory,
+        intent if replace_intent else journal.intent,
+        journal.opening,
+        journal.close_h5,
+    )
+
+
+class _ReaderArrayBundle:
+    """One all-or-none HDF array read bundle for one open reader."""
+
+    def __init__(
+        self, reader: "FrameViewReader", *, opening: bool = False,
+    ) -> None:
+        self._reader = reader
+        self._owner = _ReaderBundleOwner()
+        self._marker, self._exchange = reader._begin_array_bundle(
+            self._owner, opening=opening,
+        )
+        self._token = object()
+        self._counter = 0
+        self._local: dict[
+            tuple[object, ...], tuple[np.ndarray, object, bool]
+        ] = {}
+        self._active = True
+        self._terminal: str | None = None
+        self.pending_scan_data_columns: dict[str, np.ndarray] | None = None
+
+    def _require_active(self) -> None:
+        if not self._active:
+            raise RuntimeError("FrameView read bundle is closed")
+
+    def _callback(self, callback, /, *args, **kwargs):
+        """Run one callback window against the exact BUILDING/local state."""
+
+        self._require_active()
+        prior_local = self._local
+        stamp = self._reader._bundle_callback_stamp(
+            self._marker, self._owner,
+        )
+        result = callback(*args, **kwargs)
+        self._reader._revalidate_bundle_callback(
+            stamp, self._marker, self._owner,
+        )
+        if self._local is not prior_local:
+            raise RuntimeError("FrameView read-bundle local mapping drifted")
+        return result
+
+    def _compact(self, direction: str) -> str:
+        if direction not in {
+            _ReaderCacheDirection.ACCEPTED.value,
+            _ReaderCacheDirection.ROLLED_BACK.value,
+        }:
+            raise RuntimeError("FrameView read bundle terminal is invalid")
+        self._terminal = direction
+        self._active = False
+        self._local.clear()
+        self.pending_scan_data_columns = None
+        self._exchange = None
+        self._marker = None
+        self._owner = None
+        self._reader = None
+        return direction
+
+    def __copy__(self) -> "_ReaderArrayBundle":
+        raise TypeError("FrameView read bundle cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> "_ReaderArrayBundle":
+        raise TypeError("FrameView read bundle cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("FrameView read bundle cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("FrameView read bundle cannot be serialized")
+
+    def _semantic(self, kind: str, key: object) -> tuple[object, ...]:
+        self._counter += 1
+        return (kind, self._token, self._counter, key)
+
+    def _local_lookup(
+        self, key: tuple[object, ...],
+    ) -> tuple[
+        dict[tuple[object, ...], tuple[np.ndarray, object, bool]],
+        tuple[np.ndarray, object, bool] | None,
+    ]:
+        """Read one local entry across an exact callback/state stamp."""
+
+        prior = self._local
+        stamp = self._reader._bundle_callback_stamp(
+            self._marker, self._owner,
+        )
+        value = prior.get(key)
+        self._reader._revalidate_bundle_callback(
+            stamp, self._marker, self._owner,
+        )
+        if self._local is not prior:
+            raise RuntimeError("FrameView read-bundle local mapping drifted")
+        return prior, value
+
+    def _publish_local(
+        self,
+        prior: dict[
+            tuple[object, ...], tuple[np.ndarray, object, bool]
+        ],
+        key: tuple[object, ...],
+        value: tuple[np.ndarray, object, bool],
+    ) -> None:
+        """COW-install one local entry after every hash/equality callback."""
+
+        if self._local is not prior:
+            raise RuntimeError("FrameView read-bundle local mapping drifted")
+        stamp = self._reader._bundle_callback_stamp(
+            self._marker, self._owner,
+        )
+        candidate = dict(prior)
+        self._reader._revalidate_bundle_callback(
+            stamp, self._marker, self._owner,
+        )
+        if self._local is not prior:
+            raise RuntimeError("FrameView read-bundle local mapping drifted")
+        candidate[key] = value
+        self._reader._revalidate_bundle_callback(
+            stamp, self._marker, self._owner,
+        )
+        if self._local is not prior:
+            raise RuntimeError("FrameView read-bundle local mapping drifted")
+        self._local = candidate
+
+    def _physical_dataset_key(
+        self, dataset: h5py.Dataset,
+    ) -> tuple[object, int]:
+        self._require_active()
+        self._reader._assert_bundle_owned(self._marker, self._owner)
+        owner = self._reader._hdf_owner_token
+        if owner is None:
+            raise RuntimeError("FrameViewReader HDF owner is unavailable")
+        try:
+            address = int(h5py.h5o.get_info(dataset.id).addr)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ValueError(f"{dataset.name} object identity is unavailable") from error
+        if address < 0:
+            raise ValueError(f"{dataset.name} object identity is invalid")
+        self._reader._assert_bundle_owned(self._marker, self._owner)
+        return owner, address
+
+    def cache_key(
+        self,
+        dataset: h5py.Dataset,
+        *,
+        selection: int | None,
+        final_dtype: np.dtype,
+        transform: str,
+    ) -> tuple[object, ...]:
+        physical = self._physical_dataset_key(dataset)
+        selected = ("all",) if selection is None else ("row", int(selection))
+        return (physical, selected, np.dtype(final_dtype).str, transform)
+
+    def cached(self, key: tuple[object, ...]) -> np.ndarray | None:
+        self._require_active()
+        cached = self._reader._bundle_cached(
+            self._marker, self._owner, key,
+        )
+        if cached is not None:
+            return cached
+        _prior, local = self._local_lookup(key)
+        return None if local is None else local[0]
+
+    def read_hdf(
+        self,
+        dataset: object,
+        *,
+        role: str,
+        validator,
+        selection: int | None,
+        final_dtype: np.dtype,
+        transform: str,
+        retain: bool,
+    ) -> np.ndarray:
+        self._require_active()
+        # Scientific role qualification deliberately precedes every cache hit.
+        stamp = self._reader._bundle_callback_stamp(
+            self._marker, self._owner,
+        )
+        qualified = validator(dataset)
+        self._reader._revalidate_bundle_callback(
+            stamp, self._marker, self._owner,
+        )
+        if not isinstance(qualified, h5py.Dataset):
+            raise ValueError(f"{role} is not a qualified HDF dataset")
+        dtype = np.dtype(final_dtype)
+        key = self.cache_key(
+            qualified,
+            selection=selection,
+            final_dtype=dtype,
+            transform=transform,
+        )
+        cached = self._reader._bundle_cached(
+            self._marker, self._owner, key,
+        )
+        if cached is not None:
+            return cached
+        local_prior, local = self._local_lookup(key)
+        if local is not None:
+            if retain and not local[2]:
+                self._publish_local(
+                    local_prior, key, (local[0], local[1], True),
+                )
+            return local[0]
+        shape = (
+            tuple(int(part) for part in qualified.shape)
+            if selection is None
+            else tuple(int(part) for part in qualified.shape[1:])
+        )
+        if selection is not None and not 0 <= int(selection) < int(
+            qualified.shape[0]
+        ):
+            raise ValueError(f"{role} row is out of range")
+        nbytes = int(math.prod(shape)) * int(dtype.itemsize)
+        capacity = self._reader._bundle_exchange_claim(
+            self._marker, self._owner, nbytes,
+        )
+        destination = np.empty(shape, dtype=dtype, order="C")
+        semantic = self._semantic("reader-cache" if retain else "return", key)
+        self._reader._bundle_exchange_bind(
+            self._marker, self._owner, capacity, destination, semantic,
+        )
+        if destination.size:
+            stamp = self._reader._bundle_callback_stamp(
+                self._marker, self._owner,
+            )
+            try:
+                if selection is None:
+                    qualified.read_direct(destination)
+                else:
+                    qualified.read_direct(
+                        destination, source_sel=np.s_[int(selection)],
+                    )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise ValueError(f"{role} could not be read into final storage") from error
+            self._reader._revalidate_bundle_callback(
+                stamp, self._marker, self._owner,
+            )
+        if destination.dtype != dtype or not destination.flags.c_contiguous:
+            raise AssertionError("FrameView HDF read did not retain final storage")
+        self._publish_local(
+            local_prior, key, (destination, semantic, retain),
+        )
+        return destination
+
+    def allocate(
+        self, shape: tuple[int, ...], dtype: np.dtype, *, role: str,
+    ) -> np.ndarray:
+        self._require_active()
+        dtype = np.dtype(dtype)
+        if (
+            type(shape) is not tuple
+            or any(type(part) is not int or part < 0 for part in shape)
+        ):
+            raise TypeError(f"{role} shape is invalid")
+        local_prior = self._local
+        nbytes = int(math.prod(shape)) * int(dtype.itemsize)
+        capacity = self._reader._bundle_exchange_claim(
+            self._marker, self._owner, nbytes,
+        )
+        destination = np.empty(shape, dtype=dtype, order="C")
+        semantic = self._semantic("return", role)
+        self._reader._bundle_exchange_bind(
+            self._marker,
+            self._owner,
+            capacity,
+            destination,
+            semantic,
+        )
+        key = ("allocated", semantic)
+        self._publish_local(
+            local_prior, key, (destination, semantic, False),
+        )
+        return destination
+
+    def allocate_cached(
+        self,
+        key: tuple[object, ...] | None,
+        shape: tuple[int, ...],
+        dtype: np.dtype,
+        *,
+        role: str,
+    ) -> np.ndarray:
+        """Claim and bind one cache-owned root before allocation/read."""
+
+        self._require_active()
+        if type(key) is not tuple:
+            raise TypeError(f"{role} cache key is invalid")
+        cached = self._reader._bundle_cached(
+            self._marker, self._owner, key,
+        )
+        if cached is not None:
+            return cached
+        local_prior, local = self._local_lookup(key)
+        if local is not None:
+            return local[0]
+        dtype = np.dtype(dtype)
+        if (
+            type(shape) is not tuple
+            or any(type(part) is not int or part < 0 for part in shape)
+        ):
+            raise TypeError(f"{role} shape is invalid")
+        nbytes = int(math.prod(shape)) * int(dtype.itemsize)
+        capacity = self._reader._bundle_exchange_claim(
+            self._marker, self._owner, nbytes,
+        )
+        destination = np.empty(shape, dtype=dtype, order="C")
+        semantic = self._semantic("reader-cache", key)
+        self._reader._bundle_exchange_bind(
+            self._marker,
+            self._owner,
+            capacity,
+            destination,
+            semantic,
+        )
+        self._publish_local(
+            local_prior, key, (destination, semantic, True),
+        )
+        return destination
+
+    def adopt(
+        self,
+        key: tuple[object, ...],
+        value: np.ndarray,
+        *,
+        retain: bool,
+    ) -> np.ndarray:
+        self._require_active()
+        cached = self._reader._bundle_cached(
+            self._marker, self._owner, key,
+        )
+        if cached is not None:
+            return cached
+        local_prior, local = self._local_lookup(key)
+        if local is not None:
+            return local[0]
+        semantic = self._semantic("reader-cache" if retain else "return", key)
+        self._reader._bundle_exchange_reserve(
+            self._marker, self._owner, value, semantic,
+        )
+        self._publish_local(
+            local_prior, key, (value, semantic, retain),
+        )
+        return value
+
+    def finish(self) -> None:
+        self._require_active()
+        plan = tuple(
+            _ReaderPendingArray(key, value, semantic, retain)
+            for key, (value, semantic, retain) in self._local.items()
+        )
+        try:
+            direction = self._reader._finish_array_bundle(
+                self._marker,
+                self._owner,
+                plan,
+                self.pending_scan_data_columns,
+            )
+        except BaseException as error:
+            try:
+                direction = self._reader._recover_array_bundle(
+                    self._marker, self._owner,
+                )
+            except BaseException as recovery_error:
+                raise recovery_error from error
+            self._compact(direction)
+            raise
+        self._compact(direction)
+
+    def rollback(self) -> None:
+        if not self._active:
+            return
+        direction = self._reader._rollback_array_bundle(
+            self._marker, self._owner,
+        )
+        self._compact(direction)
+
+    def recover(self) -> str:
+        self._require_active()
+        direction = self._reader._recover_array_bundle(
+            self._marker, self._owner,
+        )
+        return self._compact(direction)
+
+    def __enter__(self) -> "_ReaderArrayBundle":
+        if not self._active:
+            raise RuntimeError("FrameView read bundle is closed")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._active:
+            self.rollback()
 
 
 class FrameViewReader:
@@ -638,223 +1944,1703 @@ class FrameViewReader:
         self._primary_mode_1d: str = DEFAULT_MODE_KEY
         self._primary_mode_2d: str = DEFAULT_MODE_KEY
         self._multi_result_modes: bool = False
-        # Lazily-filled cache of the scan_data columns for THIS open, so a
-        # full-scan read slices each column once instead of re-reading every
-        # column for every frame (was O(N^2)).  Reset on open/close.
-        self._scan_data_columns: dict[str, np.ndarray] | None = None
         self._scan_data_items: tuple[tuple[str, h5py.Dataset], ...] = ()
+        self._hdf_owner_token: object | None = None
+        self._reader_cache_lock = RLock()
+        self._memory_authority = PhysicalRootAuthority(
+            _MAX_READER_RETAINED_BYTES,
+        )
+        self._memory_authority.close()
+        self._reader_cache_builder_factory = dict
+        self._reader_cache_state = _ReaderCacheState(
+            0,
+            _ReaderCachePhase.CLOSED,
+            None,
+            MappingProxyType({}),
+            None,
+            None,
+            (),
+            (),
+        )
+
+    def __copy__(self) -> "FrameViewReader":
+        raise TypeError("FrameViewReader cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> "FrameViewReader":
+        raise TypeError("FrameViewReader cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("FrameViewReader cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("FrameViewReader cannot be serialized")
+
+    @property
+    def retained_bytes(self) -> int:
+        """Bytes retained by reader-owned internal array/buffer roots."""
+        return self._reader_accounting("bytes")
+
+    @property
+    def retained_root_count(self) -> int:
+        return self._reader_accounting("roots")
+
+    @property
+    def semantic_references(self) -> int:
+        return self._reader_accounting("semantics")
+
+    def _reader_accounting(self, kind: str) -> int:
+        state = self._snapshot_reader_cache_state()
+        if state.phase is _ReaderCachePhase.CLOSED:
+            return 0
+        if state.phase is not _ReaderCachePhase.OPEN or state.journal is not None:
+            raise RuntimeError("FrameView reader-cache accounting is busy")
+        authority = self._memory_authority
+        if kind == "bytes":
+            value = authority.retained_bytes
+        elif kind == "roots":
+            value = authority.retained_root_count
+        elif kind == "semantics":
+            value = authority.semantic_references
+        else:  # pragma: no cover - internal exact-string contract
+            raise AssertionError("unknown FrameView accounting projection")
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView reader-cache accounting drifted")
+        return int(value)
+
+    @property
+    def _read_cache(
+        self,
+    ) -> Mapping[tuple[object, ...], np.ndarray]:
+        """Read-only values-only cache diagnostic; leases never escape."""
+
+        state = self._snapshot_reader_cache_state()
+        if state.phase is _ReaderCachePhase.CLOSED:
+            return MappingProxyType({})
+        if state.phase is not _ReaderCachePhase.OPEN or state.journal is not None:
+            raise RuntimeError("FrameView reader cache publication is busy")
+        values: dict[tuple[object, ...], np.ndarray] = {}
+        for key, entry in state.entries.items():
+            self._validate_reader_cache_entry(entry)
+            values[key] = entry.array
+        projection = MappingProxyType(values)
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView reader cache publication drifted")
+        return projection
+
+    @property
+    def _scan_data_columns(self) -> Mapping[str, np.ndarray] | None:
+        state = self._snapshot_reader_cache_state()
+        if state.phase is _ReaderCachePhase.CLOSED:
+            return None
+        if state.phase is not _ReaderCachePhase.OPEN or state.journal is not None:
+            raise RuntimeError("FrameView reader cache publication is busy")
+        columns = state.scan_data_columns
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView scan-data projection drifted")
+        return columns
+
+    @staticmethod
+    def _validate_reader_cache_entry(entry: _ReaderCacheEntry) -> None:
+        if type(entry) is not _ReaderCacheEntry:
+            raise RuntimeError("FrameView reader-cache entry is untrusted")
+        if type(entry.array) is not np.ndarray or entry.array.flags.writeable:
+            raise RuntimeError("FrameView reader-cache array is not read-only")
+        if type(entry.lease) is not PhysicalRootLease or entry.lease.released:
+            raise RuntimeError("FrameView reader-cache lease is unavailable")
+
+    def _snapshot_reader_cache_state(self) -> _ReaderCacheState:
+        with self._reader_cache_lock:
+            return self._reader_cache_state
+
+    def _cas_reader_cache_state(
+        self,
+        expected: _ReaderCacheState,
+        replacement: _ReaderCacheState,
+    ) -> bool:
+        """Exact pointer CAS; no mapping work or callbacks occur under lock."""
+
+        with self._reader_cache_lock:
+            if self._reader_cache_state is not expected:
+                return False
+            self._reader_cache_state = replacement
+            return True
+
+    def _transition_reader_cache_state(
+        self,
+        expected: _ReaderCacheState,
+        replacement: _ReaderCacheState,
+    ) -> bool:
+        try:
+            swapped = self._cas_reader_cache_state(expected, replacement)
+        except BaseException as error:
+            current = self._snapshot_reader_cache_state()
+            if current is expected or current is replacement:
+                raise
+            raise RuntimeError("FrameView reader-cache state drifted") from error
+        if swapped:
+            return True
+        current = self._snapshot_reader_cache_state()
+        if current is replacement:
+            return True
+        if current is expected:
+            return False
+        raise RuntimeError("FrameView reader-cache state drifted")
+
+    @staticmethod
+    def _reader_journal_for(
+        state: _ReaderCacheState,
+        marker: _ReaderCacheMarker,
+    ) -> _ReaderCacheJournal:
+        journal = state.journal
+        if journal is None or journal.marker is not marker:
+            raise RuntimeError("FrameView reader-cache journal is not owned")
+        return journal
+
+    @staticmethod
+    def _reader_owner_for(
+        journal: _ReaderCacheJournal,
+        owner: _ReaderBundleOwner | None,
+    ) -> _ReaderBundleOwner | None:
+        owner_ref = journal.owner_ref
+        current = None if owner_ref is None else owner_ref()
+        if owner is not None:
+            if current is not owner:
+                raise RuntimeError("FrameView read-bundle owner is stale")
+            return owner
+        if current is not None:
+            raise RuntimeError("FrameView read-bundle owner is busy")
+        return None
+
+    def _assert_bundle_owned(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+    ) -> _ReaderCacheState:
+        state = self._snapshot_reader_cache_state()
+        journal = self._reader_journal_for(state, marker)
+        self._reader_owner_for(journal, owner)
+        if state.phase is not _ReaderCachePhase.BUILDING:
+            raise RuntimeError("FrameView read bundle is no longer building")
+        if state.open_token is not self._hdf_owner_token:
+            raise RuntimeError("FrameView read bundle lost its HDF owner")
+        return state
+
+    def _bundle_callback_stamp(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+    ) -> _ReaderCacheState:
+        return self._assert_bundle_owned(marker, owner)
+
+    def _revalidate_bundle_callback(
+        self,
+        stamp: _ReaderCacheState,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+    ) -> None:
+        current = self._assert_bundle_owned(marker, owner)
+        if current is not stamp:
+            raise RuntimeError("FrameView read-bundle callback drifted")
+
+    def _claim_reader_driver(
+        self,
+        state: _ReaderCacheState,
+        marker: _ReaderCacheMarker,
+        phase: _ReaderCachePhase,
+    ) -> tuple[_ReaderCacheState, _ReaderCacheDriver] | None:
+        journal = self._reader_journal_for(state, marker)
+        live_driver = (
+            None if journal.driver_ref is None else journal.driver_ref()
+        )
+        if live_driver is not None:
+            raise RuntimeError("FrameView reader-cache helper is busy")
+        owner = _ReaderCacheDriver()
+        driven_journal = _reader_cache_journal_with(
+            journal,
+            driver_ref=ref(owner),
+            replace_driver_ref=True,
+        )
+        driven = _reader_cache_state_with(
+            state,
+            phase=phase,
+            journal=driven_journal,
+            replace_journal=True,
+        )
+        if not self._transition_reader_cache_state(state, driven):
+            return None
+        return driven, owner
+
+    def _revalidate_reader_driver(
+        self,
+        driven: _ReaderCacheState,
+        owner: _ReaderCacheDriver,
+    ) -> _ReaderCacheJournal:
+        current = self._snapshot_reader_cache_state()
+        if current is not driven:
+            raise RuntimeError("FrameView reader-cache callback drifted")
+        journal = current.journal
+        if (
+            journal is None
+            or journal.driver_ref is None
+            or journal.driver_ref() is not owner
+        ):
+            raise RuntimeError("FrameView reader-cache driver is stale")
+        return journal
+
+    def _clear_reader_driver(
+        self,
+        driven: _ReaderCacheState,
+        owner: _ReaderCacheDriver,
+        *,
+        phase: _ReaderCachePhase | None = None,
+        journal: _ReaderCacheJournal | None = None,
+    ) -> _ReaderCacheState:
+        current_journal = self._revalidate_reader_driver(driven, owner)
+        source_journal = current_journal if journal is None else journal
+        cleared_journal = _reader_cache_journal_with(
+            source_journal,
+            driver_ref=None,
+            replace_driver_ref=True,
+        )
+        replacement = _reader_cache_state_with(
+            driven,
+            phase=phase,
+            journal=cleared_journal,
+            replace_journal=True,
+        )
+        if not self._transition_reader_cache_state(driven, replacement):
+            raise RuntimeError("FrameView reader-cache driver settlement raced")
+        return replacement
+
+    def _begin_array_bundle(
+        self,
+        owner: _ReaderBundleOwner,
+        *,
+        opening: bool = False,
+    ) -> tuple[_ReaderCacheMarker, PhysicalRootExchange]:
+        if self._hdf_owner_token is None:
+            raise RuntimeError("FrameViewReader has no open memory authority")
+        state = self._snapshot_reader_cache_state()
+        expected_phase = (
+            _ReaderCachePhase.OPENING if opening else _ReaderCachePhase.OPEN
+        )
+        if state.phase is not expected_phase or state.journal is not None:
+            raise RuntimeError("FrameView reader cache publication is busy")
+        if state.open_token is not self._hdf_owner_token:
+            raise RuntimeError("FrameView reader cache HDF owner is stale")
+        marker = _ReaderCacheMarker()
+        journal = _ReaderCacheJournal(
+            marker,
+            ref(owner),
+            None,
+            None,
+            state,
+            (),
+            None,
+            None,
+            None,
+            (),
+            self._reader_cache_builder_factory,
+            None,
+            opening,
+            None,
+        )
+        replacement = _reader_cache_state_with(
+            state,
+            phase=_ReaderCachePhase.BUILDING,
+            journal=journal,
+            replace_journal=True,
+        )
+        if not self._transition_reader_cache_state(state, replacement):
+            raise RuntimeError("FrameView reader cache admission raced")
+        claim = self._claim_reader_driver(
+            replacement, marker, _ReaderCachePhase.BUILDING,
+        )
+        if claim is None:
+            raise RuntimeError("FrameView reader cache admission raced")
+        driven, driver = claim
+        try:
+            exchange = self._memory_authority.exchange(())
+            driven_journal = self._revalidate_reader_driver(driven, driver)
+            installed = _reader_cache_journal_with(
+                driven_journal,
+                exchange=exchange,
+                replace_exchange=True,
+            )
+            self._clear_reader_driver(
+                driven,
+                driver,
+                phase=_ReaderCachePhase.BUILDING,
+                journal=installed,
+            )
+        except BaseException:
+            # The immutable BUILDING journal and weak owner evidence retain
+            # exact recovery custody.  No unowned rollback races a live owner.
+            error = sys.exception()
+            assert error is not None
+            try:
+                if self._snapshot_reader_cache_state() is driven:
+                    self._clear_reader_driver(
+                        driven, driver, phase=_ReaderCachePhase.BUILDING,
+                    )
+                self._rollback_array_bundle(marker, owner)
+            except BaseException as recovery_error:
+                raise recovery_error from error
+            raise
+        current = self._assert_bundle_owned(marker, owner)
+        current_journal = self._reader_journal_for(current, marker)
+        if current_journal.exchange is not exchange:
+            raise RuntimeError("FrameView physical exchange was not admitted")
+        return marker, exchange
+
+    def _bundle_cached(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+        key: tuple[object, ...],
+    ) -> np.ndarray | None:
+        state = self._assert_bundle_owned(marker, owner)
+        entry = state.entries.get(key)
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView reader-cache lookup drifted")
+        if entry is None:
+            return None
+        self._validate_reader_cache_entry(entry)
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView reader-cache lookup drifted")
+        return entry.array
+
+    def _bundle_scan_data_columns(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+    ) -> Mapping[str, np.ndarray] | None:
+        state = self._assert_bundle_owned(marker, owner)
+        columns = state.scan_data_columns
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView scan-data lookup drifted")
+        return columns
+
+    def _bundle_exchange_call(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+        method: str,
+        *args: object,
+    ) -> object:
+        state = self._assert_bundle_owned(marker, owner)
+        claim = self._claim_reader_driver(
+            state, marker, _ReaderCachePhase.BUILDING,
+        )
+        if claim is None:
+            raise RuntimeError("FrameView reader-cache helper raced")
+        driven, driver = claim
+        journal = self._revalidate_reader_driver(driven, driver)
+        exchange = journal.exchange
+        if exchange is None:
+            raise RuntimeError("FrameView physical exchange is unavailable")
+        error: BaseException | None = None
+        result: object | None = None
+        try:
+            try:
+                result = getattr(exchange, method)(*args)
+            except BaseException as caught:
+                error = caught
+            self._revalidate_reader_driver(driven, driver)
+            self._clear_reader_driver(
+                driven, driver, phase=_ReaderCachePhase.BUILDING,
+            )
+        except BaseException as settlement_error:
+            if error is not None:
+                raise settlement_error from error
+            raise
+        if error is not None:
+            raise error
+        return result
+
+    def _bundle_exchange_claim(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+        nbytes: int,
+    ) -> object:
+        return self._bundle_exchange_call(
+            marker, owner, "claim", nbytes,
+        )
+
+    def _bundle_exchange_bind(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+        token: object,
+        value: object,
+        semantic: object,
+    ) -> object:
+        return self._bundle_exchange_call(
+            marker, owner, "bind", token, value, semantic,
+        )
+
+    def _bundle_exchange_reserve(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+        value: object,
+        semantic: object,
+    ) -> object:
+        return self._bundle_exchange_call(
+            marker, owner, "reserve", value, semantic,
+        )
+
+    def _seal_array_bundle(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+        plan: tuple[_ReaderPendingArray, ...],
+        pending_scan_data_columns: dict[str, np.ndarray] | None,
+    ) -> _ReaderCacheState:
+        state = self._assert_bundle_owned(marker, owner)
+        journal = self._reader_journal_for(state, marker)
+        if journal.exchange is None:
+            raise RuntimeError("FrameView physical exchange is unavailable")
+        retained_keys: set[tuple[object, ...]] = set()
+        for pending in plan:
+            if type(pending) is not _ReaderPendingArray:
+                raise TypeError("FrameView pending array is untrusted")
+            if pending.retain:
+                if pending.key in retained_keys or pending.key in state.entries:
+                    raise RuntimeError(
+                        "FrameView reader-cache key was already retained"
+                    )
+                retained_keys.add(pending.key)
+                pending.value.setflags(write=False)
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView read-bundle seal callback drifted")
+        scan_columns = (
+            None
+            if pending_scan_data_columns is None
+            else MappingProxyType(dict(pending_scan_data_columns))
+        )
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView scan-data seal callback drifted")
+        sealed = _reader_cache_journal_with(
+            journal,
+            plan=plan,
+            pending_scan_data_columns=scan_columns,
+            replace_pending_scan_data_columns=True,
+        )
+        replacement = _reader_cache_state_with(
+            state,
+            phase=_ReaderCachePhase.PREPARING,
+            journal=sealed,
+            replace_journal=True,
+        )
+        if not self._transition_reader_cache_state(state, replacement):
+            raise RuntimeError("FrameView reader-cache seal did not complete")
+        return replacement
+
+    def _candidate_reader_journal(
+        self,
+        driven: _ReaderCacheState,
+        driver: _ReaderCacheDriver,
+        journal: _ReaderCacheJournal,
+    ) -> _ReaderCacheJournal:
+        exchange = journal.exchange
+        if exchange is None:
+            raise RuntimeError("FrameView physical exchange is unavailable")
+        leases = exchange.prepared_leases
+        self._revalidate_reader_driver(driven, driver)
+
+        desired: list[
+            tuple[tuple[object, ...], np.ndarray, PhysicalRootLease]
+        ] = []
+        for key, entry in journal.prior.entries.items():
+            self._validate_reader_cache_entry(entry)
+            desired.append((key, entry.array, entry.lease))
+        self._revalidate_reader_driver(driven, driver)
+
+        transient: list[PhysicalRootLease] = []
+        for pending in journal.plan:
+            lease = leases[pending.semantic]
+            self._revalidate_reader_driver(driven, driver)
+            if (
+                type(lease) is not PhysicalRootLease
+                or lease.released
+                or lease._authority is not self._memory_authority
+                or lease._semantic is not pending.semantic
+                or lease._token.semantic is not pending.semantic
+            ):
+                raise RuntimeError("FrameView prepared lease is invalid")
+            if pending.retain:
+                desired.append((pending.key, pending.value, lease))
+            else:
+                transient.append(lease)
+
+        # Preserve the historical cache-publication fault surface without
+        # ever trusting or publishing the builder's mapping/leases.  The
+        # factory receives values only; trusted entries are rebuilt below.
+        factory = journal.builder_factory
+        candidate_values = factory()
+        self._revalidate_reader_driver(driven, driver)
+        for key, value, _lease in desired:
+            candidate_values[key] = value
+            self._revalidate_reader_driver(driven, driver)
+        frozen_values = MappingProxyType(dict(candidate_values))
+        self._revalidate_reader_driver(driven, driver)
+        actual = tuple(frozen_values.items())
+        if len(actual) != len(desired):
+            raise RuntimeError("FrameView cache builder changed cardinality")
+        for (actual_key, actual_value), (key, value, _lease) in zip(
+            actual, desired, strict=True,
+        ):
+            if actual_key != key or actual_value is not value:
+                raise RuntimeError("FrameView cache builder changed an entry")
+            self._revalidate_reader_driver(driven, driver)
+
+        trusted: dict[tuple[object, ...], _ReaderCacheEntry] = {}
+        for key, value, lease in desired:
+            trusted[key] = _ReaderCacheEntry(value, lease)
+        candidate_entries = MappingProxyType(trusted)
+        self._revalidate_reader_driver(driven, driver)
+        candidate_scan = (
+            journal.prior.scan_data_columns
+            if journal.pending_scan_data_columns is None
+            else journal.pending_scan_data_columns
+        )
+        if candidate_scan is not None:
+            retained_arrays = tuple(
+                entry.array for entry in candidate_entries.values()
+            )
+            for value in candidate_scan.values():
+                if not any(value is candidate for candidate in retained_arrays):
+                    raise RuntimeError(
+                        "FrameView scan-data column is not cache-owned"
+                    )
+        self._revalidate_reader_driver(driven, driver)
+        return _reader_cache_journal_with(
+            journal,
+            candidate_entries=candidate_entries,
+            replace_candidate_entries=True,
+            candidate_scan_data_columns=candidate_scan,
+            replace_candidate_scan_data_columns=True,
+            transient_leases=tuple(transient),
+        )
+
+    def _reader_terminal_state(
+        self,
+        state: _ReaderCacheState,
+        journal: _ReaderCacheJournal,
+        direction: _ReaderCacheDirection,
+    ) -> _ReaderCacheState:
+        if direction is _ReaderCacheDirection.ACCEPTED:
+            entries = journal.candidate_entries
+            if entries is None:
+                raise RuntimeError("FrameView accepted cache candidate is absent")
+            scan_columns = journal.candidate_scan_data_columns
+            phase = (
+                _ReaderCachePhase.OPENING
+                if journal.opening
+                else _ReaderCachePhase.OPEN
+            )
+            open_token = state.open_token
+        elif direction is _ReaderCacheDirection.ROLLED_BACK:
+            entries = journal.prior.entries
+            scan_columns = journal.prior.scan_data_columns
+            phase = journal.prior.phase
+            open_token = journal.prior.open_token
+        elif direction is _ReaderCacheDirection.CLOSED:
+            entries = MappingProxyType({})
+            scan_columns = None
+            phase = _ReaderCachePhase.CLOSED
+            open_token = None
+        else:  # pragma: no cover - exact enum contract
+            raise RuntimeError("FrameView reader-cache terminal direction is invalid")
+        evidence, directions = _reader_terminal_evidence_with(
+            state, journal.marker, direction,
+        )
+        return _reader_cache_state_with(
+            state,
+            phase=phase,
+            open_token=open_token,
+            replace_open_token=True,
+            entries=entries,
+            scan_data_columns=scan_columns,
+            replace_scan_data_columns=True,
+            journal=None,
+            replace_journal=True,
+            terminal_evidence=evidence,
+            terminal_directions=directions,
+        )
+
+    def _install_reader_terminal(
+        self,
+        state: _ReaderCacheState,
+        journal: _ReaderCacheJournal,
+        direction: _ReaderCacheDirection,
+    ) -> None:
+        replacement = self._reader_terminal_state(state, journal, direction)
+        if not self._transition_reader_cache_state(state, replacement):
+            current = self._snapshot_reader_cache_state()
+            if _reader_marker_direction(current, journal.marker) is direction:
+                return
+            raise RuntimeError("FrameView reader-cache terminal CAS failed")
+
+    def _rollback_array_bundle(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner | None = None,
+    ) -> str:
+        state = self._snapshot_reader_cache_state()
+        direction = _reader_marker_direction(state, marker)
+        if direction is not None:
+            if direction is not _ReaderCacheDirection.ROLLED_BACK:
+                raise RuntimeError("FrameView read bundle was not rolled back")
+            return direction.value
+        journal = self._reader_journal_for(state, marker)
+        self._reader_owner_for(journal, owner)
+        if state.phase is _ReaderCachePhase.BLOCKED:
+            raise RuntimeError("FrameView reader-cache journal is blocked")
+        if state.phase in {
+            _ReaderCachePhase.ACCEPTING,
+            _ReaderCachePhase.PUBLISHING,
+        }:
+            raise RuntimeError("FrameView read bundle acceptance is pending")
+        exchange = journal.exchange
+        if exchange is None:
+            self._install_reader_terminal(
+                state, journal, _ReaderCacheDirection.ROLLED_BACK,
+            )
+            return _ReaderCacheDirection.ROLLED_BACK.value
+        claim = self._claim_reader_driver(
+            state, marker, _ReaderCachePhase.ROLLING_BACK,
+        )
+        if claim is None:
+            return self._rollback_array_bundle(marker, owner)
+        driven, driver = claim
+        driven_journal = self._revalidate_reader_driver(driven, driver)
+        exchange = driven_journal.exchange
+        assert exchange is not None
+        error: BaseException | None = None
+        try:
+            try:
+                exchange.rollback()
+            except BaseException as caught:
+                error = caught
+            phase = exchange.phase
+            self._revalidate_reader_driver(driven, driver)
+            cleared = self._clear_reader_driver(
+                driven, driver, phase=_ReaderCachePhase.ROLLING_BACK,
+            )
+            if phase is PhysicalRootExchangePhase.ROLLED_BACK:
+                cleared_journal = self._reader_journal_for(cleared, marker)
+                self._install_reader_terminal(
+                    cleared,
+                    cleared_journal,
+                    _ReaderCacheDirection.ROLLED_BACK,
+                )
+            elif phase not in {
+                PhysicalRootExchangePhase.OPEN,
+                PhysicalRootExchangePhase.PREPARED,
+                PhysicalRootExchangePhase.STAGED,
+                PhysicalRootExchangePhase.COMMIT_PENDING,
+            }:
+                blocked = _reader_cache_state_with(
+                    cleared, phase=_ReaderCachePhase.BLOCKED,
+                )
+                self._transition_reader_cache_state(cleared, blocked)
+        except BaseException as settlement_error:
+            if error is not None:
+                raise settlement_error from error
+            raise
+        if error is not None:
+            raise error
+        current = self._snapshot_reader_cache_state()
+        direction = _reader_marker_direction(current, marker)
+        if direction is _ReaderCacheDirection.ROLLED_BACK:
+            return direction.value
+        raise RuntimeError("FrameView physical rollback did not complete")
+
+    def _accept_array_bundle(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner | None = None,
+    ) -> str:
+        state = self._snapshot_reader_cache_state()
+        direction = _reader_marker_direction(state, marker)
+        if direction is not None:
+            if direction is not _ReaderCacheDirection.ACCEPTED:
+                raise RuntimeError("FrameView read bundle was not accepted")
+            return direction.value
+        journal = self._reader_journal_for(state, marker)
+        self._reader_owner_for(journal, owner)
+        if state.phase not in {
+            _ReaderCachePhase.ACCEPT_PENDING,
+            _ReaderCachePhase.ACCEPTING,
+            _ReaderCachePhase.PUBLISHING,
+        }:
+            raise RuntimeError("FrameView read bundle is not accepting")
+        if state.phase is not _ReaderCachePhase.PUBLISHING:
+            claim = self._claim_reader_driver(
+                state, marker, _ReaderCachePhase.ACCEPTING,
+            )
+            if claim is None:
+                return self._accept_array_bundle(marker, owner)
+            driven, driver = claim
+            driven_journal = self._revalidate_reader_driver(driven, driver)
+            exchange = driven_journal.exchange
+            if exchange is None:
+                raise RuntimeError("FrameView physical exchange is unavailable")
+            error: BaseException | None = None
+            try:
+                try:
+                    exchange.accept()
+                except BaseException as caught:
+                    error = caught
+                phase = exchange.phase
+                self._revalidate_reader_driver(driven, driver)
+                next_phase = (
+                    _ReaderCachePhase.PUBLISHING
+                    if phase is PhysicalRootExchangePhase.ACCEPTED
+                    else _ReaderCachePhase.ACCEPTING
+                )
+                state = self._clear_reader_driver(
+                    driven, driver, phase=next_phase,
+                )
+            except BaseException as settlement_error:
+                if error is not None:
+                    raise settlement_error from error
+                raise
+            if error is not None:
+                raise error
+            if phase is not PhysicalRootExchangePhase.ACCEPTED:
+                raise RuntimeError("FrameView physical acceptance did not complete")
+        else:
+            state = self._snapshot_reader_cache_state()
+        journal = self._reader_journal_for(state, marker)
+        for lease in journal.transient_leases:
+            if lease.released:
+                continue
+            # A fault wrapper may interrupt after exact retirement but before
+            # PhysicalRootLease can mark itself released.  Token absence from
+            # this exact accepted authority is durable completion evidence.
+            authority_state = self._memory_authority._snapshot_state()
+            if not any(
+                binding.token is lease._token
+                for binding in authority_state.bindings
+            ):
+                lease._released = True
+                continue
+            try:
+                lease.release()
+            except BaseException:
+                if self._snapshot_reader_cache_state() is not state:
+                    raise RuntimeError(
+                        "FrameView transient release callback drifted"
+                    )
+                raise
+            if self._snapshot_reader_cache_state() is not state:
+                raise RuntimeError("FrameView transient release callback drifted")
+        self._validate_authority_matches_entries(state, journal)
+        self._install_reader_terminal(
+            state, journal, _ReaderCacheDirection.ACCEPTED,
+        )
+        return _ReaderCacheDirection.ACCEPTED.value
+
+    def _validate_authority_matches_entries(
+        self,
+        state: _ReaderCacheState,
+        journal: _ReaderCacheJournal,
+    ) -> None:
+        entries = journal.candidate_entries
+        if entries is None:
+            raise RuntimeError("FrameView accepted cache candidate is absent")
+        authority_state = self._memory_authority._snapshot_state()
+        if authority_state.closed:
+            raise RuntimeError("FrameView physical authority closed early")
+        if len(authority_state.bindings) != len(entries):
+            raise RuntimeError("FrameView cache binding cardinality diverged")
+        expected_tokens: set[int] = set()
+        expected_roots: dict[int, tuple[object, int, int]] = {}
+        for entry in entries.values():
+            self._validate_reader_cache_entry(entry)
+            lease = entry.lease
+            if lease._authority is not self._memory_authority:
+                raise RuntimeError("FrameView cache lease authority diverged")
+            token = lease._token
+            token_id = id(token)
+            if token_id in expected_tokens:
+                raise RuntimeError("FrameView cache lease token is duplicated")
+            expected_tokens.add(token_id)
+            bindings = tuple(
+                binding
+                for binding in authority_state.bindings
+                if binding.token is token
+            )
+            if len(bindings) != 1:
+                raise RuntimeError("FrameView cache lease binding diverged")
+            binding = bindings[0]
+            if (
+                binding.semantic is not lease._semantic
+                or token.semantic is not lease._semantic
+            ):
+                raise RuntimeError("FrameView cache lease semantic diverged")
+            fact = physical_root_fact(entry.array)
+            identity = id(fact.root)
+            if binding.root_identity != identity:
+                raise RuntimeError("FrameView cache lease root diverged")
+            prior = expected_roots.get(identity)
+            if prior is not None and (
+                prior[0] is not fact.root or prior[1] != fact.nbytes
+            ):
+                raise RuntimeError("FrameView cache physical root diverged")
+            expected_roots[identity] = (
+                fact.root,
+                fact.nbytes,
+                1 if prior is None else prior[2] + 1,
+            )
+        if {id(binding.token) for binding in authority_state.bindings} != expected_tokens:
+            raise RuntimeError("FrameView cache and physical authority diverged")
+        if len(authority_state.roots) != len(expected_roots):
+            raise RuntimeError("FrameView physical-root cardinality diverged")
+        for root_entry in authority_state.roots:
+            expected = expected_roots.get(root_entry.identity)
+            if (
+                expected is None
+                or root_entry.identity != id(root_entry.root)
+                or root_entry.root is not expected[0]
+                or root_entry.nbytes != expected[1]
+                or root_entry.references != expected[2]
+            ):
+                raise RuntimeError("FrameView physical-root fact diverged")
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameView authority validation drifted")
+
+    def _recover_array_bundle(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner | None = None,
+    ) -> str:
+        state = self._snapshot_reader_cache_state()
+        direction = _reader_marker_direction(state, marker)
+        if direction is not None:
+            return direction.value
+        journal = self._reader_journal_for(state, marker)
+        self._reader_owner_for(journal, owner)
+        if state.phase is _ReaderCachePhase.BLOCKED:
+            raise RuntimeError("FrameView reader-cache journal is blocked")
+        if state.phase in {
+            _ReaderCachePhase.ACCEPTING,
+            _ReaderCachePhase.PUBLISHING,
+        }:
+            return self._accept_array_bundle(marker, owner)
+        return self._rollback_array_bundle(marker, owner)
+
+    def _drive_reader_prepare(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+    ) -> None:
+        state = self._snapshot_reader_cache_state()
+        journal = self._reader_journal_for(state, marker)
+        self._reader_owner_for(journal, owner)
+        if state.phase is not _ReaderCachePhase.PREPARING:
+            raise RuntimeError("FrameView read bundle is not preparing")
+        claim = self._claim_reader_driver(
+            state, marker, _ReaderCachePhase.PREPARING,
+        )
+        if claim is None:
+            raise RuntimeError("FrameView prepare helper raced")
+        driven, driver = claim
+        journal = self._revalidate_reader_driver(driven, driver)
+        exchange = journal.exchange
+        if exchange is None:
+            raise RuntimeError("FrameView physical exchange is unavailable")
+        error: BaseException | None = None
+        try:
+            try:
+                exchange.prepare()
+            except BaseException as caught:
+                error = caught
+            phase = exchange.phase
+            self._revalidate_reader_driver(driven, driver)
+            if phase is PhysicalRootExchangePhase.STAGED:
+                candidate = self._candidate_reader_journal(
+                    driven, driver, journal,
+                )
+                self._clear_reader_driver(
+                    driven,
+                    driver,
+                    phase=_ReaderCachePhase.STAGED_PENDING,
+                    journal=candidate,
+                )
+            else:
+                self._clear_reader_driver(
+                    driven, driver, phase=_ReaderCachePhase.PREPARING,
+                )
+        except BaseException as settlement_error:
+            # Best effort clears only this exact live driver; unknown state is
+            # deliberately retained for explicit recovery.
+            if self._snapshot_reader_cache_state() is driven:
+                try:
+                    self._clear_reader_driver(
+                        driven, driver, phase=_ReaderCachePhase.PREPARING,
+                    )
+                except BaseException:
+                    pass
+            if error is not None:
+                raise settlement_error from error
+            raise
+        if error is not None:
+            raise error
+        if phase is not PhysicalRootExchangePhase.STAGED:
+            raise RuntimeError("FrameView physical prepare did not complete")
+
+    def _drive_reader_commit(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+    ) -> None:
+        state = self._snapshot_reader_cache_state()
+        journal = self._reader_journal_for(state, marker)
+        self._reader_owner_for(journal, owner)
+        if state.phase is not _ReaderCachePhase.STAGED_PENDING:
+            raise RuntimeError("FrameView read bundle is not staged")
+        claim = self._claim_reader_driver(
+            state, marker, _ReaderCachePhase.COMMITTING,
+        )
+        if claim is None:
+            raise RuntimeError("FrameView commit helper raced")
+        driven, driver = claim
+        journal = self._revalidate_reader_driver(driven, driver)
+        exchange = journal.exchange
+        assert exchange is not None
+        error: BaseException | None = None
+        try:
+            try:
+                exchange.commit()
+            except BaseException as caught:
+                error = caught
+            phase = exchange.phase
+            self._revalidate_reader_driver(driven, driver)
+            next_phase = (
+                _ReaderCachePhase.ACCEPT_PENDING
+                if phase is PhysicalRootExchangePhase.COMMIT_PENDING
+                else _ReaderCachePhase.STAGED_PENDING
+            )
+            self._clear_reader_driver(driven, driver, phase=next_phase)
+        except BaseException as settlement_error:
+            if error is not None:
+                raise settlement_error from error
+            raise
+        if error is not None:
+            raise error
+        if phase is not PhysicalRootExchangePhase.COMMIT_PENDING:
+            raise RuntimeError("FrameView physical commit did not complete")
+
+    def _finish_array_bundle(
+        self,
+        marker: _ReaderCacheMarker,
+        owner: _ReaderBundleOwner,
+        plan: tuple[_ReaderPendingArray, ...],
+        pending_scan_data_columns: dict[str, np.ndarray] | None,
+    ) -> str:
+        self._seal_array_bundle(
+            marker, owner, plan, pending_scan_data_columns,
+        )
+        self._drive_reader_prepare(marker, owner)
+        self._drive_reader_commit(marker, owner)
+        return self._accept_array_bundle(marker, owner)
+
+    def _close_reader_cache(self, *, opening_failure: bool = False) -> None:
+        for _attempt in range(64):
+            state = self._snapshot_reader_cache_state()
+            if state.phase is _ReaderCachePhase.CLOSED:
+                return
+            journal = state.journal
+            if journal is not None and journal.owner_ref is not None:
+                if journal.owner_ref() is not None:
+                    raise RuntimeError("FrameView reader cache publication is busy")
+                self._recover_array_bundle(journal.marker)
+                continue
+            if journal is None:
+                if state.phase not in {
+                    _ReaderCachePhase.OPEN,
+                    _ReaderCachePhase.OPENING,
+                }:
+                    raise RuntimeError("FrameView reader-cache close state drifted")
+                if (
+                    state.phase is _ReaderCachePhase.OPENING
+                    and not opening_failure
+                ):
+                    raise RuntimeError("FrameViewReader open is still pending")
+                marker = _ReaderCacheMarker()
+                journal = _ReaderCacheJournal(
+                    marker,
+                    None,
+                    None,
+                    None,
+                    state,
+                    (),
+                    None,
+                    MappingProxyType({}),
+                    None,
+                    (),
+                    self._reader_cache_builder_factory,
+                    _ReaderCacheDirection.CLOSED,
+                    False,
+                    self._h5,
+                )
+                replacement = _reader_cache_state_with(
+                    state,
+                    phase=_ReaderCachePhase.CLOSE_ADMITTED,
+                    journal=journal,
+                    replace_journal=True,
+                )
+                if not self._transition_reader_cache_state(state, replacement):
+                    continue
+                continue
+            if state.phase is _ReaderCachePhase.BLOCKED:
+                raise RuntimeError("FrameView reader-cache close is blocked")
+            exchange = journal.exchange
+            if state.phase is _ReaderCachePhase.CLOSE_ADMITTED and exchange is None:
+                claim = self._claim_reader_driver(
+                    state, journal.marker, _ReaderCachePhase.CLOSE_ADMITTED,
+                )
+                if claim is None:
+                    continue
+                driven, driver = claim
+                driven_journal = self._revalidate_reader_driver(driven, driver)
+                error: BaseException | None = None
+                try:
+                    try:
+                        victims = tuple(
+                            entry.lease for entry in driven.entries.values()
+                        )
+                        exchange = self._memory_authority.exchange(victims)
+                    except BaseException as caught:
+                        error = caught
+                        exchange = None
+                    self._revalidate_reader_driver(driven, driver)
+                    if exchange is None:
+                        self._clear_reader_driver(
+                            driven,
+                            driver,
+                            phase=_ReaderCachePhase.CLOSE_ADMITTED,
+                        )
+                    else:
+                        installed = _reader_cache_journal_with(
+                            driven_journal,
+                            exchange=exchange,
+                            replace_exchange=True,
+                        )
+                        self._clear_reader_driver(
+                            driven,
+                            driver,
+                            phase=_ReaderCachePhase.CLOSE_ADMITTED,
+                            journal=installed,
+                        )
+                except BaseException as settlement_error:
+                    if error is not None:
+                        raise settlement_error from error
+                    raise
+                if error is not None:
+                    raise error
+                continue
+            if exchange is None:
+                raise RuntimeError("FrameView close exchange is unavailable")
+            if state.phase is _ReaderCachePhase.CLOSE_ADMITTED:
+                self._drive_close_exchange(
+                    state,
+                    method="prepare",
+                    driving_phase=_ReaderCachePhase.CLOSE_ADMITTED,
+                    success_physical=PhysicalRootExchangePhase.STAGED,
+                    success_phase=_ReaderCachePhase.CLOSE_STAGED,
+                    retry_phase=_ReaderCachePhase.CLOSE_ADMITTED,
+                )
+                continue
+            if state.phase is _ReaderCachePhase.CLOSE_STAGED:
+                self._drive_close_exchange(
+                    state,
+                    method="commit",
+                    driving_phase=_ReaderCachePhase.CLOSE_COMMITTING,
+                    success_physical=PhysicalRootExchangePhase.COMMIT_PENDING,
+                    success_phase=_ReaderCachePhase.CLOSE_ACCEPTING,
+                    retry_phase=_ReaderCachePhase.CLOSE_STAGED,
+                )
+                continue
+            if state.phase in {
+                _ReaderCachePhase.CLOSE_COMMITTING,
+                _ReaderCachePhase.CLOSE_ACCEPTING,
+            }:
+                self._drive_close_exchange(
+                    state,
+                    method="accept" if state.phase is _ReaderCachePhase.CLOSE_ACCEPTING else "commit",
+                    driving_phase=state.phase,
+                    success_physical=(
+                        PhysicalRootExchangePhase.ACCEPTED
+                        if state.phase is _ReaderCachePhase.CLOSE_ACCEPTING
+                        else PhysicalRootExchangePhase.COMMIT_PENDING
+                    ),
+                    success_phase=(
+                        _ReaderCachePhase.CLOSE_AUTHORITY
+                        if state.phase is _ReaderCachePhase.CLOSE_ACCEPTING
+                        else _ReaderCachePhase.CLOSE_ACCEPTING
+                    ),
+                    retry_phase=state.phase,
+                )
+                continue
+            if state.phase is _ReaderCachePhase.CLOSE_AUTHORITY:
+                self._drive_close_authority(state)
+                continue
+            if state.phase is _ReaderCachePhase.CLOSE_HDF:
+                self._drive_close_hdf(state)
+                continue
+            raise RuntimeError("FrameView reader-cache close journal drifted")
+        raise RuntimeError("FrameView reader-cache close did not converge")
+
+    def _drive_close_exchange(
+        self,
+        state: _ReaderCacheState,
+        *,
+        method: str,
+        driving_phase: _ReaderCachePhase,
+        success_physical: PhysicalRootExchangePhase,
+        success_phase: _ReaderCachePhase,
+        retry_phase: _ReaderCachePhase,
+    ) -> None:
+        journal = state.journal
+        if journal is None:
+            raise RuntimeError("FrameView close journal is unavailable")
+        claim = self._claim_reader_driver(
+            state, journal.marker, driving_phase,
+        )
+        if claim is None:
+            return
+        driven, driver = claim
+        driven_journal = self._revalidate_reader_driver(driven, driver)
+        exchange = driven_journal.exchange
+        if exchange is None:
+            raise RuntimeError("FrameView close exchange is unavailable")
+        error: BaseException | None = None
+        try:
+            try:
+                getattr(exchange, method)()
+            except BaseException as caught:
+                error = caught
+            phase = exchange.phase
+            self._revalidate_reader_driver(driven, driver)
+            self._clear_reader_driver(
+                driven,
+                driver,
+                phase=(success_phase if phase is success_physical else retry_phase),
+            )
+        except BaseException as settlement_error:
+            if error is not None:
+                raise settlement_error from error
+            raise
+        if error is not None:
+            raise error
+        if phase is not success_physical:
+            raise RuntimeError(f"FrameView close {method} did not complete")
+
+    def _drive_close_authority(self, state: _ReaderCacheState) -> None:
+        journal = state.journal
+        if journal is None:
+            raise RuntimeError("FrameView close journal is unavailable")
+        claim = self._claim_reader_driver(
+            state, journal.marker, _ReaderCachePhase.CLOSE_AUTHORITY,
+        )
+        if claim is None:
+            return
+        driven, driver = claim
+        error: BaseException | None = None
+        try:
+            try:
+                self._memory_authority.close()
+            except BaseException as caught:
+                error = caught
+            closed = bool(self._memory_authority._snapshot_state().closed)
+            self._revalidate_reader_driver(driven, driver)
+            self._clear_reader_driver(
+                driven,
+                driver,
+                phase=(
+                    _ReaderCachePhase.CLOSE_HDF
+                    if closed
+                    else _ReaderCachePhase.CLOSE_AUTHORITY
+                ),
+            )
+        except BaseException as settlement_error:
+            if error is not None:
+                raise settlement_error from error
+            raise
+        if error is not None:
+            raise error
+        if not closed:
+            raise RuntimeError("FrameView physical authority did not close")
+
+    def _retire_open_graph(self) -> tuple[object, ...]:
+        """Clear mutable open fields while retaining losing refs to return."""
+
+        losing = (
+            self._entry, self._g1, self._g2, self._geom, self._scan_data,
+            self._frames, self._source_base, self._map_1d, self._map_2d,
+            self._map_geom, self._map_scan_data, self._axis_1d,
+            self._axis_2d_x, self._axis_2d_y, self._g1_modes,
+            self._g2_modes, self._map_1d_modes, self._map_2d_modes,
+            self._axis_1d_modes, self._axis_2d_x_modes,
+            self._axis_2d_y_modes, self._two_d_kind_modes,
+            self._scan_data_items,
+        )
+        self._entry = self._g1 = self._g2 = None
+        self._geom = self._scan_data = self._frames = None
+        self._source_base = None
+        self._map_1d = {}
+        self._map_2d = {}
+        self._map_geom = {}
+        self._map_scan_data = {}
+        self._axis_1d = None
+        self._axis_2d_x = None
+        self._axis_2d_y = None
+        self._two_d_kind = TwoDKind.Q_CHI
+        self._g1_modes = {}
+        self._g2_modes = {}
+        self._map_1d_modes = {}
+        self._map_2d_modes = {}
+        self._axis_1d_modes = {}
+        self._axis_2d_x_modes = {}
+        self._axis_2d_y_modes = {}
+        self._two_d_kind_modes = {}
+        self._primary_mode_1d = DEFAULT_MODE_KEY
+        self._primary_mode_2d = DEFAULT_MODE_KEY
+        self._multi_result_modes = False
+        self._scan_data_items = ()
+        return losing
+
+    def _drive_close_hdf(self, state: _ReaderCacheState) -> None:
+        journal = state.journal
+        if journal is None:
+            raise RuntimeError("FrameView close journal is unavailable")
+        claim = self._claim_reader_driver(
+            state, journal.marker, _ReaderCachePhase.CLOSE_HDF,
+        )
+        if claim is None:
+            return
+        driven, driver = claim
+        driven_journal = self._revalidate_reader_driver(driven, driver)
+        handle = driven_journal.close_h5
+        error: BaseException | None = None
+        try:
+            try:
+                if handle is not None and bool(handle.id.valid):
+                    handle.close()
+            except BaseException as caught:
+                error = caught
+            closed = handle is None or not bool(handle.id.valid)
+            self._revalidate_reader_driver(driven, driver)
+            if not closed:
+                self._clear_reader_driver(
+                    driven, driver, phase=_ReaderCachePhase.CLOSE_HDF,
+                )
+            else:
+                losing = self._retire_open_graph()
+                self._revalidate_reader_driver(driven, driver)
+                self._h5 = None
+                self._hdf_owner_token = None
+                current_journal = self._revalidate_reader_driver(driven, driver)
+                terminal = self._reader_terminal_state(
+                    driven, current_journal, _ReaderCacheDirection.CLOSED,
+                )
+                self._transition_reader_cache_state(driven, terminal)
+                del losing
+        except BaseException as settlement_error:
+            if error is not None:
+                raise settlement_error from error
+            raise
+        if error is not None:
+            raise error
+        if not closed:
+            raise RuntimeError("FrameView HDF close did not complete")
+
+    def _clear_open_state(self, *, opening_failure: bool = False) -> None:
+        self._close_reader_cache(opening_failure=opening_failure)
 
     def __enter__(self) -> "FrameViewReader":
-        self._h5 = h5py.File(self.path, "r")
+        if self._h5 is not None:
+            raise RuntimeError("FrameViewReader is already open")
+        # A closed reader can be reopened.  Every open owns a fresh token and
+        # authority, so an HDF object address can never alias a prior file.
+        state = self._snapshot_reader_cache_state()
+        if state.phase is not _ReaderCachePhase.CLOSED or state.journal is not None:
+            raise RuntimeError("FrameViewReader cache is not closed")
+        authority = PhysicalRootAuthority(
+            _MAX_READER_RETAINED_BYTES,
+        )
+        token = object()
+        opening = _reader_cache_state_with(
+            state,
+            phase=_ReaderCachePhase.OPENING,
+            open_token=token,
+            replace_open_token=True,
+            entries=MappingProxyType({}),
+            scan_data_columns=None,
+            replace_scan_data_columns=True,
+            journal=None,
+            replace_journal=True,
+        )
+        if not self._transition_reader_cache_state(state, opening):
+            authority.close()
+            raise RuntimeError("FrameViewReader open admission raced")
+        self._memory_authority = authority
+        self._hdf_owner_token = token
         # Anything raising past this point (missing entry group, duplicate
         # frame labels, malformed datasets) happens BEFORE the caller's
         # with-block exists, so __exit__ never runs — close the handle
         # ourselves or it leaks (and locks the file on Windows).
         try:
+            self._h5 = h5py.File(self.path, "r")
+            if self._snapshot_reader_cache_state() is not opening:
+                raise RuntimeError("FrameViewReader HDF open state drifted")
             return self._enter_inner()
-        except BaseException:
-            self._h5.close()
-            self._h5 = None
+        except BaseException as error:
+            try:
+                self._clear_open_state(opening_failure=True)
+            except BaseException as cleanup_error:
+                raise cleanup_error from error
             raise
 
     def _enter_inner(self) -> "FrameViewReader":
-        self._entry = _required_direct_group(
-            self._h5, self.entry_name, role=f"/{self.entry_name}",
+        handle = self._h5
+        if handle is None:
+            raise RuntimeError("FrameViewReader has no open HDF handle")
+        entry = _required_direct_group(
+            handle, self.entry_name, role=f"/{self.entry_name}",
         )
-        if self._entry is None:
+        if entry is None:
             raise KeyError(f"No {self.entry_name!r} group in {self.path}")
         # C1: surface a newer-than-supported schema before any dataset access
         # fails with an opaque KeyError.
         from xrd_tools.io.nexus import warn_if_newer_schema
-        warn_if_newer_schema(self._entry, str(self.path))
+        warn_if_newer_schema(entry, str(self.path))
         # N1: the project root the relative source paths point under (None on old
         # absolute-path files; harmless there).
-        self._source_base = _bounded_text_attr(
-            self._entry,
+        source_base = _bounded_text_attr(
+            entry,
             "source_base",
-            role=f"{self._entry.name} source base",
+            role=f"{entry.name} source base",
             max_bytes=_MAX_SOURCE_PATH_BYTES,
         )
         # Recover an orphan __reint shadow left by a crash mid-swap (read-only
         # adoption) so a reintegrate interrupted between del-canonical and
         # move-shadow still opens on its complete result.
-        self._g1 = _integrated_group(self._entry, "integrated_1d")
-        self._g2 = _integrated_group(self._entry, "integrated_2d")
-        self._geom = _required_direct_group(
-            self._entry,
+        g1 = _integrated_group(entry, "integrated_1d")
+        g2 = _integrated_group(entry, "integrated_2d")
+        geom = _required_direct_group(
+            entry,
             "per_frame_geometry",
-            role=f"{self._entry.name}/per_frame_geometry",
+            role=f"{entry.name}/per_frame_geometry",
         )
-        self._scan_data = _required_direct_group(
-            self._entry, "scan_data", role=f"{self._entry.name}/scan_data",
+        scan_data = _required_direct_group(
+            entry, "scan_data", role=f"{entry.name}/scan_data",
         )
-        self._frames = _required_direct_group(
-            self._entry, "frames", role=f"{self._entry.name}/frames",
+        frames = _required_direct_group(
+            entry, "frames", role=f"{entry.name}/frames",
         )
-        self._map_1d = _frame_map(self._g1, self.target_frame)
-        self._map_2d = _frame_map(self._g2, self.target_frame)
-        self._map_geom = _frame_map(self._geom, self.target_frame)
-        self._map_scan_data = _frame_map(self._scan_data, self.target_frame)
-        self._scan_data_items = _scan_data_items(self._scan_data)
-        self._scan_data_columns = None  # rebuild lazily for this open
+        with _ReaderArrayBundle(self, opening=True) as bundle:
+            map_1d = _frame_map(g1, self.target_frame, bundle=bundle)
+            map_2d = _frame_map(g2, self.target_frame, bundle=bundle)
+            map_geom = _frame_map(geom, self.target_frame, bundle=bundle)
+            map_scan_data = _frame_map(
+                scan_data, self.target_frame, bundle=bundle,
+            )
+            scan_data_items = _scan_data_items(scan_data)
 
-        # Multi-result discovery (ADR-0003).  Read the per-scan primary + the
-        # mode-aware capability marker, then register the primary (top-level)
-        # FIRST and probe the SCHEMA-known GI subgroup names (never blind child
-        # enumeration — an unrelated child must not become a phantom mode).
-        def _primary_attr(grp):
-            if grp is None or PRIMARY_MODE_ATTR not in grp.attrs:
-                return DEFAULT_MODE_KEY
-            return str(_bounded_text_attr(
-                grp, PRIMARY_MODE_ATTR, role=f"{grp.name} primary mode",
-            ))
+            def primary_attr(group):
+                if group is None or PRIMARY_MODE_ATTR not in group.attrs:
+                    return DEFAULT_MODE_KEY
+                return str(_bounded_text_attr(
+                    group,
+                    PRIMARY_MODE_ATTR,
+                    role=f"{group.name} primary mode",
+                ))
 
-        self._primary_mode_1d = _primary_attr(self._g1)
-        self._primary_mode_2d = _primary_attr(self._g2)
-        self._multi_result_modes = bool(
-            (self._g1 is not None and MULTI_RESULT_MODES_ATTR in self._g1.attrs)
-            or (self._g2 is not None and MULTI_RESULT_MODES_ATTR in self._g2.attrs)
-        )
+            primary_mode_1d = primary_attr(g1)
+            primary_mode_2d = primary_attr(g2)
+            multi_result_modes = bool(
+                (g1 is not None and MULTI_RESULT_MODES_ATTR in g1.attrs)
+                or (g2 is not None and MULTI_RESULT_MODES_ATTR in g2.attrs)
+            )
+            g1_modes: dict[str, h5py.Group] = {}
+            g2_modes: dict[str, h5py.Group] = {}
+            map_1d_modes: dict[str, dict[int, int]] = {}
+            map_2d_modes: dict[str, dict[int, int]] = {}
+            axis_1d_modes: dict[str, Axis] = {}
+            axis_2d_x_modes: dict[str, Axis] = {}
+            axis_2d_y_modes: dict[str, Axis] = {}
+            two_d_kind_modes: dict[str, TwoDKind] = {}
 
-        def _register_1d(mode, g):
-            # Register only a READABLE mode (intensity + its q axis present) so
-            # modes_1d() never advertises a mode that read()/read_record cannot
-            # load — foreign/partially-written-file robustness.
-            intensity_node = _required_direct_dataset(
-                g, "intensity", role=f"{g.name}/intensity",
-            )
-            q_node = _required_direct_dataset(
-                g, "q", role=f"{g.name}/q",
-            )
-            if intensity_node is None or q_node is None:
-                return
-            q = _read_numeric_vector(
-                q_node,
-                role=f"{g.name}/q",
-            )
-            _qualify_1d_stack(
-                g,
-                intensity_node,
-                points=int(q.size),
-                role="intensity",
-            )
-            sigma_node = _required_direct_dataset(
-                g, "sigma", role=f"{g.name}/sigma",
-            )
-            if sigma_node is not None:
-                _qualify_1d_stack(
-                    g, sigma_node,
-                    points=int(q.size),
-                    role="sigma",
+            def register_1d(mode, group):
+                intensity_node = _required_direct_dataset(
+                    group, "intensity", role=f"{group.name}/intensity",
                 )
-            self._g1_modes[mode] = g
-            self._map_1d_modes[mode] = _frame_map(g, self.target_frame)
-            self._axis_1d_modes[mode] = axis_from_unit(
-                _dataset_unit(g, "q"), q)
+                q_node = _required_direct_dataset(
+                    group, "q", role=f"{group.name}/q",
+                )
+                if intensity_node is None or q_node is None:
+                    return
+                q = _read_numeric_vector(
+                    q_node, role=f"{group.name}/q", bundle=bundle,
+                )
+                _qualify_1d_stack(
+                    group,
+                    intensity_node,
+                    points=int(q.size),
+                    role="intensity",
+                )
+                sigma_node = _required_direct_dataset(
+                    group, "sigma", role=f"{group.name}/sigma",
+                )
+                if sigma_node is not None:
+                    _qualify_1d_stack(
+                        group,
+                        sigma_node,
+                        points=int(q.size),
+                        role="sigma",
+                    )
+                g1_modes[mode] = group
+                map_1d_modes[mode] = _frame_map(
+                    group, self.target_frame, bundle=bundle,
+                )
+                axis_1d_modes[mode] = axis_from_unit(
+                    _dataset_unit(group, "q"), q,
+                )
 
-        def _register_2d(mode, g):
-            intensity_node = _required_direct_dataset(
-                g, "intensity", role=f"{g.name}/intensity",
-            )
-            q_node = _required_direct_dataset(
-                g, "q", role=f"{g.name}/q",
-            )
-            chi_node = _required_direct_dataset(
-                g, "chi", role=f"{g.name}/chi",
-            )
-            if intensity_node is None or q_node is None or chi_node is None:
-                return
-            q = _read_numeric_vector(
-                q_node,
-                role=f"{g.name}/q",
-            )
-            chi = _read_numeric_vector(
-                chi_node,
-                role=f"{g.name}/chi",
-            )
-            _qualify_2d_stack(
-                g, intensity_node,
-                q_points=int(q.size),
-                chi_points=int(chi.size),
-                role="intensity",
-            )
-            sigma_node = _required_direct_dataset(
-                g, "sigma", role=f"{g.name}/sigma",
-            )
-            if sigma_node is not None:
+            def register_2d(mode, group):
+                intensity_node = _required_direct_dataset(
+                    group, "intensity", role=f"{group.name}/intensity",
+                )
+                q_node = _required_direct_dataset(
+                    group, "q", role=f"{group.name}/q",
+                )
+                chi_node = _required_direct_dataset(
+                    group, "chi", role=f"{group.name}/chi",
+                )
+                if (
+                    intensity_node is None
+                    or q_node is None
+                    or chi_node is None
+                ):
+                    return
+                q = _read_numeric_vector(
+                    q_node, role=f"{group.name}/q", bundle=bundle,
+                )
+                chi = _read_numeric_vector(
+                    chi_node, role=f"{group.name}/chi", bundle=bundle,
+                )
                 _qualify_2d_stack(
-                    g, sigma_node,
+                    group,
+                    intensity_node,
                     q_points=int(q.size),
                     chi_points=int(chi.size),
-                    role="sigma",
+                    role="intensity",
                 )
-            self._g2_modes[mode] = g
-            self._map_2d_modes[mode] = _frame_map(g, self.target_frame)
-            qu, cu = _dataset_unit(g, "q"), _dataset_unit(g, "chi")
-            self._axis_2d_x_modes[mode] = axis_from_unit(
-                qu, q,
-            )
-            self._axis_2d_y_modes[mode] = axis_from_unit(
-                cu, chi,
-            )
-            self._two_d_kind_modes[mode] = _decode_kind(
-                _bounded_text_attr(
-                    g, "two_d_kind", role=f"{g.name} 2-D kind",
-                ),
-                qu,
-                cu,
-            )
+                sigma_node = _required_direct_dataset(
+                    group, "sigma", role=f"{group.name}/sigma",
+                )
+                if sigma_node is not None:
+                    _qualify_2d_stack(
+                        group,
+                        sigma_node,
+                        q_points=int(q.size),
+                        chi_points=int(chi.size),
+                        role="sigma",
+                    )
+                g2_modes[mode] = group
+                map_2d_modes[mode] = _frame_map(
+                    group, self.target_frame, bundle=bundle,
+                )
+                qu = _dataset_unit(group, "q")
+                cu = _dataset_unit(group, "chi")
+                axis_2d_x_modes[mode] = axis_from_unit(qu, q)
+                axis_2d_y_modes[mode] = axis_from_unit(cu, chi)
+                two_d_kind_modes[mode] = _decode_kind(
+                    _bounded_text_attr(
+                        group,
+                        "two_d_kind",
+                        role=f"{group.name} 2-D kind",
+                    ),
+                    qu,
+                    cu,
+                )
 
-        if self._g1 is not None:
-            _register_1d(self._primary_mode_1d, self._g1)
-            for k in GI_MODE_KEYS_1D:
-                if k == self._primary_mode_1d:
-                    continue
-                child_name = mode_subgroup_name(k)
-                child = _required_direct_group(
-                    self._g1, child_name, role=f"{self._g1.name}/{child_name}",
-                )
-                if child is not None:
-                    _register_1d(k, child)
-        if self._g2 is not None:
-            _register_2d(self._primary_mode_2d, self._g2)
-            for k in GI_MODE_KEYS_2D:
-                if k == self._primary_mode_2d:
-                    continue
-                child_name = mode_subgroup_name(k)
-                child = _required_direct_group(
-                    self._g2, child_name, role=f"{self._g2.name}/{child_name}",
-                )
-                if child is not None:
-                    _register_2d(k, child)
+            if g1 is not None:
+                register_1d(primary_mode_1d, g1)
+                for key in GI_MODE_KEYS_1D:
+                    if key == primary_mode_1d:
+                        continue
+                    child_name = mode_subgroup_name(key)
+                    child = _required_direct_group(
+                        g1,
+                        child_name,
+                        role=f"{g1.name}/{child_name}",
+                    )
+                    if child is not None:
+                        register_1d(key, child)
+            if g2 is not None:
+                register_2d(primary_mode_2d, g2)
+                for key in GI_MODE_KEYS_2D:
+                    if key == primary_mode_2d:
+                        continue
+                    child_name = mode_subgroup_name(key)
+                    child = _required_direct_group(
+                        g2,
+                        child_name,
+                        role=f"{g2.name}/{child_name}",
+                    )
+                    if child is not None:
+                        register_2d(key, child)
 
-        # Scalar aliases = the PRIMARY mode's entries (back-compat: labels(),
-        # read() without mode args, and external _axis_* consumers are unchanged
-        # for both single-mode and mode-aware files).
-        self._axis_1d = self._axis_1d_modes.get(self._primary_mode_1d)
-        self._axis_2d_x = self._axis_2d_x_modes.get(self._primary_mode_2d)
-        self._axis_2d_y = self._axis_2d_y_modes.get(self._primary_mode_2d)
-        self._two_d_kind = self._two_d_kind_modes.get(
-            self._primary_mode_2d, TwoDKind.Q_CHI)
+            axis_1d = axis_1d_modes.get(primary_mode_1d)
+            axis_2d_x = axis_2d_x_modes.get(primary_mode_2d)
+            axis_2d_y = axis_2d_y_modes.get(primary_mode_2d)
+            two_d_kind = two_d_kind_modes.get(
+                primary_mode_2d, TwoDKind.Q_CHI,
+            )
+            bundle.finish()
+
+        # Publish only after the complete local graph and retained-root bundle
+        # are validated and committed.
+        self._entry = entry
+        self._source_base = source_base
+        self._g1, self._g2 = g1, g2
+        self._geom, self._scan_data, self._frames = geom, scan_data, frames
+        self._map_1d, self._map_2d = map_1d, map_2d
+        self._map_geom, self._map_scan_data = map_geom, map_scan_data
+        self._scan_data_items = scan_data_items
+        self._g1_modes, self._g2_modes = g1_modes, g2_modes
+        self._map_1d_modes, self._map_2d_modes = (
+            map_1d_modes, map_2d_modes,
+        )
+        self._axis_1d_modes = axis_1d_modes
+        self._axis_2d_x_modes = axis_2d_x_modes
+        self._axis_2d_y_modes = axis_2d_y_modes
+        self._two_d_kind_modes = two_d_kind_modes
+        self._primary_mode_1d = primary_mode_1d
+        self._primary_mode_2d = primary_mode_2d
+        self._multi_result_modes = multi_result_modes
+        self._axis_1d, self._axis_2d_x, self._axis_2d_y = (
+            axis_1d, axis_2d_x, axis_2d_y,
+        )
+        self._two_d_kind = two_d_kind
+        state = self._snapshot_reader_cache_state()
+        if (
+            state.phase is not _ReaderCachePhase.OPENING
+            or state.journal is not None
+            or state.open_token is not self._hdf_owner_token
+        ):
+            raise RuntimeError("FrameViewReader open publication drifted")
+        opened = _reader_cache_state_with(
+            state, phase=_ReaderCachePhase.OPEN,
+        )
+        if not self._transition_reader_cache_state(state, opened):
+            raise RuntimeError("FrameViewReader open publication raced")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self._h5 is not None:
-            self._h5.close()
-        self._h5 = None
-        self._entry = None
-        self._geom = None
-        self._scan_data = None
-        self._frames = None
-        self._scan_data_columns = None
-        self._scan_data_items = ()
+        self._clear_open_state()
 
     def _row(self, mapping: dict[int, int], frame: int) -> int | None:
         return mapping.get(int(frame))
 
+    def _recover_dead_read_bundle_for_admission(
+        self, state: _ReaderCacheState,
+    ) -> _ReaderCacheState:
+        """Settle one abandoned read journal before a fresh public action.
+
+        A live bundle remains the sole owner and is never helped.  Only an
+        ordinary read journal whose weak owner has died is recoverable here;
+        close, opening, blocked, and unknown journals remain explicit custody
+        failures.  A failed recovery is deliberately left journalled so the
+        next caller can retry the exact same operation.
+        """
+
+        journal = state.journal
+        if journal is None:
+            raise RuntimeError("FrameViewReader is not exactly open")
+        if (
+            state.phase is _ReaderCachePhase.BLOCKED
+            or journal.intent is _ReaderCacheDirection.CLOSED
+            or journal.opening
+            or journal.prior.phase is not _ReaderCachePhase.OPEN
+            or journal.prior.open_token is not self._hdf_owner_token
+            or journal.owner_ref is None
+            or state.phase
+            not in {
+                _ReaderCachePhase.BUILDING,
+                _ReaderCachePhase.PREPARING,
+                _ReaderCachePhase.STAGED_PENDING,
+                _ReaderCachePhase.COMMITTING,
+                _ReaderCachePhase.ACCEPT_PENDING,
+                _ReaderCachePhase.ACCEPTING,
+                _ReaderCachePhase.PUBLISHING,
+                _ReaderCachePhase.ROLLING_BACK,
+            }
+        ):
+            raise RuntimeError("FrameViewReader has an unrecoverable cache journal")
+        if journal.owner_ref() is not None:
+            raise RuntimeError("FrameView reader cache publication is busy")
+        current = self._snapshot_reader_cache_state()
+        if current is not state:
+            if (
+                current.phase is _ReaderCachePhase.OPEN
+                and current.journal is None
+                and current.open_token is self._hdf_owner_token
+            ):
+                return current
+            raise RuntimeError("FrameView read-bundle recovery admission drifted")
+        marker = journal.marker
+        try:
+            self._recover_array_bundle(marker)
+        except BaseException:
+            current = self._snapshot_reader_cache_state()
+            if (
+                current.phase is _ReaderCachePhase.OPEN
+                and current.journal is None
+                and current.open_token is self._hdf_owner_token
+            ):
+                return current
+            raise
+        current = self._snapshot_reader_cache_state()
+        if (
+            current.phase is not _ReaderCachePhase.OPEN
+            or current.journal is not None
+            or current.open_token is not self._hdf_owner_token
+        ):
+            raise RuntimeError("FrameView read-bundle recovery did not converge")
+        return current
+
+    def _require_reader_open(self) -> _ReaderCacheState:
+        state = self._snapshot_reader_cache_state()
+        if state.phase is not _ReaderCachePhase.OPEN or state.journal is not None:
+            state = self._recover_dead_read_bundle_for_admission(state)
+        if (
+            state.phase is not _ReaderCachePhase.OPEN
+            or state.journal is not None
+            or state.open_token is None
+            or state.open_token is not self._hdf_owner_token
+            or self._h5 is None
+            or not bool(self._h5.id.valid)
+        ):
+            raise RuntimeError("FrameViewReader is not exactly open")
+        return state
+
+    def _revalidate_reader_open(self, state: _ReaderCacheState) -> None:
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameViewReader open state drifted")
+
     def labels(self) -> tuple[int, ...]:
         """Frame labels known to this scan without reopening the file."""
 
+        state = self._require_reader_open()
         labels = set(self._map_geom) | set(self._map_scan_data)
         for mode_map in (*self._map_1d_modes.values(), *self._map_2d_modes.values()):
             labels |= set(mode_map)
@@ -869,23 +3655,525 @@ class FrameViewReader:
                     labels.add(int(str(name).removeprefix("frame_")))
                 except ValueError:
                     continue
+        result = tuple(sorted(labels))
+        self._revalidate_reader_open(state)
+        return result
+
+    def _scalar_catalog_inventory(self) -> tuple[int, ...]:
+        """Build the complete admitted label inventory while a bundle owns it."""
+
+        labels: set[int] = set(self._map_geom) | set(self._map_scan_data)
+        for mode_map in (
+            *self._map_1d_modes.values(), *self._map_2d_modes.values(),
+        ):
+            labels.update(mode_map)
+        frames = self._frames
+        if frames is not None:
+            if len(frames) > _MAX_PERSISTED_FRAME_ROWS:
+                raise ValueError(f"{frames.name} inventory exceeds limit")
+            for name in frames:
+                if type(name) is not str or not name.startswith("frame_"):
+                    continue
+                suffix = name.removeprefix("frame_")
+                try:
+                    label = int(suffix)
+                except ValueError:
+                    continue
+                if str(label).zfill(4) != suffix:
+                    continue
+                labels.add(label)
+        if len(labels) > _MAX_PERSISTED_FRAME_ROWS:
+            raise ValueError("Frame scalar catalog inventory exceeds limit")
+        if any(type(label) is not int or label < 0 for label in labels):
+            raise ValueError(
+                "Frame scalar catalog labels must be nonnegative integers"
+            )
         return tuple(sorted(labels))
+
+    def _scalar_catalog_projection_counts(self) -> tuple[int, int, int]:
+        """Return a pre-inventory lower bound and exact per-row fan-out."""
+
+        maps = (
+            self._map_geom,
+            self._map_scan_data,
+            *self._map_1d_modes.values(),
+            *self._map_2d_modes.values(),
+        )
+        counts = [len(mapping) for mapping in maps]
+        frames = self._frames
+        if frames is not None:
+            counts.append(len(frames))
+        return (
+            max(counts, default=0),
+            len(self._scan_data_items),
+            sum(len(mapping) for mapping in (
+                *self._map_1d_modes.values(),
+                *self._map_2d_modes.values(),
+            )),
+        )
+
+    def _scalar_catalog_scan_columns(
+        self,
+        bundle: _ReaderArrayBundle,
+        checkpoint: Callable[[], None],
+    ) -> Mapping[str, np.ndarray]:
+        group = self._scan_data
+        if group is None:
+            return MappingProxyType({})
+        retained = self._bundle_scan_data_columns(
+            bundle._marker, bundle._owner,
+        )
+        if retained is not None:
+            return retained
+        columns: dict[str, np.ndarray] = {}
+        total = 0
+        for key, item in self._scan_data_items:
+            checkpoint()
+            column, logical_bytes = _scan_data_column(
+                item,
+                role=f"{group.name}/{key}",
+                allowance_bytes=_MAX_SCAN_DATA_BYTES - total,
+                bundle=bundle,
+                checkpoint=checkpoint,
+            )
+            checkpoint()
+            total += logical_bytes
+            if total > _MAX_SCAN_DATA_BYTES:
+                raise AssertionError("scan-data reader exceeded its allowance")
+            columns[key] = column
+        bundle.pending_scan_data_columns = columns
+        return columns
+
+    def _scalar_metadata_for_frame(
+        self,
+        frame: int,
+        columns: Mapping[str, np.ndarray],
+    ) -> dict[str, object]:
+        row = self._row(self._map_scan_data, frame)
+        if row is None:
+            return {}
+        metadata: dict[str, object] = {}
+        for key, column in columns.items():
+            if not 0 <= row < int(column.shape[0]):
+                raise ValueError(f"scan-data row for frame {frame} is out of range")
+            value = column[row]
+            scalar = np.asarray(value)
+            if scalar.shape != ():
+                raise ValueError(f"scan-data value {key!r} is not scalar")
+            metadata[key] = _decode(scalar.item())
+        return metadata
+
+    def _thumbnail_fact_for_frame(self, frame: int) -> tuple[bool, bool]:
+        """Qualify thumbnail structure and mask fact without reading pixels."""
+
+        frames = self._frames
+        if frames is None:
+            return False, False
+        frame_name = f"frame_{frame:04d}"
+        group = _required_direct_group(
+            frames, frame_name, role=f"{frames.name}/{frame_name}",
+        )
+        if group is None:
+            return False, False
+        thumbnail = _required_direct_dataset(
+            group, "thumbnail", role=f"{group.name}/thumbnail",
+        )
+        if thumbnail is None:
+            return False, False
+        if (
+            thumbnail.ndim != 2
+            or not all(1 <= int(part) <= 256 for part in thumbnail.shape)
+            or thumbnail.dtype not in {np.dtype(np.uint8), np.dtype(np.uint16)}
+            or int(thumbnail.size) * int(thumbnail.dtype.itemsize)
+            > 256 * 256 * 2
+        ):
+            raise ValueError(f"{thumbnail.name} is not a bounded thumbnail")
+        mask_baked = _bounded_bool_attr(
+            thumbnail,
+            "mask_baked",
+            role=f"{thumbnail.name} mask marker",
+        )
+        return True, True if mask_baked is None else mask_baked
+
+    def read_scalar_catalog(
+        self,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> FrameScalarCatalog:
+        """Read one array-free all-frame catalog with atomic cache effects."""
+
+        self._require_reader_open()
+        if cancelled is not None and not callable(cancelled):
+            raise TypeError("cancelled must be callable or None")
+        with _ReaderArrayBundle(self) as bundle:
+
+            def checkpoint() -> None:
+                if cancelled is None:
+                    return
+                decision = bundle._callback(cancelled)
+                if type(decision) is not bool:
+                    raise TypeError("cancelled must return an exact boolean")
+                if decision:
+                    raise InterruptedError("Frame scalar catalog read cancelled")
+
+            checkpoint()
+            if self.target_frame is not None:
+                raise ValueError(
+                    "Frame scalar catalog requires a full-inventory reader"
+                )
+            lower_bound, column_count, mode_memberships = bundle._callback(
+                self._scalar_catalog_projection_counts,
+            )
+            axis_descriptor_count = len(self._axis_1d_modes)
+            _validate_scalar_catalog_projection(
+                label_count=lower_bound,
+                metadata_column_count=column_count,
+                mode_membership_count=mode_memberships,
+                axis_descriptor_count=axis_descriptor_count,
+            )
+            labels = bundle._callback(self._scalar_catalog_inventory)
+            _validate_scalar_catalog_projection(
+                label_count=len(labels),
+                metadata_column_count=column_count,
+                mode_membership_count=mode_memberships,
+                axis_descriptor_count=axis_descriptor_count,
+            )
+            axes_1d = tuple(
+                (mode, axis.label, axis.unit, axis.log)
+                for mode, axis in self._axis_1d_modes.items()
+            )
+            columns = self._scalar_catalog_scan_columns(bundle, checkpoint)
+            rows: list[FrameScalarRow] = []
+            for label in labels:
+                checkpoint()
+                metadata = self._scalar_metadata_for_frame(label, columns)
+                geometry = bundle._callback(
+                    self._scalar_catalog_geometry_for_frame, label,
+                )
+                source_path, source_index = bundle._callback(
+                    self._persisted_source_for_frame, label,
+                )
+                has_thumbnail, mask_baked = bundle._callback(
+                    self._thumbnail_fact_for_frame, label,
+                )
+                modes_1d = tuple(
+                    mode
+                    for mode, mode_map in self._map_1d_modes.items()
+                    if label in mode_map
+                )
+                modes_2d = tuple(
+                    mode
+                    for mode, mode_map in self._map_2d_modes.items()
+                    if label in mode_map
+                )
+                active_1d = (
+                    self._primary_mode_1d
+                    if self._primary_mode_1d in modes_1d else None
+                )
+                active_2d = (
+                    self._primary_mode_2d
+                    if self._primary_mode_2d in modes_2d else None
+                )
+                kinds = tuple(
+                    (mode, self._two_d_kind_modes[mode])
+                    for mode in modes_2d
+                )
+                rows.append(bundle._callback(
+                    FrameScalarRow,
+                    label=label,
+                    metadata_raw=metadata,
+                    geometry=geometry,
+                    source_path=source_path,
+                    source_frame_index=source_index,
+                    has_thumbnail=has_thumbnail,
+                    mask_baked=mask_baked,
+                    modes_1d=modes_1d,
+                    modes_2d=modes_2d,
+                    active_mode_1d=active_1d,
+                    active_mode_2d=active_2d,
+                    two_d_kinds=kinds,
+                ))
+                checkpoint()
+            checkpoint()
+            catalog = bundle._callback(
+                FrameScalarCatalog,
+                artifact_path=str(self.path),
+                entry=self.entry_name,
+                rows=tuple(rows),
+                axes_1d=axes_1d,
+            )
+            checkpoint()
+            bundle.finish()
+            return catalog
+
+    def _preflight_1d_rows(
+        self,
+        labels: tuple[int, ...],
+        bundle: _ReaderArrayBundle,
+        checkpoint: Callable[[], None],
+    ) -> tuple[_Frame1DReadModePlan, ...]:
+        """Freeze an exact bounded row route without reading row payloads."""
+
+        _validate_1d_result_projection(
+            label_count=len(labels),
+            membership_count=0,
+            root_count=0,
+            projected_bytes=0,
+        )
+        axis_roots: list[object] = []
+        axis_bytes = 0
+        row_roots: dict[tuple[int, int], int] = {}
+        row_bytes_total = 0
+        membership_count = 0
+        plans: list[_Frame1DReadModePlan] = []
+
+        for mode, group in self._g1_modes.items():
+            checkpoint()
+            axis = self._axis_1d_modes[mode]
+            if axis.values is None:
+                raise ValueError(f"1-D mode {mode!r} has no sampled axis")
+            axis_fact = bundle._callback(physical_root_fact, axis.values)
+            if not any(axis_fact.root is root for root in axis_roots):
+                axis_roots.append(axis_fact.root)
+                axis_bytes += axis_fact.nbytes
+
+            points = int(axis.values.size)
+            def qualify_mode_nodes() -> tuple[
+                h5py.Dataset, h5py.Dataset | None, int,
+            ]:
+                intensity = _qualify_1d_stack(
+                    group,
+                    _required_direct_dataset(
+                        group,
+                        "intensity",
+                        role=f"{group.name}/intensity",
+                    ),
+                    points=points,
+                    role="intensity",
+                )
+                sigma = _required_direct_dataset(
+                    group, "sigma", role=f"{group.name}/sigma",
+                )
+                if sigma is not None:
+                    sigma = _qualify_1d_stack(
+                        group, sigma, points=points, role="sigma",
+                    )
+                return intensity, sigma, int(intensity.shape[0])
+
+            intensity_node, sigma_node, row_count = bundle._callback(
+                qualify_mode_nodes,
+            )
+
+            datasets = (intensity_node,) + (
+                () if sigma_node is None else (sigma_node,)
+            )
+            def dataset_addresses() -> tuple[int, ...]:
+                addresses: list[int] = []
+                for dataset in datasets:
+                    try:
+                        address = int(h5py.h5o.get_info(dataset.id).addr)
+                    except (
+                        OSError, RuntimeError, TypeError, ValueError,
+                    ) as error:
+                        raise ValueError(
+                            f"{dataset.name} object identity is unavailable"
+                        ) from error
+                    if address < 0:
+                        raise ValueError(
+                            f"{dataset.name} object identity is invalid"
+                        )
+                    addresses.append(address)
+                return tuple(addresses)
+
+            addresses = bundle._callback(dataset_addresses)
+            mode_rows: list[tuple[int, int]] = []
+            mode_map = self._map_1d_modes[mode]
+            for label in labels:
+                checkpoint()
+                row = mode_map.get(label)
+                if row is None:
+                    continue
+                if type(row) is not int or row < 0 or row >= row_count:
+                    raise ValueError(f"1-D mode {mode!r} row route is invalid")
+                membership_count += 1
+                if membership_count > _MAX_1D_RESULT_MEMBERSHIPS:
+                    _validate_1d_result_projection(
+                        label_count=len(labels),
+                        membership_count=membership_count,
+                        root_count=len(axis_roots) + len(row_roots),
+                        projected_bytes=axis_bytes + row_bytes_total,
+                    )
+                mode_rows.append((label, row))
+                for address in addresses:
+                    key = (address, row)
+                    prior_bytes = row_roots.get(key)
+                    row_bytes = points * int(np.dtype(np.float64).itemsize)
+                    if prior_bytes is None:
+                        row_roots[key] = row_bytes
+                        row_bytes_total += row_bytes
+                    elif prior_bytes != row_bytes:
+                        raise ValueError("1-D aliased row projection is inconsistent")
+                    _validate_1d_result_projection(
+                        label_count=len(labels),
+                        membership_count=membership_count,
+                        root_count=len(axis_roots) + len(row_roots),
+                        projected_bytes=axis_bytes + row_bytes_total,
+                    )
+            plans.append(bundle._callback(
+                _Frame1DReadModePlan,
+                mode,
+                group,
+                axis,
+                tuple(mode_rows),
+                sigma_node is not None,
+            ))
+            checkpoint()
+
+        _validate_1d_result_projection(
+            label_count=len(labels),
+            membership_count=membership_count,
+            root_count=len(axis_roots) + len(row_roots),
+            projected_bytes=axis_bytes + row_bytes_total,
+        )
+        checkpoint()
+        return tuple(plans)
+
+    def read_1d_rows(
+        self,
+        labels: tuple[int, ...],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Frame1DRows:
+        """Read requested persisted 1-D rows without broad frame hydration.
+
+        One atomic reader bundle owns every row read.  The method deliberately
+        does not project metadata, geometry, source locators, thumbnails, or
+        2-D results; its returned arrays are transferred as immutable caller
+        payload only after the bundle settles.
+        """
+
+        self._require_reader_open()
+        if type(labels) is not tuple or not labels:
+            raise TypeError("labels must be a nonempty exact tuple")
+        if len(labels) > _MAX_1D_RESULT_LABELS:
+            raise ValueError("1-D row selection exceeds limit")
+        selected: list[int] = []
+        previous = -1
+        for label in labels:
+            if type(label) is not int or label < 0:
+                raise TypeError("labels must contain exact nonnegative integers")
+            if label <= previous:
+                raise ValueError("labels must be strictly increasing")
+            selected.append(label)
+            previous = label
+        selected_labels = tuple(selected)
+        if cancelled is not None and not callable(cancelled):
+            raise TypeError("cancelled must be callable or None")
+        if self.target_frame is not None:
+            raise ValueError("1-D rows require a full-inventory reader")
+
+        with _ReaderArrayBundle(self) as bundle:
+
+            def checkpoint() -> None:
+                if cancelled is None:
+                    return
+                decision = bundle._callback(cancelled)
+                if type(decision) is not bool:
+                    raise TypeError("cancelled must return an exact boolean")
+                if decision:
+                    raise InterruptedError("Frame 1-D row read cancelled")
+
+            checkpoint()
+            mode_plans = self._preflight_1d_rows(
+                selected_labels, bundle, checkpoint,
+            )
+            checkpoint()
+            mode_results: list[Frame1DModeRows] = []
+            for plan in mode_plans:
+                checkpoint()
+                mode = plan.mode
+                group = plan.group
+                axis = plan.axis
+                points = int(axis.values.size)
+                mode_labels: list[int] = []
+                intensities: list[np.ndarray] = []
+                sigmas: list[np.ndarray] | None = (
+                    [] if plan.has_sigma else None
+                )
+                for label, row in plan.rows:
+                    checkpoint()
+                    intensity = _read_1d_row(
+                        group,
+                        "intensity",
+                        row,
+                        points=points,
+                        bundle=bundle,
+                    )
+                    checkpoint()
+                    sigma = None
+                    if plan.has_sigma:
+                        sigma = _read_1d_row(
+                            group,
+                            "sigma",
+                            row,
+                            points=points,
+                            bundle=bundle,
+                        )
+                        checkpoint()
+                    mode_labels.append(label)
+                    intensities.append(intensity)
+                    if sigmas is not None:
+                        if sigma is None:
+                            raise AssertionError("qualified sigma row is unavailable")
+                        sigmas.append(sigma)
+                mode_results.append(bundle._callback(
+                    Frame1DModeRows,
+                    mode=mode,
+                    axis=axis,
+                    labels=tuple(mode_labels),
+                    intensity_rows=tuple(intensities),
+                    sigma_rows=None if sigmas is None else tuple(sigmas),
+                ))
+                checkpoint()
+
+            present_modes = tuple(result.mode for result in mode_results)
+            primary_mode = (
+                self._primary_mode_1d
+                if self._primary_mode_1d in present_modes else None
+            )
+            result = bundle._callback(
+                Frame1DRows,
+                artifact_path=str(self.path),
+                entry=self.entry_name,
+                labels=selected_labels,
+                modes=tuple(mode_results),
+                primary_mode=primary_mode,
+            )
+            checkpoint()
+            bundle.finish()
+            return result
 
     def has_frame(self, frame: int) -> bool:
         """Whether one exact frame has any persisted processed record."""
+        state = self._require_reader_open()
         frame = int(frame)
         maps = (self._map_1d, self._map_2d, self._map_geom, self._map_scan_data,
                 *self._map_1d_modes.values(), *self._map_2d_modes.values())
         if any(frame in mapping for mapping in maps):
+            self._revalidate_reader_open(state)
             return True
         record = (
             None
             if self._frames is None
             else _direct_group(self._frames, f"frame_{frame:04d}")
         )
-        return bool(record is not None and len(record))
+        result = bool(record is not None and len(record))
+        self._revalidate_reader_open(state)
+        return result
 
-    def _metadata_for_frame(self, frame: int) -> dict[str, object]:
+    def _metadata_for_frame(
+        self, frame: int, *, bundle: _ReaderArrayBundle,
+    ) -> dict[str, object]:
         row = self._row(self._map_scan_data, frame)
         group = self._scan_data
         if row is None or group is None:
@@ -899,7 +4187,14 @@ class FrameViewReader:
                 if np.asarray(value).shape == ():
                     out[str(key)] = _decode(np.asarray(value).item())
             return out
-        cols = self._scan_data_columns
+        retained_cols = self._bundle_scan_data_columns(
+            bundle._marker, bundle._owner,
+        )
+        cols = (
+            retained_cols
+            if retained_cols is not None
+            else bundle.pending_scan_data_columns
+        )
         if cols is None:
             # Read each scan_data column ONCE per open, then slice by row —
             # not once per (frame, column).  read_frame_views() loops every
@@ -912,12 +4207,13 @@ class FrameViewReader:
                     item,
                     role=f"{group.name}/{key}",
                     allowance_bytes=_MAX_SCAN_DATA_BYTES - total,
+                    bundle=bundle,
                 )
                 total += logical_bytes
                 if total > _MAX_SCAN_DATA_BYTES:  # defensive contract check
                     raise AssertionError("scan-data reader exceeded its allowance")
                 cols[str(key)] = column
-            self._scan_data_columns = cols
+            bundle.pending_scan_data_columns = cols
         out: dict[str, object] = {}
         for key, arr in cols.items():
             try:
@@ -962,8 +4258,29 @@ class FrameViewReader:
             incident_angle=read_scalar("incident_angle"),
         )
 
+    def _scalar_catalog_geometry_for_frame(
+        self, frame: int,
+    ) -> FrameGeometry | None:
+        geometry = self._geometry_for_frame(frame)
+        if geometry is None:
+            return None
+
+        def finite_or_none(value: float | None) -> float | None:
+            return value if value is not None and math.isfinite(value) else None
+
+        return FrameGeometry(
+            rot1=finite_or_none(geometry.rot1),
+            rot2=finite_or_none(geometry.rot2),
+            rot3=finite_or_none(geometry.rot3),
+            incident_angle=finite_or_none(geometry.incident_angle),
+        )
+
     def _thumbnail_for_frame(
-        self, frame: int, *, include_data: bool = True,
+        self,
+        frame: int,
+        *,
+        include_data: bool = True,
+        bundle: _ReaderArrayBundle,
     ) -> tuple[np.ndarray | None, bool]:
         frames = self._frames
         if not self.include_thumbnail or frames is None:
@@ -985,11 +4302,16 @@ class FrameViewReader:
             role=f"{thumbnail.name} mask marker",
         )
         return (
-            _read_thumbnail(fg, thumbnail) if include_data else None,
+            _read_thumbnail(fg, thumbnail, bundle=bundle)
+            if include_data else None,
             True if mask_baked is None else mask_baked,
         )
 
-    def _source_for_frame(self, frame: int) -> tuple[str | None, int | None]:
+    def _persisted_source_for_frame(
+        self, frame: int,
+    ) -> tuple[str | None, int | None]:
+        """Read the exact persisted locator without mutable path resolution."""
+
         frames = self._frames
         if frames is None:
             return None, None
@@ -1010,21 +4332,11 @@ class FrameViewReader:
             src, "path", role=f"{src.name}/path",
         )
         if path_node is not None:
-            stored = _bounded_utf8_scalar(
+            path = _bounded_utf8_scalar(
                 path_node,
                 role=f"{src.name}/path",
                 max_bytes=_MAX_SOURCE_PATH_BYTES,
             )
-            if not self.resolve_source:
-                path = stored
-            else:
-                # Resolve for normal FrameView consumers; FramePreview asks for
-                # the exact persisted locator and performs its own bounded read.
-                from xrd_tools.io.read import resolve_source_master
-                resolved = resolve_source_master(
-                    stored, scan_file=self.path,
-                    source_base=self._source_base, source_root=self.source_root)
-                path = str(resolved) if resolved is not None else stored
         source_index_node = _required_direct_dataset(
             src, "frame_index", role=f"{src.name}/frame_index",
         )
@@ -1035,16 +4347,36 @@ class FrameViewReader:
             )
         return path, source_idx
 
+    def _source_for_frame(self, frame: int) -> tuple[str | None, int | None]:
+        stored, source_idx = self._persisted_source_for_frame(frame)
+        if stored is None or not self.resolve_source:
+            return stored, source_idx
+        # Resolution remains selected-frame hydration policy.  Scalar catalogs
+        # deliberately use _persisted_source_for_frame and never consult the
+        # mutable filesystem.
+        from xrd_tools.io.read import resolve_source_master
+        resolved = resolve_source_master(
+            stored,
+            scan_file=self.path,
+            source_base=self._source_base,
+            source_root=self.source_root,
+        )
+        return str(resolved) if resolved is not None else stored, source_idx
+
     def _common_fields(
-        self, frame: int, *, include_heavy: bool = True,
+        self,
+        frame: int,
+        *,
+        include_heavy: bool = True,
+        bundle: _ReaderArrayBundle,
     ) -> dict:
         """Shared per-frame fields (thumbnail/source/metadata/geometry) — the
         same for every mode of one frame."""
         thumbnail, mask_baked = self._thumbnail_for_frame(
-            frame, include_data=include_heavy,
+            frame, include_data=include_heavy, bundle=bundle,
         )
         source_path, source_frame_index = self._source_for_frame(frame)
-        metadata_raw = self._metadata_for_frame(frame)
+        metadata_raw = self._metadata_for_frame(frame, bundle=bundle)
         geometry = self._geometry_for_frame(frame)
         incident = None if geometry is None else geometry.incident_angle
         return dict(
@@ -1062,61 +4394,84 @@ class FrameViewReader:
         primary).  An unknown/absent mode leaves that dimension empty (same as
         a frame with no row).  On a single-mode/old file both default to the
         ``DEFAULT_MODE_KEY`` top-level slot ⇒ behaviour is unchanged."""
+        self._require_reader_open()
         frame = int(frame)
-        m1 = mode_1d if mode_1d is not None else self._primary_mode_1d
-        m2 = mode_2d if mode_2d is not None else self._primary_mode_2d
-        g1 = self._g1_modes.get(m1)
-        g2 = self._g2_modes.get(m2)
-        row_1d = self._row(self._map_1d_modes.get(m1, {}), frame)
-        row_2d = self._row(self._map_2d_modes.get(m2, {}), frame)
+        with _ReaderArrayBundle(self) as bundle:
+            m1 = mode_1d if mode_1d is not None else self._primary_mode_1d
+            m2 = mode_2d if mode_2d is not None else self._primary_mode_2d
+            g1 = self._g1_modes.get(m1)
+            g2 = self._g2_modes.get(m2)
+            row_1d = self._row(self._map_1d_modes.get(m1, {}), frame)
+            row_2d = self._row(self._map_2d_modes.get(m2, {}), frame)
 
-        intensity_1d = sigma_1d = None
-        if row_1d is not None and g1 is not None:
-            points = int(self._axis_1d_modes[m1].values.size)
-            intensity_1d = _read_1d_row(
-                g1, "intensity", row_1d, points=points,
-            )
-            if _required_direct_dataset(
-                g1, "sigma", role=f"{g1.name}/sigma",
-            ) is not None:
-                sigma_1d = _read_1d_row(
-                    g1, "sigma", row_1d, points=points,
+            intensity_1d = sigma_1d = None
+            if row_1d is not None and g1 is not None:
+                points = int(self._axis_1d_modes[m1].values.size)
+                intensity_1d = _read_1d_row(
+                    g1,
+                    "intensity",
+                    row_1d,
+                    points=points,
+                    bundle=bundle,
                 )
+                if _required_direct_dataset(
+                    g1, "sigma", role=f"{g1.name}/sigma",
+                ) is not None:
+                    sigma_1d = _read_1d_row(
+                        g1,
+                        "sigma",
+                        row_1d,
+                        points=points,
+                        bundle=bundle,
+                    )
 
-        intensity_2d = sigma_2d = None
-        if row_2d is not None and g2 is not None:
-            q_points = int(self._axis_2d_x_modes[m2].values.size)
-            chi_points = int(self._axis_2d_y_modes[m2].values.size)
-            intensity_2d = _read_2d_row(
-                g2,
-                "intensity",
-                row_2d,
-                q_points=q_points,
-                chi_points=chi_points,
-            )
-            if _required_direct_dataset(
-                g2, "sigma", role=f"{g2.name}/sigma",
-            ) is not None:
-                sigma_2d = _read_2d_row(
+            intensity_2d = sigma_2d = None
+            if row_2d is not None and g2 is not None:
+                q_points = int(self._axis_2d_x_modes[m2].values.size)
+                chi_points = int(self._axis_2d_y_modes[m2].values.size)
+                intensity_2d = _read_2d_row(
                     g2,
-                    "sigma",
+                    "intensity",
                     row_2d,
                     q_points=q_points,
                     chi_points=chi_points,
+                    bundle=bundle,
                 )
+                if _required_direct_dataset(
+                    g2, "sigma", role=f"{g2.name}/sigma",
+                ) is not None:
+                    sigma_2d = _read_2d_row(
+                        g2,
+                        "sigma",
+                        row_2d,
+                        q_points=q_points,
+                        chi_points=chi_points,
+                        bundle=bundle,
+                    )
 
-        return FrameView(
-            label=frame,
-            axis_1d=self._axis_1d_modes.get(m1) if intensity_1d is not None else None,
-            intensity_1d=intensity_1d,
-            sigma_1d=sigma_1d,
-            axis_2d_x=self._axis_2d_x_modes.get(m2) if intensity_2d is not None else None,
-            axis_2d_y=self._axis_2d_y_modes.get(m2) if intensity_2d is not None else None,
-            intensity_2d=intensity_2d,
-            sigma_2d=sigma_2d,
-            two_d_kind=self._two_d_kind_modes.get(m2, TwoDKind.Q_CHI),
-            **self._common_fields(frame),
-        )
+            view = FrameView(
+                label=frame,
+                axis_1d=(
+                    self._axis_1d_modes.get(m1)
+                    if intensity_1d is not None else None
+                ),
+                intensity_1d=intensity_1d,
+                sigma_1d=sigma_1d,
+                axis_2d_x=(
+                    self._axis_2d_x_modes.get(m2)
+                    if intensity_2d is not None else None
+                ),
+                axis_2d_y=(
+                    self._axis_2d_y_modes.get(m2)
+                    if intensity_2d is not None else None
+                ),
+                intensity_2d=intensity_2d,
+                sigma_2d=sigma_2d,
+                two_d_kind=self._two_d_kind_modes.get(m2, TwoDKind.Q_CHI),
+                **self._common_fields(frame, bundle=bundle),
+            )
+            bundle.finish()
+            return view
 
     def _view_for(
         self,
@@ -1126,6 +4481,7 @@ class FrameViewReader:
         *,
         include_heavy: bool = True,
         common: dict | None = None,
+        bundle: _ReaderArrayBundle,
     ) -> "FrameView | None":
         """Dimension-pure :class:`FrameView` for one ``(dim, mode)``, or ``None``
         if absent.  Shared per-frame fields are included so a record's per-dim
@@ -1141,15 +4497,21 @@ class FrameViewReader:
                 g, "sigma", role=f"{g.name}/sigma",
             )
             sig = (
-                _read_1d_row(g, "sigma", row, points=points)
+                _read_1d_row(
+                    g, "sigma", row, points=points, bundle=bundle,
+                )
                 if sigma_node is not None else None
             )
             return FrameView(
                 label=frame, axis_1d=self._axis_1d_modes.get(mode),
                 intensity_1d=_read_1d_row(
-                    g, "intensity", row, points=points,
+                    g, "intensity", row, points=points, bundle=bundle,
                 ), sigma_1d=sig,
-                **(common if common is not None else self._common_fields(frame)),
+                **(
+                    common
+                    if common is not None
+                    else self._common_fields(frame, bundle=bundle)
+                ),
             )
         g = self._g2_modes.get(mode)
         row = self._row(self._map_2d_modes.get(mode, {}), frame)
@@ -1167,6 +4529,7 @@ class FrameViewReader:
                 row,
                 q_points=q_points,
                 chi_points=chi_points,
+                bundle=bundle,
             )
             if include_heavy and sigma_node is not None else None
         )
@@ -1180,6 +4543,7 @@ class FrameViewReader:
                     row,
                     q_points=q_points,
                     chi_points=chi_points,
+                    bundle=bundle,
                 )
                 if include_heavy else None
             ),
@@ -1188,27 +4552,44 @@ class FrameViewReader:
             **(
                 common
                 if common is not None
-                else self._common_fields(frame, include_heavy=include_heavy)
+                else self._common_fields(
+                    frame, include_heavy=include_heavy, bundle=bundle,
+                )
             ),
         )
 
     def modes_1d(self) -> tuple:
         """GI 1D mode_keys present (primary first)."""
-        return tuple(self._g1_modes)
+        state = self._require_reader_open()
+        result = tuple(self._g1_modes)
+        self._revalidate_reader_open(state)
+        return result
 
     def modes_2d(self) -> tuple:
         """GI 2D mode_keys present (primary first)."""
-        return tuple(self._g2_modes)
+        state = self._require_reader_open()
+        result = tuple(self._g2_modes)
+        self._revalidate_reader_open(state)
+        return result
 
     def primary_mode_1d(self) -> str:
-        return self._primary_mode_1d
+        state = self._require_reader_open()
+        result = self._primary_mode_1d
+        self._revalidate_reader_open(state)
+        return result
 
     def primary_mode_2d(self) -> str:
-        return self._primary_mode_2d
+        state = self._require_reader_open()
+        result = self._primary_mode_2d
+        self._revalidate_reader_open(state)
+        return result
 
     def is_multi_mode(self) -> bool:
         """True if the file carries the per-mode capability marker."""
-        return self._multi_result_modes
+        state = self._require_reader_open()
+        result = self._multi_result_modes
+        self._revalidate_reader_open(state)
+        return result
 
     def read_record(
         self, frame: int, *, include_heavy: bool = True,
@@ -1223,30 +4604,52 @@ class FrameViewReader:
         long-scan Browse projection its full cheap trace membership without
         eagerly reading detector/cake payloads that only the current frame
         needs."""
+        self._require_reader_open()
         frame = int(frame)
-        common = self._common_fields(frame, include_heavy=include_heavy)
-        r1d: dict = {}
-        r2d: dict = {}
-        for m in self.modes_1d():
-            v = self._view_for(frame, "1d", m, common=common)
-            if v is not None and v.has_1d:
-                r1d[m] = v
-        for m in self.modes_2d():
-            v = self._view_for(
-                frame, "2d", m,
-                include_heavy=include_heavy,
-                common=common,
+        with _ReaderArrayBundle(self) as bundle:
+            common = self._common_fields(
+                frame, include_heavy=include_heavy, bundle=bundle,
             )
-            if v is not None and (include_heavy is False or v.has_2d):
-                r2d[m] = v
-        a1 = self._primary_mode_1d if self._primary_mode_1d in r1d else next(
-            iter(r1d), DEFAULT_MODE_KEY)
-        a2 = self._primary_mode_2d if self._primary_mode_2d in r2d else next(
-            iter(r2d), DEFAULT_MODE_KEY)
-        return FrameRecord(
-            label=frame, results_1d=r1d, results_2d=r2d,
-            active_mode_1d=a1, active_mode_2d=a2,
-        )
+            r1d: dict = {}
+            r2d: dict = {}
+            for mode in tuple(self._g1_modes):
+                view = self._view_for(
+                    frame, "1d", mode, common=common, bundle=bundle,
+                )
+                if view is not None and view.has_1d:
+                    r1d[mode] = view
+            for mode in tuple(self._g2_modes):
+                view = self._view_for(
+                    frame,
+                    "2d",
+                    mode,
+                    include_heavy=include_heavy,
+                    common=common,
+                    bundle=bundle,
+                )
+                if view is not None and (
+                    include_heavy is False or view.has_2d
+                ):
+                    r2d[mode] = view
+            a1 = (
+                self._primary_mode_1d
+                if self._primary_mode_1d in r1d
+                else next(iter(r1d), DEFAULT_MODE_KEY)
+            )
+            a2 = (
+                self._primary_mode_2d
+                if self._primary_mode_2d in r2d
+                else next(iter(r2d), DEFAULT_MODE_KEY)
+            )
+            record = FrameRecord(
+                label=frame,
+                results_1d=r1d,
+                results_2d=r2d,
+                active_mode_1d=a1,
+                active_mode_2d=a2,
+            )
+            bundle.finish()
+            return record
 
 
 def read_frame_view(

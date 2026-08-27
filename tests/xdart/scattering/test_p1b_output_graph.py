@@ -730,6 +730,236 @@ def test_p1b_b02_overwrite_native_durable_terminal(
         admission_executor.cancel_admission(large_token)
 
 
+def test_persisted_catalog_seed_requires_exact_monotonic_work_ordinal() -> None:
+    from xdart.gui.tabs.scattering.display_catalog import DisplayCatalogIndex
+
+    catalog = DisplayCatalogIndex(
+        RunIdentity(1, "persisted-ordinal-contract"), max_items=2,
+    )
+    for arguments in (
+        (None, "/out/a.nxs", 1, 10),
+        ("", "/out/a.nxs", 1, 10),
+        ("scan", None, 1, 10),
+        ("scan", "", 1, 10),
+        ("scan", "/out/a.nxs", True, 10),
+        ("scan", "/out/a.nxs", 1.0, 10),
+    ):
+        with pytest.raises(TypeError):
+            catalog.seed_at_work_ordinal(*arguments)
+        assert catalog.entries == ()
+    for invalid, error in (
+        (True, TypeError),
+        (1.0, TypeError),
+        (0, ValueError),
+        (-1, ValueError),
+    ):
+        with pytest.raises(error):
+            catalog.seed_at_work_ordinal("scan", "/out/a.nxs", 1, invalid)
+        assert catalog.entries == ()
+
+    first = catalog.seed_at_work_ordinal(
+        "scan", "/out/a.nxs", 1, 10,
+    ).appended
+    reused = catalog.seed_at_work_ordinal(
+        "scan", "/out/a.nxs", 1, 10,
+    )
+    assert reused.appended is first
+    assert reused.retired == ()
+    prior = catalog.entries
+    with pytest.raises(ValueError, match="source scan conflicts"):
+        catalog.seed_at_work_ordinal("foreign", "/out/a.nxs", 1, 10)
+    with pytest.raises(ValueError, match="conflicts"):
+        catalog.seed_at_work_ordinal("scan", "/out/a.nxs", 1, 11)
+    with pytest.raises(ValueError, match="advance high-water"):
+        catalog.seed_at_work_ordinal("scan", "/out/a.nxs", 2, 9)
+    assert catalog.entries == prior
+    assert catalog.resolve_exact("/out/a.nxs", 1) is first
+
+    second = catalog.seed_at_work_ordinal(
+        "scan", "/out/a.nxs", 2, 12,
+    ).appended
+    seeded_third = catalog.seed_at_work_ordinal(
+        "scan", "/out/a.nxs", 3, 13,
+    )
+    assert seeded_third.retired == (first,)
+    assert catalog.resolve(first) is None
+    live = catalog.append("scan", "/out/a.nxs", 4).appended
+    assert second.work_ordinal == 12
+    assert seeded_third.appended.work_ordinal == 13
+    assert live.work_ordinal == 14
+    assert catalog.entries == (seeded_third.appended, live)
+
+    label_contract = DisplayCatalogIndex(
+        RunIdentity(1, "persisted-label-contract"), max_items=1,
+    )
+    negative = label_contract.seed_at_work_ordinal(
+        "scan", "/out/negative.nxs", -1, 1,
+    ).appended
+    assert negative.local_frame_label == -1
+
+
+def test_persisted_catalog_prefix_preflight_is_atomic() -> None:
+    from xdart.gui.tabs.scattering.display_catalog import DisplayCatalogIndex
+
+    catalog = DisplayCatalogIndex(
+        RunIdentity(1, "persisted-prefix-atomic"), max_items=2,
+    )
+    catalog.seed_many_at_work_ordinals((
+        ("scan", "/out/a.nxs", 1, 10),
+        ("scan", "/out/a.nxs", 2, 11),
+    ))
+
+    def exact_state():
+        return (
+            catalog.entries,
+            catalog._work_ordinal,
+            tuple((key, id(value)) for key, value in catalog._exact.items()),
+            tuple(
+                (key, id(value))
+                for key, value in catalog._by_value.items()
+            ),
+        )
+
+    prior = exact_state()
+    cases = (
+        (
+            (
+                ("scan", "/out/a.nxs", 3, 12),
+                ("scan", "/out/a.nxs", 4, 11),
+            ),
+            "advance high-water",
+        ),
+        (
+            (
+                ("scan", "/out/a.nxs", 3, 12),
+                ("scan", "/out/a.nxs", 3, 12),
+            ),
+            "duplicate",
+        ),
+    )
+    for rows, message in cases:
+        with pytest.raises(ValueError, match=message):
+            catalog.seed_many_at_work_ordinals(rows)
+        assert exact_state() == prior
+
+    with pytest.raises(TypeError, match="exact integer"):
+        catalog.seed_many_at_work_ordinals((
+            ("scan", "/out/a.nxs", 3, 12),
+            ("scan", "/out/a.nxs", True, 13),
+        ))
+    assert exact_state() == prior
+
+
+@pytest.mark.parametrize(
+    ("capacity", "expected_labels", "expected_ordinals"),
+    (
+        (3, (103, 104, 105), (10, 11, 12)),
+        (5, (101, 102, 103, 104, 105), (8, 9, 10, 11, 12)),
+        (8, (101, 102, 103, 104, 105), (8, 9, 10, 11, 12)),
+    ),
+    ids=("shorter", "equal", "larger"),
+)
+def test_executor_persisted_prefix_seeds_absolute_run_ordinals(
+    capacity: int,
+    expected_labels: tuple[int, ...],
+    expected_ordinals: tuple[int, ...],
+) -> None:
+    from xdart.gui.tabs.scattering.display_runtime import RunDisplayState
+
+    display = RunDisplayState(
+        RunIdentity(1, f"persisted-prefix-{capacity}"),
+        max_payload_items=1,
+        catalog_max_items=capacity,
+    )
+    artifact = "/processed/series.nexus"
+    owner = SimpleNamespace(source_scan="series", artifact=Path(artifact))
+    run = SimpleNamespace(
+        display=display,
+        completed=7,
+        current_completed=5,
+    )
+    labels = (101, 102, 103, 104, 105)
+    StandardRunExecutor._seed_persisted_prefix_navigation(
+        run, owner, labels, newly_adopted=True,
+    )
+    entries = display.catalog_snapshot().entries
+    assert tuple(key.local_frame_label for key in entries) == expected_labels
+    assert tuple(key.work_ordinal for key in entries) == expected_ordinals
+
+    prior = entries
+    run.current_completed = 4
+    with pytest.raises(ValueError, match="cardinality"):
+        StandardRunExecutor._seed_persisted_prefix_navigation(
+            run, owner, labels, newly_adopted=True,
+        )
+    assert display.catalog_snapshot().entries == prior
+
+    appended = display.append_navigation(
+        owner.source_scan, artifact, 106,
+    ).appended
+    assert appended.work_ordinal == 13
+
+
+@pytest.mark.parametrize(
+    "same_run_labels",
+    ((), (101, 102, 103, 104, 105)),
+    ids=("overwrite-empty-prefix", "append-represented-prefix"),
+)
+def test_executor_prefix_seed_distinguishes_reused_and_new_owner(
+    same_run_labels: tuple[int, ...],
+) -> None:
+    from xdart.gui.tabs.scattering.display_runtime import RunDisplayState
+
+    artifact = "/processed/series.nexus"
+    owner = SimpleNamespace(source_scan="series", artifact=Path(artifact))
+    reused = RunDisplayState(
+        RunIdentity(1, f"same-run-{len(same_run_labels)}"),
+        max_payload_items=1,
+        catalog_max_items=3,
+    )
+    reused.seed_navigation_prefix_at_work_ordinals((
+        (owner.source_scan, artifact, 8, 8),
+        (owner.source_scan, artifact, 9, 9),
+        (owner.source_scan, artifact, 10, 10),
+    ))
+    prior = reused.catalog_snapshot().entries
+    same_run = SimpleNamespace(
+        display=reused,
+        completed=10,
+        current_completed=5,
+    )
+    StandardRunExecutor._seed_persisted_prefix_navigation(
+        same_run,
+        owner,
+        same_run_labels,
+        newly_adopted=False,
+    )
+    assert reused.catalog_snapshot().entries == prior
+    assert reused.append_navigation(
+        owner.source_scan, artifact, 11,
+    ).appended.work_ordinal == 11
+
+    newly_adopted = RunDisplayState(
+        RunIdentity(1, f"cross-run-{len(same_run_labels)}"),
+        max_payload_items=1,
+        catalog_max_items=3,
+    )
+    dormant_noop = SimpleNamespace(
+        display=newly_adopted,
+        completed=7,
+        current_completed=5,
+    )
+    StandardRunExecutor._seed_persisted_prefix_navigation(
+        dormant_noop,
+        owner,
+        (101, 102, 103, 104, 105),
+        newly_adopted=True,
+    )
+    entries = newly_adopted.catalog_snapshot().entries
+    assert tuple(key.local_frame_label for key in entries) == (103, 104, 105)
+    assert tuple(key.work_ordinal for key in entries) == (10, 11, 12)
+
+
 def test_p1b_b03_native_cross_run_append_missing_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -743,14 +973,14 @@ def test_p1b_b03_native_cross_run_append_missing_only(
 
     output_adapters = []
     real_output_adapter = run_executor_module.DynamicOutputAdapter
+    real_output_init = real_output_adapter.__init__
 
-    def observed_output_adapter(configuration):
-        owner = real_output_adapter(configuration)
+    def observed_output_init(owner, configuration):
+        real_output_init(owner, configuration)
         output_adapters.append(owner)
-        return owner
 
     monkeypatch.setattr(
-        run_executor_module, "DynamicOutputAdapter", observed_output_adapter,
+        real_output_adapter, "__init__", observed_output_init,
     )
 
     raw1 = tmp_path / "series_0001.tif"
@@ -1028,33 +1258,50 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     )
     artifact = str(Path("/processed/series.nexus"))
     owner = SimpleNamespace(source_scan="series", artifact=Path(artifact))
-    run = SimpleNamespace(display=display)
-    display.seed_navigation(owner.source_scan, artifact, 999_998)
+    run = SimpleNamespace(
+        display=display,
+        completed=0,
+        current_completed=1_000_000,
+    )
+    display.seed_navigation_at_work_ordinal(
+        owner.source_scan, artifact, 999_998, 999_998,
+    )
 
     calls = []
-    real_seed = display.seed_navigation
+    real_seed = display.seed_navigation_prefix_at_work_ordinals
 
-    def observed_seed(source_scan, target, label):
-        calls.append((source_scan, target, label))
-        return real_seed(source_scan, target, label)
+    def observed_seed(rows):
+        calls.append(rows)
+        return real_seed(rows)
 
-    monkeypatch.setattr(display, "seed_navigation", observed_seed)
+    monkeypatch.setattr(
+        display, "seed_navigation_prefix_at_work_ordinals", observed_seed,
+    )
     StandardRunExecutor._seed_persisted_prefix_navigation(
         run,
         owner,
         tuple(range(1, 1_000_001)),
+        newly_adopted=True,
     )
 
     assert calls == [
-        ("series", artifact, 999_998),
-        ("series", artifact, 999_999),
-        ("series", artifact, 1_000_000),
+        (
+            ("series", artifact, 999_998, 999_998),
+            ("series", artifact, 999_999, 999_999),
+            ("series", artifact, 1_000_000, 1_000_000),
+        ),
     ]
     entries = display.catalog_snapshot().entries
     assert tuple(key.local_frame_label for key in entries) == (
         999_998, 999_999, 1_000_000,
     )
-    assert tuple(key.work_ordinal for key in entries) == (1, 2, 3)
+    assert tuple(key.work_ordinal for key in entries) == (
+        999_998, 999_999, 1_000_000,
+    )
+    appended = display.append_navigation(
+        owner.source_scan, artifact, 1_000_001,
+    ).appended
+    assert appended.work_ordinal == 1_000_001
 
 
 def test_p1b_b04_xye_only_prefix_and_append_envelope(
