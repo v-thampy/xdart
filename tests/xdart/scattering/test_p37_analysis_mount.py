@@ -475,6 +475,159 @@ def test_metadata_first_click_survives_viewer_cleanup_with_same_dialog(
         _close_page(page, qapp)
 
 
+def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
+    monkeypatch, qapp,
+) -> None:
+    from tests.xdart.scattering.test_e3_context_contract import _browse
+    from xdart.modules.display_context import ContextKind, new_context_token
+    import xrd_tools.analysis.scan_operations as scan_operations
+
+    page = _page()
+    request, browse = _browse(
+        new_context_token(ContextKind.BROWSE), 1, scan_key="refresh-scope",
+    )
+    page._context_controller._runtime.adopt_browse(browse, request)
+    page._refresh_shell()
+    table = _table(request.source_path, fingerprint="refresh-table")
+    metadata_entered, metadata_release = Event(), Event()
+    requalification_entered, requalification_release = Event(), Event()
+
+    def run_metadata(plan, *, cancel_token, progress_callback):
+        assert plan.source == request.source_path
+        assert not cancel_token.is_set()
+        progress_callback(1, 2)
+        metadata_entered.set()
+        assert metadata_release.wait(2)
+        progress_callback(2, 2)
+        return table
+
+    def run_requalification(plan, *, cancel_token, progress_callback):
+        assert plan.receipt == table.receipt
+        assert plan.table_fingerprint == table.table_fingerprint
+        assert not cancel_token.is_set()
+        progress_callback(1, 2)
+        requalification_entered.set()
+        assert requalification_release.wait(2)
+        progress_callback(2, 2)
+        return MetadataTableRequalificationResult(
+            AnalysisDisposition.COMPLETED,
+            "OK",
+            table.receipt,
+            table.table_fingerprint,
+        )
+
+    monkeypatch.setattr(
+        scan_operations, "run_metadata_table", run_metadata,
+    )
+    monkeypatch.setattr(
+        scan_operations,
+        "run_metadata_table_requalification",
+        run_requalification,
+    )
+    refreshes = []
+    controls = page._shell.controls
+    original_controls_update = controls.apply_state_update
+    original_controls_set = controls.set_state
+    original_browser = page._shell.browser.reconcile
+    original_heavy_residency = (
+        page._shell.browser.reconcile_heavy_residency
+    )
+    original_scientific = page._shell.scientific.reconcile
+
+    def controls_update(state):
+        refreshes.append("controls")
+        return original_controls_update(state)
+
+    def controls_set(state):
+        refreshes.append("controls-rebuild")
+        return original_controls_set(state)
+
+    def browser_refresh(*args, **kwargs):
+        refreshes.append("browser")
+        return original_browser(*args, **kwargs)
+
+    def heavy_residency_refresh(*args, **kwargs):
+        refreshes.append("browser-heavy-residency")
+        return original_heavy_residency(*args, **kwargs)
+
+    def scientific_refresh(*args, **kwargs):
+        refreshes.append("scientific")
+        return original_scientific(*args, **kwargs)
+
+    monkeypatch.setattr(controls, "apply_state_update", controls_update)
+    monkeypatch.setattr(controls, "set_state", controls_set)
+    monkeypatch.setattr(page._shell.browser, "reconcile", browser_refresh)
+    monkeypatch.setattr(
+        page._shell.browser,
+        "reconcile_heavy_residency",
+        heavy_residency_refresh,
+    )
+    monkeypatch.setattr(
+        page._shell.scientific, "reconcile", scientific_refresh,
+    )
+    initial_fields = tuple(
+        (field.path, field.enabled)
+        for field in controls._bound_state.fields
+    )
+    assert any(enabled for _path, enabled in initial_fields)
+
+    try:
+        page._shell.browser.metadata.click()
+        qapp.processEvents()
+        dialog = page._metadata_dialog
+        assert dialog is not None and dialog.isVisible()
+        assert metadata_entered.wait(2)
+        assert refreshes == ["controls"]
+        assert not any(
+            field.enabled for field in controls._bound_state.fields
+        )
+
+        page._drain_executor()
+        qapp.processEvents()
+        assert page._metadata_dialog is dialog and dialog.isVisible()
+        assert dialog.status.text() == "Analysis: metadata 1/2"
+        assert refreshes == ["controls"]
+
+        metadata_release.set()
+        worker = page._operation_slot._worker
+        assert worker is not None
+        worker.join(2)
+        assert not worker.is_alive()
+        page._drain_executor()
+        qapp.processEvents()
+        assert requalification_entered.wait(2)
+        assert page._metadata_dialog is dialog and dialog.isVisible()
+        assert refreshes == ["controls"]
+
+        page._drain_executor()
+        qapp.processEvents()
+        assert dialog.status.text() == (
+            "Analysis: metadata_requalification 1/2"
+        )
+        assert refreshes == ["controls"]
+
+        requalification_release.set()
+        worker = page._operation_slot._worker
+        assert worker is not None
+        worker.join(2)
+        assert not worker.is_alive()
+        page._drain_executor()
+        qapp.processEvents()
+        assert page._metadata_dialog is dialog and dialog.isVisible()
+        assert page._metadata_result is table
+        assert dialog.table.rowCount() == len(table.labels)
+        assert dialog.status.text() == "OK"
+        assert refreshes == ["controls", "controls"]
+        assert tuple(
+            (field.path, field.enabled)
+            for field in controls._bound_state.fields
+        ) == initial_fields
+    finally:
+        metadata_release.set()
+        requalification_release.set()
+        _close_page(page, qapp)
+
+
 def test_raw_tiff_viewer_metadata_click_uses_auto_sidecar_plan(
     monkeypatch, qapp, tmp_path,
 ) -> None:

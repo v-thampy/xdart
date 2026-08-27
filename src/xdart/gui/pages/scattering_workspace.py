@@ -235,8 +235,29 @@ def _authoring_source_chooser(widget):
                 "*.nexus *.edf *.cbf *.img *.mar3450 *.raw);;All files (*)"
             )
         elif asset == "mask":
-            title = "Choose TIFF for mask"
-            file_filter = "TIFF image (*.tif *.tiff)"
+            from silx.gui.dialog.ImageFileDialog import ImageFileDialog
+
+            dialog = ImageFileDialog(widget)
+            dialog.setWindowTitle(
+                "Choose TIFF or HDF5/NeXus frame for mask")
+            if start_directory:
+                dialog.setDirectory(start_directory)
+            if not dialog.exec():
+                return None
+            selected = dialog.selectedUrl()
+            if type(selected) is not str or not selected:
+                return None
+            try:
+                from silx.io.url import DataUrl
+
+                url = DataUrl(selected)
+                if url.is_valid() and url.scheme() == "fabio":
+                    file_path = url.file_path()
+                    return (file_path if type(file_path) is str
+                            and file_path else None)
+            except Exception:
+                pass
+            return selected
         else:
             return None
         selected, _filter = QtWidgets.QFileDialog.getOpenFileName(

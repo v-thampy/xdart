@@ -11,12 +11,13 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.core import FrameRecord, FrameView
 from xrd_tools.session.intent_store import RunIntentStore
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xrd_tools.sources.selection import image_series_spec
 from xdart.gui.tabs.scattering.contracts import (
     SourceCapture, SourceObservation, SourceObservationRequest, SourceObservationStatus,
 )
 from xdart.gui.tabs.scattering.browser_catalog import BrowserCatalogEntry
+from xdart.gui.tabs.scattering.controls_inventory import INT_1D_AXIS
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import (
     DisplayFrameKey,
@@ -47,6 +48,7 @@ from xdart.gui.tabs.scattering.shell_values import (
     ShellCommand,
     ShellCommandKind,
 )
+from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from xdart.modules.display_context import ContextKind
@@ -3113,5 +3115,105 @@ def test_clean_output_release_projects_pending_display_retirement(
         allow_retirement = True
         page._drain_executor()
         assert page._admission is None
+    finally:
+        _dispose(page, qapp)
+
+
+def test_native_1d_axis_follows_only_the_exact_run_first_paint(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(Path("frame_0001.tif")),
+            poni_file="calibration.poni",
+            save_path="output.nxs",
+            output_mode="Overwrite",
+            processing_mode="Int 2D",
+            bai_1d_args={"unit": "qip_A^-1"},
+            gi=GIIntent(
+                enabled=True,
+                incidence_motor="Manual",
+                mode_1d="q_ip",
+                mode_2d="qip_qoop",
+            ),
+        )),
+        lifecycle=ScatteringCoordinator(),
+        sources=_Sources(),
+        executor=_Executor(),
+    )
+    try:
+        page._preferences = ScientificPreferences(
+            plot_axis="q_ip",
+            share_axis=False,
+        )
+        outgoing = page._preferences
+
+        page._on_field_value(INT_1D_AXIS, "Q")
+        configuration = page._intents.snapshot().thaw().freeze()
+        target = RunIdentity(41, "target-q")
+        wrong = RunIdentity(42, "wrong-q")
+
+        assert page._preferences.plot_axis == outgoing.plot_axis
+        assert page._preferences.share_axis == outgoing.share_axis
+        assert page._preferences.slice_pins == outgoing.slice_pins
+        assert page._native_plot_axis_transition is not None
+        assert (
+            page._native_plot_axis_transition.origin_axis,
+            page._native_plot_axis_transition.target_axis,
+            page._native_plot_axis_transition.run_identity,
+        ) == ("q_ip", "Q", None)
+        assert configuration.gi.mode_1d == "q_total"
+        assert configuration.bai_1d_args["unit"] == "q_A^-1"
+        page._bind_native_plot_axis_to_run(target, configuration)
+        assert not page._consume_native_plot_axis_transition(wrong)
+        assert page._preferences.plot_axis == "q_ip"
+        page._release_native_plot_axis_transition_for_retry(target)
+        assert page._native_plot_axis_transition is not None
+        assert page._native_plot_axis_transition.run_identity is None
+        retry = RunIdentity(45, "retry-q")
+        page._bind_native_plot_axis_to_run(retry, configuration)
+        assert page._consume_native_plot_axis_transition(retry)
+        assert page._preferences.plot_axis == "Q"
+        assert page._native_plot_axis_transition is None
+
+        # A manual preference change after launch is authoritative.
+        page._on_field_value(INT_1D_AXIS, "Qip")
+        configuration = page._intents.snapshot().thaw().freeze()
+        manual_target = RunIdentity(43, "target-qip")
+        page._bind_native_plot_axis_to_run(manual_target, configuration)
+        page._preferences = replace(page._preferences, plot_axis="2theta")
+        assert not page._consume_native_plot_axis_transition(manual_target)
+        assert page._preferences.plot_axis == "2theta"
+
+        # Explicit Share Axis is equally authoritative at first paint.
+        page._preferences = replace(
+            page._preferences,
+            plot_axis="q_ip",
+            share_axis=False,
+        )
+        page._on_field_value(INT_1D_AXIS, "Q")
+        configuration = page._intents.snapshot().thaw().freeze()
+        shared_target = RunIdentity(44, "target-shared-q")
+        page._bind_native_plot_axis_to_run(shared_target, configuration)
+        page._preferences = replace(page._preferences, share_axis=True)
+        assert not page._consume_native_plot_axis_transition(shared_target)
+        assert page._preferences.plot_axis == "q_ip"
+        assert page._preferences.share_axis
+
+        # Normal DISPLAY_READY and the Batch terminal paint use the same
+        # exact-identity transition seam.
+        import inspect
+        assert "_consume_native_plot_axis_transition" in inspect.getsource(
+            ScatteringWorkspace._drain_executor
+        )
+        assert "_consume_native_plot_axis_transition" in inspect.getsource(
+            ScatteringWorkspace._paint_batch_terminal
+        )
+        assert "_release_native_plot_axis_transition_for_retry" in (
+            inspect.getsource(ScatteringWorkspace._stop_run)
+        )
+        assert "_release_native_plot_axis_transition_for_retry" in (
+            inspect.getsource(ScatteringWorkspace._render_start_outcome)
+        )
     finally:
         _dispose(page, qapp)

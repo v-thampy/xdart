@@ -1,7 +1,7 @@
 """Bounded standalone experiment-asset authoring operations."""
 from __future__ import annotations
 from dataclasses import dataclass
-import hashlib, json, os, shutil, signal, stat, subprocess, tempfile, time
+import hashlib, json, os, shutil, signal, stat, subprocess, sys, tempfile, time
 from pathlib import Path
 from typing import Callable
 import numpy as np
@@ -22,6 +22,7 @@ _PATH_BYTES_LIMIT = 16 << 10
 _URL_BYTES_LIMIT = 32 << 10
 _CONFIG_BYTES_LIMIT = 1 << 20
 _DIAGNOSTIC_BYTES_LIMIT = 64 << 10
+_CHILD_STDERR_BYTES_LIMIT = 16 << 10
 _CALIBRATION_SUFFIXES = frozenset({
     ".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450", ".raw",
     ".h5", ".hdf5", ".nxs", ".nexus",
@@ -351,13 +352,46 @@ class AssetValidationResult:
 class _Cancelled(RuntimeError): pass
 def _path_key(value: str) -> str:
     return os.path.normcase(os.path.normpath(value))
-def resolve_calibration_executable() -> str | None:
-    """Resolve the sole supported authoring executable through current PATH."""
-    found = shutil.which("pyFAI-calib2")
-    if not found: return None
-    try: path, state = Path(found).resolve(strict=True), Path(found).stat()
-    except OSError: return None
-    return str(path) if stat.S_ISREG(state.st_mode) and os.access(path, os.X_OK) else None
+
+
+def _validated_executable(value: object, *, exact: bool) -> str | None:
+    if (type(value) is not str or not value
+            or exact and not os.path.isabs(value)):
+        return None
+    try:
+        path = Path(value).resolve(strict=True)
+        state = path.stat()
+    except OSError:
+        return None
+    if (exact and _path_key(str(path)) != _path_key(value)
+            or not stat.S_ISREG(state.st_mode) or not os.access(path, os.X_OK)):
+        return None
+    return str(path)
+
+
+def _resolve_authoring_executable(
+    name: str, fixed: str | None = None,
+) -> str | None:
+    """Prefer the tool installed beside the running real Python executable."""
+
+    if fixed is not None:
+        return _validated_executable(fixed, exact=True)
+    try:
+        interpreter = Path(sys.executable).resolve(strict=True)
+    except (OSError, TypeError, ValueError):
+        interpreter = None
+    if interpreter is not None:
+        sibling = _validated_executable(
+            str(interpreter.with_name(name)), exact=False,
+        )
+        if sibling is not None:
+            return sibling
+    found = shutil.which(name)
+    return _validated_executable(found, exact=False)
+
+
+def resolve_calibration_executable(fixed: str | None = None) -> str | None:
+    return _resolve_authoring_executable("pyFAI-calib2", fixed)
 def _directory_identity(path: Path) -> tuple[int, int]:
     state = path.lstat()
     if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
@@ -494,20 +528,20 @@ def _hard_hdf_dataset(handle, path: str):
     if (not path.startswith("/") or not parts or len(parts) > 256
             or path != "/" + "/".join(parts)
             or len(path.encode("utf-8")) > 4096):
-        raise ValueError("Calibration HDF dataset path is invalid.")
+        raise ValueError("HDF dataset path is invalid.")
     owner: h5py.Group | h5py.File = handle
     for index, name in enumerate(parts):
         if not isinstance(owner.get(name, getlink=True), h5py.HardLink):
-            raise ValueError("Calibration HDF dataset is not locally owned.")
+            raise ValueError("HDF dataset is not locally owned.")
         value = owner.get(name)
         if index + 1 == len(parts):
             if not isinstance(value, h5py.Dataset):
-                raise ValueError("Calibration HDF selection is not a dataset.")
+                raise ValueError("HDF selection is not a dataset.")
             return value
         if not isinstance(value, h5py.Group):
-            raise ValueError("Calibration HDF dataset ancestry is invalid.")
+            raise ValueError("HDF dataset ancestry is invalid.")
         owner = value
-    raise ValueError("Calibration HDF dataset is unavailable.")
+    raise ValueError("HDF dataset is unavailable.")
 
 
 def _qualify_hdf_argument(path: Path, argument: str) -> None:
@@ -549,6 +583,197 @@ def _qualify_hdf_argument(path: Path, argument: str) -> None:
             raise ValueError("Calibration HDF URL is not one bounded numeric frame.")
     if SourceFileState.capture(path) != before:
         raise ValueError("Calibration HDF source changed during qualification.")
+
+
+def _mask_hdf_frame(
+    path: Path, argument: str, *, read: bool,
+    expected_source_state: SourceFileState | None = None,
+    expected_target_path: str | None = None,
+    expected_target_state: SourceFileState | None = None,
+) -> tuple[
+    SourceFileState, str, SourceFileState | None,
+    tuple[int, int], str, np.ndarray | None, str,
+]:
+    """Qualify one local HDF frame and optionally return its bounded pixels."""
+
+    import h5py
+    from silx.io.url import DataUrl
+
+    url = DataUrl(argument)
+    if (not url.is_valid() or url.scheme() != "silx"
+            or not _hdf_url_bound(argument, str(path))):
+        raise ValueError("Mask HDF URL changed during qualification.")
+    source_raw = path.lstat()
+    before = SourceFileState.capture(path)
+    if (stat.S_ISLNK(source_raw.st_mode)
+            or not stat.S_ISREG(source_raw.st_mode)
+            or (source_raw.st_dev, source_raw.st_ino, source_raw.st_size,
+                source_raw.st_mtime_ns, source_raw.st_ctime_ns)
+            != (before.device, before.inode, before.size,
+                before.mtime_ns, before.ctime_ns)
+            or expected_source_state is not None
+            and before != expected_source_state):
+        raise ValueError("Mask HDF source changed before qualification.")
+
+    target_path = ""
+    target_before = None
+    target_handle = None
+    array = None
+    digest = ""
+    try:
+        with h5py.File(path, "r") as master:
+            data_path = url.data_path()
+            parts = tuple(part for part in data_path.split("/") if part)
+            if (not data_path.startswith("/") or not parts
+                    or len(parts) > 256
+                    or data_path != "/" + "/".join(parts)
+                    or len(data_path.encode("utf-8")) > 4096):
+                raise ValueError("HDF dataset path is invalid.")
+            owner: h5py.Group | h5py.File = master
+            for name in parts[:-1]:
+                if not isinstance(owner.get(name, getlink=True), h5py.HardLink):
+                    raise ValueError("HDF dataset ancestry is not locally owned.")
+                value = owner.get(name)
+                if not isinstance(value, h5py.Group):
+                    raise ValueError("HDF dataset ancestry is invalid.")
+                owner = value
+            name = parts[-1]
+            link = owner.get(name, getlink=True)
+            if isinstance(link, h5py.HardLink):
+                dataset = owner.get(name)
+                if not isinstance(dataset, h5py.Dataset):
+                    raise ValueError("HDF selection is not a dataset.")
+            elif isinstance(link, h5py.ExternalLink):
+                filename = link.filename
+                if (type(filename) is not str or not filename
+                        or filename in {".", ".."}
+                        or "/" in filename or "\\" in filename
+                        or ":" in filename
+                        or not _bounded_text(filename, _NAME_BYTES_LIMIT)):
+                    raise ValueError(
+                        "Mask HDF ExternalLink must name one relative "
+                        "same-directory file.")
+                target = path.parent / filename
+                try:
+                    raw = target.lstat()
+                    resolved = target.resolve(strict=True)
+                except OSError as error:
+                    raise ValueError(
+                        "Mask HDF ExternalLink target is unavailable.") from error
+                if (stat.S_ISLNK(raw.st_mode) or not stat.S_ISREG(raw.st_mode)
+                        or not os.access(target, os.R_OK)
+                        or resolved != target
+                        or target == path
+                        or target.suffix.casefold() not in _HDF5_SUFFIXES):
+                    raise ValueError(
+                        "Mask HDF ExternalLink target is not one readable "
+                        "regular direct-child HDF file.")
+                target_path = str(target)
+                target_before = SourceFileState.capture(target)
+                latest = target.lstat()
+                if (stat.S_ISLNK(latest.st_mode)
+                        or not stat.S_ISREG(latest.st_mode)
+                        or (latest.st_dev, latest.st_ino, latest.st_size,
+                            latest.st_mtime_ns, latest.st_ctime_ns)
+                        != (target_before.device, target_before.inode,
+                            target_before.size, target_before.mtime_ns,
+                            target_before.ctime_ns)):
+                    raise ValueError(
+                        "Mask HDF ExternalLink target changed before open.")
+                target_handle = h5py.File(target, "r")
+                dataset = _hard_hdf_dataset(target_handle, link.path)
+            else:
+                raise ValueError(
+                    "Mask HDF selection must be hard-owned or one bounded "
+                    "same-directory ExternalLink.")
+
+            if expected_target_path is not None:
+                if target_path != expected_target_path:
+                    raise ValueError("Mask HDF dataset ownership changed.")
+                if (target_before is None) != (expected_target_state is None):
+                    raise ValueError("Mask HDF target custody changed.")
+                if (target_before is not None
+                        and target_before != expected_target_state):
+                    raise ValueError("Mask HDF target changed.")
+
+            properties = dataset.id.get_create_plist()
+            try:
+                external_count = int(properties.get_external_count())
+            finally:
+                properties.close()
+            shape = tuple(int(value) for value in dataset.shape)
+            dtype = np.dtype(dataset.dtype)
+            selection = url.data_slice()
+            if dataset.ndim == 2:
+                exact = selection in (None, ())
+                frame_shape = shape
+                index = ()
+            elif dataset.ndim == 3:
+                exact = (type(selection) is tuple and len(selection) == 1
+                         and type(selection[0]) is int
+                         and 0 <= selection[0] < shape[0])
+                frame_shape = shape[1:]
+                index = selection
+            else:
+                exact = False
+                frame_shape = ()
+                index = ()
+            pixels = (frame_shape[0] * frame_shape[1]
+                      if len(frame_shape) == 2 else 0)
+            if (dataset.is_virtual or external_count != 0 or not exact
+                    or len(frame_shape) != 2 or min(frame_shape) < 1
+                    or dtype.fields is not None or dtype.kind not in "biuf"
+                    or dtype.itemsize < 1 or dtype.itemsize > 8
+                    or pixels > _PIXEL_LIMIT
+                    or pixels * dtype.itemsize > _DECODED_LIMIT):
+                raise ValueError(
+                    "Mask HDF URL is not one bounded numeric frame.")
+            native_dtype = (dtype if dtype.isnative
+                            else dtype.newbyteorder("="))
+            if read:
+                observed = np.asarray(dataset[()] if not index else dataset[index])
+                if (observed.ndim != 2
+                        or tuple(observed.shape) != frame_shape
+                        or observed.dtype != dtype
+                        or observed.nbytes > _DECODED_LIMIT):
+                    raise ValueError(
+                        "Mask HDF pixels contradict the qualified dataset.")
+                if not observed.dtype.isnative:
+                    observed = observed.astype(native_dtype, copy=False)
+                array = np.ascontiguousarray(observed)
+                digest = hashlib.sha256(memoryview(array).cast("B")).hexdigest()
+            source_dtype = native_dtype.str
+    finally:
+        if target_handle is not None:
+            target_handle.close()
+
+    after = SourceFileState.capture(path)
+    source_latest = path.lstat()
+    if (before != after or stat.S_ISLNK(source_latest.st_mode)
+            or not stat.S_ISREG(source_latest.st_mode)
+            or (source_latest.st_dev, source_latest.st_ino,
+                source_latest.st_size, source_latest.st_mtime_ns,
+                source_latest.st_ctime_ns)
+            != (after.device, after.inode, after.size,
+                after.mtime_ns, after.ctime_ns)):
+        raise ValueError("Mask HDF source changed during qualification.")
+    if target_before is not None:
+        target_after = SourceFileState.capture(Path(target_path))
+        target_latest = Path(target_path).lstat()
+        if (target_before != target_after
+                or stat.S_ISLNK(target_latest.st_mode)
+                or not stat.S_ISREG(target_latest.st_mode)
+                or (target_latest.st_dev, target_latest.st_ino,
+                    target_latest.st_size, target_latest.st_mtime_ns,
+                    target_latest.st_ctime_ns)
+                != (target_after.device, target_after.inode,
+                    target_after.size, target_after.mtime_ns,
+                    target_after.ctime_ns)):
+            raise ValueError("Mask HDF target changed during qualification.")
+    return (
+        before, target_path, target_before, frame_shape, source_dtype,
+        array, digest,
+    )
 
 
 def prepare_calibration_request(selected: str) -> CalibrationRequest:
@@ -668,20 +893,81 @@ def _signal_child(process: object, *, kill: bool) -> str:
     except Exception as error:
         module, name, message = detached_exception_strings(error); return f"{module}.{name}: {message}"
     return ""
-def _wait_child(process: object, cancelled: object) -> tuple[int, str]:
-    terminated = killed = False; deadline = 0.0; diagnostic = ""
+def _wait_child(
+    process: object, cancelled: object, child_stderr=None,
+) -> tuple[int, str, bool]:
+    terminated = killed = stderr_truncated = False
+    deadline = 0.0; diagnostic = ""
     while True:
         if cancelled.is_set() and not terminated:
             terminated = True; deadline = _monotonic() + _CANCEL_GRACE_SECONDS
             observed = _signal_child(process, kill=False); diagnostic = diagnostic or observed
-        try: return int(process.wait(timeout=_POLL_SECONDS)), diagnostic
+        try:
+            code = int(process.wait(timeout=_POLL_SECONDS))
+            if child_stderr is not None:
+                stderr_truncated |= _compact_child_stderr(child_stderr)
+            return code, diagnostic, stderr_truncated
         except subprocess.TimeoutExpired:
+            if child_stderr is not None:
+                stderr_truncated |= _compact_child_stderr(child_stderr)
             if terminated and not killed and _monotonic() >= deadline:
                 killed = True; observed = _signal_child(process, kill=True); diagnostic = diagnostic or observed
         except Exception as error:
+            if child_stderr is not None:
+                stderr_truncated |= _compact_child_stderr(child_stderr)
             if not diagnostic:
                 module, name, message = detached_exception_strings(error); diagnostic = f"{module}.{name}: {message}"
             time.sleep(_POLL_SECONDS)
+
+
+def _private_child_stderr(directory: Path):
+    stream = tempfile.TemporaryFile(
+        mode="w+b", prefix=".xdart-authoring-stderr-", dir=directory,
+    )
+    try:
+        descriptor = stream.fileno()
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        observed = os.fstat(descriptor)
+        if (not stat.S_ISREG(observed.st_mode)
+                or hasattr(os, "fchmod")
+                and stat.S_IMODE(observed.st_mode) != 0o600):
+            raise OSError("private child stderr is not mode 0600")
+    except BaseException:
+        stream.close()
+        raise
+    return stream
+
+
+def _compact_child_stderr(stream) -> bool:
+    stream.flush()
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    if size <= _CHILD_STDERR_BYTES_LIMIT:
+        return False
+    start = max(0, size - _CHILD_STDERR_BYTES_LIMIT)
+    stream.seek(start)
+    payload = stream.read(_CHILD_STDERR_BYTES_LIMIT)
+    stream.seek(0)
+    stream.write(payload)
+    stream.truncate()
+    stream.flush()
+    return True
+
+
+def _bounded_child_stderr(stream, *, truncated: bool = False) -> str:
+    truncated = _compact_child_stderr(stream) or truncated
+    stream.seek(0)
+    payload = stream.read(_CHILD_STDERR_BYTES_LIMIT)
+    text = payload.decode("utf-8", errors="replace").replace("\x00", "�").strip()
+    return ("[stderr truncated] " if truncated else "") + text
+
+
+def _nonzero_child_error(tool: str, code: int, observed: str) -> RuntimeError:
+    suffix = f": {observed}" if observed else ""
+    return RuntimeError(f"{tool} exited with status {code}{suffix}")
+
+
 def _cleanup(stage: Path | None, identity: tuple[int, int] | None, names: tuple[Path, ...]) -> str:
     if stage is None or identity is None: return "" if stage is None else str(stage)
     try:
@@ -705,7 +991,8 @@ def run_calibration(
     status = OperationTerminalStatus.RETURNED; diagnostic = ""
     try:
         request.__post_init__()
-        if (resolve_calibration_executable() != request.executable
+        if (resolve_calibration_executable(request.executable)
+                != request.executable
                 or SourceFileState.capture(Path(request.executable))
                 != request.executable_state):
             raise ValueError("calibration executable changed before launch")
@@ -743,15 +1030,31 @@ def run_calibration(
         publish("launch", 1, 2)
         argv = ((request.executable,) if input_argument is None else
                 (request.executable, input_argument))
-        options = dict(cwd=str(directory), shell=False, stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       close_fds=True)
-        options["creationflags" if _WINDOWS else "start_new_session"] = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if _WINDOWS else True)
-        process = _popen(argv, **options); code, process_diagnostic = _wait_child(process, cancelled)
-        if process_diagnostic: raise RuntimeError(f"child process control failed: {process_diagnostic}")
-        if cancelled.is_set(): raise _Cancelled("calibration cancelled")
-        if code != 0: raise RuntimeError(f"pyFAI-calib2 exited with status {code}")
+        with _private_child_stderr(directory) as child_stderr:
+            options = dict(
+                cwd=str(directory), shell=False, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=child_stderr,
+                close_fds=True,
+            )
+            options["creationflags" if _WINDOWS else "start_new_session"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if _WINDOWS else True)
+            process = _popen(argv, **options)
+            code, process_diagnostic, stderr_truncated = _wait_child(
+                process, cancelled, child_stderr,
+            )
+            child_diagnostic = _bounded_child_stderr(
+                child_stderr, truncated=stderr_truncated,
+            )
+            if process_diagnostic:
+                raise RuntimeError(
+                    f"child process control failed: {process_diagnostic}"
+                    + (f": {child_diagnostic}" if child_diagnostic else ""))
+            if cancelled.is_set():
+                raise _Cancelled("calibration cancelled")
+            if code != 0:
+                raise _nonzero_child_error(
+                    "pyFAI-calib2", code, child_diagnostic)
         if not _source_context_current(
                 source, request.source_state, directory,
                 request.directory_identity):
@@ -800,11 +1103,34 @@ class MaskRequest:
     source_path: str; final_path: str; executable: str
     executable_state: SourceFileState; source_state: SourceFileState
     source_directory: str; directory_identity: tuple[int, int]
+    exact_hdf_url: str | None = None
+    hdf_target_path: str = ""
+    hdf_target_state: SourceFileState | None = None
     def __post_init__(self) -> None:
         expected = os.path.splitext(self.source_path)[0] + "-mask.edf"
+        suffix = Path(self.source_path).suffix.casefold()
+        source_kind_valid = (
+            suffix in {".tif", ".tiff"} and self.exact_hdf_url is None
+            and self.hdf_target_path == "" and self.hdf_target_state is None
+            or suffix in _HDF5_SUFFIXES
+            and type(self.exact_hdf_url) is str
+            and _bounded_text(self.exact_hdf_url, _URL_BYTES_LIMIT)
+            and self.exact_hdf_url.startswith("silx:")
+            and _hdf_url_bound(self.exact_hdf_url, self.source_path)
+            and bool(self.hdf_target_path)
+            == (self.hdf_target_state is not None)
+            and _absolute_path(self.hdf_target_path, allow_empty=True)
+            and (self.hdf_target_state is None
+                 or _state_valid(
+                     self.hdf_target_state, path=self.hdf_target_path,
+                     nonempty=True,
+                 )
+                 and Path(self.hdf_target_path).parent
+                 == Path(self.source_path).parent)
+        )
         if (not all(_absolute_path(value) for value in (
                     self.source_path, self.final_path, self.executable))
-                or Path(self.source_path).suffix.casefold() not in {".tif", ".tiff"}
+                or not source_kind_valid
                 or self.final_path != expected
                 or not _state_valid(self.executable_state,
                                     path=self.executable, nonempty=True)
@@ -868,7 +1194,10 @@ class MaskResult:
                 or self.argv and (
                     self.argv != (self.request.executable,
                                   str(Path(self.cwd)
-                                      / Path(self.request.source_path).name)))
+                                      / (Path(self.request.source_path).name
+                                         if self.request.exact_hdf_url is None
+                                         else Path(self.request.source_path).stem
+                                         + ".tiff"))))
                 or self.private_path and (
                     Path(self.private_path).parent != Path(self.cwd)
                     or Path(self.private_path).name
@@ -931,18 +1260,73 @@ def mask_terminal_result_valid(
         return False
     return False
 def resolve_mask_executable(fixed: str | None = None) -> str | None:
-    found = shutil.which("pyFAI-drawmask") if fixed is None else fixed
-    if not found or type(found) is not str or (fixed is not None and not os.path.isabs(found)): return None
-    try: path, state = Path(found).resolve(strict=True), Path(found).stat()
-    except OSError: return None
-    if fixed is not None and os.path.normcase(os.path.normpath(str(path))) != os.path.normcase(os.path.normpath(fixed)): return None
-    return str(path) if stat.S_ISREG(state.st_mode) and os.access(path, os.X_OK) else None
+    return _resolve_authoring_executable("pyFAI-drawmask", fixed)
+
+
+def _mask_source(selected: str) -> tuple[Path, str | None]:
+    if type(selected) is not str or not selected.strip():
+        raise ValueError("Choose a TIFF or exact HDF5/NeXus frame.")
+    value = selected.strip()
+    input_argument = None
+    if value.startswith("silx:"):
+        try:
+            from silx.io.url import DataUrl
+            url = DataUrl(value)
+            file_path = url.file_path()
+        except Exception as error:
+            raise ValueError("Mask HDF URL is invalid.") from error
+        if (not url.is_valid() or url.scheme() != "silx"
+                or type(file_path) is not str or not file_path
+                or url.data_path() is None):
+            raise ValueError(
+                "Mask HDF input must select one exact dataset/frame.")
+        source = Path(file_path).expanduser()
+        input_argument = url
+    else:
+        source = Path(value).expanduser()
+    try:
+        source = source.resolve(strict=True)
+        raw = source.lstat()
+    except OSError as error:
+        raise ValueError("Mask input is unavailable.") from error
+    if (stat.S_ISLNK(raw.st_mode) or not stat.S_ISREG(raw.st_mode)
+            or not os.access(source, os.R_OK)):
+        raise ValueError("Mask input must be a readable regular file.")
+    suffix = source.suffix.casefold()
+    if suffix in {".tif", ".tiff"}:
+        if input_argument is not None:
+            raise ValueError("TIFF mask input must be selected as a file.")
+    elif suffix in _HDF5_SUFFIXES:
+        if input_argument is None:
+            raise ValueError(
+                "Mask HDF5/NeXus input must select one exact dataset/frame.")
+        try:
+            input_argument = type(input_argument)(
+                scheme="silx", file_path=str(source),
+                data_path=input_argument.data_path(),
+                data_slice=input_argument.data_slice(),
+            ).path()
+        except Exception as error:
+            raise ValueError("Mask HDF URL is invalid.") from error
+        if not _bounded_text(input_argument, _URL_BYTES_LIMIT):
+            raise ValueError("Mask HDF URL exceeds its encoded-byte cap.")
+    else:
+        raise ValueError(
+            "Mask input suffix must identify TIFF, HDF5, or NeXus.")
+    return source, input_argument
+
+
 def prepare_mask_request(selected: str, *, current_poni: str = "", current_mask: str = "") -> MaskRequest:
-    if type(selected) is not str or not selected.strip(): raise ValueError("Choose a TIFF input file.")
-    try: source = Path(selected.strip()).expanduser().resolve(strict=True); state = source.lstat()
-    except OSError as error: raise ValueError("TIFF input is unavailable.") from error
-    if not stat.S_ISREG(state.st_mode) or not os.access(source, os.R_OK): raise ValueError("TIFF input must be a readable regular file.")
-    if source.suffix.casefold() not in {".tif", ".tiff"}: raise ValueError("Mask input must use the .tif or .tiff suffix.")
+    source, exact_hdf_url = _mask_source(selected)
+    target_path = ""
+    target_state = None
+    if exact_hdf_url is None:
+        source_state = SourceFileState.capture(source)
+    else:
+        (source_state, target_path, target_state, _shape, _dtype,
+         _array, _digest) = _mask_hdf_frame(
+            source, exact_hdf_url, read=False,
+        )
     final = Path(os.path.splitext(str(source))[0] + "-mask.edf")
     if os.path.lexists(final): raise ValueError("Mask output already exists.")
     key = os.path.normcase(os.path.normpath(str(final)))
@@ -952,8 +1336,9 @@ def prepare_mask_request(selected: str, *, current_poni: str = "", current_mask:
     if executable is None: raise ValueError("pyFAI-drawmask is unavailable on PATH.")
     return MaskRequest(
         str(source), str(final), executable,
-        SourceFileState.capture(Path(executable)), SourceFileState.capture(source),
-        str(source.parent), _directory_identity(source.parent),
+        SourceFileState.capture(Path(executable)), source_state,
+        str(source.parent), _directory_identity(source.parent), exact_hdf_url,
+        target_path, target_state,
     )
 
 
@@ -970,10 +1355,22 @@ def authoring_source_context_current(
             directory = Path(request.source_directory)
         else:
             return False
-        return _source_context_current(
+        current = _source_context_current(
             Path(request.source_path), request.source_state,
             directory, request.directory_identity,
         )
+        if (not current or type(request) is not MaskRequest
+                or request.exact_hdf_url is None):
+            return current
+        observed = _mask_hdf_frame(
+            Path(request.source_path), request.exact_hdf_url, read=False,
+            expected_source_state=request.source_state,
+            expected_target_path=request.hdf_target_path,
+            expected_target_state=request.hdf_target_state,
+        )
+        return (observed[0] == request.source_state
+                and observed[1] == request.hdf_target_path
+                and observed[2] == request.hdf_target_state)
     except (AttributeError, OSError, TypeError, ValueError):
         return False
 def _asset_digest(path: Path, limit: int) -> tuple[str, int]:
@@ -1071,6 +1468,101 @@ def _qualify_tiff(path: Path, staged: SourceFileState) -> tuple[tuple[int, int],
         finally: decoded.close()
         return shape, dtype
     finally: os.close(fd)
+
+
+def _stage_hdf_tiff(
+    request: MaskRequest, private: Path,
+) -> tuple[
+    SourceFileState, str, SourceFileState, str, str,
+    tuple[int, int], str,
+]:
+    source = Path(request.source_path)
+    observed = _mask_hdf_frame(
+        source, request.exact_hdf_url, read=True,
+        expected_source_state=request.source_state,
+        expected_target_path=request.hdf_target_path,
+        expected_target_state=request.hdf_target_state,
+    )
+    source_state, target_path, target_state, shape, dtype, array, digest = observed
+    if (source_state != request.source_state
+            or target_path != request.hdf_target_path
+            or target_state != request.hdf_target_state
+            or array is None or not digest):
+        raise ValueError("Mask HDF frame custody changed before staging.")
+    image = TifImage(data=array)
+    try:
+        image.write(str(private))
+    except BaseException:
+        try:
+            private.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        image.close()
+    descriptor = os.open(
+        private, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        raw = os.fstat(descriptor)
+        if (not stat.S_ISREG(raw.st_mode) or raw.st_size < 1
+                or raw.st_size > _TIFF_LIMIT
+                or hasattr(os, "fchmod")
+                and stat.S_IMODE(raw.st_mode) != 0o600):
+            raise ValueError("staged HDF frame TIFF is outside its envelope")
+    finally:
+        os.close(descriptor)
+    staged = SourceFileState.capture(private)
+    staged_shape, staged_dtype = _qualify_tiff(private, staged)
+    staged_array = np.asarray(
+        read_image(private, preserve_dtype=True, exact_frame=True),
+    )
+    staged_array = np.ascontiguousarray(staged_array)
+    staged_frame_digest = hashlib.sha256(
+        memoryview(staged_array).cast("B"),
+    ).hexdigest()
+    if (staged_shape != shape or staged_dtype != dtype
+            or tuple(staged_array.shape) != shape
+            or staged_array.dtype.str != dtype
+            or staged_frame_digest != digest):
+        raise ValueError("staged TIFF does not preserve the exact HDF frame")
+    staged_file_digest, staged_count = _asset_digest(private, _TIFF_LIMIT)
+    if (staged_count != staged.size
+            or stat.S_IMODE(private.lstat().st_mode) != 0o600):
+        raise ValueError("staged HDF frame TIFF changed during qualification")
+    return (
+        source_state, digest, staged, digest, staged_file_digest,
+        shape, dtype,
+    )
+
+
+def _mask_source_frame_current(
+    request: MaskRequest, source_state: SourceFileState,
+    source_sha: str, shape: tuple[int, int], source_dtype: str,
+) -> bool:
+    source = Path(request.source_path)
+    if request.exact_hdf_url is None:
+        return (authoring_source_context_current(request)
+                and source_state == request.source_state
+                and _unchanged(source, source_state, source_sha, _TIFF_LIMIT))
+    try:
+        observed = _mask_hdf_frame(
+            source, request.exact_hdf_url, read=True,
+            expected_source_state=request.source_state,
+            expected_target_path=request.hdf_target_path,
+            expected_target_state=request.hdf_target_state,
+        )
+        return (observed[0] == source_state == request.source_state
+                and observed[1] == request.hdf_target_path
+                and observed[2] == request.hdf_target_state
+                and observed[3] == shape and observed[4] == source_dtype
+                and observed[6] == source_sha)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _unchanged(path: Path, state: SourceFileState, digest: str, limit: int) -> bool:
     try:
         raw, current = path.lstat(), SourceFileState.capture(path); repeated, count = _asset_digest(path, limit)
@@ -1231,9 +1723,18 @@ def _existing_mask_current(proof: ExistingMaskProof, path: Path) -> bool:
         return False
 
 
-def _source_matches_mask_proof(proof: MaskProof, path: Path) -> bool:
+def _source_matches_mask_proof(
+    proof: MaskProof, request: MaskRequest,
+) -> bool:
     try:
         proof.__post_init__()
+        request.__post_init__()
+        path = Path(request.source_path)
+        if request.exact_hdf_url is not None:
+            return _mask_source_frame_current(
+                request, request.source_state, proof.source_sha256,
+                proof.shape, proof.source_dtype,
+            ) and proof.source_sha256 == proof.staged_sha256
         raw = path.lstat()
         if (stat.S_ISLNK(raw.st_mode) or not stat.S_ISREG(raw.st_mode)
                 or raw.st_size < 1 or raw.st_size > _TIFF_LIMIT):
@@ -1294,8 +1795,10 @@ def validate_authored_asset(
                 != (candidate.proof.shape, candidate.proof.mask_dtype,
                     candidate.proof.mask_sha256,
                     candidate.proof.coercion_policy)
+                or type(request.source_request) is not MaskRequest
+                or request.source_request.source_path != str(source_path)
                 or not _source_matches_mask_proof(
-                    candidate.proof, source_path)):
+                    candidate.proof, request.source_request)):
             raise ValueError("generated mask changed before adoption")
     elif (type(candidate.proof) is not ExistingMaskProof
             or candidate.state != candidate.proof.state
@@ -1326,30 +1829,70 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         stage = Path(tempfile.mkdtemp(prefix=".xdart-mask-", dir=final.parent)); created = stage.lstat(); stage_identity = (created.st_dev, created.st_ino)
         os.chmod(stage, 0o700); stage_stat = stage.lstat()
         if (stage_stat.st_dev, stage_stat.st_ino) != stage_identity or not stat.S_ISDIR(stage_stat.st_mode) or stat.S_IMODE(stage_stat.st_mode) != 0o700: raise OSError("private mask stage is not mode 0700")
-        _probe_links(stage); private_source = stage / source.name; private_mask = stage / (os.path.splitext(source.name)[0] + "-mask.edf")
-        publish("copy", 1, 4); source_state, source_sha, staged_state, staged_sha = _copy_tiff(source, private_source)
+        _probe_links(stage)
+        private_source = stage / (
+            source.name if request.exact_hdf_url is None
+            else source.stem + ".tiff"
+        )
+        private_mask = stage / (source.stem + "-mask.edf")
+        publish("copy", 1, 4)
+        if request.exact_hdf_url is None:
+            source_state, source_sha, staged_state, staged_sha = _copy_tiff(
+                source, private_source,
+            )
+            staged_file_sha = staged_sha
+            shape, source_dtype = _qualify_tiff(private_source, staged_state)
+        else:
+            (source_state, source_sha, staged_state, staged_sha,
+             staged_file_sha, shape, source_dtype) = _stage_hdf_tiff(
+                request, private_source,
+            )
         if (source_state != request.source_state
                 or not authoring_source_context_current(request)):
             raise ValueError("mask source context changed during copy")
-        shape, source_dtype = _qualify_tiff(private_source, staged_state)
-        if (not authoring_source_context_current(request)
-                or not _unchanged(source, source_state, source_sha, _TIFF_LIMIT)
-                or not _unchanged(private_source, staged_state, staged_sha, _TIFF_LIMIT)): raise ValueError("TIFF changed before child launch")
+        if (not _mask_source_frame_current(
+                    request, source_state, source_sha, shape, source_dtype)
+                or not _unchanged(
+                    private_source, staged_state, staged_file_sha,
+                    _TIFF_LIMIT)):
+            raise ValueError("mask source changed before child launch")
         if cancelled.is_set(): raise _Cancelled("mask cancelled")
         publish("launch", 2, 4); argv = (request.executable, str(private_source))
         if (resolve_mask_executable(request.executable) != request.executable
                 or SourceFileState.capture(Path(request.executable))
                 != request.executable_state):
             raise ValueError("mask executable changed immediately before launch")
-        options = dict(cwd=str(stage), shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
-        options["creationflags" if _WINDOWS else "start_new_session"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if _WINDOWS else True)
-        process = _popen(argv, **options); code, process_diagnostic = _wait_child(process, cancelled)
-        if process_diagnostic: raise RuntimeError(f"child process control failed: {process_diagnostic}")
-        if cancelled.is_set(): raise _Cancelled("mask cancelled")
-        if code != 0: raise RuntimeError(f"pyFAI-drawmask exited with status {code}")
-        if (not authoring_source_context_current(request)
-                or not _unchanged(source, source_state, source_sha, _TIFF_LIMIT)
-                or not _unchanged(private_source, staged_state, staged_sha, _TIFF_LIMIT)): raise ValueError("TIFF changed during child execution")
+        with _private_child_stderr(stage) as child_stderr:
+            options = dict(
+                cwd=str(stage), shell=False, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=child_stderr,
+                close_fds=True,
+            )
+            options["creationflags" if _WINDOWS else "start_new_session"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if _WINDOWS else True)
+            process = _popen(argv, **options)
+            code, process_diagnostic, stderr_truncated = _wait_child(
+                process, cancelled, child_stderr,
+            )
+            child_diagnostic = _bounded_child_stderr(
+                child_stderr, truncated=stderr_truncated,
+            )
+            if process_diagnostic:
+                raise RuntimeError(
+                    f"child process control failed: {process_diagnostic}"
+                    + (f": {child_diagnostic}" if child_diagnostic else ""))
+            if cancelled.is_set():
+                raise _Cancelled("mask cancelled")
+            if code != 0:
+                raise _nonzero_child_error(
+                    "pyFAI-drawmask", code, child_diagnostic)
+        if (not _mask_source_frame_current(
+                    request, source_state, source_sha, shape, source_dtype)
+                or not _unchanged(
+                    private_source, staged_state, staged_file_sha,
+                    _TIFF_LIMIT)):
+            raise ValueError("mask source changed during child execution")
         publish("qualify", 3, 4); proof = _qualify_mask(private_mask, shape, source_dtype, source_sha, staged_sha)
         if (not authoring_source_context_current(request)
                 or not _unchanged(private_mask, proof.state, proof.mask_sha256, _MASK_LIMIT)

@@ -5,6 +5,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 import signal
+import stat
 import subprocess
 from threading import Event
 
@@ -46,6 +47,10 @@ def _binary(tmp_path: Path, monkeypatch) -> Path:
     binary.parent.mkdir(exist_ok=True)
     binary.write_text("fixture", encoding="utf-8")
     binary.chmod(0o700)
+    interpreter = binary.parent / "python"
+    interpreter.write_text("fixture", encoding="utf-8")
+    interpreter.chmod(0o700)
+    monkeypatch.setattr(authoring.sys, "executable", str(interpreter))
     monkeypatch.setenv("PATH", str(binary.parent))
     return binary.resolve()
 
@@ -55,7 +60,10 @@ def _tiff(path: Path) -> Path:
     return path
 
 
-def _install_process(monkeypatch, hook, *, code=0):
+def _install_process(
+    monkeypatch, hook, *, code=0, stderr=b"",
+    timeout_stderr=(), observed_sizes=None,
+):
     calls = []
 
     class Process:
@@ -63,9 +71,18 @@ def _install_process(monkeypatch, hook, *, code=0):
 
         def __init__(self, argv, **options):
             calls.append((tuple(argv), options))
+            options["stderr"].write(stderr)
+            self._stderr = options["stderr"]
+            self._timeout_stderr = list(timeout_stderr)
             hook(tuple(argv), options)
 
         def wait(self, *, timeout):
+            if observed_sizes is not None:
+                observed_sizes.append(os.fstat(self._stderr.fileno()).st_size)
+            if self._timeout_stderr:
+                self._stderr.write(self._timeout_stderr.pop(0))
+                self._stderr.flush()
+                raise subprocess.TimeoutExpired("pyFAI-calib2", timeout)
             return code
 
         def terminate(self):
@@ -76,6 +93,31 @@ def _install_process(monkeypatch, hook, *, code=0):
 
     monkeypatch.setattr(authoring, "_popen", Process)
     return calls
+
+
+def test_resolver_prefers_real_python_sibling_then_validated_path_fallback(
+    tmp_path, monkeypatch,
+) -> None:
+    runtime = tmp_path / "runtime" / "bin"
+    fallback = tmp_path / "fallback"
+    runtime.mkdir(parents=True)
+    fallback.mkdir()
+    interpreter = runtime / "python"
+    sibling = runtime / "pyFAI-calib2"
+    path_tool = fallback / "pyFAI-calib2"
+    for path in (interpreter, sibling, path_tool):
+        path.write_text("fixture", encoding="utf-8")
+        path.chmod(0o700)
+    monkeypatch.setattr(authoring.sys, "executable", str(interpreter))
+    monkeypatch.setenv("PATH", str(fallback))
+    assert authoring.resolve_calibration_executable() == str(sibling)
+    sibling.unlink()
+    assert authoring.resolve_calibration_executable() == str(path_tool)
+    monkeypatch.setenv("PATH", "")
+    assert authoring.resolve_calibration_executable(str(path_tool)) \
+        == str(path_tool)
+    path_tool.chmod(0o600)
+    assert authoring.resolve_calibration_executable(str(path_tool)) is None
 
 
 def _direct(request, *, seal=lambda _identity: True, cancelled=None):
@@ -121,13 +163,56 @@ def test_tiff_is_preflighted_in_worker_and_launched_as_positional_input(
     assert "--poni" not in argv and "-o" not in argv
     assert options["cwd"] == str(tmp_path)
     assert options["shell"] is False
-    assert options["stdin"] is options["stdout"] is options["stderr"] is subprocess.DEVNULL
+    assert options["stdin"] is options["stdout"] is subprocess.DEVNULL
+    assert options["stderr"] is not subprocess.DEVNULL
+    assert options["stderr"].closed
     assert options["close_fds"] is True
     assert ("creationflags" in options) is authoring._WINDOWS
     assert ("start_new_session" in options) is not authoring._WINDOWS
     assert tuple(item.path for item in result.candidates) == (
         str(tmp_path / "made.poni"),
     )
+
+
+def test_nonzero_calibration_surfaces_bounded_private_stderr_without_leak(
+    tmp_path, monkeypatch,
+) -> None:
+    _binary(tmp_path, monkeypatch)
+    request = prepare_calibration_request(str(_tiff(tmp_path / "source.tif")))
+    observed = []
+
+    def inspect_stderr(_argv, options):
+        stream = options["stderr"]
+        observed.append((
+            stat.S_IMODE(os.fstat(stream.fileno()).st_mode),
+            tuple(tmp_path.glob(".xdart-authoring-stderr-*")),
+        ))
+
+    payload = b"x" * (authoring._CHILD_STDERR_BYTES_LIMIT * 2)
+    sizes = []
+    calls = _install_process(
+        monkeypatch, inspect_stderr, code=17,
+        timeout_stderr=(
+            payload, payload,
+            payload + b"\nImportError: silx Qt binding failed\n",
+        ),
+        observed_sizes=sizes,
+    )
+    terminal, _progress = _direct(request)
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert "pyFAI-calib2 exited with status 17" in terminal.diagnostic
+    assert "[stderr truncated]" in terminal.diagnostic
+    assert "ImportError: silx Qt binding failed" in terminal.diagnostic
+    assert len(terminal.diagnostic.encode("utf-8")) \
+        <= authoring._DIAGNOSTIC_BYTES_LIMIT
+    assert observed == [(0o600, ())]
+    assert sizes[0] == 0
+    assert len(sizes) == 4
+    assert all(
+        size <= authoring._CHILD_STDERR_BYTES_LIMIT for size in sizes[1:]
+    )
+    assert calls[0][1]["stderr"].closed
+    assert tuple(tmp_path.glob(".xdart-authoring-stderr-*")) == ()
 
 
 @pytest.mark.parametrize(

@@ -1,15 +1,17 @@
 """Focused standalone-Make-Mask operation oracle."""
 from __future__ import annotations
 import os, stat, subprocess
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from threading import Event, current_thread
 from types import SimpleNamespace
 import numpy as np
+import h5py
 import pytest
 import tifffile
 from PIL import Image
 from fabio.edfimage import EdfImage
+from silx.io.url import DataUrl
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 from xdart.gui.tabs.scattering import experiment_authoring as authoring
@@ -43,7 +45,9 @@ from xrd_tools.session.run_configuration import RunIntent
 def qapp(): return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 def _binary(tmp_path: Path, monkeypatch) -> Path:
     binary = tmp_path / "bin" / "pyFAI-drawmask"; binary.parent.mkdir(exist_ok=True)
-    binary.write_text("fixture"); binary.chmod(0o700); monkeypatch.setenv("PATH", str(binary.parent))
+    binary.write_text("fixture"); binary.chmod(0o700)
+    interpreter = binary.parent / "python"; interpreter.write_text("fixture"); interpreter.chmod(0o700)
+    monkeypatch.setattr(authoring.sys, "executable", str(interpreter)); monkeypatch.setenv("PATH", str(binary.parent))
     return binary.resolve()
 def _tiff(path: Path, data, **options) -> Path:
     tifffile.imwrite(path, np.asarray(data), **options); return path
@@ -53,12 +57,18 @@ def _request(tmp_path: Path, monkeypatch, data=None) -> MaskRequest:
     return prepare_mask_request(str(source))
 def _mask_path(private: Path) -> Path:
     return private.with_name(os.path.splitext(private.name)[0] + "-mask.edf")
-def _install_process(monkeypatch, mask=None, *, code=0, hook=None, missing=False):
+def _hdf_url(path: Path, data_path: str, frame: int | None = None) -> str:
+    return DataUrl(
+        file_path=str(path), data_path=data_path,
+        data_slice=None if frame is None else (frame,), scheme="silx",
+    ).path()
+def _install_process(monkeypatch, mask=None, *, code=0, hook=None, missing=False, stderr=b""):
     calls = []
     class Process:
         pid = 7373
         def __init__(self, argv, **options):
             private, output = Path(argv[1]), _mask_path(Path(argv[1])); calls.append((tuple(argv), options, stat.S_IMODE(private.stat().st_mode)))
+            options["stderr"].write(stderr)
             if not missing:
                 if mask is None: output.write_bytes(b"not-edf")
                 else:
@@ -69,6 +79,30 @@ def _install_process(monkeypatch, mask=None, *, code=0, hook=None, missing=False
         def terminate(self): calls.append("terminate")
         def kill(self): calls.append("kill")
     monkeypatch.setattr(authoring, "_popen", Process); return calls
+
+
+def test_resolver_prefers_real_python_sibling_then_validated_path_fallback(
+    tmp_path, monkeypatch,
+) -> None:
+    runtime = tmp_path / "runtime" / "bin"
+    fallback = tmp_path / "fallback"
+    runtime.mkdir(parents=True)
+    fallback.mkdir()
+    interpreter = runtime / "python"
+    sibling = runtime / "pyFAI-drawmask"
+    path_tool = fallback / "pyFAI-drawmask"
+    for path in (interpreter, sibling, path_tool):
+        path.write_text("fixture")
+        path.chmod(0o700)
+    monkeypatch.setattr(authoring.sys, "executable", str(interpreter))
+    monkeypatch.setenv("PATH", str(fallback))
+    assert authoring.resolve_mask_executable() == str(sibling)
+    sibling.unlink()
+    assert authoring.resolve_mask_executable() == str(path_tool)
+    monkeypatch.setenv("PATH", "")
+    assert authoring.resolve_mask_executable(str(path_tool)) == str(path_tool)
+    path_tool.chmod(0o600)
+    assert authoring.resolve_mask_executable(str(path_tool)) is None
 def _direct(request: MaskRequest, *, seal=lambda _identity: True, cancelled=None):
     progress = []; cancelled = Event() if cancelled is None else cancelled
     terminal = run_mask(request, OperationIdentity(1), cancelled, lambda *value: progress.append(value), seal)
@@ -92,7 +126,9 @@ def test_parent_red_make_mask_command_uses_explicit_tiff_chooser(
     tmp_path, monkeypatch
 ) -> None:
     binary = tmp_path / "bin" / "pyFAI-drawmask"; binary.parent.mkdir()
-    binary.write_text("fixture"); binary.chmod(0o700); monkeypatch.setenv("PATH", str(binary.parent))
+    binary.write_text("fixture"); binary.chmod(0o700)
+    interpreter = binary.parent / "python"; interpreter.write_text("fixture"); interpreter.chmod(0o700)
+    monkeypatch.setattr(authoring.sys, "executable", str(interpreter)); monkeypatch.setenv("PATH", str(binary.parent))
     source = tmp_path / "chosen.tiff"; source.write_bytes(b"explicit TIFF"); chosen = []
     def chooser(asset, _start): chosen.append(asset); return str(source)
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -103,6 +139,80 @@ def test_parent_red_make_mask_command_uses_explicit_tiff_chooser(
         monkeypatch.setattr(page._operation_slot, "begin_mask", lambda *_args: None); page._handle_shell_command(command)
         assert chosen == ["mask"]
     finally: _close(page, qapp)
+
+
+def test_live_mask_chooser_returns_exact_image_dialog_url_without_decoding(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from xdart.gui.pages.scattering_workspace import _authoring_source_chooser
+
+    selected = DataUrl(
+        file_path=str(tmp_path / "master.h5"),
+        data_path="/entry/data/data_000001", data_slice=(7,),
+        scheme="silx",
+    ).path()
+    calls = []
+
+    class Dialog:
+        def __init__(self, parent):
+            calls.append(("parent", parent))
+
+        def setWindowTitle(self, title):
+            calls.append(("title", title))
+
+        def setDirectory(self, path):
+            calls.append(("directory", path))
+
+        def exec(self):
+            calls.append(("exec",))
+            return 1
+
+        def selectedUrl(self):
+            calls.append(("selectedUrl",))
+            return selected
+
+    monkeypatch.setattr(
+        "silx.gui.dialog.ImageFileDialog.ImageFileDialog", Dialog,
+    )
+    parent = QtWidgets.QWidget()
+    try:
+        chooser = _authoring_source_chooser(parent)
+        assert chooser("mask", str(tmp_path)) == selected
+        assert calls == [
+            ("parent", parent),
+            ("title", "Choose TIFF or HDF5/NeXus frame for mask"),
+            ("directory", str(tmp_path)), ("exec",), ("selectedUrl",),
+        ]
+    finally:
+        parent.deleteLater()
+        qapp.processEvents()
+
+
+def test_live_mask_chooser_unwraps_fabio_tiff_url_to_original_file(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from xdart.gui.pages.scattering_workspace import _authoring_source_chooser
+
+    source = tmp_path / "detector.tiff"
+    selected = DataUrl(file_path=str(source), scheme="fabio").path()
+
+    class Dialog:
+        def __init__(self, _parent): pass
+        def setWindowTitle(self, _title): pass
+        def setDirectory(self, _path): pass
+        def exec(self): return 1
+        def selectedUrl(self): return selected
+
+    monkeypatch.setattr(
+        "silx.gui.dialog.ImageFileDialog.ImageFileDialog", Dialog,
+    )
+    parent = QtWidgets.QWidget()
+    try:
+        assert _authoring_source_chooser(parent)("mask", str(tmp_path)) \
+            == str(source)
+    finally:
+        parent.deleteLater()
+        qapp.processEvents()
 
 def test_page_focus_selected_assets_cancel_and_projection_are_exact(tmp_path, monkeypatch, qapp) -> None:
     _binary(tmp_path, monkeypatch); source = _tiff(tmp_path / "selected.tiff", np.ones((2, 4), dtype=np.uint16))
@@ -162,6 +272,148 @@ def test_request_canonicalizes_alias_and_begin_revalidates_fixed_facts(tmp_path,
     Path(request.final_path).write_text("foreign"); assert slot.begin_mask(request, OperationContextStamp(0)) is None and len(calls) == 1
     assert Path(request.final_path).read_text() == "foreign" and slot.owned is False
     Path(request.final_path).unlink(); binary.unlink(); assert slot.begin_mask(request, OperationContextStamp(0)) is None
+
+
+def test_hdf_requires_exact_numeric_frame_and_freezes_hard_dataset(
+    tmp_path, monkeypatch,
+) -> None:
+    binary = _binary(tmp_path, monkeypatch)
+    source = tmp_path / "direct.nxs"
+    with h5py.File(source, "w") as handle:
+        handle.create_dataset(
+            "/entry/data", data=np.arange(8, dtype="u2").reshape(2, 4),
+        )
+        handle.create_dataset(
+            "/entry/stack", data=np.ones((3, 2, 4), dtype="u2"),
+        )
+    with pytest.raises(ValueError, match="exact dataset/frame"):
+        prepare_mask_request(str(source))
+    with pytest.raises(ValueError, match="bounded numeric frame"):
+        prepare_mask_request(_hdf_url(source, "/entry/stack"))
+    selected = _hdf_url(source, "/entry/data")
+    request = prepare_mask_request(selected)
+    assert request.source_path == str(source)
+    assert request.exact_hdf_url == selected
+    assert request.hdf_target_path == ""
+    assert request.hdf_target_state is None
+    assert request.executable == str(binary)
+
+
+def test_eiger_external_frame_stages_private_tiff_and_requalifies_adoption(
+    tmp_path, monkeypatch,
+) -> None:
+    _binary(tmp_path, monkeypatch)
+    target = tmp_path / "scan_data_000001.h5"
+    frames = np.arange(24, dtype=np.uint16).reshape(3, 2, 4)
+    with h5py.File(target, "w") as handle:
+        handle.create_dataset("/entry/data/data", data=frames)
+    master = tmp_path / "scan_master.h5"
+    with h5py.File(master, "w") as handle:
+        group = handle.require_group("/entry/data")
+        group["data_000001"] = h5py.ExternalLink(
+            target.name, "/entry/data/data",
+        )
+    selected = _hdf_url(master, "/entry/data/data_000001", 1)
+    request = prepare_mask_request(selected)
+    assert request.hdf_target_path == str(target)
+    assert request.hdf_target_state == SourceFileState.capture(target)
+    staged = []
+
+    def inspect(private, _output):
+        staged.append((
+            private.name, private.suffix, stat.S_IMODE(private.stat().st_mode),
+            tifffile.imread(private),
+        ))
+
+    calls = _install_process(
+        monkeypatch, np.ones((2, 4), dtype=np.uint8), hook=inspect,
+    )
+    terminal, progress = _direct(request)
+    result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.RETURNED
+    assert [item[0] for item in progress] == [
+        "copy", "launch", "qualify", "publish",
+    ]
+    assert staged[0][:3] == ("scan_master.tiff", ".tiff", 0o600)
+    assert np.array_equal(staged[0][3], frames[1])
+    assert calls[0][0] == (
+        request.executable, str(Path(result.cwd) / "scan_master.tiff"),
+    )
+    assert selected not in calls[0][0]
+    assert result.proof.source_sha256 == result.proof.staged_sha256
+    assert result.proof.shape == (2, 4)
+    candidate = AuthoredAssetCandidate(
+        "mask", request.final_path, result.proof, result.final_state,
+        request.source_path,
+    )
+    validation = AssetValidationRequest(
+        "mask", request.final_path, result.proof.shape, candidate, request,
+    )
+    assert authoring.validate_authored_asset(validation).candidate is candidate
+
+    with h5py.File(target, "r+") as handle:
+        handle["/entry/data/data"][1] = np.zeros((2, 4), dtype=np.uint16)
+    rebound = replace(
+        request, hdf_target_state=SourceFileState.capture(target),
+    )
+    drifted = AssetValidationRequest(
+        "mask", request.final_path, result.proof.shape, candidate, rebound,
+    )
+    with pytest.raises(ValueError, match="generated mask changed"):
+        authoring.validate_authored_asset(drifted)
+
+
+def test_external_hdf_outside_chained_symlink_and_target_drift_refuse(
+    tmp_path, monkeypatch,
+) -> None:
+    _binary(tmp_path, monkeypatch)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.h5"
+    with h5py.File(outside, "w") as handle:
+        handle.create_dataset("/entry/data/data", data=np.ones((2, 4), dtype="u2"))
+    outside_master = tmp_path / "outside_master.h5"
+    with h5py.File(outside_master, "w") as handle:
+        handle["frame"] = h5py.ExternalLink(
+            f"../{outside.name}", "/entry/data/data",
+        )
+    with pytest.raises(ValueError, match="same-directory"):
+        prepare_mask_request(_hdf_url(outside_master, "/frame"))
+
+    real_target = tmp_path / "real.h5"
+    with h5py.File(real_target, "w") as handle:
+        handle.create_dataset("/data", data=np.ones((2, 4), dtype="u2"))
+    alias = tmp_path / "alias.h5"
+    alias.symlink_to(real_target)
+    symlink_master = tmp_path / "symlink_master.h5"
+    with h5py.File(symlink_master, "w") as handle:
+        handle["frame"] = h5py.ExternalLink(alias.name, "/data")
+    with pytest.raises(ValueError, match="regular direct-child"):
+        prepare_mask_request(_hdf_url(symlink_master, "/frame"))
+
+    chained_target = tmp_path / "chained.h5"
+    with h5py.File(chained_target, "w") as handle:
+        handle["frame"] = h5py.ExternalLink(real_target.name, "/data")
+    chained_master = tmp_path / "chained_master.h5"
+    with h5py.File(chained_master, "w") as handle:
+        handle["frame"] = h5py.ExternalLink(chained_target.name, "/frame")
+    with pytest.raises(ValueError, match="locally owned"):
+        prepare_mask_request(_hdf_url(chained_master, "/frame"))
+
+    target = tmp_path / "drift_target.h5"
+    with h5py.File(target, "w") as handle:
+        handle.create_dataset("/data", data=np.ones((2, 4), dtype="u2"))
+    master = tmp_path / "drift_master.h5"
+    with h5py.File(master, "w") as handle:
+        handle["frame"] = h5py.ExternalLink(target.name, "/data")
+    request = prepare_mask_request(_hdf_url(master, "/frame"))
+    with h5py.File(target, "r+") as handle:
+        handle["/data"][...] = 2
+    calls = _install_process(
+        monkeypatch, np.ones((2, 4), dtype=np.uint8),
+    )
+    terminal, _progress = _direct(request)
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert "source context changed before launch" in terminal.diagnostic
+    assert calls == []
 
 def test_encoded_pixel_itemsize_and_eiger_metadata_caps_precede_decode(tmp_path, monkeypatch) -> None:
     source = _tiff(tmp_path / "source.tiff", np.arange(6, dtype=np.uint16).reshape(2, 3)); private = tmp_path / "private.tiff"
@@ -238,7 +490,8 @@ def test_bool_int_uint_float_public_truth_private_launch_and_publication(tmp_pat
     assert len(calls) == 1
     argv, options, mode = calls[0]; assert argv == (request.executable, str(Path(options["cwd"]) / Path(request.source_path).name))
     assert options["cwd"] == result.cwd and options["shell"] is False and mode == 0o600
-    assert options["stdin"] is options["stdout"] is options["stderr"] is subprocess.DEVNULL
+    assert options["stdin"] is options["stdout"] is subprocess.DEVNULL
+    assert options["stderr"] is not subprocess.DEVNULL and options["stderr"].closed
     assert ("creationflags" in options) is authoring._WINDOWS and ("start_new_session" in options) is not authoring._WINDOWS
     expected = mask != 0
     if mask.dtype.kind == "f": expected |= np.isnan(mask)
@@ -247,6 +500,37 @@ def test_bool_int_uint_float_public_truth_private_launch_and_publication(tmp_pat
     assert result.proof.source_sha256 == result.proof.staged_sha256 and stat.S_IMODE(Path(request.final_path).stat().st_mode) == 0o600
     assert result.final_state == SourceFileState.capture(Path(request.final_path))
     assert not Path(result.cwd).exists()
+
+
+def test_nonzero_mask_surfaces_bounded_private_stderr_without_leak(
+    tmp_path, monkeypatch,
+) -> None:
+    request = _request(tmp_path, monkeypatch)
+    observed = []
+
+    def inspect_stderr(private, _output):
+        stage = private.parent
+        stream = calls[0][1]["stderr"]
+        observed.append((
+            stat.S_IMODE(os.fstat(stream.fileno()).st_mode),
+            tuple(stage.glob(".xdart-authoring-stderr-*")),
+        ))
+
+    payload = (b"x" * (authoring._CHILD_STDERR_BYTES_LIMIT + 32)
+               + b"\nImportError: silx Qt binding failed\n")
+    calls = _install_process(
+        monkeypatch, code=19, hook=inspect_stderr, stderr=payload,
+    )
+    terminal, _progress = _direct(request)
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert "pyFAI-drawmask exited with status 19" in terminal.diagnostic
+    assert "[stderr truncated]" in terminal.diagnostic
+    assert "ImportError: silx Qt binding failed" in terminal.diagnostic
+    assert len(terminal.diagnostic.encode("utf-8")) \
+        <= authoring._DIAGNOSTIC_BYTES_LIMIT
+    assert observed == [(0o600, ())]
+    assert calls[0][1]["stderr"].closed
+    assert not Path(terminal.payload.cwd).exists()
 
 @pytest.mark.parametrize("bad", (
     np.ones(8, dtype=np.uint8), np.ones((3, 4), dtype=np.uint8),

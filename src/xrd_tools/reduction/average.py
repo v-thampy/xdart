@@ -620,7 +620,8 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
         plan.numeric_metadata_keys or plan.invariant_metadata_keys
     )
     detector_mask = None
-    conditioned = working = valid = None
+    working = valid = None
+    floating_native = np.dtype(plan.native_dtype).kind == 'f'
     external_cursor = 0
     for index in range(extent):
         while (external_cursor < len(external_route)
@@ -644,10 +645,8 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
                 detector_mask = np.frombuffer(np.ascontiguousarray(mask, dtype=bool).tobytes(), dtype=bool).reshape(shape)
                 detector_mask.setflags(write=False)
             del mask
-            conditioned = np.empty(shape, dtype=np.float64)
             working = np.empty(shape, dtype=bool)
             valid = np.empty(shape, dtype=bool)
-        np.copyto(conditioned, native, casting='unsafe')
         working.fill(False)
         if plan.recipe.threshold_min is not None:
             np.less(native, plan.recipe.threshold_min, out=valid)
@@ -659,15 +658,17 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
             np.logical_or(working, static, out=working)
         if detector_mask is not None:
             np.logical_or(working, detector_mask, out=working)
-        np.isfinite(conditioned, out=valid)
-        np.logical_not(valid, out=valid)
-        np.logical_or(working, valid, out=working)
+        if floating_native:
+            np.isfinite(native, out=valid)
+            np.logical_not(valid, out=valid)
+            np.logical_or(working, valid, out=working)
         np.logical_not(working, out=valid)
         with np.errstate(over='ignore', invalid='ignore'):
-            np.add(sums, conditioned, out=sums, where=valid)
-        working.fill(True)
-        np.isfinite(sums, out=working, where=valid)
-        _reject(not bool(working.all()), 'AVERAGE_PIXEL_SUM_OVERFLOW')
+            np.add(sums, native, out=sums, where=valid)
+        if floating_native:
+            working.fill(True)
+            np.isfinite(sums, out=working, where=valid)
+            _reject(not bool(working.all()), 'AVERAGE_PIXEL_SUM_OVERFLOW')
         np.add(counts, np.uint32(1), out=counts, where=valid)
         if needs_metadata:
             _accumulate_metadata(
@@ -675,7 +676,7 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
             )
         progress('average', index + 1, extent)
         del native, row
-    del conditioned, working, valid
+    del working, valid
     zero = counts == 0
     _reject(bool(zero.all()), 'AVERAGE_ALL_PIXELS_INVALID')
     np.divide(sums, counts, out=sums, where=~zero)

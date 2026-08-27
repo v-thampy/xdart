@@ -222,6 +222,287 @@ def test_incomplete_and_refused_are_preserve_current_outcomes(
         _close(rig)
 
 
+def test_page_fail_closes_terminal_and_incompatible_browse_cache_misses(
+    tmp_path, monkeypatch,
+) -> None:
+    import time
+
+    from tests.xdart.scattering.test_e4_preview_transport import (
+        _write_processed,
+    )
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import (
+        _close as _close_page,
+        _page,
+    )
+    from xdart.gui.tabs.scattering.browse_1d_display import (
+        prepare_browse_1d_display,
+    )
+    from xdart.gui.tabs.scattering.browse_1d_projection import (
+        Browse1DProjectionStatus,
+    )
+    from xdart.gui.tabs.scattering.browse_1d_target_plan import (
+        Browse1DRuntimeProjection,
+    )
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
+    from xdart.gui.tabs.scattering.shell_values import BrowseTraceSnapshot
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    processed, _raw = _write_processed(
+        tmp_path / "legacy",
+        labels=tuple(range(1, 17)),
+    )
+    page, _store = _page(tmp_path, monkeypatch)
+    controller = page._context_controller
+
+    def wait_for(call):
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            value = call()
+            if value is not None:
+                return value
+            time.sleep(0.005)
+        raise AssertionError("timed out waiting for focused Browse setup")
+
+    def mount_prior_waterfall(*, include_snapshot=True, template=None):
+        prior = make_shell_projection(
+            frame_count=8,
+            selected_index=7,
+            heavy_indices=(7,),
+            plot_mode="Waterfall",
+            source_scan="eiger-prior",
+        )
+        base = (
+            replace(
+                prior.scientific,
+                processing_mode="Int 2D",
+                norm_channels=(page._preferences.norm_channel,),
+                norm_channel=page._preferences.norm_channel,
+                color_map=page._preferences.color_map,
+                plot_axis=page._preferences.plot_axis,
+                plot_mode="Waterfall",
+                share_axis=page._preferences.share_axis,
+                plot_options=page._preferences.plot_options,
+            )
+            if template is None
+            else replace(
+                template,
+                heavy_available=prior.scientific.heavy_available,
+                traces=prior.scientific.traces,
+                heavy=prior.scientific.heavy,
+                title=prior.scientific.title,
+                browse_trace_snapshot=None,
+            )
+        )
+        snapshot = BrowseTraceSnapshot(
+            logical_frames=prior.navigation.selected,
+            display_frames=tuple(trace.frame for trace in base.traces),
+            logical_positions=tuple(range(1, len(base.traces) + 1)),
+            plot_mode="Waterfall",
+            waterfall_active=True,
+            stacked_options_applied=True,
+            science_contract=base.browse_science_contract,
+        )
+        scientific = (
+            replace(base, browse_trace_snapshot=snapshot)
+            if include_snapshot
+            else base
+        )
+        page._shell.scientific.reconcile(
+            scientific,
+            prior.navigation,
+            completed=8,
+            total=8,
+            detail="Prior Eiger",
+        )
+        page._last_scientific_projection = scientific
+        assert page._shell.scientific.bottom_waterfall_active
+        assert page._shell.scientific.trace_row_count == 8
+        assert page._shell.scientific.raw.canvas.displayed_image.size
+        return scientific
+
+    try:
+        request = controller.begin_browse(str(processed.resolve()))
+        outcome = wait_for(controller.poll_browse)
+        assert outcome.request is request
+        assert outcome.status is BrowseLoadStatus.READY
+        navigation = controller.navigation
+        assert len(navigation.frames) == 16
+        assert controller.select_navigation(
+            navigation.frames[-1], navigation.frames,
+        )
+        page._preferences = replace(
+            page._preferences, plot_mode="Waterfall",
+        )
+        view = page._shell.scientific
+        original_project = controller.project_browse_1d_cache
+
+        def refresh_current_cache():
+            page._refresh_shell()
+            candidate = page._last_scientific_projection
+            snapshot = (
+                None if candidate is None
+                else candidate.browse_trace_snapshot
+            )
+            return (
+                candidate
+                if snapshot is not None
+                and all(
+                    frame.artifact == str(processed.resolve())
+                    for frame in snapshot.logical_frames
+                )
+                else None
+            )
+
+        exact_current = wait_for(refresh_current_cache)
+        exact_snapshot = exact_current.browse_trace_snapshot
+        assert exact_snapshot is not None
+        exact_history = view.trace_history_keys
+        assert exact_history == exact_snapshot.logical_frames
+
+        controller.capture_norm_aggregate_for_refresh()
+        same_contract_planned = original_project(
+            preferences=page._preferences,
+            was_waterfall_active=True,
+        )
+        assert same_contract_planned.status in {
+            Browse1DProjectionStatus.COMPLETE,
+            Browse1DProjectionStatus.INCOMPLETE,
+        }
+        if same_contract_planned.status is Browse1DProjectionStatus.COMPLETE:
+            same_contract_detached = prepare_browse_1d_display(
+                same_contract_planned,
+            )
+            assert same_contract_detached is not None
+            same_contract_plan = same_contract_detached.plan
+        else:
+            same_contract_plan = same_contract_planned.plan
+        assert same_contract_plan is not None
+        same_contract_incomplete = Browse1DRuntimeProjection(
+            Browse1DProjectionStatus.INCOMPLETE,
+            plan=same_contract_plan,
+            submission_identity=object(),
+        )
+        monkeypatch.setattr(
+            controller,
+            "project_browse_1d_cache",
+            lambda **_kwargs: same_contract_incomplete,
+        )
+
+        # One exact-current copied snapshot remains visible while its own
+        # unchanged sparse cache retry is incomplete.
+        page._refresh_shell()
+        assert view.trace_history_keys == exact_history
+        assert view.bottom_waterfall_active
+        assert page._scientific_repaint_pending
+
+        # A matching presentation contract cannot authorize an old artifact's
+        # copied Browse rows.  Exact current request/navigation/frame custody
+        # is required before an INCOMPLETE retry may retain prior science.
+        foreign = mount_prior_waterfall(template=exact_current)
+        assert (
+            foreign.browse_trace_snapshot.science_contract
+            == exact_snapshot.science_contract
+        )
+        page._refresh_shell()
+        assert view.trace_history_keys == ()
+        assert not view.bottom_waterfall_active
+        assert view.raw.canvas.displayed_image.size == 0
+        assert view.cake.canvas.displayed_image.size == 0
+        assert page._scientific_repaint_pending
+
+        # Absence of a BrowseTraceSnapshot is never evidence that arbitrary
+        # outgoing science belongs to the currently adopted Browse artifact.
+        foreign = mount_prior_waterfall(
+            include_snapshot=False,
+            template=exact_current,
+        )
+        assert (
+            foreign.browse_science_contract
+            == exact_snapshot.science_contract
+        )
+        page._refresh_shell()
+        assert view.trace_history_keys == ()
+        assert not view.bottom_waterfall_active
+        assert view.raw.canvas.displayed_image.size == 0
+        assert view.cake.canvas.displayed_image.size == 0
+        assert page._scientific_repaint_pending
+
+        monkeypatch.setattr(
+            controller, "project_browse_1d_cache", original_project,
+        )
+        mount_prior_waterfall()
+        refused = Browse1DRuntimeProjection(
+            Browse1DProjectionStatus.REFUSED,
+            diagnostic="terminal old-artifact cache refusal",
+        )
+        monkeypatch.setattr(
+            controller,
+            "project_browse_1d_cache",
+            lambda **_kwargs: refused,
+        )
+        page._refresh_shell()
+        assert page._shell.scientific is view
+        assert view.trace_history_keys == ()
+        assert not view.bottom_waterfall_active
+        assert view.raw.canvas.displayed_image.size == 0
+        assert view.cake.canvas.displayed_image.size == 0
+        assert view.title.text() == "Current"
+        assert page._notice_text == "terminal old-artifact cache refusal"
+        assert not page._scientific_repaint_pending
+
+        monkeypatch.setattr(
+            controller, "project_browse_1d_cache", original_project,
+        )
+        mount_prior_waterfall()
+        page._preferences = replace(page._preferences, plot_mode="Single")
+        controller.capture_norm_aggregate_for_refresh()
+        planned = original_project(
+            preferences=page._preferences,
+            was_waterfall_active=True,
+        )
+        assert planned.status in {
+            Browse1DProjectionStatus.COMPLETE,
+            Browse1DProjectionStatus.INCOMPLETE,
+        }
+        if planned.status is Browse1DProjectionStatus.COMPLETE:
+            detached = prepare_browse_1d_display(planned)
+            assert detached is not None
+            plan = detached.plan
+        else:
+            plan = planned.plan
+        assert plan is not None
+        incomplete = Browse1DRuntimeProjection(
+            Browse1DProjectionStatus.INCOMPLETE,
+            plan=plan,
+            submission_identity=object(),
+        )
+        monkeypatch.setattr(
+            controller,
+            "project_browse_1d_cache",
+            lambda **_kwargs: incomplete,
+        )
+        page._refresh_shell()
+        assert view.presentation_plot_mode == "Single"
+        assert view.trace_history_keys == ()
+        assert not view.bottom_waterfall_active
+        assert view.title.text() == "Current"
+        assert page._scientific_repaint_pending
+
+        mount_prior_waterfall()
+        page._preferences = replace(page._preferences, plot_mode="Average")
+        page._refresh_shell()
+        assert view.presentation_plot_mode == "Average"
+        assert view.trace_history_keys == ()
+        assert not view.bottom_waterfall_active
+        assert not page._scientific_repaint_pending
+        assert page._notice_text.startswith(
+            "Browse cache display is unavailable for Average/Sum"
+        )
+    finally:
+        _close_page(page, app)
+
+
 def test_cache_paint_exception_replaces_whole_scientific_view(
     monkeypatch,
 ) -> None:

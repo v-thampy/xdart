@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from enum import Enum
 import logging
 import math
 import os
@@ -33,6 +34,7 @@ from xrd_tools.session.run_intent_profile import (
 )
 from xrd_tools.session.run_configuration import (
     FrozenRunConfiguration,
+    RunIntent,
     heavy_residency_choice,
 )
 from xrd_tools.reduction import ReintegrateResult
@@ -151,6 +153,7 @@ from .shell_projection import (
     share_plot_axis_for_image,
 )
 from .scientific_axes import (
+    native_1d_plot_axis,
     resolve_norm_presentation,
     slice_recipe_axes_compatible,
     slice_region_orientation,
@@ -397,6 +400,16 @@ class _DeferredMetadata:
     candidate: object | None = None
 
 
+class _OperationRefresh(Enum):
+    NONE = "none"
+    DIALOG = "dialog"
+    CONTROLS = "controls"
+    FULL = "full"
+
+    def __bool__(self) -> bool:
+        return self is not _OperationRefresh.NONE
+
+
 @dataclass(frozen=True, slots=True)
 class _TerminalBrowseHandoff:
     request: BrowseLoadRequest
@@ -493,6 +506,21 @@ def _terminal_identity_for_target(
     return value if value.target == normalized else None
 
 
+def _native_plot_axis_for_run(
+    value: RunIntent | FrozenRunConfiguration,
+) -> str | None:
+    """Resolve one editable or frozen run's native 1-D plot selector."""
+
+    if type(value) not in {RunIntent, FrozenRunConfiguration}:
+        return None
+    semantic = (
+        value.gi.mode_1d
+        if value.gi.enabled
+        else value.bai_1d_args.get("unit", "q_A^-1")
+    )
+    return native_1d_plot_axis(semantic)
+
+
 @dataclass(frozen=True, slots=True)
 class _AdmissionPageOwner:
     token: AdmissionToken
@@ -501,6 +529,14 @@ class _AdmissionPageOwner:
     admission_receipt: AdmissionReceipt | None = None
     retirement_receipt: DisplayRetirementReceipt | None = None
     retirement_applied: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _NativePlotAxisTransition:
+    origin_axis: str
+    target_axis: str
+    followed_origin: bool
+    run_identity: RunIdentity | None = None
 
 
 class _AuthoredAssetDialog(QtWidgets.QDialog):
@@ -807,6 +843,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         self._shell_revision = 0
         self._preferences = ScientificPreferences()
+        self._native_plot_axis_transition: (
+            _NativePlotAxisTransition | None
+        ) = None
         self._detector_scope_owner = None
         self._detector_demand_frame = None
         self._last_scientific_projection = None
@@ -864,6 +903,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_fingerprint = ""; self._analysis_request = None
         self._analysis_candidate = None
         self._deferred_metadata: _DeferredMetadata | None = None
+        self._metadata_busy_projected = False
         self._roi_preview_binding = None
         self._metadata_result = self._scan_roi_result = None
         self._peak_result = self._phase_result = None
@@ -935,7 +975,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _experiment_operation_busy(self) -> bool:
         return (self._operation_slot.owned
                 or self._authored_asset_owner is not None
-                or self._pending_reintegrate_reload is not None)
+                or self._pending_reintegrate_reload is not None
+                or self._metadata_busy_projected)
 
     def _observe_operation_stamp(self, revision: int | None = None) -> None:
         slot = getattr(self, "_operation_slot", None)
@@ -1080,6 +1121,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return None
         return None
 
+    def _set_metadata_dialog_status(self, target, message) -> None:
+        dialog = getattr(self, f"_{target}_dialog", None)
+        status = None if dialog is None else getattr(dialog, "status", None)
+        if status is not None:
+            status.setText(str(message or ""))
+
+    def _finish_metadata_refresh(
+        self, target, message=None,
+    ) -> _OperationRefresh:
+        if message is not None:
+            self._set_metadata_dialog_status(target, message)
+        if not self._metadata_busy_projected:
+            return _OperationRefresh.DIALOG
+        self._metadata_busy_projected = False
+        return _OperationRefresh.CONTROLS
+
     def _begin_analysis(self, kind, plan, generation, *, target=None,
                         request=None, anchor=None, table=None, roi=None,
                         candidate=None):
@@ -1112,7 +1169,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_anchor, self._analysis_fingerprint = anchor, fingerprint
         self._analysis_request = request; self._analysis_candidate = candidate
         self._ensure_timer()
-        self._notice(f"Running {kind.replace('_', ' ')}…"); return identity
+        message = f"Running {kind.replace('_', ' ')}…"
+        self._notice(message)
+        if kind in {"metadata", "metadata_requalification"}:
+            self._set_metadata_dialog_status(target, message)
+            if not self._metadata_busy_projected:
+                self._metadata_busy_projected = True
+                self._refresh_shell(
+                    preserve_display=True,
+                    preserve_scientific=True,
+                )
+        return identity
 
     def _submit_metadata(
         self, plan, generation, *, target="metadata", request=None,
@@ -1199,17 +1266,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         from .analysis_mount import analysis_start_allowed
         return "ready" if analysis_start_allowed(self) else "permanent"
 
-    def _dispatch_deferred_metadata(self) -> bool:
+    def _dispatch_deferred_metadata(self) -> _OperationRefresh:
         deferred = self._deferred_metadata
         if deferred is None:
-            return False
+            return _OperationRefresh.NONE
         disposition = self._classify_deferred_metadata(deferred)
         if disposition == "transient":
-            return False
+            return _OperationRefresh.NONE
         if disposition != "ready":
             if self._deferred_metadata is deferred:
                 self._deferred_metadata = None
-            return True
+            return self._finish_metadata_refresh(
+                deferred.target,
+                "Metadata request is no longer current.",
+            )
         kind = (
             "metadata_requalification"
             if deferred.candidate is not None else "metadata"
@@ -1222,13 +1292,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if identity is not None:
             if self._deferred_metadata is deferred:
                 self._deferred_metadata = None
-            return True
+            return _OperationRefresh.DIALOG
         if self._classify_deferred_metadata(deferred) != "transient":
             if self._deferred_metadata is deferred:
                 self._deferred_metadata = None
-            return True
+            return self._finish_metadata_refresh(
+                deferred.target,
+                "Metadata request is no longer current.",
+            )
         self._ensure_timer()
-        return False
+        return _OperationRefresh.NONE
 
     def _capture_analysis_trace(self, kind):
         from .analysis_mount import capture_display_anchor, displayed_trace_input
@@ -1402,12 +1475,28 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _consume_analysis_update(self, update):
         if type(update) is not OperationUpdate or update.identity is not self._analysis_identity:
-            return False
+            return _OperationRefresh.NONE
         if update.terminal is None:
             if update.progress is not None:
-                self._notice(f"Analysis: {update.progress.stage} {update.progress.completed}/{update.progress.total}")
-            return True
+                message = f"Analysis: {update.progress.stage} {update.progress.completed}/{update.progress.total}"
+                self._notice(message)
+                if self._analysis_kind in {
+                    "metadata", "metadata_requalification",
+                }:
+                    self._set_metadata_dialog_status(
+                        self._analysis_target, message,
+                    )
+            return (
+                _OperationRefresh.DIALOG
+                if self._analysis_kind in {
+                    "metadata", "metadata_requalification",
+                }
+                else _OperationRefresh.FULL
+            )
         kind, target = self._analysis_kind, self._analysis_target
+        metadata_operation = kind in {
+            "metadata", "metadata_requalification",
+        }
         request = self._analysis_request
         current = self._analysis_generation == self._analysis_generation_for(target)
         current = bool(current and request is not None
@@ -1431,7 +1520,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._roi_preview_binding = self._scan_roi_result = None
             self._scan_roi_dialog.clear_vnext_metadata()
             if candidates: self._scan_roi_dialog.source_widget.set_external_candidates(candidates)
-            self._notice("Choose one headless-qualified source."); return True
+            message = "Choose one headless-qualified source."
+            self._notice(message)
+            return self._finish_metadata_refresh(target, message)
         from .analysis_mount import (analysis_result_matches,
             retention_admission, terminal_adoption)
         payload, diagnostic = terminal_adoption(update, current=current)
@@ -1462,18 +1553,24 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_generation = self._analysis_anchor = self._analysis_request = None
         self._analysis_fingerprint = ""; self._analysis_candidate = None
         if payload is None:
-            self._notice(diagnostic); return True
+            self._notice(diagnostic)
+            return (
+                self._finish_metadata_refresh(target, diagnostic)
+                if metadata_operation else _OperationRefresh.FULL
+            )
         if kind == "metadata" and self._deferred_metadata is not None:
             # A newer user request already owns latest-only precedence.  Do
             # not let this older terminal candidate erase it, either while
             # chaining or after completing the candidate's requalification.
-            return True
+            return _OperationRefresh.DIALOG
         if kind == "metadata" and not requalification:
-            self._submit_metadata(
+            identity = self._submit_metadata(
                 None, generation, target=target, request=request,
                 candidate=payload,
             )
-            return True
+            if identity is None and self._deferred_metadata is None:
+                return self._finish_metadata_refresh(target)
+            return _OperationRefresh.DIALOG
         retained = {"metadata": self._metadata_result,
                     "scan_roi": self._scan_roi_result,
                     "peak": self._peak_result, "phase": self._phase_result}
@@ -1482,7 +1579,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             "scan_roi" if kind in {"scan_plot", "roi_preview", "roi_scan"} else kind)
         admitted, reason = retention_admission(retained, replacing, payload)
         if not admitted:
-            self._notice(reason); return True
+            self._notice(reason)
+            return (
+                self._finish_metadata_refresh(target, reason)
+                if metadata_operation else _OperationRefresh.FULL
+            )
         if kind in {"scan_plot", "roi_preview", "roi_scan"}:
             self._roi_preview_binding = None
             if self._scan_roi_dialog is not None:
@@ -1524,7 +1625,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         else:
             self._phase_result = payload
             if self._phase_dialog is not None: self._phase_dialog.set_vnext_result(payload)
-        self._notice(""); return True
+        self._notice("")
+        return (
+            self._finish_metadata_refresh(target)
+            if metadata_operation else _OperationRefresh.FULL
+        )
 
     @staticmethod
     def _background_domain(mode: str) -> str | None:
@@ -2475,6 +2580,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         first = not self._closing
         if first:
             self._closing = True
+            self._retire_native_plot_axis_transition()
             self._retire_batch_terminal_presentation()
             authored = self._authored_asset_owner
             if authored is not None:
@@ -3377,6 +3483,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         outcome = pipeline.start(receipt)
         if isinstance(outcome, StartLaunched):
             self._admission = None
+            self._bind_native_plot_axis_to_run(
+                outcome.run_identity,
+                outcome.configuration,
+            )
             ScatteringWorkspace._clear_presentation_targets(self)
             launched_source = outcome.source_capture.source
             self._pending_source_refresh = None
@@ -3508,6 +3618,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _stop_run(self) -> None:
         if self._closing or self._closed:
             return
+        self._release_native_plot_axis_transition_for_retry()
         token = self._admission
         if token is not None:
             released = self._release_admission(token)
@@ -3741,6 +3852,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> bool:
         if self._batch_terminal_ready_to_paint() is not owner:
             return False
+        self._consume_native_plot_axis_transition(owner.run_identity)
         retained = self._retain_outgoing_display
         self._retain_outgoing_display = False
         revision = self._shell_revision
@@ -4094,6 +4206,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         force_scientific = changed
         frame_presentation_changed = False
+        controls_refresh = False
 
         executor = self._run_executor
         events: tuple[StandardRunEvent, ...] = ()
@@ -4247,12 +4360,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         continue
                     if self._active_batch_mode:
                         continue
-                if (
-                    self._context_controller.qualify_display_event(
-                        event
+                payload = self._context_controller.qualify_display_event(
+                    event
+                )
+                if payload is not None:
+                    self._consume_native_plot_axis_transition(
+                        event.run_identity
                     )
-                    is not None
-                ):
                     changed = True
                     force_scientific = True
                 continue
@@ -4282,6 +4396,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 else:
                     ScatteringWorkspace._flush_presentation_target(self)
                     self._retain_outgoing_display = False
+                batch_owner = self._batch_terminal_presentation
+                if (
+                    not was_batch
+                    or event.kind is not StandardEventKind.FINISHED
+                    or event.cleanup_status is not CleanupStatus.CLEANED
+                    or batch_owner is None
+                    or batch_owner.run_identity is not event.run_identity
+                    or batch_owner.frame is None
+                ):
+                    self._release_native_plot_axis_transition_for_retry(
+                        event.run_identity
+                    )
                 terminal_navigation = self._context_controller.navigation
                 batch_notice = (
                     self._notice_text
@@ -4334,9 +4460,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ScatteringWorkspace._observe_operation_stamp(self)
             update = operation_slot.poll(operation_identity)
             if update is not None:
-                operation_changed = self._consume_asset_validation_update(update) or self._consume_analysis_update(update) or self._consume_calibration_update(update) or self._consume_mask_update(update) or self._consume_background_update(update) or self._consume_reintegrate_update(update) or self._consume_average_update(update)
-                changed = operation_changed or changed
-                force_scientific = operation_changed or force_scientific
+                if self._consume_asset_validation_update(update):
+                    operation_refresh = _OperationRefresh.FULL
+                else:
+                    operation_refresh = self._consume_analysis_update(update)
+                    if (
+                        operation_refresh is _OperationRefresh.NONE
+                        and (
+                            self._consume_calibration_update(update)
+                            or self._consume_mask_update(update)
+                            or self._consume_background_update(update)
+                            or self._consume_reintegrate_update(update)
+                            or self._consume_average_update(update)
+                        )
+                    ):
+                        operation_refresh = _OperationRefresh.FULL
+                if operation_refresh is _OperationRefresh.CONTROLS:
+                    controls_refresh = True
+                elif operation_refresh is _OperationRefresh.FULL:
+                    changed = True
+                    force_scientific = True
             elif operation_identity is self._background_identity and not operation_slot.owned:
                 self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True; force_scientific = True
             elif operation_identity is self._reintegrate_identity and not operation_slot.owned:
@@ -4347,10 +4490,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._average_identity = self._average_revision = self._average_target = self._average_entry = None
                 self._notice("Average failed before terminal publication."); changed = True; force_scientific = True
             elif operation_identity is self._analysis_identity and not operation_slot.owned:
+                kind, target = self._analysis_kind, self._analysis_target
                 self._analysis_identity = self._analysis_kind = self._analysis_target = None
                 self._analysis_generation = self._analysis_anchor = self._analysis_request = None
                 self._analysis_fingerprint = ""; self._analysis_candidate = None
-                self._notice("Analysis failed before terminal publication."); changed = True; force_scientific = True
+                message = "Analysis failed before terminal publication."
+                self._notice(message)
+                if kind in {"metadata", "metadata_requalification"}:
+                    controls_refresh = bool(
+                        self._finish_metadata_refresh(target, message)
+                        is _OperationRefresh.CONTROLS
+                    )
+                else:
+                    changed = True
+                    force_scientific = True
             elif operation_identity is self._asset_validation_identity and not operation_slot.owned:
                 self._asset_validation_identity = None
                 owner = self._authored_asset_owner
@@ -4362,8 +4515,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice("Asset validation failed before terminal publication.")
                 changed = True
 
-        if self._dispatch_deferred_metadata():
+        deferred_refresh = self._dispatch_deferred_metadata()
+        if deferred_refresh is _OperationRefresh.CONTROLS:
+            controls_refresh = True
+        elif deferred_refresh is _OperationRefresh.FULL:
             changed = True
+            force_scientific = True
 
         advanced_presentation = (
             ScatteringWorkspace._advance_presentation_target(self)
@@ -4380,6 +4537,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 changed = True
                 force_scientific = True
+        if controls_refresh and not changed:
+            self._refresh_shell(
+                preserve_display=True,
+                preserve_scientific=True,
+            )
         batch_ready = self._batch_terminal_ready_to_paint()
         if changed and batch_ready is not None:
             self._scientific_repaint_pending = False
@@ -5483,6 +5645,75 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if state != (current.detector_available, current.detector_pending, current.detector_diagnostic):
             self._preferences = replace(current, detector_available=state[0], detector_pending=state[1], detector_diagnostic=state[2])
 
+    def _browse_snapshot_is_exact_current(
+        self,
+        scientific: object,
+        requested_contract: object,
+    ) -> bool:
+        """Authorize transient retention only for the adopted Browse scope."""
+
+        snapshot = getattr(scientific, "browse_trace_snapshot", None)
+        captured = self._context_controller.capture_reintegrate_browse()
+        navigation = self._context_controller.navigation
+        if (
+            snapshot is None
+            or type(requested_contract) is not tuple
+            or not requested_contract
+            or captured is None
+            or getattr(scientific, "browse_science_contract", None)
+            != requested_contract
+            or snapshot.science_contract != requested_contract
+            or snapshot.plot_mode != self._preferences.plot_mode
+            or getattr(scientific, "plot_mode", None) != snapshot.plot_mode
+        ):
+            return False
+        _context, request, selection, artifact = captured[:4]
+        if (
+            selection is not self._context_controller.selection
+            or request.source_path != artifact
+            or navigation.current is None
+        ):
+            return False
+        expected_logical = (
+            (navigation.current,)
+            if snapshot.plot_mode == "Single"
+            else navigation.selected
+        )
+        logical = snapshot.logical_frames
+        display = snapshot.display_frames
+        traces = getattr(scientific, "traces", ())
+        heavy = getattr(scientific, "heavy", None)
+        heavy_available = getattr(scientific, "heavy_available", ())
+        return bool(
+            len(logical) == len(expected_logical)
+            and all(
+                retained is current
+                and retained.artifact == artifact
+                and self._context_controller.owns_frame(retained)
+                for retained, current in zip(
+                    logical, expected_logical, strict=True,
+                )
+            )
+            and len(traces) == len(display)
+            and all(
+                trace.frame is frame
+                and frame.artifact == artifact
+                and self._context_controller.owns_frame(frame)
+                for trace, frame in zip(traces, display, strict=True)
+            )
+            and all(
+                frame.artifact == artifact
+                and self._context_controller.owns_frame(frame)
+                for frame in heavy_available
+            )
+            and (
+                heavy is None
+                or heavy.frame is navigation.current
+                and heavy.frame.artifact == artifact
+                and self._context_controller.owns_frame(heavy.frame)
+            )
+        )
+
     def _refresh_shell(
         self,
         *,
@@ -5584,6 +5815,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         cache_plan = None
         cache_preferences = None
         cache_current_preview = None
+        cache_adoption_missing = False
+        cache_terminal_diagnostic = ""
+        cache_retry_needed = False
         selection = self._context_controller.selection
         browse_selected = bool(
             selection is not None and selection.kind is ContextKind.BROWSE
@@ -5601,16 +5835,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             payloads = ()
         elif browse_selected and not browse_cache_supported:
             payloads = ()
-            preserve_scientific = True
-            self._notice(
-                "Browse cache display retains current science for "
-                "Average/Sum and 2-D slice or pin projections."
+            cache_adoption_missing = True
+            cache_terminal_diagnostic = (
+                "Browse cache display is unavailable for Average/Sum "
+                "and 2-D slice or pin projections."
             )
+            preserve_scientific = True
+            self._scientific_repaint_pending = False
+            self._notice(cache_terminal_diagnostic)
         elif browse_cache_supported:
             payloads = ()
             adopted = None
-            cache_retry_needed = False
             cache_runtime_status = None
+            runtime = None
             cache_preferences = self._preferences
             if self._release_browse_1d_debt():
                 # Detector/cake hydration stays on the exact-current preview
@@ -5632,7 +5869,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         self._browse_1d_release_debt = error.bundle
                         cache_retry_needed = True
                     except Browse1DDisplayRefusal as error:
-                        self._notice(str(error))
+                        cache_terminal_diagnostic = str(error)
+                        self._notice(cache_terminal_diagnostic)
             else:
                 cache_retry_needed = True
             if adopted is not None and (
@@ -5647,7 +5885,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 # Every refusal is fail-closed, but only an incomplete sparse
                 # read, an exact release debt, or detected drift can make
                 # progress by polling.  Terminal REFUSED must not spin.
-                preserve_scientific = True
                 cache_retry_needed = _browse_1d_cache_retry_needed(
                     cache_runtime_status,
                     transient=(
@@ -5655,6 +5892,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         or self._browse_1d_release_debt is not None
                     ),
                 )
+                cache_adoption_missing = True
+                if not cache_retry_needed:
+                    cache_terminal_diagnostic = (
+                        cache_terminal_diagnostic
+                        or (
+                            runtime.diagnostic
+                            if runtime is not None
+                            else "Browse 1-D runtime is unavailable."
+                        )
+                        or "Browse 1-D display was refused."
+                    )
+                    self._notice(cache_terminal_diagnostic)
+                # Compatibility is checked against the fully projected
+                # presentation contract below.  Until then, do not expose a
+                # payload-free projection that could retain a stale hybrid.
+                preserve_scientific = True
                 self._scientific_repaint_pending = cache_retry_needed
                 if cache_retry_needed:
                     self._ensure_timer()
@@ -5759,6 +6012,36 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             norm_aggregate=self._context_controller.norm_aggregate,
             presentation_background=self._background_owner.projection(),
         )
+        if cache_adoption_missing:
+            prior = self._last_scientific_projection
+            retention_compatible = self._browse_snapshot_is_exact_current(
+                prior,
+                projection.scientific.browse_science_contract,
+            )
+            if cache_terminal_diagnostic or not retention_compatible:
+                # INCOMPLETE may retain only an exact-current Browse snapshot.
+                # A terminal refusal/no-runtime state cannot, and a changed
+                # request, navigation, artifact, mode, axis, or options cannot
+                # label foreign science as the requested pending presentation.
+                diagnostic = (
+                    cache_terminal_diagnostic
+                    or "Loading Browse 1-D display for changed settings…"
+                )
+                preserve_scientific = False
+                preserve_display = False
+                projection = replace(
+                    projection,
+                    scientific=replace(
+                        projection.scientific,
+                        heavy_available=frozenset(),
+                        traces=(),
+                        heavy=None,
+                        title="Current",
+                        status=diagnostic,
+                        retain_display=False,
+                        browse_trace_snapshot=None,
+                    ),
+                )
         if cache_trace_snapshot is not None:
             trace_by_id = {
                 id(trace.frame): trace
@@ -5815,14 +6098,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._ensure_timer()
             return
         try:
-            choice, _ = heavy_residency_choice(intent.run_options)
-            self._shell.browser.reconcile_heavy_residency(
-                choice,
-                next_run=any(value is not None for value in (
-                    self._lifecycle.active_run_identity,
-                    self._lifecycle.attempt_run_identity,
-                )),
-            )
+            if not preserve_display:
+                choice, _ = heavy_residency_choice(intent.run_options)
+                self._shell.browser.reconcile_heavy_residency(
+                    choice,
+                    next_run=any(value is not None for value in (
+                        self._lifecycle.active_run_identity,
+                        self._lifecycle.attempt_run_identity,
+                    )),
+                )
             apply_options = {"preserve_display": preserve_display}
             if preserve_scientific:
                 apply_options["preserve_scientific"] = True
@@ -5879,7 +6163,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             return
         if not preserve_scientific:
-            self._scientific_repaint_pending = False
+            self._scientific_repaint_pending = bool(
+                cache_adoption_missing and cache_retry_needed
+            )
             scientific, heavy = (
                 projection.scientific,
                 projection.scientific.heavy,
@@ -5925,10 +6211,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if current is not None and current.source == source
                 else self._sources.project_motor_knowledge(source, None)
             )
-        operation_identity = self._operation_slot.current_identity
+        operation_identity = getattr(
+            self._operation_slot, "current_identity", None,
+        )
         operation_active = (operation_identity is not None and not self._closing and not self._closed)
         operation_busy = (operation_identity is not None
-                          or self._authored_asset_owner is not None)
+                          or self._authored_asset_owner is not None
+                          or self._metadata_busy_projected)
         calibration_active = operation_active and operation_identity is self._calibration_identity
         mask_active = operation_active and operation_identity is self._mask_identity
         reintegrate_active = operation_active and operation_identity is self._reintegrate_identity
@@ -6462,6 +6751,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return True
 
     def _render_start_outcome(self, outcome: object) -> None:
+        self._release_native_plot_axis_transition_for_retry()
         if isinstance(outcome, (StartRefused, StartFailed)):
             self._notice(outcome.detail or outcome.reason.value)
         else:
@@ -6762,6 +7052,119 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return False
         intent = snapshot.thaw()
         return marker == (intent.source_spec, intent.gi.incidence_motor)
+
+    def _record_native_plot_axis_edit(
+        self,
+        prior: RunIntentSnapshot,
+        current: RunIntentSnapshot,
+    ) -> None:
+        """Remember an axis-following edit without touching outgoing paint."""
+
+        prior_axis = _native_plot_axis_for_run(prior.thaw())
+        target_axis = _native_plot_axis_for_run(current.thaw())
+        if prior_axis is None or target_axis is None:
+            self._native_plot_axis_transition = None
+            return
+        pending = self._native_plot_axis_transition
+        if (
+            pending is not None
+            and pending.run_identity is None
+            and pending.target_axis == prior_axis
+        ):
+            origin_axis = pending.origin_axis
+            followed_origin = pending.followed_origin
+        else:
+            origin_axis = prior_axis
+            followed_origin = self._preferences.plot_axis == prior_axis
+        self._native_plot_axis_transition = (
+            None
+            if target_axis == origin_axis
+            else _NativePlotAxisTransition(
+                origin_axis,
+                target_axis,
+                followed_origin,
+            )
+        )
+
+    def _bind_native_plot_axis_to_run(
+        self,
+        identity: RunIdentity,
+        configuration: FrozenRunConfiguration,
+    ) -> None:
+        """Bind the pending axis-following receipt to one launched run."""
+
+        pending = self._native_plot_axis_transition
+        target_axis = _native_plot_axis_for_run(configuration)
+        self._native_plot_axis_transition = (
+            replace(pending, run_identity=identity)
+            if (
+                pending is not None
+                and pending.run_identity is None
+                and target_axis == pending.target_axis
+            )
+            else None
+        )
+
+    def _retire_native_plot_axis_transition(
+        self,
+        identity: RunIdentity | None = None,
+    ) -> None:
+        pending = self._native_plot_axis_transition
+        if (
+            pending is not None
+            and (identity is None or pending.run_identity is identity)
+        ):
+            self._native_plot_axis_transition = None
+
+    def _release_native_plot_axis_transition_for_retry(
+        self,
+        identity: RunIdentity | None = None,
+    ) -> None:
+        """Unbind an unpainted compatible transition for the next attempt."""
+
+        pending = self._native_plot_axis_transition
+        if (
+            pending is None
+            or identity is not None
+            and pending.run_identity is not identity
+        ):
+            return
+        current_axis = _native_plot_axis_for_run(
+            self._intents.snapshot().thaw()
+        )
+        self._native_plot_axis_transition = (
+            replace(pending, run_identity=None)
+            if current_axis == pending.target_axis
+            else None
+        )
+
+    def _consume_native_plot_axis_transition(
+        self,
+        identity: RunIdentity,
+    ) -> bool:
+        """Adopt one exact run's native axis at its first accepted paint."""
+
+        pending = self._native_plot_axis_transition
+        if pending is None or pending.run_identity is not identity:
+            return False
+        self._native_plot_axis_transition = None
+        preferences = self._preferences
+        if (
+            not pending.followed_origin
+            or preferences.share_axis
+            or preferences.plot_axis != pending.origin_axis
+        ):
+            return False
+        self._preferences = replace(
+            preferences,
+            plot_axis=pending.target_axis,
+            slice_pins=_slice_pins_for_plot_axis(
+                preferences.slice_pins,
+                preferences.plot_axis,
+                pending.target_axis,
+            ),
+        )
+        return True
 
     def _on_field_value(
         self,
@@ -7154,6 +7557,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refuse_preparing(token)
         prior_intent = prior.thaw()
         current_intent = current.thaw()
+        if (
+            _native_plot_axis_for_run(prior_intent)
+            != _native_plot_axis_for_run(current_intent)
+        ):
+            self._record_native_plot_axis_edit(prior, current)
+        pending_axis = self._native_plot_axis_transition
+        if (
+            pending_axis is not None
+            and pending_axis.run_identity is None
+            and _native_plot_axis_for_run(current_intent)
+            != pending_axis.target_axis
+        ):
+            self._native_plot_axis_transition = None
         prior_source = prior_intent.source_spec
         current_source = current_intent.source_spec
         catalog_policy_changed = (

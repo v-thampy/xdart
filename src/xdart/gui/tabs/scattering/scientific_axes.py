@@ -78,6 +78,14 @@ def share_plot_axis_for_image(image_axis: str) -> str | None:
     return _SHARE_PLOT_AXIS_BY_IMAGE.get(str(image_axis))
 
 
+def native_1d_plot_axis(value: object) -> str | None:
+    """Return the plot selector for one native 1-D integration semantic."""
+
+    if type(value) is not str or not value:
+        return None
+    return _PLOT_AXIS_CHOICES.get(canonical_axis_key(value))
+
+
 def payload_is_qualified(
     payload: object,
     navigation: FrameNavigationProjection,
@@ -656,6 +664,7 @@ def plot_axis_choice(
 __all__ = [
     "heavy_projection",
     "image_axis_choice",
+    "native_1d_plot_axis",
     "payload_is_qualified",
     "plot_axis_choice",
     "requested_image_axis",

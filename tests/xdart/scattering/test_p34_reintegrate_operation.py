@@ -1471,12 +1471,15 @@ def test_direct_and_gui_scheduled_1d_match_after_reopen(tmp_path, monkeypatch):
     with h5py.File(first.target) as a, h5py.File(second.target) as b: assert np.array_equal(a["entry/integrated_1d/intensity"], b["entry/integrated_1d/intensity"]) and np.array_equal(a["entry/integrated_2d/intensity"], b["entry/integrated_2d/intensity"])
 def test_browse_invalidation_terminal_reload_and_foreign_stale_refusal(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminal, OperationTerminalStatus, OperationUpdate; from xrd_tools.reduction import ReintegrateResult, reintegrate as core; page, _store, _seed, context = _loaded_page(tmp_path, monkeypatch, qapp); controller = page._context_controller
+    seeded = _seed
     owner = controller._browse_hydration_owner; assert owner is not None
     with owner._one_d_lane._lock: owner._one_d_lane._ready_pending = True
     captured = controller.capture_reintegrate_browse(); assert captured[0] is context and controller.invalidate_reintegrate_browse(*captured)
     request, target = context.load_request, context.requested_path; foreign = replace(request, token=request.token + "-foreign"); assert foreign is not request and controller.reload_reintegrate_browse(foreign, target) is None and controller.browse_context is context and context.invalidated and not context.released
-    rid = OperationIdentity(77); result = core._value(ReintegrateResult, "COMMITTED", (1,), (1,), (), (), "b"*64, "a"*64, "c"*64, None); page._reintegrate_identity, page._reintegrate_request, page._reintegrate_target = rid, request, target; assert page._consume_reintegrate_update(OperationUpdate(rid, terminal=OperationTerminal(rid, OperationTerminalStatus.RETURNED, payload=result), stale=True))
-    assert result.disposition == "COMMITTED" and page._reintegrate_identity is None and controller._browse_request is not None and controller._browse_request is not request and context.released and owner._one_d_lane._closed; page.close_workspace()
+    seal = seeded.terminal.commit_identity
+    rid = OperationIdentity(77); result = core._value(ReintegrateResult, "COMMITTED", seeded.labels, seeded.labels, (), (), "b"*64, "a"*64, "c"*64, seal); page._reintegrate_identity, page._reintegrate_request, page._reintegrate_target = rid, request, target; assert page._consume_reintegrate_update(OperationUpdate(rid, terminal=OperationTerminal(rid, OperationTerminalStatus.RETURNED, payload=result), stale=True))
+    reload_request = controller._browse_request
+    assert result.disposition == "COMMITTED" and page._reintegrate_identity is None and reload_request is not None and reload_request is not request and reload_request.terminal_commit_identity is seal and context.released and owner._one_d_lane._closed and not controller.owns_browse_request(request) and page._pending_reintegrate_reload is None; page.close_workspace()
 def test_same_event_cancels_prepare_and_run_without_false_terminal(monkeypatch):
     from xdart.gui.tabs.scattering.adapters import external_operation as module
     from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationTerminalStatus
