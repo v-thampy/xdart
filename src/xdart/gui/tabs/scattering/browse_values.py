@@ -184,27 +184,16 @@ def canonical_browse_source_identity(
             or os.path.normcase(os.path.normpath(root)) != root
         ):
             raise TypeError(f"browse {role} must be normalized absolute text or None")
-    source_path = getattr(view, "source_path", None) or artifact_path
-    source = str(source_path)
-    if not os.path.isabs(source):
-        # The selected Project root is authoritative for a moved tree.  Only
-        # when none was selected may the record's authenticated source_base
-        # own the relative locator.  Never guess from the artifact directory.
-        base = source_root if source_root is not None else source_base
-        if base is None:
-            raise ValueError("relative Browse source has no Project-root owner")
-        from xrd_tools.io.read import resolve_project_source_path
-        source = str(resolve_project_source_path(
-            source, base, must_exist=False,
-        ))
-    source_path = os.path.normcase(os.path.normpath(source))
-    source_frame_index = getattr(view, "source_frame_index", None)
-    member = (
-        getattr(view, "label")
-        if source_frame_index is None
-        else source_frame_index
+    from xdart.modules.frame_publication import canonical_frame_source_identity
+
+    # The selected Project root is authoritative for a moved tree.  Only when
+    # none was selected may the record's authenticated source_base own the
+    # relative locator.  Never guess from the artifact directory.
+    return canonical_frame_source_identity(
+        view,
+        source_base=(source_root if source_root is not None else source_base),
+        fallback_path=artifact_path,
     )
-    return f"{source_path}#{member}"
 
 
 __all__ = [

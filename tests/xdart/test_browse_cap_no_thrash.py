@@ -25,7 +25,7 @@ def _light_1d_frame(i, nq=2000):
             sigma=np.ones(nq, dtype=np.float32), unit="q_A^-1"),
         int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
         thumbnail=None, bg_raw=0, scan_info={},
-        source_file=f"f{i}.tif", source_frame_idx=i)
+        source_file=f"/raw/f{i}.tif", source_frame_idx=i)
 
 
 def test_show_all_3621_stays_fully_resident_no_eviction():

@@ -24,6 +24,7 @@ from xdart.modules.frame_publication import (
     FramePublication,
     PublicationStore,
     _publication_has_heavy_payload,
+    canonical_frame_source_identity,
 )
 from xrd_tools.core import FrameRecord, FrameView
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
@@ -98,6 +99,7 @@ class DisplayArtifact:
     source_scan: str
     records: FrameRecordStore
     publications: PublicationStore
+    source_base: str | None = None
     light_lease: Light1DRetentionLease | None = None
     light_slot: object | None = None
     light_hooks: object | None = None
@@ -296,6 +298,7 @@ class RunDisplayState:
         gi_mode_1d: str = "",
         gi_mode_2d: str = "",
         wavelength_m: float | None = None,
+        source_base: str | None = None,
     ) -> DisplayArtifact:
         if not self._configured:
             self.configure(
@@ -325,6 +328,7 @@ class RunDisplayState:
             source_scan=source_scan,
             records=records,
             publications=publications,
+            source_base=source_base,
             mask=frozen_mask,
             mask_saturation=bool(mask_saturation),
             measurement_mode=measurement_mode,
@@ -698,7 +702,8 @@ class RunDisplayState:
                 active_mode_1d=record.active_mode_1d)
             publication = FramePublication(
                 display_record.active_view(), record=display_record,
-                source_identity=source_identity, generation=owner.publications.generation,
+                source_identity=source_identity, source_base=owner.source_base,
+                generation=owner.publications.generation,
                 scan_key=owner.source_scan)
             protected = self._protected_raw_labels_locked(owner, publication)
             return owner.publications.publish_gui_light_1d(
@@ -1366,12 +1371,17 @@ class RunDisplayState:
         shell = art.publications.get_light_1d_shell(key.local_frame_label)
         source_identity = (
             shell.source_identity if shell is not None
-            else f"{view.source_path or ''}#{view.source_frame_index}"
+            else canonical_frame_source_identity(
+                view,
+                source_base=art.source_base,
+                fallback_path=art.artifact,
+            )
         )
         candidate = FramePublication(
             view,
             record=record,
             source_identity=source_identity,
+            source_base=art.source_base,
             generation=art.publications.generation,
             raw_status="ready" if preview.raw is not None else "thumbnail" if view.thumbnail is not None else "missing",
             scan_key=art.source_scan,
@@ -1489,11 +1499,17 @@ class RunDisplayState:
             source_base=preview.source_base,
             source_root=prepared.request.read_key.source_root,
         )
+        source_base = (
+            prepared.request.read_key.source_root
+            if prepared.request.read_key.source_root is not None
+            else preview.source_base
+        )
         store.upsert(
             FramePublication(
                 view,
                 record=record,
                 source_identity=source_identity,
+                source_base=source_base,
                 scan_key=prepared.request.owner.scan_key,
             ),
             protected=_hydration_locality_protection(

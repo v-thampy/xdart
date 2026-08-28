@@ -438,9 +438,19 @@ def test_get_raw_frame_does_not_guess_sibling_basename(tmp_path):
         _stamp_current_entry(e)
         g = e.create_group("integrated_1d")
         _stamp_current_1d(g)
-        g.create_dataset("intensity", data=np.zeros((1, 5), dtype=np.float32))
+        g.create_dataset(
+            "intensity",
+            data=np.zeros((1, 5), dtype=np.float32),
+            chunks=True,
+            maxshape=(None, 5),
+        )
         g.create_dataset("q", data=np.linspace(0.5, 2.0, 5, dtype=np.float32))
-        g.create_dataset("frame_index", data=np.array([7], dtype=np.int64))
+        g.create_dataset(
+            "frame_index",
+            data=np.array([7], dtype=np.int64),
+            chunks=True,
+            maxshape=(None,),
+        )
         s = e.create_group("frames/frame_0007/source")
         s.create_dataset("path", data=np.bytes_(b"old/raw/scan_master.h5"))
         s.create_dataset("frame_index", data=0)

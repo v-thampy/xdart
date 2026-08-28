@@ -9,7 +9,11 @@ from threading import Event, Lock, Thread, current_thread, get_ident
 from time import monotonic
 from typing import Any, Callable, Mapping
 import numpy as np
-from xdart.modules.frame_publication import FramePublication, PublicationStore
+from xdart.modules.frame_publication import (
+    FramePublication,
+    PublicationStore,
+    canonical_frame_source_identity,
+)
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.integrate.calibration import (
@@ -1481,6 +1485,7 @@ class StandardRunExecutor:
                 gi_mode_2d=(
                     configuration.gi.mode_2d if configuration.gi.enabled else ""
                 ),
+                source_base=configuration.project_root or None,
                 wavelength_m=(
                     float(poni.wavelength)
                     if getattr(poni, "wavelength", None)
@@ -2480,9 +2485,10 @@ class StandardRunExecutor:
                         run.display.publish_light_1d(
                             owner,
                             record,
-                            source_identity=(
-                                f"{view.source_path or ''}#"
-                                f"{view.source_frame_index}"
+                            source_identity=canonical_frame_source_identity(
+                                view,
+                                source_base=owner.source_base,
+                                fallback_path=owner.artifact,
                             ),
                         )
                 except BaseException as error:
@@ -2553,13 +2559,16 @@ class StandardRunExecutor:
             run.current_completed + run.current_epoch_published,
         )
         key = navigation.appended
-        source_identity = (
-            f"{view.source_path or ''}#{view.source_frame_index}"
+        source_identity = canonical_frame_source_identity(
+            view,
+            source_base=owner.source_base,
+            fallback_path=owner.artifact,
         )
         publication = FramePublication(
             view,
             record=record,
             source_identity=source_identity,
+            source_base=owner.source_base,
             scan_key=owner.source_scan,
         )
         run.display.retain_frame(

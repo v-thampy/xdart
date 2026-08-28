@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import os
-import posixpath
 from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from threading import RLock
@@ -112,6 +111,7 @@ class FramePublication:
     view: FrameView
     record: FrameRecord | None = None
     source_identity: str = ""
+    source_base: str | None = None
     generation: int = 0
     raw_ref: Any | None = None
     raw_status: str = "unknown"
@@ -121,13 +121,23 @@ class FramePublication:
     #: X1 Slice 3c (S3-OR1): the IMMUTABLE owning-scan identity — display
     #: publication provenance stamped by the production publish sites from the
     #: already-authoritative current/run/browse scan key (never inferred from a
-    #: source filename, never via I/O).  ``None`` = legacy/viewer-only or
-    #: genuinely ownerless; the scan-qualified projection then falls back to
-    #: the positive source-identity proof only.  Preserved through replace,
-    #: thinning, hydration, merge, and store carryover.
+    #: source filename, never via I/O).  ``None`` identifies an explicitly
+    #: ownerless viewer/public-store domain; it may merge only with another
+    #: ownerless publication, never with a stamped scan.  Preserved through
+    #: replace, thinning, hydration, merge, and store carryover.
     scan_key: str | None = None
 
     def __post_init__(self) -> None:
+        if self.source_base is not None and (
+            type(self.source_base) is not str
+            or not self.source_base
+            or not os.path.isabs(self.source_base)
+            or os.path.normcase(os.path.normpath(self.source_base))
+            != self.source_base
+        ):
+            raise TypeError(
+                "publication source base must be normalized absolute text or None"
+            )
         if self.record is None:
             object.__setattr__(self, "record", FrameRecord.from_view(self.view))
         raw = self.metadata_raw or self.view.metadata_raw
@@ -242,6 +252,7 @@ def publication_from_live_frame(
     *,
     generation: int = 0,
     source_identity: str | None = None,
+    source_base: str | None = None,
     include_raw: bool = False,
     include_2d: bool = True,
     include_thumbnail: bool = True,
@@ -303,8 +314,12 @@ def publication_from_live_frame(
         source_identity=(
             source_identity
             if source_identity is not None
-            else str(getattr(frame, "source_file", "") or getattr(frame, "idx", ""))
+            else canonical_frame_source_identity(
+                view,
+                source_base=source_base,
+            )
         ),
+        source_base=source_base,
         generation=generation,
         raw_ref=raw_ref,
         raw_status=raw_status,
@@ -312,6 +327,10 @@ def publication_from_live_frame(
         metadata_numeric=numeric_metadata(metadata_raw),
         scan_key=scan_key,
     )
+    if not _publication_has_canonical_source_identity(publication):
+        raise ValueError(
+            "live publication source identity is not exact canonical provenance"
+        )
     if validate:
         diagnostics = validate_publication(publication)
         publication = replace(publication, diagnostics=diagnostics)
@@ -323,7 +342,9 @@ def publication_from_frame_view(
     *,
     record: FrameRecord | None = None,
     generation: int = 0,
-    source_identity: str = "",
+    source_identity: str | None = None,
+    source_base: str | None = None,
+    fallback_path: str | os.PathLike[str] | None = None,
     raw_ref: Any | None = None,
     raw_status: str = "unknown",
     validate: bool = True,
@@ -337,7 +358,16 @@ def publication_from_frame_view(
     publication = FramePublication(
         view=view,
         record=record if record is not None else FrameRecord.from_view(view),
-        source_identity=source_identity or str(view.source_path or view.label),
+        source_identity=(
+            source_identity
+            if source_identity is not None
+            else canonical_frame_source_identity(
+                view,
+                source_base=source_base,
+                fallback_path=fallback_path,
+            )
+        ),
+        source_base=source_base,
         generation=generation,
         raw_ref=raw_ref,
         raw_status=raw_status,
@@ -345,6 +375,10 @@ def publication_from_frame_view(
         metadata_numeric=view.metadata_numeric,
         scan_key=scan_key,
     )
+    if not _publication_has_canonical_source_identity(publication):
+        raise ValueError(
+            "frame-view publication source identity is not exact canonical provenance"
+        )
     if validate:
         publication = replace(
             publication,
@@ -362,23 +396,35 @@ def publication_from_nexus_frame(
     include_thumbnail: bool = True,
     validate: bool = True,
     scan_key: str | None = None,
+    source_root: str | os.PathLike[str] | None = None,
 ) -> FramePublication:
     """Read a saved processed frame and publish it through the same contract."""
 
-    from xrd_tools.io import read_frame_record
+    from xrd_tools.io import FrameViewReader
 
-    record = read_frame_record(
+    with FrameViewReader(
         scan_file,
-        frame,
         entry=entry,
         include_thumbnail=include_thumbnail,
-    )
+        source_root=source_root,
+    ) as reader:
+        record = reader.read_record(int(frame))
+        persisted_source_base = reader.source_base
     view = record.active_view()
+    normalized_root = (
+        persisted_source_base
+        if source_root is None
+        else os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(source_root))))
+    )
+    artifact = os.path.normcase(
+        os.path.normpath(os.path.abspath(os.fspath(scan_file)))
+    )
     return publication_from_frame_view(
         view,
         record=record,
         generation=generation,
-        source_identity=str(scan_file),
+        source_base=normalized_root,
+        fallback_path=artifact,
         raw_status=("thumbnail" if view.thumbnail is not None else "missing"),
         validate=validate,
         scan_key=scan_key,
@@ -719,59 +765,130 @@ def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
     return acc
 
 
+def canonical_frame_source_identity(
+    view: object,
+    *,
+    source_base: str | None = None,
+    fallback_path: str | os.PathLike[str] | None = None,
+) -> str:
+    """Return one exact ``absolute-path#member`` publication identity.
+
+    A relative detector locator is meaningful only under its explicit Project
+    root.  Resolution uses the same current relocation contract as processed
+    Browse; it never guesses from the processed artifact directory or the
+    process working directory.  ``fallback_path`` is for payloads that have no
+    detector locator (for example a processed-only frame); those payloads use
+    the view label as their artifact member even if an orphaned source index is
+    still present.
+    """
+
+    if source_base is not None and (
+        type(source_base) is not str
+        or not source_base
+        or not os.path.isabs(source_base)
+        or os.path.normcase(os.path.normpath(source_base)) != source_base
+    ):
+        raise TypeError(
+            "publication source base must be normalized absolute text or None"
+        )
+    view_source = getattr(view, "source_path", None)
+    source_value = view_source if view_source is not None else fallback_path
+    if source_value is None:
+        raise ValueError("publication has no source path identity")
+    source = os.fspath(source_value)
+    if type(source) is not str or not source:
+        raise TypeError("publication source path must be nonempty text")
+    if not os.path.isabs(source):
+        if source_base is None:
+            raise ValueError("relative publication source has no Project-root owner")
+        from xrd_tools.io.read import resolve_project_source_path
+
+        source = str(resolve_project_source_path(
+            source,
+            source_base,
+            must_exist=False,
+        ))
+    canonical_path = os.path.normcase(os.path.normpath(source))
+    source_frame_index = getattr(view, "source_frame_index", None)
+    if view_source is not None and source_frame_index is None:
+        raise ValueError("detector publication source has no frame index")
+    member = getattr(view, "label") if view_source is None else source_frame_index
+    return f"{canonical_path}#{member}"
+
+
+def _canonical_source_identity_parts(value) -> tuple[str, str] | None:
+    """Parse an exact canonical runtime identity without guessing."""
+
+    if type(value) is not str or not value:
+        return None
+    path, separator, member = value.rpartition("#")
+    if (
+        separator != "#"
+        or not path
+        or not member
+        or not os.path.isabs(path)
+        or os.path.normcase(os.path.normpath(path)) != path
+    ):
+        return None
+    return path, member
+
+
+def _publication_has_canonical_source_identity(
+    publication: FramePublication,
+) -> bool:
+    """Whether the identity is canonical and agrees with its exact view."""
+
+    parts = _canonical_source_identity_parts(publication.source_identity)
+    if parts is None:
+        return False
+    canonical_path, _member = parts
+    try:
+        expected = canonical_frame_source_identity(
+            publication.view,
+            source_base=publication.source_base,
+            fallback_path=(
+                canonical_path
+                if publication.view.source_path is None
+                else None
+            ),
+        )
+    except (TypeError, ValueError, OSError):
+        return False
+    return publication.source_identity == expected
+
+
 def _same_source_id(sa, sb) -> bool:
-    """True unless the two source identities are genuinely DIFFERENT files.
+    """Require one exact canonical runtime source identity.
 
-    The SAME physical frame gets different spellings on different code paths — a
-    live frame carries an absolute ``source_file`` while a disk-reloaded frame
-    carries the relative ``source/path`` — so an exact string compare would
-    wrongly skip a legitimate same-frame accumulation.  Compared by PATH-COMPONENT
-    SUFFIX: equal after ``normpath``, or the shorter path's components are a tail
-    of the longer's (abs vs rel of the same file).  Unlike a bare-basename
-    compare this still REJECTS two different directories that share a filename
-    (e.g. ``run1/frame_0001.tif`` vs ``run2/frame_0001.tif``).  Missing source
-    IDs merge only when BOTH sides are missing; one missing + one known source is
-    not enough evidence to splice records.
-
-    KNOWN LIMITATION (transitional compat — review #3, accepted for v1.0): if one
-    side is a SINGLE-component id (a bare filename, no directory), the suffix
-    match degrades to basename matching for that pair — a bare ``frame_0001.tif``
-    would match ANY path ending in it.  This is tolerated because source IDs are
-    not yet reliably canonical (a live frame carries an absolute ``source_file``,
-    a reload the relative ``source/path``), and a real bare-filename relative path
-    (``source_base`` == the file's own directory) must still merge with its
-    absolute spelling.  Tighten to exact canonical identity once IDs are
-    canonicalised at the source seam (then abs/rel normalise to one form and this
-    whole suffix dance — and the hole — goes away)."""
-    if not sa or not sb:
-        return not sa and not sb
-    na, nb = os.path.normpath(sa), os.path.normpath(sb)
-    if na == nb:
-        return True
-    pa, pb = na.split(os.sep), nb.split(os.sep)
-    short, long_ = (pa, pb) if len(pa) <= len(pb) else (pb, pa)
-    return long_[-len(short):] == short
+    Current builders resolve Project-relative locators before constructing a
+    publication.  The store therefore has no authority to infer equality from a
+    suffix, basename, or missing value.
+    """
+    return (
+        _canonical_source_identity_parts(sa) is not None
+        and _canonical_source_identity_parts(sb) is not None
+        and sa == sb
+    )
 
 
 def _same_source(a: FramePublication, b: FramePublication) -> bool:
-    return _same_source_id(a.source_identity, b.source_identity)
+    return (
+        _publication_has_canonical_source_identity(a)
+        and _publication_has_canonical_source_identity(b)
+        and _same_source_id(a.source_identity, b.source_identity)
+    )
 
 
 def _scan_owners_compatible(a, b) -> bool:
     """Whether two publications may contribute to one accumulated record.
 
-    An unstamped legacy publication can still merge through the source guard.
-    When both publications carry explicit owners, those owners must identify
-    the same scan; a matching source file alone is not sufficient evidence.
+    Explicitly ownerless publications form their own domain.  A stamped
+    publication never merges with an unstamped one; matching source text alone
+    is not sufficient evidence to inherit or erase a scan owner.
     """
     if a in (None, "") or b in (None, ""):
-        return True
-
-    def normalized(value) -> str:
-        source = str(value).strip().rsplit("#", 1)[0].replace("\\", "/")
-        return posixpath.normpath(source).casefold()
-
-    return normalized(a) == normalized(b)
+        return a in (None, "") and b in (None, "")
+    return type(a) is str and type(b) is str and a == b
 
 
 # MEM-2: sentinel so an unspecified heavy cap resolves to the RAM-aware window
@@ -1047,6 +1164,7 @@ class PublicationStore:
             type(publication.source_identity) is not str
             or not publication.source_identity
             or source != publication.source_identity
+            or not _publication_has_canonical_source_identity(publication)
         ):
             raise ValueError("GUI light-1D source identity mismatch")
         if (
@@ -1403,8 +1521,17 @@ class PublicationStore:
                 )
             self._carryover = {
                 # X1 3c: carry the scan owner alongside the record so the
-                # reintegrate republish keeps the stamp.
-                label: (pub.record, pub.source_identity, pub.scan_key)
+                # reintegrate republish keeps the stamp.  Invalid or unanchored
+                # source text is carried as missing provenance and cannot merge.
+                label: (
+                    pub.record,
+                    (
+                        pub.source_identity
+                        if _publication_has_canonical_source_identity(pub)
+                        else ""
+                    ),
+                    pub.scan_key,
+                )
                 for label, pub in self._items.items()
                 if pub.record is not None
             }
@@ -1648,13 +1775,9 @@ class PublicationStore:
                     publication = replace(
                         publication,
                         record=_merge_records(existing.record, publication.record),
-                        # X1 3c: the same-source merge preserves the explicit
-                        # scan owner — incl. when a legacy UNSTAMPED republish
-                        # (or an unstamped hydrator result) folds onto a
-                        # stamped entry.
-                        scan_key=(publication.scan_key
-                                  if publication.scan_key is not None
-                                  else existing.scan_key),
+                        # Exact ownership classes already matched above; the
+                        # current publication retains its own identical owner.
+                        scan_key=publication.scan_key,
                     )
                 self._items.pop(label)
                 self._drop_heavy_label_locked(label)
@@ -1669,7 +1792,8 @@ class PublicationStore:
                 if carried is not None:
                     carried_record, carried_source, carried_scan_key = carried
                     if (
-                        _same_source_id(
+                        _publication_has_canonical_source_identity(publication)
+                        and _same_source_id(
                             carried_source, publication.source_identity)
                         and _scan_owners_compatible(
                             carried_scan_key, publication.scan_key)
@@ -1677,11 +1801,8 @@ class PublicationStore:
                         publication = replace(
                             publication,
                             record=_merge_records(carried_record, publication.record),
-                            # X1 3c: restore the carried scan owner for a
-                            # legacy unstamped republish of the same source.
-                            scan_key=(publication.scan_key
-                                      if publication.scan_key is not None
-                                      else carried_scan_key),
+                            # Exact ownership classes already matched above.
+                            scan_key=publication.scan_key,
                         )
             self._items[publication.label] = publication
             if _publication_has_heavy_payload(publication):
@@ -2016,6 +2137,7 @@ class PublicationStore:
 
 
 __all__ = [
+    "canonical_frame_source_identity",
     "FramePublication",
     "PublicationDiagnostics",
     "PublicationStore",

@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import replace
 import gc
 import logging
+import os
 import threading
 
 import numpy as np
@@ -38,7 +39,7 @@ class DuckFrame:
         self.idx = idx
         self.gi = gi
         self.scan_info = {"th": 0.25, "monitor": 100.0, "sample": "LaB6"}
-        self.source_file = "raw_0001.tif"
+        self.source_file = "/raw/raw_0001.tif"
         self.source_frame_idx = 0
         self.map_raw = np.arange(16, dtype=float).reshape(4, 4)
         self.thumbnail = np.arange(4, dtype=float).reshape(2, 2)
@@ -141,7 +142,7 @@ def _bound_gui_light_graph(
     def build(
         label,
         *,
-        source="scan.nxs#source",
+        source=None,
         scan="scan-owner",
         publication_source=None,
         publication_scan=None,
@@ -158,6 +159,11 @@ def _bound_gui_light_graph(
         heavy=True,
         reverse_bg_coordinate=False,
     ):
+        source = (
+            f"/test/raw_0001.tif#{label}"
+            if source is None
+            else source
+        )
         use_dtype = np.dtype(array_dtype or dtype)
         raw_coordinate = np.linspace(
             0.1, 0.4, array_length, dtype=use_dtype,
@@ -189,7 +195,7 @@ def _bound_gui_light_graph(
                 sigma_1d=uncertainty,
                 metadata_raw={"sample": "LaB6"},
                 metadata_numeric={"monitor": 100.0},
-                source_path="raw_0001.tif",
+                source_path="/test/raw_0001.tif",
                 source_frame_index=int(label),
             )
             for mode, (coordinate, intensity, uncertainty) in mode_arrays.items()
@@ -769,8 +775,19 @@ from xrd_tools.core import FrameView, assert_framerecord_equivalent  # noqa: E40
 from xdart.modules.frame_publication import _publication_has_heavy_payload  # noqa: E402
 
 
-def _mode_pub(label, *, mode_1d=None, mode_2d=None, scale=1.0, generation=0,
-              source_identity=None, scan_key=None):
+def _mode_pub(
+    label,
+    *,
+    mode_1d=None,
+    mode_2d=None,
+    scale=1.0,
+    generation=0,
+    source_identity=None,
+    scan_key="test-scan",
+    source_path=None,
+    source_frame_index=None,
+    source_base=None,
+):
     r1 = r2 = None
     if mode_1d is not None:
         r1 = IntegrationResult1D(
@@ -782,13 +799,20 @@ def _mode_pub(label, *, mode_1d=None, mode_2d=None, scale=1.0, generation=0,
             intensity=np.ones((4, 3)) * scale, unit="q_A^-1", azimuthal_unit="chi_deg")
     view = FrameView.from_results(
         label=label, result_1d=r1, result_2d=r2,
-        thumbnail=np.zeros((2, 2), dtype=float), metadata_raw={"monitor": 1.0})
+        thumbnail=np.zeros((2, 2), dtype=float), metadata_raw={"monitor": 1.0},
+        source_path=source_path, source_frame_index=source_frame_index)
     rec = FrameRecord.from_view(
         view, mode_1d=mode_1d or DEFAULT_MODE_KEY, mode_2d=mode_2d or DEFAULT_MODE_KEY)
-    return publication_from_frame_view(
+    publication = publication_from_frame_view(
         view, record=rec, generation=generation,
-        source_identity=source_identity if source_identity is not None else str(label),
+        source_base=source_base,
+        fallback_path="/test/frame-publication.nexus",
         scan_key=scan_key)
+    return (
+        publication
+        if source_identity is None
+        else replace(publication, source_identity=source_identity)
+    )
 
 
 def test_accumulation_same_frame_merges_modes_view_is_latest():
@@ -954,21 +978,32 @@ def test_accumulation_different_source_identity_does_not_merge():
     # source_identity) after a missed clear must NOT accumulate into one record.
     store = PublicationStore()
     store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
-                           source_identity="scanA"))
+                           source_identity="/test/scan-a.nexus#0"))
     store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
-                           source_identity="scanB"))
+                           source_identity="/test/scan-b.nexus#0"))
     assert store.get(0).record.modes_1d == ("q_ip",)    # plain replace, no merge
 
 
 def test_accumulation_missing_source_identity_does_not_merge_known_source():
-    # Unknown+unknown remains a transition fallback, but unknown+known is not
-    # enough evidence to splice records for a reused label.
+    # A missing identity is never enough evidence to splice a reused label.
     store = PublicationStore()
     store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
                            source_identity=""))
     store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
-                           source_identity="scanA"))
+                           source_identity="/test/scan-a.nexus#0"))
     assert store.get(0).record.modes_1d == ("q_ip",)
+
+
+def test_accumulation_two_missing_source_identities_do_not_merge():
+    store = PublicationStore()
+    store.upsert(_mode_pub(
+        0, mode_1d="q_total", generation=store.generation,
+        source_identity=""))
+    replaced = store.upsert(_mode_pub(
+        0, mode_1d="q_ip", generation=store.generation,
+        source_identity=""))
+
+    assert replaced.record.modes_1d == ("q_ip",)
 
 
 def test_accumulation_first_upsert_is_plain_replace_additive():
@@ -1052,24 +1087,107 @@ def test_clear_drops_carryover():
     assert store.get(0).record.modes_1d == ("q_ip",)    # no resurrection after clear
 
 
-def test_carryover_merges_across_abspath_relpath_source():
-    # P2 regression (review): a live frame's source_identity is an ABSPATH while
-    # the reintegrate reload uses the RELPATH of the same file; basename-
-    # normalized _same_source must treat them as the SAME source so the live
-    # mode is NOT dropped on the next Integrate.
+@pytest.mark.parametrize("carryover", (False, True), ids=("upsert", "carryover"))
+def test_project_anchored_relative_and_absolute_source_merge(
+    tmp_path,
+    carryover,
+):
+    """Current builders canonicalize two spellings before store comparison."""
+    from types import SimpleNamespace
+
+    from xdart.gui.tabs.scattering.browse_values import (
+        canonical_browse_source_identity,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    artifact = project / "xdart_processed_data" / "scan.nexus"
+    relative = SimpleNamespace(
+        label=0,
+        source_path="raw/recon_0001.tif",
+        source_frame_index=0,
+    )
+    absolute = SimpleNamespace(
+        label=0,
+        source_path=str(project / "raw" / "recon_0001.tif"),
+        source_frame_index=0,
+    )
+    source_root = str(project)
+    relative_id = canonical_browse_source_identity(
+        relative,
+        str(artifact),
+        source_root=source_root,
+    )
+    absolute_id = canonical_browse_source_identity(
+        absolute,
+        str(artifact),
+        source_root=source_root,
+    )
+    assert relative_id == absolute_id
+
     store = PublicationStore()
-    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
-                           source_identity="/data/run1/recon_0001.tif"))  # live abspath
-    store.begin_reintegrate()
-    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
-                           source_identity="recon_0001.tif"))             # reload relpath
-    assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip"}       # accumulated
+    store.upsert(_mode_pub(
+        0,
+        mode_1d="q_total",
+        generation=store.generation,
+        source_identity=relative_id,
+        scan_key="scan-a",
+        source_base=source_root,
+    ))
+    if carryover:
+        store.begin_reintegrate()
+    merged = store.upsert(_mode_pub(
+        0,
+        mode_1d="q_ip",
+        generation=store.generation,
+        source_identity=absolute_id,
+        scan_key="scan-a",
+    ))
+    assert set(merged.record.modes_1d) == {"q_total", "q_ip"}
+
+
+def test_public_frame_view_builder_requires_exact_anchored_provenance(tmp_path):
+    from xdart.modules.frame_publication import publication_from_frame_view
+
+    project = tmp_path / "project"
+    project.mkdir()
+    view = FrameView.from_results(
+        label=3,
+        result_1d=IntegrationResult1D(
+            radial=np.linspace(1.0, 2.0, 4),
+            intensity=np.arange(4.0),
+            unit="q_A^-1",
+        ),
+        source_path="raw/frame_0003.tif",
+        source_frame_index=7,
+    )
+
+    with pytest.raises(ValueError, match="Project-root owner"):
+        publication_from_frame_view(view)
+
+    source_base = str(project)
+    publication = publication_from_frame_view(
+        view,
+        source_base=source_base,
+    )
+    expected_path = os.path.normcase(os.path.normpath(
+        project / "raw" / "frame_0003.tif"
+    ))
+    assert publication.source_identity == f"{expected_path}#7"
+    assert publication.source_base == source_base
+
+    with pytest.raises(ValueError, match="exact canonical provenance"):
+        publication_from_frame_view(
+            view,
+            source_identity=f"{project / 'other' / 'frame_0003.tif'}#7",
+            source_base=source_base,
+        )
 
 
 def test_carryover_missing_source_identity_does_not_merge_known_source():
     store = PublicationStore()
     store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
-                           source_identity="/data/run1/recon_0001.tif"))
+                           source_identity="/data/run1/recon_0001.tif#0"))
     store.begin_reintegrate()
     store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
                            source_identity=""))
@@ -1104,16 +1222,115 @@ def test_end_reintegrate_drops_unconsumed_carryover():
     assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip"}  # 0 accumulated normally
 
 
-def test_same_source_id_suffix_match_rejects_different_dir():
-    # P2 (codex): suffix-match by path components, not bare basename — abs/rel of
-    # the SAME file merges; two different directories sharing a filename do NOT.
+def test_same_source_id_requires_exact_canonical_identity():
     from xdart.modules.frame_publication import _same_source_id
-    assert _same_source_id("/data/run1/frame_0001.tif", "frame_0001.tif")        # abs vs bare rel
-    assert _same_source_id("/data/run1/frame_0001.tif", "run1/frame_0001.tif")   # abs vs rel+dir
-    assert not _same_source_id("run1/frame_0001.tif", "run2/frame_0001.tif")     # different dirs
-    assert not _same_source_id("/data/run1/frame_0001.tif", "/data/run2/frame_0001.tif")
-    assert not _same_source_id("", "frame_0001.tif")                             # known beats unknown
-    assert _same_source_id("", "")                                               # transition unknown+unknown
+    canonical = "/data/run1/frame_0001.tif#0"
+    assert _same_source_id(canonical, canonical)
+    assert not _same_source_id(canonical, "frame_0001.tif#0")
+    assert not _same_source_id(canonical, "run1/frame_0001.tif#0")
+    assert not _same_source_id(
+        canonical,
+        "/data/run2/frame_0001.tif#0",
+    )
+    assert not _same_source_id("", "frame_0001.tif#0")
+    assert not _same_source_id("", "")
+
+
+def test_processed_only_source_identity_uses_label_not_orphaned_source_index(
+    tmp_path,
+):
+    """Average live/reload identities stay exact when no detector path exists."""
+    from types import SimpleNamespace
+
+    from xdart.modules.frame_publication import canonical_frame_source_identity
+
+    artifact = tmp_path / "xdart_processed_data" / "average.nexus"
+    live = SimpleNamespace(
+        label=1,
+        source_path=None,
+        source_frame_index=0,
+    )
+    reloaded = SimpleNamespace(
+        label=1,
+        source_path=None,
+        source_frame_index=None,
+    )
+
+    live_identity = canonical_frame_source_identity(
+        live,
+        fallback_path=artifact,
+    )
+    reloaded_identity = canonical_frame_source_identity(
+        reloaded,
+        fallback_path=artifact,
+    )
+    expected = f"{os.path.normcase(os.path.normpath(artifact))}#1"
+    assert live_identity == expected
+    assert reloaded_identity == expected
+
+
+@pytest.mark.parametrize("carryover", (False, True), ids=("upsert", "carryover"))
+@pytest.mark.parametrize("incoming_owner", ("scan-a", None), ids=("same-owner", "ownerless"))
+def test_cross_root_bare_source_never_accumulates(
+    carryover,
+    incoming_owner,
+):
+    """A bare root-B token cannot inherit root-A modes or scan ownership."""
+    store = PublicationStore()
+    store.upsert(_mode_pub(
+        0,
+        mode_1d="q_total",
+        generation=store.generation,
+        source_identity="/raw/root-a/frame_0001.tif#0",
+        scan_key="scan-a",
+        source_path="/raw/root-a/frame_0001.tif",
+        source_frame_index=0,
+    ))
+    if carryover:
+        store.begin_reintegrate()
+    stored = store.upsert(_mode_pub(
+        0,
+        mode_1d="q_ip",
+        generation=store.generation,
+        source_identity="frame_0001.tif#0",
+        scan_key=incoming_owner,
+        source_path="/raw/root-b/frame_0001.tif",
+        source_frame_index=0,
+    ))
+
+    assert stored.record.modes_1d == ("q_ip",)
+    assert stored.view.source_path == "/raw/root-b/frame_0001.tif"
+    assert stored.scan_key == incoming_owner
+
+
+@pytest.mark.parametrize("carryover", (False, True), ids=("upsert", "carryover"))
+def test_forged_equal_canonical_identity_cannot_override_view_provenance(
+    carryover,
+):
+    """Even equal identity text must agree with each publication's view."""
+    source_identity = "/raw/root-a/frame_0001.tif#0"
+    store = PublicationStore()
+    store.upsert(_mode_pub(
+        0,
+        mode_1d="q_total",
+        source_identity=source_identity,
+        scan_key="scan-a",
+        source_path="/raw/root-a/frame_0001.tif",
+        source_frame_index=0,
+    ))
+    if carryover:
+        store.begin_reintegrate()
+    stored = store.upsert(_mode_pub(
+        0,
+        mode_1d="q_ip",
+        source_identity=source_identity,
+        scan_key="scan-a",
+        source_path="/raw/root-b/frame_0001.tif",
+        source_frame_index=0,
+    ))
+
+    assert stored.record.modes_1d == ("q_ip",)
+    assert stored.view.source_path == "/raw/root-b/frame_0001.tif"
 
 
 def test_tier0_eviction_honors_persist_gate_mem1_15():
@@ -1196,65 +1413,70 @@ def test_scan_owner_preserved_through_thinning_tiers():
     assert thinned.scan_key == "run_a"              # owner survives eviction
 
 
-def test_scan_owner_preserved_through_same_scan_merge():
-    """The upsert merge keeps the owner — including when a legacy UNSTAMPED
-    republish of the same source merges onto a stamped entry."""
+def test_scan_owner_requires_the_same_explicit_ownership_class():
     store = PublicationStore(max_items=None, max_heavy_items=None)
-    store.upsert(publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
-    # stamped incoming, same source: merged record + owner kept
-    merged = store.upsert(
-        publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
+    source = "/raw/root-a/frame_0001.tif#1"
+    store.upsert(_mode_pub(
+        1, mode_1d="q_total", source_identity=source, scan_key="run_a"))
+    merged = store.upsert(_mode_pub(
+        1, mode_1d="q_ip", source_identity=source, scan_key="run_a"))
     assert merged.scan_key == "run_a"
-    # legacy unstamped incoming, same source: EXISTING owner is preserved
-    merged = store.upsert(publication_from_live_frame(DuckFrame(idx=1)))
-    assert merged.scan_key == "run_a"
+    assert set(merged.record.modes_1d) == {"q_total", "q_ip"}
+
+    replaced = store.upsert(_mode_pub(
+        1, mode_1d="q_oop", source_identity=source, scan_key=None))
+    assert replaced.scan_key is None
+    assert replaced.record.modes_1d == ("q_oop",)
 
 
 def test_scan_owner_mismatch_prevents_same_source_record_merge():
     """A shared source path cannot splice modes across explicit scan owners."""
     store = PublicationStore(max_items=None, max_heavy_items=None)
+    source = "/test/frame-publication.nexus#1"
     store.upsert(_mode_pub(
-        1, mode_1d="q_total", source_identity="shared.nxs",
+        1, mode_1d="q_total", source_identity=source,
         scan_key="run_a"))
     replaced = store.upsert(_mode_pub(
-        1, mode_1d="q_ip", source_identity="shared.nxs",
+        1, mode_1d="q_ip", source_identity=source,
         scan_key="run_b"))
 
     assert replaced.scan_key == "run_b"
     assert set(replaced.record.modes_1d) == {"q_ip"}
 
 
-def test_scan_owner_merge_normalizes_windows_spelling():
+def test_scan_owner_comparison_is_exact_without_path_normalization():
     store = PublicationStore(max_items=None, max_heavy_items=None)
+    source = "/test/frame-publication.nexus#1"
     store.upsert(_mode_pub(
-        1, mode_1d="q_total", source_identity="shared.nxs",
+        1, mode_1d="q_total", source_identity=source,
         scan_key=r"C:\Data\nested\..\run_a.nxs"))
-    merged = store.upsert(_mode_pub(
-        1, mode_1d="q_ip", source_identity="shared.nxs",
+    replaced = store.upsert(_mode_pub(
+        1, mode_1d="q_ip", source_identity=source,
         scan_key="c:/data/run_a.nxs"))
 
-    assert set(merged.record.modes_1d) == {"q_total", "q_ip"}
+    assert replaced.record.modes_1d == ("q_ip",)
+    assert replaced.scan_key == "c:/data/run_a.nxs"
 
 
 def test_scan_owner_preserved_through_reintegrate_carryover():
     store = PublicationStore(max_items=None, max_heavy_items=None)
     store.upsert(publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
     store.begin_reintegrate()
-    # the reintegrate republish (same source) restores the carried owner even
-    # from a legacy unstamped caller
-    republished = store.upsert(publication_from_live_frame(DuckFrame(idx=1)))
+    republished = store.upsert(
+        publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
     assert republished.scan_key == "run_a"
     store.end_reintegrate()
 
 
 def test_scan_owner_mismatch_prevents_reintegrate_carryover_merge():
     store = PublicationStore(max_items=None, max_heavy_items=None)
+    source = "/test/frame-publication.nexus#1"
     store.upsert(_mode_pub(
-        1, mode_1d="q_total", source_identity="shared.nxs",
+        1, mode_1d="q_total", source_identity=source,
         scan_key="run_a"))
     store.begin_reintegrate()
     republished = store.upsert(_mode_pub(
-        1, mode_1d="q_ip", source_identity="shared.nxs",
+        1, mode_1d="q_ip", source_identity=source,
         scan_key="run_b"))
 
     assert republished.scan_key == "run_b"
@@ -1262,16 +1484,31 @@ def test_scan_owner_mismatch_prevents_reintegrate_carryover_merge():
     store.end_reintegrate()
 
 
+def test_scan_owner_missing_never_inherits_through_reintegrate_carryover():
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    source = "/test/frame-publication.nexus#1"
+    store.upsert(_mode_pub(
+        1, mode_1d="q_total", source_identity=source,
+        scan_key="run_a"))
+    store.begin_reintegrate()
+    republished = store.upsert(_mode_pub(
+        1, mode_1d="q_ip", source_identity=source,
+        scan_key=None))
+
+    assert republished.scan_key is None
+    assert republished.record.modes_1d == ("q_ip",)
+    store.end_reintegrate()
+
+
 def test_scan_owner_preserved_through_hydration_replacement():
-    """get_or_hydrate replacing an evicted payload keeps the owner even when
-    the hydrator returns an unstamped same-source publication."""
+    """A current stamped hydrator preserves the exact scan owner."""
     store = PublicationStore(
         max_items=None, max_heavy_items=0, max_thumbnail_items=0)
     store.upsert(publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
     assert store.get(1).raw_status == "evicted"
     store.set_hydrator(
         lambda label: publication_from_live_frame(
-            DuckFrame(idx=1), generation=store.generation))
+            DuckFrame(idx=1), generation=store.generation, scan_key="run_a"))
     hydrated = store.get_or_hydrate(1)
     assert hydrated is not None
     assert hydrated.view.intensity_1d is not None    # payload restored

@@ -3653,6 +3653,15 @@ class FrameViewReader:
         self._revalidate_reader_open(state)
         return result
 
+    @property
+    def source_base(self) -> str | None:
+        """Exact persisted Project root bound by the current admission pass."""
+
+        state = self._require_reader_open()
+        value = self._source_base
+        self._revalidate_reader_open(state)
+        return value
+
     def _scalar_catalog_inventory(self) -> tuple[int, ...]:
         """Build the complete admitted label inventory while a bundle owns it."""
 

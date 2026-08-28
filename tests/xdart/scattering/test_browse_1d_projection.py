@@ -88,6 +88,7 @@ def _scope(
     path.write_bytes(b"stable Browse projection artifact")
     catalog = FrameScalarCatalog(
         str(path.resolve()), "entry", tuple(scalar_rows), tuple(axes),
+        source_base=str(tmp_path),
     )
     cache = Browse1DCache(budget)
     publications = PublicationStore(
@@ -435,7 +436,9 @@ def test_current_merges_only_exact_sparse_heavy_and_noncurrent_stays_light(
             record=record,
             source_identity=canonical_browse_source_identity(
                 rows[label - 1], scope[0].requested_path,
+                source_base=scope[4].source_base,
             ),
+            source_base=scope[4].source_base,
             scan_key=scope[0].scan_key,
         ))
         heavy_arrays[label] = (raw, thumb, cake, x, y)
@@ -576,7 +579,9 @@ def test_optional_current_publication_valid_shapes_do_not_block_cached_1d(
             record=record,
             source_identity=canonical_browse_source_identity(
                 row, scope[0].requested_path,
+                source_base=scope[4].source_base,
             ),
+            source_base=scope[4].source_base,
             scan_key=scope[0].scan_key,
         ))
         if has_2d_mode:
@@ -648,13 +653,18 @@ def test_current_heavy_requires_exact_scalar_source_and_record(
         results_2d={"map": view},
         active_mode_2d="map",
     )
-    source = canonical_browse_source_identity(row, scope[0].requested_path)
+    source = canonical_browse_source_identity(
+        row,
+        scope[0].requested_path,
+        source_base=scope[4].source_base,
+    )
     if sabotage == "source":
         source = "foreign-detector.tif#7"
     scope[6].upsert(FramePublication(
         view,
         record=record,
         source_identity=source,
+        source_base=scope[4].source_base,
         scan_key=(
             "foreign-scan" if sabotage == "scan" else scope[0].scan_key
         ),
@@ -731,7 +741,9 @@ def test_current_heavy_refuses_record_component_identity_drift(
         record=record,
         source_identity=canonical_browse_source_identity(
             row, scope[0].requested_path,
+            source_base=scope[4].source_base,
         ),
+        source_base=scope[4].source_base,
         scan_key=scope[0].scan_key,
     ))
 
@@ -779,7 +791,9 @@ def test_current_heavy_refuses_bool_view_and_record_labels(tmp_path) -> None:
         record=record,
         source_identity=canonical_browse_source_identity(
             row, scope[0].requested_path,
+            source_base=scope[4].source_base,
         ),
+        source_base=scope[4].source_base,
         scan_key=scope[0].scan_key,
     ))
 

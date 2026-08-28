@@ -287,11 +287,17 @@ class _BrowseHydrationOwner:
                 source_base=catalog.source_base,
                 source_root=request.read_key.source_root,
             )
+            source_base = (
+                request.read_key.source_root
+                if request.read_key.source_root is not None
+                else catalog.source_base
+            )
             committed = self._store.upsert(
                 FramePublication(
                     view,
                     record=record,
                     source_identity=source_identity,
+                    source_base=source_base,
                     scan_key=request.owner.scan_key,
                 ),
                 protected=_hydration_locality_protection(
