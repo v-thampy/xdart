@@ -22,10 +22,8 @@ os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 os.environ.setdefault("QT_API", "PySide6")
 os.environ.setdefault("MPLBACKEND", "Agg")
 
-# Isolate session persistence: staticWidget restores ~/.xdart/session.json at
-# construction and SAVES it at close() -- without this, GUI-test fixtures
-# polluted the user's real session (and inherited the user's state, making
-# tests order/machine dependent).
+# Isolate GUI session persistence so tests neither read nor overwrite the
+# maintainer's real session state.
 os.environ.setdefault(
     "XDART_SESSION_FILE",
     os.path.join(tempfile.mkdtemp(prefix="xdart_test_session_"),
@@ -75,12 +73,10 @@ def _qt_test_boundary(_xdart_qt_harness):
 def _qt_session_teardown(_xdart_qt_harness):
     """Session-end thread/handle cleanup — the SAFE subset only.
 
-    Runs while the interpreter is fully alive: bounded-wait the deliberately
-    orphaned slow-close QThreads (a still-running native QThread destroyed at
-    module teardown is a Qt qFatal), close surviving top-level widgets (their
-    closeEvent handlers stop workers/timers), and close the process-wide
-    H5FilePool (never leave HDF5 handle finalization to interpreter-exit
-    ordering against Qt teardown).
+    Runs while the interpreter is fully alive: close surviving top-level
+    widgets (their closeEvent handlers stop workers/timers) and close the
+    process-wide H5FilePool (never leave HDF5 handle finalization to
+    interpreter-exit ordering against Qt teardown).
 
     Deliberately does NOT deliver the session's accumulated DeferredDelete
     backlog: a previous version drained it here
@@ -99,26 +95,7 @@ def _qt_session_teardown(_xdart_qt_harness):
     except Exception:
         return
     app = QtWidgets.QApplication.instance()
-    # 1. Bounded-wait the orphaned slow-close QThreads, then drop the lists.
-    try:
-        from xdart.gui.tabs.static_scan import h5viewer as _h5v
-        from xdart.gui.tabs.static_scan import static_scan_widget as _ssw
-        for lst in (getattr(_ssw, "_ORPHANED_STITCH_THREADS", []),
-                    getattr(_h5v, "_ORPHANED_FILE_THREADS", []),
-                    getattr(_h5v, "_ORPHANED_LOAD_WORKERS", [])):
-            for th in list(lst):
-                try:
-                    if hasattr(th, "isRunning") and th.isRunning():
-                        th.wait(5000)
-                except Exception:
-                    pass
-            try:
-                lst.clear()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # 2. Close surviving top-level widgets (runs closeEvent shutdown hooks;
+    # 1. Close surviving top-level widgets (runs closeEvent shutdown hooks;
     #    no event delivery — see the docstring).
     try:
         if app is not None:
@@ -129,13 +106,13 @@ def _qt_session_teardown(_xdart_qt_harness):
                     pass
     except Exception:
         pass
-    # 3. Close the process-wide H5 read pool while h5py is fully alive.
+    # 2. Close the process-wide H5 read pool while h5py is fully alive.
     try:
         from xdart.utils.h5pool import get_pool
         get_pool().close_all()
     except Exception:
         pass
-    # 4. Python-side garbage only (no Qt event delivery).
+    # 3. Python-side garbage only (no Qt event delivery).
     try:
         _xdart_qt_harness.collect()
     except Exception:
@@ -146,19 +123,10 @@ def _qt_session_teardown(_xdart_qt_harness):
 # Skip PySide6's pathological interpreter-shutdown teardown of the accumulated
 # Qt object graph.
 #
-# Every GUI test builds a ``staticWidget`` whose sub-widgets (pyqtgraph
-# ViewBoxMenus, combobox popups, context QMenus, card QFrames, ...) create
-# ~190 PARENTLESS top-level widgets.  ``widget.close() + deleteLater()`` cannot
-# reap them: no Qt event loop runs during the tests, so the posted
-# ``DeferredDelete`` events are never delivered (the per-test
-# ``qapp.processEvents()`` drain does not flush level-0 DeferredDelete), and the
-# widgets are parentless so nothing cascade-deletes them.  All ~190 per test
-# accumulate for the whole file (>30k live QObjects, GBs of RSS) and are
-# destroyed in a single avalanche at ``Py_Finalize`` ->
-# ``PySide::destroyQCoreApplication`` -> ``visitAllPyObjects``.  Each
-# destruction walks PySide6's GLOBAL signal-connection QHash
-# (``onPysideReceiverSlotDestroyed``), so the mass teardown is O(N^2): measured
-# ~286 s of pure post-session hang for test_controls_panel.py (body ~85 s).
+# GUI tests create parentless Qt/pyqtgraph helper widgets whose DeferredDelete
+# events cannot be safely mass-drained under PySide6.  Letting the accumulated
+# object graph fall through normal interpreter finalization has historically
+# caused a long O(N^2) shutdown or a native crash.
 #
 # We CANNOT reduce N by reaping per test: a ``sendPostedEvents(DeferredDelete)``
 # drain is banned (it segfaulted linux CI mid-run -- see _qt_session_teardown),

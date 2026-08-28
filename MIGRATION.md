@@ -243,12 +243,12 @@ pre-migration reference signature.  Two additive notes:
    the shifted domain, when byte-stable edge behavior matters.  Session-1's G18
    validator pins the observed behavior; explicit clamping is deferred rather
    than silently promised here.
-19. **Legacy no-config env fallback.**  `XDART_CONTROLS_PANEL_V2=0` /
-   `XDART_CONTROLS_V2_NATIVE_RUN_PLAN=0` route runs through the legacy
-   `plan_from_live_scan` builder, which does NOT persist the full
-   `/entry/reduction/config` block the default v2 path writes (and predates the
-   S-4 χ fix, now ported to it).  Prefer the default (flags unset); the fallback
-   is retained only for parity debugging.
+19. **The old Static Scan page and opt-out execution flags are retired.**
+   The Scattering Workspace is the only built-in page and its typed controls
+   are the only run-configuration authority. `XDART_CONTROLS_PANEL_V2=0` and
+   `XDART_CONTROLS_V2_NATIVE_RUN_PLAN=0` no longer select an alternate runtime.
+   The old page's `SCAN_SWITCH` worker/emitter protocol is deleted with that
+   page; it is not migrated as a compatibility path into the current session.
 
 ## Stage-6 redesign items: done vs deferred
 

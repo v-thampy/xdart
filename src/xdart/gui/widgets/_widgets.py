@@ -46,10 +46,9 @@ class defaultWidget(Qt.QtWidgets.QWidget):
         set_parameters: Sets the list of parameters
     """
     sigSetUserDefaults = Qt.QtCore.Signal()
-    # The parameter trees are now a compatibility surface rather than the
-    # complete GUI state: Controls V2 owns several native values that have no
-    # legacy tree leaf.  Let the host add/apply one canonical snapshot while
-    # keeping this generic widget independent of the static-scan module.
+    # Parameter trees are one shared editing surface, not the complete GUI
+    # state: typed controls also own values with no ParameterTree leaf. Let the
+    # host add/apply one canonical snapshot while this widget stays page-neutral.
     sigConfigSaving = Qt.QtCore.Signal(object)
     sigConfigLoaded = Qt.QtCore.Signal(object)
 
@@ -148,7 +147,7 @@ class defaultWidget(Qt.QtWidgets.QWidget):
         # §15.12-A.4: synchronous pre-save VETO.  Config Save is a user ACTION,
         # so a pending INVALID Controls edit refuses the save — no defaults
         # captured, no dialog/file opened or written — instead of serializing a
-        # stale or permissively-clamped baseline.  The owner (staticWidget) sets
+        # stale or permissively-clamped baseline. The workspace owner sets
         # this hook; it returns True to veto.
         veto = getattr(self, "_pre_save_veto", None)
         if callable(veto):

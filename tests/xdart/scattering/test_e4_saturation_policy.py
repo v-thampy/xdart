@@ -1,19 +1,14 @@
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
 from xdart.gui.tabs.scattering.display_runtime import (
     RunDisplayState,
     project_detector_values,
     project_frame_detector_values,
 )
 from xdart.gui.tabs.scattering.events import RunIdentity
-from xrd_tools.reduction.core import _RunSaturationMask
-from xrd_tools.session import RunIntent
-from xrd_tools.session.scan_session import _EventSink
 
 
 def test_live_projection_uses_scan_stable_value_mask_not_current_frame_values() -> None:
@@ -102,26 +97,3 @@ def test_display_owner_copies_one_runtime_mask_and_rejects_divergence() -> None:
     divergent[1, 1] = True
     with pytest.raises(RuntimeError, match="changed within one run"):
         state.stamp_saturation_mask(owner, divergent)
-
-
-def test_scan_session_forwards_runtime_mask_to_qt_thumbnail_owner() -> None:
-    runtime = _RunSaturationMask(True)
-    raw = np.zeros((4, 4), dtype=np.int16)
-    raw[0, 0] = -1
-    runtime.seed(raw)
-    configuration = RunIntent().freeze()
-    host = SimpleNamespace(_admitted_run_configuration=configuration)
-    sink = QtNexusSink(
-        host,
-        SimpleNamespace(),
-        SimpleNamespace(),
-        run_configuration=configuration,
-        mask=np.array([3], dtype=np.intp),
-    )
-
-    _EventSink(sink, lambda _frame, _reduction: None)._bind_run_saturation_mask(
-        runtime
-    )
-
-    assert sink._run_saturation_mask is runtime
-    assert set(map(int, sink._thumbnail_global_mask())) == {0, 3}

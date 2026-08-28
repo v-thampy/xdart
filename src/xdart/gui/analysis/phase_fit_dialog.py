@@ -521,7 +521,7 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             msg += f"  reduced χ² = {rchi:.4g}."
         self.status.setText(msg)
 
-    # ---- batch hooks (driven by staticWidget) ---------------------------
+    # ---- batch hooks (driven by the workspace) --------------------------
     def batch_x_range(self):
         """Phase fitting has no fit-range UI — fit the whole finite pattern, so
         the batch input-builder applies no x-window (the shared batch contract)."""

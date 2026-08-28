@@ -292,11 +292,9 @@ class RunControlsBar(QtWidgets.QWidget):
         button (now 'Pause') usable.  On exit, the active wrangler's
         ``_on_mode_changed`` restores the per-mode widget state.
 
-        NOTE: currently NOT wired in production — run-locking is owned by
-        ``staticWidget._enter_run_state`` (which gates these controls directly,
-        plus Start/Stop/Advanced) and the wrangler's control alias.  Kept as a
-        self-contained helper (and unit-tested); do not also call it from the
-        run-state path or the controls would be double-gated."""
+        NOTE: current run-locking is coordinated by the Scattering Workspace,
+        which also gates Start/Stop/Advanced. This self-contained helper stays
+        unit-tested; callers must not double-gate the same controls."""
         active = bool(active)
         for w in (self.modeCombo, self.batchButton, self.coresSpin,
                   self.liveButton, self.writeModeButton):

@@ -35,8 +35,6 @@ import sys
 import xdart.gui.pages.catalog
 import xdart.gui.pages.services
 for name in (
-    'xdart.gui.tabs.static_scan',
-    'xdart.gui.tabs.static_scan.static_scan_widget',
     'xdart.gui.tabs.scattering',
     'xdart.gui.tabs.scattering.page',
     'xrd_tools.session.experiment_state',
@@ -58,8 +56,6 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
     # for annotations only, inside ``if TYPE_CHECKING:``; every runtime
     # science import and every other spelling stays forbidden.
     for path in sorted(PAGES.glob("*.py")):
-        if path.name == "legacy_static.py":
-            continue
         # The vNext lazy adapter is a sanctioned science bridge, but only for
         # imports deferred inside build-time function bodies: its MODULE level
         # stays subject to the same prohibition as every contract module, and
@@ -125,7 +121,7 @@ def test_j1_experiment_identifier_allowlist_is_exact():
     ]
 
 
-def test_main_host_has_no_page_name_branch_or_legacy_widget_reach_in():
+def test_main_host_has_no_page_name_branch_or_retired_widget_reach_in():
     source = GUI_MAIN.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(GUI_MAIN))
     string_literals = {
@@ -144,7 +140,31 @@ def test_main_host_has_no_page_name_branch_or_legacy_widget_reach_in():
 def test_catalog_is_the_only_builtin_registration_point():
     catalog = (PAGES / "catalog.py").read_text(encoding="utf-8")
     main = GUI_MAIN.read_text(encoding="utf-8")
-    assert "LEGACY_STATIC_PAGE" in catalog
+    assert "LEGACY_STATIC_PAGE" not in catalog
+    assert "STATIC_SCAN_PAGE_KEY" not in catalog
+    assert "build_legacy_static" not in catalog
+    assert catalog.count("PageDescriptor(") == 1
     assert "BUILTIN_PAGES" in catalog
     assert "BUILTIN_PAGES" in main
     assert "PageDescriptor(" not in main
+
+
+def test_retired_static_scan_page_and_package_are_absent_from_production():
+    gui = ROOT / "src" / "xdart" / "gui"
+    assert not (gui / "tabs" / "static_scan").exists()
+    assert not (PAGES / "legacy_static.py").exists()
+
+    forbidden = (
+        "xdart.gui.tabs.static_scan",
+        "gui/tabs/static_scan",
+        "STATIC_SCAN_PAGE_KEY",
+        "LEGACY_STATIC_PAGE",
+        "build_legacy_static",
+    )
+    offenders = []
+    for path in sorted(gui.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in text:
+                offenders.append(f"{path.relative_to(ROOT)}: {token}")
+    assert offenders == []

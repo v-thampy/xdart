@@ -67,14 +67,14 @@ def test_vnext_controls_modules_do_not_import_static_binding_schema():
         )
 
     controls_renderer = (
-        Path(controls_inventory.__file__).parents[1]
-        / "static_scan"
-        / "ui"
-        / "controls_panel_v2.py"
+        Path(controls_inventory.__file__).parents[2]
+        / "widgets"
+        / "controls_panel.py"
     )
-    assert "static_controls_adapter" not in controls_renderer.read_text(
-        encoding="utf-8"
-    )
+    assert controls_renderer.is_file()
+    renderer_text = controls_renderer.read_text(encoding="utf-8")
+    assert "static_controls_adapter" not in renderer_text
+    assert "StaticWidgetBinding" not in renderer_text
 
 
 def test_vnext_edit_commits_to_store_and_freezes_same_revision(tmp_path):

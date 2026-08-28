@@ -1,7 +1,6 @@
 """Esc must NOT close the Peak / Phase fit popups (match the metadata plotter) --
 the default QDialog Esc->reject would discard the whole fit setup.  Dialog imports
-are deferred into the tests (importing them pulls the static_scan GUI stack; keep
-module collection headless-safe, per test_gui_logging)."""
+are deferred so module collection remains headless-safe, per test_gui_logging."""
 import pytest
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 

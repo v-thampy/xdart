@@ -142,18 +142,33 @@ def test_first_party_never_imports_the_shim():
     assert offenders == []
 
 
-def test_static_scan_source_has_no_retired_scan_mirrors():
-    """H9/8b: scan display sources must not reintroduce the retired mirrors."""
-    root = SRC / "xdart" / "gui" / "tabs" / "static_scan"
+def test_current_display_owners_have_no_retired_scan_mirrors():
+    """H9/8b: current display owners must not reintroduce retired mirrors.
+
+    Enumerating only the deleted Static Scan directory made this guard pass
+    vacuously.  Pin the invariant to the live Scattering Workspace and its two
+    Qt-free display-state owners instead.
+    """
+    roots = (
+        SRC / "xdart" / "gui" / "tabs" / "scattering",
+        SRC / "xdart" / "modules" / "display_context.py",
+        SRC / "xdart" / "modules" / "frame_publication.py",
+    )
     retired = ("data_1d", "data_2d", "hydrated_raw")
     offenders: list[str] = []
-    for path in root.rglob("*.py"):
-        if "__pycache__" in path.parts:
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for needle in retired:
-            if needle in text:
-                offenders.append(f"{path.relative_to(ROOT)}: {needle}")
+    scanned: list[Path] = []
+    for root in roots:
+        assert root.exists()
+        paths = root.rglob("*.py") if root.is_dir() else (root,)
+        for path in paths:
+            if "__pycache__" in path.parts:
+                continue
+            scanned.append(path)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for needle in retired:
+                if needle in text:
+                    offenders.append(f"{path.relative_to(ROOT)}: {needle}")
+    assert scanned
     assert offenders == []
 
 

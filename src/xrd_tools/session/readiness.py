@@ -523,9 +523,9 @@ class SectionId(str, Enum):
 class ControlAction(str, Enum):
     """Intent emitted by the Controls V2 preview.
 
-    The Qt widget renders these as buttons, but the static-scan tab owns the
-    actual routing.  Keeping the action list pure avoids giving the preview
-    direct access to wrangler/integrator internals.
+    The Qt widget renders these as buttons, while the Scattering Workspace owns
+    command routing. Keeping the action list pure prevents the renderer from
+    acquiring execution or scientific-state ownership.
     """
 
     CHOOSE_SOURCE = "choose_source"

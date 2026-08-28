@@ -866,11 +866,12 @@ need Qt belongs in `xrd_tools` ("keep xdart thin").
   `frame_publication.py` (the Qt-free GUI envelope: `FramePublication`,
   `PublicationStore`, `validate_publication`), `ewald/` (`LiveScan` /
   `LiveFrame`, the GUI NeXus writer).
-- **`gui/tabs/static_scan/`** — the display layer: a pure, Qt-free decision
-  core (`display_logic.py`) feeds a thin generation-stamped renderer
-  (`display_frame_widget.py`) via one controller per mode
-  (`display_controllers.py`). Viewer controllers resolve files through the
-  headless `xrd_tools.io` APIs — xdart never opens HDF5 to guess.
+- **`gui/tabs/scattering/`** — the sole built-in Scattering Workspace: typed
+  control intent, source/browse adapters, run coordination, and scientific
+  presentation. Qt-free display decisions remain in `xrd_tools.session`, and
+  file access goes through the headless `xrd_tools.io` / source APIs.
+- **`gui/widgets/` and `gui/analysis/`** — shared current controls, run status,
+  plotting widgets, and analysis dialogs used by the Scattering Workspace.
 
 Layer map: [`docs/ARCHITECTURE.md`](https://github.com/v-thampy/xdart/blob/main/docs/ARCHITECTURE.md).
 

@@ -384,16 +384,14 @@ def _guard_violations(
     return violations
 
 
-def test_package_import_is_qt_and_io_light():
+def test_package_import_has_no_qt_or_retired_page_dependency():
     code = """
 import sys
-import xdart.gui.tabs.static_scan
 baseline = set(sys.modules)
 import xdart.gui.tabs.scattering
 forbidden = (
-    "qtpy", "PySide6", "PyQt5", "PyQt6", "pyqtgraph", "h5py", "fabio",
-    "xdart.gui.tabs.static_scan.static_scan_widget",
-    "xdart.gui.tabs.static_scan.display_frame_widget",
+    "qtpy", "PySide6", "PyQt5", "PyQt6", "pyqtgraph",
+    "xdart.gui.tabs.static_scan",
 )
 leaked = sorted(name for name in set(sys.modules) - baseline if any(name == item or name.startswith(item + ".") for item in forbidden))
 assert not leaked, leaked

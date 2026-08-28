@@ -6,7 +6,6 @@ from pathlib import Path
 
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
-from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 from xdart.gui.widgets.controls_panel import (
     ControlsPanel,
     FormRow,
@@ -180,79 +179,3 @@ def test_filename_presentation_retains_exact_model_then_commits_typed_edit() -> 
         assert row.current_value() == manual
     finally:
         _dispose(host)
-
-
-def test_unfocused_programmatic_text_is_not_collected_as_user_intent(
-    monkeypatch,
-) -> None:
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
-    widget = staticWidget()
-    widget._refresh_controls_v2_profile_now()
-    path = ("Int1D", "points")
-    row = next(
-        candidate
-        for candidate in widget.controls_v2.findChildren(FormRow)
-        if candidate.path == path
-    )
-    try:
-        row.editor.clearFocus()
-        app.processEvents()
-        assert not row.editor.hasFocus()
-        widget._controls_v2_edit_journal_dict().pop(path, None)
-
-        row.editor.setText("777")
-
-        winners = dict(widget._controls_v2_collect_pending_edits())
-        assert path not in winners
-        assert path not in widget._controls_v2_edit_journal_dict()
-    finally:
-        _dispose(widget)
-
-
-def test_action_time_collection_flushes_only_the_focused_editor(
-    monkeypatch,
-) -> None:
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
-    widget = staticWidget()
-    widget._refresh_controls_v2_profile_now()
-    focused_path = ("Int1D", "points")
-    unfocused_path = ("Int2D", "radial_points")
-    rows = {
-        candidate.path: candidate
-        for candidate in widget.controls_v2.findChildren(FormRow)
-        if candidate.path in {focused_path, unfocused_path}
-    }
-    assert set(rows) == {focused_path, unfocused_path}
-    focused = rows[focused_path]
-    unfocused = rows[unfocused_path]
-    try:
-        widget._controls_v2_record_edit(
-            focused_path, "111", origin="deferred"
-        )
-        widget._controls_v2_edit_journal_dict().pop(
-            unfocused_path, None
-        )
-        widget.show()
-        app.processEvents()
-        focused.editor.setFocus()
-        app.processEvents()
-        assert focused.editor.hasFocus()
-        focused.editor.selectAll()
-        QtTest.QTest.keyClicks(focused.editor, "333")
-        app.processEvents()
-        # Simulate the action arriving after the last draft signal but before
-        # focus moves: the one focused-editor flush must observe this value.
-        focused.editor.setText("444")
-        unfocused.editor.setText("777")
-
-        winners = dict(widget._controls_v2_collect_pending_edits())
-        assert winners[focused_path] == "444"
-        assert unfocused_path not in winners
-        assert (
-            unfocused_path
-            not in widget._controls_v2_edit_journal_dict()
-        )
-    finally:
-        _dispose(widget)

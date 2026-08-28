@@ -7,8 +7,8 @@ The noise-floor + width gate in ``_detect_peaks`` makes peakless data detect
 NOTHING, so the dialog shows the clean "no peaks auto-detected" hint instead --
 immediately, with no grind.  A genuine peak well above the noise is still found.
 
-Dialog import is deferred into the tests (it pulls the static_scan GUI stack;
-keep module collection headless-safe, per test_gui_logging / test_fit_dialog_esc).
+Dialog import is deferred so module collection remains headless-safe, per
+test_gui_logging / test_fit_dialog_esc.
 """
 import numpy as np
 import pytest

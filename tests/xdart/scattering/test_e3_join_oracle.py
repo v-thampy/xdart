@@ -227,7 +227,7 @@ def _mount(
     selected = members[0]
     poni = project / "detector.poni"
     poni.write_text("accepted through immutable test assets")
-    output = processed / "run.with.dots.nxs"
+    output = processed / "run.with.dots.nexus"
     facts: list[tuple[str, str]] = []
     browse_facts: list[tuple[str, str]] = []
 
@@ -979,7 +979,9 @@ def test_j0_11_relative_raw_path_survives_project_tree_move(
         moved = tmp_path / "relocated"
         shutil.move(str(rig.project), str(moved))
         raw = get_raw_frame(
-            moved / "processed" / rig.output.name, 1
+            moved / "processed" / rig.output.name,
+            1,
+            source_root=moved,
         )
         np.testing.assert_array_equal(
             np.asarray(raw),

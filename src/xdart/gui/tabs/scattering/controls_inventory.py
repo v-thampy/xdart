@@ -108,7 +108,7 @@ class ControlFieldSpec:
 
     The declaration contains only facts consumed by the vNext projection.  It
     deliberately has no Qt widget names, value roles, or ParameterTree
-    coordinates; the Qt-backed static-scan adapter owns those separately.
+    coordinates; the current Qt renderer owns presentation separately.
     """
 
     section: SectionId

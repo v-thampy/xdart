@@ -381,13 +381,13 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
     def set_live_pattern(self, x, y, x_label):
         """Show a pattern pushed by the live runner — the data appears at once;
         the fit overlay arrives later via :meth:`_draw_outcome` on the worker
-        result.  Called by staticWidget's live controller per frame."""
+        result. Called by the workspace live controller per frame."""
         self._clear_fit()
         self._show_pattern(x, y, x_label)
 
     def set_batch_running(self, running):
         """Reflect a batch run in flight: the Batch button becomes Cancel and
-        the single-frame controls are disabled (staticWidget owns the run)."""
+        the single-frame controls are disabled (the workspace owns the run)."""
         self.batch_btn.setText("Cancel" if running else "Batch")
         self.fit_btn.setEnabled(not running)
         self.live_check.setEnabled(not running)

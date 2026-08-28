@@ -92,13 +92,12 @@ def _restore_default_tier(qapp):
     apply_theme(qapp, "dark", font_scale=typo.DEFAULT_FONT_SCALE)
 
 
-class _FakeStaticWidget(QtWidgets.QWidget):
+class _FakePageWidget(QtWidgets.QWidget):
     """The host page stub used by the existing main-window menu sentinel.
 
     The seam under test is the menu/preference owner inside ``Main`` — the page
     is only the surface the Config menu is hung on, so the real (multi-second)
-    staticWidget is not needed for the menu rows.  Geometry rows below use the
-    real page.
+    A production page is not needed for these application-menu rows.
     """
 
     def __init__(self, parent=None):
@@ -127,7 +126,7 @@ def _main_window(monkeypatch):
 
     def build(_services, parent):
         return PageHandle(
-            key=key, widget=_FakeStaticWidget(parent), close=lambda: clean)
+            key=key, widget=_FakePageWidget(parent), close=lambda: clean)
 
     descriptor = PageDescriptor(
         key=key, label="Font Test", order=0, build=build,
@@ -334,31 +333,6 @@ def test_tier_reaches_ordinary_widgets_and_dialogs(qapp):
     for key in ("label", "button", "dialog"):
         assert big[key] > small[key], (
             f"{key} did not grow: a Controls-only scale is not application-wide")
-
-
-def test_tier_reaches_the_controls_panel_fields(qapp, shell):
-    """The dense Controls tokens are a density variant of the ONE tier.
-
-    Measured on the real panel inside the real page: a bare ControlsPanel
-    has only its section cards, the fields arrive with the page's wiring.
-    """
-    _window, widget = shell
-    apply_theme(qapp, "dark", font_scale="default")
-    qapp.processEvents()
-    fields = [w for w in widget.findChildren(QtWidgets.QWidget)
-              if w.objectName().startswith("controlsV2")
-              and w.font().pixelSize() > 0]
-    assert fields, "no ControlsPanel V2 widget is carrying the dense token"
-    probe = fields[0]
-    small = probe.font().pixelSize()
-
-    apply_theme(qapp, "dark", font_scale="extra_large")
-    qapp.processEvents()
-    big = probe.font().pixelSize()
-
-    assert big > small, (
-        f"{probe.objectName()} stayed at {small}px: the dense Controls token "
-        "is not following the application tier")
 
 
 def test_tier_reaches_pyqtgraph_axis_tick_and_legend(qapp):
@@ -670,117 +644,6 @@ def _clipped_widgets(root):
         if 0 < w.maximumWidth() < hint.width():
             bad.add(f"{name}:W")
     return bad
-
-
-@pytest.fixture(scope="module")
-def shell(qapp):
-    """The real three-column page, built once (it is expensive)."""
-    previous = os.environ.get("XDART_CONTROLS_PANEL_V2")
-    os.environ["XDART_CONTROLS_PANEL_V2"] = "1"
-    from xdart.gui.tabs.static_scan import staticWidget
-    window = QtWidgets.QMainWindow()
-    widget = staticWidget()
-    window.setCentralWidget(widget)
-    window.show()
-    try:
-        yield window, widget
-    finally:
-        window.close()
-        if previous is None:
-            os.environ.pop("XDART_CONTROLS_PANEL_V2", None)
-        else:
-            os.environ["XDART_CONTROLS_PANEL_V2"] = previous
-
-
-@pytest.mark.parametrize("scale", ["extra_small", "extra_large"])
-@pytest.mark.parametrize("size", SHELL_SIZES)
-def test_extreme_tiers_do_not_clip_the_three_column_shell(
-        qapp, shell, scale, size):
-    """No control becomes unreadable at an extreme tier that was readable at
-    Default.
-
-    A *regression* bar, deliberately.  Seven controls are already clipped at
-    Default on this branch's parent (``cmap``, ``controlsFrame``,
-    ``controlsV2BrowseButton``, ``controlsV2Chevron``, ``maxCoresSpinBox``,
-    ``slice_center``, ``slice_width``) — pre-existing bugs this packet does not
-    own.  What it does own is that turning the preference application-wide adds
-    none of its own.
-    """
-    window, widget = shell
-
-    apply_theme(qapp, "dark", font_scale="default")
-    _settle(qapp, window, widget, size)
-    baseline = _clipped_widgets(widget)
-
-    apply_theme(qapp, "dark", font_scale=scale)
-    _settle(qapp, window, widget, size)
-
-    for name in ("leftFrame", "middleFrame", "rightFrame"):
-        column = getattr(widget.ui, name)
-        assert column.width() > 0 and column.height() > 0, (
-            f"{name} collapsed at {scale} / {size[0]}x{size[1]}")
-
-    new = _clipped_widgets(widget) - baseline
-    assert new == set(), (
-        f"{scale} at {size[0]}x{size[1]} newly clips {sorted(new)}")
-
-
-def test_tier_change_restores_the_shell_geometry_exactly(qapp, shell):
-    """Default -> Extra Large -> Default must land on the same layout.
-
-    The refits are the risk here: one that grows a cap from the *current* cap
-    instead of recomputing it ratchets up and never comes back down.
-    """
-    window, widget = shell
-    apply_theme(qapp, "dark", font_scale="default")
-    _settle(qapp, window, widget, (1920, 1080))
-    before = (widget.minimumSizeHint().width(), _clipped_widgets(widget))
-
-    apply_theme(qapp, "dark", font_scale="extra_large")
-    _settle(qapp, window, widget, (1920, 1080))
-
-    apply_theme(qapp, "dark", font_scale="default")
-    _settle(qapp, window, widget, (1920, 1080))
-    after = (widget.minimumSizeHint().width(), _clipped_widgets(widget))
-
-    assert after == before, "the shell did not return to its Default geometry"
-
-
-def test_narrow_shell_keeps_controls_scroll_reachable(qapp, shell):
-    """At 1024x900 the shell is at its own minimum width — nothing is hidden.
-
-    The page has a hard floor well above 1024 (measured ~1448 px at Default),
-    which is pre-existing and not this packet's to move.  What matters here is
-    that the floor grows only modestly with the tier and that the controls
-    column stays inside a scroll area at every tier, so nothing becomes
-    unreachable.
-    """
-    window, widget = shell
-    widths = {}
-    for scale in typo.FONT_SCALES:
-        apply_theme(qapp, "dark", font_scale=scale)
-        _settle(qapp, window, widget, (1024, 900))
-        widths[scale] = widget.minimumSizeHint().width()
-
-        areas = [a for a in widget.findChildren(QtWidgets.QScrollArea)
-                 if a.isVisibleTo(widget)]
-        assert areas, f"the controls column lost its scroll area at {scale}"
-        for area in areas:
-            inner = area.widget()
-            if inner is None:
-                continue
-            reachable = (area.verticalScrollBar().maximum()
-                         + area.viewport().height())
-            assert reachable >= min(inner.sizeHint().height(), inner.height()), (
-                f"{area.objectName()} content is past the scrollable range "
-                f"at {scale}")
-
-    assert widths["extra_small"] <= widths["default"] <= widths["extra_large"], (
-        f"the shell floor is not monotonic in the tier: {widths}")
-    growth = widths["extra_large"] - widths["extra_small"]
-    assert growth <= 200, (
-        f"Extra Small -> Extra Large widened the shell by {growth}px: "
-        f"{widths}")
 
 
 # ── 10. theme switching preserves the tier ─────────────────────────────

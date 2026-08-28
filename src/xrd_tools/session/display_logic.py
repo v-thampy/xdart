@@ -1,24 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Pure, Qt-free display-decision layer for the static-scan display.
+"""Pure, Qt-free display decisions for the Scattering Workspace.
 
 This module is the single source of truth for *what should be on screen*.
 It is deliberately free of Qt, pyqtgraph, h5py and pyFAI so its decision
-logic can be unit-tested headlessly (``pytest -m display_logic``) — see
-``tests/test_display_logic.py``.
-
-Populated across the staged refactor:
-
-* Stage 0 (this commit) — scaffold only.  The contract *surface* is
-  declared here (the :class:`DisplayState`/:class:`DisplayPayload` data
-  shapes from the plan, plus stubs for the pure functions).  No
-  production code imports this module yet, so adding it changes no
-  behaviour.  The pure functions raise :class:`NotImplementedError`; the
-  tests that exercise them start **red** by design and go green as the
-  later stages land.
-* Stage 1 — fill in the pure selectors (``resolve_selection``,
-  ``resolve_render_ids``, ``choose_raw_source``, ``sentinel_mask``,
-  the axis-label tables) and call them from the widget.
-* Stage 2+ — ``compute_display_state``, generation, overlay/GI logic.
+logic can be unit-tested headlessly.  Current Scattering Workspace adapters
+consume these contracts; this is production decision logic, not a staged shim.
 
 Guardrail: this module must import **no** Qt, pyqtgraph, h5py or pyFAI.
 ``from __future__ import annotations`` keeps the numpy type hints as plain

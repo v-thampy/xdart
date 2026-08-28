@@ -24,14 +24,11 @@ object.  Three owners replace it:
     An immutable pointer choosing which context and which display generation
     the panels render.  Resume is a new selection, never a restoration.
 
-Deliberately **Qt-free**: stdlib only — no GUI toolkit, no plotting library, no
-HDF5, no pyFAI, no image reader, no array library — so the ownership contract
-can be asserted headlessly and so importing it can never drag the GUI stack
-into a display-logic test.  (The acceptance oracle checks this by scanning THIS
-source for toolkit names, so none may appear here, not even in prose.)  The
-records DO hold live object references — they are runtime owners, not value
-snapshots — but every identity field is write-once and every mutable field
-names its single writer.
+Deliberately **Qt- and file-I/O-free**: this owner layer may use the headless
+xrd_tools session value contracts, but it imports no GUI toolkit, plotting
+library, HDF5 binding, pyFAI, or image decoder. The records DO hold live object
+references — they are runtime owners, not value snapshots — but every identity
+field is write-once and every mutable field names its single writer.
 
 Ownership rules enforced here rather than by convention:
 

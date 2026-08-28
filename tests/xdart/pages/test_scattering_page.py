@@ -2,8 +2,7 @@
 
 Production-wired (HARD RULE 2): the real catalog, the real ``Main`` host, the
 real ``build_scattering_workspace`` factory and the real page — no fake stands
-on the mount seam. The old Static Scan page remains temporarily selectable
-while the current workspace is the product default.
+on the mount seam. The Scattering Workspace is the sole built-in product page.
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from pyqtgraph import QtCore, QtWidgets
 from xdart.gui.pages.catalog import (
     BUILTIN_PAGES,
     DEFAULT_PAGE_KEY,
-    LEGACY_STATIC_PAGE,
     SCATTERING_WORKSPACE_PAGE,
 )
 from xdart.gui.pages.registry import PageRegistry
@@ -48,12 +46,13 @@ def isolated_settings(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Catalog shape — coexistence, defaults, declared capabilities
+# Catalog shape — sole current page, default, declared capabilities
 # ---------------------------------------------------------------------------
 
 def test_catalog_registers_current_workspace_first_and_as_default():
     assert tuple(page.key for page in BUILTIN_PAGES) == (
-        "scattering-workspace", "static-scan")
+        "scattering-workspace",
+    )
     assert DEFAULT_PAGE_KEY == "scattering-workspace"
     assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
 
@@ -135,15 +134,6 @@ def test_host_hides_only_the_redundant_vnext_application_statusbar(
         workspace.close()
         workspace.deleteLater()
         qapp.processEvents()
-
-    legacy = _mounted_host(LEGACY_STATIC_PAGE.key)
-    try:
-        assert not legacy.statusBar().isHidden()
-    finally:
-        legacy.close()
-        legacy.deleteLater()
-        qapp.processEvents()
-
 
 def test_host_mounts_the_real_workspace_on_explicit_optin(
         qapp, isolated_settings):

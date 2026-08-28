@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from types import SimpleNamespace
-
 import pytest
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
+from xdart.gui.pages.descriptors import PageDescriptor
+from xdart.gui.pages.handle import AppMenuHosts, PageHandle
+from xdart.gui.pages.values import (
+    CloseReceipt,
+    PageCapability,
+    PageCleanup,
+    PageKey,
+    PageLifecycle,
+)
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from xdart.gui.themes import apply_theme
 from xdart.gui.themes.spacing import (
@@ -28,56 +34,33 @@ class _MenuHost(QtWidgets.QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.h5viewer = SimpleNamespace(
-            paramMenu=QtWidgets.QMenu(self),
-            helpMenu=QtWidgets.QMenu(self),
-        )
-        self.ui = SimpleNamespace(
-            leftFrame=QtWidgets.QFrame(self),
-            middleFrame=QtWidgets.QFrame(self),
-            rightFrame=QtWidgets.QFrame(self),
-        )
-        self.displayframe = SimpleNamespace(_processing_active=False)
-
-    def enable_async_hydration(self) -> None:
-        pass
-
-    def shortcut_load_settings(self) -> None:
-        pass
-
-    def shortcut_save_settings(self) -> None:
-        pass
-
-    def shortcut_run_pause(self) -> None:
-        pass
-
-    def shortcut_stop(self) -> None:
-        pass
-
-    def shortcut_toggle_write_mode(self) -> None:
-        pass
-
-    def shortcut_pin_slice_cut(self) -> None:
-        pass
+        self.config_menu = QtWidgets.QMenu(self)
+        self.help_menu = QtWidgets.QMenu(self)
 
 
 def _main_window(monkeypatch):
     from xdart import _gui_main
-    from xdart.gui.pages.catalog import LEGACY_STATIC_PAGE
-    from xdart.gui.pages.legacy_static import build_legacy_static
 
     del monkeypatch
 
-    def build(services, parent):
-        return build_legacy_static(
-            services,
-            parent,
-            _widget_factory=_MenuHost,
+    key = PageKey("appearance-test")
+
+    def build(_services, parent):
+        widget = _MenuHost(parent)
+        return PageHandle(
+            key=key,
+            widget=widget,
+            close=lambda: CloseReceipt(PageCleanup.CLEAN, "closed"),
+            app_menus=AppMenuHosts(widget.config_menu, widget.help_menu),
         )
 
-    descriptor = replace(
-        LEGACY_STATIC_PAGE,
+    descriptor = PageDescriptor(
+        key=key,
+        label="Appearance test",
+        order=0,
         build=build,
+        lifecycle=PageLifecycle.EXIT_ONLY,
+        capabilities=frozenset({PageCapability.APP_MENU_HOSTS}),
     )
     return _gui_main.Main(
         page_descriptors=(descriptor,),

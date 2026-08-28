@@ -3,7 +3,7 @@
 One distribution, two import packages, one direction of dependency:
 
 ```
-xdart  (Qt GUI: widgets, wranglers, display)        ── view / commands
+xdart  (Qt GUI: Scattering Workspace + widgets)     ── view / commands
   │  observes events, sends commands, never owns data
   ▼
 xrd_tools.session*  (headless acquisition/reduction service)
@@ -16,12 +16,12 @@ xrd_tools  (pure compute + schema + I/O: core / io / reduction /
 \* the session layer.  The headless
 **`xrd_tools.session.ScanSession`** EXISTS (4f-headless: commands in /
 immutable `FrameEvent` out; ADR-0003/0004) and `reduction.ReductionSession`
-is its streaming engine.  The **4f-bridge** is now BUILT — xdart's
-`ScanSessionAdapter` (`src/xdart/gui/tabs/static_scan/wranglers/scan_session.py`)
-wires over the public session so the GUI is an event→signal view (gated on live
-testing).  The static-scan display decision core also lives under
-`xrd_tools.session.display_logic`, with xdart retaining only a compatibility
-shim.  What remains: moving the GI whole-scan freeze into core.
+is its streaming engine. The sole built-in page is the current Scattering
+Workspace (`src/xdart/gui/tabs/scattering/`), whose adapters drive the public
+session/source APIs while the GUI remains an event-to-view consumer. Display
+decisions live under `xrd_tools.session.display_logic`; there is no second
+Static Scan page or xdart compatibility shim. Whole-scan GI preparation is
+owned by the headless core.
 
 ## North star
 
@@ -84,17 +84,17 @@ from-scratch framing was a local-only CC_ note, not published.)
 
 Background threads write data → the GUI computes *what to show* as
 immutable state → a thin renderer draws it, all generation-stamped
-(`display_logic.py` is the pure, Qt-free decision core; a purity guard
-enforces it). The session `FrameRecordStore` is the authoritative store;
+(`xrd_tools.session.display_logic` is the pure, Qt-free decision core; a
+purity guard enforces it). The session `FrameRecordStore` is authoritative;
 `PublicationStore` is a bounded derived projection (H8), and the legacy
 `data_1d`/`data_2d` mirrors are deleted (H9).
 
 ## Acceptance gates (non-negotiable)
 
-- **live≡batch≡reload equivalence**
-  (`tests/xdart/test_gi_batch_real_data.py::test_*_equivalence`) — the
-  same scan processed live, in batch, and reloaded from disk must produce
-  identical publications.  A failure is a bug, never a tolerance to widen.
+- **scientific run/reload equivalence** — the current core reduction spine,
+  multimode record round-trip, and Scattering Workspace GI-axis parity gates
+  must agree on canonical results. A failure is a bug, never a tolerance to
+  widen.
 - **Byte-compat gate** (`tests/core/test_v2_record_compat.py`) — the
   written record's content signature is pinned; a diff means the on-disk
   format changed.

@@ -123,7 +123,6 @@ def test_scan_plot_loads_spec_metadata_roi_disabled(qapp, tmp_path):
     finally:
         dlg.close()
 
-
 def test_roi_button_reflects_reachability(qapp, monkeypatch):
     from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.sources import MemoryFrameSource
@@ -1023,33 +1022,3 @@ def test_scan_plot_processed_reads_take_writer_lock_x16(qapp, tmp_path):
             f"(acquisitions: {rec.enter_count})")
     finally:
         dlg.close()
-
-
-def test_static_widget_read_lock_provider_matches_loaded_scan_only_x16(
-        qapp, tmp_path, monkeypatch):
-    """X1-6 GUARD (wiring half): the analysis context hands popups the loaded
-    scan's file_lock for the loaded data file ONLY — an arbitrary other file
-    has no in-process writer, so it reads unlocked (None)."""
-    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
-    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-    from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
-
-    loaded = tmp_path / "loaded_scan.nxs"
-    _write_processed_nxs_with_scan_data(loaded)
-    other = tmp_path / "other_scan.nxs"
-    _write_processed_nxs_with_scan_data(other)
-
-    widget = staticWidget()
-    try:
-        widget.scan.data_file = str(loaded)
-        ctx = widget._analysis_context()
-        expected = DisplayDataMixin._scan_file_lock(widget)
-        assert expected is not None, "loaded scan carries no file_lock?"
-        assert ctx.read_lock_for_uri(str(loaded)) is expected
-        assert ctx.read_lock_for_uri(str(other)) is None
-        # uri=None means "the current scan" (the mask_for_scan_uri semantic):
-        # with a loaded data file it resolves to that scan's lock.
-        assert ctx.read_lock_for_uri(None) is expected
-    finally:
-        widget.close()
-        widget.deleteLater()

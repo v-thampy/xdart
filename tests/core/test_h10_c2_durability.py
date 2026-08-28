@@ -1063,69 +1063,11 @@ def test_g15_one_ledger_construction_site_and_one_cadence_definition():
         "xrd_tools/session/policy.py", (
         "the cadence DEFINITION moves behind the session policy owner; a "
         f"second one is mutation 19.  Got {definitions}")
-_CADENCE_CONTROLLERS = (
-    "xdart/gui/tabs/static_scan/wranglers/image_wrangler_thread.py",
-    "xdart/gui/tabs/static_scan/wranglers/nexus_wrangler_thread.py",
-)
-_CADENCE_ADAPTER = "xdart/gui/tabs/static_scan/wranglers/scan_session.py"
-_CADENCE_OBSERVER = "xdart/gui/tabs/static_scan/wranglers/qt_nexus_sink.py"
 _POLICY_NAMES = {"FlushPolicy", "SessionPolicy"}
 _CADENCE_COUNTERS = {"_since_save", "_frames_since_save", "frames_since_save"}
 _CADENCE_THRESHOLDS = {"LIVE_SAVE_INTERVAL", "_LIVE_SAVE_INTERVAL",
                        "live_save_interval", "_flush_interval",
                        "_in_memory_cap", "hard_threshold"}
-
-
-def test_g15_three_cadence_consumers_share_one_policy_definition():
-    """Controllers delegate cadence; the display observer owns none of it."""
-    src = _src_root()
-    authority: list[tuple] = []
-    for rel in (*_CADENCE_CONTROLLERS, _CADENCE_OBSERVER):
-        path = src / rel
-        tree = _tree(path)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and any(
-                    alias.name in _POLICY_NAMES for alias in node.names):
-                authority.append((rel, "import", node.lineno))
-            if isinstance(node, ast.Call):
-                tail = (node.func.id if isinstance(node.func, ast.Name)
-                        else node.func.attr if isinstance(node.func, ast.Attribute)
-                        else None)
-                if tail in _POLICY_NAMES:
-                    authority.append((rel, "construct", node.lineno))
-            if (isinstance(node, ast.Compare)
-                    and _tokens(node) & _CADENCE_COUNTERS
-                    and _tokens(node) & _CADENCE_THRESHOLDS):
-                authority.append((rel, "comparison", node.lineno))
-    assert authority == [], (
-        "controllers and QtFrameObserver may not import, construct or recreate "
-        f"the session cadence policy; found {authority}")
-
-    for rel in _CADENCE_CONTROLLERS:
-        calls = _method_calls(src / rel, {"should_flush", "commit_epoch"})
-        assert {attr for attr, _recv, _where, _line in calls} == {
-            "should_flush", "commit_epoch",
-        }, f"{rel} must delegate the complete cadence decision; got {calls}"
-        foreign = [row for row in calls if row[1] != "adapter"]
-        assert foreign == [], (
-            f"{rel} must delegate cadence through ScanSessionAdapter; "
-            f"foreign receivers={foreign}")
-
-    adapter_calls = _method_calls(
-        src / _CADENCE_ADAPTER, {"should_flush", "commit_epoch"})
-    assert [row[:3] for row in adapter_calls if row[0] == "should_flush"] == [
-        ("should_flush", "self._session.policy", "should_flush")
-    ], f"the adapter must delegate to the mounted session policy: {adapter_calls}"
-    assert [row[:3] for row in adapter_calls if row[0] == "commit_epoch"] == [
-        ("commit_epoch", "self._session", "commit_epoch")
-    ], f"the adapter must delegate the matching epoch commit: {adapter_calls}"
-
-    observer_calls = _method_calls(
-        src / _CADENCE_OBSERVER, {"should_flush", "commit_epoch"})
-    observer_tokens = _tokens(_tree(src / _CADENCE_OBSERVER))
-    assert observer_calls == [] and not (_CADENCE_COUNTERS & observer_tokens), (
-        "QtFrameObserver is display-only and may own no cadence state; "
-        f"calls={observer_calls}, counters={_CADENCE_COUNTERS & observer_tokens}")
 
 
 _PROJECTION_WRITES = {"mark_persisted", "mark_durable", "mark_dropped",
@@ -1165,47 +1107,6 @@ def test_g15_scan_session_is_the_only_production_store_projection_writer():
         f"found {offenders} (mutation 19: a direct GUI writer)")
 
 
-def test_g15_c2_headless_store_projection_owner_split():
-    """C2 census: headless/core only; the nine canonical consumers stay C3."""
-    root = _src_root()
-    canonical_gui = {
-        "xdart/gui/tabs/static_scan/h5viewer.py",
-        "xdart/gui/tabs/static_scan/scan_threads.py",
-        "xdart/gui/tabs/static_scan/static_scan_widget.py",
-        "xdart/gui/tabs/static_scan/wranglers/image_wrangler.py",
-        "xdart/gui/tabs/static_scan/wranglers/image_wrangler_thread.py",
-        "xdart/gui/tabs/static_scan/wranglers/nexus_wrangler.py",
-        "xdart/gui/tabs/static_scan/wranglers/nexus_wrangler_thread.py",
-        "xdart/gui/tabs/static_scan/wranglers/qt_nexus_sink.py",
-        "xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py",
-    }
-    scoped = [
-        (rel, path) for rel, path in _py_files(root)
-        if rel.startswith("xrd_tools/") or rel.startswith("xdart/modules/")
-    ]
-    assert canonical_gui.isdisjoint(rel for rel, _path in scoped)
-    offenders: list[tuple] = []
-    live_series: list[tuple] = []
-    for rel, path in scoped:
-        for attr, recv, where, line in _method_calls(path, _PROJECTION_WRITES):
-            tail = "" if recv is None else recv.rsplit(".", 1)[-1]
-            if tail == "frames":
-                live_series.append((rel, attr, recv))
-            elif rel != "xrd_tools/session/scan_session.py":
-                offenders.append((rel, attr, recv, where, line))
-    series = _tree(root / "xdart/modules/ewald/frame_series.py")
-    live_class = next(node for node in ast.walk(series)
-                      if isinstance(node, ast.ClassDef)
-                      and node.name == "LiveFrameSeries")
-    assert "mark_persisted" in {
-        node.name for node in live_class.body if isinstance(node, ast.FunctionDef)
-    }, "the distinct LiveFrameSeries.frames owner disappeared"
-    assert offenders == [], (
-        "only xrd_tools/session/scan_session.py may write the C2 headless "
-        f"store projection; found {offenders}"
-    )
-
-
 def _assert_scan_session_bind_contract(src: pathlib.Path) -> None:
     cls = next(node for node in _tree(src / "xrd_tools/session/scan_session.py").body
                if isinstance(node, ast.ClassDef) and node.name == "ScanSession")
@@ -1241,40 +1142,6 @@ def _assert_scan_session_bind_contract(src: pathlib.Path) -> None:
         and ast.unparse(node.args[0]) == "prior_facade"
         for node in restores
     ), "both constructor-failure paths must restore the borrowed prior facade"
-
-
-def test_g15_sink_uses_the_private_facade_and_xrd_tools_stays_qt_free():
-    src = _src_root()
-    _assert_scan_session_bind_contract(src)
-
-    tree = _tree(src / "xdart/gui/tabs/static_scan/wranglers/qt_nexus_sink.py")
-    assert "bind_session" not in {node.name for node in ast.walk(tree)
-                                  if isinstance(node, ast.FunctionDef)}, (
-        "QtFrameObserver is display-only and exposes no session-binding hook")
-    reads = sorted({chain for chain in (_chain(node) for node in ast.walk(tree)
-                                        if isinstance(node, ast.Attribute))
-                    if chain and "session" in chain
-                    and chain.endswith((".accounting", ".record_store"))})
-    assert reads == [], (
-        "the sink and XYE helper never read session.accounting / "
-        f"session.record_store; found {reads}")
-
-    qt_offenders: list[tuple] = []
-    for rel, path in _py_files(src):
-        if not rel.startswith("xrd_tools/"):
-            continue
-        for node in ast.walk(_tree(path)):
-            if isinstance(node, ast.Import):
-                module = ",".join(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                module = node.module or ""
-            else:
-                continue
-            if any(token in module for token in
-                   ("PySide6", "PyQt", "pyqtgraph", "xdart")):
-                qt_offenders.append((rel, module))
-    assert qt_offenders == [], (
-        f"xrd_tools must never import Qt or xdart; found {qt_offenders}")
 
 
 def test_g15_c2_private_facade_and_headless_import_purity_split():

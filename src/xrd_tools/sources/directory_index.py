@@ -66,9 +66,8 @@ def _is_provisional(result: ProbeResult) -> bool:
     descriptor = result.descriptor
     return descriptor is None or not bool(descriptor.finalized)
 
-#: Default bounded-readiness window, matching the wrangler's
-#: XDART_CONTAINER_READY_DEADLINE default (image_wrangler_thread.py) — the
-#: same "young container" policy this generalizes, not a new default.
+#: Default bounded-readiness window for a young container that may still be
+#: growing. The source index owns this policy; GUI pages only consume results.
 DEFAULT_RETRY_DEADLINE = 30.0
 
 

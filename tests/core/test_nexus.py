@@ -1383,12 +1383,12 @@ class TestRequireUniformAxesGuard:
     A batch ``integrated_1d`` / ``integrated_2d`` stack stores ONE shared axis
     for every frame, so all frames must agree on it.  ``_require_uniform_axes``
     is the contract a multi-frame writer (and any per-frame-axis freeze that
-    feeds it — e.g. the grazing-incidence common-grid freeze in xdart's
-    ``image_wrangler_thread``) must satisfy: identical (frozen) per-frame axes
-    are accepted; axis/unit drift beyond ``rtol=1e-5`` is rejected.
+    feeds it — e.g. the headless grazing-incidence common-grid freeze) must
+    satisfy: identical (frozen) per-frame axes are accepted; axis/unit drift
+    beyond ``rtol=1e-5`` is rejected.
 
-    These run without any detector data (unlike xdart's real-data GI matrix,
-    which is skipped in CI), so they are the always-on guard for the invariant.
+    These run without detector data, so they are the always-on guard for the
+    invariant.
     """
 
     @staticmethod

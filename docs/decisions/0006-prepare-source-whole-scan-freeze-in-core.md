@@ -4,6 +4,14 @@
 **Builds on:** ADR-0002 (capability attrs), ADR-0003 (does not touch event/record cardinality).
 **Scopes against:** the project guardrail "do not over-abstract for non-existent features."
 
+> **Retirement update (2026-08-28).** This ADR preserves the reasoning that
+> moved whole-scan GI preparation into the headless core. The old Static Scan
+> worker and its transition tests cited below were later deleted with that
+> retired page. Current GUI code lives in `src/xdart/gui/tabs/scattering/`, and
+> the live headless contract is covered by `tests/core/test_prepare_gi.py` plus
+> current Scattering Workspace run/reload tests. Historical implementation
+> details below describe the migration boundary; they are not current owners.
+
 ## Context
 
 Difference 2 from all three deep reviews is the headline "thin xdart" gap: xdart still
@@ -27,8 +35,9 @@ frame — a silent data-quality regression on exactly the angle-dependent Eiger 
 incidence varies most. The session cannot know the whole scan's extent because it never
 saw the whole scan.
 
-**xdart's current workaround** is `_gi_freeze_whole_scan_prepass` and friends in
-`src/xdart/gui/tabs/static_scan/wranglers/image_wrangler_thread.py` (~lines 1073-1399):
+**The historical xdart workaround** was `_gi_freeze_whole_scan_prepass` and
+friends in the now-deleted
+`src/xdart/gui/tabs/static_scan/wranglers/image_wrangler_thread.py`:
 it walks the filesystem for the scan's files (`_enumerate_scan_files`, :1373), reads
 per-frame metadata to find the **global** lowest- and highest-incidence frames
 (`_resolve_incidence_from_meta` :1359; the decision tree in `_gi_whole_scan_scout_entries`
@@ -156,8 +165,9 @@ verbatim (Qt-free, image-free):
 `prepare_gi_freeze` **first** short-circuits to `status="skip"` when the plan ranges are
 already pinned (`_gi_1d_freeze_key(plan) is None and not _gi_2d_freeze_keys(plan)`),
 **before** calling `scan_manifest()` — this preserves the T0-3 silent skip
-(verification fix; `test_gi_prepass_skips_scout_when_ranges_fully_pinned`,
-`tests/xdart/test_gi_batch_real_data.py:1118`). On `"found"` it returns the plan with
+(verification fix; the current gate is
+`tests/core/test_prepare_gi.py::test_prepare_skips_when_ranges_already_pinned`). On
+`"found"` it returns the plan with
 `extra["gi_freeze_scout_indices"] = (lo, hi)`, `status="frozen"` (meaning *indices pinned*;
 the range-freeze happens downstream), `scout_indices`, and the resolved `scout_refs`.
 Otherwise it leaves `extra` unset with `status="skip"`/`"unverifiable"`.
@@ -223,44 +233,33 @@ unions. Same `freeze_common_axis` math, byte-identical given the same extremes.
 
 ## Consequences
 
-- **What actually leaves xdart is incidence-extent *discovery* (~90 lines), not the freeze
-  path.** Deleted from `image_wrangler_thread.py`: `_enumerate_scan_files` (:1373),
-  `_resolve_incidence_from_meta` (:1359), and the extreme-finding half of
-  `_gi_whole_scan_scout_entries` (:1278-1341). **Honest framing for the PR:** this resolves
-  codex-P1 (whole-scan extent) but does **not** unify the freeze invocation. The
-  freeze-over-the-extremes still runs in xdart's `freeze_live_scan_gi_ranges` throwaway
-  session, because the live-streaming chunk-1 session genuinely cannot see frame `hi`.
-- **What stays in xdart (correctly — Qt/thread concerns):** `freeze_live_scan_gi_ranges` +
-  `_freeze_gi_1d/2d_auto_range` (the thin freeze invokers and their `_build_scout` /
-  `_scout_pending_frames` helpers); `_warn_gi_first_chunk_freeze` (emits `showLabel`, stamps
-  `scan.gi_freeze_diagnostic`); `_abort_gi_prepass` (sets `command='stop'` under
-  `command_lock`); `_gi_ranges_fully_pinned` as a cheap GUI-dict pre-core latch;
-  `_gi_freeze_whole_scan_prepass` shrinks to an orchestrator that calls
-  `prepare_gi_freeze`, maps `diag.status` to the GUI reaction, and on `"frozen"` loads the
-  two `scout_refs` and runs the existing freeze. The error catch around the freeze step
-  **stays `except Exception`** (verification fix — narrowing to `except GIFreezeError` would
-  let a scout-image read/PONI/mask error escape the worker thread, which has no top-level
-  except: *worse* than the abort it is meant to preserve).
+- **What left the retired xdart page was incidence-extent *discovery* (~90 lines), not the
+  headless freeze math.** During the migration this removed `_enumerate_scan_files`,
+  `_resolve_incidence_from_meta`, and the extreme-finding half of
+  `_gi_whole_scan_scout_entries` from the old `image_wrangler_thread.py`. That worker was
+  subsequently deleted with the Static Scan page; it is not a current execution owner.
+- **What stayed in xdart during that transition was Qt/thread orchestration.** The old page
+  temporarily retained the thin freeze invokers, warning/abort hooks, and a small adapter
+  around `prepare_gi_freeze`. Those names below are retained only to document the decision
+  and its safety analysis. Current Scattering Workspace orchestration lives under
+  `src/xdart/gui/tabs/scattering/` and calls the current headless reduction APIs.
 - **Two disclosure carriers during the transition:** `PrepareDiagnostics` (new) and
   `scan.gi_freeze_diagnostic` (existing byte-compat provenance string). xdart bridges them.
   Mild debt until the provenance string is itself sourced from the diagnostics object.
-- **The equivalence spine is preserved but is NOT the gate for this move.** The spine
-  (`tests/xdart/test_gi_batch_real_data.py::test_*_publication_live_batch_reload_equivalence`)
-  hands both legs the same pre-frozen grid and is **index-set-invariant by construction** —
-  it cannot detect a wrong scout index. The actual gates are the non-spine tests:
-  `test_gi_streaming_prepass_scouts_whole_scan_extremes` (:956, `nums == [1, 5]` :986),
-  `test_gi_union_scout_covers_all_frames_not_just_frame0` (:906),
-  `test_gi_prepass_warns_and_proceeds_on_unestablishable_range` (:1014, currently asserts
-  `status == "abort"` :1042 — must change to the new status enum), and
-  `test_gi_prepass_warns_and_proceeds_on_image_directory_source` (:1053, `"Image Directory"
-  in emitted[-1]` :1088). **"Keep the suite green frame-for-frame" is overstated:** these
-  four tests are re-pointed at the new core entry points; the *numeric* freeze output is
-  byte-identical, but the test surfaces change.
+- **The old GUI equivalence spine was not the gate for this move.** It handed both legs the
+  same pre-frozen grid and therefore could not detect a wrong scout index. The current
+  headless contract in `tests/core/test_prepare_gi.py` pins value-based extremes, order
+  independence, metadata gaps, unverifiable sources, already-pinned skipping, immutable
+  diagnostics, and manifest behavior. Current Scattering Workspace tests separately own
+  run/reload integration; deleted Static Scan tests are not acceptance dependencies.
 - **HDF5 single-writer / byte-compat v2 / ADR-0003 unaffected.** `prepare_gi_freeze` +
   `scan_manifest()` are read-only metadata; the throwaway freeze session has no write sink;
   frozen values land in `plan.integration_1d/2d`; nothing touches the event/record structure.
 
-## Residual risk (honest)
+## Historical residual risks recorded at acceptance
+
+These risks described the retired worker-side migration. They are retained as
+decision history, not as current Scattering Workspace implementation guidance.
 
 1. **Eiger conservatism is preserved but not improved.** Eiger masters stay
    `has_scan_manifest=False` (per-frame incidence is in the SPEC sidecar, not cheaply
@@ -268,14 +267,15 @@ unions. Same `freeze_common_axis` math, byte-identical given the same extremes.
    varies most — still warn-and-proceed on a first-chunk freeze. The GI grid policy
    (AUTHORITATIVE memory) accepts this. Solving it needs a SPEC-aware source with a real
    `scan_manifest()`; out of scope, but the seam now exists for it.
-2. **The Step-2 `_frame_source_for(scan)` factory is the dominant regression risk.** xdart's
-   batch path does not build a `FrameSource` today; it builds pending tuples + `LiveFrame`s.
-   The factory must reproduce the strict `^{scan_name}_\d+\.{ext}$` discovery regex
+2. **The proposed Step-2 `_frame_source_for(scan)` factory was the dominant regression
+   risk.** The old xdart batch path did not build a `FrameSource`; it built pending tuples
+   plus `LiveFrame`s. The proposed factory had to reproduce the strict
+   `^{scan_name}_\d+\.{ext}$` discovery regex
    (`image_wrangler_thread.py:1390-1391`) — **not** `TiffSeriesSource.from_directory`, whose
    unanchored `fnmatch` glob (`sources/image.py:120`) would ingest neighbour files like
    `{scan}_again_0001.tif` ⇒ wrong extremes ⇒ silent clip — and set `has_scan_manifest` from
    the same `inp_type`/extension checks that gate `_enumerate_scan_files` returning `[]`.
-3. **Frame-index vs file-number index space.** `TiffSeriesSource.frame_indices` is positional
+3. **Frame-index vs file-number index space.** `TiffSeriesSource.frame_indices` was positional
    `range(1, len+1)` (`sources/image.py:96`); xdart's `_get_scan_info` keys on filename
    number. They coincide for contiguous 1-based scans (the spine's `Combi4` fixture), so the
    fail-loud membership check (`core.py:1703`) passes — but a Step-2 factory that mixes the
@@ -285,18 +285,16 @@ unions. Same `freeze_common_axis` math, byte-identical given the same extremes.
 
 ## Status note for the maintainer
 
-This is additive and reversible. **Step 1 (below) ships dead-but-proven core code** — xdart
-still runs its own prepass, the spine stays green untouched — so it can land on `dev` without
-a live checkpoint. **Step 2 (the xdart rewiring + deletion) is the regression-prone part and
-requires a live beamline confirmation** (Stabilization C per `CLAUDE.md`) before merge,
-because the `_frame_source_for` factory is new behavior on the live batch path. If the lift
-proves not worth it, Step 1 leaves a clean, tested core API and no xdart change to revert.
-**At release, the `ssrl_xrd_tools>=` floor must already cover this once Step 1 lands** (the
-writer hard-imports core; see CLAUDE.md).
+The headless `prepare_gi_freeze` / `scan_manifest()` API shipped and remains current. The
+old Static Scan worker-side Step-2 path described above has since been retired with that
+page. The Scattering Workspace now owns GUI orchestration through current adapters and the
+headless APIs. Future GI changes must use current workspace/core gates, not the deleted
+worker or its deleted transition tests.
 
-## Amendment (post-STEP-1, from the round-2 reviews)
+## Historical amendment (post-STEP-1, from the round-2 reviews)
 
-Two clarifications applied to the as-built STEP 1, and the STEP-2 gate is strengthened:
+Two clarifications applied to the as-built Step 1, and the then-proposed Step-2 gate was
+strengthened. The worker/factory requirements below no longer name current owners:
 
 1. **`scout_refs` → `scout_metadata`, deeply immutable** (codex P2/P3). The field was
    mislabelled "source refs" but only ever held the extreme frames' metadata; it is renamed for
