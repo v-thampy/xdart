@@ -23,6 +23,7 @@ from xdart.gui.tabs.scattering.operation_values import (
     OperationCleanupReceipt,
     OperationContextStamp,
     OperationIdentity,
+    OperationPending,
     OperationProgress,
     OperationTerminal,
     OperationTerminalStatus,
@@ -134,7 +135,7 @@ def test_page_close_waits_for_held_operation_owner() -> None:
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = _page()
     held = _HeldOperationOwner()
-    page._operation_slot = held
+    page._workspace_operations._slot = held
     try:
         pending = page.close_workspace()
         assert pending.cleanup_status is CleanupStatus.CLEANUP_PENDING
@@ -402,15 +403,15 @@ def test_real_page_timer_polling_and_close_include_operation_owner() -> None:
         identity = page._begin_operation(_Job(), _held_body(entered, release))
         assert type(identity) is OperationIdentity and entered.wait(2)
         assert page._run_timer.isActive() and page._polling_needed()
-        worker = page._operation_slot._worker
+        worker = page._workspace_operations._slot._worker
         release.set(); worker.join(2); page._drain_executor()
-        assert page._operation_slot.owned is False
+        assert page._workspace_operations.owned is False
         assert not page._run_timer.isActive()
         entered2, release2 = Event(), Event()
         page._begin_operation(_Job("close"), _held_body(entered2, release2))
         assert entered2.wait(2)
         assert page.close_workspace().cleanup_status is CleanupStatus.CLEANUP_PENDING
-        worker2 = page._operation_slot._worker
+        worker2 = page._workspace_operations._slot._worker
         release2.set(); worker2.join(2)
         assert page.close_workspace().cleanup_status is CleanupStatus.CLEANED
     finally:
@@ -421,9 +422,11 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
     root = Path(__file__).parents[3]
     slot_path = root / "src/xdart/gui/tabs/scattering/adapters/external_operation.py"
     page_path = root / "src/xdart/gui/tabs/scattering/page.py"
+    owner_path = root / "src/xdart/gui/tabs/scattering/workspace_operations.py"
     values_path = root / "src/xdart/gui/tabs/scattering/operation_values.py"
-    slot_text, page_text, values_text = (
-        slot_path.read_text(), page_path.read_text(), values_path.read_text()
+    slot_text, page_text, owner_text, values_text = (
+        slot_path.read_text(), page_path.read_text(), owner_path.read_text(),
+        values_path.read_text(),
     )
     tree = ast.parse(slot_text)
     calls = [node.func.id for node in ast.walk(tree)
@@ -431,13 +434,15 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
     methods = {node.name for node in ast.walk(tree)
                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     assert calls.count("Thread") == calls.count("Event") == 1
-    assert not ({"Queue", "Timer", "ThreadPoolExecutor", "Process"} & set(calls))
+    assert calls.count("Queue") == 1  # Average cleanup command handoff
+    assert not ({"Timer", "ThreadPoolExecutor", "Process"} & set(calls))
     assert "_begin" in methods and "begin" not in methods
-    assert page_text.count("OperationSlot()") == 1
-    assert page_text.count("QtCore.QTimer(") == 2
+    assert page_text.count("OperationSlot()") == 1  # analysis only
+    assert owner_text.count("OperationSlot()") == 1  # experiment only
+    assert page_text.count("QtCore.QTimer(") == 3
     assert page_text.count("ThreadPoolExecutor(max_workers=1)") == 2
     assert page_text.count("deque(maxlen=1)") == 1
-    assert page_text.count("ScatteringWorkspace._observe_operation_stamp") == 3
+    assert page_text.count("ScatteringWorkspace._observe_operation_stamp") == 4
     assert page_text.count("begin_calibrate(") == page_text.count("begin_mask(") == 1
     slot_owner = next(node for node in tree.body
                       if isinstance(node, ast.ClassDef) and node.name == "OperationSlot")
@@ -449,9 +454,9 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
                         if isinstance(node, ast.ImportFrom) and node.module)
     assert not ({"numpy", "h5py", "pyFAI"} & slot_imports)
     value_types = (OperationCleanupReceipt, OperationContextStamp,
-                   OperationIdentity, OperationProgress, OperationTerminal,
-                   OperationUpdate)
-    assert values_text.count("@dataclass(frozen=True, slots=True") == 6
+                   OperationIdentity, OperationPending, OperationProgress,
+                   OperationTerminal, OperationUpdate)
+    assert values_text.count("@dataclass(frozen=True, slots=True") == 7
     assert all(value.__dataclass_params__.frozen and hasattr(value, "__slots__")
                for value in value_types)
     state = project_controls(

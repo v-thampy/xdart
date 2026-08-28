@@ -39,6 +39,10 @@ from xdart.gui.tabs.scattering.tools_view import ToolsView
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import RunIdentity
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
+from xdart.gui.tabs.scattering.workspace_operations import (
+    ReintegrateReloadDirective,
+)
 from xrd_tools.analysis.plans import RoiSignal
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition, AnalysisSourceReceipt, CandidateProjection,
@@ -56,6 +60,19 @@ from xrd_tools.core.roi import RoiSpec
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
+
+
+def _set_pending_reintegrate_reload(
+    page, target: str = "/tmp/current.nexus",
+) -> ReintegrateReloadDirective:
+    request = BrowseLoadRequest("pending-reintegrate", 1, target)
+    directive = ReintegrateReloadDirective(request, target)
+    page._workspace_operations._reintegrate_reload = directive
+    return directive
+
+
+def _clear_pending_reintegrate_reload(page) -> None:
+    page._workspace_operations._reintegrate_reload = None
 
 
 @pytest.fixture
@@ -264,7 +281,7 @@ def test_p37b_only_exact_idle_without_writer_or_cleanup_can_start() -> None:
     page = SimpleNamespace(
         _closing=False, _closed=False, _admission_state=None,
         _analysis_slot=SimpleNamespace(owned=False),
-        _operation_slot=SimpleNamespace(owned=False),
+        _workspace_operations=SimpleNamespace(owned=False),
         _lifecycle=SimpleNamespace(phase=SimpleNamespace(value="idle"),
                                    active_run_identity=None,
                                    attempt_run_identity=None),
@@ -272,13 +289,13 @@ def test_p37b_only_exact_idle_without_writer_or_cleanup_can_start() -> None:
             browse_pending=False, viewer_1d_cleanup_pending=False,
             viewer_2d_cleanup_pending=False),
     )
-    page._experiment_operation_busy = lambda: page._operation_slot.owned
+    page._experiment_operation_busy = lambda: page._workspace_operations.owned
     assert analysis_start_allowed(page)
     for owner, name, bad in (
         (page, "_closing", True),
         (page, "_admission_state", object()),
         (page._analysis_slot, "owned", True),
-        (page._operation_slot, "owned", True),
+        (page._workspace_operations, "owned", True),
         (page._lifecycle, "active_run_identity", object()),
         (page._context_controller, "browse_pending", True),
     ):
@@ -796,8 +813,8 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
     )
 
     try:
-        assert not page._operation_slot.owned
-        page._pending_reintegrate_reload = (object(), "/tmp/current.nexus", None)
+        assert not page._workspace_operations.owned
+        _set_pending_reintegrate_reload(page)
         assert page._experiment_operation_busy()
         assert not analysis_start_allowed(page)
         assert page._begin_analysis(
@@ -841,7 +858,7 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
         assert "browser" not in refreshes
         assert "scientific" not in refreshes
 
-        page._pending_reintegrate_reload = None
+        _clear_pending_reintegrate_reload(page)
         page._refresh_shell(
             preserve_display=True,
             preserve_scientific=True,
@@ -860,7 +877,7 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
         assert action_enabled["reintegrate_2d"]
         assert page._shell.scientific.background.isEnabled()
     finally:
-        page._pending_reintegrate_reload = None
+        _clear_pending_reintegrate_reload(page)
         _close_page(page, qapp)
 
 
@@ -903,10 +920,8 @@ def test_pending_reintegrate_reload_dominates_active_background_mutation(
                 reconcile_scientific,
             )
 
-            page._pending_reintegrate_reload = (
-                object(), "/tmp/current.nexus", None,
-            )
-            assert not page._operation_slot.owned
+            _set_pending_reintegrate_reload(page)
+            assert not page._workspace_operations.owned
 
             page._handle_shell_command(
                 ShellCommand(ShellCommandKind.SET_BACKGROUND)
@@ -926,7 +941,7 @@ def test_pending_reintegrate_reload_dominates_active_background_mutation(
                 }),
             ]
 
-            page._pending_reintegrate_reload = None
+            _clear_pending_reintegrate_reload(page)
             page._handle_shell_command(
                 ShellCommand(ShellCommandKind.SET_BACKGROUND)
             )
@@ -938,17 +953,15 @@ def test_pending_reintegrate_reload_dominates_active_background_mutation(
                 current_identity=identity,
                 observe_stamp=lambda _stamp: None,
             )
-            page._pending_reintegrate_reload = (
-                object(), "/tmp/current.nexus", None,
-            )
+            _set_pending_reintegrate_reload(page)
             page._background_identity = identity
-            patch.setattr(page, "_operation_slot", active_slot)
+            patch.setattr(page._workspace_operations, "_slot", active_slot)
             page._handle_shell_command(
                 ShellCommand(ShellCommandKind.SET_BACKGROUND)
             )
             assert releases == [True, True]
     finally:
-        page._pending_reintegrate_reload = None
+        _clear_pending_reintegrate_reload(page)
         page._background_identity = None
         _close_page(page, qapp)
 

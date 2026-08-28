@@ -26,6 +26,10 @@ from xdart.gui.tabs.scattering.shell_values import (
     ShellCommandKind,
 )
 from xdart.gui.tabs.scattering.state_machine import RunPhase
+from xdart.gui.tabs.scattering.workspace_operations import (
+    WorkspaceOperationOwner,
+    WorkspaceRefreshEffect,
+)
 from xdart.modules.display_context import ContextKind
 from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome
 from xrd_tools.session.run_configuration import RunIntent
@@ -653,13 +657,10 @@ def test_catalog_activation_routes_are_gui_thread_zero_io(monkeypatch) -> None:
         _closing=False,
         _closed=False,
         _context_controller=controller,
-        _operation_slot=SimpleNamespace(
-            owned=False, current_identity=None, observe_stamp=lambda _stamp: None,
-        ),
+        _workspace_operations=WorkspaceOperationOwner(),
+        _analysis_operation_busy=lambda: False,
         _calibration_identity=None,
         _mask_identity=None,
-        _reintegrate_identity=None,
-        _reintegrate_dimension=None,
         _experiment_operation_busy=lambda: False,
         _notice=lambda _message: None,
         _refresh_shell=lambda: None,
@@ -779,16 +780,11 @@ def test_viewer_1d_clicked_current_seeds_single_but_overlay_keeps_all_paths(
         _closing=False,
         _closed=False,
         _context_controller=controller,
-        _operation_slot=SimpleNamespace(
-            owned=False,
-            current_identity=None,
-            observe_stamp=lambda _stamp: None,
-        ),
+        _workspace_operations=WorkspaceOperationOwner(),
+        _analysis_operation_busy=lambda: False,
         _experiment_operation_busy=lambda: False,
         _calibration_identity=None,
         _mask_identity=None,
-        _reintegrate_identity=None,
-        _reintegrate_dimension=None,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(
             revision=1,
             thaw=lambda: intent,
@@ -925,6 +921,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     intent = SimpleNamespace(processing_mode="1D Viewer", live_mode=False, run_options={})
     forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("foreign seam"))
     page = SimpleNamespace(_context_controller=controller,
+        _workspace_operations=WorkspaceOperationOwner(),
         _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
         _retire_batch_presentation=lambda: None,
         _retain_outgoing_display=True,
@@ -961,12 +958,12 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     directory = tmp_path / "viewer-folder"; directory.mkdir()
     dispatch = SimpleNamespace(_closing=False, _closed=False,
         _context_controller=SimpleNamespace(viewer_1d_owned=True, viewer_2d_owned=False, selection=None),
-        _operation_slot=SimpleNamespace(owned=False, current_identity=None, observe_stamp=lambda _stamp: None),
+        _workspace_operations=WorkspaceOperationOwner(),
+        _analysis_operation_busy=lambda: False,
         _experiment_operation_busy=lambda: False,
         _notice=lambda _message: None,
         _refresh_shell=lambda: None,
         _calibration_identity=None, _mask_identity=None,
-        _reintegrate_identity=None, _reintegrate_dimension=None,
         _clear_viewer_1d_renderer=lambda *, close: ordered.append(("clear", close)) or outcomes.pop(0),
         _clear_viewer_2d_renderer=forbidden,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(revision=1, thaw=lambda: intent)),
@@ -1008,12 +1005,11 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     dispatch.__dict__.update(_poll_admission=lambda: False, _run_executor=SimpleNamespace(drain_events=lambda: (
         StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)), _lifecycle=SimpleNamespace(
         active_run_identity=identity, attempt_run_identity=None), _refresh_shell=forbidden,
-        _pending_reintegrate_reload=None,
         _settle_browse_1d_before_drain=lambda: True,
         _terminal_browse_handoff=None,
         _terminal_browse_presentation=None,
         _terminal_browse_perf=None,
-        _dispatch_deferred_metadata=lambda: page_module._OperationRefresh.NONE,
+        _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
         _batch_ready_to_paint=lambda: None,
         _show_queued_authored_asset_confirmation=lambda: None,
         _batch_terminal=SimpleNamespace(active=False),

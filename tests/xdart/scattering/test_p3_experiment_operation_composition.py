@@ -128,12 +128,14 @@ def _queue_calibration(
 def _finish_validation(page: ScatteringWorkspace) -> OperationUpdate:
     identity = page._asset_validation_identity
     assert type(identity) is OperationIdentity
-    worker = page._operation_slot._worker
+    worker = page._workspace_operations._slot._worker
     assert worker is not None
     worker.join(3)
     assert not worker.is_alive()
-    page._operation_slot.observe_stamp(page._operation_context_stamp())
-    update = page._operation_slot.poll(identity)
+    page._workspace_operations._slot.observe_stamp(
+        page._operation_context_stamp()
+    )
+    update = page._workspace_operations._slot.poll(identity)
     assert type(update) is OperationUpdate
     assert page._consume_asset_validation_update(update)
     return update
@@ -180,7 +182,7 @@ def test_calibrate_uses_dedicated_source_chooser_after_focus_settlement(
         lambda: order.append(("settle",)) or True,
     )
     monkeypatch.setattr(
-        page._operation_slot, "begin_calibrate",
+        page._workspace_operations, "begin_calibrate",
         lambda request, stamp: begun.append((request, stamp)) or identity,
     )
     try:
@@ -711,14 +713,14 @@ def test_average_refuses_active_background_before_dispatch(
     page, _store = _page(tmp_path, monkeypatch, store=store)
     try:
         monkeypatch.setattr(
-            page._operation_slot,
+            page._workspace_operations,
             "begin_average",
             lambda *_args, **_kwargs: pytest.fail(
                 "active Background reached Average dispatch"
             ),
         )
         page._average_action(store.snapshot())
-        assert page._average_identity is None
+        assert page._workspace_operations.average_identity is None
         assert page._notice_text == (
             "Average Scan does not support an active Background; "
             "choose Background: None before averaging."

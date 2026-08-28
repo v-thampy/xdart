@@ -136,7 +136,7 @@ def test_parent_red_make_mask_command_uses_explicit_tiff_chooser(
     page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(), authoring_source_chooser=chooser)
     command = ShellCommand(ShellCommandKind.CONTROL_ACTION, "make_mask")
     try:
-        monkeypatch.setattr(page._operation_slot, "begin_mask", lambda *_args: None); page._handle_shell_command(command)
+        monkeypatch.setattr(page._workspace_operations, "begin_mask", lambda *_args: None); page._handle_shell_command(command)
         assert chosen == ["mask"]
     finally: _close(page, qapp)
 
@@ -316,7 +316,7 @@ def test_page_focus_selected_assets_cancel_and_projection_are_exact(tmp_path, mo
     def capture(selected, *, current_poni="", current_mask=""):
         prepared.append((selected, current_poni, current_mask)); return real_prepare(selected, current_poni=current_poni, current_mask=current_mask)
     monkeypatch.setattr(page_module, "prepare_mask_request", capture)
-    monkeypatch.setattr(page._operation_slot, "begin_mask", lambda request, stamp: begun.append((request, stamp)) or identity)
+    monkeypatch.setattr(page._workspace_operations, "begin_mask", lambda request, stamp: begun.append((request, stamp)) or identity)
     command = ShellCommand(ShellCommandKind.CONTROL_ACTION, "make_mask")
     try:
         monkeypatch.setattr(page, "_commit_focused_control_edit_for_run", lambda: False); page._handle_shell_command(command)
@@ -335,7 +335,7 @@ def test_page_focus_selected_assets_cancel_and_projection_are_exact(tmp_path, mo
         )
         active = project_controls(store.snapshot(), None, RunPhase.IDLE, operation_busy=True, mask_active=True)
         actions = active.actions_for(SectionId.EXPERIMENT); assert actions[1].label == "Cancel Mask" and actions[1].enabled and not actions[0].enabled
-        cancelled = []; monkeypatch.setattr(OperationSlot, "current_identity", property(lambda _slot: identity)); monkeypatch.setattr(page._operation_slot, "cancel", lambda item: cancelled.append(item) or True)
+        cancelled = []; monkeypatch.setattr(OperationSlot, "current_identity", property(lambda _slot: identity)); monkeypatch.setattr(page._workspace_operations, "cancel", lambda item: cancelled.append(item) or True)
         page._refresh_shell(); page.show(); qapp.processEvents()
         assert any(button.text() == "Cancel Mask" and button.isVisible() for button in page.findChildren(QtWidgets.QPushButton))
         page._handle_shell_command(command); assert cancelled == [identity] and len(chosen) == 1
@@ -954,12 +954,14 @@ def _queue_published_mask(page, store, identity, result, *, stale=False):
 def _finish_mask_validation(page):
     identity = page._asset_validation_identity
     assert type(identity) is OperationIdentity
-    worker = page._operation_slot._worker
+    worker = page._workspace_operations._slot._worker
     assert worker is not None
     worker.join(3)
     assert not worker.is_alive()
-    page._operation_slot.observe_stamp(page._operation_context_stamp())
-    update = page._operation_slot.poll(identity)
+    page._workspace_operations._slot.observe_stamp(
+        page._operation_context_stamp()
+    )
+    update = page._workspace_operations._slot.poll(identity)
     assert type(update) is OperationUpdate
     assert page._consume_asset_validation_update(update)
     return update
@@ -969,9 +971,13 @@ def test_timer_poll_dispatches_exact_mask_update(tmp_path, monkeypatch, qapp) ->
     page = ScatteringWorkspace(intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter())
     identity, result = _published(tmp_path); update = OperationUpdate(identity, terminal=OperationTerminal(identity, OperationTerminalStatus.RETURNED, payload=result))
     observed, polled, consumed = [], [], []; page._mask_identity = identity
-    monkeypatch.setattr(OperationSlot, "current_identity", property(lambda _slot: identity))
-    monkeypatch.setattr(page._operation_slot, "observe_stamp", lambda stamp: observed.append(stamp))
-    monkeypatch.setattr(page._operation_slot, "poll", lambda item: polled.append(item) or update)
+    monkeypatch.setattr(
+        type(page._workspace_operations),
+        "current_identity",
+        property(lambda _owner: identity),
+    )
+    monkeypatch.setattr(page._workspace_operations, "observe_stamp", lambda stamp, *, intent_revision: observed.append((stamp, intent_revision)))
+    monkeypatch.setattr(page._workspace_operations, "poll", lambda item: polled.append(item) or update)
     monkeypatch.setattr(page, "_consume_calibration_update", lambda _update: False)
     monkeypatch.setattr(page, "_consume_mask_update", lambda item: consumed.append(item) or True)
     try:
@@ -1167,7 +1173,7 @@ def test_busy_single_mask_popup_suppresses_escape_and_close_until_exact_cleanup(
         update = _finish_mask_validation(page)
         assert update.stale
         assert page._authored_asset_owner is None
-        assert page._operation_slot.owned is False
+        assert page._workspace_operations.owned is False
         assert page._experiment_operation_busy() is False
         assert page._consume_asset_validation_update(update) is False
         assert store.snapshot().thaw().mask_file == ""
@@ -1203,7 +1209,7 @@ def test_busy_delete_later_autonomously_closes_after_worker_join(
         intents=store, lifecycle=ScatteringCoordinator(),
         sources=FilesystemSourceAdapter(),
     )
-    slot = page._operation_slot
+    slot = page._workspace_operations._slot
     page_destroyed = []
     page.destroyed.connect(lambda *_args: page_destroyed.append(True))
     try:
@@ -1216,7 +1222,7 @@ def test_busy_delete_later_autonomously_closes_after_worker_join(
         dialog.accept_button.click()
         assert entered.wait(2)
         validation_identity = owner.validation_identity
-        worker = page._operation_slot._worker
+        worker = page._workspace_operations._slot._worker
         assert validation_identity is not None and worker is not None
         page.deleteLater()
         QtCore.QCoreApplication.sendPostedEvents(

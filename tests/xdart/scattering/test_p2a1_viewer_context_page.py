@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 import subprocess
@@ -20,6 +20,10 @@ from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.state_machine import RunPhase
+from xdart.gui.tabs.scattering.workspace_operations import (
+    WorkspaceOperationOwner,
+    WorkspaceRefreshEffect,
+)
 from xdart.modules.display_context import (ContextKind, Viewer2DCleanupState, Viewer2DRendererClearReceipt,
                                            Viewer2DRendererClearRequest, Viewer2DReceiptPhase, Viewer2DState)
 from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome, HydrationScope, HydrationToken
@@ -307,6 +311,15 @@ def test_viewer_authority_census_provider_order_refusal_and_cleanup(tmp_path, mo
         setattr(lifecycle, name, None)
 
 def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
+    @dataclass(frozen=True)
+    class _ScientificProjection:
+        heavy: object
+        background_enabled: bool = True
+
+    @dataclass(frozen=True)
+    class _ShellProjection:
+        scientific: _ScientificProjection
+
     calls: list[object] = []
     clear_request = object()
     identity = RunIdentity(2, "delayed")
@@ -329,16 +342,26 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _retain_outgoing_display=False,
         _scientific_repaint_pending=False,
         _waterfall_candidate_count=0,
-        _operation_slot=SimpleNamespace(
-            owned=False, current_identity=None,
-            observe_stamp=lambda _stamp: None,
+        _workspace_operations=WorkspaceOperationOwner(),
+        _batch_terminal=SimpleNamespace(
+            active=False,
+            project_progress=lambda progress: progress,
         ),
+        _analysis_operation_busy=lambda: False,
+        _experiment_operation_busy=lambda: False,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(
             revision=0,
             thaw=lambda: SimpleNamespace(processing_mode="Int 2D"),
         )),
         _last_scientific_projection=object(),
-        _select_scan=lambda value: calls.append(value), _poll_admission=lambda: False,
+        _terminal_browse_handoff=None,
+        _terminal_browse_presentation=None,
+        _select_scan=lambda value, **_kwargs: calls.append(value),
+        _poll_admission=lambda: False,
+        _settle_browse_1d_before_drain=lambda: True,
+        _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
+        _batch_ready_to_paint=lambda: None,
+        _show_queued_authored_asset_confirmation=lambda: None,
         _run_executor=SimpleNamespace(drain_events=lambda: (StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)),
         _lifecycle=SimpleNamespace(active_run_identity=identity, attempt_run_identity=None),
         _refresh_shell=lambda: calls.append("refresh"), _polling_needed=lambda: True,
@@ -356,10 +379,15 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     assert page._last_scientific_projection is None
     canonical = np.arange(4.0).reshape(2, 2)
     frame, context = controller.viewer_2d_frame, object()
-    retained = SimpleNamespace(heavy=SimpleNamespace(raw=canonical, frame=frame))
+    retained = _ScientificProjection(
+        heavy=SimpleNamespace(raw=canonical, frame=frame),
+    )
     controller.viewer_2d_context = context
     controller.__dict__.update(
-        synchronize_acquisition_scope=lambda: None, viewer_2d_cleanup_pending=False,
+        synchronize_acquisition_scope=lambda: None,
+        capture_norm_aggregate_for_refresh=lambda: None,
+        viewer_2d_cleanup_pending=False,
+        browse_context=None,
         navigation=SimpleNamespace(current=None), project_navigation=lambda **_: (),
         resident_frame_keys=(), projectable_contexts=(), selection=None,
         norm_aggregate=None, viewer_2d_diagnostic="")
@@ -368,9 +396,12 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: SimpleNamespace(
             processing_mode="2D Viewer", live_mode=False, source_spec=None, run_options={}))),
         _project_controls=lambda _snapshot: None, _start_permitted=lambda: (True, ""), _sync_detector_demand=lambda: None,
+        _mutating_operation_busy=lambda: False,
         _preferences=SimpleNamespace(slice_pins=()), _retain_outgoing_display=False,
         _source_observation=None,
-            _context_projection=SimpleNamespace(build_shell=lambda **_: SimpleNamespace(scientific=retained)),
+            _context_projection=SimpleNamespace(
+                build_shell=lambda **_: _ShellProjection(retained),
+            ),
             _background_owner=SimpleNamespace(projection=lambda: None),
             _shell_revision=0, _controls_readiness=None, _progress=None,
         _browser_directory=None, _browser_catalog=None, _browser_transient_frame=None,

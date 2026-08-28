@@ -108,7 +108,7 @@ def _active_page_background(mode="Int 2D"):
         page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, mode)
     page._refresh_shell()
     page._handle_shell_command(ShellCommand(ShellCommandKind.SET_BACKGROUND))
-    worker = page._operation_slot._worker
+    worker = page._workspace_operations._slot._worker
     assert worker is not None; worker.join(3); assert not worker.is_alive()
     page._drain_executor(); qapp.processEvents()
     assert page._background_owner.phase == "ACTIVE"
@@ -342,7 +342,7 @@ def test_pre_adoption_context_membership_and_shape_drift_release_exact_roots(
     runtime = page._context_controller._runtime
     runtime.adopt_acquisition(identity, acquisition); page._refresh_shell()
     page._handle_shell_command(ShellCommand(ShellCommandKind.SET_BACKGROUND))
-    worker = page._operation_slot._worker
+    worker = page._workspace_operations._slot._worker
     assert worker is not None; worker.join(3); assert not worker.is_alive()
     if drift == "generation":
         runtime._selection = replace(runtime._selection,
@@ -711,7 +711,7 @@ def test_real_page_one_click_one_worker_adopts_and_clear_preserves_source(monkey
     monkeypatch.setattr(owner_module, "run_display_background", observed)
     try:
         page._handle_shell_command(ShellCommand(ShellCommandKind.SET_BACKGROUND))
-        worker = page._operation_slot._worker
+        worker = page._workspace_operations._slot._worker
         assert worker is not None; worker.join(3); assert not worker.is_alive()
         page._drain_executor(); qapp.processEvents()
         projection = page._background_owner.projection()

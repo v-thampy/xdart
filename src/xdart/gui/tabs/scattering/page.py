@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from enum import Enum
 import logging
 import math
 import os
@@ -38,13 +37,11 @@ from xrd_tools.session.run_configuration import (
     RunIntent,
     heavy_residency_choice,
 )
-from xrd_tools.reduction import ReintegrateResult
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.io.viewer_1d import SUPPORTED_VIEWER_1D_SUFFIXES
 from xrd_tools.io.viewer_2d import SUPPORTED_VIEWER_SUFFIXES
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
-    stream_terminal_object_revision,
 )
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.sources.selection import (
@@ -195,7 +192,7 @@ from .performance_diagnostics import (
     performance_diagnostics_error,
 )
 from .operation_values import (
-    OperationContextStamp, OperationIdentity, OperationPending,
+    OperationContextStamp, OperationIdentity,
     OperationTerminalStatus, OperationUpdate,
 )
 from .presentation_background import (DisplayBackgroundTransferReceipt,
@@ -214,6 +211,10 @@ from .start_outcomes import (
 from .start_pipeline import StartPipeline
 from .state_machine import RunPhase
 from .workspace_shell import ScatteringWorkspaceShell
+from .workspace_operations import (
+    WorkspaceOperationOwner,
+    WorkspaceRefreshEffect,
+)
 
 
 _LOG = logging.getLogger(__name__)
@@ -413,16 +414,6 @@ class _DeferredMetadata:
     candidate: object | None = None
 
 
-class _OperationRefresh(Enum):
-    NONE = "none"
-    DIALOG = "dialog"
-    CONTROLS = "controls"
-    FULL = "full"
-
-    def __bool__(self) -> bool:
-        return self is not _OperationRefresh.NONE
-
-
 @dataclass(frozen=True, slots=True)
 class _TerminalBrowseHandoff:
     request: BrowseLoadRequest
@@ -470,20 +461,6 @@ def _terminal_frame_signature(
         if canonical is None
         else (canonical, frame.local_frame_label)
     )
-
-
-def _terminal_identity_for_target(
-    value: object,
-    target: str,
-) -> StreamTerminal | None:
-    """Return an exact writer seal only for its lexical output target."""
-
-    if type(value) is not StreamTerminal or type(target) is not str or not target:
-        return None
-    if stream_terminal_object_revision(value) is None:
-        return None
-    normalized = os.path.normcase(os.path.abspath(os.path.expanduser(target)))
-    return value if value.target == normalized else None
 
 
 def _native_plot_axis_for_run(
@@ -847,7 +824,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browse_loader=self._browse_loader,
             projection=self._context_projection,
         )
-        self._operation_slot = OperationSlot()
+        self._workspace_operations = WorkspaceOperationOwner()
         self._analysis_slot = OperationSlot()
         self._background_owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_identity: OperationIdentity | None = None
@@ -860,17 +837,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._authored_asset_token = 0
         self._authored_asset_owner: _AuthoredAssetOwner | None = None
         self._asset_validation_identity: OperationIdentity | None = None
-        self._reintegrate_identity: OperationIdentity | None = None
-        self._reintegrate_request: object | None = None
-        self._reintegrate_target: str | None = None; self._reintegrate_dimension: str | None = None
-        self._pending_reintegrate_reload: tuple[
-            BrowseLoadRequest, str, StreamTerminal | None,
-        ] | None = None
-        self._average_identity: OperationIdentity | None = None
-        self._average_pending: OperationPending | None = None
-        self._average_revision: int | None = None
-        self._average_target: str | None = None
-        self._average_entry: str | None = None
         self._metadata_dialog = self._scan_roi_dialog = None
         self._peak_dialog = self._phase_dialog = None
         self._metadata_generation = self._scan_roi_generation = 0
@@ -950,9 +916,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
 
     def _experiment_operation_busy(self) -> bool:
-        return (self._operation_slot.owned
+        return (self._workspace_operations.busy
                 or self._authored_asset_owner is not None
-                or self._pending_reintegrate_reload is not None)
+        )
 
     def _analysis_operation_busy(self) -> bool:
         return bool(
@@ -967,20 +933,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
 
     def _observe_operation_stamp(self, revision: int | None = None) -> None:
-        slot = getattr(self, "_operation_slot", None)
-        average = getattr(self, "_average_identity", None)
-        if slot is not None and (
-            average is not None and slot.current_identity is average
-        ):
+        operations = getattr(self, "_workspace_operations", None)
+        if operations is not None:
             if revision is None:
                 revision = self._intents.snapshot().revision
-            stamp = OperationContextStamp(revision)
-            slot.observe_stamp(stamp)
-        elif slot is not None:
-            stamp = ScatteringWorkspace._operation_context_stamp(
-                self, revision
+            operations.observe_stamp(
+                ScatteringWorkspace._operation_context_stamp(
+                    self, revision
+                ),
+                intent_revision=revision,
             )
-            slot.observe_stamp(stamp)
 
         analysis_slot = getattr(self, "_analysis_slot", None)
         analysis = getattr(self, "_analysis_identity", None)
@@ -1007,7 +969,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> OperationIdentity | None:
         if self._authored_asset_owner is not None:
             return None
-        identity = self._operation_slot._begin(
+        identity = self._workspace_operations.begin(
             frozen, self._operation_context_stamp(), body
         )
         if identity is not None:
@@ -1131,16 +1093,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _finish_metadata_refresh(
         self, target, message=None,
-    ) -> _OperationRefresh:
+    ) -> WorkspaceRefreshEffect:
         if message is not None:
             self._set_metadata_dialog_status(target, message)
         # Metadata never locks editable fields or repaints science.  Its final
         # transition does, however, release the mutually-exclusive Run and
         # mutating-action affordances through one controls-only projection.
         return (
-            _OperationRefresh.DIALOG
+            WorkspaceRefreshEffect.DIALOG
             if self._analysis_operation_busy()
-            else _OperationRefresh.CONTROLS
+            else WorkspaceRefreshEffect.CONTROLS
         )
 
     def _begin_analysis(self, kind, plan, generation, *, target=None,
@@ -1273,13 +1235,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         from .analysis_mount import analysis_start_allowed
         return "ready" if analysis_start_allowed(self) else "permanent"
 
-    def _dispatch_deferred_metadata(self) -> _OperationRefresh:
+    def _dispatch_deferred_metadata(self) -> WorkspaceRefreshEffect:
         deferred = self._deferred_metadata
         if deferred is None:
-            return _OperationRefresh.NONE
+            return WorkspaceRefreshEffect.NONE
         disposition = self._classify_deferred_metadata(deferred)
         if disposition == "transient":
-            return _OperationRefresh.NONE
+            return WorkspaceRefreshEffect.NONE
         if disposition != "ready":
             if self._deferred_metadata is deferred:
                 self._deferred_metadata = None
@@ -1299,7 +1261,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if identity is not None:
             if self._deferred_metadata is deferred:
                 self._deferred_metadata = None
-            return _OperationRefresh.DIALOG
+            return WorkspaceRefreshEffect.DIALOG
         if self._classify_deferred_metadata(deferred) != "transient":
             if self._deferred_metadata is deferred:
                 self._deferred_metadata = None
@@ -1308,7 +1270,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 "Metadata request is no longer current.",
             )
         self._ensure_timer()
-        return _OperationRefresh.NONE
+        return WorkspaceRefreshEffect.NONE
 
     def _capture_analysis_trace(self, kind):
         from .analysis_mount import capture_display_anchor, displayed_trace_input
@@ -1482,7 +1444,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _consume_analysis_update(self, update):
         if type(update) is not OperationUpdate or update.identity is not self._analysis_identity:
-            return _OperationRefresh.NONE
+            return WorkspaceRefreshEffect.NONE
         if update.terminal is None:
             if update.progress is not None:
                 message = f"Analysis: {update.progress.stage} {update.progress.completed}/{update.progress.total}"
@@ -1494,11 +1456,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         self._analysis_target, message,
                     )
             return (
-                _OperationRefresh.DIALOG
+                WorkspaceRefreshEffect.DIALOG
                 if self._analysis_kind in {
                     "metadata", "metadata_requalification",
                 }
-                else _OperationRefresh.FULL
+                else WorkspaceRefreshEffect.FULL
             )
         kind, target = self._analysis_kind, self._analysis_target
         metadata_operation = kind in {
@@ -1563,13 +1525,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(diagnostic)
             return (
                 self._finish_metadata_refresh(target, diagnostic)
-                if metadata_operation else _OperationRefresh.FULL
+                if metadata_operation else WorkspaceRefreshEffect.FULL
             )
         if kind == "metadata" and self._deferred_metadata is not None:
             # A newer user request already owns latest-only precedence.  Do
             # not let this older terminal candidate erase it, either while
             # chaining or after completing the candidate's requalification.
-            return _OperationRefresh.DIALOG
+            return WorkspaceRefreshEffect.DIALOG
         if kind == "metadata" and not requalification:
             identity = self._submit_metadata(
                 None, generation, target=target, request=request,
@@ -1577,7 +1539,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             if identity is None and self._deferred_metadata is None:
                 return self._finish_metadata_refresh(target)
-            return _OperationRefresh.DIALOG
+            return WorkspaceRefreshEffect.DIALOG
         retained = {"metadata": self._metadata_result,
                     "scan_roi": self._scan_roi_result,
                     "peak": self._peak_result, "phase": self._phase_result}
@@ -1589,7 +1551,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(reason)
             return (
                 self._finish_metadata_refresh(target, reason)
-                if metadata_operation else _OperationRefresh.FULL
+                if metadata_operation else WorkspaceRefreshEffect.FULL
             )
         if kind in {"scan_plot", "roi_preview", "roi_scan"}:
             self._roi_preview_binding = None
@@ -1635,7 +1597,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._notice("")
         return (
             self._finish_metadata_refresh(target)
-            if metadata_operation else _OperationRefresh.FULL
+            if metadata_operation else WorkspaceRefreshEffect.FULL
         )
 
     @staticmethod
@@ -1648,7 +1610,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 plan.contributor_ids, plan.value_shapes, plan.axis_shapes, target_facts)
 
     def _background_action(self) -> None:
-        owner, slot = self._background_owner, self._operation_slot
+        owner, operations = self._background_owner, self._workspace_operations
         if self._analysis_operation_busy():
             self._notice(
                 "Display background is unavailable while analysis is active."
@@ -1660,7 +1622,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         background_cancel = (
             self._background_identity is not None
-            and slot.current_identity is self._background_identity
+            and operations.current_identity is self._background_identity
         )
         if self._experiment_operation_busy() and not background_cancel:
             self._notice("Display background is unavailable while another operation is active.")
@@ -1693,7 +1655,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if reservation is None:
             self._notice("Display background exceeds its standalone 512 MiB workspace.")
             self._refresh_shell(); return
-        identity = slot.begin_background(plan, stamp, owner, reservation)
+        identity = operations.begin_background(
+            plan, stamp, owner, reservation
+        )
         if identity is None:
             owner.abort(reservation, "START_REFUSED")
             self._notice("Display background operation was not started."); return
@@ -1738,14 +1702,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if prior not in {"EMPTY", "RELEASED"}: self._context_controller.reseed_background_projection()
             self._background_identity = None; return True
         identity = self._background_identity
-        if identity is not None and self._operation_slot.current_identity is identity:
-            self._operation_slot.cancel(identity)
+        if identity is not None and self._workspace_operations.current_identity is identity:
+            self._workspace_operations.cancel(identity)
         self._ensure_timer(); return False
 
     def _calibrate_action(self) -> None:
-        slot, identity = self._operation_slot, self._calibration_identity
-        if identity is not None and slot.current_identity is identity:
-            accepted = slot.cancel(identity)
+        operations, identity = self._workspace_operations, self._calibration_identity
+        if identity is not None and operations.current_identity is identity:
+            accepted = operations.cancel(identity)
             self._notice("Cancelling calibration…" if accepted else "Calibration cancellation was not accepted.")
             self._refresh_shell(); return
         if not self._commit_focused_control_edit_for_run(): return
@@ -1773,7 +1737,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(str(error)); self._refresh_shell(); return
         remember_browse_path(request.source_path)
         stamp = self._operation_context_stamp(snapshot.revision)
-        identity = slot.begin_calibrate(request, stamp)
+        identity = operations.begin_calibrate(request, stamp)
         if identity is None:
             self._notice("Calibration operation was not started."); return
         self._calibration_identity, self._calibration_revision = identity, snapshot.revision
@@ -1839,9 +1803,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return True
 
     def _mask_action(self) -> None:
-        slot, identity = self._operation_slot, self._mask_identity
-        if identity is not None and slot.current_identity is identity:
-            accepted = slot.cancel(identity); self._notice("Cancelling mask…" if accepted else "Mask cancellation was not accepted.")
+        operations, identity = self._workspace_operations, self._mask_identity
+        if identity is not None and operations.current_identity is identity:
+            accepted = operations.cancel(identity); self._notice("Cancelling mask…" if accepted else "Mask cancellation was not accepted.")
             self._refresh_shell(); return
         if not self._commit_focused_control_edit_for_run(): return
         phase = self._lifecycle.phase
@@ -1865,7 +1829,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(str(error)); self._refresh_shell(); return
         remember_browse_path(request.source_path); self._notice(f"Preparing {os.path.basename(request.source_path)}…")
         stamp = self._operation_context_stamp(snapshot.revision)
-        identity = slot.begin_mask(request, stamp)
+        identity = operations.begin_mask(request, stamp)
         if identity is None:
             self._notice("Mask operation was not started."); return
         self._mask_identity, self._mask_revision = identity, snapshot.revision
@@ -2042,7 +2006,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or owner.dialog is not dialog):
             return
         if owner.validation_identity is not None:
-            self._operation_slot.cancel(owner.validation_identity)
+            self._workspace_operations.cancel(owner.validation_identity)
         self._authored_asset_owner = None
         self._asset_validation_identity = None
         if not self._closing and not self._closed:
@@ -2140,12 +2104,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         request: AssetValidationRequest,
     ) -> None:
         if (not self._authored_asset_context_current(owner)
-                or self._operation_slot.owned):
+                or self._workspace_operations.owned):
             self._retire_authored_asset(
                 owner, "Authored asset context changed; nothing was adopted.",
             )
             return
-        identity = self._operation_slot.begin_asset_validation(
+        identity = self._workspace_operations.begin_asset_validation(
             request, owner.stamp,
         )
         if identity is None:
@@ -2284,31 +2248,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": None,
                                 "requests": {"workers": workers}}}
 
-    def _reload_after_reintegrate(
-        self,
-        request,
-        target,
-        terminal_commit_identity: StreamTerminal | None = None,
-    ) -> None:
-        if type(request) is not BrowseLoadRequest or type(target) is not str:
-            self._request_browser_catalog()
-            return
-        self._pending_reintegrate_reload = (
-            request, target, terminal_commit_identity,
-        )
-        self._retry_pending_reintegrate_reload()
-
     def _retry_pending_reintegrate_reload(self) -> bool:
-        pending = self._pending_reintegrate_reload
-        if pending is None:
+        operations = self._workspace_operations
+        directive = operations.pending_reintegrate_reload
+        if directive is None:
             return False
         if self._closing or self._closed:
-            self._pending_reintegrate_reload = None
+            operations.retire_reintegrate_reload(directive)
             return False
         if not self._release_browse_1d_debt():
             self._ensure_timer()
             return False
-        request, target, terminal_commit_identity = pending
+        request = directive.request
+        target = directive.target
+        terminal_commit_identity = directive.terminal_commit_identity
         reloaded = (
             self._context_controller.reload_reintegrate_browse(
                 request, target,
@@ -2326,20 +2279,32 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 self._ensure_timer()
                 return False
-            self._pending_reintegrate_reload = None
+            operations.retire_reintegrate_reload(directive)
             self._request_browser_catalog()
             self._notice(
                 "Reintegrate Browse reload lost its exact context; "
                 "refresh the persisted artifact from the browser."
             )
             return True
-        self._pending_reintegrate_reload = None
+        operations.retire_reintegrate_reload(directive)
         return True
 
     def _reintegrate_action(self, dimension) -> None:
-        slot, active = self._operation_slot, self._reintegrate_identity
-        if active is not None and slot.current_identity is active and self._reintegrate_dimension != dimension: self._refresh_shell(); return
-        if active is not None and slot.current_identity is active and self._reintegrate_dimension == dimension: accepted = slot.cancel(active); self._notice(f"Cancelling Reintegrate {dimension[0]}-D…" if accepted else "Reintegrate cancellation was not accepted."); self._refresh_shell(); return
+        operations = self._workspace_operations
+        active = operations.reintegrate_identity
+        if (
+            active is not None
+            and operations.current_identity is active
+            and operations.reintegrate_dimension != dimension
+        ):
+            self._refresh_shell(); return
+        if (
+            active is not None
+            and operations.current_identity is active
+            and operations.reintegrate_dimension == dimension
+        ):
+            accepted = operations.cancel_reintegrate(dimension)
+            self._notice(f"Cancelling Reintegrate {dimension[0]}-D…" if accepted else "Reintegrate cancellation was not accepted."); self._refresh_shell(); return
         if self._authored_asset_owner is not None:
             self._notice("Reintegrate is unavailable while authored-asset confirmation is pending.")
             self._refresh_shell(); return
@@ -2360,161 +2325,74 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         stamp = self._operation_context_stamp(snapshot.revision); recaptured = self._context_controller.capture_reintegrate_browse(); current = self._intents.snapshot()
         try: current_preparation = self._reintegrate_preparation(current.thaw(), dimension)
         except (TypeError, ValueError): current_preparation = None
-        same_browse = (recaptured is not None and recaptured[0] is captured[0] and recaptured[1] is captured[1] and recaptured[2] is captured[2] and recaptured[3:] == captured[3:])
-        if current.revision != snapshot.revision or current_preparation != preparation or not same_browse or not self._context_controller.invalidate_reintegrate_browse(*captured):
+        same_browse = (
+            recaptured is not None and captured.is_exactly(recaptured)
+        )
+        if current.revision != snapshot.revision or current_preparation != preparation or not same_browse or not self._context_controller.invalidate_reintegrate_browse(captured):
             self._notice("Reintegrate context changed before dispatch."); self._refresh_shell(); return
-        context, request, _selection, target, entry, target_snapshot, labels = captured
-        identity = slot.begin_reintegrate(target=target, entry=entry,
-            source_root=request.source_root,
-            expected_target_snapshot=target_snapshot, expected_labels=labels,
-            dimension=dimension, preparation_values=preparation, stamp=stamp,
-            expected_terminal_identity=(
-                request.terminal_commit_identity
-                if stream_terminal_object_revision(
-                    request.terminal_commit_identity,
-                ) is not None
-                else None
-            ))
+        identity = operations.begin_reintegrate(
+            captured,
+            dimension=dimension,
+            preparation_values=preparation,
+            stamp=stamp,
+        )
         if identity is None:
-            self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None; self._reload_after_reintegrate(request, target); self._notice(f"Reintegrate {dimension[0]}-D was not started; Browse is reloading."); self._refresh_shell(); return
-        self._reintegrate_identity, self._reintegrate_request, self._reintegrate_target, self._reintegrate_dimension = identity, request, target, dimension
+            self._retry_pending_reintegrate_reload(); self._notice(f"Reintegrate {dimension[0]}-D was not started; Browse is reloading."); self._refresh_shell(); return
         self._notice(f"Reintegrating {dimension[0]}-D from authenticated loaded artifact science…"); self._refresh_shell(); self._ensure_timer()
 
-    def _consume_reintegrate_update(self, update: object) -> _OperationRefresh:
-        if type(update) is not OperationUpdate or update.identity is not self._reintegrate_identity: return _OperationRefresh.NONE
-        if update.terminal is None:
-            if update.progress is not None: self._notice(f"Reintegrate {self._reintegrate_dimension[0]}-D: {update.progress.stage} {update.progress.completed}/{update.progress.total}…")
-            return _OperationRefresh.CONTROLS
-        terminal, request, target = update.terminal, self._reintegrate_request, self._reintegrate_target
-        shown = {"1d": "1-D", "2d": "2-D"}.get(self._reintegrate_dimension, "operation"); self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
-        result = terminal.payload
-        self._notice(f"Reintegrate {shown} {result.disposition.lower()}; reloading persisted results." if terminal.status is OperationTerminalStatus.RETURNED and type(result) is ReintegrateResult else f"Reintegrate {shown} cancelled; reloading persisted results." if terminal.status is OperationTerminalStatus.CANCELLED else f"Reintegrate {shown} failed: {terminal.diagnostic}")
-        committed = (
-            terminal.status is OperationTerminalStatus.RETURNED
-            and type(result) is ReintegrateResult
-            and result.disposition == "COMMITTED"
+    def _consume_reintegrate_update(
+        self, update: object,
+    ) -> WorkspaceRefreshEffect:
+        transition = self._workspace_operations.consume_reintegrate_update(
+            update
         )
-        commit_identity = (
-            _terminal_identity_for_target(result.commit_identity, target)
-            if committed and target is not None
-            else None
-        )
-        if committed and commit_identity is None:
-            self._notice(
-                f"Reintegrate {shown} returned an invalid commit identity; "
-                "reloading the persisted artifact without its terminal seal."
-            )
-            if request is not None and target is not None:
-                self._reload_after_reintegrate(request, target)
-            else:
-                self._request_browser_catalog()
-            return _OperationRefresh.FULL
-        if request is not None and target is not None: self._reload_after_reintegrate(
-            request, target, commit_identity,
-        )
-        else: self._request_browser_catalog()
-        return _OperationRefresh.FULL
+        if transition.notice:
+            self._notice(transition.notice)
+        if transition.effect is WorkspaceRefreshEffect.FULL:
+            self._retry_pending_reintegrate_reload()
+        return transition.effect
 
-    def _consume_average_update(self, update: object) -> bool:
-        if type(update) is not OperationUpdate or update.identity is not self._average_identity:
-            return False
-        if update.pending is not None:
-            pending = update.pending
-            if type(pending) is not OperationPending:
-                self._notice("Average failed: invalid cleanup-pending token")
-                return True
-            self._average_pending = pending
-            phase = pending.phase.replace("-", " ")
-            self._notice(
-                f"Average {phase} pending; press Run to retry or Stop to cancel."
-            )
-            return True
-        if update.terminal is None:
-            if update.progress is not None:
-                self._notice(f"Average: {update.progress.stage} {update.progress.completed}/{update.progress.total}…")
-            return True
-        target, entry, revision = self._average_target, self._average_entry, self._average_revision
-        self._average_identity = self._average_pending = self._average_revision = self._average_target = self._average_entry = None
-        terminal = update.terminal; result = terminal.payload
-        from xrd_tools.reduction.average import AverageScanResult
-        valid_result = False
-        if type(result) is AverageScanResult:
+    def _consume_average_update(
+        self, update: object,
+    ) -> WorkspaceRefreshEffect:
+        transition = self._workspace_operations.consume_average_update(
+            update,
+            current_intent_revision=self._intents.revision,
+        )
+        if transition.notice:
+            self._notice(transition.notice)
+        directive = transition.average_reload
+        if directive is not None:
             try:
-                result.__post_init__()
-            except (AttributeError, TypeError, ValueError, OverflowError):
-                pass
-            else:
-                valid_result = True
-        typed_cancellation = (
-            valid_result and result.disposition == "CANCELLED"
-        )
-        if terminal.status is OperationTerminalStatus.CANCELLED:
-            if result is None:
-                self._notice("Average cancelled.")
-                return True
-            if typed_cancellation:
-                self._notice("Average cancelled.")
-            else:
-                self._notice("Average failed: invalid terminal result")
-            return True
-        if typed_cancellation:
-            self._notice("Average failed: invalid terminal result")
-            return True
-        if not valid_result:
-            self._notice(f"Average failed: {terminal.diagnostic or 'invalid terminal result'}"); return True
-        stale = update.stale or revision != self._intents.revision
-        if terminal.status is OperationTerminalStatus.FAILED:
-            shown = (f"{result.diagnostic_code}: {result.diagnostic}"
-                     if result.disposition == "ABORTED" else
-                     f"Average failed: {terminal.diagnostic}")
-            self._notice(shown); return True
-        if result.disposition == "REFUSED":
-            self._notice(f"{result.diagnostic_code}: {result.diagnostic}"); return True
-        if result.disposition != "COMMITTED" or terminal.status is not OperationTerminalStatus.RETURNED:
-            self._notice("Average returned an invalid terminal disposition."); return True
-        if result.target != target or result.entry != entry:
-            self._notice("Average terminal target mismatch; Browse was not reloaded."); return True
-        commit_identity = _terminal_identity_for_target(
-            result.commit_identity, target,
-        )
-        if commit_identity is None:
-            self._notice(
-                "Average terminal commit identity mismatch; Browse was not reloaded."
-            )
-            return True
-        if stale:
-            self._notice(
-                "Average committed but context changed; Browse was not reloaded."
-            )
+                self._clear_terminal_browse()
+                if not self._release_browse_1d_debt():
+                    raise RuntimeError(
+                        "Browse 1-D cache release remains pending"
+                    )
+                self._context_controller.begin_browse(
+                    directive.target,
+                    terminal_commit_identity=(
+                        directive.terminal_commit_identity
+                    ),
+                    source_root=(
+                        self._intents.snapshot().thaw().project_root or None
+                    ),
+                )
+            except Exception as error:
+                self._error_notice(
+                    "Average committed; Browse reload deferred", error,
+                )
+                if self._context_controller.browse_pending:
+                    self._ensure_timer()
+        if transition.request_catalog:
             self._request_browser_catalog()
-            self._refresh_shell()
-            return True
-        try:
-            self._clear_terminal_browse()
-            if not self._release_browse_1d_debt():
-                raise RuntimeError("Browse 1-D cache release remains pending")
-            self._context_controller.begin_browse(
-                target,
-                terminal_commit_identity=commit_identity,
-                source_root=(
-                    self._intents.snapshot().thaw().project_root or None
-                ),
-            )
-        except Exception as error:
-            self._error_notice(
-                "Average committed; Browse reload deferred", error,
-            )
-            if self._context_controller.browse_pending:
-                self._ensure_timer()
-        self._request_browser_catalog()
-        self._refresh_shell()
-        return True
+        return transition.effect
 
     def _average_action(self, snapshot: RunIntentSnapshot) -> None:
         if self._authored_asset_owner is not None:
             self._notice("Average is unavailable while authored-asset confirmation is pending.")
             self._refresh_shell(); return
-        slot = self._operation_slot
+        operations = self._workspace_operations
         intent = snapshot.thaw()
         if getattr(intent.background, "mode", "None") != "None":
             self._notice(
@@ -2582,15 +2460,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Average configuration freeze returned invalid state.")
             self._refresh_shell()
             return
-        identity = slot.begin_average(
-            frozen.configuration, target,
-            stamp=OperationContextStamp(snapshot.revision),
+        identity = operations.begin_average(
+            frozen.configuration,
+            target,
+            revision=snapshot.revision,
         )
         if identity is None:
             self._notice("Average operation was not started."); self._refresh_shell(); return
-        self._average_identity, self._average_revision = identity, snapshot.revision
-        self._average_pending = None
-        self._average_target, self._average_entry = target, "entry"
         self._notice("Averaging the finite source…"); self._refresh_shell(); self._ensure_timer()
 
     @property
@@ -2647,7 +2523,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if authored is not None:
                 self._retire_authored_asset(authored)
             self._deferred_metadata = None
-            self._pending_reintegrate_reload = None
             self._clear_terminal_browse()
             for dialog in (self._metadata_dialog, self._scan_roi_dialog,
                            self._peak_dialog, self._phase_dialog):
@@ -2668,22 +2543,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         catalog_clean = self._cancel_browser_catalog()
 
-        operation_slot = getattr(self, "_operation_slot", None)
+        operations = getattr(self, "_workspace_operations", None)
         analysis_slot = getattr(self, "_analysis_slot", None)
         try:
             operation_close = (
-                None if operation_slot is None else operation_slot.close()
+                None if operations is None else operations.close()
             )
             operation_clean = (
-                operation_slot is None
+                operations is None
                 or operation_close.cleanup_status is CleanupStatus.CLEANED
             )
             if operation_clean:
                 self._calibration_identity = self._calibration_revision = self._calibration_stamp = self._calibration_request = None
                 self._mask_identity = self._mask_revision = self._mask_stamp = self._mask_request = None
                 self._asset_validation_identity = None
-                self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
-                self._average_identity = self._average_pending = self._average_revision = self._average_target = self._average_entry = None
         except Exception:
             operation_clean = False
 
@@ -2947,28 +2820,29 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         operation_cancel = (
             kind is ShellCommandKind.SET_BACKGROUND
             and self._background_identity is not None
-            and self._operation_slot.current_identity
+            and self._workspace_operations.current_identity
             is self._background_identity
             or kind is ShellCommandKind.CONTROL_ACTION
             and (
                 command.value == "calibrate"
                 and self._calibration_identity is not None
-                and self._operation_slot.current_identity
+                and self._workspace_operations.current_identity
                 is self._calibration_identity
                 or command.value == "make_mask"
                 and self._mask_identity is not None
-                and self._operation_slot.current_identity is self._mask_identity
-                or command.value == f"reintegrate_{self._reintegrate_dimension}"
-                and self._reintegrate_identity is not None
-                and self._operation_slot.current_identity
-                is self._reintegrate_identity
+                and self._workspace_operations.current_identity is self._mask_identity
+                or command.value == f"reintegrate_{self._workspace_operations.reintegrate_dimension}"
+                and self._workspace_operations.reintegrate_identity is not None
+                and self._workspace_operations.current_identity
+                is self._workspace_operations.reintegrate_identity
             )
         )
         operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.SET_BACKGROUND, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
         operation_retry = (
             kind is ShellCommandKind.RUN_ACTION
-            and self._average_pending is not None
-            and self._operation_slot.current_identity is self._average_identity
+            and self._workspace_operations.average_pending is not None
+            and self._workspace_operations.current_identity
+            is self._workspace_operations.average_identity
         )
         if (
             self._experiment_operation_busy()
@@ -2986,9 +2860,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._run_action()
             return
         if kind is ShellCommandKind.STOP:
-            average = self._average_identity
-            if average is not None and self._operation_slot.current_identity is average:
-                accepted = self._operation_slot.cancel(average)
+            average = self._workspace_operations.average_identity
+            if average is not None and self._workspace_operations.current_identity is average:
+                accepted = self._workspace_operations.cancel_average()
                 self._notice("Cancelling Average…" if accepted else "Average cancellation was not accepted.")
                 self._refresh_shell(); return
             self._stop_run()
@@ -3147,16 +3021,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell()
 
     def _run_action(self) -> None:
-        pending = self._average_pending
-        average = self._average_identity
+        operations = self._workspace_operations
+        pending = operations.average_pending
+        average = operations.average_identity
         if (
             pending is not None
             and average is not None
-            and self._operation_slot.current_identity is average
+            and operations.current_identity is average
         ):
-            accepted = self._operation_slot.retry_average(average, pending)
-            if accepted:
-                self._average_pending = None
+            accepted = operations.retry_average()
             self._notice(
                 "Retrying Average cleanup…"
                 if accepted
@@ -4191,11 +4064,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         # it before draining any event that could replace Browse with an
         # acquisition context, and retry an exact deferred reintegrate reload
         # immediately after its bundle reaches terminal release.
-        pending_reload = self._pending_reintegrate_reload is not None
+        pending_reload = (
+            self._workspace_operations.pending_reintegrate_reload is not None
+        )
         if not self._settle_browse_1d_before_drain():
             return
         pending_reload_changed = bool(
-            pending_reload and self._pending_reintegrate_reload is None
+            pending_reload
+            and self._workspace_operations.pending_reintegrate_reload is None
         )
         defer_terminal_science = False
         terminal_science_complete = False
@@ -4550,47 +4426,41 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._run_frame_seen = False
                 changed = True
 
-        operation_slot = getattr(self, "_operation_slot", None)
+        operations = getattr(self, "_workspace_operations", None)
         operation_identity = (
             None
-            if operation_slot is None
-            else operation_slot.current_identity
+            if operations is None
+            else operations.current_identity
         )
         if operation_identity is not None:
             ScatteringWorkspace._observe_operation_stamp(self)
-            update = operation_slot.poll(operation_identity)
+            update = operations.poll(operation_identity)
             if update is not None:
                 if self._consume_asset_validation_update(update):
-                    operation_refresh = _OperationRefresh.FULL
+                    operation_refresh = WorkspaceRefreshEffect.FULL
                 else:
                     operation_refresh = self._consume_reintegrate_update(
                         update
                     )
-                    if (
-                        operation_refresh is _OperationRefresh.NONE
-                        and (
+                    if operation_refresh is WorkspaceRefreshEffect.NONE:
+                        if (
                             self._consume_calibration_update(update)
                             or self._consume_mask_update(update)
                             or self._consume_background_update(update)
-                            or self._consume_average_update(update)
-                        )
-                    ):
-                        operation_refresh = _OperationRefresh.FULL
-                if operation_refresh is _OperationRefresh.CONTROLS:
+                        ):
+                            operation_refresh = WorkspaceRefreshEffect.FULL
+                        else:
+                            operation_refresh = (
+                                self._consume_average_update(update)
+                            )
+                if operation_refresh is WorkspaceRefreshEffect.CONTROLS:
                     controls_refresh = True
-                elif operation_refresh is _OperationRefresh.FULL:
+                elif operation_refresh is WorkspaceRefreshEffect.FULL:
                     changed = True
                     force_scientific = True
-            elif operation_identity is self._background_identity and not operation_slot.owned:
+            elif operation_identity is self._background_identity and not operations.owned:
                 self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True; force_scientific = True
-            elif operation_identity is self._reintegrate_identity and not operation_slot.owned:
-                request, target = self._reintegrate_request, self._reintegrate_target; shown = {"1d": "1-D", "2d": "2-D"}.get(self._reintegrate_dimension, "operation"); self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
-                if request is not None and target is not None: self._reload_after_reintegrate(request, target)
-                self._notice(f"Reintegrate {shown} failed before terminal publication."); changed = True; force_scientific = True
-            elif operation_identity is self._average_identity and not operation_slot.owned:
-                self._average_identity = self._average_pending = self._average_revision = self._average_target = self._average_entry = None
-                self._notice("Average failed before terminal publication."); changed = True; force_scientific = True
-            elif operation_identity is self._asset_validation_identity and not operation_slot.owned:
+            elif operation_identity is self._asset_validation_identity and not operations.owned:
                 self._asset_validation_identity = None
                 owner = self._authored_asset_owner
                 if owner is not None:
@@ -4600,6 +4470,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     owner.dialog.set_busy(False)
                 self._notice("Asset validation failed before terminal publication.")
                 changed = True
+            elif not operations.owned:
+                transition = operations.consume_lost_owner(
+                    operation_identity
+                )
+                if transition.notice:
+                    self._notice(transition.notice)
+                if transition.effect is WorkspaceRefreshEffect.FULL:
+                    self._retry_pending_reintegrate_reload()
+                    changed = True
+                    force_scientific = True
 
         analysis_slot = getattr(self, "_analysis_slot", None)
         analysis_identity = (
@@ -4612,9 +4492,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             update = analysis_slot.poll(analysis_identity)
             if update is not None:
                 analysis_refresh = self._consume_analysis_update(update)
-                if analysis_refresh is _OperationRefresh.CONTROLS:
+                if analysis_refresh is WorkspaceRefreshEffect.CONTROLS:
                     controls_refresh = True
-                elif analysis_refresh is _OperationRefresh.FULL:
+                elif analysis_refresh is WorkspaceRefreshEffect.FULL:
                     changed = True
                     force_scientific = True
             elif (
@@ -4635,16 +4515,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if kind in {"metadata", "metadata_requalification"}:
                     if self._finish_metadata_refresh(
                         target, message,
-                    ) is _OperationRefresh.CONTROLS:
+                    ) is WorkspaceRefreshEffect.CONTROLS:
                         controls_refresh = True
                 else:
                     changed = True
                     force_scientific = True
 
         deferred_refresh = self._dispatch_deferred_metadata()
-        if deferred_refresh is _OperationRefresh.CONTROLS:
+        if deferred_refresh is WorkspaceRefreshEffect.CONTROLS:
             controls_refresh = True
-        elif deferred_refresh is _OperationRefresh.FULL:
+        elif deferred_refresh is WorkspaceRefreshEffect.FULL:
             changed = True
             force_scientific = True
 
@@ -4922,8 +4802,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return False
         return bool(
             captured is not None
-            and captured[0] is owner.context
-            and captured[1] is owner.request
+            and captured.context is owner.context
+            and captured.request is owner.request
         )
 
     def _begin_terminal_browse(
@@ -5365,7 +5245,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         captured = self._context_controller.capture_reintegrate_browse()
         if (
             captured is None
-            or captured[1] is not request
+            or captured.request is not request
         ):
             self._clear_terminal_browse(preserve_perf=preserve_perf)
             return False
@@ -5385,7 +5265,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         elif current is not None:
             self._context_controller.select_navigation(current, selected)
-        context = captured[0]
+        context = captured.context
         self._clear_terminal_browse(preserve_perf=preserve_perf)
         self._terminal_browse_presentation = _TerminalBrowsePresentation(
             request, context,
@@ -5634,11 +5514,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
 
     def _polling_needed(self) -> bool:
-        operation_slot = getattr(self, "_operation_slot", None)
+        operations = getattr(self, "_workspace_operations", None)
         analysis_slot = getattr(self, "_analysis_slot", None)
         try:
             if (
-                (operation_slot is not None and operation_slot.owned)
+                (operations is not None and operations.owned)
                 or (analysis_slot is not None and analysis_slot.owned)
             ):
                 return True
@@ -5653,7 +5533,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or self._context_controller.browse_pending
             or self._context_controller.browse_preview_polling_needed
             or self._browse_1d_release_debt is not None
-            or self._pending_reintegrate_reload is not None
+            or (
+                operations is not None
+                and operations.pending_reintegrate_reload is not None
+            )
             or self._scientific_repaint_pending
         ):
             return True
@@ -5796,7 +5679,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or getattr(scientific, "plot_mode", None) != snapshot.plot_mode
         ):
             return False
-        _context, request, selection, artifact = captured[:4]
+        request = captured.request
+        selection = captured.selection
+        artifact = captured.target
         if (
             selection is not self._context_controller.selection
             or request.source_path != artifact
@@ -5899,7 +5784,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if (
             selected_invalidated_browse
-            or self._pending_reintegrate_reload is not None
+            or self._workspace_operations.pending_reintegrate_reload
+            is not None
             or pending_browse_replacement
         ):
             preserve_scientific = True
@@ -6187,10 +6073,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 background_enabled=not self._mutating_operation_busy(),
             ),
         )
-        pending_average = self._average_pending
+        pending_average = self._workspace_operations.average_pending
         if (
             pending_average is not None
-            and self._operation_slot.current_identity is self._average_identity
+            and self._workspace_operations.current_identity
+            is self._workspace_operations.average_identity
         ):
             pending_readiness = (
                 "Average cleanup pending · Run retries · Stop cancels"
@@ -6405,14 +6292,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if current is not None and current.source == source
                 else self._sources.project_motor_knowledge(source, None)
             )
-        operation_identity = getattr(
-            self._operation_slot, "current_identity", None,
-        )
+        operation_identity = self._workspace_operations.current_identity
         operation_active = (operation_identity is not None and not self._closing and not self._closed)
         operation_busy = self._experiment_operation_busy()
         calibration_active = operation_active and operation_identity is self._calibration_identity
         mask_active = operation_active and operation_identity is self._mask_identity
-        reintegrate_active = operation_active and operation_identity is self._reintegrate_identity
+        reintegrate_active = (
+            operation_active
+            and operation_identity
+            is self._workspace_operations.reintegrate_identity
+        )
         phase = self._lifecycle.phase; calibrate_dependency_available = resolve_calibration_executable() is not None; mask_dependency_available = resolve_mask_executable() is not None
         calibrate_available = (
             not self._closing and not self._closed
@@ -6446,7 +6335,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and (phase is RunPhase.IDLE or phase is RunPhase.FAILED
                      and self._lifecycle.reset_permitted)
                 and self._context_controller.capture_reintegrate_browse() is not None),
-            reintegrate_active=reintegrate_active, reintegrate_dimension=self._reintegrate_dimension,
+            reintegrate_active=reintegrate_active,
+            reintegrate_dimension=(
+                self._workspace_operations.reintegrate_dimension
+            ),
         )
         if self._analysis_operation_busy():
             conflicting = {

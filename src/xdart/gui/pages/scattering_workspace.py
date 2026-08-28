@@ -504,7 +504,7 @@ def build_scattering_workspace(
         write_mode=_WorkspaceWriteMode(widget),
         slice_pin=_WorkspaceSlicePin(widget),
         activity=_WorkspaceActivity(
-            lifecycle, widget._operation_slot,
+            lifecycle, widget._workspace_operations,
             widget._experiment_operation_busy,
         ),
         app_menus=_WorkspaceMenus(widget),

@@ -66,6 +66,7 @@ from .state_machine import RunPhase
 from .shell_projection import ScientificPreferences
 from .shell_values import FrameNavigationProjection
 from .hydration_transport import HydrationTransport
+from .workspace_operations import ReintegrateBrowseCapture
 _Viewer1DIntent = namedtuple(
     "_Viewer1DIntent",
     "paths current_path policy generation provider",
@@ -489,16 +490,31 @@ class ContextController:
             and selection.source_path == target
         )
 
-    def capture_reintegrate_browse(self):
+    def capture_reintegrate_browse(
+        self,
+    ) -> ReintegrateBrowseCapture | None:
         context, selection = self._runtime.browse_context, self._runtime.selection
         request = None if context is None else context.load_request
         labels = () if context is None else context.loaded_labels
         stable = (not self._closed and self._close is None and self._cleanup_receipt is None and self._browse_request is None and type(context) is BrowseContext and context.loaded and not context.invalidated and not context.released and type(request) is BrowseLoadRequest and request is context.operation and type(selection) is DisplaySelection and selection.kind is ContextKind.BROWSE and selection.names(context) and request.source_path == context.requested_path == selection.source_path and type(context.target_entry) is str and bool(context.target_entry) and type(context.target_snapshot) is TargetSnapshot and context.target_snapshot.exists and type(labels) is tuple and bool(labels) and labels == tuple(sorted(set(labels))) and tuple(context.frame_ids) == labels and all(type(value) is int and value >= 0 for value in labels))
-        return (context, request, selection, context.requested_path, context.target_entry, context.target_snapshot, labels) if stable else None
+        return ReintegrateBrowseCapture(
+            context,
+            request,
+            selection,
+            context.requested_path,
+            context.target_entry,
+            context.target_snapshot,
+            labels,
+        ) if stable else None
 
-    def invalidate_reintegrate_browse(self, context, request, selection, target, entry, snapshot, labels) -> bool:
+    def invalidate_reintegrate_browse(
+        self, capture: ReintegrateBrowseCapture,
+    ) -> bool:
+        if type(capture) is not ReintegrateBrowseCapture:
+            return False
         current = self.capture_reintegrate_browse()
-        if current is None or current[0] is not context or current[1] is not request or current[2] is not selection or current[3:] != (target, entry, snapshot, labels): return False
+        if current is None or not capture.is_exactly(current):
+            return False
         self._runtime.invalidate_browse(); return True
 
     def reload_reintegrate_browse(

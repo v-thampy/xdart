@@ -823,10 +823,14 @@ def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
 ) -> None:
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xdart.gui.tabs.scattering.workspace_operations import (
+        ReintegrateReloadDirective,
+        WorkspaceOperationOwner,
+    )
     from xrd_tools.io.output_transaction import StreamTerminal
 
     target = "/detached/result.nxs"
-    seal = StreamTerminal(target, 1, "a" * 64, 1)
+    seal = StreamTerminal(target, 1, "a" * 64, 1, 1, 1, 1, 1)
     request = BrowseLoadRequest("reload", 1, target, seal)
 
     class Controller:
@@ -856,7 +860,10 @@ def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
         _closed = False
 
         def __init__(self):
-            self._pending_reintegrate_reload = (request, target, seal)
+            self._workspace_operations = WorkspaceOperationOwner()
+            self._workspace_operations._reintegrate_reload = (
+                ReintegrateReloadDirective(request, target, seal)
+            )
             self._context_controller = Controller()
             self.releases = [False, True, True]
             self.timer_starts = 0
@@ -877,13 +884,13 @@ def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
     page = Page()
     retry = ScatteringWorkspace._retry_pending_reintegrate_reload
     assert not retry(page)
-    assert page._pending_reintegrate_reload == (request, target, seal)
+    assert page._workspace_operations.pending_reintegrate_reload is not None
     assert page._context_controller.calls == []
     assert not retry(page)
-    assert page._pending_reintegrate_reload == (request, target, seal)
+    assert page._workspace_operations.pending_reintegrate_reload is not None
     assert page._context_controller.calls == [(request, target, seal)]
     assert retry(page)
-    assert page._pending_reintegrate_reload is None
+    assert page._workspace_operations.pending_reintegrate_reload is None
     assert page._context_controller.calls == [
         (request, target, seal),
         (request, target, seal),
@@ -898,7 +905,7 @@ def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
     assert lost._context_controller.owns_browse_request(request)
     lost._context_controller.retryable = False
     assert retry(lost)
-    assert lost._pending_reintegrate_reload is None
+    assert lost._workspace_operations.pending_reintegrate_reload is None
     assert lost.catalog_requests == 1
 
 

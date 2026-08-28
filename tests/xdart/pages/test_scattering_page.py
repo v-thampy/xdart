@@ -634,12 +634,14 @@ def test_mounted_popup_choose_another_keeps_modal_focus_and_validates_off_gui(
         )]
         assert store.snapshot().thaw().poni_file == ""
         identity = page._asset_validation_identity
-        worker = page._operation_slot._worker
+        worker = page._workspace_operations._slot._worker
         assert identity is not None and worker is not None
         worker.join(3)
         assert not worker.is_alive()
-        page._operation_slot.observe_stamp(page._operation_context_stamp())
-        update = page._operation_slot.poll(identity)
+        page._workspace_operations._slot.observe_stamp(
+            page._operation_context_stamp()
+        )
+        update = page._workspace_operations._slot.poll(identity)
         assert type(update) is OperationUpdate
         assert page._consume_asset_validation_update(update)
         assert worker_threads and worker_threads[0].startswith(

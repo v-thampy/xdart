@@ -680,8 +680,17 @@ def test_nonaverage_paths_have_zero_average_reachability_and_allocations(tmp_pat
         rig = _mount(patch, tmp_path / "page", labels=(1,))
         accepted = run_executor.build_admission_receipt
         patch.setitem(accepted.__globals__, "AcceptedScientificAssets", lambda *args, _owner=accepted.__globals__["AcceptedScientificAssets"]: _owner(*args[:4], "0" * 64, None if args[5] is None else "1" * 64, *args[6:]))
-        patch.setattr(run_executor, "build_admission_receipt", lambda capture, **kwargs: accepted(capture, targets_owner=lambda _paths: None, **kwargs))
-        patch.setattr(type(rig.page._operation_slot), "begin_average", forbidden, raising=False)
+        patch.setattr(
+            run_executor,
+            "build_admission_receipt",
+            lambda capture, **kwargs: accepted(capture, **kwargs),
+        )
+        patch.setattr(
+            type(rig.page._workspace_operations._slot),
+            "begin_average",
+            forbidden,
+            raising=False,
+        )
         try:
             _run(rig); _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
             request = rig.controller.begin_browse(str(rig.output))

@@ -27,6 +27,10 @@ from xdart.gui.tabs.scattering.operation_values import (
     OperationUpdate,
 )
 from xdart.gui.tabs.scattering.state_machine import RunPhase
+from xdart.gui.tabs.scattering.workspace_operations import (
+    AverageOperationState,
+    WorkspaceOperationOwner,
+)
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.reduction import (
     AverageCommand, AverageFiniteCountsEvidence, AveragePendingPhase,
@@ -36,6 +40,22 @@ from xrd_tools.reduction import (
 )
 from xrd_tools.session.intent_store import IntentFreezeAccepted, RunIntentStore
 from xrd_tools.session.run_configuration import GIIntent, RunIntent, ThresholdIntent
+
+
+def _set_average_state(
+    page,
+    identity: OperationIdentity,
+    revision: int,
+    target: str,
+    *,
+    entry: str = "entry",
+    pending: OperationPending | None = None,
+) -> WorkspaceOperationOwner:
+    operations = page._workspace_operations
+    operations._average = AverageOperationState(
+        identity, revision, target, entry, pending
+    )
+    return operations
 
 
 def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageScanResult:
@@ -483,23 +503,27 @@ def test_average_page_projects_and_retries_the_exact_pending_token() -> None:
             calls.append((owner, token))
             return True
 
+    operations = WorkspaceOperationOwner()
+    operations._slot = Slot()
+    operations._average = AverageOperationState(
+        identity, 0, "/detached/average.nxs", "entry"
+    )
     page = SimpleNamespace(
-        _average_identity=identity,
-        _average_pending=None,
-        _operation_slot=Slot(),
+        _workspace_operations=operations,
+        _intents=SimpleNamespace(revision=0),
         _notice=lambda value: calls.append(("notice", value)),
         _refresh_shell=lambda: calls.append(("refresh",)),
         _ensure_timer=lambda: calls.append(("timer",)),
     )
     update = OperationUpdate(identity, pending=pending)
     assert ScatteringWorkspace._consume_average_update(page, update)
-    assert page._average_pending is pending
+    assert operations.average_pending is pending
     assert calls == [("notice", (
         "Average source cleanup pending; press Run to retry or Stop to cancel."
     ))]
 
     ScatteringWorkspace._run_action(page)
-    assert page._average_pending is None
+    assert operations.average_pending is None
     assert calls[1:] == [
         (identity, pending),
         ("notice", "Retrying Average cleanup…"),
@@ -522,13 +546,18 @@ def test_average_pending_projection_enables_run_retry_and_stop(
     pending = OperationPending(
         identity, 1, "source-cleanup", "source close retained",
     )
-    slot = page._operation_slot
+    slot = page._workspace_operations._slot
     with slot._lock:
         slot._identity = identity
         slot._pending = pending
         slot._command_queue = Queue()
-    page._average_identity = identity
-    page._average_pending = pending
+    _set_average_state(
+        page,
+        identity,
+        page._intents.revision,
+        str(tmp_path / "average.nexus"),
+        pending=pending,
+    )
     try:
         page._refresh_shell()
         assert page._shell.run_controls.startButton.isEnabled()
@@ -539,12 +568,12 @@ def test_average_pending_projection_enables_run_retry_and_stop(
         page._handle_shell_command(
             ShellCommand(ShellCommandKind.RUN_ACTION)
         )
-        assert page._average_pending is None
+        assert page._workspace_operations.average_pending is None
         assert slot._command_queue.get_nowait() == "retry"
     finally:
         with slot._lock:
             slot._retire_locked()
-        page._average_identity = page._average_pending = None
+        page._workspace_operations._average = None
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
@@ -849,19 +878,13 @@ def test_average_page_accepts_only_exact_cancelled_payload_status_pairs(
     try:
         for token, (status, payload, expected_notice) in enumerate(rows, 1):
             identity = OperationIdentity(100 + token)
-            page._average_identity = identity
-            page._average_revision = store.revision
-            page._average_target = target
-            page._average_entry = "entry"
+            _set_average_state(page, identity, store.revision, target)
             assert page._consume_average_update(OperationUpdate(
                 identity,
                 terminal=OperationTerminal(identity, status, payload=payload),
             ))
             assert notices[-1] == expected_notice
-            assert all(getattr(page, name) is None for name in (
-                "_average_identity", "_average_revision",
-                "_average_target", "_average_entry",
-            ))
+            assert page._workspace_operations.average_state is None
         assert reloads == clears == catalogs == []
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
@@ -1056,7 +1079,7 @@ def test_average_page_dispatches_one_revision_checked_canonical_freeze(
                 "Average enumerated TIFF members on the GUI thread"
             ),
         )
-        monkeypatch.setattr(page._operation_slot, "begin_average", begin)
+        monkeypatch.setattr(page._workspace_operations._slot, "begin_average", begin)
         page._source_observation = None
         snapshot = store.snapshot()
 
@@ -1072,7 +1095,10 @@ def test_average_page_dispatches_one_revision_checked_canonical_freeze(
         assert configuration.max_cores == 3
         assert configuration.thaw_source_spec() == source
         assert target.endswith("/processed/scan.nexus")
-        assert kwargs == {"stamp": OperationContextStamp(snapshot.revision)}
+        assert kwargs == {
+            "entry": "entry",
+            "stamp": OperationContextStamp(snapshot.revision),
+        }
         assert store.snapshot().thaw().generation == 1
     finally:
         page.close_workspace()
@@ -1607,8 +1633,12 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     )
 
     def arm(identity, value=None):
-        page._average_identity = identity; page._average_revision = store.revision
-        page._average_target = value or str(target.resolve()); page._average_entry = "entry"
+        _set_average_state(
+            page,
+            identity,
+            store.revision,
+            value or str(target.resolve()),
+        )
 
     identity, update = scheduled(committed)
     arm(identity, committed.target)
@@ -1625,10 +1655,8 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     )]
     assert len(catalog) == before_catalog + 1
     assert reintegrate_reloads == []
-    assert len(refreshes) == before_refreshes + 1 and refreshes[-1] is False
-    assert all(getattr(page, name) is None for name in (
-        "_average_identity", "_average_revision", "_average_target", "_average_entry",
-    ))
+    assert len(refreshes) == before_refreshes
+    assert page._workspace_operations.average_state is None
 
     expected_notice = {
         "REFUSED": "AVERAGE_TEST_REFUSED: detached refusal",
@@ -1668,7 +1696,7 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     ))
     assert len(reloads) == 1
     assert len(catalog) == before_catalog + 1
-    assert len(refreshes) == before_refreshes + 1
+    assert len(refreshes) == before_refreshes
     assert len(notices) == before_notices + 1
     assert notices[-1] == (
         "Average committed but context changed; Browse was not reloaded."
@@ -1765,10 +1793,7 @@ def test_average_commit_reload_refusal_is_terminally_total(
     )
     monkeypatch.setattr(page, "_notice", notices.append)
     monkeypatch.setattr(page, "_ensure_timer", lambda: timers.append(None))
-    page._average_identity = identity
-    page._average_revision = store.revision
-    page._average_target = target
-    page._average_entry = "entry"
+    _set_average_state(page, identity, store.revision, target)
     controller = page._context_controller
     if blocked_by == "viewer":
         controller._viewer_2d_standalone = object()
@@ -1789,10 +1814,7 @@ def test_average_commit_reload_refusal_is_terminally_total(
             )
         ]
         assert bool(timers) is (blocked_by == "browse_cleanup")
-        assert all(getattr(page, name) is None for name in (
-            "_average_identity", "_average_revision",
-            "_average_target", "_average_entry",
-        ))
+        assert page._workspace_operations.average_state is None
     finally:
         controller._viewer_2d_standalone = None
         controller._cleanup_receipt = None
@@ -1830,10 +1852,7 @@ def test_average_stale_committed_terminal_reports_without_auto_reload(
         page, "_refresh_shell",
         lambda *, preserve_display=False: refreshes.append(preserve_display),
     )
-    page._average_identity = identity
-    page._average_revision = store.revision
-    page._average_target = target
-    page._average_entry = "entry"
+    _set_average_state(page, identity, store.revision, target)
     before = store.snapshot()
     changed = before.thaw()
     changed.project_root = str(tmp_path / "changed-context")
@@ -1842,13 +1861,10 @@ def test_average_stale_committed_terminal_reports_without_auto_reload(
         assert page._consume_average_update(update)
         assert reloads == []
         assert catalogs == [1]
-        assert refreshes == [False]
+        assert refreshes == []
         assert notices == [
             "Average committed but context changed; Browse was not reloaded."
         ]
-        assert all(getattr(page, name) is None for name in (
-            "_average_identity", "_average_revision",
-            "_average_target", "_average_entry",
-        ))
+        assert page._workspace_operations.average_state is None
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
