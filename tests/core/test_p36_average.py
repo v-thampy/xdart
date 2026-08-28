@@ -371,10 +371,10 @@ def test_average_persists_anisotropic_detector_axes_without_transposition(
 def test_all_nonfinite_and_invariant_mismatch_refuse_without_output(tmp_path, monkeypatch) -> None:
     dead = tmp_path / "dead"; dead.mkdir()
     source = _series(dead, (np.full((2, 2), np.nan),))
-    _recipe_value, result, observed = _public_run(dead, monkeypatch, source=source)
+    recipe, result, observed = _public_run(dead, monkeypatch, source=source)
     assert result.disposition == "REFUSED"
     assert result.diagnostic_code == "AVERAGE_ALL_PIXELS_INVALID"
-    assert observed == [] and not (dead / "average.nxs").exists()
+    assert observed == [] and not Path(recipe.target).exists()
 
     drift = tmp_path / "drift"; drift.mkdir()
     source = _series(drift, (np.ones((2, 2)), np.ones((2, 2))))
@@ -383,13 +383,13 @@ def test_all_nonfinite_and_invariant_mismatch_refuse_without_output(tmp_path, mo
     source = SourceSpec(source.uri, source.kind, options={
         **dict(source.options), "metadata_format": "txt",
     })
-    _recipe_value, result, observed = _public_run(
+    recipe, result, observed = _public_run(
         drift, monkeypatch, source=source, numeric_metadata_keys=(),
         invariant_metadata_keys=("T",),
     )
     assert result.disposition == "REFUSED"
     assert result.diagnostic_code == "AVERAGE_INVARIANT_METADATA_CHANGED"
-    assert observed == [] and not (drift / "average.nxs").exists()
+    assert observed == [] and not Path(recipe.target).exists()
 
 
 def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkeypatch) -> None:
@@ -403,6 +403,7 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     monkeypatch.setattr(execution_graph, "read_detector_image_layout", lambda *_a, **_k: effects.append("header"))
     monkeypatch.setattr(module, "resolve_session_policy", lambda *_a, **_k: effects.append("allocation"))
     monkeypatch.setattr(module, "NexusSink", lambda *_a, **_k: effects.append("h23"))
+    canonical_targets = set()
     for target in (tmp_path / "absent.nxs", existing):
         for updates, code in (
             ({"live_mode": True, "output_mode": "Append", "save_xye": True},
@@ -411,9 +412,11 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
             ({"save_xye": True}, "AVERAGE_NEXUS_REQUIRED"),
         ):
             recipe = AverageScanRecipe(source, target, ReductionPlan(), **updates)
+            canonical_targets.add(Path(recipe.target))
             result = _run_average_scan(recipe)
             assert (result.disposition, result.diagnostic_code) == ("REFUSED", code)
-    assert effects == [] and not (tmp_path / "absent.nxs").exists()
+    assert effects == [] and not any(path.exists() for path in canonical_targets)
+    assert not (tmp_path / "absent.nxs").exists()
     assert existing.read_bytes() == prior
 
     monkeypatch.undo()
@@ -458,7 +461,10 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     assert all(result.logical_labels == result.committed_labels == (1,)
                for result in accepted)
     assert len(observed) == 2 and counts == {"qualify": 2, "open": 4, "sink": 2}
-    assert {Path(result.target) for result in accepted} == set(batch_root.glob("*.nxs"))
+    assert {Path(result.target) for result in accepted} == {
+        Path(recipe.target) for recipe in recipes
+    }
+    assert all(Path(result.target).suffix == ".nexus" for result in accepted)
     from xrd_tools.core.provenance import read_provenance
     from xrd_tools.io import get_1d, get_metadata
     products = []
@@ -497,6 +503,10 @@ def test_average_background_none_is_canonical_and_active_refuses_pre_effect(
     explicit = AverageScanRecipe(
         source, target, reduction, background=FrameBackgroundPlan(),
     )
+    assert omitted.target == str((tmp_path / "average.nexus").resolve())
+    reconstructed = replace(omitted, target=tmp_path / "reconstructed.nxs")
+    assert reconstructed.target == str((tmp_path / "reconstructed.nexus").resolve())
+    assert replace(reconstructed) == reconstructed
     assert omitted == explicit
     assert omitted.background is explicit.background is None
     assert module._recipe_payload(omitted) == module._recipe_payload(explicit)
@@ -556,7 +566,7 @@ def test_average_background_none_is_canonical_and_active_refuses_pre_effect(
     assert len(run_configuration) == 1
     assert "background" not in run_configuration[0]
     from xrd_tools.core.provenance import read_provenance
-    persisted = read_provenance(target)["config"]["average_scan_v1"]
+    persisted = read_provenance(committed.target)["config"]["average_scan_v1"]
     assert persisted["background"] is None
 
 
@@ -607,12 +617,13 @@ def test_pixel_and_metadata_sum_overflow_refuse_without_output(tmp_path, monkeyp
             })
         observed = []
         _stub_integrators(monkeypatch, observed)
-        result = _run_average_scan(AverageScanRecipe(
+        recipe = AverageScanRecipe(
             source, root / "average.nxs", ReductionPlan(),
             numeric_metadata_keys=("I0",) if name == "metadata" else (),
-        ))
+        )
+        result = _run_average_scan(recipe)
         assert (result.disposition, result.diagnostic_code) == ("REFUSED", code)
-        assert observed == [] and not (root / "average.nxs").exists()
+        assert observed == [] and not Path(recipe.target).exists()
 
 
 def test_partial_owner_block_grant_refuses_before_pixel_read(tmp_path, monkeypatch) -> None:
@@ -809,11 +820,13 @@ def test_preparation_metadata_row_drift_refuses_before_key_identity_derivation(t
         patch.setattr(execution_graph._AverageSourceReadWindow,
                       "complete_metadata_for", row)
         patch.setattr(module, "source_graph_digest", lambda *_a: pytest.fail("identity derived after metadata drift"))
+        recipe = AverageScanRecipe(
+            source, tmp_path / "average.nxs", ReductionPlan(),
+            numeric_metadata_keys=("i0",),
+        )
         with pytest.raises(ValueError, match="AVERAGE_SOURCE_DRIFT"):
-            _prepare_average_scan(AverageScanRecipe(
-                source, tmp_path / "average.nxs", ReductionPlan(), numeric_metadata_keys=("i0",),
-            ))
-    assert not (tmp_path / "average.nxs").exists()
+            _prepare_average_scan(recipe)
+    assert not Path(recipe.target).exists()
     gi_root = tmp_path / "gi"; gi_root.mkdir(); gi_source = _series(gi_root)
     for path in gi_source.options["files"]: _txt(path, motors=(("theta", 0.2),))
     gi_source = SourceSpec(gi_source.uri, gi_source.kind, options={**dict(gi_source.options), "metadata_format": "txt"})
@@ -971,7 +984,11 @@ def test_metadata_key_domains_refuse_duplicate_and_overlap_before_effects(tmp_pa
         AverageScanRecipe(_series(tmp_path), tmp_path / "b.nxs", ReductionPlan(), numeric_metadata_keys=("I0",), invariant_metadata_keys=("I0",))
     with pytest.raises(ValueError, match="nonempty|metadata"):
         AverageScanRecipe(_series(tmp_path), tmp_path / "c.nxs", ReductionPlan(), numeric_metadata_keys=("",))
-    assert not any((tmp_path / name).exists() for name in ("a.nxs", "b.nxs", "c.nxs"))
+    assert not any(
+        (tmp_path / name).exists()
+        for stem in ("a", "b", "c")
+        for name in (f"{stem}.nxs", f"{stem}.nexus")
+    )
 
 
 def test_average_static_mask_loads_authenticated_edf(tmp_path) -> None:

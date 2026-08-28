@@ -469,7 +469,7 @@ def test_average_provenance_records_terminal_direct_and_fallback_counts(
     assert runner.plan.direct_eiger_eligible
     assert runner.close() is result
 
-    persisted = read_provenance(target)["config"]["average_scan_v1"]
+    persisted = read_provenance(result.target)["config"]["average_scan_v1"]
     assert persisted["direct_eiger_eligible"] is True
     fact = persisted["direct_eiger_execution"]
     assert fact == {

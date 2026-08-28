@@ -17,6 +17,7 @@ from xrd_tools.io.append import AppendIntent, science_fingerprint
 from xrd_tools.io.image import load_mask, read_detector_image_layout
 from xrd_tools.io.nexus_record import _average_count_chunks, _average_count_digest
 from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot
+from xrd_tools.io.output_path import OVERWRITE_MODE, resolve_output_target
 from xrd_tools.io.read import _read_average_lineage, get_average_finite_counts, resolve_source_master
 from xrd_tools.io.record_writer import WriterIncomplete
 from xrd_tools.reduction.background import FrameBackgroundPlan, resolve_frame_background
@@ -98,6 +99,15 @@ def _copy_background(value: FrameBackgroundPlan | None) -> FrameBackgroundPlan |
 def _absolute(value: str | Path, *, optional: bool=False) -> str | None:
     if optional and (value is None or str(value) == ''): return None
     _reject(not isinstance(value, (str, Path)) or not str(value), 'Average path is empty or invalid'); return os.path.abspath(os.path.expanduser(str(value)))
+def _average_target(value: str | Path) -> str:
+    """Normalize every generated Average artifact through the shared owner."""
+    requested = Path(_absolute(value))
+    return str(resolve_output_target(
+        requested.parent,
+        requested.stem,
+        mode=OVERWRITE_MODE,
+        explicit_target=requested,
+    ))
 def _metadata_keys(value, name: str, *, optional: bool) -> tuple[str, ...] | None:
     if optional and value is None: return None
     _reject(type(value) is not tuple, f'{name} must be an exact tuple', TypeError)
@@ -157,7 +167,7 @@ class AverageScanRecipe:
         if type(source) is FrozenSourceSpec and reduction is None:
             required = {'api_version', 'integration_1d', 'integration_2d', 'integrator_gi', 'threshold_min', 'threshold_max', 'mask_saturation', 'reduction_extra'}
             _reject(set(canonical) != required or canonical['api_version'] != _COUNT_POLICY, 'Average canonical recipe reconstruction is invalid', TypeError)
-            values = {'api_version': _COUNT_POLICY, 'source': source, 'target': target, 'entry': entry, 'source_base': source_base, 'output_mode': output_mode, 'live_mode': live_mode, 'save_xye': save_xye, 'batch_mode': batch_mode, **{key: canonical[key] for key in required - {'api_version'}}, 'calibration': _copy_calibration(calibration), 'background': _copy_background(background), 'numeric_metadata_keys': numeric_metadata_keys, 'invariant_metadata_keys': invariant_metadata_keys, 'envelope_bytes': envelope_bytes, 'resource_requests': tuple(resource_requests), 'resource_env': tuple(resource_env)}
+            values = {'api_version': _COUNT_POLICY, 'source': source, 'target': _average_target(target), 'entry': entry, 'source_base': source_base, 'output_mode': output_mode, 'live_mode': live_mode, 'save_xye': save_xye, 'batch_mode': batch_mode, **{key: canonical[key] for key in required - {'api_version'}}, 'calibration': _copy_calibration(calibration), 'background': _copy_background(background), 'numeric_metadata_keys': numeric_metadata_keys, 'invariant_metadata_keys': invariant_metadata_keys, 'envelope_bytes': envelope_bytes, 'resource_requests': tuple(resource_requests), 'resource_env': tuple(resource_env)}
             for name, item in values.items():
                 object.__setattr__(self, name, item)
             return
@@ -179,7 +189,7 @@ class AverageScanRecipe:
         one = _integration_1d(reduction.integration_1d, count)
         two = _integration_2d(reduction.integration_2d, count)
         extra = _freeze_pairs(reduction.extra, count)
-        values = {'api_version': _COUNT_POLICY, 'source': _compact_source(source), 'target': _absolute(target), 'entry': entry, 'source_base': _absolute(source_base, optional=True), 'output_mode': mode.title(), 'live_mode': live_mode, 'save_xye': save_xye, 'batch_mode': batch_mode, 'integration_1d': one, 'integration_2d': two, 'integrator_gi': _gi(reduction.gi), 'threshold_min': reduction.threshold_min, 'threshold_max': reduction.threshold_max, 'mask_saturation': reduction.mask_saturation, 'reduction_extra': extra, 'calibration': _copy_calibration(calibration), 'background': _copy_background(background), 'numeric_metadata_keys': numeric, 'invariant_metadata_keys': invariant, 'envelope_bytes': envelope_bytes, 'resource_requests': tuple(sorted(requests.items())), 'resource_env': tuple(sorted(env.items()))}
+        values = {'api_version': _COUNT_POLICY, 'source': _compact_source(source), 'target': _average_target(target), 'entry': entry, 'source_base': _absolute(source_base, optional=True), 'output_mode': mode.title(), 'live_mode': live_mode, 'save_xye': save_xye, 'batch_mode': batch_mode, 'integration_1d': one, 'integration_2d': two, 'integrator_gi': _gi(reduction.gi), 'threshold_min': reduction.threshold_min, 'threshold_max': reduction.threshold_max, 'mask_saturation': reduction.mask_saturation, 'reduction_extra': extra, 'calibration': _copy_calibration(calibration), 'background': _copy_background(background), 'numeric_metadata_keys': numeric, 'invariant_metadata_keys': invariant, 'envelope_bytes': envelope_bytes, 'resource_requests': tuple(sorted(requests.items())), 'resource_env': tuple(sorted(env.items()))}
         _reject(len(_canonical(_recipe_payload_values(values))) > _JSON_MAX_BYTES, 'Average recipe JSON projection exceeds 64 KiB')
         for name, item in values.items():
             object.__setattr__(self, name, item)
@@ -499,7 +509,7 @@ def _result(plan: AverageScanPlan, disposition: str, *, code: str='', diagnostic
     committed = (1,) if disposition == 'COMMITTED' else ()
     return AverageScanResult(disposition, plan.recipe.target, plan.recipe.entry, plan.operation_identity, plan.science_identity, plan.contributor_extent, plan.logical_labels, committed, tuple(denominators), evidence if disposition == 'COMMITTED' else None, code, diagnostic, 'committed' if disposition == 'COMMITTED' else h23_phase, commit if disposition == 'COMMITTED' else None)
 def _committed_average_mismatch(result: AverageScanResult, target: str | Path, entry: str) -> str | None:
-    expected = _absolute(target); commit = result.commit_identity
+    expected = _average_target(target); commit = result.commit_identity
     if result.target != expected or result.entry != entry: return 'target' if result.target != expected else 'entry'
     if type(commit) is not StreamTerminal or commit.target != expected or type(commit.ordinal) is not int or commit.ordinal <= 0: return 'commit'
     try: persisted = read_provenance(expected, entry=entry)['config'][_COUNT_POLICY]; snapshot = capture_target_snapshot(expected)

@@ -1592,8 +1592,8 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     monkeypatch.setattr(
         page._context_controller,
         "begin_browse",
-        lambda value, *, terminal_commit_identity=None:
-            reloads.append((value, terminal_commit_identity)),
+        lambda value, *, terminal_commit_identity=None, source_root=None:
+            reloads.append((value, terminal_commit_identity, source_root)),
     )
     monkeypatch.setattr(
         page._context_controller, "reload_reintegrate_browse",
@@ -1606,12 +1606,13 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         lambda *, preserve_display=False: refreshes.append(preserve_display),
     )
 
-    def arm(identity):
+    def arm(identity, value=None):
         page._average_identity = identity; page._average_revision = store.revision
-        page._average_target = str(target.resolve()); page._average_entry = "entry"
+        page._average_target = value or str(target.resolve()); page._average_entry = "entry"
 
     identity, update = scheduled(committed)
-    arm(identity)
+    arm(identity, committed.target)
+    before_catalog = len(catalog); before_refreshes = len(refreshes)
     from xrd_tools.core import provenance as provenance_module
     def forbidden(*_args, **_kwargs):
         pytest.fail("the page performed committed-artifact I/O")
@@ -1620,8 +1621,11 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         patch.setattr(Path, "stat", forbidden); patch.setattr(Path, "open", forbidden)
         assert page._consume_average_update(update)
     assert reloads == [(
-        str(target.resolve()), committed.commit_identity,
-    )] and catalog == [1] and reintegrate_reloads == [] and refreshes == [False]
+        committed.target, committed.commit_identity, str(tmp_path),
+    )]
+    assert len(catalog) == before_catalog + 1
+    assert reintegrate_reloads == []
+    assert len(refreshes) == before_refreshes + 1 and refreshes[-1] is False
     assert all(getattr(page, name) is None for name in (
         "_average_identity", "_average_revision", "_average_target", "_average_entry",
     ))
@@ -1657,7 +1661,7 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         )
 
     stale, stale_update = scheduled(committed)
-    arm(stale); before_notices = len(notices); before_catalog = len(catalog)
+    arm(stale, committed.target); before_notices = len(notices); before_catalog = len(catalog)
     before_refreshes = len(refreshes)
     assert page._consume_average_update(OperationUpdate(
         stale, terminal=stale_update.terminal, stale=True,
