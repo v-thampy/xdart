@@ -635,13 +635,14 @@ def test_post_worker_replacement_and_pending_direct_entrypoints_are_blocked(
         assert page._start_permitted() == (
             False, "Experiment operation is still active",
         )
-        assert page._begin_operation(
-            CalibrationResult(
-                prepare_calibration_request(str(source)), (), 0,
-                (str(_binary(tmp_path, monkeypatch)),), str(tmp_path),
-            ),
-            lambda *_args: pytest.fail("operation body started"),
-        ) is None
+        monkeypatch.setattr(
+            page,
+            "_authoring_source_chooser",
+            lambda *_args: pytest.fail("calibration chooser was reached"),
+        )
+        page._calibrate_action()
+        assert page._calibration_identity is None
+        assert "unavailable while another operation" in page._notice_text
         assert page._begin_analysis(
             "metadata", object(), 0, request=("blocked",),
         ) is None

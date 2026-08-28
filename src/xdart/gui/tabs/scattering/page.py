@@ -964,18 +964,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             analysis_slot.observe_stamp(stamp)
 
-    def _begin_operation(
-        self, frozen: object, body: Callable[..., object]
-    ) -> OperationIdentity | None:
-        if self._authored_asset_owner is not None:
-            return None
-        identity = self._workspace_operations.begin(
-            frozen, self._operation_context_stamp(), body
-        )
-        if identity is not None:
-            self._ensure_timer()
-        return identity
-
     def _analysis_generation_for(self, kind: str) -> int:
         return (self._metadata_generation if kind in {
                     "metadata", "metadata_requalification"} else
@@ -2361,32 +2349,47 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if transition.notice:
             self._notice(transition.notice)
-        directive = transition.average_reload
-        if directive is not None:
-            try:
-                self._clear_terminal_browse()
-                if not self._release_browse_1d_debt():
-                    raise RuntimeError(
-                        "Browse 1-D cache release remains pending"
-                    )
-                self._context_controller.begin_browse(
-                    directive.target,
-                    terminal_commit_identity=(
-                        directive.terminal_commit_identity
-                    ),
-                    source_root=(
-                        self._intents.snapshot().thaw().project_root or None
-                    ),
-                )
-            except Exception as error:
-                self._error_notice(
-                    "Average committed; Browse reload deferred", error,
-                )
-                if self._context_controller.browse_pending:
-                    self._ensure_timer()
+        if transition.average_reload is not None:
+            self._retry_pending_average_reload(report_error=True)
         if transition.request_catalog:
             self._request_browser_catalog()
         return transition.effect
+
+    def _retry_pending_average_reload(
+        self, *, report_error: bool = False,
+    ) -> bool:
+        operations = self._workspace_operations
+        directive = operations.pending_average_reload
+        if directive is None:
+            return False
+        if self._closing or self._closed:
+            operations.retire_average_reload(directive)
+            return False
+        if self._context_controller.browse_pending:
+            self._ensure_timer()
+            return False
+        if not self._release_browse_1d_debt():
+            return False
+        try:
+            self._context_controller.begin_browse(
+                directive.target,
+                terminal_commit_identity=(
+                    directive.terminal_commit_identity
+                ),
+                source_root=(
+                    self._intents.snapshot().thaw().project_root or None
+                ),
+            )
+        except Exception as error:
+            if report_error:
+                self._notice(
+                    "Average committed; Browse reload deferred: "
+                    f"{detached_exception_strings(error)[2]}"
+                )
+            self._ensure_timer()
+            return False
+        self._clear_terminal_browse()
+        return operations.retire_average_reload(directive)
 
     def _average_action(self, snapshot: RunIntentSnapshot) -> None:
         if self._authored_asset_owner is not None:
@@ -4062,16 +4065,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         # Cache borrow debt is page-owned, not selected-context-owned.  Settle
         # it before draining any event that could replace Browse with an
-        # acquisition context, and retry an exact deferred reintegrate reload
-        # immediately after its bundle reaches terminal release.
-        pending_reload = (
+        # acquisition context, and retry exact deferred operation reloads
+        # immediately after their blocking owner reaches terminal release.
+        pending_reintegrate_reload = (
             self._workspace_operations.pending_reintegrate_reload is not None
+        )
+        pending_average_reload = (
+            self._workspace_operations.pending_average_reload is not None
         )
         if not self._settle_browse_1d_before_drain():
             return
-        pending_reload_changed = bool(
-            pending_reload
+        pending_reintegrate_reload_changed = bool(
+            pending_reintegrate_reload
             and self._workspace_operations.pending_reintegrate_reload is None
+        )
+        pending_average_reload_changed = bool(
+            pending_average_reload
+            and self._workspace_operations.pending_average_reload is None
         )
         defer_terminal_science = False
         terminal_science_complete = False
@@ -4079,7 +4089,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         hold_batch_terminal_science = False
         browse_presentation_ready: _TerminalBrowsePresentation | None = None
         browse_perf_ready: _TerminalBrowsePerf | None = None
-        changed = self._poll_admission() or pending_reload_changed
+        changed = (
+            self._poll_admission() or pending_reintegrate_reload_changed
+        )
         poll_viewer_1d = getattr(self._context_controller, "poll_viewer_1d", None)
         if poll_viewer_1d is not None and poll_viewer_1d():
             changed = True
@@ -4207,7 +4219,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         force_scientific = changed
         frame_presentation_changed = False
-        controls_refresh = False
+        controls_refresh = pending_average_reload_changed
 
         executor = self._run_executor
         events: tuple[StandardRunEvent, ...] = ()
@@ -4476,7 +4488,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
                 if transition.notice:
                     self._notice(transition.notice)
-                if transition.effect is WorkspaceRefreshEffect.FULL:
+                if transition.effect is WorkspaceRefreshEffect.CONTROLS:
+                    controls_refresh = True
+                elif transition.effect is WorkspaceRefreshEffect.FULL:
                     self._retry_pending_reintegrate_reload()
                     changed = True
                     force_scientific = True
@@ -5537,6 +5551,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 operations is not None
                 and operations.pending_reintegrate_reload is not None
             )
+            or (
+                operations is not None
+                and operations.pending_average_reload is not None
+            )
             or self._scientific_repaint_pending
         ):
             return True
@@ -5582,6 +5600,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not self._release_browse_1d_debt():
             return False
         self._retry_pending_reintegrate_reload()
+        self._retry_pending_average_reload()
         return self._browse_1d_release_debt is None
 
     def _set_detector_mode(self, mode: str) -> bool:
@@ -5786,6 +5805,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             selected_invalidated_browse
             or self._workspace_operations.pending_reintegrate_reload
             is not None
+            or self._workspace_operations.pending_average_reload is not None
             or pending_browse_replacement
         ):
             preserve_scientific = True

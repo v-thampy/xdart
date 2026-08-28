@@ -42,6 +42,7 @@ from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
 from xdart.gui.tabs.scattering.workspace_operations import (
     ReintegrateReloadDirective,
+    WorkspaceRefreshEffect,
 )
 from xrd_tools.analysis.plans import RoiSignal
 from xrd_tools.analysis.scan_operations import (
@@ -1884,8 +1885,9 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
 
         exact = OperationIdentity(91)
         page._analysis_identity = exact
-        assert not page._consume_analysis_update(
-            _returned(OperationIdentity(92), table))
+        assert page._consume_analysis_update(
+            _returned(OperationIdentity(92), table)
+        ) is WorkspaceRefreshEffect.NONE
         assert page._analysis_identity is exact
         page._analysis_kind = "metadata"; page._analysis_target = "metadata"
         page._analysis_generation = page._metadata_generation

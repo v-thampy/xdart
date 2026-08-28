@@ -2,7 +2,8 @@
 
 The page composes notices, dialogs, and Browse mutations.  This owner keeps
 the one experiment worker slot and the state that must survive those page
-effects: Average cleanup commands and Reintegrate's mandatory reload intent.
+effects: Average cleanup/reload commands and Reintegrate's mandatory reload
+intent.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 import os
-from typing import Callable, Mapping
+from typing import Mapping
 
 from xdart.modules.display_context import BrowseContext, ContextKind, DisplaySelection
 from xrd_tools.io.output_transaction import (
@@ -41,9 +42,6 @@ class WorkspaceRefreshEffect(Enum):
     DIALOG = "dialog"
     CONTROLS = "controls"
     FULL = "full"
-
-    def __bool__(self) -> bool:
-        return self is not WorkspaceRefreshEffect.NONE
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,10 +108,13 @@ class ReintegrateReloadDirective:
             or self.request.source_path != self.target
             or (
                 self.terminal_commit_identity is not None
-                and stream_terminal_object_revision(
-                    self.terminal_commit_identity
+                and (
+                    stream_terminal_object_revision(
+                        self.terminal_commit_identity
+                    )
+                    is None
+                    or self.terminal_commit_identity.target != self.target
                 )
-                is None
             )
         ):
             raise ValueError("Reintegrate reload directive is invalid")
@@ -135,6 +136,7 @@ class AverageReloadDirective:
             or not self.entry
             or stream_terminal_object_revision(self.terminal_commit_identity)
             is None
+            or self.terminal_commit_identity.target != self.target
         ):
             raise ValueError("Average reload directive is invalid")
 
@@ -230,6 +232,7 @@ class WorkspaceOperationOwner:
         self._reintegrate: ReintegrateOperationState | None = None
         self._reintegrate_reload: ReintegrateReloadDirective | None = None
         self._average: AverageOperationState | None = None
+        self._average_reload: AverageReloadDirective | None = None
 
     @property
     def owned(self) -> bool:
@@ -237,7 +240,11 @@ class WorkspaceOperationOwner:
 
     @property
     def busy(self) -> bool:
-        return self._slot.owned or self._reintegrate_reload is not None
+        return (
+            self._slot.owned
+            or self._reintegrate_reload is not None
+            or self._average_reload is not None
+        )
 
     @property
     def current_identity(self) -> OperationIdentity | None:
@@ -282,13 +289,9 @@ class WorkspaceOperationOwner:
         state = self._average
         return None if state is None else state.pending
 
-    def begin(
-        self,
-        frozen: object,
-        stamp: OperationContextStamp,
-        body: Callable[..., object],
-    ) -> OperationIdentity | None:
-        return self._slot._begin(frozen, stamp, body)
+    @property
+    def pending_average_reload(self) -> AverageReloadDirective | None:
+        return self._average_reload
 
     def begin_calibrate(
         self, request: object, stamp: OperationContextStamp
@@ -392,6 +395,33 @@ class WorkspaceOperationOwner:
         if self._reintegrate_reload is not directive:
             return False
         self._reintegrate_reload = None
+        return True
+
+    def require_average_reload(
+        self,
+        target: str,
+        entry: str,
+        terminal_commit_identity: StreamTerminal,
+    ) -> AverageReloadDirective:
+        directive = AverageReloadDirective(
+            target, entry, terminal_commit_identity
+        )
+        self._average_reload = directive
+        return directive
+
+    def retire_average_reload(
+        self, directive: AverageReloadDirective
+    ) -> bool:
+        if self._average_reload is not directive:
+            return False
+        self._average_reload = None
+        state = self._average
+        if (
+            state is not None
+            and state.target == directive.target
+            and state.entry == directive.entry
+        ):
+            self._average = None
         return True
 
     def cancel(self, identity: object) -> bool:
@@ -516,7 +546,7 @@ class WorkspaceOperationOwner:
             pending = update.pending
             if type(pending) is not OperationPending:
                 return WorkspaceOperationTransition(
-                    WorkspaceRefreshEffect.FULL,
+                    WorkspaceRefreshEffect.CONTROLS,
                     "Average failed: invalid cleanup-pending token",
                 )
             self._average = replace(state, pending=pending)
@@ -537,7 +567,6 @@ class WorkspaceOperationOwner:
             )
 
         target, entry, revision = state.target, state.entry, state.revision
-        self._average = None
         terminal = update.terminal
         result = terminal.payload
         from xrd_tools.reduction.average import AverageScanResult
@@ -554,71 +583,82 @@ class WorkspaceOperationOwner:
             valid_result and result.disposition == "CANCELLED"
         )
         if terminal.status is OperationTerminalStatus.CANCELLED:
+            self._average = None
             notice = (
                 "Average cancelled."
                 if result is None or typed_cancellation
                 else "Average failed: invalid terminal result"
             )
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL, notice
+                WorkspaceRefreshEffect.CONTROLS, notice
             )
         if typed_cancellation:
+            self._average = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
+                WorkspaceRefreshEffect.CONTROLS,
                 "Average failed: invalid terminal result",
             )
         if not valid_result:
+            self._average = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
+                WorkspaceRefreshEffect.CONTROLS,
                 f"Average failed: {terminal.diagnostic or 'invalid terminal result'}",
             )
         stale = update.stale or revision != current_intent_revision
         if terminal.status is OperationTerminalStatus.FAILED:
+            self._average = None
             notice = (
                 f"{result.diagnostic_code}: {result.diagnostic}"
                 if result.disposition == "ABORTED"
                 else f"Average failed: {terminal.diagnostic}"
             )
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL, notice
+                WorkspaceRefreshEffect.CONTROLS, notice
             )
         if result.disposition == "REFUSED":
+            self._average = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
+                WorkspaceRefreshEffect.CONTROLS,
                 f"{result.diagnostic_code}: {result.diagnostic}",
             )
         if (
             result.disposition != "COMMITTED"
             or terminal.status is not OperationTerminalStatus.RETURNED
         ):
+            self._average = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
+                WorkspaceRefreshEffect.CONTROLS,
                 "Average returned an invalid terminal disposition.",
             )
         if result.target != target or result.entry != entry:
+            self._average = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
+                WorkspaceRefreshEffect.CONTROLS,
                 "Average terminal target mismatch; Browse was not reloaded.",
             )
         commit_identity = _terminal_identity_for_target(
             result.commit_identity, target
         )
         if commit_identity is None:
+            self._average = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
+                WorkspaceRefreshEffect.CONTROLS,
                 "Average terminal commit identity mismatch; Browse was not reloaded.",
             )
         if stale:
+            self._average = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
+                WorkspaceRefreshEffect.CONTROLS,
                 "Average committed but context changed; Browse was not reloaded.",
                 request_catalog=True,
             )
+        directive = self.require_average_reload(
+            target, entry, commit_identity
+        )
         return WorkspaceOperationTransition(
-            WorkspaceRefreshEffect.FULL,
-            average_reload=AverageReloadDirective(
-                target, entry, commit_identity
-            ),
+            WorkspaceRefreshEffect.CONTROLS,
+            "Average committed; Browse reload queued.",
+            average_reload=directive,
             request_catalog=True,
         )
 
@@ -639,14 +679,16 @@ class WorkspaceOperationOwner:
         average = self._average
         if average is not None and average.identity is identity:
             self._average = None
+            self._average_reload = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
+                WorkspaceRefreshEffect.CONTROLS,
                 "Average failed before terminal publication.",
             )
         return WorkspaceOperationTransition(WorkspaceRefreshEffect.NONE)
 
     def close(self) -> OperationCleanupReceipt:
         self._reintegrate_reload = None
+        self._average_reload = None
         receipt = self._slot.close()
         if receipt.cleanup_status is CleanupStatus.CLEANED:
             self._reintegrate = None

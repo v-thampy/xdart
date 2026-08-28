@@ -917,7 +917,8 @@ def test_drain_gate_settles_page_debt_before_retry_or_context_mutation(
         def __init__(self):
             self.releases = [False, True]
             self._browse_1d_release_debt = object()
-            self.retries = 0
+            self.reintegrate_retries = 0
+            self.average_retries = 0
 
         def _release_browse_1d_debt(self):
             released = self.releases.pop(0)
@@ -926,12 +927,15 @@ def test_drain_gate_settles_page_debt_before_retry_or_context_mutation(
             return released
 
         def _retry_pending_reintegrate_reload(self):
-            self.retries += 1
+            self.reintegrate_retries += 1
+
+        def _retry_pending_average_reload(self):
+            self.average_retries += 1
 
     page = Page()
     settle = ScatteringWorkspace._settle_browse_1d_before_drain
     assert not settle(page)
-    assert page.retries == 0
+    assert page.reintegrate_retries == page.average_retries == 0
     assert settle(page)
-    assert page.retries == 1
+    assert page.reintegrate_retries == page.average_retries == 1
     assert page._browse_1d_release_debt is None

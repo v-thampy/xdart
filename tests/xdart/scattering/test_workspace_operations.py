@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
 from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.gui.tabs.scattering.operation_values import (
@@ -17,7 +19,9 @@ from xdart.gui.tabs.scattering.operation_values import (
 )
 from xdart.gui.tabs.scattering.workspace_operations import (
     AverageOperationState,
+    AverageReloadDirective,
     ReintegrateBrowseCapture,
+    ReintegrateReloadDirective,
     WorkspaceOperationOwner,
     WorkspaceRefreshEffect,
 )
@@ -176,8 +180,18 @@ def test_typed_capture_requires_live_identity_but_compares_value_facts() -> None
     assert capture.is_exactly(same_values)
     foreign = replace(capture, request=replace(capture.request))
     assert not capture.is_exactly(foreign)
-    assert bool(WorkspaceRefreshEffect.FULL)
-    assert not WorkspaceRefreshEffect.NONE
+    assert "__bool__" not in WorkspaceRefreshEffect.__dict__
+
+
+def test_reload_directives_require_the_seal_to_name_the_exact_target() -> None:
+    capture = _capture()
+    foreign = _seal("/detached/foreign.nexus")
+    with pytest.raises(ValueError, match="Reintegrate reload directive"):
+        ReintegrateReloadDirective(
+            capture.request, capture.target, foreign
+        )
+    with pytest.raises(ValueError, match="Average reload directive"):
+        AverageReloadDirective(capture.target, capture.entry, foreign)
 
 
 def test_reintegrate_begin_transfers_exact_capture_and_refusal_queues_reload(
@@ -302,14 +316,88 @@ def test_average_stale_terminal_never_reloads_and_lost_owner_retires_state(
         ),
         current_intent_revision=4,
     )
-    assert transition.effect is WorkspaceRefreshEffect.FULL
+    assert transition.effect is WorkspaceRefreshEffect.CONTROLS
     assert transition.average_reload is None
     assert transition.request_catalog
     assert owner.average_state is None
 
     owner._average = AverageOperationState(identity, 4, target, "entry")
     lost = owner.consume_lost_owner(identity)
-    assert lost.effect is WorkspaceRefreshEffect.FULL
+    assert lost.effect is WorkspaceRefreshEffect.CONTROLS
+    assert owner.average_state is None
+
+
+def test_committed_average_reload_remains_owned_until_exact_retirement(
+) -> None:
+    owner, slot = _owner_with_slot()
+    identity = OperationIdentity(33)
+    target = "/detached/average.nxs"
+    slot._identity = identity
+    state = AverageOperationState(identity, 4, target, "entry")
+    owner._average = state
+    result = _average_result(target)
+    transition = owner.consume_average_update(
+        OperationUpdate(
+            identity,
+            terminal=OperationTerminal(
+                identity, OperationTerminalStatus.RETURNED, payload=result
+            ),
+        ),
+        current_intent_revision=4,
+    )
+    directive = transition.average_reload
+    assert transition.effect is WorkspaceRefreshEffect.CONTROLS
+    assert directive is owner.pending_average_reload
+    assert owner.average_state is state
+    assert owner.busy
+    assert not owner.retire_average_reload(replace(directive))
+    assert owner.pending_average_reload is directive
+    slot._identity = None
+    assert owner.retire_average_reload(directive)
+    assert owner.pending_average_reload is None
+    assert owner.average_state is None
+    assert not owner.busy
+
+
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    (
+        (OperationTerminalStatus.CANCELLED, None),
+        (OperationTerminalStatus.RETURNED, None),
+        (
+            OperationTerminalStatus.RETURNED,
+            replace(
+                _average_result("/detached/average.nxs"),
+                disposition="REFUSED",
+                committed_labels=(),
+                finite_counts=None,
+                diagnostic_code="AVERAGE_REFUSED",
+                diagnostic="refused",
+                h23_phase=None,
+                commit_identity=None,
+            ),
+        ),
+    ),
+)
+def test_non_science_average_terminals_are_controls_only(
+    status: OperationTerminalStatus, payload: object,
+) -> None:
+    owner, slot = _owner_with_slot()
+    identity = OperationIdentity(34)
+    target = "/detached/average.nxs"
+    slot._identity = identity
+    owner._average = AverageOperationState(identity, 4, target, "entry")
+    transition = owner.consume_average_update(
+        OperationUpdate(
+            identity,
+            terminal=OperationTerminal(
+                identity, status, payload=payload,
+            ),
+        ),
+        current_intent_revision=4,
+    )
+    assert transition.effect is WorkspaceRefreshEffect.CONTROLS
+    assert transition.average_reload is None
     assert owner.average_state is None
 
 

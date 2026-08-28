@@ -30,6 +30,7 @@ from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_operations import (
     AverageOperationState,
     WorkspaceOperationOwner,
+    WorkspaceRefreshEffect,
 )
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.reduction import (
@@ -516,7 +517,10 @@ def test_average_page_projects_and_retries_the_exact_pending_token() -> None:
         _ensure_timer=lambda: calls.append(("timer",)),
     )
     update = OperationUpdate(identity, pending=pending)
-    assert ScatteringWorkspace._consume_average_update(page, update)
+    assert (
+        ScatteringWorkspace._consume_average_update(page, update)
+        is WorkspaceRefreshEffect.CONTROLS
+    )
     assert operations.average_pending is pending
     assert calls == [("notice", (
         "Average source cleanup pending; press Run to retry or Stop to cancel."
@@ -882,11 +886,66 @@ def test_average_page_accepts_only_exact_cancelled_payload_status_pairs(
             assert page._consume_average_update(OperationUpdate(
                 identity,
                 terminal=OperationTerminal(identity, status, payload=payload),
-            ))
+            )) is WorkspaceRefreshEffect.CONTROLS
             assert notices[-1] == expected_notice
             assert page._workspace_operations.average_state is None
         assert reloads == clears == catalogs == []
     finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_average_cancellation_drain_refreshes_controls_without_science(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
+
+    page, store = _page(tmp_path, monkeypatch)
+    identity = OperationIdentity(170)
+    update = OperationUpdate(
+        identity,
+        terminal=OperationTerminal(
+            identity, OperationTerminalStatus.CANCELLED,
+        ),
+    )
+
+    class TerminalSlot:
+        current_identity = identity
+        owned = False
+
+        @staticmethod
+        def observe_stamp(_stamp):
+            return None
+
+        @staticmethod
+        def poll(candidate):
+            return update if candidate is identity else None
+
+    operations = _set_average_state(
+        page,
+        identity,
+        store.revision,
+        str((tmp_path / "cancelled.nxs").resolve()),
+    )
+    original_slot = operations._slot
+    operations._slot = TerminalSlot()
+    refreshes = []
+    monkeypatch.setattr(
+        page, "_refresh_shell", lambda **kwargs: refreshes.append(kwargs),
+    )
+    monkeypatch.setattr(
+        page,
+        "_refresh_event_shell",
+        lambda **_kwargs: pytest.fail("Average cancellation repainted science"),
+    )
+    try:
+        page._drain_executor()
+        assert refreshes == [{
+            "preserve_display": True,
+            "preserve_scientific": True,
+        }]
+        assert operations.average_state is None
+    finally:
+        operations._slot = original_slot
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
@@ -1649,7 +1708,10 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     with monkeypatch.context() as patch:
         patch.setattr(provenance_module, "read_provenance", forbidden)
         patch.setattr(Path, "stat", forbidden); patch.setattr(Path, "open", forbidden)
-        assert page._consume_average_update(update)
+        assert (
+            page._consume_average_update(update)
+            is WorkspaceRefreshEffect.CONTROLS
+        )
     assert reloads == [(
         committed.target, committed.commit_identity, str(tmp_path),
     )]
@@ -1667,7 +1729,10 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         result = _result(disposition, str(target.resolve()))
         current, terminal = scheduled(result)
         arm(current); before_notices = len(notices)
-        assert page._consume_average_update(terminal)
+        assert (
+            page._consume_average_update(terminal)
+            is WorkspaceRefreshEffect.CONTROLS
+        )
         assert len(reloads) == 1
         assert len(notices) == before_notices + 1
         assert notices[-1] == expected_notice[disposition]
@@ -1682,7 +1747,10 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     ):
         bad, update = scheduled(malformed, verification=token)
         arm(bad); before_notices = len(notices)
-        assert page._consume_average_update(update)
+        assert (
+            page._consume_average_update(update)
+            is WorkspaceRefreshEffect.CONTROLS
+        )
         assert len(reloads) == 1 and len(notices) == before_notices + 1
         assert notices[-1] == (
             f"Average failed: AVERAGE_COMMIT_VERIFICATION_FAILED: {token}"
@@ -1693,7 +1761,7 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     before_refreshes = len(refreshes)
     assert page._consume_average_update(OperationUpdate(
         stale, terminal=stale_update.terminal, stale=True,
-    ))
+    )) is WorkspaceRefreshEffect.CONTROLS
     assert len(reloads) == 1
     assert len(catalog) == before_catalog + 1
     assert len(refreshes) == before_refreshes
@@ -1762,8 +1830,10 @@ def test_average_control_and_edit_are_integration_mode_only(
     assert (not isinstance(edited, EditRefusal)) is accepted
 
 
-@pytest.mark.parametrize("blocked_by", ("viewer", "browse_cleanup"))
-def test_average_commit_reload_refusal_is_terminally_total(
+@pytest.mark.parametrize(
+    "blocked_by", ("viewer", "browse_cleanup", "cache_debt")
+)
+def test_average_commit_reload_refusal_retains_exact_retryable_directive(
     tmp_path, monkeypatch, qapp, blocked_by,
 ) -> None:
     from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
@@ -1797,27 +1867,56 @@ def test_average_commit_reload_refusal_is_terminally_total(
     controller = page._context_controller
     if blocked_by == "viewer":
         controller._viewer_2d_standalone = object()
-    else:
+    elif blocked_by == "browse_cleanup":
         controller._cleanup_receipt = BrowseCleanupReceipt(
             None, CleanupStatus.CLEANUP_PENDING,
         )
+    else:
+        page._browse_1d_release_debt = SimpleNamespace(
+            released=False, release=lambda: None,
+        )
     try:
-        assert page._consume_average_update(update)
+        assert page._consume_average_update(
+            update
+        ) is WorkspaceRefreshEffect.CONTROLS
         assert catalogs == [None]
-        assert refreshes
-        assert notices == [
-            "Average committed; Browse reload deferred: "
-            + (
-                "2D Viewer cleanup remains pending"
-                if blocked_by == "viewer"
-                else "Browse cleanup remains pending"
-            )
-        ]
-        assert bool(timers) is (blocked_by == "browse_cleanup")
+        assert refreshes == []
+        assert notices == (
+            [
+                "Average committed; Browse reload queued.",
+                "Average committed; Browse reload deferred: "
+                "2D Viewer cleanup remains pending",
+            ]
+            if blocked_by == "viewer"
+            else ["Average committed; Browse reload queued."]
+        )
+        assert timers == [None]
+        directive = page._workspace_operations.pending_average_reload
+        assert directive is not None
+        assert page._workspace_operations.average_state is not None
+        assert page._workspace_operations.busy
+
+        controller._viewer_2d_standalone = None
+        controller._cleanup_receipt = None
+        page._browse_1d_release_debt = None
+        reloads = []
+        monkeypatch.setattr(
+            controller,
+            "begin_browse",
+            lambda *args, **kwargs: reloads.append((args, kwargs)),
+        )
+        assert page._retry_pending_average_reload()
+        assert reloads == [((target,), {
+            "terminal_commit_identity": result.commit_identity,
+            "source_root": str(tmp_path),
+        })]
+        assert page._workspace_operations.pending_average_reload is None
         assert page._workspace_operations.average_state is None
+        assert not page._workspace_operations.busy
     finally:
         controller._viewer_2d_standalone = None
         controller._cleanup_receipt = None
+        page._browse_1d_release_debt = None
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
@@ -1858,7 +1957,10 @@ def test_average_stale_committed_terminal_reports_without_auto_reload(
     changed.project_root = str(tmp_path / "changed-context")
     store.commit(changed, expected_revision=before.revision)
     try:
-        assert page._consume_average_update(update)
+        assert (
+            page._consume_average_update(update)
+            is WorkspaceRefreshEffect.CONTROLS
+        )
         assert reloads == []
         assert catalogs == [1]
         assert refreshes == []

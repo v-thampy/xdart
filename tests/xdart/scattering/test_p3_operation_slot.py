@@ -107,17 +107,17 @@ def _release_and_poll(slot: OperationSlot, identity, release):
     return update
 
 
-def _background():
+def _background(owner: PresentationBackgroundOwner | None = None):
     axis = np.arange(3.0)
     values = np.array([1.0, 2.0, 3.0])
     plan = DisplayBackgroundPlan(
         "integrated_1d", ("source",), ((3,),), (((3,),),), (("q",),))
-    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    owner = owner or PresentationBackgroundOwner(capacity_bytes=536_870_912)
     reservation = owner.reserve(
         plan, ((values, axis),), stamp=OperationContextStamp(0, "context", 1),
         active_key=("context", 1, "integrated_1d"),
         projection_keys=(1,), projection_indices=(0,))
-    assert reservation == 1
+    assert type(reservation) is int and reservation >= 1
     return owner, plan, reservation
 
 
@@ -395,20 +395,55 @@ def test_post_stage_terminal_construction_failure_finalizes_outside_lock(
     assert owner.phase == "RELEASED" and not slot.owned
 
 
-def test_real_page_timer_polling_and_close_include_operation_owner() -> None:
+def test_real_page_timer_polling_and_close_include_operation_owner(
+    monkeypatch,
+) -> None:
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = _page()
     try:
         entered, release = Event(), Event()
-        identity = page._begin_operation(_Job(), _held_body(entered, release))
+        owner, plan, reservation = _background(page._background_owner)
+        run_and_stage = owner.run_and_stage
+
+        def held(reservation, cancelled):
+            entered.set()
+            assert release.wait(2)
+            return run_and_stage(reservation, cancelled)
+
+        monkeypatch.setattr(owner, "run_and_stage", held)
+        identity = page._workspace_operations.begin_background(
+            plan,
+            OperationContextStamp(0, "context", 1),
+            owner,
+            reservation,
+        )
+        page._background_identity = identity
+        page._ensure_timer()
         assert type(identity) is OperationIdentity and entered.wait(2)
         assert page._run_timer.isActive() and page._polling_needed()
         worker = page._workspace_operations._slot._worker
         release.set(); worker.join(2); page._drain_executor()
         assert page._workspace_operations.owned is False
         assert not page._run_timer.isActive()
+
         entered2, release2 = Event(), Event()
-        page._begin_operation(_Job("close"), _held_body(entered2, release2))
+        owner, plan, reservation = _background(page._background_owner)
+
+        def held2(reservation, cancelled):
+            entered2.set()
+            assert release2.wait(2)
+            return run_and_stage(reservation, cancelled)
+
+        monkeypatch.setattr(owner, "run_and_stage", held2)
+        identity2 = page._workspace_operations.begin_background(
+            plan,
+            OperationContextStamp(0, "context", 1),
+            owner,
+            reservation,
+        )
+        page._background_identity = identity2
+        page._ensure_timer()
+        assert type(identity2) is OperationIdentity
         assert entered2.wait(2)
         assert page.close_workspace().cleanup_status is CleanupStatus.CLEANUP_PENDING
         worker2 = page._workspace_operations._slot._worker
@@ -439,6 +474,18 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
     assert "_begin" in methods and "begin" not in methods
     assert page_text.count("OperationSlot()") == 1  # analysis only
     assert owner_text.count("OperationSlot()") == 1  # experiment only
+    assert "_begin_operation" not in page_text
+    owner_tree = ast.parse(owner_text)
+    workspace_owner = next(
+        node for node in owner_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "WorkspaceOperationOwner"
+    )
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "begin"
+        for node in workspace_owner.body
+    )
     assert page_text.count("QtCore.QTimer(") == 3
     assert page_text.count("ThreadPoolExecutor(max_workers=1)") == 2
     assert page_text.count("deque(maxlen=1)") == 1
