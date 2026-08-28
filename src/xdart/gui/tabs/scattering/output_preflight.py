@@ -3177,12 +3177,9 @@ def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
         _prepared_source_execution(item), writer=False
     )
 def execution_plan_values(
-    configuration: FrozenRunConfiguration, detector_mask: np.ndarray | None = None,
+    configuration: FrozenRunConfiguration,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     threshold, gi = configuration.threshold, configuration.gi
-    if detector_mask is None and configuration.mask_file:
-        path = Path(configuration.mask_file)
-        detector_mask = load_mask(path)
     one, two = configuration.bai_1d_args, configuration.bai_2d_args
     if gi.enabled:
         one["gi_mode_1d"], two["gi_mode_2d"] = gi.mode_1d, gi.mode_2d
@@ -3205,8 +3202,24 @@ def execution_plan_values(
             threshold.threshold_max if threshold.apply_threshold else None
         ),
         "mask_saturation": threshold.mask_saturation,
-        "detector_mask": detector_mask,
     }
+
+
+def native_int_reduction_plan(configuration: FrozenRunConfiguration):
+    """Translate one frozen Controls V2 configuration into its mask-free plan.
+
+    Scientific assets are admitted independently of control intent. The
+    ordinary run path attaches its already-authenticated detector mask after
+    this pure translation; Average keeps the mask in its calibration state so
+    it can apply the accepted static mask while accumulating detector pixels.
+    """
+
+    from xrd_tools.session.readiness import (
+        build_native_int_reduction_plan_from_args,
+    )
+
+    one, two, values = execution_plan_values(configuration)
+    return build_native_int_reduction_plan_from_args(one, two, **values)
 def _validate_targets(
     configuration: FrozenRunConfiguration | OutputCandidate,
     source: SourceSpec | DirectorySourceSpec,
@@ -3811,7 +3824,8 @@ __all__ = [
     "DeferredDirectoryEntry", "DeferredDirectoryPlan", "LiveDirectoryAttempt",
     "LiveDirectoryGroup", "OutputCandidate", "SourceRevisionChanged",
     "ValidatedSourceAliases",
-    "execution_plan_values", "inspect_output", "materialize_deferred_output",
+    "execution_plan_values", "native_int_reduction_plan", "inspect_output",
+    "materialize_deferred_output",
     "live_directory_groups", "materialize_live_directory_group",
     "OutputFact", "prepare_output", "source_snapshots",
     "target_state_matches", "validate_admitted_receipt",

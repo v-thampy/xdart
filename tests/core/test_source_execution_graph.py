@@ -87,7 +87,7 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[1])
-from xrd_tools.reduction import AverageScanRecipe, ReductionPlan, prepare_average_scan
+from xrd_tools.reduction import AverageScanRecipe, AverageScanRunner, ReductionPlan
 from xrd_tools.sources import adapters
 from xrd_tools.sources.selection import image_series_spec
 assert adapters._ADAPTERS == {} and "xrd_tools.sources.registry" not in sys.modules
@@ -97,7 +97,10 @@ qualify = average.qualify_source_execution_graph
 def observed(*args, **kwargs):
     value = qualify(*args, **kwargs); bindings.append(value.reader_binding); return value
 average.qualify_source_execution_graph = observed
-plan = prepare_average_scan(AverageScanRecipe(image_series_spec(Path(sys.argv[2]), metadata_format=None), Path(sys.argv[3]), ReductionPlan()))
+runner = AverageScanRunner(AverageScanRecipe(image_series_spec(Path(sys.argv[2]), metadata_format=None), Path(sys.argv[3]), ReductionPlan()))
+runner._execute_graph = lambda _graph: runner.plan
+plan = runner.start()
+runner.close()
 def has_array(value):
     if type(value).__module__ == "numpy" and type(value).__name__ == "ndarray": return True
     if is_dataclass(value): return any(has_array(getattr(value, item.name)) for item in fields(value))
@@ -192,6 +195,32 @@ def test_compact_tiff_preserves_unnumbered_and_empty_enumeration_singletons(tmp_
     ).source.thaw()
     monkeypatch.setattr(Path, "iterdir", lambda _self: (_ for _ in ()).throw(OSError("closed")))
     assert graph.qualify_source_execution_graph(compact, reader_binding="average_closed_v1").stamp.frame_count == 1
+
+
+def test_average_source_state_sweep_captures_each_admitted_alias_once(
+    tmp_path,
+) -> None:
+    source = _tiffs(tmp_path)
+    prepared = graph.qualify_source_execution_graph(
+        source, reader_binding="average_closed_v1",
+    )
+    expected = tuple(binding.raw_path for binding in prepared.stamp.source_aliases)
+    captures = []
+    real_capture = graph.SourceFileState.capture
+
+    def capture(path):
+        captures.append(str(path))
+        return real_capture(path)
+
+    graph.validate_source_state_sweep(prepared.stamp, capture=capture)
+    assert tuple(captures) == expected
+
+    changed = Path(source.options["files"][1])
+    changed.write_bytes(changed.read_bytes() + b"x")
+    captures.clear()
+    with pytest.raises(graph.SourceRevisionChanged, match="target changed"):
+        graph.validate_source_state_sweep(prepared.stamp, capture=capture)
+    assert tuple(captures) == expected
 
 
 def test_unmarked_ordinary_tiff_adds_zero_layout_reads_and_uses_null_layout(tmp_path, monkeypatch) -> None:
@@ -1298,6 +1327,32 @@ def test_average_binding_atomic_transfer_has_one_close_authority(
                for identifier in identifiers)
 
 
+def test_ordinary_container_qualification_keeps_internal_cleanup_retry(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.sources import registry as _registered_source_registry
+
+    assert _registered_source_registry is not None
+    path = _container(tmp_path / "ordinary-cleanup.h5")
+    source = SourceSpec(path, SourceKind.NEXUS_STACK)
+    real_close = nexus_io._ResolvedNexusStack.close
+    attempts = []
+    remaining = [1]
+
+    def fail_once(owner):
+        attempts.append(owner)
+        if remaining[0]:
+            remaining[0] -= 1
+            raise OSError("ordinary cleanup fault")
+        return real_close(owner)
+
+    monkeypatch.setattr(nexus_io._ResolvedNexusStack, "close", fail_once)
+    value = graph.qualify_source_execution_graph(source)
+    assert value.reader_binding is None
+    # One failed close, its internal retry, then the clean qualification pass.
+    assert len(attempts) == 3
+
+
 def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
     tmp_path, monkeypatch,
 ) -> None:
@@ -1315,8 +1370,9 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
         raise OSError("busy")
     monkeypatch.setattr(type(owner), "close", fail_close)
     for expected in range(1, 4):
-        with pytest.raises(OSError, match="AVERAGE_SOURCE_CLEANUP_FAILED|busy"):
+        with pytest.raises(graph.SourceCleanupPending) as caught:
             window.close()
+        assert caught.value.owner is window
         assert len(attempts) == expected
         assert cursor._stack is owner and cursor._h5 is master
         assert not cursor.closed and not window._closed
@@ -1333,16 +1389,20 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
         real_close = nexus_io.NexusImageStack.close
         remaining = [2]
         def twice(stack):
-            timestamps.append(graph.time.monotonic())
+            timestamps.append(time.monotonic())
             if remaining[0]:
                 remaining[0] -= 1
                 raise KeyboardInterrupt("retryable BaseException")
             return real_close(stack)
         patch.setattr(nexus_io.NexusImageStack, "close", twice)
-        with window:
-            pass
+        with pytest.raises(graph.SourceCleanupPending) as first:
+            with window:
+                pass
+        with pytest.raises(graph.SourceCleanupPending) as second:
+            first.value.owner.close()
+        assert second.value.owner is first.value.owner is window
+        second.value.owner.close()
     assert len(timestamps) == 3
-    assert all(later - earlier >= 0.045 for earlier, later in zip(timestamps, timestamps[1:]))
 
     from xrd_tools.core.containers import IntegrationResult1D
     from xrd_tools.reduction import AverageScanRecipe, Integration1DPlan, ReductionPlan
@@ -1393,11 +1453,11 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
     for case in ("unchanged", "member", "sidecar", "dependency", "target", "commit-target"):
         source, target, changed = inputs(case)
         original_target = target.read_bytes()
-        plan = average_module.prepare_average_scan(AverageScanRecipe(
+        recipe = AverageScanRecipe(
             source, target,
             ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
             numeric_metadata_keys=("I0",) if case == "sidecar" else None,
-        ))
+        )
         counts = {key: 0 for key in (
             "open", "pixel", "metadata", "background", "integrate", "write",
         )}
@@ -1408,11 +1468,13 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
         real_pixel = execution_module._AverageSourceReadWindow.read_native
         real_metadata = execution_module._AverageSourceReadWindow.complete_metadata_for
         real_background = average_module.resolve_frame_background
-        real_requalify = average_module.requalify_source_execution_graph
+        real_state_sweep = average_module.validate_source_state_sweep
         real_target = average_module.capture_target_snapshot
         real_sink = average_module.NexusSink; real_write = real_sink.write
 
         def held_close(window):
+            if counts["open"] == 1:
+                return real_window_close(window)
             close_attempts.append((window, window._cursor, time.monotonic()))
             if len(close_attempts) <= fail_count:
                 raise OSError("injected execution-window close hold")
@@ -1434,11 +1496,11 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
             return IntegrationResult1D(
                 np.arange(npt, dtype=float), np.ones(npt), None, "q_A^-1",
             )
-        def requalify(*args, **kwargs):
+        def source_sweep(*args, **kwargs):
             events.append("source-sweep")
             if case == "commit-target" and events.count("source-sweep") == 2:
                 target.write_bytes(target.read_bytes() + b"x")
-            return real_requalify(*args, **kwargs)
+            return real_state_sweep(*args, **kwargs)
         def target_snapshot(*args, **kwargs):
             events.append("target-sweep")
             return real_target(*args, **kwargs)
@@ -1457,26 +1519,23 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
             patch.setattr(execution_module._AverageSourceReadWindow, "complete_metadata_for", metadata)
             patch.setattr(average_module, "resolve_frame_background", background)
             patch.setattr(reduction_core, "integrate_1d", integrate)
-            patch.setattr(average_module, "requalify_source_execution_graph", requalify)
+            patch.setattr(average_module, "validate_source_state_sweep", source_sweep)
             patch.setattr(average_module, "capture_target_snapshot", target_snapshot)
             patch.setattr(average_module, "NexusSink", sink)
             patch.setattr(real_sink, "write", write)
-            runner = average_module.AverageScanRunner(plan)
-            assert runner.__enter__() is runner
-            pending = runner.run()
+            runner = average_module.AverageScanRunner(recipe)
+            pending = runner.start()
+            plan = runner.plan
             retained = runner._source_window
             retained_cursor = retained._cursor
             identifiers = (() if retained_cursor is None else
                 tuple(dataset.id for dataset in retained_cursor._stack._dsets))
-            assert pending.disposition == "SETTLEMENT_PENDING"
-            assert pending.h23_phase is None
-            assert pending.diagnostic_code == "AVERAGE_SOURCE_CLEANUP_PENDING"
-            assert pending.committed_labels == ()
-            assert pending.finite_counts is None and pending.commit_identity is None
+            assert type(pending) is average_module.AverageScanPending
+            assert pending.phase is average_module.AveragePendingPhase.SOURCE_CLEANUP
             assert pending.operation_identity == plan.operation_identity
             assert runner._source_window is retained
             assert [(row[0], row[1]) for row in close_attempts] == [(retained, retained_cursor)]
-            assert counts["open"] == 1 and sinks == []
+            assert counts["open"] == 2 and sinks == []
             assert all(identifier.valid for identifier in identifiers)
             frozen_science = tuple(counts[key] for key in (
                 "open", "pixel", "metadata", "background", "integrate",
@@ -1486,12 +1545,11 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
                 changed.write_bytes(changed.read_bytes() + b"x")
             preserved_target = target.read_bytes()
             for ordinal in range(1, fail_count):
-                again = runner.finish_current()
-                assert again.disposition == "SETTLEMENT_PENDING"
-                assert again.h23_phase is None
-                assert again.diagnostic_code == "AVERAGE_SOURCE_CLEANUP_PENDING"
-                assert again.committed_labels == ()
-                assert again.finite_counts is None and again.commit_identity is None
+                again = runner.command(
+                    average_module.AverageCommand.RETRY, pending,
+                )
+                assert type(again) is average_module.AverageScanPending
+                assert again.phase is average_module.AveragePendingPhase.SOURCE_CLEANUP
                 assert again.operation_identity == pending.operation_identity
                 assert runner._source_window is retained
                 assert close_attempts[-1][:2] == (retained, retained_cursor)
@@ -1500,14 +1558,17 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
                     "open", "pixel", "metadata", "background", "integrate",
                 )) == frozen_science
                 assert all(identifier.valid for identifier in identifiers)
-            terminal = runner.close() if case == "unchanged" else runner.finish_current()
+                pending = again
+            terminal = runner.command(
+                average_module.AverageCommand.RETRY, pending,
+            )
             assert tuple(counts[key] for key in (
                 "open", "pixel", "metadata", "background", "integrate",
             )) == frozen_science
             assert len(close_attempts) == fail_count + 1
             assert all(attempt[:2] == (retained, retained_cursor) for attempt in close_attempts)
             if case == "unchanged":
-                assert all(b[2] - a[2] >= 0.045 for a, b in zip(close_attempts, close_attempts[1:]))
+                assert all(b[2] >= a[2] for a, b in zip(close_attempts, close_attempts[1:]))
             assert terminal.operation_identity == pending.operation_identity
             if case == "unchanged":
                 assert events == [
@@ -1535,7 +1596,6 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
                 assert target.read_bytes() == original_target
             assert all(not identifier.valid for identifier in identifiers)
             terminal_events, terminal_counts = tuple(events), dict(counts)
-            assert runner.finish_current() is terminal
             assert runner.close() is terminal
             assert tuple(events) == terminal_events and counts == terminal_counts
 
@@ -1607,7 +1667,7 @@ def test_average_value_descriptor_and_dependency_failures_close_binding(
     def observed_bind(*args, **kwargs):
         result = real_bind(*args, **kwargs); bindings.append(result[1]); return result
     def twice_then_close(owner):
-        close_calls.append((graph.time.monotonic(), owner))
+        close_calls.append((time.monotonic(), owner))
         if failures[0]:
             failures[0] -= 1
             raise OSError("injected lexical binding close hold")
@@ -1615,17 +1675,20 @@ def test_average_value_descriptor_and_dependency_failures_close_binding(
     with monkeypatch.context() as patch:
         patch.setattr(descriptor_module, "_describe_container_from_open_with_binding", observed_bind)
         patch.setattr(nexus_io._ResolvedNexusStack, "close", twice_then_close)
-        refreshed = graph.qualify_source_execution_graph(
-            SourceSpec(path, SourceKind.NEXUS_STACK),
-            reader_binding="average_closed_v1",
-        )
-    assert refreshed.stamp.frame_count == 3 and len(bindings) == 2
-    assert [owner for _, owner in close_calls[:3]] == [bindings[0]] * 3
-    assert close_calls[3][1] is bindings[1] and bindings[0] is not bindings[1]
-    assert all(later[0] - earlier[0] >= 0.045
-               for earlier, later in zip(close_calls[:2], close_calls[1:3]))
+        with pytest.raises(graph.SourceCleanupPending) as first:
+            graph.qualify_source_execution_graph(
+                SourceSpec(path, SourceKind.NEXUS_STACK),
+                reader_binding="average_closed_v1",
+            )
+        cleanup = first.value.owner
+        with pytest.raises(graph.SourceCleanupPending) as second:
+            cleanup.close()
+        assert second.value.owner is cleanup
+        cleanup.close()
+        refreshed = cleanup.take()
+    assert refreshed.stamp.frame_count == 3 and len(bindings) == 1
+    assert [owner for _, owner in close_calls] == [bindings[0]] * 3
     assert all(owner.state == "CLOSED" for owner in bindings)
-
     dependency = tmp_path / "dependency.h5"
     with h5py.File(dependency, "w") as handle:
         handle.create_dataset("pixels", data=np.ones((3, 2, 3), dtype="u2"))
@@ -1652,12 +1715,16 @@ def test_average_value_descriptor_and_dependency_failures_close_binding(
     with monkeypatch.context() as patch:
         patch.setattr(descriptor_module, "_describe_container_from_open_with_binding", observed_bind)
         patch.setattr(nexus_io._ResolvedNexusStack, "close", mutate_then_close)
-        with pytest.raises(graph.SourceRevisionChanged, match="container dependency changed"):
+        with pytest.raises(graph.SourceCleanupPending) as caught:
             graph.requalify_source_execution_graph(
                 dependency_source, admitted, reader_binding="average_closed_v1",
             )
-    assert len(bindings) == 2 and close_calls[:2] == [bindings[0], bindings[0]]
-    assert close_calls[2:] == [bindings[1]] and all(owner.state == "CLOSED" for owner in bindings)
+        cleanup = caught.value.owner
+        cleanup.close()
+        with pytest.raises(graph.SourceRevisionChanged, match="container dependency changed"):
+            cleanup.take()
+    assert len(bindings) == 1 and close_calls == [bindings[0], bindings[0]]
+    assert all(owner.state == "CLOSED" for owner in bindings)
 
     bindings.clear(); close_calls.clear(); helper_calls = []; failures[:] = [1]
     def interrupted_dependencies(*_args, **_kwargs):
@@ -1666,14 +1733,67 @@ def test_average_value_descriptor_and_dependency_failures_close_binding(
         patch.setattr(descriptor_module, "_describe_container_from_open_with_binding", observed_bind)
         patch.setattr(graph, "_capture_bound_container_dependencies", interrupted_dependencies)
         patch.setattr(nexus_io._ResolvedNexusStack, "close", twice_then_close)
-        with pytest.raises(KeyboardInterrupt, match="dependency facts after clean"):
+        with pytest.raises(graph.SourceCleanupPending) as caught:
             graph.qualify_source_execution_graph(
                 SourceSpec(path, SourceKind.NEXUS_STACK),
                 reader_binding="average_closed_v1",
             )
-    assert helper_calls == [1, 1] and len(bindings) == 2
-    assert [owner for _, owner in close_calls] == [bindings[0], bindings[0], bindings[1]]
+        cleanup = caught.value.owner
+        cleanup.close()
+        with pytest.raises(KeyboardInterrupt, match="dependency facts after clean"):
+            cleanup.take()
+    assert helper_calls == [1] and len(bindings) == 1
+    assert [owner for _, owner in close_calls] == [bindings[0], bindings[0]]
     assert all(owner.state == "CLOSED" for owner in bindings)
+
+
+def test_average_preparation_cancel_closes_exact_pending_owner_without_rewalk(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.io import nexus as nexus_io
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.reduction import ReductionPlan
+    from xrd_tools.sources import descriptor as descriptor_module
+
+    path = _container(tmp_path / "preparation-pending.h5")
+    source = SourceSpec(path, SourceKind.NEXUS_STACK)
+    target = tmp_path / "average.nxs"
+    real_bind = descriptor_module._describe_container_from_open_with_binding
+    real_close = nexus_io._ResolvedNexusStack.close
+    bindings = []
+    closes = []
+
+    def bind(*args, **kwargs):
+        result = real_bind(*args, **kwargs)
+        bindings.append(result[1])
+        return result
+
+    def fail_once(owner):
+        closes.append(owner)
+        if len(closes) == 1:
+            raise OSError("injected preparation close hold")
+        return real_close(owner)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            descriptor_module,
+            "_describe_container_from_open_with_binding",
+            bind,
+        )
+        patch.setattr(nexus_io._ResolvedNexusStack, "close", fail_once)
+        runner = average_module.AverageScanRunner(
+            average_module.AverageScanRecipe(source, target, ReductionPlan())
+        )
+        pending = runner.start()
+        assert type(pending) is average_module.AverageScanPending
+        assert pending.phase is average_module.AveragePendingPhase.PREPARATION_CLEANUP
+        assert len(bindings) == 1 and closes == [bindings[0]]
+        terminal = runner.command(average_module.AverageCommand.CANCEL, pending)
+
+    assert terminal.disposition == "CANCELLED"
+    assert len(bindings) == 1 and closes == [bindings[0], bindings[0]]
+    assert bindings[0].state == "CLOSED"
+    assert runner.close() is terminal
 
 
 def test_average_bound_dependencies_use_same_group_without_master_reopen(

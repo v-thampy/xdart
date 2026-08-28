@@ -5,6 +5,7 @@ from dataclasses import fields, replace
 import json
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 import h5py
 import numpy as np
@@ -20,6 +21,7 @@ from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.gui.tabs.scattering.operation_values import (
     OperationContextStamp,
     OperationIdentity,
+    OperationPending,
     OperationTerminal,
     OperationTerminalStatus,
     OperationUpdate,
@@ -27,11 +29,13 @@ from xdart.gui.tabs.scattering.operation_values import (
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.reduction import (
-    AverageFiniteCountsEvidence, AverageScanRecipe, AverageScanResult,
-    Integration1DPlan, Integration2DPlan, ReductionPlan,
+    AverageCommand, AverageFiniteCountsEvidence, AveragePendingPhase,
+    AverageScanPending, AverageScanRecipe, AverageScanResult,
+    AverageScanRunner, GIMode, Integration1DPlan, Integration2DPlan,
+    ReductionPlan,
 )
-from xrd_tools.session.intent_store import RunIntentStore
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.intent_store import IntentFreezeAccepted, RunIntentStore
+from xrd_tools.session.run_configuration import GIIntent, RunIntent, ThresholdIntent
 
 
 def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageScanResult:
@@ -77,11 +81,471 @@ def _source(tmp_path: Path, arrays=None) -> SourceSpec:
     })
 
 
+def _configuration(
+    source,
+    reduction=None,
+    *,
+    output_mode="Overwrite",
+    live_mode=False,
+    batch_mode=False,
+    poni_file="",
+    mask_file="",
+    background=None,
+    project_root="",
+    max_cores=1,
+):
+    from xrd_tools.reduction.background import FrameBackgroundPlan
+
+    reduction = ReductionPlan() if reduction is None else reduction
+    one = reduction.integration_1d or Integration1DPlan()
+    two = reduction.integration_2d
+    one_args = {
+        **dict(one.extra),
+        "npt": one.npt,
+        "unit": one.unit,
+        "method": one.method,
+        "radial_range": one.radial_range,
+        "azimuth_range": one.azimuth_range,
+        "monitor": one.monitor_key,
+        "error_model": one.error_model,
+        "polarization_factor": one.polarization_factor,
+        "chi_npt_rad": one.npt_rad,
+        "chi_offset": one.azimuth_offset,
+    }
+    two_args = {} if two is None else {
+        **dict(two.extra),
+        "npt_rad": two.npt_rad,
+        "npt_azim": two.npt_azim,
+        "unit": two.unit,
+        "method": two.method,
+        "radial_range": two.radial_range,
+        "azimuth_range": two.azimuth_range,
+        "chi_offset": two.azimuth_offset,
+        "monitor": two.monitor_key,
+        "error_model": two.error_model,
+        "polarization_factor": two.polarization_factor,
+    }
+    gi = GIIntent()
+    if reduction.gi is not None:
+        value = reduction.gi
+        gi = GIIntent(
+            enabled=True,
+            incidence_motor=value.incidence_motor or "Manual",
+            th_val=0.1 if value.incident_angle is None else value.incident_angle,
+            sample_orientation=value.sample_orientation,
+            tilt_angle=value.tilt_angle,
+            mode_1d=value.mode_1d.value,
+            mode_2d=value.mode_2d.value,
+        )
+    intent = RunIntent(
+        source_spec=source,
+        processing_mode="Int 2D" if two is not None else "Int 1D",
+        output_mode=output_mode,
+        live_mode=live_mode,
+        batch_mode=batch_mode,
+        max_cores=max_cores,
+        bai_1d_args=one_args,
+        bai_2d_args=two_args,
+        gi=gi,
+        threshold=ThresholdIntent(
+            apply_threshold=(
+                reduction.threshold_min is not None
+                or reduction.threshold_max is not None
+            ),
+            threshold_min=reduction.threshold_min,
+            threshold_max=reduction.threshold_max,
+            mask_saturation=reduction.mask_saturation,
+        ),
+        poni_file=poni_file,
+        mask_file=mask_file,
+        background=(FrameBackgroundPlan() if background is None else background),
+        project_root=str(project_root),
+        run_options={"series_average": True},
+    )
+    frozen = RunIntentStore(intent).freeze(expected_revision=0)
+    assert type(frozen) is IntentFreezeAccepted
+    return frozen.configuration
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        (
+            "standard",
+            ReductionPlan(
+                integration_1d=Integration1DPlan(npt=13),
+                integration_2d=Integration2DPlan(npt_rad=7, npt_azim=5),
+            ),
+        ),
+        (
+            "int1d",
+            ReductionPlan(integration_1d=Integration1DPlan(npt=17)),
+        ),
+        (
+            "gi-manual",
+            ReductionPlan(
+                integration_1d=Integration1DPlan(npt=19, unit="qip_A^-1"),
+                integration_2d=Integration2DPlan(
+                    npt_rad=11, npt_azim=9, unit="qip_A^-1",
+                ),
+                gi=GIMode(
+                    incident_angle=0.27, sample_orientation=3,
+                    tilt_angle=0.04, mode_1d="q_ip",
+                    mode_2d="qip_qoop",
+                ),
+            ),
+        ),
+        (
+            "gi-motor",
+            ReductionPlan(
+                integration_1d=Integration1DPlan(npt=23, unit="qoop_A^-1"),
+                integration_2d=Integration2DPlan(
+                    npt_rad=12, npt_azim=10, unit="q_A^-1",
+                ),
+                gi=GIMode(
+                    incidence_motor="theta", sample_orientation=2,
+                    tilt_angle=-0.03, mode_1d="q_oop", mode_2d="q_chi",
+                ),
+            ),
+        ),
+        (
+            "threshold",
+            ReductionPlan(
+                integration_1d=Integration1DPlan(npt=29),
+                integration_2d=Integration2DPlan(npt_rad=8, npt_azim=6),
+                threshold_min=2.5, threshold_max=4094.5,
+            ),
+        ),
+        (
+            "saturation",
+            ReductionPlan(
+                integration_1d=Integration1DPlan(npt=31),
+                integration_2d=Integration2DPlan(npt_rad=9, npt_azim=7),
+                mask_saturation=True,
+            ),
+        ),
+    ),
+)
+def test_frozen_configuration_has_one_independent_mask_free_reduction_policy(
+    tmp_path, case, expected,
+) -> None:
+    from xdart.gui.tabs.scattering.output_preflight import (
+        native_int_reduction_plan,
+    )
+
+    configuration = _configuration(_source(tmp_path / case), expected)
+
+    actual = native_int_reduction_plan(configuration)
+
+    assert actual == expected
+    assert actual.mask is None
+
+
 def _join(slot: OperationSlot, identity):
     worker = slot._worker; assert worker is not None
     worker.join(20); assert not worker.is_alive()
     update = slot.poll(identity); assert update is not None and update.terminal is not None
     return update
+
+
+def _runner_from_callable(call):
+    class Runner:
+        def __init__(self, recipe):
+            self.recipe = recipe
+            self.result = None
+
+        def start(self, **kwargs):
+            self.result = call(self.recipe, **kwargs)
+            return self.result
+
+        def command(self, *_args, **_kwargs):
+            pytest.fail("terminal test runner received a cleanup command")
+
+        def close(self):
+            return self.result
+
+    return Runner
+
+
+def _run_terminal_average(recipe, **kwargs):
+    runner = AverageScanRunner(recipe)
+    result = runner.start(**kwargs)
+    assert type(result) is AverageScanResult
+    assert runner.close() is result
+    return result
+
+
+def _wait_update(slot: OperationSlot, identity, predicate, *, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        update = slot.poll(identity)
+        if update is not None and predicate(update):
+            return update
+        time.sleep(0.005)
+    pytest.fail("operation update did not arrive")
+
+
+def test_average_cleanup_pending_requires_exact_explicit_commands(
+    tmp_path, monkeypatch,
+) -> None:
+    commands = []
+    result = _result("REFUSED", str((tmp_path / "average.nxs").resolve()))
+
+    class Runner:
+        def __init__(self, recipe):
+            self.recipe = recipe
+
+        def start(self, **_kwargs):
+            return AverageScanPending(
+                "headless-operation", 1,
+                AveragePendingPhase.SOURCE_CLEANUP,
+                "source close retained",
+            )
+
+        def command(self, command, pending):
+            commands.append((command, pending))
+            if len(commands) == 1:
+                return AverageScanPending(
+                    "headless-operation", 2,
+                    AveragePendingPhase.OUTPUT_SETTLEMENT,
+                    "output settlement retained",
+                )
+            return result
+
+        def close(self):
+            return result
+
+    monkeypatch.setattr(adapter, "AverageScanRunner", Runner)
+    slot = OperationSlot()
+    identity = slot.begin_average(
+        _configuration(_source(tmp_path / "source")), result.target,
+        stamp=OperationContextStamp(0),
+    )
+    assert identity is not None
+    first_update = _wait_update(
+        slot, identity, lambda value: value.pending is not None,
+    )
+    first = first_update.pending
+    assert type(first) is OperationPending and first.revision == 1
+    assert first.phase == "source-cleanup"
+    assert not slot.retry_average(identity, OperationPending(
+        identity, first.revision, first.phase, first.diagnostic,
+    ))
+    assert slot.retry_average(identity, first)
+    assert not slot.retry_average(identity, first)
+
+    second_update = _wait_update(
+        slot, identity, lambda value: value.pending is not None,
+    )
+    second = second_update.pending
+    assert type(second) is OperationPending and second.revision == 2
+    assert second.phase == "output-settlement"
+    assert slot.cancel(identity)
+    terminal = _wait_update(
+        slot, identity, lambda value: value.terminal is not None,
+    )
+    assert terminal.terminal.status is OperationTerminalStatus.RETURNED
+    assert [item[0] for item in commands] == [
+        AverageCommand.RETRY, AverageCommand.CANCEL,
+    ]
+    assert [item[1].revision for item in commands] == [1, 2]
+
+
+def test_average_cancel_does_not_auto_spin_across_pending_owners(
+    tmp_path, monkeypatch,
+) -> None:
+    commands = []
+    result = _result("CANCELLED", str((tmp_path / "average.nxs").resolve()))
+
+    class Runner:
+        def __init__(self, recipe):
+            self.recipe = recipe
+
+        def start(self, **_kwargs):
+            return AverageScanPending(
+                "headless-operation", 1,
+                AveragePendingPhase.SOURCE_CLEANUP,
+                "first source close retained",
+            )
+
+        def command(self, command, pending):
+            commands.append((command, pending))
+            if len(commands) == 1:
+                return AverageScanPending(
+                    "headless-operation", 2,
+                    AveragePendingPhase.SOURCE_CLEANUP,
+                    "second source close retained",
+                )
+            return result
+
+        def close(self):
+            return result
+
+    monkeypatch.setattr(adapter, "AverageScanRunner", Runner)
+    slot = OperationSlot()
+    identity = slot.begin_average(
+        _configuration(_source(tmp_path / "source")), result.target,
+        stamp=OperationContextStamp(0),
+    )
+    first = _wait_update(
+        slot, identity, lambda value: value.pending is not None,
+    ).pending
+    assert slot.cancel(identity)
+    second = _wait_update(
+        slot, identity,
+        lambda value: value.pending is not None
+        and value.pending.revision == 2,
+    ).pending
+    assert [item[0] for item in commands] == [AverageCommand.CANCEL]
+    assert slot._worker is not None and slot._worker.is_alive()
+    assert slot.cancel(identity)
+    terminal = _wait_update(
+        slot, identity, lambda value: value.terminal is not None,
+    )
+    assert terminal.terminal.status is OperationTerminalStatus.CANCELLED
+    assert [item[0] for item in commands] == [
+        AverageCommand.CANCEL, AverageCommand.CANCEL,
+    ]
+
+
+def test_average_close_workspace_advances_each_pending_revision_once(
+    tmp_path, monkeypatch,
+) -> None:
+    commands = []
+    result = _result("CANCELLED", str((tmp_path / "average.nxs").resolve()))
+
+    class Runner:
+        def __init__(self, recipe):
+            self.recipe = recipe
+
+        def start(self, **_kwargs):
+            return AverageScanPending(
+                "headless-operation", 1,
+                AveragePendingPhase.SOURCE_CLEANUP,
+                "first source close retained",
+            )
+
+        def command(self, command, pending):
+            commands.append((command, pending))
+            if len(commands) == 1:
+                return AverageScanPending(
+                    "headless-operation", 2,
+                    AveragePendingPhase.SOURCE_CLEANUP,
+                    "second source close retained",
+                )
+            return result
+
+        def close(self):
+            return result
+
+    monkeypatch.setattr(adapter, "AverageScanRunner", Runner)
+    slot = OperationSlot()
+    identity = slot.begin_average(
+        _configuration(_source(tmp_path / "source")), result.target,
+        stamp=OperationContextStamp(0),
+    )
+    worker = slot._worker
+    assert worker is not None and worker.daemon is False
+    _wait_update(slot, identity, lambda value: value.pending is not None)
+    receipts = []
+    for _ in range(100):
+        receipt = slot.close()
+        receipts.append(receipt)
+        if receipt.cleanup_status.value == "cleaned":
+            break
+        time.sleep(0.005)
+    else:
+        pytest.fail("close_workspace did not settle the Average worker")
+    assert [item[0] for item in commands] == [
+        AverageCommand.CLOSE, AverageCommand.CLOSE,
+    ]
+    assert [item[1].revision for item in commands] == [1, 2]
+    assert receipts[-1].terminal is not None
+    assert receipts[-1].terminal.status is OperationTerminalStatus.CANCELLED
+    assert not worker.is_alive()
+    assert slot._worker is None and not slot.owned
+
+
+def test_average_page_projects_and_retries_the_exact_pending_token() -> None:
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+
+    identity = OperationIdentity(7)
+    pending = OperationPending(
+        identity, 3, "source-cleanup", "source close retained",
+    )
+    calls = []
+
+    class Slot:
+        current_identity = identity
+
+        @staticmethod
+        def retry_average(owner, token):
+            calls.append((owner, token))
+            return True
+
+    page = SimpleNamespace(
+        _average_identity=identity,
+        _average_pending=None,
+        _operation_slot=Slot(),
+        _notice=lambda value: calls.append(("notice", value)),
+        _refresh_shell=lambda: calls.append(("refresh",)),
+        _ensure_timer=lambda: calls.append(("timer",)),
+    )
+    update = OperationUpdate(identity, pending=pending)
+    assert ScatteringWorkspace._consume_average_update(page, update)
+    assert page._average_pending is pending
+    assert calls == [("notice", (
+        "Average source cleanup pending; press Run to retry or Stop to cancel."
+    ))]
+
+    ScatteringWorkspace._run_action(page)
+    assert page._average_pending is None
+    assert calls[1:] == [
+        (identity, pending),
+        ("notice", "Retrying Average cleanup…"),
+        ("refresh",),
+        ("timer",),
+    ]
+
+
+def test_average_pending_projection_enables_run_retry_and_stop(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
+    from queue import Queue
+    from xdart.gui.tabs.scattering.shell_values import (
+        ShellCommand, ShellCommandKind,
+    )
+
+    page, _store = _page(tmp_path, monkeypatch)
+    identity = OperationIdentity(77)
+    pending = OperationPending(
+        identity, 1, "source-cleanup", "source close retained",
+    )
+    slot = page._operation_slot
+    with slot._lock:
+        slot._identity = identity
+        slot._pending = pending
+        slot._command_queue = Queue()
+    page._average_identity = identity
+    page._average_pending = pending
+    try:
+        page._refresh_shell()
+        assert page._shell.run_controls.startButton.isEnabled()
+        assert page._shell.run_controls.stopButton.isEnabled()
+        assert "Average cleanup pending" in (
+            page._shell.run_controls.readinessLabel.full_text()
+        )
+        page._handle_shell_command(
+            ShellCommand(ShellCommandKind.RUN_ACTION)
+        )
+        assert page._average_pending is None
+        assert slot._command_queue.get_nowait() == "retry"
+    finally:
+        with slot._lock:
+            slot._retire_locked()
+        page._average_identity = page._average_pending = None
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
 def _stub_integrators(monkeypatch):
@@ -104,6 +568,203 @@ def _stub_integrators(monkeypatch):
     return calls
 
 
+def test_average_internal_source_failure_retains_exact_owner_until_close(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.sources import execution_graph
+
+    source = _source(tmp_path / "source")
+    target = tmp_path / "average.nxs"
+    integrations = _stub_integrators(monkeypatch)
+    real_close = execution_graph._AverageSourceReadWindow.close
+    real_hold = average_module.AverageScanRunner._hold_source_cleanup
+    real_runner = average_module.AverageScanRunner
+    close_calls = []
+    hold_calls = []
+    runners = []
+
+    def held_runtime_close(window):
+        close_calls.append(window)
+        # Preparation owns the first window. The runtime window then needs two
+        # explicit cleanup commands before its real close can complete.
+        if len(close_calls) in {2, 3}:
+            raise OSError("injected source close hold")
+        return real_close(window)
+
+    def fail_first_hold(owner, *args, **kwargs):
+        hold_calls.append(id(owner))
+        if len(hold_calls) == 1:
+            raise RuntimeError("injected source owner publication failure")
+        return real_hold(owner, *args, **kwargs)
+
+    def capture_runner(recipe):
+        value = real_runner(recipe)
+        runners.append(value)
+        return value
+
+    monkeypatch.setattr(
+        execution_graph._AverageSourceReadWindow, "close", held_runtime_close,
+    )
+    monkeypatch.setattr(real_runner, "_hold_source_cleanup", fail_first_hold)
+    monkeypatch.setattr(adapter, "AverageScanRunner", capture_runner)
+    slot = OperationSlot()
+    identity = slot.begin_average(
+        _configuration(
+            source,
+            ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
+        ),
+        target,
+        stamp=OperationContextStamp(0),
+    )
+    assert identity is not None
+    worker = slot._worker
+    assert worker is not None and worker.daemon is False
+    first = _wait_update(
+        slot, identity,
+        lambda value: value.pending is not None
+        and value.pending.revision == 1,
+    ).pending
+    assert first.phase == "source-cleanup"
+    frozen_integrations = tuple(integrations)
+
+    assert slot.close().cleanup_status is CleanupStatus.CLEANUP_PENDING
+    second = _wait_update(
+        slot, identity,
+        lambda value: value.pending is not None
+        and value.pending.revision == 2,
+    ).pending
+    assert second.phase == "source-cleanup"
+    assert tuple(integrations) == frozen_integrations
+
+    receipts = []
+    for _ in range(100):
+        receipt = slot.close()
+        receipts.append(receipt)
+        if receipt.cleanup_status is CleanupStatus.CLEANED:
+            break
+        time.sleep(0.005)
+    else:
+        pytest.fail("close_workspace-shaped calls did not settle Average source")
+
+    assert len(runners) == 1
+    assert runners[0]._pending_revision == 2
+    assert runners[0]._source_window is None
+    assert len(close_calls) == 4
+    assert close_calls[1] is close_calls[2] is close_calls[3]
+    assert len(set(hold_calls)) == 1 and len(hold_calls) == 2
+    assert tuple(integrations) == frozen_integrations
+    assert receipts[-1].terminal is not None
+    assert receipts[-1].terminal.status is OperationTerminalStatus.RETURNED
+    assert receipts[-1].terminal.payload.disposition == "REFUSED"
+    assert not worker.is_alive()
+
+
+def test_average_internal_h23_failure_retains_revisioned_owner_until_close(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.reduction import average as average_module
+
+    source = _source(tmp_path / "source")
+    target = tmp_path / "average.nxs"
+    integrations = _stub_integrators(monkeypatch)
+    real_sink = average_module.NexusSink
+    real_runner = average_module.AverageScanRunner
+    real_retry = real_runner._retry_output_once
+    real_commit = OutputTransaction.commit_stream
+    sinks = []
+    runners = []
+    retries = []
+    commits = []
+
+    def capture_sink(*args, **kwargs):
+        value = real_sink(*args, **kwargs)
+        sinks.append(value)
+        return value
+
+    def capture_runner(recipe):
+        value = real_runner(recipe)
+        runners.append(value)
+        return value
+
+    def fail_internal_retry_once(owner):
+        retries.append(id(owner))
+        if len(retries) == 1:
+            raise RuntimeError("injected retry owner failure")
+        return real_retry(owner)
+
+    def hold_commit_twice(owner, *args, **kwargs):
+        commits.append(id(owner))
+        if len(commits) <= 2:
+            raise OSError("injected H23 commit hold")
+        return real_commit(owner, *args, **kwargs)
+
+    monkeypatch.setattr(average_module, "NexusSink", capture_sink)
+    monkeypatch.setattr(real_runner, "_retry_output_once", fail_internal_retry_once)
+    monkeypatch.setattr(OutputTransaction, "commit_stream", hold_commit_twice)
+    monkeypatch.setattr(adapter, "AverageScanRunner", capture_runner)
+    slot = OperationSlot()
+    identity = slot.begin_average(
+        _configuration(
+            source,
+            ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
+        ),
+        target,
+        stamp=OperationContextStamp(0),
+    )
+    assert identity is not None
+    worker = slot._worker
+    assert worker is not None and worker.daemon is False
+    first = _wait_update(
+        slot, identity,
+        lambda value: value.pending is not None
+        and value.pending.revision == 1,
+    ).pending
+    assert first.phase == "output-settlement"
+    frozen_integrations = tuple(integrations)
+
+    assert slot.close().cleanup_status is CleanupStatus.CLEANUP_PENDING
+    second = _wait_update(
+        slot, identity,
+        lambda value: value.pending is not None
+        and value.pending.revision == 2,
+    ).pending
+    assert second.phase == "output-settlement"
+    assert tuple(integrations) == frozen_integrations
+
+    assert slot.close().cleanup_status is CleanupStatus.CLEANUP_PENDING
+    third = _wait_update(
+        slot, identity,
+        lambda value: value.pending is not None
+        and value.pending.revision == 3,
+    ).pending
+    assert third.phase == "output-settlement"
+    assert tuple(integrations) == frozen_integrations
+
+    receipts = []
+    for _ in range(100):
+        receipt = slot.close()
+        receipts.append(receipt)
+        if receipt.cleanup_status is CleanupStatus.CLEANED:
+            break
+        time.sleep(0.005)
+    else:
+        pytest.fail("close_workspace-shaped calls did not settle Average H23")
+
+    assert len(runners) == len(sinks) == 1
+    assert runners[0]._pending_revision == 3
+    assert runners[0]._source_window is None
+    assert sinks[0]._transaction_owners is None
+    assert len(set(commits)) == 1 and len(commits) == 3
+    assert len(set(retries)) == 1 and len(retries) == 3
+    assert tuple(integrations) == frozen_integrations
+    assert receipts[-1].terminal is not None
+    assert receipts[-1].terminal.status is OperationTerminalStatus.RETURNED
+    assert receipts[-1].terminal.payload.disposition == "COMMITTED"
+    assert not worker.is_alive()
+
+
 def test_average_calibration_admission_cancel_is_a_cancelled_terminal(
     tmp_path, monkeypatch,
 ) -> None:
@@ -117,9 +778,8 @@ def test_average_calibration_admission_cancel_is_a_cancelled_terminal(
     monkeypatch.setattr(adapter, "_average_calibration", cancelled_admission)
     slot = OperationSlot()
     identity = slot.begin_average(
-        _source(tmp_path),
+        _configuration(_source(tmp_path)),
         tmp_path / "cancelled.nxs",
-        ReductionPlan(),
         stamp=OperationContextStamp(0),
     )
     assert identity is not None and entered.wait(5)
@@ -331,11 +991,14 @@ def test_average_active_background_is_a_stable_pre_source_refusal(
         monkeypatch.setattr(average_module, name, forbidden(name))
     slot = OperationSlot()
     identity = slot.begin_average(
-        source, target, ReductionPlan(),
-        background=FrameBackgroundPlan(
-            mode="Single BG File",
-            locator=str(source.options["selected_file"]),
+        _configuration(
+            source,
+            background=FrameBackgroundPlan(
+                mode="Single BG File",
+                locator=str(source.options["selected_file"]),
+            ),
         ),
+        target,
         stamp=OperationContextStamp(0),
     )
     assert identity is not None
@@ -354,24 +1017,80 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+def test_average_page_dispatches_one_revision_checked_canonical_freeze(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
+    from xrd_tools.sources import selection
+
+    source = _source(tmp_path / "source")
+    intent = RunIntent(
+        source_spec=source,
+        processing_mode="Int 2D",
+        output_mode="Overwrite",
+        max_cores=3,
+        project_root=str(tmp_path),
+        save_path=str(tmp_path / "processed"),
+        run_options={"series_average": True},
+    )
+    store = RunIntentStore(intent)
+    page, _store = _page(tmp_path, monkeypatch, store=store)
+    freezes = []
+    dispatches = []
+    real_freeze = store.freeze
+
+    def freeze(**kwargs):
+        freezes.append(kwargs)
+        return real_freeze(**kwargs)
+
+    def begin(configuration, target, **kwargs):
+        dispatches.append((configuration, target, kwargs))
+        return OperationIdentity(901)
+
+    try:
+        monkeypatch.setattr(store, "freeze", freeze)
+        monkeypatch.setattr(
+            selection,
+            "image_series_spec",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Average enumerated TIFF members on the GUI thread"
+            ),
+        )
+        monkeypatch.setattr(page._operation_slot, "begin_average", begin)
+        page._source_observation = None
+        snapshot = store.snapshot()
+
+        page._average_action(snapshot)
+
+        assert freezes == [{
+            "expected_revision": snapshot.revision,
+            "gi_motor_choices": None,
+        }]
+        assert len(dispatches) == 1
+        configuration, target, kwargs = dispatches[0]
+        assert configuration.generation == 1
+        assert configuration.max_cores == 3
+        assert configuration.thaw_source_spec() == source
+        assert target.endswith("/processed/scan.nexus")
+        assert kwargs == {"stamp": OperationContextStamp(snapshot.revision)}
+        assert store.snapshot().thaw().generation == 1
+    finally:
+        page.close_workspace()
+        page.deleteLater()
+        qapp.processEvents()
+
+
 def test_average_private_request_builds_recipe_and_enumerates_only_on_worker(
     tmp_path, monkeypatch
 ) -> None:
     from xdart.gui.tabs.scattering.contracts import AcceptedScientificAssets
     from xdart.gui.tabs.scattering import output_preflight
-    from xrd_tools.reduction.background import FrameBackgroundPlan
     from xrd_tools.session.experiment_state import (
         CalibrationState, FactStatus, MaskState, PoniValues,
     )
     source = _source(tmp_path)
-    class AdvisoryFiles(list):
-        armed = False
-        def __iter__(self):
-            if self.armed and threading.current_thread() is threading.main_thread():
-                raise AssertionError("advisory files iterated on the caller thread")
-            return super().__iter__()
     mutable_options = copy.deepcopy(dict(source.options))
-    mutable_options["files"] = AdvisoryFiles(mutable_options["files"])
+    mutable_options["files"] = list(mutable_options["files"])
     source = SourceSpec(source.uri, source.kind, options=mutable_options)
     reduction_extra = {"nested": [1, {"value": 2}], "enabled_modes_1d": ["q"]}
     reduction = ReductionPlan(
@@ -403,20 +1122,21 @@ def test_average_private_request_builds_recipe_and_enumerates_only_on_worker(
             DetectorCalibration(value.poni, detector.get_config()).to_json(),
         )
     accepted_truth = detector_truth(accepted_calibration, accepted_detector)
-    background = FrameBackgroundPlan(
-        mode="Single BG File", locator=str(source.options["selected_file"]),
-    )
-    requests = {"workers": 1}; env = {"OMP_NUM_THREADS": "1"}
     target = tmp_path / "average.nxs"; source_base = tmp_path / "source-base"
     source_copy = SourceSpec(source.uri, source.kind, source.metadata_uri, source.entry,
                              copy.deepcopy(dict(source.options)))
     reduction_copy = copy.deepcopy(reduction)
+    configuration = _configuration(
+        source_copy, reduction_copy, poni_file=poni_path, mask_file=mask_path,
+        batch_mode=True, project_root=source_base, max_cores=1,
+    )
     expected = AverageScanRecipe(
-        source_copy, target, reduction_copy, entry="entry", source_base=source_base,
-        output_mode="Overwrite", live_mode=True, save_xye=True, batch_mode=True,
-        calibration=calibration, background=background,
+        configuration.thaw_source_spec(), target,
+        reduction_copy, entry="entry",
+        source_base=source_base, output_mode="Overwrite", live_mode=False,
+        save_xye=False, batch_mode=True, calibration=calibration,
         numeric_metadata_keys=("I0",), invariant_metadata_keys=("temperature",),
-        envelope_bytes=4 << 30, resource_requests=dict(requests), resource_env=dict(env),
+        resource_requests={"workers": 1},
     )
     from xrd_tools.reduction import average as average_module
     from xrd_tools.sources import selection
@@ -465,32 +1185,20 @@ def test_average_private_request_builds_recipe_and_enumerates_only_on_worker(
     monkeypatch.setattr(adapter, "detector_calibration_to_integrator", reconstruct,
                         raising=False)
     monkeypatch.setattr(adapter, "AverageScanRecipe", Recipe)
-    monkeypatch.setattr(adapter, "run_average_scan", run)
+    monkeypatch.setattr(adapter, "AverageScanRunner", _runner_from_callable(run))
     slot = OperationSlot()
-    mutable_options["files"].armed = True
     identity = slot.begin_average(
-        source, target, reduction, entry="entry", source_base=source_base,
-        output_mode="Overwrite", live_mode=True, save_xye=True, batch_mode=True,
-        poni_file=poni_path, mask_file=mask_path, background=background,
+        configuration, target, entry="entry",
         numeric_metadata_keys=("I0",), invariant_metadata_keys=("temperature",),
-        envelope_bytes=4 << 30, resource_requests=requests, resource_env=env,
         stamp=OperationContextStamp(0),
     )
     assert identity is not None and entered.wait(5)
     assert type(slot._frozen).__name__ == "_AverageRequest"
     assert tuple(item.name for item in fields(type(slot._frozen))) == (
-        "source_syntax", "target", "target_was_path", "entry", "source_base",
-        "source_base_was_path", "output_mode", "live_mode", "save_xye",
-        "batch_mode", "reduction_syntax", "poni_file", "mask_file",
-        "background_syntax", "numeric_metadata_keys", "invariant_metadata_keys",
-        "envelope_bytes", "resource_requests", "resource_env",
+        "configuration", "target", "entry", "numeric_metadata_keys",
+        "invariant_metadata_keys",
     )
-    assert slot._frozen.source_syntax == (
-        str(source.uri), True, source.kind.value, None, False, source.entry,
-        str(source.options["selected_file"]), "scan_*.tif", "scan", None,
-        None, None, None, None, None, None,
-    )
-    assert len(slot._frozen.source_syntax) == 16
+    assert slot._frozen.configuration is configuration
     assert calls == [("assets", calls[0][1], poni_path, mask_path)]
     assert calls[0][1].startswith("scattering-operation-")
     assert effects == []
@@ -498,7 +1206,6 @@ def test_average_private_request_builds_recipe_and_enumerates_only_on_worker(
     reduction_extra["nested"][1]["value"] = 99
     reduction_extra["enabled_modes_1d"].append("chi")
     reduction.integration_1d.npt = 99
-    requests["workers"] = 8; env["OMP_NUM_THREADS"] = "8"
     cancel_event = slot._cancel_event; release.set()
     update = _join(slot, identity)
     assert update.terminal.status is OperationTerminalStatus.RETURNED
@@ -582,10 +1289,14 @@ def test_average_private_request_builds_recipe_and_enumerates_only_on_worker(
             patch.setattr(calibration_module, "detector_calibration_to_integrator", row_reconstruct)
             patch.setattr(adapter, "detector_calibration_to_integrator", row_reconstruct, raising=False)
             patch.setattr(adapter, "AverageScanRecipe", lambda *_a, **_k: pytest.fail("recipe constructed after refusal"))
-            patch.setattr(adapter, "run_average_scan", lambda *_a, **_k: pytest.fail("runner reached after refusal"))
+            patch.setattr(adapter, "AverageScanRunner", lambda *_a, **_k: pytest.fail("runner reached after refusal"))
             refused = OperationSlot(); refused_identity = refused.begin_average(
-                source_copy, target, reduction_copy, poni_file=requested_poni,
-                mask_file=requested_mask, stamp=OperationContextStamp(0))
+                _configuration(
+                    source_copy, reduction_copy, poni_file=requested_poni,
+                    mask_file=requested_mask,
+                ),
+                target, stamp=OperationContextStamp(0),
+            )
             assert refused_identity is not None
             refused_update = _join(refused, refused_identity)
         assert refused_update.terminal.status is OperationTerminalStatus.FAILED
@@ -594,11 +1305,28 @@ def test_average_private_request_builds_recipe_and_enumerates_only_on_worker(
         assert target_bytes() == target_before
     from xrd_tools.sources import DirectorySourceSpec
     directory = OperationSlot(); before = (tuple(calls), tuple(effects), target_bytes())
-    assert directory.begin_average(
-        DirectorySourceSpec(tmp_path), target, reduction_copy,
-        poni_file=poni_path, mask_file=mask_path, stamp=OperationContextStamp(0),
-    ) is None
-    assert (directory._identity, directory._worker, directory._frozen) == (None, None, None)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            output_preflight,
+            "_load_scientific_assets",
+            lambda *_args, **_kwargs: replace(
+                assets,
+                poni_values=None,
+                mask_dtype=None,
+                mask_shape=None,
+                mask_bytes=None,
+                poni_sha256=None,
+                mask_sha256=None,
+                poni_detector_config_json=None,
+            ),
+        )
+        directory_identity = directory.begin_average(
+            _configuration(DirectorySourceSpec(tmp_path), reduction_copy), target,
+            stamp=OperationContextStamp(0),
+        )
+        assert directory_identity is not None
+        directory_update = _join(directory, directory_identity)
+    assert directory_update.terminal.status is OperationTerminalStatus.FAILED
     assert (tuple(calls), tuple(effects), target_bytes()) == before
 
 
@@ -607,9 +1335,8 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
 ) -> None:
     from xrd_tools.io import get_average_finite_counts
     from xrd_tools.io.output_transaction import OutputTransaction
-    from xrd_tools.reduction import average as average_module
     _stub_integrators(monkeypatch)
-    real_run = average_module.run_average_scan
+    real_run = _run_terminal_average
 
     def exercise(name, *, cancel_first=False, throw=False):
         root = tmp_path / name; source = _source(root)
@@ -649,14 +1376,14 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
             return real_run(recipe, **{**kwargs, "progress_cb": held_progress,
                                        "publication_gate": held_gate})
         with monkeypatch.context() as patch:
-            patch.setattr(adapter, "run_average_scan", run)
+            patch.setattr(adapter, "AverageScanRunner", _runner_from_callable(run))
             patch.setattr(OutputTransaction, "commit_stream", commit)
             patch.setattr(OperationSlot, "_run_average_request", body)
             slot = OperationSlot()
             identity = slot.begin_average(
-                source, target, ReductionPlan(
+                _configuration(source, ReductionPlan(
                     integration_1d=Integration1DPlan(npt=3),
-                ), stamp=OperationContextStamp(0),
+                )), target, stamp=OperationContextStamp(0),
             )
             assert identity is not None and progress_waiting.wait(5)
             assert not slot._cancel_sealed; progress_release.set()
@@ -706,7 +1433,6 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
 def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) -> None:
     from xrd_tools.core.provenance import read_provenance
     from xrd_tools.io import get_1d, get_2d, get_average_finite_counts, get_metadata
-    from xrd_tools.reduction import AverageScanRecipe, run_average_scan
     from xrd_tools.reduction import average as average_module
     calls = _stub_integrators(monkeypatch)
     root = tmp_path / "parity"; source = _source(root)
@@ -725,13 +1451,14 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
         ),
     )
     direct_target = root / "direct.nxs"; gui_target = root / "gui.nxs"
-    direct = run_average_scan(AverageScanRecipe(
+    direct = _run_terminal_average(AverageScanRecipe(
         source, direct_target, reduction, numeric_metadata_keys=("I0",),
     ))
     assert direct.disposition == "COMMITTED"
     slot = OperationSlot()
     identity = slot.begin_average(
-        source, gui_target, reduction, numeric_metadata_keys=("I0",),
+        _configuration(source, reduction), gui_target,
+        numeric_metadata_keys=("I0",),
         stamp=OperationContextStamp(0),
     )
     assert identity is not None
@@ -786,16 +1513,17 @@ def test_average_stop_stale_close_and_single_slot_truth(tmp_path, monkeypatch) -
         entered.set(); release.wait(2)
         return _result("CANCELLED" if cancel_token.is_set() else "REFUSED")
 
-    monkeypatch.setattr(adapter, "run_average_scan", run)
+    monkeypatch.setattr(adapter, "AverageScanRunner", _runner_from_callable(run))
     slot = OperationSlot()
     source = _source(tmp_path)
+    configuration = _configuration(source)
     identity = slot.begin_average(
-        source, tmp_path / "one.nxs", ReductionPlan(),
+        configuration, tmp_path / "one.nxs",
         stamp=OperationContextStamp(1, "context", 2),
     )
     assert identity is not None and entered.wait(2)
     assert slot.begin_average(
-        source, tmp_path / "two.nxs", ReductionPlan(),
+        configuration, tmp_path / "two.nxs",
         stamp=OperationContextStamp(1, "context", 2),
     ) is None
     slot.observe_stamp(OperationContextStamp(2, "context", 2))
@@ -817,26 +1545,16 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
 ) -> None:
     from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
     from xdart.gui.tabs.scattering.operation_values import OperationUpdate
-    from xrd_tools.reduction import run_average_scan
     source = _source(tmp_path / "source")
     target = tmp_path / "committed.nxs"; reduction = ReductionPlan(integration_1d=Integration1DPlan(npt=3))
     _stub_integrators(monkeypatch)
-    committed = run_average_scan(AverageScanRecipe(source, target, reduction))
+    committed = _run_terminal_average(AverageScanRecipe(source, target, reduction))
     assert committed.disposition == "COMMITTED"
     base = _result("REFUSED", str(target.resolve()))
-    source_pending = replace(base, disposition="SETTLEMENT_PENDING",
-        diagnostic_code="AVERAGE_SOURCE_CLEANUP_PENDING",
-        diagnostic="AVERAGE_SOURCE_CLEANUP_PENDING")
-    h23_pending = replace(base, disposition="SETTLEMENT_PENDING",
-        diagnostic_code="AVERAGE_H23_SETTLEMENT_PENDING",
-        diagnostic="AVERAGE_H23_SETTLEMENT_PENDING", h23_phase="ready-to-retry")
-    assert source_pending.h23_phase is None and h23_pending.h23_phase == "ready-to-retry"
     malformed_rows = (
         (committed, {"committed_labels": ()}), (committed, {"finite_counts": None}),
         (committed, {"h23_phase": None}), (committed, {"commit_identity": None}),
         (committed, {"contributor_extent": 1}), (base, {"finite_counts": committed.finite_counts}),
-        (source_pending, {"h23_phase": "ready-to-retry"}),
-        (h23_pending, {"diagnostic_code": "WRONG", "diagnostic": "WRONG"}),
         (base, {"logical_labels": ()}), (base, {"logical_labels": (True,)}), (committed, {"committed_labels": (True,)}),
         (base, {"metadata_denominators": (("", 0),)}),
     )
@@ -845,9 +1563,15 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
 
     def scheduled(result, *, verification=None):
         with monkeypatch.context() as patch:
-            patch.setattr(adapter, "run_average_scan", lambda *_a, **_k: result)
+            patch.setattr(
+                adapter, "AverageScanRunner",
+                _runner_from_callable(lambda *_a, **_k: result),
+            )
             slot = OperationSlot()
-            identity = slot.begin_average(source, target, reduction, stamp=OperationContextStamp(0))
+            identity = slot.begin_average(
+                _configuration(source, reduction), target,
+                stamp=OperationContextStamp(0),
+            )
             assert identity is not None
             update = _join(slot, identity)
         expected_status = {"COMMITTED": OperationTerminalStatus.RETURNED,
@@ -958,14 +1682,20 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
     monkeypatch.setattr(execution_graph._AverageSourceReadWindow, "close", held_close)
     pending_source = _source(tmp_path / "pending-source")
     slot = OperationSlot(); pending_identity = slot.begin_average(
-        pending_source, tmp_path / "pending.nxs", reduction,
+        _configuration(pending_source, reduction), tmp_path / "pending.nxs",
         stamp=OperationContextStamp(0),
     )
     assert pending_identity is not None and entered.wait(5)
-    pending = slot.poll(pending_identity)
+    pending_update = _wait_update(
+        slot, pending_identity, lambda value: value.pending is not None,
+    )
+    pending = pending_update.pending
     assert slot._worker is not None and slot._worker.is_alive()
-    assert pending is None or pending.terminal is None
-    release.set(); terminal = _join(slot, pending_identity)
+    assert type(pending) is OperationPending
+    assert pending.phase == "source-cleanup"
+    release.set()
+    assert slot.retry_average(pending_identity, pending)
+    terminal = _join(slot, pending_identity)
     assert terminal.terminal.payload.disposition == "COMMITTED"
     page.close_workspace(); page.deleteLater(); qapp.processEvents()
 

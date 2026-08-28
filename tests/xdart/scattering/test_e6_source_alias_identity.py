@@ -1374,11 +1374,14 @@ def test_average_lineage_and_provenance_match_exact_ordinary_projections(
     monkeypatch.setattr(average_module, "NexusSink", sink)
     monkeypatch.setattr(reduction_core, "integrate_1d", lambda _image, _ai, *, npt, **_k:
         IntegrationResult1D(np.arange(npt, dtype=float), np.ones(npt), None, "q_A^-1"))
-    result = average_module.run_average_scan(AverageScanRecipe(
+    runner = average_module.AverageScanRunner(AverageScanRecipe(
         graph.execution_source, target,
         ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
         numeric_metadata_keys=("I0",),
     ))
+    result = runner.start()
+    assert type(result) is average_module.AverageScanResult
+    assert runner.close() is result
     assert result.disposition == "COMMITTED"
     expected_execution = source_execution_projection(prepared)
     expected_snapshots = source_snapshots_projection(prepared, writer=True)

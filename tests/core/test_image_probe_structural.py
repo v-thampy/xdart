@@ -16,6 +16,17 @@ from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources import registry as _registered_source_registry
 
 
+def _prepare_average_scan(module, recipe):
+    runner = module.AverageScanRunner(recipe)
+    runner._execute_graph = lambda _graph: runner.plan
+    value = runner.start()
+    if type(value) is module.AverageScanResult:
+        raise ValueError(value.diagnostic or value.diagnostic_code)
+    assert type(value) is module.AverageScanPlan
+    runner.close()
+    return value
+
+
 def _probe(path: Path):
     # Importing registry installs the built-in adapters; keep that bootstrap
     # explicit in this narrowly focused adapter test.
@@ -454,14 +465,13 @@ def test_tiff_layout_is_header_only_and_precedes_exact_allocation(
         execution_graph._AverageSourceReadWindow, "read_native",
         lambda *_a, **_k: pytest.fail("detector pixel read during preparation"),
     )
-    plan = average.prepare_average_scan(AverageScanRecipe(
+    plan = _prepare_average_scan(average, AverageScanRecipe(
         image_series_spec(members[0], metadata_format=None),
         tmp_path / "average.nxs", ReductionPlan(),
     ))
     assert plan.detector_shape == (5, 6) and plan.native_dtype == "<u2"
     kinds = [item[0] for item in events]
     assert [item for item in events if item[0] == "layout"] == [
-        ("layout", "scan_0001.tif"), ("layout", "scan_0002.tif"),
         ("layout", "scan_0001.tif"), ("layout", "scan_0002.tif"),
         ("layout", "scan_0001.tif"), ("layout", "scan_0002.tif"),
     ]
@@ -473,7 +483,7 @@ def test_tiff_layout_is_header_only_and_precedes_exact_allocation(
     tifffile.imwrite(members[1], np.zeros((4, 6), dtype=np.uint16))
     events.clear()
     with pytest.raises(ValueError, match="layout|shape"):
-        average.prepare_average_scan(AverageScanRecipe(
+        _prepare_average_scan(average, AverageScanRecipe(
             image_series_spec(members[0], metadata_format=None),
             tmp_path / "mismatch.nxs", ReductionPlan(),
         ))
@@ -482,7 +492,7 @@ def test_tiff_layout_is_header_only_and_precedes_exact_allocation(
     tifffile.imwrite(members[1], np.zeros((5, 6), dtype=np.float32))
     events.clear()
     with pytest.raises(ValueError, match="layout|dtype"):
-        average.prepare_average_scan(AverageScanRecipe(
+        _prepare_average_scan(average, AverageScanRecipe(
             image_series_spec(members[0], metadata_format=None),
             tmp_path / "dtype-mismatch.nxs", ReductionPlan(),
         ))
@@ -494,7 +504,7 @@ def test_tiff_layout_is_header_only_and_precedes_exact_allocation(
     tifffile.imwrite(multipage, np.ones((5, 6), dtype=np.uint16), append=True)
     events.clear()
     with pytest.raises(ValueError, match="one frame|frame count"):
-        average.prepare_average_scan(AverageScanRecipe(
+        _prepare_average_scan(average, AverageScanRecipe(
             image_series_spec(multipage, metadata_format=None),
             tmp_path / "multipage.nxs", ReductionPlan(),
         ))

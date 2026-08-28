@@ -63,6 +63,24 @@ class OperationProgress:
             "operation progress is invalid",
         )
         self.identity.__post_init__()
+
+
+@dataclass(frozen=True, slots=True)
+class OperationPending:
+    identity: OperationIdentity
+    revision: int
+    phase: str
+    diagnostic: str
+
+    def __post_init__(self) -> None:
+        _invalid(
+            type(self.identity) is not OperationIdentity
+            or type(self.revision) is not int or self.revision < 1
+            or type(self.phase) is not str or not self.phase
+            or type(self.diagnostic) is not str or not self.diagnostic,
+            "operation pending value is invalid",
+        )
+        self.identity.__post_init__()
 class OperationTerminalStatus(str, Enum):
     RETURNED = "returned"
     CANCELLED = "cancelled"
@@ -95,19 +113,29 @@ class OperationTerminal:
 class OperationUpdate:
     identity: OperationIdentity
     progress: OperationProgress | None = None
+    pending: OperationPending | None = None
     terminal: OperationTerminal | None = None
     stale: bool = False
 
     def __post_init__(self) -> None:
         _invalid(
             type(self.identity) is not OperationIdentity
-            or (self.progress is None and self.terminal is None)
+            or (self.progress is None and self.pending is None
+                and self.terminal is None)
+            or (self.pending is not None and self.terminal is not None)
             or type(self.stale) is not bool
             or (
                 self.progress is not None
                 and (
                     type(self.progress) is not OperationProgress
                     or self.progress.identity is not self.identity
+                )
+            )
+            or (
+                self.pending is not None
+                and (
+                    type(self.pending) is not OperationPending
+                    or self.pending.identity is not self.identity
                 )
             )
             or (
@@ -122,6 +150,8 @@ class OperationUpdate:
         self.identity.__post_init__()
         if self.progress is not None:
             self.progress.__post_init__()
+        if self.pending is not None:
+            self.pending.__post_init__()
         if self.terminal is not None:
             self.terminal.__post_init__()
 @dataclass(frozen=True, slots=True)
@@ -182,6 +212,6 @@ class OperationCleanupReceipt:
             self.terminal.__post_init__()
 __all__ = [
     "OperationCleanupReceipt", "OperationContextStamp", "OperationIdentity",
-    "OperationProgress", "OperationTerminal", "OperationTerminalStatus",
+    "OperationPending", "OperationProgress", "OperationTerminal", "OperationTerminalStatus",
     "OperationUpdate",
 ]

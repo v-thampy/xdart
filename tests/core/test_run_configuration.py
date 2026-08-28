@@ -665,13 +665,13 @@ def test_nonaverage_paths_have_zero_average_reachability_and_allocations(tmp_pat
     def forbidden(*_a, _name="average", **_k):
         hits.append(_name); raise AssertionError(f"ordinary path reached {_name}")
     for owner, names in (
-        (average, ("AverageScanRecipe", "prepare_average_scan", "run_average_scan",
-                   "AverageScanRunner", "requirements_from", "resolve_session_policy")),
+        (average, ("AverageScanRecipe", "AverageScanRunner",
+                   "requirements_from", "resolve_session_policy")),
         (execution_graph, ("read_detector_image_layout",)),
         (read_module, ("get_average_finite_counts",)),
         (nexus_record, ("write_average_finite_counts",)),
         (record_writer, ("write_average_finite_counts",)),
-        (external_operation, ("AverageScanRecipe", "run_average_scan")),
+        (external_operation, ("AverageScanRecipe", "AverageScanRunner")),
     ):
         for name in names:
             monkeypatch.setattr(owner, name, lambda *a, _name=name, **k:
@@ -713,8 +713,10 @@ def test_average_import_owner_and_alternate_writer_census():
     import ast, subprocess
     from xrd_tools.io import record_writer
     from xrd_tools.reduction import average
-    public = {"AverageScanRecipe", "AverageScanPlan", "AverageScanProgress", "AverageScanResult", "AverageScanRunner", "AverageContributor", "AverageFiniteCounts", "AverageFiniteCountsEvidence"}; functions = {"prepare_average_scan", "run_average_scan", "iter_average_contributors"}
+    public = {"AverageCommand", "AveragePendingPhase", "AverageRunnerPhase", "AverageScanPending", "AverageScanRecipe", "AverageScanPlan", "AverageScanProgress", "AverageScanResult", "AverageScanRunner", "AverageContributor", "AverageFiniteCounts", "AverageFiniteCountsEvidence"}; functions = {"iter_average_contributors"}
     assert public | functions <= set(vars(average)) and all(getattr(average, name).__module__ == average.__name__ for name in public)
+    assert "AverageCleanupRequired" not in vars(average)
+    assert "prepare_average_scan" not in vars(average)
     assert "average_finite_counts" not in record_writer.RecordWrite.__dataclass_fields__ and "average_finite_counts" in record_writer.WriterFinalization.__dataclass_fields__
     average_path = Path(average.__file__); root = average_path.parents[2]
     probe = subprocess.run([sys.executable, "-c", "import xdart.gui.tabs.scattering.page, xdart.gui.tabs.scattering.adapters.run_executor, xdart.gui.tabs.scattering.adapters.browse_loader, sys; assert 'xrd_tools.reduction.average' not in sys.modules"], cwd=root, check=False)
@@ -732,8 +734,8 @@ def test_average_import_owner_and_alternate_writer_census():
     read_path, nexus_path = root / "xrd_tools/io/read.py", root / "xrd_tools/io/nexus_record.py"; writer_path = root / "xrd_tools/io/record_writer.py"; request_path = root / "xdart/gui/tabs/scattering/adapters/external_operation.py"; run_path = root / "xdart/gui/tabs/scattering/adapters/run_executor.py"; graph_path = root / "xrd_tools/sources/execution_graph.py"
     assert owners["get_average_finite_counts"] == [read_path] and owners["write_average_finite_counts"] == [nexus_path]
     assert [(path, scope) for path, scope, name in edges if name == "write_average_finite_counts"] == [(writer_path, "_write_finalization")] and owners["_AverageRequest"] == [request_path]
-    assert calls["prepare_average_scan"] == [average_path] and calls["run_average_scan"] == [request_path] and calls["AverageScanRunner"] == [average_path] and calls["NexusSink"].count(average_path) == 1 and average_path not in calls.get("NexusRecordWriter", ()) and average_path not in calls.get("OutputTransaction", ())
-    run_scope = next(scope for path, scope, name in edges if path == request_path and name == "run_average_scan")
+    assert calls.get("prepare_average_scan", ()) == () and calls["AverageScanRunner"] == [request_path] and calls["NexusSink"].count(average_path) == 1 and average_path not in calls.get("NexusRecordWriter", ()) and average_path not in calls.get("OutputTransaction", ())
+    run_scope = next(scope for path, scope, name in edges if path == request_path and name == "AverageScanRunner")
     assert "average" in run_scope.lower() and sum(path == request_path and scope == run_scope and name == "_seal_publication" for path, scope, name in edges) == 1
     page_path = root / "xdart/gui/tabs/scattering/page.py"
     page_edges = [(scope, name) for path, scope, name in edges if path == page_path and name == "begin_average"]

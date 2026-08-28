@@ -5,6 +5,17 @@ from __future__ import annotations
 import pytest
 
 
+def _prepare_average_scan(module, recipe):
+    runner = module.AverageScanRunner(recipe)
+    runner._execute_graph = lambda _graph: runner.plan
+    value = runner.start()
+    if type(value) is module.AverageScanResult:
+        raise ValueError(value.diagnostic or value.diagnostic_code)
+    assert type(value) is module.AverageScanPlan
+    runner.close()
+    return value
+
+
 def test_w1_policy_and_source_binding_are_exact_owner_identity_contracts() -> None:
     from dataclasses import replace
     from types import SimpleNamespace
@@ -126,6 +137,399 @@ def test_external_link_direct_chunks_decode_tail_and_stay_detached_in_cursor_ord
     assert frames[-1][0, 0] == 65535
     assert not any(thread.name.startswith("xrd-tools-eiger-decode")
                    for thread in live_threads())
+
+
+def test_average_window_uses_exact_direct_grant_and_matches_conventional_frames(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+    import hdf5plugin
+    import numpy as np
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.reduction import AverageScanRecipe, ReductionPlan
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.sources.execution_graph import (
+        open_source_execution_graph, qualify_source_execution_graph,
+    )
+    from xrd_tools.sources.cursor import ContainerCursor
+    from threading import enumerate as live_threads
+
+    expected = np.stack([
+        np.full((17, 17), value, dtype=np.uint16) for value in (3, 7, 11)
+    ])
+    data_path = tmp_path / "average_data_000001.h5"
+    with h5py.File(data_path, "w") as handle:
+        handle.create_dataset(
+            "data", data=expected, chunks=(1, 17, 17),
+            **hdf5plugin.Bitshuffle(cname="lz4"),
+        )
+    master = tmp_path / "average_master.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data["data_000001"] = h5py.ExternalLink(data_path.name, "/data")
+
+    source = SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry")
+    recipe = AverageScanRecipe(source, tmp_path / "average.nxs", ReductionPlan())
+    plan = _prepare_average_scan(average_module, recipe)
+    assert plan.direct_eiger_eligible
+    graph = qualify_source_execution_graph(
+        source, reader_binding="average_closed_v1",
+    )
+    policy = average_module._average_direct_chunk_policy(plan, graph)
+    native_bytes = expected[0].nbytes
+    conventional = average_module._conventional_owner_block_bytes((17, 17))
+    quantum = 8 * 17 * 17
+    assert plan.allocation.owner_block_bytes == (
+        (conventional + native_bytes + quantum - 1) // quantum * quantum
+    )
+    assert plan.allocation.owner_block_bytes >= conventional + native_bytes
+    assert policy.enabled and policy.workspace_bytes == 2 * native_bytes
+    assert policy.owner_grant_bytes == 2 * native_bytes
+
+    with open_source_execution_graph(graph) as conventional:
+        conventional_frames = [
+            conventional.read_native(index).copy() for index in range(len(expected))
+        ]
+    original_close = ContainerCursor.close
+    close_observations = []
+    def checked_close(cursor):
+        close_observations.append(not any(
+            thread.name.startswith("xrd-tools-eiger-decode")
+            for thread in live_threads()
+        ))
+        return original_close(cursor)
+    monkeypatch.setattr(ContainerCursor, "close", checked_close)
+    with open_source_execution_graph(
+        graph, direct_chunk_policy=policy,
+    ) as direct:
+        direct_frames = [
+            direct.read_native(index).copy() for index in range(len(expected))
+        ]
+        fact = direct.direct_chunk_fact
+    assert [value.tobytes() for value in direct_frames] == [
+        value.tobytes() for value in conventional_frames
+    ] == [value.tobytes() for value in expected]
+    assert fact.selected and fact.direct_frames == len(expected)
+    assert fact.fallback_frames == 0
+    assert close_observations == [True]
+
+
+def test_average_direct_iterator_cancellation_is_terminal_cancelled(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Event
+    import h5py
+    import hdf5plugin
+    import numpy as np
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.reduction import AverageScanRecipe, ReductionPlan
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    master = tmp_path / "cancel_master.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("data").create_dataset(
+            "data_000001", data=np.ones((1, 17, 17), dtype="u2"),
+            chunks=(1, 17, 17), **hdf5plugin.Bitshuffle(cname="lz4"),
+        )
+    cancelled = Event()
+
+    def stop_during_decode(*_args, **_kwargs):
+        cancelled.set()
+        if False:
+            yield None
+
+    monkeypatch.setattr(
+        ContainerCursor, "iter_eiger_direct_blocks", stop_during_decode,
+    )
+    runner = average_module.AverageScanRunner(AverageScanRecipe(
+        SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry"),
+        tmp_path / "cancelled.nxs", ReductionPlan(),
+    ))
+    result = runner.start(cancel_token=cancelled)
+    assert type(result) is average_module.AverageScanResult
+    assert (result.disposition, result.diagnostic_code) == (
+        "CANCELLED", "AVERAGE_CANCELLED",
+    )
+    assert runner.close() is result
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "cursor_pending"),
+    (("fail-once", False), ("permanent", True)),
+)
+def test_average_direct_shutdown_failure_is_terminal_not_retryable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str, cursor_pending: bool,
+) -> None:
+    import h5py
+    import hdf5plugin
+    import numpy as np
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.reduction import AverageScanRecipe, ReductionPlan
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.sources.cursor import ContainerCursor, ReadBlock
+
+    master = tmp_path / f"shutdown_{failure_mode.replace('-', '_')}_master.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("data").create_dataset(
+            "data_000001", data=np.ones((1, 17, 17), dtype="u2"),
+            chunks=(1, 17, 17), **hdf5plugin.Bitshuffle(cname="lz4"),
+        )
+    target = tmp_path / f"shutdown-{failure_mode}.nxs"
+    iterator_close_calls = []
+    cursors = []
+
+    class FailingCloseIterator:
+        def __init__(self, cursor, state):
+            self.cursor = cursor
+            self.index = 0
+            state.select()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= self.cursor.descriptor.frame_count:
+                raise StopIteration
+            index = self.index
+            self.index += 1
+            return ReadBlock(
+                index, index + 1,
+                self.cursor.read_frame(index)[np.newaxis, ...],
+            )
+
+        def close(self):
+            iterator_close_calls.append(self)
+            if failure_mode == "permanent" or len(iterator_close_calls) == 1:
+                raise OSError(f"{failure_mode} decoder shutdown")
+
+    def failing_iterator(cursor, _plan, _policy, *, cancelled, state):
+        del cancelled
+        cursors.append(cursor)
+        return FailingCloseIterator(cursor, state)
+
+    monkeypatch.setattr(
+        ContainerCursor, "iter_eiger_direct_blocks", failing_iterator,
+    )
+    cursor_close_calls = []
+    real_cursor_close = ContainerCursor.close
+    if cursor_pending:
+        def cursor_close(cursor):
+            if cursor not in cursors:
+                return real_cursor_close(cursor)
+            cursor_close_calls.append(cursor)
+            if len(cursor_close_calls) == 1:
+                raise OSError("cursor close pending")
+            return real_cursor_close(cursor)
+
+        monkeypatch.setattr(ContainerCursor, "close", cursor_close)
+    runner = average_module.AverageScanRunner(AverageScanRecipe(
+        SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry"),
+        target, ReductionPlan(),
+    ))
+    outcome = runner.start()
+    assert runner.plan is not None, outcome
+    assert runner.plan.direct_eiger_eligible
+    if cursor_pending:
+        assert type(outcome) is average_module.AverageScanPending
+        assert outcome.phase is average_module.AveragePendingPhase.SOURCE_CLEANUP
+        result = runner.command(average_module.AverageCommand.RETRY, outcome)
+        assert len(cursor_close_calls) == 2
+    else:
+        result = outcome
+    assert (result.disposition, result.diagnostic_code) == (
+        "REFUSED", "AVERAGE_SOURCE_CLEANUP_FAILED",
+    )
+    assert type(result) is average_module.AverageScanResult
+    assert len(iterator_close_calls) == 1 and runner.pending is None
+    assert len(cursors) == 1 and cursors[0].closed
+    assert runner.close() is result
+    assert not target.exists()
+
+
+def test_average_window_direct_layout_refusal_falls_back_once(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+    import hdf5plugin
+    import numpy as np
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.io.nexus import NexusImageStack
+    from xrd_tools.reduction import AverageScanRecipe, ReductionPlan
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.sources.execution_graph import (
+        open_source_execution_graph, qualify_source_execution_graph,
+    )
+
+    expected = np.stack([
+        np.full((2, 2), value, dtype=np.uint16) for value in (5, 9)
+    ])
+    master = tmp_path / "fallback_master.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("data").create_dataset(
+            "data_000001", data=expected, chunks=(1, 2, 2),
+            **hdf5plugin.Bitshuffle(cname="lz4"),
+        )
+    source = SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry")
+    plan = _prepare_average_scan(average_module, AverageScanRecipe(
+        source, tmp_path / "fallback.nxs", ReductionPlan(),
+    ))
+    graph = qualify_source_execution_graph(
+        source, reader_binding="average_closed_v1",
+    )
+    policy = average_module._average_direct_chunk_policy(plan, graph)
+    assert plan.direct_eiger_eligible and policy is not None
+    calls = []
+    monkeypatch.setattr(
+        NexusImageStack, "eiger_direct_chunk_layout",
+        lambda _self: (calls.append(True) or (None, "synthetic layout refusal")),
+    )
+    with open_source_execution_graph(
+        graph, direct_chunk_policy=policy,
+    ) as window:
+        frames = [window.read_native(index).copy() for index in range(len(expected))]
+        fact = window.direct_chunk_fact
+    assert len(calls) == 1
+    assert [value.tobytes() for value in frames] == [
+        value.tobytes() for value in expected
+    ]
+    assert not fact.selected and fact.direct_frames == 0
+    assert fact.fallback_frames == len(expected)
+    assert fact.reason == "synthetic layout refusal"
+
+
+def test_average_provenance_records_terminal_direct_and_fallback_counts(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+    import hdf5plugin
+    import numpy as np
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.provenance import read_provenance
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.io.nexus import NexusImageStack
+    from xrd_tools.reduction import (
+        AverageScanRecipe, AverageScanResult, AverageScanRunner, ReductionPlan,
+    )
+    from xrd_tools.reduction import core as reduction_core
+
+    expected = np.stack([
+        np.full((17, 17), value, dtype=np.uint16) for value in (5, 9)
+    ])
+    data_path = tmp_path / "provenance_data_000001.h5"
+    with h5py.File(data_path, "w") as handle:
+        handle.create_dataset(
+            "data", data=expected, chunks=(1, 17, 17),
+            **hdf5plugin.Bitshuffle(cname="lz4"),
+        )
+    master = tmp_path / "provenance_master.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("data")["data_000001"] = h5py.ExternalLink(
+            data_path.name, "/data",
+        )
+
+    real_read = NexusImageStack.read_eiger_direct_chunk
+
+    def one_runtime_fallback(stack, index, cap):
+        if index == 1:
+            return None, "synthetic runtime fallback"
+        return real_read(stack, index, cap)
+
+    monkeypatch.setattr(
+        NexusImageStack, "read_eiger_direct_chunk", one_runtime_fallback,
+    )
+    monkeypatch.setattr(
+        reduction_core, "integrate_1d",
+        lambda image, _integrator, *, npt, **_kwargs: IntegrationResult1D(
+            np.arange(npt, dtype=float),
+            np.full(npt, float(np.nanmean(image))), None, "q_A^-1",
+        ),
+    )
+    target = tmp_path / "average.nxs"
+    runner = AverageScanRunner(AverageScanRecipe(
+        SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry"),
+        target, ReductionPlan(),
+    ))
+    result = runner.start()
+    assert type(result) is AverageScanResult
+    assert result.disposition == "COMMITTED", (
+        result.diagnostic_code, result.diagnostic,
+    )
+    assert runner.plan.direct_eiger_eligible
+    assert runner.close() is result
+
+    persisted = read_provenance(target)["config"]["average_scan_v1"]
+    assert persisted["direct_eiger_eligible"] is True
+    fact = persisted["direct_eiger_execution"]
+    assert fact == {
+        "source": str(master.resolve()),
+        "selected": True,
+        "reason": "selected; frame fallback: synthetic runtime fallback",
+        "workers": 1,
+        "owner_grant_bytes": 2 * expected[0].nbytes,
+        "workspace_bytes": 2 * expected[0].nbytes,
+        "direct_frames": 1,
+        "fallback_frames": 1,
+        "compressed_high_water_bytes": fact["compressed_high_water_bytes"],
+    }
+    assert 0 < fact["compressed_high_water_bytes"] <= expected[0].nbytes
+
+
+def test_average_plan_qualifies_layout_before_direct_grant(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+    import numpy as np
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.io.nexus import NexusImageStack
+    from xrd_tools.reduction import AverageScanRecipe, ReductionPlan
+    from xrd_tools.reduction import average as average_module
+    from xrd_tools.sources.execution_graph import qualify_source_execution_graph
+
+    expected = np.stack([
+        np.full((2, 2), value, dtype=np.uint16) for value in (5, 9)
+    ])
+    master = tmp_path / "conventional_master.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("data").create_dataset(
+            "data_000001", data=expected, chunks=(1, 2, 2),
+        )
+    source = SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry")
+    calls = []
+    real_layout = NexusImageStack.eiger_direct_chunk_layout
+
+    def observed_layout(owner):
+        calls.append(True)
+        return real_layout(owner)
+
+    monkeypatch.setattr(
+        NexusImageStack, "eiger_direct_chunk_layout", observed_layout,
+    )
+    plan = _prepare_average_scan(average_module, AverageScanRecipe(
+        source, tmp_path / "conventional.nxs", ReductionPlan(),
+    ))
+    graph = qualify_source_execution_graph(
+        source, reader_binding="average_closed_v1",
+    )
+    assert calls == [True]
+    assert not plan.direct_eiger_eligible
+    assert plan.allocation.owner_block_bytes == (
+        average_module._conventional_owner_block_bytes((2, 2))
+    )
+    assert average_module._average_direct_chunk_policy(plan, graph) is None
 
 
 def test_missing_imagecodecs_refuses_direct_decode_and_uses_conventional_blocks(

@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib, json, math, os
 from pathlib import Path
-import time
+import threading, time
 from typing import Any, Callable
 import h5py
 import numpy as np
@@ -14,6 +14,87 @@ from xrd_tools.io.append import (
 from xrd_tools.io.image import read_detector_image_layout
 from xrd_tools.sources.descriptor import ContainerDescriptor, describe_container_from_open
 class SourceRevisionChanged(ValueError): pass
+
+
+class SourceCleanupPending(RuntimeError):
+    """One exact source owner needs another creating-thread close command."""
+
+    def __init__(self, owner: object, diagnostic: str) -> None:
+        super().__init__(diagnostic)
+        self.owner = owner
+        self.diagnostic = diagnostic
+
+
+class SourceCleanupFailed(RuntimeError):
+    """A source sub-owner finalized but reported a non-retryable failure."""
+
+
+class _QualificationCleanupOwner:
+    """Retain one qualification handle graph across explicit close commands."""
+
+    def __init__(self, handle: Any, slot: Any, completion: Callable[[], Any]) -> None:
+        self._handle = handle
+        self._slot = slot
+        self._completion = completion
+        self._completed = False
+        self._value = None
+        self._error: BaseException | None = None
+        self._thread = threading.get_ident()
+
+    @property
+    def closed(self) -> bool:
+        owner = self._slot.owner
+        return (
+            (owner is None or owner.state == "CLOSED")
+            and not self._handle.id.valid
+        )
+
+    def close(self) -> None:
+        if threading.get_ident() != self._thread:
+            raise RuntimeError("qualification cleanup is creating-thread affine")
+        owner = self._slot.owner
+        if owner is not None and owner.state != "CLOSED":
+            try:
+                owner.close()
+            except BaseException as error:
+                if owner.state != "CLOSED":
+                    raise SourceCleanupPending(
+                        self, f"AVERAGE_QUALIFICATION_CLEANUP_PENDING: {error}",
+                    ) from error
+        if owner is not None and owner.state == "CLOSED":
+            self._slot.owner = None
+        if self._handle.id.valid:
+            try:
+                self._handle.close()
+            except BaseException as error:
+                if self._handle.id.valid:
+                    raise SourceCleanupPending(
+                        self, f"AVERAGE_QUALIFICATION_CLEANUP_PENDING: {error}",
+                    ) from error
+        if not self.closed:
+            raise SourceCleanupPending(
+                self, "AVERAGE_QUALIFICATION_CLEANUP_PENDING",
+            )
+
+    def take(self) -> Any:
+        """Complete once after the exact retained handle graph is closed."""
+        if threading.get_ident() != self._thread:
+            raise RuntimeError("qualification completion is creating-thread affine")
+        if not self.closed:
+            raise SourceCleanupPending(
+                self, "AVERAGE_QUALIFICATION_CLEANUP_PENDING",
+            )
+        if not self._completed:
+            completion, self._completion = self._completion, None
+            try:
+                self._value = completion()
+            except BaseException as error:
+                self._error = error
+            finally:
+                self._completed = True
+        if self._error is not None:
+            raise self._error
+        return self._value
 @dataclass(frozen=True, slots=True)
 class SourceFileState:
     path: str; size: int; mtime_ns: int; ctime_ns: int; device: int; inode: int
@@ -292,6 +373,46 @@ def validate_source_aliases(
                     f"{binding.raw_path}"
                 )
     return stamp.execution_identity_v1, targets
+
+
+def validate_source_state_sweep(
+    stamp: SourceExecutionStamp,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    capture: Callable[[Path], SourceFileState] | None = None,
+) -> None:
+    """Perform one cheap exact-state sweep of the admitted source aliases.
+
+    Qualification owns structural discovery and graph comparison.  Once that
+    graph is fixed, Average only needs to prove that every admitted lexical
+    path still resolves to the same canonical target with the same captured
+    file revision before it can publish derived data.
+    """
+    if type(stamp) is not SourceExecutionStamp:
+        raise TypeError("source state sweep requires an execution stamp")
+    is_cancelled = (lambda: False) if cancelled is None else cancelled
+    capture = SourceFileState.capture if capture is None else capture
+    targets = stamp.canonical_targets
+    for binding in stamp.source_aliases:
+        if is_cancelled():
+            raise InterruptedError("source state sweep cancelled")
+        expected = targets[binding.target_id]
+        try:
+            current = capture(Path(binding.raw_path))
+        except OSError as error:
+            raise SourceRevisionChanged(
+                f"source alias is unavailable: {binding.raw_path}"
+            ) from error
+        if _path_key(_resolved(current)) != _path_key(binding.resolved_path):
+            raise SourceRevisionChanged(
+                f"source alias retargeted after admission: {binding.raw_path}"
+            )
+        if _revision(current) != _revision(expected.state):
+            raise SourceRevisionChanged(
+                f"source target changed after admission: {binding.resolved_path}"
+            )
+    if is_cancelled():
+        raise InterruptedError("source state sweep cancelled")
 @dataclass(frozen=True, slots=True)
 class PreparedSourceExecutionGraph:
     execution_source: SourceSpec; source_path: str; stamp: SourceExecutionStamp
@@ -455,6 +576,14 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         frame_count=len(members), first_label=1, detector_shape=detector_shape,
         native_dtype=native_dtype, members=tuple(members), admitted_motor_values=tuple(motor_rows),
         metadata_sources=tuple(metadata_sources), motor_names=names, scanned_motor_names=scanned)
+def _drain_average_qualification(
+    handle: Any, slot: Any, completion: Callable[[], Any],
+) -> Any:
+    owner = _QualificationCleanupOwner(handle, slot, completion)
+    owner.close()
+    return owner.take()
+
+
 def _drain_qualification(handle: Any, slot: Any) -> bool:
     retried = False; owner = slot.owner
     if owner is not None:
@@ -470,6 +599,8 @@ def _drain_qualification(handle: Any, slot: Any) -> bool:
         try: handle.close(); delayed = False
         except BaseException: retried = delayed = True
     return retried
+
+
 def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader_binding: str | None,
                        cancelled: Callable[[], bool] | None,
                        expected: PreparedSourceExecutionGraph | None = None) -> PreparedSourceExecutionGraph | None:
@@ -488,17 +619,17 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
         external_index = dependency_index = 0; pair: tuple[Any, Any] = (None, None)
         def emit_external(value: ExternalSourceState) -> None:
             nonlocal external_index
-            if expected is None: external_members.append(value)
-            elif external_index >= len(expected.stamp.external_members):
+            if expected is not None and external_index >= len(expected.stamp.external_members):
                 raise SourceRevisionChanged("container external graph gained a member")
-            else: _same(value, expected.stamp.external_members[external_index], "container external member changed")
+            if expected is not None: _same(value, expected.stamp.external_members[external_index], "container external member changed")
+            external_members.append(value)
             external_index += 1
         def emit_dependency(value: SourceFileState) -> None:
             nonlocal dependency_index
-            if expected is None: dependencies.append(value)
-            elif dependency_index >= len(expected.stamp.dependency_files):
+            if expected is not None and dependency_index >= len(expected.stamp.dependency_files):
                 raise SourceRevisionChanged("container dependency graph gained a member")
-            else: _same(value, expected.stamp.dependency_files[dependency_index], "container dependency changed")
+            if expected is not None: _same(value, expected.stamp.dependency_files[dependency_index], "container dependency changed")
+            dependencies.append(value)
             dependency_index += 1
         try:
             entry_group = resolve_nxentry(handle, entry_name, exact_hint=bool(reader_binding))
@@ -530,45 +661,54 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
             _capture_bound_container_dependencies(binding, descriptor, before, cancelled=cancelled,
                 emit_external=emit_external, emit_dependency=emit_dependency)
         except BaseException as caught: error = caught
-        if _drain_qualification(handle, slot): continue
-        if error is not None:
-            if isinstance(error, KeyError) and error.args == ("captured entry has no detector dataset",):
-                raise ValueError("container has no detector dataset") from error
-            raise error
-        break
-    after = SourceFileState.capture(path); current_owner = None if reader_binding else candidate_owner(path)
-    if before != after or _path_key(_resolved(before)) != _path_key(_resolved(after)) \
-            or not reader_binding and (current_owner is None or current_owner.id != owner_id):
-        raise SourceRevisionChanged("container changed during qualification")
-    all_motors = tuple(pair[1] or ()) if reader_binding else descriptor.motor_names
-    scanned = tuple(pair[0] or ()) if reader_binding else None
-    if selected_motor is not None and selected_motor not in (all_motors or ()):
-        raise ValueError("selected motor is absent from the container")
-    group = descriptor.scan_name or path.stem.removesuffix("_master")
-    execution = SourceSpec(path, descriptor.kind, metadata_uri=source.metadata_uri,
-        entry=descriptor.resolved_entry or entry_name, options=dict(source.options))
-    adapter_id = "nexus_hdf5" if reader_binding else owner_id
-    if expected is not None:
-        if external_index != len(expected.stamp.external_members) or dependency_index != len(expected.stamp.dependency_files):
-            raise SourceRevisionChanged("container dependency graph cardinality changed")
-        _same(before, expected.stamp.file, "container source changed")
-        _same((expected.stamp.adapter_id, expected.stamp.frame_count, expected.stamp.first_label,
-               expected.descriptor, expected.source_path, expected.group_key, expected.motor_names,
-               expected.scanned_motor_names, expected.detector_shape, expected.native_dtype),
-              (adapter_id, descriptor.frame_count, 0, descriptor, _absolute(str(path)), group,
-               None if all_motors is None else tuple(all_motors), scanned, tuple(descriptor.frame_shape),
-               np.dtype(descriptor.dtype).str), "container source graph changed")
-        _same(_source_policy(execution, dict(execution.options)),
-              _source_policy(expected.execution_source, dict(expected.execution_source.options)),
-              "container source read policy changed")
-        return None
-    return freeze_source_execution_graph(source, execution, source_path=path,
-        group_key=group, reader_binding=reader_binding, file=before,
-        adapter_id=adapter_id, frame_count=descriptor.frame_count, first_label=0,
-        detector_shape=tuple(descriptor.frame_shape), native_dtype=np.dtype(descriptor.dtype).str,
-        descriptor=descriptor, external_members=tuple(external_members),
-        dependency_files=tuple(dependencies), motor_names=None if all_motors is None else tuple(all_motors),
-        scanned_motor_names=scanned)
+
+        def complete() -> PreparedSourceExecutionGraph | None:
+            if error is not None:
+                if isinstance(error, KeyError) and error.args == ("captured entry has no detector dataset",):
+                    raise ValueError("container has no detector dataset") from error
+                raise error
+            after = SourceFileState.capture(path); current_owner = None if reader_binding else candidate_owner(path)
+            if before != after or _path_key(_resolved(before)) != _path_key(_resolved(after)) \
+                    or not reader_binding and (current_owner is None or current_owner.id != owner_id):
+                raise SourceRevisionChanged("container changed during qualification")
+            if reader_binding and any(not state.matches_disk() for state in (
+                    *(item.file for item in external_members), *dependencies)):
+                raise SourceRevisionChanged("container dependency changed during qualification")
+            all_motors = tuple(pair[1] or ()) if reader_binding else descriptor.motor_names
+            scanned = tuple(pair[0] or ()) if reader_binding else None
+            if selected_motor is not None and selected_motor not in (all_motors or ()):
+                raise ValueError("selected motor is absent from the container")
+            group = descriptor.scan_name or path.stem.removesuffix("_master")
+            execution = SourceSpec(path, descriptor.kind, metadata_uri=source.metadata_uri,
+                entry=descriptor.resolved_entry or entry_name, options=dict(source.options))
+            adapter_id = "nexus_hdf5" if reader_binding else owner_id
+            if expected is not None:
+                if external_index != len(expected.stamp.external_members) or dependency_index != len(expected.stamp.dependency_files):
+                    raise SourceRevisionChanged("container dependency graph cardinality changed")
+                _same(before, expected.stamp.file, "container source changed")
+                _same((expected.stamp.adapter_id, expected.stamp.frame_count, expected.stamp.first_label,
+                       expected.descriptor, expected.source_path, expected.group_key, expected.motor_names,
+                       expected.scanned_motor_names, expected.detector_shape, expected.native_dtype),
+                      (adapter_id, descriptor.frame_count, 0, descriptor, _absolute(str(path)), group,
+                       None if all_motors is None else tuple(all_motors), scanned, tuple(descriptor.frame_shape),
+                       np.dtype(descriptor.dtype).str), "container source graph changed")
+                _same(_source_policy(execution, dict(execution.options)),
+                      _source_policy(expected.execution_source, dict(expected.execution_source.options)),
+                      "container source read policy changed")
+                return None
+            return freeze_source_execution_graph(source, execution, source_path=path,
+                group_key=group, reader_binding=reader_binding, file=before,
+                adapter_id=adapter_id, frame_count=descriptor.frame_count, first_label=0,
+                detector_shape=tuple(descriptor.frame_shape), native_dtype=np.dtype(descriptor.dtype).str,
+                descriptor=descriptor, external_members=tuple(external_members),
+                dependency_files=tuple(dependencies), motor_names=None if all_motors is None else tuple(all_motors),
+                scanned_motor_names=scanned)
+
+        if reader_binding:
+            return _drain_average_qualification(handle, slot, complete)
+        if _drain_qualification(handle, slot):
+            continue
+        return complete()
 def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | None = None,
         reader_binding: str | None = None,
         cancelled: Callable[[], bool] | None = None) -> PreparedSourceExecutionGraph:
@@ -773,15 +913,23 @@ def _capture_bound_container_dependencies(
         finally:
             binding.close_dependency_dataset()
 class _AverageSourceReadWindow:
-    def __init__(self, value: PreparedSourceExecutionGraph, *, cancelled=None):
+    def __init__(self, value: PreparedSourceExecutionGraph, *, cancelled=None,
+                 direct_chunk_policy=None, prevalidated=False):
         self._graph = value; self._cancelled = cancelled; self._cursor = None
         self._tiff = None
+        self._prevalidated = bool(prevalidated)
+        self._direct_chunk_policy = direct_chunk_policy
+        self._direct_chunk_state = None; self._direct_iterator = None
+        self._terminal_cleanup_error = None
         self._closed = False; self._entered = False
     @property
     def extent(self) -> int: return self._graph.stamp.frame_count
+    @property
+    def closed(self) -> bool: return self._closed
     def __enter__(self) -> "_AverageSourceReadWindow":
         if self._entered: return self
-        validate_source_execution_graph(self._graph, cancelled=self._cancelled)
+        if not self._prevalidated:
+            validate_source_execution_graph(self._graph, cancelled=self._cancelled)
         if self._graph.stamp.adapter_id == "nexus_hdf5":
             from xrd_tools.sources.cursor import ContainerCursor
             self._cursor = ContainerCursor(self._graph.source_path,
@@ -790,6 +938,21 @@ class _AverageSourceReadWindow:
                 expected_scanned_motor_names=self._graph.scanned_motor_names,
                 expected_all_motor_names=self._graph.motor_names)
             self._cursor.open()
+            if self._direct_chunk_policy is not None:
+                from xrd_tools.sources.eiger_direct_chunk import EigerDirectChunkState
+                from xrd_tools.sources.read_plan import plan_reads
+                descriptor = self._cursor.descriptor
+                policy = self._direct_chunk_policy
+                plan = plan_reads(
+                    descriptor.frame_count, descriptor.frame_shape,
+                    descriptor.dtype, descriptor.chunks, policy.frame_bytes,
+                    requested_block_frames=1, two_d=descriptor.is_2d,
+                )
+                self._direct_chunk_state = EigerDirectChunkState(policy)
+                self._direct_iterator = self._cursor.iter_eiger_direct_blocks(
+                    plan, policy, cancelled=self._cancelled or (lambda: False),
+                    state=self._direct_chunk_state,
+                )
         else:
             from xrd_tools.sources.image import TiffSeriesSource
             options = dict(self._graph.execution_source.options)
@@ -812,6 +975,24 @@ class _AverageSourceReadWindow:
     def read_native(self, logical_index: int) -> np.ndarray:
         _cancelled(self._cancelled); index = int(logical_index)
         if not 0 <= index < self.extent: raise IndexError(index)
+        if self._direct_iterator is not None:
+            try:
+                block = next(self._direct_iterator)
+            except StopIteration as error:
+                _cancelled(self._cancelled)
+                raise RuntimeError(
+                    "Average direct source ended before its admitted extent"
+                ) from error
+            if (block.start, block.stop) != (index, index + 1):
+                raise RuntimeError(
+                    "Average direct source violated exact frame order"
+                )
+            array = np.asarray(block.array)
+            if array.shape != (1, *self._graph.detector_shape):
+                raise RuntimeError(
+                    "Average direct source changed its detector layout"
+                )
+            return array[0]
         if self._cursor is not None: return self._cursor.read_frame(index)
         return np.asarray(self._tiff.load_frame(index + 1))
     def complete_metadata_for(self, logical_index: int) -> dict[str, Any]:
@@ -821,25 +1002,61 @@ class _AverageSourceReadWindow:
         return dict(getattr(self._tiff, "metadata_for")(
             index + 1, max_input_bytes=1 << 16,
         ))
+    def eiger_direct_chunk_layout(self):
+        if self._cursor is None:
+            return None, "direct decode requires a container source"
+        return self._cursor.eiger_direct_chunk_layout()
     def close(self) -> None:
         if self._closed: return
+        iterator = self._direct_iterator
+        if iterator is not None:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as error:
+                    self._terminal_cleanup_error = SourceCleanupFailed(
+                        f"AVERAGE_SOURCE_CLEANUP_FAILED({error})"
+                    )
+            self._direct_iterator = None
         if self._cursor is not None:
-            self._cursor.close()
-            if not self._cursor.closed: raise OSError("AVERAGE_SOURCE_CLEANUP_FAILED")
+            try:
+                self._cursor.close()
+            except BaseException as error:
+                raise SourceCleanupPending(
+                    self, f"AVERAGE_SOURCE_CLEANUP_PENDING: {error}",
+                ) from error
+            if not self._cursor.closed:
+                raise SourceCleanupPending(
+                    self, "AVERAGE_SOURCE_CLEANUP_PENDING",
+                )
         self._closed = True
+        if self._terminal_cleanup_error is not None:
+            error, self._terminal_cleanup_error = (
+                self._terminal_cleanup_error, None,
+            )
+            raise error
+    @property
+    def direct_chunk_fact(self):
+        state = self._direct_chunk_state
+        return None if state is None else state.fact(self._graph.source_path)
     def __exit__(self, exc_type, exc, tb) -> None:
-        while not self._closed:
-            try: self.close()
-            except BaseException:
-                time.sleep(0.05)
+        self.close()
 def open_source_execution_graph(value: PreparedSourceExecutionGraph, *,
-        cancelled: Callable[[], bool] | None = None) -> _AverageSourceReadWindow:
+        cancelled: Callable[[], bool] | None = None,
+        direct_chunk_policy=None, prevalidated: bool = False,
+) -> _AverageSourceReadWindow:
     if value.reader_binding != "average_closed_v1":
         raise ValueError("Average source opening requires average_closed_v1")
-    return _AverageSourceReadWindow(value, cancelled=cancelled)
+    return _AverageSourceReadWindow(
+        value, cancelled=cancelled,
+        direct_chunk_policy=direct_chunk_policy,
+        prevalidated=prevalidated,
+    )
 __all__ = [
     "AdmittedMetadataSource", "AdmittedMotorValue", "CanonicalSourceTarget",
     "ExternalSourceState", "PreparedSourceExecutionGraph", "SourceAliasBinding",
+    "SourceCleanupFailed", "SourceCleanupPending",
     "SourceExecutionIdentityV1", "SourceExecutionStamp", "SourceFileState",
     "SourceRevisionChanged", "append_source_from_execution_graph",
     "freeze_source_execution_graph", "open_source_execution_graph",
@@ -847,4 +1064,5 @@ __all__ = [
     "source_execution_identity_v1_projection", "source_execution_projection",
     "source_graph_digest", "source_graph_payload", "source_snapshots_projection",
     "stable_lineage_projection", "validate_source_execution_graph",
+    "validate_source_state_sweep",
 ]

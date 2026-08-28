@@ -21,7 +21,6 @@ from xrd_tools.io.output_transaction import (
     StreamTerminal,
     stream_terminal_object_revision,
 )
-from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources import open_source
 from xrd_tools.sources.cursor import open_container_cursor
@@ -59,7 +58,7 @@ from ..output_preflight import (
     _background_frame_fact, _merge_background_binding,
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
-    execution_plan_values, materialize_deferred_output,
+    native_int_reduction_plan, materialize_deferred_output,
     live_directory_groups, materialize_live_directory_group,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
@@ -1404,8 +1403,10 @@ class StandardRunExecutor:
             if item is not None
             else len(run.scan.frames)
         )
-        args_1d, args_2d, values = execution_plan_values(configuration, None if assets is None else assets.mask)
-        plan = build_native_int_reduction_plan_from_args(args_1d, args_2d, **values)
+        plan = replace(
+            native_int_reduction_plan(configuration),
+            mask=None if assets is None else assets.mask,
+        )
         try:
             npt = int(configuration.bai_1d_args.get("npt", 0))
         except (TypeError, ValueError):

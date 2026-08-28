@@ -1,9 +1,10 @@
 from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, fields
+from enum import Enum
 import hashlib, json, math, os
 from pathlib import Path
-import re, threading, time
+import re, threading
 import tempfile
 from types import SimpleNamespace
 from typing import Any
@@ -25,8 +26,7 @@ from xrd_tools.session import policy as _resource_policy
 from xrd_tools.session.policy import SessionResourceAllocation, requirements_from, resolve_session_policy
 from xrd_tools.session.run_configuration import FrozenSourceSpec
 from xrd_tools.session.scan_session import required_result_modes
-from xrd_tools.sources import execution_graph as _source_graph_owner
-from xrd_tools.sources.execution_graph import PreparedSourceExecutionGraph, SourceRevisionChanged, append_source_from_execution_graph, open_source_execution_graph, qualify_source_execution_graph, requalify_source_execution_graph, source_execution_projection, source_graph_digest, source_snapshots_projection, stable_lineage_projection
+from xrd_tools.sources.execution_graph import PreparedSourceExecutionGraph, SourceCleanupFailed, SourceCleanupPending, SourceRevisionChanged, append_source_from_execution_graph, open_source_execution_graph, qualify_source_execution_graph, requalify_source_execution_graph, source_execution_projection, source_graph_digest, source_snapshots_projection, stable_lineage_projection, validate_source_state_sweep
 from xrd_tools.sources.selection import image_series_spec, is_single_image_spec, single_image_spec
 _COUNT_POLICY = 'average_scan_v1'
 _COUNT_DTYPE = np.dtype('<u4')
@@ -208,15 +208,56 @@ class AverageScanPlan:
     recipe: AverageScanRecipe; source_graph_digest: str; contributor_extent: int
     detector_shape: tuple[int, int]; native_dtype: str; expected_target_snapshot: TargetSnapshot
     numeric_metadata_keys: tuple[str, ...]; invariant_metadata_keys: tuple[str, ...]; allocation: SessionResourceAllocation
-    science_identity: str; operation_identity: str
+    direct_eiger_eligible: bool; science_identity: str; operation_identity: str
     logical_labels: tuple[int, ...] = (1,)
     def __post_init__(self) -> None:
-        _reject(type(self.recipe) is not AverageScanRecipe or type(self.contributor_extent) is not int or (not 1 <= self.contributor_extent <= _MAX_CONTRIBUTORS) or (type(self.detector_shape) is not tuple) or (len(self.detector_shape) != 2) or any((type(item) is not int or item <= 0 for item in self.detector_shape)) or (type(self.expected_target_snapshot) is not TargetSnapshot) or (type(self.allocation) is not SessionResourceAllocation) or (self.logical_labels != (1,)), 'Average scan plan is invalid')
+        _reject(type(self.recipe) is not AverageScanRecipe or type(self.contributor_extent) is not int or (not 1 <= self.contributor_extent <= _MAX_CONTRIBUTORS) or (type(self.detector_shape) is not tuple) or (len(self.detector_shape) != 2) or any((type(item) is not int or item <= 0 for item in self.detector_shape)) or (type(self.expected_target_snapshot) is not TargetSnapshot) or (type(self.allocation) is not SessionResourceAllocation) or type(self.direct_eiger_eligible) is not bool or (self.logical_labels != (1,)), 'Average scan plan is invalid')
 @dataclass(frozen=True, slots=True)
 class AverageScanProgress:
     operation_identity: str; stage: str; completed: int; total: int; revision: int
     def __post_init__(self) -> None:
         _reject(type(self.operation_identity) is not str or self.stage not in _STAGES or any((type(item) is not int for item in (self.completed, self.total, self.revision))) or (not 0 <= self.completed <= self.total) or (self.revision < 0), 'Average progress value is invalid')
+
+
+class AverageCommand(str, Enum):
+    RETRY = 'retry'
+    CANCEL = 'cancel'
+    CLOSE = 'close'
+
+
+class AveragePendingPhase(str, Enum):
+    PREPARATION_CLEANUP = 'preparation-cleanup'
+    SOURCE_CLEANUP = 'source-cleanup'
+    OUTPUT_SETTLEMENT = 'output-settlement'
+
+
+class AverageRunnerPhase(str, Enum):
+    NEW = 'new'
+    PREPARING = 'preparing'
+    EXECUTING = 'executing'
+    SOURCE_CLEANUP_PENDING = 'source-cleanup-pending'
+    OUTPUT_SETTLEMENT_PENDING = 'output-settlement-pending'
+    TERMINAL = 'terminal'
+    CLOSED = 'closed'
+
+
+@dataclass(frozen=True, slots=True)
+class AverageScanPending:
+    operation_identity: str
+    revision: int
+    phase: AveragePendingPhase
+    diagnostic: str
+
+    def __post_init__(self) -> None:
+        _reject(
+            type(self.operation_identity) is not str
+            or type(self.revision) is not int or self.revision < 1
+            or type(self.phase) is not AveragePendingPhase
+            or type(self.diagnostic) is not str or not self.diagnostic,
+            'Average pending token is invalid',
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AverageScanResult:
     disposition: str; target: str; entry: str; operation_identity: str; science_identity: str
@@ -224,14 +265,12 @@ class AverageScanResult:
     metadata_denominators: tuple[tuple[str, int], ...]; finite_counts: AverageFiniteCountsEvidence | None
     diagnostic_code: str; diagnostic: str; h23_phase: str | None; commit_identity: StreamTerminal | None
     def __post_init__(self):
-        terminal = self.disposition in {'COMMITTED', 'REFUSED', 'CANCELLED', 'ABORTED', 'SETTLEMENT_PENDING'}
+        terminal = self.disposition in {'COMMITTED', 'REFUSED', 'CANCELLED', 'ABORTED'}
         denominators = self.metadata_denominators; logical = self.logical_labels; committed_labels = self.committed_labels
         base = all(type(value) is str for value in (self.disposition, self.target, self.entry, self.operation_identity, self.science_identity, self.diagnostic_code, self.diagnostic)) and type(self.contributor_extent) is int and 0 <= self.contributor_extent <= _MAX_CONTRIBUTORS and type(logical) is tuple and logical == (1,) and all(type(value) is int for value in logical) and type(denominators) is tuple and all(type(value) is tuple and len(value) == 2 and type(value[0]) is str and bool(value[0]) and type(value[1]) is int and value[1] >= 0 for value in denominators) and len({value[0] for value in denominators}) == len(denominators)
         committed = type(committed_labels) is tuple and committed_labels == (1,) and all(type(value) is int for value in committed_labels) and type(self.finite_counts) is AverageFiniteCountsEvidence and self.finite_counts.contributor_extent == self.contributor_extent and self.h23_phase == 'committed' and type(self.commit_identity) is StreamTerminal and not self.diagnostic_code and not self.diagnostic
-        source_pending = self.h23_phase is None and self.diagnostic_code == self.diagnostic == 'AVERAGE_SOURCE_CLEANUP_PENDING'
-        h23_pending = self.h23_phase in {'ready-to-retry', 'rollback-pending', 'cleanup-pending', 'integrity-hold'} and self.diagnostic_code == self.diagnostic == 'AVERAGE_H23_SETTLEMENT_PENDING'
         empty = type(committed_labels) is tuple and committed_labels == () and self.finite_counts is None and self.commit_identity is None
-        valid = committed if self.disposition == 'COMMITTED' else empty and (source_pending or h23_pending) if self.disposition == 'SETTLEMENT_PENDING' else empty and self.h23_phase is None
+        valid = committed if self.disposition == 'COMMITTED' else empty and self.h23_phase is None
         _reject(not terminal or not base or not valid, 'Average result contract is invalid')
 @dataclass(frozen=True, slots=True)
 class AverageContributor:
@@ -306,7 +345,7 @@ def _background_resource_terms(plan: FrameBackgroundPlan | None, pixels: int) ->
         return (0, 0, 0, 0)
     _reject(type(plan) is not FrameBackgroundPlan, 'Average Background resource policy is invalid', TypeError)
     return (8 * pixels, (25 if plan.mode == 'Series Average' else 8) * pixels, 8 * pixels, 64 * 1024 ** 2)
-def _owner_block_bytes(shape: tuple[int, int]) -> int:
+def _conventional_owner_block_bytes(shape: tuple[int, int]) -> int:
     height, width = shape
     pixels = height * width
     frame = 8 * pixels
@@ -316,14 +355,47 @@ def _owner_block_bytes(shape: tuple[int, int]) -> int:
     evidence_scratch = 4 * (4 * rows * width)
     peak = max(2 * frame + counts + 4 * mask + _JSON_MAX_BYTES, frame + counts + mask + _JSON_MAX_BYTES + evidence_scratch)
     return (peak + frame - 1) // frame * frame
+
+
+def _owner_block_bytes(
+    shape: tuple[int, int], native_dtype: np.dtype, *,
+    direct_eiger_eligible: bool,
+) -> int:
+    """Exact Average owner grant, including the optional direct decoder slot.
+
+    The conventional peak already owns the native frame yielded to the
+    accumulator.  Direct Eiger decoding needs one additional native-frame slot
+    so its two-slot compressed/shuffled/output workspace can coexist with that
+    yielded frame.  Non-Eiger sources retain the unchanged conventional grant.
+    """
+    conventional = _conventional_owner_block_bytes(shape)
+    if not direct_eiger_eligible:
+        return conventional
+    native_frame = math.prod(shape) * int(np.dtype(native_dtype).itemsize)
+    # The shared resource resolver requires owner grants in its float64
+    # detector-frame quantum.  Round the one additional native slot upward;
+    # the direct policy below exposes only the two native slots it can prove.
+    quantum = 8 * math.prod(shape)
+    required = conventional + native_frame
+    return (required + quantum - 1) // quantum * quantum
 def _selected_motor(recipe: AverageScanRecipe) -> str | None:
     gi = recipe.integrator_gi
     return None if gi is None or gi[1] in (None, 'Manual') else gi[1]
-def _average_allocation(recipe: AverageScanRecipe, shape: tuple[int, int], allocation: SessionResourceAllocation | None=None) -> SessionResourceAllocation:
+def _average_allocation(
+    recipe: AverageScanRecipe,
+    shape: tuple[int, int],
+    native_dtype: np.dtype,
+    *,
+    direct_eiger_eligible: bool,
+    allocation: SessionResourceAllocation | None = None,
+) -> SessionResourceAllocation:
     descriptor = SimpleNamespace(frame_shape=shape, dtype=np.dtype('<f8'))
     terms = _background_resource_terms(recipe.background, shape[0] * shape[1])
     requirements = requirements_from(descriptor, _derived_reduction(recipe), background_bytes=terms[0], resolver_background_bytes=terms[1], worker_background_bytes=terms[2], background_binding_bytes=terms[3])
-    owner = _owner_block_bytes(shape); requests = dict(recipe.resource_requests); requests['owner_block_bytes'] = owner
+    owner = _owner_block_bytes(
+        shape, native_dtype,
+        direct_eiger_eligible=direct_eiger_eligible,
+    ); requests = dict(recipe.resource_requests); requests['owner_block_bytes'] = owner
     current = allocation if allocation is not None else resolve_session_policy(requirements, envelope_bytes=recipe.envelope_bytes, requests=requests, env=dict(recipe.resource_env)).allocation
     exact_categories = None if current is None else _resource_policy._categories(requirements, dict(current.counts))
     if current is None or current.requirements.fingerprint != requirements.fingerprint or current.owner_block_bytes != owner or dict(current.categories) != exact_categories:
@@ -331,6 +403,33 @@ def _average_allocation(recipe: AverageScanRecipe, shape: tuple[int, int], alloc
         code = 'AVERAGE_ALLOCATION_CHANGED' if allocation is not None else 'AVERAGE_OWNER_BLOCK_GRANT_INCOMPLETE'
         raise ValueError(f'{code}(required={owner}, granted={granted})')
     return current
+
+
+def _direct_eiger_candidate(graph: PreparedSourceExecutionGraph) -> bool:
+    return (
+        graph.stamp.adapter_id == 'nexus_hdf5'
+        and graph.execution_source.kind is SourceKind.EIGER_MASTER
+    )
+
+
+def _average_direct_chunk_policy(
+    plan: AverageScanPlan, graph: PreparedSourceExecutionGraph,
+):
+    if not plan.direct_eiger_eligible or not _direct_eiger_candidate(graph):
+        return None
+    from xrd_tools.sources.eiger_direct_chunk import EigerDirectChunkPolicy
+
+    native_frame = math.prod(plan.detector_shape) * np.dtype(plan.native_dtype).itemsize
+    conventional = _conventional_owner_block_bytes(plan.detector_shape)
+    # One of the direct decoder's two native slots is the conventional
+    # accumulator input slot.  The Eiger allocation adds at least one more.
+    _reject(
+        plan.allocation.owner_block_bytes < conventional + native_frame,
+        'AVERAGE_DIRECT_CHUNK_GRANT_INCOMPLETE',
+    )
+    return EigerDirectChunkPolicy.from_owner_grant(
+        native_frame, 2 * native_frame,
+    )
 def _science_payload(plan: AverageScanPlan) -> dict[str, Any]:
     recipe = plan.recipe
     payload = _recipe_payload(recipe)
@@ -340,7 +439,7 @@ def _allocation_payload(value: SessionResourceAllocation) -> dict[str, Any]:
     return {'requirements': {item.name: getattr(value.requirements, item.name) for item in fields(value.requirements)}, 'envelope_bytes': value.envelope_bytes, 'counts': dict(value.counts), 'categories': dict(value.categories), 'minimum_bytes': value.minimum_bytes, 'floor_bytes': value.floor_bytes, 'assigned_bytes': value.assigned_bytes, 'origin': value.origin, 'oversize_excess_bytes': value.oversize_excess_bytes}
 def _operation_payload(plan: AverageScanPlan) -> dict[str, Any]:
     recipe = plan.recipe
-    return {'api_version': _COUNT_POLICY, 'source_graph_digest': plan.source_graph_digest, 'science_identity': plan.science_identity, 'target': recipe.target, 'entry': recipe.entry, 'source_base': recipe.source_base or '', 'output_mode': recipe.output_mode, 'live_mode': recipe.live_mode, 'save_xye': recipe.save_xye, 'batch_mode': recipe.batch_mode, 'contributor_extent': plan.contributor_extent, 'detector_shape': plan.detector_shape, 'native_dtype': plan.native_dtype, 'numeric_metadata_keys': plan.numeric_metadata_keys, 'invariant_metadata_keys': plan.invariant_metadata_keys, 'logical_labels': plan.logical_labels, 'expected_target_snapshot': {item.name: getattr(plan.expected_target_snapshot, item.name) for item in fields(plan.expected_target_snapshot)}, 'resource_inputs': {'envelope_bytes': recipe.envelope_bytes, 'resource_requests': recipe.resource_requests, 'resource_env': recipe.resource_env}, 'allocation': _allocation_payload(plan.allocation)}
+    return {'api_version': _COUNT_POLICY, 'source_graph_digest': plan.source_graph_digest, 'science_identity': plan.science_identity, 'target': recipe.target, 'entry': recipe.entry, 'source_base': recipe.source_base or '', 'output_mode': recipe.output_mode, 'live_mode': recipe.live_mode, 'save_xye': recipe.save_xye, 'batch_mode': recipe.batch_mode, 'contributor_extent': plan.contributor_extent, 'detector_shape': plan.detector_shape, 'native_dtype': plan.native_dtype, 'numeric_metadata_keys': plan.numeric_metadata_keys, 'invariant_metadata_keys': plan.invariant_metadata_keys, 'logical_labels': plan.logical_labels, 'direct_eiger_eligible': plan.direct_eiger_eligible, 'expected_target_snapshot': {item.name: getattr(plan.expected_target_snapshot, item.name) for item in fields(plan.expected_target_snapshot)}, 'resource_inputs': {'envelope_bytes': recipe.envelope_bytes, 'resource_requests': recipe.resource_requests, 'resource_env': recipe.resource_env}, 'allocation': _allocation_payload(plan.allocation)}
 def _derived_reduction(recipe: AverageScanRecipe) -> ReductionPlan:
     value = _thaw_reduction(recipe)
     value.mask = None
@@ -362,40 +461,31 @@ def _source_for_requalification(source: SourceSpec,
             metadata_uri=source.metadata_uri, entry=source.entry,
             options=dict(source.options))
     return source
-def prepare_average_scan(recipe: AverageScanRecipe, *, cancel_token: threading.Event | None=None) -> AverageScanPlan:
-    _reject(type(recipe) is not AverageScanRecipe, 'prepare_average_scan requires an exact recipe', TypeError)
-    _cancelled(cancel_token) and (_ for _ in ()).throw(InterruptedError('Average preparation cancelled'))
-    _reject(recipe.background is not None,
-            'AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED')
-    _reject(recipe.live_mode, 'AVERAGE_LIVE_TERMINALITY_UNSUPPORTED')
-    _reject(recipe.output_mode != 'Overwrite', 'AVERAGE_APPEND_UNSUPPORTED')
-    _reject(recipe.save_xye, 'AVERAGE_NEXUS_REQUIRED')
-    source = _source_from_recipe(recipe)
-    selected_motor = _selected_motor(recipe)
-    graph = qualify_source_execution_graph(source, selected_motor=selected_motor, reader_binding=_READER_BINDING, cancelled=None if cancel_token is None else cancel_token.is_set)
+def _plan_from_prepared_graph(
+    recipe: AverageScanRecipe, graph: PreparedSourceExecutionGraph,
+    first_row: Mapping[str, Any], *, direct_eiger_eligible: bool,
+) -> AverageScanPlan:
     extent = graph.stamp.frame_count
     _reject(type(extent) is not int or not 1 <= extent <= _MAX_CONTRIBUTORS, 'AVERAGE_CONTRIBUTOR_EXTENT_INVALID')
     _reject(graph.detector_shape is None or graph.native_dtype is None, 'AVERAGE_DETECTOR_LAYOUT_UNAVAILABLE')
     dtype = np.dtype(graph.native_dtype)
     _reject(dtype.kind not in 'iuf' or dtype.itemsize > 8 or dtype.fields is not None, 'AVERAGE_NATIVE_DTYPE_UNSUPPORTED')
-    window = open_source_execution_graph(graph, cancelled=None if cancel_token is None else cancel_token.is_set)
-    try: window.__enter__(); first_row = window.complete_metadata_for(0)
-    finally: window.__exit__(None, None, None)
-    try:
-        requalify_source_execution_graph(_source_for_requalification(source, graph), graph, selected_motor=selected_motor, reader_binding=_READER_BINDING, cancelled=None if cancel_token is None else cancel_token.is_set)
-    except SourceRevisionChanged as error:
-        raise ValueError('AVERAGE_SOURCE_DRIFT') from error
     reduction = _thaw_reduction(recipe)
     numeric, invariant = _selected_metadata_keys(recipe, first_row, reduction)
     shape = tuple((int(item) for item in graph.detector_shape))
-    allocation = _average_allocation(recipe, shape)
+    allocation = _average_allocation(
+        recipe, shape, dtype,
+        direct_eiger_eligible=direct_eiger_eligible,
+    )
     graph_digest = source_graph_digest(graph)
     snapshot = capture_target_snapshot(recipe.target)
-    provisional = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, '', '')
+    provisional = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, direct_eiger_eligible, '', '')
     science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(provisional))).hexdigest()
-    prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, science, '')
+    prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '')
     operation = hashlib.sha256(b'xdart.average-operation.v1\x00' + _canonical(_operation_payload(prospective))).hexdigest()
-    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, science, operation)
+    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation)
+
+
 class _AverageCancelled(RuntimeError): pass
 def _poll(token: threading.Event | None) -> None:
     if _cancelled(token):
@@ -416,8 +506,13 @@ def _committed_average_mismatch(result: AverageScanResult, target: str | Path, e
     except Exception: return 'commit'
     if type(persisted) is not dict or persisted.get('operation_identity') != result.operation_identity or persisted.get('science_identity') != result.science_identity: return 'operation' if type(persisted) is not dict or persisted.get('operation_identity') != result.operation_identity else 'science'
     return None if snapshot.exists and commit.size == snapshot.size and commit.digest == snapshot.digest else 'commit'
-def _recipe_refusal(recipe: AverageScanRecipe, code: str) -> AverageScanResult:
-    return AverageScanResult('REFUSED', recipe.target, recipe.entry, '', '', 0, (1,), (), (), None, code, code, None, None)
+def _recipe_refusal(
+    recipe: AverageScanRecipe, code: str, *, diagnostic: str | None = None,
+) -> AverageScanResult:
+    return AverageScanResult(
+        'REFUSED', recipe.target, recipe.entry, '', '', 0, (1,), (), (), None,
+        code, code if diagnostic is None else diagnostic, None, None,
+    )
 def _error_result(plan: AverageScanPlan, error: BaseException, *, h23: bool=False, denominators=()) -> AverageScanResult:
     if isinstance(error, _AverageCancelled):
         return _result(plan, 'CANCELLED', code='AVERAGE_CANCELLED', diagnostic=_diagnostic(error), denominators=denominators)
@@ -470,7 +565,6 @@ def _validate_contributor(
                 states.append(metadata.metadata_file)
     else:
         states.append(stamp.file)
-        states.extend(stamp.dependency_files)
         if external_member is not None:
             if not (external_member.first <= index < external_member.stop):
                 raise SourceRevisionChanged(
@@ -633,6 +727,26 @@ def _effective_integer_thresholds(
     )
 
 
+def _direct_eiger_execution(window, extent: int) -> dict[str, Any] | None:
+    fact = window.direct_chunk_fact
+    if fact is None:
+        return None
+    from xrd_tools.sources.eiger_direct_chunk import EigerDirectChunkFact
+    _reject(type(fact) is not EigerDirectChunkFact,
+            'AVERAGE_DIRECT_EIGER_FACT_INVALID')
+    direct = fact.direct_frames
+    fallback = fact.fallback_frames
+    _reject(
+        any(type(value) is not int or value < 0 for value in (
+            fact.workers, fact.owner_grant_bytes, fact.workspace_bytes,
+            direct, fallback, fact.compressed_high_water_bytes,
+        ))
+        or direct + fallback != extent,
+        'AVERAGE_DIRECT_EIGER_FRAME_CENSUS_INVALID',
+    )
+    return {item.name: getattr(fact, item.name) for item in fields(fact)}
+
+
 def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph, window, token: threading.Event | None, progress: Callable[[str, int, int], None]) -> dict[str, Any]:
     shape, extent = (plan.detector_shape, plan.contributor_extent)
     _reject(plan.recipe.background is not None,
@@ -759,7 +873,11 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
     chunks = _average_count_chunks(shape)
     evidence = AverageFiniteCountsEvidence(_COUNT_POLICY, extent, shape, '<u4', _average_count_digest(counts, extent, rows=chunks[0]), int(counts.min()), int(counts.max()), int(np.count_nonzero(zero)), chunks, 'gzip', 1, True, False)
     finite = AverageFiniteCounts._from_owned_array(evidence, counts)
-    return {'average': sums, 'zero': zero, 'metadata': output_metadata, 'denominators': tuple(denominators), 'finite': finite}
+    return {
+        'average': sums, 'zero': zero, 'metadata': output_metadata,
+        'denominators': tuple(denominators), 'finite': finite,
+        'direct_eiger_execution': _direct_eiger_execution(window, extent),
+    }
 def _scan_calibration(recipe: AverageScanRecipe):
     values = recipe.calibration.values
     if values is None:
@@ -780,7 +898,7 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
         detector_values['x_pixel_size'] = config.get('pixel2')
         detector_values['y_pixel_size'] = config.get('pixel1')
     frame = ScanFrame(1, image=science['average'], metadata=dict(science['metadata']), source_path=None, source_frame_index=0, background=None, mask=science['zero'])
-    provenance = {**_science_payload(plan), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators']}
+    provenance = {**_science_payload(plan), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
     scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.recipe.target, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})
     progress('reduce', 0, 1)
     reduced = run_reduction(_derived_reduction(plan.recipe), scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True))
@@ -797,7 +915,7 @@ def _average_sink(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph):
         run_configuration.pop('background')
     return NexusSink(plan.recipe.target, entry=plan.recipe.entry, overwrite=True, source_base=plan.recipe.source_base, run_configuration_provenance=run_configuration, source_execution_provenance=source_execution_projection(graph), source_snapshots_provenance=source_snapshots_projection(graph, writer=True), same_run_intent=_append_intent(plan, graph), rollback_until_commit=True)
 def _resolved_lineage_path(stored: str, artifact: str | Path, source_base: str) -> str:
-    value = resolve_source_master(stored, scan_file=artifact, source_base=source_base, allow_basename_fallbacks=True)
+    value = resolve_source_master(stored, scan_file=artifact, source_base=source_base, allow_basename_fallbacks=False)
     _reject(value is None, 'Average lineage source is unavailable')
     return str(value.resolve(strict=True))
 def iter_average_contributors(path, *, entry='entry', label=1) -> Iterator[AverageContributor]:
@@ -827,115 +945,471 @@ def iter_average_contributors(path, *, entry='entry', label=1) -> Iterator[Avera
     for index in range(extent):
         yield AverageContributor(index, index, resolved, index, source.dataset_paths[0], index, index + 1, source.size, source.mtime_ns)
 class AverageScanRunner:
-    def __init__(self, plan: AverageScanPlan) -> None:
-        _reject(type(plan) is not AverageScanPlan, 'AverageScanRunner requires an exact plan', TypeError)
-        self.plan = plan
+    """One creating-thread owner for Average preparation through settlement."""
+
+    def __init__(self, recipe: AverageScanRecipe) -> None:
+        _reject(type(recipe) is not AverageScanRecipe,
+                'AverageScanRunner requires one exact recipe', TypeError)
+        self.plan = None
+        self.recipe = recipe
         self._thread = threading.get_ident()
-        self._state = 'NEW'
-        self._ran = False
-        self._result = None
-        self._source_window = None
-        self._source_error = None; self._science = self._reduction = None
-        self._graph = None
-        self._sink = None
+        self._state = AverageRunnerPhase.NEW
+        self._result: AverageScanResult | None = None
+        self._pending_token: AverageScanPending | None = None
+        self._pending_owner = None; self._pending_resume = None
+        self._pending_revision = 0
+        self._preparation_graph = None
+        self._preparation_window = None
+        self._preparation_first_row = None
+        self._preparation_direct_eiger_eligible = False
+        self._preparation_error = None
+        self._source_window = None; self._source_error = None
+        self._science = self._reduction = None; self._graph = None
+        self._sink = None; self._pending_abort = None
         self._h23_target_snapshot = None
-        self._cancel_token = None
-        self._progress_cb = None
+        self._cancel_token = None; self._progress_cb = None
         self._publication_gate = None
         self._gate_called = False; self._revision = 0
+
+    @property
+    def phase(self) -> AverageRunnerPhase:
+        return self._state
+
+    @property
+    def pending(self) -> AverageScanPending | None:
+        return self._pending_token
+
     def _affine(self) -> None:
-        _reject(threading.get_ident() != self._thread, 'AverageScanRunner is creating-thread affine', RuntimeError)
-    def __enter__(self) -> 'AverageScanRunner':
-        self._affine()
-        _reject(self._state != 'NEW', 'AverageScanRunner can be entered only once', RuntimeError)
-        self._state = 'ACTIVE'
-        return self
+        _reject(threading.get_ident() != self._thread,
+                'AverageScanRunner is creating-thread affine', RuntimeError)
+
     def _progress(self, stage: str, completed: int, total: int) -> None:
+        if self.plan is None:
+            return
         self._revision += 1
         callback = self._progress_cb
         if callback is None:
             return
         try:
-            callback(AverageScanProgress(self.plan.operation_identity, stage, completed, total, self._revision))
+            callback(AverageScanProgress(
+                self.plan.operation_identity, stage, completed, total,
+                self._revision,
+            ))
         except BaseException:
             pass
+
     def _terminal(self, value: AverageScanResult) -> AverageScanResult:
+        value.__post_init__()
         self._result = value
-        self._state = 'TERMINAL'
+        self._state = AverageRunnerPhase.TERMINAL
+        self._pending_token = None
+        self._pending_owner = self._pending_resume = None
         self._science = self._reduction = None
-        self._source_error = None
+        self._preparation_graph = self._preparation_window = None
+        self._preparation_first_row = self._preparation_error = None
+        self._preparation_direct_eiger_eligible = False
+        self._source_error = self._pending_abort = None
         return value
-    def _pending(self, *, source: bool=False) -> AverageScanResult:
-        self._state = 'SETTLEMENT_PENDING'
-        raw = None if source or self._sink is None else self._sink._transaction.snapshot().phase.value
-        phase = None if source else 'ready-to-retry' if raw in {None, 'executing'} else 'cleanup-pending' if raw in {'epoch-committed', 'committed'} else raw
-        code = 'AVERAGE_SOURCE_CLEANUP_PENDING' if source else 'AVERAGE_H23_SETTLEMENT_PENDING'
-        self._result = _result(self.plan, 'SETTLEMENT_PENDING', code=code, diagnostic=code, denominators=() if self._science is None else self._science['denominators'], h23_phase=phase)
-        return self._result
-    def _fresh_graph(self) -> PreparedSourceExecutionGraph:
-        graph = _source_graph_owner.qualify_source_execution_graph(_source_from_recipe(self.plan.recipe), selected_motor=_selected_motor(self.plan.recipe), reader_binding=_READER_BINDING, cancelled=None if self._cancel_token is None else self._cancel_token.is_set)
-        if source_graph_digest(graph) != self.plan.source_graph_digest or graph.stamp.frame_count != self.plan.contributor_extent or graph.detector_shape != self.plan.detector_shape or (graph.native_dtype != self.plan.native_dtype):
-            raise SourceRevisionChanged('Average execution graph changed')
-        _average_allocation(self.plan.recipe, self.plan.detector_shape, self.plan.allocation)
-        return graph
-    def run(self, *, cancel_token: threading.Event | None=None, progress_cb: Callable[[AverageScanProgress], object] | None=None, publication_gate: Callable[[], bool] | None=None) -> AverageScanResult:
+
+    def _preparation_cancelled(self) -> AverageScanResult:
+        return self._terminal(AverageScanResult(
+            'CANCELLED', self.recipe.target, self.recipe.entry, '', '', 0,
+            (1,), (), (), None, 'AVERAGE_CANCELLED',
+            'Average preparation cancelled', None, None,
+        ))
+
+    def _pending(
+        self, phase: AveragePendingPhase, diagnostic: str, *, owner=None,
+        resume=None,
+    ) -> AverageScanPending:
+        self._pending_revision += 1
+        operation = '' if self.plan is None else self.plan.operation_identity
+        token = AverageScanPending(
+            operation, self._pending_revision, phase, diagnostic,
+        )
+        self._pending_token = token
+        self._pending_owner = owner; self._pending_resume = resume
+        self._state = (
+            AverageRunnerPhase.OUTPUT_SETTLEMENT_PENDING
+            if phase is AveragePendingPhase.OUTPUT_SETTLEMENT
+            else AverageRunnerPhase.SOURCE_CLEANUP_PENDING
+        )
+        return token
+
+    def _hold_source_cleanup(self, error: SourceCleanupPending, resume,
+                             *, preparation: bool = False):
+        phase = (AveragePendingPhase.PREPARATION_CLEANUP if preparation
+                 else AveragePendingPhase.SOURCE_CLEANUP)
+        return self._pending(
+            phase, error.diagnostic, owner=error.owner, resume=resume,
+        )
+
+    def _preparation_failure(self, error: BaseException):
+        if isinstance(error, InterruptedError) and _cancelled(self._cancel_token):
+            return self._preparation_cancelled()
+        diagnostic = _diagnostic(error)
+        code = diagnostic.split('(', 1)[0]
+        return self._terminal(_recipe_refusal(
+            self.recipe,
+            code if code.startswith('AVERAGE_')
+            else 'AVERAGE_PREPARATION_FAILED',
+            diagnostic=diagnostic,
+        ))
+
+    @staticmethod
+    def _owner_is_open(owner) -> bool:
+        try:
+            return not bool(owner.closed)
+        except BaseException:
+            return True
+
+    def _after_retained_failure_cleanup(
+        self, error: BaseException, *, preparation: bool,
+    ):
+        if preparation:
+            self._preparation_window = None
+            return self._preparation_failure(error)
+        self._source_window = None
+        return self._terminal(_error_result(self.plan, error))
+
+    def _retain_internal_failure(
+        self, error: BaseException, *, prior_phase: AveragePendingPhase | None = None,
+    ) -> AverageScanResult | AverageScanPending:
+        """Convert an internal owner-path exception into revisioned settlement.
+
+        This method deliberately performs no source close and no H23 action.
+        It only retains the exact owner and publishes the next command boundary;
+        the creating worker thread advances that owner when ``command`` is
+        called again.  A failure in close/settlement therefore cannot escape to
+        ``OperationSlot`` as a false terminal while resources remain owned.
+        """
+
+        if self._result is not None:
+            return self._result
+        preparation = (
+            prior_phase is AveragePendingPhase.PREPARATION_CLEANUP
+            or self.plan is None
+        )
+        owner = self._pending_owner
+        if owner is None:
+            owner = self._preparation_window if preparation else self._source_window
+        if owner is not None and self._owner_is_open(owner):
+            phase = (
+                AveragePendingPhase.PREPARATION_CLEANUP
+                if preparation else AveragePendingPhase.SOURCE_CLEANUP
+            )
+            return self._pending(
+                phase,
+                f"AVERAGE_SOURCE_CLEANUP_PENDING: {_diagnostic(error)}",
+                owner=owner,
+                resume=lambda error=error, preparation=preparation:
+                    self._after_retained_failure_cleanup(
+                        error, preparation=preparation,
+                    ),
+            )
+        self._pending_owner = self._pending_resume = None
+        if preparation:
+            self._preparation_window = None
+        else:
+            self._source_window = None
+        if self._sink is not None:
+            if not self._gate_called and self._pending_abort is None:
+                self._pending_abort = (error, 'ABORTED')
+            return self._pending(
+                AveragePendingPhase.OUTPUT_SETTLEMENT,
+                'AVERAGE_H23_SETTLEMENT_PENDING',
+            )
+        if preparation:
+            return self._preparation_failure(error)
+        return self._terminal(_error_result(self.plan, error))
+
+    def _prepare(self):
+        self._state = AverageRunnerPhase.PREPARING
+        if _cancelled(self._cancel_token):
+            return self._preparation_cancelled()
+        for condition, code in (
+            (self.recipe.background is not None,
+             'AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED'),
+            (self.recipe.live_mode, 'AVERAGE_LIVE_TERMINALITY_UNSUPPORTED'),
+            (self.recipe.output_mode != 'Overwrite', 'AVERAGE_APPEND_UNSUPPORTED'),
+            (self.recipe.save_xye, 'AVERAGE_NEXUS_REQUIRED'),
+        ):
+            if condition:
+                return self._terminal(_recipe_refusal(self.recipe, code))
+        return self._prepare_qualification()
+
+    def _prepare_qualification(self):
+        try:
+            graph = qualify_source_execution_graph(
+                _source_from_recipe(self.recipe),
+                selected_motor=_selected_motor(self.recipe),
+                reader_binding=_READER_BINDING,
+                cancelled=None if self._cancel_token is None
+                else self._cancel_token.is_set,
+            )
+        except SourceCleanupPending as error:
+            return self._hold_source_cleanup(
+                error,
+                lambda owner=error.owner:
+                    self._resume_preparation_qualification(owner),
+                preparation=True,
+            )
+        except BaseException as error:
+            return self._preparation_failure(error)
+        return self._prepare_metadata(graph)
+
+    def _resume_preparation_qualification(self, owner):
+        try:
+            graph = owner.take()
+        except BaseException as error:
+            return self._preparation_failure(error)
+        if _cancelled(self._cancel_token):
+            return self._preparation_cancelled()
+        return self._prepare_metadata(graph)
+
+    def _prepare_metadata(self, graph):
+        try:
+            _reject(graph.detector_shape is None or graph.native_dtype is None,
+                    'AVERAGE_DETECTOR_LAYOUT_UNAVAILABLE')
+            self._preparation_graph = graph
+            window = open_source_execution_graph(
+                graph,
+                cancelled=None if self._cancel_token is None
+                else self._cancel_token.is_set,
+                prevalidated=True,
+            )
+            self._preparation_window = window
+            window.__enter__()
+            self._preparation_first_row = window.complete_metadata_for(0)
+            if _direct_eiger_candidate(graph):
+                layout, _reason = window.eiger_direct_chunk_layout()
+                self._preparation_direct_eiger_eligible = layout is not None
+        except BaseException as error:
+            self._preparation_error = error
+        window = self._preparation_window
+        if window is not None:
+            try:
+                window.close()
+            except SourceCleanupFailed as error:
+                return self._preparation_failure(error)
+            except SourceCleanupPending as error:
+                return self._hold_source_cleanup(
+                    error, self._after_preparation_window_cleanup,
+                    preparation=True,
+                )
+            except BaseException as error:
+                return self._hold_source_cleanup(
+                    SourceCleanupPending(
+                        window,
+                        f'AVERAGE_SOURCE_CLEANUP_PENDING: {error}',
+                    ),
+                    self._after_preparation_window_cleanup,
+                    preparation=True,
+                )
+        return self._after_preparation_window_cleanup()
+
+    def _after_preparation_window_cleanup(self):
+        self._preparation_window = None
+        if _cancelled(self._cancel_token):
+            return self._preparation_cancelled()
+        if self._preparation_error is not None:
+            error, self._preparation_error = self._preparation_error, None
+            return self._preparation_failure(error)
+        return self._prepare_requalification()
+
+    def _prepare_requalification(self):
+        graph = self._preparation_graph
+        try:
+            requalify_source_execution_graph(
+                _source_for_requalification(
+                    _source_from_recipe(self.recipe), graph,
+                ),
+                graph,
+                selected_motor=_selected_motor(self.recipe),
+                reader_binding=_READER_BINDING,
+                cancelled=None if self._cancel_token is None
+                else self._cancel_token.is_set,
+            )
+        except SourceCleanupPending as error:
+            return self._hold_source_cleanup(
+                error,
+                lambda owner=error.owner:
+                    self._resume_preparation_requalification(owner),
+                preparation=True,
+            )
+        except SourceRevisionChanged as error:
+            return self._preparation_failure(
+                ValueError('AVERAGE_SOURCE_DRIFT')
+            )
+        except BaseException as error:
+            return self._preparation_failure(error)
+        return self._finish_preparation()
+
+    def _resume_preparation_requalification(self, owner):
+        try:
+            owner.take()
+        except SourceRevisionChanged:
+            return self._preparation_failure(
+                ValueError('AVERAGE_SOURCE_DRIFT')
+            )
+        except BaseException as error:
+            return self._preparation_failure(error)
+        if _cancelled(self._cancel_token):
+            return self._preparation_cancelled()
+        return self._finish_preparation()
+
+    def _finish_preparation(self):
+        graph = self._preparation_graph
+        try:
+            self.plan = _plan_from_prepared_graph(
+                self.recipe, graph,
+                self._preparation_first_row,
+                direct_eiger_eligible=self._preparation_direct_eiger_eligible,
+            )
+        except BaseException as error:
+            return self._preparation_failure(error)
+        self._preparation_graph = self._preparation_first_row = None
+        self._state = AverageRunnerPhase.EXECUTING
+        return self._execute_graph(graph)
+
+    def start(
+        self, *, cancel_token: threading.Event | None = None,
+        progress_cb: Callable[[AverageScanProgress], object] | None = None,
+        publication_gate: Callable[[], bool] | None = None,
+    ) -> AverageScanResult | AverageScanPending:
         self._affine()
-        _reject(self._state != 'ACTIVE' or self._ran, 'AverageScanRunner.run is one-shot and requires entry', RuntimeError)
-        _reject(progress_cb is not None and (not callable(progress_cb)), 'Average progress callback must be callable', TypeError)
-        _reject(publication_gate is not None and (not callable(publication_gate)), 'Average publication gate must be callable', TypeError)
+        _reject(self._state is not AverageRunnerPhase.NEW,
+                'AverageScanRunner.start is one-shot', RuntimeError)
+        _reject(progress_cb is not None and not callable(progress_cb),
+                'Average progress callback must be callable', TypeError)
+        _reject(publication_gate is not None and not callable(publication_gate),
+                'Average publication gate must be callable', TypeError)
         _cancelled(cancel_token)
-        self._ran = True
-        self._cancel_token = cancel_token
+        self._cancel_token = (
+            cancel_token if cancel_token is not None else threading.Event()
+        )
         self._progress_cb = progress_cb
         self._publication_gate = publication_gate
-        error = None
         try:
-            _poll(cancel_token)
-            self._progress('qualify', 0, 1)
-            self._graph = self._fresh_graph()
-            self._progress('qualify', 1, 1)
-            self._source_window = open_source_execution_graph(self._graph, cancelled=None if cancel_token is None else cancel_token.is_set)
+            return self._prepare()
+        except BaseException as error:
+            return self._retain_internal_failure(error)
+
+    def _execute_graph(self, graph):
+        error = None
+        self._graph = graph
+        self._progress('qualify', 1, 1)
+        try:
+            self._source_window = open_source_execution_graph(
+                self._graph,
+                cancelled=None if self._cancel_token is None
+                else self._cancel_token.is_set,
+                direct_chunk_policy=_average_direct_chunk_policy(
+                    self.plan, self._graph,
+                ),
+                prevalidated=True,
+            )
             self._source_window.__enter__()
-            self._science = _average_contributors(self.plan, self._graph, self._source_window, cancel_token, self._progress)
-            self._reduction = _reduce_average(self.plan, self._science, cancel_token, self._progress)
+            self._science = _average_contributors(
+                self.plan, self._graph, self._source_window,
+                self._cancel_token, self._progress,
+            )
+            self._reduction = _reduce_average(
+                self.plan, self._science, self._cancel_token, self._progress,
+            )
         except BaseException as caught:
-            error = (_AverageCancelled('Average operation cancelled') if isinstance(caught, InterruptedError) and _cancelled(cancel_token) else caught)
+            error = (_AverageCancelled('Average operation cancelled')
+                     if isinstance(caught, InterruptedError)
+                     and _cancelled(self._cancel_token) else caught)
         if self._source_window is not None:
             try:
                 self._source_window.close()
-            except BaseException:
+            except SourceCleanupFailed as caught:
+                self._source_window = None
+                return self._terminal(_error_result(self.plan, caught))
+            except SourceCleanupPending as caught:
                 self._source_error = error
-                return self._pending(source=True)
+                return self._hold_source_cleanup(
+                    caught, self._after_runtime_source_cleanup,
+                )
+            except BaseException as caught:
+                self._source_error = error
+                return self._hold_source_cleanup(
+                    SourceCleanupPending(
+                        self._source_window,
+                        f'AVERAGE_SOURCE_CLEANUP_PENDING: {caught}',
+                    ),
+                    self._after_runtime_source_cleanup,
+                )
             self._source_window = None
         if error is not None:
             return self._terminal(_error_result(self.plan, error))
         return self._after_source_clean()
-    def _source_sweep(self) -> None:
-        source = _source_for_requalification(
-            _source_from_recipe(self.plan.recipe), self._graph)
-        try: requalify_source_execution_graph(source, self._graph, selected_motor=_selected_motor(self.plan.recipe), reader_binding=_READER_BINDING, cancelled=None if self._cancel_token is None else self._cancel_token.is_set)
-        except InterruptedError as error: raise (_AverageCancelled('Average operation cancelled') if _cancelled(self._cancel_token) else error)
-        except SourceRevisionChanged as error: raise SourceRevisionChanged('AVERAGE_SOURCE_DRIFT') from error
+
+    def _after_runtime_source_cleanup(self):
+        self._source_window = None
+        if self._source_error is not None:
+            error, self._source_error = self._source_error, None
+            return self._terminal(_error_result(self.plan, error))
+        return self._after_source_clean()
+
+    def _source_state_sweep(self) -> None:
+        try:
+            validate_source_state_sweep(
+                self._graph.stamp,
+                cancelled=None if self._cancel_token is None
+                else self._cancel_token.is_set,
+            )
+        except InterruptedError as error:
+            raise (_AverageCancelled('Average operation cancelled')
+                   if _cancelled(self._cancel_token) else error)
+        except SourceRevisionChanged as error:
+            raise SourceRevisionChanged('AVERAGE_SOURCE_DRIFT') from error
+
     def _target_sweep(self, expected: TargetSnapshot) -> None:
-        _reject(capture_target_snapshot(self.plan.recipe.target) != expected, 'AVERAGE_TARGET_DRIFT')
-    def _final_sweep(self, expected: TargetSnapshot) -> None:
-        self._source_sweep(); self._target_sweep(expected)
-    def _abort(self, error: BaseException, *, disposition: str='ABORTED') -> AverageScanResult:
+        _reject(capture_target_snapshot(self.plan.recipe.target) != expected,
+                'AVERAGE_TARGET_DRIFT')
+
+    def _terminal_abort(self, error: BaseException, disposition: str):
+        value = _error_result(
+            self.plan, error, h23=True,
+            denominators=self._science['denominators'],
+        )
+        if disposition == 'CANCELLED':
+            value = _result(
+                self.plan, 'CANCELLED',
+                code=('AVERAGE_CANCELLED' if isinstance(error, _AverageCancelled)
+                      else str(error)), diagnostic=_diagnostic(error),
+                denominators=self._science['denominators'],
+            )
+        return self._terminal(value)
+
+    def _abort(self, error: BaseException, *, disposition: str = 'ABORTED'):
+        self._pending_abort = (error, disposition)
         if self._sink is not None:
             try:
                 self._sink._scan = self._sink._plan = None
                 self._sink._abort_composed()
             except BaseException:
                 phase = self._sink._transaction.snapshot().phase.value
-                if phase in {'ready-to-retry', 'rollback-pending', 'cleanup-pending', 'integrity-hold', 'executing'}:
-                    return self._pending()
+                if phase in {
+                    'ready-to-retry', 'rollback-pending', 'cleanup-pending',
+                    'integrity-hold', 'executing',
+                }:
+                    return self._pending(
+                        AveragePendingPhase.OUTPUT_SETTLEMENT,
+                        'AVERAGE_H23_SETTLEMENT_PENDING',
+                    )
                 raise
-        value = _error_result(self.plan, error, h23=True, denominators=self._science['denominators'])
-        if disposition == 'CANCELLED':
-            value = _result(self.plan, 'CANCELLED', code='AVERAGE_CANCELLED' if isinstance(error, _AverageCancelled) else str(error), diagnostic=_diagnostic(error), denominators=self._science['denominators'])
-        return self._terminal(value)
-    def _gate(self) -> AverageScanResult | None:
-        if _cancelled(self._cancel_token): return self._abort(_AverageCancelled('Average operation cancelled'), disposition='CANCELLED')
+        self._pending_abort = None
+        return self._terminal_abort(error, disposition)
+
+    def _gate(self):
+        if _cancelled(self._cancel_token):
+            return self._abort(
+                _AverageCancelled('Average operation cancelled'),
+                disposition='CANCELLED',
+            )
         if self._gate_called:
             return None
         self._gate_called = True
@@ -944,32 +1418,74 @@ class AverageScanRunner:
         try:
             accepted = self._publication_gate()
         except BaseException as error:
-            return self._abort(ValueError(f'AVERAGE_PUBLICATION_GATE_FAILED: {_diagnostic(error)}'))
+            return self._abort(ValueError(
+                f'AVERAGE_PUBLICATION_GATE_FAILED: {_diagnostic(error)}'
+            ))
         if accepted is not True:
-            return self._abort(ValueError('AVERAGE_PUBLICATION_NOT_SEALED'), disposition='CANCELLED')
+            return self._abort(
+                ValueError('AVERAGE_PUBLICATION_NOT_SEALED'),
+                disposition='CANCELLED',
+            )
         return None
-    def _commit(self) -> AverageScanResult:
+
+    def _commit(self):
         sink = self._sink
         try:
-            snapshot = sink._transaction.commit_stream(sink._attempt, lease=sink._lease)
+            snapshot = sink._transaction.commit_stream(
+                sink._attempt, lease=sink._lease,
+            )
             sink._release_terminal_lease()
             terminal = sink._typed_terminal(snapshot)
             sink._scan = sink._plan = None
         except BaseException as error:
             phase = sink._transaction.snapshot().phase.value
-            if phase in {'ready-to-retry', 'rollback-pending', 'cleanup-pending', 'integrity-hold', 'executing'}:
-                return self._pending()
-            return self._terminal(_error_result(self.plan, error, h23=True, denominators=self._science['denominators']))
-        return self._terminal(_result(self.plan, 'COMMITTED', denominators=self._science['denominators'], evidence=self._science['finite'].evidence, commit=terminal.commit_identity))
-    def _writer_pending(self) -> AverageScanResult:
-        try: self._h23_target_snapshot = capture_target_snapshot(self.plan.recipe.target)
-        except BaseException as error: return self._abort(error)
-        return self._pending()
-    def _after_source_clean(self) -> AverageScanResult:
+            if phase in {
+                'ready-to-retry', 'rollback-pending', 'cleanup-pending',
+                'integrity-hold', 'executing',
+            }:
+                return self._pending(
+                    AveragePendingPhase.OUTPUT_SETTLEMENT,
+                    'AVERAGE_H23_SETTLEMENT_PENDING',
+                )
+            return self._terminal(_error_result(
+                self.plan, error, h23=True,
+                denominators=self._science['denominators'],
+            ))
+        return self._terminal(_result(
+            self.plan, 'COMMITTED',
+            denominators=self._science['denominators'],
+            evidence=self._science['finite'].evidence,
+            commit=terminal.commit_identity,
+        ))
+
+    def _writer_pending(self):
+        try:
+            self._h23_target_snapshot = capture_target_snapshot(
+                self.plan.recipe.target,
+            )
+        except BaseException as error:
+            return self._abort(error)
+        return self._pending(
+            AveragePendingPhase.OUTPUT_SETTLEMENT,
+            'AVERAGE_H23_SETTLEMENT_PENDING',
+        )
+
+    def _after_source_clean(self):
         try:
             _poll(self._cancel_token)
+            self._source_state_sweep()
+        except BaseException as error:
+            return self._terminal(_error_result(self.plan, error))
+        return self._write_after_source_sweep()
+
+    def _write_after_source_sweep(self):
+        try:
+            _poll(self._cancel_token)
+            self._target_sweep(self.plan.expected_target_snapshot)
             scan, frame, reduced, _provenance = self._reduction
-            self._final_sweep(self.plan.expected_target_snapshot)
+        except BaseException as error:
+            return self._terminal(_error_result(self.plan, error))
+        try:
             self._sink = _average_sink(self.plan, self._graph)
             self._sink.begin(scan, _derived_reduction(self.plan.recipe))
             self._progress('write', 0, 1)
@@ -977,85 +1493,179 @@ class AverageScanRunner:
             self._sink._apply_pending_extension()
             self._sink._drain_pending_record_writes(force=True)
             writer = self._sink._writer
-            writer.finish(self._sink._writer_finalization(writer)); self._h23_target_snapshot = capture_target_snapshot(self.plan.recipe.target)
+            writer.finish(self._sink._writer_finalization(writer))
+            self._h23_target_snapshot = capture_target_snapshot(
+                self.plan.recipe.target,
+            )
             self._progress('write', 1, 1)
-        except WriterIncomplete: return self._writer_pending()
+        except WriterIncomplete:
+            return self._writer_pending()
         except BaseException as error:
-            if self._sink is not None:
-                return self._abort(error)
-            return self._terminal(_error_result(self.plan, error))
+            return self._abort(error) if self._sink is not None else self._terminal(
+                _error_result(self.plan, error)
+            )
+        return self._after_writer_finished()
+
+    def _after_writer_finished(self):
         try:
-            self._final_sweep(self._h23_target_snapshot)
+            self._source_state_sweep()
+        except BaseException as error:
+            return self._abort(error)
+        return self._commit_after_writer_source_sweep()
+
+    def _commit_after_writer_source_sweep(self):
+        try:
+            self._target_sweep(self._h23_target_snapshot)
         except BaseException as error:
             return self._abort(error)
         gated = self._gate()
-        if gated is not None:
-            return gated
-        return self._commit()
-    def finish_current(self) -> AverageScanResult:
-        self._affine()
-        if self._state in {'TERMINAL', 'CLOSED'} and self._result is not None:
-            return self._result
-        _reject(self._state != 'SETTLEMENT_PENDING', 'AverageScanRunner has no pending settlement', RuntimeError)
-        if self._source_window is not None:
-            time.sleep(0.05)
-            try:
-                self._source_window.close()
-            except BaseException:
-                return self._pending(source=True)
-            self._source_window = None
-            if self._source_error is not None:
-                error, self._source_error = (self._source_error, None)
-                return self._terminal(_error_result(self.plan, error))
-            self._state = 'ACTIVE'
-            return self._after_source_clean()
+        return gated if gated is not None else self._commit()
+
+    def _retry_output_once(self):
         sink = self._sink
+        if self._pending_abort is not None:
+            error, disposition = self._pending_abort
+            try:
+                sink._scan = sink._plan = None
+                sink._abort_composed()
+            except BaseException:
+                return self._pending(
+                    AveragePendingPhase.OUTPUT_SETTLEMENT,
+                    'AVERAGE_H23_SETTLEMENT_PENDING',
+                )
+            self._pending_abort = None
+            return self._terminal_abort(error, disposition)
         phase = sink._transaction.snapshot().phase.value
         if phase in {'cleanup-pending', 'epoch-committed', 'committed'}:
             try:
                 terminal = sink.finish(SimpleNamespace(cancelled=False))
             except BaseException:
-                return self._pending()
-            return self._terminal(_result(self.plan, 'COMMITTED', denominators=self._science['denominators'], evidence=self._science['finite'].evidence, commit=terminal.commit_identity))
+                return self._pending(
+                    AveragePendingPhase.OUTPUT_SETTLEMENT,
+                    'AVERAGE_H23_SETTLEMENT_PENDING',
+                )
+            return self._terminal(_result(
+                self.plan, 'COMMITTED',
+                denominators=self._science['denominators'],
+                evidence=self._science['finite'].evidence,
+                commit=terminal.commit_identity,
+            ))
+        return self._retry_writer_once()
+
+    def _retry_writer_once(self):
+        sink = self._sink
+        if _cancelled(self._cancel_token):
+            return self._abort(
+                _AverageCancelled('Average operation cancelled'),
+                disposition='CANCELLED',
+            )
         try:
-            self._final_sweep(self._h23_target_snapshot)
-            sink._writer.finish()
-        except WriterIncomplete: return self._writer_pending()
+            self._target_sweep(self._h23_target_snapshot)
         except BaseException as error:
             return self._abort(error)
         try:
-            self._h23_target_snapshot = capture_target_snapshot(self.plan.recipe.target)
-            self._final_sweep(self._h23_target_snapshot)
-        except BaseException as error: return self._abort(error)
-        gated = self._gate()
-        if gated is not None:
-            return gated
-        return self._commit()
-    def close(self) -> AverageScanResult | None:
+            sink._writer.finish()
+        except WriterIncomplete:
+            return self._writer_pending()
+        except BaseException as error:
+            return self._abort(error)
+        try:
+            self._h23_target_snapshot = capture_target_snapshot(
+                self.plan.recipe.target,
+            )
+        except BaseException as error:
+            return self._abort(error)
+        try:
+            self._source_state_sweep()
+        except BaseException as error:
+            return self._abort(error)
+        return self._commit_after_writer_source_sweep()
+
+    def command(
+        self, command: AverageCommand, pending: AverageScanPending,
+    ) -> AverageScanResult | AverageScanPending:
         self._affine()
-        if self._state == 'CLOSED':
+        _reject(type(command) is not AverageCommand,
+                'Average command is invalid', TypeError)
+        _reject(pending is not self._pending_token,
+                'Average pending token is stale', RuntimeError)
+        _reject(self._state not in {
+                    AverageRunnerPhase.SOURCE_CLEANUP_PENDING,
+                    AverageRunnerPhase.OUTPUT_SETTLEMENT_PENDING,
+                }, 'Average runner has no pending owner', RuntimeError)
+        try:
+            return self._command_once(command, pending)
+        except BaseException as error:
+            return self._retain_internal_failure(
+                error, prior_phase=pending.phase,
+            )
+
+    def _command_once(
+        self, command: AverageCommand, pending: AverageScanPending,
+    ) -> AverageScanResult | AverageScanPending:
+        if command in {AverageCommand.CANCEL, AverageCommand.CLOSE}:
+            if self._cancel_token is not None and not self._gate_called:
+                self._cancel_token.set()
+        owner, resume = self._pending_owner, self._pending_resume
+        self._pending_token = None
+        if owner is not None:
+            try:
+                owner.close()
+            except SourceCleanupFailed as error:
+                self._pending_owner = self._pending_resume = None
+                self._state = AverageRunnerPhase.EXECUTING
+                if pending.phase is AveragePendingPhase.PREPARATION_CLEANUP:
+                    self._preparation_window = None
+                    return self._preparation_failure(error)
+                self._source_window = self._source_error = None
+                return self._terminal(_error_result(self.plan, error))
+            except SourceCleanupPending as error:
+                return self._hold_source_cleanup(
+                    error, resume,
+                    preparation=(pending.phase
+                                 is AveragePendingPhase.PREPARATION_CLEANUP),
+                )
+            except BaseException as error:
+                wrapped = SourceCleanupPending(
+                    owner, f'AVERAGE_SOURCE_CLEANUP_PENDING: {error}',
+                )
+                return self._hold_source_cleanup(
+                    wrapped, resume,
+                    preparation=(pending.phase
+                                 is AveragePendingPhase.PREPARATION_CLEANUP),
+                )
+            if not getattr(owner, 'closed', False):
+                wrapped = SourceCleanupPending(
+                    owner, 'AVERAGE_SOURCE_CLEANUP_PENDING',
+                )
+                return self._hold_source_cleanup(
+                    wrapped, resume,
+                    preparation=(pending.phase
+                                 is AveragePendingPhase.PREPARATION_CLEANUP),
+                )
+            self._pending_owner = self._pending_resume = None
+            self._state = AverageRunnerPhase.EXECUTING
+            return resume()
+        self._state = AverageRunnerPhase.EXECUTING
+        if command in {AverageCommand.CANCEL, AverageCommand.CLOSE}:
+            # Once publication has been sealed, or an earlier failure already
+            # selected rollback, cleanup commands must finish that exact
+            # settlement direction.  They cannot replace it with a new abort.
+            if self._gate_called or self._pending_abort is not None:
+                return self._retry_output_once()
+            return self._abort(
+                _AverageCancelled('Average operation cancelled'),
+                disposition='CANCELLED',
+            )
+        return self._retry_output_once()
+
+    def close(self):
+        self._affine()
+        if self._state is AverageRunnerPhase.CLOSED:
             return self._result
-        while self._state == 'SETTLEMENT_PENDING':
-            self.finish_current()
-        self._state = 'CLOSED'
+        if self._pending_token is not None:
+            outcome = self.command(AverageCommand.CLOSE, self._pending_token)
+            if type(outcome) is AverageScanPending:
+                return outcome
+        self._state = AverageRunnerPhase.CLOSED
         return self._result
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        self.close()
-        return False
-def run_average_scan(recipe: AverageScanRecipe, *, cancel_token: threading.Event | None=None, progress_cb: Callable[[AverageScanProgress], object] | None=None, publication_gate: Callable[[], bool] | None=None) -> AverageScanResult:
-    _reject(type(recipe) is not AverageScanRecipe, 'run_average_scan requires an exact recipe', TypeError)
-    for condition, code in ((recipe.background is not None, 'AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED'), (recipe.live_mode, 'AVERAGE_LIVE_TERMINALITY_UNSUPPORTED'), (recipe.output_mode != 'Overwrite', 'AVERAGE_APPEND_UNSUPPORTED'), (recipe.save_xye, 'AVERAGE_NEXUS_REQUIRED')):
-        if condition:
-            return _recipe_refusal(recipe, code)
-    try:
-        plan = prepare_average_scan(recipe, cancel_token=cancel_token)
-    except InterruptedError:
-        return AverageScanResult('CANCELLED', recipe.target, recipe.entry, '', '', 0, (1,), (), (), None, 'AVERAGE_CANCELLED', 'Average preparation cancelled', None, None)
-    except BaseException as error:
-        code = _diagnostic(error).split('(', 1)[0]
-        return _recipe_refusal(recipe, code if code.startswith('AVERAGE_') else 'AVERAGE_PREPARATION_FAILED')
-    with AverageScanRunner(plan) as runner:
-        result = runner.run(cancel_token=cancel_token, progress_cb=progress_cb, publication_gate=publication_gate)
-        while result.disposition == 'SETTLEMENT_PENDING':
-            result = runner.finish_current()
-        return result

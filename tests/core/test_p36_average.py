@@ -26,6 +26,8 @@ from xrd_tools.reduction import average as module
 from xrd_tools.session.experiment_state import (
     CalibrationState, FactStatus, MaskState, PoniValues,
 )
+from xrd_tools.session.intent_store import IntentFreezeAccepted, RunIntentStore
+from xrd_tools.session.run_configuration import RunIntent, ThresholdIntent
 from xrd_tools.reduction.background import FrameBackgroundPlan
 from xrd_tools.sources.selection import image_series_spec
 
@@ -39,6 +41,55 @@ def _series(tmp_path: Path, arrays=None) -> SourceSpec:
     for index, value in enumerate(arrays, 1):
         tifffile.imwrite(tmp_path / f"scan_{index:04d}.tif", value)
     return image_series_spec(tmp_path / "scan_0001.tif", metadata_format=None)
+
+
+def _frozen_configuration(source: SourceSpec, reduction: ReductionPlan):
+    one = reduction.integration_1d or Integration1DPlan()
+    two = reduction.integration_2d
+    intent = RunIntent(
+        source_spec=source,
+        processing_mode="Int 2D" if two is not None else "Int 1D",
+        output_mode="Overwrite",
+        bai_1d_args={
+            "npt": one.npt,
+            "unit": one.unit,
+            "method": one.method,
+            "radial_range": one.radial_range,
+            "azimuth_range": one.azimuth_range,
+            "monitor": one.monitor_key,
+            "error_model": one.error_model,
+            "polarization_factor": one.polarization_factor,
+            "chi_npt_rad": one.npt_rad,
+            "chi_offset": one.azimuth_offset,
+            **dict(one.extra),
+        },
+        bai_2d_args={} if two is None else {
+            "npt_rad": two.npt_rad,
+            "npt_azim": two.npt_azim,
+            "unit": two.unit,
+            "method": two.method,
+            "radial_range": two.radial_range,
+            "azimuth_range": two.azimuth_range,
+            "chi_offset": two.azimuth_offset,
+            "monitor": two.monitor_key,
+            "error_model": two.error_model,
+            "polarization_factor": two.polarization_factor,
+            **dict(two.extra),
+        },
+        threshold=ThresholdIntent(
+            apply_threshold=(
+                reduction.threshold_min is not None
+                or reduction.threshold_max is not None
+            ),
+            threshold_min=reduction.threshold_min,
+            threshold_max=reduction.threshold_max,
+            mask_saturation=reduction.mask_saturation,
+        ),
+        run_options={"series_average": True},
+    )
+    frozen = RunIntentStore(intent).freeze(expected_revision=0)
+    assert type(frozen) is IntentFreezeAccepted
+    return frozen.configuration
 
 
 def _txt(path: str | Path, *, counters=(), motors=()) -> None:
@@ -68,6 +119,27 @@ def _stub_integrators(monkeypatch, observed, *, all_dummy_2d=False):
     monkeypatch.setattr(core, "integrate_2d", two)
 
 
+def _run_average_scan(recipe, **kwargs):
+    runner = module.AverageScanRunner(recipe)
+    result = runner.start(**kwargs)
+    assert type(result) is module.AverageScanResult
+    assert runner.close() is result
+    return result
+
+
+def _prepare_average_scan(recipe):
+    runner = module.AverageScanRunner(recipe)
+    runner._execute_graph = lambda _graph: runner.plan
+    value = runner.start()
+    if type(value) is module.AverageScanResult:
+        raise ValueError(value.diagnostic or value.diagnostic_code)
+    if type(value) is module.AverageScanPending:
+        raise RuntimeError(value.diagnostic)
+    assert type(value) is module.AverageScanPlan
+    runner.close()
+    return value
+
+
 def _public_run(tmp_path, monkeypatch, *, source=None, target_name="average.nxs",
                 reduction=None, **recipe_kwargs):
     observed = []
@@ -77,7 +149,7 @@ def _public_run(tmp_path, monkeypatch, *, source=None, target_name="average.nxs"
         reduction or ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
         **recipe_kwargs,
     )
-    result = module.run_average_scan(recipe)
+    result = _run_average_scan(recipe)
     return recipe, result, observed
 
 
@@ -339,7 +411,7 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
             ({"save_xye": True}, "AVERAGE_NEXUS_REQUIRED"),
         ):
             recipe = AverageScanRecipe(source, target, ReductionPlan(), **updates)
-            result = module.run_average_scan(recipe)
+            result = _run_average_scan(recipe)
             assert (result.disposition, result.diagnostic_code) == ("REFUSED", code)
     assert effects == [] and not (tmp_path / "absent.nxs").exists()
     assert existing.read_bytes() == prior
@@ -361,7 +433,16 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     recipes = tuple(AverageScanRecipe(
         source, batch_root / f"average-{mode}.nxs", ReductionPlan(), batch_mode=mode,
     ) for mode in (False, True))
-    plans = tuple(module.prepare_average_scan(recipe) for recipe in recipes)
+    plans = []
+    accepted = []
+    for recipe in recipes:
+        runner = module.AverageScanRunner(recipe)
+        result = runner.start()
+        assert type(result) is module.AverageScanResult
+        plans.append(runner.plan)
+        accepted.append(result)
+        assert runner.close() is result
+    plans = tuple(plans)
     assert module._science_payload(plans[0]) == module._science_payload(plans[1])
     assert plans[0].science_identity == plans[1].science_identity
     operation_payloads = [module._operation_payload(plan) for plan in plans]
@@ -372,10 +453,6 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
         normalized.append(payload)
     assert normalized[0] == normalized[1]
     assert plans[0].operation_identity != plans[1].operation_identity
-    accepted = []
-    for plan in plans:
-        with module.AverageScanRunner(plan) as runner:
-            accepted.append(runner.run())
     assert all(result.disposition == "COMMITTED" and result.contributor_extent == 1
                for result in accepted)
     assert all(result.logical_labels == result.committed_labels == (1,)
@@ -424,7 +501,7 @@ def test_average_background_none_is_canonical_and_active_refuses_pre_effect(
     assert omitted.background is explicit.background is None
     assert module._recipe_payload(omitted) == module._recipe_payload(explicit)
     assert module._recipe_payload(explicit)["background"] is None
-    plans = tuple(module.prepare_average_scan(recipe)
+    plans = tuple(_prepare_average_scan(recipe)
                   for recipe in (omitted, explicit))
     assert plans[0].allocation == plans[1].allocation
     assert plans[0].science_identity == plans[1].science_identity
@@ -457,8 +534,8 @@ def test_average_background_none_is_canonical_and_active_refuses_pre_effect(
             ValueError,
             match="^AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED$",
         ):
-            module.prepare_average_scan(active)
-        refused = module.run_average_scan(active)
+            _prepare_average_scan(active)
+        refused = _run_average_scan(active)
     assert (refused.disposition, refused.diagnostic_code) == (
         "REFUSED", "AVERAGE_BACKGROUND_AGGREGATE_PROVENANCE_UNSUPPORTED",
     )
@@ -474,7 +551,7 @@ def test_average_background_none_is_canonical_and_active_refuses_pre_effect(
 
     _stub_integrators(monkeypatch, integrations)
     monkeypatch.setattr(module, "NexusSink", sink)
-    committed = module.run_average_scan(explicit)
+    committed = _run_average_scan(explicit)
     assert committed.disposition == "COMMITTED" and len(integrations) == 1
     assert len(run_configuration) == 1
     assert "background" not in run_configuration[0]
@@ -501,7 +578,7 @@ def test_post_admission_source_drift_rolls_back_prior_target(tmp_path, monkeypat
         return value
 
     monkeypatch.setattr(core, "integrate_1d", mutate_after_reduction)
-    result = module.run_average_scan(AverageScanRecipe(
+    result = _run_average_scan(AverageScanRecipe(
         source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
     ))
     assert result.disposition == "REFUSED"
@@ -530,7 +607,7 @@ def test_pixel_and_metadata_sum_overflow_refuse_without_output(tmp_path, monkeyp
             })
         observed = []
         _stub_integrators(monkeypatch, observed)
-        result = module.run_average_scan(AverageScanRecipe(
+        result = _run_average_scan(AverageScanRecipe(
             source, root / "average.nxs", ReductionPlan(),
             numeric_metadata_keys=("I0",) if name == "metadata" else (),
         ))
@@ -549,7 +626,9 @@ def test_partial_owner_block_grant_refuses_before_pixel_read(tmp_path, monkeypat
         execution_graph._AverageSourceReadWindow, "read_native",
         lambda window, index: reads.append(index) or original_read(window, index),
     )
-    valid = module._average_allocation(recipe, (2, 2)); counts = dict(valid.counts)
+    valid = module._average_allocation(
+        recipe, (2, 2), np.dtype("<u2"), direct_eiger_eligible=False,
+    ); counts = dict(valid.counts)
     key = next(iter(valid.categories)); categories = dict(valid.categories)
     mutants = (
         replace(valid, requirements=replace(
@@ -564,15 +643,7 @@ def test_partial_owner_block_grant_refuses_before_pixel_read(tmp_path, monkeypat
             patch.setattr(module, "resolve_session_policy", lambda *_a, bad=bad, **_k: SimpleNamespace(allocation=bad))
             patch.setattr(module, "capture_target_snapshot", lambda *_a: targets.append(1) or pytest.fail("target reached"))
             with pytest.raises(ValueError, match="AVERAGE_OWNER_BLOCK_GRANT_INCOMPLETE"):
-                module.prepare_average_scan(recipe)
-    plan = module.prepare_average_scan(recipe)
-    for bad in mutants:
-        with monkeypatch.context() as patch:
-            patch.setattr(module, "open_source_execution_graph", lambda *_a, **_k: pytest.fail("execution window opened"))
-            patch.setattr(module, "NexusSink", lambda *_a, **_k: pytest.fail("sink reached"))
-            with module.AverageScanRunner(replace(plan, allocation=bad)) as runner:
-                result = runner.run()
-            assert (result.disposition, result.diagnostic_code) == ("REFUSED", "AVERAGE_ALLOCATION_CHANGED")
+                _prepare_average_scan(recipe)
     assert reads == [] and targets == [] and not Path(recipe.target).exists()
 
 
@@ -626,8 +697,8 @@ def test_recipe_deep_snapshot_survives_all_caller_mutation(tmp_path) -> None:
     )
     variant = replace(recipe, calibration=variant_calibration)
     assert module._recipe_payload(variant) != before
-    prepared = module.prepare_average_scan(replace(recipe, background=None))
-    variant_prepared = module.prepare_average_scan(
+    prepared = _prepare_average_scan(replace(recipe, background=None))
+    variant_prepared = _prepare_average_scan(
         replace(variant, background=None),
     )
     assert tuple(module._science_payload(prepared)["calibration"]
@@ -739,7 +810,7 @@ def test_preparation_metadata_row_drift_refuses_before_key_identity_derivation(t
                       "complete_metadata_for", row)
         patch.setattr(module, "source_graph_digest", lambda *_a: pytest.fail("identity derived after metadata drift"))
         with pytest.raises(ValueError, match="AVERAGE_SOURCE_DRIFT"):
-            module.prepare_average_scan(AverageScanRecipe(
+            _prepare_average_scan(AverageScanRecipe(
                 source, tmp_path / "average.nxs", ReductionPlan(), numeric_metadata_keys=("i0",),
             ))
     assert not (tmp_path / "average.nxs").exists()
@@ -747,21 +818,22 @@ def test_preparation_metadata_row_drift_refuses_before_key_identity_derivation(t
     for path in gi_source.options["files"]: _txt(path, motors=(("theta", 0.2),))
     gi_source = SourceSpec(gi_source.uri, gi_source.kind, options={**dict(gi_source.options), "metadata_format": "txt"})
     calls = []; real_prepare_q = module.qualify_source_execution_graph
-    real_execution_q = module._source_graph_owner.qualify_source_execution_graph
     real_rq = module.requalify_source_execution_graph
+    real_state_sweep = module.validate_source_state_sweep
     def prepare_q(*args, **kwargs): calls.append(("prepare", kwargs.get("selected_motor"))); return real_prepare_q(*args, **kwargs)
-    def execution_q(*args, **kwargs): calls.append(("execution", kwargs.get("selected_motor"))); return real_execution_q(*args, **kwargs)
     def rq(*args, **kwargs): calls.append(("requalify", kwargs.get("selected_motor"))); return real_rq(*args, **kwargs)
+    def state_sweep(*args, **kwargs): calls.append(("state-sweep", None)); return real_state_sweep(*args, **kwargs)
     with monkeypatch.context() as patch:
+        _stub_integrators(patch, [])
         patch.setattr(module, "qualify_source_execution_graph", prepare_q)
-        patch.setattr(module._source_graph_owner, "qualify_source_execution_graph", execution_q)
         patch.setattr(module, "requalify_source_execution_graph", rq)
-        plan = module.prepare_average_scan(AverageScanRecipe(
-            gi_source, gi_root / "average.nxs", ReductionPlan(gi=GIMode(incidence_motor="theta")),
+        patch.setattr(module, "validate_source_state_sweep", state_sweep)
+        result = _run_average_scan(AverageScanRecipe(
+            gi_source, gi_root / "average.nxs", ReductionPlan(),
         ))
-        runner = module.AverageScanRunner(plan); runner._graph = runner._fresh_graph(); runner._source_sweep()
-    assert calls == [("prepare", "theta"), ("requalify", "theta"),
-                     ("execution", "theta"), ("requalify", "theta")]
+    assert result.disposition == "COMMITTED"
+    assert calls == [("prepare", None), ("requalify", None),
+                     ("state-sweep", None), ("state-sweep", None)]
 
 
 def test_average_tiff_fence_is_aligned_and_nexus_segment_lookup_is_binary(
@@ -882,7 +954,7 @@ def test_average_rejects_selected_sidecar_foreign_snapshot_then_restore(
         lambda values: adopted.append(dict(values)) or {},
     )
     with pytest.raises(OSError, match="metadata source changed during read"):
-        module.prepare_average_scan(AverageScanRecipe(
+        _prepare_average_scan(AverageScanRecipe(
             source, tmp_path / f"average-{metadata_format}.nxs",
             ReductionPlan(integration_1d=Integration1DPlan(npt=2)),
             numeric_metadata_keys=("I0",),
@@ -1101,16 +1173,16 @@ def test_source_science_and_operation_identity_domains_vary_independently(tmp_pa
     base_target = tmp_path / "basé.nxs"
     resources = {"resource_requests": {"workers": 1},
                  "resource_env": {"XDART_PREFETCH_QUEUE_SIZE": "1"}}
-    base = module.prepare_average_scan(AverageScanRecipe(
+    base = _prepare_average_scan(AverageScanRecipe(
         base_source, base_target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)), **resources,
     ))
-    changed_source = module.prepare_average_scan(AverageScanRecipe(
+    changed_source = _prepare_average_scan(AverageScanRecipe(
         other_source, base_target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)), **resources,
     ))
-    changed_science = module.prepare_average_scan(AverageScanRecipe(
+    changed_science = _prepare_average_scan(AverageScanRecipe(
         base_source, base_target, ReductionPlan(integration_1d=Integration1DPlan(npt=5)), **resources,
     ))
-    changed_operation = module.prepare_average_scan(AverageScanRecipe(
+    changed_operation = _prepare_average_scan(AverageScanRecipe(
         base_source, tmp_path / "other.nxs", ReductionPlan(integration_1d=Integration1DPlan(npt=4)), **resources,
     ))
     assert base.source_graph_digest != changed_source.source_graph_digest
@@ -1129,7 +1201,8 @@ def test_source_science_and_operation_identity_domains_vary_independently(tmp_pa
         "entry", "source_base", "output_mode", "live_mode", "save_xye",
         "batch_mode", "contributor_extent", "detector_shape", "native_dtype",
         "numeric_metadata_keys", "invariant_metadata_keys", "logical_labels",
-        "expected_target_snapshot", "resource_inputs", "allocation",
+        "direct_eiger_eligible", "expected_target_snapshot", "resource_inputs",
+        "allocation",
     }
     assert payload["api_version"] == "average_scan_v1"
     assert (payload["target"], payload["entry"], payload["source_base"],
@@ -1139,6 +1212,7 @@ def test_source_science_and_operation_identity_domains_vary_independently(tmp_pa
     )
     assert (payload["contributor_extent"], tuple(payload["detector_shape"]),
             payload["native_dtype"], tuple(payload["logical_labels"])) == (1, (2, 2), "<u2", (1,))
+    assert payload["direct_eiger_eligible"] is base.direct_eiger_eligible is False
     assert tuple(payload["numeric_metadata_keys"]) == base.numeric_metadata_keys
     assert tuple(payload["invariant_metadata_keys"]) == base.invariant_metadata_keys
     assert set(payload["expected_target_snapshot"]) == {
@@ -1233,7 +1307,7 @@ def test_average_lineage_iterators_cover_container_tiff_and_eiger(tmp_path, monk
     _stub_integrators(monkeypatch, observed)
     rows = {}
     for family, source in sources.items():
-        result = module.run_average_scan(AverageScanRecipe(
+        result = _run_average_scan(AverageScanRecipe(
             source, roots[family] / "average.nxs", ReductionPlan(),
         ))
         assert result.disposition == "COMMITTED"
@@ -1270,37 +1344,49 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
 ) -> None:
     from xrd_tools.sources import execution_graph
 
-    source_path = tmp_path / "651.nxs"
+    members = []
+    for ordinal, extent in enumerate((217, 217, 217), 1):
+        path = tmp_path / f"data_{ordinal:06d}.h5"
+        with h5py.File(path, "w") as handle:
+            handle.create_dataset(
+                "entry/data/data",
+                data=np.arange(extent, dtype="u2").reshape(extent, 1, 1),
+                chunks=(1, 1, 1),
+            )
+        members.append(path)
+    source_path = tmp_path / "scan_master.h5"
     with h5py.File(source_path, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
-        detector = entry.create_group("instrument/detector")
-        detector.create_dataset(
-            "data", data=np.arange(651, dtype="u2").reshape(651, 1, 1),
-            chunks=(1, 1, 1),
-        )
-    source = SourceSpec(
-        source_path, SourceKind.NEXUS_STACK, entry="entry",
-    )
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        for ordinal, path in enumerate(members, 1):
+            data[f"data_{ordinal:06d}"] = h5py.ExternalLink(
+                path.name, "/entry/data/data",
+            )
+    source = image_series_spec(source_path, metadata_format=None)
     recipe = AverageScanRecipe(
         source, tmp_path / "average-651.nxs",
         ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
         background=FrameBackgroundPlan(),
     )
     counts = {
-        "prepare_qualify": 0, "execution_qualify": 0,
-        "requalify": 0, "read_native": 0, "metadata": 0,
+        "prepare_qualify": 0, "requalify": 0, "source_state_sweep": 0,
+        "read_native": 0, "metadata": 0,
         "contributor_fence": 0, "background_fact": 0,
-        "background_resolver": 0, "count_increment": 0,
+        "contributor_state": 0, "background_resolver": 0, "count_increment": 0,
         "count_seal": 0,
     }
+    fenced_paths = {}
+    in_fence = [False]
     integrations = []
     real_prepare = module.qualify_source_execution_graph
-    real_execution = module._source_graph_owner.qualify_source_execution_graph
     real_requalify = module.requalify_source_execution_graph
+    real_state_sweep = module.validate_source_state_sweep
     real_read = execution_graph._AverageSourceReadWindow.read_native
     real_metadata = execution_graph._AverageSourceReadWindow.complete_metadata_for
     real_fence = module._validate_contributor
+    real_matches = execution_graph.SourceFileState.matches_disk
     real_count_increment = module._increment_finite_counts
     real_count_seal = module._seal_invariant_finite_counts
 
@@ -1308,13 +1394,13 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
         counts["prepare_qualify"] += 1
         return real_prepare(*args, **kwargs)
 
-    def execution_qualify(*args, **kwargs):
-        counts["execution_qualify"] += 1
-        return real_execution(*args, **kwargs)
-
     def requalify(*args, **kwargs):
         counts["requalify"] += 1
         return real_requalify(*args, **kwargs)
+
+    def source_state_sweep(*args, **kwargs):
+        counts["source_state_sweep"] += 1
+        return real_state_sweep(*args, **kwargs)
 
     def read_native(window, index):
         counts["read_native"] += 1
@@ -1326,7 +1412,17 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
 
     def fence(graph, index, token, external_member=None):
         counts["contributor_fence"] += 1
-        return real_fence(graph, index, token, external_member)
+        in_fence[0] = True
+        try:
+            return real_fence(graph, index, token, external_member)
+        finally:
+            in_fence[0] = False
+
+    def matches(state):
+        if in_fence[0]:
+            counts["contributor_state"] += 1
+            fenced_paths[state.path] = fenced_paths.get(state.path, 0) + 1
+        return real_matches(state)
 
     def count_increment(*args, **kwargs):
         counts["count_increment"] += 1
@@ -1346,11 +1442,8 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
     monkeypatch.setattr(
         module, "qualify_source_execution_graph", prepare_qualify,
     )
-    monkeypatch.setattr(
-        module._source_graph_owner, "qualify_source_execution_graph",
-        execution_qualify,
-    )
     monkeypatch.setattr(module, "requalify_source_execution_graph", requalify)
+    monkeypatch.setattr(module, "validate_source_state_sweep", source_state_sweep)
     monkeypatch.setattr(
         execution_graph._AverageSourceReadWindow, "read_native", read_native,
     )
@@ -1359,6 +1452,7 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
         "complete_metadata_for", metadata,
     )
     monkeypatch.setattr(module, "_validate_contributor", fence)
+    monkeypatch.setattr(execution_graph.SourceFileState, "matches_disk", matches)
     monkeypatch.setattr(module, "_increment_finite_counts", count_increment)
     monkeypatch.setattr(
         module, "_seal_invariant_finite_counts", count_seal,
@@ -1370,15 +1464,20 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
         module, "resolve_frame_background",
         forbidden("background_resolver"),
     )
-    result = module.run_average_scan(recipe)
+    result = _run_average_scan(recipe)
     assert result.disposition == "COMMITTED"
     assert len(integrations) == 1
     assert counts == {
-        "prepare_qualify": 1, "execution_qualify": 1,
-        "requalify": 3, "read_native": 651, "metadata": 1,
+        "prepare_qualify": 1, "requalify": 1, "source_state_sweep": 2,
+        "read_native": 651, "metadata": 1,
         "contributor_fence": 1302, "background_fact": 0,
-        "background_resolver": 0, "count_increment": 0,
+        "contributor_state": 2604, "background_resolver": 0,
+        "count_increment": 0,
         "count_seal": 1,
+    }
+    assert fenced_paths == {
+        str(source_path.resolve()): 1302,
+        **{str(path.resolve()): 434 for path in members},
     }
 
 
@@ -1461,17 +1560,18 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
 
     for case in ("unchanged", "member", "sidecar", "dependency", "target", "commit-target", "recapture-error"):
         source, target, mutate = inputs(case); before_target = target.read_bytes()
-        plan = module.prepare_average_scan(AverageScanRecipe(
+        recipe = AverageScanRecipe(
             source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
             numeric_metadata_keys=("I0",) if case == "sidecar" else None,
-        ))
+        )
         counts = {name: 0 for name in ("open", "pixel", "metadata", "background", "write")}
         events = []; sinks = []; integrations = []; recapture_armed = []
+        source_sweeps = []
         real_open = module.open_source_execution_graph
         real_pixel = execution_graph._AverageSourceReadWindow.read_native
         real_metadata = execution_graph._AverageSourceReadWindow.complete_metadata_for
         real_background = module.resolve_frame_background
-        real_requalify = module.requalify_source_execution_graph
+        real_state_sweep = module.validate_source_state_sweep
         real_target = module.capture_target_snapshot
         real_sink = module.NexusSink; real_write = real_sink.write
         real_verify = NexusRecordWriter._verify_dirty_evidence
@@ -1480,11 +1580,12 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
         def pixel(window, index): counts["pixel"] += 1; return real_pixel(window, index)
         def metadata(window, index): counts["metadata"] += 1; return real_metadata(window, index)
         def background(*args, **kwargs): counts["background"] += 1; return real_background(*args, **kwargs)
-        def requalify(*args, **kwargs):
+        def source_sweep(*args, **kwargs):
+            source_sweeps.append(1)
             events.append("source-sweep")
-            if case == "commit-target" and events.count("source-sweep") == 2:
+            if case == "commit-target" and len(source_sweeps) == 2:
                 target.write_bytes(target.read_bytes() + b"x")
-            return real_requalify(*args, **kwargs)
+            return real_state_sweep(*args, **kwargs)
         def snapshot(*args, **kwargs):
             events.append("target-sweep")
             if case == "recapture-error" and recapture_armed and events.count("target-sweep") == 2:
@@ -1504,16 +1605,18 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
             patch.setattr(execution_graph._AverageSourceReadWindow, "read_native", pixel)
             patch.setattr(execution_graph._AverageSourceReadWindow, "complete_metadata_for", metadata)
             patch.setattr(module, "resolve_frame_background", background)
-            patch.setattr(module, "requalify_source_execution_graph", requalify)
+            patch.setattr(module, "validate_source_state_sweep", source_sweep)
             patch.setattr(module, "capture_target_snapshot", snapshot)
             patch.setattr(module, "NexusSink", sink); patch.setattr(real_sink, "write", write)
             patch.setattr(NexusRecordWriter, "_verify_dirty_evidence", verify)
             patch.setattr(OutputTransaction, "commit_stream", commit)
-            runner = module.AverageScanRunner(plan); assert runner.__enter__() is runner
-            pending = runner.run()
-            assert pending.disposition == "SETTLEMENT_PENDING"
-            assert pending.h23_phase == "ready-to-retry" and pending.committed_labels == ()
-            assert pending.finite_counts is None and pending.commit_identity is None
+            runner = module.AverageScanRunner(recipe)
+            pending = runner.start()
+            plan = runner.plan
+            assert type(pending) is module.AverageScanPending
+            assert pending.phase is module.AveragePendingPhase.OUTPUT_SETTLEMENT
+            assert pending.operation_identity == plan.operation_identity
+            assert pending.revision == 1
             assert len(sinks) == 1 and held == [1] and "commit" not in events
             owned_sink = sinks[0]; writer = owned_sink._writer; transaction = owned_sink._transaction
             assert writer.phase.value == "partial" and writer._pending_owner == "checkpoint"
@@ -1525,16 +1628,20 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
             frozen_counts = dict(counts); frozen_integrations = len(integrations); events.clear()
             if mutate is not None: mutate.write_bytes(mutate.read_bytes() + b"x")
             if case == "unchanged":
-                again = runner.finish_current()
-                assert again.disposition == "SETTLEMENT_PENDING" and held == [1, 1]
-                assert events == ["source-sweep", "target-sweep", "target-sweep"]
+                again = runner.command(module.AverageCommand.RETRY, pending)
+                assert type(again) is module.AverageScanPending
+                assert again.phase is module.AveragePendingPhase.OUTPUT_SETTLEMENT
+                assert again.revision == 2 and held == [1, 1]
+                assert events == ["target-sweep", "target-sweep"]
                 events.clear()
+                pending = again
             if case == "recapture-error": recapture_armed.append(True)
-            terminal = runner.finish_current()
-            expected_events = (["source-sweep", "target-sweep", "target-sweep", "source-sweep", "target-sweep", "commit"]
-                if case == "unchanged" else ["source-sweep", "target-sweep", "target-sweep", "source-sweep", "target-sweep"]
-                if case == "commit-target" else ["source-sweep", "target-sweep", "target-sweep"]
-                if case == "recapture-error" else ["source-sweep", "target-sweep"] if case == "target" else ["source-sweep"])
+            terminal = runner.command(module.AverageCommand.RETRY, pending)
+            expected_events = (["target-sweep", "target-sweep", "source-sweep", "target-sweep", "commit"]
+                if case == "unchanged" else ["target-sweep", "target-sweep", "source-sweep", "target-sweep"]
+                if case == "commit-target" else ["target-sweep", "target-sweep"]
+                if case == "recapture-error" else ["target-sweep"] if case == "target"
+                else ["target-sweep", "target-sweep", "source-sweep"])
             assert events == expected_events
             assert counts == frozen_counts and len(integrations) == frozen_integrations
             assert writer._finalization.average_finite_counts is finalization
@@ -1552,8 +1659,6 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
                 with pytest.raises((KeyError, ValueError)): get_average_finite_counts(target)
                 assert not tuple(target.parent.glob(f".{target.name}*"))
             terminal_events, terminal_counts = tuple(events), dict(counts)
-            assert runner.finish_current() is terminal
-            assert tuple(events) == terminal_events and counts == terminal_counts
             assert runner.close() is terminal
             assert tuple(events) == terminal_events and counts == terminal_counts
 
@@ -1567,7 +1672,7 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
         _stub_integrators(patch, [])
         patch.setattr(module.AverageScanRunner, "_gate", cancel_at_gate)
         patch.setattr(module, "NexusSink", capture_sink)
-        terminal = module.run_average_scan(AverageScanRecipe(
+        terminal = _run_average_scan(AverageScanRecipe(
             source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
         ), cancel_token=token, publication_gate=lambda: gate_calls.append(1) or True)
     assert (terminal.disposition, terminal.diagnostic_code) == ("CANCELLED", "AVERAGE_CANCELLED")
@@ -1578,34 +1683,69 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
 
     source, target, _ = inputs("cancel-during-final-sweep")
     before_target = target.read_bytes(); token = Event(); sinks = []; gate_calls = []; sweeps = []
-    real_requalify = module.requalify_source_execution_graph
+    real_state_sweep = module.validate_source_state_sweep
     def cancel_final_sweep(*args, **kwargs):
         sweeps.append(1)
-        if len(sweeps) == 3: token.set(); raise InterruptedError("cancelled sweep")
-        return real_requalify(*args, **kwargs)
+        if len(sweeps) == 2: token.set(); raise InterruptedError("cancelled sweep")
+        return real_state_sweep(*args, **kwargs)
     with monkeypatch.context() as patch:
         _stub_integrators(patch, [])
-        patch.setattr(module, "requalify_source_execution_graph", cancel_final_sweep)
+        patch.setattr(module, "validate_source_state_sweep", cancel_final_sweep)
         patch.setattr(module, "NexusSink", capture_sink)
-        terminal = module.run_average_scan(AverageScanRecipe(
+        terminal = _run_average_scan(AverageScanRecipe(
             source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
         ), cancel_token=token, publication_gate=lambda: gate_calls.append(1) or True)
     assert (terminal.disposition, terminal.diagnostic_code) == ("CANCELLED", "AVERAGE_CANCELLED")
-    assert sweeps == [1, 1, 1] and gate_calls == [] and target.read_bytes() == before_target
+    assert sweeps == [1, 1] and gate_calls == [] and target.read_bytes() == before_target
     assert len(sinks) == 1 and sinks[0]._transaction_owners is None
     assert sinks[0]._transaction.snapshot().phase.value == "aborted"
 
     source, target, _ = inputs("cancel-during-initial-qualification")
     before_target = target.read_bytes(); token = Event(); qualifications = []
-    def interrupt_initial(owner):
-        qualifications.append(owner); token.set(); raise InterruptedError("cancelled qualification")
+    def interrupt_initial(*args, **kwargs):
+        qualifications.append(args[0]); token.set(); raise InterruptedError("cancelled qualification")
     with monkeypatch.context() as patch:
-        patch.setattr(module.AverageScanRunner, "_fresh_graph", interrupt_initial)
-        terminal = module.run_average_scan(AverageScanRecipe(
+        patch.setattr(module, "qualify_source_execution_graph", interrupt_initial)
+        terminal = _run_average_scan(AverageScanRecipe(
             source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
         ), cancel_token=token)
     assert (terminal.disposition, terminal.diagnostic_code) == ("CANCELLED", "AVERAGE_CANCELLED")
     assert len(qualifications) == 1 and target.read_bytes() == before_target
+
+
+def test_close_finishes_exact_post_gate_commit_instead_of_replacing_it(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.io.output_transaction import OutputTransaction
+
+    source = _series(tmp_path)
+    target = tmp_path / "average.nxs"
+    with h5py.File(target, "w") as handle:
+        handle.create_dataset("prior", data=np.arange(3))
+    _stub_integrators(monkeypatch, [])
+    real_commit = OutputTransaction.commit_stream
+    commits = []
+
+    def held_once(owner, *args, **kwargs):
+        commits.append(id(owner))
+        if len(commits) == 1:
+            raise OSError("post-gate commit hold")
+        return real_commit(owner, *args, **kwargs)
+
+    monkeypatch.setattr(OutputTransaction, "commit_stream", held_once)
+    runner = module.AverageScanRunner(AverageScanRecipe(
+        source, target,
+        ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
+    ))
+    pending = runner.start(publication_gate=lambda: True)
+    assert type(pending) is module.AverageScanPending
+    assert pending.phase is module.AveragePendingPhase.OUTPUT_SETTLEMENT
+    assert runner._gate_called and runner._pending_abort is None
+
+    terminal = runner.command(module.AverageCommand.CLOSE, pending)
+    assert terminal.disposition == "COMMITTED"
+    assert len(commits) == 2 and commits[0] == commits[1]
+    assert runner.close() is terminal
 
 
 def test_average_fail_loud_monitor_policy_is_identical_in_science_provenance_and_execution(tmp_path, monkeypatch) -> None:
@@ -1617,7 +1757,8 @@ def test_average_fail_loud_monitor_policy_is_identical_in_science_provenance_and
     def gui_run(source, target, reduction, *, keys=("I0",)):
         slot = OperationSlot()
         identity = slot.begin_average(
-            source, target, reduction, numeric_metadata_keys=keys,
+            _frozen_configuration(source, reduction), target,
+            numeric_metadata_keys=keys,
             stamp=OperationContextStamp(0),
         )
         assert identity is not None and slot._worker is not None
@@ -1651,14 +1792,14 @@ def test_average_fail_loud_monitor_policy_is_identical_in_science_provenance_and
             calls = []
             _stub_integrators(monkeypatch, calls)
             reduction = (ReductionPlan(integration_1d=Integration1DPlan(npt=3, monitor_key="I0"))
-                         if dimension == "1d" else ReductionPlan(
-                             integration_1d=None,
+                             if dimension == "1d" else ReductionPlan(
+                                 integration_1d=Integration1DPlan(monitor_key="I0"),
                              integration_2d=Integration2DPlan(npt_rad=2, npt_azim=3, monitor_key="I0"),
                          ))
             recipe = AverageScanRecipe(source, target, reduction, numeric_metadata_keys=("I0",))
-            plan = module.prepare_average_scan(recipe)
+            plan = _prepare_average_scan(recipe)
             assert module._science_payload(plan)["reduction_strict_policy"] == strict
-            result = module.run_average_scan(recipe)
+            result = _run_average_scan(recipe)
             gui = gui_run(source, gui_target, reduction)
             assert (result.disposition, result.diagnostic_code) == (
                 "REFUSED", "AVERAGE_REDUCTION_MISSING_NORMALIZATION",
@@ -1688,7 +1829,7 @@ def test_average_fail_loud_monitor_policy_is_identical_in_science_provenance_and
     reduction = ReductionPlan(
         integration_1d=Integration1DPlan(npt=3, monitor_key="I0"),
     )
-    result = module.run_average_scan(AverageScanRecipe(
+    result = _run_average_scan(AverageScanRecipe(
         source, valid / "direct.nxs", reduction,
         numeric_metadata_keys=("I0", "optional"),
     ))
@@ -1725,18 +1866,19 @@ def test_average_fail_loud_all_dummy_2d_refuses_before_commit(tmp_path, monkeypa
     observed = []
     _stub_integrators(monkeypatch, observed, all_dummy_2d=True)
     reduction = ReductionPlan(
-        integration_1d=None,
+        integration_1d=Integration1DPlan(),
         integration_2d=Integration2DPlan(npt_rad=2, npt_azim=3),
     )
     recipe = AverageScanRecipe(source, target, reduction)
-    plan = module.prepare_average_scan(recipe)
+    plan = _prepare_average_scan(recipe)
     strict = {"policy": "average_reduction_strict_v1", "missing_normalization": True,
               "gi_all_dummy": True, "thumbnail_fallback": True}
     assert module._science_payload(plan)["reduction_strict_policy"] == strict
-    result = module.run_average_scan(recipe)
+    result = _run_average_scan(recipe)
     slot = OperationSlot()
     identity = slot.begin_average(
-        source, gui_target, reduction, stamp=OperationContextStamp(0),
+        _frozen_configuration(source, reduction), gui_target,
+        stamp=OperationContextStamp(0),
     )
     assert identity is not None and slot._worker is not None
     slot._worker.join(5); assert not slot._worker.is_alive()
@@ -1754,7 +1896,7 @@ def test_average_fail_loud_all_dummy_2d_refuses_before_commit(tmp_path, monkeypa
     assert result.diagnostic and gui.diagnostic == result.diagnostic
     assert result.commit_identity is gui.commit_identity is None
     assert result.finite_counts is gui.finite_counts is None
-    assert len(observed) == 2 and all(row[0] == "2d" for row in observed)
+    assert [row[0] for row in observed] == ["1d", "2d", "1d", "2d"]
     assert target.read_bytes() == before and gui_target.read_bytes() == gui_before
     for path in (target, gui_target):
         with pytest.raises((KeyError, ValueError)):

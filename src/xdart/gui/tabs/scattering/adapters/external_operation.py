@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, is_dataclass
 import json
 import math
 import os, stat; from pathlib import Path
+from queue import Queue
 from threading import Event, Lock, Thread
 from typing import Callable
 
@@ -18,7 +19,7 @@ from ..experiment_authoring import (
 )
 from ..operation_values import (
     OperationCleanupReceipt, OperationContextStamp, OperationIdentity,
-    OperationProgress, OperationTerminal, OperationTerminalStatus,
+    OperationPending, OperationProgress, OperationTerminal, OperationTerminalStatus,
     OperationUpdate,
 )
 from ..presentation_background import PresentationBackgroundOwner
@@ -26,10 +27,11 @@ from xrd_tools.reduction.background import DisplayBackgroundPlan
 from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot
 from xrd_tools.reduction import ReintegratePlan, ReintegrateProgress, ReintegrateResult, run_reintegrate
 from xrd_tools.reduction.reintegrate import ReintegrateCancelled
+from xrd_tools.session.run_configuration import FrozenRunConfiguration
 
 def _average_scan_recipe(*args, **kwargs): from xrd_tools.reduction.average import AverageScanRecipe as owner; return owner(*args, **kwargs)
-def _run_average_scan(*args, **kwargs): from xrd_tools.reduction.average import run_average_scan as owner; return owner(*args, **kwargs)
-AverageScanRecipe = _average_scan_recipe; run_average_scan = _run_average_scan
+def _average_scan_runner(*args, **kwargs): from xrd_tools.reduction.average import AverageScanRunner as owner; return owner(*args, **kwargs)
+AverageScanRecipe = _average_scan_recipe; AverageScanRunner = _average_scan_runner
 def detector_calibration_to_integrator(*args, **kwargs): from xrd_tools.integrate.calibration import detector_calibration_to_integrator as owner; return owner(*args, **kwargs)
 class _BackgroundPreterminalAbort(RuntimeError): pass
 @dataclass(frozen=True, slots=True)
@@ -43,142 +45,34 @@ class _ReintegrateRequest:
     preparation_json: str
 @dataclass(frozen=True, slots=True)
 class _AverageRequest:
-    source_syntax: tuple[object, ...]; target: str; target_was_path: bool
-    entry: str; source_base: str; source_base_was_path: bool
-    output_mode: str; live_mode: bool; save_xye: bool; batch_mode: bool
-    reduction_syntax: str; poni_file: str; mask_file: str
-    background_syntax: str | None; numeric_metadata_keys: tuple[str, ...] | None
-    invariant_metadata_keys: tuple[str, ...]; envelope_bytes: int | None
-    resource_requests: tuple[tuple[str, int], ...]; resource_env: tuple[tuple[str, str], ...]
+    configuration: FrozenRunConfiguration
+    target: str
+    entry: str
+    numeric_metadata_keys: tuple[str, ...] | None
+    invariant_metadata_keys: tuple[str, ...]
 @dataclass(frozen=True, slots=True)
 class _ScanPlotRequest:
     plan: object
     table: object
     roi_result: object | None
-def _json_snapshot(value: object) -> str: return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-def _bounded_json_snapshot(value: object) -> str:
-    count = [0]
-    def detached(item, depth=0):
-        count[0] += 1
-        if count[0] > 4096 or depth > 8: raise ValueError
-        if item is None or type(item) in {bool, int, str}: return item
-        from xrd_tools.reduction.core import GI1DMode, GI2DMode
-        if type(item) in {GI1DMode, GI2DMode}: return item.value
-        if type(item) is float and math.isfinite(item): return item
-        if is_dataclass(item) and not isinstance(item, type):
-            return {field.name: detached(getattr(item, field.name), depth + 1)
-                    for field in fields(item)}
-        if isinstance(item, Mapping):
-            if len(item) > 4096: raise ValueError
-            if any(type(key) is not str or not key for key in item): raise TypeError
-            return {key: detached(child, depth + 1)
-                    for key, child in item.items()}
-        if type(item) in {list, tuple}:
-            if len(item) > 4096: raise ValueError
-            return tuple(detached(child, depth + 1) for child in item)
-        raise TypeError
-    text = _json_snapshot(detached(value))
-    if len(text.encode("utf-8")) > 65_536: raise ValueError
-    return text
-def _average_source_syntax(source: object) -> tuple[object, ...] | None:
-    from xrd_tools.core.scan import SourceSpec
-    if type(source) is not SourceSpec: return None
-    options = source.options
-    allowed = {
-        "selected_file", "files", "pattern", "scan_name", "metadata_format",
-        "meta_dir", "selection_mode", "detector", "detector_shape",
-        "raw_dtype", "raw_header_skip", "admitted_motor_values",
-    }
-    if len(options) > 64 or any(type(key) is not str or key not in allowed for key in options): return None
-    selection_mode = options.get("selection_mode")
-    if selection_mode not in {None, "single_image"}: return None
-    if selection_mode == "single_image":
-        files, selected = options.get("files"), options.get("selected_file")
-        if (type(files) is not tuple or len(files) != 1
-                or type(files[0]) is not str or not files[0]
-                or type(selected) is not str or selected != files[0]): return None
-    names = (
-        "selected_file", "pattern", "scan_name", "metadata_format",
-        "meta_dir", "selection_mode", "detector", "detector_shape",
-        "raw_dtype", "raw_header_skip",
-    )
-    count = [0]
-    def detached(value, depth=0):
-        count[0] += 1
-        if count[0] > 4096 or depth > 8: raise ValueError
-        if value is None or type(value) in {bool, int, str}: return value
-        if type(value) is float and math.isfinite(value): return value
-        if isinstance(value, Path): return str(value)
-        if type(value) in {list, tuple}:
-            return tuple(detached(item, depth + 1) for item in value)
-        raise TypeError
-    try:
-        values = tuple(detached(options.get(name)) for name in names)
-        if len(_json_snapshot(values).encode("utf-8")) > 65_536: return None
-    except (TypeError, ValueError, OverflowError):
-        return None
-    path = lambda value: (str(value), isinstance(value, Path)) if value is not None else (None, False)
-    uri, uri_path = path(source.uri); metadata_uri, metadata_path = path(source.metadata_uri)
-    result = (uri, uri_path, source.kind.value, metadata_uri, metadata_path, source.entry, *values)
-    try:
-        if len(_json_snapshot(result).encode("utf-8")) > 65_536: return None
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return result
-def _average_source_from_syntax(value: tuple[object, ...]):
-    from xrd_tools.core.scan import SourceKind, SourceSpec
-    if type(value) is not tuple or len(value) != 16: raise ValueError("AVERAGE_SOURCE_UNREPRESENTABLE")
-    uri, uri_path, kind, metadata_uri, metadata_path, entry, *parts = value
-    names = (
-        "selected_file", "pattern", "scan_name", "metadata_format",
-        "meta_dir", "selection_mode", "detector", "detector_shape",
-        "raw_dtype", "raw_header_skip",
-    )
-    options = {name: item for name, item in zip(names, parts, strict=True) if item is not None}
-    return SourceSpec(Path(uri) if uri_path else uri, SourceKind(kind),
-        Path(metadata_uri) if metadata_path else metadata_uri, entry, options)
-def _average_reduction_from_syntax(text: str):
-    from xrd_tools.reduction import GIMode, Integration1DPlan, Integration2DPlan, ReductionPlan
-    value = json.loads(text)
-    if type(value) is not dict: raise ValueError("AVERAGE_REDUCTION_UNREPRESENTABLE")
-    def integration(owner, row):
-        if row is None: return None
-        if type(row) is not dict: raise ValueError("AVERAGE_REDUCTION_UNREPRESENTABLE")
-        for name in ("radial_range", "azimuth_range"):
-            if row.get(name) is not None: row[name] = tuple(row[name])
-        return owner(**row)
-    gi = value.get("gi")
-    return ReductionPlan(
-        integration_1d=integration(Integration1DPlan, value.get("integration_1d")),
-        integration_2d=integration(Integration2DPlan, value.get("integration_2d")),
-        gi=None if gi is None else GIMode(**gi), mask=None,
-        threshold_min=value.get("threshold_min"),
-        threshold_max=value.get("threshold_max"),
-        mask_saturation=value.get("mask_saturation", False),
-        extra=value.get("extra", {}),
-    )
-def _average_background_from_syntax(text: str | None):
-    if text is None: return None
-    from xrd_tools.reduction.background import FrameBackgroundPlan
-    value = json.loads(text)
-    if type(value) is not dict: raise ValueError("AVERAGE_BACKGROUND_UNREPRESENTABLE")
-    return FrameBackgroundPlan(**value)
-def _average_calibration(request: _AverageRequest, cancelled=None):
+def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
     from .. import output_preflight
     from xrd_tools.session.experiment_state import CalibrationState, FactStatus, MaskState, PoniValues
     assets = output_preflight._load_scientific_assets(
-        request,
+        configuration,
         cancelled=(lambda: False) if cancelled is None else cancelled.is_set,
     )
-    if request.poni_file and assets.poni_values is None: raise ValueError("AVERAGE_CALIBRATION_UNAVAILABLE")
-    if request.mask_file and assets.mask_bytes is None: raise ValueError("AVERAGE_MASK_UNAVAILABLE")
+    if configuration.poni_file and assets.poni_values is None: raise ValueError("AVERAGE_CALIBRATION_UNAVAILABLE")
+    if configuration.mask_file and assets.mask_bytes is None: raise ValueError("AVERAGE_MASK_UNAVAILABLE")
     config = None
     if assets.poni_values is not None:
         text = assets.poni_detector_config_json
         try:
             if type(text) is not str or len(text.encode("utf-8")) > 65_536: raise ValueError
             config = json.loads(text)
-            if (type(config) is not dict or _json_snapshot(config) != text
+            if (type(config) is not dict
+                    or json.dumps(config, sort_keys=True, separators=(",", ":"),
+                                  allow_nan=False) != text
                     or type(config.get("orientation")) is not int
                     or config["orientation"] not in range(1, 5)): raise ValueError
         except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as error:
@@ -198,11 +92,11 @@ def _average_calibration(request: _AverageRequest, cancelled=None):
                     or any(type(item) is not int or item <= 0 for item in shape)
                     or math.prod(shape) * dtype.itemsize != len(assets.mask_bytes)): raise ValueError
             np.frombuffer(assets.mask_bytes, dtype=dtype).reshape(shape)
-            mask_state = MaskState(request.mask_file, assets.mask_sha256 or "", dtype.str, shape, FactStatus.PRESENT)
+            mask_state = MaskState(configuration.mask_file, assets.mask_sha256 or "", dtype.str, shape, FactStatus.PRESENT)
         except (TypeError, ValueError, OverflowError) as error: raise ValueError("AVERAGE_MASK_UNREPRESENTABLE") from error
     state = (CalibrationState(mask=mask_state) if values is None else
         CalibrationState(values, assets.poni_values[7], config, "",
-            assets.poni_sha256 or "", request.poni_file, mask_state, FactStatus.PRESENT))
+            assets.poni_sha256 or "", configuration.poni_file, mask_state, FactStatus.PRESENT))
     if values is None: return state
     try:
         from xrd_tools.core import PONI
@@ -254,6 +148,12 @@ class OperationSlot:
         self._cancel_event: Event | None = None
         self._progress: OperationProgress | None = None
         self._progress_delivered_revision = 0
+        self._pending: OperationPending | None = None
+        self._pending_revision = 0
+        self._pending_delivered_revision = 0
+        self._pending_commanded_revision = 0
+        self._deferred_pending_command: str | None = None
+        self._command_queue: Queue[str] | None = None
         self._terminal: OperationTerminal | None = None
         self._stale = False
         self._close_cancel_accepted = False
@@ -420,73 +320,34 @@ class OperationSlot:
         return OperationTerminal(identity, OperationTerminalStatus.RETURNED,
                                  payload=result)
 
-    def begin_average(self, source: object, target: object, reduction: object, *,
-                      entry: str = "entry", source_base: object = None,
-                      output_mode: str = "Overwrite", live_mode: bool = False,
-                      save_xye: bool = False, batch_mode: bool = False,
-                      poni_file: str = "", mask_file: str = "",
-                      background: object | None = None,
+    def begin_average(self, configuration: object, target: object, *,
+                      entry: str = "entry",
                       numeric_metadata_keys: tuple[str, ...] | None = None,
                       invariant_metadata_keys: tuple[str, ...] = (),
-                      envelope_bytes: int | None = None,
-                      resource_requests: Mapping[str, int] | None = None,
-                      resource_env: Mapping[str, str] | None = None,
                       stamp: OperationContextStamp) -> OperationIdentity | None:
-        from xrd_tools.reduction import ReductionPlan; from xrd_tools.reduction.background import FrameBackgroundPlan
-        syntax = _average_source_syntax(source)
         pathlike = lambda value: isinstance(value, (str, Path)) and bool(str(value))
-        if (syntax is None or not pathlike(target)
-                or not (source_base is None or pathlike(source_base))
-                or type(reduction) is not ReductionPlan or reduction.mask is not None
+        if (type(configuration) is not FrozenRunConfiguration
+                or not pathlike(target)
                 or type(entry) is not str or not entry
-                or any(type(value) is not bool for value in (live_mode, save_xye, batch_mode))
-                or type(output_mode) is not str
-                or type(poni_file) is not str or type(mask_file) is not str
-                or background is not None and type(background) is not FrameBackgroundPlan
                 or numeric_metadata_keys is not None and type(numeric_metadata_keys) is not tuple
-                or type(invariant_metadata_keys) is not tuple
-                or envelope_bytes is not None and (type(envelope_bytes) is not int or envelope_bytes <= 0)):
+                or type(invariant_metadata_keys) is not tuple):
             return None
-        try:
-            if (numeric_metadata_keys is not None
-                    and len(numeric_metadata_keys) > 64
-                    or len(invariant_metadata_keys) > 64
-                    or any(type(value) is not str or not value for value in (numeric_metadata_keys or ()))
-                    or any(type(value) is not str or not value for value in invariant_metadata_keys)
-                    or resource_requests is not None and (not isinstance(resource_requests, Mapping) or len(resource_requests) > 64)
-                    or resource_env is not None and (not isinstance(resource_env, Mapping) or len(resource_env) > 64)):
-                return None
-            requests = {} if resource_requests is None else dict(resource_requests)
-            environment = {} if resource_env is None else dict(resource_env)
-            if ("owner_block_bytes" in requests
-                    or any(type(key) is not str or type(value) is not int or type(value) is bool for key, value in requests.items())
-                    or any(type(key) is not str or type(value) is not str for key, value in environment.items())):
-                return None
-            reduction_syntax = _bounded_json_snapshot(reduction)
-            background_syntax = None if background is None else _bounded_json_snapshot(background)
-            _bounded_json_snapshot((
-                entry, str(target), None if source_base is None else str(source_base),
-                output_mode, poni_file, mask_file, numeric_metadata_keys,
-                invariant_metadata_keys, tuple(sorted(requests.items())),
-                tuple(sorted(environment.items())),
-            ))
-        except (TypeError, ValueError, OverflowError):
+        if (numeric_metadata_keys is not None
+                and len(numeric_metadata_keys) > 64
+                or len(invariant_metadata_keys) > 64
+                or any(type(value) is not str or not value for value in (numeric_metadata_keys or ()))
+                or any(type(value) is not str or not value for value in invariant_metadata_keys)):
             return None
         request = _AverageRequest(
-            syntax, str(target), isinstance(target, Path), entry,
-            "" if source_base is None else str(source_base),
-            isinstance(source_base, Path), output_mode, live_mode, save_xye,
-            batch_mode, reduction_syntax, poni_file, mask_file,
-            background_syntax, numeric_metadata_keys, invariant_metadata_keys,
-            envelope_bytes, tuple(sorted(requests.items())),
-            tuple(sorted(environment.items())),
+            configuration, str(target), entry,
+            numeric_metadata_keys, invariant_metadata_keys,
         )
         return self._begin(request, stamp, self._run_average_request)
 
     def _run_average_request(self, request, identity, cancelled, publish):
         publish("prepare", 0, 1)
         try:
-            calibration = _average_calibration(request, cancelled)
+            calibration = _average_calibration(request.configuration, cancelled)
         except RuntimeError as error:
             if (
                 cancelled.is_set()
@@ -496,25 +357,28 @@ class OperationSlot:
                     identity, OperationTerminalStatus.CANCELLED,
                 )
             raise
-        source = _average_source_from_syntax(request.source_syntax)
-        reduction = _average_reduction_from_syntax(request.reduction_syntax)
-        background = _average_background_from_syntax(request.background_syntax)
+        configuration = request.configuration
+        source = configuration.thaw_source_spec()
+        from ..output_preflight import native_int_reduction_plan
+        reduction = native_int_reduction_plan(configuration)
         recipe = AverageScanRecipe(
-            source, Path(request.target) if request.target_was_path else request.target,
+            source, request.target,
             reduction, entry=request.entry,
-            source_base=(Path(request.source_base) if request.source_base_was_path
-                         else request.source_base),
-            output_mode=request.output_mode, live_mode=request.live_mode,
-            save_xye=request.save_xye, batch_mode=request.batch_mode,
-            calibration=calibration, background=background,
+            source_base=configuration.project_root or None,
+            output_mode=configuration.output_mode,
+            live_mode=configuration.live_mode,
+            save_xye=configuration.processing_mode == "Int 1D (XYE)",
+            batch_mode=configuration.batch_mode,
+            calibration=calibration, background=configuration.background,
             numeric_metadata_keys=request.numeric_metadata_keys,
             invariant_metadata_keys=request.invariant_metadata_keys,
-            envelope_bytes=request.envelope_bytes,
-            resource_requests=dict(request.resource_requests),
-            resource_env=dict(request.resource_env),
+            resource_requests={"workers": configuration.max_cores},
         )
         publish("prepare", 1, 1)
-        from xrd_tools.reduction.average import AverageScanProgress, AverageScanResult, _committed_average_mismatch
+        from xrd_tools.reduction.average import (
+            AverageCommand, AverageScanPending, AverageScanProgress,
+            AverageScanResult, _committed_average_mismatch,
+        )
         headless_revision = -1; headless_identity = None
         def progress(value):
             nonlocal headless_revision, headless_identity
@@ -525,10 +389,16 @@ class OperationSlot:
                 headless_revision = value.revision
                 publish(value.stage, value.completed, value.total)
             except BaseException: return
-        result = run_average_scan(
-            recipe, cancel_token=cancelled, progress_cb=progress,
+        runner = AverageScanRunner(recipe)
+        outcome = runner.start(
+            cancel_token=cancelled, progress_cb=progress,
             publication_gate=lambda: self._seal_publication(identity),
         )
+        while type(outcome) is AverageScanPending:
+            command = self._await_average_command(identity, outcome)
+            outcome = runner.command(AverageCommand(command), outcome)
+        result = outcome
+        runner.close()
         if type(result) is not AverageScanResult or headless_identity is not None and result.operation_identity != headless_identity:
             raise TypeError("Average runner returned an invalid result")
         if result.disposition == "COMMITTED":
@@ -723,6 +593,12 @@ class OperationSlot:
             self._cancel_event = cancel_event
             self._progress = None
             self._progress_delivered_revision = 0
+            self._pending = None
+            self._pending_revision = 0
+            self._pending_delivered_revision = 0
+            self._pending_commanded_revision = 0
+            self._deferred_pending_command = None
+            self._command_queue = Queue()
             self._terminal = None
             self._stale = False
             self._close_cancel_accepted = False
@@ -773,10 +649,14 @@ class OperationSlot:
             if self._identity is not identity or self._worker is not worker:
                 return None
             progress = self._undelivered_progress_locked()
+            pending = self._undelivered_pending_locked()
             if alive:
-                if progress is None:
+                if progress is None and pending is None:
                     return None
-                return OperationUpdate(identity, progress=progress, stale=self._stale)
+                return OperationUpdate(
+                    identity, progress=progress, pending=pending,
+                    stale=self._stale,
+                )
             terminal = self._terminal
             if terminal is None:
                 if self._abort_fact is None:
@@ -788,6 +668,7 @@ class OperationSlot:
                 update = OperationUpdate(
                     identity,
                     progress=progress,
+                    pending=pending,
                     terminal=terminal,
                     stale=self._stale,
                 )
@@ -802,15 +683,43 @@ class OperationSlot:
     def cancel(self, identity: object) -> bool:
         with self._lock:
             event = self._cancel_event
+            pending = self._pending
+            queue = self._command_queue
+            pending_command = (
+                pending is not None and queue is not None
+                and self._pending_commanded_revision < pending.revision
+            )
             if (
                 self._identity is not identity
                 or self._terminal is not None
                 or self._cancel_sealed
                 or event is None
-                or event.is_set()
+                or event.is_set() and not pending_command
             ):
                 return False
-            event.set()
+            if not event.is_set():
+                event.set()
+            if pending_command:
+                self._pending_commanded_revision = pending.revision
+                queue.put("cancel")
+            elif queue is not None:
+                self._deferred_pending_command = "cancel"
+            return True
+
+    def retry_average(self, identity: object, pending: object) -> bool:
+        with self._lock:
+            queue = self._command_queue
+            if (
+                self._identity is not identity
+                or type(pending) is not OperationPending
+                or self._pending is not pending
+                or self._terminal is not None
+                or queue is None
+                or self._pending_commanded_revision >= pending.revision
+            ):
+                return False
+            self._pending_commanded_revision = pending.revision
+            queue.put("retry")
             return True
 
     def close(self) -> OperationCleanupReceipt:
@@ -832,6 +741,16 @@ class OperationSlot:
             ):
                 event.set()
                 self._close_cancel_accepted = True
+            pending = self._pending
+            queue = self._command_queue
+            if (pending is not None and queue is not None
+                    and self._pending_commanded_revision < pending.revision):
+                self._pending_commanded_revision = pending.revision
+                queue.put("close")
+            elif (pending is None and self._terminal is None
+                  and queue is not None
+                  and self._deferred_pending_command is None):
+                self._deferred_pending_command = "close"
             worker = self._worker
             started = self._worker_started
             worker_identity = self._worker_identity
@@ -943,6 +862,33 @@ class OperationSlot:
         except BaseException:
             return
 
+    def _await_average_command(self, identity, value) -> str:
+        try:
+            phase = value.phase.value
+            diagnostic = value.diagnostic
+        except BaseException as error:
+            raise ValueError("Average runner returned an invalid pending token") from error
+        with self._lock:
+            if self._identity is not identity or self._terminal is not None:
+                raise RuntimeError("Average operation lost pending ownership")
+            self._pending_revision += 1
+            revision = self._pending_revision
+            pending = OperationPending(identity, revision, phase, diagnostic)
+            self._pending = pending
+            queue = self._command_queue
+            if queue is None:
+                raise RuntimeError("Average operation lost its command queue")
+            immediate = self._deferred_pending_command
+            if immediate is not None:
+                self._deferred_pending_command = None
+                self._pending_commanded_revision = revision
+        command = immediate if immediate is not None else queue.get()
+        with self._lock:
+            if self._identity is not identity or self._pending is not pending:
+                raise RuntimeError("Average pending command became stale")
+            self._pending = None
+        return command
+
     def _undelivered_progress_locked(self) -> OperationProgress | None:
         progress = self._progress
         if (
@@ -952,6 +898,14 @@ class OperationSlot:
             return None
         self._progress_delivered_revision = progress.revision
         return progress
+
+    def _undelivered_pending_locked(self) -> OperationPending | None:
+        pending = self._pending
+        if (pending is None
+                or pending.revision <= self._pending_delivered_revision):
+            return None
+        self._pending_delivered_revision = pending.revision
+        return pending
 
     def _retire_locked(self) -> None:
         self._identity = None
@@ -963,6 +917,12 @@ class OperationSlot:
         self._cancel_event = None
         self._progress = None
         self._progress_delivered_revision = 0
+        self._pending = None
+        self._pending_revision = 0
+        self._pending_delivered_revision = 0
+        self._pending_commanded_revision = 0
+        self._deferred_pending_command = None
+        self._command_queue = None
         self._terminal = None
         self._stale = False
         self._close_cancel_accepted = False

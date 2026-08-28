@@ -577,12 +577,9 @@ def test_p1b_b02_overwrite_native_durable_terminal(
     # but attempts are minted only at each submit boundary. The named lineage
     # ceiling, rather than reduction in-flight, bounds the unsettled epoch.
     import xdart.gui.tabs.scattering.adapters.dynamic_output as dynamic_output
-    from xdart.gui.tabs.scattering.output_preflight import execution_plan_values
+    from xdart.gui.tabs.scattering.output_preflight import native_int_reduction_plan
     from xrd_tools.integrate.calibration import poni_to_integrator
     from xrd_tools.session.frame_record_store import FrameRecordStore
-    from xrd_tools.session.readiness import (
-        build_native_int_reduction_plan_from_args,
-    )
     from xrd_tools.sources import open_source
 
     large = tmp_path / "large.nxs"
@@ -614,12 +611,9 @@ def test_p1b_b02_overwrite_native_durable_terminal(
         integrator=poni_to_integrator(accepted_poni),
         output_path=large_decision.item.target,
     )
-    args_1d, args_2d, values = execution_plan_values(
-        large_configuration,
-        large_admission.scientific_assets.mask,
-    )
-    plan = build_native_int_reduction_plan_from_args(
-        args_1d, args_2d, **values,
+    plan = replace(
+        native_int_reduction_plan(large_configuration),
+        mask=large_admission.scientific_assets.mask,
     )
 
     adapter = dynamic_output.DynamicOutputAdapter(large_configuration)

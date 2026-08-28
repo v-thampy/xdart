@@ -24,6 +24,7 @@ from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
+    IntentFreezeAccepted,
     IntentRecaptureRequired,
     RunIntentStore,
     RunIntentSnapshot,
@@ -181,8 +182,8 @@ from .performance_diagnostics import (
     performance_diagnostics_error,
 )
 from .operation_values import (
-    OperationContextStamp, OperationIdentity, OperationTerminalStatus,
-    OperationUpdate,
+    OperationContextStamp, OperationIdentity, OperationPending,
+    OperationTerminalStatus, OperationUpdate,
 )
 from .presentation_background import (DisplayBackgroundTransferReceipt,
     PresentationBackgroundOwner, prepare_background_plan)
@@ -891,6 +892,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             BrowseLoadRequest, str, StreamTerminal | None,
         ] | None = None
         self._average_identity: OperationIdentity | None = None
+        self._average_pending: OperationPending | None = None
         self._average_revision: int | None = None
         self._average_target: str | None = None
         self._average_entry: str | None = None
@@ -2440,12 +2442,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _consume_average_update(self, update: object) -> bool:
         if type(update) is not OperationUpdate or update.identity is not self._average_identity:
             return False
+        if update.pending is not None:
+            pending = update.pending
+            if type(pending) is not OperationPending:
+                self._notice("Average failed: invalid cleanup-pending token")
+                return True
+            self._average_pending = pending
+            phase = pending.phase.replace("-", " ")
+            self._notice(
+                f"Average {phase} pending; press Run to retry or Stop to cancel."
+            )
+            return True
         if update.terminal is None:
             if update.progress is not None:
                 self._notice(f"Average: {update.progress.stage} {update.progress.completed}/{update.progress.total}…")
             return True
         target, entry, revision = self._average_target, self._average_entry, self._average_revision
-        self._average_identity = self._average_revision = self._average_target = self._average_entry = None
+        self._average_identity = self._average_pending = self._average_revision = self._average_target = self._average_entry = None
         terminal = update.terminal; result = terminal.payload
         from xrd_tools.reduction.average import AverageScanResult
         valid_result = False
@@ -2545,19 +2558,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         try:
             from pathlib import Path
             from .output_preflight import _resolved_generated_target
-            from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args
-            gi = intent.gi; manual = gi.incidence_motor == "Manual"
-            threshold = intent.threshold
-            reduction = build_native_int_reduction_plan_from_args(
-                intent.bai_1d_args, intent.bai_2d_args, gi_enabled=gi.enabled,
-                gi_incident_angle=gi.th_val if gi.enabled and manual else None,
-                incidence_motor=None if manual else gi.incidence_motor,
-                tilt_angle=gi.tilt_angle, sample_orientation=gi.sample_orientation,
-                integrate_2d=not ("1D" in intent.processing_mode and "2D" not in intent.processing_mode),
-                threshold_min=threshold.threshold_min if threshold.apply_threshold else None,
-                threshold_max=threshold.threshold_max if threshold.apply_threshold else None,
-                mask_saturation=threshold.mask_saturation,
-            )
             options = source.options
             syntactic_name = options.get("scan_name")
             if syntactic_name is not None and (
@@ -2573,19 +2573,44 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             target = os.path.abspath(os.path.expanduser(str(generated)))
         except (TypeError, ValueError, OverflowError) as error:
             self._notice(str(error)); self._refresh_shell(); return
-        if self._intents.revision != snapshot.revision:
-            self._notice("Average context changed before dispatch."); self._refresh_shell(); return
+        observation = self._source_observation
+        choices = (
+            observation.gi_motor_choices
+            if observation is not None
+            and observation.intent_revision == snapshot.revision
+            and observation.source == source
+            else None
+        )
+        try:
+            frozen = self._intents.freeze(
+                expected_revision=snapshot.revision,
+                gi_motor_choices=choices,
+            )
+        except (TypeError, ValueError) as error:
+            self._notice(str(error)); self._refresh_shell(); return
+        except Exception as error:
+            self._error_notice("Average configuration freeze failed", error)
+            return
+        if type(frozen) is IntentRecaptureRequired:
+            self._notice("Average context changed before dispatch.")
+            self._refresh_shell()
+            return
+        if (
+            type(frozen) is not IntentFreezeAccepted
+            or frozen.revision != snapshot.revision
+            or type(frozen.configuration) is not FrozenRunConfiguration
+        ):
+            self._notice("Average configuration freeze returned invalid state.")
+            self._refresh_shell()
+            return
         identity = slot.begin_average(
-            source, target, reduction, source_base=intent.project_root or None,
-            output_mode=intent.output_mode, live_mode=intent.live_mode,
-            save_xye=False, batch_mode=intent.batch_mode,
-            poni_file=intent.poni_file, mask_file=intent.mask_file,
-            background=intent.background, resource_requests={"workers": intent.max_cores},
+            frozen.configuration, target,
             stamp=OperationContextStamp(snapshot.revision),
         )
         if identity is None:
             self._notice("Average operation was not started."); self._refresh_shell(); return
         self._average_identity, self._average_revision = identity, snapshot.revision
+        self._average_pending = None
         self._average_target, self._average_entry = target, "entry"
         self._notice("Averaging the finite source…"); self._refresh_shell(); self._ensure_timer()
 
@@ -2679,7 +2704,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._mask_identity = self._mask_revision = self._mask_stamp = self._mask_request = None
                 self._asset_validation_identity = None
                 self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
-                self._average_identity = self._average_revision = self._average_target = self._average_entry = None
+                self._average_identity = self._average_pending = self._average_revision = self._average_target = self._average_entry = None
         except Exception:
             operation_clean = False
 
@@ -2961,7 +2986,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         )
         operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.SET_BACKGROUND, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
-        if self._experiment_operation_busy() and operation_locked and not operation_cancel:
+        operation_retry = (
+            kind is ShellCommandKind.RUN_ACTION
+            and self._average_pending is not None
+            and self._operation_slot.current_identity is self._average_identity
+        )
+        if (
+            self._experiment_operation_busy()
+            and operation_locked
+            and not operation_cancel
+            and not operation_retry
+        ):
             self._notice("Experiment operation is still active.")
             self._refresh_shell(
                 preserve_display=True,
@@ -3133,6 +3168,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell()
 
     def _run_action(self) -> None:
+        pending = self._average_pending
+        average = self._average_identity
+        if (
+            pending is not None
+            and average is not None
+            and self._operation_slot.current_identity is average
+        ):
+            accepted = self._operation_slot.retry_average(average, pending)
+            if accepted:
+                self._average_pending = None
+            self._notice(
+                "Retrying Average cleanup…"
+                if accepted
+                else "Average cleanup retry was not accepted."
+            )
+            self._refresh_shell()
+            if accepted:
+                self._ensure_timer()
+            return
         phase = self._lifecycle.phase
         if phase is RunPhase.RUNNING:
             ScatteringWorkspace._flush_presentation_target(self)
@@ -4668,7 +4722,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if request is not None and target is not None: self._reload_after_reintegrate(request, target)
                 self._notice(f"Reintegrate {shown} failed before terminal publication."); changed = True; force_scientific = True
             elif operation_identity is self._average_identity and not operation_slot.owned:
-                self._average_identity = self._average_revision = self._average_target = self._average_entry = None
+                self._average_identity = self._average_pending = self._average_revision = self._average_target = self._average_entry = None
                 self._notice("Average failed before terminal publication."); changed = True; force_scientific = True
             elif operation_identity is self._asset_validation_identity and not operation_slot.owned:
                 self._asset_validation_identity = None
@@ -6269,6 +6323,33 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 background_enabled=not self._mutating_operation_busy(),
             ),
         )
+        pending_average = self._average_pending
+        if (
+            pending_average is not None
+            and self._operation_slot.current_identity is self._average_identity
+        ):
+            pending_readiness = (
+                "Average cleanup pending · Run retries · Stop cancels"
+            )
+            projection = replace(
+                projection,
+                controls=replace(
+                    projection.controls,
+                    profile=replace(
+                        projection.controls.profile,
+                        run_enabled=True,
+                        run_blockers=(),
+                    ),
+                ),
+                run=replace(
+                    projection.run,
+                    readiness=pending_readiness,
+                    readiness_tooltip=pending_average.diagnostic,
+                    ready=True,
+                    run_enabled=True,
+                    stop_enabled=True,
+                ),
+            )
         if cache_adoption_missing:
             prior = self._last_scientific_projection
             retention_compatible = self._browse_snapshot_is_exact_current(

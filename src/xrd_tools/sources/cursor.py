@@ -417,7 +417,7 @@ class ContainerCursor:
         if descriptor.state is not ProbeState.READY or not descriptor.finalized:
             yield from standard("direct decode requires a finalized READY container")
             return
-        layout, reason = self._stack.eiger_direct_chunk_layout()
+        layout, reason = self.eiger_direct_chunk_layout()
         if layout is None:
             yield from standard(reason)
             return
@@ -446,6 +446,11 @@ class ContainerCursor:
             state=state,
         ):
             yield ReadBlock(index, index + 1, array[np.newaxis, ...])
+
+    def eiger_direct_chunk_layout(self):
+        """Qualify the currently owned detector stack for direct decoding."""
+        self._require_readable()
+        return self._stack.eiger_direct_chunk_layout()
 
     # -- helpers --------------------------------------------------------------
     @staticmethod

@@ -62,10 +62,11 @@ __all__ = [
 ]
 __all__ += ["ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"]
 __all__ += [
-    "AverageContributor", "AverageFiniteCounts", "AverageFiniteCountsEvidence",
+    "AverageCommand", "AverageContributor",
+    "AverageFiniteCounts", "AverageFiniteCountsEvidence",
+    "AveragePendingPhase", "AverageRunnerPhase", "AverageScanPending",
     "AverageScanPlan", "AverageScanProgress", "AverageScanRecipe",
     "AverageScanResult", "AverageScanRunner", "iter_average_contributors",
-    "prepare_average_scan", "run_average_scan",
 ]
 
 _CORE_EXPORTS = {
@@ -119,10 +120,11 @@ _BACKGROUND_EXPORTS = {"DisplayBackgroundPlan", "DisplayBackgroundResult", "run_
 _BACKGROUND_EXPORTS.update({"FrameBackgroundPlan", "FrameBackgroundResult", "resolve_frame_background"})
 _REINTEGRATE_EXPORTS = {"ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"}
 _AVERAGE_EXPORTS = {
-    "AverageContributor", "AverageFiniteCounts", "AverageFiniteCountsEvidence",
+    "AverageCommand", "AverageContributor",
+    "AverageFiniteCounts", "AverageFiniteCountsEvidence",
+    "AveragePendingPhase", "AverageRunnerPhase", "AverageScanPending",
     "AverageScanPlan", "AverageScanProgress", "AverageScanRecipe",
     "AverageScanResult", "AverageScanRunner", "iter_average_contributors",
-    "prepare_average_scan", "run_average_scan",
 }
 
 
