@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import pytest
 from pyqtgraph.Qt import QtWidgets
@@ -18,7 +19,6 @@ from xdart.gui.tabs.scattering.controls_projection import (
     source_mode,
 )
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
-from xdart.gui.tabs.scattering.contracts import SourceObservationRequest
 from xdart.gui.tabs.scattering.events import RequestId
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_values import (
@@ -102,7 +102,7 @@ def test_page_keeps_and_restores_explicit_single_image_mode(
     )
     try:
         page.select_source(single)
-        assert page._source_mode == "Single Image"
+        assert page._source_selection.mode == "Single Image"
         state = page._project_controls(store.snapshot())
         fields = {
             field.path: field
@@ -110,16 +110,20 @@ def test_page_keeps_and_restores_explicit_single_image_mode(
         }
         assert fields[SOURCE_TYPE].value == "Single Image"
 
-        page._switch_source_mode("Image Series")
+        page._on_field_value(SOURCE_TYPE, "Image Series")
         assert store.snapshot().thaw().source_spec is None
-        page._switch_source_mode("Single Image")
+        page._on_field_value(SOURCE_TYPE, "Single Image")
         assert store.snapshot().thaw().source_spec == single
-        assert page._source_mode == "Single Image"
+        assert page._source_selection.mode == "Single Image"
 
-        page._cancel_observation()
-        page._source_observation = FilesystemSourceAdapter().observe(
-            SourceObservationRequest(2, store.revision, single)
-        )
+        deadline = time.monotonic() + 3.0
+        while (
+            time.monotonic() < deadline
+            and page._source_selection.observation is None
+        ):
+            qapp.processEvents()
+            time.sleep(0.01)
+        assert page._source_selection.observation is not None
         page._run_executor = object()
         monkeypatch.setattr(
             page,
@@ -678,7 +682,7 @@ def test_intent_boundary_materializes_visible_auto_metadata_policy(
         page.close()
 
 
-def test_unowned_control_and_analysis_actions_fail_closed(
+def test_mounted_actions_fail_closed_without_required_context(
     qapp: QtWidgets.QApplication,
 ) -> None:
     store = RunIntentStore(RunIntent(output_mode="Overwrite"))
@@ -695,17 +699,13 @@ def test_unowned_control_and_analysis_actions_fail_closed(
             "reintegrate_1d",
         ))
         assert notices[-1] == (
-            "Reintegrate 1D is unavailable: no vNext operation service is "
-            "mounted."
+            "Reintegrate 1-D requires one stable loaded Browse context."
         )
         page._handle_shell_command(ShellCommand(
             ShellCommandKind.ANALYSIS_ACTION,
             "peak_fit",
         ))
-        assert notices[-1] == (
-            "Analysis action is unavailable: no vNext analysis service is "
-            "mounted."
-        )
+        assert notices[-1] == "Select one displayed 1-D trace first."
         assert store.revision == 0
     finally:
         page.close_workspace()

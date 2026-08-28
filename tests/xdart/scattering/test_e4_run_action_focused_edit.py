@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
+import time
 
 import pytest
 from pyqtgraph.Qt import QtWidgets
@@ -18,6 +18,7 @@ from xdart.gui.tabs.scattering.controls_inventory import (
     INT_1D_POINTS,
     INT_2D_RADIAL_POINTS,
     SOURCE_DIRECTORY,
+    SOURCE_FILE,
 )
 from xdart.gui.tabs.scattering.controls_inventory import integration_values
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
@@ -49,6 +50,7 @@ def qapp() -> QtWidgets.QApplication:
 class _Sources:
     def __init__(self) -> None:
         self.epoch = 0
+        self.choices: tuple[str, ...] | None = None
 
     def capture(self, source, request_id):
         self.epoch += 1
@@ -68,7 +70,11 @@ class _Sources:
             "frame.tif",
             True,
             False,
+            gi_motor_choices=self.choices,
         )
+
+    def preview_motors(self, request: SourceObservationRequest):
+        return self.observe(request)
 
     def cancel_observation(self, _observation_id: int) -> None:
         return None
@@ -85,9 +91,13 @@ class _CountingStore(RunIntentStore):
         super().__init__(initial)
         self.commit_calls = 0
         self.recapture_next_commit = False
+        self.raise_next_commit = False
 
     def commit(self, candidate, *, expected_revision: int):
         self.commit_calls += 1
+        if self.raise_next_commit:
+            self.raise_next_commit = False
+            raise RuntimeError("intent store unavailable")
         if self.recapture_next_commit:
             self.recapture_next_commit = False
             concurrent = self.snapshot().thaw()
@@ -106,7 +116,7 @@ class _CountingStore(RunIntentStore):
 
 def _page(
     tmp_path: Path,
-) -> tuple[ScatteringWorkspace, _CountingStore]:
+) -> tuple[ScatteringWorkspace, _CountingStore, _Sources]:
     store = _CountingStore(
         RunIntent(
             source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
@@ -115,13 +125,14 @@ def _page(
             output_mode="Overwrite",
         )
     )
+    sources = _Sources()
     page = ScatteringWorkspace(
         intents=store,
         lifecycle=ScatteringCoordinator(),
-        sources=_Sources(),
+        sources=sources,
         executor=object(),  # Admission is intercepted at the capture boundary.
     )
-    return page, store
+    return page, store, sources
 
 
 def _row(
@@ -172,7 +183,7 @@ def test_run_cas_commits_one_focused_point_edit_before_capture(
     path: tuple[str, ...],
     value: str,
 ) -> None:
-    page, store = _page(tmp_path)
+    page, store, _ = _page(tmp_path)
     captures = []
     try:
         row = _row(page, path)
@@ -213,7 +224,7 @@ def test_invalid_focused_edit_visibly_refuses_without_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    page, store = _page(tmp_path)
+    page, store, _ = _page(tmp_path)
     captures = []
     try:
         row = _row(page, INT_1D_POINTS)
@@ -236,7 +247,7 @@ def test_focused_edit_cas_recapture_visibly_refuses_without_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    page, store = _page(tmp_path)
+    page, store, _ = _page(tmp_path)
     captures = []
     try:
         row = _row(page, INT_1D_POINTS)
@@ -261,23 +272,58 @@ def test_focused_edit_cas_recapture_visibly_refuses_without_capture(
         _close(page)
 
 
+def test_focused_source_edit_commit_error_visibly_refuses_without_capture(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, store, _ = _page(tmp_path)
+    captures = []
+    try:
+        row = _row(page, SOURCE_FILE)
+        _focus(page, row.editor, qapp)
+        replacement = str(tmp_path / "replacement")
+        row.editor.setText(replacement)
+        row.editor.textEdited.emit(replacement)
+        qapp.processEvents()
+        store.raise_next_commit = True
+        monkeypatch.setattr(page, "_begin_admission", captures.append)
+
+        _run(page)
+
+        assert store.commit_calls == 1
+        assert captures == []
+        assert page._lifecycle.phase.value == "idle"
+        assert "Run edit commit failed" in page._shell.scientific.status.text()
+        assert "intent store unavailable" in page._shell.scientific.status.text()
+    finally:
+        _close(page)
+
+
 def test_run_cas_resets_an_automatic_motor_with_the_focused_source_edit(
     qapp: QtWidgets.QApplication,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    page, store = _page(tmp_path)
+    page, store, sources = _page(tmp_path)
     captures = []
     try:
         source = DirectorySourceSpec(
             tmp_path / "raw",
             suffixes=(".nxs",),
         )
+        sources.choices = ("exposure", "halpha")
         page.select_source(source)
-        page._maybe_default_gi_motor(
-            SimpleNamespace(gi_motor_choices=("exposure", "halpha"))
-        )
+        deadline = time.monotonic() + 3.0
+        while (
+            time.monotonic() < deadline
+            and page._intents.snapshot().thaw().gi.incidence_motor
+            != "halpha"
+        ):
+            qapp.processEvents()
+            time.sleep(0.01)
         assert store.snapshot().thaw().gi.incidence_motor == "halpha"
+        sources.choices = None
 
         row = _row(page, SOURCE_DIRECTORY)
         _focus(page, row.editor, qapp)
@@ -307,7 +353,7 @@ def test_unfocused_programmatic_text_is_not_harvested_for_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    page, store = _page(tmp_path)
+    page, store, _ = _page(tmp_path)
     captures = []
     try:
         row = _row(page, INT_1D_POINTS)

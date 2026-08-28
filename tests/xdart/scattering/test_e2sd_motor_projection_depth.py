@@ -139,7 +139,7 @@ def test_known_new_source_keeps_stale_motor_visible_until_real_edit(tmp_path) ->
     try:
         _wait(
             app,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and _field(page).choices == ("Manual", "halpha"),
         )
         assert _row(page).editor.currentText() == "halpha"
@@ -147,7 +147,7 @@ def test_known_new_source_keeps_stale_motor_visible_until_real_edit(tmp_path) ->
         page.select_source(second)
         _wait(
             app,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and _field(page).choices == ("Manual", "eta"),
         )
 

@@ -398,7 +398,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _project_controls=lambda _snapshot: None, _start_permitted=lambda: (True, ""), _sync_detector_demand=lambda: None,
         _mutating_operation_busy=lambda: False,
         _preferences=SimpleNamespace(slice_pins=()), _retain_outgoing_display=False,
-        _source_observation=None,
+        _source_selection=SimpleNamespace(observation=None),
             _context_projection=SimpleNamespace(
                 build_shell=lambda **_: _ShellProjection(retained),
             ),
@@ -422,9 +422,10 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
     def forbidden(*_args, **_kwargs):
         raise AssertionError("viewer chooser entered an acquisition seam")
     for name in (
-        "image_series_spec", "single_image_spec", "reduce_source_selection",
-        "is_single_image_spec", "source_mode", "browse_start_dir", "remember_browse_path",
-        "_typed_file_source"):
+        "is_single_image_spec",
+        "browse_start_dir",
+        "remember_browse_path",
+    ):
         monkeypatch.setattr(f"xdart.gui.tabs.scattering.page.{name}", forbidden)
     filesystem = SimpleNamespace(path=SimpleNamespace(**dict.fromkeys(
         ("abspath", "expanduser", "exists", "isfile", "realpath", "splitext"), forbidden)), stat=forbidden, open=forbidden)
@@ -432,24 +433,49 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
     controller = SimpleNamespace(
         viewer_2d_context=None, run_identity=None,
         open_viewer_2d=lambda path: calls.append(("open", path)) or object())
-    intent = SimpleNamespace(processing_mode="2D Viewer", live_mode=False)
+    intent = SimpleNamespace(
+        processing_mode="2D Viewer",
+        live_mode=False,
+        run_options={},
+    )
     page = SimpleNamespace(
         _context_controller=controller, _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
         _viewer_2d_start_directory=lambda: calls.append("start") or "/viewer",
         _viewer_file_chooser=lambda start: calls.append(("choose", start)) or selected,
         _clear_viewer_2d_renderer=forbidden,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: intent), commit=forbidden),
-        _source_mode="directory", _source_history={"directory": object()},
-        _live_source_refresh_source=object(),
+        _source_selection=SimpleNamespace(
+            mode="directory",
+            history={"directory": object()},
+            live_source=object(),
+        ),
+        _workspace_operations=SimpleNamespace(
+            average_pending=None,
+            average_identity=None,
+        ),
+        _retire_batch_presentation=lambda: None,
+        _retain_outgoing_display=False,
         _notice=lambda value: calls.append(("notice", value)),
         _ensure_timer=lambda: calls.append("timer"), _error_notice=forbidden,
         **dict.fromkeys(("select_source", "_queue_live_source_refresh", "_begin_run"), forbidden),
     )
     page._choose_viewer_2d_file = partial(ScatteringWorkspace._choose_viewer_2d_file, page)
-    source_state = (page._source_mode, dict(page._source_history), page._live_source_refresh_source)
+    page._open_viewer_2d_path = partial(
+        ScatteringWorkspace._open_viewer_2d_path,
+        page,
+    )
+    source_state = (
+        page._source_selection.mode,
+        dict(page._source_selection.history),
+        page._source_selection.live_source,
+    )
     ScatteringWorkspace._run_action(page)
     assert calls == ["start", ("choose", "/viewer"), ("open", selected), ("notice", ""), "timer"]
-    assert source_state == (page._source_mode, page._source_history, page._live_source_refresh_source)
+    assert source_state == (
+        page._source_selection.mode,
+        page._source_selection.history,
+        page._source_selection.live_source,
+    )
     controller.viewer_2d_context = SimpleNamespace(original_path=selected)
     page._viewer_file_chooser = forbidden
     page._clear_viewer_2d_renderer = lambda: calls.append("clear") or True

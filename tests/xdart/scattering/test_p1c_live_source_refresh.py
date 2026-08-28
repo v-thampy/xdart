@@ -241,7 +241,7 @@ def _start(
     page: ScatteringWorkspace,
     app: QtWidgets.QApplication,
 ) -> RunIdentity:
-    _wait(app, lambda: page._observation is None)
+    _wait(app, lambda: not page._source_selection.observing)
     page._shell.commandRequested.emit(
         ShellCommand(ShellCommandKind.RUN_ACTION)
     )
@@ -296,7 +296,7 @@ def test_live_discovery_passively_refreshes_source_header_without_preview(
 
         _wait(
             qapp,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and page._source_status._header.text
             == "1 file · Image Directory",
         )
@@ -341,7 +341,7 @@ def test_discoveries_during_preview_coalesce_to_newest_passive_request(
         sources.preview_release.set()
         _wait(
             qapp,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and page._source_status._header.text
             == "4 files · Image Directory",
         )
@@ -351,8 +351,10 @@ def test_discoveries_during_preview_coalesce_to_newest_passive_request(
             4,
         ]
         assert [item.observation_id for item in sources.preview_requests] == [1]
-        assert page._source_observation is not None
-        assert page._source_observation.gi_motor_choices == ("theta",)
+        assert page._source_selection.observation is not None
+        assert page._source_selection.observation.gi_motor_choices == (
+            "theta",
+        )
 
         sources.refresh_count = 5
         sources.refresh_fingerprint = "changed"
@@ -362,7 +364,7 @@ def test_discoveries_during_preview_coalesce_to_newest_passive_request(
         page._drain_executor()
         _wait(
             qapp,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and page._source_status._header.text
             == "5 files · Image Directory",
         )
@@ -370,8 +372,8 @@ def test_discoveries_during_preview_coalesce_to_newest_passive_request(
             item.observation_id for item in sources.observe_requests
         ] == [1, 4, 5]
         assert [item.observation_id for item in sources.preview_requests] == [1]
-        assert page._source_observation is not None
-        assert page._source_observation.gi_motor_choices is None
+        assert page._source_selection.observation is not None
+        assert page._source_selection.observation.gi_motor_choices is None
     finally:
         sources.preview_release.set()
         _dispose(page, qapp)
@@ -407,7 +409,7 @@ def test_discoveries_during_passive_refresh_launch_only_newest_successor(
         sources.refresh_release.set()
         _wait(
             qapp,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and page._source_status._header.text
             == "4 files · Image Directory",
         )
@@ -454,7 +456,7 @@ def test_terminal_during_passive_refresh_cannot_repaint_or_launch_pending(
         page._drain_executor()
         assert page._lifecycle.phase is RunPhase.IDLE
         sources.refresh_release.set()
-        _wait(qapp, lambda: page._observation is None)
+        _wait(qapp, lambda: not page._source_selection.observing)
 
         assert [item.observation_id for item in sources.observe_requests] == [
             1,
@@ -462,7 +464,7 @@ def test_terminal_during_passive_refresh_cannot_repaint_or_launch_pending(
         ]
         assert page._source_status._header.text == "0 files · Image Directory"
         assert page._source_status._header.ready is False
-        assert page._pending_source_refresh is None
+        assert page._source_selection.pending_refresh is None
     finally:
         sources.refresh_release.set()
         _dispose(page, qapp)
@@ -495,7 +497,7 @@ def test_unrelated_intent_edit_does_not_drop_blocked_passive_refresh(
         sources.refresh_release.set()
         _wait(
             qapp,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and page._source_status._header.text
             == "1 file · Image Directory",
         )
@@ -592,9 +594,9 @@ def test_source_change_clears_blocked_refresh_and_queued_successor(
         sources.refresh_release.set()
         _wait(
             qapp,
-            lambda: page._observation is None
-            and page._source_observation is not None
-            and page._source_observation.source == second,
+            lambda: not page._source_selection.observing
+            and page._source_selection.observation is not None
+            and page._source_selection.observation.source == second,
         )
 
         old_source = DirectorySourceSpec(
@@ -632,14 +634,14 @@ def test_close_clears_blocked_refresh_and_queued_successor(
 
         page.close_workspace()
         sources.refresh_release.set()
-        _wait(qapp, lambda: page._observation_pool is None)
+        _wait(qapp, lambda: not page._source_selection.pool_open)
         qapp.processEvents()
 
         assert len(sources.observe_requests) == 2
         assert page._source_status._header.text == "0 files · Image Directory"
         assert page._source_status._header.ready is False
-        assert page._pending_source_refresh is None
-        assert page._live_source_refresh_source is None
+        assert page._source_selection.pending_refresh is None
+        assert page._source_selection.live_source is None
     finally:
         sources.refresh_release.set()
         _dispose(page, qapp)

@@ -19,8 +19,7 @@ import weakref
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.modules.display_context import BrowseContext, ContextKind, DisplaySelection
-from xrd_tools.core.scan import SourceKind, SourceSpec
-from xrd_tools.session.gi_motor import pick_default_gi_motor
+from xrd_tools.core.scan import SourceSpec
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
     IntentFreezeAccepted,
@@ -46,9 +45,7 @@ from xrd_tools.io.output_transaction import (
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
-    image_series_spec,
     is_single_image_spec,
-    single_image_spec,
 )
 from xdart.utils.browse import browse_start_dir, remember_browse_path
 from .advanced_editor import AdvancedSettingsDialog
@@ -97,30 +94,24 @@ from .contracts import (
     SourceCountScope,
     SourceFileState,
     SourceObservation,
-    SourceObservationRequest,
     SourcePort,
     SourceSelection,
 )
 from .context_controller import ContextController
 from .context_projection import ContextProjection
-from .controls_inventory import SOURCE_EDIT_PATHS
 from .controls_projection import (
     AdvancedSettingsValues,
     EditNoChange,
     EditRefusal,
-    EditResult,
     MASK_FILE,
     OUTPUT_MODE,
     PONI_FILE,
     SOURCE_DIRECTORY,
     SOURCE_FILE,
-    GI_MOTOR,
     SOURCE_TYPE,
     reduce_advanced_settings,
     reduce_control_edit,
-    reduce_source_selection,
     project_controls,
-    source_mode,
 )
 from .controls_readiness import (
     ControlsReadinessProjection,
@@ -210,6 +201,13 @@ from .start_outcomes import (
 )
 from .start_pipeline import StartPipeline
 from .state_machine import RunPhase
+from .source_selection import (
+    SourceSelectionTransition,
+    SourceObservationWake,
+    SourceRefreshEffect,
+    SourceSelectionOwner,
+    SourceStatusDirective,
+)
 from .workspace_shell import ScatteringWorkspaceShell
 from .workspace_operations import (
     WorkspaceOperationOwner,
@@ -218,8 +216,6 @@ from .workspace_operations import (
 
 
 _LOG = logging.getLogger(__name__)
-_NO_DELIBERATE_MANUAL = object()
-_NO_AUTOMATIC_GI_MOTOR = object()
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
 _DEFAULT_LIVE_PLOT_INTERVAL_MS = 250
 _LIVE_PLOT_INTERVAL_ENV = "XDART_LIVE_PLOT_INTERVAL_MS"
@@ -236,13 +232,6 @@ _NEXUS_ONLY_PERFORMANCE_KEYS = (
 )
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _DEFERRED_DELETE_RETRY_INTERVAL_MS = 25
-_LIVE_SOURCE_REFRESH_PHASES = frozenset({
-    RunPhase.RUNNING,
-    RunPhase.PAUSING,
-    RunPhase.PAUSED,
-    RunPhase.RESUMING,
-    RunPhase.STOPPING,
-})
 
 
 def _live_plot_interval_ms() -> int:
@@ -328,36 +317,6 @@ def _source_selection_path(source: object) -> str:
     return str(selected or source.uri)
 
 
-def _typed_file_source(
-    current: object,
-    mode: str,
-    value: object,
-) -> SourceSelection | EditRefusal:
-    """Build one complete image-source value from a committed path edit."""
-
-    if type(value) is not str or not value.strip():
-        return EditRefusal("Choose an image file.")
-    metadata_format: str | None = "auto"
-    if type(current) is SourceSpec:
-        candidate = current.options.get("metadata_format", "auto")
-        if candidate is None or type(candidate) is str:
-            metadata_format = candidate
-    try:
-        if mode == "Image Series":
-            return image_series_spec(
-                value,
-                metadata_format=metadata_format,
-            )
-        if mode == "Single Image":
-            return single_image_spec(
-                value,
-                metadata_format=metadata_format,
-            )
-    except (OSError, ValueError) as error:
-        return EditRefusal(str(error))
-    return EditRefusal("Choose an image source before editing its file.")
-
-
 def _directory_file_progress(
     event: StandardRunEvent,
 ) -> DirectoryFileProgress | None:
@@ -369,16 +328,6 @@ def _directory_file_progress(
         event.files_pending,
         event.files_discovered,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class _ObservationOperation:
-    request: SourceObservationRequest
-    future: Future[object]
-    preview: bool = False
-    candidate_fingerprint: str = ""
-    passive_refresh: bool = False
-    refresh_identity: RunIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,7 +571,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     sourceSelectionRequested = QtCore.Signal(object)
     browseRequested = QtCore.Signal(object)
     noticeChanged = QtCore.Signal(str)
-    _observationFinished = QtCore.Signal(object, object)
+    _observationFinished = QtCore.Signal(object)
     _browserCatalogFinished = QtCore.Signal(object, object)
 
     def __init__(
@@ -668,7 +617,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self.setObjectName("scatteringWorkspace")
         self._intents = intents
         self._lifecycle = lifecycle
-        self._sources = sources
         self._run_executor = executor
         self._pipeline = (
             StartPipeline(
@@ -680,23 +628,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if executor is not None
             else None
         )
-        self._observation_pool: ThreadPoolExecutor | None = (
-            ThreadPoolExecutor(max_workers=1)
-        )
-        self._observation: _ObservationOperation | None = None
-        self._pending_source_refresh: SourceObservationRequest | None = None
-        self._live_source_refresh_source: DirectorySourceSpec | None = None
-        self._source_observation: SourceObservation | None = None
-        # LV-UI-5b: source_spec a DELIBERATE user 'Manual' belongs to
-        # (F3 sticky rule).  A sentinel — NOT None — marks "no deliberate
-        # Manual": a source_spec can itself be None, and the default state
-        # must never compare equal to it.
-        self._gi_manual_source = _NO_DELIBERATE_MANUAL
-        # An automatic metadata pick is source-scoped.  Keep its provenance
-        # outside RunIntent so a later source edit can reset only OUR pick,
-        # without erasing an explicit real-motor selection by the user.
-        self._gi_auto_motor: object = _NO_AUTOMATIC_GI_MOTOR
-        self._observation_token = 0
         self._browser_catalog_pool: ThreadPoolExecutor | None = (
             ThreadPoolExecutor(max_workers=1)
         )
@@ -768,13 +699,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._performance_diagnostics_editor = (
             self._show_performance_diagnostics_dialog
         )
-        initial_intent = intents.snapshot().thaw()
-        self._source_mode = source_mode(initial_intent.source_spec)
-        self._source_history: dict[str, SourceSelection] = {}
-        if initial_intent.source_spec is not None:
-            self._source_history[self._source_mode] = (
-                initial_intent.source_spec
-            )
+        initial = intents.snapshot()
+        initial_intent = initial.thaw()
+        page_ref = weakref.ref(self)
+        self._source_selection = SourceSelectionOwner(
+            sources,
+            intents,
+            lambda wake: ScatteringWorkspace._deliver_observation(
+                page_ref, wake
+            ),
+        )
         self._browser_directory = processed_directory(
             initial_intent.save_path
         )
@@ -884,8 +818,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._source_status.chooseRequested,
             self._choose_source_selection,
         )
-        self._connect(
-            self._observationFinished, self._on_observation
+        self._observationFinished.connect(
+            self._on_observation,
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
+        self._connections.append(
+            (self._observationFinished, self._on_observation)
         )
         self._connect(
             self._browserCatalogFinished,
@@ -897,7 +835,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._poll_browser_catalog,
         )
 
-        initial = self._intents.snapshot()
         self._refresh_shell()
         self._request_observation(initial)
         self._request_browser_catalog()
@@ -2433,7 +2370,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             target = os.path.abspath(os.path.expanduser(str(generated)))
         except (TypeError, ValueError, OverflowError) as error:
             self._notice(str(error)); self._refresh_shell(); return
-        observation = self._source_observation
+        observation = self._source_selection.observation
         choices = (
             observation.gi_motor_choices
             if observation is not None
@@ -2486,31 +2423,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def select_source(self, source: SourceSelection) -> None:
         if self._closing or self._closed:
             return
-        snapshot = self._intents.snapshot()
-        reduced = reduce_source_selection(
-            snapshot,
-            source,
-            reset_auto_gi_motor=self._auto_gi_motor_matches(snapshot),
+        self._apply_source_observation_transition(
+            self._source_selection.select(source)
         )
-        if isinstance(reduced, EditRefusal):
-            self._notice(reduced.reason)
-            self._refresh_shell()
-            return
-        if isinstance(reduced, EditNoChange):
-            self._notice("")
-            return
-        result = self._intents.commit(
-            reduced, expected_revision=snapshot.revision
-        )
-        if type(result) is IntentCommitAccepted:
-            self._source_mode = source_mode(source)
-            self._source_history[self._source_mode] = source
-        self._notice(
-            ""
-            if type(result) is IntentCommitAccepted
-            else "Edit superseded; review current value."
-        )
-        self._reconcile_snapshot(snapshot, result.snapshot)
 
     def close_workspace(self) -> StartClosed:
         terminal = self._terminal_close
@@ -2531,12 +2446,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                            self._peak_dialog, self._phase_dialog):
                 if dialog is not None: dialog.close()
             ScatteringWorkspace._clear_presentation_targets(self)
-            self._clear_live_source_refresh()
+            self._source_selection.begin_close()
             self._shell.browser.cancel_pending_frame_selection()
             self._run_timer.stop()
             self._browser_catalog_timer.stop()
-            self._observation_token += 1
-            self._cancel_observation()
             self._browser_catalog_token += 1
             self._close_identity = (
                 self._context_controller.run_identity
@@ -2771,9 +2684,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             except (RuntimeError, TypeError):
                 pass
         self._connections.clear()
-        pool, self._observation_pool = self._observation_pool, None
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
+        self._source_selection.finalize_close()
         browser_pool, self._browser_catalog_pool = (
             self._browser_catalog_pool,
             None,
@@ -3155,9 +3066,40 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return False
         if edit is None:
             return True
+        if self._source_selection.owns_edit(edit.path):
+            try:
+                transition = self._source_selection.edit(
+                    edit.path,
+                    edit.value,
+                )
+            except Exception as error:
+                self._error_notice("Run edit commit failed", error)
+                return False
+            receipt = transition.intent
+            if (
+                receipt is not None
+                and type(receipt.result) is IntentRecaptureRequired
+            ):
+                transition = replace(
+                    transition,
+                    notice=(
+                        "Run not started: edit superseded; review current "
+                        "value."
+                    ),
+                )
+            self._apply_source_observation_transition(transition)
+            return bool(
+                transition.notice == ""
+                and (
+                    receipt is None
+                    or type(receipt.result) is IntentCommitAccepted
+                )
+            )
         snapshot = self._intents.snapshot()
-        reduced = self._reduce_page_control_edit(
-            snapshot, edit.path, edit.value
+        reduced = reduce_control_edit(
+            snapshot,
+            edit.path,
+            edit.value,
         )
         if isinstance(reduced, EditRefusal):
             self._notice(reduced.reason)
@@ -3328,39 +3270,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Profile load superseded; review current values.")
         self._reconcile_snapshot(prior, result.snapshot)
 
-    def _reduce_page_control_edit(
-        self,
-        snapshot: RunIntentSnapshot,
-        path: object,
-        value: object,
-    ) -> EditResult:
-        """Reduce controls whose complete value is owned by the page."""
-
-        reset_auto_gi_motor = (
-            type(path) is tuple
-            and (path in SOURCE_EDIT_PATHS or path == SOURCE_FILE)
-            and self._auto_gi_motor_matches(snapshot)
-        )
-        if path == SOURCE_FILE:
-            source = _typed_file_source(
-                snapshot.thaw().source_spec,
-                self._source_mode,
-                value,
-            )
-            if isinstance(source, EditRefusal):
-                return source
-            return reduce_source_selection(
-                snapshot,
-                source,
-                reset_auto_gi_motor=reset_auto_gi_motor,
-            )
-        return reduce_control_edit(
-            snapshot,
-            path,  # type: ignore[arg-type]
-            value,
-            reset_auto_gi_motor=reset_auto_gi_motor,
-        )
-
     def _begin_run(self) -> None:
         pipeline = self._pipeline
         if self._closing or self._closed or pipeline is None:
@@ -3527,14 +3436,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             ScatteringWorkspace._clear_presentation_targets(self)
             launched_source = outcome.source_capture.source
-            self._pending_source_refresh = None
-            self._live_source_refresh_source = (
-                launched_source
-                if (
-                    outcome.configuration.live_mode
-                    and type(launched_source) is DirectorySourceSpec
-                )
-                else None
+            self._source_selection.set_launched_source(
+                launched_source,
+                outcome.run_identity,
+                live_mode=outcome.configuration.live_mode,
             )
             self._begin_browser_follow(outcome.run_identity)
             retirement = self._batch_terminal.begin_run(
@@ -6029,7 +5934,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and not batch_science_hold
             and not explicit_preserve_scientific
         )
-        observation = self._source_observation
+        observation = self._source_selection.observation
         source = intent.source_spec
         if observation is None or observation.source != source:
             source_count = None
@@ -6303,15 +6208,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if detector_key != self._detector_summary_key:
             self._detector_summary_text = detector_summary(*detector_key)
             self._detector_summary_key = detector_key
-        observation = None
-        source = intent.source_spec
-        if source is not None:
-            current = self._source_observation
-            observation = (
-                current
-                if current is not None and current.source == source
-                else self._sources.project_motor_knowledge(source, None)
-            )
+        observation = self._source_selection.project_observation(snapshot)
         operation_identity = self._workspace_operations.current_identity
         operation_active = (operation_identity is not None and not self._closing and not self._closed)
         operation_busy = self._experiment_operation_busy()
@@ -6340,7 +6237,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             advanced_editor_available=(
                 self._advanced_settings_editor is not None
             ),
-            source_mode_override=self._source_mode,
+            source_mode_override=self._source_selection.mode,
             detector_summary_override=self._detector_summary_text,
             calibrate_available=calibrate_available,
             calibrate_dependency_available=calibrate_dependency_available,
@@ -7169,55 +7066,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._reconcile_snapshot(snapshot, result.snapshot)
 
-    def _maybe_default_gi_motor(self, observation) -> None:
-        """LV-UI-5b: adopt the metadata-preferred incidence motor.
+    def _automatic_motor_permitted(self) -> bool:
+        """Return whether an observation may revise the next-run intent."""
 
-        The default POLICY is owned by
-        :func:`xrd_tools.session.gi_motor.pick_default_gi_motor`; this seam
-        only decides WHEN it may apply: the intent still carries the
-        construction default ``'Manual'``, the user has not deliberately
-        chosen Manual for this exact source (F3 sticky rule), and the
-        observation names motors for the selected source.  The pick commits
-        through the one ``_on_field_value`` CAS path.
-        """
-        choices = getattr(observation, "gi_motor_choices", None)
-        if not choices:
-            return
-        # Observation delivery and Run click are serialized on the GUI
-        # thread.  Once start owns PREPARING/admission, an automatic CAS would
-        # invalidate the exact captured revision and refuse the user's click.
-        # Keep the captured displayed value for this run; the retained
-        # observation is reconsidered after a clean terminal transition.
-        if (
-            self._admission is not None
-            or self._lifecycle.phase is not RunPhase.IDLE
-        ):
-            return
-        intent = self._intents.snapshot().thaw()
-        if intent.gi.incidence_motor != "Manual":
-            return
-        if (self._gi_manual_source is not _NO_DELIBERATE_MANUAL
-                and self._gi_manual_source == intent.source_spec):
-            return
-        preferred = pick_default_gi_motor(choices)
-        if preferred == "Manual":
-            return
-        self._on_field_value(GI_MOTOR, preferred, automatic=True)
+        return (
+            self._admission is None
+            and self._lifecycle.phase is RunPhase.IDLE
+        )
 
-    def _retry_deferred_gi_motor_default(self) -> None:
-        observation = self._source_observation
-        if observation is not None:
-            self._maybe_default_gi_motor(observation)
-
-    def _auto_gi_motor_matches(
-        self,
-        snapshot: RunIntentSnapshot,
-    ) -> bool:
-        marker = self._gi_auto_motor
-        if marker is _NO_AUTOMATIC_GI_MOTOR:
-            return False
-        intent = snapshot.thaw()
-        return marker == (intent.source_spec, intent.gi.incidence_motor)
+    def _retry_deferred_gi_motor_default(self) -> SourceRefreshEffect:
+        transition = self._source_selection.commit_deferred_motor_default(
+            permitted=self._automatic_motor_permitted(),
+        )
+        return self._compose_source_transition(transition)
 
     def _record_native_plot_axis_edit(
         self,
@@ -7336,199 +7197,65 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self,
         path: object,
         value: object,
-        *,
-        automatic: bool = False,
     ) -> None:
         if self._closing or self._closed:
             return
-        if path == SOURCE_TYPE:
-            if type(value) is not str or value not in {
-                "Image Series",
-                "Image Directory",
-                "Single Image",
-            }:
-                self._notice("Unknown source type.")
-                self._refresh_shell()
-                return
-            self._switch_source_mode(value)
+        if self._source_selection.owns_edit(path):
+            self._apply_source_observation_transition(
+                self._source_selection.edit(path, value)
+            )
             return
         snapshot = self._intents.snapshot()
-        reduced = self._reduce_page_control_edit(snapshot, path, value)
+        reduced = reduce_control_edit(
+            snapshot,
+            path,  # type: ignore[arg-type]
+            value,
+        )
         if isinstance(reduced, EditRefusal):
-            if not automatic:
-                self._notice(reduced.reason)
+            self._notice(reduced.reason)
             self._refresh_shell()
             return
         if isinstance(reduced, EditNoChange):
-            if path == GI_MOTOR and not automatic:
-                # A same-value activation is still an operator claim over an
-                # earlier automatic pick.  No intent revision is needed, but
-                # provenance must stop treating that value as disposable on
-                # the next source change.
-                self._gi_manual_source = (
-                    snapshot.thaw().source_spec
-                    if value == "Manual" else _NO_DELIBERATE_MANUAL
-                )
-                self._gi_auto_motor = _NO_AUTOMATIC_GI_MOTOR
-            if not automatic:
-                self._notice("")
+            self._notice("")
             self._refresh_shell()
             return
         result = self._intents.commit(
             reduced, expected_revision=snapshot.revision
         )
         if type(result) is IntentCommitAccepted:
-            if path == GI_MOTOR:
-                # F3 sticky rule: only an ACCEPTED deliberate 'Manual' pins
-                # Manual for this exact source; any real pick releases it.
-                self._gi_manual_source = (
-                    snapshot.thaw().source_spec
-                    if value == "Manual" else _NO_DELIBERATE_MANUAL
-                )
-                self._gi_auto_motor = (
-                    (snapshot.thaw().source_spec, value)
-                    if automatic
-                    else _NO_AUTOMATIC_GI_MOTOR
-                )
-            if not automatic:
-                self._notice("")
+            self._notice("")
             self._reconcile_snapshot(
                 snapshot,
                 result.snapshot,
-                preserve_terminal=automatic,
             )
         elif type(result) is IntentRecaptureRequired:
-            if not automatic:
-                self._notice("Edit superseded; review current value.")
+            self._notice("Edit superseded; review current value.")
             self._reconcile_snapshot(snapshot, result.snapshot)
 
     def _request_observation(
         self, snapshot: RunIntentSnapshot
     ) -> None:
-        source = snapshot.thaw().source_spec
-        if source is None:
-            self._source_observation = None
-            self._source_status.show_no_source()
-            return
-        pool = self._observation_pool
-        if pool is None or self._closing:
-            return
-        self._observation_token += 1
-        if (
-            self._source_observation is not None
-            and self._source_observation.source != source
-        ):
-            self._source_observation = None
-        request = SourceObservationRequest(
-            self._observation_token, snapshot.revision, source
-        )
-        self._source_status.show_checking(_source_label(source))
-        self._submit_observation(request)
-
-    def _submit_observation(
-        self,
-        request: SourceObservationRequest,
-        *,
-        passive_refresh: bool = False,
-        refresh_identity: RunIdentity | None = None,
-    ) -> None:
-        pool = self._observation_pool
-        if pool is None or self._closing:
-            return
-        future = pool.submit(self._sources.observe, request)
-        operation = _ObservationOperation(
-            request,
-            future,
-            passive_refresh=passive_refresh,
-            refresh_identity=refresh_identity,
-        )
-        self._observation = operation
-        page_ref = weakref.ref(self)
-        future.add_done_callback(
-            lambda done: ScatteringWorkspace._deliver_observation(
-                page_ref, operation, done
-            )
-        )
+        transition = self._source_selection.request_observation(snapshot)
+        self._apply_source_observation_transition(transition)
 
     def _queue_live_source_refresh(
         self, event: StandardRunEvent
     ) -> None:
         """Coalesce one Live discovery into one passive source observation."""
-
-        source = self._live_source_refresh_source
-        if source is None:
-            return
-        identity = event.run_identity
-        snapshot = self._intents.snapshot()
-        self._observation_token += 1
-        pending = SourceObservationRequest(
-            self._observation_token,
-            snapshot.revision,
-            source,
+        self._source_selection.queue_live_refresh(
+            event.run_identity,
+            self._intents.snapshot(),
+            active_identity=self._lifecycle.active_run_identity,
+            phase=self._lifecycle.phase,
         )
-        if not self._live_source_refresh_is_current(identity, pending):
-            return
-        if self._observation is not None:
-            self._pending_source_refresh = pending
-            return
-        self._submit_observation(
-            pending,
-            passive_refresh=True,
-            refresh_identity=identity,
-        )
-
-    def _live_source_refresh_is_current(
-        self,
-        identity: RunIdentity,
-        request: SourceObservationRequest,
-    ) -> bool:
-        source = self._live_source_refresh_source
-        if (
-            self._closing
-            or self._closed
-            or self._observation_pool is None
-            or source is None
-            or request.source != source
-            or self._lifecycle.active_run_identity is not identity
-            or self._lifecycle.phase not in _LIVE_SOURCE_REFRESH_PHASES
-        ):
-            return False
-        snapshot = self._intents.snapshot()
-        intent = snapshot.thaw()
-        return (
-            intent.live_mode
-            and type(intent.source_spec) is DirectorySourceSpec
-            and intent.source_spec == source
-        )
-
-    def _launch_pending_source_refresh(self) -> None:
-        if self._observation is not None:
-            return
-        pending, self._pending_source_refresh = (
-            self._pending_source_refresh,
-            None,
-        )
-        identity = self._lifecycle.active_run_identity
-        if (
-            pending is not None
-            and identity is not None
-            and self._live_source_refresh_is_current(identity, pending)
-        ):
-            self._submit_observation(
-                pending,
-                passive_refresh=True,
-                refresh_identity=identity,
-            )
 
     def _clear_live_source_refresh(self) -> None:
-        self._pending_source_refresh = None
-        self._live_source_refresh_source = None
+        self._source_selection.clear_live_refresh()
 
     @staticmethod
     def _deliver_observation(
         page_ref: weakref.ReferenceType["ScatteringWorkspace"],
-        operation: _ObservationOperation,
-        future: Future[object],
+        wake: SourceObservationWake,
     ) -> None:
         page = page_ref()
         if page is None:
@@ -7536,176 +7263,87 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         try:
             if page._closing or page._closed:
                 return
-            page._observationFinished.emit(operation, future)
+            page._observationFinished.emit(wake)
         except RuntimeError:
             return
 
     def _on_observation(
-        self, operation: object, future: object
+        self, wake: object
     ) -> None:
-        if (
-            self._closing
-            or self._closed
-            or operation is not self._observation
-        ):
+        if self._closing or self._closed:
             return
-        if (
-            type(operation) is not _ObservationOperation
-            or future is not operation.future
-        ):
-            return
-        self._observation = None
-        try:
-            self._settle_observation(operation)
-        finally:
-            self._launch_pending_source_refresh()
-
-    def _settle_observation(
-        self, operation: _ObservationOperation
-    ) -> None:
-        request = operation.request
-        if operation.passive_refresh:
-            identity = operation.refresh_identity
-            if identity is None or not self._live_source_refresh_is_current(
-                identity, request
-            ):
-                return
-        try:
-            observation: object = operation.future.result()
-        except Exception:
-            if not operation.passive_refresh:
-                self._source_status.show_unavailable(
-                    _source_label(request.source)
-                )
-            return
-        if type(observation) is not SourceObservation:
-            if not operation.passive_refresh:
-                self._source_status.show_unavailable(
-                    _source_label(request.source)
-                )
-            return
-        snapshot = self._intents.snapshot()
-        expected_fingerprint = (
-            operation.candidate_fingerprint
-            if operation.preview
-            else None
+        transition = self._source_selection.consume(
+            wake,
+            active_identity=self._lifecycle.active_run_identity,
+            phase=self._lifecycle.phase,
+            automatic_motor_permitted=self._automatic_motor_permitted(),
+            terminal_progress=self._progress.terminal,
         )
-        if not observation.qualifies(
-            request, expected_fingerprint
-        ):
-            if not operation.passive_refresh:
-                self._source_status.show_unavailable(
-                    _source_label(request.source)
-                )
-            return
-        if snapshot.thaw().source_spec != request.source:
-            return
-        if operation.passive_refresh:
-            identity = operation.refresh_identity
-            if identity is None or not self._live_source_refresh_is_current(
-                identity, request
-            ):
-                return
-            observation = self._retain_exact_motor_knowledge(observation)
-        prior_observation = self._source_observation
-        if (
-            self._progress.terminal
-            and prior_observation is not None
-            and (
-                prior_observation.candidate_fingerprint,
-                prior_observation.status,
-                prior_observation.exists,
-                prior_observation.observed_file_count,
-            )
-            != (
-                observation.candidate_fingerprint,
-                observation.status,
-                observation.exists,
-                observation.observed_file_count,
-            )
-        ):
+        self._apply_source_observation_transition(transition)
+
+    def _compose_source_transition(
+        self,
+        transition: SourceSelectionTransition,
+    ) -> SourceRefreshEffect:
+        if type(transition) is not SourceSelectionTransition:
+            return SourceRefreshEffect.NONE
+        if transition.notice is not None:
+            self._notice(transition.notice)
+        source = self._intents.snapshot().thaw().source_spec
+        status = transition.status
+        if status is SourceStatusDirective.NO_SOURCE:
+            self._source_status.show_no_source()
+        elif status is SourceStatusDirective.CHECKING and source is not None:
+            self._source_status.show_checking(_source_label(source))
+        elif status is SourceStatusDirective.UNAVAILABLE and source is not None:
+            self._source_status.show_unavailable(_source_label(source))
+
+        if transition.reset_terminal_progress:
             self._progress = replace(
                 self._progress,
                 detail="",
                 directory_files=None,
                 terminal=False,
             )
-        self._source_observation = observation
-        self._maybe_default_gi_motor(observation)
-        if operation.preview:
-            self._sources.publish_motor_knowledge(observation)
-        self._source_status.render(observation)
-        self._refresh_shell()
+        effect = transition.refresh
+        receipt = transition.intent
+        if receipt is not None:
+            nested = self._apply_snapshot_effects(
+                receipt.before,
+                receipt.result.snapshot,
+                preserve_terminal=transition.preserve_terminal,
+            )
+            nested_effect = self._compose_source_transition(nested)
+            if nested_effect is SourceRefreshEffect.CONTROLS:
+                effect = SourceRefreshEffect.CONTROLS
+
+        observation = transition.observation
         if (
-            not operation.preview
-            and not operation.passive_refresh
-            and (
-                type(request.source) is DirectorySourceSpec
-                or (
-                    type(request.source) is SourceSpec
-                    and request.source.kind is SourceKind.TIFF_SERIES
-                )
-            )
-            and observation.exists
-            and observation.candidate_fingerprint
-            and self._observation_pool is not None
+            status is SourceStatusDirective.OBSERVED
+            and type(observation) is SourceObservation
+            and self._source_selection.observation is observation
         ):
-            future = self._observation_pool.submit(
-                self._sources.preview_motors, request
-            )
-            preview = _ObservationOperation(
-                request,
-                future,
-                True,
-                observation.candidate_fingerprint,
-            )
-            self._observation = preview
-            page_ref = weakref.ref(self)
-            future.add_done_callback(
-                lambda done: ScatteringWorkspace._deliver_observation(
-                    page_ref, preview, done
-                )
+            self._source_status.render(observation)
+        return effect
+
+    def _apply_source_observation_transition(
+        self,
+        transition: SourceSelectionTransition,
+    ) -> None:
+        effect = self._compose_source_transition(transition)
+        if effect is SourceRefreshEffect.CONTROLS:
+            self._refresh_shell(
+                preserve_display=True,
+                preserve_scientific=True,
             )
 
-    def _retain_exact_motor_knowledge(
-        self, observation: SourceObservation
-    ) -> SourceObservation:
-        fingerprint = observation.candidate_fingerprint
-        if not fingerprint or observation.gi_motor_choices is not None:
-            return observation
-        knowledge = self._sources.project_motor_knowledge(
-            observation.source,
-            fingerprint,
-        )
-        if (
-            type(knowledge) is SourceObservation
-            and knowledge.source == observation.source
-            and knowledge.candidate_fingerprint == fingerprint
-            and knowledge.gi_motor_choices is not None
-        ):
-            return replace(
-                observation,
-                gi_motor_choices=knowledge.gi_motor_choices,
-            )
-        return observation
-
-    def _cancel_observation(self) -> None:
-        operation, self._observation = self._observation, None
-        if operation is not None and not operation.future.cancel():
-            try:
-                self._sources.cancel_observation(
-                    operation.request.observation_id
-                )
-            except Exception:
-                pass
-
-    def _reconcile_snapshot(
+    def _apply_snapshot_effects(
         self,
         prior: RunIntentSnapshot,
         current: RunIntentSnapshot,
         *,
         preserve_terminal: bool = False,
-    ) -> None:
+    ) -> SourceSelectionTransition:
         if (
             current.revision != prior.revision
             and self._progress.terminal
@@ -7736,16 +7374,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             != pending_axis.target_axis
         ):
             self._native_plot_axis_transition = None
-        prior_source = prior_intent.source_spec
-        current_source = current_intent.source_spec
         catalog_policy_changed = (
             _browser_suffixes_for_mode(prior_intent.processing_mode)
             != _browser_suffixes_for_mode(current_intent.processing_mode)
         )
-        if current_source is not None:
-            current_mode = source_mode(current_source)
-            self._source_mode = current_mode
-            self._source_history[current_mode] = current_source
+        source_transition = self._source_selection.reconcile_source(
+            prior,
+            current,
+        )
         browser_directory_changed = (
             prior_intent.save_path != current_intent.save_path
             and not self._browser_explicit_directory
@@ -7757,15 +7393,32 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if browser_directory_changed or catalog_policy_changed:
             self._browser_catalog = ()
             self._request_browser_catalog()
+        ScatteringWorkspace._observe_operation_stamp(
+            self,
+            current.revision,
+        )
+        return source_transition
+
+    def _reconcile_snapshot(
+        self,
+        prior: RunIntentSnapshot,
+        current: RunIntentSnapshot,
+        *,
+        preserve_terminal: bool = False,
+    ) -> None:
+        source_transition = self._apply_snapshot_effects(
+            prior,
+            current,
+            preserve_terminal=preserve_terminal,
+        )
+        self._compose_source_transition(source_transition)
+        default_transition = (
+            self._source_selection.commit_deferred_motor_default(
+                permitted=self._automatic_motor_permitted(),
+            )
+        )
+        self._compose_source_transition(default_transition)
         self._refresh_shell()
-        if prior_source != current_source:
-            self._clear_live_source_refresh()
-            self._gi_auto_motor = _NO_AUTOMATIC_GI_MOTOR
-            self._source_observation = None
-            self._cancel_observation()
-            self._request_observation(current)
-        self._retry_deferred_gi_motor_default()
-        ScatteringWorkspace._observe_operation_stamp(self, current.revision)
 
     def _choose_directory_dialog(
         self,
@@ -7861,7 +7514,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         intent = self._intents.snapshot().thaw()
         current = intent.source_spec
-        requested_mode = desired_mode or self._source_mode
+        requested_mode = desired_mode or self._source_selection.mode
         start_directory = browse_start_dir(
             _source_selection_path(current),
             fallback=intent.project_root,
@@ -7880,39 +7533,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self.select_source(selected)
         else:
             self._refresh_shell()
-
-    def _switch_source_mode(self, desired_mode: str) -> None:
-        """Switch editor modes without opening a chooser.
-
-        Each mode remembers its last complete selection for this workspace.
-        A first visit has no complete selection, so the revisioned intent is
-        cleared and Run remains safely unavailable until the user explicitly
-        browses.
-        """
-        if desired_mode == self._source_mode:
-            self._notice("")
-            self._refresh_shell()
-            return
-        snapshot = self._intents.snapshot()
-        current = snapshot.thaw().source_spec
-        if current is not None:
-            self._source_history[source_mode(current)] = current
-        candidate = snapshot.thaw()
-        candidate.source_spec = self._source_history.get(desired_mode)
-        if self._auto_gi_motor_matches(snapshot):
-            candidate.gi.incidence_motor = "Manual"
-        result = self._intents.commit(
-            candidate,
-            expected_revision=snapshot.revision,
-        )
-        if type(result) is IntentCommitAccepted:
-            self._source_mode = desired_mode
-            self._notice("")
-        else:
-            recovered = result.snapshot.thaw().source_spec
-            self._source_mode = source_mode(recovered)
-            self._notice("Edit superseded; review current value.")
-        self._reconcile_snapshot(snapshot, result.snapshot)
 
     def _choose_browser_directory(self) -> None:
         project_root = self._intents.snapshot().thaw().project_root

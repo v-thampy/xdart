@@ -1139,7 +1139,7 @@ def test_average_page_dispatches_one_revision_checked_canonical_freeze(
             ),
         )
         monkeypatch.setattr(page._workspace_operations._slot, "begin_average", begin)
-        page._source_observation = None
+        assert page._source_selection.observation is None
         snapshot = store.snapshot()
 
         page._average_action(snapshot)

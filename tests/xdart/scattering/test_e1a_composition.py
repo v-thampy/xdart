@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future
+import ast
 from pathlib import Path
 from threading import Event, get_ident
 import time
@@ -14,6 +14,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.session.intent_store import RunIntentStore
+from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 from xdart.gui.tabs.scattering.contracts import (
@@ -28,9 +29,9 @@ from xdart.gui.tabs.scattering.controls_projection import (
 )
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
-from xdart.gui.tabs.scattering.page import (
-    ScatteringWorkspace,
-    _ObservationOperation,
+from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.source_selection import (
+    SourceObservationWake,
 )
 from xdart.gui.tabs.scattering.source_view import SourceStatusView
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
@@ -65,8 +66,8 @@ def qapp() -> QtWidgets.QApplication:
 
 
 class CountingStore(RunIntentStore):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, initial: RunIntent | None = None) -> None:
+        super().__init__(initial)
         self.commit_calls = 0
         self.make_next_commit_stale = False
 
@@ -81,11 +82,15 @@ class CountingStore(RunIntentStore):
 
 
 class ImmediateSource:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        choices: tuple[str, ...] | None = None,
+    ) -> None:
         self.observation_thread: int | None = None
         self.cancelled: list[int] = []
         self.capture_calls = 0
         self.motor_knowledge: SourceObservation | None = None
+        self.choices = choices
 
     def capture(self, source: object, request_id: object) -> object:
         self.capture_calls += 1
@@ -105,6 +110,7 @@ class ImmediateSource:
             True,
             False,
             size_bytes=12,
+            gi_motor_choices=self.choices,
         )
 
     def cancel_observation(self, observation_id: int) -> None:
@@ -290,6 +296,36 @@ def test_stale_cas_renders_returned_snapshot_without_retry(qapp: QtWidgets.QAppl
         workspace.close_workspace()
 
 
+def test_motor_observation_is_one_owner_cas_and_one_controls_refresh(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    selected = SourceSpec("/selected.nxs")
+    store = CountingStore(RunIntent(source_spec=selected))
+    workspace = ScatteringWorkspace(
+        intents=store,
+        lifecycle=ScatteringCoordinator(),
+        sources=ImmediateSource(("exposure", "chi", "th")),
+    )
+    refreshes: list[dict[str, object]] = []
+    workspace._refresh_shell = lambda **values: refreshes.append(values)
+    try:
+        assert _wait_until(
+            qapp,
+            lambda: (
+                not workspace._source_selection.observing
+                and store.snapshot().thaw().gi.incidence_motor == "th"
+            ),
+        )
+        assert store.commit_calls == 1
+        assert store.snapshot().revision == 1
+        assert refreshes == [{
+            "preserve_display": True,
+            "preserve_scientific": True,
+        }]
+    finally:
+        workspace.close_workspace()
+
+
 def test_source_selection_is_one_store_value_and_observes_off_gui_thread(
     qapp: QtWidgets.QApplication, tmp_path: Path
 ) -> None:
@@ -340,26 +376,24 @@ def test_foreign_callback_and_post_close_completion_are_inert(qapp: QtWidgets.QA
         assert source.started.wait(1.0)
         request = source.last_request
         assert request is not None
-        operation = workspace._observation
-        assert operation is not None
+        wake = workspace._source_selection.current_wake
+        assert wake is not None
         before = source_status._header
-        foreign = Future()
-        foreign.set_result(object())
-        workspace._observationFinished.emit(object(), foreign)
+        workspace._observationFinished.emit(object())
         qapp.processEvents()
         assert source_status._header == before
-        assert workspace._observation is operation
-        workspace._observationFinished.emit(operation, foreign)
+        assert workspace._source_selection.current_wake is wake
+        workspace._observationFinished.emit(SourceObservationWake(wake.token))
         qapp.processEvents()
         assert source_status._header == before
-        assert workspace._observation is operation
+        assert workspace._source_selection.current_wake is wake
 
         commits_before_close = store.commit_calls
         workspace.close_workspace()
         assert lifecycle.closed is True
         assert source.cancelled == [request.observation_id]
-        assert workspace._observation_pool is None
-        assert workspace._observation is None
+        assert not workspace._source_selection.pool_open
+        assert workspace._source_selection.current_wake is None
         workspace.close_workspace()
         source.release.set()
         assert _wait_until(qapp, lambda: source.observation_thread is not None)
@@ -385,7 +419,10 @@ def test_unrelated_edit_accepts_existing_observation_without_restat(
         shell.controls.fieldValueChanged.emit(PROJECT_ROOT, "/outside")
         assert len(source.requests) == 1
         source.release.set()
-        assert _wait_until(qapp, lambda: workspace._observation is None)
+        assert _wait_until(
+            qapp,
+            lambda: workspace._source_selection.current_wake is None,
+        )
         assert source_status._header.text == "Single Image"
         assert source_status._header.ready is False
         assert request.intent_revision == 1
@@ -409,7 +446,10 @@ def test_current_bad_completion_is_consumed_as_unavailable(
         source_status = _source_status(workspace)
         workspace.select_source(SourceSpec("/selected.dat"))
         assert _wait_until(qapp, lambda: source.observation_thread is not None)
-        assert _wait_until(qapp, lambda: workspace._observation is None)
+        assert _wait_until(
+            qapp,
+            lambda: workspace._source_selection.current_wake is None,
+        )
         assert source_status._header.text == "unavailable"
         assert store.snapshot().revision == 1
     finally:
@@ -428,12 +468,10 @@ def test_deleted_page_completion_is_contained(qapp: QtWidgets.QApplication) -> N
     workspace.deleteLater()
     QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
     qapp.processEvents()
-    future = Future()
-    future.set_result(object())
-    operation = _ObservationOperation(
-        SourceObservationRequest(1, 0, SourceSpec("/selected.dat")), future,
+    ScatteringWorkspace._deliver_observation(
+        page_ref,
+        SourceObservationWake(1),
     )
-    ScatteringWorkspace._deliver_observation(page_ref, operation, future)
     assert store.revision == 0
 
 
@@ -533,8 +571,6 @@ def test_page_adds_only_the_e1b_execution_path_without_legacy_hosts() -> None:
     source = Path(__file__).parents[3] / "src" / "xdart" / "gui" / "tabs" / "scattering" / "page.py"
     text = source.read_text()
     for forbidden in (
-        ".freeze(",
-        ".capture(",
         "OutputPort",
         "BrowseLoaderPort",
         "ProjectionPort",
@@ -544,5 +580,30 @@ def test_page_adds_only_the_e1b_execution_path_without_legacy_hosts() -> None:
         "ParameterTree",
     ):
         assert forbidden not in text
+    syntax = ast.parse(text)
+    workspace = next(
+        node
+        for node in syntax.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "ScatteringWorkspace"
+    )
+    direct_run_boundary_calls = sorted(
+        (method.name, call.func.value.attr, call.func.attr)
+        for method in workspace.body
+        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"capture", "freeze"}
+        and isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr in {"_intents", "_sources"}
+        and isinstance(call.func.value.value, ast.Name)
+        and call.func.value.value.id == "self"
+    )
+    # Average is a separately accepted operation-owner boundary.  Ordinary
+    # Run capture/freeze remains exclusively behind StartPipeline.
+    assert direct_run_boundary_calls == [
+        ("_average_action", "_intents", "freeze")
+    ]
     assert "StartPipeline" in text
     assert "RunExecutorPort" in text

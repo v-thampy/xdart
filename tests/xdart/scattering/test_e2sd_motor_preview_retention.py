@@ -124,7 +124,7 @@ def test_motor_preview_survives_unrelated_valid_edit(tmp_path) -> None:
     try:
         _wait(
             app,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and _choices(page) == ("Manual", "halpha"),
         )
         # The mounted editor must reconcile to the projected source vocabulary;
@@ -157,7 +157,7 @@ def test_source_change_synchronously_drops_prior_motor_knowledge(
     try:
         _wait(
             app,
-            lambda: page._observation is None
+            lambda: not page._source_selection.observing
             and _choices(page) == ("Manual", "halpha"),
         )
         page.select_source(second)

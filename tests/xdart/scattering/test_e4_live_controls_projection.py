@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from pyqtgraph.Qt import QtWidgets
 
@@ -765,55 +766,108 @@ def test_production_projection_mounts_full_processing_subsections() -> None:
 # LV-UI-5b — metadata-preferred incidence motor (F3 sticky Manual)
 # ---------------------------------------------------------------------------
 
+class _MotorSource:
+    def __init__(self) -> None:
+        self.choices: tuple[str, ...] | None = None
+
+    def observe(self, request):
+        from xdart.gui.tabs.scattering.contracts import (
+            SourceObservation,
+            SourceObservationStatus,
+        )
+
+        return SourceObservation(
+            request.observation_id,
+            request.intent_revision,
+            request.source,
+            SourceObservationStatus.AVAILABLE,
+            "eiger",
+            True,
+            True,
+            direct_child_count=1,
+            gi_motor_choices=self.choices,
+        )
+
+    def preview_motors(self, request):
+        return self.observe(request)
+
+    def cancel_observation(self, _observation_id):
+        return None
+
+    def publish_motor_knowledge(self, _observation):
+        return None
+
+    def project_motor_knowledge(
+        self, _source, _candidate_fingerprint=None
+    ):
+        return None
+
+
 def _motor_page(intent: RunIntent | None = None):
     from pyqtgraph.Qt import QtWidgets
     from xrd_tools.session.intent_store import RunIntentStore
     from xdart.gui.tabs.scattering.adapters.run_executor import (
         StandardRunExecutor,
     )
-    from xdart.gui.tabs.scattering.adapters.source import (
-        FilesystemSourceAdapter,
-    )
     from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    return ScatteringWorkspace(
+    source = _MotorSource()
+    page = ScatteringWorkspace(
         intents=RunIntentStore(
-            intent or RunIntent(output_mode="Overwrite")
+            intent
+            or RunIntent(
+                source_spec=DirectorySourceSpec(Path("/raw/eiger")),
+                output_mode="Overwrite",
+            )
         ),
         lifecycle=ScatteringCoordinator(),
-        sources=FilesystemSourceAdapter(),
+        sources=source,
         executor=StandardRunExecutor(),
     )
+    return page, source
 
 
-def _motor_knowledge(*choices):
-    from types import SimpleNamespace
+def _wait_motor(page, expected: str) -> None:
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if (
+            not page._source_selection.observing
+            and page._intents.snapshot().thaw().gi.incidence_motor
+            == expected
+        ):
+            return
+        time.sleep(0.01)
+    raise AssertionError("motor observation did not settle")
 
-    # The seam consumes exactly ``gi_motor_choices``; the qualification of a
-    # full SourceObservation is proven by the _on_observation rows above.
-    return SimpleNamespace(gi_motor_choices=tuple(choices))
+
+def _observe_motor(page, source: _MotorSource, *choices: str) -> None:
+    source.choices = tuple(choices)
+    page._request_observation(page._intents.snapshot())
 
 
 def test_metadata_motor_default_pick_adopts_the_preferred_motor():
-    page = _motor_page()
+    page, source = _motor_page()
     try:
-        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
-        assert page._intents.snapshot().thaw().gi.incidence_motor == "th"
+        _observe_motor(page, source, "exposure", "chi", "th")
+        _wait_motor(page, "th")
     finally:
         page.close_workspace()
         page.deleteLater()
 
 
 def test_metadata_motor_default_preserves_the_operator_notice():
-    page = _motor_page()
+    page, source = _motor_page()
     try:
         page._notice("Standard run stopped.")
 
-        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+        _observe_motor(page, source, "exposure", "chi", "th")
+        _wait_motor(page, "th")
 
-        assert page._intents.snapshot().thaw().gi.incidence_motor == "th"
         assert page._notice_text == "Standard run stopped."
     finally:
         page.close_workspace()
@@ -823,29 +877,31 @@ def test_metadata_motor_default_preserves_the_operator_notice():
 def test_metadata_motor_default_pick_respects_a_deliberate_manual():
     from xdart.gui.tabs.scattering.controls_inventory import GI_MOTOR
 
-    page = _motor_page()
+    page, source = _motor_page()
     try:
-        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
-        assert page._intents.snapshot().thaw().gi.incidence_motor == "th"
+        _observe_motor(page, source, "exposure", "chi", "th")
+        _wait_motor(page, "th")
         # The user deliberately chooses Manual for this source...
         page._on_field_value(GI_MOTOR, "Manual")
         assert page._intents.snapshot().thaw().gi.incidence_motor == "Manual"
         # ...and a re-observation must NOT flip it back (F3 sticky rule).
-        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
-        assert page._intents.snapshot().thaw().gi.incidence_motor == "Manual"
+        _observe_motor(page, source, "exposure", "chi", "th")
+        _wait_motor(page, "Manual")
     finally:
         page.close_workspace()
         page.deleteLater()
 
 
 def test_metadata_motor_default_never_invalidates_an_owned_start_capture():
-    page = _motor_page()
+    page, source = _motor_page()
     try:
+        _wait_motor(page, "Manual")
         started = page._lifecycle.begin_start()
         assert started.phase is RunPhase.PREPARING
         before = page._intents.snapshot()
 
-        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+        _observe_motor(page, source, "exposure", "chi", "th")
+        _wait_motor(page, "Manual")
 
         after = page._intents.snapshot()
         assert after.revision == before.revision
@@ -855,39 +911,31 @@ def test_metadata_motor_default_never_invalidates_an_owned_start_capture():
         page.deleteLater()
 
 
-def test_deferred_metadata_motor_default_retries_after_preflight_refusal():
-    from xdart.gui.tabs.scattering.contracts import (
-        SourceObservation,
-        SourceObservationStatus,
-    )
+def test_deferred_metadata_motor_default_retries_after_preflight_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+):
     from xdart.gui.tabs.scattering.events import PreflightRefused
     from xdart.gui.tabs.scattering.start_outcomes import (
         StartRefusal,
         StartRefused,
     )
 
-    page = _motor_page(_intent())
+    page, source = _motor_page(_intent())
     try:
-        source = page._intents.snapshot().thaw().source_spec
-        observation = SourceObservation(
-            1,
-            0,
-            source,
-            SourceObservationStatus.AVAILABLE,
-            "eiger",
-            True,
-            True,
-            direct_child_count=1,
-            gi_motor_choices=("exposure", "chi", "th"),
-        )
-        page._source_observation = observation
+        _wait_motor(page, "Manual")
         started = page._lifecycle.begin_start()
         assert started.phase is RunPhase.PREPARING
-        page._maybe_default_gi_motor(observation)
-        assert page._intents.snapshot().thaw().gi.incidence_motor == "Manual"
+        _observe_motor(page, source, "exposure", "chi", "th")
+        _wait_motor(page, "Manual")
 
         refused = page._lifecycle.preflight_refused(
             PreflightRefused(started.request_id)
+        )
+        refreshes = []
+        monkeypatch.setattr(
+            page,
+            "_refresh_shell",
+            lambda **kwargs: refreshes.append(kwargs),
         )
         page._render_start_outcome(StartRefused(
             started.request_id,
@@ -899,6 +947,7 @@ def test_deferred_metadata_motor_default_retries_after_preflight_refusal():
         assert page._lifecycle.phase is RunPhase.IDLE
         assert page._intents.snapshot().thaw().gi.incidence_motor == "th"
         assert page._notice_text == "Output admission refused."
+        assert len(refreshes) == 1
     finally:
         page.close_workspace()
         page.deleteLater()
@@ -907,9 +956,10 @@ def test_deferred_metadata_motor_default_retries_after_preflight_refusal():
 def test_explicit_real_motor_survives_source_replacement():
     from xdart.gui.tabs.scattering.controls_inventory import GI_MOTOR
 
-    page = _motor_page()
+    page, source = _motor_page()
     try:
-        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+        _observe_motor(page, source, "exposure", "chi", "th")
+        _wait_motor(page, "th")
         # A same-value user activation claims the automatic value without an
         # unnecessary intent revision.
         page._on_field_value(GI_MOTOR, "th")
@@ -926,11 +976,14 @@ def test_explicit_real_motor_survives_source_replacement():
 
 
 def test_automatic_motor_resets_in_the_same_directory_source_edit():
-    page = _motor_page(_intent())
+    page, source = _motor_page(_intent())
     try:
-        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+        _observe_motor(page, source, "exposure", "chi", "th")
+        _wait_motor(page, "th")
+        source.choices = None
 
         page._on_field_value(SOURCE_DIRECTORY, "/raw/replacement")
+        _wait_motor(page, "Manual")
 
         intent = page._intents.snapshot().thaw()
         assert intent.source_spec.root == Path("/raw/replacement")

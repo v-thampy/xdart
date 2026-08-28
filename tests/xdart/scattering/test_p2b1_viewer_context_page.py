@@ -627,7 +627,7 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
         _terminal_close=None, _closing=True, _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
         _close_identity=None, _clear_viewer_2d_renderer=lambda *, close: True)
     workspace._clear_viewer_1d_renderer = partial(ScatteringWorkspace._clear_viewer_1d_renderer, workspace)
-    workspace.__dict__.update(_closed=False, _sync_detector_demand=lambda: None, _retain_outgoing_display=False, _source_observation=None,
+    workspace.__dict__.update(_closed=False, _sync_detector_demand=lambda: None, _retain_outgoing_display=False, _source_selection=SimpleNamespace(observation=None),
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: SimpleNamespace(
             processing_mode="1D Viewer", live_mode=False, source_spec=None, run_options={}))), _project_controls=lambda _snapshot: None,
         _start_permitted=lambda: (True, ""), _context_projection=SimpleNamespace(build_shell=lambda **_: object()),

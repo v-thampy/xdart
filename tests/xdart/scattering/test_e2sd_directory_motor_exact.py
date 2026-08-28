@@ -3033,7 +3033,7 @@ def test_unrelated_edit_during_preview_eventually_populates_matching_motor(
         source.passive_release.set()
         _wait(
             qapp,
-            lambda: workspace._observation is None
+            lambda: not workspace._source_selection.observing
             and bool(source.preview_requests),
         )
         projection = controls.projection

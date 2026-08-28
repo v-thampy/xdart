@@ -129,7 +129,7 @@ def test_tiff_series_selection_updates_mounted_motor_dropdown(
         _wait(
             app,
             lambda: (
-                page._observation is None
+                not page._source_selection.observing
                 and _motor_field(page).choices
                 == ("Manual", "th", "exposure", "sequence")
             ),
