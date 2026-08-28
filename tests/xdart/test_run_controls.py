@@ -1,4 +1,4 @@
-"""Unit tests for the shared StaticControls run-controls widget (Stage 2a).
+"""Unit tests for the shared RunControlsBar run-controls widget (Stage 2a).
 
 The widget owns the run-lifecycle controls and the Phase-B action-button morph;
 it emits intent and the active wrangler owns the logic.  These exercise the
@@ -15,7 +15,7 @@ import pytest
 pytest.importorskip("pyqtgraph")
 from pyqtgraph import QtCore, QtGui, QtWidgets
 
-from xdart.gui.tabs.static_scan.ui.static_controls import StaticControls
+from xdart.gui.widgets.run_controls import RunControlsBar
 
 
 @pytest.fixture(scope="module")
@@ -24,7 +24,7 @@ def qapp():
 
 
 def test_action_phase_morph_cycles(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     c.set_action_phase('idle')
     assert c.startButton.text() == '▶ Run'
     assert c.startButton.property('runPhase') == 'idle'
@@ -49,7 +49,7 @@ def test_action_phase_morph_cycles(qapp):
 
 
 def test_signals_emit_on_user_actions(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     c.apply_profile(modes=['Int 1D', 'Int 2D'])
     got = {'action': 0, 'stop': 0, 'mode': [], 'batch': [], 'live': []}
     c.actionClicked.connect(lambda: got.__setitem__('action', got['action'] + 1))
@@ -72,7 +72,7 @@ def test_signals_emit_on_user_actions(qapp):
 
 
 def test_profile_hides_live_and_batch(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     c.apply_profile(modes=['Int 1D + 2D', 'Int 1D'], live=False, batch=False)
     assert c.liveButton.isHidden()
     assert c.batchButton.isHidden()
@@ -81,7 +81,7 @@ def test_profile_hides_live_and_batch(qapp):
 
 
 def test_run_active_locks_controls(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     c.set_run_active(True)
     assert not c.modeCombo.isEnabled()
     assert not c.batchButton.isEnabled()
@@ -97,7 +97,7 @@ def test_mode_row_enabled_locks_mode_batch_cores(qapp):
     """The mode row (mode combo + Batch + Cores) locks during a run while the
     action row stays usable.  Owned by _enter/_exit_run_state so a reintegrate
     (which skips wrangler.enabled()) also locks it."""
-    c = StaticControls()
+    c = RunControlsBar()
     c.set_mode_row_enabled(False)
     assert not c.modeCombo.isEnabled()
     assert not c.batchButton.isEnabled()
@@ -130,7 +130,7 @@ def _shortcut_host(**attrs):
 
 
 def test_run_shortcut_commits_line_edit_before_click(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     host = _shortcut_host(controls=c)
     order = []
     c.startButton.clicked.connect(lambda: order.append("run"))
@@ -151,7 +151,7 @@ def test_run_shortcut_commits_line_edit_before_click(qapp):
 
 
 def test_run_shortcut_noops_when_start_disabled(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     host = _shortcut_host(controls=c)
     clicks = []
     c.startButton.clicked.connect(lambda: clicks.append("run"))
@@ -163,7 +163,7 @@ def test_run_shortcut_noops_when_start_disabled(qapp):
 
 
 def test_stop_shortcut_stays_available_when_mode_row_locked(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     host = _shortcut_host(controls=c)
     clicks = []
     c.stopButton.clicked.connect(lambda: clicks.append("stop"))
@@ -176,7 +176,7 @@ def test_stop_shortcut_stays_available_when_mode_row_locked(qapp):
 
 
 def test_toggle_write_mode_shortcut_respects_run_lock(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     host = _shortcut_host(controls=c)
     changes = []
     c.writeModeChanged.connect(changes.append)
@@ -331,7 +331,7 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
 
 def test_run_row_visibility_can_collapse_to_mode_only(qapp):
     """File viewers can collapse the controls bar to the mode row only."""
-    c = StaticControls()
+    c = RunControlsBar()
     c.set_run_row_visible(False)
     assert c.actionRow.isHidden()
     assert c._divider.isHidden()
@@ -341,7 +341,7 @@ def test_run_row_visibility_can_collapse_to_mode_only(qapp):
 
 
 def test_getters(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     c.apply_profile(modes=['Int 1D', 'Int 2D'])
     c.modeCombo.setCurrentText('Int 2D')
     c.batchButton.setChecked(True)
@@ -354,7 +354,7 @@ def test_getters(qapp):
 
 
 def test_readiness_summary_toggles_compact_status_row(qapp):
-    c = StaticControls()
+    c = RunControlsBar()
     assert c.readinessRow.isHidden()
 
     changed = c.set_readiness_summary(

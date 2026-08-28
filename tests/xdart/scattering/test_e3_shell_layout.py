@@ -6,8 +6,8 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.gui.tabs.scattering.workspace_shell import (
     ScatteringWorkspaceShell,
 )
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
-from xdart.gui.tabs.static_scan.ui.static_controls import StaticControls
+from xdart.gui.widgets.controls_panel import ControlsPanel
+from xdart.gui.widgets.run_controls import RunControlsBar
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
 
@@ -40,8 +40,8 @@ def test_e3_ui1_composes_exact_three_column_shell(
         assert shell.control_scroll.minimumSizeHint().width() >= (
             shell.controls.minimumSizeHint().width()
         )
-        assert type(shell.controls) is ControlsPanelV2
-        assert type(shell.run_controls) is StaticControls
+        assert type(shell.controls) is ControlsPanel
+        assert type(shell.run_controls) is RunControlsBar
     finally:
         shell.close()
         shell.deleteLater()

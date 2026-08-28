@@ -14,7 +14,7 @@ def qapp():
 
 
 def test_param_trend_second_family_on_right_axis(qapp):
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
 
     dlg = PeakFitDialog(lambda: None)          # no provider needed for the trend
     try:
@@ -50,7 +50,7 @@ def test_param_trend_second_family_on_right_axis(qapp):
 
 def test_param_trend_right_skips_when_same_as_left(qapp):
     """Picking the SAME family on both axes draws it once (left only)."""
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
 
     dlg = PeakFitDialog(lambda: None)
     try:

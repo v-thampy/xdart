@@ -919,7 +919,7 @@ def test_row15_raw_source_pickers_keep_their_literal_nxs():
     row 15) and required to stay literal by §2 rule 7 — ``.nexus`` is
     output-only and excluded from raw discovery.
     """
-    picker = (SRC / "xdart/gui/tabs/static_scan/scan_source_widget.py"
+    picker = (SRC / "xdart/gui/analysis/scan_source_widget.py"
               ).read_text(encoding="utf-8")
     assert "*.nxs" in picker
     # The glob filter specifically — the file legitimately mentions the word

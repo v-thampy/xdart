@@ -66,8 +66,8 @@ from xrd_tools.session.readiness import (
     build_native_int_reduction_plan_from_args,
     build_native_int_reduction_plan_from_scan,
 )
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
-    ControlsPanelV2,
+from xdart.gui.widgets.controls_panel import (
+    ControlsPanel,
     FieldRow,
     FormRow,
     PillRow,
@@ -386,7 +386,7 @@ def _drain_qt_events_after_test(qapp):
         qapp.processEvents()
 
 
-def test_controls_panel_v2_int_inventory_includes_units_and_advanced_rows():
+def test_controls_panel_int_inventory_includes_units_and_advanced_rows():
     specs = {spec.path: spec for spec in INTEGRATOR_BACKED_CONTROL_SPECS}
     required = {
         ("Int1D", "unit"),
@@ -420,7 +420,7 @@ def test_controls_panel_v2_int_inventory_includes_units_and_advanced_rows():
         assert specs[path].parameter_group == expected_group
 
 
-def test_controls_panel_v2_advanced_rows_not_rendered_inline(qapp, monkeypatch):
+def test_controls_panel_advanced_rows_not_rendered_inline(qapp, monkeypatch):
     """The Advanced (parameter_group-backed) params have ONE editing surface:
     the "Advanced" button on the Reintegrate row → the "Integration — Advanced
     Settings" dialog.  The old collapsed "Advanced" sub-panel duplicated that
@@ -520,7 +520,7 @@ def test_controls_panel_v2_advanced_rows_not_rendered_inline(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_run_lock_disables_buttons_and_ignores_signals(
+def test_controls_panel_run_lock_disables_buttons_and_ignores_signals(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -584,7 +584,7 @@ def test_controls_panel_v2_run_lock_disables_buttons_and_ignores_signals(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_combined_advanced_dialog_locked_during_run(
+def test_controls_panel_combined_advanced_dialog_locked_during_run(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -607,7 +607,7 @@ def test_controls_panel_v2_combined_advanced_dialog_locked_during_run(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_point_counts_refuse_below_minimum(qapp, monkeypatch):
+def test_controls_panel_point_counts_refuse_below_minimum(qapp, monkeypatch):
     """§15.3 / §15.12-A.1 (updated from the retired clamp-to-one behavior): a
     below-minimum / negative point count is REFUSED at the checked idle commit —
     the permissive clamp is gone, so no carrier is mutated and the committed
@@ -639,7 +639,7 @@ def test_controls_panel_v2_point_counts_refuse_below_minimum(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_refresh_failure_warns_once(qapp, monkeypatch, caplog):
+def test_controls_panel_refresh_failure_warns_once(qapp, monkeypatch, caplog):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -665,7 +665,7 @@ def test_controls_panel_v2_refresh_failure_warns_once(qapp, monkeypatch, caplog)
         widget.deleteLater()
 
 
-def test_controls_panel_v2_native_int_advanced_rows_write_through_and_match_plan(
+def test_controls_panel_native_int_advanced_rows_write_through_and_match_plan(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -796,7 +796,7 @@ def test_advanced_polarization_none_survives_dialog_round_trip_s10(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_renders_blockers_and_launchers(qapp):
+def test_controls_panel_renders_blockers_and_launchers(qapp):
     profile = ControlProfile(
         processing_page=ProcessingPage.RSM,
         run_enabled=False,
@@ -811,7 +811,7 @@ def test_controls_panel_v2_renders_blockers_and_launchers(qapp):
         ),
     )
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_profile(profile)
 
     badges = panel.summary_card.body.findChildren(QtWidgets.QLabel)
@@ -824,14 +824,14 @@ def test_controls_panel_v2_renders_blockers_and_launchers(qapp):
     assert buttons[1].toolTip() == "Needs ψ metadata."
 
 
-def test_controls_panel_v2_emits_launcher_intent(qapp):
+def test_controls_panel_emits_launcher_intent(qapp):
     profile = ControlProfile(
         processing_page=ProcessingPage.INT_1D,
         run_enabled=True,
         analysis_launchers=(
             AnalysisLauncherSpec(AnalysisTool.SCAN_PLOT, "Plot Metadata"),),
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_profile(profile)
     got = []
     panel.analysisLaunchRequested.connect(got.append)
@@ -839,7 +839,7 @@ def test_controls_panel_v2_emits_launcher_intent(qapp):
     assert got == [AnalysisTool.SCAN_PLOT]
 
 
-def test_controls_panel_v2_emits_action_intent(qapp):
+def test_controls_panel_emits_action_intent(qapp):
     profile = build_control_profile(
         ControlState(
             tool=Tool.INT_2D,
@@ -847,7 +847,7 @@ def test_controls_panel_v2_emits_action_intent(qapp):
             source_caps=SourceCaps(has_frames=True),
         )
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_profile(profile)
     got = []
     panel.controlActionRequested.connect(got.append)
@@ -858,7 +858,7 @@ def test_controls_panel_v2_emits_action_intent(qapp):
     assert got == [ControlAction.CHOOSE_PROJECT]
 
 
-def test_controls_panel_v2_backend_conflict_gates_run():
+def test_controls_panel_backend_conflict_gates_run():
     profile = build_control_profile(
         ControlState(
             tool=Tool.STITCH,
@@ -883,7 +883,7 @@ def test_controls_panel_v2_backend_conflict_gates_run():
     assert profile.run_blockers == (backend.reason,)
 
 
-def test_controls_panel_v2_renders_typed_field_cards(qapp):
+def test_controls_panel_renders_typed_field_cards(qapp):
     profile = build_control_profile(
         ControlState(
             source_label="/tmp/scan.nxs",
@@ -898,7 +898,7 @@ def test_controls_panel_v2_renders_typed_field_cards(qapp):
         )
     )
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_profile(profile)
 
     project_rows = panel.project_card.body.findChildren(FieldRow)
@@ -915,7 +915,7 @@ def test_controls_panel_v2_renders_typed_field_cards(qapp):
         "1D result", "2D result", "RSM result"]
 
 
-def test_controls_panel_v2_renders_bound_render_state_directly(qapp):
+def test_controls_panel_renders_bound_render_state_directly(qapp):
     profile = build_control_profile(
         ControlState(
             source_caps=SourceCaps(has_frames=True),
@@ -945,7 +945,7 @@ def test_controls_panel_v2_renders_bound_render_state_directly(qapp):
         )),
     )
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_state(state)
 
     project_rows = panel.project_card.body.findChildren(FormRow)
@@ -957,7 +957,7 @@ def test_controls_panel_v2_renders_bound_render_state_directly(qapp):
     assert panel.analysis_card.isHidden()
 
 
-def test_controls_panel_v2_detector_status_uses_poni_summary(qapp):
+def test_controls_panel_detector_status_uses_poni_summary(qapp):
     profile = build_control_profile(
         ControlState(
             source_caps=SourceCaps(has_frames=True),
@@ -977,7 +977,7 @@ def test_controls_panel_v2_detector_status_uses_poni_summary(qapp):
         )),
     )
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_state(state)
 
     detector = next(
@@ -987,12 +987,12 @@ def test_controls_panel_v2_detector_status_uses_poni_summary(qapp):
     assert detector.status.text() == "Eiger 1M · 200.4mm · fitted"
 
 
-def test_controls_panel_v2_custom_title_keeps_specialized_gi_layout(qapp):
+def test_controls_panel_custom_title_keeps_specialized_gi_layout(qapp):
     state = build_control_panel_state(
         ControlState(),
         {("GI", "Grazing"): False},
     )
-    panel = ControlsPanelV2(experiment_title="Configuration")
+    panel = ControlsPanel(experiment_title="Configuration")
     try:
         panel.set_state(state)
         group = next(
@@ -1007,7 +1007,7 @@ def test_controls_panel_v2_custom_title_keeps_specialized_gi_layout(qapp):
         panel.deleteLater()
 
 
-def test_controls_panel_v2_section_ticks_and_source_synopsis(qapp):
+def test_controls_panel_section_ticks_and_source_synopsis(qapp):
     profile = build_control_profile(
         ControlState(
             tool=Tool.INT_2D,
@@ -1051,7 +1051,7 @@ def test_controls_panel_v2_section_ticks_and_source_synopsis(qapp):
         )),
     )
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_state(state)
 
     assert panel.source_card.status.text() == "Image Series"
@@ -1060,7 +1060,7 @@ def test_controls_panel_v2_section_ticks_and_source_synopsis(qapp):
     assert not panel.experiment_card.valid_marker.isHidden()
 
 
-def test_controls_panel_v2_viewer_mode_shows_only_project(qapp):
+def test_controls_panel_viewer_mode_shows_only_project(qapp):
     profile = build_control_profile(
         ControlState(tool=Tool.IMAGE_VIEWER, processing_mode="Image Viewer")
     )
@@ -1098,7 +1098,7 @@ def test_controls_panel_v2_viewer_mode_shows_only_project(qapp):
         )),
     )
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_state(state)
 
     assert not panel.project_card.isHidden()
@@ -1107,7 +1107,7 @@ def test_controls_panel_v2_viewer_mode_shows_only_project(qapp):
     assert panel.processing_card.isHidden()
 
 
-def test_controls_panel_v2_requires_valid_project_before_setup_cards(qapp):
+def test_controls_panel_requires_valid_project_before_setup_cards(qapp):
     fields = (
         ControlFormField(
             section=SectionId.PROJECT,
@@ -1147,7 +1147,7 @@ def test_controls_panel_v2_requires_valid_project_before_setup_cards(qapp):
         )
     )
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.set_state(ControlPanelRenderState(
         profile=profile,
         bound_controls=BoundControlState(fields=fields),
@@ -1224,7 +1224,7 @@ def test_set_poni_field_updates_poni_box_with_focused_editor(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_mounts_by_default(qapp, monkeypatch):
+def test_controls_panel_mounts_by_default(qapp, monkeypatch):
     monkeypatch.delenv("XDART_CONTROLS_PANEL_V2", raising=False)
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1266,7 +1266,7 @@ def test_controls_panel_v2_mounts_by_default(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_bound_mode_uses_inline_browse_and_top_actions(qapp, monkeypatch):
+def test_controls_panel_bound_mode_uses_inline_browse_and_top_actions(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1315,7 +1315,7 @@ def test_controls_panel_v2_bound_mode_uses_inline_browse_and_top_actions(qapp, m
         widget.deleteLater()
 
 
-def test_controls_panel_v2_source_energy_button_updates_native_preference(
+def test_controls_panel_source_energy_button_updates_native_preference(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -1347,7 +1347,7 @@ def test_controls_panel_v2_source_energy_button_updates_native_preference(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_can_be_hidden_by_env(qapp, monkeypatch):
+def test_controls_panel_can_be_hidden_by_env(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "0")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1359,7 +1359,7 @@ def test_controls_panel_v2_can_be_hidden_by_env(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_field_edits_update_static_parameters(qapp, monkeypatch):
+def test_controls_panel_field_edits_update_static_parameters(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1374,7 +1374,7 @@ def test_controls_panel_v2_field_edits_update_static_parameters(qapp, monkeypatc
         widget.deleteLater()
 
 
-def test_controls_panel_v2_integration_edits_update_native_state_immediately(qapp, monkeypatch):
+def test_controls_panel_integration_edits_update_native_state_immediately(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1396,7 +1396,7 @@ def test_controls_panel_v2_integration_edits_update_native_state_immediately(qap
         widget.deleteLater()
 
 
-def test_controls_panel_v2_gi_edits_update_native_state(qapp, monkeypatch):
+def test_controls_panel_gi_edits_update_native_state(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1415,7 +1415,7 @@ def test_controls_panel_v2_gi_edits_update_native_state(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_grazing_renders_as_segmented_control(qapp, monkeypatch):
+def test_controls_panel_grazing_renders_as_segmented_control(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1444,7 +1444,7 @@ def test_controls_panel_v2_grazing_renders_as_segmented_control(qapp, monkeypatc
         widget.deleteLater()
 
 
-def test_controls_panel_v2_gi_detail_fields_inline_only_in_grazing(qapp, monkeypatch):
+def test_controls_panel_gi_detail_fields_inline_only_in_grazing(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1472,7 +1472,7 @@ def test_controls_panel_v2_gi_detail_fields_inline_only_in_grazing(qapp, monkeyp
         widget.deleteLater()
 
 
-def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
+def test_controls_panel_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
     """The Controls-V2 θ-motor row must never inject a phantom 'th': a fresh
     widget (no source) defaults to Manual, and a stale ``scan.incidence_motor ==
     'th'`` carried from the LiveScan default is dropped in favour of the shared
@@ -1605,7 +1605,7 @@ def test_source_card_mounts_shared_widget_and_freezes_directory_intent(
     qapp, monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from xrd_tools.sources.directory_index import DirectoryIndex
     from xrd_tools.sources.selection import DirectorySourceSpec
@@ -2015,7 +2015,7 @@ def test_gi_enable_repicks_default_over_leftover_manual(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_gi_motor_is_a_pure_view_of_the_single_source(qapp, monkeypatch):
+def test_controls_panel_gi_motor_is_a_pure_view_of_the_single_source(qapp, monkeypatch):
     """GUARD against the phantom-'th' bug CLASS (Controls-V2 field forking its
     source): the θ-motor row must be a pure VIEW of the single source of truth —
     the integrator ``gi_motor`` combo for the CHOICES and the shared
@@ -2051,7 +2051,7 @@ def test_controls_panel_v2_gi_motor_is_a_pure_view_of_the_single_source(qapp, mo
         widget.deleteLater()
 
 
-def test_controls_panel_v2_every_combo_value_is_within_its_own_choices(qapp, monkeypatch):
+def test_controls_panel_every_combo_value_is_within_its_own_choices(qapp, monkeypatch):
     """GUARD generalising the phantom-'th' invariant to EVERY Controls-V2 combo
     field: a combo's rendered VALUE must always be a member of its rendered
     CHOICES.  Phantom-'th' was exactly a violation — the θ-motor field showed
@@ -2088,7 +2088,7 @@ def test_controls_panel_v2_every_combo_value_is_within_its_own_choices(qapp, mon
         widget.deleteLater()
 
 
-def test_controls_panel_v2_unit_choices_mirror_the_legacy_unit_combos(qapp, monkeypatch):
+def test_controls_panel_unit_choices_mirror_the_legacy_unit_combos(qapp, monkeypatch):
     """GUARD: the V2 1D/2D UNIT fields are a pure VIEW of the legacy integrator
     unit combos (unit_1D / unit_2D) — same items, same order — never a forked
     hardcoded list.  Extends the phantom-'th' parity guard to the unit fields
@@ -2119,7 +2119,7 @@ def test_controls_panel_v2_unit_choices_mirror_the_legacy_unit_combos(qapp, monk
         widget.deleteLater()
 
 
-def test_controls_panel_v2_grazing_roundtrips_scan_gi_and_config(qapp, monkeypatch):
+def test_controls_panel_grazing_roundtrips_scan_gi_and_config(qapp, monkeypatch):
     """P2: the V2 Grazing path must flip scan.gi AND land sample facts in
     get_gi_config() (the reintegrate source), independent of the legacy toggle —
     the GI-inline rework re-routes exactly this signal."""
@@ -2142,7 +2142,7 @@ def test_controls_panel_v2_grazing_roundtrips_scan_gi_and_config(qapp, monkeypat
         widget.deleteLater()
 
 
-def test_controls_panel_v2_refresh_does_not_refire_gi_signal(qapp, monkeypatch):
+def test_controls_panel_refresh_does_not_refire_gi_signal(qapp, monkeypatch):
     """P2/#56: a profile refresh or programmatic GI re-sync must NOT re-emit
     sigUpdateGI when the user didn't toggle.  Removing the GI popup makes the old
     re-open-on-refresh bug impossible; this pins that no spurious GI signal fires
@@ -2173,7 +2173,7 @@ def test_controls_panel_v2_refresh_does_not_refire_gi_signal(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_refresh_defers_while_line_editor_focused(qapp, monkeypatch):
+def test_controls_panel_refresh_defers_while_line_editor_focused(qapp, monkeypatch):
     """P2 (dropped input): a background rebuild (set_state -> clear_rows) must NOT
     destroy a line editor the user is mid-edit in and drop the uncommitted text.
     When a QLineEdit is focused, the refresh defers by arming a one-shot on the
@@ -2234,7 +2234,7 @@ def test_controls_panel_v2_refresh_defers_while_line_editor_focused(qapp, monkey
         widget.deleteLater()
 
 
-def test_controls_panel_v2_active_run_refreshes_once_after_run(qapp, monkeypatch):
+def test_controls_panel_active_run_refreshes_once_after_run(qapp, monkeypatch):
     """Active non-viewer runs should not rebuild V2 controls every progress tick.
 
     The profile is refreshed once the run exits, so the final state still
@@ -2270,7 +2270,7 @@ def test_controls_panel_v2_active_run_refreshes_once_after_run(qapp, monkeypatch
         widget.deleteLater()
 
 
-def test_controls_panel_v2_energy_conflict_reaches_widget_profile(
+def test_controls_panel_energy_conflict_reaches_widget_profile(
         qapp, monkeypatch):
     """The real widget state now carries both calibration and source energy.
 
@@ -2307,7 +2307,7 @@ def test_controls_panel_v2_energy_conflict_reaches_widget_profile(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_metadata_energy_preference_becomes_authoritative(
+def test_controls_panel_metadata_energy_preference_becomes_authoritative(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -2337,7 +2337,7 @@ def test_controls_panel_v2_metadata_energy_preference_becomes_authoritative(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_state_summarizes_cached_poni_detector(
+def test_controls_panel_state_summarizes_cached_poni_detector(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -2360,7 +2360,7 @@ def test_controls_panel_v2_state_summarizes_cached_poni_detector(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_not_ready_disables_run_row(qapp, monkeypatch):
+def test_controls_panel_not_ready_disables_run_row(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -2378,7 +2378,7 @@ def test_controls_panel_v2_not_ready_disables_run_row(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_readiness_summary_shows_only_top_blocker():
+def test_controls_panel_readiness_summary_shows_only_top_blocker():
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     state = ControlState(
@@ -2404,9 +2404,9 @@ def test_controls_panel_v2_readiness_summary_shows_only_top_blocker():
 
 
 def test_run_readiness_label_elides_without_widening_controls(qapp):
-    from xdart.gui.tabs.static_scan.ui.static_controls import StaticControls
+    from xdart.gui.widgets.run_controls import RunControlsBar
 
-    controls = StaticControls()
+    controls = RunControlsBar()
     try:
         controls.set_readiness_summary(
             "Needs setup · short blocker",
@@ -2436,7 +2436,7 @@ def test_run_readiness_label_elides_without_widening_controls(qapp):
         controls.deleteLater()
 
 
-def test_controls_panel_v2_cached_scan_poni_satisfies_calibration(
+def test_controls_panel_cached_scan_poni_satisfies_calibration(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -2470,7 +2470,7 @@ def test_controls_panel_v2_cached_scan_poni_satisfies_calibration(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_energy_values_use_poni_without_scan():
+def test_controls_panel_energy_values_use_poni_without_scan():
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.energy import wavelength_m_to_energy_eV
@@ -2502,7 +2502,7 @@ def test_controls_panel_v2_energy_values_use_poni_without_scan():
     assert source_energy_eV is None
 
 
-def test_controls_panel_v2_calibration_energy_prefers_poni_over_scan_wavelength():
+def test_controls_panel_calibration_energy_prefers_poni_over_scan_wavelength():
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.energy import wavelength_m_to_energy_eV
@@ -2524,7 +2524,7 @@ def test_controls_panel_v2_calibration_energy_prefers_poni_over_scan_wavelength(
         )
 
 
-def test_controls_panel_v2_source_count_uses_container_frame_count(
+def test_controls_panel_source_count_uses_container_frame_count(
         monkeypatch, tmp_path):
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from xrd_tools.io import image as image_io
@@ -2545,7 +2545,7 @@ def test_controls_panel_v2_source_count_uses_container_frame_count(
     assert count == 50
 
 
-def test_controls_panel_v2_source_count_reports_entire_image_series(
+def test_controls_panel_source_count_reports_entire_image_series(
         monkeypatch, tmp_path):
     """The Source card describes the series, not the selected suffix onward."""
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -2574,7 +2574,7 @@ def test_controls_panel_v2_source_count_reports_entire_image_series(
     assert count == 5
 
 
-def test_controls_panel_v2_source_count_directory_masters_is_file_count(
+def test_controls_panel_source_count_directory_masters_is_file_count(
         monkeypatch, tmp_path):
     """DIR-2: a directory of masters reports the FILE count (2) — count_frames
     is never called for a container directory."""
@@ -2603,7 +2603,7 @@ def test_controls_panel_v2_source_count_directory_masters_is_file_count(
     assert count == 2
 
 
-def test_controls_panel_v2_source_count_counts_single_image_files(
+def test_controls_panel_source_count_counts_single_image_files(
         monkeypatch, tmp_path):
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from xrd_tools.io import image as image_io
@@ -2628,7 +2628,7 @@ def test_controls_panel_v2_source_count_counts_single_image_files(
     assert count == 3
 
 
-def test_controls_panel_v2_source_frame_count_is_unknown_in_live_mode(tmp_path):
+def test_controls_panel_source_frame_count_is_unknown_in_live_mode(tmp_path):
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     raw_path = tmp_path / "scan_0001.tif"
@@ -2653,7 +2653,7 @@ def test_controls_panel_v2_source_frame_count_is_unknown_in_live_mode(tmp_path):
     assert host._controls_v2_source_frame_count() is None
 
 
-def test_controls_panel_v2_frame_count_cache_tracks_directory_mtime(tmp_path):
+def test_controls_panel_frame_count_cache_tracks_directory_mtime(tmp_path):
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     values = {
@@ -2683,7 +2683,7 @@ def test_controls_panel_v2_frame_count_cache_tracks_directory_mtime(tmp_path):
     assert host._controls_v2_source_frame_count() == 1
 
 
-def test_controls_panel_v2_first_metadata_file_uses_resolved_preview_no_walk(tmp_path):
+def test_controls_panel_first_metadata_file_uses_resolved_preview_no_walk(tmp_path):
     """§15.12-D.2/D.3: the GUI profile takes the metadata authority ONLY from the
     wrangler's already-resolved direct-child preview — never an independent
     directory walk.  A matching file physically present in the directory does NOT
@@ -2721,7 +2721,7 @@ def test_controls_panel_v2_first_metadata_file_uses_resolved_preview_no_walk(tmp
     assert host._controls_v2_first_metadata_file() == str(tmp_path / "chosen.tif")
 
 
-def test_controls_panel_v2_source_caps_delegate_to_headless_readiness(
+def test_controls_panel_source_caps_delegate_to_headless_readiness(
         qapp, tmp_path):
     """H18: ``_controls_v2_source_caps`` no longer constructs SourceCaps inline
     (the ``has_frames = has_raw = raw_reachable = source_ready`` collapse is
@@ -2811,7 +2811,7 @@ def test_controls_panel_v2_source_caps_delegate_to_headless_readiness(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_source_label_uses_configured_raw_source(
+def test_controls_panel_source_label_uses_configured_raw_source(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -2838,7 +2838,7 @@ def test_controls_panel_v2_source_label_uses_configured_raw_source(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_frame_count_refresh_updates_without_rebuild(
+def test_controls_panel_frame_count_refresh_updates_without_rebuild(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -2875,7 +2875,7 @@ def test_controls_panel_v2_frame_count_refresh_updates_without_rebuild(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_loaded_scan_does_not_populate_source_or_run(
+def test_controls_panel_loaded_scan_does_not_populate_source_or_run(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -2924,7 +2924,7 @@ def test_controls_panel_v2_loaded_scan_does_not_populate_source_or_run(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_raw_source_and_poni_enable_run_with_source_frames(
+def test_controls_panel_raw_source_and_poni_enable_run_with_source_frames(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -2972,7 +2972,7 @@ def test_controls_panel_v2_raw_source_and_poni_enable_run_with_source_frames(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_append_mismatch_same_target_stays_clickable(
+def test_controls_panel_append_mismatch_same_target_stays_clickable(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -3068,7 +3068,7 @@ def test_controls_panel_v2_append_mismatch_same_target_stays_clickable(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_append_mismatch_ignores_unrelated_displayed_scan(
+def test_controls_panel_append_mismatch_ignores_unrelated_displayed_scan(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -3124,7 +3124,7 @@ def test_controls_panel_v2_append_mismatch_ignores_unrelated_displayed_scan(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_native_int_uses_binding_table(
+def test_controls_panel_native_int_uses_binding_table(
         qapp, monkeypatch):
     """All V2 integration fields are harvested through the single binding table,
     so adding a future control is a one-row native-state change."""
@@ -3150,7 +3150,7 @@ def test_controls_panel_v2_native_int_uses_binding_table(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_native_gi_oop_points_feed_plan(
+def test_controls_panel_native_gi_oop_points_feed_plan(
         qapp, monkeypatch):
     """Native GI fiber OOP points remain visible to V2 and reach the plan."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -3193,7 +3193,7 @@ def test_controls_panel_v2_native_gi_oop_points_feed_plan(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_standard_edits_feed_native_reduction_plan(
+def test_controls_panel_standard_edits_feed_native_reduction_plan(
         qapp, monkeypatch):
     """V2 standard edits are authoritative for the scan-backed native plan."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -3247,7 +3247,7 @@ def test_controls_panel_v2_standard_edits_feed_native_reduction_plan(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_gi_edits_feed_native_reduction_plan(
+def test_controls_panel_gi_edits_feed_native_reduction_plan(
         qapp, monkeypatch):
     """GI edits feed the native plan without the hidden legacy parser."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -3308,7 +3308,7 @@ def test_controls_panel_v2_gi_edits_feed_native_reduction_plan(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_threshold_edits_feed_native_plan_overlay(
+def test_controls_panel_threshold_edits_feed_native_plan_overlay(
         qapp, monkeypatch):
     """Threshold + saturation are a native plan overlay."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -3346,7 +3346,7 @@ def test_controls_panel_v2_threshold_edits_feed_native_plan_overlay(
         (True, True),
     ),
 )
-def test_controls_panel_v2_native_plan_matches_legacy_output_modes(
+def test_controls_panel_native_plan_matches_legacy_output_modes(
         qapp, monkeypatch, integrate_1d, integrate_2d):
     """The native plan seam must preserve one-output and both-output runs."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -3383,7 +3383,7 @@ def test_controls_panel_v2_native_plan_matches_legacy_output_modes(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_native_plan_preserves_monitor_parity():
+def test_controls_panel_native_plan_preserves_monitor_parity():
     from xdart.modules.reduction import plan_from_live_scan
 
     args_1d = {
@@ -3445,7 +3445,7 @@ def test_controls_panel_v2_native_plan_preserves_monitor_parity():
     assert "normalization_factor" not in snapshot["integration_2d"]["extra"]
 
 
-def test_controls_panel_v2_native_scan_builder_matches_legacy_plan():
+def test_controls_panel_native_scan_builder_matches_legacy_plan():
     from xdart.modules.reduction import plan_from_live_scan
 
     args_1d = {
@@ -3497,7 +3497,7 @@ def test_controls_panel_v2_native_scan_builder_matches_legacy_plan():
     ))
 
 
-def test_controls_panel_v2_native_gi_plan_defaults_orientation_to_4():
+def test_controls_panel_native_gi_plan_defaults_orientation_to_4():
     args_plan = build_native_int_reduction_plan_from_args(
         {},
         {},
@@ -3528,7 +3528,7 @@ def test_controls_panel_v2_native_gi_plan_defaults_orientation_to_4():
     assert scan_plan.gi.sample_orientation == 4
 
 
-def test_controls_panel_v2_native_run_plan_gate_configures_plan_caches(
+def test_controls_panel_native_run_plan_gate_configures_plan_caches(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     monkeypatch.delenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", raising=False)
@@ -3558,7 +3558,7 @@ def test_controls_panel_v2_native_run_plan_gate_configures_plan_caches(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_native_plan_builder_is_snapshot_scoped(
+def test_controls_panel_native_plan_builder_is_snapshot_scoped(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     monkeypatch.delenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", raising=False)
@@ -3586,7 +3586,7 @@ def test_controls_panel_v2_native_plan_builder_is_snapshot_scoped(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_native_reintegrate_plan_is_authoritative(
+def test_controls_panel_native_reintegrate_plan_is_authoritative(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     monkeypatch.delenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", raising=False)
@@ -3637,7 +3637,7 @@ def test_controls_panel_v2_native_reintegrate_plan_is_authoritative(
 
 
 @pytest.mark.parametrize("gi_enabled", [False, True])
-def test_controls_panel_v2_native_reintegrate_results_match_run_after_stale_legacy_click(
+def test_controls_panel_native_reintegrate_results_match_run_after_stale_legacy_click(
         qapp, monkeypatch, gi_enabled):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     monkeypatch.delenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", raising=False)
@@ -3804,7 +3804,7 @@ def test_controls_panel_v2_native_reintegrate_results_match_run_after_stale_lega
         widget.deleteLater()
 
 
-def test_controls_panel_v2_reintegrate_action_installs_native_builder(
+def test_controls_panel_reintegrate_action_installs_native_builder(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
@@ -3833,7 +3833,7 @@ def test_controls_panel_v2_reintegrate_action_installs_native_builder(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_native_session_roundtrip_hydrates_visible_rows(
+def test_controls_panel_native_session_roundtrip_hydrates_visible_rows(
         qapp, monkeypatch, tmp_path):
     """V2-edited integration state survives close/open through native state."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -4050,7 +4050,7 @@ def test_legacy_calibration_poni_restores_after_signal_schema_config(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_native_int_session_roundtrip_feeds_native_plan(
+def test_controls_panel_native_int_session_roundtrip_feeds_native_plan(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
@@ -4130,7 +4130,7 @@ def test_controls_panel_v2_native_int_session_roundtrip_feeds_native_plan(
             restored.deleteLater()
 
 
-def test_controls_panel_v2_threshold_edits_update_native_state(qapp, monkeypatch):
+def test_controls_panel_threshold_edits_update_native_state(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4153,7 +4153,7 @@ def test_controls_panel_v2_threshold_edits_update_native_state(qapp, monkeypatch
         widget.deleteLater()
 
 
-def test_controls_panel_v2_renders_integration_fields_from_live_widgets(qapp, monkeypatch):
+def test_controls_panel_renders_integration_fields_from_live_widgets(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4182,7 +4182,7 @@ def test_controls_panel_v2_renders_integration_fields_from_live_widgets(qapp, mo
         widget.deleteLater()
 
 
-def test_controls_panel_v2_threshold_value_autoenables_native_state(
+def test_controls_panel_threshold_value_autoenables_native_state(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -4210,7 +4210,7 @@ def test_controls_panel_v2_threshold_value_autoenables_native_state(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_mask_saturated_survives_run_state(qapp, monkeypatch):
+def test_controls_panel_mask_saturated_survives_run_state(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4238,7 +4238,7 @@ def test_controls_panel_v2_mask_saturated_survives_run_state(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_bool_rows_render_as_pill_toggles(qapp, monkeypatch):
+def test_controls_panel_bool_rows_render_as_pill_toggles(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4257,7 +4257,7 @@ def test_controls_panel_v2_bool_rows_render_as_pill_toggles(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_average_scan_renders_as_conditioning_pill(qapp, monkeypatch):
+def test_controls_panel_average_scan_renders_as_conditioning_pill(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4291,7 +4291,7 @@ def test_controls_panel_v2_average_scan_renders_as_conditioning_pill(qapp, monke
         widget.deleteLater()
 
 
-def test_controls_panel_v2_source_layout_coalesces_rows(qapp, monkeypatch):
+def test_controls_panel_source_layout_coalesces_rows(qapp, monkeypatch):
     """SOURCE layout: in Image Directory mode the mode combo + Subdirs toggle
     share a row, and File Type + Meta Type share a row.  In Image Series mode
     Subdirs is absent and Meta Type stands alone."""
@@ -4334,7 +4334,7 @@ def test_controls_panel_v2_source_layout_coalesces_rows(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_gi_options_popup_holds_orient_and_tilt(qapp, monkeypatch):
+def test_controls_panel_gi_options_popup_holds_orient_and_tilt(qapp, monkeypatch):
     """In Grazing mode: θ motor renders inline (compact label, descriptive
     tooltip); Orientation + Tilt Angle live behind a '…' button that opens a
     small popup, whose rows still write through."""
@@ -4388,7 +4388,7 @@ def test_controls_panel_v2_gi_options_popup_holds_orient_and_tilt(qapp, monkeypa
         widget.deleteLater()
 
 
-def test_controls_panel_v2_path_fields_show_full_path_tooltip(qapp, monkeypatch):
+def test_controls_panel_path_fields_show_full_path_tooltip(qapp, monkeypatch):
     """Path/file fields (browse) show their FULL value on hover, since the editor
     truncates it in the narrow panel (a description would be less useful)."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -4645,7 +4645,7 @@ def test_integrator_gi_motor_keeps_deliberate_manual_across_repopulation(qapp, m
         widget.deleteLater()
 
 
-def test_controls_panel_v2_gi_popup_torn_down_on_rebuild_no_stale_clobber(qapp, monkeypatch):
+def test_controls_panel_gi_popup_torn_down_on_rebuild_no_stale_clobber(qapp, monkeypatch):
     """F1/F2: the GI '…' popup is torn down on a panel rebuild, so a stale popup
     row can't be harvested by current_form_edits and clobber a fresher
     sample_orientation on the next pending-edit commit — and it leaves no orphan
@@ -4683,7 +4683,7 @@ def test_controls_panel_v2_gi_popup_torn_down_on_rebuild_no_stale_clobber(qapp, 
         widget.deleteLater()
 
 
-def test_controls_panel_v2_gi_popup_edit_commits_on_run(qapp, monkeypatch):
+def test_controls_panel_gi_popup_edit_commits_on_run(qapp, monkeypatch):
     """Finding 2: typing a new Orientation in the GI '…' popup and immediately
     committing pending edits (what Run does at run start) applies the value to
     THIS run — the popup is a transient widget, so the run-commit must harvest its
@@ -4771,7 +4771,7 @@ def _admit_pending_run_configuration(widget):
             setattr(owner, name, frozen)
     return frozen
 
-def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatch):
+def test_controls_panel_run_commits_focused_integration_edit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4817,7 +4817,7 @@ def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatc
         widget.deleteLater()
 
 
-def test_controls_panel_v2_run_state_harvests_and_deep_copies_snapshot(
+def test_controls_panel_run_state_harvests_and_deep_copies_snapshot(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -4852,7 +4852,7 @@ def test_controls_panel_v2_run_state_harvests_and_deep_copies_snapshot(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_run_commits_focused_2d_points(qapp, monkeypatch):
+def test_controls_panel_run_commits_focused_2d_points(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4901,7 +4901,7 @@ def test_controls_panel_v2_run_commits_focused_2d_points(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_reintegrate_commits_focused_edit(qapp, monkeypatch):
+def test_controls_panel_reintegrate_commits_focused_edit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4934,7 +4934,7 @@ def test_controls_panel_v2_reintegrate_commits_focused_edit(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_reintegrate_finish_unlocks_stale_running_phase(
+def test_controls_panel_reintegrate_finish_unlocks_stale_running_phase(
         qapp, monkeypatch):
     """A stale wrangler run PHASE must not leave V2 grey after reintegrate.
 
@@ -4983,7 +4983,7 @@ def test_controls_panel_v2_reintegrate_finish_unlocks_stale_running_phase(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_run_exit_unlocks_focused_editor(qapp, monkeypatch):
+def test_controls_panel_run_exit_unlocks_focused_editor(qapp, monkeypatch):
     """A focused V2 line edit must not block the run-exit rebuild/unlock."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -5017,7 +5017,7 @@ def test_controls_panel_v2_run_exit_unlocks_focused_editor(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_advanced_commits_focused_edit(qapp, monkeypatch):
+def test_controls_panel_advanced_commits_focused_edit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -5046,7 +5046,7 @@ def test_controls_panel_v2_advanced_commits_focused_edit(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_range_labels_follow_native_axis_state(
+def test_controls_panel_range_labels_follow_native_axis_state(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -5071,7 +5071,7 @@ def test_controls_panel_v2_range_labels_follow_native_axis_state(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
+def test_controls_panel_auto_rows_disable_range_edits(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -5112,7 +5112,7 @@ def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_manual_range_stays_visibly_checked_while_run_locked(
+def test_controls_panel_manual_range_stays_visibly_checked_while_run_locked(
         qapp, monkeypatch):
     """The active entered-range toggle remains visibly on while run-locked.
 
@@ -5122,7 +5122,7 @@ def test_controls_panel_v2_manual_range_stays_visibly_checked_while_run_locked(
     """
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+    from xdart.gui.widgets.controls_panel import RangeRow
     from xdart.gui.themes import render_qss
 
     widget = staticWidget()
@@ -5150,7 +5150,7 @@ def test_controls_panel_v2_manual_range_stays_visibly_checked_while_run_locked(
 
 
 @pytest.mark.parametrize("theme", ("dark", "light"))
-def test_controls_panel_v2_checked_disabled_matches_disabled_text_color(
+def test_controls_panel_checked_disabled_matches_disabled_text_color(
     theme,
 ):
     from xdart.gui.themes import render_qss
@@ -5181,7 +5181,7 @@ def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
     from xdart.gui.tabs.scattering.controls_projection import project_controls
     from xdart.gui.tabs.scattering.state_machine import RunPhase
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         intent = RunIntent()
         panel.set_state(project_controls(
@@ -5213,7 +5213,7 @@ def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
     from xrd_tools.session.run_configuration import RunIntent
     from xdart.gui.tabs.scattering.controls_projection import project_controls
     from xdart.gui.tabs.scattering.state_machine import RunPhase
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ActionButton
+    from xdart.gui.widgets.controls_panel import ActionButton
 
     store = RunIntentStore(RunIntent())
     disabled = project_controls(
@@ -5224,7 +5224,7 @@ def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
         store.snapshot(), None, RunPhase.IDLE,
         reintegrate_available=True,
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         panel.set_state(disabled)
         before = next(
@@ -5350,7 +5350,7 @@ def test_apply_state_update_locks_gi_more_without_rebuilding(qapp):
         operation_busy=True,
         calibration_active=True,
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         panel.set_state(idle)
         more = next(
@@ -5431,7 +5431,7 @@ def test_apply_state_update_refreshes_source_energy_popup_capture(qapp):
             ),
         ),
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         panel.set_state(before)
         button = next(
@@ -5477,7 +5477,7 @@ def test_apply_state_update_refreshes_derived_subsection_statuses(qapp):
         before,
         profile=replace(before.profile, detector_summary="Eiger4M · fitted"),
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         panel.set_state(before)
         detector = next(
@@ -5516,7 +5516,7 @@ def test_apply_state_update_refuses_render_schema_change_before_mutation(qapp):
             + before.bound_controls.fields[1:],
         ),
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         panel.set_state(before)
         row = next(
@@ -5543,9 +5543,9 @@ def test_threshold_and_mask_saturated_are_independent_in_vnext(qapp):
     )
     from xdart.gui.tabs.scattering.controls_projection import project_controls
     from xdart.gui.tabs.scattering.state_machine import RunPhase
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import PillRow, RangeRow
+    from xdart.gui.widgets.controls_panel import PillRow, RangeRow
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         panel.set_state(project_controls(
             RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE))
@@ -5643,7 +5643,7 @@ def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
     intent.threshold.mask_saturation = False
     intent.threshold.threshold_min = 12.0
     intent.threshold.threshold_max = 4294967295.0
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     generic = RangeRow(
         label="Q",
         low={"path": ("Int1D", "radial_low"), "value": 0.25},
@@ -5736,7 +5736,7 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
     from xrd_tools.session.run_configuration import RunIntent
     from xdart.gui.tabs.scattering.controls_projection import project_controls
     from xdart.gui.tabs.scattering.state_machine import RunPhase
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+    from xdart.gui.widgets.controls_panel import RangeRow
 
     def _row(host):
         return next(
@@ -5745,7 +5745,7 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
         )
 
     store = RunIntentStore(RunIntent())
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         # Construction while run-locked.
         panel.set_state(project_controls(
@@ -5775,7 +5775,7 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
 
 def test_range_toggle_presents_manual_on_while_preserving_auto_model(qapp):
     """A lit range toggle means its boxes apply; storage remains ``*_auto``."""
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+    from xdart.gui.widgets.controls_panel import RangeRow
 
     emitted = []
     row = RangeRow(
@@ -5853,7 +5853,7 @@ def test_all_integration_range_toggles_invert_only_the_ui_fact(qapp, path):
 
 def test_threshold_toggle_keeps_direct_apply_polarity(qapp):
     """Threshold's direct enable stays checked exactly when the band applies."""
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+    from xdart.gui.widgets.controls_panel import RangeRow
 
     emitted = []
     row = RangeRow(
@@ -5874,7 +5874,7 @@ def test_threshold_toggle_keeps_direct_apply_polarity(qapp):
         row.close()
         row.deleteLater()
 
-def test_controls_panel_v2_pending_manual_range_survives_run_commit(qapp, monkeypatch):
+def test_controls_panel_pending_manual_range_survives_run_commit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -5902,7 +5902,7 @@ def test_controls_panel_v2_pending_manual_range_survives_run_commit(qapp, monkey
         widget.deleteLater()
 
 
-def test_controls_panel_v2_mask_saturated_is_pushed_before_run_lock(qapp, monkeypatch):
+def test_controls_panel_mask_saturated_is_pushed_before_run_lock(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -5948,7 +5948,7 @@ def test_controls_panel_v2_mask_saturated_is_pushed_before_run_lock(qapp, monkey
         widget.deleteLater()
 
 
-def test_controls_panel_v2_renders_nexus_wrangler_fields(qapp, monkeypatch):
+def test_controls_panel_renders_nexus_wrangler_fields(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -5968,7 +5968,7 @@ def test_controls_panel_v2_renders_nexus_wrangler_fields(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_static_widget_routes_actions(qapp, monkeypatch):
+def test_controls_panel_static_widget_routes_actions(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -8076,8 +8076,8 @@ def test_t2r_same_value_source_edit_does_not_reconcile(qapp, monkeypatch):
 
 
 def test_section_number_presentation_option_preserves_canonical_default(qapp):
-    compact = ControlsPanelV2(show_section_numbers=False)
-    canonical = ControlsPanelV2()
+    compact = ControlsPanel(show_section_numbers=False)
+    canonical = ControlsPanel()
     try:
         canonical_chips = canonical.findChildren(
             QtWidgets.QLabel, "controlsV2SectionChip")
@@ -8155,7 +8155,7 @@ def test_form_row_combo_appends_absent_explicit_current_last(qapp):
 
 def test_form_row_combo_reconciliation_emits_no_field_value_changed(qapp):
     """A rebuild is silent on ``fieldValueChanged``; a real pick still emits."""
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     row = _combo_row(value="halpha", choices=("Manual", "halpha"))
     row.valueChanged.connect(panel.fieldValueChanged)
     emitted = []

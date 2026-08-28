@@ -26,10 +26,10 @@ def _survives_escape(dlg, qapp):
 
 
 def test_peak_fit_dialog_swallows_escape(qapp):
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     assert _survives_escape(PeakFitDialog(analysis_context=None), qapp)
 
 
 def test_phase_fit_dialog_swallows_escape(qapp):
-    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     assert _survives_escape(PhaseFitDialog(analysis_context=None), qapp)

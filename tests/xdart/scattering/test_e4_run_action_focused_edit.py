@@ -26,7 +26,7 @@ from xdart.gui.tabs.scattering.shell_values import (
     ShellCommand,
     ShellCommandKind,
 )
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import FormRow
+from xdart.gui.widgets.controls_panel import FormRow
 from xrd_tools.session.intent_store import (
     IntentFreezeAccepted,
     RunIntentStore,

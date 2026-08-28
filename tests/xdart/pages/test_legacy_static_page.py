@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from xdart.gui.pages.catalog import DEFAULT_PAGE_KEY, LEGACY_STATIC_PAGE
+from xdart.gui.pages.catalog import LEGACY_STATIC_PAGE
 from xdart.gui.pages.legacy_static import build_legacy_static
 from xdart.gui.pages.services import (
     DiagnosticIdentity,
     ExecutionProfile,
     HostServices,
 )
-from xdart.gui.pages.values import PageCapability, PageCleanup, PageLifecycle
+from xdart.gui.pages.values import (
+    PageCapability,
+    PageCleanup,
+    PageLifecycle,
+    STATIC_SCAN_PAGE_KEY,
+)
 
 
 class _NoopStatus:
@@ -100,7 +105,7 @@ class _HydrationFailureLegacy(_FakeLegacy):
 
 
 def test_legacy_descriptor_is_lazy_exit_only_and_keeps_app_menus_host_owned():
-    assert LEGACY_STATIC_PAGE.key == DEFAULT_PAGE_KEY
+    assert LEGACY_STATIC_PAGE.key == STATIC_SCAN_PAGE_KEY
     assert LEGACY_STATIC_PAGE.lifecycle is PageLifecycle.EXIT_ONLY
     assert PageCapability.OPEN_FOLDER not in LEGACY_STATIC_PAGE.capabilities
     assert PageCapability.APP_MENU_HOSTS not in LEGACY_STATIC_PAGE.capabilities

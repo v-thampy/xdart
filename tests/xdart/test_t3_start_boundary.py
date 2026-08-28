@@ -22,7 +22,7 @@ Boundary 6-11 modules (``test_t2_5r1_bound_carriers``,
 ``test_t2_5r4_cleanup_totality``, ``test_t2_5r5_registry_ownership``,
 ``test_t2_5r6_diagnostic_reachability``, ``test_t2_5_atomic_engine``,
 ``test_t2_5r_atomicity_depth``) and the real-PONI compound carrier is owned by
-``test_controls_panel_v2::test_t2_1_compound_poni_*``.  Every widget here is the
+``test_controls_panel::test_t2_1_compound_poni_*``.  Every widget here is the
 REAL ``staticWidget`` with its real wrangler, real parameter tree, real
 ``PONI``, and the real transaction engine (rule 2: no fakes on the seam).
 """
@@ -489,7 +489,7 @@ def test_real_poni_to_dict_populates_the_frozen_configuration(
     ``as_dict``) fills ``poni_values`` on the frozen object and on every carrier.
 
     Engine-side compound motion is owned by
-    ``test_controls_panel_v2::test_t2_1_compound_poni_*``; this is the freeze
+    ``test_controls_panel::test_t2_1_compound_poni_*``; this is the freeze
     boundary's own guard."""
     from xrd_tools.core.containers import PONI
 

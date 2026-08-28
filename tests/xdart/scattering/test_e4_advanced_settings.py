@@ -32,7 +32,7 @@ from xdart.gui.tabs.scattering.shell_values import (
     ShellCommandKind,
 )
 from xdart.gui.tabs.scattering.state_machine import RunPhase
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ActionButton
+from xdart.gui.widgets.controls_panel import ActionButton
 from xrd_tools.session.intent_store import (
     IntentFreezeAccepted,
     RunIntentStore,

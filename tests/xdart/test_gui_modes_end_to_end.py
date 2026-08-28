@@ -479,7 +479,7 @@ def test_peak_fit_dialog_fits_synthetic_pattern(qapp):
     pattern via xrd_tools.analysis.fitting and fills its results table.  Uses a
     synthetic two-Gaussian pattern so the recovered centers are checkable."""
     lmfit = pytest.importorskip("lmfit")  # the xrd-tools[fitting] extra
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     x = np.linspace(1.0, 5.0, 600)
 
     def g(c, s, a):
@@ -507,7 +507,7 @@ def test_peak_fit_auto_detect_and_range(qapp):
     """Auto peak detection finds the peaks unaided, and the fit range restricts
     the fit to the selected window (excludes out-of-range peaks)."""
     pytest.importorskip("lmfit")
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     x = np.linspace(1.0, 6.0, 800)
 
     def g(c, s, a):
@@ -536,7 +536,7 @@ def test_peak_fit_auto_detect_and_range(qapp):
 
 def test_peak_fit_dialog_handles_no_pattern(qapp):
     """No frame selected -> the dialog reports it and does not crash on Fit."""
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     dlg = PeakFitDialog(lambda: None)
     try:
         dlg.refresh_pattern()
@@ -567,7 +567,7 @@ def test_peak_fit_live_path_draws_outcome(qapp):
     produce an outcome, and _draw_outcome fills the table — the exact path the
     live worker drives, run synchronously here so it's lmfit-real but not flaky."""
     pytest.importorskip("lmfit")
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     x = np.linspace(1.0, 5.0, 600)
 
     def g(c, s, a):
@@ -610,7 +610,7 @@ def test_live_fit_is_noop_without_open_dialog(widget):
 def test_param_family_helpers_are_pure():
     """split_family / group_families / accumulator_to_table parse the flat param
     keys into per-peak families + an aligned vs-frame table, with no Qt."""
-    from xdart.gui.tabs.static_scan.peak_fit_util import (
+    from xdart.gui.analysis.peak_fit_util import (
         accumulator_to_table, group_families, split_family)
     assert split_family("center_0") == ("center", 0)
     assert split_family("center_err_2") == ("center_err", 2)
@@ -631,7 +631,7 @@ def test_peak_fit_dialog_param_trend_row(qapp):
     """Row 3 (params vs frame): accumulating frames builds the family combo and
     plots one curve per peak; Overlay toggles all-peaks vs the first; reset
     clears it."""
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     dlg = PeakFitDialog(lambda: None)
     try:
         for idx in range(3):
@@ -666,7 +666,7 @@ def test_peak_fit_advanced_options_feed_the_plan(qapp):
     """Advanced box: manual centers override Auto, and the optional kwargs
     (σ init/bounds, center δ, max_nfev) flow into the PeakFitPlan + fit."""
     pytest.importorskip("lmfit")
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     x = np.linspace(1.0, 5.0, 600)
 
     def g(c, s, a):
@@ -704,7 +704,7 @@ def test_peak_fit_advanced_options_feed_the_plan(qapp):
 def test_peak_fit_manual_centers_filter_to_range_and_toggle(qapp):
     """The Advanced toggle shows the box; manual centers outside the fit range
     are dropped (seeds must lie in the fitted window)."""
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     x = np.linspace(1.0, 5.0, 400)
     dlg = PeakFitDialog(lambda: (x, x * 0 + 1.0, "q"))
     try:
@@ -726,7 +726,7 @@ def test_peak_fit_manual_centers_filter_to_range_and_toggle(qapp):
 def test_reload_during_live_keeps_trend(qapp):
     """Reload while Live is on must NOT wipe the accumulated vs-frame trend;
     Reload when not live starts fresh."""
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     x = np.linspace(1.0, 5.0, 200)
     dlg = PeakFitDialog(lambda: (x, x * 0 + 1.0, "q"))
     try:
@@ -775,7 +775,7 @@ def test_phase_fit_tool_wired_in_static_widget(widget):
 def test_phase_fit_dialog_scaffolding(qapp):
     """The Phase dialog builds (CIF list + options + shared trend), and
     build_fit_request refuses without phases."""
-    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     x = np.linspace(1.0, 5.0, 200)
     dlg = PhaseFitDialog(lambda: (x, x * 0 + 1.0, "q"))
     try:
@@ -803,7 +803,7 @@ def test_phase_fit_dialog_scaffolding(qapp):
 def test_phase_fit_fills_phase_table(qapp):
     """_fill_phase_table renders the per-phase fractions + lattice from a
     FitResultStore entry (synthetic — no pymatgen / lmfit)."""
-    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     dlg = PhaseFitDialog(lambda: None)
     try:
         entry = {"phase_fractions": {"Ortho": 0.6, "Mono": 0.4},
@@ -887,7 +887,7 @@ def test_scan_plot_dialog_columns_and_normalization(qapp):
     plots a curve; a second Y overlays; normalization divides; non-numeric
     columns are excluded."""
     from pyqtgraph.Qt import QtCore
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     dlg = ScanPlotDialog()
     try:
         table = {
@@ -925,7 +925,7 @@ def test_scan_plot_dialog_columns_and_normalization(qapp):
 
 def test_scan_plot_dialog_empty_table_is_graceful(qapp):
     """No metadata -> no columns, no curves, Save disabled, no crash."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     dlg = ScanPlotDialog()
     try:
         dlg.set_table("empty", {})
@@ -4426,7 +4426,7 @@ def test_threshold_autoenables_on_value_entry(widget):
 
 
 def test_shared_controls_reroute_on_wrangler_swap(widget):
-    """Stage 2b: the ONE StaticControls bar follows the active wrangler.  On
+    """Stage 2b: the ONE RunControlsBar bar follows the active wrangler.  On
     swap, apply_profile repopulates the mode items + shows/hides Live/Batch for
     the new wrangler, the new wrangler's control refs ALIAS onto the shared
     widgets, and the old wrangler's signal connections are dropped (no stale

@@ -270,12 +270,12 @@ def test_apply_theme_publishes_the_exact_spacing_for_responsive_layouts(qapp):
 
 
 def test_controls_cards_follow_all_five_spacing_tiers_live(qapp):
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
-        ControlsPanelV2,
+    from xdart.gui.widgets.controls_panel import (
+        ControlsPanel,
         SubsectionCard,
     )
 
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     subsection = SubsectionCard("Example")
     panel.show()
     subsection.show()

@@ -8,6 +8,8 @@ from typing import NewType, TypeAlias
 
 
 PageKey = NewType("PageKey", str)
+SCATTERING_PAGE_KEY = PageKey("scattering-workspace")
+STATIC_SCAN_PAGE_KEY = PageKey("static-scan")
 
 
 class PageCapability(str, Enum):

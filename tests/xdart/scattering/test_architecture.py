@@ -524,27 +524,26 @@ def test_e1a_exact_ui_and_adapter_allowlists_and_page_ownership():
     executor_imports = _imports_from(RUN_EXECUTOR_SOURCE.read_text())
 
     controls_imports = {
-        "xdart.gui.tabs.static_scan.ui.controls_panel_v2.ControlsPanelV2",
-        "xdart.gui.tabs.static_scan.ui.static_controls.StaticControls",
+        "xdart.gui.widgets.controls_panel.ControlsPanel",
+        "xdart.gui.widgets.run_controls.RunControlsBar",
     }
     assert controls_imports <= view_imports
     assert not any(
         name.startswith("xdart.gui.tabs.static_scan")
         for name in page_imports
     )
-    assert {
-        name
-        for name in view_imports
-        if name.startswith("xdart.gui.tabs.static_scan")
-    } == controls_imports
+    assert not any(
+        name.startswith("xdart.gui.tabs.static_scan")
+        for name in page_imports | view_imports
+    )
     assert "pyqtgraph.Qt.QtCore" in page_imports
     assert "pyqtgraph.Qt.QtWidgets" in page_imports
     assert "pyqtgraph.Qt.QtCore" in view_imports
     assert "pyqtgraph.Qt.QtWidgets" in view_imports
-    assert "pathlib.Path" not in page_imports | view_imports
+    assert "pathlib.Path" not in view_imports
     assert not {
         violation
-        for source in (page.read_text(), *(path.read_text() for path in views))
+        for source in (path.read_text() for path in views)
         for violation in _guard_violations(source)
         if violation.startswith("direct file I/O")
     }

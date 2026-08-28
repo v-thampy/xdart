@@ -203,7 +203,7 @@ class nexusWrangler(wranglerWidget):
         btn_layout.addWidget(self.coresLabel)
         btn_layout.addWidget(self.maxCoresSpinBox)
         # Wrap the legacy per-wrangler controls in a frame so attach_controls()
-        # can hide them as one — the run controls are the shared StaticControls
+        # can hide them as one — the run controls are the shared RunControlsBar
         # widget now (Stage-3 cleanup deletes this build entirely).
         self._legacy_controls = QtWidgets.QFrame()
         self._legacy_controls.setLayout(btn_layout)

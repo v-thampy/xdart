@@ -40,7 +40,7 @@ def widget(qapp, monkeypatch):
 
 
 def _form_row(widget, path):
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import FormRow
+    from xdart.gui.widgets.controls_panel import FormRow
 
     path = tuple(path)
     for row in widget.controls_v2.findChildren(FormRow):
@@ -50,7 +50,7 @@ def _form_row(widget, path):
 
 
 def _range_row(widget, low_path):
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+    from xdart.gui.widgets.controls_panel import RangeRow
 
     low_path = tuple(low_path)
     for row in widget.controls_v2.findChildren(RangeRow):

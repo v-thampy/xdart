@@ -1311,7 +1311,7 @@ class SegmentedControl(QtWidgets.QWidget):
         return True
 
 
-class ControlsPanelV2(QtWidgets.QWidget):
+class ControlsPanel(QtWidgets.QWidget):
     """Render :class:`ControlProfile` and bound field state.
 
     It emits intents only. The owning page builds state and decides how to
@@ -1336,7 +1336,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
         super().__init__(parent)
         self._experiment_title = experiment_title
         self._show_section_numbers = bool(show_section_numbers)
-        self.setObjectName("controlsPanelV2")
+        self.setObjectName("controlsPanel")
         # LV-UI-7: no explicit root minimum — the layout's minimumSizeHint is
         # the panel's one true width floor, so embedding surfaces (the vNext
         # shell's width-hugging scroll column) can derive exactly what the

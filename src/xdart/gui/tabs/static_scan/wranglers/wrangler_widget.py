@@ -635,7 +635,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         self.thread.sigXyeOutputReady.connect(self.sigXyeOutputReady.emit)
 
         # Shared run-controls (CONTROLS section): the staticWidget owns one
-        # StaticControls widget and ATTACHES it to the active wrangler, which
+        # RunControlsBar widget and ATTACHES it to the active wrangler, which
         # aliases its own control refs onto the shared widgets so all existing
         # run-lifecycle logic drives them.  None until attached.
         self._controls = None
@@ -892,13 +892,13 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
 
     # ── Shared run-controls (CONTROLS section) ──────────────────────────
     def controls_profile(self):
-        """Per-wrangler capability descriptor for the shared StaticControls:
+        """Per-wrangler capability descriptor for the shared RunControlsBar:
         the mode items to show + whether Live / Batch / cores apply.  Base
         default = no Live/Batch (subclasses override)."""
         return {'modes': None, 'live': False, 'batch': False, 'cores': True}
 
     def attach_controls(self, controls):
-        """Adopt the shared StaticControls widget.  Base just stores the ref;
+        """Adopt the shared RunControlsBar widget.  Base just stores the ref;
         subclasses override to alias their own control attributes onto the shared
         widgets and wire the shared signals to their handlers (tracking
         connections via _connect_control for detach_controls)."""
@@ -1007,7 +1007,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
 
     def _status_label(self):
         """The status QLabel that messages route to.  Prefers the shared
-        control-layer ``statusLabel`` (StaticControls) when controls are
+        control-layer ``statusLabel`` (RunControlsBar) when controls are
         attached, so the message bar lives in ONE place (the control stack)
         instead of the wrangler's own orphaned label; falls back to the
         subclass's own label / specUI specLabel when standalone."""

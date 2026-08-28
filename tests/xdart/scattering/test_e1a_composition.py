@@ -34,7 +34,7 @@ from xdart.gui.tabs.scattering.page import (
 )
 from xdart.gui.tabs.scattering.source_view import SourceStatusView
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
+from xdart.gui.widgets.controls_panel import ControlsPanel
 
 
 def _wait_until(qapp: QtWidgets.QApplication, predicate: object, timeout: float = 3.0) -> bool:
@@ -230,7 +230,7 @@ def test_workspace_uses_real_controls_and_one_cas_per_valid_edit(qapp: QtWidgets
         shell = _shell(workspace)
         controls = shell.controls
         source_status = _source_status(workspace)
-        assert type(controls) is ControlsPanelV2
+        assert type(controls) is ControlsPanel
         assert controls.profile is not None
         assert controls.profile.run_enabled is False
         assert (

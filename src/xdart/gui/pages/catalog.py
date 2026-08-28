@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from .descriptors import PageDescriptor
-from .values import PageCapability, PageKey, PageLifecycle
+from .values import (
+    PageCapability,
+    PageLifecycle,
+    SCATTERING_PAGE_KEY,
+    STATIC_SCAN_PAGE_KEY,
+)
 
 
-DEFAULT_PAGE_KEY = PageKey("static-scan")
+DEFAULT_PAGE_KEY = SCATTERING_PAGE_KEY
 
 
 def _build_legacy_static(services, parent):
@@ -15,12 +20,12 @@ def _build_legacy_static(services, parent):
 
 
 LEGACY_STATIC_PAGE = PageDescriptor(
-    key=DEFAULT_PAGE_KEY,
+    key=STATIC_SCAN_PAGE_KEY,
     label="Static Scan",
     description="Legacy static-scan reduction workspace",
     icon_key="static-scan",
     category="workspace",
-    order=0,
+    order=1,
     lifecycle=PageLifecycle.EXIT_ONLY,
     capabilities=frozenset({
         PageCapability.SETTINGS_PERSISTENCE,
@@ -39,12 +44,12 @@ def _build_scattering_workspace(services, parent):
 
 
 SCATTERING_WORKSPACE_PAGE = PageDescriptor(
-    key=PageKey("scattering-workspace"),
+    key=SCATTERING_PAGE_KEY,
     label="Scattering Workspace",
-    description="vNext scattering reduction workspace (opt-in)",
+    description="Scattering reduction workspace",
     icon_key="scattering-workspace",
     category="workspace",
-    order=1,
+    order=0,
     lifecycle=PageLifecycle.EXIT_ONLY,
     capabilities=frozenset({
         PageCapability.OPEN_FOLDER,
@@ -58,4 +63,4 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
     build=_build_scattering_workspace,
 )
 
-BUILTIN_PAGES = (LEGACY_STATIC_PAGE, SCATTERING_WORKSPACE_PAGE)
+BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE, LEGACY_STATIC_PAGE)

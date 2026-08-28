@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pg = pytest.importorskip("pyqtgraph")
 from pyqtgraph.Qt import QtCore
 
-from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
 
 
 def _draw():

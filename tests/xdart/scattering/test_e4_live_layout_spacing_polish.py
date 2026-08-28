@@ -14,7 +14,7 @@ from xdart.gui.tabs.scattering.scientific_view import (
 )
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import FormRow, RangeRow
+from xdart.gui.widgets.controls_panel import FormRow, RangeRow
 from xdart.gui.themes import apply_theme
 from xdart.gui.themes.spacing import spacing_tokens
 from xrd_tools.session.intent_store import RunIntentStore

@@ -339,7 +339,7 @@ def test_tier_reaches_ordinary_widgets_and_dialogs(qapp):
 def test_tier_reaches_the_controls_panel_fields(qapp, shell):
     """The dense Controls tokens are a density variant of the ONE tier.
 
-    Measured on the real panel inside the real page: a bare ControlsPanelV2
+    Measured on the real panel inside the real page: a bare ControlsPanel
     has only its section cards, the fields arrive with the page's wiring.
     """
     _window, widget = shell

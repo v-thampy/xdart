@@ -447,7 +447,7 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         }
         assert actions[ControlAction.REINTEGRATE_1D].enabled
         assert actions[ControlAction.REINTEGRATE_2D].enabled
-        from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ActionButton
+        from xdart.gui.widgets.controls_panel import ActionButton
 
         qapp.processEvents()
         mounted = {

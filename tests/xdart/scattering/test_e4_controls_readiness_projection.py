@@ -30,7 +30,7 @@ from xdart.gui.tabs.scattering.shell_widgets import (
 from xdart.gui.tabs.scattering.source_view import SourceStatusView
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
+from xdart.gui.widgets.controls_panel import ControlsPanel
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.readiness import (
     BoundControlState,
@@ -101,7 +101,7 @@ def _directory_observation(
 
 def test_source_observation_projects_into_header_not_large_summary_card() -> None:
     _qapp()
-    panel = ControlsPanelV2(show_section_numbers=False)
+    panel = ControlsPanel(show_section_numbers=False)
     source = SourceStatusView(panel)
     panel.set_source_widget(source, visible=False)
     try:
@@ -350,7 +350,7 @@ def test_recursive_tiff_count_includes_only_immediate_subfolders(
 
 def test_source_header_never_claims_unobserved_or_empty_directory_ready() -> None:
     _qapp()
-    panel = ControlsPanelV2(show_section_numbers=False)
+    panel = ControlsPanel(show_section_numbers=False)
     source = SourceStatusView(panel)
     panel.set_source_widget(source)
     try:
@@ -734,7 +734,7 @@ def test_detector_header_reports_mounted_poni_detector_facts(
         None,
         RunPhase.IDLE,
     )
-    panel = ControlsPanelV2(
+    panel = ControlsPanel(
         experiment_title="Configuration",
         show_section_numbers=False,
     )

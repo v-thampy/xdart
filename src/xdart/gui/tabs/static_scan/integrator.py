@@ -1424,7 +1424,7 @@ class integratorTree(QtWidgets.QWidget):
 
     def _reintegrate_is_live(self):
         """Reintegrate runs LIVE (per-frame, abortable) by default; the shared
-        **Batch** toggle (StaticControls) switches it to the fast multicore path.
+        **Batch** toggle (RunControlsBar) switches it to the fast multicore path.
         The host installs ``_reintegrate_batch_provider`` (reads
         controls.batchButton); absent it (tests / standalone) we default to live."""
         prov = getattr(self, '_reintegrate_batch_provider', None)

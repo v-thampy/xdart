@@ -2136,8 +2136,8 @@ class staticWidget(QWidget):
         # wrangler (routing its signals) — it is never reparented on swap.  Its
         # mode-change drives the staticWidget-level reaction (viewer reset +
         # display clear + integration-control state) here, ONCE.
-        from .ui.static_controls import StaticControls
-        self.controls = StaticControls()
+        from xdart.gui.widgets.run_controls import RunControlsBar
+        self.controls = RunControlsBar()
         self._accepted_processing_mode = self.controls.modeCombo.currentText()
         self.ui.controlsLayout.setContentsMargins(0, 0, 0, 0)
         self.ui.controlsLayout.addWidget(self.controls)
@@ -2322,10 +2322,10 @@ class staticWidget(QWidget):
         if not self._controls_v2_enabled():
             return
         try:
-            from .ui.controls_panel_v2 import ControlsPanelV2
-            panel = ControlsPanelV2(self.ui.wranglerFrame)
+            from xdart.gui.widgets.controls_panel import ControlsPanel
+            panel = ControlsPanel(self.ui.wranglerFrame)
             preview = QtWidgets.QScrollArea(self.ui.wranglerFrame)
-            preview.setObjectName("controlsPanelV2Preview")
+            preview.setObjectName("controlsPanelPreview")
             preview.setWidgetResizable(True)
             preview.setFrameShape(QtWidgets.QFrame.NoFrame)
             preview.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -2359,7 +2359,7 @@ class staticWidget(QWidget):
                 pass
             self.controls_v2_preview = preview
             self.controls_v2 = panel
-            from .scan_source_widget import ScanSourceWidget
+            from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
             source_widget = ScanSourceWidget(
                 mode="controls_source", parent=panel, async_probe=True)
             source_widget.sigDirectoryChanged.connect(
@@ -8576,7 +8576,7 @@ class staticWidget(QWidget):
     def _controls_v2_source_widget_visible(self) -> bool:
         """The EXPLICIT embedded-source projection state (§21.5 req 2).
 
-        Read through the reviewed ``ControlsPanelV2.source_widget_visible()``
+        Read through the reviewed ``ControlsPanel.source_widget_visible()``
         accessor — what the Source card last actually applied — never the desired
         ``config is not None``.  A panel that predates the accessor reports
         ``False`` rather than guessing."""
@@ -9640,7 +9640,7 @@ class staticWidget(QWidget):
         non-modal (so the live scan + frame browsing stay responsive; Reload
         re-grabs the current frame)."""
         if self._peak_fit_dialog is None:
-            from .peak_fit_dialog import PeakFitDialog
+            from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
             self._peak_fit_dialog = PeakFitDialog(
                 analysis_context=self._analysis_context(), parent=self)
             # Toggling Live on re-fits the current frame at once (then every new
@@ -9667,7 +9667,7 @@ class staticWidget(QWidget):
     def _ensure_live_analysis_worker(self):
         """Lazily create + start the latest-wins live analysis worker."""
         if self._live_analysis_worker is None:
-            from .analysis_worker import LiveAnalysisWorker
+            from xdart.gui.analysis.analysis_worker import LiveAnalysisWorker
             self._live_analysis_worker = LiveAnalysisWorker(self)
             self._live_analysis_worker.sigAnalyzed.connect(self._on_live_analyzed)
             self._live_analysis_worker.start()
@@ -9770,7 +9770,7 @@ class staticWidget(QWidget):
         if not inputs:
             dlg.status.setText("No fittable frames in the selected range.")
             return
-        from .analysis_worker import BatchAnalysisWorker
+        from xdart.gui.analysis.analysis_worker import BatchAnalysisWorker
         if self._batch_analysis_worker is None:
             self._batch_analysis_worker = BatchAnalysisWorker(self)
             self._batch_analysis_worker.sigProgress.connect(self._on_batch_progress)
@@ -9824,7 +9824,7 @@ class staticWidget(QWidget):
         """Open (or re-show) the Phase Fitting popup — lazy, single-instance,
         non-modal.  Shares the batch worker + vs-frame trend with Peak Fitting."""
         if self._phase_fit_dialog is None:
-            from .phase_fit_dialog import PhaseFitDialog
+            from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
             self._phase_fit_dialog = PhaseFitDialog(
                 analysis_context=self._analysis_context(), parent=self)
             self._phase_fit_dialog.batch_btn.clicked.connect(
@@ -9891,7 +9891,7 @@ class staticWidget(QWidget):
         """Open (or re-show) the Scan Plot popup — lazy, single-instance,
         non-modal.  Starts on the currently-loaded scan (or blank)."""
         if self._scan_plot_dialog is None:
-            from .scan_plot_dialog import ScanPlotDialog
+            from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
             ctx = self._analysis_context()
             self._scan_plot_dialog = ScanPlotDialog(
                 default_uri=ctx.current_scan_uri(),
@@ -10418,7 +10418,7 @@ class staticWidget(QWidget):
     def _fit_controls_height(self):
         """Pin the bottom controls bar to its current content height.
 
-        Recomputed (not set once) because StaticControls shows/hides rows after
+        Recomputed (not set once) because RunControlsBar shows/hides rows after
         init -- the run row hides in viewer modes, mode-specific widgets toggle
         per profile -- so a height frozen from the initial sizeHint would leave
         slack (run row hidden) or clip (content grown).  Called at init and after
@@ -10434,7 +10434,7 @@ class staticWidget(QWidget):
     def changeEvent(self, event):
         """Re-fit the bottom controls bar when the application font changes.
 
-        Deferred one event-loop turn: when FontChange arrives, StaticControls'
+        Deferred one event-loop turn: when FontChange arrives, RunControlsBar'
         cached sizeHint still answers for the previous tier, so a synchronous
         refit would pin the bar one tier behind and clip it.  The page inherits
         the shared preference through this event -- it reads no setting and
@@ -12630,7 +12630,7 @@ class staticWidget(QWidget):
         if panel is None:
             return
         try:
-            from .ui.controls_panel_v2 import (  # local import avoids init-time Qt churn
+            from xdart.gui.widgets.controls_panel import (  # local import avoids init-time Qt churn
                 FormRow,
                 PillRow,
                 RangeRow,

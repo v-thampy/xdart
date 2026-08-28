@@ -158,7 +158,7 @@ def _qt_session_teardown(_xdart_qt_harness):
 # ``PySide::destroyQCoreApplication`` -> ``visitAllPyObjects``.  Each
 # destruction walks PySide6's GLOBAL signal-connection QHash
 # (``onPysideReceiverSlotDestroyed``), so the mass teardown is O(N^2): measured
-# ~286 s of pure post-session hang for test_controls_panel_v2.py (body ~85 s).
+# ~286 s of pure post-session hang for test_controls_panel.py (body ~85 s).
 #
 # We CANNOT reduce N by reaping per test: a ``sendPostedEvents(DeferredDelete)``
 # drain is banned (it segfaulted linux CI mid-run -- see _qt_session_teardown),

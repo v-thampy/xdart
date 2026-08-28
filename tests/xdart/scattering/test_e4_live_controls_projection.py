@@ -17,8 +17,8 @@ from xdart.gui.tabs.scattering.controls_projection import (
     reduce_control_edit,
 )
 from xdart.gui.tabs.scattering.state_machine import RunPhase
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
-    ControlsPanelV2,
+from xdart.gui.widgets.controls_panel import (
+    ControlsPanel,
     FormRow,
     SubsectionCard,
 )
@@ -238,7 +238,7 @@ def test_standard_grazing_schema_change_rebuilds_exact_axis_choices() -> None:
         None,
         RunPhase.IDLE,
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     try:
         panel.set_state(standard)
         standard_axis = next(
@@ -739,7 +739,7 @@ def test_empty_integration_args_project_native_builder_defaults() -> None:
 
 def test_production_projection_mounts_full_processing_subsections() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     panel.resize(520, 1000)
     panel.show()
     try:

@@ -22,7 +22,7 @@ def qapp():
 
 
 def test_detect_peaks_rejects_peakless_noise(qapp):
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     dlg = PeakFitDialog(analysis_context=None)
     try:
         rng = np.random.default_rng(0)
@@ -39,7 +39,7 @@ def test_detect_peaks_rejects_peakless_noise(qapp):
 
 
 def test_detect_peaks_finds_real_peak_above_noise(qapp):
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     dlg = PeakFitDialog(analysis_context=None)
     try:
         rng = np.random.default_rng(1)

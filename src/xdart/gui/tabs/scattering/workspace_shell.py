@@ -1,4 +1,4 @@
-"""Opt-in three-column E3 visual shell with one reconciliation boundary."""
+"""Current three-column scattering shell with one reconciliation boundary."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from xrd_tools.session.readiness import (
     SectionId,
 )
 
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
-from xdart.gui.tabs.static_scan.ui.static_controls import StaticControls
+from xdart.gui.widgets.controls_panel import ControlsPanel
+from xdart.gui.widgets.run_controls import RunControlsBar
 
 from .browser_view import BrowserView
 from .scientific_view import ScientificView
@@ -126,12 +126,12 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         self.control_scroll = _HugWidthScrollArea()
         self.control_scroll.setObjectName("e3ControlsScroll")
         self.control_scroll.setWidgetResizable(True)
-        self.controls = ControlsPanelV2(
+        self.controls = ControlsPanel(
             experiment_title="Configuration",
             show_section_numbers=False,
         )
         self.control_scroll.setWidget(self.controls)
-        self.run_controls = StaticControls()
+        self.run_controls = RunControlsBar()
         layout.addWidget(self.control_scroll, 1)
         layout.addWidget(self.run_controls, 0)
         return column

@@ -24,7 +24,7 @@ from xdart.gui.tabs.scattering.shell_values import (
 )
 from xdart.gui.tabs.scattering.shell_widgets import repeated_labels
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
+from xdart.gui.widgets.controls_panel import ControlsPanel
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
 
@@ -248,7 +248,7 @@ def test_e3_ui4_shell_has_one_output_control_and_overrides_title_only(
 ) -> None:
     state = make_shell_projection()
     shell = ScatteringWorkspaceShell()
-    standalone = ControlsPanelV2()
+    standalone = ControlsPanel()
     try:
         shell.apply_state(state)
         shell_paths = {edit.path for edit in shell.controls.current_form_edits()}

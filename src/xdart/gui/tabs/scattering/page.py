@@ -1351,13 +1351,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 from .analysis_mount import MetadataResultDialog
                 dialog = MetadataResultDialog(self)
             elif target == "scan_roi":
-                from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+                from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
                 dialog = ScanPlotDialog(parent=self, vnext_submit=self._scan_analysis_action)
             elif target == "peak":
-                from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+                from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
                 dialog = PeakFitDialog(parent=self, vnext_submit=self._peak_analysis_action)
             else:
-                from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+                from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
                 dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
             dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
             setattr(self, field, dialog)
@@ -1609,7 +1609,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         elif kind == "roi_preview":
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None and payload.image is not None:
-                from xdart.gui.tabs.static_scan.roi_select_dialog import RoiSelectDialog
+                from xdart.gui.analysis.roi_select_dialog import RoiSelectDialog
                 old = self._scan_roi_dialog._roi_dialog
                 if old is not None: old.close(); old.deleteLater()
                 table = self._scan_roi_dialog._vnext_table_result
@@ -3267,7 +3267,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _commit_focused_control_edit_for_run(self) -> bool:
         """Commit the one active editor before capturing the next run.
 
-        ``ControlsPanelV2.current_form_edits()`` is diagnostic only.  The
+        ``ControlsPanel.current_form_edits()`` is diagnostic only.  The
         focused editor is the sole presentation value that can be newer than
         the revisioned intent when an action arrives before
         ``editingFinished``.

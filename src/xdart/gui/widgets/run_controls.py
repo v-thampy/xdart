@@ -1,16 +1,9 @@
-"""StaticControls — the shared run-controls bar (the CONTROLS section).
+"""Shared, state-free run controls for scattering workspaces.
 
-Hand-authored Qt widget (NOT a regenerated .ui).  staticWidget owns ONE
-instance and routes its signals to the ACTIVE wrangler, instead of every
-wrangler carrying its own copy of these run-lifecycle controls in specUI.  This
-is the mode-agnostic seam for future Stitch/RSM modes: the controls stay put,
-only the active wrangler behind them changes.
-
-The widget is STATELESS about run logic — it emits *intent*
+The widget is stateless about run logic: it emits *intent*
 (``actionClicked`` / ``stopClicked`` / ``modeChanged`` / ``batchToggled`` /
-``liveToggled``); the active wrangler owns the state machine and drives the
-single Start/Pause/Resume action button's look via :meth:`set_action_phase`
-(the Phase-B morph, lifted from the per-wrangler ``_set_action_button``).
+``liveToggled``), while its owning page drives the single
+Start/Pause/Resume action button through :meth:`set_action_phase`.
 """
 import os
 
@@ -64,7 +57,7 @@ class _ElidingLabel(QtWidgets.QLabel):
             super().setText(text)
 
 
-class StaticControls(QtWidgets.QWidget):
+class RunControlsBar(QtWidgets.QWidget):
     """Mode selector + Batch + cores + Live + Start/Pause/Resume + Stop."""
 
     actionClicked = QtCore.Signal()          # the single 3-state action button
@@ -87,7 +80,7 @@ class StaticControls(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName('staticRunControls')
+        self.setObjectName('runControlsBar')
         # Two rows separated by a divider: the SELECTION/OPTIONS row (mode +
         # Batch + Cores) on top, the ACTION row (Live + Start + Stop) below.  The
         # action row lives in its own container so it (and the divider) can be

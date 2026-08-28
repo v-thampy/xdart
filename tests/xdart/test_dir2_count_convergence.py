@@ -164,7 +164,7 @@ def test_files_mode_tooltip_hint_and_source_header_unit(qapp, monkeypatch, tmp_p
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from xrd_tools.session.readiness import build_control_profile
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
+    from xdart.gui.widgets.controls_panel import ControlsPanel
 
     d = _container_dir(tmp_path, n_files=2, frames=2)
     widget = staticWidget()
@@ -181,7 +181,7 @@ def test_files_mode_tooltip_hint_and_source_header_unit(qapp, monkeypatch, tmp_p
         state = widget._controls_v2_state()
         assert state.frame_count_is_files is True
         profile = build_control_profile(state)
-        header = ControlsPanelV2._source_status(profile)
+        header = ControlsPanel._source_status(profile)
         assert "2 files" in header
         assert "frames" not in header
     finally:

@@ -1,10 +1,9 @@
-"""Opt-in coexistence mount of the vNext Scattering Workspace.
+"""Default mount of the current Scattering Workspace.
 
 Production-wired (HARD RULE 2): the real catalog, the real ``Main`` host, the
 real ``build_scattering_workspace`` factory and the real page — no fake stands
-on the mount seam. The legacy page stays registered and remains the default;
-selecting the vNext page is an explicit opt-in (persisted key or constructor
-argument).
+on the mount seam. The old Static Scan page remains temporarily selectable
+while the current workspace is the product default.
 """
 
 from __future__ import annotations
@@ -52,17 +51,17 @@ def isolated_settings(tmp_path, monkeypatch):
 # Catalog shape — coexistence, defaults, declared capabilities
 # ---------------------------------------------------------------------------
 
-def test_catalog_registers_both_pages_and_keeps_legacy_default():
+def test_catalog_registers_current_workspace_first_and_as_default():
     assert tuple(page.key for page in BUILTIN_PAGES) == (
-        "static-scan", "scattering-workspace")
-    assert DEFAULT_PAGE_KEY == "static-scan"
-    assert BUILTIN_PAGES[0] is LEGACY_STATIC_PAGE
+        "scattering-workspace", "static-scan")
+    assert DEFAULT_PAGE_KEY == "scattering-workspace"
+    assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
 
 
 def test_scattering_descriptor_declares_the_frozen_adoption_ports():
     page = SCATTERING_WORKSPACE_PAGE
     assert page.lifecycle is PageLifecycle.EXIT_ONLY
-    assert page.order == 1
+    assert page.order == 0
     assert page.capabilities == frozenset({
         PageCapability.OPEN_FOLDER,
         PageCapability.SETTINGS_PERSISTENCE,
@@ -74,10 +73,11 @@ def test_scattering_descriptor_declares_the_frozen_adoption_ports():
     })
 
 
-def test_default_selection_without_optin_is_the_legacy_page():
+def test_default_selection_is_the_current_workspace():
     registry = PageRegistry(BUILTIN_PAGES).freeze()
-    assert registry.select(None, DEFAULT_PAGE_KEY) is LEGACY_STATIC_PAGE
-    assert registry.select("unknown-page", DEFAULT_PAGE_KEY) is LEGACY_STATIC_PAGE
+    assert registry.select(None, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
+    assert registry.select(
+        "unknown-page", DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
     assert registry.select(
         "scattering-workspace", DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
 
@@ -201,13 +201,13 @@ def test_host_mounts_the_real_workspace_on_explicit_optin(
         qapp.processEvents()
 
 
-def test_host_default_startup_still_mounts_the_legacy_page(
+def test_host_default_startup_mounts_the_current_workspace(
         qapp, isolated_settings):
     window = _mounted_host(None)
     try:
-        assert window.selected_page_key == "static-scan"
-        assert window.page_descriptor is LEGACY_STATIC_PAGE
-        assert window.main_widget.objectName() != "scatteringWorkspace"
+        assert window.selected_page_key == "scattering-workspace"
+        assert window.page_descriptor is SCATTERING_WORKSPACE_PAGE
+        assert window.main_widget.objectName() == "scatteringWorkspace"
     finally:
         window.close()
         window.deleteLater()
@@ -816,7 +816,7 @@ def test_default_fallback_seeds_an_admittable_overwrite_intent(
         QtWidgets.QApplication.processEvents()
 
 
-def test_fresh_process_default_startup_selects_legacy_without_scattering(
+def test_fresh_process_default_startup_selects_current_workspace(
         tmp_path):
     code = (
         "import os, sys\n"
@@ -842,4 +842,4 @@ def test_fresh_process_default_startup_selects_legacy_without_scattering(
         timeout=300,
     )
     assert result.returncode == 0, result.stderr
-    assert "SELECTED static-scan 0" in result.stdout
+    assert "SELECTED scattering-workspace " in result.stdout

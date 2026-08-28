@@ -1,7 +1,8 @@
 """Lazy adapter from the vNext Scattering Workspace to the generic page handle.
 
-Opt-in coexistence mount: the legacy static page remains registered and the
-product default. This factory constructs the real ``ScatteringWorkspace`` with
+Current product mount: the old Static Scan page remains temporarily registered
+while this workspace is the default. This factory constructs the real
+``ScatteringWorkspace`` with
 its production services and returns a typed ``PageHandle`` whose ports map the
 page truthfully — Open/Run/Stop, profile persistence, slice pinning, and
 write-mode changes dispatch through the page's single command owner; run
@@ -26,15 +27,12 @@ from .values import (
     ActionCompleted,
     CloseReceipt,
     PageCleanup,
-    PageKey,
+    SCATTERING_PAGE_KEY,
 )
 
 if TYPE_CHECKING:
     from pyqtgraph import QtWidgets as _QtWidgets  # noqa: F401 (typing only)
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
-
-
-SCATTERING_PAGE_KEY = PageKey("scattering-workspace")
 
 
 def _tool_button_menu(widget, object_name: str):

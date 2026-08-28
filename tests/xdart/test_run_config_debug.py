@@ -12,7 +12,7 @@ pytest.importorskip("pyqtgraph")
 from pyqtgraph import QtWidgets
 
 from xdart.gui.tabs.static_scan.run_config_debug import run_config_debug_log
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import SegmentedControl
+from xdart.gui.widgets.controls_panel import SegmentedControl
 
 
 @pytest.fixture(scope="module")

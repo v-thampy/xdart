@@ -16,7 +16,7 @@ from xdart.gui.tabs.scattering.shell_values import (
 )
 from xdart.gui.tabs.scattering.tools_view import ToolsView
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
+from xdart.gui.widgets.controls_panel import ControlsPanel
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
 
@@ -200,7 +200,7 @@ def test_e3_ui6_tools_are_heading_free_dynamic_and_scrollable(
 def test_e3_ui6_section_numbers_are_hidden_only_in_vnext_shell(
     qapp: QtWidgets.QApplication,
 ) -> None:
-    canonical = ControlsPanelV2()
+    canonical = ControlsPanel()
     shell = ScatteringWorkspaceShell()
     try:
         canonical_chips = canonical.findChildren(

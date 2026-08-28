@@ -149,7 +149,7 @@ params = [
          'tip': "Filename filter: space-separated terms = AND (any order), '|' or OR = either, leading -term or NOT = exclude.  Case-insensitive substrings; empty = all files."},
         {'name': 'mask_file', 'title': 'Mask File', 'type': 'str_browse', 'value': ''},
         # (Write Mode moved to the Controls run bar — it's a run/output property,
-        # not a data input.  setup() reads it from the shared StaticControls.)
+        # not a data input.  setup() reads it from the shared RunControlsBar.)
     ], 'expanded': True, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
      'children': [
@@ -488,7 +488,7 @@ class imageWrangler(wranglerWidget):
         if _nx_idx >= 0:
             self.ui.processingModeCombo.removeItem(_nx_idx)
         # Run-control signal wiring moved to attach_controls() — the controls are
-        # the shared StaticControls widget now, connected to this wrangler's
+        # the shared RunControlsBar widget now, connected to this wrangler's
         # handlers on wrangler swap (and disconnected on the previous swap).
         self._on_mode_changed()
         self._set_wrangler_tooltips()
@@ -1706,7 +1706,7 @@ class imageWrangler(wranglerWidget):
         wire the shared signals to this wrangler's handlers."""
         super().attach_controls(controls)
         # Hide the now-dead specUI rows: the command/run rows (controls moved to
-        # StaticControls) AND specLabel — the status bar moved to the control
+        # RunControlsBar) AND specLabel — the status bar moved to the control
         # layer (controls.statusLabel via _status_label), so specLabel would just
         # sit as an empty bar above the integrator.
         for name in ('commandFrame', 'frame', 'specLabel'):
@@ -2120,7 +2120,7 @@ class imageWrangler(wranglerWidget):
         (styled in the dark theme).  ``pausing`` is a transient disabled state."""
         btn = self.ui.startButton
         # Labels carry the run-control glyphs (▶ play / ❚❚ pause), matching
-        # StaticControls._PHASES — both drive this same button.
+        # RunControlsBar._PHASES — both drive this same button.
         label, prop, enabled = {
             'idle':    ('▶ Run',      'idle',   True),
             'running': ('❚❚ Pause',    'active', True),

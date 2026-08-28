@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from pyqtgraph import Qt
-from xdart.gui.tabs.static_scan.analysis_worker import (
+from xdart.gui.analysis.analysis_worker import (
     BatchAnalysisWorker, LiveAnalysisWorker, _run_analyzer,
 )
 from xrd_tools.analysis.runner import AnalysisInput, AnalysisOutcome
@@ -236,7 +236,7 @@ def _img_stack():
 def test_roi_stats_worker_streams_and_returns_result(qapp):
     """Streams per-frame stats AND the completed series equals a direct headless
     run_roi_signals — the mini live≡batch spine for the ROI worker."""
-    from xdart.gui.tabs.static_scan.analysis_worker import RoiStatsWorker
+    from xdart.gui.analysis.analysis_worker import RoiStatsWorker
     from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
     from xrd_tools.core.roi import RoiSpec
     from xrd_tools.sources import MemoryFrameSource
@@ -268,7 +268,7 @@ def test_roi_stats_worker_streams_and_returns_result(qapp):
 
 def test_roi_stats_worker_cancel_emits_none(qapp):
     """Cancelling mid-run emits None (the dialog then abandons partial columns)."""
-    from xdart.gui.tabs.static_scan.analysis_worker import RoiStatsWorker
+    from xdart.gui.analysis.analysis_worker import RoiStatsWorker
     from xrd_tools.analysis.plans import RoiSignal
     from xrd_tools.core.roi import RoiSpec
     from xrd_tools.sources import MemoryFrameSource

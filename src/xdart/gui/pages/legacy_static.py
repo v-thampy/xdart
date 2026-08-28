@@ -13,7 +13,7 @@ from .values import (
     ActionCompleted,
     CloseReceipt,
     PageCleanup,
-    PageKey,
+    STATIC_SCAN_PAGE_KEY,
 )
 
 
@@ -176,7 +176,7 @@ def build_legacy_static(
         )
 
     return PageHandle(
-        key=PageKey("static-scan"),
+        key=STATIC_SCAN_PAGE_KEY,
         widget=widget,
         close=_LegacyCloser(widget, widget.close, activity),
         settings_io=_SettingsIO(

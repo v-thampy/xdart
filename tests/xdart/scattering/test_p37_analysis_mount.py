@@ -1353,7 +1353,7 @@ def test_metadata_reuse_is_pure_and_worker_requalification_rejects_replacement(
 
 def test_p37b_source_widget_external_mode_does_zero_discovery_probe_or_io(
         monkeypatch, qapp) -> None:
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
     import xrd_tools.analysis.scan_operations as scan
 
     def forbidden(*_args, **_kwargs):
@@ -2204,9 +2204,9 @@ def test_p37b_gui_retention_cap_refuses_new_adoption_without_silent_eviction() -
 def test_p37b_batch_live_texture_export_writer_and_private_average_are_absent(
         qapp) -> None:
     from xdart.gui.tabs.scattering.analysis_mount import HELD_REASONS
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
-    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     assert HELD_REASONS == {
         "peak_live": "P3_7_LIVE_FITTING_UNAVAILABLE",
@@ -2251,9 +2251,9 @@ def test_p37b_cold_import_and_ordinary_page_paths_are_analysis_dormant() -> None
 
 
 def test_p37b_legacy_dialog_defaults_remain_reachable_only_for_canonical_callers(qapp) -> None:
-    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
-    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     dialogs = [ScanPlotDialog(), PeakFitDialog(), PhaseFitDialog()]
     try:

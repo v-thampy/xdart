@@ -27,10 +27,10 @@ from xrd_tools.session.readiness import AnalysisTool
 # AnalysisTool -> "module:Class" dotted path of the Qt dialog that services it.
 # ROI_STATS reuses the ScanPlot dialog (its ROI reduction lives there).
 ANALYSIS_LAUNCHER_ENTRY_POINTS: dict[AnalysisTool, str] = {
-    AnalysisTool.PEAK_FIT: "xdart.gui.tabs.static_scan.peak_fit_dialog:PeakFitDialog",
-    AnalysisTool.PHASE_FIT: "xdart.gui.tabs.static_scan.phase_fit_dialog:PhaseFitDialog",
-    AnalysisTool.SCAN_PLOT: "xdart.gui.tabs.static_scan.scan_plot_dialog:ScanPlotDialog",
-    AnalysisTool.ROI_STATS: "xdart.gui.tabs.static_scan.scan_plot_dialog:ScanPlotDialog",
+    AnalysisTool.PEAK_FIT: "xdart.gui.analysis.peak_fit_dialog:PeakFitDialog",
+    AnalysisTool.PHASE_FIT: "xdart.gui.analysis.phase_fit_dialog:PhaseFitDialog",
+    AnalysisTool.SCAN_PLOT: "xdart.gui.analysis.scan_plot_dialog:ScanPlotDialog",
+    AnalysisTool.ROI_STATS: "xdart.gui.analysis.scan_plot_dialog:ScanPlotDialog",
     AnalysisTool.SIN2PSI: "xdart.gui.tabs.static_scan.strain_dialog:StrainDialog",
     AnalysisTool.TEXTURE: "xdart.gui.tabs.static_scan.texture_dialog:TextureDialog",
 }

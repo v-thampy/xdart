@@ -90,7 +90,7 @@ def qapp():
 @pytest.fixture(autouse=True)
 def _controls_panel_session_isolation():
     """``staticWidget.close()`` persists the integrator session; keep it from
-    leaking between tests (same guard as test_controls_panel_v2)."""
+    leaking between tests (same guard as test_controls_panel)."""
     path = os.environ.get("XDART_SESSION_FILE")
 
     def _unlink_session():
@@ -276,7 +276,7 @@ def test_processed_with_reachable_raw_parity(qapp, tmp_path):
         w._controls_v2_param(("Signal", "File")).setValue(str(nxs))
         w._controls_v2_param(("Signal", "img_ext")).setValue("nxs")
         # The GUI's loaded-scan handle — same setup as the loaded-scan cases
-        # in test_controls_panel_v2 (a full h5viewer load additionally
+        # in test_controls_panel (a full h5viewer load additionally
         # hydrates scan_data / viewer rows; see the ResultCaps pins below).
         w.scan.data_file = str(nxs)
 

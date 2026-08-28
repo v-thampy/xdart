@@ -7,13 +7,13 @@ from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.tabs.scattering.controls_projection import project_controls
 from xdart.gui.tabs.scattering.state_machine import RunPhase
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
-    ControlsPanelV2,
+from xdart.gui.widgets.controls_panel import (
+    ControlsPanel,
     FormRow,
     RangeRow,
     SubsectionCard,
 )
-from xdart.gui.tabs.static_scan.ui.static_controls import StaticControls
+from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.themes import apply_theme
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
@@ -106,8 +106,8 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
         font_scale=font_scale,
         spacing=spacing,
     )
-    panel = ControlsPanelV2()
-    run_controls = StaticControls()
+    panel = ControlsPanel()
+    run_controls = RunControlsBar()
     try:
         intent = _intent()
         intent.gi.enabled = True
@@ -259,7 +259,7 @@ def test_tight_combo_popup_rows_keep_independent_readable_height(
         font_scale="default",
         spacing="tight",
     )
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     combo = None
     try:
         panel.set_state(

@@ -1,4 +1,4 @@
-"""Additive oracle for the canonical/visual ControlsPanelV2 synthesis."""
+"""Additive oracle for the canonical/visual ControlsPanel synthesis."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
-    ControlsPanelV2,
+from xdart.gui.widgets.controls_panel import (
+    ControlsPanel,
     FormRow,
     SectionCard,
 )
@@ -29,7 +29,7 @@ def _dispose(widget: QtWidgets.QWidget) -> None:
 
 def test_embedded_source_visibility_is_explicit_through_recovery() -> None:
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    panel = ControlsPanelV2()
+    panel = ControlsPanel()
     card = SectionCard("direct")
     source = QtWidgets.QLabel("source")
     replacement = QtWidgets.QLabel("replacement")

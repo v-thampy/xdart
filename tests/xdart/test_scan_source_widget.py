@@ -63,7 +63,7 @@ def _open(sel):
 
 
 def test_widget_spec_metadata_then_images(qapp, tmp_path):
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
     from xrd_tools.core.scan import SourceKind
 
     spec = _spec_with_images(tmp_path)
@@ -104,7 +104,7 @@ def test_widget_spec_metadata_then_images(qapp, tmp_path):
 def test_widget_spec_auto_image_folder(qapp, tmp_path):
     """When the image folder is left blank, images sitting next to the spec file
     are auto-found (design §3), so raw becomes reachable without a folder pick."""
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
 
     spec = _spec_with_images(tmp_path)
     w = ScanSourceWidget(mode="roi")
@@ -127,7 +127,7 @@ def test_widget_spec_auto_image_folder(qapp, tmp_path):
 def test_widget_caches_unchanged_spec(qapp, tmp_path):
     """Re-emitting with no field change re-uses the cached, already-opened
     selection (no redundant open_source / frame decode)."""
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
 
     spec = _spec_with_images(tmp_path)
     w = ScanSourceWidget(mode="roi")
@@ -143,7 +143,7 @@ def test_widget_caches_unchanged_spec(qapp, tmp_path):
 
 
 def test_widget_scan_switch_reloads(qapp, tmp_path):
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
 
     spec = _spec_with_images(tmp_path)
     w = ScanSourceWidget(mode="roi")
@@ -160,7 +160,7 @@ def test_widget_scan_switch_reloads(qapp, tmp_path):
 
 
 def test_widget_directory_mode_discovers_scans(qapp, tmp_path):
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
 
     _spec_with_images(tmp_path)
     w = ScanSourceWidget(mode="roi")
@@ -180,7 +180,7 @@ def test_widget_directory_mode_discovers_scans(qapp, tmp_path):
 
 
 def test_widget_async_probe_emits_latest_selection(qapp, tmp_path):
-    from xdart.gui.tabs.static_scan.scan_source_widget import (
+    from xdart.gui.analysis.scan_source_widget import (
         ImagePreview, ScanSourceWidget)
 
     spec = _spec_with_images(tmp_path)
@@ -213,7 +213,7 @@ def test_widget_async_probe_emits_latest_selection(qapp, tmp_path):
 
 
 def test_widget_async_probe_ignores_stale_generation(qapp, tmp_path):
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
     from xrd_tools.core.scan import SourceKind, SourceSpec
 
     w = ScanSourceWidget(mode="roi", async_probe=True)
@@ -236,7 +236,7 @@ def test_widget_async_probe_ignores_stale_generation(qapp, tmp_path):
 def test_controls_source_widget_emits_latest_directory_generation(
     qapp, tmp_path, monkeypatch,
 ):
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
     from xrd_tools.sources.directory_index import DirectoryIndex
 
     first = tmp_path / "first"
@@ -295,7 +295,7 @@ def test_controls_source_counts_direct_names_without_content_or_subdir_walk(
     Subdirs is frozen as Run intent, but selecting it must neither recurse nor
     open/probe every candidate merely to paint the Source card.
     """
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
     from xrd_tools.sources.directory_index import DirectoryIndex
 
     for index in range(17):
@@ -342,7 +342,7 @@ def test_controls_source_counts_direct_names_without_content_or_subdir_walk(
 
 
 def test_image_preview_is_read_only_and_rejects_unsafe_payloads():
-    from xdart.gui.tabs.static_scan.scan_source_widget import ImagePreview
+    from xdart.gui.analysis.scan_source_widget import ImagePreview
 
     preview = ImagePreview.from_array(np.arange(6, dtype=np.uint16).reshape(2, 3))
     restored = preview.to_array()
@@ -358,7 +358,7 @@ def test_image_preview_is_read_only_and_rejects_unsafe_payloads():
 def test_file_candidates_tiff_filters_to_scan_stem(qapp, tmp_path):
     """A picked TIFF resolves to a TIFF_SERIES filtered to its OWN scan stem, so a
     folder holding several scans isn't concatenated into one series."""
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
     from xrd_tools.core.scan import SourceKind, SourceSpec
 
     for name in ("scanA_0001.tif", "scanA_0002.tif",
@@ -377,7 +377,7 @@ def test_file_candidates_tiff_filters_to_scan_stem(qapp, tmp_path):
 def test_widget_numbered_raw_file_resolves_series_and_enables_roi(qapp, tmp_path):
     """Picking one numbered RAW frame represents its whole scan series, and
     the widget's binary-read parameters reach the source used by the ROI gate."""
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
     from xrd_tools.core.scan import SourceKind
 
     for index in (0, 1, 2):
@@ -415,7 +415,7 @@ def test_widget_numbered_raw_file_resolves_series_and_enables_roi(qapp, tmp_path
 
 
 def test_widget_spec_raw_controls_use_operator_facing_labels(qapp, tmp_path):
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
 
     spec = _spec_with_images(tmp_path)
     w = ScanSourceWidget(mode="roi")
@@ -433,7 +433,7 @@ def test_widget_spec_raw_controls_use_operator_facing_labels(qapp, tmp_path):
 def test_widget_spec_raw_status_explains_shape_and_scan_match(qapp, tmp_path):
     """A disabled ROI gate tells the operator which SPEC/raw precondition is
     missing instead of collapsing every failure to ``raw unavailable``."""
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
 
     spec = _spec_with_images(tmp_path)
     w = ScanSourceWidget(mode="roi")
@@ -458,7 +458,7 @@ def test_widget_spec_common_raw_shape_enables_roi_without_manual_shape(
         qapp, tmp_path):
     """A known headerless detector shape is a headless reader capability, not
     a private Image Viewer fallback or an operator requirement."""
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
 
     spec = tmp_path / "known"
     spec.write_text(_SPEC.replace("#F myscan", "#F known"))
@@ -482,7 +482,7 @@ def test_widget_spec_common_raw_shape_enables_roi_without_manual_shape(
 
 def test_source_widget_ui_tweaks(qapp):
     """Folder label reserves room (no clip), and Raw-params shares the images row."""
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
 
     w = ScanSourceWidget(mode="roi")
     try:

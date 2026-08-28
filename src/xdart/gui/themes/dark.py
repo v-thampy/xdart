@@ -578,27 +578,27 @@ QPushButton#stopButton:disabled {
 QWidget#runReadinessRow {
     background-color: transparent;
 }
-QWidget#staticRunControls,
-QWidget#staticRunControls QLabel,
-QWidget#staticRunControls QComboBox,
-QWidget#staticRunControls QSpinBox,
-QWidget#staticRunControls QPushButton {
+QWidget#runControlsBar,
+QWidget#runControlsBar QLabel,
+QWidget#runControlsBar QComboBox,
+QWidget#runControlsBar QSpinBox,
+QWidget#runControlsBar QPushButton {
     font-size: $control_panel_run_font;
 }
-/* The readiness dot/label live INSIDE #staticRunControls, whose group rule
-   (QWidget#staticRunControls QLabel -> control_panel_run_font) outranks a plain
+/* The readiness dot/label live INSIDE #runControlsBar, whose group rule
+   (QWidget#runControlsBar QLabel -> control_panel_run_font) outranks a plain
    #runReadinessDot/#runReadinessLabel selector -- so the readiness bar was
    stuck at the run font and ignored control_panel_status_font.  Qualify these
-   with the #staticRunControls ancestor so they win (and keep the three in
+   with the #runControlsBar ancestor so they win (and keep the three in
    lock-step so the green-when-ready colour still outranks the base colour). */
-QWidget#staticRunControls QLabel#runReadinessDot {
+QWidget#runControlsBar QLabel#runReadinessDot {
     color: $stop_text;
     font-size: $control_panel_status_font;
 }
-QWidget#staticRunControls QLabel#runReadinessDot[ready="true"] {
+QWidget#runControlsBar QLabel#runReadinessDot[ready="true"] {
     color: $start;
 }
-QWidget#staticRunControls QLabel#runReadinessLabel {
+QWidget#runControlsBar QLabel#runReadinessLabel {
     color: $text_3;
     font-size: $control_panel_status_font;
     font-weight: 400;
@@ -814,18 +814,18 @@ QFrame#displayScaleDivider {
 }
 
 /* ── Controls Panel V2 workflow cards ─────────────────────────── */
-QWidget#controlsPanelV2 {
+QWidget#controlsPanel {
     background-color: $win_bg;
     /* No font-family override — inherit the app default so the panel matches
        the rest of xdart (left browser + display frame).  A hair smaller than
        the default so the dense panel reads lighter. */
     font-size: $control_panel_font;
 }
-QWidget#controlsPanelV2 QLabel,
-QWidget#controlsPanelV2 QLineEdit,
-QWidget#controlsPanelV2 QComboBox,
-QWidget#controlsPanelV2 QPushButton,
-QWidget#controlsPanelV2 QToolButton {
+QWidget#controlsPanel QLabel,
+QWidget#controlsPanel QLineEdit,
+QWidget#controlsPanel QComboBox,
+QWidget#controlsPanel QPushButton,
+QWidget#controlsPanel QToolButton {
     font-size: $control_panel_font;
 }
 QMenu#controlsV2EnergyPopup,
@@ -1155,43 +1155,43 @@ QWidget#scatteringWorkspaceShell QComboBox::down-arrow {
    square chrome.  Individual spacing tokens still own horizontal breathing
    room; zeroing only the vertical padding lets the common floor determine the
    exact outer height instead of each widget class growing independently. */
-QWidget#controlsPanelV2 QLineEdit#controlsV2LineEdit,
-QWidget#controlsPanelV2 QComboBox#controlsV2ComboBox,
-QWidget#controlsPanelV2 QSpinBox,
-QWidget#controlsPanelV2 QDoubleSpinBox,
-QWidget#controlsPanelV2 QPushButton#controlsV2ActionButton,
-QWidget#controlsPanelV2 QPushButton#controlsV2ToggleButton,
-QWidget#controlsPanelV2 QPushButton#controlsV2PillButton,
-QWidget#controlsPanelV2 QPushButton#controlsV2SegmentButton,
-QWidget#controlsPanelV2 QToolButton#controlsV2BrowseButton,
-QWidget#controlsPanelV2 QToolButton#controlsV2MoreButton,
-QWidget#controlsPanelV2 QToolButton#controlsV2AutoButton,
-QWidget#staticRunControls QComboBox,
-QWidget#staticRunControls QSpinBox,
-QWidget#staticRunControls QDoubleSpinBox,
-QWidget#staticRunControls QPushButton {
+QWidget#controlsPanel QLineEdit#controlsV2LineEdit,
+QWidget#controlsPanel QComboBox#controlsV2ComboBox,
+QWidget#controlsPanel QSpinBox,
+QWidget#controlsPanel QDoubleSpinBox,
+QWidget#controlsPanel QPushButton#controlsV2ActionButton,
+QWidget#controlsPanel QPushButton#controlsV2ToggleButton,
+QWidget#controlsPanel QPushButton#controlsV2PillButton,
+QWidget#controlsPanel QPushButton#controlsV2SegmentButton,
+QWidget#controlsPanel QToolButton#controlsV2BrowseButton,
+QWidget#controlsPanel QToolButton#controlsV2MoreButton,
+QWidget#controlsPanel QToolButton#controlsV2AutoButton,
+QWidget#runControlsBar QComboBox,
+QWidget#runControlsBar QSpinBox,
+QWidget#runControlsBar QDoubleSpinBox,
+QWidget#runControlsBar QPushButton {
     min-height: $control_interactive_height;
     max-height: $control_interactive_height;
     padding-top: 0px;
     padding-bottom: 0px;
     border-radius: 0px;
 }
-QWidget#controlsPanelV2 QComboBox#controlsV2ComboBox::drop-down,
-QWidget#controlsPanelV2 QSpinBox::up-button,
-QWidget#controlsPanelV2 QSpinBox::down-button,
-QWidget#controlsPanelV2 QDoubleSpinBox::up-button,
-QWidget#controlsPanelV2 QDoubleSpinBox::down-button,
-QWidget#staticRunControls QComboBox::drop-down,
-QWidget#staticRunControls QSpinBox::up-button,
-QWidget#staticRunControls QSpinBox::down-button {
+QWidget#controlsPanel QComboBox#controlsV2ComboBox::drop-down,
+QWidget#controlsPanel QSpinBox::up-button,
+QWidget#controlsPanel QSpinBox::down-button,
+QWidget#controlsPanel QDoubleSpinBox::up-button,
+QWidget#controlsPanel QDoubleSpinBox::down-button,
+QWidget#runControlsBar QComboBox::drop-down,
+QWidget#runControlsBar QSpinBox::up-button,
+QWidget#runControlsBar QSpinBox::down-button {
     border-radius: 0px;
 }
-QWidget#controlsPanelV2 QComboBox#controlsV2ComboBox::drop-down,
-QWidget#staticRunControls QComboBox::drop-down {
+QWidget#controlsPanel QComboBox#controlsV2ComboBox::drop-down,
+QWidget#runControlsBar QComboBox::drop-down {
     width: 16px;
 }
-QWidget#controlsPanelV2 QComboBox#controlsV2ComboBox::down-arrow,
-QWidget#staticRunControls QComboBox::down-arrow {
+QWidget#controlsPanel QComboBox#controlsV2ComboBox::down-arrow,
+QWidget#runControlsBar QComboBox::down-arrow {
     image: none;
     width: 0px;
     height: 0px;

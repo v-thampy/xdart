@@ -16,7 +16,7 @@ from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import FormRow
+from xdart.gui.widgets.controls_panel import FormRow
 from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import GIIntent, RunIntent

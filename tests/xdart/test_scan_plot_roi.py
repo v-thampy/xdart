@@ -51,7 +51,7 @@ def _memory_spec(monkeypatch, source, *, uri="memory://roi-test"):
 
 
 def test_raw_is_reachable_truth_table(qapp):
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import raw_is_reachable
+    from xdart.gui.analysis.scan_plot_dialog import raw_is_reachable
     from xrd_tools.sources import MemoryFrameSource
 
     # Eiger/TIFF-like: the images ARE the source -> reachable.
@@ -106,7 +106,7 @@ def test_scan_plot_loads_spec_metadata_roi_disabled(qapp, tmp_path):
     """An extensionless SPEC file populates the table from its columns; the scan
     selector appears; Plot ROI stays disabled (metadata only — no raw)."""
     pytest.importorskip("silx")
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     p = tmp_path / "myscan"            # extensionless, the SSRL convention
     p.write_text(_SPEC)
@@ -125,7 +125,7 @@ def test_scan_plot_loads_spec_metadata_roi_disabled(qapp, tmp_path):
 
 
 def test_roi_button_reflects_reachability(qapp, monkeypatch):
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.sources import MemoryFrameSource
 
     dlg = ScanPlotDialog()
@@ -148,7 +148,7 @@ def test_roi_button_reflects_reachability(qapp, monkeypatch):
 
 
 def test_roi_select_field_round_trip(qapp):
-    from xdart.gui.tabs.static_scan.roi_select_dialog import (
+    from xdart.gui.analysis.roi_select_dialog import (
         RoiSelectDialog, _rect_center_size)
 
     img = np.zeros((100, 80), dtype=float)       # (rows, cols)
@@ -189,7 +189,7 @@ def test_roi_select_field_round_trip(qapp):
 def test_roi_select_picker_defaults_and_gating(qapp):
     """First ROI defaults to the whole frame; the saturation toggle is exposed;
     the background controls gate to mean/sum."""
-    from xdart.gui.tabs.static_scan.roi_select_dialog import (
+    from xdart.gui.analysis.roi_select_dialog import (
         RoiSelectDialog, _rect_center_size)
 
     dlg = RoiSelectDialog(np.zeros((40, 60), dtype=float))   # rows=40, cols=60
@@ -214,7 +214,7 @@ def test_roi_select_picker_defaults_and_gating(qapp):
 
 
 def test_roi_select_reducer_and_background(qapp):
-    from xdart.gui.tabs.static_scan.roi_select_dialog import RoiSelectDialog
+    from xdart.gui.analysis.roi_select_dialog import RoiSelectDialog
 
     dlg = RoiSelectDialog(np.zeros((50, 50), dtype=float))
     try:
@@ -241,7 +241,7 @@ def test_roi_select_reducer_and_background(qapp):
 
 
 def test_scan_plot_roi_fills_columns_end_to_end(qapp, monkeypatch):
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
     from xrd_tools.core.roi import RoiSpec
     from xrd_tools.sources import MemoryFrameSource
@@ -283,7 +283,7 @@ def test_scan_plot_roi_fills_columns_end_to_end(qapp, monkeypatch):
 def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp, monkeypatch):
     """ROI stats stream the SOURCE frame index; _frame_row_map must map them to
     the right table rows when frame_index doesn't start at 0 / isn't 0..n-1."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
     from xrd_tools.core.roi import RoiSpec
     from xrd_tools.core.scan import ScanFrame
@@ -327,8 +327,8 @@ def test_scan_plot_same_scan_param_change_keeps_columns(qapp, tmp_path):
     """Editing the raw/image pairing of the SAME scan refreshes the source +
     gating but must NOT wipe the table or the user's computed ROI columns; a
     DIFFERENT scan rebuilds wholesale."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSelection
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_source_widget import ScanSelection
 
     spec5 = _nxs_stack(tmp_path / "a5.nxs", _stack())
     spec6 = _nxs_stack(tmp_path / "a6.nxs", _stack())
@@ -356,8 +356,8 @@ def test_scan_plot_same_scan_param_change_keeps_columns(qapp, tmp_path):
 def test_scan_plot_metadata_less_source_roi_vs_frame(qapp, tmp_path):
     """An images-only source (Eiger/raw burst — no motors) plots ROI vs frame
     number: the table is just frame_index, raw is reachable, ROI fills (§2.3)."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSelection
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_source_widget import ScanSelection
     from xrd_tools.analysis.plans import RoiSignal
     from xrd_tools.core.roi import RoiSpec
 
@@ -382,7 +382,7 @@ def test_scan_plot_metadata_less_source_roi_vs_frame(qapp, tmp_path):
 def test_scan_plot_roi_applies_provider_mask(qapp, monkeypatch):
     """The dialog's mask_provider mask is threaded to the worker, so the ROI
     column matches a direct masked run (and differs from the unmasked one)."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
     from xrd_tools.core.roi import RoiSpec
     from xrd_tools.sources import MemoryFrameSource
@@ -414,7 +414,7 @@ def test_scan_plot_roi_column_normalizes_and_csv_roundtrips(qapp, tmp_path):
     """An ROI/metadata column normalizes (y/norm) and the CSV exports the full
     assembled table incl. a non-numeric column."""
     from pyqtgraph.Qt import QtCore
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     dlg = ScanPlotDialog()
     try:
@@ -448,7 +448,7 @@ def test_scan_plot_roi_column_normalizes_and_csv_roundtrips(qapp, tmp_path):
 def test_scan_plot_roi_abort_on_source_swap(qapp, monkeypatch):
     """Loading a new source mid-run stops the worker + forgets the run state, so
     a stale worker can't stream into the replaced table."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.analysis.plans import RoiSignal
     from xrd_tools.core.roi import RoiSpec
     from xrd_tools.sources import MemoryFrameSource
@@ -479,7 +479,7 @@ def test_scan_plot_right_axis_splits_series(qapp):
     PlotItem onto the linked right ViewBox (so incommensurable columns overlay
     cleanly)."""
     from pyqtgraph.Qt import QtCore
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     _EX = QtCore.Qt.MatchFlag.MatchExactly
     _CHECKED = QtCore.Qt.CheckState.Checked
@@ -514,7 +514,7 @@ def test_scan_plot_right_axis_plots_column_not_checked_in_y(qapp):
     """A column checked ONLY in the Right-axis list still plots (on the right) —
     the right toggle is never a silent no-op."""
     from pyqtgraph.Qt import QtCore
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     _EX = QtCore.Qt.MatchFlag.MatchExactly
     dlg = ScanPlotDialog()
@@ -535,7 +535,7 @@ def test_scan_plot_right_axis_plots_column_not_checked_in_y(qapp):
 def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp, monkeypatch):
     """Closing the dialog mid-ROI-run drops the partial NaN columns (they must
     not survive into the reused single-instance dialog's next show)."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.analysis.plans import RoiSignal
     from xrd_tools.core.roi import RoiSpec
     from xrd_tools.sources import MemoryFrameSource
@@ -565,7 +565,7 @@ def test_roi_source_is_opened_and_closed_on_worker_thread(qapp, monkeypatch):
     """The value-only spec crosses Qt; the live source is born, consumed, and
     closed inside RoiStatsWorker's owner thread."""
     import threading
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.analysis.plans import RoiSignal
     from xrd_tools.core.roi import RoiSpec
     from xrd_tools.sources import MemoryFrameSource
@@ -608,8 +608,8 @@ def test_roi_source_is_opened_and_closed_on_worker_thread(qapp, monkeypatch):
 
 def test_selection_metadata_open_is_short_lived(qapp, monkeypatch):
     """Browsing selections must not leave one HDF5/source handle per click."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSelection
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_source_widget import ScanSelection
     from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.sources import MemoryFrameSource
 
@@ -645,7 +645,7 @@ def test_selection_metadata_open_is_short_lived(qapp, monkeypatch):
 
 def test_roi_frame_updates_are_redraw_coalesced(qapp):
     from pyqtgraph.Qt import QtCore
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     dlg = ScanPlotDialog()
     try:
@@ -676,7 +676,7 @@ def test_roi_done_flushes_final_coalesced_redraw(qapp):
     """A completing sigRoiDone cancels the pending debounce timer, so it must
     issue a final _redraw() itself — else the last frame's update stays stale."""
     import types
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     dlg = ScanPlotDialog()
     try:
@@ -704,7 +704,7 @@ def test_roi_done_flushes_final_coalesced_redraw(qapp):
 
 def test_scan_plot_skips_all_nan_series_without_pyqtgraph_warning(qapp):
     from pyqtgraph.Qt import QtCore
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     dlg = ScanPlotDialog()
     try:
@@ -728,7 +728,7 @@ def test_scan_plot_skips_all_nan_series_without_pyqtgraph_warning(qapp):
 def test_scan_plot_default_y_priority_counter(qapp):
     """10.2: default Y is the first present of the counter priority list
     (Photod>bs>mon>i2>i1>i0), and an ROI counter is never auto-selected (10.1)."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     dlg = ScanPlotDialog()
     try:
         n = 5
@@ -751,7 +751,7 @@ def test_scan_plot_default_y_priority_counter(qapp):
 def test_scan_plot_default_y_never_roi(qapp):
     """10.1: with only ROI columns present (no priority counter), default Y falls
     back to frame_index — never an ROI column."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     dlg = ScanPlotDialog()
     try:
         n = 5
@@ -771,7 +771,7 @@ def test_scan_plot_default_y_never_roi(qapp):
 def test_scan_plot_default_x_positioner_else_frame_index(qapp):
     """10.3: default X = the positioner that actually varies; with no positioner
     recorded, frame_index."""
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     n = 5
     table = {
         "frame_index": np.arange(n, dtype=float),
@@ -800,8 +800,8 @@ def test_scan_plot_spec_default_x_is_declared_motor_not_largest_counter(
     """A SPEC #L table contains counters as well as motors; a large counter
     range must not become the default X axis merely because it varies most."""
     pytest.importorskip("silx")
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSelection
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_source_widget import ScanSelection
     from xrd_tools.core.scan import SourceKind, SourceSpec
 
     spec_file = tmp_path / "scan"
@@ -831,7 +831,7 @@ def test_scan_plot_log_button_drives_left_axis(qapp):
     """10.5: Log toggles the LEFT axis only and survives a redraw; the RIGHT axis
     stays linear so its ticks match its (untransformed) curves."""
     from pyqtgraph.Qt import QtCore
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
     dlg = ScanPlotDialog()
     try:
         n = 5
@@ -863,7 +863,7 @@ def test_scan_plot_log_button_drives_left_axis(qapp):
 def test_roi_select_has_viewer_controls(qapp):
     """10.4: the ROI picker carries the intensity bar + Default/Log controls, and
     a Log re-render does not move the RectROI (the picked geometry is preserved)."""
-    from xdart.gui.tabs.static_scan.roi_select_dialog import (
+    from xdart.gui.analysis.roi_select_dialog import (
         RoiSelectDialog, _rect_center_size)
     img = np.abs(np.random.RandomState(0).normal(100, 20, (40, 60)))
     dlg = RoiSelectDialog(img)
@@ -883,8 +883,8 @@ def test_roi_select_has_viewer_controls(qapp):
 def test_dialogs_swallow_escape(qapp):
     """10.8: Esc does not dismiss the Scan Plot / ROI picker popups."""
     from pyqtgraph.Qt import QtCore, QtGui
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
-    from xdart.gui.tabs.static_scan.roi_select_dialog import RoiSelectDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.roi_select_dialog import RoiSelectDialog
 
     def press_escape(widget):
         ev = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress,
@@ -922,7 +922,7 @@ def test_dialog_close_shuts_down_probe_executor(qapp, tmp_path):
     hang; app-exit hang live).  Real dialog, real widget, real probe on a
     real TIFF."""
     import fabio.tifimage
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     tif = tmp_path / "close_probe_0000.tif"
     fabio.tifimage.TifImage(data=np.ones((6, 6), dtype=np.int32)).write(
@@ -1000,7 +1000,7 @@ def test_scan_plot_processed_reads_take_writer_lock_x16(qapp, tmp_path):
     live writer's `r+` saves (the RN-1 family; every other display reader goes
     through _locked_scan_read)."""
     import os
-    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
     p = tmp_path / "processed_scan.nxs"
     _write_processed_nxs_with_scan_data(p)

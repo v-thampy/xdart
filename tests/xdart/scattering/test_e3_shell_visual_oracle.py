@@ -11,7 +11,7 @@ from shiboken6 import isValid
 from xdart.gui.tabs.scattering.workspace_shell import (
     ScatteringWorkspaceShell,
 )
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
+from xdart.gui.widgets.controls_panel import (
     FormRow,
     PillRow,
     RangeRow,
