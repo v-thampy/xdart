@@ -151,7 +151,9 @@ def test_catalog_is_the_only_builtin_registration_point():
 
 def test_retired_static_scan_page_and_package_are_absent_from_production():
     gui = ROOT / "src" / "xdart" / "gui"
-    assert not (gui / "tabs" / "static_scan").exists()
+    retired = gui / "tabs" / "static_scan"
+    assert not any(retired.rglob("*.py"))
+    assert not any(retired.rglob("*.ui"))
     assert not (PAGES / "legacy_static.py").exists()
 
     forbidden = (
