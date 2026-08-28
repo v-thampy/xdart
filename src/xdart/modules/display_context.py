@@ -540,6 +540,7 @@ class Viewer1DContext:
     paths: tuple[str, ...]
     commit_gate: Viewer1DCommitGate
     state: Viewer1DState = Viewer1DState.EMPTY
+    current_path: str | None = None
 
     def __post_init__(self):
         _viewer_malformed(type(self.context_token) is not str or not self.context_token
@@ -547,6 +548,10 @@ class Viewer1DContext:
             or type(self.paths) is not tuple or not 1 <= len(self.paths) <= 256
             or any(type(path) is not str or not path or len(os.fsencode(path)) > 4096
                    for path in self.paths)
+            or len(set(self.paths)) != len(self.paths)
+            or self.current_path is not None
+            and (type(self.current_path) is not str
+                 or self.current_path not in self.paths)
             or type(self.commit_gate) is not Viewer1DCommitGate
             or type(self.state) is not Viewer1DState, "viewer 1-D context is malformed")
 

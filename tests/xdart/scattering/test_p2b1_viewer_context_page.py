@@ -11,6 +11,7 @@ import time
 import numpy as np
 import pytest
 
+from xdart.gui.tabs.scattering.browser_catalog import BrowserCatalogEntry
 from xdart.gui.tabs.scattering.context_controller import ContextController
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.display_values import RunIdentity, StandardEventKind, StandardRunEvent
@@ -18,7 +19,12 @@ from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 import xdart.gui.tabs.scattering.page as page_module
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
-from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+from xdart.gui.tabs.scattering.shell_values import (
+    FrameNavigationProjection,
+    FrameSelectionIntent,
+    ShellCommand,
+    ShellCommandKind,
+)
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.modules.display_context import ContextKind
 from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome
@@ -83,17 +89,35 @@ def _close_1d(controller: ContextController) -> None:
     assert controller.close_viewer_1d()
 
 
-def _shell(controller: ContextController, preferences: ScientificPreferences,
-           processing_mode="1D Viewer"):
+def _shell(
+    controller: ContextController,
+    preferences: ScientificPreferences,
+    processing_mode="1D Viewer",
+    *,
+    browser_catalog: tuple[BrowserCatalogEntry, ...] = (),
+):
     base = make_shell_projection(plot_mode="Single")
     intent = RunIntent(processing_mode=processing_mode, output_mode="")
     payloads = controller.project_navigation(preferences=preferences, processing_mode="1D Viewer")
+    context = controller.viewer_1d_context
+    if not browser_catalog and context is not None:
+        browser_catalog = tuple(
+            BrowserCatalogEntry(path, Path(path).name, index)
+            for index, path in enumerate(context.paths)
+        )
     return ContextProjection().build_shell(
         revision=1, controls=base.controls, controls_readiness=base.controls_readiness,
         phase=RunPhase.IDLE, intent=intent, contexts=controller.projectable_contexts,
         selection=controller.selection, navigation=controller.navigation, payloads=payloads,
         resident_frames=controller.resident_frame_keys, progress=base.progress,
-        preferences=preferences, browser_directory="", date_sorted=False, auto_last=True,
+        preferences=preferences, browser_directory="",
+        browser_catalog=browser_catalog,
+        date_sorted=False, auto_last=True,
+        viewer_1d_paths=(
+            ()
+            if context is None
+            else context.paths
+        ),
         executor_available=False, start_permitted=True, start_blocker="",
         notice=getattr(controller, "viewer_1d_diagnostic", ""),
     )
@@ -136,8 +160,7 @@ def test_viewer_1d_mount_uses_one_owner_three_method_port_and_raw_provider(tmp_p
     assert owner.holder is not None and owner.holder.borrow is not None
     assert controller.selection.kind is ContextKind.VIEWER_1D
     assert controller.navigation.current is controller.navigation.frames[0]
-    assert all(selected is frame for selected, frame in zip(
-        controller.navigation.selected, controller.navigation.frames, strict=True))
+    assert controller.navigation.selected == controller.navigation.frames
     assert controller.resident_frame_keys == frozenset(controller.navigation.frames)
     prior_frames = controller.navigation.frames
     prior_reads = sum(owner.provider.counters().values())
@@ -385,6 +408,10 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     single = _shell(controller, ScientificPreferences(plot_mode="Single"))
     assert single.scientific.processing_mode == "1D Viewer"
     assert single.scientific.plot_mode == "Single"
+    assert single.browser.frames == controller.navigation.frames
+    assert single.browser.selected_scan == str(first)
+    assert single.browser.selected_artifacts == (str(first), str(second))
+    assert single.browser.multi_artifact_selection
     assert len(single.scientific.traces) == 1
     trace = single.scientific.traces[0]
     mode = borrow.modes[0]
@@ -393,24 +420,26 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     assert trace.sigma is mode.uncertainty
     assert not trace.sigma.flags.writeable
     frames = controller.navigation.frames
-    assert (frames[0] is not frames[1] and owner.request.paths == (str(first), str(second)) and controller.navigation.current is frames[0] and len(controller.navigation.selected) == len(frames) and all(selected is frame for selected, frame in zip(controller.navigation.selected, frames)))
-    assert controller.select_viewer_1d_frame(frames[1])
+    assert (frames[0] is not frames[1] and owner.request.paths == (str(first), str(second)) and controller.navigation.current is frames[0] and controller.navigation.selected == frames)
+    assert controller.select_viewer_1d(frames[1], (frames[1],))
     assert controller.navigation.current is frames[1]
-    assert all(selected is frame for selected, frame in zip(controller.navigation.selected, frames, strict=True))
+    assert controller.navigation.selected == (frames[1],)
     selected = _shell(controller, ScientificPreferences(plot_mode="Single"))
     assert len(selected.scientific.traces) == 1
     assert selected.scientific.traces[0].frame is frames[1]
+    assert selected.browser.selected_scan == str(second)
+    assert selected.browser.selected_artifacts == (str(second),)
     selected_by_context = _shell(controller, ScientificPreferences(plot_mode="Single"), "Int 2D")
     assert selected_by_context.scientific.processing_mode == "1D Viewer"
     commands = []
     view = SimpleNamespace(
         _processing_mode="1D Viewer", _frame_keys=frames,
-        _selected_keys=frames,
+        _selected_keys=(frames[1],), _single_mode=True,
         frame_selector=SimpleNamespace(itemData=lambda _index: frames[0]),
         commandRequested=SimpleNamespace(emit=commands.append),
     )
     ScientificView._frame_selected(view, 0)
-    assert commands[0].frames == frames
+    assert commands[0].frames == (frames[0],)
     presented = []
     page = SimpleNamespace(
         _context_controller=controller,
@@ -418,13 +447,33 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
             _shell(controller, ScientificPreferences()).scientific.traces[0].frame),
     )
     ScatteringWorkspace._select_frames(page, commands[0])
-    assert presented == [frames[0]] and controller.navigation.selected == frames
-    assert controller.select_viewer_1d_frame(frames[1]) and controller.navigation.current is frames[1]
+    assert presented == [frames[0]] and controller.navigation.selected == (frames[0],)
+    current_only = _shell(controller, ScientificPreferences(plot_mode="Single"))
+    assert current_only.browser.selected_scan == str(first)
+    assert current_only.browser.selected_artifacts == (str(first),)
+    assert controller.select_viewer_1d(frames[1], frames) and controller.navigation.current is frames[1]
     overlay = _shell(controller, ScientificPreferences(plot_mode="Overlay"))
     assert tuple(trace.frame for trace in overlay.scientific.traces) == frames
     assert overlay.scientific.traces[0].axis.values is borrow.modes[0].coordinate
     assert overlay.scientific.traces[1].axis.values is borrow.modes[1].coordinate
     assert overlay.scientific.traces[0].axis.values.shape != overlay.scientific.traces[1].axis.values.shape
+    ScatteringWorkspace._select_frames(page, ShellCommand(
+        ShellCommandKind.SELECT_BROWSER_FRAMES,
+        frame=frames[0],
+        frames=(frames[0],),
+        intent=FrameSelectionIntent.TOGGLE_TRACE,
+    ))
+    assert controller.navigation.current is frames[0]
+    assert controller.navigation.selected == (frames[1],)
+    toggled = _shell(
+        controller, ScientificPreferences(plot_mode="Overlay")
+    )
+    assert tuple(
+        item.frame for item in toggled.scientific.traces
+    ) == (frames[1],)
+    assert toggled.browser.selected_scan == str(first)
+    assert toggled.browser.selected_artifacts == (str(second),)
+    assert controller.select_viewer_1d(frames[1], frames)
     waterfall = _shell(controller, ScientificPreferences(plot_mode="Waterfall"))
     assert "first selected 1D source" in waterfall.scientific.status
     assert all(trace.axis.values is borrow.modes[0].coordinate for trace in waterfall.scientific.traces)
@@ -443,12 +492,17 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     render = SimpleNamespace(_processing_mode="1D Viewer", _trace_history_scope=(), _trace_selection_keys=(),
         _trace_history_by_identity={}, _trace_history_keys=(), _bottom_waterfall_active=False, _share_link_on=False,
         _rendered_plot_mode="", _rendered_plot_options=None, _rendered_overlay_step=None,
-        _rendered_trace_keys=(), _waterfall_source_keys=(), _waterfall_render_contract=None,
+        _rendered_trace_keys=(), _rendered_trace_axis_key=None,
+        _waterfall_source_keys=(), _waterfall_render_contract=None,
+        _rendered_browse_science_contract=None,
         _merge_pinned_trace_history=lambda _state: (), _skip_live_waterfall=lambda *_args, **_kwargs: False,
         _bounded_waterfall_rows=lambda rows: rows, _axis_key=lambda axis: id(axis.values),
         _waterfall_axis=lambda _scope, traces, *_args: (np.arange(len(traces), dtype=float), "Frame #"),
         waterfall=SimpleNamespace(render=lambda rows, **kwargs: rendered.append((rows, kwargs))),
-        curve=curve, legend=legend, bottom_stack=SimpleNamespace(setCurrentWidget=lambda _widget: None))
+        curve=curve, legend=legend, bottom_stack=SimpleNamespace(
+            setCurrentWidget=lambda _widget: None,
+            currentWidget=lambda: curve,
+        ))
     render._merge_trace_history = partial(ScientificView._merge_trace_history, render); render._render_waterfall = partial(ScientificView._render_waterfall, render)
     assert render._merge_trace_history(single.scientific, controller.navigation)[0] is trace
     assert render._merge_trace_history(selected.scientific, controller.navigation)[0] is selected.scientific.traces[0] and render._trace_history_keys == (frames[1],)
@@ -502,7 +556,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     monkeypatch.setattr(ScientificView, "clear_viewer_2d", scrub)
     receipt = ScientificView.clear_viewer_1d(render, clear)
     assert receipt.cleared and not render._trace_history_by_identity and not render._pinned_trace_by_id and render._waterfall_y_values == ()
-    del single, trace, mode, selected, selected_by_context, overlay, waterfall, inherited, borrow, waterfall_state, overlay_state, render, real_merge, payloads, base, view, invalid, refused
+    del single, trace, mode, selected, selected_by_context, current_only, overlay, toggled, waterfall, inherited, borrow, waterfall_state, overlay_state, render, real_merge, payloads, base, view, invalid, refused
     assert controller.acknowledge_viewer_1d_renderer_clear(receipt)
     _close_1d(controller)
 
@@ -512,6 +566,8 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     controller = _controller()
     controller.open_viewer_1d((str(first), str(mixed)))
     _await_ready(controller)
+    frames = controller.navigation.frames
+    assert controller.select_viewer_1d(frames[0], frames)
     refused = _shell(controller, ScientificPreferences(plot_mode="Overlay"))
     assert refused.scientific.traces == ()
     assert "conflicting units" in refused.scientific.status
@@ -604,10 +660,15 @@ def test_catalog_activation_routes_are_gui_thread_zero_io(monkeypatch) -> None:
         _mask_identity=None,
         _reintegrate_identity=None,
         _reintegrate_dimension=None,
+        _experiment_operation_busy=lambda: False,
+        _notice=lambda _message: None,
+        _refresh_shell=lambda: None,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(
             revision=1, thaw=lambda: intent,
         )),
-        _open_viewer_1d_paths=lambda paths: calls.append(("xye", paths)),
+        _open_viewer_1d_paths=lambda paths, *, current_path=None: calls.append(
+            ("xye", paths, current_path)
+        ),
         _open_viewer_2d_path=lambda path: calls.append(("tiff", path)),
         _clear_viewer_1d_renderer=lambda **_kwargs: True,
         _clear_viewer_2d_renderer=lambda **_kwargs: True,
@@ -625,7 +686,8 @@ def test_catalog_activation_routes_are_gui_thread_zero_io(monkeypatch) -> None:
         ShellCommandKind.SELECT_SCAN, "/data/subdir", path=("directory",),
     ))
     ScatteringWorkspace._handle_shell_command(page, ShellCommand(
-        ShellCommandKind.SELECT_SCAN, "/data/curve.xye", path=("artifact",),
+        ShellCommandKind.SELECT_SCAN, "/data/second.xye", path=("artifact",),
+        artifacts=("/data/curve.xye", "/data/second.xye"),
     ))
     intent.processing_mode = "2D Viewer"
     ScatteringWorkspace._handle_shell_command(page, ShellCommand(
@@ -638,23 +700,234 @@ def test_catalog_activation_routes_are_gui_thread_zero_io(monkeypatch) -> None:
 
     assert calls == [
         ("select", "/data/subdir", {"is_directory": True}),
-        ("xye", ("/data/curve.xye",)),
+        (
+            "xye",
+            ("/data/curve.xye", "/data/second.xye"),
+            "/data/second.xye",
+        ),
         ("tiff", "/data/image.tiff"),
         ("select", "/data/result.nxs", {"is_directory": False}),
     ]
 
 
+def test_viewer_1d_catalog_selection_emits_one_exact_batch_command() -> None:
+    from xdart.gui.tabs.scattering.browser_view import (
+        BrowserView,
+        _DIRECTORY_ROLE,
+        _USER_ROLE,
+    )
+
+    class _Artifact:
+        def __init__(self, path: str, *, selected: bool = True) -> None:
+            self.path = path
+            self.selected = selected
+
+        def data(self, role: int):
+            if role == _USER_ROLE:
+                return self.path
+            if role == _DIRECTORY_ROLE:
+                return False
+            raise AssertionError("unexpected browser role")
+
+        def isSelected(self):
+            return self.selected
+
+    commands: list[ShellCommand] = []
+    paths = ("/data/first.xye", "/data/second.csv")
+    items = tuple(_Artifact(path) for path in paths)
+    view = SimpleNamespace(
+        scans=SimpleNamespace(
+            count=lambda: len(items),
+            item=lambda index: items[index],
+            currentItem=lambda: items[0],
+        ),
+        _cancel_pending_frame_selection=lambda: None,
+        commandRequested=SimpleNamespace(emit=commands.append),
+    )
+
+    BrowserView._scan_selected(view)
+
+    assert commands == [ShellCommand(
+        ShellCommandKind.SELECT_SCAN,
+        paths[0],
+        path=("artifact",),
+        artifacts=paths,
+    )]
+
+
+def test_viewer_1d_clicked_current_seeds_single_but_overlay_keeps_all_paths(
+    tmp_path,
+) -> None:
+    from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
+
+    from xdart.gui.tabs.scattering.browser_view import BrowserView
+    from xdart.gui.tabs.scattering.shell_projection import (
+        build_browser_projection,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    first = _write_xye(tmp_path / "a.xye", [0, 1], [10, 11])
+    second = _write_xye(tmp_path / "b.xye", [0, 1], [20, 21])
+    paths = (str(first), str(second))
+    catalog = tuple(
+        BrowserCatalogEntry(path, Path(path).name, index)
+        for index, path in enumerate(paths)
+    )
+    controller = _controller()
+    intent = SimpleNamespace(processing_mode="1D Viewer")
+    page = SimpleNamespace(
+        _closing=False,
+        _closed=False,
+        _context_controller=controller,
+        _operation_slot=SimpleNamespace(
+            owned=False,
+            current_identity=None,
+            observe_stamp=lambda _stamp: None,
+        ),
+        _experiment_operation_busy=lambda: False,
+        _calibration_identity=None,
+        _mask_identity=None,
+        _reintegrate_identity=None,
+        _reintegrate_dimension=None,
+        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(
+            revision=1,
+            thaw=lambda: intent,
+        )),
+        _retire_batch_terminal_presentation=lambda: None,
+        _retain_outgoing_display=True,
+        _clear_viewer_2d_renderer=lambda **_kwargs: True,
+        _notice=lambda _message: None,
+        _refresh_shell=lambda: None,
+        _ensure_timer=lambda: None,
+        _error_notice=lambda title, error: pytest.fail(f"{title}: {error}"),
+    )
+    page._open_viewer_1d_paths = partial(
+        ScatteringWorkspace._open_viewer_1d_paths,
+        page,
+    )
+    browser = BrowserView()
+    browser.resize(640, 480)
+    browser.show()
+    browser.commandRequested.connect(partial(
+        ScatteringWorkspace._handle_shell_command,
+        page,
+    ))
+    browser.reconcile(
+        build_browser_projection(
+            contexts=(),
+            selection=None,
+            navigation=FrameNavigationProjection(),
+            browser_directory=str(tmp_path),
+            date_sorted=False,
+            auto_last=True,
+            catalog=catalog,
+            selected_artifacts=(paths[0],),
+            current_artifact=paths[0],
+            multi_artifact_selection=True,
+        ),
+        FrameNavigationProjection(),
+        plot_mode="Single",
+    )
+    app.processEvents()
+    second_row = browser.scans.visualItemRect(browser.scans.item(1)).center()
+    QtTest.QTest.mouseClick(
+        browser.scans.viewport(),
+        QtCore.Qt.MouseButton.LeftButton,
+        QtCore.Qt.KeyboardModifier.ControlModifier,
+        second_row,
+    )
+    app.processEvents()
+    _await_ready(controller)
+    single = overlay = None
+    try:
+        frames = controller.navigation.frames
+        assert controller.viewer_1d_context.paths == paths
+        assert controller.viewer_1d_context.current_path == paths[1]
+        assert controller.navigation.current is frames[1]
+        assert controller.navigation.selected == frames
+
+        single = _shell(
+            controller,
+            ScientificPreferences(plot_mode="Single"),
+            browser_catalog=catalog,
+        )
+        assert single.browser.selected_scan == paths[1]
+        assert single.browser.selected_artifacts == paths
+        assert tuple(trace.frame for trace in single.scientific.traces) == (
+            frames[1],
+        )
+
+        overlay = _shell(
+            controller,
+            ScientificPreferences(plot_mode="Overlay"),
+        )
+        assert tuple(trace.frame for trace in overlay.scientific.traces) == frames
+        assert tuple(trace.title for trace in overlay.scientific.traces) == (
+            first.name,
+            second.name,
+        )
+    finally:
+        del single, overlay
+        _close_1d(controller)
+        browser.deleteLater()
+        app.processEvents()
+
+
+def test_viewer_1d_single_collapses_membership_without_preclear(
+    monkeypatch,
+) -> None:
+    current = object()
+    calls: list[object] = []
+    controller = SimpleNamespace(
+        selection=SimpleNamespace(kind=ContextKind.VIEWER_1D),
+        navigation=SimpleNamespace(current=current),
+        select_viewer_1d=lambda frame, selected: calls.append(
+            ("select", frame, selected)
+        ) or True,
+    )
+    page = SimpleNamespace(
+        _context_controller=controller,
+        _preferences=ScientificPreferences(plot_mode="Waterfall"),
+        _retire_batch_terminal_presentation=lambda: calls.append("retire"),
+        _shell=SimpleNamespace(browser=SimpleNamespace(
+            cancel_pending_frame_selection=lambda: calls.append("cancel"),
+        )),
+        _background_owner=SimpleNamespace(projection=lambda: None),
+    )
+    monkeypatch.setattr(
+        ScatteringWorkspace,
+        "_clear_presentation_targets",
+        lambda *_args: pytest.fail("Viewer1D mode switch pre-cleared plots"),
+    )
+
+    assert ScatteringWorkspace._edit_scientific_preference(
+        page,
+        ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Single"),
+    )
+
+    assert calls == ["retire", "cancel", ("select", current, (current,))]
+    assert page._preferences.plot_mode == "Single"
+
+
 def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, tmp_path) -> None:
     calls = []
     paths = ("/opaque/first.xye", "/other/first.xye")
-    context = SimpleNamespace(paths=paths, state=SimpleNamespace(value="ready"))
+    context = SimpleNamespace(
+        paths=paths,
+        current_path=paths[1],
+        state=SimpleNamespace(value="ready"),
+    )
     controller = SimpleNamespace(viewer_1d_context=None, viewer_1d_owned=False,
         viewer_2d_owned=False, run_identity=None,
-        open_viewer_1d=lambda selected: calls.append(("open", selected)) or object())
+        open_viewer_1d=lambda selected, *, current_path=None: calls.append(
+            ("open", selected, current_path)
+        ) or object())
     intent = SimpleNamespace(processing_mode="1D Viewer", live_mode=False, run_options={})
     forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("foreign seam"))
     page = SimpleNamespace(_context_controller=controller,
         _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
+        _retire_batch_terminal_presentation=lambda: None,
+        _retain_outgoing_display=True,
         _viewer_1d_start_directory=lambda: calls.append("start") or "/viewer",
         _viewer_file_chooser=lambda start: calls.append(("choose", start)) or paths,
         _clear_viewer_1d_renderer=forbidden, _intents=SimpleNamespace(
@@ -666,15 +939,21 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     page._open_viewer_1d_paths = partial(
         _api(ScatteringWorkspace, "_open_viewer_1d_paths"), page)
     ScatteringWorkspace._run_action(page)
-    assert calls == ["start", ("choose", "/viewer"), ("open", paths), ("notice", ""), "timer"]
+    assert calls == [
+        "start",
+        ("choose", "/viewer"),
+        ("open", paths, paths[0]),
+        ("notice", ""),
+        "timer",
+    ]
     controller.viewer_1d_context = context
     controller.viewer_1d_owned = True
     page._viewer_file_chooser = forbidden
-    page._clear_viewer_1d_renderer = lambda *, paths=None, close=False: (
-        calls.append(("clear", paths, close)) or True
+    page._clear_viewer_1d_renderer = lambda *, paths=None, current_path=None, close=False: (
+        calls.append(("clear", paths, current_path, close)) or True
     )
     ScatteringWorkspace._run_action(page)
-    assert calls[-2:] == [("clear", paths, False), "timer"]
+    assert calls[-2:] == [("clear", paths, paths[1], False), "timer"]
     page._clear_viewer_1d_renderer = lambda **_: False
     ScatteringWorkspace._edit_run_strip(page, ShellCommandKind.SET_PROCESSING_MODE, "Int 2D")
     assert intent.processing_mode == "1D Viewer" and calls[-1] == ("notice", "1D Viewer cleanup remains pending")
@@ -683,12 +962,17 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     dispatch = SimpleNamespace(_closing=False, _closed=False,
         _context_controller=SimpleNamespace(viewer_1d_owned=True, viewer_2d_owned=False, selection=None),
         _operation_slot=SimpleNamespace(owned=False, current_identity=None, observe_stamp=lambda _stamp: None),
+        _experiment_operation_busy=lambda: False,
+        _notice=lambda _message: None,
+        _refresh_shell=lambda: None,
         _calibration_identity=None, _mask_identity=None,
         _reintegrate_identity=None, _reintegrate_dimension=None,
         _clear_viewer_1d_renderer=lambda *, close: ordered.append(("clear", close)) or outcomes.pop(0),
         _clear_viewer_2d_renderer=forbidden,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(revision=1, thaw=lambda: intent)),
-        _open_viewer_1d_paths=lambda value: ordered.append(("open-1d", value)),
+        _open_viewer_1d_paths=lambda value, *, current_path=None: ordered.append(
+            ("open-1d", value, current_path)
+        ),
         _open_viewer_2d_path=lambda value: ordered.append(("open-2d", value)),
         _select_scan=lambda value, **kwargs: ordered.append(
             ("select", value, kwargs)
@@ -701,7 +985,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
         ShellCommandKind.SELECT_SCAN, "scan.xye", path=("artifact",),
     ))
-    assert ordered[-1] == ("open-1d", ("scan.xye",))
+    assert ordered[-1] == ("open-1d", ("scan.xye",), "scan.xye")
     intent.processing_mode = "2D Viewer"
     ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
         ShellCommandKind.SELECT_SCAN, "image.tif", path=("artifact",),
@@ -724,15 +1008,31 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     dispatch.__dict__.update(_poll_admission=lambda: False, _run_executor=SimpleNamespace(drain_events=lambda: (
         StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)), _lifecycle=SimpleNamespace(
         active_run_identity=identity, attempt_run_identity=None), _refresh_shell=forbidden,
+        _pending_reintegrate_reload=None,
+        _settle_browse_1d_before_drain=lambda: True,
+        _terminal_browse_handoff=None,
+        _terminal_browse_presentation=None,
+        _terminal_browse_perf=None,
+        _dispatch_deferred_metadata=lambda: page_module._OperationRefresh.NONE,
+        _batch_terminal_ready_to_paint=lambda: None,
+        _show_queued_authored_asset_confirmation=lambda: None,
+        _active_batch_mode=False,
         _polling_needed=lambda: True, _run_timer=SimpleNamespace(stop=forbidden),
         _scientific_repaint_pending=False,
         _retain_outgoing_display=False, _waterfall_candidate_count=0,
         _shell=SimpleNamespace(scientific=SimpleNamespace(
             trace_row_count=0, bottom_waterfall_active=False)))
+    monkeypatch.setattr(
+        ScatteringWorkspace,
+        "_advance_presentation_target",
+        lambda _self: False,
+    )
     dispatch._clear_presentation_targets = lambda: None; ScatteringWorkspace._drain_executor(dispatch)
     preferences = ScientificPreferences(plot_mode="Overlay")
     owner = SimpleNamespace(
         _preferences=preferences,
+        _retire_batch_terminal_presentation=lambda: None,
+        _retain_outgoing_display=True,
         _context_controller=SimpleNamespace(
             selection=SimpleNamespace(kind=ContextKind.VIEWER_1D),
             navigation=SimpleNamespace(current=object()),

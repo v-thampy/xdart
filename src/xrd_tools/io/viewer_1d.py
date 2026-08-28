@@ -122,18 +122,21 @@ def _descriptor_limit_and_count():
 
 def _state(fd, path):
     opened, named = os.fstat(fd), os.stat(path)
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise ValueError("viewer source changed")
     return (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
             opened.st_ctime_ns, getattr(opened, "st_gen", None), named.st_dev,
             named.st_ino, named.st_size, named.st_mtime_ns, named.st_ctime_ns,
             getattr(named, "st_gen", None))
 
 
-def _digest(stream):
+def _digest(stream, encoded_limit):
     stream.seek(0); digest = hashlib.sha256(); total = 0
-    while True:
-        block = stream.read(1024 * 1024)
-        if not block: break
+    while total < encoded_limit:
+        block = stream.read(min(1024 * 1024, encoded_limit - total))
+        if not block: raise ValueError("viewer source changed")
         digest.update(block); total += len(block)
+    if stream.read(1): raise ValueError("viewer source changed")
     return digest.digest(), total
 
 
@@ -181,12 +184,17 @@ def _dtype_code(dtype):
     except KeyError: raise ValueError("NPY dtype") from None
 
 
-def _scan_text(stream, csv):
-    stream.seek(0); count = columns = 0; labels = ("x", "", "intensity"); header = False
+def _scan_text_and_digest(stream, csv, encoded_limit):
+    """Validate one text source while producing its pass-one identity."""
+
+    stream.seek(0); count = columns = encoded = 0
+    digest = hashlib.sha256()
+    labels = ("x", "", "intensity"); header = False
     first = True
-    while True:
-        raw = stream.readline(4098)
-        if not raw: break
+    while encoded < encoded_limit:
+        raw = stream.readline(min(4098, encoded_limit - encoded))
+        if not raw: raise ValueError("viewer source changed")
+        digest.update(raw); encoded += len(raw)
         if len(raw) > 4096 or b"\x00" in raw: raise ValueError("text line bound")
         if first and raw.startswith(b"\xef\xbb\xbf"): raw = raw[3:]
         first = False
@@ -209,8 +217,9 @@ def _scan_text(stream, csv):
             raise ValueError("negative sigma")
         count += 1
         if count > 1_000_000: raise ValueError("point count")
+    if stream.read(1): raise ValueError("viewer source changed")
     if count < 1: raise ValueError("empty source")
-    return count, columns, labels
+    return count, columns, labels, digest.digest(), encoded
 
 
 def _record(index, format_code, schema, columns, dtypes, sigma, synthesized,
@@ -322,16 +331,21 @@ def _inspect_npz(stream, index, path, digest, encoded):
 
 
 def _inspect(stream, index, path, state, suffix, *, retain_roles=False):
-    digest, encoded = _digest(stream)
-    if encoded > 256 * 1024**2: raise ValueError("encoded size")
     code = _FORMATS.get(suffix)
     if code is None: raise ValueError("viewer suffix")
+    encoded_limit = state[2]
+    if suffix in {".xye", ".csv"}:
+        points, columns, labels, digest, encoded = _scan_text_and_digest(
+            stream, suffix == ".csv", encoded_limit
+        )
+    else:
+        digest, encoded = _digest(stream, encoded_limit)
+    if encoded > 256 * 1024**2: raise ValueError("encoded size")
     if suffix == ".npz":
         manifest, schema, roles = _inspect_npz(stream, index, path, digest, encoded)
         return _Fact(stream, str(path), state, manifest, schema,
                      roles if retain_roles else None)
     if suffix in {".xye", ".csv"}:
-        points, columns, labels = _scan_text(stream, suffix == ".csv")
         dtypes, synthesized = (), False
     else:
         stream.seek(0); dtype, shape, _, payload = _npy_header(stream)
@@ -355,35 +369,88 @@ def _columns(array):
             None if value.shape[1] == 2 else np.array(value[:, 2], dtype=float, copy=True))
 
 
-def _read_text(stream, csv, points):
-    stream.seek(0); columns = None; result = None; row = 0
-    first = True
-    while True:
-        raw = stream.readline(4098)
-        if not raw: break
+def _read_text(stream, csv, points, encoded_limit):
+    stream.seek(0); columns = None; result = None; row = encoded = 0
+    digest = hashlib.sha256()
+    first, header = True, False
+    while encoded < encoded_limit:
+        raw = stream.readline(min(4098, encoded_limit - encoded))
+        if not raw: raise ValueError("viewer source changed")
+        digest.update(raw); encoded += len(raw)
+        if len(raw) > 4096 or b"\x00" in raw: raise ValueError("text line bound")
         if first and raw.startswith(b"\xef\xbb\xbf"): raw = raw[3:]
-        first = False; line = raw.decode("utf8").strip()
+        first = False
+        try: line = raw.decode("utf8").strip()
+        except UnicodeDecodeError as error: raise ValueError("text encoding") from error
         if not line or line.lstrip().startswith("#"): continue
+        if '"' in line or "'" in line or "\\" in line: raise ValueError("text quoting")
         cells = [value.strip() for value in line.split(",")] if csv else line.split()
+        if len(cells) not in (2, 3) or any(not value for value in cells):
+            raise ValueError("text columns")
         try: values = tuple(float(value) for value in cells)
-        except ValueError: continue
+        except ValueError:
+            if not csv or row or header: raise ValueError("CSV header")
+            if any(len(value.encode("utf8")) > 128 for value in cells):
+                raise ValueError("CSV label")
+            header = True
+            continue
         if result is None:
             columns = len(values)
             result = tuple(np.empty(points, dtype=float) for _ in range(columns))
+        if (len(values) != columns or not np.isfinite(values[0])
+                or any(np.isinf(value) for value in values[1:])):
+            raise ValueError("text numeric values")
+        if len(values) == 3 and np.isfinite(values[2]) and values[2] < 0:
+            raise ValueError("negative sigma")
+        if row >= points: raise ValueError("text point count changed")
         for target, value in zip(result, values): target[row] = value
         row += 1
+    if stream.read(1): raise ValueError("viewer source changed")
     if result is None or row != points: raise ValueError("text point count changed")
-    return result[0], result[1], None if columns == 2 else result[2]
+    return (
+        (result[0], result[1], None if columns == 2 else result[2]),
+        digest.digest(),
+        encoded,
+    )
 
 
 def _read_fact(fact):
     stream, manifest = fact.stream, fact.manifest
+    if manifest.format in {"xye", "csv"}:
+        if _state(stream.fileno(), fact.path) != fact.state:
+            raise ValueError("viewer source changed")
+        values, decoded_digest, decoded_size = _read_text(
+            stream,
+            manifest.format == "csv",
+            manifest.points,
+            int.from_bytes(manifest.scalar_record[32:40], "big"),
+        )
+        if (
+            decoded_digest != manifest.source_sha256
+            or decoded_size != int.from_bytes(
+                manifest.scalar_record[32:40], "big"
+            )
+            or _state(stream.fileno(), fact.path) != fact.state
+        ):
+            raise ValueError("viewer source changed")
+        final_digest, final_size = _digest(stream, decoded_size)
+        if (
+            final_digest != manifest.source_sha256
+            or final_size != decoded_size
+            or _state(stream.fileno(), fact.path) != fact.state
+        ):
+            raise ValueError("viewer source changed")
+        x, y, sigma = values
+        if (len(x) != manifest.points or not np.all(np.isfinite(x))
+                or np.any(np.isinf(y)) or sigma is not None and
+                (np.any(np.isinf(sigma)) or np.any(sigma[np.isfinite(sigma)] < 0))):
+            raise ValueError("viewer numeric values changed")
+        return values
     recertified = _inspect(stream, int.from_bytes(manifest.scalar_record[8:10], "big"),
                            fact.path, fact.state, "." + manifest.format, retain_roles=True)
     if recertified.manifest != manifest or _state(stream.fileno(), fact.path) != fact.state:
         raise ValueError("viewer source changed")
-    if manifest.format in {"xye", "csv"}: values = _read_text(stream, manifest.format == "csv", manifest.points)
-    elif manifest.format == "npy":
+    if manifest.format == "npy":
         stream.seek(0); dtype, shape, _, _ = _npy_header(stream)
         mapped = np.memmap(stream, dtype=dtype, mode="r", offset=stream.tell(), shape=shape)
         try: values = _columns(mapped)

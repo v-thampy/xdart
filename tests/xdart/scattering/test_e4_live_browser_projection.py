@@ -7,7 +7,7 @@ from threading import Event, Thread
 import time
 from types import SimpleNamespace
 
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 import pytest
 
 from xdart.gui.tabs.scattering.adapters.source import (
@@ -838,7 +838,23 @@ def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
     commands = []
     browser.commandRequested.connect(commands.append)
     try:
-        browser.reconcile(projected, navigation, plot_mode="Single")
+        viewer_projected = replace(
+            projected,
+            selected_scan="/out/result.nxs",
+            selected_artifacts=("/out/result.nxs",),
+            multi_artifact_selection=True,
+        )
+        browser.reconcile(viewer_projected, navigation, plot_mode="Single")
+        assert browser.scans.selectionMode() == (
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        assert tuple(
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for item in browser.scans.selectedItems()
+        ) == ("/out/result.nxs",)
+        assert browser.scans.currentItem().data(
+            QtCore.Qt.ItemDataRole.UserRole
+        ) == "/out/result.nxs"
         for row, expected in enumerate(("directory", "artifact")):
             blocker = QtCore.QSignalBlocker(browser.scans)
             browser.scans.setCurrentRow(row)
@@ -848,7 +864,139 @@ def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
                 ShellCommandKind.SELECT_SCAN,
                 projected.scans[row].identifier,
                 path=(expected,),
+                artifacts=(
+                    ()
+                    if expected == "directory"
+                    else (projected.scans[row].identifier,)
+                ),
             )
+    finally:
+        browser.deleteLater()
+        app.processEvents()
+
+
+def test_viewer_1d_artifact_modifier_gestures_emit_clicked_current_and_catalog_order(
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    paths = tuple(f"/out/{name}.xye" for name in ("a", "b", "c"))
+    projected = build_browser_projection(
+        contexts=(),
+        selection=None,
+        navigation=FrameNavigationProjection(),
+        browser_directory="/out",
+        date_sorted=False,
+        auto_last=True,
+        catalog=tuple(
+            BrowserCatalogEntry(path, Path(path).name, index)
+            for index, path in enumerate(paths)
+        ),
+        selected_artifacts=(paths[0],),
+        current_artifact=paths[0],
+        multi_artifact_selection=True,
+    )
+    browser = BrowserView()
+    browser.resize(640, 480)
+    browser.show()
+    commands = []
+    browser.commandRequested.connect(commands.append)
+    try:
+        browser.reconcile(projected, FrameNavigationProjection(), plot_mode="Single")
+        app.processEvents()
+
+        third = browser.scans.visualItemRect(browser.scans.item(2)).center()
+        QtTest.QTest.mouseClick(
+            browser.scans.viewport(),
+            QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.ControlModifier,
+            third,
+        )
+        app.processEvents()
+        assert commands[-1] == ShellCommand(
+            ShellCommandKind.SELECT_SCAN,
+            paths[2],
+            path=("artifact",),
+            artifacts=(paths[0], paths[2]),
+        )
+
+        browser.reconcile(projected, FrameNavigationProjection(), plot_mode="Single")
+        commands.clear()
+        app.processEvents()
+        QtTest.QTest.mouseClick(
+            browser.scans.viewport(),
+            QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.ShiftModifier,
+            third,
+        )
+        app.processEvents()
+        assert commands[-1] == ShellCommand(
+            ShellCommandKind.SELECT_SCAN,
+            paths[2],
+            path=("artifact",),
+            artifacts=paths,
+        )
+
+        projected_all = replace(
+            projected,
+            selected_scan=paths[2],
+            selected_artifacts=paths,
+        )
+        browser.reconcile(
+            projected_all, FrameNavigationProjection(), plot_mode="Single"
+        )
+        commands.clear()
+        middle = browser.scans.visualItemRect(browser.scans.item(1)).center()
+        QtTest.QTest.mouseClick(
+            browser.scans.viewport(),
+            QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.ControlModifier,
+            middle,
+        )
+        app.processEvents()
+        assert commands[-1] == ShellCommand(
+            ShellCommandKind.SELECT_SCAN,
+            paths[2],
+            path=("artifact",),
+            artifacts=(paths[0], paths[2]),
+        )
+
+        projected_pair = replace(
+            projected,
+            selected_scan=paths[2],
+            selected_artifacts=(paths[0], paths[2]),
+        )
+        browser.reconcile(
+            projected_pair, FrameNavigationProjection(), plot_mode="Single"
+        )
+        commands.clear()
+        QtTest.QTest.mouseClick(
+            browser.scans.viewport(),
+            QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.ControlModifier,
+            third,
+        )
+        app.processEvents()
+        assert commands[-1] == ShellCommand(
+            ShellCommandKind.SELECT_SCAN,
+            paths[0],
+            path=("artifact",),
+            artifacts=(paths[0],),
+        )
+
+        browser.reconcile(projected, FrameNavigationProjection(), plot_mode="Single")
+        commands.clear()
+        first = browser.scans.visualItemRect(browser.scans.item(0)).center()
+        QtTest.QTest.mouseClick(
+            browser.scans.viewport(),
+            QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.ControlModifier,
+            first,
+        )
+        app.processEvents()
+        assert commands == []
+        assert tuple(
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for item in browser.scans.selectedItems()
+        ) == (paths[0],)
     finally:
         browser.deleteLater()
         app.processEvents()

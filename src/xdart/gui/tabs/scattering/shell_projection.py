@@ -75,12 +75,25 @@ def build_browser_projection(
     auto_last: bool,
     catalog: tuple[BrowserCatalogEntry, ...] = (),
     transient_frame: DisplayFrameKey | None = None,
+    selected_artifacts: tuple[str, ...] = (),
+    current_artifact: str = "",
+    multi_artifact_selection: bool = False,
+    show_all_frames: bool = False,
 ) -> BrowserProjection:
     if (
         transient_frame is not None
         and type(transient_frame) is not DisplayFrameKey
     ):
         raise TypeError("transient browser frame must be exact")
+    if (
+        type(selected_artifacts) is not tuple
+        or not all(type(item) is str and item for item in selected_artifacts)
+        or len(set(selected_artifacts)) != len(selected_artifacts)
+        or type(current_artifact) is not str
+        or type(multi_artifact_selection) is not bool
+        or type(show_all_frames) is not bool
+    ):
+        raise TypeError("browser artifact selection must be exact")
     transient_owner = (
         transient_frame
         if transient_frame is not None
@@ -143,13 +156,17 @@ def build_browser_projection(
     # an artifact still exists.  Only the exact latest in-flight artifact may
     # lend a transient row while NexusSink is publishing its hidden temp file.
     # Earlier artifacts from the same directory run stay catalog-owned.
-    selected_scan = ""
-    if (
+    selected_scan = (
+        current_artifact
+        if current_artifact in seen_artifacts
+        else ""
+    )
+    if (not selected_scan and
         navigation.current is not None
         and navigation.current.artifact in seen_artifacts
     ):
         selected_scan = navigation.current.artifact
-    elif (
+    elif (not selected_scan and
         selection is not None
         and any(
             scan.identifier == selection.context_token
@@ -157,10 +174,14 @@ def build_browser_projection(
         )
     ):
         selected_scan = selection.context_token
-    frames = tuple(
-        frame
-        for frame in navigation.frames
-        if frame.artifact == selected_scan
+    frames = (
+        navigation.frames
+        if show_all_frames
+        else tuple(
+            frame
+            for frame in navigation.frames
+            if frame.artifact == selected_scan
+        )
     )
     return BrowserProjection(
         directory=browser_directory,
@@ -169,6 +190,8 @@ def build_browser_projection(
         date_sorted=date_sorted,
         auto_last=auto_last,
         frames=frames,
+        selected_artifacts=selected_artifacts,
+        multi_artifact_selection=multi_artifact_selection,
     )
 
 

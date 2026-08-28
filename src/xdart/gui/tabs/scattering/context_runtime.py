@@ -302,7 +302,16 @@ class _ContextRuntime:
         frames = tuple(DisplayFrameKey(
             identity, "viewer-1d", "viewer-1d", index, index + 1)
             for index in range(count))
-        navigation = FrameNavigationProjection(frames, frames[0], frames)
+        current_index = (
+            0
+            if context.current_path is None
+            else context.paths.index(context.current_path)
+        )
+        navigation = FrameNavigationProjection(
+            frames,
+            frames[current_index],
+            frames,
+        )
         return navigation, {id(frame): frame for frame in frames}
     def replace_viewer_1d_context(self, context: Viewer1DContext) -> bool:
         current = self._viewer_1d
@@ -310,12 +319,26 @@ class _ContextRuntime:
                 or context.context_token != current.context_token
                 or context.commit_gate is not current.commit_gate): return False
         self._viewer_1d = context; return True
-    def select_viewer_1d(self, frame: DisplayFrameKey) -> bool:
+    def select_viewer_1d(
+        self,
+        frame: DisplayFrameKey,
+        selected: tuple[DisplayFrameKey, ...],
+    ) -> bool:
         if (type(frame) is not DisplayFrameKey
                 or self._viewer_1d_frame_by_id.get(id(frame)) is not frame): return False
+        if (
+            type(selected) is not tuple
+            or len({id(item) for item in selected}) != len(selected)
+            or any(
+                type(item) is not DisplayFrameKey
+                or self._viewer_1d_frame_by_id.get(id(item)) is not item
+                for item in selected
+            )
+        ):
+            return False
         navigation = self._viewer_1d_navigation
         self._set_viewer_1d_navigation(FrameNavigationProjection(
-            navigation.frames, frame, navigation.frames))
+            navigation.frames, frame, selected))
         self._reset_trace_projection(); return True
     def clear_viewer_1d(self) -> None:
         if (self._selection is not None
@@ -553,7 +576,10 @@ class _ContextRuntime:
             return False
         selection = self._selection
         if selection is not None and selection.kind is ContextKind.VIEWER_1D:
-            return self.select_viewer_1d(current)
+            return bool(
+                current is not None
+                and self.select_viewer_1d(current, selected)
+            )
         if selection is not None and selection.kind is ContextKind.VIEWER_2D:
             return False
         elif selection is not None and selection.kind is ContextKind.BROWSE:

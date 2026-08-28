@@ -628,16 +628,67 @@ def test_r12_post_decode_digest_rejects_stat_invisible_change(tmp_path, monkeypa
     import xrd_tools.io.viewer_1d as reader
     path = tmp_path / "stable.xye"
     path.write_text("0 1\n1 2\n")
-    real_inspect, inspections = reader._inspect, []
-    def inspect(*args, **kwargs):
-        result = real_inspect(*args, **kwargs); inspections.append(result)
-        if len(inspections) == 2: path.write_text("0 9\n1 8\n")
+    real_read, reads = reader._read_text, []
+    def read(*args, **kwargs):
+        result = real_read(*args, **kwargs); reads.append(result)
+        path.write_text("0 9\n1 8\n")
         return result
-    monkeypatch.setattr(reader, "_inspect", inspect)
-    monkeypatch.setattr(reader, "_state", lambda *args: ("stable",))
+    monkeypatch.setattr(reader, "_read_text", read)
+    real_state, stable = reader._state, []
+    def state(*args):
+        if not stable:
+            stable.append(real_state(*args))
+        return stable[0]
+    monkeypatch.setattr(reader, "_state", state)
     _, transport, port, completion = _load((path,))
     assert completion.outcome is HydrationOutcome.FAILED and port.holder is None
-    assert len(inspections) >= 3 and transport.retire(join_timeout=1)
+    assert len(reads) == 1 and transport.retire(join_timeout=1)
+
+
+def test_text_sources_use_three_bounded_content_passes(tmp_path, monkeypatch):
+    import xrd_tools.io.viewer_1d as reader
+    path = tmp_path / "three-pass.xye"
+    path.write_text("0 1\n1 2\n")
+    calls = []
+    for name in ("_scan_text_and_digest", "_read_text", "_digest"):
+        operation = getattr(reader, name)
+        monkeypatch.setattr(reader, name, lambda *args, _name=name,
+                            _operation=operation, **kwargs:
+                            (calls.append(_name), _operation(*args, **kwargs))[1])
+    _, transport, port, completion = _load((path,))
+    assert completion.outcome is HydrationOutcome.HYDRATED
+    assert calls == ["_scan_text_and_digest", "_read_text", "_digest"]
+    assert port.holder.release("done") and transport.retire(join_timeout=1)
+
+
+@pytest.mark.parametrize("operation", ("scan", "decode", "digest"))
+def test_text_passes_refuse_bytes_beyond_certified_size(operation):
+    import xrd_tools.io.viewer_1d as reader
+
+    certified = b"0 1\n1 2\n"
+    stream = io.BytesIO(certified + b"# concurrently appended\n")
+    with pytest.raises(ValueError, match="viewer source changed"):
+        if operation == "scan":
+            reader._scan_text_and_digest(stream, False, len(certified))
+        elif operation == "decode":
+            reader._read_text(stream, False, 2, len(certified))
+        else:
+            reader._digest(stream, len(certified))
+
+
+def test_opened_descriptor_must_still_name_the_selected_inode(tmp_path):
+    import xrd_tools.io.viewer_1d as reader
+
+    opened = tmp_path / "opened.xye"
+    named = tmp_path / "named.xye"
+    opened.write_text("0 1\n")
+    named.write_text("0 2\n")
+    descriptor = os.open(opened, os.O_RDONLY)
+    try:
+        with pytest.raises(ValueError, match="viewer source changed"):
+            reader._state(descriptor, named)
+    finally:
+        os.close(descriptor)
 
 def test_r12_released_disposal_has_no_graph_alias(tmp_path, monkeypatch):
     import xrd_tools.io.viewer_1d as reader

@@ -2079,9 +2079,14 @@ class ScientificView(QtWidgets.QFrame):
         if (self._processing_mode == "1D Viewer"
                 and frame.source_scan == frame.artifact == "viewer-1d"
                 and any(frame is item for item in self._frame_keys)):
+            membership = (
+                (frame,)
+                if self._single_mode
+                else self._selected_keys or (frame,)
+            )
             self.commandRequested.emit(ShellCommand(
                 ShellCommandKind.SELECT_FRAME, frame=frame,
-                frames=self._selected_keys))
+                frames=membership))
             return
         if (self._processing_mode == "2D Viewer"
                 and frame.source_scan == frame.artifact == "viewer-2d"

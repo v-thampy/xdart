@@ -239,6 +239,7 @@ class BrowserView(QtWidgets.QFrame):
         self.setObjectName("e3BrowserView")
         self.setMinimumWidth(255)
         self._scans = ()
+        self._current_artifact = ""
         self._selected_frames: tuple[DisplayFrameKey, ...] = ()
         self._trace_frames: tuple[DisplayFrameKey, ...] = ()
         self._plot_mode = "Single"
@@ -537,6 +538,13 @@ class BrowserView(QtWidgets.QFrame):
             )
         ]
         self.directory_label.set_path(state.directory)
+        selection_mode = (
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+            if state.multi_artifact_selection
+            else QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        if self.scans.selectionMode() != selection_mode:
+            self.scans.setSelectionMode(selection_mode)
         if state.scans != self._scans:
             self.scans.clear()
             for scan in state.scans:
@@ -546,9 +554,22 @@ class BrowserView(QtWidgets.QFrame):
                 item.setToolTip(scan.detail)
                 self.scans.addItem(item)
             self._scans = state.scans
+        selected_artifacts = (
+            state.selected_artifacts
+            or (() if not state.selected_scan else (state.selected_scan,))
+        )
+        current_artifact_item = None
         for index in range(self.scans.count()):
             item = self.scans.item(index)
-            item.setSelected(item.data(_USER_ROLE) == state.selected_scan)
+            item.setSelected(item.data(_USER_ROLE) in selected_artifacts)
+            if item.data(_USER_ROLE) == state.selected_scan:
+                current_artifact_item = item
+        if current_artifact_item is not None:
+            self.scans.setCurrentItem(
+                current_artifact_item,
+                QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+        self._current_artifact = state.selected_scan
 
         self._plot_mode = plot_mode
         frames = state.frames
@@ -625,18 +646,74 @@ class BrowserView(QtWidgets.QFrame):
         del blockers
 
     def _scan_selected(self) -> None:
-        items = self.scans.selectedItems()
-        if items:
-            self._cancel_pending_frame_selection()
+        items = tuple(
+            self.scans.item(index)
+            for index in range(self.scans.count())
+            if self.scans.item(index).isSelected()
+        )
+        if not items:
+            retained = next(
+                (
+                    self.scans.item(index)
+                    for index in range(self.scans.count())
+                    if self.scans.item(index).data(_USER_ROLE)
+                    == self._current_artifact
+                ),
+                None,
+            )
+            if retained is not None:
+                blocker = QtCore.QSignalBlocker(self.scans)
+                retained.setSelected(True)
+                self.scans.setCurrentItem(
+                    retained,
+                    QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
+                del blocker
+            return
+        self._cancel_pending_frame_selection()
+        directories = tuple(
+            item for item in items if item.data(_DIRECTORY_ROLE)
+        )
+        if directories:
+            if len(items) != 1:
+                return
             self._emit(
                 ShellCommandKind.SELECT_SCAN,
-                items[0].data(_USER_ROLE),
-                path=(
-                    "directory"
-                    if items[0].data(_DIRECTORY_ROLE)
-                    else "artifact",
-                ),
+                directories[0].data(_USER_ROLE),
+                path=("directory",),
             )
+            return
+        artifacts = tuple(
+            item.data(_USER_ROLE)
+            for item in items
+            if type(item.data(_USER_ROLE)) is str
+            and item.data(_USER_ROLE)
+        )
+        if not artifacts:
+            return
+        current_item = self.scans.currentItem()
+        current_row = self.scans.currentRow()
+        current_artifact = (
+            current_item.data(_USER_ROLE)
+            if current_item in items
+            and type(current_item.data(_USER_ROLE)) is str
+            and current_item.data(_USER_ROLE)
+            else self._current_artifact
+            if self._current_artifact in artifacts
+            else min(
+                items,
+                key=lambda item: (
+                    abs(self.scans.row(item) - current_row),
+                    self.scans.row(item),
+                ),
+            ).data(_USER_ROLE)
+        )
+        self.commandRequested.emit(ShellCommand(
+            ShellCommandKind.SELECT_SCAN,
+            current_artifact,
+            path=("artifact",),
+            artifacts=artifacts,
+        ))
 
     def _frames_selected(
         self,

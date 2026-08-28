@@ -66,7 +66,10 @@ from .state_machine import RunPhase
 from .shell_projection import ScientificPreferences
 from .shell_values import FrameNavigationProjection
 from .hydration_transport import HydrationTransport
-_Viewer1DIntent = namedtuple("_Viewer1DIntent", "paths policy generation provider")
+_Viewer1DIntent = namedtuple(
+    "_Viewer1DIntent",
+    "paths current_path policy generation provider",
+)
 class _OneDViewerOwner:
     __slots__ = ("controller", "owner_identity", "owner_request_claim", "context", "policy",
         "provider", "request", "request_token", "holder", "batch_identity", "loading", "diagnostic",
@@ -886,8 +889,14 @@ class ContextController:
             self._projection, event, self._browse_hydration_owner
         )
 
-    def open_viewer_1d(self, paths: tuple[str, ...]):
+    def open_viewer_1d(
+        self,
+        paths: tuple[str, ...],
+        *,
+        current_path: str | None = None,
+    ):
         paths = self._viewer_1d_paths(paths)
+        current_path = self._viewer_1d_current_path(paths, current_path)
         if (self._closed or self._close is not None or not self._viewer_2d_admissible()):
             raise RuntimeError("1D Viewer is not allowed in the current lifecycle")
         if self._viewer_2d.context is not None or self._viewer_1d.context is None and self.viewer_2d_owned:
@@ -907,7 +916,8 @@ class ContextController:
                 "1D Viewer renderer clear is required")
             if owner.clear_request is not None:
                 generation = self._runtime._display_generation + 1
-                owner.latest_intent = _Viewer1DIntent(paths, owner.policy, generation, owner.provider)
+                owner.latest_intent = _Viewer1DIntent(
+                    paths, current_path, owner.policy, generation, owner.provider)
                 self._runtime._display_generation = generation
                 selection = self._runtime._selection
                 if selection is not None and selection.kind is ContextKind.VIEWER_1D: self._runtime._selection = replace(
@@ -923,9 +933,17 @@ class ContextController:
             try:
                 gate = Viewer1DCommitGate() if context is None else context.commit_gate
                 if context is not None: reserved = gate.reserve_advance()
-                candidate = Viewer1DContext(new_context_token(ContextKind.VIEWER_1D) if context is None
-                    else context.context_token, generation, paths, gate, Viewer1DState.CLEANUP_PENDING
-                    if owner.cleanup_notice is not None else Viewer1DState.LOADING)
+                candidate = Viewer1DContext(
+                    new_context_token(ContextKind.VIEWER_1D)
+                    if context is None else context.context_token,
+                    generation,
+                    paths,
+                    gate,
+                    Viewer1DState.CLEANUP_PENDING
+                    if owner.cleanup_notice is not None
+                    else Viewer1DState.LOADING,
+                    current_path,
+                )
                 begin = self._runtime.prepare_viewer_1d_begin(candidate)
                 if reserved is not None and gate.advance() != reserved: raise RuntimeError("1D Viewer request fence failed")
                 request = self._viewer_1d_request(candidate, policy, provider)
@@ -949,16 +967,30 @@ class ContextController:
             runtime._viewer_1d_navigation, runtime._viewer_1d_frame_by_id, runtime._selection = begin
             runtime._pending_replacement = None; runtime._reset_trace_projection()
         return self._viewer_1d_submit(request)
-    def select_viewer_1d_frame(self, frame: DisplayFrameKey) -> bool:
+    def select_viewer_1d(
+        self,
+        frame: DisplayFrameKey,
+        selected: tuple[DisplayFrameKey, ...],
+    ) -> bool:
         with self._viewer_2d_lock:
             owner, selection = self._viewer_1d, self._runtime.selection
             if (owner.context is None or owner.context.state is not Viewer1DState.READY or owner.holder is None
                     or selection is None or selection.kind is not ContextKind.VIEWER_1D
                     or selection.context_token != owner.context.context_token
                     or self._runtime._viewer_1d is not owner.context): return False
-            return self._runtime.select_viewer_1d(frame)
-    def begin_viewer_1d_renderer_clear(self, paths=None):
+            return self._runtime.select_viewer_1d(frame, selected)
+    def begin_viewer_1d_renderer_clear(
+        self,
+        paths=None,
+        *,
+        current_path: str | None = None,
+    ):
         paths = None if paths is None else self._viewer_1d_paths(paths)
+        if paths is None:
+            if current_path is not None:
+                return None
+        else:
+            current_path = self._viewer_1d_current_path(paths, current_path)
         with self._viewer_2d_lock:
             owner, context = self._viewer_1d, self._viewer_1d.context
             if owner.clear_request is not None: return owner.clear_request
@@ -975,7 +1007,17 @@ class ContextController:
                 failed = replace(context, state=Viewer1DState.EMPTY)
                 candidate_selection = replace(selection, owner=replace(selection.owner, epoch=predicted),
                     display_generation=generation)
-                intent = None if paths is None else _Viewer1DIntent(paths, owner.policy, generation, owner.provider)
+                intent = (
+                    None
+                    if paths is None
+                    else _Viewer1DIntent(
+                        paths,
+                        current_path,
+                        owner.policy,
+                        generation,
+                        owner.provider,
+                    )
+                )
             except Exception: return None
             try: epoch = context.commit_gate.reserve_advance()
             except Exception: return None
@@ -1051,9 +1093,15 @@ class ContextController:
         return True
     def _viewer_1d_paths(self, paths):
         if (type(paths) is not tuple or not 1 <= len(paths) <= 256 or any(
-                type(path) is not str or not path or len(os.fsencode(path)) > 4096 for path in paths)):
+                type(path) is not str or not path or len(os.fsencode(path)) > 4096
+                for path in paths) or len(set(paths)) != len(paths)):
             raise RuntimeError("1D Viewer paths are invalid")
         return paths
+    def _viewer_1d_current_path(self, paths, current_path):
+        current_path = paths[0] if current_path is None else current_path
+        if type(current_path) is not str or current_path not in paths:
+            raise RuntimeError("1D Viewer current path is invalid")
+        return current_path
     def _viewer_1d_provider(self, *, install=True):
         acquisition = self._runtime.acquisition_context
         if acquisition is not None:
@@ -1108,7 +1156,14 @@ class ContextController:
                 and selection.context_token == context.context_token and selection.owner.epoch == reserved
                 and selection.display_generation == intent.generation)
             try:
-                candidate = Viewer1DContext(context.context_token, intent.generation, intent.paths, context.commit_gate, Viewer1DState.LOADING)
+                candidate = Viewer1DContext(
+                    context.context_token,
+                    intent.generation,
+                    intent.paths,
+                    context.commit_gate,
+                    Viewer1DState.LOADING,
+                    intent.current_path,
+                )
                 begin = runtime.prepare_viewer_1d_begin(candidate)
                 if valid and context.commit_gate.advance() == reserved: request = self._viewer_1d_request(
                     candidate, intent.policy, intent.provider)

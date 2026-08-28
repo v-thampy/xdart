@@ -2938,7 +2938,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             mode = self._intents.snapshot().thaw().processing_mode
             tool = tool_from_mode_text(mode)
             if tool is Tool.XYE_VIEWER and type(value) is str and value:
-                self._open_viewer_1d_paths((value,))
+                selected = command.artifacts or (value,)
+                self._open_viewer_1d_paths(selected, current_path=value)
                 return
             if tool is Tool.IMAGE_VIEWER and type(value) is str and value:
                 self._open_viewer_2d_path(value)
@@ -2958,7 +2959,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         }:
             self._retire_batch_terminal_presentation()
             self._retain_outgoing_display = False
-            ScatteringWorkspace._clear_presentation_targets(self)
+            selection = self._context_controller.selection
+            if (
+                selection is None
+                or selection.kind is not ContextKind.VIEWER_1D
+            ):
+                ScatteringWorkspace._clear_presentation_targets(self)
             if kind is not ShellCommandKind.SELECT_BROWSER_FRAMES:
                 self._shell.browser.cancel_pending_frame_selection()
             self._select_frames(command)
@@ -4046,7 +4052,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if frame is None or not any(
                     frame is item for item in self._context_controller.navigation.frames):
                 return
-            if self._context_controller.select_viewer_1d_frame(frame):
+            if command.kind is ShellCommandKind.SELECT_BROWSER_FRAMES:
+                frames = _linearized_frame_selection(
+                    self._context_controller.navigation,
+                    command,
+                )
+            if self._context_controller.select_viewer_1d(frame, frames):
                 self._refresh_shell()
             return
         if selection is not None and selection.kind is ContextKind.VIEWER_2D:
@@ -6090,6 +6101,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browser_directory=self._browser_directory,
             browser_catalog=self._browser_catalog,
             browser_transient_frame=self._browser_transient_frame,
+            viewer_1d_paths=(
+                self._context_controller.viewer_1d_context.paths
+                if viewer_1d
+                and self._context_controller.viewer_1d_context is not None
+                else ()
+            ),
             date_sorted=self._date_sorted,
             auto_last=self._auto_last,
             executor_available=self._run_executor is not None,
@@ -6477,7 +6494,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _choose_viewer_1d_files(self) -> None:
         context = self._context_controller.viewer_1d_context
         if context is not None and context.state.value == "ready":
-            if not self._clear_viewer_1d_renderer(paths=context.paths):
+            if not self._clear_viewer_1d_renderer(
+                paths=context.paths,
+                current_path=context.current_path,
+            ):
                 self._notice("1D Viewer cleanup remains pending")
             self._ensure_timer(); return
         try:
@@ -6488,9 +6508,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._error_notice("1D Viewer refused", error); return
         self._open_viewer_1d_paths(selected)
 
-    def _open_viewer_1d_paths(self, selected: tuple[str, ...]) -> None:
+    def _open_viewer_1d_paths(
+        self,
+        selected: tuple[str, ...],
+        *,
+        current_path: str | None = None,
+    ) -> None:
         if (type(selected) is not tuple or not selected
-                or any(type(path) is not str or not path for path in selected)):
+                or any(type(path) is not str or not path for path in selected)
+                or len(set(selected)) != len(selected)):
+            return
+        current_path = selected[0] if current_path is None else current_path
+        if type(current_path) is not str or current_path not in selected:
             return
         self._retire_batch_terminal_presentation()
         self._retain_outgoing_display = False
@@ -6499,10 +6528,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("2D Viewer cleanup remains pending"); return
         context = self._context_controller.viewer_1d_context
         if context is not None and context.state.value == "ready":
-            if not self._clear_viewer_1d_renderer(paths=selected):
+            if not self._clear_viewer_1d_renderer(
+                paths=selected,
+                current_path=current_path,
+            ):
                 self._notice("1D Viewer cleanup remains pending")
             self._ensure_timer(); return
-        try: request = self._context_controller.open_viewer_1d(selected)
+        try:
+            request = self._context_controller.open_viewer_1d(
+                selected,
+                current_path=current_path,
+            )
         except Exception as error:
             self._error_notice("1D Viewer refused", error); return
         if request is not None: self._notice("")
@@ -6517,9 +6553,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         context = self._context_controller.viewer_1d_context
         return "" if context is None else os.path.dirname(context.paths[0])
 
-    def _clear_viewer_1d_renderer(self, *, paths=None, close=False) -> bool:
+    def _clear_viewer_1d_renderer(
+        self,
+        *,
+        paths=None,
+        current_path: str | None = None,
+        close=False,
+    ) -> bool:
         self._last_scientific_projection = None
-        request = self._context_controller.begin_viewer_1d_renderer_clear(paths)
+        request = self._context_controller.begin_viewer_1d_renderer_clear(
+            paths,
+            current_path=current_path,
+        )
         if request is not None and close: self._context_controller.close_viewer_1d()
         if request is None:
             context = self._context_controller.viewer_1d_context
@@ -6660,17 +6705,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             prior_mode = self._preferences.plot_mode
             if value != prior_mode:
                 self._retire_batch_terminal_presentation()
-            ScatteringWorkspace._clear_presentation_targets(self)
+            if not viewer_1d:
+                ScatteringWorkspace._clear_presentation_targets(self)
             updates["plot_mode"] = value
             if value not in {"Overlay", "Waterfall"}:
                 updates["slice_pins"] = ()
-            if not viewer_1d and value == "Single" and prior_mode != "Single":
+            if value == "Single" and prior_mode != "Single":
                 self._shell.browser.cancel_pending_frame_selection()
                 current = self._context_controller.navigation.current
-                self._context_controller.select_navigation(
-                    current,
-                    () if current is None else (current,),
-                )
+                if current is not None:
+                    if viewer_1d:
+                        self._context_controller.select_viewer_1d(
+                            current, (current,),
+                        )
+                    else:
+                        self._context_controller.select_navigation(
+                            current, (current,),
+                        )
         elif kind is ShellCommandKind.SET_SHARE_AXIS:
             if type(value) is not bool:
                 return False

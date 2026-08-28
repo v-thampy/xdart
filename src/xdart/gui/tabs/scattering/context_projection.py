@@ -353,6 +353,7 @@ class ContextProjection:
         browser_directory: str,
         browser_catalog: tuple[BrowserCatalogEntry, ...] = (),
         browser_transient_frame: DisplayFrameKey | None = None,
+        viewer_1d_paths: tuple[str, ...] = (),
         date_sorted: bool,
         auto_last: bool,
         executor_available: bool,
@@ -378,6 +379,26 @@ class ContextProjection:
                              and selection.kind in {
                                  ContextKind.VIEWER_1D, ContextKind.VIEWER_2D}
                              else FrameNavigationProjection())
+        viewer_1d_current_path = ""
+        viewer_1d_selected_paths: tuple[str, ...] = ()
+        if (viewer_1d_selected
+                and len(viewer_1d_paths) == len(viewer_navigation.frames)):
+            path_by_frame = {
+                id(frame): path
+                for path, frame in zip(
+                    viewer_1d_paths,
+                    viewer_navigation.frames,
+                    strict=True,
+                )
+            }
+            viewer_1d_current_path = path_by_frame.get(
+                id(viewer_navigation.current), ""
+            )
+            viewer_1d_selected_paths = tuple(
+                path_by_frame[id(frame)]
+                for frame in viewer_navigation.selected
+                if id(frame) in path_by_frame
+            )
         run = build_run_strip_projection(
             phase,
             intent,
@@ -468,6 +489,12 @@ class ContextProjection:
                 auto_last=auto_last,
                 catalog=browser_catalog,
                 transient_frame=browser_transient_frame,
+                selected_artifacts=(
+                    viewer_1d_selected_paths if viewer_1d_selected else ()
+                ),
+                current_artifact=viewer_1d_current_path,
+                multi_artifact_selection=tool is Tool.XYE_VIEWER,
+                show_all_frames=viewer_1d_selected,
             ),
             scientific,
             viewer_navigation if viewer_selected else navigation,

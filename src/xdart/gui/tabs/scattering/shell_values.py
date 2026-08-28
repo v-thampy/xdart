@@ -74,6 +74,7 @@ class ShellCommand:
     frame: DisplayFrameKey | None = None
     frames: tuple[DisplayFrameKey, ...] = ()
     intent: FrameSelectionIntent = FrameSelectionIntent.EXACT
+    artifacts: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.kind) is not ShellCommandKind:
@@ -94,6 +95,12 @@ class ShellCommand:
             raise TypeError("shell command frames must be exact frame keys")
         if type(self.intent) is not FrameSelectionIntent:
             raise TypeError("frame selection intent must be exact")
+        if (
+            type(self.artifacts) is not tuple
+            or not all(type(item) is str and item for item in self.artifacts)
+            or len(set(self.artifacts)) != len(self.artifacts)
+        ):
+            raise TypeError("shell command artifacts must be unique paths")
 
 
 class ShellPhase(str, Enum):
@@ -173,6 +180,8 @@ class BrowserProjection:
     date_sorted: bool = False
     auto_last: bool = True
     frames: tuple[DisplayFrameKey, ...] = ()
+    selected_artifacts: tuple[str, ...] = ()
+    multi_artifact_selection: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -186,6 +195,17 @@ class BrowserProjection:
             )
         if len({id(frame) for frame in self.frames}) != len(self.frames):
             raise ValueError("browser frame identities must be unique")
+        if (
+            type(self.selected_artifacts) is not tuple
+            or not all(
+                type(artifact) is str and artifact
+                for artifact in self.selected_artifacts
+            )
+            or len(set(self.selected_artifacts))
+            != len(self.selected_artifacts)
+            or type(self.multi_artifact_selection) is not bool
+        ):
+            raise TypeError("browser artifact selection is invalid")
 
 
 @dataclass(frozen=True, slots=True)
