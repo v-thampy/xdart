@@ -201,15 +201,14 @@ class ActionButton(QtWidgets.QPushButton):
         return self._spec
 
     def apply_spec(self, spec: ControlActionSpec) -> None:
-        self._spec = spec
-        self.setText(
+        label = (
             spec.label
             if spec.label.startswith("Cancel ")
             else _ACTION_LABELS.get(spec.action, spec.label)
         )
-        self.setEnabled(bool(spec.enabled))
-        self.setToolTip(spec.reason or _ACTION_TOOLTIPS.get(spec.action, ""))
-        self.setProperty("productionReady", bool(spec.production_ready))
+        enabled = bool(spec.enabled)
+        tooltip = spec.reason or _ACTION_TOOLTIPS.get(spec.action, "")
+        production_ready = bool(spec.production_ready)
         # Role drives a subtle tint: Reintegrate = green (run-like), Advanced =
         # red (the destructive/expert escape hatch); producers stay neutral.
         if spec.action in (ControlAction.REINTEGRATE_1D, ControlAction.REINTEGRATE_2D):
@@ -218,9 +217,33 @@ class ActionButton(QtWidgets.QPushButton):
             role = "advanced"
         else:
             role = ""
-        self.setProperty("actionRole", role)
-        self.style().unpolish(self)
-        self.style().polish(self)
+        style_changed = (
+            self.property("productionReady") != production_ready
+            or self.property("actionRole") != role
+        )
+        if (
+            self._spec == spec
+            and self.text() == label
+            and self.isEnabled() == enabled
+            and self.toolTip() == tooltip
+            and not style_changed
+        ):
+            return
+
+        self._spec = spec
+        if self.text() != label:
+            self.setText(label)
+        if self.isEnabled() != enabled:
+            self.setEnabled(enabled)
+        if self.toolTip() != tooltip:
+            self.setToolTip(tooltip)
+        if self.property("productionReady") != production_ready:
+            self.setProperty("productionReady", production_ready)
+        if self.property("actionRole") != role:
+            self.setProperty("actionRole", role)
+        if style_changed:
+            self.style().unpolish(self)
+            self.style().polish(self)
 
 
 class SectionCard(QtWidgets.QFrame):
@@ -1438,13 +1461,15 @@ class ControlsPanelV2(QtWidgets.QWidget):
 
         if self._bound_state is None or state.bound_controls is None:
             return False
+        current_sequence = tuple(self._bound_state.fields)
+        next_sequence = tuple(state.bound_controls.fields)
         current_fields = {
             tuple(field.path): field
-            for field in self._bound_state.fields
+            for field in current_sequence
         }
         next_fields = {
             tuple(field.path): field
-            for field in state.bound_controls.fields
+            for field in next_sequence
         }
         # The row walkers below prove that every existing row still has an
         # owner.  Exact set equality also proves the inverse: no newly
@@ -1453,15 +1478,40 @@ class ControlsPanelV2(QtWidgets.QWidget):
         # in-place path must force a rebuild for it to appear.  (Unlike the
         # E4-era guard, a changed combo CHOICE inventory does NOT force a
         # rebuild: PM1's accepted apply_field reconciles vocabulary in place.)
-        if current_fields.keys() != next_fields.keys():
-            return False
-        if any(
-            current_fields[path].kind != next_fields[path].kind
-            for path in current_fields
-        ):
+        def render_schema(fields):
+            return tuple(
+                (
+                    field.section,
+                    field.label,
+                    tuple(field.path),
+                    field.kind,
+                    bool(field.browse),
+                    field.parameter_group,
+                )
+                for field in fields
+            )
+
+        if render_schema(current_sequence) != render_schema(next_sequence):
             return False
         if self._profile is None:
             return False
+        if self._profile.analysis_launchers != state.profile.analysis_launchers:
+            return False
+
+        next_experiment = tuple(
+            field for field in next_sequence
+            if field.section is SectionId.EXPERIMENT
+        )
+
+        def processing_groups(fields):
+            grouped: dict[str, list[ControlFormField]] = {}
+            for field in fields:
+                if (field.section is not SectionId.PROCESSING
+                        or field.parameter_group):
+                    continue
+                group = self._processing_group_for_path(field.path)
+                grouped.setdefault(group, []).append(field)
+            return grouped
         current_action_schema = tuple(
             (
                 section,
@@ -1504,6 +1554,91 @@ class ControlsPanelV2(QtWidgets.QWidget):
             mounted_actions[key] = button
         if mounted_actions.keys() != expected_actions.keys():
             return False
+
+        # Compact popup launchers are not FormRows.  Validate their ownership
+        # before any in-place mutation, then refresh the field snapshots they
+        # use when opened.  This keeps the controls-only metadata refresh fast
+        # without leaving an enabled GI/energy popup backed by stale fields.
+        source_field = next_fields.get(_SOURCE_ENERGY_PATH)
+        source_more = [
+            button
+            for button in self.source_card.body.findChildren(
+                QtWidgets.QToolButton
+            )
+            if button.objectName() == "controlsV2MoreButton"
+            and button.property("role") == "sourceEnergy"
+        ]
+        if (source_field is None and source_more) or (
+            source_field is not None and len(source_more) != 1
+        ):
+            return False
+
+        gi_popup_paths = (
+            ("GI", "sample_orientation"),
+            ("GI", "tilt_angle"),
+        )
+        gi_popup_fields = tuple(
+            next_fields[path]
+            for path in gi_popup_paths
+            if path in next_fields
+        )
+        gi_more = [
+            button
+            for button in self.experiment_card.body.findChildren(
+                QtWidgets.QToolButton
+            )
+            if button.objectName() == "controlsV2MoreButton"
+            and button.property("role") != "sourceEnergy"
+        ]
+        if (not gi_popup_fields and gi_more) or (
+            gi_popup_fields and len(gi_more) != 1
+        ):
+            return False
+
+        detector_paths = {
+            ("Signal", "poni_file"),
+            ("Calibration", "poni_file"),
+            ("Signal", "mask_file"),
+        }
+        gi_paths = {
+            ("GI", "Grazing"),
+            ("GI", "th_motor"),
+            ("GI", "th_val"),
+            *gi_popup_paths,
+        }
+        experiment_statuses = {}
+        if any(field.path in detector_paths for field in next_experiment):
+            experiment_statuses["Detector"] = self._detector_status(
+                next_experiment, state.profile.detector_summary,
+            )
+        if any(field.path in gi_paths for field in next_experiment):
+            experiment_statuses[self._experiment_title] = (
+                self._experiment_status(next_experiment)
+            )
+        experiment_subsections = {
+            subsection.title.text(): subsection
+            for subsection in self.experiment_card.body.findChildren(
+                SubsectionCard
+            )
+        }
+        if experiment_subsections.keys() != experiment_statuses.keys():
+            return False
+
+        next_processing_groups = processing_groups(next_sequence)
+        processing_statuses = {
+            name: self._group_status(next_processing_groups[name])
+            for name in ("1-D", "2-D", "Conditioning", "Background")
+            if next_processing_groups.get(name)
+        }
+        processing_subsections = {
+            subsection.title.text(): subsection
+            for subsection in self.processing_card.body.findChildren(
+                SubsectionCard
+            )
+        }
+        if processing_subsections.keys() != processing_statuses.keys():
+            return False
+
         self._profile = state.profile
         self._bound_state = state.bound_controls
         fields_by_path = {
@@ -1537,6 +1672,44 @@ class ControlsPanelV2(QtWidgets.QWidget):
 
         for key, spec in expected_actions.items():
             mounted_actions[key].apply_spec(spec)
+
+        if source_field is not None:
+            source_button = source_more[0]
+            source_button._controls_v2_field = source_field
+            source_button.setEnabled(bool(source_field.enabled))
+            source_button.setToolTip(
+                _field_tooltip(source_field.path, source_field.reason)
+                or "Energy source"
+            )
+            if not source_field.enabled:
+                self._close_source_energy_popup()
+        if gi_popup_fields:
+            gi_button = gi_more[0]
+            gi_button._controls_v2_fields = gi_popup_fields
+            gi_button.setEnabled(
+                any(field.enabled for field in gi_popup_fields)
+            )
+            gi_button.setToolTip(
+                next(
+                    (
+                        _field_tooltip(field.path, field.reason)
+                        for field in gi_popup_fields
+                        if field.reason
+                    ),
+                    "More GI options: Orientation, Tilt Angle",
+                )
+            )
+            if not any(field.enabled for field in gi_popup_fields):
+                self._close_gi_more_popup()
+
+        for title, status in experiment_statuses.items():
+            label = experiment_subsections[title].status
+            label.setText(status)
+            label.setVisible(bool(status))
+        for title, status in processing_statuses.items():
+            label = processing_subsections[title].status
+            label.setText(status)
+            label.setVisible(bool(status))
 
         if fields_by_path and not updated:
             return False
@@ -1785,8 +1958,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
         btn.setProperty("role", "sourceEnergy")
         btn.setToolTip("Energy source")
         btn.setEnabled(bool(field.enabled))
+        btn._controls_v2_field = field
         btn.clicked.connect(
-            lambda _=False, f=field: self._open_source_energy_popup(f))
+            lambda _=False, b=btn: self._open_source_energy_popup(
+                b._controls_v2_field
+            )
+        )
         return btn
 
     def _close_source_energy_popup(self) -> None:
@@ -1938,8 +2115,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
             more.setObjectName("controlsV2MoreButton")
             more.setToolTip("More GI options: Orientation, Tilt Angle")
             more.setEnabled(any(field.enabled for field in popup_fields))
+            more._controls_v2_fields = tuple(popup_fields)
             more.clicked.connect(
-                lambda _=False, f=tuple(popup_fields): self._open_gi_more_popup(f))
+                lambda _=False, b=more: self._open_gi_more_popup(
+                    b._controls_v2_fields
+                )
+            )
             lay.addWidget(more, 0)
         group.add_row(row)
 

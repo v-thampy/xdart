@@ -605,6 +605,34 @@ def _accumulate_metadata(row: Mapping[str, Any], plan: AverageScanPlan, configur
             invariants[key] = (encoded, value.item() if isinstance(value, np.generic) else value)
         else:
             _reject(key not in invariants or invariants[key][0] != encoded, 'AVERAGE_INVARIANT_METADATA_CHANGED')
+
+
+def _increment_finite_counts(counts: np.ndarray, valid: np.ndarray) -> None:
+    np.add(counts, np.uint32(1), out=counts, where=valid)
+
+
+def _seal_invariant_finite_counts(
+    counts: np.ndarray, valid: np.ndarray | None, extent: int,
+) -> None:
+    value = np.uint32(extent)
+    if valid is None:
+        counts.fill(value)
+    else:
+        np.copyto(counts, value, where=valid)
+
+
+def _effective_integer_thresholds(
+    dtype: np.dtype, minimum: float | None, maximum: float | None,
+) -> tuple[float | None, float | None]:
+    if dtype.kind not in 'iu':
+        return minimum, maximum
+    domain = np.iinfo(dtype)
+    return (
+        None if minimum is not None and minimum <= domain.min else minimum,
+        None if maximum is not None and maximum >= domain.max else maximum,
+    )
+
+
 def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph, window, token: threading.Event | None, progress: Callable[[str, int, int], None]) -> dict[str, Any]:
     shape, extent = (plan.detector_shape, plan.contributor_extent)
     _reject(plan.recipe.background is not None,
@@ -619,9 +647,18 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
     needs_metadata = bool(
         plan.numeric_metadata_keys or plan.invariant_metadata_keys
     )
-    detector_mask = None
-    working = valid = None
-    floating_native = np.dtype(plan.native_dtype).kind == 'f'
+    detector_mask = invariant_valid = None
+    scratch = valid = None
+    native_dtype = np.dtype(plan.native_dtype)
+    floating_native = native_dtype.kind == 'f'
+    threshold_min, threshold_max = _effective_integer_thresholds(
+        native_dtype, plan.recipe.threshold_min, plan.recipe.threshold_max,
+    )
+    invariant_counts = (
+        not floating_native
+        and threshold_min is None
+        and threshold_max is None
+    )
     external_cursor = 0
     for index in range(extent):
         while (external_cursor < len(external_route)
@@ -645,38 +682,65 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
                 detector_mask = np.frombuffer(np.ascontiguousarray(mask, dtype=bool).tobytes(), dtype=bool).reshape(shape)
                 detector_mask.setflags(write=False)
             del mask
-            working = np.empty(shape, dtype=bool)
             valid = np.empty(shape, dtype=bool)
-        working.fill(False)
-        if plan.recipe.threshold_min is not None:
-            np.less(native, plan.recipe.threshold_min, out=valid)
-            np.logical_or(working, valid, out=working)
-        if plan.recipe.threshold_max is not None:
-            np.greater(native, plan.recipe.threshold_max, out=valid)
-            np.logical_or(working, valid, out=working)
-        if static is not None:
-            np.logical_or(working, static, out=working)
-        if detector_mask is not None:
-            np.logical_or(working, detector_mask, out=working)
-        if floating_native:
-            np.isfinite(native, out=valid)
-            np.logical_not(valid, out=valid)
-            np.logical_or(working, valid, out=working)
-        np.logical_not(working, out=valid)
+            scratch = np.empty(shape, dtype=bool)
+            if static is not None or detector_mask is not None:
+                if static is not None and detector_mask is not None:
+                    np.logical_or(static, detector_mask, out=valid)
+                else:
+                    np.copyto(
+                        valid,
+                        static if static is not None else detector_mask,
+                    )
+                np.logical_not(valid, out=valid)
+                invariant_valid = np.array(valid, copy=True)
+            static = detector_mask = None
+        frame_valid = invariant_valid
+        if not invariant_counts:
+            predicates = 0
+            if threshold_min is not None:
+                np.greater_equal(native, threshold_min, out=valid)
+                predicates += 1
+            if threshold_max is not None:
+                target = valid if predicates == 0 else scratch
+                np.less_equal(native, threshold_max, out=target)
+                if predicates:
+                    np.logical_and(valid, target, out=valid)
+                predicates += 1
+            if floating_native:
+                target = valid if predicates == 0 else scratch
+                np.isfinite(native, out=target)
+                if predicates:
+                    np.logical_and(valid, target, out=valid)
+                predicates += 1
+            if invariant_valid is not None:
+                if predicates:
+                    np.logical_and(valid, invariant_valid, out=valid)
+                else:
+                    np.copyto(valid, invariant_valid)
+                predicates += 1
+            _reject(predicates == 0, 'AVERAGE_VALIDITY_POLICY_UNREACHABLE')
+            frame_valid = valid
         with np.errstate(over='ignore', invalid='ignore'):
-            np.add(sums, native, out=sums, where=valid)
+            if frame_valid is None:
+                np.add(sums, native, out=sums)
+            else:
+                np.add(sums, native, out=sums, where=frame_valid)
         if floating_native:
-            working.fill(True)
-            np.isfinite(sums, out=working, where=valid)
-            _reject(not bool(working.all()), 'AVERAGE_PIXEL_SUM_OVERFLOW')
-        np.add(counts, np.uint32(1), out=counts, where=valid)
+            scratch.fill(True)
+            np.isfinite(sums, out=scratch, where=frame_valid)
+            _reject(not bool(scratch.all()), 'AVERAGE_PIXEL_SUM_OVERFLOW')
+        if not invariant_counts:
+            _increment_finite_counts(counts, frame_valid)
         if needs_metadata:
             _accumulate_metadata(
                 row, plan, configured, numeric, invariants, index == 0,
             )
         progress('average', index + 1, extent)
         del native, row
-    del working, valid
+    if invariant_counts:
+        _seal_invariant_finite_counts(counts, invariant_valid, extent)
+    del scratch, valid
     zero = counts == 0
     _reject(bool(zero.all()), 'AVERAGE_ALL_PIXELS_INVALID')
     np.divide(sums, counts, out=sums, where=~zero)

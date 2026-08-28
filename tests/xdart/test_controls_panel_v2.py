@@ -5179,10 +5179,10 @@ def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
         panel.deleteLater()
 
 
-def test_apply_state_update_updates_action_buttons_in_place_until_schema_changes(
-    qapp,
+def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
+    qapp, monkeypatch,
 ):
-    """Action state changes preserve identity; ordered schema changes rebuild."""
+    """Unchanged/action-only refreshes avoid polish; style changes do not."""
     from dataclasses import replace
 
     from xrd_tools.session.intent_store import RunIntentStore
@@ -5233,6 +5233,35 @@ def test_apply_state_update_updates_action_buttons_in_place_until_schema_changes
         assert row_before.editor is editor_before
         assert "Replaces selected 1-D results" in after.toolTip()
 
+        style = after.style()
+        original_unpolish = style.unpolish
+        original_polish = style.polish
+        repolished: list[tuple[str, ActionButton]] = []
+
+        def record_unpolish(widget):
+            if isinstance(widget, ActionButton):
+                repolished.append(("unpolish", widget))
+            return original_unpolish(widget)
+
+        def record_polish(widget):
+            if isinstance(widget, ActionButton):
+                repolished.append(("polish", widget))
+            return original_polish(widget)
+
+        monkeypatch.setattr(style, "unpolish", record_unpolish)
+        monkeypatch.setattr(style, "polish", record_polish)
+
+        # A controls-only refresh commonly projects an equal immutable state.
+        # It must neither rebuild nor force every action through the style
+        # engine: that global repolish is visible as a whole-panel flicker.
+        assert panel.apply_state_update(enabled) is True
+        assert repolished == []
+        assert next(
+            button
+            for button in panel.findChildren(ActionButton)
+            if button.spec.action is ControlAction.REINTEGRATE_1D
+        ) is after
+
         active = project_controls(
             store.snapshot(), None, RunPhase.IDLE,
             operation_busy=True,
@@ -5246,15 +5275,236 @@ def test_apply_state_update_updates_action_buttons_in_place_until_schema_changes
             if button.spec.action is ControlAction.CALIBRATE
         ) is calibrate_before
         assert calibrate_before.text() == "Cancel Calibration"
+        assert repolished == []
 
+        # ``productionReady`` participates in the stylesheet selector.  A
+        # genuine change to it must still update the dynamic property and
+        # repolish exactly that one action button.
         actions = dict(active.profile.section_actions)
-        processing = actions[SectionId.PROCESSING]
-        actions[SectionId.PROCESSING] = tuple(reversed(processing))
-        reordered = replace(
+        actions[SectionId.EXPERIMENT] = tuple(
+            replace(spec, production_ready=False)
+            if spec.action is ControlAction.CALIBRATE
+            else spec
+            for spec in actions[SectionId.EXPERIMENT]
+        )
+        style_changed = replace(
             active,
             profile=replace(active.profile, section_actions=actions),
         )
+        assert panel.apply_state_update(style_changed) is True
+        assert calibrate_before.property("productionReady") is False
+        assert repolished == [
+            ("unpolish", calibrate_before),
+            ("polish", calibrate_before),
+        ]
+
+        actions = dict(style_changed.profile.section_actions)
+        processing = actions[SectionId.PROCESSING]
+        actions[SectionId.PROCESSING] = tuple(reversed(processing))
+        reordered = replace(
+            style_changed,
+            profile=replace(style_changed.profile, section_actions=actions),
+        )
         assert panel.apply_state_update(reordered) is False
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_apply_state_update_locks_gi_more_without_rebuilding(qapp):
+    """A controls-only operation refresh must not leave the GI popup live."""
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    intent = RunIntent()
+    intent.gi.enabled = True
+    store = RunIntentStore(intent)
+    idle = project_controls(store.snapshot(), None, RunPhase.IDLE)
+    busy = project_controls(
+        store.snapshot(), None, RunPhase.IDLE,
+        operation_busy=True,
+        calibration_active=True,
+    )
+    panel = ControlsPanelV2()
+    try:
+        panel.set_state(idle)
+        more = next(
+            button
+            for button in panel.experiment_card.body.findChildren(
+                QtWidgets.QToolButton
+            )
+            if button.objectName() == "controlsV2MoreButton"
+        )
+        first_row = panel.findChildren(FormRow)[0]
+        more.click()
+        qapp.processEvents()
+        assert panel._gi_options_popup is not None
+
+        assert panel.apply_state_update(busy) is True
+        qapp.processEvents()
+        assert more is next(
+            button
+            for button in panel.experiment_card.body.findChildren(
+                QtWidgets.QToolButton
+            )
+            if button.objectName() == "controlsV2MoreButton"
+        )
+        assert panel.findChildren(FormRow)[0] is first_row
+        assert not more.isEnabled()
+        assert panel._gi_options_popup is None
+        assert {
+            subsection.status.text()
+            for subsection in panel.processing_card.body.findChildren(
+                SubsectionCard
+            )
+        } == {"locked"}
+
+        more.click()
+        qapp.processEvents()
+        assert panel._gi_options_popup is None
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_apply_state_update_refreshes_source_energy_popup_capture(qapp):
+    """The Source More button must open the newly projected preference."""
+    from dataclasses import replace
+
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    base = project_controls(
+        RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE,
+    )
+    energy = ControlFormField(
+        SectionId.SOURCE,
+        "Energy Source",
+        ("Source", "energy_preference"),
+        "poni",
+        kind=ControlFieldKind.COMBO,
+        choices=("poni", "metadata"),
+    )
+    before = replace(
+        base,
+        bound_controls=replace(
+            base.bound_controls,
+            fields=base.bound_controls.fields + (energy,),
+        ),
+    )
+    after = replace(
+        before,
+        bound_controls=replace(
+            before.bound_controls,
+            fields=tuple(
+                replace(field, value="metadata")
+                if field.path == energy.path
+                else field
+                for field in before.bound_controls.fields
+            ),
+        ),
+    )
+    panel = ControlsPanelV2()
+    try:
+        panel.set_state(before)
+        button = next(
+            candidate
+            for candidate in panel.source_card.body.findChildren(
+                QtWidgets.QToolButton
+            )
+            if candidate.property("role") == "sourceEnergy"
+        )
+        assert panel.apply_state_update(after) is True
+        assert button is next(
+            candidate
+            for candidate in panel.source_card.body.findChildren(
+                QtWidgets.QToolButton
+            )
+            if candidate.property("role") == "sourceEnergy"
+        )
+
+        button.click()
+        qapp.processEvents()
+        popup = panel._source_energy_popup
+        assert popup is not None
+        segmented = popup.findChild(SegmentedControl)
+        assert segmented is not None
+        assert segmented.current_value() == "metadata"
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_apply_state_update_refreshes_derived_subsection_statuses(qapp):
+    from dataclasses import replace
+
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    before = project_controls(
+        RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE,
+    )
+    after = replace(
+        before,
+        profile=replace(before.profile, detector_summary="Eiger4M · fitted"),
+    )
+    panel = ControlsPanelV2()
+    try:
+        panel.set_state(before)
+        detector = next(
+            subsection
+            for subsection in panel.experiment_card.body.findChildren(
+                SubsectionCard
+            )
+            if subsection.title.text() == "Detector"
+        )
+        assert detector.status.text() != "Eiger4M · fitted"
+        assert panel.apply_state_update(after) is True
+        assert detector.status.text() == "Eiger4M · fitted"
+        assert detector.status.isVisibleTo(detector)
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_apply_state_update_refuses_render_schema_change_before_mutation(qapp):
+    from dataclasses import replace
+
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    before = project_controls(
+        RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE,
+    )
+    target = before.bound_controls.fields[0]
+    after = replace(
+        before,
+        bound_controls=replace(
+            before.bound_controls,
+            fields=(replace(target, label=target.label + " changed"),)
+            + before.bound_controls.fields[1:],
+        ),
+    )
+    panel = ControlsPanelV2()
+    try:
+        panel.set_state(before)
+        row = next(
+            candidate
+            for candidate in panel.findChildren(FormRow)
+            if candidate.path == target.path
+        )
+        label = row.label.text()
+        assert panel.apply_state_update(after) is False
+        assert panel._bound_state is before.bound_controls
+        assert row.label.text() == label
     finally:
         panel.close()
         panel.deleteLater()

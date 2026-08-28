@@ -182,7 +182,7 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
                 ((1, 8, 4), (5, 6, 7)),
                 ((2, 9, 5), (6, 7, 8)),
             ),
-            (None, 100.0), False, id="u4",
+            (0.0, 100.0), False, id="u4-redundant-lower-bound",
         ),
         pytest.param(
             "<u8",
@@ -1291,7 +1291,8 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
         "prepare_qualify": 0, "execution_qualify": 0,
         "requalify": 0, "read_native": 0, "metadata": 0,
         "contributor_fence": 0, "background_fact": 0,
-        "background_resolver": 0,
+        "background_resolver": 0, "count_increment": 0,
+        "count_seal": 0,
     }
     integrations = []
     real_prepare = module.qualify_source_execution_graph
@@ -1300,6 +1301,8 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
     real_read = execution_graph._AverageSourceReadWindow.read_native
     real_metadata = execution_graph._AverageSourceReadWindow.complete_metadata_for
     real_fence = module._validate_contributor
+    real_count_increment = module._increment_finite_counts
+    real_count_seal = module._seal_invariant_finite_counts
 
     def prepare_qualify(*args, **kwargs):
         counts["prepare_qualify"] += 1
@@ -1325,6 +1328,14 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
         counts["contributor_fence"] += 1
         return real_fence(graph, index, token, external_member)
 
+    def count_increment(*args, **kwargs):
+        counts["count_increment"] += 1
+        return real_count_increment(*args, **kwargs)
+
+    def count_seal(*args, **kwargs):
+        counts["count_seal"] += 1
+        return real_count_seal(*args, **kwargs)
+
     def forbidden(name):
         def call(*_args, **_kwargs):
             counts[name] += 1
@@ -1348,6 +1359,10 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
         "complete_metadata_for", metadata,
     )
     monkeypatch.setattr(module, "_validate_contributor", fence)
+    monkeypatch.setattr(module, "_increment_finite_counts", count_increment)
+    monkeypatch.setattr(
+        module, "_seal_invariant_finite_counts", count_seal,
+    )
     monkeypatch.setattr(
         module, "_background_fact", forbidden("background_fact"),
     )
@@ -1362,8 +1377,24 @@ def test_651_frame_inactive_average_has_exact_serial_cadence(
         "prepare_qualify": 1, "execution_qualify": 1,
         "requalify": 3, "read_native": 651, "metadata": 1,
         "contributor_fence": 1302, "background_fact": 0,
-        "background_resolver": 0,
+        "background_resolver": 0, "count_increment": 0,
+        "count_seal": 1,
     }
+
+
+def test_average_elides_only_integer_thresholds_outside_native_domain() -> None:
+    assert module._effective_integer_thresholds(
+        np.dtype("<u4"), 0.0, 10000.0,
+    ) == (None, 10000.0)
+    assert module._effective_integer_thresholds(
+        np.dtype("<i2"), -32768.0, 32767.0,
+    ) == (None, None)
+    assert module._effective_integer_thresholds(
+        np.dtype("<i2"), -10.0, 10.0,
+    ) == (-10.0, 10.0)
+    assert module._effective_integer_thresholds(
+        np.dtype("<f4"), 0.0, 10000.0,
+    ) == (0.0, 10000.0)
 
 
 def test_average_contributor_fields_are_exact_per_logical_frame_and_family(tmp_path) -> None:
