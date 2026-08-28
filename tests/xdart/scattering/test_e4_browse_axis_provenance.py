@@ -66,7 +66,7 @@ def _project_browse(context, *, identity: RunIdentity | None = None):
         request,
         selection,
         identity,
-        (frame,),
+        {id(frame): frame},
     )
 
 

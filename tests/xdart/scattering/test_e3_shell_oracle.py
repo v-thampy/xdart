@@ -164,7 +164,7 @@ def test_e3_ui3_footer_uses_typed_current_artifact_progress(
             52,
             2961,
             "Running",
-            (ArtifactProgress(current.artifact, 52, 1000),),
+            (ArtifactProgress(current.artifact, 52, 1000, published=52),),
         ),
     )
     try:
@@ -276,7 +276,7 @@ def test_e3_ui3_footer_keeps_absolute_scan_position_after_catalog_eviction(
         5,
         5,
         "Finished",
-        (ArtifactProgress(artifact, 5, 5),),
+        (ArtifactProgress(artifact, 5, 5, published=5),),
     )
     try:
         shell.apply_state(replace(

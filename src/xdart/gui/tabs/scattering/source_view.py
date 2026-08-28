@@ -4,11 +4,7 @@ from __future__ import annotations
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from .contracts import (
-    SourceCountScope,
-    SourceObservation,
-    SourceObservationStatus,
-)
+from .contracts import SourceObservation
 from .controls_readiness import SectionHeaderProjection
 from .shell_widgets import (
     apply_section_header,
@@ -27,13 +23,6 @@ class SourceStatusView(QtWidgets.QFrame):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(0)
-        self._name = QtWidgets.QLabel("No source selected.")
-        self._status = QtWidgets.QLabel("Select a source to inspect it.")
-        self._count = QtWidgets.QLabel("")
-        for label in (self._name, self._status, self._count):
-            # Retain the diagnostic text surface for compatibility, but do not
-            # render the redundant three-line summary below the real form.
-            label.hide()
         self._choose = QtWidgets.QPushButton("Choose source")
         self._choose.clicked.connect(self.chooseRequested.emit)
         layout.addWidget(self._choose)
@@ -44,9 +33,6 @@ class SourceStatusView(QtWidgets.QFrame):
         )
 
     def show_checking(self, selected_name: str) -> None:
-        self._name.setText(selected_name or "Selected source")
-        self._status.setText("Checking source…")
-        self._count.setText("")
         self._set_header(SectionHeaderProjection(
             "checking…",
             False,
@@ -54,9 +40,6 @@ class SourceStatusView(QtWidgets.QFrame):
         ))
 
     def show_no_source(self) -> None:
-        self._name.setText("No source selected.")
-        self._status.setText("Select a source to inspect it.")
-        self._count.setText("")
         self._set_header(SectionHeaderProjection(
             "not selected",
             False,
@@ -64,9 +47,6 @@ class SourceStatusView(QtWidgets.QFrame):
         ))
 
     def show_unavailable(self, selected_name: str) -> None:
-        self._name.setText(selected_name or "Selected source")
-        self._status.setText("UNAVAILABLE")
-        self._count.setText("")
         self._set_header(SectionHeaderProjection(
             "unavailable",
             False,
@@ -74,33 +54,6 @@ class SourceStatusView(QtWidgets.QFrame):
         ))
 
     def render(self, observation: SourceObservation) -> None:
-        self._name.setText(observation.selected_name or "Selected source")
-        text = {
-            SourceObservationStatus.AVAILABLE: "AVAILABLE",
-            SourceObservationStatus.MISSING: "MISSING",
-            SourceObservationStatus.UNAVAILABLE: "UNAVAILABLE",
-        }[observation.status]
-        self._status.setText(observation.reason or text)
-        count = observation.observed_file_count
-        if count is not None:
-            self._count.setText(f"{count} matching files")
-        elif observation.subdirectories_deferred:
-            self._count.setText("Immediate subfolders are the Run boundary")
-        else:
-            self._count.setText("")
-        if (
-            observation.file_count_scope
-            is SourceCountScope.SELECTED_PLUS_IMMEDIATE
-        ):
-            self._count.setText(
-                f"{count} matching files · Only the selected folder and "
-                "immediate subfolders are processed · "
-                "Deeper subfolders are outside the supported Run scope"
-            )
-        elif observation.subdirectories_deferred and count is not None:
-            self._count.setText(
-                f"{count} matching files · Run is limited to one folder level"
-            )
         self._set_header(source_header_projection(observation))
 
     def reapply_header(self) -> None:

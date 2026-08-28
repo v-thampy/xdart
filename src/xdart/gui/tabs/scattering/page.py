@@ -215,7 +215,6 @@ _UNSAFE_UNFUNDED_STAGING_KEY = (
     "_post_g2_unfunded_staging_diagnostic_v1"
 )
 _NEXUS_ONLY_PERFORMANCE_KEYS = (
-    "_post_g2_pipeline",
     "_post_g2_pipeline_v2",
     "_post_g2_output_diagnostics_v1",
     _UNSAFE_UNFUNDED_STAGING_KEY,
@@ -5551,11 +5550,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         published = 0
         if prior is not None:
             completed = max(completed, prior.completed)
-            published = (
-                prior.completed
-                if prior.published is None
-                else prior.published
-            )
+            published = prior.published
         if event.kind not in {
             StandardEventKind.FINISHED,
             StandardEventKind.STOPPED,
@@ -7025,7 +7020,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if candidate.processing_mode == "Int 1D (XYE)":
             _drop_nexus_only_performance_options(candidate)
         else:
-            candidate.run_options.pop("_post_g2_pipeline", None)
             candidate.run_options["_post_g2_pipeline_v2"] = (
                 values.pipeline_mapping()
             )

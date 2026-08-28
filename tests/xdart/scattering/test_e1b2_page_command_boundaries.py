@@ -415,7 +415,6 @@ def test_performance_diagnostics_fresh_default_is_tuned_tuple(
 def test_xye_mode_drops_only_private_nexus_performance_options(
         qapp: QtWidgets.QApplication) -> None:
     nexus_only = {
-        "_post_g2_pipeline": {"legacy": "stale"},
         "_post_g2_pipeline_v2": {"pipeline": "stale"},
         "_post_g2_output_diagnostics_v1": {"save_xye": False},
         "_post_g2_unfunded_staging_diagnostic_v1": {"mode": "stale"},

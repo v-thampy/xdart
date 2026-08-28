@@ -510,21 +510,17 @@ class ContextProjection:
         request: ProjectionRequest,
         current_selection: DisplaySelection,
         accepted_run_identity: RunIdentity | None,
-        frame_keys: tuple[DisplayFrameKey, ...] | dict[int, DisplayFrameKey],
+        frame_keys: dict[int, DisplayFrameKey],
         browse_hydration_owner=None,
         *,
         viewer_1d_owner=None,
         viewer_catalog=None,
         viewer_frame=None,
     ) -> StandardDisplayPayload | None:
-        if type(frame_keys) is dict:
-            owns_frame = frame_keys.get(id(request.frame)) is request.frame
-        elif type(frame_keys) is tuple:
-            # Compatibility for direct port tests and third-party callers.
-            # Production passes the runtime's exact O(1) identity index.
-            owns_frame = any(frame is request.frame for frame in frame_keys)
-        else:
-            owns_frame = False
+        owns_frame = (
+            type(frame_keys) is dict
+            and frame_keys.get(id(request.frame)) is request.frame
+        )
         if type(context) is Viewer1DContext:
             return _viewer_1d_payload(
                 context, request, current_selection, frame_keys, viewer_1d_owner)

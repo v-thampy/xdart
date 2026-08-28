@@ -275,11 +275,7 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                             0,
                             min(
                                 artifact_progress.total,
-                                (
-                                    artifact_progress.completed
-                                    if artifact_progress.published is None
-                                    else artifact_progress.published
-                                )
+                                artifact_progress.published
                                 - len(local_frames)
                                 + retained_index,
                             ),

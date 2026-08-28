@@ -308,11 +308,11 @@ def test_source_selection_is_one_store_value_and_observes_off_gui_thread(
         assert _wait_until(qapp, lambda: source.observation_thread is not None)
         assert source.observation_thread != gui_thread
         # Selected plus immediate is the shared preview and Run boundary.
-        assert _wait_until(qapp, lambda: "2 matching files" in source_status._count.text())
-        assert source_status._count.text() == (
-            "2 matching files · Only the selected folder and immediate "
-            "subfolders are processed · "
-            "Deeper subfolders are outside the supported Run scope"
+        assert _wait_until(qapp, lambda: "2 files" in source_status._header.text)
+        assert source_status._header.text == "2 files (folder + 1 level) · Image Directory"
+        assert source_status._header.detail.endswith(
+            "Only the selected folder and immediate subfolders are processed. "
+            "Deeper subfolders are outside the supported Run scope."
         )
         assert store.snapshot().thaw().source_spec == DirectorySourceSpec(
             tmp_path, recursive=True, suffixes=(".tif",)
@@ -342,16 +342,16 @@ def test_foreign_callback_and_post_close_completion_are_inert(qapp: QtWidgets.QA
         assert request is not None
         operation = workspace._observation
         assert operation is not None
-        before = source_status._status.text()
+        before = source_status._header
         foreign = Future()
         foreign.set_result(object())
         workspace._observationFinished.emit(object(), foreign)
         qapp.processEvents()
-        assert source_status._status.text() == before
+        assert source_status._header == before
         assert workspace._observation is operation
         workspace._observationFinished.emit(operation, foreign)
         qapp.processEvents()
-        assert source_status._status.text() == before
+        assert source_status._header == before
         assert workspace._observation is operation
 
         commits_before_close = store.commit_calls
@@ -386,7 +386,8 @@ def test_unrelated_edit_accepts_existing_observation_without_restat(
         assert len(source.requests) == 1
         source.release.set()
         assert _wait_until(qapp, lambda: workspace._observation is None)
-        assert source_status._status.text() == "AVAILABLE"
+        assert source_status._header.text == "Single Image"
+        assert source_status._header.ready is False
         assert request.intent_revision == 1
         assert store.snapshot().revision == 2
     finally:
@@ -409,7 +410,7 @@ def test_current_bad_completion_is_consumed_as_unavailable(
         workspace.select_source(SourceSpec("/selected.dat"))
         assert _wait_until(qapp, lambda: source.observation_thread is not None)
         assert _wait_until(qapp, lambda: workspace._observation is None)
-        assert source_status._status.text() == "UNAVAILABLE"
+        assert source_status._header.text == "unavailable"
         assert store.snapshot().revision == 1
     finally:
         workspace.close_workspace()

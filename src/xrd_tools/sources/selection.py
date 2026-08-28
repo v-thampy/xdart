@@ -15,26 +15,20 @@ _SINGLE_IMAGE_SUFFIXES = frozenset({
 })
 
 
-def normalize_metadata_format(
-    value: object,
-    *,
-    legacy_none_is_auto: bool = False,
-) -> str | None:
-    """Normalize one typed image-metadata policy without conflating ``None``.
+def normalize_metadata_format(value: object) -> str | None:
+    """Normalize one typed image-metadata policy.
 
-    A live Controls selection of ``None`` is an explicit metadata-off policy.
-    Legacy session/profile values need a separate compatibility boundary:
-    blank, JSON null, and the old literal ``none`` were historical defaults,
-    so those values migrate to the modern ``auto`` default there.
+    ``None`` and the literal ``none`` are the explicit metadata-off policy;
+    blank text selects automatic discovery.
     """
 
     if value is None:
-        return "auto" if legacy_none_is_auto else None
+        return None
     normalized = str(value).strip().lower()
     if not normalized:
         return "auto"
     if normalized == "none":
-        return "auto" if legacy_none_is_auto else None
+        return None
     return normalized
 
 

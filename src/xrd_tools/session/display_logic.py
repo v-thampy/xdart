@@ -2841,9 +2841,6 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
 # these remain as the cleanup fallback so switching from a 2D mode into a
 # plot-only/viewer mode still blanks stale raw/cake panels.
 _LEGACY_RENDER_ROLES = (PanelRole.PLOT_1D, PanelRole.RAW_2D, PanelRole.CAKE_2D)
-# Compatibility alias for old tests/imports.  Do not extend this tuple for new
-# modules; put new panel roles in DisplayState.layout instead.
-_RENDER_ROLES = _LEGACY_RENDER_ROLES
 
 
 def _role_from_panel_key(key):

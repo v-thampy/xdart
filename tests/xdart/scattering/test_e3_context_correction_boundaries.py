@@ -146,12 +146,20 @@ def test_projection_port_independently_rejects_foreign_browse_identity():
         accepted.selection,
         accepted.frame,
     )
+    frame_by_id = {id(accepted.frame): accepted.frame}
+    assert controller._projection.project(
+        controller.browse_context,
+        accepted,
+        controller.selection,
+        accepted.run_identity,
+        frame_by_id,
+    ) is not None
     assert controller._projection.project(
         controller.browse_context,
         request,
         controller.selection,
         accepted.run_identity,
-        controller.frame_keys,
+        frame_by_id,
     ) is None
 
 

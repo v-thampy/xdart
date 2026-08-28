@@ -34,14 +34,6 @@ def test_container_image_selection_carries_actual_auto_metadata_policy(tmp_path)
     assert spec.options["metadata_format"] == "auto"
 
 
-@pytest.mark.parametrize("saved", (None, "", "None", "none"))
-def test_legacy_profile_metadata_off_encodings_migrate_to_auto(saved):
-    assert normalize_metadata_format(
-        saved,
-        legacy_none_is_auto=True,
-    ) == "auto"
-
-
 def test_live_metadata_none_remains_explicitly_off(tmp_path):
     assert normalize_metadata_format(None) is None
     assert normalize_metadata_format("None") is None

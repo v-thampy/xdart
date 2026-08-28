@@ -515,9 +515,8 @@ class ArtifactProgress:
     artifact: str
     completed: int
     total: int
-    # Exact prefix represented by navigation events. ``None`` keeps detached
-    # callers that only know durable progress on the legacy suffix fallback.
-    published: int | None = None
+    # Exact prefix represented by navigation events.
+    published: int
 
     def __post_init__(self) -> None:
         if not (
@@ -526,11 +525,8 @@ class ArtifactProgress:
             and type(self.completed) is int
             and type(self.total) is int
             and 0 <= self.completed <= self.total
-            and (
-                self.published is None
-                or type(self.published) is int
-                and 0 <= self.published <= self.completed
-            )
+            and type(self.published) is int
+            and 0 <= self.published <= self.completed
         ):
             raise ValueError("artifact progress is invalid")
 

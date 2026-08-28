@@ -20,7 +20,6 @@ _PIPELINE_FIELDS = (
     "semantic_checkpoint_frame_cap",
     "staging_frame_cap",
 )
-_LEGACY_PIPELINE_FIELDS = _PIPELINE_FIELDS[:-1]
 _DEFAULT_PIPELINE = (1, 8, 8, 16, 64)
 
 
@@ -103,18 +102,9 @@ def _loaded_pipeline(
     candidate = snapshot.thaw().run_options.get(_PIPELINE_KEY)
     if not isinstance(candidate, Mapping):
         return _DEFAULT_PIPELINE
-    fields = (
-        _PIPELINE_FIELDS
-        if set(candidate) == set(_PIPELINE_FIELDS)
-        else _LEGACY_PIPELINE_FIELDS
-        if set(candidate) == set(_LEGACY_PIPELINE_FIELDS)
-        else ()
-    )
-    if not fields:
+    if set(candidate) != set(_PIPELINE_FIELDS):
         return _DEFAULT_PIPELINE
-    row = tuple(candidate[field] for field in fields)
-    if fields == _LEGACY_PIPELINE_FIELDS:
-        row += (64,)
+    row = tuple(candidate[field] for field in _PIPELINE_FIELDS)
     if any(type(value) is not int for value in row):
         return _DEFAULT_PIPELINE
     values = PerformanceDiagnosticsValues(

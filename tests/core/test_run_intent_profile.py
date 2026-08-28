@@ -208,140 +208,15 @@ def test_profile_load_rejects_partial_or_runtime_state_before_return(tmp_path):
         load_run_intent_profile('{"value": NaN}')
 
 
-def test_historical_static_scan_translation_is_host_independent(
-    tmp_path, monkeypatch
-):
-    first = tmp_path / "scan_0001.tif"
-    second = tmp_path / "scan_0002.tif"
-    first.write_bytes(b"first")
-    second.write_bytes(b"second")
-    project = tmp_path / "project"
-    save_path = tmp_path / "historical-output"
-    monkeypatch.setenv("SAVE_PATH", str(tmp_path / "environment-output"))
-    monkeypatch.setenv("VNEXT_MAX_CORES", "47")
+def test_unversioned_static_scan_profile_is_refused():
     document = {
         "image_wrangler": {
             "image_wrangler": {
-                "Project": {
-                    "project_folder": str(project),
-                    "h5_dir": str(save_path),
-                },
                 "Signal": {
                     "inp_type": "Image Series",
-                    "File": str(second),
-                    "meta_ext": "none",
-                    "mask_file": str(tmp_path / "legacy-mask.edf"),
-                    "write_mode": "Replace",
-                },
-                "GI": {
-                    "Grazing": False,
-                    "th_motor": "legacy-theta",
-                    "th_val": 0.1,
-                    "sample_orientation": 4,
-                    "tilt_angle": 0.0,
-                    "gi_mode_1d": "q_total",
-                    "gi_mode_2d": "qip_qoop",
                 },
             }
         },
-        "_xdart_static_controls": {
-            "schema_version": 1,
-            "poni_file": str(tmp_path / "legacy.poni"),
-            "processing_mode": "Int 1D",
-            "controls_v2_int": {
-                "bai_1d_args": {"numpoints": 333},
-                "bai_2d_args": {"npt_rad": 444, "npt_azim": 55},
-                "gi": True,
-                "gi_config": {
-                    "incidence_motor": "theta",
-                    "th_val": 0.2,
-                    "sample_orientation": 6,
-                    "tilt_angle": 1.25,
-                    "gi_mode_1d": "q_xy",
-                    "gi_mode_2d": "qip_qoop",
-                },
-                "threshold_config": {
-                    "apply_threshold": True,
-                    "threshold_min": 2.0,
-                    "threshold_max": 9.0,
-                    "mask_saturation": False,
-                },
-            },
-        },
     }
-
-    loaded = load_run_intent_profile(json.dumps(document))
-
-    assert loaded.generation == 0
-    assert type(loaded.source_spec) is SourceSpec
-    assert loaded.source_spec.kind is SourceKind.TIFF_SERIES
-    assert loaded.source_spec.options["selected_file"] == str(second)
-    assert loaded.source_spec.options["files"] == (str(first), str(second))
-    assert loaded.source_spec.options["metadata_format"] == "auto"
-    assert loaded.project_root == str(project)
-    assert loaded.save_path == str(save_path)
-    assert loaded.poni_file == str(tmp_path / "legacy.poni")
-    assert loaded.mask_file == str(tmp_path / "legacy-mask.edf")
-    assert loaded.processing_mode == "Int 1D"
-    assert loaded.output_mode == "Overwrite"
-    assert loaded.live_mode is loaded.batch_mode is False
-    assert loaded.max_cores == 1
-    assert loaded.bai_1d_args == {"numpoints": 333}
-    assert loaded.bai_2d_args == {"npt_rad": 444, "npt_azim": 55}
-    assert loaded.gi == GIIntent(True, "theta", 0.2, 6, 1.25, "q_xy", "qip_qoop")
-    assert loaded.threshold == ThresholdIntent(True, 2.0, 9.0, False)
-    assert loaded.background == FrameBackgroundPlan()
-    assert loaded.run_options == {}
-
-
-def test_historical_directory_uses_fixed_missing_field_defaults(tmp_path):
-    document = {
-        "image_wrangler": {
-            "image_wrangler": {
-                "Signal": {
-                    "inp_type": "Image Directory",
-                    "img_dir": str(tmp_path / "incoming"),
-                    "img_ext": "CBF",
-                    "include_subdir": True,
-                    "Filter": "sample*",
-                    "meta_ext": None,
-                }
-            }
-        }
-    }
-
-    loaded = load_run_intent_profile(json.dumps(document))
-
-    assert type(loaded.source_spec) is DirectorySourceSpec
-    assert loaded.source_spec.generation == 0
-    assert loaded.source_spec.root == tmp_path / "incoming"
-    assert loaded.source_spec.recursive is True
-    assert loaded.source_spec.suffixes == (".cbf",)
-    assert loaded.source_spec.name_filter == "sample*"
-    assert loaded.source_spec.metadata_format == "auto"
-    assert loaded.project_root == str(tmp_path / "incoming")
-    assert loaded.save_path == str(tmp_path / "incoming" / "xdart_processed_data")
-    assert loaded.max_cores == 1
-    assert loaded.bai_1d_args == {"npt": 128}
-    assert loaded.bai_2d_args == {"npt_rad": 128, "npt_azim": 64}
-
-
-def test_historical_active_background_is_rejected_without_science_loss(
-    tmp_path,
-):
-    document = {
-        "image_wrangler": {
-            "image_wrangler": {
-                "Signal": {"inp_type": "Image Series"},
-                "BG": {
-                    "bg_type": "Single BG File",
-                    "File": str(tmp_path / "background.tif"),
-                    "Scale": 0.5,
-                    "norm_channel": "monitor",
-                },
-            }
-        }
-    }
-
-    with pytest.raises(RunIntentProfileError, match="background"):
+    with pytest.raises(RunIntentProfileError, match="profile.*keyset"):
         load_run_intent_profile(json.dumps(document))

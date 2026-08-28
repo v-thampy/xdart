@@ -194,7 +194,6 @@ def test_p1b_b13_directory_count_is_physical_and_bounded(
         view.render(observation)
         mounted_text = " ".join((
             shell.controls.source_card.status.text(),
-            view._count.text(),
             view._header.text,
             view._header.detail,
         )).casefold()

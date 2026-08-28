@@ -2297,14 +2297,11 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
     ("pipeline", "expected"),
     (
         (None, (1, 8, 16, 16, 1, 4, 4)),
-        ((16, 16, 48), (16, 16, 48, 48, 16, 4, 4)),
-        ((1, 4, 56), (1, 4, 56, 56, 1, 4, 4)),
-        ((1, 8, 16, 56), (1, 16, 56, 56, 1, 4, 4)),
+        ((1, 8, 16, 56, 64), (1, 16, 56, 56, 1, 4, 4)),
         ((1, 8, 8, 64, 72), (1, 8, 64, 64, 1, 4, 4)),
     ),
     ids=(
-        "default", "diagnostic-16-16-48", "diagnostic-1-4-56",
-        "v2-settlement1-record8-inflight16-checkpoint56",
+        "default", "v2-settlement1-record8-inflight16-checkpoint56",
         "v2-funded-staging72-checkpoint64",
     ),
 )
@@ -2322,23 +2319,13 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
     intent = _intent(raw, target, poni)
     intent.max_cores = 4
     if pipeline is not None:
-        if len(pipeline) == 3:
-            intent.run_options["_post_g2_pipeline"] = {
-                "writer_batch_size": pipeline[0],
-                "reduction_inflight": pipeline[1],
-                "checkpoint_frame_cap": pipeline[2],
-            }
-        else:
-            intent.run_options["_post_g2_pipeline_v2"] = {
-                "writer_settlement_batch_size": pipeline[0],
-                "nexus_record_batch_size": pipeline[1],
-                "reduction_inflight": pipeline[2],
-                "semantic_checkpoint_frame_cap": pipeline[3],
-            }
-            if len(pipeline) == 5:
-                intent.run_options["_post_g2_pipeline_v2"][
-                    "staging_frame_cap"
-                ] = pipeline[4]
+        intent.run_options["_post_g2_pipeline_v2"] = {
+            "writer_settlement_batch_size": pipeline[0],
+            "nexus_record_batch_size": pipeline[1],
+            "reduction_inflight": pipeline[2],
+            "semantic_checkpoint_frame_cap": pipeline[3],
+            "staging_frame_cap": pipeline[4],
+        }
     expected_pipeline = (
         (1, 8, 8, 16, 64) if pipeline is None else pipeline
     )
@@ -2360,7 +2347,7 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             session._session._writer_batch_size,
             kwargs["executor"], session._session._worker._max_workers,
         ))
-        if len(expected_pipeline) in (4, 5):
+        if len(expected_pipeline) == 5:
             children = kwargs["sink"].output_sink_children
             (nexus,) = tuple(
                 child for child in children
@@ -2640,6 +2627,7 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
         "nexus_record_batch_size": 8,
         "reduction_inflight": 16,
         "semantic_checkpoint_frame_cap": 56,
+        "staging_frame_cap": 64,
     }
     intent.run_options["_post_g2_output_diagnostics_v1"] = {
         "save_xye": False,

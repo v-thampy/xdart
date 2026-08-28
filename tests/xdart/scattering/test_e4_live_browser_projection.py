@@ -187,63 +187,6 @@ def test_dynamic_policy_widens_only_standard_four_worker_grants(monkeypatch):
     assert calls[0][0]["requests"] == {"reduction_inflight": 16}
 
 
-def test_post_g2_pipeline_matrix_is_exact_private_nonlive_configuration():
-    from xdart.gui.tabs.scattering.adapters import dynamic_output
-
-    assert dynamic_output._post_g2_pipeline_choice(
-        RunIntent().freeze(), coordinated=False,
-    ) is None
-
-    legacy_fields = (
-        "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
-    )
-    rows = (
-        (1, 4, 56),
-        (8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48),
-    )
-    assert dynamic_output._POST_G2_PIPELINE_ROWS == frozenset(rows)
-    for row in rows:
-        configuration = RunIntent(run_options={
-            "_post_g2_pipeline": dict(zip(legacy_fields, row, strict=True)),
-        }).freeze()
-        assert dynamic_output._post_g2_pipeline_choice(
-            configuration, coordinated=True,
-        ) == row
-
-    complete = dict(zip(legacy_fields, rows[0], strict=True))
-    malformed = (
-        (None, TypeError),
-        ({**complete, "writer_batch_size": True}, TypeError),
-        ({key: complete[key] for key in legacy_fields[:-1]}, ValueError),
-        ({**complete, "extra": 1}, ValueError),
-        (dict(zip(legacy_fields, (8, 4, 8), strict=True)), ValueError),
-    )
-    for value, error in malformed:
-        configuration = RunIntent(
-            run_options={"_post_g2_pipeline": value},
-        ).freeze()
-        with pytest.raises(error):
-            dynamic_output._post_g2_pipeline_choice(
-                configuration, coordinated=True,
-            )
-
-    for configuration, message in (
-        (RunIntent(live_mode=True, run_options={
-            "_post_g2_pipeline": complete,
-        }).freeze(), "non-Live"),
-        (RunIntent(run_options={
-            "_post_g2_pipeline": complete,
-        }).freeze(), "coordinated"),
-        (RunIntent(processing_mode="Int 1D (XYE)", run_options={
-            "_post_g2_pipeline": complete,
-        }).freeze(), "Nexus"),
-    ):
-        with pytest.raises(ValueError, match=message):
-            dynamic_output._post_g2_pipeline_choice(
-                configuration, coordinated=message != "coordinated",
-            )
-
-
 def test_post_g2_pipeline_v2_absent_default_is_eligibility_bounded():
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 
@@ -261,22 +204,6 @@ def test_post_g2_pipeline_v2_absent_default_is_eligibility_bounded():
             intent.freeze(), coordinated=coordinated,
         ) is None
 
-    legacy = {
-        "writer_batch_size": 1,
-        "reduction_inflight": 4,
-        "checkpoint_frame_cap": 56,
-    }
-    legacy_configuration = RunIntent(
-        output_mode="Overwrite",
-        run_options={"_post_g2_pipeline": legacy},
-    ).freeze()
-    assert dynamic_output._post_g2_pipeline_v2_choice(
-        legacy_configuration, coordinated=True,
-    ) is None
-    assert dynamic_output._post_g2_pipeline_choice(
-        legacy_configuration, coordinated=True,
-    ) == (1, 4, 56)
-
     choice = dynamic_output._post_g2_pipeline_v2_choice(
         RunIntent(output_mode="Overwrite").freeze(), coordinated=True,
     )
@@ -290,14 +217,15 @@ def test_post_g2_pipeline_v2_absent_default_is_eligibility_bounded():
     ) == (1, 8, 8, 16, 64)
 
 
-def test_post_g2_pipeline_four_knob_choice_is_named_bounded_and_nonlive():
+def test_post_g2_pipeline_choice_is_named_bounded_and_nonlive():
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 
     fields = (
         "writer_settlement_batch_size", "nexus_record_batch_size",
         "reduction_inflight", "semantic_checkpoint_frame_cap",
+        "staging_frame_cap",
     )
-    values = (1, 8, 4, 56)
+    values = (1, 8, 4, 56, 64)
     complete = dict(zip(fields, values, strict=True))
     choice = dynamic_output._post_g2_pipeline_v2_choice(
         RunIntent(
@@ -390,20 +318,6 @@ def test_post_g2_pipeline_four_knob_choice_is_named_bounded_and_nonlive():
             coordinated=True,
         )
 
-    legacy = {
-        "writer_batch_size": 1, "reduction_inflight": 4,
-        "checkpoint_frame_cap": 56,
-    }
-    configuration = RunIntent(run_options={
-        "_post_g2_pipeline": legacy,
-        "_post_g2_pipeline_v2": complete,
-    }).freeze()
-    with pytest.raises(ValueError, match="both"):
-        dynamic_output._post_g2_pipeline_v2_choice(
-            configuration, coordinated=True,
-        )
-
-
 def test_post_g2_output_diagnostics_are_exact_private_v2_values():
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 
@@ -412,6 +326,7 @@ def test_post_g2_output_diagnostics_are_exact_private_v2_values():
         "nexus_record_batch_size": 8,
         "reduction_inflight": 16,
         "semantic_checkpoint_frame_cap": 56,
+        "staging_frame_cap": 64,
     }
     configured = RunIntent(
         output_mode="Overwrite",
@@ -477,16 +392,24 @@ def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(monkeypatch)
         lambda *_args: touched.append("science"),
     )
     fields = (
-        "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
+        "writer_settlement_batch_size", "nexus_record_batch_size",
+        "reduction_inflight", "semantic_checkpoint_frame_cap",
+        "staging_frame_cap",
     )
-    valid = dict(zip(fields, (8, 8, 8), strict=True))
+    valid = dict(zip(fields, (1, 8, 8, 16, 64), strict=True))
     configurations = (
-        RunIntent(run_options={"_post_g2_pipeline": valid}).freeze(),
+        RunIntent(run_options={
+            "_post_g2_pipeline_v2": {
+                key: valid[key] for key in fields[:-1]
+            },
+        }).freeze(),
         RunIntent(live_mode=True, run_options={
-            "_post_g2_pipeline": valid,
+            "_post_g2_pipeline_v2": valid,
         }).freeze(),
         RunIntent(run_options={
-            "_post_g2_pipeline": {**valid, "checkpoint_frame_cap": False},
+            "_post_g2_pipeline_v2": {
+                **valid, "semantic_checkpoint_frame_cap": False,
+            },
         }).freeze(),
     )
     for configuration in configurations:

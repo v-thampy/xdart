@@ -25,9 +25,6 @@ from xrd_tools.session.run_configuration import (
 )
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
-    image_series_spec,
-    normalize_metadata_format,
-    single_image_spec,
 )
 
 
@@ -511,208 +508,6 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
     return _validate_candidate(candidate)
 
 
-def _legacy_mapping(value: object) -> dict[str, Any]:
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _legacy_bool(value: object, *, default: bool, path: str) -> bool:
-    if value is None:
-        return default
-    if type(value) is bool:
-        return value
-    if type(value) is int and value in (0, 1):
-        return bool(value)
-    raise RunIntentProfileError(f"{path} is not a historical boolean")
-
-
-def _legacy_output_mode(value: object) -> str:
-    text = str(value or "Overwrite").strip().lower()
-    if text == "append":
-        return "Append"
-    if text in {"overwrite", "replace"}:
-        return "Overwrite"
-    raise RunIntentProfileError("historical output mode is unsupported")
-
-
-def _decode_legacy_static_scan(document: dict[str, Any]) -> RunIntent:
-    """Adapt the established image-wrangler session JSON translator.
-
-    Historical files have no live/batch/core/run-options contract.  Those
-    values therefore use fixed, host-independent next-run defaults rather than
-    environment variables or machine CPU counts.  An active legacy Background
-    is rejected because silently replacing it with None changes run science.
-    """
-
-    image = _legacy_mapping(
-        _legacy_mapping(document.get("image_wrangler")).get("image_wrangler")
-    )
-    signal = _legacy_mapping(image.get("Signal"))
-    if not signal:
-        raise RunIntentProfileError(
-            "document is neither a versioned profile nor an image-wrangler static-scan session"
-        )
-    legacy_background = _legacy_mapping(image.get("BG"))
-    background_mode = str(
-        legacy_background.get("bg_type") or "None"
-    ).strip()
-    if background_mode.casefold() != "none":
-        raise RunIntentProfileError(
-            "historical background settings require explicit migration"
-        )
-    input_type = str(signal.get("inp_type") or "Image Series")
-    metadata_format = normalize_metadata_format(
-        signal.get("meta_ext"), legacy_none_is_auto=True
-    )
-    source: SourceSpec | DirectorySourceSpec | None
-    source_project_root: Path | None
-    if input_type == "Image Directory":
-        selected_text = str(signal.get("img_dir") or "").strip()
-        if selected_text:
-            selected = Path(selected_text).expanduser()
-            extension = str(signal.get("img_ext") or "").strip().lower().lstrip(".") or "tif"
-            source = DirectorySourceSpec(
-                selected,
-                recursive=_legacy_bool(
-                    signal.get("include_subdir"),
-                    default=False,
-                    path="historical Signal.include_subdir",
-                ),
-                suffixes=(f".{extension}",),
-                name_filter=str(signal.get("Filter") or "") or None,
-                generation=0,
-                metadata_format=metadata_format,
-            )
-            source_project_root = selected
-        else:
-            source = None
-            source_project_root = None
-    elif input_type in {"Image Series", "Single Image"}:
-        selected_text = str(signal.get("File") or "").strip()
-        if selected_text:
-            selected = Path(selected_text).expanduser()
-            source = (
-                single_image_spec(selected, metadata_format=metadata_format)
-                if input_type == "Single Image"
-                else image_series_spec(selected, metadata_format=metadata_format)
-            )
-            source_project_root = selected.parent
-        else:
-            source = None
-            source_project_root = None
-    else:
-        raise RunIntentProfileError(
-            f"historical input type {input_type!r} is unsupported"
-        )
-
-    project = _legacy_mapping(image.get("Project"))
-    configured_project = str(project.get("project_folder") or "").strip()
-    project_root = (
-        Path(configured_project).expanduser()
-        if configured_project
-        else source_project_root
-    )
-    configured_save = str(
-        project.get("h5_dir") or image.get("h5_dir") or ""
-    ).strip()
-    save_path = (
-        Path(configured_save).expanduser()
-        if configured_save
-        else project_root / "xdart_processed_data" if project_root is not None else None
-    )
-
-    controls = _legacy_mapping(document.get("_xdart_static_controls"))
-    integration = _legacy_mapping(controls.get("controls_v2_int"))
-    bai_1d_args = _legacy_mapping(integration.get("bai_1d_args")) or {"npt": 128}
-    bai_2d_args = _legacy_mapping(integration.get("bai_2d_args")) or {
-        "npt_rad": 128,
-        "npt_azim": 64,
-    }
-
-    legacy_gi = _legacy_mapping(image.get("GI"))
-    gi_values = {
-        "enabled": _legacy_bool(
-            legacy_gi.get("Grazing"), default=False, path="historical GI.Grazing"
-        ),
-        "incidence_motor": str(legacy_gi.get("th_motor") or "Manual"),
-        "th_val": legacy_gi.get("th_val", 0.1),
-        "sample_orientation": legacy_gi.get("sample_orientation", 4),
-        "tilt_angle": legacy_gi.get("tilt_angle", 0.0),
-        "mode_1d": legacy_gi.get("gi_mode_1d", "q_total"),
-        "mode_2d": legacy_gi.get("gi_mode_2d", "qip_qoop"),
-    }
-    native_gi = _legacy_mapping(integration.get("gi_config"))
-    gi_values.update({
-        "incidence_motor": native_gi.get(
-            "incidence_motor", native_gi.get("th_motor", gi_values["incidence_motor"])
-        ),
-        "th_val": native_gi.get("th_val", gi_values["th_val"]),
-        "sample_orientation": native_gi.get(
-            "sample_orientation", gi_values["sample_orientation"]
-        ),
-        "tilt_angle": native_gi.get("tilt_angle", gi_values["tilt_angle"]),
-        "mode_1d": native_gi.get(
-            "mode_1d", native_gi.get("gi_mode_1d", gi_values["mode_1d"])
-        ),
-        "mode_2d": native_gi.get(
-            "mode_2d", native_gi.get("gi_mode_2d", gi_values["mode_2d"])
-        ),
-    })
-    if "gi" in integration:
-        gi_values["enabled"] = _legacy_bool(
-            integration["gi"], default=False, path="historical controls_v2_int.gi"
-        )
-    gi = _decode_gi(gi_values)
-
-    threshold_values = _legacy_mapping(integration.get("threshold_config"))
-    if not threshold_values:
-        legacy_threshold = _legacy_mapping(image.get("Mask"))
-        legacy_saturation = _legacy_mapping(image.get("MaskSat"))
-        threshold_values = {
-            "apply_threshold": _legacy_bool(
-                legacy_threshold.get("Threshold"),
-                default=False,
-                path="historical Mask.Threshold",
-            ),
-            "threshold_min": legacy_threshold.get("min"),
-            "threshold_max": legacy_threshold.get("max"),
-            "mask_saturation": _legacy_bool(
-                legacy_saturation.get("mask_sentinel"),
-                default=True,
-                path="historical MaskSat.mask_sentinel",
-            ),
-        }
-    threshold = _decode_threshold(threshold_values)
-
-    calibration = _legacy_mapping(image.get("Calibration"))
-    poni_file = str(
-        controls.get("poni_file")
-        or signal.get("poni_file")
-        or calibration.get("poni_file")
-        or ""
-    )
-    candidate = RunIntent(
-        source_spec=source,
-        processing_mode=str(controls.get("processing_mode") or "Int 2D"),
-        output_mode=_legacy_output_mode(signal.get("write_mode")),
-        live_mode=False,
-        batch_mode=False,
-        max_cores=1,
-        bai_1d_args=_json_mapping(bai_1d_args, path="historical bai_1d_args"),
-        bai_2d_args=_json_mapping(bai_2d_args, path="historical bai_2d_args"),
-        gi=gi,
-        threshold=threshold,
-        poni_file=poni_file,
-        poni_values=None,
-        mask_file=str(signal.get("mask_file") or ""),
-        background=FrameBackgroundPlan(),
-        project_root="" if project_root is None else str(project_root),
-        save_path="" if save_path is None else str(save_path),
-        run_options={},
-        generation=0,
-    )
-    return _validate_candidate(candidate)
-
-
 def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -787,7 +582,7 @@ def dump_run_intent_profile(intent: RunIntent) -> str:
 
 
 def load_run_intent_profile(text: str) -> RunIntent:
-    """Decode and fully validate versioned or historical profile JSON text."""
+    """Decode and fully validate one versioned vNext profile document."""
 
     if type(text) is not str:
         raise TypeError("profile text must be str")
@@ -798,9 +593,7 @@ def load_run_intent_profile(text: str) -> RunIntent:
             parse_constant=_reject_constant,
         )
         document = _mapping(document, path="profile")
-        if "schema" in document or "version" in document:
-            return _decode_versioned(document)
-        return _decode_legacy_static_scan(document)
+        return _decode_versioned(document)
     except RunIntentProfileError:
         raise
     except (json.JSONDecodeError, TypeError, ValueError, OverflowError) as error:

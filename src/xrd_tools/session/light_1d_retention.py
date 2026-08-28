@@ -1995,16 +1995,6 @@ class Light1DRetentionLease:
                     raise RuntimeError("light-1D cleanup hooks are frozen")
             return self._run_cleanup()
 
-    def retry_release(
-        self,
-        token: Light1DCleanupToken,
-        *,
-        hooks: Light1DCleanupHooks | None = None,
-    ) -> Light1DReleaseReceipt:
-        """Compatibility alias for the exact frozen cleanup retry."""
-        return self.retry_cleanup(token, hooks=hooks)
-
-
 def _custody_terminal(terminal, *, adoption: bool):
     dynamic_module = sys.modules.get("xrd_tools.session.dynamic_accounting")
     terminal_type = getattr(dynamic_module, "DynamicRunState", None)

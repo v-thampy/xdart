@@ -76,18 +76,10 @@ from ..output_preflight import (
 
 _MISSING = object()
 _SUPPORTED_LINEAGE_FRAME_CEILING = 1_000_000
-_POST_G2_PIPELINE_FIELDS = frozenset({
-    "writer_batch_size", "reduction_inflight", "checkpoint_frame_cap",
-})
-_POST_G2_PIPELINE_ROWS = frozenset({
-    (1, 4, 56), (8, 8, 8), (8, 8, 56), (8, 16, 56), (16, 16, 48),
-})
-_POST_G2_PIPELINE_V2_LEGACY_FIELDS = frozenset({
+_POST_G2_PIPELINE_V2_FIELDS = frozenset({
     "writer_settlement_batch_size", "nexus_record_batch_size",
     "reduction_inflight", "semantic_checkpoint_frame_cap",
-})
-_POST_G2_PIPELINE_V2_FIELDS = frozenset({
-    *_POST_G2_PIPELINE_V2_LEGACY_FIELDS, "staging_frame_cap",
+    "staging_frame_cap",
 })
 _POST_G2_OUTPUT_DIAGNOSTICS_FIELDS = frozenset({
     "save_xye", "durable_fsync",
@@ -105,31 +97,6 @@ _UNSAFE_UNFUNDED_STAGING_PAIR = (10_000, 10_008)
 _UNSAFE_UNFUNDED_STAGING_MAX_FRAMES = 3_621
 _UNSAFE_UNFUNDED_STAGING_RESIDUAL_BYTES = 16 * 1024 ** 3
 logger = logging.getLogger(__name__)
-
-
-def _post_g2_pipeline_choice(configuration, *, coordinated):
-    value = configuration.run_options.get("_post_g2_pipeline", _MISSING)
-    if value is _MISSING:
-        return None
-    if not isinstance(value, Mapping):
-        raise TypeError("post-G2 pipeline choice must be one exact mapping")
-    if set(value) != _POST_G2_PIPELINE_FIELDS:
-        raise ValueError("post-G2 pipeline choice has an invalid exact keyset")
-    row = (
-        value["writer_batch_size"], value["reduction_inflight"],
-        value["checkpoint_frame_cap"],
-    )
-    if any(type(item) is not int for item in row):
-        raise TypeError("post-G2 pipeline values must be exact integers")
-    if row not in _POST_G2_PIPELINE_ROWS:
-        raise ValueError("post-G2 pipeline choice is not an allowed row")
-    if configuration.live_mode:
-        raise ValueError("post-G2 pipeline choice requires a non-Live run")
-    if not coordinated:
-        raise ValueError("post-G2 pipeline choice requires a coordinated run")
-    if configuration.processing_mode == "Int 1D (XYE)":
-        raise ValueError("post-G2 pipeline choice requires Nexus output")
-    return row
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,13 +120,8 @@ class _PostG2OutputDiagnosticsChoice:
 
 
 def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
-    legacy = configuration.run_options.get("_post_g2_pipeline", _MISSING)
     value = configuration.run_options.get("_post_g2_pipeline_v2", _MISSING)
-    if legacy is not _MISSING and value is not _MISSING:
-        raise ValueError("post-G2 pipeline cannot supply both V1 and V2")
     if value is _MISSING:
-        if legacy is not _MISSING:
-            return None
         if (
             configuration.live_mode
             or configuration.batch_mode
@@ -171,17 +133,13 @@ def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
         return _PostG2PipelineV2Choice(1, 8, 8, 16, 64)
     if not isinstance(value, Mapping):
         raise TypeError("post-G2 pipeline V2 choice must be one exact mapping")
-    fields = set(value)
-    if fields not in {
-        _POST_G2_PIPELINE_V2_LEGACY_FIELDS,
-        _POST_G2_PIPELINE_V2_FIELDS,
-    }:
+    if set(value) != _POST_G2_PIPELINE_V2_FIELDS:
         raise ValueError("post-G2 pipeline V2 choice has an invalid exact keyset")
     row = tuple(value[field] for field in (
         "writer_settlement_batch_size", "nexus_record_batch_size",
         "reduction_inflight", "semantic_checkpoint_frame_cap",
     ))
-    staging = value.get("staging_frame_cap", 64)
+    staging = value["staging_frame_cap"]
     row += (staging,)
     if any(type(item) is not int for item in row):
         raise TypeError("post-G2 pipeline V2 values must be exact integers")
@@ -942,8 +900,6 @@ class DynamicOutputAdapter:
         if stop_signal.is_set(): raise RuntimeError("admission cancelled")
         env = dict(os.environ); frame_count = _supported_lineage_frame_count(item.source_stamp)
         pipeline_v2 = _post_g2_pipeline_v2_choice(self.configuration, coordinated=True)
-        pipeline = (_post_g2_pipeline_choice(self.configuration, coordinated=True)
-                    if pipeline_v2 is None else None)
         diagnostics = _post_g2_output_diagnostics_choice(self.configuration, pipeline_v2=pipeline_v2)
         unsafe = _unsafe_unfunded_staging_requested(
             pipeline_v2, run_options=self.configuration.run_options, env=env,
@@ -965,7 +921,7 @@ class DynamicOutputAdapter:
             effective = replace(decision, background_bindings=())
             prepared = _PreparedAdmission(
                 self, scan, plan, item, decision, effective, stop_signal,
-                (pipeline_v2, pipeline, diagnostics, env, unsafe, heavy),
+                (pipeline_v2, diagnostics, env, unsafe, heavy),
                 None, None, dormant_noop=True,
             )
             object.__setattr__(prepared, "identity", prepared)
@@ -973,8 +929,8 @@ class DynamicOutputAdapter:
         dormant = self._current if graph is None and self._current is not None and self._current.get("dormant") and self._current.get("policy") is not None and self._current["target"] == key and self._current["lineage"] == _stable_lineage(item) else None; authority = graph if graph is not None else dormant; accepted = None if authority is None else authority["policy"].allocation
         policy, layout, rows, ceiling, first = _light_policy_layout(
             self.configuration, plan, item, scan, decision.labels, heavy_request=heavy,
-            reduction_inflight=(pipeline_v2.reduction_inflight if pipeline_v2 else
-                                None if pipeline is None else pipeline[1]),
+            reduction_inflight=(pipeline_v2.reduction_inflight
+                                if pipeline_v2 else None),
             staging_frame_cap=(pipeline_v2.staging_frame_cap if pipeline_v2 else None),
             semantic_checkpoint_frame_cap=(pipeline_v2.semantic_checkpoint_frame_cap if pipeline_v2 else None),
             unsafe_unfunded_staging=unsafe, env=env, accepted_allocation=accepted)
@@ -983,7 +939,7 @@ class DynamicOutputAdapter:
         bindings = qualify(policy, prior)
         effective = replace(decision, background_bindings=bindings)
         prepared = _PreparedAdmission(self, scan, plan, item, decision, effective, stop_signal,
-            (pipeline_v2, pipeline, diagnostics, env, unsafe, heavy), (policy, layout, rows, ceiling, first), None)
+            (pipeline_v2, diagnostics, env, unsafe, heavy), (policy, layout, rows, ceiling, first), None)
         object.__setattr__(prepared, "identity", prepared); return prepared
     def activate(self, *args, cancelled=lambda: False, **kwargs):
         if len(args) != 1 or type(args[0]) is not _PreparedAdmission: raise TypeError("activation requires one prepared admission")
@@ -1053,7 +1009,7 @@ class DynamicOutputAdapter:
                                       preparation.item, preparation.effective)
         if _target_key(item.target) != _target_key(item.group.target):
             raise ValueError("planned output target differs from its canonical group target")
-        pipeline_v2, pipeline, output_diagnostics, resource_env, \
+        pipeline_v2, output_diagnostics, resource_env, \
             unsafe_unfunded_staging, heavy_request = preparation.context
         if preparation.dormant_noop:
             if preparation.resources is not None:
@@ -1343,10 +1299,8 @@ class DynamicOutputAdapter:
                     )
                 else:
                     nexus._configure_writer_batch_size(
-                        (
-                            1 if self.configuration.live_mode
-                            else min(8, inflight_max)
-                        ) if pipeline is None else pipeline[0]
+                        1 if self.configuration.live_mode
+                        else min(8, inflight_max)
                     )
                 self._pending_nexus.append(nexus)
             if nexus is None:
@@ -1415,8 +1369,7 @@ class DynamicOutputAdapter:
                 ),
                 dynamic_nexus_checkpoint_threshold=(
                     pipeline_v2.semantic_checkpoint_frame_cap
-                    if pipeline_v2 is not None else
-                    (None if pipeline is None else pipeline[2])
+                    if pipeline_v2 is not None else None
                 ),
             )
             if coordinated:
@@ -1543,15 +1496,6 @@ class DynamicOutputAdapter:
                         if output_diagnostics.durable_fsync
                         else "UNSAFE_SIMULATED"
                     ),
-                )
-            elif pipeline is not None:
-                logger.info(
-                    "[RUN-PIPELINE] requested-batch=%d effective-batch=%d "
-                    "requested-inflight=%d effective-inflight=%d "
-                    "requested-checkpoint=%d effective-checkpoint=%d",
-                    pipeline[0], nexus.writer_batch_size,
-                    pipeline[1], policy.allocation.reduction_inflight,
-                    pipeline[2], session._dynamic_nexus_checkpoint_threshold,
                 )
             return session, True
         except BaseException as primary:
