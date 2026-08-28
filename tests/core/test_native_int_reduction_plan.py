@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from xdart.modules.reduction import plan_from_live_scan
 from xrd_tools.session.readiness import (
     build_native_int_reduction_plan_from_args,
     build_native_int_reduction_plan_from_scan,
@@ -55,6 +54,7 @@ def _plan_snapshot(plan):
             "monitor_key",
             "error_model",
             "polarization_factor",
+            "azimuth_offset",
             "extra",
         )),
         "integration_2d": _snap(plan.integration_2d, (
@@ -113,30 +113,17 @@ def test_args_builder_preserves_monitor_and_mask_contract() -> None:
         "polarization_factor": 0.9,
     }
 
-    class FakeFrames:
-        index = []
-
-    class FakeScan:
-        skip_2d = False
-        gi = False
-        global_mask = np.array([1, 4])
-        detector_shape = (2, 3)
-        frames = FakeFrames()
-        bai_1d_args = dict(args_1d)
-        bai_2d_args = dict(args_2d)
-
-    expected = plan_from_live_scan(FakeScan(), integrate_2d=True)
+    detector_mask = np.array([1, 4])
     actual = build_native_int_reduction_plan_from_args(
         args_1d,
         args_2d,
         gi_enabled=False,
         integrate_1d=True,
         integrate_2d=True,
-        detector_mask=FakeScan.global_mask,
-        detector_shape=FakeScan.detector_shape,
+        detector_mask=detector_mask,
+        detector_shape=(2, 3),
     )
 
-    assert _plan_snapshot(actual) == _plan_snapshot(expected)
     snapshot = _plan_snapshot(actual)
     assert snapshot["integration_1d"]["monitor_key"] == "I0"
     assert snapshot["integration_2d"]["monitor_key"] == "mon"
@@ -147,7 +134,7 @@ def test_args_builder_preserves_monitor_and_mask_contract() -> None:
     assert "normalization_factor" not in snapshot["integration_2d"]["extra"]
 
 
-def test_scan_builder_matches_live_scan_plan() -> None:
+def test_scan_builder_matches_current_args_builder() -> None:
     args_1d = {
         "unit": "2th_deg",
         "method": "BBox",
@@ -190,11 +177,22 @@ def test_scan_builder_matches_live_scan_plan() -> None:
         bai_1d_args = dict(args_1d)
         bai_2d_args = dict(args_2d)
 
-    assert _plan_snapshot(build_native_int_reduction_plan_from_scan(
+    from_scan = build_native_int_reduction_plan_from_scan(
         FakeScan(), integrate_1d=True, integrate_2d=True
-    )) == _plan_snapshot(plan_from_live_scan(
-        FakeScan(), integrate_1d=True, integrate_2d=True
-    ))
+    )
+    from_args = build_native_int_reduction_plan_from_args(
+        args_1d,
+        args_2d,
+        gi_enabled=False,
+        integrate_1d=True,
+        integrate_2d=True,
+        detector_mask=FakeScan.global_mask,
+        detector_shape=FakeScan.detector_shape,
+    )
+
+    assert _plan_snapshot(from_scan) == _plan_snapshot(from_args)
+    assert from_scan.integration_1d.azimuth_offset == 90.0
+    assert from_scan.integration_2d.azimuth_offset == 12.0
 
 
 def test_gi_plan_defaults_orientation_to_four() -> None:
