@@ -166,7 +166,7 @@ def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selecti
         "QLineEdit#BrowsePathEdit:focus",
         "QPushButton#BrowseButton",
         "QPushButton#startButton",
-        'QFrame#controlsV2SectionHeader[accent="project"]',
+        'QFrame#controlsSectionHeader[accent="project"]',
         "QProgressBar::chunk",
     ):
         assert _selector_body(mauve, selector) == _selector_body(
@@ -192,9 +192,9 @@ def test_each_candidate_reaches_every_selected_control_family(
         "QPushButton:checked",
         "QToolButton:checked",
         "QCheckBox::indicator:checked, QRadioButton::indicator:checked",
-        "QPushButton#controlsV2ToggleButton:checked,\n"
-        "QPushButton#controlsV2PillButton:checked",
-        "QToolButton#controlsV2AutoButton:checked",
+        "QPushButton#controlsToggleButton:checked,\n"
+        "QPushButton#controlsPillButton:checked",
+        "QToolButton#controlsAutoButton:checked",
     ):
         assert f"background-color: {expected};" in _selector_body(
             qss, selector
@@ -209,18 +209,18 @@ def test_buttons_are_square_while_panel_cards_remain_rounded():
         "QToolButton",
         "QPushButton#BrowseButton",
         "QPushButton#toolButton",
-        "QPushButton#controlsV2ActionButton",
-        "QToolButton#controlsV2BrowseButton,\nQToolButton#controlsV2MoreButton",
-        "QPushButton#controlsV2ToggleButton,\nQPushButton#controlsV2PillButton",
-        "QToolButton#controlsV2AutoButton",
+        "QPushButton#controlsActionButton",
+        "QToolButton#controlsBrowseButton,\nQToolButton#controlsMoreButton",
+        "QPushButton#controlsToggleButton,\nQPushButton#controlsPillButton",
+        "QToolButton#controlsAutoButton",
     ):
         assert "border-radius: 0px;" in _selector_body(qss, selector), selector
 
     assert "border-radius: 7px;" in _selector_body(
-        qss, "QFrame#controlsV2SubsectionCard"
+        qss, "QFrame#controlsSubsectionCard"
     )
     assert "border-top-left-radius: 7px;" in _selector_body(
-        qss, "QFrame#controlsV2SectionHeader"
+        qss, "QFrame#controlsSectionHeader"
     )
 
 

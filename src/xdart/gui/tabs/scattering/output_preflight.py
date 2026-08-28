@@ -3208,7 +3208,7 @@ def execution_plan_values(
 
 
 def native_int_reduction_plan(configuration: FrozenRunConfiguration):
-    """Translate one frozen Controls V2 configuration into its mask-free plan.
+    """Translate one frozen Controls configuration into its mask-free plan.
 
     Scientific assets are admitted independently of control intent. The
     ordinary run path attaches its already-authenticated detector mask after

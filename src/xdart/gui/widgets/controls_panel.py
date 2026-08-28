@@ -134,7 +134,7 @@ class ActionButton(QtWidgets.QPushButton):
 
     def __init__(self, spec: ControlActionSpec, parent=None):
         super().__init__(spec.label, parent)
-        self.setObjectName("controlsV2ActionButton")
+        self.setObjectName("controlsActionButton")
         self._spec = spec
         self.clicked.connect(lambda: self.actionRequested.emit(self._spec.action))
         self.apply_spec(spec)
@@ -202,7 +202,7 @@ class SectionCard(QtWidgets.QFrame):
         collapsible: bool = True,
     ):
         super().__init__(parent)
-        self.setObjectName("controlsV2SectionCard")
+        self.setObjectName("controlsSectionCard")
         self.setProperty("accent", accent)
         self._collapsed = False
         self._collapsible = bool(collapsible)
@@ -212,14 +212,14 @@ class SectionCard(QtWidgets.QFrame):
         outer.setSpacing(0)
 
         self.header = QtWidgets.QFrame()
-        self.header.setObjectName("controlsV2SectionHeader")
+        self.header.setObjectName("controlsSectionHeader")
         self.header.setProperty("accent", accent)
         header_lay = QtWidgets.QHBoxLayout(self.header)
         self._header_layout = header_lay
         header_lay.setContentsMargins(7, 5, 8, 5)
         header_lay.setSpacing(7)
         self.toggle = QtWidgets.QToolButton()
-        self.toggle.setObjectName("controlsV2Chevron")
+        self.toggle.setObjectName("controlsChevron")
         self.toggle.setText("▾")
         self.toggle.setAutoRaise(True)
         self.toggle.setToolTip("Collapse section")
@@ -227,21 +227,21 @@ class SectionCard(QtWidgets.QFrame):
         self.toggle.clicked.connect(self.toggle_collapsed)
         header_lay.addWidget(self.toggle)
         self.chip = QtWidgets.QLabel(number)
-        self.chip.setObjectName("controlsV2SectionChip")
+        self.chip.setObjectName("controlsSectionChip")
         self.chip.setProperty("accent", accent)
         self.chip.setAlignment(QtCore.Qt.AlignCenter)
         self.chip.setVisible(bool(number))
         header_lay.addWidget(self.chip)
         self.title = QtWidgets.QLabel(title.upper())
-        self.title.setObjectName("controlsV2SectionTitle")
+        self.title.setObjectName("controlsSectionTitle")
         header_lay.addWidget(self.title, 1)
         self.status = QtWidgets.QLabel("")
-        self.status.setObjectName("controlsV2SectionStatus")
+        self.status.setObjectName("controlsSectionStatus")
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.status.hide()
         header_lay.addWidget(self.status)
         self.valid_marker = QtWidgets.QLabel("✓")
-        self.valid_marker.setObjectName("controlsV2SectionTick")
+        self.valid_marker.setObjectName("controlsSectionTick")
         self.valid_marker.setProperty("accent", accent)
         self.valid_marker.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.valid_marker.hide()
@@ -250,14 +250,14 @@ class SectionCard(QtWidgets.QFrame):
         outer.addWidget(self.header)
 
         self.body = QtWidgets.QFrame()
-        self.body.setObjectName("controlsV2SectionBody")
+        self.body.setObjectName("controlsSectionBody")
         self.body_layout = QtWidgets.QVBoxLayout(self.body)
         self.body_layout.setContentsMargins(8, 7, 8, 8)
         self.body_layout.setSpacing(5)
         outer.addWidget(self.body)
 
         self.embedded = QtWidgets.QFrame()
-        self.embedded.setObjectName("controlsV2Embedded")
+        self.embedded.setObjectName("controlsEmbedded")
         self.embedded_layout = QtWidgets.QVBoxLayout(self.embedded)
         self.embedded_layout.setContentsMargins(0, 4, 0, 0)
         self.embedded_layout.setSpacing(0)
@@ -348,7 +348,7 @@ class SectionCard(QtWidgets.QFrame):
 
     def add_group_header(self, text: str) -> None:
         label = QtWidgets.QLabel(text)
-        label.setObjectName("controlsV2GroupHeader")
+        label.setObjectName("controlsGroupHeader")
         self.add_row(label)
 
     def embedded_visible(self) -> bool:
@@ -399,27 +399,27 @@ class SubsectionCard(QtWidgets.QFrame):
         accent: str = "neutral",
     ):
         super().__init__(parent)
-        self.setObjectName("controlsV2SubsectionCard")
+        self.setObjectName("controlsSubsectionCard")
         self._collapsed = False
         outer = QtWidgets.QVBoxLayout(self)
         self._outer_layout = outer
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         self.header = QtWidgets.QFrame()
-        self.header.setObjectName("controlsV2SubsectionHeader")
+        self.header.setObjectName("controlsSubsectionHeader")
         h_lay = QtWidgets.QHBoxLayout(self.header)
         self._header_layout = h_lay
         h_lay.setContentsMargins(7, 4, 7, 4)
         h_lay.setSpacing(6)
         self.toggle = QtWidgets.QToolButton()
-        self.toggle.setObjectName("controlsV2SubChevron")
+        self.toggle.setObjectName("controlsSubChevron")
         self.toggle.setText("▾")
         self.toggle.setAutoRaise(True)
         self.toggle.clicked.connect(self.toggle_collapsed)
         h_lay.addWidget(self.toggle)
         if prefix:
             self.prefix = QtWidgets.QLabel(prefix)
-            self.prefix.setObjectName("controlsV2SubsectionPrefix")
+            self.prefix.setObjectName("controlsSubsectionPrefix")
             # The prefix chip takes the parent section's accent (amber for
             # Experiment, violet for Processing, …), not the global purple.
             self.prefix.setProperty("accent", accent)
@@ -427,7 +427,7 @@ class SubsectionCard(QtWidgets.QFrame):
         else:
             self.prefix = None
         self.title = QtWidgets.QLabel(title)
-        self.title.setObjectName("controlsV2SubsectionTitle")
+        self.title.setObjectName("controlsSubsectionTitle")
         # The title carries the section accent (amber for Experiment, red for
         # Processing, …) so every subsection reads consistently — no number chip.
         self.title.setProperty("accent", accent)
@@ -443,21 +443,21 @@ class SubsectionCard(QtWidgets.QFrame):
         # Trailing header slot for compact controls that belong on the header row
         # (e.g. the "Pts" field(s) for 1-D / 2-D), mirroring the mockup.
         self.header_extra = QtWidgets.QWidget()
-        self.header_extra.setObjectName("controlsV2SubsectionHeaderExtra")
+        self.header_extra.setObjectName("controlsSubsectionHeaderExtra")
         self.header_extra_layout = QtWidgets.QHBoxLayout(self.header_extra)
         self.header_extra_layout.setContentsMargins(0, 0, 0, 0)
         self.header_extra_layout.setSpacing(5)
         self.header_extra.hide()
         h_lay.addWidget(self.header_extra)
         self.status = QtWidgets.QLabel(status)
-        self.status.setObjectName("controlsV2SubsectionStatus")
+        self.status.setObjectName("controlsSubsectionStatus")
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.status.setVisible(bool(status))
         h_lay.addWidget(self.status)
         self.header.mousePressEvent = self._header_mouse_press
         outer.addWidget(self.header)
         self.body = QtWidgets.QFrame()
-        self.body.setObjectName("controlsV2SubsectionBody")
+        self.body.setObjectName("controlsSubsectionBody")
         self.body_layout = QtWidgets.QVBoxLayout(self.body)
         self.body_layout.setContentsMargins(7, 5, 7, 7)
         self.body_layout.setSpacing(4)
@@ -585,7 +585,7 @@ class FormRow(QtWidgets.QWidget):
         parent=None,
     ):
         super().__init__(parent)
-        self.setObjectName("controlsV2FormRow")
+        self.setObjectName("controlsFormRow")
         self._path = tuple(path)
         self._kind = kind
         self._enabled = bool(enabled)
@@ -601,7 +601,7 @@ class FormRow(QtWidgets.QWidget):
         lay.setSpacing(6)
 
         self.label = QtWidgets.QLabel(label)
-        self.label.setObjectName("controlsV2FieldLabel")
+        self.label.setObjectName("controlsFieldLabel")
         self.label.setMinimumWidth(76)
 
         if kind == "bool":
@@ -610,7 +610,7 @@ class FormRow(QtWidgets.QWidget):
             # checked-but-disabled controls visibly checked during active runs.
             self.label.hide()
             editor = QtWidgets.QPushButton(label)
-            editor.setObjectName("controlsV2ToggleButton")
+            editor.setObjectName("controlsToggleButton")
             editor.setCheckable(True)
             editor.setChecked(bool(value))
             editor.toggled.connect(
@@ -624,7 +624,7 @@ class FormRow(QtWidgets.QWidget):
         elif kind == "combo":
             lay.addWidget(self.label)
             editor = _ControlsComboBox()
-            editor.setObjectName("controlsV2ComboBox")
+            editor.setObjectName("controlsComboBox")
             # Qt's native popup ignores the QSS item-height floor on some
             # platforms.  Keep this parented delegate alive with the row so a
             # Tight live-theme change cannot compress choices into one line.
@@ -656,7 +656,7 @@ class FormRow(QtWidgets.QWidget):
         else:
             lay.addWidget(self.label)
             editor = QtWidgets.QLineEdit(self._line_display_value(value))
-            editor.setObjectName("controlsV2LineEdit")
+            editor.setObjectName("controlsLineEdit")
             editor.editingFinished.connect(self._emit_editor_edit)
             # A focused draft (user typing, NOT programmatic setText) is
             # revisioned at action time so it survives a rebuild and wins by
@@ -676,7 +676,7 @@ class FormRow(QtWidgets.QWidget):
         if browse:
             btn = QtWidgets.QToolButton()
             btn.setText("📁")
-            btn.setObjectName("controlsV2BrowseButton")
+            btn.setObjectName("controlsBrowseButton")
             btn.setToolTip(f"Browse {label}")
             btn.clicked.connect(lambda _=False, p=self._path: self.browseRequested.emit(p))
             btn.setMinimumWidth(31)
@@ -863,7 +863,7 @@ class RangeRow(QtWidgets.QWidget):
         parent=None,
     ):
         super().__init__(parent)
-        self.setObjectName("controlsV2RangeRow")
+        self.setObjectName("controlsRangeRow")
         self._entries: list[tuple[tuple[str, ...], str]] = []
         self._display_decimals = display_decimals
         self._model_text_by_path: dict[tuple[str, ...], str] = {}
@@ -873,13 +873,13 @@ class RangeRow(QtWidgets.QWidget):
         lay.setSpacing(PROCESSING_ROW_GAP)
 
         self.label = QtWidgets.QLabel(self._display_label)
-        self.label.setObjectName("controlsV2FieldLabel")
+        self.label.setObjectName("controlsFieldLabel")
         self.label.setMinimumWidth(PROCESSING_ROW_LABEL_WIDTH)
         lay.addWidget(self.label)
 
         self._low, self._low_path = self._edit(low, lay)
         dash = QtWidgets.QLabel("–")
-        dash.setObjectName("controlsV2RangeDash")
+        dash.setObjectName("controlsRangeDash")
         dash.setAlignment(QtCore.Qt.AlignCenter)
         lay.addWidget(dash)
         self._high, self._high_path = self._edit(high, lay)
@@ -888,7 +888,7 @@ class RangeRow(QtWidgets.QWidget):
         self._toggle_inverts_model = False
         if toggle is not None:
             btn = QtWidgets.QToolButton()
-            btn.setObjectName("controlsV2AutoButton")
+            btn.setObjectName("controlsAutoButton")
             btn.setText("✦")
             btn.setCheckable(True)
             tpath = tuple(toggle["path"])
@@ -927,7 +927,7 @@ class RangeRow(QtWidgets.QWidget):
         self._model_text_by_path[path] = self._model_text(value)
         edit = QtWidgets.QLineEdit(self._display_text(value))
         edit.setModified(False)
-        edit.setObjectName("controlsV2LineEdit")
+        edit.setObjectName("controlsLineEdit")
         edit.setEnabled(bool(spec.get("enabled", True)))
         # Same tooltip rule as _apply_edit: a full render must not leave the
         # bounds without their hover text until the first state UPDATE.
@@ -1075,7 +1075,7 @@ class PillRow(QtWidgets.QWidget):
         parent=None,
     ):
         super().__init__(parent)
-        self.setObjectName("controlsV2PillRow")
+        self.setObjectName("controlsPillRow")
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
@@ -1084,11 +1084,11 @@ class PillRow(QtWidgets.QWidget):
             btn = QtWidgets.QPushButton(field.label)
             # Reuse the accent-when-checked toggle styling, but content-sized and
             # fully rounded, via a DEDICATED object name (grouped with
-            # controlsV2ToggleButton in the theme).  The fully-rounded radius
+            # controlsToggleButton in the theme).  The fully-rounded radius
             # also needs the button tall enough for macOS to draw the rounded
             # bezel -- the theme floors it with a min-height (see the
-            # #controlsV2PillButton rule).
-            btn.setObjectName("controlsV2PillButton")
+            # #controlsPillButton rule).
+            btn.setObjectName("controlsPillButton")
             btn.setCheckable(True)
             btn.setChecked(bool(field.value))
             btn.setEnabled(bool(field.enabled))
@@ -1147,7 +1147,7 @@ class SegmentedControl(QtWidgets.QWidget):
     def __init__(self, path, options, *, value, enabled=True, reason="",
                  parent=None):
         super().__init__(parent)
-        self.setObjectName("controlsV2SegmentedControl")
+        self.setObjectName("controlsSegmentedControl")
         self._path = tuple(path)
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1157,7 +1157,7 @@ class SegmentedControl(QtWidgets.QWidget):
         self._segments: list[tuple[object, QtWidgets.QPushButton]] = []
         for idx, (label, opt_value) in enumerate(options):
             btn = QtWidgets.QPushButton(label)
-            btn.setObjectName("controlsV2SegmentButton")
+            btn.setObjectName("controlsSegmentButton")
             btn.setProperty("segment", True)
             btn.setCheckable(True)
             btn.setEnabled(bool(enabled))
@@ -1429,7 +1429,7 @@ class ControlsPanel(QtWidgets.QWidget):
             for button in self.source_card.body.findChildren(
                 QtWidgets.QToolButton
             )
-            if button.objectName() == "controlsV2MoreButton"
+            if button.objectName() == "controlsMoreButton"
             and button.property("role") == "sourceEnergy"
         ]
         if (source_field is None and source_more) or (
@@ -1451,7 +1451,7 @@ class ControlsPanel(QtWidgets.QWidget):
             for button in self.experiment_card.body.findChildren(
                 QtWidgets.QToolButton
             )
-            if button.objectName() == "controlsV2MoreButton"
+            if button.objectName() == "controlsMoreButton"
             and button.property("role") != "sourceEnergy"
         ]
         if (not gi_popup_fields and gi_more) or (
@@ -1538,7 +1538,7 @@ class ControlsPanel(QtWidgets.QWidget):
 
         if source_field is not None:
             source_button = source_more[0]
-            source_button._controls_v2_field = source_field
+            source_button._controls_field = source_field
             source_button.setEnabled(bool(source_field.enabled))
             source_button.setToolTip(
                 _field_tooltip(source_field.path, source_field.reason)
@@ -1548,7 +1548,7 @@ class ControlsPanel(QtWidgets.QWidget):
                 self._close_source_energy_popup()
         if gi_popup_fields:
             gi_button = gi_more[0]
-            gi_button._controls_v2_fields = gi_popup_fields
+            gi_button._controls_fields = gi_popup_fields
             gi_button.setEnabled(
                 any(field.enabled for field in gi_popup_fields)
             )
@@ -1735,14 +1735,14 @@ class ControlsPanel(QtWidgets.QWidget):
             self, field: ControlFormField) -> QtWidgets.QToolButton:
         btn = QtWidgets.QToolButton()
         btn.setText("…")
-        btn.setObjectName("controlsV2MoreButton")
+        btn.setObjectName("controlsMoreButton")
         btn.setProperty("role", "sourceEnergy")
         btn.setToolTip("Energy source")
         btn.setEnabled(bool(field.enabled))
-        btn._controls_v2_field = field
+        btn._controls_field = field
         btn.clicked.connect(
             lambda _=False, b=btn: self._open_source_energy_popup(
-                b._controls_v2_field
+                b._controls_field
             )
         )
         return btn
@@ -1758,7 +1758,7 @@ class ControlsPanel(QtWidgets.QWidget):
     def _open_source_energy_popup(self, field: ControlFormField) -> None:
         self._close_source_energy_popup()
         popup = QtWidgets.QWidget(self, QtCore.Qt.Tool)
-        popup.setObjectName("controlsV2EnergyPopup")
+        popup.setObjectName("controlsEnergyPopup")
         popup.setWindowTitle("Energy Source")
         lay = QtWidgets.QVBoxLayout(popup)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -1790,7 +1790,7 @@ class ControlsPanel(QtWidgets.QWidget):
         producers = self._experiment_producers(state)
         if producers:
             row = QtWidgets.QWidget()
-            row.setObjectName("controlsV2ActionRow")
+            row.setObjectName("controlsActionRow")
             prow = QtWidgets.QHBoxLayout(row)
             prow.setContentsMargins(0, 0, 0, 3)
             prow.setSpacing(5)
@@ -1894,13 +1894,13 @@ class ControlsPanel(QtWidgets.QWidget):
         if popup_fields:
             more = QtWidgets.QToolButton()
             more.setText("…")
-            more.setObjectName("controlsV2MoreButton")
+            more.setObjectName("controlsMoreButton")
             more.setToolTip("More GI options: Orientation, Tilt Angle")
             more.setEnabled(any(field.enabled for field in popup_fields))
-            more._controls_v2_fields = tuple(popup_fields)
+            more._controls_fields = tuple(popup_fields)
             more.clicked.connect(
                 lambda _=False, b=more: self._open_gi_more_popup(
-                    b._controls_v2_fields
+                    b._controls_fields
                 )
             )
             lay.addWidget(more, 0)
@@ -1922,10 +1922,10 @@ class ControlsPanel(QtWidgets.QWidget):
 
     def _open_gi_more_popup(self, fields: tuple[ControlFormField, ...]) -> None:
         """Small floating popup for the less-used GI options (Orientation, Tilt
-        Angle).  Its rows write through like any other V2 row."""
+        Angle).  Its rows write through like any other control row."""
         self._close_gi_more_popup()
         popup = QtWidgets.QWidget(self, QtCore.Qt.Tool)
-        popup.setObjectName("controlsV2GIMorePopup")
+        popup.setObjectName("controlsGIMorePopup")
         popup.setWindowTitle("GI Options")
         lay = QtWidgets.QVBoxLayout(popup)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -2089,7 +2089,7 @@ class ControlsPanel(QtWidgets.QWidget):
         Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
         the draft/focused-edit seam and route through the same write-through path."""
         label = QtWidgets.QLabel("Pts")
-        label.setObjectName("controlsV2HeaderLabel")
+        label.setObjectName("controlsHeaderLabel")
         sub.add_header_widget(label)
         for field in point_fields:
             row = FormRow(
@@ -2260,7 +2260,7 @@ class ControlsPanel(QtWidgets.QWidget):
         Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
         the draft/focused-edit seam and route through the same write-through path."""
         label = QtWidgets.QLabel("Pts")
-        label.setObjectName("controlsV2HeaderLabel")
+        label.setObjectName("controlsHeaderLabel")
         row.add_trailing_widget(label)
         for field in point_fields:
             pr = FormRow(
@@ -2306,7 +2306,7 @@ class ControlsPanel(QtWidgets.QWidget):
         if not actions:
             return
         row = QtWidgets.QWidget()
-        row.setObjectName("controlsV2ActionRow")
+        row.setObjectName("controlsActionRow")
         lay = QtWidgets.QHBoxLayout(row)
         lay.setContentsMargins(0, 2, 0, 0)
         lay.setSpacing(5)

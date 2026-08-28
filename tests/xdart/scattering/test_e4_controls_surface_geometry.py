@@ -48,15 +48,15 @@ def _intent() -> RunIntent:
 
 
 _SURFACE_NAMES = (
-    "controlsV2LineEdit",
-    "controlsV2ComboBox",
-    "controlsV2ToggleButton",
-    "controlsV2PillButton",
-    "controlsV2SegmentButton",
-    "controlsV2BrowseButton",
-    "controlsV2MoreButton",
-    "controlsV2AutoButton",
-    "controlsV2ActionButton",
+    "controlsLineEdit",
+    "controlsComboBox",
+    "controlsToggleButton",
+    "controlsPillButton",
+    "controlsSegmentButton",
+    "controlsBrowseButton",
+    "controlsMoreButton",
+    "controlsAutoButton",
+    "controlsActionButton",
 )
 
 
@@ -144,7 +144,7 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
                 assert widget.minimumHeight() == expected_height
                 assert widget.maximumHeight() == expected_height
                 assert _is_square(widget)
-        for combo in surfaces["controlsV2ComboBox"]:
+        for combo in surfaces["controlsComboBox"]:
             # The compact caret adds one theme-coloured interior pixel family;
             # a blank drop-down well would be a single flat field colour.
             assert len(_right_interior_colors(combo, width=16)) > 1

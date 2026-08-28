@@ -204,10 +204,10 @@ def test_e3_ui6_section_numbers_are_hidden_only_in_vnext_shell(
     shell = ScatteringWorkspaceShell()
     try:
         canonical_chips = canonical.findChildren(
-            QtWidgets.QLabel, "controlsV2SectionChip"
+            QtWidgets.QLabel, "controlsSectionChip"
         )
         shell_chips = shell.controls.findChildren(
-            QtWidgets.QLabel, "controlsV2SectionChip"
+            QtWidgets.QLabel, "controlsSectionChip"
         )
         assert any(chip.text() == "1" and not chip.isHidden() for chip in canonical_chips)
         assert all(chip.isHidden() for chip in shell_chips)

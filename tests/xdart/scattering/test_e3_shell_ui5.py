@@ -134,7 +134,7 @@ def test_e3_ui5_detector_and_directory_source_use_accepted_paths_and_order(
         assert y[("Signal", "meta_ext")] < y[("Signal", "Filter")]
 
         more = body.findChildren(
-            QtWidgets.QToolButton, "controlsV2MoreButton"
+            QtWidgets.QToolButton, "controlsMoreButton"
         )
         assert len(more) == 1
         assert more[0].property("role") == "sourceEnergy"

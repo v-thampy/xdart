@@ -156,7 +156,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             self._directory_session = DirectoryIndexSession(
                 probe_candidates=False)
             self.directory_status = QtWidgets.QLabel("No directory index")
-            self.directory_status.setObjectName("controlsV2DirectoryStatus")
+            self.directory_status.setObjectName("controlsDirectoryStatus")
             self.directory_status.setWordWrap(True)
             self.directory_status.setToolTip(
                 "Counts matching files directly in the selected folder. "
@@ -760,7 +760,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self.shutdown_probe_worker()
         super().closeEvent(event)
 
-    # ---- persistent Controls-V2 directory index -----------------------
+    # ---- persistent Controls directory index --------------------------
     @property
     def directory_session(self):
         return self._directory_session

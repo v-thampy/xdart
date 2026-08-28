@@ -813,7 +813,7 @@ QFrame#displayScaleDivider {
     max-width: 1px;
 }
 
-/* ── Controls Panel V2 workflow cards ─────────────────────────── */
+/* ── Controls workflow cards ──────────────────────────────────── */
 QWidget#controlsPanel {
     background-color: $win_bg;
     /* No font-family override — inherit the app default so the panel matches
@@ -828,15 +828,11 @@ QWidget#controlsPanel QPushButton,
 QWidget#controlsPanel QToolButton {
     font-size: $control_panel_font;
 }
-QMenu#controlsV2EnergyPopup,
-QMenu#controlsV2GIMorePopup {
+QMenu#controlsEnergyPopup,
+QMenu#controlsGIMorePopup {
     font-size: $control_panel_font;
 }
-QWidget#controlsV2TopActionBar {
-    background-color: transparent;
-    border: none;
-}
-QPushButton#controlsV2ActionButton {
+QPushButton#controlsActionButton {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
@@ -846,30 +842,30 @@ QPushButton#controlsV2ActionButton {
 }
 /* Reintegrate = transparent green (run-like); Advanced = transparent red
    (destructive/expert).  Producers stay neutral $field. */
-QPushButton#controlsV2ActionButton[actionRole="reintegrate"] {
+QPushButton#controlsActionButton[actionRole="reintegrate"] {
     background-color: rgba(224, 108, 117, 0.16);
     border-color: rgba(224, 108, 117, 0.45);
 }
-QPushButton#controlsV2ActionButton[actionRole="advanced"] {
+QPushButton#controlsActionButton[actionRole="advanced"] {
     background-color: rgba(224, 108, 117, 0.16);
     border-color: rgba(224, 108, 117, 0.45);
 }
-QPushButton#controlsV2ActionButton:hover {
+QPushButton#controlsActionButton:hover {
     background-color: $accent_muted;
     border-color: $accent;
 }
-QPushButton#controlsV2ActionButton:disabled {
+QPushButton#controlsActionButton:disabled {
     background-color: $panel;
     color: $text_muted;
     border-color: $field_border;
 }
 
-QFrame#controlsV2SectionCard {
+QFrame#controlsSectionCard {
     background-color: transparent;
     border: none;
     border-radius: 0px;
 }
-QFrame#controlsV2SectionHeader {
+QFrame#controlsSectionHeader {
     background-color: $panel;
     border: 1px solid $field_border;
     border-left: 4px solid $field_border;
@@ -878,24 +874,24 @@ QFrame#controlsV2SectionHeader {
     border-bottom-left-radius: 0px;
     border-bottom-right-radius: 0px;
 }
-QFrame#controlsV2SectionHeader[accent="project"] {
+QFrame#controlsSectionHeader[accent="project"] {
     background-color: $hdr_project;
     border-left-color: #8fb4ff;
 }
-QFrame#controlsV2SectionHeader[accent="source"] {
+QFrame#controlsSectionHeader[accent="source"] {
     background-color: $hdr_source;
     border-left-color: #6fdca5;
 }
-QFrame#controlsV2SectionHeader[accent="experiment"] {
+QFrame#controlsSectionHeader[accent="experiment"] {
     background-color: $hdr_experiment;
     border-left-color: #e8c46a;
 }
-QFrame#controlsV2SectionHeader[accent="processing"] {
+QFrame#controlsSectionHeader[accent="processing"] {
     background-color: $hdr_processing;
     border-left-color: #e06c75;
 }
-QToolButton#controlsV2Chevron,
-QToolButton#controlsV2SubChevron {
+QToolButton#controlsChevron,
+QToolButton#controlsSubChevron {
     background-color: transparent;
     color: $text_muted;
     border: none;
@@ -903,46 +899,46 @@ QToolButton#controlsV2SubChevron {
     min-width: 12px;
     max-width: 14px;
 }
-QLabel#controlsV2SectionChip {
+QLabel#controlsSectionChip {
     color: #11131a;
     border-radius: 5px;
     font-weight: 800;
     padding: 1px 6px;
     min-width: 18px;
 }
-QLabel#controlsV2SectionChip[accent="project"] {
+QLabel#controlsSectionChip[accent="project"] {
     background-color: #8fb4ff;
 }
-QLabel#controlsV2SectionChip[accent="source"] {
+QLabel#controlsSectionChip[accent="source"] {
     background-color: #6fdca5;
 }
-QLabel#controlsV2SectionChip[accent="experiment"] {
+QLabel#controlsSectionChip[accent="experiment"] {
     background-color: #e8c46a;
 }
-QLabel#controlsV2SectionChip[accent="processing"] {
+QLabel#controlsSectionChip[accent="processing"] {
     background-color: #e06c75;
 }
-QLabel#controlsV2SectionTitle {
+QLabel#controlsSectionTitle {
     color: $text;
     font-weight: 800;
     letter-spacing: 1px;
 }
-QLabel#controlsV2SectionStatus {
+QLabel#controlsSectionStatus {
     color: $text_muted;
     font-size: $control_panel_status_font;
     font-weight: 400;
 }
-QLabel#controlsV2SectionTick {
+QLabel#controlsSectionTick {
     background-color: transparent;
     font-size: $control_panel_tick_font;
     font-weight: 600;
     padding-left: 2px;
 }
-QLabel#controlsV2SectionTick[accent="project"] { color: #8fb4ff; }
-QLabel#controlsV2SectionTick[accent="source"] { color: #6fdca5; }
-QLabel#controlsV2SectionTick[accent="experiment"] { color: #e8c46a; }
-QLabel#controlsV2SectionTick[accent="processing"] { color: #e06c75; }
-QFrame#controlsV2SectionBody {
+QLabel#controlsSectionTick[accent="project"] { color: #8fb4ff; }
+QLabel#controlsSectionTick[accent="source"] { color: #6fdca5; }
+QLabel#controlsSectionTick[accent="experiment"] { color: #e8c46a; }
+QLabel#controlsSectionTick[accent="processing"] { color: #e06c75; }
+QFrame#controlsSectionBody {
     background-color: $card;
     border: 1px solid $field_border;
     border-top: none;
@@ -950,72 +946,68 @@ QFrame#controlsV2SectionBody {
     border-bottom-right-radius: $panel_corner_radius;
 }
 
-QFrame#controlsV2SubsectionCard {
+QFrame#controlsSubsectionCard {
     background-color: transparent;
     border: 1px solid $field_border;
     border-radius: $panel_corner_radius;
 }
-QFrame#controlsV2SubsectionHeader {
+QFrame#controlsSubsectionHeader {
     background-color: $panel;
     border: none;
     border-top-left-radius: $panel_corner_radius;
     border-top-right-radius: $panel_corner_radius;
 }
-QFrame#controlsV2SubsectionBody {
+QFrame#controlsSubsectionBody {
     background-color: transparent;
     border: none;
 }
 /* Subsection number (3a/3b, 1-D/2-D): the accent shown as TEXT on the section
    background — not dark text on a filled chip. */
-QLabel#controlsV2SubsectionPrefix {
+QLabel#controlsSubsectionPrefix {
     background-color: transparent;
     color: $accent_text;
     padding: 1px 4px;
     font-weight: 800;
 }
-QLabel#controlsV2SubsectionPrefix[accent="project"] { color: #8fb4ff; }
-QLabel#controlsV2SubsectionPrefix[accent="source"] { color: #6fdca5; }
-QLabel#controlsV2SubsectionPrefix[accent="experiment"] { color: #e8c46a; }
-QLabel#controlsV2SubsectionPrefix[accent="processing"] { color: #e06c75; }
-QLabel#controlsV2SubsectionTitle {
+QLabel#controlsSubsectionPrefix[accent="project"] { color: #8fb4ff; }
+QLabel#controlsSubsectionPrefix[accent="source"] { color: #6fdca5; }
+QLabel#controlsSubsectionPrefix[accent="experiment"] { color: #e8c46a; }
+QLabel#controlsSubsectionPrefix[accent="processing"] { color: #e06c75; }
+QLabel#controlsSubsectionTitle {
     color: $text_2;
     font-weight: 700;
 }
-QLabel#controlsV2SubsectionTitle[accent="project"] { color: #8fb4ff; }
-QLabel#controlsV2SubsectionTitle[accent="source"] { color: #6fdca5; }
-QLabel#controlsV2SubsectionTitle[accent="experiment"] { color: #e8c46a; }
-QLabel#controlsV2SubsectionTitle[accent="processing"] { color: #e06c75; }
-QLabel#controlsV2SubsectionStatus {
+QLabel#controlsSubsectionTitle[accent="project"] { color: #8fb4ff; }
+QLabel#controlsSubsectionTitle[accent="source"] { color: #6fdca5; }
+QLabel#controlsSubsectionTitle[accent="experiment"] { color: #e8c46a; }
+QLabel#controlsSubsectionTitle[accent="processing"] { color: #e06c75; }
+QLabel#controlsSubsectionStatus {
     color: $text_muted;
     font-size: $control_panel_status_font;
     font-weight: 400;
 }
 
-QWidget#controlsV2FormRow,
-QWidget#controlsV2FieldRow {
+QWidget#controlsFormRow {
     background-color: transparent;
 }
-QLabel#controlsV2FieldLabel {
+QLabel#controlsFieldLabel {
     color: $text_2;
 }
-QLabel#controlsV2FieldValue {
-    color: $text;
-}
-QLineEdit#controlsV2LineEdit,
-QComboBox#controlsV2ComboBox {
+QLineEdit#controlsLineEdit,
+QComboBox#controlsComboBox {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
     border-radius: 0px;
     padding: $control_field_padding;
 }
-QLineEdit#controlsV2LineEdit:disabled,
-QComboBox#controlsV2ComboBox:disabled {
+QLineEdit#controlsLineEdit:disabled,
+QComboBox#controlsComboBox:disabled {
     background-color: $panel;
     color: $text_muted;
 }
-QToolButton#controlsV2BrowseButton,
-QToolButton#controlsV2MoreButton {
+QToolButton#controlsBrowseButton,
+QToolButton#controlsMoreButton {
     background-color: #4d6fbd;
     color: $browse_text;
     border: 1px solid #6483ce;
@@ -1025,16 +1017,16 @@ QToolButton#controlsV2MoreButton {
     font-size: $control_panel_browse_font;
     min-width: 28px;
 }
-QToolButton#controlsV2BrowseButton:hover,
-QToolButton#controlsV2MoreButton:hover {
+QToolButton#controlsBrowseButton:hover,
+QToolButton#controlsMoreButton:hover {
     background-color: #5a7bd0;
 }
-QToolButton#controlsV2BrowseButton:pressed,
-QToolButton#controlsV2MoreButton:pressed {
+QToolButton#controlsBrowseButton:pressed,
+QToolButton#controlsMoreButton:pressed {
     background-color: $browse_pressed;
 }
-QPushButton#controlsV2ToggleButton,
-QPushButton#controlsV2PillButton {
+QPushButton#controlsToggleButton,
+QPushButton#controlsPillButton {
     background-color: $field;
     color: $text_2;
     border: 1px solid $field_border;
@@ -1043,33 +1035,33 @@ QPushButton#controlsV2PillButton {
     font-weight: 700;
     text-align: center;
 }
-QPushButton#controlsV2ToggleButton:checked,
-QPushButton#controlsV2PillButton:checked {
+QPushButton#controlsToggleButton:checked,
+QPushButton#controlsPillButton:checked {
     background-color: $selection_accent;
     color: $selection_accent_on_text;
     border-color: $selection_accent;
 }
-QPushButton#controlsV2ToggleButton:checked:disabled,
-QPushButton#controlsV2PillButton:checked:disabled {
+QPushButton#controlsToggleButton:checked:disabled,
+QPushButton#controlsPillButton:checked:disabled {
     background-color: $selection_accent_muted;
     color: $text_muted;
     border-color: $selection_accent_muted;
 }
-QPushButton#controlsV2ToggleButton:disabled,
-QPushButton#controlsV2PillButton:disabled {
+QPushButton#controlsToggleButton:disabled,
+QPushButton#controlsPillButton:disabled {
     background-color: $panel;
     color: $text_muted;
     border-color: $field_border;
 }
 /* Compact Conditioning / Corrections toggles.  A dedicated object name makes
    their first polish deterministic while several controls still share a row. */
-QPushButton#controlsV2PillButton {
+QPushButton#controlsPillButton {
     border-radius: 0px;
     padding: $pill_padding;
     min-height: 18px;
 }
 /* The compact RangeRow's ✦ auto/enable toggle + the low–high separator. */
-QToolButton#controlsV2AutoButton {
+QToolButton#controlsAutoButton {
     background-color: $field;
     color: $accent_text;
     border: 1px solid $field_border;
@@ -1077,17 +1069,17 @@ QToolButton#controlsV2AutoButton {
     padding: $auto_padding;
     font-weight: 700;
 }
-QToolButton#controlsV2AutoButton:checked {
+QToolButton#controlsAutoButton:checked {
     background-color: $selection_accent;
     color: $selection_accent_on_text;
     border-color: $selection_accent;
 }
-QToolButton#controlsV2AutoButton:checked:disabled {
+QToolButton#controlsAutoButton:checked:disabled {
     background-color: $selection_accent_muted;
     color: $text_2;
     border-color: $selection_accent_muted;
 }
-QToolButton#controlsV2AutoButton:disabled {
+QToolButton#controlsAutoButton:disabled {
     background-color: $panel;
     color: $text_muted;
     border-color: $field_border;
@@ -1155,17 +1147,17 @@ QWidget#scatteringWorkspaceShell QComboBox::down-arrow {
    square chrome.  Individual spacing tokens still own horizontal breathing
    room; zeroing only the vertical padding lets the common floor determine the
    exact outer height instead of each widget class growing independently. */
-QWidget#controlsPanel QLineEdit#controlsV2LineEdit,
-QWidget#controlsPanel QComboBox#controlsV2ComboBox,
+QWidget#controlsPanel QLineEdit#controlsLineEdit,
+QWidget#controlsPanel QComboBox#controlsComboBox,
 QWidget#controlsPanel QSpinBox,
 QWidget#controlsPanel QDoubleSpinBox,
-QWidget#controlsPanel QPushButton#controlsV2ActionButton,
-QWidget#controlsPanel QPushButton#controlsV2ToggleButton,
-QWidget#controlsPanel QPushButton#controlsV2PillButton,
-QWidget#controlsPanel QPushButton#controlsV2SegmentButton,
-QWidget#controlsPanel QToolButton#controlsV2BrowseButton,
-QWidget#controlsPanel QToolButton#controlsV2MoreButton,
-QWidget#controlsPanel QToolButton#controlsV2AutoButton,
+QWidget#controlsPanel QPushButton#controlsActionButton,
+QWidget#controlsPanel QPushButton#controlsToggleButton,
+QWidget#controlsPanel QPushButton#controlsPillButton,
+QWidget#controlsPanel QPushButton#controlsSegmentButton,
+QWidget#controlsPanel QToolButton#controlsBrowseButton,
+QWidget#controlsPanel QToolButton#controlsMoreButton,
+QWidget#controlsPanel QToolButton#controlsAutoButton,
 QWidget#runControlsBar QComboBox,
 QWidget#runControlsBar QSpinBox,
 QWidget#runControlsBar QDoubleSpinBox,
@@ -1176,7 +1168,7 @@ QWidget#runControlsBar QPushButton {
     padding-bottom: 0px;
     border-radius: 0px;
 }
-QWidget#controlsPanel QComboBox#controlsV2ComboBox::drop-down,
+QWidget#controlsPanel QComboBox#controlsComboBox::drop-down,
 QWidget#controlsPanel QSpinBox::up-button,
 QWidget#controlsPanel QSpinBox::down-button,
 QWidget#controlsPanel QDoubleSpinBox::up-button,
@@ -1186,11 +1178,11 @@ QWidget#runControlsBar QSpinBox::up-button,
 QWidget#runControlsBar QSpinBox::down-button {
     border-radius: 0px;
 }
-QWidget#controlsPanel QComboBox#controlsV2ComboBox::drop-down,
+QWidget#controlsPanel QComboBox#controlsComboBox::drop-down,
 QWidget#runControlsBar QComboBox::drop-down {
     width: 16px;
 }
-QWidget#controlsPanel QComboBox#controlsV2ComboBox::down-arrow,
+QWidget#controlsPanel QComboBox#controlsComboBox::down-arrow,
 QWidget#runControlsBar QComboBox::down-arrow {
     image: none;
     width: 0px;
@@ -1199,18 +1191,18 @@ QWidget#runControlsBar QComboBox::down-arrow {
     border-right: 3px solid transparent;
     border-top: 4px solid $text_muted;
 }
-QLabel#controlsV2RangeDash {
+QLabel#controlsRangeDash {
     color: $text_muted;
     min-width: 8px;
     background: transparent;
     border: none;
 }
-QLabel#controlsV2GroupHeader {
+QLabel#controlsGroupHeader {
     color: $text_muted;
     font-weight: 800;
     padding-top: 4px;
 }
-QFrame#controlsV2ActionRow {
+QFrame#controlsActionRow {
     border: none;
     background-color: transparent;
 }

@@ -285,7 +285,7 @@ def test_e3_ui6_compact_shell_continuity_at_review_viewports(
         )
 
         chips = shell.controls.findChildren(
-            QtWidgets.QLabel, "controlsV2SectionChip"
+            QtWidgets.QLabel, "controlsSectionChip"
         )
         assert all(chip.isHidden() for chip in chips)
 

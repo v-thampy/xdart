@@ -745,9 +745,9 @@ def build_native_int_reduction_plan_from_args(
     detector_mask: Any = None,
     detector_shape: tuple[int, int] | None = None,
 ):
-    """Build the native Controls V2 Int reduction plan.
+    """Build the native Controls integration plan.
 
-    This consumes the already-synced Controls V2 argument dictionaries
+    This consumes the already-synced Controls argument dictionaries
     directly and remains the pure controls-layer production plan builder.
     """
 
@@ -894,7 +894,7 @@ def build_native_int_reduction_plan_from_scan(
     threshold_max: Any = None,
     mask_saturation: bool = False,
 ):
-    """Build the native Controls V2 Int plan from a live-scan-like object.
+    """Build the native Controls integration plan from a live-scan-like object.
 
     This is the Qt-free run-path form of
     :func:`build_native_int_reduction_plan_from_args`: it reads only typed scan

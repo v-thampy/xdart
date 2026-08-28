@@ -372,8 +372,8 @@ def test_controls_panel_checked_disabled_matches_disabled_text_color(
         )
 
     assert color_for(
-        "QPushButton#controlsV2ToggleButton:checked:disabled"
-    ) == color_for("QPushButton#controlsV2ToggleButton:disabled")
+        "QPushButton#controlsToggleButton:checked:disabled"
+    ) == color_for("QPushButton#controlsToggleButton:disabled")
 
 
 
@@ -567,7 +567,7 @@ def test_reconcile_locks_gi_more_without_rebuilding(qapp):
             for button in panel.experiment_card.body.findChildren(
                 QtWidgets.QToolButton
             )
-            if button.objectName() == "controlsV2MoreButton"
+            if button.objectName() == "controlsMoreButton"
         )
         first_row = panel.findChildren(FormRow)[0]
         more.click()
@@ -581,7 +581,7 @@ def test_reconcile_locks_gi_more_without_rebuilding(qapp):
             for button in panel.experiment_card.body.findChildren(
                 QtWidgets.QToolButton
             )
-            if button.objectName() == "controlsV2MoreButton"
+            if button.objectName() == "controlsMoreButton"
         )
         assert panel.findChildren(FormRow)[0] is first_row
         assert not more.isEnabled()
@@ -783,7 +783,7 @@ def test_threshold_and_mask_saturated_are_independent_in_vnext(qapp):
         )
         assert pill.isEnabled()
         assert pill.isChecked()
-        assert pill.objectName() == "controlsV2PillButton"
+        assert pill.objectName() == "controlsPillButton"
         assert (MASK_SATURATION, True) in pill_rows[0].current_edits()
         pill.setChecked(False)
         assert (MASK_SATURATION, False) in emitted
@@ -1119,9 +1119,9 @@ def test_section_number_presentation_option_preserves_canonical_default(qapp):
     canonical = ControlsPanel()
     try:
         canonical_chips = canonical.findChildren(
-            QtWidgets.QLabel, "controlsV2SectionChip")
+            QtWidgets.QLabel, "controlsSectionChip")
         compact_chips = compact.findChildren(
-            QtWidgets.QLabel, "controlsV2SectionChip")
+            QtWidgets.QLabel, "controlsSectionChip")
 
         assert any(
             chip.text() == "1" and not chip.isHidden()
