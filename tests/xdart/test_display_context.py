@@ -28,7 +28,6 @@ import pytest
 pytest.importorskip("pyqtgraph")
 from pyqtgraph.Qt import QtWidgets
 
-from xdart.modules.live import LiveScan
 from xdart.modules.display_context import (
     AcquisitionContext,
     BrowseContext,

@@ -382,7 +382,8 @@ def test_reduction_subtracts_without_mutation_or_alternate_owner() -> None:
         "src/xdart/gui/tabs/scattering/adapters/run_executor.py",
         "src/xdart/gui/tabs/scattering/adapters/dynamic_output.py",
         "src/xrd_tools/reduction/core.py", "src/xrd_tools/io/record_writer.py",
-        "src/xrd_tools/io/nexus_record.py", "src/xdart/modules/reduction.py"))
+        "src/xrd_tools/io/nexus_record.py",
+        "src/xrd_tools/session/headless_scan.py"))
     definitions = sum(path.read_text().count("def _resolve_background_before_submit") for path in owners)
     assert definitions == 1
     assert sum(path.read_text().count("class NexusRecordWriter") for path in owners) == 1

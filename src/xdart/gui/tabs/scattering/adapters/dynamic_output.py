@@ -12,7 +12,6 @@ from typing import Any
 
 import numpy as np
 
-from xdart.modules.reduction import open_headless_scan_session
 from xrd_tools.io import (
     AppendDisposition,
     AppendIntent,
@@ -46,6 +45,7 @@ from xrd_tools.session import (
     SessionResourceAuthority,
     StageLedger,
     acquire_light_1d_retention,
+    open_headless_scan_session,
     required_result_modes,
     resolve_session_policy,
 )
@@ -1361,7 +1361,7 @@ class DynamicOutputAdapter:
                 accounting=accounting,
                 xye_receipt_boundary=xye,
                 policy=policy,
-                _background_plan=self.configuration.background,
+                background_plan=self.configuration.background,
                 dynamic_nexus_checkpoint=bool(
                     nexus is not None
                     and policy is not None

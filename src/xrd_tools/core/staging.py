@@ -1,9 +1,8 @@
 """RAM-aware sizing for the live heavy-staging caps (MEM-2).
 
-One function decides the window; the three live heavy caps consume it —
-``LiveFrameSeries._in_memory_cap`` (write-side staging), and the
-``max_heavy_items`` of both ``FrameRecordStore`` and ``PublicationStore``.
-Before MEM-2 all three hardcoded ``64``.
+One function decides the window consumed by acquisition staging and the
+``max_heavy_items`` bounds of ``FrameRecordStore`` and ``PublicationStore``.
+Before MEM-2 these paths hardcoded ``64``.
 
 The window is ~25% of TOTAL physical RAM (total, not available — stable and
 predictable across machines) divided by the AS-STORED per-frame heavy cost,

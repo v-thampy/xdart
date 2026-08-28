@@ -1,7 +1,7 @@
 """Immutable run-boundary configuration values.
 
 The GUI may edit a :class:`RunIntent` over time, but a processing run must not
-consult mutable widgets, legacy ParameterTrees, or a display ``LiveScan`` after
+consult mutable widgets, legacy ParameterTrees, or a display scan after
 the operator presses Run.  ``RunIntent.freeze()`` therefore creates one deeply
 immutable :class:`FrozenRunConfiguration` that can be shared by the wrangler,
 worker, reduction-plan builder, and writer provenance.
@@ -352,7 +352,7 @@ class FrozenGIConfiguration:
         return str(motor)
 
     def scan_config(self) -> dict[str, Any]:
-        """Return a fresh ``LiveScan.gi_config`` mapping."""
+        """Return a fresh run-owned GI configuration mapping."""
 
         if not self.enabled:
             return {}
@@ -921,7 +921,7 @@ class FrozenRunConfiguration:
         return None if self.source is None else self.source.thaw()
 
     def scan_args(self) -> dict[str, dict[Any, Any]]:
-        """Return fresh ``LiveScan`` integration keyword arguments."""
+        """Return fresh integration keyword arguments."""
 
         return {
             "bai_1d_args": self.bai_1d_args,
@@ -929,7 +929,7 @@ class FrozenRunConfiguration:
         }
 
     def scan_kwargs(self) -> dict[str, Any]:
-        """Return fresh run-owned ``LiveScan`` configuration values."""
+        """Return fresh run-owned scan configuration values."""
 
         values: dict[str, Any] = self.scan_args()
         values.update({

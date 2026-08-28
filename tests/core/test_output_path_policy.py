@@ -216,26 +216,6 @@ def test_row3_directory_watcher_names_outputs_nexus(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Row 4 — ``LiveScan(name)`` defaults to ``name.nexus``
-# ---------------------------------------------------------------------------
-
-def test_row4_livescan_default_data_file_is_nexus():
-    from xdart.modules.ewald.scan import LiveScan
-
-    scan = LiveScan("scan_042")
-    assert scan.data_file == "scan_042.nexus"
-
-
-def test_row4_livescan_preserves_an_explicit_data_file(tmp_path):
-    """§2 rule 5: an explicit legacy target is preserved exactly."""
-    from xdart.modules.ewald.scan import LiveScan
-
-    explicit = os.fspath(tmp_path / "chosen.nxs")
-    scan = LiveScan("scan_042", data_file=explicit)
-    assert scan.data_file == explicit
-
-
-# ---------------------------------------------------------------------------
 # Row 5 — time-resolved discovery naturally orders a mixed set
 # ---------------------------------------------------------------------------
 
@@ -786,7 +766,6 @@ def test_c2row10_a_safe_headless_target_is_still_accepted(tmp_path):
 HEADLESS_PRODUCERS = (
     ("xrd_tools/integrate/batch.py", "process_series"),
     ("xrd_tools/integrate/batch.py", "DirectoryWatcher._process_new_file"),
-    ("xdart/modules/ewald/scan.py", "LiveScan.__init__"),
     ("xrd_tools/analysis/time_resolved.py", "discover_processed_scans"),
 )
 

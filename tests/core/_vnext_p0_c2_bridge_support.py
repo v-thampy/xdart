@@ -2,8 +2,7 @@
 
 This module deliberately knows nothing about the H23 transaction, writer,
 lease, or physical-target implementation.  It turns immutable E6 directory
-observations into H10 identities and drives the public high-level LiveScan
-session surface used by the bridge tests.
+observations into H10 identities used by the composition tests.
 """
 
 from __future__ import annotations
@@ -11,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-import threading
 
 import numpy as np
 
@@ -193,71 +191,4 @@ def append_intent(
         modes=("1d:default",),
         source=source,
         labels=tuple(int(value) for value in labels),
-    )
-
-
-class LiveFrames:
-    def __init__(self, labels=()):
-        self._values = {}
-        self._persisted = set()
-        for label in labels:
-            self.add(label)
-
-    @property
-    def index(self):
-        return sorted(self._values)
-
-    def __getitem__(self, label):
-        return self._values[int(label)]
-
-    def add(self, label, *, value=None):
-        label = int(label)
-        self._values[label] = SimpleNamespace(
-            idx=label,
-            int_1d=integration_1d(label if value is None else value),
-            int_2d=None,
-            gi_1d={},
-            gi_2d={},
-            scan_info={},
-            map_raw=None,
-            bg_raw=None,
-            source_file="",
-            source_frame_idx=0,
-            mask=None,
-            poni=None,
-            thumbnail=None,
-        )
-
-    def mark_persisted(self, labels):
-        self._persisted.update(int(label) for label in labels)
-
-
-def live_scan(target: Path, intent, labels=()):
-    return SimpleNamespace(
-        name="c2-bridge",
-        data_file=str(target),
-        source_base=target.parent,
-        file_lock=threading.RLock(),
-        frames=LiveFrames(labels),
-        skip_2d=True,
-        bai_1d_args={},
-        bai_2d_args={},
-        gi=False,
-        gi_config={},
-        scan_data=None,
-        geometry=None,
-        global_mask=None,
-        detector_shape=None,
-        mg_args={"wavelength": 1e-10},
-        _same_run_intent=intent,
-    )
-
-
-def open_session(live, accounting, *, replace=True):
-    from xdart.modules.reduction import open_live_scan_nexus_session
-
-    return open_live_scan_nexus_session(
-        live,
-        replace=bool(replace),
-        accounting=accounting.writer_boundary,
     )

@@ -271,31 +271,6 @@ def _apply_prepared_run_state(widget):
     return widget._apply_controls_v2_run_state(frozen), frozen
 
 
-def _current_plan_snapshot(widget, *, include_threshold=True,
-                           integrate_1d=True, integrate_2d=True,
-                           commit_pending=True):
-    from xdart.modules.reduction import (
-        apply_threshold_saturation_to_plan,
-        plan_from_live_scan,
-    )
-
-    if commit_pending:
-        widget._commit_controls_v2_pending_edits()
-    widget._controls_v2_ensure_native_int_defaults()
-    widget._controls_v2_apply_gi_config_to_scan()
-    plan = plan_from_live_scan(
-        widget.scan,
-        integrate_1d=integrate_1d,
-        integrate_2d=integrate_2d,
-    )
-    if include_threshold:
-        plan = apply_threshold_saturation_to_plan(
-            plan,
-            widget._controls_v2_threshold_config(),
-        )
-    return _plan_snapshot(plan)
-
-
 def _native_plan_snapshot(widget, *, include_threshold=True,
                           integrate_1d=True, integrate_2d=True,
                           commit_pending=True):
@@ -756,8 +731,6 @@ def test_run_readiness_label_elides_without_widening_controls(qapp):
 
 
 def test_controls_panel_native_plan_preserves_monitor_parity():
-    from xdart.modules.reduction import plan_from_live_scan
-
     args_1d = {
         "unit": "q_A^-1",
         "method": "csr",
@@ -783,30 +756,16 @@ def test_controls_panel_native_plan_preserves_monitor_parity():
         "polarization_factor": 0.9,
     }
 
-    class FakeFrames:
-        index = []
-
-    class FakeScan:
-        skip_2d = False
-        gi = False
-        global_mask = np.array([1, 4])
-        detector_shape = (2, 3)
-        frames = FakeFrames()
-        bai_1d_args = dict(args_1d)
-        bai_2d_args = dict(args_2d)
-
-    legacy = plan_from_live_scan(FakeScan(), integrate_2d=True)
     native = build_native_int_reduction_plan_from_args(
         args_1d,
         args_2d,
         gi_enabled=False,
         integrate_1d=True,
         integrate_2d=True,
-        detector_mask=FakeScan.global_mask,
-        detector_shape=FakeScan.detector_shape,
+        detector_mask=np.array([1, 4]),
+        detector_shape=(2, 3),
     )
 
-    assert _plan_snapshot(native) == _plan_snapshot(legacy)
     snapshot = _plan_snapshot(native)
     assert snapshot["integration_1d"]["monitor_key"] == "I0"
     assert snapshot["integration_2d"]["monitor_key"] == "mon"
@@ -815,58 +774,6 @@ def test_controls_panel_native_plan_preserves_monitor_parity():
     assert snapshot["mask"]["true_count"] == 2
     assert "normalization_factor" not in snapshot["integration_1d"]["extra"]
     assert "normalization_factor" not in snapshot["integration_2d"]["extra"]
-
-
-def test_controls_panel_native_scan_builder_matches_legacy_plan():
-    from xdart.modules.reduction import plan_from_live_scan
-
-    args_1d = {
-        "unit": "2th_deg",
-        "method": "BBox",
-        "numpoints": 321,
-        "radial_range": (1.0, 4.0),
-        "azimuth_range": (60.0, 120.0),
-        "chi_offset": 90.0,
-        "error_model": "poisson",
-        "polarization_factor": 0.8,
-        "correctSolidAngle": False,
-        "dummy": -2.0,
-        "delta_dummy": 0.1,
-        "safe": False,
-    }
-    args_2d = {
-        "unit": "q_A^-1",
-        "method": "csr",
-        "npt_rad": 77,
-        "npt_azim": 88,
-        "radial_range": (0.5, 5.0),
-        "azimuth_range": (-45.0, 45.0),
-        "chi_offset": 12.0,
-        "error_model": "azimuthal",
-        "polarization_factor": 0.9,
-        "correctSolidAngle": True,
-        "dummy": -3.0,
-        "delta_dummy": 0.2,
-        "safe": True,
-    }
-
-    class FakeFrames:
-        index = []
-
-    class FakeScan:
-        skip_2d = False
-        gi = False
-        global_mask = np.array([1, 4])
-        detector_shape = (2, 3)
-        frames = FakeFrames()
-        bai_1d_args = dict(args_1d)
-        bai_2d_args = dict(args_2d)
-
-    assert _plan_snapshot(build_native_int_reduction_plan_from_scan(
-        FakeScan(), integrate_1d=True, integrate_2d=True
-    )) == _plan_snapshot(plan_from_live_scan(
-        FakeScan(), integrate_1d=True, integrate_2d=True
-    ))
 
 
 def test_controls_panel_native_gi_plan_defaults_orientation_to_4():

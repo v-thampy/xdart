@@ -1,6 +1,6 @@
 """P1-A transaction-backed dynamic XYE acceptance discriminators.
 
-The tests deliberately enter through the public xdart session facade and keep
+The tests deliberately enter through the public xrd_tools session boundary and keep
 the existing H10 accounting and H23 XYE transaction as the only authorities.
 The parent has no ``TransactionalXYESink`` yet; the fallback to the legacy
 ``XYESink`` makes that absence fail at the current truthful typed admission
@@ -54,20 +54,21 @@ def _plan():
     )
 
 
-def _live_frames(tmp_path: Path, count: int, integrator):
-    return tuple(
-        SimpleNamespace(
-            idx=index,
-            map_raw=np.full((2, 2), index + 1.0),
-            bg_raw=None,
-            scan_info={},
-            source_file=str(tmp_path / f"source-{index}.tif"),
-            source_frame_idx=0,
-            mask=None,
-            poni=None,
-            integrator=integrator,
-        )
-        for index in range(int(count))
+def _scan(tmp_path: Path, count: int, integrator, *, name="dynamic-xye"):
+    from xrd_tools.reduction import Frame, Scan
+
+    return Scan(
+        name,
+        [
+            Frame(
+                index,
+                image=np.full((2, 2), index + 1.0),
+                source_path=tmp_path / f"source-{index}.tif",
+                source_frame_index=0,
+            )
+            for index in range(int(count))
+        ],
+        integrator=integrator,
     )
 
 
@@ -136,7 +137,7 @@ def _open_case(
     checkpoint_threshold=None,
     with_xye=True,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import CompositeSink, NexusSink
     from xrd_tools.session import (
         FlushPolicy, SessionResourceRequirements, resolve_session_policy,
@@ -178,10 +179,9 @@ def _open_case(
             flush=FlushPolicy(interval=2, cap=8, margin=2),
             env={},
         )
-    session = open_live_scan_session(
-        _live_frames(tmp_path, frame_count, integrator),
+    session = open_headless_scan_session(
+        _scan(tmp_path, frame_count, integrator, name=name),
         _plan(),
-        scan_name=name,
         sink=sink,
         executor=1,
         accounting=accounting,
@@ -1315,9 +1315,9 @@ def test_xye_postpublication_receipt_failure_resumes_without_republication(
 def test_xye_identity_and_exact_graph_refusals_are_pre_effect(
     tmp_path, monkeypatch,
 ):
-    from xdart.modules.reduction import (
+    from xrd_tools.session import (
         DynamicXyeReceiptBoundaryRequired,
-        open_live_scan_session,
+        open_headless_scan_session,
     )
     import xrd_tools.reduction as reduction
     import xrd_tools.reduction.core as reduction_core
@@ -1409,10 +1409,14 @@ def test_xye_identity_and_exact_graph_refusals_are_pre_effect(
         else:
             sink = exact
         with pytest.raises(DynamicXyeReceiptBoundaryRequired):
-            open_live_scan_session(
-                _live_frames(tmp_path, 1, _CountingIntegrator()),
+            open_headless_scan_session(
+                _scan(
+                    tmp_path,
+                    1,
+                    _CountingIntegrator(),
+                    name=f"refusal-{ordinal}",
+                ),
                 plan,
-                scan_name=f"refusal-{ordinal}",
                 sink=sink,
                 executor=1,
                 accounting=accounting,

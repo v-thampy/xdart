@@ -883,10 +883,8 @@ def build_native_int_reduction_plan_from_args(
 ):
     """Build the native Controls V2 Int reduction plan.
 
-    This mirrors ``xdart.modules.reduction.plan_from_live_scan`` but takes the
-    already-synced Controls V2 argument dictionaries directly.  It stays in the
-    pure controls layer as the pre-flip equivalence gate; callers still decide
-    when this becomes the production plan source.
+    This consumes the already-synced Controls V2 argument dictionaries
+    directly and remains the pure controls-layer production plan builder.
     """
 
     from xrd_tools.reduction import (  # lazy: preserve readiness import purity

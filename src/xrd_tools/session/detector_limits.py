@@ -4,8 +4,8 @@
 SCOPE (review 2026-08-04): this is a beamline-scoped GUI seed, NOT an
 acquisition-dtype oracle.  A PONI names a detector family but carries no
 bit-depth fact, and one family can legitimately deliver more than one raw
-dtype (the supported Eiger path preserves uint16 AND uint32 frames —
-``xdart.modules.ewald.frame``).  The value produced here therefore only SEEDS
+dtype (the supported source adapters preserve uint16 AND uint32 Eiger frames).
+The value produced here therefore only SEEDS
 the manual-threshold inputs (LV-UI-11, maintainer-confirmed 0..detector-max
 defaults); saturated-pixel masking itself always derives its ceiling from the
 ACQUIRED frame's own dtype at reduction time

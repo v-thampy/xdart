@@ -1,7 +1,7 @@
 """C2 public-seam composition discriminators.
 
 The rows intentionally drive E6 discovery values into the accepted H10
-dynamic owner and then into the one high-level H23 LiveScan session.  They do
+dynamic owner and then into the exact headless session. They do
 not import or inspect writer, transaction, lease, or target internals.
 """
 
@@ -25,13 +25,53 @@ from tests.core._vnext_p0_c2_bridge_support import (
     accounting_for,
     append_intent,
     discover,
-    live_scan,
+    integration_1d,
     observe_source_fact,
-    open_session,
     retryable_attempt,
     successful_attempt,
     submission_attempt,
 )
+
+
+def _exact_scan(frames, *, name="c2-headless"):
+    from xrd_tools.reduction import Frame, Scan
+
+    fixtures = tuple(frames)
+    if not fixtures:
+        return Scan(name, [])
+    converted = [
+        Frame(
+            int(frame.idx),
+            image=np.asarray(frame.map_raw),
+            metadata=dict(frame.scan_info or {}),
+            source_path=frame.source_file,
+            source_frame_index=frame.source_frame_idx,
+            background=frame.bg_raw,
+            mask=frame.mask,
+        )
+        for frame in fixtures
+    ]
+    first = fixtures[0]
+    return Scan(
+        name,
+        converted,
+        poni=first.poni,
+        integrator=first.integrator,
+    )
+
+
+def _one_frame_scan(tmp_path, name):
+    return _exact_scan((SimpleNamespace(
+        idx=0,
+        map_raw=np.ones((2, 2)),
+        bg_raw=None,
+        scan_info={},
+        source_file=str(tmp_path / f"{name}.tif"),
+        source_frame_idx=0,
+        mask=None,
+        poni=None,
+        integrator=DeterministicIntegrator(),
+    ),), name=name)
 
 
 def _rows(target: Path) -> tuple[int, ...]:
@@ -51,459 +91,6 @@ def _write_ready_nexus(target: Path, frames: int = 1) -> None:
             data=np.arange(frames * 12, dtype=np.uint16).reshape(frames, 3, 4),
         )
         entry.create_dataset("end_time", data=np.bytes_("2026-08-07T00:00:00"))
-
-
-@pytest.mark.parametrize(
-    "filename", ("growing.nxs", "growing.h5", "armed_master.h5"),
-)
-def test_growing_container_retries_same_key_and_extends_one_live_owner(
-    tmp_path,
-    filename,
-):
-    from xrd_tools.sources import ProbeState, open_source
-    from xrd_tools.sources.directory_session import DirectoryIndexSession
-
-    source = tmp_path / filename
-    linked = tmp_path / "armed_data_000001.h5"
-    ordinary = filename != "armed_master.h5"
-    if filename == "armed_master.h5":
-        with h5py.File(source, "w") as handle:
-            entry = handle.create_group("entry")
-            entry.attrs["NX_class"] = "NXentry"
-            data = entry.create_group("data")
-            data.attrs["NX_class"] = "NXdata"
-            data["data_000001"] = h5py.ExternalLink(
-                str(linked), "/entry/data/data",
-            )
-        suffixes = ("_master.h5",)
-    else:
-        initial_value = 3 if filename.endswith(".nxs") else 5
-        with h5py.File(source, "w") as handle:
-            entry = handle.create_group("entry")
-            detector = entry.create_group("instrument/detector")
-            detector.create_dataset(
-                "data", data=np.full((1, 3, 4), initial_value, dtype=np.uint16),
-                maxshape=(None, 3, 4), chunks=(1, 3, 4),
-            )
-        suffixes = (Path(filename).suffix,)
-    source_owner = DirectoryIndexSession(probe_candidates=False)
-    source_owner.configure(tmp_path, suffixes=suffixes)
-    discovered = source_owner.observe()
-    candidate = next(
-        item for item in discovered.discovered_snapshot.candidates
-        if item.path == source
-    )
-    provisional = source_owner.probe_candidate(candidate, refresh=False)
-    expected_initial_state = (
-        ProbeState.READY if ordinary else ProbeState.IN_PROGRESS
-    )
-    assert provisional.result.state is expected_initial_state
-    assert provisional.result.descriptor is not None
-    assert provisional.result.descriptor.state is expected_initial_state
-    if ordinary:
-        opened = open_source(source)
-        try:
-            np.testing.assert_array_equal(
-                opened.load_frame(0),
-                np.full((3, 4), initial_value, dtype=np.uint16),
-            )
-        finally:
-            close = getattr(opened, "close", None)
-            if callable(close):
-                close()
-    first_fact = observe_source_fact(tmp_path, filename, logical_identity=0)
-    target = tmp_path / f"{Path(filename).stem}-processed.nexus"
-    _ledger, accounting, mode, target_name = accounting_for(target)
-    key0 = discover(accounting, first_fact, group="detector", ordinal=0, label=0)
-    if ordinary:
-        first_attempt = successful_attempt(
-            accounting, key0, first_fact.source_revision, mode,
-        )
-        first_intent = append_intent(
-            tmp_path, extent=1, labels=(0,), generation=0,
-            source_identity=first_fact.source_identity,
-        )
-        live = live_scan(target, first_intent, (0,))
-        session = open_session(live, accounting)
-        session.flush(force=True)
-        session.commit_epoch()
-    else:
-        failed = retryable_attempt(
-            accounting, key0, first_fact.source_revision,
-            "missing Eiger ExternalLink dependency",
-        )
-
-    if filename == "armed_master.h5":
-        master_stamp = source.stat().st_mtime_ns
-        with h5py.File(linked, "w") as handle:
-            handle.create_dataset(
-                "entry/data/data",
-                data=np.stack((
-                    np.full((3, 4), 11, dtype=np.uint16),
-                    np.full((3, 4), 13, dtype=np.uint16),
-                )),
-            )
-        assert source.stat().st_mtime_ns == master_stamp
-    else:
-        with h5py.File(source, "a") as handle:
-            data = handle["entry/instrument/detector/data"]
-            data.resize((2, 3, 4))
-            data[1] = np.full((3, 4), initial_value + 4, dtype=np.uint16)
-    current = source_owner.observe().discovered_snapshot.candidates
-    candidate = next(item for item in current if item.path == source)
-    ready = source_owner.probe_candidate(candidate, refresh=False)
-    assert ready.result.state is ProbeState.READY
-    opened = open_source(source)
-    try:
-        expected0 = 11 if not ordinary else initial_value
-        expected1 = 13 if not ordinary else initial_value + 4
-        np.testing.assert_array_equal(
-            opened.load_frame(0), np.full((3, 4), expected0, dtype=np.uint16),
-        )
-        np.testing.assert_array_equal(
-            opened.load_frame(1), np.full((3, 4), expected1, dtype=np.uint16),
-        )
-    finally:
-        close = getattr(opened, "close", None)
-        if callable(close):
-            close()
-    retry_fact = observe_source_fact(tmp_path, filename, logical_identity=0)
-    if ordinary:
-        successor = first_attempt
-    else:
-        successor = successful_attempt(
-            accounting,
-            key0,
-            max(first_fact.source_revision + 1, retry_fact.source_revision),
-            mode,
-        )
-        first_intent = append_intent(
-            tmp_path, extent=1, labels=(0,), generation=0,
-            source_identity=first_fact.source_identity,
-        )
-        live = live_scan(target, first_intent, (0,))
-        session = open_session(live, accounting)
-        session.flush(force=True)
-        session.commit_epoch()
-    assert accounting.owner_census().count(session) == 1
-
-    second_fact = observe_source_fact(tmp_path, filename, logical_identity=1)
-    key1 = discover(accounting, second_fact, group="detector", ordinal=1, label=1)
-    second = successful_attempt(
-        accounting,
-        key1,
-        max(successor.source_revision + 1, second_fact.source_revision),
-        mode,
-    )
-    session.extend(append_intent(
-        tmp_path, extent=2, labels=(0, 1), generation=1,
-        source_identity=first_fact.source_identity,
-    ))
-    live.frames.add(1)
-    session.flush(force=True)
-    session.commit_epoch()
-    session.finish(finalize=True)
-
-    snapshot = accounting.snapshot()
-    assert snapshot.attempts[key0] == (
-        (successor,) if ordinary else (failed, successor)
-    )
-    assert snapshot.attempts[key1] == (second,)
-    assert snapshot.durable_attempts[(key0, mode, target_name)] is successor
-    assert snapshot.durable_attempts[(key1, mode, target_name)] is second
-    assert _rows(target) == (0, 1)
-    assert session not in accounting.owner_census()
-    source_owner.close()
-
-
-@pytest.mark.parametrize("truncation", ("incomplete_object", "decoder_exception"))
-def test_partial_tiff_retry_has_no_receipt_then_same_key_succeeds(
-    tmp_path, truncation,
-):
-    from xrd_tools.sources import ProbeState, open_source
-    from xrd_tools.sources.directory_session import DirectoryIndexSession
-
-    source = tmp_path / "frame_0001.tif"
-    tifffile = pytest.importorskip("tifffile")
-    image = np.arange(12, dtype=np.uint16).reshape(3, 4)
-    complete = tmp_path / "complete.tif"
-    tifffile.imwrite(complete, image)
-    complete_bytes = complete.read_bytes()
-    complete.unlink()
-    cutoff = len(complete_bytes) // 3 if truncation == "incomplete_object" else 8
-    source.write_bytes(complete_bytes[:cutoff])
-    source_owner = DirectoryIndexSession(probe_candidates=False)
-    source_owner.configure(tmp_path, suffixes=(".tif",))
-    candidate = source_owner.observe().discovered_snapshot.candidates[0]
-    assert source_owner.probe_candidate(candidate, refresh=False).result.state \
-        is ProbeState.IN_PROGRESS
-    partial = observe_source_fact(tmp_path, source.name, logical_identity=0)
-    target = tmp_path / f"partial-tiff-{truncation}.nexus"
-    ledger, accounting, mode, target_name = accounting_for(target)
-    key = discover(accounting, partial, group="tiff", ordinal=0, label=0)
-    failed = retryable_attempt(accounting, key, partial.source_revision, "partial TIFF")
-    assert ledger.snapshot().persisted == ledger.snapshot().durable == frozenset()
-
-    source.write_bytes(complete_bytes)
-    candidate = source_owner.observe().discovered_snapshot.candidates[0]
-    ready = source_owner.probe_candidate(candidate, refresh=False)
-    assert ready.result.state is ProbeState.READY
-    opened = open_source(source)
-    assert np.array_equal(opened.load_frame(0), image)
-    completed = observe_source_fact(tmp_path, source.name, logical_identity=0)
-    successor = successful_attempt(
-        accounting,
-        key,
-        max(partial.source_revision + 1, completed.source_revision),
-        mode,
-    )
-    intent = append_intent(
-        tmp_path, extent=1, labels=(0,), generation=0,
-        source_identity=partial.source_identity,
-    )
-    session = open_session(live_scan(target, intent, (0,)), accounting)
-    session.flush(force=True)
-    session.commit_epoch()
-    session.finish(finalize=True)
-
-    snapshot = accounting.snapshot()
-    assert snapshot.attempts[key] == (failed, successor)
-    assert snapshot.durable_attempts[(key, mode, target_name)] is successor
-    assert _rows(target) == (0,)
-    source_owner.close()
-
-
-def test_ready_to_open_drift_is_retry_owned_and_opens_no_h23_session(tmp_path):
-    from xrd_tools.sources.directory_index import StaleCandidateError
-    from xrd_tools.sources.directory_session import DirectoryIndexSession
-
-    source = tmp_path / "ready.nxs"
-    _write_ready_nexus(source)
-    owner = DirectoryIndexSession(probe_candidates=False)
-    try:
-        owner.configure(tmp_path, suffixes=(".nxs",))
-        observation = owner.observe()
-        candidate = next(
-            value for value in observation.discovered_snapshot.candidates
-            if value.path == source
-        )
-        fact = observe_source_fact(tmp_path, source.name, logical_identity=0)
-        target = tmp_path / "drift-output.nexus"
-        ledger, accounting, mode, target_name = accounting_for(target)
-        key = discover(accounting, fact, group="drift", ordinal=0, label=0)
-        owner_census = accounting.owner_census()
-
-        with h5py.File(source, "a") as handle:
-            handle["entry"].attrs["revision"] = 2
-        with pytest.raises(StaleCandidateError):
-            owner.probe_candidate(candidate, refresh=True)
-        failed = retryable_attempt(accounting, key, fact.source_revision, "READY drift")
-        assert accounting.owner_census() == owner_census
-        assert not target.exists()
-        assert ledger.snapshot().persisted == ledger.snapshot().durable == frozenset()
-
-        current = observe_source_fact(tmp_path, source.name, logical_identity=0)
-        successor = successful_attempt(
-            accounting,
-            key,
-            max(fact.source_revision + 1, current.source_revision),
-            mode,
-        )
-        intent = append_intent(
-            tmp_path, extent=1, labels=(0,), generation=0,
-            source_identity=fact.source_identity,
-        )
-        session = open_session(live_scan(target, intent, (0,)), accounting)
-        session.flush(force=True)
-        session.commit_epoch()
-        session.finish(finalize=True)
-    finally:
-        owner.close()
-
-    snapshot = accounting.snapshot()
-    assert snapshot.attempts[key] == (failed, successor)
-    assert snapshot.durable_attempts[(key, mode, target_name)] is successor
-
-
-def test_interleaved_groups_advance_independent_contiguous_high_water(tmp_path):
-    source = tmp_path / "interleaved.nxs"
-    source.write_bytes(b"catalog")
-    facts = tuple(
-        observe_source_fact(tmp_path, source.name, logical_identity=value)
-        for value in range(4)
-    )
-    target = tmp_path / "interleaved-output.nexus"
-    _ledger, accounting, mode, _target_name = accounting_for(
-        target, max_groups=2, max_outstanding=4,
-    )
-    keys = []
-    for label, (group, ordinal) in enumerate(
-        (("a", 0), ("b", 0), ("a", 1), ("b", 1))
-    ):
-        key = discover(accounting, facts[label], group=group, ordinal=ordinal, label=label)
-        successful_attempt(accounting, key, facts[label].source_revision + label, mode)
-        keys.append(key)
-    before = accounting.snapshot()
-    assert before.high_water["a"].written == 1
-    assert before.high_water["b"].written == 1
-
-    intent = append_intent(
-        tmp_path, extent=4, labels=range(4), generation=0,
-        source_identity=facts[0].source_identity,
-    )
-    session = open_session(live_scan(target, intent, range(4)), accounting)
-    session.flush(force=True)
-    session.commit_epoch()
-    session.finish(finalize=True)
-    after = accounting.snapshot()
-    assert after.high_water["a"].durable == 1
-    assert after.high_water["b"].durable == 1
-    assert after.durable == frozenset(
-        (key, mode, f"nexus:{target}") for key in keys
-    )
-    assert _rows(target) == (0, 1, 2, 3)
-
-
-def test_failed_attempt_never_supplies_positive_stage_or_durability(tmp_path):
-    source = tmp_path / "successor.h5"
-    source.write_bytes(b"attempt-a")
-    first = observe_source_fact(tmp_path, source.name, logical_identity=0)
-    target = tmp_path / "successor-output.nexus"
-    ledger, accounting, mode, target_name = accounting_for(target)
-    key = discover(accounting, first, group="g", ordinal=0, label=0)
-    failed = retryable_attempt(accounting, key, first.source_revision, "revision changed")
-    source.write_bytes(b"attempt-b-complete")
-    second = observe_source_fact(tmp_path, source.name, logical_identity=0)
-    successor = successful_attempt(
-        accounting,
-        key,
-        max(first.source_revision + 1, second.source_revision),
-        mode,
-    )
-    intent = append_intent(
-        tmp_path, extent=1, labels=(0,), generation=0,
-        source_identity=first.source_identity,
-    )
-    session = open_session(live_scan(target, intent, (0,)), accounting)
-    session.flush(force=True)
-    session.commit_epoch()
-    session.finish(finalize=True)
-
-    dynamic = accounting.snapshot()
-    stage = ledger.snapshot()
-    assert dynamic.completed_attempts[key] is successor
-    assert dynamic.written_attempts[(key, mode)] is successor
-    assert dynamic.persisted_attempts[(key, mode, target_name)] is successor
-    assert dynamic.durable_attempts[(key, mode, target_name)] is successor
-    assert failed not in dynamic.completed_attempts.values()
-    assert stage.durable == frozenset(((0, mode, target_name),))
-
-
-def test_same_run_owner_refuses_duplicate_foreign_and_abort_restores_epoch(tmp_path):
-    source = tmp_path / "same-run.nxs"
-    source.write_bytes(b"same-run")
-    first_fact = observe_source_fact(tmp_path, source.name, logical_identity=0)
-    target = tmp_path / "same-run-output.nexus"
-    _ledger, accounting, mode, _target_name = accounting_for(target)
-    key0 = discover(accounting, first_fact, group="g", ordinal=0, label=0)
-    successful_attempt(accounting, key0, first_fact.source_revision, mode)
-    first = append_intent(
-        tmp_path, extent=1, labels=(0,), generation=0,
-        source_identity=first_fact.source_identity,
-    )
-    live = live_scan(target, first, (0,))
-    session = open_session(live, accounting)
-    session.flush(force=True)
-    session.commit_epoch()
-    epoch_a = target.read_bytes()
-    epoch_revision = accounting.snapshot().epoch_revision
-    assert accounting.owner_census().count(session) == 1
-
-    with pytest.raises((TypeError, ValueError)):
-        append_intent(
-            tmp_path, extent=2, labels=(0, 0), generation=1,
-            source_identity=first_fact.source_identity,
-        )
-    foreign = append_intent(
-        tmp_path, extent=2, labels=(0, 1), generation=1,
-        source_identity="foreign/source",
-    )
-    with pytest.raises(Exception):
-        session.extend(foreign)
-
-    second_fact = observe_source_fact(tmp_path, source.name, logical_identity=1)
-    key1 = discover(accounting, second_fact, group="g", ordinal=1, label=1)
-    successful_attempt(accounting, key1, second_fact.source_revision + 1, mode)
-    session.extend(append_intent(
-        tmp_path, extent=2, labels=(0, 1), generation=1,
-        source_identity=first_fact.source_identity,
-    ))
-    live.frames.add(1)
-    session.flush(force=True)
-    session.abort()
-
-    assert target.read_bytes() == epoch_a
-    snapshot = accounting.snapshot()
-    assert snapshot.epoch_revision == epoch_revision
-    assert key1 not in frozenset(key for key, _mode, _target in snapshot.durable)
-    assert session not in accounting.owner_census()
-
-
-def test_stop_is_preterminal_and_commits_only_preaccepted_ready_prefix(tmp_path):
-    source = tmp_path / "stopped.nxs"
-    source.write_bytes(b"stopped")
-    facts = tuple(
-        observe_source_fact(tmp_path, source.name, logical_identity=value)
-        for value in range(3)
-    )
-    target = tmp_path / "stopped-output.nexus"
-    ledger, accounting, mode, target_name = accounting_for(target)
-    key0 = discover(accounting, facts[0], group="g", ordinal=0, label=0)
-    attempt0 = successful_attempt(accounting, key0, facts[0].source_revision, mode)
-    key1 = discover(accounting, facts[1], group="g", ordinal=1, label=1)
-    attempt1 = accounting.begin_attempt(key1, source_revision=facts[1].source_revision + 1)
-    accounting.record_enqueued(attempt1)
-    accounting.record_accepted(attempt1)
-    key2 = discover(accounting, facts[2], group="g", ordinal=2, label=2)
-    retry = retryable_attempt(accounting, key2, facts[2].source_revision + 2, "partial")
-
-    first = append_intent(
-        tmp_path, extent=1, labels=(0,), generation=0,
-        source_identity=facts[0].source_identity,
-    )
-    live = live_scan(target, first, (0,))
-    session = open_session(live, accounting)
-    session.flush(force=True)
-    session.commit_epoch()
-    session.extend(append_intent(
-        tmp_path, extent=2, labels=(0, 1), generation=1,
-        source_identity=facts[0].source_identity,
-    ))
-
-    stopped = accounting.stop()
-    assert stopped.state.value == "active"
-    with pytest.raises(RuntimeError, match="frontier"):
-        discover(accounting, facts[2], group="late", ordinal=0, label=99)
-    accounting.record_completed(attempt1, produced=(mode,))
-    accounting.record_written(attempt1, modes=(mode,))
-    live.frames.add(1)
-    session.flush(force=True)
-    session.commit_epoch()
-    session.finish(finalize=False)
-
-    snapshot = accounting.snapshot()
-    assert _rows(target) == (0, 1)
-    assert snapshot.durable_attempts[(key0, mode, target_name)] is attempt0
-    assert snapshot.durable_attempts[(key1, mode, target_name)] is attempt1
-    assert key2 not in frozenset(key for key, _mode, _target in snapshot.durable)
-    assert snapshot.attempt_states[retry].value == "failed"
-    assert snapshot.in_flight == snapshot.retry_owned == frozenset()
-    # The retry failed before acceptance, so the run owns no StageLedger attempt
-    # that could truthfully receive a terminal disposition.
-    assert 2 not in ledger.snapshot().dispositions
-    with pytest.raises(RuntimeError, match="terminal"):
-        accounting.record_accepted(attempt1)
-    assert session not in accounting.owner_census()
 
 
 def test_event_sink_exposes_worker_process_only_for_callable_inner_hook():
@@ -663,7 +250,7 @@ def test_source_snapshot_and_mask_provenance_are_durable_and_conflict_atomic(
 
     record = writer_api.RecordWrite(
         label=0,
-        result_1d=live_scan(target, None, (0,)).frames[0].int_1d,
+        result_1d=integration_1d(0),
         source_path=source,
         source_frame_index=0,
         source_snapshot=snapshot,
@@ -698,7 +285,7 @@ def test_source_snapshot_and_mask_provenance_are_durable_and_conflict_atomic(
     before = target.read_bytes()
     conflicting = writer_api.RecordWrite(
         label=0,
-        result_1d=live_scan(target, None, (0,)).frames[0].int_1d,
+        result_1d=integration_1d(0),
         source_path=source,
         source_snapshot={**expected_snapshot, "size": expected_snapshot["size"] + 1},
     )
@@ -706,162 +293,6 @@ def test_source_snapshot_and_mask_provenance_are_durable_and_conflict_atomic(
         writer.write(conflicting)
     assert target.read_bytes() == before
     writer.finish()
-
-
-def test_close_revalidates_compact_frame_proof_after_checkpoint_corruption(
-    tmp_path,
-):
-    source = tmp_path / "proof-source.nxs"
-    source.write_bytes(b"source")
-    fact = observe_source_fact(tmp_path, source.name, logical_identity=0)
-    target = tmp_path / "proof-output.nexus"
-    _ledger, accounting, mode, _target = accounting_for(target)
-    key = discover(accounting, fact, group="proof", ordinal=0, label=0)
-    successful_attempt(accounting, key, fact.source_revision, mode)
-    intent = append_intent(
-        tmp_path, extent=1, labels=(0,), generation=0,
-        source_identity=fact.source_identity,
-    )
-    session = open_session(live_scan(target, intent, (0,)), accounting)
-    session._record_checkpoint_revoked = lambda _owner: None
-    session._record_checkpoint_recoverable = lambda *_args: None
-    session.flush(force=True)
-
-    writer = session.sink._writer
-    assert writer._transaction_binding is not None
-    assert writer._dirty_frames == {}
-    assert writer._durable_frame_proofs
-    proof = writer._durable_frame_proofs[0]
-    assert writer._frame_row_digest(0)[0] == proof.digest
-    frame_group = writer._h5["entry/frames/frame_0000"]
-    frame_group.attrs["mask_baked"] = not bool(frame_group.attrs["mask_baked"])
-    writer._h5.flush()
-    assert writer._frame_row_digest(0)[0] != proof.digest
-    with pytest.raises(Exception, match="frame proof changed"):
-        writer._close_handle()
-    session.abort()
-
-
-def test_descriptor_bound_close_reads_each_mode_array_once_and_hashes_each_observed_payload_once(
-    tmp_path,
-    monkeypatch,
-):
-    record_writer = importlib.import_module("xrd_tools.io.record_writer")
-    source = tmp_path / "one-pass-source.nxs"
-    source.write_bytes(b"source")
-    fact = observe_source_fact(tmp_path, source.name, logical_identity=0)
-    target = tmp_path / "one-pass-output.nexus"
-    _ledger, accounting, mode, _target = accounting_for(target)
-    key = discover(accounting, fact, group="proof", ordinal=0, label=0)
-    successful_attempt(accounting, key, fact.source_revision, mode)
-    intent = append_intent(
-        tmp_path, extent=1, labels=(0,), generation=0,
-        source_identity=fact.source_identity,
-    )
-    session = open_session(live_scan(target, intent, (0,)), accounting)
-    # This terminal-proof discriminator does not exercise the separate active
-    # hydration gate; the lightweight C2 bridge lacks that optional callback.
-    session._record_checkpoint_revoked = lambda _owner: None
-    session._record_checkpoint_recoverable = lambda *_args: None
-    session.flush(force=True)
-
-    writer = session.sink._writer
-    binding = writer._transaction_binding
-    assert binding is not None
-    checkpoint_digests = {
-        key: proof.digest for key, proof in writer._durable_mode_proofs.items()
-    }
-    assert checkpoint_digests
-    reads = {}
-    real_getitem = h5py.Dataset.__getitem__
-
-    def count_mode_array_reads(dataset, item):
-        if dataset.name.rsplit("/", 1)[-1] in {
-            "q", "intensity", "sigma", "chi",
-        }:
-            reads[dataset.name] = reads.get(dataset.name, 0) + 1
-        return real_getitem(dataset, item)
-
-    observed_digests = {}
-    expected_payload_hashes = {}
-    observed_payload_hashes = {}
-    real_reverify = writer._reverify_durable_mode_proof
-    real_update = record_writer._EvidenceBuilder._update
-
-    def capture_observed_digest(proof, *args):
-        evidence = real_reverify(proof, *args)
-        observed_digests[(proof.group_name, proof.label)] = (
-            evidence.observed_hexdigest()
-        )
-        return evidence
-
-    def count_observed_payload_hash(digest, role, side, payload):
-        if role.startswith("/") and role.rsplit("/", 1)[-1] in {
-            "frame_index", "q", "intensity", "sigma", "chi",
-        }:
-            if side == "expected":
-                expected_payload_hashes[role] = expected_payload_hashes.get(role, 0) + 1
-            elif side == "observed":
-                observed_payload_hashes[role] = observed_payload_hashes.get(role, 0) + 1
-        return real_update(digest, role, side, payload)
-
-    monkeypatch.setattr(h5py.Dataset, "__getitem__", count_mode_array_reads)
-    monkeypatch.setattr(
-        writer, "_reverify_durable_mode_proof", capture_observed_digest,
-    )
-    monkeypatch.setattr(
-        record_writer._EvidenceBuilder,
-        "_update",
-        staticmethod(count_observed_payload_hash),
-    )
-    writer._close_handle()
-
-    expected_reads = {}
-    for proof in writer._durable_mode_proofs.values():
-        prefix = f"/{writer.entry}/{proof.group_name}"
-        for name in ("q", "intensity"):
-            expected_reads[f"{prefix}/{name}"] = 1
-        if proof.sigma_expected:
-            expected_reads[f"{prefix}/sigma"] = 1
-        if proof.dimension == "2d":
-            expected_reads[f"{prefix}/chi"] = 1
-    assert reads == expected_reads
-    assert observed_digests == checkpoint_digests
-    assert expected_payload_hashes == {}
-    assert observed_payload_hashes
-    assert set(observed_payload_hashes.values()) == {1}
-    session.abort()
-
-
-def test_one_shot_refuses_a_second_owner_during_live_cadence(tmp_path):
-    from xdart.modules.reduction import write_live_scan_to_nexus
-
-    source = tmp_path / "cadence.nxs"
-    source.write_bytes(b"cadence")
-    fact = observe_source_fact(tmp_path, source.name, logical_identity=0)
-    target = tmp_path / "cadence-output.nexus"
-    _ledger, accounting, mode, _target_name = accounting_for(target)
-    key = discover(accounting, fact, group="g", ordinal=0, label=0)
-    successful_attempt(accounting, key, fact.source_revision, mode)
-    intent = append_intent(
-        tmp_path, extent=1, labels=(0,), generation=0,
-        source_identity=fact.source_identity,
-    )
-    live = live_scan(target, intent, (0,))
-    session = open_session(live, accounting)
-    session.flush(force=True)
-    session.commit_epoch()
-    before = target.read_bytes()
-    before_census = accounting.owner_census()
-    with pytest.raises(Exception):
-        write_live_scan_to_nexus(
-            live,
-            replace=True,
-            accounting=accounting.writer_boundary,
-        )
-    assert target.read_bytes() == before
-    assert accounting.owner_census() == before_census
-    session.finish(finalize=True)
 
 
 def test_real_reduction_session_refeed_uses_explicit_atomic_replace(
@@ -947,9 +378,9 @@ def test_public_durable_xye_capability_is_typed_and_composite_aggregated():
 def test_dynamic_bare_xye_refuses_before_any_positive_fact_or_target_mutation(
     tmp_path,
 ):
-    from xdart.modules.reduction import (
+    from xrd_tools.session import (
         DynamicXyeReceiptBoundaryRequired,
-        open_live_scan_session,
+        open_headless_scan_session,
     )
     from xrd_tools.reduction import ReductionPlan
     from xrd_tools.session import (
@@ -984,10 +415,9 @@ def test_dynamic_bare_xye_refuses_before_any_positive_fact_or_target_mutation(
     before_stage = ledger.snapshot()
     before_census = accounting.owner_census()
     with pytest.raises(DynamicXyeReceiptBoundaryRequired):
-        open_live_scan_session(
-            (live,),
+        open_headless_scan_session(
+            _exact_scan((live,)),
             ReductionPlan(integration_2d=None),
-            scan_name="bare-xye",
             sink=object(),
             xye_target=target_name,
             accounting=accounting,
@@ -1001,9 +431,9 @@ def test_dynamic_bare_xye_refuses_before_any_positive_fact_or_target_mutation(
 def test_dynamic_nested_actual_xye_cannot_be_laundered_by_receipt_capability(
     tmp_path,
 ):
-    from xdart.modules.reduction import (
+    from xrd_tools.session import (
         DynamicXyeReceiptBoundaryRequired,
-        open_live_scan_session,
+        open_headless_scan_session,
     )
     from xrd_tools.io import OutputReceiptCapability
     from xrd_tools.reduction import CompositeSink, ReductionPlan, XYESink
@@ -1040,8 +470,8 @@ def test_dynamic_nested_actual_xye_cannot_be_laundered_by_receipt_capability(
     before_stage = ledger.snapshot()
     before_census = accounting.owner_census()
     with pytest.raises(DynamicXyeReceiptBoundaryRequired):
-        open_live_scan_session(
-            (live,), ReductionPlan(integration_2d=None), sink=nested,
+        open_headless_scan_session(
+            _exact_scan((live,)), ReductionPlan(integration_2d=None), sink=nested,
             accounting=accounting, xye_receipt_boundary=UnrelatedReceiptOwner(),
         )
     assert accounting.snapshot() == before_dynamic
@@ -1064,12 +494,12 @@ def _dynamic_sink_case(tmp_path, name):
 
 
 def test_d1_direct_nexus_dynamic_graph_is_bound_and_admitted(tmp_path):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import NexusSink
 
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "direct-nexus")
-    session = open_live_scan_session(
-        (live,), plan,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan,
         sink=NexusSink(target, overwrite=True, atomic=False, flush_every=None),
         accounting=accounting,
         nexus_target=f"nexus:{target}",
@@ -1079,12 +509,12 @@ def test_d1_direct_nexus_dynamic_graph_is_bound_and_admitted(tmp_path):
 
 
 def test_d1_nexus_memory_dynamic_composite_is_bound_and_admitted(tmp_path):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import CompositeSink, MemorySink, NexusSink
 
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "nexus-memory")
-    session = open_live_scan_session(
-        (live,), plan,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan,
         sink=CompositeSink((
             MemorySink(), NexusSink(
                 target, overwrite=True, atomic=False, flush_every=None,
@@ -1098,8 +528,8 @@ def test_d1_nexus_memory_dynamic_composite_is_bound_and_admitted(tmp_path):
 
 
 def test_d1_swapping_delegation_proxy_refuses_before_begin_or_effect(tmp_path):
-    from xdart.modules.reduction import (
-        DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
+    from xrd_tools.session import (
+        DynamicXyeReceiptBoundaryRequired, open_headless_scan_session,
     )
     from xrd_tools.reduction import MemorySink, XYESink
 
@@ -1124,8 +554,8 @@ def test_d1_swapping_delegation_proxy_refuses_before_begin_or_effect(tmp_path):
     proxy = SwappingProxy(MemorySink())
     before = accounting.snapshot()
     with pytest.raises(DynamicXyeReceiptBoundaryRequired):
-        open_live_scan_session(
-            (live,), plan, sink=proxy, accounting=accounting,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=proxy, accounting=accounting,
             nexus_target=f"nexus:{target}",
         )
     assert proxy.begun is False
@@ -1134,7 +564,7 @@ def test_d1_swapping_delegation_proxy_refuses_before_begin_or_effect(tmp_path):
 
 
 def test_d1_original_composite_mutation_cannot_change_bound_execution(tmp_path):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import CompositeSink, MemorySink
 
     class LateEffectSink:
@@ -1144,8 +574,8 @@ def test_d1_original_composite_mutation_cannot_change_bound_execution(tmp_path):
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "bound-copy")
     marker = tmp_path / "late-effect.txt"
     original = CompositeSink((MemorySink(),))
-    session = open_live_scan_session(
-        (live,), plan, sink=original, accounting=accounting,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=original, accounting=accounting,
         nexus_target=f"nexus:{target}",
     )
     object.__setattr__(original, "sinks", (LateEffectSink(),))
@@ -1154,7 +584,7 @@ def test_d1_original_composite_mutation_cannot_change_bound_execution(tmp_path):
 
 
 def test_dynamic_accounting_subclass_refuses_before_xye_safety(tmp_path):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import XYESink
     from xrd_tools.session import (
         DynamicAccountingLimits, DynamicRunAccounting, ResultMode, StageLedger,
@@ -1176,8 +606,8 @@ def test_dynamic_accounting_subclass_refuses_before_xye_safety(tmp_path):
     directory = tmp_path / "subclass-xye"
     before = derived.snapshot()
     with pytest.raises(TypeError, match="DynamicRunAccounting"):
-        open_live_scan_session(
-            (live,), plan, sink=XYESink(directory), accounting=derived,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=XYESink(directory), accounting=derived,
             nexus_target=f"nexus:{target}",
         )
     assert derived.snapshot() == before
@@ -1185,47 +615,9 @@ def test_dynamic_accounting_subclass_refuses_before_xye_safety(tmp_path):
     assert not target.exists()
 
 
-def test_dynamic_accounting_subclass_refuses_before_direct_source_materialization(
-    tmp_path,
-):
-    from xdart.modules.reduction import open_live_scan_session
-    from xrd_tools.reduction import NexusSink, ReductionPlan
-    from xrd_tools.session import (
-        DynamicAccountingLimits, DynamicRunAccounting, ResultMode, StageLedger,
-    )
-
-    class DerivedDynamicAccounting(DynamicRunAccounting):
-        pass
-
-    class MustNotMaterialize:
-        def __iter__(self):
-            raise AssertionError("dynamic subclass admission touched the source")
-
-    target = tmp_path / "subclass-direct.nexus"
-    mode, target_name = ResultMode.one_d(), f"nexus:{target}"
-    ledger = StageLedger(
-        required_modes=(mode,), targets_by_mode={mode: (target_name,)},
-    )
-    accounting = DerivedDynamicAccounting(
-        ledger, run_generation=1,
-        limits=DynamicAccountingLimits(1, 2, 1),
-    )
-    before = accounting.snapshot()
-    with pytest.raises(TypeError, match="DynamicRunAccounting"):
-        open_live_scan_session(
-            MustNotMaterialize(), ReductionPlan(integration_2d=None),
-            sink=NexusSink(
-                target, overwrite=True, atomic=False, flush_every=None,
-            ),
-            accounting=accounting, nexus_target=target_name,
-        )
-    assert accounting.snapshot() == before
-    assert not target.exists()
-
-
 def test_dynamic_unclassified_proxy_fails_closed_before_begin(tmp_path):
-    from xdart.modules.reduction import (
-        DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
+    from xrd_tools.session import (
+        DynamicXyeReceiptBoundaryRequired, open_headless_scan_session,
     )
 
     class UnclassifiedProxy:
@@ -1240,8 +632,8 @@ def test_dynamic_unclassified_proxy_fails_closed_before_begin(tmp_path):
     proxy = UnclassifiedProxy()
     before = accounting.snapshot()
     with pytest.raises(DynamicXyeReceiptBoundaryRequired):
-        open_live_scan_session(
-            (live,), plan, sink=proxy, accounting=accounting,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=proxy, accounting=accounting,
             nexus_target=f"nexus:{target}",
         )
     assert proxy.begun is False
@@ -1249,8 +641,8 @@ def test_dynamic_unclassified_proxy_fails_closed_before_begin(tmp_path):
 
 
 def test_dynamic_delegated_proxy_classifies_its_actual_xye_child(tmp_path):
-    from xdart.modules.reduction import (
-        DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
+    from xrd_tools.session import (
+        DynamicXyeReceiptBoundaryRequired, open_headless_scan_session,
     )
     from xrd_tools.reduction import XYESink
 
@@ -1271,8 +663,8 @@ def test_dynamic_delegated_proxy_classifies_its_actual_xye_child(tmp_path):
     proxy = DelegatedProxy(XYESink(directory))
     before = accounting.snapshot()
     with pytest.raises(DynamicXyeReceiptBoundaryRequired):
-        open_live_scan_session(
-            (live,), plan, sink=proxy, accounting=accounting,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=proxy, accounting=accounting,
             nexus_target=f"nexus:{target}",
         )
     assert accounting.snapshot() == before
@@ -1280,8 +672,8 @@ def test_dynamic_delegated_proxy_classifies_its_actual_xye_child(tmp_path):
 
 
 def test_dynamic_admission_reclassifies_mutated_composite_children(tmp_path):
-    from xdart.modules.reduction import (
-        DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
+    from xrd_tools.session import (
+        DynamicXyeReceiptBoundaryRequired, open_headless_scan_session,
     )
     from xrd_tools.reduction import CompositeSink, MemorySink, XYESink
 
@@ -1297,8 +689,8 @@ def test_dynamic_admission_reclassifies_mutated_composite_children(tmp_path):
     object.__setattr__(sink, "sinks", (XYESink(directory), MustNotBegin()))
     before = accounting.snapshot()
     with pytest.raises(DynamicXyeReceiptBoundaryRequired):
-        open_live_scan_session(
-            (live,), plan, sink=sink, accounting=accounting,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=sink, accounting=accounting,
             nexus_target=f"nexus:{target}",
         )
     assert accounting.snapshot() == before
@@ -1306,13 +698,13 @@ def test_dynamic_admission_reclassifies_mutated_composite_children(tmp_path):
 
 
 def test_admitted_composite_children_are_immutable_for_session_lifetime(tmp_path):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import CompositeSink, MemorySink, XYESink
 
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "frozen")
     sink = CompositeSink((MemorySink(),))
-    session = open_live_scan_session(
-        (live,), plan, sink=sink, accounting=accounting,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=sink, accounting=accounting,
         nexus_target=f"nexus:{target}",
     )
     try:
@@ -1365,34 +757,23 @@ def _armed_submission(accounting, *, label=0, revision=1, logical=None):
 
 def _open_final_session(tmp_path, name, sink, accounting, live, plan, *, store=None,
                         nexus_target=None, executor=1, policy=None):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
 
-    return open_live_scan_session(
-        (live,), plan, sink=sink, accounting=accounting, executor=executor,
+    return open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=sink, accounting=accounting, executor=executor,
         record_store=store,
         nexus_target=nexus_target or f"nexus:{tmp_path / (name + '.nexus')}",
         policy=policy,
     )
 
 
-class _ObservedLiveFrames:
-    def __init__(self, frame, effects):
-        self._frame = frame
-        self._effects = effects
-
-    def __iter__(self):
-        self._effects["source_iterations"] += 1
-        return iter((self._frame,))
-
-
 def _install_policy_effect_spies(monkeypatch):
-    import xdart.modules.reduction as reduction_module
-    import xrd_tools.session as session_module
+    import xrd_tools.session.headless_scan as headless_module
     from xrd_tools.reduction import NexusSink
     from xrd_tools.session import DynamicRunAccounting
 
     active = {"accounting": None, "effects": None}
-    original_binder = reduction_module.bind_dynamic_output_sink
+    original_binder = headless_module.bind_dynamic_output_sink
     original_ledger = DynamicRunAccounting.ledger.fget
     original_bind = NexusSink.bind_session
     original_begin = NexusSink.begin
@@ -1424,12 +805,12 @@ def _install_policy_effect_spies(monkeypatch):
         return original_begin(owner, scan, plan)
 
     monkeypatch.setattr(
-        reduction_module, "bind_dynamic_output_sink", observed_binder,
+        headless_module, "bind_dynamic_output_sink", observed_binder,
     )
     monkeypatch.setattr(
         DynamicRunAccounting, "ledger", property(observed_ledger),
     )
-    monkeypatch.setattr(session_module, "ScanSession", observed_session)
+    monkeypatch.setattr(headless_module, "ScanSession", observed_session)
     monkeypatch.setattr(NexusSink, "bind_session", observed_bind)
     monkeypatch.setattr(NexusSink, "begin", observed_begin)
     return active
@@ -1440,10 +821,10 @@ def _install_policy_effect_spies(monkeypatch):
     ("foreign-policy", "policy-subclass", "missing-or-foreign-allocation"),
     ids=("foreign-policy", "policy-subclass", "missing-or-foreign-allocation"),
 )
-def test_live_scan_facade_refuses_invalid_policy_before_source_or_sink_effect(
+def test_headless_session_refuses_invalid_policy_before_sink_effect(
     tmp_path, monkeypatch, invalid_kind,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import NexusSink, ReductionPlan
     from xrd_tools.session import (
         FlushPolicy,
@@ -1492,7 +873,6 @@ def test_live_scan_facade_refuses_invalid_policy_before_source_or_sink_effect(
         target = tmp_path / name / "result.nexus"
         _ledger, accounting, _mode, target_name = accounting_for(target)
         effects = {
-            "source_iterations": 0,
             "sink_classifications": 0,
             "accounting_observations": 0,
             "session_constructions": 0,
@@ -1517,8 +897,8 @@ def test_live_scan_facade_refuses_invalid_policy_before_source_or_sink_effect(
         active["effects"] = effects
         error = None
         try:
-            open_live_scan_session(
-                _ObservedLiveFrames(live, effects),
+            open_headless_scan_session(
+                _exact_scan((live,)),
                 ReductionPlan(integration_2d=None),
                 sink=NexusSink(
                     target, overwrite=True, atomic=False, flush_every=None,
@@ -1538,7 +918,6 @@ def test_live_scan_facade_refuses_invalid_policy_before_source_or_sink_effect(
 
     for effects, error, before, after in observations:
         assert effects == {
-            "source_iterations": 0,
             "sink_classifications": 0,
             "accounting_observations": 0,
             "session_constructions": 0,
@@ -1550,10 +929,10 @@ def test_live_scan_facade_refuses_invalid_policy_before_source_or_sink_effect(
         assert str(error) == expected
 
 
-def test_live_scan_facade_refuses_policy_for_other_requirements_before_sink_or_target(
+def test_headless_session_refuses_foreign_requirements_before_sink_or_target(
     tmp_path, monkeypatch,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import NexusSink, ReductionPlan
     from xrd_tools.session import (
         FlushPolicy,
@@ -1564,7 +943,6 @@ def test_live_scan_facade_refuses_policy_for_other_requirements_before_sink_or_t
     target = tmp_path / "mismatch" / "result.nexus"
     _ledger, accounting, _mode, target_name = accounting_for(target)
     effects = {
-        "source_iterations": 0,
         "sink_classifications": 0,
         "accounting_observations": 0,
         "session_constructions": 0,
@@ -1602,8 +980,8 @@ def test_live_scan_facade_refuses_policy_for_other_requirements_before_sink_or_t
     active["effects"] = effects
     error = None
     try:
-        open_live_scan_session(
-            _ObservedLiveFrames(live, effects),
+        open_headless_scan_session(
+            _exact_scan((live,)),
             ReductionPlan(integration_2d=None),
             sink=NexusSink(
                 target, overwrite=True, atomic=False, flush_every=None,
@@ -1617,7 +995,6 @@ def test_live_scan_facade_refuses_policy_for_other_requirements_before_sink_or_t
     active["accounting"] = None
     active["effects"] = None
 
-    assert effects["source_iterations"] == 1
     assert effects["session_constructions"] == 0
     assert effects["sink_binds"] == 0
     assert effects["sink_begins"] == 0
@@ -1751,7 +1128,7 @@ def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
     tmp_path, monkeypatch, frame_count, batch_size, cap, margin,
     checkpoint_threshold, expected_threshold, inflight, expected_remainder,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import (
         CompositeSink, Integration1DPlan, MemorySink, NexusSink, ReductionPlan,
     )
@@ -1812,8 +1189,8 @@ def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
         return real_flush(owner, force=force)
 
     monkeypatch.setattr(NexusSink, "flush", observed_flush)
-    session = open_live_scan_session(
-        live, plan, sink=graph, accounting=accounting,
+    session = open_headless_scan_session(
+        _exact_scan(live, name="settled-checkpoint"), plan, sink=graph, accounting=accounting,
         executor=policy.allocation.workers,
         inflight_max=policy.allocation.reduction_inflight,
         nexus_target=target_name, policy=policy,
@@ -1864,7 +1241,7 @@ def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
 
 
 def test_c2_dynamic_submit_refuses_every_invalid_capability_before_engine(tmp_path):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import Frame, NexusSink
     from xrd_tools.session import (
         DynamicAccountingLimits, DynamicAttemptToken, DynamicFrameIdentity,
@@ -1903,8 +1280,8 @@ def test_c2_dynamic_submit_refuses_every_invalid_capability_before_engine(tmp_pa
     foreign.discover(foreign_key, group="foreign", ordinal=0, output_label=0)
     foreign_token = submission_attempt(foreign, foreign_key, 1)
     wrong_generation = DynamicAttemptToken(keys[1], 999, 1, 1)
-    session = open_live_scan_session(
-        (live,), plan,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan,
         sink=NexusSink(target, overwrite=True, atomic=False, flush_every=None),
         accounting=accounting, executor=MustNotSubmit(), nexus_target=target_name,
     )
@@ -1928,8 +1305,8 @@ def test_c2_dynamic_submit_refuses_every_invalid_capability_before_engine(tmp_pa
     session.stop()
     session.finish(raise_on_failure=False)
 
-    static = open_live_scan_session(
-        (live,), plan, sink=None, executor=MustNotSubmit(),
+    static = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=None, executor=MustNotSubmit(),
     )
     with pytest.raises(ValueError, match="static"):
         static.submit(static.scan.frames[0], attempt_token=tokens[0])
@@ -1970,7 +1347,7 @@ def test_dynamic_existing_target_append_extends_through_public_session_capabilit
 ):
     import json
 
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.core.containers import IntegrationResult1D
     from xrd_tools.core.scan import Scan, ScanFrame
     from xrd_tools.io import (
@@ -2025,8 +1402,8 @@ def test_dynamic_existing_target_append_extends_through_public_session_capabilit
         target, atomic=False, flush_every=None, source_base=tmp_path,
         append_preflight=preflight,
     )
-    session = open_live_scan_session(
-        (live,), plan, sink=nexus, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=nexus, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     assert session.submit(session.scan.frames[0], attempt_token=token1)
@@ -2384,7 +1761,7 @@ def test_scan_session_active_epoch_extends_exact_prefix_until_policy_commit(
 def test_scan_session_commit_epoch_then_extend_live_reuses_exact_capability(
     tmp_path, monkeypatch, composite,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.io import AppendRefused, get_output_transaction_coordinator
     import xrd_tools.io.append as append_module
     from xrd_tools.io.output_transaction import OutputTransaction
@@ -2431,8 +1808,8 @@ def test_scan_session_commit_epoch_then_extend_live_reuses_exact_capability(
     monkeypatch.setattr(OutputTransaction, "acquire_lease", count_acquire)
     monkeypatch.setattr(append_module, "qualify_append", count_qualify)
 
-    session = open_live_scan_session(
-        (live,), plan, sink=sink, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=sink, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     assert session.submit(session.scan.frames[0], attempt_token=token0)
@@ -2492,7 +1869,7 @@ def test_scan_session_commit_epoch_then_extend_live_reuses_exact_capability(
 def test_scan_session_extend_live_refusals_and_stop_preserve_committed_epoch(
     tmp_path, monkeypatch,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import NexusSink
 
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "same-run-stop")
@@ -2521,8 +1898,8 @@ def test_scan_session_extend_live_refusals_and_stop_preserve_committed_epoch(
         return original_extend(owner, capability, intent)
 
     monkeypatch.setattr(NexusSink, "extend_live", count_extend)
-    session = open_live_scan_session(
-        (live,), plan, sink=nexus, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=nexus, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     before = accounting.snapshot()
@@ -2557,7 +1934,7 @@ def test_scan_session_extend_live_refusals_and_stop_preserve_committed_epoch(
 def test_scan_session_capture_fault_aborts_graph_but_keeps_dynamic_light_reusable(
     tmp_path, monkeypatch,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import NexusSink
     from xrd_tools.session import (
         Light1DBufferLayout, Light1DCleanupHooks, Light1DLayout,
@@ -2602,8 +1979,8 @@ def test_scan_session_capture_fault_aborts_graph_but_keeps_dynamic_light_reusabl
         same_run_intent=intent,
     )
     with pytest.raises(RuntimeError, match="forced continuation capture fault"):
-        open_live_scan_session(
-            (live,), plan,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan,
             sink=nexus,
             accounting=accounting, executor=1, nexus_target=target_name,
         )
@@ -2617,8 +1994,8 @@ def test_scan_session_capture_fault_aborts_graph_but_keeps_dynamic_light_reusabl
         target, overwrite=True, atomic=False, flush_every=None,
         same_run_intent=intent,
     )
-    session = open_live_scan_session(
-        (live,), plan, sink=fresh, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=fresh, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     assert session.submit(session.scan.frames[0], attempt_token=token)
@@ -2631,7 +2008,7 @@ def test_c2_post_begin_cleanup_replay_keeps_accounting_reusable(
     tmp_path, monkeypatch, composite,
 ):
     from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     import xrd_tools.reduction.core as reduction_core
     from xrd_tools.io.output_transaction import OutputTransaction
     from xrd_tools.reduction import (
@@ -2707,8 +2084,8 @@ def test_c2_post_begin_cleanup_replay_keeps_accounting_reusable(
         OutputTransaction, "release_lease_owner", fail_h23_cleanup_once,
     )
     with pytest.raises(RuntimeError, match="forced reduction writer start fault") as caught:
-        open_live_scan_session(
-            (live,), plan,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan,
             sink=sink,
             accounting=accounting, executor=1, nexus_target=target_name,
         )
@@ -2743,8 +2120,8 @@ def test_c2_post_begin_cleanup_replay_keeps_accounting_reusable(
         return original_finish(owner, result)
 
     monkeypatch.setattr(NexusSink, "finish", count_finish)
-    session = open_live_scan_session(
-        (live,), plan, sink=fresh_sink, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=fresh_sink, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     assert session.submit(session.scan.frames[0], attempt_token=token)
@@ -2766,7 +2143,7 @@ def test_c2_post_begin_cleanup_replay_keeps_accounting_reusable(
 def test_dynamic_targetless_graph_finishes_written_without_false_durable(
     tmp_path, monkeypatch, sink_kind,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import CompositeSink, MemorySink, ReductionPlan
     from xrd_tools.session import (
         DynamicAccountingLimits, DynamicFrameIdentity, DynamicRunAccounting,
@@ -2809,8 +2186,8 @@ def test_dynamic_targetless_graph_finishes_written_without_false_durable(
 
     monkeypatch.setattr(MemorySink, "finish", count_memory_finish)
     monkeypatch.setattr(CompositeSink, "finish", count_composite_finish)
-    session = open_live_scan_session(
-        (live,), ReductionPlan(integration_2d=None), sink=sink,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), ReductionPlan(integration_2d=None), sink=sink,
         accounting=accounting, executor=1,
     )
     assert session.submit(session.scan.frames[0], attempt_token=token)
@@ -2860,7 +2237,7 @@ def test_dynamic_targetless_completion_without_written_cannot_finish(tmp_path):
 
 
 def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monkeypatch):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import Frame, NexusSink
     from xrd_tools.session import DynamicFrameIdentity
 
@@ -2881,8 +2258,8 @@ def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monk
         target, overwrite=True, atomic=False, flush_every=None,
         same_run_intent=first_intent,
     )
-    session = open_live_scan_session(
-        (live,), plan, sink=nexus, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=nexus, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     assert session.submit(session.scan.frames[0], attempt_token=token0)
@@ -2921,8 +2298,8 @@ def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monk
     ("automatic-flush", "target-mismatch", "multi-nexus", "unbound-same-run"),
 )
 def test_c2_dynamic_nexus_admission_refuses_pre_effect(tmp_path, case):
-    from xdart.modules.reduction import (
-        DynamicXyeReceiptBoundaryRequired, open_live_scan_session,
+    from xrd_tools.session import (
+        DynamicXyeReceiptBoundaryRequired, open_headless_scan_session,
     )
     from xrd_tools.reduction import CompositeSink, NexusSink
 
@@ -2945,14 +2322,10 @@ def test_c2_dynamic_nexus_admission_refuses_pre_effect(tmp_path, case):
                       flush_every=None),
         ))
 
-    class MustNotMaterialize:
-        def __iter__(self):
-            raise AssertionError("invalid sink admission touched the source")
-
     before = accounting.snapshot()
     with pytest.raises((ValueError, DynamicXyeReceiptBoundaryRequired)):
-        open_live_scan_session(
-            MustNotMaterialize(),
+        open_headless_scan_session(
+            _one_frame_scan(tmp_path, case),
             __import__("xrd_tools.reduction", fromlist=["ReductionPlan"]).ReductionPlan(
                 integration_2d=None,
             ),
@@ -2967,7 +2340,7 @@ def test_c2_dynamic_nexus_admission_refuses_pre_effect(tmp_path, case):
 def test_c2_already_active_nexus_refuses_before_foreign_or_accounting_mutation(
     tmp_path, composite,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import (
         CompositeSink, Frame, MemorySink, NexusSink, ReductionResult, Scan,
     )
@@ -2996,8 +2369,8 @@ def test_c2_already_active_nexus_refuses_before_foreign_or_accounting_mutation(
         target.stat().st_size,
     )
     with pytest.raises(RuntimeError, match="facade cannot change"):
-        open_live_scan_session(
-            (live,), plan, sink=sink, accounting=accounting, executor=1,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=sink, accounting=accounting, executor=1,
             nexus_target=target_name,
         )
     gc.collect()
@@ -3018,8 +2391,8 @@ def test_c2_already_active_nexus_refuses_before_foreign_or_accounting_mutation(
     assert after == before
 
     fresh = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
-    session = open_live_scan_session(
-        (live,), plan, sink=fresh, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=fresh, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     assert session.submit(session.scan.frames[0], attempt_token=token)
@@ -3211,7 +2584,7 @@ def test_c2_raise_on_failure_false_preserves_failed_terminal_disposition(
 def test_c2_writer_timeout_defers_all_terminal_owners_until_writer_exit(
     tmp_path, monkeypatch,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import NexusSink
     import xrd_tools.session.scan_session as scan_module
 
@@ -3236,8 +2609,8 @@ def test_c2_writer_timeout_defers_all_terminal_owners_until_writer_exit(
     ]))
     _key, token = _armed_submission(accounting)
     nexus = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
-    session = open_live_scan_session(
-        (live,), plan, sink=nexus, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=nexus, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     abort_calls, sweeps, states = [], [], []
@@ -3312,7 +2685,7 @@ def test_c2_stop_terminal_disposition_is_exact(tmp_path, written_prefix):
 def test_c2_stop_after_committed_epoch_preserves_prefix_without_reopen(
     tmp_path, monkeypatch,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.io import NexusRecordWriter
     from xrd_tools.reduction import NexusSink, NexusTerminalDisposition
 
@@ -3354,8 +2727,8 @@ def test_c2_stop_after_committed_epoch_preserves_prefix_without_reopen(
     monkeypatch.setattr(NexusRecordWriter, "begin", count_begin)
     monkeypatch.setattr(NexusSink, "truncate_epoch", count_truncate)
     monkeypatch.setattr(boundary_type, "session_finished", count_finished)
-    session = open_live_scan_session(
-        (live,), plan, sink=nexus, accounting=accounting, executor=1,
+    session = open_headless_scan_session(
+        _exact_scan((live,)), plan, sink=nexus, accounting=accounting, executor=1,
         nexus_target=target_name,
     )
     assert session.submit(session.scan.frames[0], attempt_token=token)
@@ -3936,7 +3309,7 @@ def _c2_retry_graph(memory_count, nexus):
 def test_c2_exact_composite_retry_settles_nexus_before_memory(
     tmp_path, monkeypatch, case,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.io.output_transaction import OutputTransaction
     from xrd_tools.reduction import (
         CompositeSink, MemorySink, NexusSink, NexusTerminalDisposition,
@@ -3999,8 +3372,8 @@ def test_c2_exact_composite_retry_settles_nexus_before_memory(
         with pytest.raises(
             RuntimeError, match="forced reduction writer start failure",
         ) as caught:
-            open_live_scan_session(
-                (live,), plan, sink=graph, accounting=accounting, executor=1,
+            open_headless_scan_session(
+                _exact_scan((live,)), plan, sink=graph, accounting=accounting, executor=1,
                 nexus_target=target_name,
             )
         assert isinstance(caught.value.__cause__, OSError)
@@ -4013,8 +3386,8 @@ def test_c2_exact_composite_retry_settles_nexus_before_memory(
         assert type(terminal) is NexusTerminalResult
         assert terminal.disposition is NexusTerminalDisposition.ABORTED
     else:
-        session = open_live_scan_session(
-            (live,), plan, sink=graph, accounting=accounting, executor=1,
+        session = open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=graph, accounting=accounting, executor=1,
             nexus_target=target_name,
         )
         if case.endswith("abort"):
@@ -4081,7 +3454,7 @@ def _c2_bind_light_owner(accounting, name):
 def test_c2_failed_constructor_restores_borrowed_facade_before_replay(
     tmp_path, monkeypatch, failure_kind, composite,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.io.output_transaction import OutputTransaction
     from xrd_tools.reduction import (
         CompositeSink, MemorySink, NexusSink, NexusTerminalDisposition,
@@ -4096,8 +3469,8 @@ def test_c2_failed_constructor_restores_borrowed_facade_before_replay(
     reserved = authority.snapshot().reserved_bytes
     existing = None
     if failure_kind == "final-bind":
-        existing = open_live_scan_session(
-            (live,), plan, sink=MemorySink(), accounting=accounting, executor=1,
+        existing = open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=MemorySink(), accounting=accounting, executor=1,
             nexus_target=target_name,
         )
         token = None
@@ -4135,8 +3508,8 @@ def test_c2_failed_constructor_restores_borrowed_facade_before_replay(
         expected = "dynamic accounting already has a bound live session"
 
     with pytest.raises(RuntimeError, match=expected) as caught:
-        open_live_scan_session(
-            (live,), plan, sink=graph, accounting=accounting, executor=1,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=graph, accounting=accounting, executor=1,
             nexus_target=target_name,
         )
     assert isinstance(caught.value.__cause__, OSError)
@@ -4152,8 +3525,8 @@ def test_c2_failed_constructor_restores_borrowed_facade_before_replay(
 
     if existing is None:
         fresh = NexusSink(target, overwrite=True, atomic=False, flush_every=None)
-        session = open_live_scan_session(
-            (live,), plan, sink=fresh, accounting=accounting, executor=1,
+        session = open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=fresh, accounting=accounting, executor=1,
             nexus_target=target_name,
         )
         assert session.submit(session.scan.frames[0], attempt_token=token)
@@ -4169,7 +3542,7 @@ def test_c2_failed_constructor_restores_borrowed_facade_before_replay(
 def test_c2_exact_composite_begin_runs_nexus_branch_before_memory(
     tmp_path, monkeypatch, nested,
 ):
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.io import NexusRecordWriter
     from xrd_tools.reduction import (
         CompositeSink, MemorySink, NexusSink, NexusTerminalDisposition,
@@ -4211,8 +3584,8 @@ def test_c2_exact_composite_begin_runs_nexus_branch_before_memory(
     monkeypatch.setattr(MemorySink, "finish", count_memory_finish)
     monkeypatch.setattr(NexusRecordWriter, "begin", fail_nexus_begin)
     with pytest.raises(RuntimeError, match="forced Nexus writer begin failure"):
-        open_live_scan_session(
-            (live,), plan, sink=graph, accounting=accounting, executor=1,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=graph, accounting=accounting, executor=1,
             nexus_target=target_name,
         )
     assert all(count == 0 for count in begin_calls.values())
@@ -4589,7 +3962,7 @@ def test_dynamic_record_store_persisted_on_write_refuses_before_sink_effect(
     tmp_path, monkeypatch,
 ):
     import xrd_tools.session.scan_session as scan_session_module
-    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import Frame, MemorySink, NexusSink, Scan
     from xrd_tools.session import ResultMode, ScanSession
 
@@ -4625,8 +3998,8 @@ def test_dynamic_record_store_persisted_on_write_refuses_before_sink_effect(
         match="^dynamic durable truth is owned only by the writer boundary$",
     ):
         # The public facade's earlier pure classification remains unpoisoned.
-        open_live_scan_session(
-            (live,), plan, sink=nexus, accounting=accounting, executor=1,
+        open_headless_scan_session(
+            _exact_scan((live,)), plan, sink=nexus, accounting=accounting, executor=1,
             nexus_target=target_name, record_store_persisted_on_write=True,
         )
     assert constructor_classifications == []

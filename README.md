@@ -862,10 +862,9 @@ need Qt belongs in `xrd_tools` ("keep xdart thin").
 
 - **`xdart_main.py`** — thin Qt-probing entry (the `xdart` console script;
   `xdart.xdart_main:main`).
-- **`modules/`** — `reduction.py` (the LiveScan→core adapter),
-  `frame_publication.py` (the Qt-free GUI envelope: `FramePublication`,
-  `PublicationStore`, `validate_publication`), `ewald/` (`LiveScan` /
-  `LiveFrame`, the GUI NeXus writer).
+- **`modules/`** — the retained Qt-free GUI ownership records and publication
+  envelope (`display_context.py`, `frame_publication.py`). Reduction sessions,
+  source reads, and NeXus writes are owned by `xrd_tools`.
 - **`gui/tabs/scattering/`** — the sole built-in Scattering Workspace: typed
   control intent, source/browse adapters, run coordination, and scientific
   presentation. Qt-free display decisions remain in `xrd_tools.session`, and

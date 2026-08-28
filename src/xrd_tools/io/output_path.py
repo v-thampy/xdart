@@ -5,8 +5,8 @@ New generated output is written as ``.nexus`` and only current ``.nexus``
 artifacts participate in processed Browse/Append reuse.  Raw ``.nxs`` remains
 supported by structure-aware source discovery.  Before
 this owner existed the decision was duplicated as a hard-coded ``+ ".nxs"`` in
-every producer — the headless series/watcher, ``LiveScan``, both wranglers, the
-scratch placeholder and the run-end fallback — so the suffix could not be
+every producer — headless series/watchers, GUI run owners, scratch placeholders,
+and run-end fallbacks — so the suffix could not be
 changed anywhere without drifting somewhere else.
 
 Scope (deliberately narrow).  This module **selects paths only**.  It does not

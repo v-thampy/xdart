@@ -132,7 +132,7 @@ def test_headless_nexus_sink_writes_reduction_provenance(
 class _ExplodingFrames:
     """Frame series that raises if anything iterates it.
 
-    Mirrors the GUI ``LiveFrameSeries`` failure mode: walking it triggers a
+    Mirrors the lazy GUI frame-collection failure mode: walking it triggers a
     per-frame disk read under ``file_lock``.  Used here as an observable
     sentinel to prove whether ``build_reduction_config`` touches the series.
     """
@@ -169,7 +169,7 @@ def test_display_snapshot_skips_frame_walk() -> None:
 
 
 class _LazyExplodingSeries:
-    """Mimics xdart ``LiveFrameSeries``: iterating it lazy-loads from disk (here
+    """Mimics a lazy frame collection: iterating it loads from disk (here
     it explodes), but ``_in_memory`` holds already-resident frames.  xdart
     ``LiveFrame`` carries ``source_file``/``_source_root`` but NO ``source_path``
     (S-19), so the provenance walk returns [] for it -- the short-circuit's job is

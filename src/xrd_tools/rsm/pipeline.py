@@ -254,8 +254,8 @@ def process_scan(
 # v2 NeXus scan as a data source
 # ---------------------------------------------------------------------------
 #
-# Lets the RSM pipeline consume an xdart v2 :class:`LiveScan` directly,
-# so a scan that's already been through xdart's 1D/2D integration can be
+# Lets the RSM pipeline consume a v2 frame-source scan directly,
+# so a scan that's already been through 1D/2D integration can be
 # re-used as the RSM input without re-parsing SPEC + raw image files.
 #
 # Per-scan quantities pulled here:
@@ -285,7 +285,7 @@ class _FrameLike(Protocol):
 
 
 class _FrameSeriesLike(Protocol):
-    """Minimal LiveFrameSeries interface — index + lazy __getitem__."""
+    """Minimal indexed lazy-frame interface."""
     index: list[int]
     def __getitem__(self, idx: int) -> _FrameLike: ...
 
@@ -520,8 +520,8 @@ def process_scan_from_nexus(
     Parameters
     ----------
     scan : FrameSource scan (duck-typed)
-        Must expose chunk iteration plus per-frame motor metadata. xdart
-        ``LiveScan`` and ``io.read.ProcessedScan`` both satisfy this boundary.
+        Must expose chunk iteration plus per-frame motor metadata. Canonical
+        core scans and ``io.read.ProcessedScan`` satisfy this boundary.
     mapper : PixelQMap
         Diffractometer convention + detector header.
     diff_motors : sequence of str
@@ -619,7 +619,7 @@ def grid_scans_streaming(
     corrections: Any = None,
     gi: Any = None,
 ) -> RSMVolume:
-    """Stream multiple v2 :class:`LiveScan`s into one :class:`RSMVolume`.
+    """Stream multiple v2 frame-source scans into one :class:`RSMVolume`.
 
     Per-scan :class:`ScanInput` carries its own ``energy``, ``UB``,
     and ``roi``.  All scans' frames feed a single

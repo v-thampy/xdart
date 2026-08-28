@@ -20,7 +20,6 @@ import h5py
 import numpy as np
 import pytest
 
-from tests.core._vnext_p0_c2_bridge_support import append_intent, live_scan
 from tests.xdart.scattering._admission import await_admission
 from tests.xdart.scattering._e2sd_support import write_poni
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
@@ -57,7 +56,6 @@ RUN_EXECUTOR = SCATTERING / "adapters/run_executor.py"
 TARGET_RESERVATION = SCATTERING / "adapters/target_reservation.py"
 DISPLAY_RUNTIME = SCATTERING / "display_runtime.py"
 PAGE = SCATTERING / "page.py"
-HEADLESS_FACADE = ROOT / "src/xdart/modules/reduction.py"
 _TERMINAL = {
     StandardEventKind.FINISHED,
     StandardEventKind.FAILED,
@@ -1507,13 +1505,12 @@ def test_p1b_b04_xye_only_prefix_and_append_envelope(
         append_executor.cancel_admission(token)
 
 
-def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
+def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """B17: real H23 collision/zero truth and typed XYE Append refusal."""
+    """B17: real H23 collision/custody and typed XYE Append refusal."""
 
-    from xdart.modules.reduction import open_live_scan_nexus_session
     from xrd_tools.io import (
         AppendPreflightState,
         LeaseOwner,
@@ -1573,47 +1570,6 @@ def test_p1b_b17_collision_zero_frame_and_xye_append_refuse_typed(
     for role in LeaseOwner:
         contender.release_lease_owner(
             contender_lease, role, contender_owners[role],
-        )
-
-    # Zero-frame Replace binds the valid lineage/target before frame zero and
-    # aborts through the accepted H23 owner; vNext must preserve this truth.
-    zero_target = tmp_path / "zero.nexus"
-    zero_intent = append_intent(
-        tmp_path,
-        extent=1,
-        labels=(0,),
-        generation=0,
-        source_identity="p1b/zero",
-    )
-    zero_session = open_live_scan_nexus_session(
-        live_scan(zero_target, zero_intent, ()),
-        replace=True,
-    )
-    zero_session.flush(force=True)
-    assert zero_target.exists()
-    zero_session.abort()
-
-    zero_transaction_owner = OwnerToken("p1b-zero-reacquire-transaction")
-    zero_target_owner = OwnerToken("p1b-zero-reacquire-target")
-    zero_transaction = coordinator.admit(
-        zero_target,
-        transaction_owner=zero_transaction_owner,
-        target_owner=zero_target_owner,
-    )
-    zero_owners = {
-        role: OwnerToken(f"p1b-zero-reacquire-{role.value}")
-        for role in LeaseOwner
-    }
-    zero_lease = zero_transaction.acquire_lease(
-        admission=zero_transaction.admission,
-        transaction_owner=zero_transaction_owner,
-        target_owner=zero_target_owner,
-        owners=zero_owners,
-    )
-    zero_transaction.abandon(zero_lease)
-    for role in LeaseOwner:
-        zero_transaction.release_lease_owner(
-            zero_lease, role, zero_owners[role],
         )
 
     # Construction custody: a preflight acquired at JIT remains reachable
@@ -2684,9 +2640,9 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
 def test_p1b_b18_headless_and_single_owner_census(tmp_path: Path) -> None:
     """B18: exact Scan identity survives one Qt-free public facade."""
 
-    import xdart.modules.reduction as reduction_facade
     from xrd_tools.core.scan import Scan, ScanFrame
     from xrd_tools.reduction import Integration1DPlan, MemorySink, ReductionPlan
+    from xrd_tools.session import open_headless_scan_session
 
     loads: list[int] = []
 
@@ -2718,9 +2674,7 @@ def test_p1b_b18_headless_and_single_owner_census(tmp_path: Path) -> None:
         geometry=object(),
         extra={"identity": "must-survive"},
     )
-    facade = getattr(reduction_facade, "open_headless_scan_session", None)
-    assert callable(facade), "exact-Scan public facade is absent"
-    session = facade(
+    session = open_headless_scan_session(
         scan,
         ReductionPlan(
             integration_1d=Integration1DPlan(npt=8),
@@ -2746,8 +2700,8 @@ def test_p1b_b18_headless_and_single_owner_census(tmp_path: Path) -> None:
     # coupling in the exact public facade module.
     code = """
 import sys
-import xdart.modules.reduction as reduction
-assert callable(getattr(reduction, 'open_headless_scan_session', None))
+from xrd_tools.session import open_headless_scan_session
+assert callable(open_headless_scan_session)
 for name in tuple(sys.modules):
     assert not (name == 'qtpy' or name.startswith(('qtpy.', 'PyQt', 'PySide', 'pyqtgraph'))), name
 """

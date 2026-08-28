@@ -598,17 +598,13 @@ def test_concurrent_upsert_mark_hydrate_is_thread_safe():
 # --------------------------------------------------------------------------- #
 # A-prep2: freeze the config the LIVE store (D3 one-store collapse) will use.
 #
-# The live store mirrors xdart's LiveFrameSeries in-memory cap
-# (``frame_series.py::_in_memory_cap == 64``) and the persist-before-evict
-# invariant (``frame_series.py``: ``_in_memory`` never evicts unpersisted
-# frames).  These tests pin that exact config so the later eviction wiring lands
-# against a tested spec rather than re-deriving it.  Read-only confirmed against
-# ``src/xdart/modules/ewald/frame_series.py``; this constant is duplicated, not
-# imported, to keep the test xdart-free.
+# The bounded acquisition-store fixture pins the 64-item compatibility ceiling
+# and the persist-before-evict invariant. Production derives its granted bound
+# from the session allocation; this direct store contract remains xdart-free.
 # --------------------------------------------------------------------------- #
 
 LIVE_STORE_HEAVY_CAP = 64
-"""Mirror of ``LiveFrameSeries._in_memory_cap`` (xdart frame_series.py)."""
+"""Compatibility ceiling for the direct acquisition-store contract."""
 
 
 def _live_store() -> FrameRecordStore:

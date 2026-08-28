@@ -590,7 +590,7 @@ class ScanSession:
                 gi_freeze_mode=gi_freeze_mode,
                 cancel_token=cancel_token,
                 # Strictness policy (default loud, matching ReductionSession).  The GUI
-                # write path (open_live_scan_session) passes graceful() so a per-frame
+                # GUI write path passes graceful() so a per-frame
                 # degradation skips-and-defers instead of aborting the whole-scan save —
                 # the streaming path's per-frame contract (B-1 regression fix).
                 strict=strict if strict is not None else StrictPolicy.loud(),

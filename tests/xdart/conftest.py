@@ -108,7 +108,7 @@ def _qt_session_teardown(_xdart_qt_harness):
         pass
     # 2. Close the process-wide H5 read pool while h5py is fully alive.
     try:
-        from xdart.utils.h5pool import get_pool
+        from xrd_tools.session import get_pool
         get_pool().close_all()
     except Exception:
         pass

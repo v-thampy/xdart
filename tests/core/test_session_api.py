@@ -29,6 +29,7 @@ from xrd_tools.reduction import (
     MemorySink,
     ReductionPlan,
     Scan,
+    StrictPolicy,
 )
 import xrd_tools.reduction.core as reduction_core
 from xrd_tools.session import (
@@ -524,7 +525,7 @@ def test_double_finish_is_idempotent_no_extra_state_event():
 def test_clear_frame_images_true_nulls_source_images_after_write():
     """ScanSession threads clear_frame_images to its inner ReductionSession, so
     the writer nulls frame.image post-write (the xdart streaming path passes
-    True via open_live_scan_session to release ~18 MB/frame)."""
+    True via open_headless_scan_session to release ~18 MB/frame)."""
     frames = _frames(3)
     sess = ScanSession(ReductionPlan(integration_2d=None),
                        Scan("s", frames, integrator=object()),
@@ -544,6 +545,32 @@ def test_clear_frame_images_default_keeps_images():
         sess.submit(fr)
     sess.finish()
     assert all(fr.image is not None for fr in frames)
+
+
+def test_headless_scan_opener_requires_one_exact_scan_and_is_graceful():
+    from xrd_tools.session import open_headless_scan_session
+
+    class ScanSubclass(Scan):
+        pass
+
+    plan = ReductionPlan(integration_2d=None)
+    frames = _frames(2)
+    scan = Scan("headless", frames, integrator=object())
+    session = open_headless_scan_session(scan, plan, sink=MemorySink(), executor=1)
+    assert session.scan is scan
+    assert session._session.strict == StrictPolicy.graceful()
+    for frame in frames:
+        session.submit(frame)
+    session.finish()
+    assert all(frame.image is None for frame in frames)
+
+    with pytest.raises(TypeError, match="exact Scan"):
+        open_headless_scan_session(
+            ScanSubclass("derived", _frames(1), integrator=object()),
+            plan,
+        )
+    with pytest.raises(ValueError, match="without frames"):
+        open_headless_scan_session(Scan("empty", []), plan)
 
 
 def test_optional_record_store_receives_completed_frame_records():
@@ -567,48 +594,6 @@ def test_optional_record_store_receives_completed_frame_records():
     assert rec.modes_1d == ("default",)
     np.testing.assert_allclose(rec.view_1d().intensity_1d, [0.0, 1.0])
     assert store.source_identity(0) == "/tmp/source.tif#0"
-
-
-def test_live_scan_session_adapter_wires_store_with_live_source_identity(tmp_path):
-    from types import SimpleNamespace
-
-    from xdart.modules.reduction import frame_from_live_frame, open_live_scan_session
-
-    source = tmp_path / "raw_master.h5"
-    live_frames = [
-        SimpleNamespace(
-            idx=i,
-            map_raw=np.full((2, 2), i + 1, dtype=float),
-            bg_raw=None,
-            scan_info={},
-            source_file=str(source),
-            source_frame_idx=i + 10,
-            mask=None,
-            poni=None,
-            integrator=object(),
-        )
-        for i in range(2)
-    ]
-    store = FrameRecordStore(max_heavy_items=None)
-    sess = open_live_scan_session(
-        live_frames,
-        ReductionPlan(integration_2d=None),
-        scan_name="live",
-        record_store=store,
-    )
-
-    converted = [frame_from_live_frame(live) for live in live_frames]
-    for frame in converted:
-        sess.submit(frame)
-    sess.finish()
-
-    assert len(store) == len(converted)
-    for frame in converted:
-        rec = store.get(frame.index)
-        assert rec is not None
-        assert store.source_identity(frame.index) == (
-            f"{frame.source_path}#{frame.source_frame_index}"
-        )
 
 
 def test_optional_record_store_can_mark_completed_writes_persisted_for_eviction():
@@ -642,8 +627,8 @@ def test_optional_record_store_can_mark_completed_writes_persisted_for_eviction(
 
 
 def test_live_store_config_wired_through_scan_session_evicts_persisted_completions():
-    # A-prep2: pin the exact live-store config (max_heavy_items=64 mirror of
-    # LiveFrameSeries._in_memory_cap; require_persisted_for_eviction) end-to-end
+    # Pin the bounded acquisition-store config (max_heavy_items=64 and
+    # require_persisted_for_eviction) end-to-end
     # through ScanSession with record_store_persisted_on_write=True.  Completing
     # more frames than the heavy cap thins the persisted overflow, never an
     # unpersisted frame (none here, since each write marks itself persisted).

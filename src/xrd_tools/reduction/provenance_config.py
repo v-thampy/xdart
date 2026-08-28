@@ -25,8 +25,8 @@ def build_reduction_config(
 
     ``include_inputs`` gates the (potentially expensive) raw-input enumeration.
     ``_inputs_from_scan`` may walk the ENTIRE frame series to collect source
-    paths, and for a GUI ``LiveFrameSeries`` each non-resident frame triggers a
-    disk read under ``file_lock`` (``__getitem__``) -- ruinous on the GUI thread
+    paths, and for a lazy GUI frame collection each non-resident frame can
+    trigger a disk read under its file lock -- ruinous on the GUI thread
     while a live run holds that same lock.  Callers that only need the
     integration ``config`` (e.g. the display-provenance snapshot, which discards
     ``inputs``) pass ``include_inputs=False`` to skip the walk; the authoritative
@@ -249,9 +249,9 @@ def _raw_files_from_scan(scan: Any) -> list[str]:
         return [str(h5_path)]
 
     frames = getattr(scan, "frames", None) or ()
-    # Do NOT hydrate a lazy frame series (xdart ``LiveFrameSeries``) just to read
+    # Do NOT hydrate a lazy frame series just to read
     # source paths.  Iterating it triggers a per-frame disk load under
-    # ``file_lock`` (``__getitem__``), and an xdart ``LiveFrame`` carries no
+    # its file lock, and a legacy GUI frame carries no
     # ``source_path`` -- so this walk hydrates every frame and returns [] today
     # (S-19).  On the WRITER thread that lengthens the flush's lock hold, which is
     # exactly the contention that amplified BB-1.  A lazy series exposes an

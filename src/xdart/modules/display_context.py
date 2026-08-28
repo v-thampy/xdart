@@ -3,19 +3,19 @@
 
 The defect these types exist to remove is a mutable singleton: acquisition,
 paused browse, display, integrator, writer and hydration all aliased ONE
-``LiveScan``.  Loading a browsed scan mutated the object the paused run still
+scan object. Loading a browsed scan mutated the object the paused run still
 owned, and Resume then tried to recover the run by writing back into that same
 object.  Three owners replace it:
 
 ``AcquisitionContext``
     The display-side identity and lifetime of the exact admitted
-    ``FrozenRunConfiguration``: run identity, the acquisition ``LiveScan``, its
+    ``FrozenRunConfiguration``: run identity, the admitted acquisition scan, its
     display bindings and stores, and DETACHED calibration/mask/geometry stamps.
     It does not own or mutate the writer, PONI, mask or scientific
     configuration — the existing execution/writer owners stay authoritative.
 
 ``BrowseContext``
-    One independently loaded processed scan: its own ``LiveScan``, its own
+    One independently loaded processed scan: its own scan handle, its own
     display bindings and stores, its detached persisted provenance, the
     requested path and the exact browse load receipt.  It is not a second
     scientific authority.

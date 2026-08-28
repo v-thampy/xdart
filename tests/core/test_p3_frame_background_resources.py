@@ -125,15 +125,15 @@ def test_worker_and_resolver_terms_are_not_double_charged() -> None:
     assert _requirements(resolver_background_bytes=5001).fingerprint != req.fingerprint
     assert _requirements(background_binding_bytes=64 * 1024 * 1024 - 1).fingerprint != req.fingerprint
 
-    from xdart.modules import reduction as wrapper
     from xrd_tools.core.scan import Scan, ScanFrame
     from xrd_tools.reduction.core import Integration1DPlan, ReductionPlan
+    from xrd_tools.session import open_headless_scan_session
     plan_exact = ReductionPlan(integration_1d=Integration1DPlan(npt=100))
     scan = Scan("headless", [ScanFrame(0, image=np.ones((10, 20), np.uint16))])
     captured = []
-    from xrd_tools import session as session_module
-    original = session_module.ScanSession
-    session_module.ScanSession = lambda *args, **kwargs: captured.append(kwargs) or args
+    import xrd_tools.session.headless_scan as headless_module
+    original = headless_module.ScanSession
+    headless_module.ScanSession = lambda *args, **kwargs: captured.append(kwargs) or args
     try:
         from xrd_tools.session.policy import SessionPolicy
         modes = ((FrameBackgroundPlan(), (0, 0, 0, 0)),
@@ -149,21 +149,21 @@ def test_worker_and_resolver_terms_are_not_double_charged() -> None:
                 resolver_background_bytes=terms[1], worker_background_bytes=terms[2],
                 background_binding_bytes=terms[3])
             policy = resolve_session_policy(exact, envelope_bytes=8 * 1024 ** 3)
-            wrapper.open_headless_scan_session(scan, plan_exact, policy=policy,
-                                               _background_plan=background)
+            open_headless_scan_session(scan, plan_exact, policy=policy,
+                                       background_plan=background)
             assert captured[-1]["policy"].allocation is policy.allocation
             for field in ("background_bytes", "resolver_background_bytes",
                           "worker_background_bytes", "background_binding_bytes"):
                 altered = replace(exact, **{field: getattr(exact, field) + 1})
                 with __import__("pytest").raises(ValueError):
-                    wrapper.open_headless_scan_session(scan, plan_exact,
+                    open_headless_scan_session(scan, plan_exact,
                         policy=SessionPolicy(policy.flush,
                             replace(policy.allocation, requirements=altered)),
-                        _background_plan=background)
+                        background_plan=background)
             with __import__("pytest").raises(ValueError):
-                wrapper.open_headless_scan_session(scan, plan_exact,
+                open_headless_scan_session(scan, plan_exact,
                     policy=SessionPolicy(policy.flush, replace(policy.allocation,
                         requirements=replace(exact, native_itemsize=4))),
-                    _background_plan=background)
+                    background_plan=background)
     finally:
-        session_module.ScanSession = original
+        headless_module.ScanSession = original

@@ -74,8 +74,8 @@ from-scratch framing was a local-only CC_ note, not published.)
   `FrameRecordStore` is wired into the live path, owns eviction + worker-thread
   hydration, and reads are store-only: `record_store → bounded publication
   projection → disk hydration` (the Role-A `data_1d`/`data_2d` mirrors are
-  retired; viewer rows stay viewer-scoped), with `LiveFrameSeries` demoted to
-  write-side staging.
+  retired; viewer rows stay viewer-scoped), with acquisition staging bounded
+  by the source and session resource owners.
   N1 portability: raw-source paths are stored
   relative to `entry/@source_base` (design:
   `design/design_project_root_paths_jun2026.md`).

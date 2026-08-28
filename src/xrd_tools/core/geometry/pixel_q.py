@@ -133,8 +133,8 @@ class DetectorHeader:
 
         Bridges the xdart-side detector calibration (PONI, in SI units) to
         the xrayutilities-side header (mm + pixel units).  Useful when
-        plumbing an :class:`~xdart.modules.ewald.EwaldSphere` into the RSM
-        pipeline — `frame.poni` plus the detector's pixel size are
+        plumbing a calibrated frame into the RSM pipeline — `frame.poni` plus
+        the detector's pixel size are
         everything ``DetectorHeader`` needs apart from ``Nch1`` / ``Nch2``.
 
         Parameters

@@ -254,7 +254,7 @@ pre-migration reference signature.  Two additive notes:
 
 Done in 1.0: 6a complete-v2-record orchestration into core (incl. headless
 sink record + byte-compat gate), 6b schema-as-code starter, 6c API renames
-(list above), 6d single LiveScan→core adapter + single TwoDKind classifier
+(list above), 6d exact-Scan headless session composition + single TwoDKind classifier
 (+ import-light `xrd_tools.core`), 6e cleanups + S8 + D1 + D6 + D5 + F1.
 
 Deferred to a later release:

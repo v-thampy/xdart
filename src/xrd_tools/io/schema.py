@@ -64,7 +64,7 @@ __all__ = [
 
 # ── streaming-reintegrate shadow recovery ────────────────────────────────────
 #: suffix of the shadow group a streaming reintegrate stages rows into before
-#: the atomic swap (writer side: xdart.modules.ewald.nexus_writer).  Shared here
+#: the atomic swap performed by the canonical NeXus writer.  Shared here
 #: so the headless readers can recover an orphan left by a crash mid-swap.
 REINTEGRATE_SHADOW_SUFFIX = "__reint"
 #: attr the writer stamps on a shadow ONLY once its coverage is validated, right

@@ -1094,7 +1094,7 @@ def test_g15_scan_session_is_the_only_production_store_projection_writer():
             elif rel != "xrd_tools/session/scan_session.py":
                 offenders.append((rel, attr, recv, where, line))
     assert live_series, (
-        "the LiveFrameSeries owner stays distinguishable from the store API")
+        "the acquisition staging owner stays distinguishable from the store API")
     assert display_light, (
         "the GUI-light cache stays distinguishable from the canonical store")
     assert display_notifications == [(
