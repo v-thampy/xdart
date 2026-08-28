@@ -828,8 +828,8 @@ QWidget#controlsPanel QPushButton,
 QWidget#controlsPanel QToolButton {
     font-size: $control_panel_font;
 }
-QMenu#controlsEnergyPopup,
-QMenu#controlsGIMorePopup {
+QWidget#controlsEnergyPopup,
+QWidget#controlsGIMorePopup {
     font-size: $control_panel_font;
 }
 QPushButton#controlsActionButton {
@@ -1202,7 +1202,7 @@ QLabel#controlsGroupHeader {
     font-weight: 800;
     padding-top: 4px;
 }
-QFrame#controlsActionRow {
+QWidget#controlsActionRow {
     border: none;
     background-color: transparent;
 }

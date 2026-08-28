@@ -657,12 +657,27 @@ def test_reconcile_refreshes_source_energy_popup_capture(qapp):
         qapp.processEvents()
         popup = panel._source_energy_popup
         assert popup is not None
+        assert type(popup) is QtWidgets.QWidget
+        assert popup.objectName() == "controlsEnergyPopup"
         segmented = popup.findChild(SegmentedControl)
         assert segmented is not None
         assert segmented.current_value() == "metadata"
     finally:
         panel.close()
         panel.deleteLater()
+
+
+def test_controls_theme_selectors_match_current_runtime_widget_classes():
+    from xdart.gui.themes import render_qss
+
+    qss = render_qss("dark")
+    assert (
+        "QWidget#controlsEnergyPopup,\n"
+        "QWidget#controlsGIMorePopup {"
+    ) in qss
+    assert "QWidget#controlsActionRow {" in qss
+    assert "QMenu#controlsEnergyPopup" not in qss
+    assert "QFrame#controlsActionRow" not in qss
 
 
 def test_reconcile_refreshes_derived_subsection_statuses(qapp):
