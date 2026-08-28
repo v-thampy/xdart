@@ -266,7 +266,10 @@ def project_controls(
     mask_reason = (
         "Cancel the standalone mask operation."
         if mask_active
-        else "Choose an explicit TIFF and create its beside-source EDF mask."
+        else (
+            "Choose an explicit TIFF, HDF5, or NeXus image source and create "
+            "its beside-source EDF mask."
+        )
         if mask_enabled
         else "Another experiment operation owns the common slot."
         if operation_busy
