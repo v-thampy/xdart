@@ -184,9 +184,21 @@ def resolve_integrated_group(entry_grp, group_name: str):
     ``(None, False)``.  A writer pass repairs/clears the orphan via
     ``cleanup_reintegrate_shadow_groups``.
     """
-    g = _local_group(entry_grp, group_name)
-    if g is not None:
-        return g, False
+    try:
+        canonical_link = entry_grp.get(group_name, getlink=True)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"cannot inspect generated result group {group_name}"
+        ) from error
+    if canonical_link is not None:
+        # A shadow is recovery storage only when the canonical namespace slot
+        # is genuinely absent.  Never let an indirect or wrong-kind canonical
+        # node disappear behind an otherwise valid completed shadow.
+        return local_hard_group(
+            entry_grp,
+            group_name,
+            role=group_name,
+        ), False
     shadow = _local_group(
         entry_grp,
         f"{group_name}{REINTEGRATE_SHADOW_SUFFIX}",

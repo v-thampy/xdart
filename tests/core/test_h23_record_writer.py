@@ -1141,9 +1141,8 @@ def test_finish_replace_failure_preserves_typed_partial_artifact(monkeypatch, tm
 def _seed_target(path: Path, n: int) -> None:
     results_1d = [_r1(float(i), n=3) for i in range(n)]
     results_2d = [_r2(float(i), nq=3, nchi=2) for i in range(n)]
-    with h5py.File(path, "w") as h5:
-        entry = h5.create_group("entry")
-        entry.attrs["NX_class"] = "NXentry"
+    with open_nexus_writer(path, overwrite=True) as h5:
+        entry = h5["entry"]
         write_integrated_stack(
             entry, frame_indices=list(range(n)),
             results_1d=results_1d, results_2d=results_2d,
@@ -1243,22 +1242,21 @@ def test_malformed_indexed_group_refuses_before_header_or_row_mutation(tmp_path)
         )
 
 
-def test_existing_empty_hdf5_file_gets_complete_empty_cursor_map(tmp_path):
+def test_existing_empty_hdf5_file_is_refused_without_mutation(tmp_path):
     rw = _api()
     target = tmp_path / "empty-existing.nexus"
     with h5py.File(target, "w"):
         pass
+    before = target.read_bytes()
     writer = rw.NexusRecordWriter(
         target, atomic=False, overwrite=False, flush_every=None,
         complete_record=False,
     )
-    writer.begin()
-    writer.write(rw.RecordWrite(label=3, result_1d=_r1(3)))
-    writer.finish()
-    with h5py.File(target, "r") as h5:
-        np.testing.assert_array_equal(
-            h5["entry/integrated_1d/frame_index"][()], [3],
-        )
+    with pytest.raises(rw.WriterIncomplete) as caught:
+        writer.begin()
+    assert caught.value.outcome.pending_owner == "begin"
+    writer.abort()
+    assert target.read_bytes() == before
 
 
 def test_stale_metadata_cursor_refuses_before_integrated_mutation(tmp_path):

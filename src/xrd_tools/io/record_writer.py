@@ -64,6 +64,7 @@ from xrd_tools.io.output_transaction import (
     StreamTerminal,
     TargetLease,
 )
+from xrd_tools.io.processed_scan_id import require_current_processed_groups
 from xrd_tools.io.read import relative_source_path
 from xrd_tools.io.schema import (
     GI_MODE_KEYS_1D,
@@ -77,7 +78,6 @@ from xrd_tools.io.schema import (
     local_hard_dataset,
     local_hard_group_path,
     mode_subgroup_name,
-    read_current_mode_layout,
 )
 from xrd_tools.session import ResultMode, StageReceipt, get_pool
 
@@ -2380,6 +2380,15 @@ class NexusRecordWriter:
             _replacement_hard_group(entry, name)
             if local_hard else local_hard_group_path(entry, name, role=name)
         )
+        return self._load_cursor_group(group, name, local_hard=local_hard)
+
+    def _load_cursor_group(
+        self,
+        group: h5py.Group | None,
+        name: str,
+        *,
+        local_hard: bool = False,
+    ) -> dict[int, int]:
         if group is None:
             return {}
         labels_node = (
@@ -2402,11 +2411,16 @@ class NexusRecordWriter:
 
     def _validate_existing_contract(self) -> dict[str, dict[int, int]]:
         with h5py.File(self.target, "r") as h5:
-            entry = (
-                _replacement_hard_group(h5, self.entry)
-                if self._replacement_configuration is not None
-                else local_hard_group_path(h5, self.entry, role=self.entry)
-            )
+            admitted = None
+            if self._replacement_configuration is not None:
+                entry = _replacement_hard_group(h5, self.entry)
+            else:
+                admitted = require_current_processed_groups(
+                    h5,
+                    self.entry,
+                    container=self.target,
+                )
+                entry = admitted.entry
             if self._replacement_configuration is not None:
                 dimension = self._replacement_configuration[0]; root = entry.name if isinstance(entry, h5py.Group) else f"/{self.entry.strip('/')}"; excluded = (f"{root}/integrated_{dimension}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}", f"{root}/reduction/config/source_execution", f"{root}/reduction/config/append_lineage"); config = _replacement_hard_group(entry, "reduction/config"); (None if isinstance(entry, h5py.Group) and isinstance(config, h5py.Group) else (_ for _ in ()).throw(WriterStateError("replacement entry/config is not local"))); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = config.get("gi_config", getlink=True); (None if gi_link is None or type(gi_link) is h5py.HardLink else (_ for _ in ()).throw(WriterStateError("replacement GI config is not local"))); gi_values = _replacement_json_node(config, "gi_config", "replacement GI config", required=False)
                 gi_values = {} if gi_values is None else gi_values
@@ -2429,19 +2443,22 @@ class NexusRecordWriter:
                 ("integrated_1d", self._primary_mode_1d),
                 ("integrated_2d", self._primary_mode_2d),
             ):
-                group = (
-                    _replacement_hard_group(entry, name)
-                    if self._replacement_configuration is not None
-                    else local_hard_group_path(entry, name, role=name)
-                )
+                if self._replacement_configuration is not None:
+                    group = _replacement_hard_group(entry, name)
+                elif name == "integrated_1d":
+                    group = admitted.integrated_1d
+                else:
+                    group = admitted.integrated_2d
                 if group is None:
                     continue
                 existing = (
                     group.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)
                     if self._replacement_configuration is not None
-                    else read_current_mode_layout(
-                        group, "1d" if name.endswith("1d") else "2d",
-                    )[0]
+                    else (
+                        admitted.primary_mode_1d
+                        if name == "integrated_1d"
+                        else admitted.primary_mode_2d
+                    )
                 )
                 if self._replacement_configuration is None and existing != requested:
                     raise ValueError(
@@ -2449,19 +2466,37 @@ class NexusRecordWriter:
                         f"{requested!r}; sparse writes cannot reinterpret "
                         "untouched rows"
                     )
-            cursors = {
-                name: self._load_cursor_from(entry, name, local_hard=self._replacement_configuration is not None)
-                for name in (
-                    "integrated_1d", "integrated_2d", "scan_data",
-                    "per_frame_geometry",
-                )
-            }
+            if self._replacement_configuration is not None:
+                cursors = {
+                    name: self._load_cursor_from(entry, name, local_hard=True)
+                    for name in (
+                        "integrated_1d", "integrated_2d", "scan_data",
+                        "per_frame_geometry",
+                    )
+                }
+            else:
+                cursors = {
+                    "integrated_1d": self._load_cursor_group(
+                        admitted.integrated_1d,
+                        "integrated_1d",
+                    ),
+                    "integrated_2d": self._load_cursor_group(
+                        admitted.integrated_2d,
+                        "integrated_2d",
+                    ),
+                    "scan_data": self._load_cursor_from(entry, "scan_data"),
+                    "per_frame_geometry": self._load_cursor_from(
+                        entry,
+                        "per_frame_geometry",
+                    ),
+                }
             for name in ("integrated_1d", "integrated_2d"):
-                group = (
-                    _replacement_hard_group(entry, name)
-                    if self._replacement_configuration is not None
-                    else local_hard_group_path(entry, name, role=name)
-                )
+                if self._replacement_configuration is not None:
+                    group = _replacement_hard_group(entry, name)
+                elif name == "integrated_1d":
+                    group = admitted.integrated_1d
+                else:
+                    group = admitted.integrated_2d
                 if group is None:
                     continue
                 if self._replacement_configuration is not None:
@@ -2469,24 +2504,26 @@ class NexusRecordWriter:
                         (child_name, _replacement_hard_group(group, child_name))
                         for child_name in group
                     )
-                    nested_names = tuple(
-                        f"{name}/{child_name}"
+                    nested_groups = tuple(
+                        (f"{name}/{child_name}", child)
                         for child_name, child in children
                         if isinstance(child, h5py.Group)
                     )
                 else:
-                    pairs = read_current_mode_layout(
-                        group, "1d" if name.endswith("1d") else "2d",
-                    )[2]
-                    nested_names = tuple(
-                        f"{name}/{mode_subgroup_name(mode)}"
-                        for mode, _child in pairs[1:]
+                    pairs = (
+                        admitted.mode_groups_1d
+                        if name == "integrated_1d"
+                        else admitted.mode_groups_2d
                     )
-                for nested in nested_names:
-                    cursors[nested] = self._load_cursor_from(
-                        entry,
-                        nested,
-                        local_hard=self._replacement_configuration is not None,
+                    nested_groups = tuple(
+                        (f"{name}/{mode_subgroup_name(mode)}", child)
+                        for mode, child in pairs[1:]
+                    )
+                for nested, child in nested_groups:
+                    cursors[nested] = (
+                        self._load_cursor_from(entry, nested, local_hard=True)
+                        if self._replacement_configuration is not None
+                        else self._load_cursor_group(child, nested)
                     )
             return cursors
 
