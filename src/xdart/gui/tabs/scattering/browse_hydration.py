@@ -278,7 +278,9 @@ class _BrowseHydrationOwner:
             )
             detector_unavailable = view.raw is None and view.thumbnail is None
             source_identity = canonical_browse_source_identity(
-                view, self._artifact,
+                view,
+                self._artifact,
+                source_base=catalog.source_base,
             )
             committed = self._store.upsert(
                 FramePublication(

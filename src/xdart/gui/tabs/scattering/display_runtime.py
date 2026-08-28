@@ -1484,7 +1484,9 @@ class RunDisplayState:
             ),
         )
         source_identity = canonical_browse_source_identity(
-            view, prepared.request.read_key.artifact_identity,
+            view,
+            prepared.request.read_key.artifact_identity,
+            source_base=preview.source_base,
         )
         store.upsert(
             FramePublication(

@@ -399,7 +399,9 @@ def _current_heavy(scope: _ProjectionScope, frame: DisplayFrameKey, scalar_row):
     if type(publication) is not FramePublication:
         raise _Refused("Browse sparse publication is foreign")
     expected_source = canonical_browse_source_identity(
-        scalar_row, scope.artifact,
+        scalar_row,
+        scope.artifact,
+        source_base=scope.catalog.source_base,
     )
     record = publication.record
     view = publication.view
@@ -420,7 +422,11 @@ def _current_heavy(scope: _ProjectionScope, frame: DisplayFrameKey, scalar_row):
         )
         or type(publication.source_identity) is not str
         or publication.source_identity != expected_source
-        or canonical_browse_source_identity(view, scope.artifact)
+        or canonical_browse_source_identity(
+            view,
+            scope.artifact,
+            source_base=scope.catalog.source_base,
+        )
         != expected_source
         or type(publication.scan_key) is not str
         or publication.scan_key != scope.context.scan_key

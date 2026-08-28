@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
+import os
 from pathlib import Path
 
 from xrd_tools.io.output_transaction import StreamTerminal
@@ -148,7 +149,12 @@ def canonical_browse_scan_key(source_path: str) -> str:
     return "" if owner is None else str(owner.scan_name(path) or "")
 
 
-def canonical_browse_source_identity(view, artifact_path: str) -> str:
+def canonical_browse_source_identity(
+    view,
+    artifact_path: str,
+    *,
+    source_base: str | None = None,
+) -> str:
     """Name one persisted frame identically before and after hydration.
 
     Processed frame labels are commonly one-based while detector-source frame
@@ -158,7 +164,26 @@ def canonical_browse_source_identity(view, artifact_path: str) -> str:
 
     if type(artifact_path) is not str or not artifact_path:
         raise TypeError("browse artifact identity must be a nonempty string")
+    if source_base is not None and (
+        type(source_base) is not str or not source_base
+    ):
+        raise TypeError("browse source base must be nonempty text or None")
     source_path = getattr(view, "source_path", None) or artifact_path
+    source = str(source_path)
+    if not os.path.isabs(source):
+        # NeXus detector-source members are stored relative to the processed
+        # entry's authenticated source_base/project root, while hydration
+        # presents the same member as an absolute path.  Legacy artifacts
+        # without source_base fall back to their own directory.  Keep this
+        # lexical: the helper also runs on the GUI projection path and must
+        # not touch the filesystem.
+        base = (
+            source_base
+            if source_base is not None
+            else os.path.dirname(artifact_path)
+        )
+        source = os.path.join(base, source)
+    source_path = os.path.normcase(os.path.normpath(source))
     source_frame_index = getattr(view, "source_frame_index", None)
     member = (
         getattr(view, "label")

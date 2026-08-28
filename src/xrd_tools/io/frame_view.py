@@ -277,6 +277,7 @@ class FrameScalarCatalog:
     entry: str
     rows: tuple[FrameScalarRow, ...]
     axes_1d: tuple[tuple[str, str, str, bool], ...] = ()
+    source_base: str | None = None
     labels: tuple[int, ...] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -286,6 +287,10 @@ class FrameScalarCatalog:
             raise TypeError("entry must be an exact nonempty string")
         if type(self.rows) is not tuple:
             raise TypeError("rows must be an exact tuple")
+        if self.source_base is not None and (
+            type(self.source_base) is not str or not self.source_base
+        ):
+            raise TypeError("source_base must be nonempty text or None")
         labels: list[int] = []
         previous = -1
         for row in self.rows:
@@ -3901,6 +3906,7 @@ class FrameViewReader:
                 entry=self.entry_name,
                 rows=tuple(rows),
                 axes_1d=axes_1d,
+                source_base=self._source_base,
             )
             checkpoint()
             bundle.finish()

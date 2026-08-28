@@ -15,6 +15,54 @@ def _readonly(values) -> np.ndarray:
     return array
 
 
+def test_project_root_source_identity_matches_hydrated_output_subdir_member(
+    tmp_path,
+) -> None:
+    import os
+    from types import SimpleNamespace
+
+    from xdart.gui.tabs.scattering.browse_values import (
+        canonical_browse_source_identity,
+    )
+    from xrd_tools.io import FrameScalarCatalog, FrameScalarRow
+
+    project = tmp_path / "project"
+    artifact = project / "xdart_processed_data" / "scan.nxs"
+    persisted = FrameScalarRow(
+        label=9,
+        source_path="eiger/master.h5",
+        source_frame_index=651,
+    )
+    catalog = FrameScalarCatalog(
+        str(artifact),
+        "entry",
+        (persisted,),
+        source_base=str(project),
+    )
+    hydrated = SimpleNamespace(
+        label=9,
+        source_path=str(project / "eiger" / "master.h5"),
+        source_frame_index=651,
+    )
+    expected_path = os.path.normcase(os.path.normpath(
+        str(project / "eiger" / "master.h5")
+    ))
+    expected = f"{expected_path}#651"
+    assert canonical_browse_source_identity(
+        persisted,
+        catalog.artifact_path,
+        source_base=catalog.source_base,
+    ) == expected
+    assert canonical_browse_source_identity(
+        hydrated,
+        catalog.artifact_path,
+        source_base=catalog.source_base,
+    ) == expected
+    assert expected_path != os.path.normcase(os.path.normpath(str(
+        artifact.parent / "eiger" / "master.h5"
+    )))
+
+
 def _scope(
     tmp_path,
     scalar_rows,
