@@ -767,6 +767,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._run_frame_seen = False
         self._retain_outgoing_display = False
         self._batch_latest_frame: DisplayFrameKey | None = None
+        self._batch_visible_progress: ProgressProjection | None = None
         self._batch_terminal_presentation: (
             _BatchTerminalPresentation | None
         ) = None
@@ -2007,7 +2008,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if notice:
             self._notice(notice)
         if not self._closing and not self._closed:
-            self._refresh_shell()
+            self._refresh_shell(preserve_scientific=True)
             self._ensure_timer()
 
     def _authored_asset_dialog_destroyed(
@@ -2474,6 +2475,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell(); return
         slot = self._operation_slot
         intent = snapshot.thaw()
+        if getattr(intent.background, "mode", "None") != "None":
+            self._notice(
+                "Average Scan does not support an active Background; "
+                "choose Background: None before averaging."
+            )
+            self._refresh_shell()
+            return
         source = intent.source_spec
         phase = self._lifecycle.phase
         if (self._closing or self._closed or self._admission_state is not None or self._experiment_operation_busy()
@@ -2581,7 +2589,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if first:
             self._closing = True
             self._retire_native_plot_axis_transition()
-            self._retire_batch_terminal_presentation()
+            self._retire_batch_terminal_presentation(force=True)
             authored = self._authored_asset_owner
             if authored is not None:
                 self._retire_authored_asset(authored)
@@ -3501,6 +3509,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._begin_browser_follow(outcome.run_identity)
             self._retire_batch_terminal_presentation(
                 release_display=False,
+                force=True,
             )
             self._active_batch_mode = outcome.configuration.batch_mode
             self._run_frame_seen = False
@@ -3521,6 +3530,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._artifact_progress.clear()
             self._progress = ProgressProjection(
                 detail="Run started"
+            )
+            self._batch_visible_progress = (
+                self._progress if self._active_batch_mode else None
             )
             self._notice("")
             self._refresh_shell(preserve_display=True)
@@ -3637,17 +3649,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._progress = replace(
             self._progress, detail="Stopping run…"
         )
+        if self._active_batch_mode:
+            self._batch_visible_progress = self._progress
         self._refresh_shell()
         self._ensure_timer()
 
     def _retire_batch_terminal_presentation(
-        self, *, release_display: bool = True,
+        self, *, release_display: bool = True, force: bool = False,
     ) -> bool:
         terminal = self._batch_terminal_presentation
         # Batch is a frozen execution fact until its exact terminal arrives.
         # Presentation edits during RUNNING may not turn later FRAME_READY
         # events into Live paints or discard the tracked absolute latest.
         if terminal is None:
+            return False
+        if not force and not terminal.painted:
+            # An unpainted terminal is a durable fail-closed fence.  Ordinary
+            # plot, Auto Last, Show All, and frame-selection commands may
+            # update their intent/internal navigation, but cannot publish the
+            # partial Batch acquisition.  Only page close or a newly admitted
+            # run may replace this custody explicitly.
             return False
         owned = True
         if terminal is not None and terminal.awaiting_full_raw:
@@ -3656,6 +3677,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._batch_terminal_presentation = None
         self._active_batch_mode = False
         self._batch_latest_frame = None
+        self._batch_visible_progress = None
         if release_display:
             self._retain_outgoing_display = False
         return owned
@@ -3694,6 +3716,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self, event: StandardRunEvent,
     ) -> _BatchTerminalPresentation:
         identity = event.run_identity
+        if (
+            event.kind is not StandardEventKind.FINISHED
+            or event.cleanup_status is not CleanupStatus.CLEANED
+        ):
+            self._notice(
+                "Batch did not finish cleanly; prior display retained."
+            )
+            return _BatchTerminalPresentation(identity, None)
         frame = self._qualify_batch_terminal_frame(event)
         if frame is None:
             self._notice(
@@ -3870,6 +3900,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._active_batch_mode = False
             self._batch_latest_frame = None
+            self._batch_visible_progress = None
         elif self._batch_terminal_presentation is owner:
             self._retain_outgoing_display = retained
         return applied
@@ -3963,6 +3994,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if not self._release_browse_1d_debt():
             self._notice("Browse 1-D cache release remains pending.")
+            # QListWidget highlights the clicked row before dispatching this
+            # command.  Debt refusal has not changed display custody, so
+            # immediately replay the authoritative Browser projection rather
+            # than leaving old science under a false new selection.
+            self._refresh_shell(preserve_scientific=True)
             self._ensure_timer()
             return
         if (
@@ -3982,6 +4018,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if terminal_request is not None and request is not terminal_request:
             self._clear_terminal_browse()
         self._notice("")
+        # A submitted Browse request is still only intent.  The prior
+        # selection remains authoritative until poll_browse adopts the exact
+        # ready context; do not let Qt's optimistic row highlight claim the
+        # new artifact early.
+        self._refresh_shell(preserve_scientific=True)
         self._ensure_timer()
 
     def _select_frames(self, command: ShellCommand) -> None:
@@ -4289,7 +4330,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     first_paced_frame = paced and not self._run_frame_seen
                     self._run_frame_seen = True
                     self._batch_latest_frame = frame
-                    self._browser_transient_frame = frame
                     self._record_artifact_progress(event)
                     self._progress = ProgressProjection(
                         event.completed,
@@ -4299,8 +4339,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         _directory_file_progress(event),
                     )
                     if self._active_batch_mode:
-                        changed = True
+                        # Batch owns the accepted publication internally, but
+                        # FRAME_READY is never a GUI projection boundary.  In
+                        # particular, do not publish a transient browser row or
+                        # wake a shell/status reconciliation for this prefix.
                         continue
+                    self._browser_transient_frame = frame
                     prior_waterfall_candidate_count = (
                         self._waterfall_candidate_count
                     )
@@ -4434,6 +4478,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if batch_notice:
                     self._notice(batch_notice)
                 self._retry_deferred_gi_motor_default()
+                if was_batch:
+                    # Terminal status may now replace the frozen Batch-visible
+                    # status, independently of whether final science qualifies.
+                    self._batch_visible_progress = None
                 # The writer publishes its atomic final path before emitting
                 # the terminal event.  Re-enumerate here so a non-batch run
                 # whose FRAME_READY preceded that rename becomes visible.
@@ -5746,6 +5794,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             preserve_scientific = True
             skip_scientific_projection = True
         if batch_science_hold:
+            preserve_display = True
             preserve_scientific = True
             skip_scientific_projection = True
             rebind_scientific_navigation = False
@@ -5980,6 +6029,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 observation.file_count_scope
                 is SourceCountScope.SELECTED_PLUS_IMMEDIATE
             )
+        projection_progress = (
+            self._batch_visible_progress
+            if (
+                self._active_batch_mode
+                and self._batch_visible_progress is not None
+            )
+            else self._progress
+        )
         projection = self._context_projection.build_shell(
             revision=self._shell_revision,
             controls=controls,
@@ -5991,7 +6048,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             navigation=navigation,
             payloads=payloads,
             resident_frames=resident_frames,
-            progress=self._progress,
+            progress=projection_progress,
             preferences=self._preferences,
             browser_directory=self._browser_directory,
             browser_catalog=self._browser_catalog,
@@ -7784,7 +7841,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._browser_directory = directory
         self._browser_catalog = ()
         self._notice("")
-        self._refresh_shell(preserve_scientific=True)
+        self._refresh_shell()
         self._request_browser_catalog()
 
     def _begin_browser_follow(self, identity: RunIdentity) -> None:

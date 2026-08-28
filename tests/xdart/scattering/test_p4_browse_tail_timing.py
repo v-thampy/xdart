@@ -593,3 +593,66 @@ def test_terminal_browse_loading_status_restores_complete_after_repaint(
         assert "presentation=3.000s" in message
     finally:
         _dispose(page, qapp)
+
+
+@pytest.mark.parametrize(
+    "admission",
+    ("pending", "cache-debt", "refused"),
+)
+def test_scan_activation_reconciles_to_committed_browser_until_browse_adopts(
+    qapp, monkeypatch, admission: str,
+) -> None:
+    """A clicked row is intent, not a committed Browse selection."""
+
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
+    from tests.xdart.scattering.test_e1b2_page_command_boundaries import (
+        _Executor,
+        _active_page,
+        _dispose,
+    )
+
+    page, _, _ = _active_page(_Executor())
+    target = "/out/new-selection.nxs"
+    request = BrowseLoadRequest("pending-selection", 1, target)
+    refreshes: list[dict[str, object]] = []
+    timers: list[bool] = []
+    controller = page._context_controller
+    monkeypatch.setattr(
+        controller, "select_browser_target", lambda _value: False,
+    )
+    monkeypatch.setattr(
+        page, "_refresh_shell",
+        lambda **kwargs: refreshes.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(page, "_ensure_timer", lambda: timers.append(True))
+    if admission == "cache-debt":
+        monkeypatch.setattr(page, "_release_browse_1d_debt", lambda: False)
+        monkeypatch.setattr(
+            controller,
+            "begin_browse",
+            lambda _value: pytest.fail("cache debt reached Browse admission"),
+        )
+    elif admission == "refused":
+        monkeypatch.setattr(page, "_release_browse_1d_debt", lambda: True)
+
+        def refuse(_value):
+            raise RuntimeError("previous Browse cleanup is pending")
+
+        monkeypatch.setattr(controller, "begin_browse", refuse)
+    else:
+        monkeypatch.setattr(page, "_release_browse_1d_debt", lambda: True)
+        monkeypatch.setattr(controller, "begin_browse", lambda _value: request)
+    try:
+        page._select_scan(target)
+
+        # BrowserView paints the clicked QListWidget row before dispatching
+        # SELECT_SCAN.  Every not-yet-adopted path must immediately replay the
+        # authoritative projection so old science cannot wear the new row.
+        assert refreshes == (
+            [{}]
+            if admission == "refused"
+            else [{"preserve_scientific": True}]
+        )
+        assert timers == ([] if admission == "refused" else [True])
+    finally:
+        _dispose(page, qapp)

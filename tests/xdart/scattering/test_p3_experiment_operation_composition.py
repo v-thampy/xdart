@@ -694,3 +694,34 @@ def test_post_worker_replacement_and_pending_direct_entrypoints_are_blocked(
         page.close_workspace()
         page.deleteLater()
         qapp.processEvents()
+
+
+def test_average_refuses_active_background_before_dispatch(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from xrd_tools.reduction.background import FrameBackgroundPlan
+
+    source = _source(tmp_path)
+    intent = RunIntent(project_root=str(tmp_path))
+    intent.background = FrameBackgroundPlan(
+        mode="Single BG File",
+        locator=str(source),
+    )
+    store = RunIntentStore(intent)
+    page, _store = _page(tmp_path, monkeypatch, store=store)
+    try:
+        monkeypatch.setattr(
+            page._operation_slot,
+            "begin_average",
+            lambda *_args, **_kwargs: pytest.fail(
+                "active Background reached Average dispatch"
+            ),
+        )
+        page._average_action(store.snapshot())
+        assert page._average_identity is None
+        assert page._notice_text == (
+            "Average Scan does not support an active Background; "
+            "choose Background: None before averaging."
+        )
+    finally:
+        _close(page, qapp)

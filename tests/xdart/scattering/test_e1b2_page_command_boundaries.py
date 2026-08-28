@@ -2105,6 +2105,10 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
         )
         controller = page._context_controller
         scientific = shell.scientific
+        visible_frames = shell.browser.frame_model.frames
+        visible_current = shell.browser._committed_current
+        visible_status = shell.run_controls.readinessLabel.full_text()
+        visible_transient = page._browser_transient_frame
         calls = {
             "project": 0,
             "qualify": 0,
@@ -2193,16 +2197,26 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
             page._drain_executor()
             assert page._active_batch_mode
             assert page._batch_latest_frame is delta.appended
-            assert shell.browser._committed_current is delta.appended
+            assert page._progress.completed == completed
+            assert page._progress.total == len(deltas)
+            assert shell.browser.frame_model.frames == visible_frames
+            assert shell.browser._committed_current is visible_current
             assert shell.run_controls.readinessLabel.full_text() == (
-                f"Batch {completed}/{len(deltas)}"
+                visible_status
             )
+            assert page._browser_transient_frame is visible_transient
             if completed == 1:
                 page._handle_shell_command(ShellCommand(
                     ShellCommandKind.SET_CORES, 2,
                 ))
                 assert page._active_batch_mode
                 assert page._batch_latest_frame is delta.appended
+                assert shell.browser.frame_model.frames == visible_frames
+                assert shell.browser._committed_current is visible_current
+                assert shell.run_controls.readinessLabel.full_text() == (
+                    visible_status
+                )
+                assert page._browser_transient_frame is visible_transient
 
         assert calls == {
             "project": 0,
@@ -2367,7 +2381,12 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
             deltas[0].appended.artifact
         )
         page._active_batch_mode = True
+        page._batch_visible_progress = page._progress
         page._retain_outgoing_display = True
+        visible_frames = browser.frame_model.frames
+        visible_current = browser._committed_current
+        visible_status = shell.run_controls.readinessLabel.full_text()
+        visible_transient = page._browser_transient_frame
         for completed, delta in enumerate(deltas, start=1):
             frame = delta.appended
             executor.events.append(StandardRunEvent(
@@ -2381,20 +2400,14 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
                 navigation_delta=delta,
             ))
             page._drain_executor()
-            visible = browser.frame_model.frames
-            expected = tuple(
-                item.appended for item in deltas[:completed]
-            )
-            assert len(visible) == completed
-            assert all(
-                shown is target
-                for shown, target in zip(visible, expected, strict=True)
-            )
-            assert browser._committed_current is frame
             assert page._progress.completed == completed
+            assert page._progress.total == 3
+            assert browser.frame_model.frames == visible_frames
+            assert browser._committed_current is visible_current
             assert shell.run_controls.readinessLabel.full_text() == (
-                f"Batch {completed}/3"
+                visible_status
             )
+            assert page._browser_transient_frame is visible_transient
 
         # Exercise an otherwise ordinary control refresh and the acquisition
         # rescope catch-up branch without replacing the production refresh.
@@ -2410,6 +2423,10 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
             ))
             assert synchronized == [True]
         assert page._intents.snapshot().thaw().max_cores == 2
+        assert browser.frame_model.frames == visible_frames
+        assert browser._committed_current is visible_current
+        assert shell.run_controls.readinessLabel.full_text() == visible_status
+        assert page._browser_transient_frame is visible_transient
 
         assert calls == {
             "project": 0,
@@ -2526,6 +2543,176 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         assert calls["commit"] == before_edit["commit"] + 1
         assert calls["reconcile"] == before_edit["reconcile"] + 1
         assert calls["traces"] == before_edit["traces"] + 1
+
+        # A painted-success receipt is not a durable failure fence: ordinary
+        # post-success mode interaction retires it and projects normally.
+        before_mode = calls.copy()
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PLOT_MODE,
+            "Single" if plot_mode != "Single" else "Overlay",
+        ))
+        assert page._batch_terminal_presentation is None
+        assert not page._active_batch_mode
+        assert calls["project"] == before_mode["project"] + 1
+        assert calls["commit"] == before_mode["commit"] + 1
+        assert calls["reconcile"] == before_mode["reconcile"] + 1
+        assert calls["traces"] == before_mode["traces"] + 1
+    finally:
+        _dispose(page, qapp)
+
+
+@pytest.mark.parametrize(
+    ("kind", "cleanup", "expected_phase", "detail"),
+    (
+        (
+            StandardEventKind.FAILED,
+            CleanupStatus.CLEANED,
+            RunPhase.FAILED,
+            "Batch failed",
+        ),
+        (
+            StandardEventKind.STOPPED,
+            CleanupStatus.CLEANED,
+            RunPhase.IDLE,
+            "Stopped · 3 Frames",
+        ),
+        (
+            StandardEventKind.FINISHED,
+            CleanupStatus.CLEANUP_PENDING,
+            RunPhase.FAILED,
+            "Batch cleanup pending",
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "post_action", ("refresh", "plot_mode", "auto_last", "show_all", "frame"),
+)
+def test_batch_non_success_terminal_retains_prior_display(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+    kind: StandardEventKind,
+    cleanup: CleanupStatus,
+    expected_phase: RunPhase,
+    detail: str,
+    post_action: str,
+) -> None:
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(executor)
+    try:
+        deltas = _batch_display(page, executor, identity)
+        controller = page._context_controller
+        shell = _shell(page)
+        browser = shell.browser
+        scientific = shell.scientific
+        visible_frames = browser.frame_model.frames
+        visible_current = browser._committed_current
+        visible_transient = page._browser_transient_frame
+        old_projection = page._last_scientific_projection
+        old_raw = scientific.raw.image.image
+        old_cake = scientific.cake.image.image
+        old_items = tuple(scientific.curve.listDataItems())
+        calls = {"project": 0, "reconcile": 0}
+        real_project = controller.project_navigation
+        real_reconcile = scientific.reconcile
+
+        def project(**options):
+            calls["project"] += 1
+            return real_project(**options)
+
+        def reconcile(*args, **options):
+            calls["reconcile"] += 1
+            return real_reconcile(*args, **options)
+
+        monkeypatch.setattr(controller, "project_navigation", project)
+        monkeypatch.setattr(scientific, "reconcile", reconcile)
+        monkeypatch.setattr(page, "_request_browser_catalog", lambda: None)
+        page._active_batch_mode = True
+        page._batch_visible_progress = page._progress
+        page._retain_outgoing_display = True
+        for completed, delta in enumerate(deltas, start=1):
+            executor.events.append(StandardRunEvent(
+                identity,
+                StandardEventKind.FRAME_READY,
+                completed=completed,
+                total=3,
+                artifact=delta.appended.artifact,
+                detail=f"Batch {completed}/3",
+                frame_key=delta.appended,
+                navigation_delta=delta,
+            ))
+        page._drain_executor()
+
+        terminal_frame = deltas[-1].appended
+        executor.events.append(StandardRunEvent(
+            identity,
+            kind,
+            completed=3,
+            total=3,
+            artifact=terminal_frame.artifact,
+            detail=detail,
+            cleanup_status=cleanup,
+        ))
+        page._drain_executor()
+
+        assert lifecycle.phase is expected_phase
+        assert page._active_batch_mode
+        assert page._batch_latest_frame is None
+        assert page._batch_visible_progress is None
+        owner = page._batch_terminal_presentation
+        assert owner is not None
+        assert owner.run_identity is identity
+        assert owner.frame is None
+        assert page._retain_outgoing_display
+        assert calls == {"project": 0, "reconcile": 0}
+        assert browser.frame_model.frames == visible_frames
+        assert browser._committed_current is visible_current
+        assert page._browser_transient_frame is visible_transient
+        assert page._last_scientific_projection is old_projection
+        assert scientific.raw.image.image is old_raw
+        assert scientific.cake.image.image is old_cake
+        assert tuple(scientific.curve.listDataItems()) == old_items
+        terminal_status = (
+            "Standard cleanup remains pending"
+            if cleanup is CleanupStatus.CLEANUP_PENDING
+            else detail
+        )
+        assert shell.run_controls.readinessLabel.full_text() == terminal_status
+
+        if post_action == "refresh":
+            page._refresh_shell()
+        elif post_action == "plot_mode":
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SET_PLOT_MODE, "Overlay",
+            ))
+        elif post_action == "auto_last":
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SET_AUTO_LAST, False,
+            ))
+        elif post_action == "show_all":
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SHOW_ALL,
+            ))
+        else:
+            first = deltas[0].appended
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SELECT_FRAME,
+                frame=first,
+                frames=(first,),
+            ))
+
+        assert page._batch_terminal_presentation is owner
+        assert page._active_batch_mode
+        assert page._batch_latest_frame is None
+        assert page._batch_visible_progress is None
+        assert calls == {"project": 0, "reconcile": 0}
+        assert browser.frame_model.frames == visible_frames
+        assert browser._committed_current is visible_current
+        assert page._browser_transient_frame is visible_transient
+        assert page._last_scientific_projection is old_projection
+        assert scientific.raw.image.image is old_raw
+        assert scientific.cake.image.image is old_cake
+        assert tuple(scientific.curve.listDataItems()) == old_items
+        assert shell.run_controls.readinessLabel.full_text() == terminal_status
     finally:
         _dispose(page, qapp)
 
@@ -2599,6 +2786,7 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
             detector_mode="full",
         )
         page._active_batch_mode = True
+        page._batch_visible_progress = page._progress
         page._retain_outgoing_display = True
         for completed, delta in enumerate(deltas, start=1):
             executor.events.append(StandardRunEvent(
@@ -2660,6 +2848,20 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
 
         page._handle_shell_command(ShellCommand(
             ShellCommandKind.SET_CORES, 3,
+        ))
+        assert page._batch_terminal_presentation is owner
+        assert page._active_batch_mode
+        assert calls == {
+            "project": 0,
+            "qualify": 0,
+            "request": 1,
+            "reconcile": 0,
+            "waterfall": 0,
+        }
+
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PLOT_MODE,
+            "Single" if plot_mode != "Single" else "Overlay",
         ))
         assert page._batch_terminal_presentation is owner
         assert page._active_batch_mode
@@ -2800,6 +3002,7 @@ def test_batch_terminal_accepts_absolute_latest_after_prefix_exceeds_capacity(
             detector_mode="thumbnail",
         )
         page._active_batch_mode = True
+        page._batch_visible_progress = page._progress
         page._retain_outgoing_display = True
         executor.events.append(StandardRunEvent(
             identity,
@@ -2921,7 +3124,12 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
             deltas[0].appended.artifact
         )
         page._active_batch_mode = True
+        page._batch_visible_progress = page._progress
         page._retain_outgoing_display = True
+        visible_frames = browser.frame_model.frames
+        visible_current = browser._committed_current
+        visible_status = shell.run_controls.readinessLabel.full_text()
+        visible_transient = page._browser_transient_frame
         if terminal_case in {"owned_historical", "request_refused"}:
             for completed, delta in enumerate(deltas, start=1):
                 frame = delta.appended
@@ -2936,11 +3144,14 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
                     navigation_delta=delta,
                 ))
                 page._drain_executor()
-                assert browser._committed_current is frame
                 assert page._progress.completed == completed
+                assert page._progress.total == 3
+                assert browser.frame_model.frames == visible_frames
+                assert browser._committed_current is visible_current
                 assert shell.run_controls.readinessLabel.full_text() == (
-                    f"Batch {completed}/3"
+                    visible_status
                 )
+                assert page._browser_transient_frame is visible_transient
             if terminal_case == "owned_historical":
                 # This is an exact owned member, but not the terminal event's
                 # exact latest frame.  Membership alone must never qualify it.
@@ -2977,14 +3188,9 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
                 1 if terminal_case == "request_refused" else 0
             ),
         }
-        assert browser.frame_model.rowCount() == (
-            0 if terminal_case == "zero" else 3
-        )
-        assert browser._committed_current is (
-            None
-            if terminal_case == "zero"
-            else deltas[-1].appended
-        )
+        assert browser.frame_model.frames == visible_frames
+        assert browser._committed_current is visible_current
+        assert page._browser_transient_frame is visible_transient
         assert shell.run_controls.readinessLabel.full_text() == (
             f"Complete · {completed} Frames"
         )
