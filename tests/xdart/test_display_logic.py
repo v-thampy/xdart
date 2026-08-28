@@ -36,6 +36,7 @@ import pytest
 
 import xdart.gui.tabs.static_scan.display_logic as dl
 from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
+from xrd_tools.session import HydrationPurpose
 
 # Absolute path to the module under test, derived from this test's
 # location (tests/xdart is two levels below the repo root; the module
@@ -185,19 +186,24 @@ def test_resolve_frame_data_typed_statuses_and_fallbacks(caplog):
         ignored = dl.resolve_frame_data(
             6, dl.Mode.INT_1D, dl.DataTier.ONE_D,
             viewer_rows_1d={6: "scan-legacy-frame"},
-            request_hydration=lambda label, *, purpose="full":
+            request_hydration=lambda label, *,
+            purpose=HydrationPurpose.FULL:
                 requests.append((label, purpose)),
         )
         ignored_again = dl.resolve_frame_data(
             7, dl.Mode.INT_1D, dl.DataTier.ONE_D,
             viewer_rows_1d={7: "scan-legacy-frame"},
-            request_hydration=lambda label, *, purpose="full":
+            request_hydration=lambda label, *,
+            purpose=HydrationPurpose.FULL:
                 requests.append((label, purpose)),
         )
     assert ignored.status is dl.ReadStatus.EVICTED_HYDRATING
     assert ignored.source == "hydration"
     assert ignored_again.status is dl.ReadStatus.EVICTED_HYDRATING
-    assert requests == [(6, "1d"), (7, "1d")]
+    assert requests == [
+        (6, HydrationPurpose.ONE_D),
+        (7, HydrationPurpose.ONE_D),
+    ]
     assert "ignored legacy mirror" not in caplog.text
 
     absent = dl.resolve_frame_data(
@@ -228,12 +234,13 @@ def test_resolve_frame_data_hydrates_async_without_blocking_disk_read():
     result = dl.resolve_frame_data(
         7, dl.Mode.INT_1D, dl.DataTier.ONE_D,
         publication_store=Store(),
-        request_hydration=lambda label, *, purpose="full":
+        request_hydration=lambda label, *,
+        purpose=HydrationPurpose.FULL:
             requests.append((label, purpose)),
     )
 
     assert result.status is dl.ReadStatus.EVICTED_HYDRATING
-    assert requests == [(7, "1d")]
+    assert requests == [(7, HydrationPurpose.ONE_D)]
 
 
 def test_read_policy_table_enumerates_consumers_and_statuses():

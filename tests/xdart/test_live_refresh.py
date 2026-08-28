@@ -10,6 +10,7 @@ from threading import RLock
 
 import numpy as np
 import pytest
+from xrd_tools.session import HydrationPurpose
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -3508,7 +3509,8 @@ def test_update_store_evicted_overlay_selection_preserves_history_and_hydrates()
             ),
         ),
         normalize=lambda data, metadata: data,
-        _request_frame_hydration=lambda label, *, purpose="full":
+        _request_frame_hydration=lambda label, *,
+        purpose=HydrationPurpose.FULL:
             queued.append((int(label), purpose)),
         _apply_share_axis_state=lambda: calls.append("share_axis"),
         _apply_1d_only_visibility=lambda: calls.append("layout"),
@@ -3541,7 +3543,7 @@ def test_update_store_evicted_overlay_selection_preserves_history_and_hydrates()
 
     assert host.update() is True
 
-    assert queued == [(10, "1d")]
+    assert queued == [(10, HydrationPurpose.ONE_D)]
     assert "payload_plot" in calls
     assert "clear_plot" not in calls
     assert host._waterfall_history.ids == initial_ids

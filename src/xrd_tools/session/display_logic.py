@@ -56,6 +56,7 @@ from xrd_tools.session.frame_projection import (
     CapabilityState,
     DisplayCapabilities,
 )
+from xrd_tools.session.hydration import HydrationPurpose
 from xrd_tools.core.invalid import (
     UINT32_CEILING as _UINT32_CEILING,
     integer_saturation_ceiling as _core_saturation_ceiling,
@@ -2021,16 +2022,14 @@ def _viewer_row_for_tier(label, tier_needed, viewer_rows_1d=None, viewer_rows_2d
 def _request_tier_hydration(request_hydration, label, tier_needed):
     if request_hydration is None:
         return False
-    purpose = "1d" if _tier(tier_needed) is DataTier.ONE_D else "full"
+    purpose = (
+        HydrationPurpose.ONE_D
+        if _tier(tier_needed) is DataTier.ONE_D
+        else HydrationPurpose.FULL
+    )
     try:
         request_hydration(label, purpose=purpose)
         return True
-    except TypeError:
-        try:
-            request_hydration(label)
-            return True
-        except Exception:
-            return False
     except Exception:
         return False
 
@@ -2040,12 +2039,12 @@ def _hydration_suppressed_by_selected_capability(
     """X1 Slice 3b (R3-P8): the typed hydration-eligibility decision at the
     request boundary — BEFORE anything is queued.
 
-    Suppress a ``"1d"`` request iff the request's exact ``(scan_key, label)``
+    Suppress a 1D request iff the request's exact ``(scan_key, label)``
     matches the pinned selection AND the pinned ``integrated_1d`` disposition
     is DROPPED or PERSISTED_NO_HYDRATOR — a TYPED comparison, never a
     reason-string parse (R3-P2).  Any identity mismatch or missing pin keeps
-    the legacy behavior; ABSENT does not suppress (record-not-present is not
-    proof recovery is pointless).  Purpose ``"full"`` is never gated in this
+    the ordinary behavior; ABSENT does not suppress (record-not-present is not
+    proof recovery is pointless).  ``HydrationPurpose.FULL`` is never gated in this
     slice: it serves both the integrated-2D and raw/thumbnail tiers, and
     record capabilities cannot see every production recovery path."""
     if selected_capability is None:

@@ -372,6 +372,31 @@ class TestReloadOnlyFlagWiring:
                                    source_root=str(tmp_path))
         assert loaded.is_reload_only is True
 
+    def test_never_written_source_ref_group_is_ignored(self, tmp_path):
+        """Only the current ``source`` group can recover a raw frame."""
+        from xdart.modules.ewald.frame_series import _load_frame_v2
+
+        nxs = tmp_path / "source_ref_only.nexus"
+        with h5py.File(nxs, "w") as handle:
+            frames = handle.create_group("entry/frames")
+            frame_group = frames.create_group("frame_0000")
+            retired = frame_group.create_group("source_ref")
+            retired.create_dataset("path", data=b"raw/frame.tif")
+            retired.create_dataset("frame_index", data=4)
+
+        with h5py.File(nxs, "r") as handle:
+            loaded = _load_frame_v2(
+                handle,
+                0,
+                static=False,
+                gi=False,
+                source_root=str(tmp_path),
+            )
+
+        assert not loaded.source_file
+        assert loaded.source_frame_idx is None
+        assert loaded.is_reload_only is True
+
 
 # ---------------------------------------------------------------------------
 # integrate_*: lazy load happens automatically when map_raw is None

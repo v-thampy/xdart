@@ -21,7 +21,10 @@ from xrd_tools.core import (
 )
 from xrd_tools.io import read_frame_view, write_integrated_stack
 from xrd_tools.session import (
-    FrameHydrationRequest, FrameHydrationResult, FrameRecordStore,
+    FrameHydrationRequest,
+    FrameHydrationResult,
+    FrameRecordStore,
+    HydrationPurpose,
 )
 
 _DIRECT = Qt.QtCore.Qt.ConnectionType.DirectConnection
@@ -112,6 +115,12 @@ def test_worker_dedupes_same_label_generation_before_read(qapp):
     assert reads == [7]
 
 
+def test_worker_rejects_string_purpose(qapp):
+    worker = FrameHydrationWorker(None)
+    with pytest.raises(TypeError, match="HydrationPurpose"):
+        worker.request(7, 3, purpose="1d")
+
+
 def test_worker_drains_stale_queue_on_generation_cancel(qapp):
     reads = []
     done = threading.Event()
@@ -150,9 +159,9 @@ def test_worker_batches_same_generation_1d_requests(qapp):
     worker = FrameHydrationWorker(Store())
     worker.sigHydrated.connect(
         lambda label, gen: emitted.append((label, gen)), _DIRECT)
-    worker.request(1, 5, purpose="1d")
-    worker.request(2, 5, purpose="1d")
-    worker.request(3, 5, purpose="1d")
+    worker.request(1, 5, purpose=HydrationPurpose.ONE_D)
+    worker.request(2, 5, purpose=HydrationPurpose.ONE_D)
+    worker.request(3, 5, purpose=HydrationPurpose.ONE_D)
     worker.start()
     try:
         assert done.wait(5.0)
@@ -180,7 +189,8 @@ def test_worker_overlay_1d_keeps_selection_superseded_requests_in_order(qapp):
         lambda label, gen: emitted.append((label, gen)), _DIRECT)
     for label in range(21):
         worker.request(
-            label, label, purpose="1d", consumer=ConsumerKind.OVERLAY_1D,
+            label, label, purpose=HydrationPurpose.ONE_D,
+            consumer=ConsumerKind.OVERLAY_1D,
             supersede_reason=SupersedeReason.SELECTION)
     worker.start()
     try:
@@ -206,11 +216,13 @@ def test_worker_overlay_1d_scan_switch_cancels_old_pending(qapp):
     worker = FrameHydrationWorker(Store())
     for label in range(5):
         worker.request(
-            label, 1, purpose="1d", consumer=ConsumerKind.OVERLAY_1D,
+            label, 1, purpose=HydrationPurpose.ONE_D,
+            consumer=ConsumerKind.OVERLAY_1D,
             supersede_reason=SupersedeReason.SELECTION)
     worker.cancel_stale_before(2, reason=SupersedeReason.SCAN_SWITCH)
     worker.request(
-        99, 2, purpose="1d", consumer=ConsumerKind.OVERLAY_1D,
+        99, 2, purpose=HydrationPurpose.ONE_D,
+        consumer=ConsumerKind.OVERLAY_1D,
         supersede_reason=SupersedeReason.SELECTION)
     worker.start()
     try:
@@ -235,7 +247,8 @@ def test_worker_compacts_large_same_generation_1d_burst(qapp):
     worker = FrameHydrationWorker(Store())
     for label in range(3621):
         worker.request(
-            label, 7, purpose="1d", consumer=ConsumerKind.OVERLAY_1D,
+            label, 7, purpose=HydrationPurpose.ONE_D,
+            consumer=ConsumerKind.OVERLAY_1D,
             supersede_reason=SupersedeReason.SELECTION)
 
     assert len(worker._queue) == 1
@@ -319,7 +332,10 @@ def test_full_raw_request_skips_store_without_raw_hydration_capability(qapp):
     done = threading.Event()
 
     class RecordStore:
-        hydration_purposes = frozenset({"1d", "2d", "record"})
+        hydration_purposes = frozenset({
+            HydrationPurpose.ONE_D,
+            HydrationPurpose.PREVIEW,
+        })
 
         def get_or_hydrate(self, label):
             calls.append(("record", label))
@@ -335,7 +351,7 @@ def test_full_raw_request_skips_store_without_raw_hydration_capability(qapp):
     worker.sigHydrated.connect(lambda _label, _gen: done.set(), _DIRECT)
     worker.start()
     try:
-        worker.request(148, 1, purpose="full")
+        worker.request(148, 1, purpose=HydrationPurpose.FULL)
         assert done.wait(5.0)
     finally:
         worker.stop()
@@ -402,7 +418,7 @@ def test_record_store_rehydrates_evicted_frame_on_worker_thread(qapp, tmp_path):
     worker.sigHydrated.connect(lambda label, gen: done.set(), _DIRECT)
     worker.start()
     try:
-        worker.request(1, 1, purpose="2d")
+        worker.request(1, 1, purpose=HydrationPurpose.PREVIEW)
         assert done.wait(5.0), "record-store hydration did not finish"
     finally:
         worker.stop()

@@ -377,11 +377,8 @@ def _load_source_ref(frame: LiveFrame, fg) -> None:
     """Populate ``frame.source_file`` and ``frame.source_frame_idx`` from a
     per-frame :class:`NXcollection`.
 
-    R2 schema lives under ``<frame_group>/source/{path, frame_index}``.
-    A legacy ``source_ref`` dict (never actually written by the v2
-    writer prior to R2 — the attribute-name mismatch silenced it) is
-    also supported for forward-compat with any one-off files that
-    might carry it.
+    The current schema lives under
+    ``<frame_group>/source/{path, frame_index}``.
     """
     # Narrow except set on every read: h5py raises KeyError on missing
     # fields, ValueError/OSError on corrupt data, TypeError on weird
@@ -423,32 +420,6 @@ def _load_source_ref(frame: LiveFrame, fg) -> None:
             except _SRC_READ_ERRORS:
                 continue
         frame.source_snapshot = snapshot
-        return
-
-    # Legacy support: dict-shaped source_ref subgroup.
-    legacy = fg.get("source_ref") if "source_ref" in fg else None
-    if legacy is None:
-        return
-    path = None
-    if "path" in legacy:
-        path = legacy["path"]
-    elif "file" in legacy:
-        path = legacy["file"]
-    if path is not None:
-        try:
-            v = path[()]
-            if isinstance(v, bytes):
-                v = v.decode("utf-8", errors="replace")
-            frame.source_file = str(v)
-        except _SRC_READ_ERRORS as e:
-            logger.debug("legacy source_ref path read failed for frame %s: %s",
-                         frame.idx, e)
-    if "frame_index" in legacy:
-        try:
-            frame.source_frame_idx = int(legacy["frame_index"][()])
-        except _SRC_READ_ERRORS as e:
-            logger.debug("legacy source_ref frame_index read failed for frame %s: %s",
-                         frame.idx, e)
 
 
 class LiveFrameSeries:

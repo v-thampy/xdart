@@ -47,6 +47,7 @@ from xdart.modules.display_context import (
     HydrationOwner,
     new_context_token,
 )
+from xrd_tools.session import HydrationPurpose
 
 _DIRECT = Qt.QtCore.Qt.ConnectionType.DirectConnection
 
@@ -277,7 +278,8 @@ def test_a_request_made_under_b_never_lands_in_a_after_the_selection_moves(
     b_stores = display._hydration_stores()
     assert browse.publication_store in b_stores
 
-    request = display._build_hydration_request(3, purpose="full")
+    request = display._build_hydration_request(
+        3, purpose=HydrationPurpose.FULL)
     assert request is not None, "no owned hydration request was built"
     assert request.context_token == browse.context_token
     assert request.context_scan_key == browse.scan_key
@@ -319,7 +321,8 @@ def test_a_read_that_returns_after_resume_inserts_into_neither_context(
     browse = _browsing_run(widget, monkeypatch, tmp_path)
     display = widget.displayframe
 
-    request = display._build_hydration_request(5, purpose="full")
+    request = display._build_hydration_request(
+        5, purpose=HydrationPurpose.FULL)
     assert request is not None
     before = _store_state(widget, browse)
 
@@ -517,7 +520,8 @@ def test_completion_admission_refuses_a_foreign_source_and_a_stale_epoch(
     widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
     display = widget.displayframe
     context = widget._acquisition_context
-    request = display._build_hydration_request(4, purpose="full")
+    request = display._build_hydration_request(
+        4, purpose=HydrationPurpose.FULL)
     assert request is not None
     good = request.owner
     assert good.source and good.epoch

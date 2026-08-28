@@ -51,6 +51,7 @@ from xdart.modules.display_context import (
     DisplaySelection,
     HydrationOwner,
 )
+from xrd_tools.session import HydrationPurpose
 
 _ADMITTED = "/raw/admitted-root"
 _MEMBER = "/raw/member-0007.h5"
@@ -229,7 +230,7 @@ def test_the_request_is_minted_from_the_current_source(tmp_path):
     context.rescope_to("scan-A-member-7", source=_MEMBER)
 
     request = displayFrameWidget._build_hydration_request(
-        display, 1, purpose="2d")
+        display, 1, purpose=HydrationPurpose.PREVIEW)
 
     assert request.owner == context.hydration_owner
     assert request.context_scan_key == context.scan_key
@@ -242,7 +243,7 @@ def test_a_request_built_after_a_rescope_is_admitted_by_its_own_context():
     display = _display(context)
     context.rescope_to("scan-A-member-7", source=_MEMBER)
     request = displayFrameWidget._build_hydration_request(
-        display, 1, purpose="2d")
+        display, 1, purpose=HydrationPurpose.PREVIEW)
 
     assert displayFrameWidget._admit_hydration_owner(
         display, request.owner, request.label, request.generation) is True
@@ -260,7 +261,7 @@ def test_active_context_never_reconstructs_a_missing_owner_projection():
     )
     display = _display(context)
     request = displayFrameWidget._build_hydration_request(
-        display, 1, purpose="2d")
+        display, 1, purpose=HydrationPurpose.PREVIEW)
     assert request is not None
     assert request.owner == HydrationOwner()
     assert request.enqueueable is False
@@ -366,7 +367,7 @@ def test_a_broken_resolver_does_not_mint_an_ownerless_request():
     """ERROR may not be downgraded to the explicit idle adapter."""
     display = _broken_display(_context())
     request = displayFrameWidget._build_hydration_request(
-        display, 1, purpose="2d")
+        display, 1, purpose=HydrationPurpose.PREVIEW)
     assert request is not None
     assert request.enqueueable is False, (
         "an unresolvable owner produced an enqueueable request")
@@ -381,7 +382,7 @@ def test_an_installed_but_unresolved_selection_is_error_not_idle(widget):
         # Keep the installed selection but withdraw the context it names.
         widget._acquisition_context = None
         request = displayFrameWidget._build_hydration_request(
-            display, 1, purpose="2d")
+            display, 1, purpose=HydrationPurpose.PREVIEW)
         assert request is not None
         assert request.enqueueable is False
         assert request.owner == HydrationOwner()
@@ -410,7 +411,7 @@ def test_the_genuine_idle_path_still_admits_an_ownerless_completion():
     assert displayFrameWidget._admit_hydration_owner(
         display, None, 1, 1) is True
     assert displayFrameWidget._build_hydration_request(
-        display, 1, purpose="2d") is None
+        display, 1, purpose=HydrationPurpose.PREVIEW) is None
 
 
 # --------------------------------------------------------------------------- #

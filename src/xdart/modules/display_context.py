@@ -58,7 +58,6 @@ from xrd_tools.session.hydration import (
     HydrationReadKey,
     HydrationScope,
     HydrationToken,
-    normalize_hydration_purpose,
     _CheckpointHydrationGate,
     _CheckpointHydrationToken,
 )
@@ -465,7 +464,9 @@ class HydrationRequest:
             raise TypeError("hydration label/generation must be exact values")
         if type(self.owner) is not HydrationOwner or type(self.stores) is not tuple:
             raise TypeError("hydration owner and store references are malformed")
-        purpose = normalize_hydration_purpose(self.purpose)
+        if type(self.purpose) is not HydrationPurpose:
+            raise TypeError("hydration purpose must be a HydrationPurpose")
+        purpose = self.purpose
         scope = HydrationScope(*self.owner.as_tuple())
         object.__setattr__(self, "purpose", purpose)
         object.__setattr__(self, "scope", scope)

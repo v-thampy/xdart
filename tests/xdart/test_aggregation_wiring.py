@@ -15,6 +15,7 @@ from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
+from xrd_tools.session import HydrationPurpose
 
 NQ, NCHI = 6, 4
 
@@ -227,7 +228,7 @@ def test_sum_average_state_snapshot_does_not_reenqueue_full_2d_hydration():
     from xdart.gui.tabs.static_scan.display_logic import Mode
 
     queued = []
-    def request(label, *, purpose="full"):
+    def request(label, *, purpose=HydrationPurpose.FULL):
         queued.append((label, purpose))
 
     pub = SimpleNamespace(
@@ -318,7 +319,8 @@ def test_explicit_sum_subset_missing_frames_hydrates_or_refuses():
 
     queued = []
     widget._request_frame_hydration = (
-        lambda label, *, purpose="full": queued.append((label, purpose)))
+        lambda label, *, purpose=HydrationPurpose.FULL:
+        queued.append((label, purpose)))
     live_store = PublicationStore(max_heavy_items=1)
     for label in state.selected_ids:
         live_store.upsert(publication_from_live_frame(_frame(label)))
@@ -329,7 +331,10 @@ def test_explicit_sum_subset_missing_frames_hydrates_or_refuses():
 
     assert payload is not None
     assert payload.traces == ()
-    assert queued == [(1, "1d"), (2, "1d")]
+    assert queued == [
+        (1, HydrationPurpose.ONE_D),
+        (2, HydrationPurpose.ONE_D),
+    ]
 
     calls = []
     sync_store = PublicationStore(max_heavy_items=None)
@@ -1588,7 +1593,8 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
             ),
             slice=SimpleNamespace(isChecked=lambda: False, isEnabled=lambda: False),
         ),
-        _request_frame_hydration=lambda label, *, purpose="full":
+        _request_frame_hydration=lambda label, *,
+        purpose=HydrationPurpose.FULL:
             queued.append((int(label), purpose)),
     )
     counts = [initial_history.count]
@@ -1607,7 +1613,7 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
 
     state, payload = render_and_guard()
     assert tuple(state.render_ids) == ()
-    assert queued == [(331, "1d")]
+    assert queued == [(331, HydrationPurpose.ONE_D)]
     assert payload.plot_history.ids == initial_ids
 
     widget.frame_ids = []

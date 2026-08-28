@@ -1,4 +1,4 @@
-"""E4-S shared hydration values and the canonical compatibility adapter."""
+"""Shared enum-native hydration value contracts."""
 
 from __future__ import annotations
 
@@ -18,22 +18,11 @@ def _scope(api):
     return api.HydrationScope("context-a", "scan-7", "/raw/source", 4)
 
 
-def test_purpose_values_and_exact_legacy_aliases():
+def test_purpose_values_are_enum_only():
     api = _api()
     assert [str(value) for value in api.HydrationPurpose] == ["1d", "2d", "full"]
-    aliases = {
-        "1d": api.HydrationPurpose.ONE_D,
-        "2d": api.HydrationPurpose.PREVIEW,
-        "preview": api.HydrationPurpose.PREVIEW,
-        "full": api.HydrationPurpose.FULL,
-        "raw": api.HydrationPurpose.FULL,
-    }
-    for spelling, expected in aliases.items():
-        assert api.normalize_hydration_purpose(spelling) is expected
-        assert api.normalize_hydration_purpose(expected) is expected
-    for invalid in ("", "2D", " preview", "all", "record", None, 2):
-        with pytest.raises((TypeError, ValueError)):
-            api.normalize_hydration_purpose(invalid)
+    assert not hasattr(api, "normalize_hydration_purpose")
+    assert not hasattr(import_module("xrd_tools.session"), "normalize_hydration_purpose")
 
 
 def test_outcomes_are_complete_and_frozen_values_are_total():
@@ -128,13 +117,13 @@ def test_contract_values_cannot_carry_arrays_handles_stores_or_callbacks(tmp_pat
             )
 
 
-def test_context_request_is_the_single_explicit_legacy_adapter():
+def test_context_request_accepts_only_the_current_enum():
     api = _api()
     context = import_module("xdart.modules.display_context")
     owner = context.HydrationOwner("context-a", "scan-7", "/raw/source", 4)
     request = context.HydrationRequest(
         label=17,
-        purpose="preview",
+        purpose=api.HydrationPurpose.PREVIEW,
         generation=9,
         owner=owner,
         stores=(object(),),
@@ -147,21 +136,22 @@ def test_context_request_is_the_single_explicit_legacy_adapter():
     with pytest.raises(TypeError):
         context.HydrationRequest(
             label=np.zeros(1),
-            purpose="preview",
+            purpose=api.HydrationPurpose.PREVIEW,
             generation=9,
             owner=owner,
             stores=(),
             commit_gate=None,
         )
-    with pytest.raises(ValueError):
-        context.HydrationRequest(
-            label=17,
-            purpose="all",
-            generation=9,
-            owner=owner,
-            stores=(),
-            commit_gate=None,
-        )
+    for spelling in ("1d", "2d", "preview", "full", "raw"):
+        with pytest.raises(TypeError):
+            context.HydrationRequest(
+                label=17,
+                purpose=spelling,
+                generation=9,
+                owner=owner,
+                stores=(),
+                commit_gate=None,
+            )
 
 
 def test_typed_context_request_requires_one_consistent_identity():
@@ -283,6 +273,8 @@ def test_context_request_fields_are_the_complete_reference_only_shape():
         "commit_gate",
         "read_key",
         "token",
+        "checkpoint_token",
+        "checkpoint_gate",
         "scope",
     )
     assert context.HydrationRequest.__annotations__ == {
@@ -294,6 +286,8 @@ def test_context_request_fields_are_the_complete_reference_only_shape():
         "commit_gate": "object",
         "read_key": "HydrationReadKey | None",
         "token": "HydrationToken | None",
+        "checkpoint_token": "_CheckpointHydrationToken | None",
+        "checkpoint_gate": "_CheckpointHydrationGate | None",
         "scope": "HydrationScope",
     }
 

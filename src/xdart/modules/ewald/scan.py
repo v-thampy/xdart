@@ -12,7 +12,6 @@ from .frame import LiveFrame
 from .frame_series import LiveFrameSeries
 from xrd_tools.io.output_path import default_output_path
 from xdart import utils
-from xdart.modules.live_compat import normalize_live_class_names
 from xrd_tools.core.energy import (
     DEFAULT_WAVELENGTH_SENTINEL_M,
     wavelength_angstrom_to_m,
@@ -928,7 +927,7 @@ class LiveScan:
             loaded_scan_data = True
 
         # ── wavelength + bai args from reduction config (if present) ─
-        reduction = normalize_live_class_names(ds.attrs.get("reduction", {}) or {})
+        reduction = ds.attrs.get("reduction", {}) or {}
         config = reduction.get("config", {}) or {}
         if isinstance(config, dict) and (config or not data_only):
             stored_config = copy.deepcopy(config)

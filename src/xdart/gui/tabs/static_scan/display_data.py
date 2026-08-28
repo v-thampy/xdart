@@ -34,7 +34,12 @@ from xrd_tools.core import (
     view_to_result_2d,
 )
 from xrd_tools.core.energy import normalize_wavelength_m
-from xrd_tools.session import MetadataRow, WavelengthStatus, normalization_value
+from xrd_tools.session import (
+    HydrationPurpose,
+    MetadataRow,
+    WavelengthStatus,
+    normalization_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,18 +243,14 @@ class DisplayDataMixin:
             else bool(allow_blocking_read)
         )
 
-    def _request_missing_publication(self, idx, *, purpose="full") -> None:
+    def _request_missing_publication(
+            self, idx, *,
+            purpose: HydrationPurpose = HydrationPurpose.FULL) -> None:
         request = getattr(self, "_request_frame_hydration", None)
         if request is None:
             return
         try:
             request(int(idx), purpose=purpose)
-        except TypeError:
-            try:
-                request(int(idx))
-            except Exception:
-                logger.debug("publication hydration request failed for %s", idx,
-                             exc_info=True)
         except Exception:
             logger.debug("publication hydration request failed for %s", idx,
                          exc_info=True)
@@ -1244,7 +1245,8 @@ class DisplayDataMixin:
                     int(idx), allow_blocking_read=should_block)
                 if lf is None or getattr(lf, 'int_1d', None) is None:
                     if not should_block:
-                        self._request_missing_publication(int(idx), purpose="1d")
+                        self._request_missing_publication(
+                            int(idx), purpose=HydrationPurpose.ONE_D)
                     continue
                 frame_1d = lf
                 if frame_2d is None:

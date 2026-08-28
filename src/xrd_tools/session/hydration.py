@@ -3,7 +3,7 @@ from __future__ import annotations
 from threading import Lock
 from dataclasses import dataclass
 from enum import StrEnum
-__all__ = ["HydrationPurpose", "HydrationOutcome", "HydrationScope", "HydrationReadKey", "HydrationToken", "HydrationCompletion", "normalize_hydration_purpose"]
+__all__ = ["HydrationPurpose", "HydrationOutcome", "HydrationScope", "HydrationReadKey", "HydrationToken", "HydrationCompletion"]
 class HydrationPurpose(StrEnum):
     ONE_D = "1d"
     PREVIEW = "2d"
@@ -15,17 +15,6 @@ class HydrationOutcome(StrEnum):
     OWNER_MISMATCH = "owner_mismatch"
     FAILED = "failed"
     CANCELLED = "cancelled"
-_PURPOSE_ALIASES = {"1d": HydrationPurpose.ONE_D, "2d": HydrationPurpose.PREVIEW, "preview": HydrationPurpose.PREVIEW, "full": HydrationPurpose.FULL, "raw": HydrationPurpose.FULL}
-def normalize_hydration_purpose(value) -> HydrationPurpose:
-    """The sole legacy spelling adapter."""
-    if type(value) is HydrationPurpose:
-        return value
-    if type(value) is not str:
-        raise TypeError("hydration purpose must be an enum or string")
-    try:
-        return _PURPOSE_ALIASES[value]
-    except KeyError:
-        raise ValueError(f"unknown hydration purpose {value!r}") from None
 def _text(name, value, *, allow_empty=False) -> str:
     if type(value) is not str or (not allow_empty and not value):
         raise TypeError(f"{name} must be an exact nonempty string")

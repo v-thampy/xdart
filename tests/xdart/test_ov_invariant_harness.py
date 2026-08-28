@@ -31,6 +31,7 @@ from xdart.gui.tabs.static_scan.display_logic import (
     AccumulatorLifecycle,
     LifecycleCause,
 )
+from xrd_tools.session import HydrationPurpose
 
 
 def _ids(harness):
@@ -64,7 +65,7 @@ def test_ov2_evicted_click_preserves_history():
     h.click(0)                             # the OV-2 click
     assert h.persistent_count == 12        # whole plot does NOT redraw bare
     assert set(_ids(h)) == {("scanA", i) for i in range(12)}
-    assert (0, "1d") in h.hydration_requests   # rehydration was queued
+    assert (0, HydrationPurpose.ONE_D) in h.hydration_requests
     assert h.resets_observed == []
 
 
@@ -79,7 +80,7 @@ def test_ov3_hydration_completion_appends_not_fresh_plots():
     h.evict(8)
     h.click(8)                             # select the evicted frame
     assert h.persistent_count == 8         # preserved while hydrating
-    assert (8, "1d") in h.hydration_requests
+    assert (8, HydrationPurpose.ONE_D) in h.hydration_requests
     h.hydration_complete(8)                # worker lands the 1D row
     assert h.persistent_count == 9         # appended onto the overlay
     assert set(_ids(h)) == {("scanA", i) for i in range(9)}

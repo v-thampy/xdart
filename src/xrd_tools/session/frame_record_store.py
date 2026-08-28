@@ -16,7 +16,10 @@ from threading import RLock
 from types import MappingProxyType
 
 from xrd_tools.core import FrameRecord, FrameView
-from xrd_tools.session.hydration import _CheckpointHydrationGate
+from xrd_tools.session.hydration import (
+    HydrationPurpose,
+    _CheckpointHydrationGate,
+)
 
 _ModeKey = tuple[str, str]
 
@@ -187,7 +190,10 @@ class FrameRecordStore:
 
     # The registered disk hydrator reads integrated results from the processed
     # container. Detector raw pixels belong to PublicationStore/source fallback.
-    hydration_purposes = frozenset({"1d", "2d", "record"})
+    hydration_purposes = frozenset({
+        HydrationPurpose.ONE_D,
+        HydrationPurpose.PREVIEW,
+    })
 
     def __init__(
         self,

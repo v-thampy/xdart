@@ -88,6 +88,7 @@ from xdart.gui.tabs.static_scan.run_config_debug import (
     FAIL_CLOSED_DECISIONS,
     FAIL_CLOSED_REJECTION_EVENT,
 )
+from xrd_tools.session import HydrationPurpose
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
     scan_name_from_source,
 )
@@ -1109,7 +1110,8 @@ def test_delayed_browse_hydration_rejected_after_resume(
             "no browsed frame had an evicted heavy tier, so no real hydration "
             "could be put in flight")
         requests_before = len(requests)
-        display._request_frame_hydration(target_label, purpose="full")
+        display._request_frame_hydration(
+            target_label, purpose=HydrationPurpose.FULL)
         _wait_until(qapp, latch.entered.is_set, _BOUNDARY_TIMEOUT_S,
                     "the real hydrator to enter the latch")
         # Capture the HELD request NOW: after Resume the worker may enqueue A

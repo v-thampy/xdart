@@ -21,7 +21,6 @@ from xrd_tools.reduction import (
 )
 
 from xdart.modules.live import LiveFrame, LiveFrameSeries, LiveScan
-from xdart.modules.live_compat import normalize_live_class_names
 import xdart.modules.reduction as reduction_adapters
 from xdart.modules.reduction import (
     StandardPlanCache,
@@ -77,83 +76,28 @@ class _FakeIntegrator:
     pass
 
 
-def test_legacy_ewald_aliases_are_dropped() -> None:
-    """The Live rename's transitional Ewald* class + function aliases were
-    removed at the end of the rename release window.  Reader-side string
-    normalisation in :mod:`xdart.modules.live_compat` still keeps old
-    ``.nxs`` files loading (covered by a separate test below).
-    """
+def test_only_current_live_names_are_exported() -> None:
+    """The live-object API exposes only the current names."""
     import xdart.modules.ewald as ewald_pkg
     import xdart.modules.reduction as reduction_pkg
 
-    for legacy_name in ("EwaldArch", "EwaldSphere", "ArchSeries"):
-        assert not hasattr(ewald_pkg, legacy_name), (
-            f"{legacy_name} should have been dropped; still on "
+    for retired_name in ("EwaldArch", "EwaldSphere", "ArchSeries"):
+        assert not hasattr(ewald_pkg, retired_name), (
+            f"{retired_name} should have been dropped; still on "
             f"xdart.modules.ewald"
         )
 
-    for legacy_fn in (
+    for retired_fn in (
         "frame_from_ewald_arch",
         "scan_from_ewald_sphere",
         "plan_from_ewald_sphere",
         "reduce_ewald_arch",
         "dispatch_arch_reduction",
     ):
-        assert not hasattr(reduction_pkg, legacy_fn), (
-            f"{legacy_fn} should have been dropped; still on "
+        assert not hasattr(reduction_pkg, retired_fn), (
+            f"{retired_fn} should have been dropped; still on "
             f"xdart.modules.reduction"
         )
-
-
-def test_legacy_live_class_names_are_normalized_from_reader_data() -> None:
-    provenance = {
-        "config": {
-            "class": "EwaldSphere",
-            "frames": ["EwaldArch", "xdart.modules.ewald.arch.EwaldArch"],
-            "series": {"type": "ArchSeries"},
-        },
-        "unchanged": "not_a_class_name",
-    }
-
-    normalized = normalize_live_class_names(provenance)
-
-    assert normalized["config"]["class"] == "LiveScan"
-    assert normalized["config"]["frames"] == [
-        "LiveFrame",
-        "xdart.modules.ewald.frame.LiveFrame",
-    ]
-    assert normalized["config"]["series"]["type"] == "LiveFrameSeries"
-    assert normalized["unchanged"] == "not_a_class_name"
-
-
-def test_live_scan_loader_normalizes_legacy_reduction_provenance(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    import xrd_tools.io.nexus as nexus_io
-
-    fake_ds = SimpleNamespace(
-        attrs={
-            "reduction": {
-                "config": {
-                    "bai_1d_args": {"owner": "EwaldArch"},
-                    "bai_2d_args": {"owner": "EwaldSphere"},
-                },
-            },
-        },
-        sizes={},
-        data_vars={},
-        dims={},
-        coords={},
-    )
-    monkeypatch.setattr(nexus_io, "read_scan_metadata", lambda _path: fake_ds)
-
-    live_scan = LiveScan("old", data_file=str(tmp_path / "old_037.nxs"))
-    live_scan._load_from_nexus_v2(None)
-
-    assert live_scan.bai_1d_args["owner"] == "LiveFrame"
-    assert live_scan.bai_2d_args["owner"] == "LiveScan"
-
 
 def test_live_scan_loader_uses_union_of_1d_and_2d_labels(monkeypatch, tmp_path) -> None:
     import xrd_tools.io.nexus as nexus_io

@@ -83,6 +83,7 @@ from .browse_debug import (
     sequence_summary,
 )
 from xdart.modules.display_context import HydrationOwner, HydrationRequest
+from xrd_tools.session.hydration import HydrationPurpose
 
 #: §12.6 D — the three states selected-context resolution actually has.  Private
 #: sentinels, values only: no registry, no widget back-reference.
@@ -1377,34 +1378,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._hydration_worker = worker
         return self._hydration_worker
 
-    def _view_has_hydration_payload(self, view, purpose) -> bool:
+    def _view_has_hydration_payload(
+            self, view, purpose: HydrationPurpose) -> bool:
         # TIER-ACCURATE residency (RL-1 fix): a hydration is "resident/succeeded"
         # only when the payload of the REQUESTED tier actually became resident.
         # The old permissive branch counted a persisted THUMBNAIL (or a stray 1d)
-        # as satisfying a full-raw "full" request -> a thumbnail-only frame whose
+        # as satisfying a ``HydrationPurpose.FULL`` request -> a thumbnail-only
+        # frame whose
         # full raw was evicted during live was mis-scored as a SUCCESSFUL hydration
         # every render, so its _hydration_failure_counts never reached the limit,
         # _hydration_request_suppressed never tripped, and the run-end display
-        # re-requested purpose="full" forever (the treadmill).  Scoring a
+        # re-requested ``HydrationPurpose.FULL`` forever (the treadmill). Scoring a
         # thumbnail-only full-raw hydration as a FAILURE lets the backoff self-
         # suppress after _HYDRATION_FAILURE_LIMIT; the panel keeps showing the
         # thumbnail via the SEPARATE resolve_frame_data RESIDENT path, so this is
         # graceful, not a blank.
         if view is None:
             return False
-        purpose = str(purpose or "full")
-        if purpose == "1d":
+        if purpose is HydrationPurpose.ONE_D:
             return bool(
                 getattr(view, "has_1d", False)
                 or getattr(view, "intensity_1d", None) is not None
             )
-        if purpose == "2d":
+        if purpose is HydrationPurpose.PREVIEW:
             return bool(
                 getattr(view, "has_2d", False)
                 or getattr(view, "intensity_2d", None) is not None
             )
-        # "full" / "raw" (and any other non-1d/2d purpose): the FULL raw must have
-        # actually become resident.  A thumbnail does NOT satisfy a full-raw request.
+        # FULL requires the detector raw itself. A thumbnail does not satisfy it.
         return getattr(view, "raw", None) is not None
 
     def _hydration_item_views(self, item):
@@ -1428,8 +1429,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     views.append(view)
         return tuple(views)
 
-    def _hydration_purpose_resident(self, label, purpose) -> bool:
-        purpose = str(purpose or "full")
+    def _hydration_purpose_resident(
+            self, label, purpose: HydrationPurpose) -> bool:
         stores_fn = getattr(self, "_hydration_stores", None)
         if stores_fn is None:
             return False
@@ -1452,11 +1453,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return True
         return False
 
-    def _hydration_request_suppressed(self, label, purpose) -> bool:
+    def _hydration_request_suppressed(
+            self, label, purpose: HydrationPurpose) -> bool:
         failures = getattr(self, "_hydration_failure_counts", None)
         if not failures:
             return False
-        key = (label, str(purpose or "full"))
+        key = (label, purpose)
         entry = failures.get(key)
         if entry is None:
             return False
@@ -1475,12 +1477,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return True
 
     def _record_hydration_completion(
-            self, label, purpose, *, success: bool, generation) -> None:
+            self, label, purpose: HydrationPurpose, *, success: bool,
+            generation) -> None:
         failures = getattr(self, "_hydration_failure_counts", None)
         if failures is None:
             failures = {}
             self._hydration_failure_counts = failures
-        key = (label, str(purpose or "full"))
+        key = (label, purpose)
         if success:
             failures.pop(key, None)
             return
@@ -1512,16 +1515,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     count,
                 )
 
-    def _request_frame_hydration(self, label, *, purpose="full") -> None:
+    def _request_frame_hydration(
+            self, label, *,
+            purpose: HydrationPurpose = HydrationPurpose.FULL) -> None:
         """Queue a background rehydration for an evicted frame (no-op unless the
         live app enabled async hydration)."""
+        if type(purpose) is not HydrationPurpose:
+            raise TypeError("purpose must be a HydrationPurpose")
         if not self._async_hydration_enabled:
             return
         try:
             label_key = int(label)
         except (TypeError, ValueError):
             label_key = label
-        purpose_key = str(purpose or "full")
+        purpose_key = purpose
         suppressed = getattr(self, "_hydration_request_suppressed", None)
         if suppressed is None:
             suppressed = displayFrameWidget._hydration_request_suppressed.__get__(
@@ -1576,7 +1583,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         worker = self._ensure_hydration_worker()
         if worker is not None:
             consumer = ConsumerKind.PLOT_1D
-            if purpose_key == "1d":
+            if purpose_key is HydrationPurpose.ONE_D:
                 try:
                     method = self.ui.plotMethod.currentText()
                 except Exception:
@@ -1664,13 +1671,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         state, context = displayFrameWidget._resolve_selected_context(self)
         return context if state is _CONTEXT_ACTIVE else None
 
-    def _build_hydration_request(self, label, *, purpose="full"):
+    def _build_hydration_request(
+            self, label, *,
+            purpose: HydrationPurpose = HydrationPurpose.FULL):
         """Freeze WHERE a hydration lands, at the moment it is requested.
 
         Returns ``None`` only when no context is active — the idle/legacy
         regime, which keeps the ownerless path through an explicit adapter.
         While a context IS active a request can never be ownerless (§9.2.1/5).
         """
+        if type(purpose) is not HydrationPurpose:
+            raise TypeError("purpose must be a HydrationPurpose")
         state, context = displayFrameWidget._resolve_selected_context(self)
         if state is _CONTEXT_IDLE:
             return None
@@ -1684,10 +1695,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 outcome="request_not_enqueueable", blanks_panel=False,
                 expected="one resolvable display context", found="",
                 origin="displayFrameWidget._build_hydration_request",
-                label=label, purpose=str(purpose or "full"))
+                label=label, purpose=purpose.value)
             return HydrationRequest(
                 label=label,
-                purpose=str(purpose or "full"),
+                purpose=purpose,
                 generation=int(getattr(self, "display_generation", 0)),
                 owner=HydrationOwner(),
                 stores=(),
@@ -1696,7 +1707,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         owner = _context_hydration_owner(context)
         return HydrationRequest(
             label=label,
-            purpose=str(purpose or "full"),
+            purpose=purpose,
             generation=int(getattr(self, "display_generation", 0)),
             # §12.6 B.2 — the context's OWN projection, carried unchanged.
             owner=owner,

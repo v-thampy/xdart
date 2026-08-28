@@ -82,6 +82,7 @@ from threading import RLock
 from types import MethodType, SimpleNamespace
 
 import numpy as np
+from xrd_tools.session import HydrationPurpose
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
@@ -328,7 +329,7 @@ class OVHarness:
             # scan-constant either way).
             _get_wavelength=lambda ref, **_kw: self._wavelength_m,
             _request_frame_hydration=(
-                lambda label, *, purpose="full":
+                lambda label, *, purpose=HydrationPurpose.FULL:
                 self.hydration_requests.append((int(label), purpose))),
             request_current_selection_repaint=(
                 lambda **kw: self.repaint_requests.append(kw)),

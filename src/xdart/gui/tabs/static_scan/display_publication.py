@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+from xrd_tools.session.hydration import HydrationPurpose
 
 from xdart.modules.frame_publication import (
     publication_has_1d_errors,
@@ -338,15 +339,14 @@ class PublicationDisplayAdapter:
             request = getattr(widget, "_request_missing_publication", None)
         if request is None:
             return
-        purpose = "full" if needs_2d else "1d"
+        purpose = (
+            HydrationPurpose.FULL
+            if needs_2d
+            else HydrationPurpose.ONE_D
+        )
         for label in _label_keys(labels):
             try:
                 request(label, purpose=purpose)
-            except TypeError:
-                try:
-                    request(label)
-                except Exception:
-                    continue
             except Exception:
                 continue
 

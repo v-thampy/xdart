@@ -82,7 +82,6 @@ _EXPORTS = {
     "next_norm_revision": "xrd_tools.session.scan_norm",
     "normalization_channels": "xrd_tools.session.frame_projection",
     "normalization_value": "xrd_tools.session.frame_projection",
-    "normalize_hydration_purpose": "xrd_tools.session.hydration",
     "pick_default_gi_motor": "xrd_tools.session.gi_motor",
     "ProgressEvent": "xrd_tools.session.scan_session",
     "PROFILE_SCHEMA": "xrd_tools.session.run_intent_profile",

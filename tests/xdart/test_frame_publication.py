@@ -21,6 +21,7 @@ from xrd_tools.core import (
     assert_frameview_equivalent,
 )
 from xrd_tools.io.nexus import write_integrated_stack
+from xrd_tools.session import HydrationPurpose
 
 from xdart.modules.frame_publication import (
     FramePublication,
@@ -1752,7 +1753,8 @@ def test_overlay_missing_anchor_hydrates_and_renders_last_selected_2d():
     widget._browse_one_shot_publications = publications
     widget._browse_one_shot_anchor_label = 3
     widget._request_frame_hydration = (
-        lambda label, *, purpose="full": requested.append((int(label), purpose)))
+        lambda label, *, purpose=HydrationPurpose.FULL:
+        requested.append((int(label), purpose)))
     widget.scan = SimpleNamespace(
         name="scan",
         gi=False,
@@ -1769,7 +1771,8 @@ def test_overlay_missing_anchor_hydrates_and_renders_last_selected_2d():
 
     assert state.render_ids == (1, 2, 3)
     assert {label for label, _purpose in requested} == {3}
-    assert {purpose for _label, purpose in requested} == {"full"}
+    assert {purpose for _label, purpose in requested} == {
+        HydrationPurpose.FULL}
 
     anchor = DuckFrame(idx=3)
     anchor.map_raw = np.full((4, 4), 3.0)

@@ -30,6 +30,7 @@ from .display_logic import (
     hydration_supersede_action,
 )
 from xdart.modules.display_context import HydrationOwner
+from xrd_tools.session.hydration import HydrationPurpose
 from .browse_debug import browse_debug_log, sequence_summary
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ _MAX_PENDING_REQUESTS = 64
 class _HydrationRequest:
     labels: tuple
     generation: int
-    purpose: str
+    purpose: HydrationPurpose
     consumer: ConsumerKind
     #: §12.6 B.3 — the display context this request was made UNDER, stored and
     #: echoed WHOLE.  A generation alone cannot authorize a completion (two
@@ -85,7 +86,9 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         self._store = store
         self._cond = Condition()
         self._queue: deque = deque()
-        self._queued: set[tuple[object, int, str, ConsumerKind]] = set()
+        self._queued: set[
+            tuple[object, int, HydrationPurpose, ConsumerKind]
+        ] = set()
         self._newest_gen = -1        # highest generation ever requested (P3)
         self._stop = False
 
@@ -124,7 +127,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
     def _token(label, generation, purpose, consumer, owner=None):
         # §9.2.6 / §10.3 / §12.6 B.3: the COMPLETE owner IS part of the queue
         # identity, used as it was minted rather than rebuilt from scalars.
-        return (label, int(generation), str(purpose or "full"), consumer,
+        return (label, int(generation), purpose, consumer,
                 owner if owner is not None else HydrationOwner())
 
     def _discard_locked(self, request: _HydrationRequest) -> None:
@@ -166,7 +169,8 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             self._cond.notify()
 
     def request(
-            self, label, generation: int, *, purpose: str = "full",
+            self, label, generation: int, *,
+            purpose: HydrationPurpose = HydrationPurpose.FULL,
             consumer=ConsumerKind.PLOT_1D,
             supersede_reason=SupersedeReason.SELECTION,
             owner=None, stores=None, commit_gate=None) -> None:
@@ -176,6 +180,8 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         time and echoed unchanged with the completion (§12.6 B.3).  ``None`` is
         the explicit ownerless idle adapter.
         """
+        if type(purpose) is not HydrationPurpose:
+            raise TypeError("purpose must be a HydrationPurpose")
         generation = int(generation)
         # §12.6 B.3: an owner supplied whole is carried unchanged.  The
         # ownerless value is the explicit idle adapter; active production
@@ -187,7 +193,6 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         if stores is None:
             stores = self._stores()
         stores = tuple(stores or ())
-        purpose = str(purpose or "full")
         consumer = self._consumer(consumer)
         supersede_reason = self._reason(supersede_reason)
         with self._cond:
@@ -212,7 +217,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 return
             self._queued.add(token)
             if (
-                purpose == "1d"
+                purpose is HydrationPurpose.ONE_D
                 and self._queue
                 and self._queue[-1].generation == generation
                 and self._queue[-1].purpose == purpose
@@ -245,7 +250,8 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         return request
 
     @staticmethod
-    def _store_supports_purpose(store, purpose: str) -> bool:
+    def _store_supports_purpose(
+            store, purpose: HydrationPurpose) -> bool:
         purposes = getattr(store, "hydration_purposes", None)
         return purposes is None or purpose in purposes
 
@@ -257,7 +263,8 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         return {"commit_gate": request.commit_gate,
                 "commit_epoch": request.owner.epoch}
 
-    def _hydrate_full(self, request, label, purpose: str) -> bool:
+    def _hydrate_full(
+            self, request, label, purpose: HydrationPurpose) -> bool:
         hydrated = False
         commit = self._commit_kwargs(request)
         for store in (request.stores or ()):
@@ -323,7 +330,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                     suppressed_by="stale_generation",
                 )
                 continue
-            if purpose == "1d":
+            if purpose is HydrationPurpose.ONE_D:
                 success = self._hydrate_1d_many(request, tuple(labels))
             else:
                 success = False
@@ -334,7 +341,11 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             # display_generation (a change that landed during the read). Emit
             # even when hydration failed so GUI-side pending dedupe can clear the
             # request key for this generation.
-            emitted_label = tuple(labels) if purpose == "1d" else labels[-1]
+            emitted_label = (
+                tuple(labels)
+                if purpose is HydrationPurpose.ONE_D
+                else labels[-1]
+            )
             browse_debug_log(
                 logger,
                 "hydration_worker_result",

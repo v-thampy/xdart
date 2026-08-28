@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.session import HydrationPurpose
 from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
 from xdart.gui.tabs.static_scan.display_logic import ConsumerKind
 from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
@@ -361,7 +362,8 @@ def test_request_frame_hydration_respects_enabled_flag():
         # it silently downgraded an owned request to an ownerless one whenever
         # ANY production TypeError escaped, bypassing the admission boundary.
         # A double must therefore accept the arguments production passes.
-        request=lambda label, gen, *, purpose="full", **kw: calls.append(
+        request=lambda label, gen, *,
+        purpose=HydrationPurpose.FULL, **kw: calls.append(
             (label, gen, purpose)))
     h = SimpleNamespace(
         _async_hydration_enabled=False, display_generation=5,
@@ -376,13 +378,13 @@ def test_request_frame_hydration_respects_enabled_flag():
 
     h._async_hydration_enabled = True
     h._request_frame_hydration(3)
-    assert calls == [(3, 5, "full")]          # enabled -> queued with generation
+    assert calls == [(3, 5, HydrationPurpose.FULL)]
     h._request_frame_hydration(3)
-    assert calls == [(3, 5, "full")]          # duplicate label/gen coalesced
-    h._request_frame_hydration(3, purpose="1d")
+    assert calls == [(3, 5, HydrationPurpose.FULL)]
+    h._request_frame_hydration(3, purpose=HydrationPurpose.ONE_D)
     assert calls == [
-        (3, 5, "full"),
-        (3, 5, "1d"),
+        (3, 5, HydrationPurpose.FULL),
+        (3, 5, HydrationPurpose.ONE_D),
     ]                                        # same label, different purpose
 
 
@@ -394,7 +396,8 @@ def test_repeated_failed_hydration_suppresses_until_generation_bump(caplog):
         # it silently downgraded an owned request to an ownerless one whenever
         # ANY production TypeError escaped, bypassing the admission boundary.
         # A double must therefore accept the arguments production passes.
-        request=lambda label, gen, *, purpose="full", **kw: calls.append(
+        request=lambda label, gen, *,
+        purpose=HydrationPurpose.FULL, **kw: calls.append(
             (label, gen, purpose)))
     h = SimpleNamespace(
         _async_hydration_enabled=True,
@@ -417,28 +420,30 @@ def test_repeated_failed_hydration_suppresses_until_generation_bump(caplog):
     with caplog.at_level(logging.DEBUG):
         for _ in range(5):
             before = len(calls)
-            h._request_frame_hydration(8, purpose="1d")
+            h._request_frame_hydration(8, purpose=HydrationPurpose.ONE_D)
             if len(calls) > before:
                 h._on_frame_hydrated(8, 5)
 
-    assert calls == [(8, 5, "1d")] * 3
+    assert calls == [(8, 5, HydrationPurpose.ONE_D)] * 3
     assert caplog.text.count("suppressing repeated hydration requests") == 1
     assert not [record for record in caplog.records if record.levelno >= logging.INFO]
 
     h.display_generation = 6
-    h._request_frame_hydration(8, purpose="1d")
-    assert calls[-1] == (8, 6, "1d")
+    h._request_frame_hydration(8, purpose=HydrationPurpose.ONE_D)
+    assert calls[-1] == (8, 6, HydrationPurpose.ONE_D)
 
 
 def test_overlay_1d_pending_marker_does_not_block_retry():
     calls = []
     fake_worker = SimpleNamespace(
-        request=lambda label, gen, *, purpose="full", **kwargs: calls.append(
+        request=lambda label, gen, *,
+        purpose=HydrationPurpose.FULL, **kwargs: calls.append(
             (label, gen, purpose, kwargs.get("consumer"))))
     h = SimpleNamespace(
         _async_hydration_enabled=True,
         display_generation=5,
-        _hydration_pending_labels={(8, "1d", ConsumerKind.OVERLAY_1D.value)},
+        _hydration_pending_labels={(
+            8, HydrationPurpose.ONE_D, ConsumerKind.OVERLAY_1D.value)},
         _hydration_failure_counts={},
         ui=SimpleNamespace(
             plotMethod=SimpleNamespace(currentText=lambda: "Overlay")
@@ -448,14 +453,15 @@ def test_overlay_1d_pending_marker_does_not_block_retry():
     h._request_frame_hydration = MethodType(
         displayFrameWidget._request_frame_hydration, h)
 
-    h._request_frame_hydration(8, purpose="1d")
+    h._request_frame_hydration(8, purpose=HydrationPurpose.ONE_D)
 
-    assert calls == [(8, 5, "1d", ConsumerKind.OVERLAY_1D)]
+    assert calls == [(
+        8, 5, HydrationPurpose.ONE_D, ConsumerKind.OVERLAY_1D)]
 
 
-def test_legacy_1d_catchup_requests_1d_hydration_purpose():
+def test_1d_catchup_requests_1d_hydration_purpose():
     calls = []
-    def request(idx, *, purpose="full"):
+    def request(idx, *, purpose=HydrationPurpose.FULL):
         calls.append((idx, purpose))
 
     h = SimpleNamespace(
@@ -469,12 +475,12 @@ def test_legacy_1d_catchup_requests_1d_hydration_purpose():
     ydata, xdata = DisplayDataMixin.get_frames_int_1d(h, [7])
 
     assert (ydata, xdata) == (None, None)
-    assert calls == [(7, "1d")]
+    assert calls == [(7, HydrationPurpose.ONE_D)]
 
 
-def test_legacy_2d_catchup_keeps_full_hydration_purpose():
+def test_2d_catchup_keeps_full_hydration_purpose():
     calls = []
-    def request(idx, *, purpose="full"):
+    def request(idx, *, purpose=HydrationPurpose.FULL):
         calls.append((idx, purpose))
 
     h = SimpleNamespace(
@@ -488,14 +494,18 @@ def test_legacy_2d_catchup_keeps_full_hydration_purpose():
     intensity, xdata, ydata = DisplayDataMixin.get_frames_int_2d(h, [7])
 
     assert (intensity, xdata, ydata) == (None, None, None)
-    assert calls == [(7, "full")]
+    assert calls == [(7, HydrationPurpose.FULL)]
 
 
 def test_on_frame_hydrated_discards_all_pending_purposes_for_label():
     rendered = []
     h = SimpleNamespace(
         display_generation=7,
-        _hydration_pending_labels={(4, "full"), (4, "1d"), (5, "full")},
+        _hydration_pending_labels={
+            (4, HydrationPurpose.FULL),
+            (4, HydrationPurpose.ONE_D),
+            (5, HydrationPurpose.FULL),
+        },
         _pending_hydration_render=False,
         _pending_hydration_generation=None,
     )
@@ -507,7 +517,7 @@ def test_on_frame_hydrated_discards_all_pending_purposes_for_label():
 
     h._on_frame_hydrated(4, 7)
 
-    assert h._hydration_pending_labels == {(5, "full")}
+    assert h._hydration_pending_labels == {(5, HydrationPurpose.FULL)}
     assert rendered == [True]
 
 
@@ -530,7 +540,8 @@ def test_on_frame_hydrated_stale_overlay_1d_queues_append_repaint():
     requests = []
     h = SimpleNamespace(
         display_generation=8,
-        _hydration_pending_labels={(4, "1d", ConsumerKind.OVERLAY_1D.value)},
+        _hydration_pending_labels={(
+            4, HydrationPurpose.ONE_D, ConsumerKind.OVERLAY_1D.value)},
         _overlay_hydrated_pending_append_labels=deque(),
         _pending_hydration_render=False,
         _pending_hydration_generation=None,
@@ -585,7 +596,11 @@ def test_on_frame_hydrated_accepts_batched_1d_labels():
     rendered = []
     h = SimpleNamespace(
         display_generation=7,
-        _hydration_pending_labels={(1, "1d"), (2, "1d"), (3, "1d")},
+        _hydration_pending_labels={
+            (1, HydrationPurpose.ONE_D),
+            (2, HydrationPurpose.ONE_D),
+            (3, HydrationPurpose.ONE_D),
+        },
         _pending_hydration_render=False,
     )
     h.update = lambda: rendered.append(True)
@@ -595,7 +610,7 @@ def test_on_frame_hydrated_accepts_batched_1d_labels():
         displayFrameWidget._on_frame_hydrated, h)
 
     h._on_frame_hydrated((1, 2), 7)
-    assert h._hydration_pending_labels == {(3, "1d")}
+    assert h._hydration_pending_labels == {(3, HydrationPurpose.ONE_D)}
     assert rendered == [True]
 
 
@@ -604,7 +619,7 @@ def test_hydration_completion_requests_current_selection_repaint():
     rendered = []
     h = SimpleNamespace(
         display_generation=7,
-        _hydration_pending_labels={(4, "full")},
+        _hydration_pending_labels={(4, HydrationPurpose.FULL)},
         _pending_hydration_render=False,
         _pending_hydration_generation=None,
     )
@@ -632,7 +647,7 @@ def test_hydration_completion_drops_when_selection_changed_before_update():
         _last_selection_sig=((1,), False),
         frame_ids=["2"],
         overall=False,
-        _hydration_pending_labels={(1, "full")},
+        _hydration_pending_labels={(1, HydrationPurpose.FULL)},
         _pending_hydration_render=False,
         _pending_hydration_generation=None,
     )
@@ -672,7 +687,8 @@ def test_hydration_completion_stream_coalesces_rerenders():
     progress = FakeTimer()
     h = SimpleNamespace(
         display_generation=7,
-        _hydration_pending_labels={(label, "full") for label in range(100)},
+        _hydration_pending_labels={
+            (label, HydrationPurpose.FULL) for label in range(100)},
         _pending_hydration_render=False,
         _last_hydration_render=0.0,
         _hydration_quiet_timer=quiet,
@@ -705,13 +721,15 @@ def test_hydration_completion_stream_coalesces_rerenders():
 
 def test_full_raw_thumbnail_only_hydration_self_suppresses_rl1():
     """RL-1 run-end treadmill: the last frame's full raw was evicted during live;
-    only a THUMBNAIL persisted.  The render re-requests purpose="full"; the
+    only a THUMBNAIL persisted.  The render re-requests
+    ``HydrationPurpose.FULL``; the
     hydration "completes" with only the thumbnail resident.  The OLD
     _view_has_hydration_payload counted a thumbnail as satisfying "full" ->
     success=True -> the failure count never reached the limit ->
     _hydration_request_suppressed never tripped -> the run-end display re-requested
-    "full" forever.  After the tier-accurate fix a thumbnail does NOT satisfy
-    "full" -> success=False -> suppression trips after <=3 completions -> bounded.
+    ``HydrationPurpose.FULL`` forever. After the tier-accurate fix a thumbnail
+    does NOT satisfy ``HydrationPurpose.FULL`` -> success=False -> suppression
+    trips after <=3 completions -> bounded.
 
     Spins-before / terminates-after: on pre-fix code len(calls) reaches the loop
     bound (8, unbounded); after the fix it stops at _HYDRATION_FAILURE_LIMIT (3).
@@ -720,7 +738,8 @@ def test_full_raw_thumbnail_only_hydration_self_suppresses_rl1():
         _HYDRATION_FAILURE_LIMIT)
     calls = []
     fake_worker = SimpleNamespace(
-        request=lambda label, gen, *, purpose="full", **kw: calls.append(
+        request=lambda label, gen, *,
+        purpose=HydrationPurpose.FULL, **kw: calls.append(
             (label, gen, purpose)))
     # a store item whose view has a THUMBNAIL but NO full raw and NO 2d payload
     view = SimpleNamespace(
@@ -752,17 +771,18 @@ def test_full_raw_thumbnail_only_hydration_self_suppresses_rl1():
     # completion (as _on_frame_hydrated would on sigHydrated).
     for _ in range(8):
         before = len(calls)
-        h._request_frame_hydration(LABEL, purpose="full")
+        h._request_frame_hydration(LABEL, purpose=HydrationPurpose.FULL)
         if len(calls) > before:
             h._on_frame_hydrated(LABEL, 5)
 
     assert len(calls) <= _HYDRATION_FAILURE_LIMIT, (
         f"treadmill: full-raw hydration re-requested {len(calls)}x unbounded "
         "(thumbnail-only mis-scored as a successful full hydration)")
-    assert h._hydration_request_suppressed(LABEL, "full") is True
+    assert h._hydration_request_suppressed(
+        LABEL, HydrationPurpose.FULL) is True
     # a further render-driven re-request issues NO new worker request
     before = len(calls)
-    h._request_frame_hydration(LABEL, purpose="full")
+    h._request_frame_hydration(LABEL, purpose=HydrationPurpose.FULL)
     assert len(calls) == before, "suppressed request must not reach the worker"
 
 
@@ -777,7 +797,8 @@ def test_resident_tier_hydration_request_is_skipped_rl1_overlay():
     """
     calls = []
     fake_worker = SimpleNamespace(
-        request=lambda label, gen, *, purpose="full", **kw: calls.append(
+        request=lambda label, gen, *,
+        purpose=HydrationPurpose.FULL, **kw: calls.append(
             (label, gen, purpose)))
     view = SimpleNamespace(                       # full raw RESIDENT
         raw=np.zeros((2, 2)), thumbnail=np.zeros((2, 2)),
@@ -799,7 +820,7 @@ def test_resident_tier_hydration_request_is_skipped_rl1_overlay():
     # (as _on_frame_hydrated's completion does).  Pre-fix this issues one worker
     # request per cycle (unbounded); after the resident-guard it issues NONE.
     for _ in range(5):
-        h._request_frame_hydration(651, purpose="full")
+        h._request_frame_hydration(651, purpose=HydrationPurpose.FULL)
         h._hydration_pending_labels.clear()
     assert calls == [], \
         "a resident tier must not be re-requested (RL-1 overlay treadmill)"
@@ -816,7 +837,8 @@ def test_succeeded_frame_not_re_requested_after_eviction_rl1_show_all():
     """
     calls = []
     fake_worker = SimpleNamespace(
-        request=lambda label, gen, *, purpose="full", **kw: calls.append(
+        request=lambda label, gen, *,
+        purpose=HydrationPurpose.FULL, **kw: calls.append(
             (label, gen, purpose)))
     view = SimpleNamespace(
         raw=None, thumbnail=None, has_2d=False, intensity_2d=None,
@@ -839,20 +861,20 @@ def test_succeeded_frame_not_re_requested_after_eviction_rl1_show_all():
 
     LABEL = 3600
     # cycle 1: not resident -> request issued
-    h._request_frame_hydration(LABEL, purpose="1d")
-    assert calls == [(LABEL, 3, "1d")]
+    h._request_frame_hydration(LABEL, purpose=HydrationPurpose.ONE_D)
+    assert calls == [(LABEL, 3, HydrationPurpose.ONE_D)]
     view.has_1d = True                              # hydration made it resident
     h._on_frame_hydrated(LABEL, 3)                  # SUCCESS -> success-set
     view.has_1d = False                             # store evicts it (cap pressure)
     for _ in range(5):                              # render loop re-requests it
         h._hydration_pending_labels.clear()
-        h._request_frame_hydration(LABEL, purpose="1d")
-    assert calls == [(LABEL, 3, "1d")], \
+        h._request_frame_hydration(LABEL, purpose=HydrationPurpose.ONE_D)
+    assert calls == [(LABEL, 3, HydrationPurpose.ONE_D)], \
         "an already-succeeded frame must not be re-requested after eviction"
     # a selection change (new generation) allows a fresh request
     h.display_generation = 4
-    h._request_frame_hydration(LABEL, purpose="1d")
-    assert calls[-1] == (LABEL, 4, "1d")
+    h._request_frame_hydration(LABEL, purpose=HydrationPurpose.ONE_D)
+    assert calls[-1] == (LABEL, 4, HydrationPurpose.ONE_D)
 
 
 def test_bound_full_hydration_preserves_pair_without_duplicate_1d():

@@ -1,16 +1,4 @@
-"""Import surface for xdart live scan objects.
-
-Note: this module historically also re-exported the legacy
-``EwaldArch`` / ``EwaldSphere`` / ``ArchSeries`` aliases for one
-release after the Live rename.  Those aliases were dropped after
-the transitional release.  New code should always import from
-:mod:`xdart.modules.live`; this module remains the in-package home
-of the underlying classes.
-
-Reader-side compatibility for ``.nxs`` files written by xdart 0.37.x
-(which serialised the old class names into reduction provenance)
-still works — see :mod:`xdart.modules.live_compat`.
-"""
+"""Import surface for the current xdart live scan objects."""
 
 from .frame import LiveFrame
 from .frame_series import LiveFrameSeries
