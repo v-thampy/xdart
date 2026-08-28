@@ -51,10 +51,16 @@ def _set_average_state(
     *,
     entry: str = "entry",
     pending: OperationPending | None = None,
+    source_root: str | None = None,
 ) -> WorkspaceOperationOwner:
     operations = page._workspace_operations
     operations._average = AverageOperationState(
-        identity, revision, target, entry, pending
+        identity,
+        revision,
+        target,
+        entry,
+        pending,
+        source_root,
     )
     return operations
 
@@ -1697,6 +1703,7 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
             identity,
             store.revision,
             value or str(target.resolve()),
+            source_root=str(tmp_path),
         )
 
     identity, update = scheduled(committed)
@@ -1863,7 +1870,13 @@ def test_average_commit_reload_refusal_retains_exact_retryable_directive(
     )
     monkeypatch.setattr(page, "_notice", notices.append)
     monkeypatch.setattr(page, "_ensure_timer", lambda: timers.append(None))
-    _set_average_state(page, identity, store.revision, target)
+    _set_average_state(
+        page,
+        identity,
+        store.revision,
+        target,
+        source_root=str(tmp_path),
+    )
     controller = page._context_controller
     if blocked_by == "viewer":
         controller._viewer_2d_standalone = object()
@@ -1891,10 +1904,10 @@ def test_average_commit_reload_refusal_retains_exact_retryable_directive(
             else ["Average committed; Browse reload queued."]
         )
         assert timers == [None]
-        directive = page._workspace_operations.pending_average_reload
+        directive = page._processed_browser.pending_average_reload
         assert directive is not None
-        assert page._workspace_operations.average_state is not None
-        assert page._workspace_operations.busy
+        assert page._workspace_operations.average_state is None
+        assert page._processed_browser.busy
 
         controller._viewer_2d_standalone = None
         controller._cleanup_receipt = None
@@ -1910,9 +1923,9 @@ def test_average_commit_reload_refusal_retains_exact_retryable_directive(
             "terminal_commit_identity": result.commit_identity,
             "source_root": str(tmp_path),
         })]
-        assert page._workspace_operations.pending_average_reload is None
+        assert page._processed_browser.pending_average_reload is None
         assert page._workspace_operations.average_state is None
-        assert not page._workspace_operations.busy
+        assert not page._processed_browser.busy
     finally:
         controller._viewer_2d_standalone = None
         controller._cleanup_receipt = None

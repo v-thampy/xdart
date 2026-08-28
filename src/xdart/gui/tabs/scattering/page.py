@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import logging
 import math
@@ -11,7 +10,6 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-import threading
 import time
 from typing import Any, Callable
 import weakref
@@ -37,8 +35,6 @@ from xrd_tools.session.run_configuration import (
     heavy_residency_choice,
 )
 from xrd_tools.reduction.provenance_config import jsonable_run_value
-from xrd_tools.io.viewer_1d import SUPPORTED_VIEWER_1D_SUFFIXES
-from xrd_tools.io.viewer_2d import SUPPORTED_VIEWER_SUFFIXES
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
 )
@@ -64,12 +60,6 @@ from .batch_terminal_presentation import (
     BatchTerminalPresentation,
     BatchTerminalPresentationController,
 )
-from .browser_catalog import (
-    BrowserCatalogEntry,
-    DirectoryModifiedCache,
-    enumerate_processed_artifacts,
-    processed_directory,
-)
 from .browse_1d_display import (
     Browse1DDisplayRefusal,
     Browse1DReleaseDebt,
@@ -83,7 +73,6 @@ from .browse_values import (
     BrowseLoadOutcome,
     BrowseLoadRequest,
     BrowseLoadStatus,
-    BrowseLoadTiming,
 )
 from .contracts import (
     AdmissionFailure,
@@ -208,6 +197,20 @@ from .source_selection import (
     SourceSelectionOwner,
     SourceStatusDirective,
 )
+from .processed_browser import (
+    BrowserCatalogRequest,
+    BrowserCatalogWake,
+    BrowserRefreshEffect,
+    ProcessedBrowserOwner,
+    ProcessedBrowserTransition,
+    ReintegrateReloadDirective,
+    TerminalBrowseHandoff,
+    TerminalBrowsePaintReceipt,
+    TerminalBrowsePaintRequest,
+    TerminalBrowsePresentation,
+    TerminalPaintMode,
+    TerminalRebindAuthorization,
+)
 from .workspace_shell import ScatteringWorkspaceShell
 from .workspace_operations import (
     WorkspaceOperationOwner,
@@ -331,29 +334,6 @@ def _directory_file_progress(
 
 
 @dataclass(frozen=True, slots=True)
-class _BrowserCatalogRequest:
-    token: int
-    directory: str
-    accepted_suffixes: frozenset[str] | None
-
-
-@dataclass(frozen=True, slots=True)
-class _BrowserCatalogOperation:
-    request: _BrowserCatalogRequest
-    cancelled: threading.Event
-    future: Future[object]
-    @property
-    def token(self) -> int:
-        return self.request.token
-    @property
-    def directory(self) -> str:
-        return self.request.directory
-    @property
-    def accepted_suffixes(self) -> frozenset[str] | None:
-        return self.request.accepted_suffixes
-
-
-@dataclass(frozen=True, slots=True)
 class _DeferredMetadata:
     plan: object
     request: tuple[object, ...]
@@ -361,43 +341,6 @@ class _DeferredMetadata:
     generation: int
     dialog: object
     candidate: object | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _TerminalBrowseHandoff:
-    request: BrowseLoadRequest
-    run_identity: RunIdentity
-    artifact: str
-    current_label: int | None
-    selected_labels: tuple[int, ...]
-    commit_identity: StreamTerminal | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _TerminalBrowsePresentation:
-    request: BrowseLoadRequest
-    context: object
-
-
-@dataclass(slots=True)
-class _TerminalBrowsePerf:
-    request: BrowseLoadRequest
-    started_at: float
-    poll_adopt_count: int = 0
-    poll_adopt_s: float = 0.0
-    settle_s: float = 0.0
-    presentation_s: float = 0.0
-    worker: BrowseLoadTiming | None = None
-    fallback_pending: bool = False
-
-
-def _browser_suffixes_for_mode(mode: str) -> frozenset[str] | None:
-    tool = tool_from_mode_text(mode)
-    if tool is Tool.XYE_VIEWER:
-        return SUPPORTED_VIEWER_1D_SUFFIXES
-    if tool is Tool.IMAGE_VIEWER:
-        return SUPPORTED_VIEWER_SUFFIXES
-    return None
 
 
 def _terminal_frame_signature(
@@ -572,7 +515,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     browseRequested = QtCore.Signal(object)
     noticeChanged = QtCore.Signal(str)
     _observationFinished = QtCore.Signal(object)
-    _browserCatalogFinished = QtCore.Signal(object, object)
+    _browserCatalogFinished = QtCore.Signal(object)
 
     def __init__(
         self,
@@ -581,7 +524,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         lifecycle: ScatteringCoordinator,
         sources: SourcePort,
         executor: RunExecutorPort | None = None,
-        viewer_file_chooser: Callable[[str], str | None] | None = None,
+        viewer_1d_file_chooser: (
+            Callable[[str], tuple[str, ...] | None] | None
+        ) = None,
+        viewer_2d_file_chooser: (
+            Callable[[str], str | None] | None
+        ) = None,
         browser_directory_chooser: (
             Callable[[str, str], str | None] | None
         ) = None,
@@ -628,29 +576,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if executor is not None
             else None
         )
-        self._browser_catalog_pool: ThreadPoolExecutor | None = (
-            ThreadPoolExecutor(max_workers=1)
-        )
-        self._browser_catalog_operation: (
-            _BrowserCatalogOperation | None
-        ) = None
-        self._browser_catalog_queued: _BrowserCatalogRequest | None = None
-        self._browser_catalog_token = 0
-        self._browser_catalog: tuple[BrowserCatalogEntry, ...] = ()
-        self._browser_directory_time_cache = DirectoryModifiedCache()
-        self._browser_follow_identity: RunIdentity | None = None
-        self._browser_seen_artifacts: set[str] = set()
-        self._browser_transient_frame: DisplayFrameKey | None = None
-        self._browser_transient_clear_token: int | None = None
-        self._terminal_browse_handoff: _TerminalBrowseHandoff | None = None
-        self._terminal_browse_presentation: (
-            _TerminalBrowsePresentation | None
-        ) = None
-        self._terminal_browse_perf: _TerminalBrowsePerf | None = None
-        self._browse_clock = browse_clock
-        self._terminal_rebind_artifacts: tuple[
-            RunIdentity, str, str
-        ] | None = None
         self._batch_terminal = BatchTerminalPresentationController()
         self._run_frame_seen = False
         self._retain_outgoing_display = False
@@ -668,13 +593,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if browser_directory_chooser is not None
             else self._choose_directory_dialog
         )
-        self._viewer_file_chooser = (
-            viewer_file_chooser if viewer_file_chooser is not None
+        self._viewer_2d_file_chooser = (
+            viewer_2d_file_chooser if viewer_2d_file_chooser is not None
             else self._choose_viewer_2d_dialog
         )
         self._viewer_1d_file_chooser = (
-            viewer_file_chooser if viewer_file_chooser is not None
-            else self._choose_viewer_1d_dialog)
+            viewer_1d_file_chooser if viewer_1d_file_chooser is not None
+            else self._choose_viewer_1d_dialog
+        )
         self._control_path_chooser = control_path_chooser
         self._authoring_source_chooser = (
             authoring_source_chooser
@@ -709,10 +635,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 page_ref, wake
             ),
         )
-        self._browser_directory = processed_directory(
-            initial_intent.save_path
+        self._processed_browser = ProcessedBrowserOwner(
+            save_path=initial_intent.save_path,
+            processing_mode=initial_intent.processing_mode,
+            deliver=lambda wake: ScatteringWorkspace._deliver_browser_catalog(
+                page_ref, wake
+            ),
+            clock=browse_clock,
         )
-        self._browser_explicit_directory = False
         self._admission_state: _AdmissionPageOwner | None = None
         self._closing = False
         self._closed = False
@@ -747,8 +677,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._artifact_progress: dict[str, ArtifactProgress] = {}
         self._progress = ProgressProjection()
         self._notice_text = ""
-        self._date_sorted = False
-        self._auto_last = True
 
         self._context_projection = ContextProjection()
         self._browse_loader = BrowseLoader()
@@ -825,9 +753,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._connections.append(
             (self._observationFinished, self._on_observation)
         )
-        self._connect(
-            self._browserCatalogFinished,
+        self._browserCatalogFinished.connect(
             self._on_browser_catalog,
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
+        self._connections.append(
+            (self._browserCatalogFinished, self._on_browser_catalog)
         )
         self._connect(self._run_timer.timeout, self._drain_executor)
         self._connect(
@@ -854,6 +785,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _experiment_operation_busy(self) -> bool:
         return (self._workspace_operations.busy
+                or self._processed_browser.busy
                 or self._authored_asset_owner is not None
         )
 
@@ -2173,13 +2105,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": None,
                                 "requests": {"workers": workers}}}
 
+    def _capture_current_loaded_browse(self):
+        context = self._context_controller.browse_context
+        request = None if context is None else context.load_request
+        return (
+            None
+            if type(request) is not BrowseLoadRequest
+            else self._context_controller.capture_loaded_browse(request)
+        )
+
     def _retry_pending_reintegrate_reload(self) -> bool:
-        operations = self._workspace_operations
-        directive = operations.pending_reintegrate_reload
+        browser = self._processed_browser
+        directive = browser.pending_reintegrate_reload
         if directive is None:
             return False
         if self._closing or self._closed:
-            operations.retire_reintegrate_reload(directive)
+            browser.retire_reload(directive)
             return False
         if not self._release_browse_1d_debt():
             self._ensure_timer()
@@ -2204,14 +2145,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 self._ensure_timer()
                 return False
-            operations.retire_reintegrate_reload(directive)
+            browser.retire_reload(directive)
             self._request_browser_catalog()
             self._notice(
                 "Reintegrate Browse reload lost its exact context; "
                 "refresh the persisted artifact from the browser."
             )
             return True
-        operations.retire_reintegrate_reload(directive)
+        browser.retire_reload(directive)
         return True
 
     def _reintegrate_action(self, dimension) -> None:
@@ -2236,18 +2177,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not self._commit_focused_control_edit_for_run(): return
         snapshot = self._intents.snapshot()
         if snapshot.thaw().processing_mode == "Int 1D (XYE)":
+            # XYE cannot satisfy the retained NeXus Browse cache contract.
+            # Reconcile controls first so that projection diagnostics cannot
+            # replace the action-specific refusal the operator just requested.
+            self._refresh_shell()
             self._notice(
                 f"Reintegrate {dimension[0]}-D is unavailable for XYE-only output."
             )
-            self._refresh_shell()
             return
         phase = self._lifecycle.phase; permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
-        captured = self._context_controller.capture_reintegrate_browse()
+        captured = self._capture_current_loaded_browse()
         if self._closing or self._closed or self._admission_state is not None or self._mutating_operation_busy() or not permitted or captured is None:
             self._notice(f"Reintegrate {dimension[0]}-D requires one stable loaded Browse context."); self._refresh_shell(); return
         try: preparation = self._reintegrate_preparation(snapshot.thaw(), dimension)
         except (TypeError, ValueError) as error: self._notice(str(error)); self._refresh_shell(); return
-        stamp = self._operation_context_stamp(snapshot.revision); recaptured = self._context_controller.capture_reintegrate_browse(); current = self._intents.snapshot()
+        stamp = self._operation_context_stamp(snapshot.revision); recaptured = self._context_controller.capture_loaded_browse(captured.request); current = self._intents.snapshot()
         try: current_preparation = self._reintegrate_preparation(current.thaw(), dimension)
         except (TypeError, ValueError): current_preparation = None
         same_browse = (
@@ -2262,6 +2206,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             stamp=stamp,
         )
         if identity is None:
+            self._processed_browser.adopt_reload(
+                ReintegrateReloadDirective(
+                    captured.request,
+                    captured.target,
+                )
+            )
             self._retry_pending_reintegrate_reload(); self._notice(f"Reintegrate {dimension[0]}-D was not started; Browse is reloading."); self._refresh_shell(); return
         self._notice(f"Reintegrating {dimension[0]}-D from authenticated loaded artifact science…"); self._refresh_shell(); self._ensure_timer()
 
@@ -2273,6 +2223,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if transition.notice:
             self._notice(transition.notice)
+        if transition.reintegrate_reload is not None:
+            self._processed_browser.adopt_reload(
+                transition.reintegrate_reload
+            )
         if transition.effect is WorkspaceRefreshEffect.FULL:
             self._retry_pending_reintegrate_reload()
         return transition.effect
@@ -2287,6 +2241,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if transition.notice:
             self._notice(transition.notice)
         if transition.average_reload is not None:
+            self._processed_browser.adopt_reload(
+                transition.average_reload
+            )
             self._retry_pending_average_reload(report_error=True)
         if transition.request_catalog:
             self._request_browser_catalog()
@@ -2295,12 +2252,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _retry_pending_average_reload(
         self, *, report_error: bool = False,
     ) -> bool:
-        operations = self._workspace_operations
-        directive = operations.pending_average_reload
+        browser = self._processed_browser
+        directive = browser.pending_average_reload
         if directive is None:
             return False
         if self._closing or self._closed:
-            operations.retire_average_reload(directive)
+            browser.retire_reload(directive)
             return False
         if self._context_controller.browse_pending:
             self._ensure_timer()
@@ -2313,9 +2270,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 terminal_commit_identity=(
                     directive.terminal_commit_identity
                 ),
-                source_root=(
-                    self._intents.snapshot().thaw().project_root or None
-                ),
+                source_root=directive.source_root,
             )
         except Exception as error:
             if report_error:
@@ -2325,8 +2280,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             self._ensure_timer()
             return False
-        self._clear_terminal_browse()
-        return operations.retire_average_reload(directive)
+        self._processed_browser.retire_terminal(force=True)
+        return browser.retire_reload(directive)
 
     def _average_action(self, snapshot: RunIntentSnapshot) -> None:
         if self._authored_asset_owner is not None:
@@ -2441,7 +2396,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if authored is not None:
                 self._retire_authored_asset(authored)
             self._deferred_metadata = None
-            self._clear_terminal_browse()
+            self._processed_browser.retire_terminal(force=True)
             for dialog in (self._metadata_dialog, self._scan_roi_dialog,
                            self._peak_dialog, self._phase_dialog):
                 if dialog is not None: dialog.close()
@@ -2450,14 +2405,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.browser.cancel_pending_frame_selection()
             self._run_timer.stop()
             self._browser_catalog_timer.stop()
-            self._browser_catalog_token += 1
+            self._processed_browser.begin_close()
             self._close_identity = (
                 self._context_controller.run_identity
                 or self._lifecycle.active_run_identity
                 or self._lifecycle.attempt_run_identity
             )
 
-        catalog_clean = self._cancel_browser_catalog()
+        catalog_clean = self._processed_browser.retry_close()
 
         operations = getattr(self, "_workspace_operations", None)
         analysis_slot = getattr(self, "_analysis_slot", None)
@@ -2685,12 +2640,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 pass
         self._connections.clear()
         self._source_selection.finalize_close()
-        browser_pool, self._browser_catalog_pool = (
-            self._browser_catalog_pool,
-            None,
-        )
-        if browser_pool is not None:
-            browser_pool.shutdown(wait=False, cancel_futures=True)
+        self._processed_browser.retry_close()
         self._source_status.close()
         self._closed = True
 
@@ -2824,7 +2774,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._choose_browser_directory()
             return
         if kind is ShellCommandKind.REFRESH_BROWSER:
-            self._browser_directory_time_cache.clear()
+            self._processed_browser.clear_directory_cache()
             self._request_browser_catalog()
             return
         if kind is ShellCommandKind.SHOW_ALL:
@@ -3441,7 +3391,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 outcome.run_identity,
                 live_mode=outcome.configuration.live_mode,
             )
-            self._begin_browser_follow(outcome.run_identity)
+            self._processed_browser.begin_follow(outcome.run_identity)
             retirement = self._batch_terminal.begin_run(
                 outcome.run_identity,
                 batch_mode=outcome.configuration.batch_mode,
@@ -3460,8 +3410,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 else None
             )
             self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
-            self._browser_transient_frame = None
-            self._browser_transient_clear_token = None
+            self._processed_browser.set_transient_frame(None)
+            self._processed_browser.mark_transient_catalog_barrier(None)
             self._artifact_progress.clear()
             self._progress = ProgressProjection(
                 detail="Run started"
@@ -3770,7 +3720,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and controller.run_identity is identity
             and not self._batch_terminal.active
             and self._preferences.plot_mode == "Single"
-            and self._auto_last
+            and self._processed_browser.auto_last
             and context is not None
             and selection is not None
             and selection.kind is ContextKind.ACQUISITION
@@ -3826,13 +3776,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if type(is_directory) is not bool:
             return
-        handoff = self._terminal_browse_handoff
-        presentation = self._terminal_browse_presentation
-        terminal_request = (
-            handoff.request
-            if handoff is not None
-            else None if presentation is None else presentation.request
-        )
+        terminal_request = self._processed_browser.terminal_request
         if is_directory:
             self._set_browser_directory(value, explicit=True)
             return
@@ -3871,7 +3815,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._ensure_timer()
             return
         if terminal_request is not None and request is not terminal_request:
-            self._clear_terminal_browse()
+            self._processed_browser.retire_terminal(
+                terminal_request
+            )
         self._notice("")
         # A submitted Browse request is still only intent.  The prior
         # selection remains authoritative until poll_browse adopts the exact
@@ -3934,10 +3880,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else None
         )
         if frame is not None and frame is not latest:
-            self._auto_last = False
-        handoff = self._terminal_browse_handoff
+            self._processed_browser.set_auto_last(False)
+        handoff = self._processed_browser.terminal_handoff
         request = None if handoff is None else handoff.request
-        terminal_artifact = None if handoff is None else handoff.artifact
+        terminal_artifact = (
+            None if handoff is None else handoff.source_artifact
+        )
         current = navigation.current
         selected = navigation.selected
         if (
@@ -3956,11 +3904,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             # Preserve an explicit acquisition-frame choice made while the
             # clean terminal artifact is loading.  Browse settlement maps the
             # accepted labels onto the authenticated persisted context.
-            self._terminal_browse_handoff = _TerminalBrowseHandoff(
-                request, handoff.run_identity, terminal_artifact,
-                current.local_frame_label,
-                tuple(candidate.local_frame_label for candidate in selected),
-                handoff.commit_identity,
+            self._processed_browser.update_terminal_selection(
+                request,
+                run_identity=handoff.run_identity,
+                source_artifact=terminal_artifact,
+                current_label=current.local_frame_label,
+                selected_labels=tuple(
+                    candidate.local_frame_label for candidate in selected
+                ),
             )
         self._refresh_shell()
         self._ensure_timer()
@@ -3973,27 +3924,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         # acquisition context, and retry exact deferred operation reloads
         # immediately after their blocking owner reaches terminal release.
         pending_reintegrate_reload = (
-            self._workspace_operations.pending_reintegrate_reload is not None
+            self._processed_browser.pending_reintegrate_reload is not None
         )
         pending_average_reload = (
-            self._workspace_operations.pending_average_reload is not None
+            self._processed_browser.pending_average_reload is not None
         )
         if not self._settle_browse_1d_before_drain():
             return
         pending_reintegrate_reload_changed = bool(
             pending_reintegrate_reload
-            and self._workspace_operations.pending_reintegrate_reload is None
+            and self._processed_browser.pending_reintegrate_reload is None
         )
         pending_average_reload_changed = bool(
             pending_average_reload
-            and self._workspace_operations.pending_average_reload is None
+            and self._processed_browser.pending_average_reload is None
         )
         defer_terminal_science = False
         terminal_science_complete = False
         reuse_terminal_science = False
         hold_batch_terminal_science = False
-        browse_presentation_ready: _TerminalBrowsePresentation | None = None
-        browse_perf_ready: _TerminalBrowsePerf | None = None
+        browse_presentation_ready: TerminalBrowsePresentation | None = None
         changed = (
             self._poll_admission() or pending_reintegrate_reload_changed
         )
@@ -4005,89 +3955,57 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if self._context_controller.poll_browse_preview():
             changed = True
         if self._context_controller.browse_pending:
-            browse_perf = self._terminal_browse_perf
-            handoff = self._terminal_browse_handoff
-            exact_browse_perf = (
-                browse_perf
-                if (
-                    browse_perf is not None
-                    and handoff is not None
-                    and browse_perf.request is handoff.request
-                )
-                else None
+            handoff = self._processed_browser.terminal_handoff
+            terminal_request = (
+                None if handoff is None else handoff.request
             )
             poll_started = (
                 None
-                if exact_browse_perf is None
-                else self._browse_timing_now()
+                if terminal_request is None
+                else self._processed_browser.begin_poll_timing(
+                    terminal_request
+                )
             )
-            if exact_browse_perf is not None and poll_started is None:
-                self._terminal_browse_perf = None
-                exact_browse_perf = None
             try:
                 outcome = self._context_controller.poll_browse()
             except Exception as error:
                 self._error_notice("Browse failed", error)
                 outcome = None
             finally:
-                if (
-                    exact_browse_perf is not None
-                    and poll_started is not None
-                    and self._terminal_browse_perf is exact_browse_perf
-                ):
-                    poll_ended = self._browse_timing_now()
-                    if poll_ended is None:
-                        self._terminal_browse_perf = None
-                        exact_browse_perf = None
-                    else:
-                        exact_browse_perf.poll_adopt_count += 1
-                        exact_browse_perf.poll_adopt_s += max(
-                            0.0, poll_ended - poll_started,
-                        )
+                if terminal_request is not None:
+                    self._processed_browser.finish_poll_timing(
+                        terminal_request, poll_started
+                    )
             if outcome is not None:
                 load_outcome = (
                     outcome if type(outcome) is BrowseLoadOutcome else None
                 )
                 settle_started = (
                     None
-                    if exact_browse_perf is None
-                    else self._browse_timing_now()
+                    if terminal_request is None
+                    else self._processed_browser.begin_settle_timing(
+                        terminal_request
+                    )
                 )
-                if exact_browse_perf is not None and settle_started is None:
-                    self._terminal_browse_perf = None
-                    exact_browse_perf = None
                 reuse_terminal_science = self._settle_terminal_browse(
-                    outcome,
-                    preserve_perf=exact_browse_perf is not None,
+                    outcome
                 )
                 if (
-                    exact_browse_perf is not None
-                    and settle_started is not None
-                    and self._terminal_browse_perf is exact_browse_perf
+                    terminal_request is not None
+                    and load_outcome is not None
                 ):
-                    settle_ended = self._browse_timing_now()
-                    if settle_ended is None:
-                        self._terminal_browse_perf = None
-                    else:
-                        exact_browse_perf.settle_s += max(
-                            0.0, settle_ended - settle_started,
-                        )
-                        if (
-                            load_outcome is not None
-                            and load_outcome.status is BrowseLoadStatus.READY
-                            and type(load_outcome.timing) is BrowseLoadTiming
-                        ):
-                            exact_browse_perf.worker = load_outcome.timing
-                            browse_perf_ready = exact_browse_perf
-                        else:
-                            self._terminal_browse_perf = None
-                presentation = self._terminal_browse_presentation
+                    self._processed_browser.finish_settle_timing(
+                        terminal_request,
+                        settle_started,
+                        load_outcome,
+                    )
+                presentation = self._processed_browser.terminal_presentation
                 if (
                     load_outcome is not None
                     and load_outcome.status is BrowseLoadStatus.READY
                     and presentation is not None
                     and presentation.request is load_outcome.request
-                    and self._terminal_browse_presentation_is_current(
+                    and self._processed_terminal_presentation_is_current(
                         presentation
                     )
                 ):
@@ -4098,28 +4016,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 current = self._context_controller.navigation.current
                 if current is not None:
                     self._follow_processed_artifact(current)
-        handoff = self._terminal_browse_handoff
+        handoff = self._processed_browser.terminal_handoff
         if (
             handoff is not None
             and not self._context_controller.owns_browse_request(
                 handoff.request
             )
         ):
-            self._clear_terminal_browse()
+            self._processed_browser.retire_terminal(handoff.request)
             changed = True
-        presentation = self._terminal_browse_presentation
+        presentation = self._processed_browser.terminal_presentation
         if (
             presentation is not None
-            and not self._terminal_browse_presentation_is_current(
+            and not self._processed_terminal_presentation_is_current(
                 presentation
             )
         ):
-            if self._terminal_browse_presentation is presentation:
-                self._terminal_browse_presentation = None
-                self._terminal_rebind_artifacts = None
-            perf = self._terminal_browse_perf
-            if perf is not None and perf.request is presentation.request:
-                self._terminal_browse_perf = None
+            self._processed_browser.retire_terminal(
+                presentation.request
+            )
             changed = True
 
         force_scientific = changed
@@ -4201,7 +4116,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if self._context_controller.accept_navigation(
                     event.navigation_delta,
                     plot_mode=self._preferences.plot_mode,
-                    follow_latest=False if paced else self._auto_last,
+                    follow_latest=(
+                        False if paced else self._processed_browser.auto_last
+                    ),
                 ):
                     frame = event.navigation_delta.appended
                     first_paced_frame = paced and not self._run_frame_seen
@@ -4220,7 +4137,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         # particular, do not publish a transient browser row or
                         # wake a shell/status reconciliation for this prefix.
                         continue
-                    self._browser_transient_frame = frame
+                    self._processed_browser.set_transient_frame(frame)
                     prior_waterfall_candidate_count = (
                         self._waterfall_candidate_count
                     )
@@ -4322,7 +4239,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     current=terminal_navigation.current,
                     selected=terminal_navigation.selected,
                 )
-                handoff = self._terminal_browse_handoff
+                handoff = self._processed_browser.terminal_handoff
                 terminal_science_complete = (
                     defer_terminal_science
                     and handoff is not None
@@ -4337,8 +4254,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 # the terminal event.  Re-enumerate here so a non-batch run
                 # whose FRAME_READY preceded that rename becomes visible.
                 catalog_request = self._request_browser_catalog()
-                self._browser_transient_clear_token = (
-                    None if catalog_request is None else catalog_request.token
+                self._processed_browser.mark_transient_catalog_barrier(
+                    catalog_request
                 )
                 self._run_frame_seen = False
                 changed = True
@@ -4391,6 +4308,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 transition = operations.consume_lost_owner(
                     operation_identity
                 )
+                if transition.reintegrate_reload is not None:
+                    self._processed_browser.adopt_reload(
+                        transition.reintegrate_reload
+                    )
+                if transition.average_reload is not None:
+                    self._processed_browser.adopt_reload(
+                        transition.average_reload
+                    )
                 if transition.notice:
                     self._notice(transition.notice)
                 if transition.effect is WorkspaceRefreshEffect.CONTROLS:
@@ -4485,7 +4410,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and self._batch_ready_to_paint() is None
         )
         if changed:
-            handoff = self._terminal_browse_handoff
+            handoff = self._processed_browser.terminal_handoff
             hold_complete_terminal_science = (
                 terminal_science_complete
                 or handoff is not None
@@ -4524,39 +4449,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         suppress_detector_demand=True,
                     )
                 elif reuse_terminal_science:
-                    presentation_started = (
+                    presentation = browse_presentation_ready
+                    paint = (
                         None
-                        if browse_perf_ready is None
-                        else self._browse_timing_now()
-                    )
-                    if (
-                        browse_perf_ready is not None
-                        and presentation_started is None
-                        and self._terminal_browse_perf is browse_perf_ready
-                    ):
-                        self._terminal_browse_perf = None
-                        browse_perf_ready = None
-                    owner = browse_presentation_ready
-                    if (
-                        owner is not None
-                        and not self._terminal_browse_presentation_is_current(
-                            owner
+                        if presentation is None
+                        else self._begin_processed_terminal_paint(
+                            presentation,
+                            reuse_science=True,
                         )
-                    ):
-                        owner = None
-                        browse_perf_ready = None
+                    )
                     prior_revision = self._shell_revision
                     self._refresh_event_shell(
                         preserve_scientific=True,
                         skip_scientific_projection=True,
                         rebind_scientific_navigation=True,
+                        terminal_paint=paint,
                     )
-                    if owner is not None:
-                        self._finish_terminal_browse_presentation(
-                            owner,
-                            browse_perf_ready,
-                            started=presentation_started,
-                            mode="rebind",
+                    if paint is not None:
+                        self._complete_processed_terminal_paint(
+                            paint,
                             applied=self._shell_revision > prior_revision,
                         )
                 else:
@@ -4572,56 +4483,29 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else:
                 presentation_owner = browse_presentation_ready
                 if presentation_owner is None:
-                    candidate_owner = self._terminal_browse_presentation
+                    candidate_owner = (
+                        self._processed_browser.terminal_presentation
+                    )
                     if (
                         candidate_owner is not None
-                        and self._terminal_browse_presentation_is_current(
+                        and self._processed_terminal_presentation_is_current(
                             candidate_owner
                         )
                     ):
                         presentation_owner = candidate_owner
-                presentation_perf = browse_perf_ready
-                presentation_mode = "repaint"
-                if (
-                    presentation_perf is None
-                    and presentation_owner is not None
-                ):
-                    candidate = self._terminal_browse_perf
-                    if (
-                        candidate is not None
-                        and candidate.request is presentation_owner.request
-                    ):
-                        presentation_perf = candidate
-                        if candidate.fallback_pending:
-                            presentation_mode = "repaint-fallback"
-                presentation_started = (
+                paint = (
                     None
-                    if presentation_perf is None
-                    else self._browse_timing_now()
-                )
-                if (
-                    presentation_perf is not None
-                    and presentation_started is None
-                    and self._terminal_browse_perf is presentation_perf
-                ):
-                    self._terminal_browse_perf = None
-                    presentation_perf = None
-                if (
-                    presentation_owner is not None
-                    and not self._terminal_browse_presentation_is_current(
-                        presentation_owner
-                    )
-                ):
-                    presentation_owner = None
-                    presentation_perf = None
-                prior_revision = self._shell_revision
-                self._refresh_event_shell()
-                if presentation_owner is not None:
-                    self._finish_terminal_browse_presentation(
+                    if presentation_owner is None
+                    else self._begin_processed_terminal_paint(
                         presentation_owner,
-                        presentation_perf,
-                        started=presentation_started,
-                        mode=presentation_mode,
+                        reuse_science=False,
+                    )
+                )
+                prior_revision = self._shell_revision
+                self._refresh_event_shell(terminal_paint=paint)
+                if paint is not None:
+                    self._complete_processed_terminal_paint(
+                        paint,
                         applied=self._shell_revision > prior_revision,
                     )
         self._show_queued_authored_asset_confirmation()
@@ -4697,32 +4581,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else ""
         )
 
-    def _browse_timing_now(self) -> float | None:
-        try:
-            value = float(self._browse_clock())
-        except BaseException:
-            return None
-        return value if math.isfinite(value) else None
-
-    def _terminal_browse_presentation_is_current(
-        self, owner: _TerminalBrowsePresentation,
+    def _processed_terminal_presentation_is_current(
+        self, presentation: TerminalBrowsePresentation,
     ) -> bool:
-        if (
-            type(owner) is not _TerminalBrowsePresentation
-            or self._terminal_browse_presentation is not owner
-            or not self._context_controller.owns_browse_request(
-                owner.request
-            )
-        ):
-            return False
         try:
-            captured = self._context_controller.capture_reintegrate_browse()
+            captured = self._context_controller.capture_loaded_browse(
+                presentation.request
+            )
         except BaseException:
-            return False
-        return bool(
-            captured is not None
-            and captured.context is owner.context
-            and captured.request is owner.request
+            captured = None
+        return self._processed_browser.terminal_presentation_is_current(
+            presentation,
+            captured,
+            owns_request=self._context_controller.owns_browse_request(
+                presentation.request
+            ),
         )
 
     def _begin_terminal_browse(
@@ -4771,66 +4644,66 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         ):
             return False
-        browse_started = (
-            self._browse_timing_now()
-            if _browse_perf_enabled()
-            else None
+        timing_start = self._processed_browser.begin_terminal_timing(
+            enabled=_browse_perf_enabled()
         )
         try:
             if not self._release_browse_1d_debt():
+                self._processed_browser.retire_terminal_timing(timing_start)
                 return False
             commit_identity = event.terminal_commit_identity
+            source_root = acquisition.run_configuration.project_root or None
             request = (
                 controller.begin_browse(
                     artifact,
-                    source_root=(
-                        self._intents.snapshot().thaw().project_root or None
-                    ),
+                    source_root=source_root,
                 )
                 if commit_identity is None
                 else controller.begin_browse(
                     artifact,
                     terminal_commit_identity=commit_identity,
-                    source_root=(
-                        self._intents.snapshot().thaw().project_root or None
-                    ),
+                    source_root=source_root,
                 )
             )
         except RuntimeError:
+            self._processed_browser.retire_terminal_timing(timing_start)
             # The published artifact remains available in the browser.  A
             # transient viewer/cleanup owner must not turn a clean Run terminal
             # into a failure or bypass Browse's normal lifecycle checks.
             return False
+        except BaseException:
+            self._processed_browser.retire_terminal_timing(timing_start)
+            raise
         # Browse owns the resolved absolute source path, while the output
         # contract deliberately preserves an explicit target's spelling.
         # Retain both exact identities so acquisition-frame choices made while
         # Browse is pending compare against their original artifact spelling.
-        self._clear_terminal_browse()
-        self._terminal_browse_handoff = _TerminalBrowseHandoff(
+        handoff = self._processed_browser.begin_terminal_handoff(
             request,
             run_identity,
             artifact,
-            current.local_frame_label
-            if current is not None and current.artifact == artifact
-            else None,
+            (
+                current.local_frame_label
+                if current is not None and current.artifact == artifact
+                else None
+            ),
             tuple(
                 frame.local_frame_label
                 for frame in selected
                 if frame.artifact == artifact
             ),
             request.terminal_commit_identity,
+            timing_start=timing_start,
         )
-        self._terminal_browse_perf = (
-            None
-            if browse_started is None
-            else _TerminalBrowsePerf(request, browse_started)
-        )
+        if handoff is None:
+            self._processed_browser.retire_terminal_timing(timing_start)
+            return False
         self._ensure_timer()
         return True
 
     def _terminal_scientific_matches(
         self,
-        handoff: _TerminalBrowseHandoff,
+        handoff: TerminalBrowseHandoff,
         navigation: FrameNavigationProjection,
     ) -> bool:
         """Whether terminal Browse can reuse the exact painted science."""
@@ -4872,7 +4745,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return False
         artifact = handoff.request.source_path
         canonical_by_artifact = {
-            handoff.artifact: artifact,
+            handoff.source_artifact: artifact,
             artifact: artifact,
         }
         compared_frames = (
@@ -5145,10 +5018,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _settle_terminal_browse(
         self,
         outcome: object,
-        *,
-        preserve_perf: bool = False,
     ) -> bool:
-        handoff = self._terminal_browse_handoff
+        handoff = self._processed_browser.terminal_handoff
         request = None if handoff is None else handoff.request
         if (
             type(outcome) is not BrowseLoadOutcome
@@ -5156,46 +5027,34 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or outcome.request is not request
         ):
             return False
-        current_label = handoff.current_label
-        selected_labels = handoff.selected_labels
-        if outcome.status is not BrowseLoadStatus.READY:
-            self._clear_terminal_browse(preserve_perf=preserve_perf)
+        captured = (
+            self._context_controller.capture_loaded_browse(request)
+            if outcome.status is BrowseLoadStatus.READY
+            else None
+        )
+        settlement = self._processed_browser.settle_terminal(
+            outcome, captured
+        )
+        if settlement is None:
             return False
-        captured = self._context_controller.capture_reintegrate_browse()
-        if (
-            captured is None
-            or captured.request is not request
-        ):
-            self._clear_terminal_browse(preserve_perf=preserve_perf)
-            return False
+        handoff = settlement.handoff
         navigation = self._context_controller.navigation
         by_label = {
             frame.local_frame_label: frame for frame in navigation.frames
         }
-        current = by_label.get(current_label)
+        current = by_label.get(handoff.current_label)
         selected = tuple(
             by_label[label]
-            for label in selected_labels
+            for label in handoff.selected_labels
             if label in by_label
         )
-        if self._auto_last and navigation.frames:
+        if self._processed_browser.auto_last and navigation.frames:
             self._context_controller.select_navigation(
                 navigation.frames[-1], selected
             )
         elif current is not None:
             self._context_controller.select_navigation(current, selected)
-        context = captured.context
-        self._clear_terminal_browse(preserve_perf=preserve_perf)
-        self._terminal_browse_presentation = _TerminalBrowsePresentation(
-            request, context,
-        )
-        commit_identity = handoff.commit_identity
-        if (
-            request.terminal_commit_identity is not commit_identity
-            or type(commit_identity) is not StreamTerminal
-            or captured[5].size != commit_identity.size
-            or captured[5].digest != commit_identity.digest
-        ):
+        if not settlement.reuse_seal_authorized:
             # An ordinary terminal Browse may preserve its exact frame-label
             # choice, but only a writer-authenticated seal can authorize
             # zero-copy reuse of the acquisition scientific arrays.
@@ -5204,127 +5063,60 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             handoff, self._context_controller.navigation,
         )
         if matches:
-            self._terminal_rebind_artifacts = (
-                handoff.run_identity,
-                handoff.artifact,
-                request.source_path,
+            self._processed_browser.authorize_terminal_rebind(
+                settlement.presentation,
+                TerminalRebindAuthorization(
+                    handoff.run_identity,
+                    handoff.source_artifact,
+                    request.source_path,
+                ),
             )
         return matches
 
-    def _clear_terminal_browse(
-        self, *, preserve_perf: bool = False,
-    ) -> None:
-        self._terminal_browse_handoff = None
-        self._terminal_browse_presentation = None
-        self._terminal_rebind_artifacts = None
-        if not preserve_perf:
-            self._terminal_browse_perf = None
-
-    def _finish_terminal_browse_presentation(
+    def _begin_processed_terminal_paint(
         self,
-        owner: _TerminalBrowsePresentation,
-        perf: _TerminalBrowsePerf | None,
+        presentation: TerminalBrowsePresentation,
         *,
-        started: float | None,
-        mode: str,
+        reuse_science: bool,
+    ) -> TerminalBrowsePaintRequest | None:
+        try:
+            captured = self._context_controller.capture_loaded_browse(
+                presentation.request
+            )
+        except BaseException:
+            captured = None
+        return self._processed_browser.begin_terminal_paint(
+            presentation,
+            captured,
+            owns_request=self._context_controller.owns_browse_request(
+                presentation.request
+            ),
+            reuse_science=reuse_science,
+        )
+
+    def _complete_processed_terminal_paint(
+        self,
+        request: TerminalBrowsePaintRequest,
+        *,
         applied: bool,
     ) -> None:
-        if not self._terminal_browse_presentation_is_current(owner):
-            if self._terminal_browse_presentation is owner:
-                self._terminal_browse_presentation = None
-                self._terminal_rebind_artifacts = None
-            current_perf = self._terminal_browse_perf
-            if (
-                current_perf is not None
-                and current_perf.request is owner.request
-            ):
-                self._terminal_browse_perf = None
-            return
-        exact_perf = (
-            perf
-            if (
-                perf is not None
-                and self._terminal_browse_perf is perf
-                and perf.request is owner.request
+        completion = self._processed_browser.complete_terminal_paint(
+            TerminalBrowsePaintReceipt(
+                request,
+                applied,
+                self._scientific_repaint_pending,
             )
-            else None
         )
-        ended = (
-            self._browse_timing_now()
-            if exact_perf is not None and started is not None
-            else None
-        )
-        if exact_perf is not None:
-            if ended is None:
-                self._terminal_browse_perf = None
-                exact_perf = None
-            else:
-                exact_perf.presentation_s += max(0.0, ended - started)
-        if not applied:
+        if completion.schedule_repaint:
             self._scientific_repaint_pending = True
             self._ensure_timer()
             return
-        if mode == "rebind" and self._scientific_repaint_pending:
-            if exact_perf is not None:
-                exact_perf.fallback_pending = True
-            return
-        if mode == "repaint-fallback" and self._scientific_repaint_pending:
-            return
-        worker = None if exact_perf is None else exact_perf.worker
-        if (
-            type(worker) is BrowseLoadTiming
-            and ended is not None
-            and type(exact_perf.started_at) is float
-            and math.isfinite(exact_perf.started_at)
-        ):
-            try:
-                # The worker froze this resolved source while qualifying the
-                # artifact.  Telemetry must not perform GUI-thread path I/O.
-                source = worker.canonical_path
-                gui_total = max(0.0, ended - exact_perf.started_at)
-                _LOG.info(
-                    "[PERF-BROWSE] source=%s token=%s generation=%d "
-                    "seal=%s records=%d mode=%s | "
-                    "worker=%.3fs initial-seal=%.3fs scan-open=%.3fs "
-                    "record-iteration=%.3fs presentation-read=%.3fs "
-                    "final-seal=%.3fs context-build=%.3fs | "
-                    "gui-total=%.3fs poll/adopt=%.3fs(n=%d) "
-                    "settle=%.3fs presentation=%.3fs",
-                    source,
-                    owner.request.token,
-                    owner.request.load_generation,
-                    worker.seal_mode,
-                    worker.record_count,
-                    mode,
-                    worker.worker_total_s,
-                    worker.initial_seal_s,
-                    worker.scan_open_s,
-                    worker.record_iteration_s,
-                    worker.presentation_read_s,
-                    worker.final_seal_s,
-                    worker.context_build_s,
-                    gui_total,
-                    exact_perf.poll_adopt_s,
-                    exact_perf.poll_adopt_count,
-                    exact_perf.settle_s,
-                    exact_perf.presentation_s,
-                )
-            except BaseException:
-                pass
-        if self._terminal_browse_presentation is owner:
-            self._terminal_browse_presentation = None
-            self._terminal_rebind_artifacts = None
-        current_perf = self._terminal_browse_perf
-        if (
-            current_perf is not None
-            and current_perf.request is owner.request
-        ):
-            self._terminal_browse_perf = None
-        self._refresh_event_shell(
-            preserve_scientific=True,
-            skip_scientific_projection=True,
-            suppress_detector_demand=True,
-        )
+        if completion.retired:
+            self._refresh_event_shell(
+                preserve_scientific=True,
+                skip_scientific_projection=True,
+                suppress_detector_demand=True,
+            )
 
     def _refresh_event_shell(
         self,
@@ -5334,6 +5126,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         rebind_scientific_navigation: bool = False,
         suppress_detector_demand: bool = False,
         allow_batch_terminal_paint: bool = False,
+        terminal_paint: TerminalBrowsePaintRequest | None = None,
     ) -> None:
         started = (
             time.monotonic()
@@ -5347,11 +5140,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 rebind_scientific_navigation=rebind_scientific_navigation,
                 suppress_detector_demand=suppress_detector_demand,
                 allow_batch_terminal_paint=allow_batch_terminal_paint,
+                terminal_paint=terminal_paint,
             )
         else:
             self._refresh_shell(
                 suppress_detector_demand=suppress_detector_demand,
                 allow_batch_terminal_paint=allow_batch_terminal_paint,
+                terminal_paint=terminal_paint,
             )
         if started is None:
             return
@@ -5452,14 +5247,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or self._context_controller.browse_pending
             or self._context_controller.browse_preview_polling_needed
             or self._browse_1d_release_debt is not None
-            or (
-                operations is not None
-                and operations.pending_reintegrate_reload is not None
-            )
-            or (
-                operations is not None
-                and operations.pending_average_reload is not None
-            )
+            or self._processed_browser.polling_needed
             or self._scientific_repaint_pending
         ):
             return True
@@ -5589,7 +5377,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         """Authorize transient retention only for the adopted Browse scope."""
 
         snapshot = getattr(scientific, "browse_trace_snapshot", None)
-        captured = self._context_controller.capture_reintegrate_browse()
+        captured = self._capture_current_loaded_browse()
         navigation = self._context_controller.navigation
         if (
             snapshot is None
@@ -5661,6 +5449,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         rebind_scientific_navigation: bool = False,
         suppress_detector_demand: bool = False,
         allow_batch_terminal_paint: bool = False,
+        terminal_paint: TerminalBrowsePaintRequest | None = None,
     ) -> None:
         explicit_preserve_display = preserve_display
         explicit_preserve_scientific = preserve_scientific
@@ -5708,9 +5497,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if (
             selected_invalidated_browse
-            or self._workspace_operations.pending_reintegrate_reload
-            is not None
-            or self._workspace_operations.pending_average_reload is not None
+            or self._processed_browser.preserve_science
             or pending_browse_replacement
         ):
             preserve_scientific = True
@@ -5953,6 +5740,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         projection_progress = self._batch_terminal.project_progress(
             self._progress
         )
+        browser = self._processed_browser.projection()
         projection = self._context_projection.build_shell(
             revision=self._shell_revision,
             controls=controls,
@@ -5966,17 +5754,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             resident_frames=resident_frames,
             progress=projection_progress,
             preferences=self._preferences,
-            browser_directory=self._browser_directory,
-            browser_catalog=self._browser_catalog,
-            browser_transient_frame=self._browser_transient_frame,
+            browser_directory=browser.directory,
+            browser_catalog=browser.catalog,
+            browser_transient_frame=browser.transient_frame,
             viewer_1d_paths=(
                 self._context_controller.viewer_1d_context.paths
                 if viewer_1d
                 and self._context_controller.viewer_1d_context is not None
                 else ()
             ),
-            date_sorted=self._date_sorted,
-            auto_last=self._auto_last,
+            date_sorted=browser.date_sorted,
+            auto_last=browser.auto_last,
             executor_available=self._run_executor is not None,
             start_permitted=permitted,
             start_blocker=blocker,
@@ -6084,13 +5872,24 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     browse_trace_snapshot=cache_trace_snapshot,
                 ),
             )
-        rebind_artifacts = (
-            self._terminal_rebind_artifacts
-            if rebind_scientific_navigation
+        authorization = (
+            terminal_paint.authorization
+            if (
+                rebind_scientific_navigation
+                and type(terminal_paint) is TerminalBrowsePaintRequest
+                and terminal_paint.mode is TerminalPaintMode.REBIND
+            )
             else None
         )
-        if rebind_scientific_navigation:
-            self._terminal_rebind_artifacts = None
+        rebind_artifacts = (
+            None
+            if authorization is None
+            else (
+                authorization.run_identity,
+                authorization.source_artifact,
+                authorization.browse_artifact,
+            )
+        )
         if cache_trace_snapshot is not None and (
             cache_plan is None
             or self._preferences is not cache_preferences
@@ -6251,7 +6050,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and intent.processing_mode != "Int 1D (XYE)"
                 and (phase is RunPhase.IDLE or phase is RunPhase.FAILED
                      and self._lifecycle.reset_permitted)
-                and self._context_controller.capture_reintegrate_browse() is not None),
+                and self._capture_current_loaded_browse() is not None),
             reintegrate_active=reintegrate_active,
             reintegrate_dimension=(
                 self._workspace_operations.reintegrate_dimension
@@ -6332,7 +6131,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return False, "Finishing prior display cleanup…"
             return False, "Output cleanup remains pending"
         if self._context_controller.browse_pending:
-            handoff = self._terminal_browse_handoff
+            handoff = self._processed_browser.terminal_handoff
             if (
                 handoff is not None
                 and self._context_controller.owns_browse_request(
@@ -6341,10 +6140,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 return False, "Loading finalized Browse context…"
             return False, "Browse cleanup remains pending"
-        presentation = self._terminal_browse_presentation
+        presentation = self._processed_browser.terminal_presentation
         if (
             presentation is not None
-            and self._terminal_browse_presentation_is_current(presentation)
+            and self._processed_terminal_presentation_is_current(
+                presentation
+            )
         ):
             return False, "Loading finalized Browse context…"
         phase = self._lifecycle.phase
@@ -6420,9 +6221,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice("1D Viewer cleanup remains pending")
             self._ensure_timer(); return
         try:
-            chooser = getattr(self, "_viewer_1d_file_chooser", self._viewer_file_chooser)
-            selected = chooser(self._viewer_1d_start_directory())
-            selected = tuple(selected) if type(selected) in {tuple, list} else ()
+            selected = self._viewer_1d_file_chooser(
+                self._viewer_1d_start_directory()
+            )
+            if selected is None:
+                return
+            if type(selected) is not tuple:
+                raise TypeError(
+                    "1D Viewer chooser must return a tuple of paths"
+                )
         except Exception as error:
             self._error_notice("1D Viewer refused", error); return
         self._open_viewer_1d_paths(selected)
@@ -6504,7 +6311,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             selected = None if context is None else context.original_path
         else:
             try:
-                selected = self._viewer_file_chooser(
+                selected = self._viewer_2d_file_chooser(
                     self._viewer_2d_start_directory())
             except Exception as error:
                 self._error_notice("2D Viewer chooser failed", error)
@@ -6766,18 +6573,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             updates["plot_options"] = replace(options, **option_updates)
         elif kind is ShellCommandKind.SET_DATE_SORT:
             requested = bool(value)
-            changed = requested != self._date_sorted
-            self._date_sorted = requested
-            if changed and requested:
-                self._request_browser_catalog()
+            self._processed_browser.set_date_sorted(requested)
             return True
         elif kind is ShellCommandKind.SET_AUTO_LAST:
             requested = bool(value)
-            if requested != self._auto_last:
+            if self._processed_browser.set_auto_last(requested):
                 self._retire_batch_presentation()
             ScatteringWorkspace._clear_presentation_targets(self)
-            self._auto_last = requested
-            if self._auto_last:
+            if self._processed_browser.auto_last:
                 self._context_controller.select_latest_navigation(
                     plot_mode=self._preferences.plot_mode
                 )
@@ -7374,25 +7177,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             != pending_axis.target_axis
         ):
             self._native_plot_axis_transition = None
-        catalog_policy_changed = (
-            _browser_suffixes_for_mode(prior_intent.processing_mode)
-            != _browser_suffixes_for_mode(current_intent.processing_mode)
-        )
         source_transition = self._source_selection.reconcile_source(
             prior,
             current,
         )
-        browser_directory_changed = (
-            prior_intent.save_path != current_intent.save_path
-            and not self._browser_explicit_directory
-        )
-        if browser_directory_changed:
-            self._browser_directory = processed_directory(
-                current_intent.save_path
-            )
-        if browser_directory_changed or catalog_policy_changed:
-            self._browser_catalog = ()
-            self._request_browser_catalog()
+        self._processed_browser.reconcile_intent(prior, current)
         ScatteringWorkspace._observe_operation_stamp(
             self,
             current.revision,
@@ -7536,13 +7325,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _choose_browser_directory(self) -> None:
         project_root = self._intents.snapshot().thaw().project_root
+        directory = self._processed_browser.directory
         start_directory = browse_start_dir(
-            self._browser_directory,
+            directory,
             fallback=project_root,
         )
         try:
             selected = self._browser_directory_chooser(
-                self._browser_directory,
+                directory,
                 start_directory,
             )
         except Exception as error:
@@ -7559,122 +7349,34 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         *,
         explicit: bool,
     ) -> None:
-        directory = os.path.abspath(os.path.expanduser(selected))
-        self._browser_explicit_directory = explicit
-        self._browser_directory = directory
-        self._browser_catalog = ()
-        self._notice("")
-        self._refresh_shell()
-        self._request_browser_catalog()
-
-    def _begin_browser_follow(self, identity: RunIdentity) -> None:
-        """Release a prior manual-browse veto for one newly launched run."""
-
-        if type(identity) is not RunIdentity:
-            return
-        self._browser_explicit_directory = False
-        self._browser_follow_identity = identity
-        self._browser_seen_artifacts.clear()
+        self._apply_processed_browser_transition(
+            self._processed_browser.set_directory(
+                selected,
+                explicit=explicit,
+            )
+        )
 
     def _follow_processed_artifact(
         self,
         frame: DisplayFrameKey,
     ) -> None:
-        if (
-            self._closing
-            or self._closed
-            or type(frame) is not DisplayFrameKey
-        ):
-            return
-        if frame.run_identity is not self._browser_follow_identity:
-            self._browser_follow_identity = frame.run_identity
-            self._browser_seen_artifacts.clear()
-        artifact = os.path.abspath(os.path.expanduser(frame.artifact))
-        first_seen = artifact not in self._browser_seen_artifacts
-        self._browser_seen_artifacts.add(artifact)
-        if self._browser_explicit_directory:
-            return
-        directory = os.path.dirname(artifact)
-        changed = directory != self._browser_directory
-        if changed:
-            self._browser_directory = directory
-            self._browser_catalog = ()
-            self._refresh_shell()
-        if changed or first_seen:
-            self._request_browser_catalog()
+        self._apply_processed_browser_transition(
+            self._processed_browser.follow_processed_artifact(frame)
+        )
 
-    def _request_browser_catalog(self) -> _BrowserCatalogRequest | None:
-        pool = self._browser_catalog_pool
-        if (
-            pool is None
-            or self._closing
-            or self._closed
-        ):
-            return None
-        self._browser_catalog_token += 1
-        request = _BrowserCatalogRequest(
-            self._browser_catalog_token,
-            self._browser_directory,
-            _browser_suffixes_for_mode(
-                self._intents.snapshot().thaw().processing_mode
-            ),
-        )
-        operation = self._browser_catalog_operation
-        if operation is not None:
-            operation.cancelled.set()
-            operation.future.cancel()
-            self._browser_catalog_queued = request
-            return request
-        self._launch_browser_catalog(request)
-        return request
-
-    def _launch_browser_catalog(
-        self, request: _BrowserCatalogRequest,
-    ) -> None:
-        pool = self._browser_catalog_pool
-        if (
-            pool is None or self._closing or self._closed
-            or self._browser_catalog_operation is not None
-        ):
-            return
-        cancelled = threading.Event()
-        future = pool.submit(
-            enumerate_processed_artifacts,
-            request.directory,
-            accepted_suffixes=request.accepted_suffixes,
-            inspect_directory_contents=self._date_sorted,
-            directory_time_cache=self._browser_directory_time_cache,
-            cancelled=cancelled,
-        )
-        operation = _BrowserCatalogOperation(request, cancelled, future)
-        self._browser_catalog_operation = operation
-        page_ref = weakref.ref(self)
-        future.add_done_callback(
-            lambda done: ScatteringWorkspace._deliver_browser_catalog(
-                page_ref,
-                operation,
-                done,
-            )
-        )
+    def _request_browser_catalog(self) -> BrowserCatalogRequest | None:
+        return self._processed_browser.request_catalog()
 
     def _poll_browser_catalog(self) -> None:
         """Observe idle external deletion/recreation without GUI-thread I/O."""
-        operation = self._browser_catalog_operation
-        if operation is not None and operation.future.done():
-            self._on_browser_catalog(operation, operation.future)
-        elif operation is None and self._browser_catalog_queued is not None:
-            request, self._browser_catalog_queued = (
-                self._browser_catalog_queued, None,
-            )
-            self._launch_browser_catalog(request)
-        elif operation is None:
-            self._request_browser_catalog()
+        self._apply_processed_browser_transition(
+            self._processed_browser.poll_catalog()
+        )
 
     @staticmethod
     def _deliver_browser_catalog(
         page_ref: weakref.ReferenceType["ScatteringWorkspace"],
-        operation: _BrowserCatalogOperation,
-        future: Future[object],
+        wake: BrowserCatalogWake,
     ) -> None:
         page = page_ref()
         if page is None:
@@ -7682,90 +7384,31 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         try:
             if page._closing or page._closed:
                 return
-            page._browserCatalogFinished.emit(operation, future)
+            page._browserCatalogFinished.emit(wake)
         except RuntimeError:
             return
 
-    def _on_browser_catalog(
-        self,
-        operation: object,
-        future: object,
-    ) -> None:
-        if (
-            self._closing
-            or self._closed
-            or type(operation) is not _BrowserCatalogOperation
-            or operation is not self._browser_catalog_operation
-            or future is not operation.future
-        ):
-            return
-        request = operation.request
-        self._browser_catalog_operation = None
-        queued, self._browser_catalog_queued = (
-            self._browser_catalog_queued, None,
-        )
-        current = (
-            not operation.cancelled.is_set()
-            and request.token == self._browser_catalog_token
-            and request.directory == self._browser_directory
-            and request.accepted_suffixes == _browser_suffixes_for_mode(
-                self._intents.snapshot().thaw().processing_mode
-            )
-        )
-        try:
-            catalog = operation.future.result()
-        except Exception as error:
-            if current:
-                self._error_notice("Browser refresh failed", error)
-            if queued is not None:
-                self._launch_browser_catalog(queued)
-            return
-        if queued is not None:
-            self._launch_browser_catalog(queued)
-        if not current:
-            return
-        if (
-            type(catalog) is not tuple
-            or not all(
-                type(entry) is BrowserCatalogEntry
-                for entry in catalog
-            )
-        ):
-            self._notice("Browser refresh returned invalid data.")
-            self._refresh_shell()
-            return
-        clear_token = self._browser_transient_clear_token
-        transient_cleared = (
-            clear_token is not None
-            and request.token >= clear_token
-        )
-        if transient_cleared:
-            self._browser_transient_frame = None
-            self._browser_transient_clear_token = None
-        if catalog == self._browser_catalog and not transient_cleared:
-            return
-        self._browser_catalog = catalog
-        self._refresh_shell(
-            preserve_scientific=True,
-            skip_scientific_projection=True,
-            suppress_detector_demand=True,
+    def _on_browser_catalog(self, wake: object) -> None:
+        self._apply_processed_browser_transition(
+            self._processed_browser.consume_catalog(wake)
         )
 
-    def _cancel_browser_catalog(self) -> bool:
-        self._browser_catalog_queued = None
-        operation = self._browser_catalog_operation
-        if operation is None:
-            return True
-        operation.cancelled.set()
-        operation.future.cancel()
-        if not operation.future.done():
-            return False
-        self._browser_catalog_operation = None
-        try:
-            operation.future.result()
-        except BaseException:
-            pass
-        return True
+    def _apply_processed_browser_transition(
+        self,
+        transition: ProcessedBrowserTransition,
+    ) -> None:
+        if type(transition) is not ProcessedBrowserTransition:
+            return
+        if transition.notice is not None:
+            self._notice(transition.notice)
+        if transition.refresh is BrowserRefreshEffect.FULL:
+            self._refresh_shell()
+        elif transition.refresh is BrowserRefreshEffect.CATALOG:
+            self._refresh_shell(
+                preserve_scientific=True,
+                skip_scientific_projection=True,
+                suppress_detector_demand=True,
+            )
 
     def _refuse_preparing(self, token: AdmissionToken) -> None:
         if (

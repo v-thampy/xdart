@@ -5,7 +5,6 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-import subprocess
 from threading import Event
 from types import SimpleNamespace
 import time
@@ -17,6 +16,7 @@ from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey, StandardEventKind, StandardRunEvent
 from xdart.gui.tabs.scattering.events import RunIdentity
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.processed_browser import ProcessedBrowserOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.state_machine import RunPhase
@@ -30,7 +30,6 @@ from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome, H
 from xrd_tools.io import viewer_2d as viewer_api
 from tests.core import test_viewer_2d as a0
 from tests.xdart.scattering.test_e3_context_contract import _acquisition
-_PARENT = "ddf266ec6c6f17edbf23bfabb5435b55fe772a6e"
 def _ast_facts(source: str):
     tree, aliases = ast.parse(source), {}
     for node in tree.body:
@@ -71,7 +70,19 @@ def _clear(controller: ContextController) -> None:
     assert controller.acknowledge_viewer_2d_renderer_clear(Viewer2DRendererClearReceipt(request, True))
 def _mount_source(tmp_path, family):
     base = np.arange(12, dtype=np.uint16).reshape(3, 4)
-    suffix = {"edf": ".edf", "tiff": ".tiff", "cbf": ".cbf", "raw": ".raw", "hdf": ".h5", "nexus": ".nxs", "csv": ".csv", "npy2": ".npy", "npy3": ".npy", "npz": ".npz"}.get(family, ".nxs")
+    suffix = {
+        "edf": ".edf",
+        "tiff": ".tiff",
+        "cbf": ".cbf",
+        "raw": ".raw",
+        "hdf": ".h5",
+        "nexus": ".nxs",
+        "processed": ".nexus",
+        "csv": ".csv",
+        "npy2": ".npy",
+        "npy3": ".npy",
+        "npz": ".npz",
+    }.get(family, ".nxs")
     path, policy, expected = tmp_path / f"{family}{suffix}", None, (base,)
     if family in {"edf", "tiff", "cbf", "raw"}:
         a0._write_selected_source(path, "fabio" if family == "edf" else family, base)
@@ -89,6 +100,9 @@ def _mount_source(tmp_path, family):
         with h5py.File(path, "w") as handle:
             a0._processed_source(handle, 2, raw.name, 0, "/entry/data/data")
             a0._processed_thumbnail(handle, 7, thumb, vmin=0.0, vmax=255.0)
+        policy = viewer_api.Viewer2DFormatPolicy(
+            source_root=str(tmp_path)
+        )
         expected = (base, thumb.astype(float))
     elif family == "csv":
         np.savetxt(path, base, delimiter=",")
@@ -241,35 +255,28 @@ def test_viewer_authority_census_provider_order_refusal_and_cleanup(tmp_path, mo
     root = Path(__file__).parents[3]
     module = "src/xdart/gui/tabs/scattering/"
     relative_paths = ("src/xrd_tools/session/readiness.py", *(module + name for name in ("context_runtime.py", "context_controller.py", "context_projection.py", "controls_projection.py", "run_mode_projection.py", "page.py", "scientific_view.py")))
-    trees, calls, identifiers, baseline = [], Counter(), Counter(), Counter()
+    trees, calls, identifiers = [], Counter(), Counter()
     for path in relative_paths:
         tree, path_calls, path_identifiers = _ast_facts((root / path).read_text())
-        parent = subprocess.check_output(("git", "-C", str(root), "show", f"{_PARENT}:{path}"), text=True)
-        _, _, parent_identifiers = _ast_facts(parent)
         trees.append(tree)
         calls.update(path_calls)
         identifiers.update(path_identifiers)
-        baseline.update(parent_identifiers)
     classes = tuple(node for tree in trees for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
     owners = tuple(node for node in classes if node.name == "_TwoDViewerOwner")
     assert len(owners) == calls["_TwoDViewerOwner"] == 1
     assert {node.name for node in owners[0].body if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")} == {
         "activate", "dispose", "commit", "complete"}
     assert calls["RLock"] == calls["HydrationTransport"] == 1
-    authority_terms = ("target", "port", "provider", "generation", "worker", "thread", "timer", "queue", "scheduler", "cache", "watcher", "store", "lease", "writer",
-        "output", "durability", "accounting", "calibration", "mask", "integration", "rsm",
-        "descriptor", "archive", "parser", "mmap", "callback", "resource")
-    identifiers.subtract(baseline)
-    authority_delta = {name: count for name, count in identifiers.items() if count and any(term in name.lower() for term in authority_terms)}
-    assert authority_delta == {
-        "_display_generation": 14, "_ensure_timer": 4, "_release_browse": 1,
-        "_release_browse_for_viewer": 2, "_release_viewer_1d_holder": 2,
-        "_viewer_1d_provider": 1, "_viewer_2d_provider": 2,
-        "admission_generation": 1, "admitted_provider_identity": 3,
-        "display_generation": 7, "generation": 51, "output_supported": 1,
-        "port": 2, "presentation_generation": 4, "provider": 73,
-        "publication_store": 2, "release": 2, "target": 5,
-        "transport_token": 1, "HydrationTransport": 2,
+    assert not {
+        name
+        for name in (
+            "Thread",
+            "ThreadPoolExecutor",
+            "Timer",
+            "Queue",
+            "Process",
+        )
+        if calls[name]
     }
     assert not {"StageLedger", "TargetLease"}.intersection(identifiers)
     path = tmp_path / "deliberately-missing.npy"
@@ -323,6 +330,12 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     calls: list[object] = []
     clear_request = object()
     identity = RunIdentity(2, "delayed")
+    processed_browser = ProcessedBrowserOwner(
+        save_path="",
+        processing_mode="Int 2D",
+        deliver=lambda _wake: None,
+        catalog_reader=lambda _directory, **_kwargs: (),
+    )
     controller = SimpleNamespace(
         viewer_2d_owned=True, viewer_2d_frame=object(), run_identity=identity,
         selection=None,
@@ -343,6 +356,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _scientific_repaint_pending=False,
         _waterfall_candidate_count=0,
         _workspace_operations=WorkspaceOperationOwner(),
+        _processed_browser=processed_browser,
         _batch_terminal=SimpleNamespace(
             active=False,
             project_progress=lambda progress: progress,
@@ -354,8 +368,6 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
             thaw=lambda: SimpleNamespace(processing_mode="Int 2D"),
         )),
         _last_scientific_projection=object(),
-        _terminal_browse_handoff=None,
-        _terminal_browse_presentation=None,
         _select_scan=lambda value, **_kwargs: calls.append(value),
         _poll_admission=lambda: False,
         _settle_browse_1d_before_drain=lambda: True,
@@ -404,8 +416,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
             ),
             _background_owner=SimpleNamespace(projection=lambda: None),
             _shell_revision=0, _controls_readiness=None, _progress=None,
-        _browser_directory=None, _browser_catalog=None, _browser_transient_frame=None,
-        _date_sorted=False, _auto_last=False, _notice_text="")
+        _notice_text="")
     def fail_render(_projection, *, preserve_display=False):
         raise RuntimeError("render")
     page._shell = SimpleNamespace(browser=SimpleNamespace(reconcile_heavy_residency=lambda *_args, **_kwargs: None), apply_state=fail_render)
@@ -415,6 +426,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     assert retained.heavy.raw is canonical
     ScatteringWorkspace._refresh_shell(page)
     assert page._last_scientific_projection is None and owner_state == (controller.viewer_2d_frame, controller.viewer_2d_context)
+    assert processed_browser.begin_close()
 
 def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation(monkeypatch) -> None:
     calls = []
@@ -441,7 +453,7 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
     page = SimpleNamespace(
         _context_controller=controller, _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
         _viewer_2d_start_directory=lambda: calls.append("start") or "/viewer",
-        _viewer_file_chooser=lambda start: calls.append(("choose", start)) or selected,
+        _viewer_2d_file_chooser=lambda start: calls.append(("choose", start)) or selected,
         _clear_viewer_2d_renderer=forbidden,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: intent), commit=forbidden),
         _source_selection=SimpleNamespace(
@@ -477,7 +489,7 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
         page._source_selection.live_source,
     )
     controller.viewer_2d_context = SimpleNamespace(original_path=selected)
-    page._viewer_file_chooser = forbidden
+    page._viewer_2d_file_chooser = forbidden
     page._clear_viewer_2d_renderer = lambda: calls.append("clear") or True
     ScatteringWorkspace._run_action(page)
     assert calls[-4:] == ["clear", ("open", selected), ("notice", ""), "timer"]

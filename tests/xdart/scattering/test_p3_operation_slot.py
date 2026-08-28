@@ -461,10 +461,21 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
     source_owner_path = (
         root / "src/xdart/gui/tabs/scattering/source_selection.py"
     )
+    browser_owner_path = (
+        root / "src/xdart/gui/tabs/scattering/processed_browser.py"
+    )
     values_path = root / "src/xdart/gui/tabs/scattering/operation_values.py"
-    slot_text, page_text, owner_text, source_owner_text, values_text = (
+    (
+        slot_text,
+        page_text,
+        owner_text,
+        source_owner_text,
+        browser_owner_text,
+        values_text,
+    ) = (
         slot_path.read_text(), page_path.read_text(), owner_path.read_text(),
-        source_owner_path.read_text(), values_path.read_text(),
+        source_owner_path.read_text(), browser_owner_path.read_text(),
+        values_path.read_text(),
     )
     tree = ast.parse(slot_text)
     calls = [node.func.id for node in ast.walk(tree)
@@ -490,8 +501,11 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
         for node in workspace_owner.body
     )
     assert page_text.count("QtCore.QTimer(") == 3
-    assert page_text.count("ThreadPoolExecutor(max_workers=1)") == 1
+    assert page_text.count("ThreadPoolExecutor(max_workers=1)") == 0
     assert source_owner_text.count(
+        "ThreadPoolExecutor(max_workers=1)"
+    ) == 1
+    assert browser_owner_text.count(
         "ThreadPoolExecutor(max_workers=1)"
     ) == 1
     assert page_text.count("deque(maxlen=1)") == 1

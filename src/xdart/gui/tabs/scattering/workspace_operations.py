@@ -1,9 +1,9 @@
 """Qt-free ownership for workspace experiment operations.
 
 The page composes notices, dialogs, and Browse mutations.  This owner keeps
-the one experiment worker slot and the state that must survive those page
-effects: Average cleanup/reload commands and Reintegrate's mandatory reload
-intent.
+the one experiment worker slot and active operation state.  Terminal reload
+directives transfer immediately to ``ProcessedBrowserOwner`` through typed
+transitions; this owner does not retain a second copy.
 """
 
 from __future__ import annotations
@@ -13,17 +13,15 @@ from enum import Enum
 import os
 from typing import Mapping
 
-from xdart.modules.display_context import BrowseContext, ContextKind, DisplaySelection
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
-    TargetSnapshot,
     stream_terminal_object_revision,
 )
 from xrd_tools.reduction import ReintegrateResult
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
 
 from .adapters.external_operation import OperationSlot
-from .browse_values import BrowseLoadRequest
+from .browse_values import LoadedBrowseCapture
 from .events import CleanupStatus
 from .operation_values import (
     OperationCleanupReceipt,
@@ -32,6 +30,10 @@ from .operation_values import (
     OperationPending,
     OperationTerminalStatus,
     OperationUpdate,
+)
+from .processed_browser import (
+    AverageReloadDirective,
+    ReintegrateReloadDirective,
 )
 
 
@@ -45,108 +47,12 @@ class WorkspaceRefreshEffect(Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class ReintegrateBrowseCapture:
-    """One exact, stable processed-Browse source for Reintegrate."""
-
-    context: BrowseContext
-    request: BrowseLoadRequest
-    selection: DisplaySelection
-    target: str
-    entry: str
-    target_snapshot: TargetSnapshot
-    labels: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        valid = (
-            type(self.context) is BrowseContext
-            and type(self.request) is BrowseLoadRequest
-            and type(self.selection) is DisplaySelection
-            and self.selection.kind is ContextKind.BROWSE
-            and type(self.target) is str
-            and bool(self.target)
-            and self.request.source_path == self.target
-            and type(self.entry) is str
-            and bool(self.entry)
-            and type(self.target_snapshot) is TargetSnapshot
-            and self.target_snapshot.exists
-            and type(self.labels) is tuple
-            and bool(self.labels)
-            and self.labels == tuple(sorted(set(self.labels)))
-            and all(type(label) is int and label >= 0 for label in self.labels)
-        )
-        if not valid:
-            raise ValueError("Reintegrate Browse capture is invalid")
-
-    def is_exactly(self, other: object) -> bool:
-        """Compare value facts but require all live owners by identity."""
-
-        return bool(
-            type(other) is ReintegrateBrowseCapture
-            and other.context is self.context
-            and other.request is self.request
-            and other.selection is self.selection
-            and other.target == self.target
-            and other.entry == self.entry
-            and other.target_snapshot == self.target_snapshot
-            and other.labels == self.labels
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ReintegrateReloadDirective:
-    """Persisted Browse artifact that must be reloaded after invalidation."""
-
-    request: BrowseLoadRequest
-    target: str
-    terminal_commit_identity: StreamTerminal | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.request) is not BrowseLoadRequest
-            or type(self.target) is not str
-            or not self.target
-            or self.request.source_path != self.target
-            or (
-                self.terminal_commit_identity is not None
-                and (
-                    stream_terminal_object_revision(
-                        self.terminal_commit_identity
-                    )
-                    is None
-                    or self.terminal_commit_identity.target != self.target
-                )
-            )
-        ):
-            raise ValueError("Reintegrate reload directive is invalid")
-
-
-@dataclass(frozen=True, slots=True)
-class AverageReloadDirective:
-    """Validated committed Average result that the page may Browse."""
-
-    target: str
-    entry: str
-    terminal_commit_identity: StreamTerminal
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.target) is not str
-            or not self.target
-            or type(self.entry) is not str
-            or not self.entry
-            or stream_terminal_object_revision(self.terminal_commit_identity)
-            is None
-            or self.terminal_commit_identity.target != self.target
-        ):
-            raise ValueError("Average reload directive is invalid")
-
-
-@dataclass(frozen=True, slots=True)
 class WorkspaceOperationTransition:
     """Detached effect returned to the Qt composition page."""
 
     effect: WorkspaceRefreshEffect
     notice: str = ""
+    reintegrate_reload: ReintegrateReloadDirective | None = None
     average_reload: AverageReloadDirective | None = None
     request_catalog: bool = False
 
@@ -156,8 +62,17 @@ class WorkspaceOperationTransition:
             or type(self.notice) is not str
             or type(self.request_catalog) is not bool
             or (
+                self.reintegrate_reload is not None
+                and type(self.reintegrate_reload)
+                is not ReintegrateReloadDirective
+            )
+            or (
                 self.average_reload is not None
                 and type(self.average_reload) is not AverageReloadDirective
+            )
+            or (
+                self.reintegrate_reload is not None
+                and self.average_reload is not None
             )
         ):
             raise ValueError("workspace operation transition is invalid")
@@ -168,13 +83,13 @@ class ReintegrateOperationState:
     """Active Reintegrate identity and its invalidated Browse owner."""
 
     identity: OperationIdentity
-    capture: ReintegrateBrowseCapture
+    capture: LoadedBrowseCapture
     dimension: str
 
     def __post_init__(self) -> None:
         if (
             type(self.identity) is not OperationIdentity
-            or type(self.capture) is not ReintegrateBrowseCapture
+            or type(self.capture) is not LoadedBrowseCapture
             or self.dimension not in {"1d", "2d"}
         ):
             raise ValueError("Reintegrate operation state is invalid")
@@ -189,6 +104,7 @@ class AverageOperationState:
     target: str
     entry: str
     pending: OperationPending | None = None
+    source_root: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -199,6 +115,16 @@ class AverageOperationState:
             or not self.target
             or type(self.entry) is not str
             or not self.entry
+            or (
+                self.source_root is not None
+                and (
+                    type(self.source_root) is not str
+                    or not self.source_root
+                    or not os.path.isabs(self.source_root)
+                    or os.path.normcase(os.path.normpath(self.source_root))
+                    != self.source_root
+                )
+            )
             or (
                 self.pending is not None
                 and (
@@ -230,9 +156,7 @@ class WorkspaceOperationOwner:
     def __init__(self) -> None:
         self._slot = OperationSlot()
         self._reintegrate: ReintegrateOperationState | None = None
-        self._reintegrate_reload: ReintegrateReloadDirective | None = None
         self._average: AverageOperationState | None = None
-        self._average_reload: AverageReloadDirective | None = None
 
     @property
     def owned(self) -> bool:
@@ -240,11 +164,7 @@ class WorkspaceOperationOwner:
 
     @property
     def busy(self) -> bool:
-        return (
-            self._slot.owned
-            or self._reintegrate_reload is not None
-            or self._average_reload is not None
-        )
+        return self._slot.owned
 
     @property
     def current_identity(self) -> OperationIdentity | None:
@@ -265,15 +185,9 @@ class WorkspaceOperationOwner:
         return None if state is None else state.dimension
 
     @property
-    def reintegrate_capture(self) -> ReintegrateBrowseCapture | None:
+    def reintegrate_capture(self) -> LoadedBrowseCapture | None:
         state = self._reintegrate
         return None if state is None else state.capture
-
-    @property
-    def pending_reintegrate_reload(
-        self,
-    ) -> ReintegrateReloadDirective | None:
-        return self._reintegrate_reload
 
     @property
     def average_identity(self) -> OperationIdentity | None:
@@ -288,10 +202,6 @@ class WorkspaceOperationOwner:
     def average_pending(self) -> OperationPending | None:
         state = self._average
         return None if state is None else state.pending
-
-    @property
-    def pending_average_reload(self) -> AverageReloadDirective | None:
-        return self._average_reload
 
     def begin_calibrate(
         self, request: object, stamp: OperationContextStamp
@@ -319,13 +229,13 @@ class WorkspaceOperationOwner:
 
     def begin_reintegrate(
         self,
-        capture: ReintegrateBrowseCapture,
+        capture: LoadedBrowseCapture,
         *,
         dimension: str,
         preparation_values: Mapping[str, object],
         stamp: OperationContextStamp,
     ) -> OperationIdentity | None:
-        if type(capture) is not ReintegrateBrowseCapture:
+        if type(capture) is not LoadedBrowseCapture:
             return None
         identity = self._slot.begin_reintegrate(
             target=capture.target,
@@ -346,7 +256,6 @@ class WorkspaceOperationOwner:
             ),
         )
         if identity is None:
-            self.require_reintegrate_reload(capture)
             return None
         self._reintegrate = ReintegrateOperationState(
             identity, capture, dimension
@@ -363,6 +272,14 @@ class WorkspaceOperationOwner:
     ) -> OperationIdentity | None:
         if type(revision) is not int or revision < 0:
             return None
+        source_root = configuration.project_root or None
+        if source_root is not None and (
+            type(source_root) is not str
+            or not source_root
+            or not os.path.isabs(source_root)
+            or os.path.normcase(os.path.normpath(source_root)) != source_root
+        ):
+            return None
         identity = self._slot.begin_average(
             configuration,
             target,
@@ -372,57 +289,13 @@ class WorkspaceOperationOwner:
         if identity is None:
             return None
         self._average = AverageOperationState(
-            identity, revision, str(target), entry
+            identity,
+            revision,
+            str(target),
+            entry,
+            source_root=source_root,
         )
         return identity
-
-    def require_reintegrate_reload(
-        self,
-        capture: ReintegrateBrowseCapture,
-        terminal_commit_identity: StreamTerminal | None = None,
-    ) -> ReintegrateReloadDirective:
-        directive = ReintegrateReloadDirective(
-            capture.request,
-            capture.target,
-            terminal_commit_identity,
-        )
-        self._reintegrate_reload = directive
-        return directive
-
-    def retire_reintegrate_reload(
-        self, directive: ReintegrateReloadDirective
-    ) -> bool:
-        if self._reintegrate_reload is not directive:
-            return False
-        self._reintegrate_reload = None
-        return True
-
-    def require_average_reload(
-        self,
-        target: str,
-        entry: str,
-        terminal_commit_identity: StreamTerminal,
-    ) -> AverageReloadDirective:
-        directive = AverageReloadDirective(
-            target, entry, terminal_commit_identity
-        )
-        self._average_reload = directive
-        return directive
-
-    def retire_average_reload(
-        self, directive: AverageReloadDirective
-    ) -> bool:
-        if self._average_reload is not directive:
-            return False
-        self._average_reload = None
-        state = self._average
-        if (
-            state is not None
-            and state.target == directive.target
-            and state.entry == directive.entry
-        ):
-            self._average = None
-        return True
 
     def cancel(self, identity: object) -> bool:
         return self._slot.cancel(identity)
@@ -524,9 +397,13 @@ class WorkspaceOperationOwner:
                 f"Reintegrate {shown} returned an invalid commit identity; "
                 "reloading the persisted artifact without its terminal seal."
             )
-        self.require_reintegrate_reload(capture, commit_identity)
+        directive = ReintegrateReloadDirective(
+            capture.request, capture.target, commit_identity
+        )
         return WorkspaceOperationTransition(
-            WorkspaceRefreshEffect.FULL, notice
+            WorkspaceRefreshEffect.FULL,
+            notice,
+            reintegrate_reload=directive,
         )
 
     def consume_average_update(
@@ -652,9 +529,13 @@ class WorkspaceOperationOwner:
                 "Average committed but context changed; Browse was not reloaded.",
                 request_catalog=True,
             )
-        directive = self.require_average_reload(
-            target, entry, commit_identity
+        directive = AverageReloadDirective(
+            target,
+            entry,
+            commit_identity,
+            state.source_root,
         )
+        self._average = None
         return WorkspaceOperationTransition(
             WorkspaceRefreshEffect.CONTROLS,
             "Average committed; Browse reload queued.",
@@ -670,16 +551,19 @@ class WorkspaceOperationOwner:
             shown = {"1d": "1-D", "2d": "2-D"}.get(
                 reintegrate.dimension, "operation"
             )
-            self.require_reintegrate_reload(reintegrate.capture)
+            directive = ReintegrateReloadDirective(
+                reintegrate.capture.request,
+                reintegrate.capture.target,
+            )
             self._reintegrate = None
             return WorkspaceOperationTransition(
                 WorkspaceRefreshEffect.FULL,
                 f"Reintegrate {shown} failed before terminal publication.",
+                reintegrate_reload=directive,
             )
         average = self._average
         if average is not None and average.identity is identity:
             self._average = None
-            self._average_reload = None
             return WorkspaceOperationTransition(
                 WorkspaceRefreshEffect.CONTROLS,
                 "Average failed before terminal publication.",
@@ -687,8 +571,6 @@ class WorkspaceOperationOwner:
         return WorkspaceOperationTransition(WorkspaceRefreshEffect.NONE)
 
     def close(self) -> OperationCleanupReceipt:
-        self._reintegrate_reload = None
-        self._average_reload = None
         receipt = self._slot.close()
         if receipt.cleanup_status is CleanupStatus.CLEANED:
             self._reintegrate = None
@@ -698,10 +580,7 @@ class WorkspaceOperationOwner:
 
 __all__ = [
     "AverageOperationState",
-    "AverageReloadDirective",
-    "ReintegrateBrowseCapture",
     "ReintegrateOperationState",
-    "ReintegrateReloadDirective",
     "WorkspaceOperationOwner",
     "WorkspaceOperationTransition",
     "WorkspaceRefreshEffect",

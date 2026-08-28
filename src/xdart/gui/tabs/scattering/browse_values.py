@@ -8,7 +8,13 @@ import math
 import os
 from pathlib import Path
 
+from xdart.modules.display_context import (
+    BrowseContext,
+    ContextKind,
+    DisplaySelection,
+)
 from xrd_tools.io.output_transaction import StreamTerminal
+from xrd_tools.io.output_transaction import TargetSnapshot
 
 from .events import (
     CleanupStatus,
@@ -98,6 +104,54 @@ class BrowseLoadRequest:
             )
         ):
             raise TypeError("browse load request is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedBrowseCapture:
+    """One exact stable loaded-Browse context and its persisted target facts."""
+
+    context: BrowseContext
+    request: BrowseLoadRequest
+    selection: DisplaySelection
+    target: str
+    entry: str
+    target_snapshot: TargetSnapshot
+    labels: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        valid = (
+            type(self.context) is BrowseContext
+            and type(self.request) is BrowseLoadRequest
+            and type(self.selection) is DisplaySelection
+            and self.selection.kind is ContextKind.BROWSE
+            and type(self.target) is str
+            and bool(self.target)
+            and self.request.source_path == self.target
+            and type(self.entry) is str
+            and bool(self.entry)
+            and type(self.target_snapshot) is TargetSnapshot
+            and self.target_snapshot.exists
+            and type(self.labels) is tuple
+            and bool(self.labels)
+            and self.labels == tuple(sorted(set(self.labels)))
+            and all(type(label) is int and label >= 0 for label in self.labels)
+        )
+        if not valid:
+            raise ValueError("loaded Browse capture is invalid")
+
+    def is_exactly(self, other: object) -> bool:
+        """Compare frozen facts while requiring every live owner by identity."""
+
+        return bool(
+            type(other) is LoadedBrowseCapture
+            and other.context is self.context
+            and other.request is self.request
+            and other.selection is self.selection
+            and other.target == self.target
+            and other.entry == self.entry
+            and other.target_snapshot == self.target_snapshot
+            and other.labels == self.labels
+        )
 
 @dataclass(frozen=True, slots=True)
 class BrowseLoadOutcome:
@@ -202,6 +256,7 @@ __all__ = [
     "BrowseLoadStatus",
     "BrowseLoadTiming",
     "BrowseCleanupReceipt",
+    "LoadedBrowseCapture",
     "canonical_browse_scan_key",
     "canonical_browse_source_identity",
 ]

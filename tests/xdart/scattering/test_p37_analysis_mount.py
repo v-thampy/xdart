@@ -40,8 +40,10 @@ from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import RunIdentity
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
-from xdart.gui.tabs.scattering.workspace_operations import (
+from xdart.gui.tabs.scattering.processed_browser import (
     ReintegrateReloadDirective,
+)
+from xdart.gui.tabs.scattering.workspace_operations import (
     WorkspaceRefreshEffect,
 )
 from xrd_tools.analysis.plans import RoiSignal
@@ -68,12 +70,14 @@ def _set_pending_reintegrate_reload(
 ) -> ReintegrateReloadDirective:
     request = BrowseLoadRequest("pending-reintegrate", 1, target)
     directive = ReintegrateReloadDirective(request, target)
-    page._workspace_operations._reintegrate_reload = directive
+    assert page._processed_browser.adopt_reload(directive) is directive
     return directive
 
 
 def _clear_pending_reintegrate_reload(page) -> None:
-    page._workspace_operations._reintegrate_reload = None
+    directive = page._processed_browser.pending_reintegrate_reload
+    if directive is not None:
+        assert page._processed_browser.retire_reload(directive)
 
 
 @pytest.fixture
@@ -771,8 +775,8 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
     )
     monkeypatch.setattr(
         type(page._context_controller),
-        "capture_reintegrate_browse",
-        lambda _self: object(),
+        "capture_loaded_browse",
+        lambda _self, _request: object(),
     )
 
     refreshes = []

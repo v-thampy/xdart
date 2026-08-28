@@ -823,9 +823,9 @@ def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
 ) -> None:
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
-    from xdart.gui.tabs.scattering.workspace_operations import (
+    from xdart.gui.tabs.scattering.processed_browser import (
+        ProcessedBrowserOwner,
         ReintegrateReloadDirective,
-        WorkspaceOperationOwner,
     )
     from xrd_tools.io.output_transaction import StreamTerminal
 
@@ -860,10 +860,14 @@ def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
         _closed = False
 
         def __init__(self):
-            self._workspace_operations = WorkspaceOperationOwner()
-            self._workspace_operations._reintegrate_reload = (
-                ReintegrateReloadDirective(request, target, seal)
+            self._processed_browser = ProcessedBrowserOwner(
+                save_path="/detached",
+                processing_mode="Int 2D",
+                deliver=lambda _wake: None,
+                catalog_reader=lambda _directory, **_kwargs: (),
             )
+            directive = ReintegrateReloadDirective(request, target, seal)
+            assert self._processed_browser.adopt_reload(directive) is directive
             self._context_controller = Controller()
             self.releases = [False, True, True]
             self.timer_starts = 0
@@ -884,13 +888,13 @@ def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
     page = Page()
     retry = ScatteringWorkspace._retry_pending_reintegrate_reload
     assert not retry(page)
-    assert page._workspace_operations.pending_reintegrate_reload is not None
+    assert page._processed_browser.pending_reintegrate_reload is not None
     assert page._context_controller.calls == []
     assert not retry(page)
-    assert page._workspace_operations.pending_reintegrate_reload is not None
+    assert page._processed_browser.pending_reintegrate_reload is not None
     assert page._context_controller.calls == [(request, target, seal)]
     assert retry(page)
-    assert page._workspace_operations.pending_reintegrate_reload is None
+    assert page._processed_browser.pending_reintegrate_reload is None
     assert page._context_controller.calls == [
         (request, target, seal),
         (request, target, seal),
@@ -905,7 +909,7 @@ def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
     assert lost._context_controller.owns_browse_request(request)
     lost._context_controller.retryable = False
     assert retry(lost)
-    assert lost._workspace_operations.pending_reintegrate_reload is None
+    assert lost._processed_browser.pending_reintegrate_reload is None
     assert lost.catalog_requests == 1
 
 

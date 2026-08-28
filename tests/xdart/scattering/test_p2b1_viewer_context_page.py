@@ -12,16 +12,21 @@ import numpy as np
 import pytest
 
 from xdart.gui.tabs.scattering.browser_catalog import BrowserCatalogEntry
+from xdart.gui.tabs.scattering.batch_terminal_presentation import (
+    BatchTerminalPresentationController,
+)
 from xdart.gui.tabs.scattering.context_controller import ContextController
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.display_values import RunIdentity, StandardEventKind, StandardRunEvent
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 import xdart.gui.tabs.scattering.page as page_module
+from xdart.gui.tabs.scattering.processed_browser import ProcessedBrowserOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_values import (
     FrameNavigationProjection,
     FrameSelectionIntent,
+    ProgressProjection,
     ShellCommand,
     ShellCommandKind,
 )
@@ -620,19 +625,45 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
     controller.open_viewer_1d((str(one_d),))
     _await_ready(controller)
     clear_results = [True, False, True]
+    processed_browser = ProcessedBrowserOwner(
+        save_path="",
+        processing_mode="1D Viewer",
+        deliver=lambda _wake: None,
+        catalog_reader=lambda _directory, **_kwargs: (),
+    )
+    assert processed_browser.begin_close()
     workspace = SimpleNamespace(_context_controller=controller,
-        _shell=SimpleNamespace(browser=SimpleNamespace(reconcile_heavy_residency=lambda *_args, **_kwargs: None), scientific=SimpleNamespace(clear_viewer_1d=lambda request:
-            viewer._new_viewer_1d_renderer_clear_receipt(request, clear_results.pop(0)))),
+        _shell=SimpleNamespace(browser=SimpleNamespace(reconcile_heavy_residency=lambda *_args, **_kwargs: None), scientific=SimpleNamespace(
+            clear_viewer_1d=lambda request:
+                viewer._new_viewer_1d_renderer_clear_receipt(
+                    request, clear_results.pop(0)
+                ),
+            expect_display_background=lambda _key: None,
+            clear_workspace=lambda: True,
+        )),
         _last_scientific_projection=object(), _preferences=ScientificPreferences(),
+        _batch_terminal=BatchTerminalPresentationController(),
         _terminal_close=None, _closing=True, _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
-        _close_identity=None, _clear_viewer_2d_renderer=lambda *, close: True)
+        _close_identity=None, _clear_viewer_2d_renderer=lambda *, close: True,
+        _processed_browser=processed_browser,
+        _background_owner=SimpleNamespace(
+            active_key=None, projection=lambda: None,
+        ),
+        _workspace_operations=SimpleNamespace(average_pending=None),
+    )
     workspace._clear_viewer_1d_renderer = partial(ScatteringWorkspace._clear_viewer_1d_renderer, workspace)
     workspace.__dict__.update(_closed=False, _sync_detector_demand=lambda: None, _retain_outgoing_display=False, _source_selection=SimpleNamespace(observation=None),
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: SimpleNamespace(
             processing_mode="1D Viewer", live_mode=False, source_spec=None, run_options={}))), _project_controls=lambda _snapshot: None,
-        _start_permitted=lambda: (True, ""), _context_projection=SimpleNamespace(build_shell=lambda **_: object()),
-        _shell_revision=0, _date_sorted=False, _auto_last=False, _run_executor=None, _notice_text="",
-        **dict.fromkeys(("_controls_readiness", "_progress", "_browser_directory", "_browser_catalog", "_browser_transient_frame")))
+        _start_permitted=lambda: (True, ""), _mutating_operation_busy=lambda: False,
+        _context_projection=SimpleNamespace(
+            build_shell=lambda **_: make_shell_projection(frame_count=0)
+        ),
+        _shell_revision=0, _run_executor=None, _notice_text="",
+        _controls_readiness=None, _progress=ProgressProjection(),
+            _browse_1d_release_debt=None, _scientific_repaint_pending=False,
+            _ensure_timer=lambda: None, _release_browse_1d_debt=lambda: True,
+            _retire_batch_presentation=lambda **_kwargs: None)
     workspace._lifecycle.__dict__.update(reset_permitted=False, active_run_identity=None, attempt_run_identity=None)
     notices = []; workspace._notice = notices.append; workspace._shell.apply_state = lambda *_args, **_kw: (_ for _ in ()).throw(RuntimeError("render"))
     ScatteringWorkspace._refresh_shell(workspace)
@@ -738,10 +769,11 @@ def test_viewer_1d_catalog_selection_emits_one_exact_batch_command() -> None:
     items = tuple(_Artifact(path) for path in paths)
     view = SimpleNamespace(
         scans=SimpleNamespace(
-            count=lambda: len(items),
-            item=lambda index: items[index],
-            currentItem=lambda: items[0],
-        ),
+                count=lambda: len(items),
+                item=lambda index: items[index],
+                currentItem=lambda: items[0],
+                currentRow=lambda: 0,
+            ),
         _cancel_pending_frame_selection=lambda: None,
         commandRequested=SimpleNamespace(emit=commands.append),
     )
@@ -926,7 +958,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
         _retire_batch_presentation=lambda: None,
         _retain_outgoing_display=True,
         _viewer_1d_start_directory=lambda: calls.append("start") or "/viewer",
-        _viewer_file_chooser=lambda start: calls.append(("choose", start)) or paths,
+        _viewer_1d_file_chooser=lambda start: calls.append(("choose", start)) or paths,
         _clear_viewer_1d_renderer=forbidden, _intents=SimpleNamespace(
             snapshot=lambda: SimpleNamespace(thaw=lambda: intent)),
         _notice=lambda value: calls.append(("notice", value)), _ensure_timer=lambda: calls.append("timer"),
@@ -945,7 +977,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     ]
     controller.viewer_1d_context = context
     controller.viewer_1d_owned = True
-    page._viewer_file_chooser = forbidden
+    page._viewer_1d_file_chooser = forbidden
     page._clear_viewer_1d_renderer = lambda *, paths=None, current_path=None, close=False: (
         calls.append(("clear", paths, current_path, close)) or True
     )
@@ -956,9 +988,16 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     assert intent.processing_mode == "1D Viewer" and calls[-1] == ("notice", "1D Viewer cleanup remains pending")
     ordered, outcomes = [], [False, True]
     directory = tmp_path / "viewer-folder"; directory.mkdir()
+    processed_browser = ProcessedBrowserOwner(
+        save_path="",
+        processing_mode="Int 2D",
+        deliver=lambda _wake: None,
+        catalog_reader=lambda _directory, **_kwargs: (),
+    )
     dispatch = SimpleNamespace(_closing=False, _closed=False,
         _context_controller=SimpleNamespace(viewer_1d_owned=True, viewer_2d_owned=False, selection=None),
         _workspace_operations=WorkspaceOperationOwner(),
+        _processed_browser=processed_browser,
         _analysis_operation_busy=lambda: False,
         _experiment_operation_busy=lambda: False,
         _notice=lambda _message: None,
@@ -1006,9 +1045,6 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
         StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)), _lifecycle=SimpleNamespace(
         active_run_identity=identity, attempt_run_identity=None), _refresh_shell=forbidden,
         _settle_browse_1d_before_drain=lambda: True,
-        _terminal_browse_handoff=None,
-        _terminal_browse_presentation=None,
-        _terminal_browse_perf=None,
         _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
         _batch_ready_to_paint=lambda: None,
         _show_queued_authored_asset_confirmation=lambda: None,
@@ -1076,6 +1112,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     assert view._processing_mode == "Int 2D"
     assert ("images", True) in calls and ("sizes", [500, 500]) in calls
     assert enabled == [False, False, True, True] and owner._preferences is preferences
+    assert processed_browser.begin_close()
 
 
 def test_viewer_1d_scope_and_authority_census_stays_bounded() -> None:
@@ -1088,7 +1125,7 @@ def test_viewer_1d_scope_and_authority_census_stays_bounded() -> None:
     identifiers = [(node.id if isinstance(node, ast.Name) else node.attr) for node in nodes
                    if isinstance(node, (ast.Name, ast.Attribute))]
     expected = {"RLock": 1, "Lock": 0, "HydrationTransport": 2, "_OneDViewerOwner": 1,
-                "Thread": 0, "ThreadPoolExecutor": 4, "Queue": 0, "deque": 2}
+                "Thread": 0, "ThreadPoolExecutor": 0, "Queue": 0, "deque": 2}
     assert {name: identifiers.count(name) for name in expected} == expected
     calls = [(node.func.id if isinstance(node.func, ast.Name) else node.func.attr)
              for node in nodes if isinstance(node, ast.Call)

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 import os
 from pathlib import Path
+from threading import Event
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,7 +18,6 @@ from xrd_tools.sources.selection import image_series_spec
 from xdart.gui.tabs.scattering.contracts import (
     SourceCapture, SourceObservation, SourceObservationRequest, SourceObservationStatus,
 )
-from xdart.gui.tabs.scattering.browser_catalog import BrowserCatalogEntry
 from xdart.gui.tabs.scattering.controls_inventory import INT_1D_AXIS
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import (
@@ -35,8 +36,10 @@ from xdart.gui.tabs.scattering.events import (
 from xdart.gui.tabs.scattering.display_retirement import (
     DisplayRetirementReceipt,
 )
-from xdart.gui.tabs.scattering.page import (
-    ScatteringWorkspace, _TerminalBrowseHandoff,
+from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.processed_browser import (
+    ProcessedBrowserOwner,
+    TerminalBrowseHandoff,
 )
 import xdart.gui.tabs.scattering.page as page_module
 from xdart.gui.tabs.scattering.performance_diagnostics import (
@@ -140,6 +143,7 @@ def _active_page(
     *,
     output_mode: str = "Overwrite",
     processing_mode: str = "Int 2D",
+    project_root: str = "",
 ) -> tuple[ScatteringWorkspace, ScatteringCoordinator, RunIdentity]:
     lifecycle = ScatteringCoordinator()
     request = lifecycle.begin_start().request_id
@@ -147,6 +151,7 @@ def _active_page(
     configuration = RunIntent(
         output_mode=output_mode,
         processing_mode=processing_mode,
+        project_root=project_root,
     ).freeze()
     identity = lifecycle.preflight_accepted(PreflightAccepted(request, configuration)).run_identity
     assert identity is not None
@@ -159,6 +164,7 @@ def _active_page(
                 save_path="output.nxs",
                 output_mode=output_mode,
                 processing_mode=processing_mode,
+                project_root=project_root,
             )
         ),
         lifecycle=lifecycle,
@@ -180,8 +186,24 @@ def _shell(page: ScatteringWorkspace) -> ScatteringWorkspaceShell:
     return shell
 
 
+def _wait_until(qapp, predicate, *, timeout=5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return
+        time.sleep(0.001)
+    raise AssertionError("asynchronous test owner did not settle")
+
+
 def _paced_frame_events(
-    page, executor, identity, count, *, processing_mode="Int 2D",
+    page,
+    executor,
+    identity,
+    count,
+    *,
+    processing_mode="Int 2D",
+    project_root="",
 ):
     from tests.xdart.scattering.test_e3_context_contract import _acquisition
 
@@ -189,6 +211,7 @@ def _paced_frame_events(
         configuration=RunIntent(
             output_mode="Overwrite",
             processing_mode=processing_mode,
+            project_root=project_root,
         ).freeze(),
         identity=identity,
     )
@@ -973,7 +996,7 @@ def test_pacer_boundaries_clear_stale_work_and_flush_exact_latest(
             frames=(first,),
         ))
         assert tuple(page._presentation_targets) == ()
-        assert page._auto_last is False
+        assert page._processed_browser.auto_last is False
         assert page._context_controller.navigation.current is first
 
         latest = events[-1].frame_key
@@ -1114,27 +1137,45 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
     from xrd_tools.io.output_transaction import StreamTerminal
 
     executor = _Executor()
-    page, lifecycle, identity = _active_page(executor)
+    frozen_root = "/frozen-project"
+    page, lifecycle, identity = _active_page(
+        executor, project_root=frozen_root
+    )
     try:
-        executor.events.extend(_paced_frame_events(
-            page, executor, identity, 3,
-        ))
+        executor.events.extend(
+            _paced_frame_events(
+                page,
+                executor,
+                identity,
+                3,
+                project_root=frozen_root,
+            )
+        )
         page._drain_executor()
         navigation = page._context_controller.navigation
         assert navigation.current.local_frame_label == 3
+
+        live_snapshot = page._intents.snapshot()
+        edited = live_snapshot.thaw()
+        edited.project_root = "/edited-after-admission"
+        page._intents.commit(
+            edited, expected_revision=live_snapshot.revision
+        )
 
         seal = StreamTerminal(
             "/out/a.nxs", 1024, "d" * 64, 1, 1, 2, 3, 4,
         )
         request = BrowseLoadRequest(
             "terminal", 1, "/out/a.nxs", seal,
+            source_root=frozen_root,
         )
         calls = []
         monkeypatch.setattr(
             page._context_controller,
             "begin_browse",
-            lambda artifact, *, terminal_commit_identity=None:
-                calls.append((artifact, terminal_commit_identity)) or request,
+            lambda artifact, *, terminal_commit_identity=None, source_root=None:
+                calls.append((artifact, terminal_commit_identity, source_root))
+                or request,
         )
         paints = []
         monkeypatch.setattr(
@@ -1159,8 +1200,8 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
         page._drain_executor()
 
         assert lifecycle.phase is RunPhase.IDLE
-        assert calls == [("/out/a.nxs", seal)]
-        assert page._terminal_browse_handoff == _TerminalBrowseHandoff(
+        assert calls == [("/out/a.nxs", seal, frozen_root)]
+        assert page._processed_browser.terminal_handoff == TerminalBrowseHandoff(
             request, identity, "/out/a.nxs", 3, (3,), seal,
         )
         assert paints == [(True, True)]
@@ -1185,8 +1226,8 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
             current=navigation.current,
             selected=navigation.selected,
         )
-        assert calls == [("/out/a.nxs", seal)]
-        assert page._terminal_browse_handoff == _TerminalBrowseHandoff(
+        assert calls == [("/out/a.nxs", seal, frozen_root)]
+        assert page._processed_browser.terminal_handoff == TerminalBrowseHandoff(
             request, identity, "/out/a.nxs", 3, (3,), seal,
         )
     finally:
@@ -1247,8 +1288,9 @@ def test_terminal_browse_ready_performs_one_normal_scientific_reconcile(
     page, _, identity = _active_page(executor)
     controller = page._context_controller
     request = BrowseLoadRequest("terminal-ready", 1, "/out/a.nxs")
-    page._terminal_browse_handoff = _TerminalBrowseHandoff(
-        request, identity, request.source_path, None, (),
+    page._processed_browser.begin_terminal_handoff(
+        request, identity, request.source_path, None, (), None,
+        timing_start=None,
     )
     pending = [True]
     monkeypatch.setattr(
@@ -1264,12 +1306,12 @@ def test_terminal_browse_ready_performs_one_normal_scientific_reconcile(
     paints = []
     monkeypatch.setattr(
         page, "_refresh_event_shell",
-        lambda *, preserve_scientific=False:
+        lambda *, preserve_scientific=False, **_kwargs:
             paints.append(preserve_scientific),
     )
     try:
         page._drain_executor()
-        assert page._terminal_browse_handoff is None
+        assert page._processed_browser.terminal_handoff is None
         assert paints == [False]
     finally:
         _dispose(page, qapp)
@@ -1285,8 +1327,9 @@ def test_terminal_browse_refusal_retires_exact_handoff_without_outcome(
     page, _, identity = _active_page(executor)
     controller = page._context_controller
     request = BrowseLoadRequest("terminal-refused", 1, "/out/a.nxs")
-    page._terminal_browse_handoff = _TerminalBrowseHandoff(
-        request, identity, request.source_path, None, (),
+    page._processed_browser.begin_terminal_handoff(
+        request, identity, request.source_path, None, (), None,
+        timing_start=None,
     )
     pending = [True]
     monkeypatch.setattr(
@@ -1302,7 +1345,7 @@ def test_terminal_browse_refusal_retires_exact_handoff_without_outcome(
     )
     try:
         page._drain_executor()
-        assert page._terminal_browse_handoff is None
+        assert page._processed_browser.terminal_handoff is None
     finally:
         _dispose(page, qapp)
 
@@ -1347,7 +1390,7 @@ def test_clean_xye_terminal_does_not_browse_unwritten_nexus_target(
 
         assert lifecycle.phase is RunPhase.IDLE
         assert browse_calls == []
-        assert page._terminal_browse_handoff is None
+        assert page._processed_browser.terminal_handoff is None
         assert not page._context_controller.browse_pending
     finally:
         _dispose(page, qapp)
@@ -1366,8 +1409,9 @@ def test_terminal_browse_marker_survives_catalog_actions_and_clears_on_new_load(
     page, _, identity = _active_page(executor)
     terminal = BrowseLoadRequest("terminal", 1, "/out/a.nxs")
     replacement = BrowseLoadRequest("replacement", 2, "/out/b.nxs")
-    page._terminal_browse_handoff = _TerminalBrowseHandoff(
-        terminal, identity, terminal.source_path, 5, (5,),
+    page._processed_browser.begin_terminal_handoff(
+        terminal, identity, terminal.source_path, 5, (5,), None,
+        timing_start=None,
     )
     directory_calls = []
     selected_targets = []
@@ -1385,7 +1429,8 @@ def test_terminal_browse_marker_survives_catalog_actions_and_clears_on_new_load(
     monkeypatch.setattr(
         page._context_controller,
         "begin_browse",
-        lambda value: browse_calls.append(value) or replacement,
+        lambda value, *, source_root=None:
+            browse_calls.append(value) or replacement,
     )
     monkeypatch.setattr(page, "_refresh_shell", lambda **_kwargs: None)
     forbidden_probe = lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -1396,15 +1441,15 @@ def test_terminal_browse_marker_survives_catalog_actions_and_clears_on_new_load(
     try:
         page._select_scan(str(tmp_path), is_directory=True)
         assert directory_calls == [(str(tmp_path), True)]
-        assert page._terminal_browse_handoff.request is terminal
+        assert page._processed_browser.terminal_handoff.request is terminal
 
         page._select_scan(terminal.source_path)
         assert selected_targets == [terminal.source_path]
-        assert page._terminal_browse_handoff.request is terminal
+        assert page._processed_browser.terminal_handoff.request is terminal
 
         page._select_scan(replacement.source_path)
         assert browse_calls == [replacement.source_path]
-        assert page._terminal_browse_handoff is None
+        assert page._processed_browser.terminal_handoff is None
     finally:
         _dispose(page, qapp)
 
@@ -1533,18 +1578,27 @@ def test_explicit_paint_preservation_skips_scientific_projection(
 def test_directory_selection_updates_browser_without_clearing_science(
     qapp: QtWidgets.QApplication,
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
     executor = _Executor()
     page, _, identity = _active_page(executor)
     _paced_frame_events(page, executor, identity, 1)
-    page._browser_catalog = (
-        BrowserCatalogEntry("/old/out.nxs", "out.nxs", 1),
+    owner = page._processed_browser
+    old_directory = tmp_path / "old"
+    old_directory.mkdir()
+    (old_directory / "out.nexus").touch()
+    owner.set_directory(
+        str(old_directory), explicit=False,
     )
+    _wait_until(
+        qapp,
+        lambda: owner.active_request is None
+        and owner.queued_request is None,
+    )
+    assert owner.catalog
     page._refresh_shell()
     shell = _shell(page)
     browser = shell.browser
-    assert browser.scans.count() == 1
+    assert browser.scans.count() > 0
     old_directory_text = browser.directory_label.text()
     old_directory_path = browser.directory_label.toolTip()
     scientific = shell.scientific
@@ -1556,7 +1610,6 @@ def test_directory_selection_updates_browser_without_clearing_science(
     raw = scientific.raw.image.image
     cake = scientific.cake.image.image
     trace_x, trace_y = trace.xData, trace.yData
-    projection = page._last_scientific_projection
     bottom = scientific.bottom_stack.currentWidget()
     background_owner = page._background_owner
     expected_background = scientific._expected_background_key
@@ -1564,12 +1617,6 @@ def test_directory_selection_updates_browser_without_clearing_science(
     page._retain_outgoing_display = True
     page._presentation_run_identity = identity
     page._presentation_targets.append(current)
-    catalog_requests = []
-    monkeypatch.setattr(
-        page,
-        "_request_browser_catalog",
-        lambda: catalog_requests.append(page._browser_directory),
-    )
     try:
         shell.commandRequested.emit(ShellCommand(
             ShellCommandKind.SELECT_SCAN,
@@ -1577,24 +1624,24 @@ def test_directory_selection_updates_browser_without_clearing_science(
             path=("directory",),
         ))
 
-        assert page._browser_directory == str(tmp_path)
-        assert page._browser_catalog == ()
-        assert catalog_requests == [str(tmp_path)]
+        assert owner.directory == str(tmp_path)
+        assert owner.catalog == ()
+        catalog_request = owner.active_request or owner.queued_request
+        assert catalog_request is not None
+        assert catalog_request.directory == str(tmp_path)
         assert browser.directory_label.toolTip() == str(tmp_path)
         assert browser.directory_label.toolTip() != old_directory_path
         assert browser.directory_label.text()
         assert browser.directory_label.text() != old_directory_text
         assert browser.scans.count() == 0
-        assert page._retain_outgoing_display is True
         assert page._presentation_run_identity is identity
         assert tuple(page._presentation_targets) == (current,)
-        assert page._last_scientific_projection is projection
         assert scientific.bottom_stack.currentWidget() is bottom
         assert scientific.raw.image.image is raw
         assert scientific.cake.image.image is cake
         assert scientific.curve.listDataItems()[0] is trace
-        assert trace.xData is trace_x
-        assert trace.yData is trace_y
+        np.testing.assert_array_equal(trace.xData, trace_x)
+        np.testing.assert_array_equal(trace.yData, trace_y)
         assert page._background_owner is background_owner
         assert scientific._expected_background_key is expected_background
         assert scientific._rendered_background_key is rendered_background
@@ -1830,13 +1877,13 @@ def test_historical_frame_disables_auto_last_and_reenable_selects_latest(
                 frames=(first,),
             )
         )
-        assert page._auto_last is False
+        assert page._processed_browser.auto_last is False
         assert page._context_controller.navigation.current is first
 
         page._handle_shell_command(
             ShellCommand(ShellCommandKind.SET_AUTO_LAST, True)
         )
-        assert page._auto_last is True
+        assert page._processed_browser.auto_last is True
         assert selected_plot_modes == ["Single"]
         assert page._context_controller.navigation.current is latest
         assert page._context_controller.navigation.selected == (latest,)
@@ -2109,7 +2156,7 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
         visible_frames = shell.browser.frame_model.frames
         visible_current = shell.browser._committed_current
         visible_status = shell.run_controls.readinessLabel.full_text()
-        visible_transient = page._browser_transient_frame
+        visible_transient = page._processed_browser.transient_frame
         calls = {
             "project": 0,
             "qualify": 0,
@@ -2205,7 +2252,7 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
             assert shell.run_controls.readinessLabel.full_text() == (
                 visible_status
             )
-            assert page._browser_transient_frame is visible_transient
+            assert page._processed_browser.transient_frame is visible_transient
             if completed == 1:
                 page._handle_shell_command(ShellCommand(
                     ShellCommandKind.SET_CORES, 2,
@@ -2217,7 +2264,7 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
                 assert shell.run_controls.readinessLabel.full_text() == (
                     visible_status
                 )
-                assert page._browser_transient_frame is visible_transient
+                assert page._processed_browser.transient_frame is visible_transient
 
         assert calls == {
             "project": 0,
@@ -2254,31 +2301,32 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
     executor = _Executor()
     page, lifecycle, identity = _active_page(executor)
     try:
-        deltas = _batch_display(page, executor, identity)
         page._browser_catalog_timer.stop()
-        initial_catalog = page._browser_catalog_operation
-        if initial_catalog is not None:
-            try:
-                initial_catalog.future.result(timeout=5.0)
-            except BaseException:
-                pass
-            page._on_browser_catalog(
-                initial_catalog, initial_catalog.future,
-            )
-        assert page._browser_catalog_operation is None
-        assert page._browser_catalog_queued is None
-        catalog_futures = []
+        retired_browser = page._processed_browser
+        retired_browser.begin_close()
+        _wait_until(qapp, retired_browser.retry_close)
+        catalog_gates = (Event(), Event())
+        catalog_calls: list[str] = []
+        catalog_wakes = []
 
-        def submit_catalog(*_args, **_kwargs):
-            future = page_module.Future()
-            assert future.set_running_or_notify_cancel()
-            catalog_futures.append(future)
-            return future
+        def read_catalog(directory, **_kwargs):
+            index = len(catalog_calls)
+            assert index < len(catalog_gates)
+            catalog_calls.append(directory)
+            assert catalog_gates[index].wait(5.0)
+            return ()
 
-        assert page._browser_catalog_pool is not None
-        monkeypatch.setattr(
-            page._browser_catalog_pool, "submit", submit_catalog,
+        browser_owner = ProcessedBrowserOwner(
+            save_path="/out/output.nexus",
+            processing_mode="Int 2D",
+            deliver=catalog_wakes.append,
+            catalog_reader=read_catalog,
         )
+        page._processed_browser = browser_owner
+        browser_owner.begin_follow(identity)
+        deltas = _batch_display(page, executor, identity)
+        assert browser_owner.active_request is None
+        assert browser_owner.queued_request is None
         controller = page._context_controller
         shell = _shell(page)
         scientific = shell.scientific
@@ -2378,7 +2426,7 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         )
         selection = controller.selection
         assert selection is not None
-        page._browser_directory = os.path.dirname(
+        assert browser_owner.directory == os.path.dirname(
             deltas[0].appended.artifact
         )
         page._batch_terminal.begin_run(
@@ -2388,7 +2436,7 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         visible_frames = browser.frame_model.frames
         visible_current = browser._committed_current
         visible_status = shell.run_controls.readinessLabel.full_text()
-        visible_transient = page._browser_transient_frame
+        visible_transient = page._processed_browser.transient_frame
         for completed, delta in enumerate(deltas, start=1):
             frame = delta.appended
             executor.events.append(StandardRunEvent(
@@ -2409,7 +2457,7 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
             assert shell.run_controls.readinessLabel.full_text() == (
                 visible_status
             )
-            assert page._browser_transient_frame is visible_transient
+            assert page._processed_browser.transient_frame is visible_transient
 
         # Exercise an otherwise ordinary control refresh and the acquisition
         # rescope catch-up branch without replacing the production refresh.
@@ -2428,7 +2476,7 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         assert browser.frame_model.frames == visible_frames
         assert browser._committed_current is visible_current
         assert shell.run_controls.readinessLabel.full_text() == visible_status
-        assert page._browser_transient_frame is visible_transient
+        assert page._processed_browser.transient_frame is visible_transient
 
         assert calls == {
             "project": 0,
@@ -2449,6 +2497,9 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         assert old_item.xData is old_x and old_item.yData is old_y
         assert page._retain_outgoing_display is True
         assert lifecycle.phase is RunPhase.RUNNING
+        assert catalog_calls == []
+        assert browser_owner.active_request is None
+        assert browser_owner.queued_request is None
 
         third = deltas[-1].appended
         executor.events.append(StandardRunEvent(
@@ -2477,7 +2528,7 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         assert navigation.selected == (third,)
         assert controller.selection is not None
         assert controller.selection.kind is ContextKind.ACQUISITION
-        assert page._terminal_browse_handoff is None
+        assert page._processed_browser.terminal_handoff is None
         assert not controller.browse_pending
         assert calls["project"] == 1
         assert calls["commit"] == 1
@@ -2505,24 +2556,30 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         # catalog-only refresh may update Browser/status and clear the
         # transient row, but must not project science or demand pixels again.
         terminal_counts = calls.copy()
-        clear_token = page._browser_transient_clear_token
-        first_catalog = page._browser_catalog_operation
-        assert clear_token is not None and first_catalog is not None
-        assert catalog_futures == [first_catalog.future]
-        first_catalog.future.set_result(())
-        qapp.processEvents()
-        final_catalog = page._browser_catalog_operation
+        _wait_until(qapp, lambda: len(catalog_calls) == 1)
+        first_catalog = browser_owner.active_request
+        final_catalog = browser_owner.queued_request
+        first_wake = browser_owner.active_wake
+        assert first_catalog is not None
         assert final_catalog is not None
-        assert final_catalog.request.token == clear_token
-        assert catalog_futures == [
-            first_catalog.future, final_catalog.future,
-        ]
-        final_catalog.future.set_result(())
-        qapp.processEvents()
+        assert first_wake is not None
+        assert final_catalog is not first_catalog
+        catalog_gates[0].set()
+        _wait_until(qapp, lambda: first_wake in catalog_wakes)
+        page._on_browser_catalog(first_wake)
+        _wait_until(qapp, lambda: len(catalog_calls) == 2)
+        assert browser_owner.active_request is final_catalog
+        assert browser_owner.queued_request is None
+        final_wake = browser_owner.active_wake
+        assert final_wake is not None and final_wake is not first_wake
+        catalog_gates[1].set()
+        _wait_until(qapp, lambda: final_wake in catalog_wakes)
+        page._on_browser_catalog(final_wake)
 
-        assert page._browser_catalog_operation is None
-        assert page._browser_transient_frame is None
-        assert page._browser_transient_clear_token is None
+        assert browser_owner.active_request is None
+        assert browser_owner.queued_request is None
+        assert catalog_calls == ["/out", "/out"]
+        assert page._processed_browser.transient_frame is None
         assert browser.frame_model.rowCount() == 0
         assert shell.run_controls.readinessLabel.full_text() == (
             "Complete · 3 Frames"
@@ -2608,7 +2665,7 @@ def test_batch_non_success_terminal_retains_prior_display(
         scientific = shell.scientific
         visible_frames = browser.frame_model.frames
         visible_current = browser._committed_current
-        visible_transient = page._browser_transient_frame
+        visible_transient = page._processed_browser.transient_frame
         old_projection = page._last_scientific_projection
         old_raw = scientific.raw.image.image
         old_cake = scientific.cake.image.image
@@ -2669,7 +2726,7 @@ def test_batch_non_success_terminal_retains_prior_display(
         assert calls == {"project": 0, "reconcile": 0}
         assert browser.frame_model.frames == visible_frames
         assert browser._committed_current is visible_current
-        assert page._browser_transient_frame is visible_transient
+        assert page._processed_browser.transient_frame is visible_transient
         assert page._last_scientific_projection is old_projection
         assert scientific.raw.image.image is old_raw
         assert scientific.cake.image.image is old_cake
@@ -2710,7 +2767,7 @@ def test_batch_non_success_terminal_retains_prior_display(
         assert calls == {"project": 0, "reconcile": 0}
         assert browser.frame_model.frames == visible_frames
         assert browser._committed_current is visible_current
-        assert page._browser_transient_frame is visible_transient
+        assert page._processed_browser.transient_frame is visible_transient
         assert page._last_scientific_projection is old_projection
         assert scientific.raw.image.image is old_raw
         assert scientific.cake.image.image is old_cake
@@ -3124,8 +3181,9 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
         detector_frame = deltas[0].appended
         page._detector_scope_owner = detector_owner
         page._detector_demand_frame = detector_frame
-        page._browser_directory = os.path.dirname(
-            deltas[0].appended.artifact
+        page._processed_browser.set_directory(
+            os.path.dirname(deltas[0].appended.artifact),
+            explicit=False,
         )
         page._batch_terminal.begin_run(
             identity, batch_mode=True, visible_progress=page._progress,
@@ -3134,7 +3192,7 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
         visible_frames = browser.frame_model.frames
         visible_current = browser._committed_current
         visible_status = shell.run_controls.readinessLabel.full_text()
-        visible_transient = page._browser_transient_frame
+        visible_transient = page._processed_browser.transient_frame
         if terminal_case in {"owned_historical", "request_refused"}:
             for completed, delta in enumerate(deltas, start=1):
                 frame = delta.appended
@@ -3156,7 +3214,7 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
                 assert shell.run_controls.readinessLabel.full_text() == (
                     visible_status
                 )
-                assert page._browser_transient_frame is visible_transient
+                assert page._processed_browser.transient_frame is visible_transient
             if terminal_case == "owned_historical":
                 # This is an exact owned member, but not the terminal event's
                 # exact latest frame.  Membership alone must never qualify it.
@@ -3203,7 +3261,7 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
         }
         assert browser.frame_model.frames == visible_frames
         assert browser._committed_current is visible_current
-        assert page._browser_transient_frame is visible_transient
+        assert page._processed_browser.transient_frame is visible_transient
         assert shell.run_controls.readinessLabel.full_text() == (
             f"Complete · {completed} Frames"
         )

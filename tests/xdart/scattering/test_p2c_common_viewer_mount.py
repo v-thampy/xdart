@@ -16,6 +16,7 @@ from xdart.gui.tabs.scattering.batch_terminal_presentation import (
     BatchTerminalPresentationController,
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.processed_browser import ProcessedBrowserOwner
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences, build_scientific_projection
 from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions, ShellCommand, ShellCommandKind, SlicePin
 from xdart.gui.tabs.scattering.state_machine import RunPhase
@@ -76,25 +77,33 @@ class _Mount:
         self.loader.begin = lambda request: (self.events.append("browse"), begin(request))[1]
         self.renderer = _Renderer(self.events)
         self.choice2 = str(self.image)
+        self.processed_browser = ProcessedBrowserOwner(
+            save_path="",
+            processing_mode="Int 2D",
+            deliver=lambda _wake: None,
+            catalog_reader=lambda _directory, **_kwargs: (),
+        )
         self.page = SimpleNamespace(
             _closing=False, _closed=False, _context_controller=self.controller,
             _batch_terminal=BatchTerminalPresentationController(),
-            _terminal_browse_handoff=None,
-            _terminal_browse_presentation=None,
+            _processed_browser=self.processed_browser,
+            _browse_1d_release_debt=None,
             _intents=RunIntentStore(RunIntent(processing_mode="Int 2D")),
+            _analysis_operation_busy=lambda: False,
             _experiment_operation_busy=lambda: False,
             _shell=SimpleNamespace(scientific=self.renderer, browser=SimpleNamespace(
                 cancel_pending_frame_selection=lambda: self.events.append("cancel-browser"))),
             _last_scientific_projection=None, _presentation_targets=[],
-            _viewer_file_chooser=lambda _start: self.choice2,
+            _viewer_2d_file_chooser=lambda _start: self.choice2,
             _viewer_1d_file_chooser=lambda _start: self.paths,
             _notice=lambda value: self.events.append(("notice", value)),
             _error_notice=lambda *value: self.events.append(("error", value)),
             _ensure_timer=lambda: self.events.append("timer"),
-            _refresh_shell=lambda: self.events.append("refresh"))
+            _refresh_shell=lambda **_kwargs: self.events.append("refresh"))
         for name in ("_viewer_1d_start_directory", "_viewer_2d_start_directory",
                      "_clear_viewer_1d_renderer", "_clear_viewer_2d_renderer",
                      "_apply_batch_retirement", "_retire_batch_presentation",
+                     "_release_browse_1d_debt",
                      "_open_viewer_1d_paths", "_open_viewer_2d_path",
                      "_select_scan"):
             setattr(self.page, name, partial(getattr(ScatteringWorkspace, name), self.page))
@@ -148,6 +157,8 @@ class _Mount:
             except Exception: pass
         try: self.controller.close()
         except Exception: pass
+        self.processed_browser.begin_close()
+        self.processed_browser.retry_close()
         self.controller.release_acquisition(self.identity)
         self.acquisition.publication_store.transport.retire(join_timeout=1.0)
 

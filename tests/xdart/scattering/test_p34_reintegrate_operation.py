@@ -12,6 +12,10 @@ import pytest
 from tests.core.test_vnext_p34_existing_replacement import _seed_existing, _stub_integrators
 from tests.xdart.scattering.test_e4_preview_transport import _write_processed
 from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
+from xdart.gui.tabs.scattering.processed_browser import (
+    TerminalBrowseHandoff,
+    TerminalPaintMode,
+)
 from xdart.gui.tabs.scattering.workspace_operations import (
     ReintegrateOperationState,
 )
@@ -26,6 +30,21 @@ def _set_reintegrate_state(page, identity, capture, dimension="1d"):
         identity, capture, dimension
     )
     return page._workspace_operations
+
+
+def _begin_terminal_handoff(page, expected: TerminalBrowseHandoff):
+    handoff = page._processed_browser.begin_terminal_handoff(
+        expected.request,
+        expected.run_identity,
+        expected.source_artifact,
+        expected.current_label,
+        expected.selected_labels,
+        expected.commit_identity,
+        timing_start=None,
+    )
+    assert handoff == expected
+    assert page._processed_browser.terminal_handoff is handoff
+    return handoff
 
 
 @pytest.fixture
@@ -337,17 +356,20 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
                 frame=latest,
                 frames=included,
             ))
-            assert page._auto_last
+            assert page._processed_browser.auto_last
             assert page._context_controller.navigation.current is latest
             assert page._context_controller.navigation.selected == included
 
         real_begin = page._context_controller.begin_browse
         browse_calls = []
+        def begin_browse(artifact, **kwargs):
+            browse_calls.append((artifact, kwargs))
+            return real_begin(artifact, **kwargs)
+
         monkeypatch.setattr(
             page._context_controller,
             "begin_browse",
-            lambda artifact: browse_calls.append(artifact)
-            or real_begin(artifact),
+            begin_browse,
         )
 
         executor.events.append(StandardRunEvent(
@@ -362,11 +384,11 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
         ))
         page._drain_executor()
         assert lifecycle.phase.value == "idle"
-        assert browse_calls == [target]
-        handoff = page._terminal_browse_handoff
+        assert browse_calls == [(target, {"source_root": None})]
+        handoff = page._processed_browser.terminal_handoff
         assert handoff is not None
         assert handoff.request.source_path == resolved_target
-        assert handoff.artifact == target
+        assert handoff.source_artifact == target
         assert page._context_controller.browse_pending
 
         historical = deltas[1].appended
@@ -379,11 +401,11 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
                 frame=historical,
                 frames=(historical,),
             ))
-            assert not page._auto_last
-            assert page._terminal_browse_handoff.current_label == (
+            assert not page._processed_browser.auto_last
+            assert page._processed_browser.terminal_handoff.current_label == (
                 historical.local_frame_label
             )
-            assert page._terminal_browse_handoff.selected_labels == (
+            assert page._processed_browser.terminal_handoff.selected_labels == (
                 historical.local_frame_label,
             )
             if selection_case == "manual-then-auto-last":
@@ -391,7 +413,7 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
                     ShellCommandKind.SET_AUTO_LAST,
                     True,
                 ))
-                assert page._auto_last
+                assert page._processed_browser.auto_last
                 # Acquisition can follow latest immediately, but the terminal
                 # remap snapshot intentionally remains the last explicit
                 # choice. Settlement must apply Auto Last to the authenticated
@@ -403,19 +425,21 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
                 assert page._context_controller.navigation.selected == (
                     historical,
                 )
-                assert page._terminal_browse_handoff.current_label == (
+                assert page._processed_browser.terminal_handoff.current_label == (
                     historical.local_frame_label
                 )
 
         def settled():
             page._drain_executor()
-            return page._context_controller.capture_reintegrate_browse()
+            return page._context_controller.capture_loaded_browse(
+                handoff.request
+            )
 
         captured = _wait(settled)
         assert captured.target == resolved_target
         assert captured.labels == seeded.labels
         assert captured.target_snapshot.exists
-        assert page._terminal_browse_handoff is None
+        assert page._processed_browser.terminal_handoff is None
         assert not page._context_controller.browse_pending
         navigation = page._context_controller.navigation
         expected_current = (
@@ -487,7 +511,6 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
         BrowseLoadOutcome, BrowseLoadStatus,
     )
     from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
-    from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
     from xdart.gui.tabs.scattering.shell_values import (
         FrameNavigationProjection, ShellCommandKind,
     )
@@ -563,7 +586,7 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
         request = context.load_request
         commit_identity = request.terminal_commit_identity
         assert type(commit_identity) is StreamTerminal
-        handoff = _TerminalBrowseHandoff(
+        expected_handoff = TerminalBrowseHandoff(
             request,
             latest.run_identity,
             latest.artifact,
@@ -571,12 +594,16 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
             (latest.local_frame_label,),
             commit_identity,
         )
+        handoff = _begin_terminal_handoff(page, expected_handoff)
         assert page._terminal_scientific_matches(handoff, rebound)
         controller._runtime._set_browse_navigation(rebound)
-        page._terminal_browse_handoff = handoff
+        capture = controller.capture_loaded_browse(request)
+        assert capture is not None and capture.context is context
         assert page._settle_terminal_browse(BrowseLoadOutcome(
             request, BrowseLoadStatus.READY,
         ))
+        presentation = page._processed_browser.terminal_presentation
+        assert presentation is not None
 
         controller._runtime._committed_trace_scope = ("stale",)
         controller._runtime._committed_trace_selection = (clones[-1],)
@@ -615,10 +642,20 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
                 ),
             )
 
+        paint = page._begin_processed_terminal_paint(
+            presentation, reuse_science=True,
+        )
+        assert paint is not None
+        assert paint.mode is TerminalPaintMode.REBIND
+        revision = page._shell_revision
         page._refresh_shell(
             preserve_scientific=True,
             skip_scientific_projection=True,
             rebind_scientific_navigation=True,
+            terminal_paint=paint,
+        )
+        page._complete_processed_terminal_paint(
+            paint, applied=page._shell_revision > revision,
         )
 
         after = page._last_scientific_projection
@@ -670,7 +707,6 @@ def test_terminal_browse_single_rebind_refuses_multi_selected_or_foreign(
     )
     from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
     from xdart.gui.tabs.scattering.events import RunIdentity
-    from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
     from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
     from xrd_tools.io.output_transaction import StreamTerminal
 
@@ -713,7 +749,7 @@ def test_terminal_browse_single_rebind_refuses_multi_selected_or_foreign(
         request = context.load_request
         commit_identity = request.terminal_commit_identity
         assert type(commit_identity) is StreamTerminal
-        handoff = _TerminalBrowseHandoff(
+        expected_handoff = TerminalBrowseHandoff(
             request,
             latest.run_identity,
             latest.artifact,
@@ -721,6 +757,7 @@ def test_terminal_browse_single_rebind_refuses_multi_selected_or_foreign(
             (latest.local_frame_label,),
             commit_identity,
         )
+        handoff = _begin_terminal_handoff(page, expected_handoff)
         assert page._terminal_scientific_matches(handoff, valid)
 
         foreign_identity = RunIdentity(
@@ -757,30 +794,45 @@ def test_terminal_browse_single_rebind_refuses_multi_selected_or_foreign(
         multiple = FrameNavigationProjection(
             clones, clones[-1], (clones[-2], clones[-1]),
         )
-        page._terminal_browse_handoff = replace(
-            handoff,
+        assert page._processed_browser.update_terminal_selection(
+            request,
+            run_identity=handoff.run_identity,
+            source_artifact=handoff.source_artifact,
+            current_label=handoff.current_label,
             selected_labels=(
                 clones[-2].local_frame_label,
                 clones[-1].local_frame_label,
             ),
         )
         controller._runtime._set_browse_navigation(multiple)
+        capture = controller.capture_loaded_browse(request)
+        assert capture is not None and capture.context is context
         assert not page._settle_terminal_browse(BrowseLoadOutcome(
             request, BrowseLoadStatus.READY,
         ))
-        assert page._terminal_rebind_artifacts is None
+        presentation = page._processed_browser.terminal_presentation
+        assert presentation is not None
+        paint = page._begin_processed_terminal_paint(
+            presentation, reuse_science=True,
+        )
+        assert paint is not None
+        assert paint.mode is TerminalPaintMode.REPAINT
         projected = []
-        original_project = controller.project_navigation
+        original_project = controller.project_browse_1d_cache
 
-        def project_navigation(**kwargs):
+        def project_browse_1d_cache(**kwargs):
             result = original_project(**kwargs)
             projected.append(result)
             return result
 
         monkeypatch.setattr(
-            controller, "project_navigation", project_navigation,
+            controller, "project_browse_1d_cache", project_browse_1d_cache,
         )
-        page._refresh_shell()
+        revision = page._shell_revision
+        page._refresh_shell(terminal_paint=paint)
+        page._complete_processed_terminal_paint(
+            paint, applied=page._shell_revision > revision,
+        )
         assert projected
     finally:
         page.close_workspace()
@@ -796,7 +848,6 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
     )
     from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
     from xdart.gui.tabs.scattering.events import RunIdentity
-    from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
     from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
     from xrd_tools.io.output_transaction import StreamTerminal
     from pyqtgraph.Qt import QtCore
@@ -866,12 +917,13 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
         request = context.load_request
         commit_identity = request.terminal_commit_identity
         assert type(commit_identity) is StreamTerminal
-        handoff = _TerminalBrowseHandoff(
+        expected_handoff = TerminalBrowseHandoff(
             request, clones[-1].run_identity, clones[-1].artifact,
             clones[-1].local_frame_label,
             tuple(frame.local_frame_label for frame in clones),
             commit_identity,
         )
+        handoff = _begin_terminal_handoff(page, expected_handoff)
         foreign_identity = RunIdentity(
             run_identity.generation,
             run_identity.fingerprint,
@@ -896,23 +948,36 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
         )
         assert not page._terminal_scientific_rebind_authorized(
             foreign_navigation,
-            (run_identity, handoff.artifact, request.source_path),
+            (run_identity, handoff.source_artifact, request.source_path),
         )
         assert page._terminal_scientific_matches(handoff, rebound)
 
         controller._runtime._set_browse_navigation(rebound)
-        page._terminal_browse_handoff = handoff
+        capture = controller.capture_loaded_browse(request)
+        assert capture is not None and capture.context is context
         assert page._settle_terminal_browse(BrowseLoadOutcome(
             request, BrowseLoadStatus.READY,
         ))
-        assert page._terminal_browse_handoff is None
+        assert page._processed_browser.terminal_handoff is None
+        presentation = page._processed_browser.terminal_presentation
+        assert presentation is not None
         # Cache-backed Browse receipts deliberately cannot zero-copy rebind
         # acquisition arrays.  The first terminal rebind attempt must retain
         # the coherent old paint and schedule the copied-cache fallback.
+        paint = page._begin_processed_terminal_paint(
+            presentation, reuse_science=True,
+        )
+        assert paint is not None
+        assert paint.mode is TerminalPaintMode.REBIND
+        revision = page._shell_revision
         page._refresh_shell(
             preserve_scientific=True,
             skip_scientific_projection=True,
             rebind_scientific_navigation=True,
+            terminal_paint=paint,
+        )
+        page._complete_processed_terminal_paint(
+            paint, applied=page._shell_revision > revision,
         )
         assert page._scientific_repaint_pending
 
@@ -1018,7 +1083,6 @@ def test_terminal_browse_same_labels_changed_content_forces_normal_repaint(
         BrowseLoadOutcome, BrowseLoadStatus,
     )
     from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
-    from xdart.gui.tabs.scattering.page import _TerminalBrowseHandoff
     from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
     from xrd_tools.io.output_transaction import StreamTerminal
 
@@ -1067,7 +1131,7 @@ def test_terminal_browse_same_labels_changed_content_forces_normal_repaint(
             if snapshot.digest != "0" * 64
             else "1" * 64
         )
-        handoff = _TerminalBrowseHandoff(
+        expected_handoff = TerminalBrowseHandoff(
             request,
             clones[-1].run_identity,
             clones[-1].artifact,
@@ -1084,6 +1148,7 @@ def test_terminal_browse_same_labels_changed_content_forces_normal_repaint(
                 accepted_commit.ctime_ns,
             ),
         )
+        handoff = _begin_terminal_handoff(page, expected_handoff)
         assert page._terminal_scientific_matches(handoff, rebound)
 
         stale_arrays = tuple(
@@ -1100,23 +1165,35 @@ def test_terminal_browse_same_labels_changed_content_forces_normal_repaint(
             ),
         )
         controller._runtime._set_browse_navigation(rebound)
-        page._terminal_browse_handoff = handoff
+        capture = controller.capture_loaded_browse(request)
+        assert capture is not None and capture.context is context
         assert not page._settle_terminal_browse(BrowseLoadOutcome(
             request, BrowseLoadStatus.READY,
         ))
+        presentation = page._processed_browser.terminal_presentation
+        assert presentation is not None
+        paint = page._begin_processed_terminal_paint(
+            presentation, reuse_science=False,
+        )
+        assert paint is not None
+        assert paint.mode is TerminalPaintMode.REPAINT
 
         projection_calls = []
-        original_project = controller.project_navigation
+        original_project = controller.project_browse_1d_cache
 
-        def project_navigation(**kwargs):
+        def project_browse_1d_cache(**kwargs):
             value = original_project(**kwargs)
             projection_calls.append(value)
             return value
 
         monkeypatch.setattr(
-            controller, "project_navigation", project_navigation,
+            controller, "project_browse_1d_cache", project_browse_1d_cache,
         )
-        page._refresh_shell()
+        revision = page._shell_revision
+        page._refresh_shell(terminal_paint=paint)
+        page._complete_processed_terminal_paint(
+            paint, applied=page._shell_revision > revision,
+        )
         assert projection_calls
         assert all(
             not np.all(trace.intensity == -123.0)
@@ -1137,7 +1214,7 @@ def test_xye_loaded_browse_disables_and_refuses_reintegrate(
         tmp_path, monkeypatch, qapp,
     )
     try:
-        assert page._context_controller.capture_reintegrate_browse() is not None
+        assert page._capture_current_loaded_browse() is not None
         snapshot = store.snapshot()
         candidate = snapshot.thaw()
         candidate.processing_mode = "Int 1D (XYE)"
@@ -1164,7 +1241,7 @@ def test_xye_loaded_browse_disables_and_refuses_reintegrate(
         page._reintegrate_action("1d")
         assert dispatches == []
         assert "XYE-only output" in page._notice_text
-        assert page._context_controller.capture_reintegrate_browse() is not None
+        assert page._capture_current_loaded_browse() is not None
     finally:
         page.close_workspace()
 
@@ -1494,12 +1571,13 @@ def test_browse_invalidation_terminal_reload_and_foreign_stale_refusal(tmp_path,
     seeded = _seed
     owner = controller._browse_hydration_owner; assert owner is not None
     with owner._one_d_lane._lock: owner._one_d_lane._ready_pending = True
-    captured = controller.capture_reintegrate_browse(); assert captured.context is context and controller.invalidate_reintegrate_browse(captured)
-    request, target = context.load_request, context.requested_path; foreign = replace(request, token=request.token + "-foreign"); assert foreign is not request and controller.reload_reintegrate_browse(foreign, target) is None and controller.browse_context is context and context.invalidated and not context.released
+    request, target = context.load_request, context.requested_path; foreign = replace(request, token=request.token + "-foreign"); assert foreign is not request and controller.capture_loaded_browse(foreign) is None
+    captured = controller.capture_loaded_browse(request); assert captured.context is context and controller.invalidate_reintegrate_browse(captured)
+    assert controller.reload_reintegrate_browse(foreign, target) is None and controller.browse_context is context and context.invalidated and not context.released
     seal = seeded.terminal.commit_identity
     rid = OperationIdentity(77); result = core._value(ReintegrateResult, "COMMITTED", seeded.labels, seeded.labels, (), (), "b"*64, "a"*64, "c"*64, seal); _set_reintegrate_state(page, rid, captured); assert page._consume_reintegrate_update(OperationUpdate(rid, terminal=OperationTerminal(rid, OperationTerminalStatus.RETURNED, payload=result), stale=True))
     reload_request = controller._browse_request
-    assert result.disposition == "COMMITTED" and page._workspace_operations.reintegrate_state is None and reload_request is not None and reload_request is not request and reload_request.terminal_commit_identity is seal and context.released and owner._one_d_lane._closed and not controller.owns_browse_request(request) and page._workspace_operations.pending_reintegrate_reload is None; page.close_workspace()
+    assert result.disposition == "COMMITTED" and page._workspace_operations.reintegrate_state is None and reload_request is not None and reload_request is not request and reload_request.terminal_commit_identity is seal and context.released and owner._one_d_lane._closed and not controller.owns_browse_request(request) and page._processed_browser.pending_reintegrate_reload is None; page.close_workspace()
 def test_same_event_cancels_prepare_and_run_without_false_terminal(monkeypatch):
     from xdart.gui.tabs.scattering.adapters import external_operation as module
     from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationTerminalStatus
@@ -1534,7 +1612,7 @@ def test_reintegrate_request_accepts_exact_dimensions_but_p34b_gui_is_1d_only(tm
     kwargs=dict(target="/target",entry="entry",source_root="/",expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64),expected_labels=(1,),preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}),stamp=OperationContextStamp(0))
     assert slot.begin_reintegrate(dimension="1d",**kwargs) is not None and slot.begin_reintegrate(dimension="2d",**kwargs) is not None and slot.begin_reintegrate(dimension="3d",**kwargs) is None and tuple(f.name for f in fields(type(seen[0]))) == ("target","entry","source_root","expected_target_snapshot","expected_terminal_identity","expected_labels","dimension","preparation_json")
     page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); calls=[]; monkeypatch.setattr(page,"_reintegrate_action",calls.append); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_1d")); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_2d")); assert calls==["1d","2d"]
-    rid=OperationIdentity(77); _reintegrate_slot(page)._identity=rid; captured=page._context_controller.capture_reintegrate_browse(); assert captured is not None; operations=_set_reintegrate_state(page,rid,captured); assert page._context_controller.invalidate_reintegrate_browse(captured)
+    rid=OperationIdentity(77); _reintegrate_slot(page)._identity=rid; captured=page._capture_current_loaded_browse(); assert captured is not None; operations=_set_reintegrate_state(page,rid,captured); assert page._context_controller.invalidate_reintegrate_browse(captured)
     for dimension,matching,other in (("1d",ControlAction.REINTEGRATE_1D,ControlAction.REINTEGRATE_2D),("2d",ControlAction.REINTEGRATE_2D,ControlAction.REINTEGRATE_1D)):
         operations._reintegrate=replace(operations.reintegrate_state,dimension=dimension); actions={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}; assert actions[matching].enabled and actions[matching].label==f"Cancel Reintegrate {dimension[0]}-D" and not actions[other].enabled
     page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_1d")); assert calls==["1d","2d"]; page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_2d")); assert calls==["1d","2d","2d"]
@@ -1626,7 +1704,7 @@ def test_reintegrate_dimensions_share_one_slot_cancel_terminal_and_reload(tmp_pa
     monkeypatch.setattr(module.ReintegratePlan,"from_artifact",staticmethod(cancelled)); page._reintegrate_action("2d"); operations=page._workspace_operations; identity=operations.reintegrate_identity; capture=operations.reintegrate_capture; request=capture.request; target=capture.target; reloads=[]; real_reload=page._context_controller.reload_reintegrate_browse; monkeypatch.setattr(page._context_controller,"reload_reintegrate_browse",lambda got_request,got_target:(reloads.append((got_request,got_target)),real_reload(got_request,got_target))[1]); assert entered.wait(2) and operations.owned and operations.reintegrate_dimension=="2d"
     actions={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}; assert actions[ControlAction.REINTEGRATE_2D].enabled and actions[ControlAction.REINTEGRATE_2D].label=="Cancel Reintegrate 2-D" and not actions[ControlAction.REINTEGRATE_1D].enabled; page._reintegrate_action("1d"); assert not tokens[0].is_set(); page._reintegrate_action("2d"); assert tokens[0].is_set()
     update=_join(_reintegrate_slot(page),identity); assert update.terminal.status is OperationTerminalStatus.CANCELLED and page._consume_reintegrate_update(update) and reloads==[(request,target)] and operations.reintegrate_state is None and page._context_controller._browse_request is not request
-    outcome=_wait(page._context_controller.poll_browse); assert outcome is not None; reloaded_capture=page._context_controller.capture_reintegrate_browse(); assert reloaded_capture is not None; monkeypatch.setattr(_reintegrate_slot(page),"begin_reintegrate",lambda **_kw:None); page._reintegrate_action("2d"); assert operations.reintegrate_state is None
+    outcome=_wait(page._context_controller.poll_browse); assert outcome is not None; reloaded_capture=page._capture_current_loaded_browse(); assert reloaded_capture is not None; monkeypatch.setattr(_reintegrate_slot(page),"begin_reintegrate",lambda **_kw:None); page._reintegrate_action("2d"); assert operations.reintegrate_state is None
     foreign=OperationIdentity(101); _reintegrate_slot(page)._identity=foreign; actions={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}; assert not actions[ControlAction.REINTEGRATE_1D].enabled and not actions[ControlAction.REINTEGRATE_2D].enabled; _reintegrate_slot(page)._identity=None; _set_reintegrate_state(page,foreign,reloaded_capture); page.close_workspace(); assert operations.reintegrate_state is None
 
 def test_active_reintegrate_progress_and_cancel_preserve_invalidated_browse_science(tmp_path, monkeypatch, qapp):
@@ -1655,7 +1733,7 @@ def test_active_reintegrate_progress_and_cancel_preserve_invalidated_browse_scie
     page._reintegrate_action("2d"); assert tokens[0].is_set() and page._notice_text=="Cancelling Reintegrate 2-D…" and page._last_scientific_projection is before and view.trace_history_projections==before_history
     update=_join(_reintegrate_slot(page),identity); assert update.terminal.status is OperationTerminalStatus.CANCELLED and page._consume_reintegrate_update(update) and page._context_controller._browse_request is not request
     def reloaded():
-        page._drain_executor(); captured=page._context_controller.capture_reintegrate_browse()
+        page._drain_executor(); captured=page._capture_current_loaded_browse()
         if captured is None:
             assert page._last_scientific_projection is before and view.trace_history_projections==before_history
         return captured

@@ -6,7 +6,10 @@ from dataclasses import replace
 
 import pytest
 
-from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
+from xdart.gui.tabs.scattering.browse_values import (
+    BrowseLoadRequest,
+    LoadedBrowseCapture,
+)
 from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.gui.tabs.scattering.operation_values import (
     OperationCleanupReceipt,
@@ -19,11 +22,12 @@ from xdart.gui.tabs.scattering.operation_values import (
 )
 from xdart.gui.tabs.scattering.workspace_operations import (
     AverageOperationState,
-    AverageReloadDirective,
-    ReintegrateBrowseCapture,
-    ReintegrateReloadDirective,
     WorkspaceOperationOwner,
     WorkspaceRefreshEffect,
+)
+from xdart.gui.tabs.scattering.processed_browser import (
+    AverageReloadDirective,
+    ReintegrateReloadDirective,
 )
 from xdart.modules.display_context import (
     BrowseContext,
@@ -38,6 +42,7 @@ from xrd_tools.reduction import (
     ReintegrateResult,
 )
 from xrd_tools.reduction import reintegrate as reintegrate_core
+from xrd_tools.session.run_configuration import RunIntent
 
 
 def _seal(target: str, ordinal: int = 1) -> StreamTerminal:
@@ -46,7 +51,7 @@ def _seal(target: str, ordinal: int = 1) -> StreamTerminal:
     )
 
 
-def _capture(target: str = "/detached/scan.nexus") -> ReintegrateBrowseCapture:
+def _capture(target: str = "/detached/scan.nexus") -> LoadedBrowseCapture:
     request = BrowseLoadRequest(
         "capture-token", 1, target, source_root="/detached"
     )
@@ -56,7 +61,7 @@ def _capture(target: str = "/detached/scan.nexus") -> ReintegrateBrowseCapture:
         HydrationOwner("capture-token", "scan", target, 1),
         2,
     )
-    return ReintegrateBrowseCapture(
+    return LoadedBrowseCapture(
         context,
         request,
         selection,
@@ -68,7 +73,7 @@ def _capture(target: str = "/detached/scan.nexus") -> ReintegrateBrowseCapture:
 
 
 def _reintegrate_result(
-    capture: ReintegrateBrowseCapture,
+    capture: LoadedBrowseCapture,
     *,
     disposition: str = "COMMITTED",
     seal: StreamTerminal | None = None,
@@ -194,7 +199,7 @@ def test_reload_directives_require_the_seal_to_name_the_exact_target() -> None:
         AverageReloadDirective(capture.target, capture.entry, foreign)
 
 
-def test_reintegrate_begin_transfers_exact_capture_and_refusal_queues_reload(
+def test_reintegrate_begin_transfers_exact_capture_without_reload_custody(
 ) -> None:
     owner, slot = _owner_with_slot()
     capture = _capture()
@@ -225,10 +230,8 @@ def test_reintegrate_begin_transfers_exact_capture_and_refusal_queues_reload(
         preparation_values=preparation,
         stamp=OperationContextStamp(3),
     ) is None
-    directive = refused.pending_reintegrate_reload
-    assert directive is not None
-    assert directive.request is capture.request
-    assert directive.target == capture.target
+    assert refused.reintegrate_state is None
+    assert not refused.busy
     assert refused_slot.reintegrate_calls
 
 
@@ -253,7 +256,9 @@ def test_reintegrate_terminal_and_lost_owner_always_require_full_reload() -> Non
     ))
     assert transition.effect is WorkspaceRefreshEffect.FULL
     assert owner.reintegrate_state is None
-    assert owner.pending_reintegrate_reload.terminal_commit_identity is seal
+    assert transition.reintegrate_reload is not None
+    assert transition.reintegrate_reload.terminal_commit_identity is seal
+    assert owner.reintegrate_state is None
 
     lost, lost_slot = _owner_with_slot()
     lost_identity = OperationIdentity(12)
@@ -268,7 +273,8 @@ def test_reintegrate_terminal_and_lost_owner_always_require_full_reload() -> Non
     assert transition.effect is WorkspaceRefreshEffect.FULL
     assert "before terminal publication" in transition.notice
     assert lost.reintegrate_state is None
-    assert lost.pending_reintegrate_reload.request is capture.request
+    assert transition.reintegrate_reload is not None
+    assert transition.reintegrate_reload.request is capture.request
 
 
 def test_average_pending_retry_cancel_and_stamp_remain_exact() -> None:
@@ -296,6 +302,30 @@ def test_average_pending_retry_cancel_and_stamp_remain_exact() -> None:
     assert slot.observed == [OperationContextStamp(5)]
     assert owner.cancel_average()
     assert slot.cancel_calls == [identity]
+
+
+def test_average_freezes_project_root_before_worker_dispatch() -> None:
+    owner, slot = _owner_with_slot()
+    identity = OperationIdentity(22)
+    slot.next_identity = identity
+    configuration = RunIntent(project_root="/project").freeze()
+    assert owner.begin_average(
+        configuration,
+        "/detached/average.nexus",
+        revision=3,
+    ) is identity
+    assert owner.average_state is not None
+    assert owner.average_state.source_root == "/project"
+
+    refused, refused_slot = _owner_with_slot()
+    refused_slot.next_identity = OperationIdentity(23)
+    malformed = replace(configuration, project_root="relative/project")
+    assert refused.begin_average(
+        malformed,
+        "/detached/average.nexus",
+        revision=3,
+    ) is None
+    assert refused_slot.average_calls == []
 
 
 def test_average_stale_terminal_never_reloads_and_lost_owner_retires_state(
@@ -327,7 +357,7 @@ def test_average_stale_terminal_never_reloads_and_lost_owner_retires_state(
     assert owner.average_state is None
 
 
-def test_committed_average_reload_remains_owned_until_exact_retirement(
+def test_committed_average_reload_transfers_without_dual_operation_ownership(
 ) -> None:
     owner, slot = _owner_with_slot()
     identity = OperationIdentity(33)
@@ -347,15 +377,9 @@ def test_committed_average_reload_remains_owned_until_exact_retirement(
     )
     directive = transition.average_reload
     assert transition.effect is WorkspaceRefreshEffect.CONTROLS
-    assert directive is owner.pending_average_reload
-    assert owner.average_state is state
-    assert owner.busy
-    assert not owner.retire_average_reload(replace(directive))
-    assert owner.pending_average_reload is directive
-    slot._identity = None
-    assert owner.retire_average_reload(directive)
-    assert owner.pending_average_reload is None
+    assert directive is not None
     assert owner.average_state is None
+    slot._identity = None
     assert not owner.busy
 
 

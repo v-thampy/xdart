@@ -48,7 +48,7 @@ from .browse_preview import (
 )
 from .browse_values import (
     BrowseCleanupReceipt, BrowseLoadOutcome, BrowseLoadRequest,
-    BrowseLoadStatus,
+    BrowseLoadStatus, LoadedBrowseCapture,
 )
 from .context_projection import ContextProjection, ProjectionRequest
 from .context_runtime import _ContextRuntime
@@ -66,7 +66,6 @@ from .state_machine import RunPhase
 from .shell_projection import ScientificPreferences
 from .shell_values import FrameNavigationProjection
 from .hydration_transport import HydrationTransport
-from .workspace_operations import ReintegrateBrowseCapture
 _Viewer1DIntent = namedtuple(
     "_Viewer1DIntent",
     "paths current_path policy generation provider",
@@ -490,14 +489,14 @@ class ContextController:
             and selection.source_path == target
         )
 
-    def capture_reintegrate_browse(
-        self,
-    ) -> ReintegrateBrowseCapture | None:
+    def capture_loaded_browse(
+        self, request: BrowseLoadRequest,
+    ) -> LoadedBrowseCapture | None:
         context, selection = self._runtime.browse_context, self._runtime.selection
-        request = None if context is None else context.load_request
+        owned_request = None if context is None else context.load_request
         labels = () if context is None else context.loaded_labels
-        stable = (not self._closed and self._close is None and self._cleanup_receipt is None and self._browse_request is None and type(context) is BrowseContext and context.loaded and not context.invalidated and not context.released and type(request) is BrowseLoadRequest and request is context.operation and type(selection) is DisplaySelection and selection.kind is ContextKind.BROWSE and selection.names(context) and request.source_path == context.requested_path == selection.source_path and type(context.target_entry) is str and bool(context.target_entry) and type(context.target_snapshot) is TargetSnapshot and context.target_snapshot.exists and type(labels) is tuple and bool(labels) and labels == tuple(sorted(set(labels))) and tuple(context.frame_ids) == labels and all(type(value) is int and value >= 0 for value in labels))
-        return ReintegrateBrowseCapture(
+        stable = (not self._closed and self._close is None and self._cleanup_receipt is None and self._browse_request is None and type(context) is BrowseContext and context.loaded and not context.invalidated and not context.released and type(request) is BrowseLoadRequest and owned_request is request and request is context.operation and type(selection) is DisplaySelection and selection.kind is ContextKind.BROWSE and selection.names(context) and request.source_path == context.requested_path == selection.source_path and type(context.target_entry) is str and bool(context.target_entry) and type(context.target_snapshot) is TargetSnapshot and context.target_snapshot.exists and type(labels) is tuple and bool(labels) and labels == tuple(sorted(set(labels))) and tuple(context.frame_ids) == labels and all(type(value) is int and value >= 0 for value in labels))
+        return LoadedBrowseCapture(
             context,
             request,
             selection,
@@ -508,11 +507,11 @@ class ContextController:
         ) if stable else None
 
     def invalidate_reintegrate_browse(
-        self, capture: ReintegrateBrowseCapture,
+        self, capture: LoadedBrowseCapture,
     ) -> bool:
-        if type(capture) is not ReintegrateBrowseCapture:
+        if type(capture) is not LoadedBrowseCapture:
             return False
-        current = self.capture_reintegrate_browse()
+        current = self.capture_loaded_browse(capture.request)
         if current is None or not capture.is_exactly(current):
             return False
         self._runtime.invalidate_browse(); return True

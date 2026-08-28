@@ -23,9 +23,9 @@ from xdart.gui.tabs.scattering.browser_catalog import (
 from xdart.gui.tabs.scattering.browser_view import BrowserView
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import RunIdentity
-from xdart.gui.tabs.scattering.page import (
-    ScatteringWorkspace,
-    _browser_suffixes_for_mode,
+from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.processed_browser import (
+    browser_suffixes_for_mode,
 )
 from xdart.gui.tabs.scattering.shell_projection import (
     build_browser_projection,
@@ -486,8 +486,8 @@ def test_processed_catalog_includes_parent_and_child_directory_navigation(
     root = tmp_path / "processed"
     root.mkdir()
     (root / "nested").mkdir()
-    (root / "scan_10.nxs").touch()
-    (root / "scan_2.nxs").touch()
+    (root / "scan_10.nexus").touch()
+    (root / "scan_2.nexus").touch()
     (root / "ignored.txt").touch()
 
     catalog = enumerate_processed_artifacts(str(root))
@@ -498,8 +498,8 @@ def test_processed_catalog_includes_parent_and_child_directory_navigation(
     ) == (
         ("..", True),
         ("nested/", True),
-        ("scan_2.nxs", False),
-        ("scan_10.nxs", False),
+        ("scan_2.nexus", False),
+        ("scan_10.nexus", False),
     )
     assert catalog[0].artifact == str(tmp_path)
     assert catalog[1].artifact == str(root / "nested")
@@ -529,9 +529,9 @@ def test_browser_catalog_uses_exact_normal_and_viewer_suffix_policies(
     assert labels(SUPPORTED_VIEWER_SUFFIXES) == (
         "..", "image.tif", "nested/", "scan.nexus",
     )
-    assert _browser_suffixes_for_mode("1D Viewer") == SUPPORTED_VIEWER_1D_SUFFIXES
-    assert _browser_suffixes_for_mode("2D Viewer") == SUPPORTED_VIEWER_SUFFIXES
-    assert _browser_suffixes_for_mode("Int 2D") is None
+    assert browser_suffixes_for_mode("1D Viewer") == SUPPORTED_VIEWER_1D_SUFFIXES
+    assert browser_suffixes_for_mode("2D Viewer") == SUPPORTED_VIEWER_SUFFIXES
+    assert browser_suffixes_for_mode("Int 2D") is None
 
 
 def test_deleted_processed_directory_retains_parent_navigation(
@@ -556,18 +556,18 @@ def test_processed_catalog_naturally_interleaves_directories_and_artifacts(
     root.mkdir()
     (root / "scan_2").mkdir()
     (root / "scan_20").mkdir()
-    (root / "scan_1.nxs").touch()
+    (root / "scan_1.nexus").touch()
     (root / "scan_3.nexus").touch()
-    (root / "scan_10.nxs").touch()
+    (root / "scan_10.nexus").touch()
 
     catalog = enumerate_processed_artifacts(str(root))
 
     assert tuple(entry.label for entry in catalog) == (
         "..",
-        "scan_1.nxs",
+        "scan_1.nexus",
         "scan_2/",
         "scan_3.nexus",
-        "scan_10.nxs",
+        "scan_10.nexus",
         "scan_20/",
     )
 
@@ -1180,14 +1180,14 @@ def test_open_folder_and_refresh_publish_processed_catalog(
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     configured = tmp_path / "configured"
     configured.mkdir()
-    (configured / "initial.nxs").touch()
+    (configured / "initial.nexus").touch()
     selected = tmp_path / "selected"
     selected.mkdir()
-    (selected / "scan_10.nxs").touch()
-    (selected / "scan_2.nxs").touch()
+    (selected / "scan_10.nexus").touch()
+    (selected / "scan_2.nexus").touch()
     nested = selected / "nested"
     nested.mkdir()
-    (nested / "inside.nxs").touch()
+    (nested / "inside.nexus").touch()
     chooser_calls: list[str] = []
 
     def choose(current: str, _start_directory: str) -> str:
@@ -1263,11 +1263,11 @@ def test_open_folder_and_refresh_publish_processed_catalog(
         assert artifacts == [
             str(tmp_path),
             str(nested),
-            str(selected / "scan_2.nxs"),
-            str(selected / "scan_10.nxs"),
+            str(selected / "scan_2.nexus"),
+            str(selected / "scan_10.nexus"),
         ]
 
-        (selected / "scan_1.nxs").touch()
+        (selected / "scan_1.nexus").touch()
         shell.browser.refresh.click()
         wait_for(lambda: shell.browser.scans.count() == 5)
         assert [
@@ -1275,29 +1275,29 @@ def test_open_folder_and_refresh_publish_processed_catalog(
                 QtCore.Qt.ItemDataRole.UserRole
             )
             for index in range(shell.browser.scans.count())
-        ][2] == str(selected / "scan_1.nxs")
+        ][2] == str(selected / "scan_1.nexus")
 
         # An idle external deletion/recreation has no shell command or run
         # event to drive a refresh.  The background catalog poll must evict
         # and later restore the exact filesystem member on its own.
-        (selected / "scan_10.nxs").unlink()
+        (selected / "scan_10.nexus").unlink()
         wait_for(
             lambda: (
                 shell.browser.scans.count() == 4
                 and all(
                     shell.browser.scans.item(index).data(
                         QtCore.Qt.ItemDataRole.UserRole
-                    ) != str(selected / "scan_10.nxs")
+                    ) != str(selected / "scan_10.nexus")
                     for index in range(shell.browser.scans.count())
                 )
             )
         )
-        (selected / "scan_10.nxs").touch()
+        (selected / "scan_10.nexus").touch()
         wait_for(
             lambda: any(
                 shell.browser.scans.item(index).data(
                     QtCore.Qt.ItemDataRole.UserRole
-                ) == str(selected / "scan_10.nxs")
+                ) == str(selected / "scan_10.nexus")
                 for index in range(shell.browser.scans.count())
             )
         )
@@ -1317,7 +1317,7 @@ def test_open_folder_and_refresh_publish_processed_catalog(
             )
         )
 
-        (nested / "inside.nxs").unlink()
+        (nested / "inside.nexus").unlink()
         nested.rmdir()
         wait_for(
             lambda: (
@@ -1411,15 +1411,15 @@ def test_published_artifact_auto_follows_until_user_opens_folder(
     configured.mkdir()
     produced = tmp_path / "processed"
     produced.mkdir()
-    first_artifact = produced / "scan_2.nxs"
+    first_artifact = produced / "scan_2.nexus"
     first_artifact.touch()
     selected = tmp_path / "selected"
     selected.mkdir()
-    selected_artifact = selected / "browse.nxs"
+    selected_artifact = selected / "browse.nexus"
     selected_artifact.touch()
     other = tmp_path / "other"
     other.mkdir()
-    later_artifact = other / "later.nxs"
+    later_artifact = other / "later.nexus"
     later_artifact.touch()
 
     page = ScatteringWorkspace(
@@ -1496,7 +1496,7 @@ def test_published_artifact_auto_follows_until_user_opens_folder(
             0,
             1,
         )
-        page._begin_browser_follow(next_identity)
+        page._processed_browser.begin_follow(next_identity)
         page._follow_processed_artifact(next_frame)
         wait_for(
             lambda: (
@@ -1539,12 +1539,13 @@ def test_terminal_transient_is_retained_until_catalog_barrier(
     frame = DisplayFrameKey(
         identity,
         "atomic-output",
-        str(configured / "atomic-output.nxs"),
+        str(configured / "atomic-output.nexus"),
         0,
         1,
     )
     try:
-        wait_for(lambda: page._browser_catalog_operation is None)
+        wait_for(lambda: page._processed_browser.active_request is None)
+        page._browser_catalog_timer.stop()
         refreshes: list[bool] = []
         refresh_shell = page._refresh_shell
 
@@ -1556,19 +1557,17 @@ def test_terminal_transient_is_retained_until_catalog_barrier(
             )
 
         monkeypatch.setattr(page, "_refresh_shell", record_refresh)
-        page._browser_transient_frame = frame
-        page._request_browser_catalog()
-        operation = page._browser_catalog_operation
-        assert operation is not None
-        page._browser_transient_clear_token = operation.token
+        page._processed_browser.set_transient_frame(frame)
+        request = page._request_browser_catalog()
+        assert request is not None
+        page._processed_browser.mark_transient_catalog_barrier(request)
 
         # The terminal refresh is asynchronous.  Do not create a one-turn
         # blank browser/display seam by dropping the only exact transient
         # owner before the authoritative filesystem result arrives.
-        assert page._browser_transient_frame is frame
-        wait_for(lambda: page._browser_catalog_operation is None)
-        assert page._browser_transient_frame is None
-        assert page._browser_transient_clear_token is None
+        assert page._processed_browser.transient_frame is frame
+        wait_for(lambda: page._processed_browser.active_request is None)
+        assert page._processed_browser.transient_frame is None
         assert refreshes and refreshes[-1] is True
     finally:
         page.close_workspace()
@@ -1610,15 +1609,11 @@ def test_browser_catalog_cooperatively_stops_mid_enumeration(
 def test_browser_catalog_active_plus_latest_queued_never_publishes_stale(
     tmp_path, monkeypatch,
 ) -> None:
-    import xdart.gui.tabs.scattering.page as page_module
+    import xdart.gui.tabs.scattering.processed_browser as browser_owner_module
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     for name in ("a", "b", "c"):
         (tmp_path / name).mkdir()
-    page = ScatteringWorkspace(
-        intents=RunIntentStore(RunIntent(save_path=str(tmp_path))),
-        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
-    )
     entered = Event()
     release = Event()
     calls = []
@@ -1637,26 +1632,39 @@ def test_browser_catalog_active_plus_latest_queued_never_publishes_stale(
         if directory.endswith("/a"):
             entered.set()
             assert release.wait(timeout=5.0)
+        if directory == str(tmp_path):
+            return ()
         return (BrowserCatalogEntry(
-            str(Path(directory) / "result.nxs"), Path(directory).name, 1,
+            str(Path(directory) / "result.nexus"), Path(directory).name, 1,
         ),)
 
+    monkeypatch.setattr(
+        browser_owner_module, "enumerate_processed_artifacts", catalog,
+    )
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(save_path=str(tmp_path))),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+    )
     try:
-        wait_for(lambda: page._browser_catalog_operation is None)
-        monkeypatch.setattr(page_module, "enumerate_processed_artifacts", catalog)
-        page._browser_directory = str(tmp_path / "a")
-        page._request_browser_catalog()
+        wait_for(lambda: page._processed_browser.active_request is None)
+        page._browser_catalog_timer.stop()
+        calls.clear()
+        page._set_browser_directory(str(tmp_path / "a"), explicit=False)
         assert entered.wait(timeout=5.0)
-        page._browser_directory = str(tmp_path / "b")
-        page._request_browser_catalog()
-        page._browser_directory = str(tmp_path / "c")
-        latest = page._request_browser_catalog()
-        assert latest is page._browser_catalog_queued
+        page._set_browser_directory(str(tmp_path / "b"), explicit=False)
+        page._set_browser_directory(str(tmp_path / "c"), explicit=False)
+        latest = page._processed_browser.queued_request
+        assert latest is not None
         assert latest.directory == str(tmp_path / "c")
         release.set()
-        wait_for(lambda: page._browser_catalog_operation is None)
+        wait_for(lambda: (
+            page._processed_browser.active_request is None
+            and page._processed_browser.queued_request is None
+        ))
         assert calls == [str(tmp_path / "a"), str(tmp_path / "c")]
-        assert tuple(entry.label for entry in page._browser_catalog) == ("c",)
+        assert tuple(
+            entry.label for entry in page._processed_browser.catalog
+        ) == ("c",)
     finally:
         release.set()
         page.close_workspace()
@@ -1667,15 +1675,12 @@ def test_browser_catalog_active_plus_latest_queued_never_publishes_stale(
 def test_browser_catalog_cancel_is_nonblocking_until_exact_future_retires(
     tmp_path, monkeypatch,
 ) -> None:
-    import xdart.gui.tabs.scattering.page as page_module
+    from xdart.gui.tabs.scattering.events import CleanupStatus
+    import xdart.gui.tabs.scattering.processed_browser as browser_owner_module
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     selected = tmp_path / "blocked"
     selected.mkdir()
-    page = ScatteringWorkspace(
-        intents=RunIntentStore(RunIntent(save_path=str(tmp_path))),
-        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
-    )
     entered = Event()
     release = Event()
 
@@ -1688,27 +1693,33 @@ def test_browser_catalog_cancel_is_nonblocking_until_exact_future_retires(
             time.sleep(0.005)
         raise AssertionError("catalog cancellation did not settle")
 
-    def blocked(_directory, **_kwargs):
-        entered.set()
-        assert release.wait(timeout=5.0)
+    def blocked(directory, **_kwargs):
+        if directory == str(selected):
+            entered.set()
+            assert release.wait(timeout=5.0)
         return ()
 
+    monkeypatch.setattr(
+        browser_owner_module, "enumerate_processed_artifacts", blocked,
+    )
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(save_path=str(tmp_path))),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+    )
     try:
-        wait_for(lambda: page._browser_catalog_operation is None)
-        monkeypatch.setattr(page_module, "enumerate_processed_artifacts", blocked)
-        page._browser_directory = str(selected)
-        page._request_browser_catalog()
+        wait_for(lambda: page._processed_browser.active_request is None)
+        page._browser_catalog_timer.stop()
+        page._set_browser_directory(str(selected), explicit=False)
         assert entered.wait(timeout=5.0)
         started = time.monotonic()
-        assert page._cancel_browser_catalog() is False
+        pending = page.close_workspace()
+        assert pending.cleanup_status is CleanupStatus.CLEANUP_PENDING
         assert time.monotonic() - started < 0.2
         release.set()
-        wait_for(lambda: (
-            page._browser_catalog_operation is None
-            or page._browser_catalog_operation.future.done()
-        ))
-        assert page._cancel_browser_catalog() is True
-        assert page._browser_catalog_operation is None
+        wait_for(lambda: page._processed_browser.retry_close())
+        cleaned = page.close_workspace()
+        assert cleaned.cleanup_status is CleanupStatus.CLEANED
+        assert page._processed_browser.closed
     finally:
         release.set()
         page.close_workspace()

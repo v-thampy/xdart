@@ -515,7 +515,12 @@ def test_held_overlay_arrow_is_one_bounded_page_refresh(
         def select_navigation(cls, current, selected) -> bool:
             cls.navigation = FrameNavigationProjection(frames, current, selected); return True
 
-    owner = SimpleNamespace(_context_controller=Controller(), _auto_last=True,
+    owner = SimpleNamespace(
+        _context_controller=Controller(),
+        _processed_browser=SimpleNamespace(
+            terminal_handoff=None,
+            set_auto_last=lambda _value: True,
+        ),
         _refresh_shell=lambda: refreshes.append(Controller.navigation), _ensure_timer=lambda: None)
     shell.commandRequested.connect(commands.append)
     shell.commandRequested.connect(lambda row: ScatteringWorkspace._select_frames(owner, row))
@@ -1190,7 +1195,10 @@ def test_active_acquisition_overlay_visit_accumulates_over_arrivals() -> None:
         _context_controller=Controller(),
         _preferences=ScientificPreferences(plot_mode="Overlay"),
         _lifecycle=SimpleNamespace(phase=RunPhase.RUNNING),
-        _auto_last=True,
+        _processed_browser=SimpleNamespace(
+            terminal_handoff=None,
+            set_auto_last=lambda _value: True,
+        ),
         _refresh_shell=lambda: None,
         _ensure_timer=lambda: None,
     )
@@ -1239,7 +1247,10 @@ def test_active_live_overlay_intents_linearize_against_latest_navigation(
         _context_controller=Controller(),
         _preferences=ScientificPreferences(plot_mode="Overlay"),
         _lifecycle=SimpleNamespace(phase=RunPhase.RUNNING),
-        _auto_last=True,
+        _processed_browser=SimpleNamespace(
+            terminal_handoff=None,
+            set_auto_last=lambda _value: True,
+        ),
         _refresh_shell=lambda: None,
         _ensure_timer=lambda: None,
     )
@@ -1318,7 +1329,10 @@ def test_nonactive_or_browse_overlay_adopts_exact_ui_membership(
         _context_controller=Controller(),
         _preferences=ScientificPreferences(plot_mode="Overlay"),
         _lifecycle=SimpleNamespace(phase=phase),
-        _auto_last=True,
+        _processed_browser=SimpleNamespace(
+            terminal_handoff=None,
+            set_auto_last=lambda _value: True,
+        ),
         _refresh_shell=lambda: None,
         _ensure_timer=lambda: None,
     )
