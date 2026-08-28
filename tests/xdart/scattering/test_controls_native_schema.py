@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import fields
+from dataclasses import MISSING, fields
 from pathlib import Path
+
+import pytest
 
 from xdart.gui.tabs.scattering import (
     controls_editing,
@@ -23,6 +25,8 @@ from xrd_tools.session.intent_store import (
     RunIntentStore,
 )
 from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session import readiness
+from xrd_tools.session.readiness import ControlsProjection
 
 
 def test_native_control_schema_has_no_static_widget_metadata():
@@ -77,6 +81,87 @@ def test_vnext_controls_modules_do_not_import_static_binding_schema():
     assert "StaticWidgetBinding" not in renderer_text
 
 
+def test_controls_projection_has_one_required_native_owner_and_renderer_route():
+    projection_fields = fields(ControlsProjection)
+    assert tuple(field.name for field in projection_fields) == (
+        "processing_page",
+        "fields",
+        "section_actions",
+        "detector_summary",
+    )
+    assert all(field.default is MISSING for field in projection_fields)
+    assert all(field.default_factory is MISSING for field in projection_fields)
+
+    readiness_path = Path(readiness.__file__)
+    readiness_tree = ast.parse(
+        readiness_path.read_text(encoding="utf-8"),
+        filename=str(readiness_path),
+    )
+    readiness_classes = {
+        node.name
+        for node in readiness_tree.body
+        if isinstance(node, ast.ClassDef)
+    }
+    assert readiness_classes.isdisjoint({
+        "BoundControlState",
+        "ControlPanelRenderState",
+        "ControlProfile",
+        "ControlState",
+    })
+
+    projection_path = Path(controls_projection.__file__)
+    projection_tree = ast.parse(
+        projection_path.read_text(encoding="utf-8"),
+        filename=str(projection_path),
+    )
+    projected_names = {
+        node.id for node in ast.walk(projection_tree)
+        if isinstance(node, ast.Name)
+    }
+    assert "project_control_fields" in projected_names
+    assert "build_native_control_state" not in projected_names
+
+    controls_renderer = (
+        Path(controls_inventory.__file__).parents[2]
+        / "widgets"
+        / "controls_panel.py"
+    )
+    renderer_tree = ast.parse(
+        controls_renderer.read_text(encoding="utf-8"),
+        filename=str(controls_renderer),
+    )
+    panel_class = next(
+        node for node in renderer_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ControlsPanel"
+    )
+    methods = {
+        node.name for node in panel_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "reconcile" in methods
+    assert methods.isdisjoint({
+        "apply_state_update",
+        "current_form_edits",
+        "set_bound_state",
+        "set_profile",
+        "set_state",
+    })
+
+    run_controls_path = controls_renderer.with_name("run_controls.py")
+    run_controls_text = run_controls_path.read_text(encoding="utf-8")
+    assert "statusLabel" not in run_controls_text
+    assert "def set_run_active" not in run_controls_text
+
+    projected = project_controls(
+        RunIntentStore(RunIntent()).snapshot(),
+        None,
+        RunPhase.IDLE,
+    )
+    assert type(projected) is ControlsProjection
+    with pytest.raises(TypeError):
+        projected.section_actions[next(iter(projected.section_actions))] = ()
+
+
 def test_vnext_edit_commits_to_store_and_freezes_same_revision(tmp_path):
     original_root = tmp_path / "before"
     edited_root = tmp_path / "after"
@@ -84,8 +169,7 @@ def test_vnext_edit_commits_to_store_and_freezes_same_revision(tmp_path):
 
     captured = store.snapshot()
     before = project_controls(captured, None, RunPhase.IDLE)
-    assert before.bound_controls is not None
-    assert before.bound_controls.value_for(PROJECT_ROOT) == str(original_root)
+    assert before.value_for(PROJECT_ROOT) == str(original_root)
 
     candidate = reduce_control_edit(captured, PROJECT_ROOT, str(edited_root))
     assert isinstance(candidate, RunIntent)
@@ -94,8 +178,7 @@ def test_vnext_edit_commits_to_store_and_freezes_same_revision(tmp_path):
     committed = store.commit(candidate, expected_revision=captured.revision)
     assert isinstance(committed, IntentCommitAccepted)
     projected = project_controls(committed.snapshot, None, RunPhase.IDLE)
-    assert projected.bound_controls is not None
-    assert projected.bound_controls.value_for(PROJECT_ROOT) == str(edited_root)
+    assert projected.value_for(PROJECT_ROOT) == str(edited_root)
 
     frozen = store.freeze(expected_revision=committed.revision)
     assert isinstance(frozen, IntentFreezeAccepted)

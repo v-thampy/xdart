@@ -297,7 +297,7 @@ def test_defaulted_bounds_materialize_to_exactly_the_displayed_band(tmp_path):
             field.path: field.value
             for field in project_controls(
                 store.snapshot(), None, RunPhase.IDLE
-            ).bound_controls.fields
+            ).fields
         }
         assert shown[THRESHOLD_MIN] == 0.0
         assert shown[THRESHOLD_MAX] == want_max

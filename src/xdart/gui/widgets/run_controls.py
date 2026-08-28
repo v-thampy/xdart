@@ -95,15 +95,6 @@ class RunControlsBar(QtWidgets.QWidget):
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
                            QtWidgets.QSizePolicy.Policy.Fixed)
 
-        # Run/browse status now shows in the main window's BOTTOM status bar
-        # (wranglerWidget._set_status_text routes there), not in a strip above the
-        # mode row.  Keep this label — parented + hidden, NOT in the layout — only
-        # for back-compat references and the standalone fallback; dropping it from
-        # the layout frees the vertical space it used to occupy at the top.
-        self.statusLabel = QtWidgets.QLabel('', self)
-        self.statusLabel.setObjectName('statusLabel')
-        self.statusLabel.hide()
-
         self.readinessRow = QtWidgets.QWidget()
         self.readinessRow.setObjectName('runReadinessRow')
         readiness = QtWidgets.QHBoxLayout(self.readinessRow)
@@ -285,22 +276,6 @@ class RunControlsBar(QtWidgets.QWidget):
     def _on_write_mode_toggled(self, checked):
         self.writeModeButton.setText('Replace ⇄' if checked else 'Append ⇄')
         self.writeModeChanged.emit(self.write_mode())
-
-    # ── run-state gating (self-contained helper) ──
-    def set_run_active(self, active):
-        """During a run, lock mode/Batch/cores/Live; keep Stop and the action
-        button (now 'Pause') usable.  On exit, the active wrangler's
-        ``_on_mode_changed`` restores the per-mode widget state.
-
-        NOTE: current run-locking is coordinated by the Scattering Workspace,
-        which also gates Start/Stop/Advanced. This self-contained helper stays
-        unit-tested; callers must not double-gate the same controls."""
-        active = bool(active)
-        for w in (self.modeCombo, self.batchButton, self.coresSpin,
-                  self.liveButton, self.writeModeButton):
-            w.setEnabled(not active)
-        if active:
-            self.stopButton.setEnabled(True)
 
     def set_run_row_visible(self, visible):
         """Show/hide the ACTION row (Live/Start/Stop) + its divider.  Hidden in

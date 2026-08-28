@@ -93,14 +93,14 @@ def test_viewer_aliases_share_one_headless_parser_and_2d_is_mounted() -> None:
         one_d_snapshot, None, RunPhase.IDLE, advanced_editor_available=True)
     assert (snapshot.thaw().processing_mode, Tool.IMAGE_VIEWER.value, Tool.XYE_VIEWER.value, Mode.IMAGE_VIEWER.value, Mode.XYE_VIEWER.value, ProcessingPage.VIEWER.value) == (
         "2D Viewer", "image_viewer", "xye_viewer", "image_viewer", "xye_viewer", "viewer")
-    assert controls.profile.processing_page is ProcessingPage.VIEWER
-    assert all(not field.enabled for field in controls.bound_controls.fields)
-    assert all(not action.enabled for actions in controls.profile.section_actions.values()
+    assert controls.processing_page is ProcessingPage.VIEWER
+    assert all(not field.enabled for field in controls.fields)
+    assert all(not action.enabled for actions in controls.section_actions.values()
                for action in actions)
-    assert one_d_controls.profile.processing_page is ProcessingPage.VIEWER
-    assert all(not field.enabled for field in one_d_controls.bound_controls.fields)
-    assert {field.reason for field in one_d_controls.bound_controls.fields} == {"1D Viewer has no acquisition authority."}
-    assert all(not action.enabled for actions in one_d_controls.profile.section_actions.values()
+    assert one_d_controls.processing_page is ProcessingPage.VIEWER
+    assert all(not field.enabled for field in one_d_controls.fields)
+    assert {field.reason for field in one_d_controls.fields} == {"1D Viewer has no acquisition authority."}
+    assert all(not action.enabled for actions in one_d_controls.section_actions.values()
                for action in actions)
     assert RUN_MODE_CHOICES == _EXPECTED_MODES
     assert UNOWNED_RUN_MODE_REASONS == _EXPECTED_DISABLED_REASONS
@@ -313,7 +313,7 @@ def test_xye_output_uses_the_existing_int1d_trace_and_center_layout(
     controls = project_controls(
         RunIntentStore(intent).snapshot(), None, RunPhase.IDLE,
     )
-    paths = {field.path for field in controls.bound_controls.fields}
+    paths = {field.path for field in controls.fields}
     assert ("Int1D", "axis") in paths
     assert ("Mask", "Threshold") in paths
     assert ("Signal", "series_average") not in paths

@@ -111,7 +111,7 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
     try:
         intent = _intent()
         intent.gi.enabled = True
-        panel.set_state(
+        panel.reconcile(
             project_controls(
                 RunIntentStore(intent).snapshot(),
                 None,
@@ -120,7 +120,7 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
         )
         # Reproduce the mounted Controls redraw that used to leave the native
         # Tight popup container at approximately one closed-control height.
-        panel.set_state(
+        panel.reconcile(
             project_controls(
                 RunIntentStore(intent).snapshot(),
                 None,
@@ -262,7 +262,7 @@ def test_tight_combo_popup_rows_keep_independent_readable_height(
     panel = ControlsPanel()
     combo = None
     try:
-        panel.set_state(
+        panel.reconcile(
             project_controls(
                 RunIntentStore(_intent()).snapshot(),
                 None,

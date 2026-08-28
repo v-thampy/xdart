@@ -113,7 +113,7 @@ def _intent(tmp_path: Path) -> RunIntent:
 def _action(state):
     return next(
         action
-        for action in state.profile.actions_for(SectionId.PROCESSING)
+        for action in state.actions_for(SectionId.PROCESSING)
         if action.action is ControlAction.ADVANCED_PROCESSING
     )
 

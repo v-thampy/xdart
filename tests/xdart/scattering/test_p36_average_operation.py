@@ -1727,7 +1727,7 @@ def test_average_control_and_edit_are_integration_mode_only(
     projected = project_controls(snapshot, None, RunPhase.IDLE)
     paths = {
         field.path
-        for field in projected.bound_controls.fields
+        for field in projected.fields
     }
     assert (AVERAGE_SCAN in paths) is visible
     edited = reduce_control_edit(snapshot, AVERAGE_SCAN, True)

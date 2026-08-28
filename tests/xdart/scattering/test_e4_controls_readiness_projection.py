@@ -33,8 +33,7 @@ from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from xdart.gui.widgets.controls_panel import ControlsPanel
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.readiness import (
-    BoundControlState,
-    ControlPanelRenderState,
+    ControlsProjection,
 )
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.core.scan import SourceKind, SourceSpec
@@ -61,7 +60,7 @@ def _dispose(widget: QtWidgets.QWidget) -> None:
 
 
 def _controls_readiness(
-    state: ControlPanelRenderState,
+    state: ControlsProjection,
 ) -> ControlsReadinessProjection:
     return ControlsReadinessProjection(
         project_header_projection(state),
@@ -563,16 +562,13 @@ def test_shell_reapplies_observed_source_and_typed_processing_readiness() -> Non
         )
 
         controls = state.controls
-        bound = controls.bound_controls
-        assert bound is not None
-        incomplete = BoundControlState(tuple(
-            field
-            for field in bound.fields
-            if field.path != ("Int2D", "azim_points")
-        ))
-        incomplete_controls = ControlPanelRenderState(
-            controls.profile,
-            incomplete,
+        incomplete_controls = replace(
+            controls,
+            fields=tuple(
+                field
+                for field in controls.fields
+                if field.path != ("Int2D", "azim_points")
+            ),
         )
         shell.apply_state(replace(
             state,
@@ -739,10 +735,10 @@ def test_detector_header_reports_mounted_poni_detector_facts(
         show_section_numbers=False,
     )
     try:
-        assert state.profile.detector_summary == (
+        assert state.detector_summary == (
             "RayonixMx225 · 179.4mm · fitted"
         )
-        panel.set_state(state)
+        panel.reconcile(state)
         detector = next(
             child
             for child in panel.experiment_card.findChildren(

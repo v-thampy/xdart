@@ -3267,10 +3267,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _commit_focused_control_edit_for_run(self) -> bool:
         """Commit the one active editor before capturing the next run.
 
-        ``ControlsPanel.current_form_edits()`` is diagnostic only.  The
-        focused editor is the sole presentation value that can be newer than
-        the revisioned intent when an action arrives before
-        ``editingFinished``.
+        The focused editor is the sole presentation value that can be newer
+        than the revisioned intent when an action arrives before
+        ``editingFinished``; the renderer never owns a second form snapshot.
         """
 
         try:
@@ -6198,14 +6197,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             projection = replace(
                 projection,
-                controls=replace(
-                    projection.controls,
-                    profile=replace(
-                        projection.controls.profile,
-                        run_enabled=True,
-                        run_blockers=(),
-                    ),
-                ),
                 run=replace(
                     projection.run,
                     readiness=pending_readiness,
@@ -6476,14 +6467,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     for action in actions
                 )
                 for section, actions
-                in controls.profile.section_actions.items()
+                in controls.section_actions.items()
             }
             controls = replace(
                 controls,
-                profile=replace(
-                    controls.profile,
-                    section_actions=section_actions,
-                ),
+                section_actions=section_actions,
             )
         project_key = (
             str(intent.project_root or ""),
@@ -7907,15 +7895,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if path in {SOURCE_FILE, SOURCE_DIRECTORY}:
             snapshot = self._intents.snapshot()
             state = self._project_controls(snapshot)
-            fields = (
-                ()
-                if state.bound_controls is None
-                else state.bound_controls.fields
-            )
             source_type = next(
                 (
                     str(candidate.value)
-                    for candidate in fields
+                    for candidate in state.fields
                     if candidate.path == SOURCE_TYPE
                 ),
                 None,
@@ -7928,13 +7911,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         snapshot = self._intents.snapshot()
         state = self._project_controls(snapshot)
-        fields = (
-            ()
-            if state.bound_controls is None
-            else state.bound_controls.fields
-        )
         field = next(
-            (candidate for candidate in fields if candidate.path == path),
+            (
+                candidate
+                for candidate in state.fields
+                if candidate.path == path
+            ),
             None,
         )
         if field is None:

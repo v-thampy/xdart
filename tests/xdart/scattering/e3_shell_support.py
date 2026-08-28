@@ -5,15 +5,14 @@ import numpy as np
 from xrd_tools.session.readiness import (
     ControlAction,
     ControlActionSpec,
-    ControlPanelRenderState,
-    ControlProfile,
+    ControlsProjection,
     ProcessingPage,
     SectionId,
     Tool,
 )
 
 from xdart.gui.tabs.scattering.controls_inventory import (
-    build_native_control_state,
+    project_control_fields,
 )
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.controls_readiness import (
@@ -173,7 +172,7 @@ def _heavy(frame: DisplayFrameKey) -> HeavyProjection:
     return HeavyProjection(frame, raw, cake, q, chi)
 
 
-def _control_state(phase: ShellPhase) -> ControlPanelRenderState:
+def _control_state(phase: ShellPhase) -> ControlsProjection:
     unlocked = phase in {ShellPhase.IDLE, ShellPhase.FAILED}
     values = {
         ("Project", "project_folder"): "/project",
@@ -232,7 +231,7 @@ def _control_state(phase: ShellPhase) -> ControlPanelRenderState:
         ("Int2D", "axis"): ("Q-χ", "2θ-χ"),
         ("BG", "bg_type"): ("None", "File"),
     }
-    fields = build_native_control_state(
+    fields = project_control_fields(
         values,
         choices,
         tool=Tool.INT_2D,
@@ -249,14 +248,12 @@ def _control_state(phase: ShellPhase) -> ControlPanelRenderState:
             ControlActionSpec(ControlAction.ADVANCED_PROCESSING, "Advanced", SectionId.PROCESSING, unlocked),
         ),
     }
-    profile = ControlProfile(
+    return ControlsProjection(
         ProcessingPage.INT_2D,
-        unlocked,
-        () if unlocked else ("Run active",),
+        tuple(fields),
         section_actions=actions,
         detector_summary="Pilatus - Standard",
     )
-    return ControlPanelRenderState(profile, fields)
 
 
 def _frozen(value: np.ndarray) -> np.ndarray:

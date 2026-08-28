@@ -80,19 +80,6 @@ def test_profile_hides_live_and_batch(qapp):
         ['Int 1D + 2D', 'Int 1D']
 
 
-def test_run_active_locks_controls(qapp):
-    c = RunControlsBar()
-    c.set_run_active(True)
-    assert not c.modeCombo.isEnabled()
-    assert not c.batchButton.isEnabled()
-    assert not c.coresSpin.isEnabled()
-    assert not c.liveButton.isEnabled()
-    assert c.stopButton.isEnabled()                # Stop stays live during a run
-    c.set_run_active(False)
-    assert c.modeCombo.isEnabled()
-    assert c.liveButton.isEnabled()
-
-
 def test_mode_row_enabled_locks_mode_batch_cores(qapp):
     """The mode row (mode combo + Batch + Cores) locks during a run while the
     action row stays usable.  Owned by _enter/_exit_run_state so a reintegrate

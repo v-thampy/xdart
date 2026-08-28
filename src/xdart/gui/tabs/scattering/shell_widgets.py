@@ -12,7 +12,7 @@ from xdart.gui.widgets.image_widget import pgImageWidget
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.display_logic import pretty_unit, x_axis_for_unit
 from xrd_tools.session.readiness import (
-    ControlPanelRenderState,
+    ControlsProjection,
     ProcessingPage,
 )
 from xrd_tools.sources.selection import (
@@ -497,7 +497,7 @@ class ContentFitComboBox(QtWidgets.QComboBox):
 
 
 def project_header_projection(
-    state: ControlPanelRenderState,
+    state: ControlsProjection,
 ) -> SectionHeaderProjection:
     """Qualify PROJECT from the mounted intent's directory facts."""
 
@@ -514,7 +514,7 @@ def project_header_projection(
 
 
 def experiment_header_projection(
-    state: ControlPanelRenderState,
+    state: ControlsProjection,
 ) -> SectionHeaderProjection:
     """Qualify EXPERIMENT from the production parsed-PONI fact."""
 
@@ -652,24 +652,23 @@ def source_header_projection(
 
 
 def processing_header_projection(
-    state: ControlPanelRenderState,
+    state: ControlsProjection,
 ) -> SectionHeaderProjection:
     """Qualify typed processing fields without borrowing whole-run readiness."""
 
-    if type(state) is not ControlPanelRenderState:
+    if type(state) is not ControlsProjection:
         raise TypeError(
-            "processing header requires an exact ControlPanelRenderState"
+            "processing header requires an exact ControlsProjection"
         )
-    page = state.profile.processing_page
+    page = state.processing_page
     text = str(getattr(page, "value", page)).replace("_", " ")
-    bound = state.bound_controls
-    if bound is None or page not in {
+    if page not in {
         ProcessingPage.INT_1D,
         ProcessingPage.INT_2D,
     }:
         return SectionHeaderProjection(text)
 
-    values = {field.path: field.value for field in bound.fields}
+    values = {field.path: field.value for field in state.fields}
     required = [
         (("Int1D", "axis"), _nonempty_text),
         (("Int1D", "points"), _positive_int),
@@ -747,19 +746,14 @@ def _apply_section_header(
 
 
 def _bound_values(
-    state: ControlPanelRenderState,
+    state: ControlsProjection,
     owner: str,
 ) -> dict[tuple[str, ...], object]:
-    if type(state) is not ControlPanelRenderState:
+    if type(state) is not ControlsProjection:
         raise TypeError(
-            f"{owner} header requires an exact ControlPanelRenderState"
+            f"{owner} header requires an exact ControlsProjection"
         )
-    bound = state.bound_controls
-    return (
-        {}
-        if bound is None
-        else {field.path: field.value for field in bound.fields}
-    )
+    return {field.path: field.value for field in state.fields}
 
 
 def _nonempty_text(value: object) -> bool:

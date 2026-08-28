@@ -3047,7 +3047,7 @@ def test_batch_run_click_projects_phase_and_control_lock_without_display_repaint
 
     def capture_apply(state, *, preserve_display=False):
         original_apply(state, preserve_display=preserve_display)
-        fields = state.controls.bound_controls.fields
+        fields = state.controls.fields
         captures.append(
             (
                 state.run.phase.value,

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.readiness import (
-    BoundControlState,
     ControlAction,
     ControlActionSpec,
     ControlFieldKind,
-    ControlPanelRenderState,
-    ControlProfile,
+    ControlsProjection,
     ProcessingPage,
     SectionId,
     Tool,
@@ -78,7 +77,7 @@ from .controls_inventory import (
     THRESHOLD_MAX,
     THRESHOLD_MIN,
     bound_values,
-    build_native_control_state,
+    project_control_fields,
     field,
     source_name,
     source_mode,
@@ -106,7 +105,7 @@ def project_controls(
     reintegrate_available: bool = False,
     reintegrate_active: bool = False,
     reintegrate_dimension: str | None = None,
-) -> ControlPanelRenderState:
+) -> ControlsProjection:
     intent = snapshot.thaw()
     raw_motor = intent.gi.incidence_motor
     motor_value = raw_motor
@@ -135,7 +134,7 @@ def project_controls(
     processing_mode = str(intent.processing_mode or "")
     tool = tool_from_mode_text(processing_mode)
     viewer = tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER}
-    projected = build_native_control_state(
+    projected = project_control_fields(
         values,
         choices,
         tool=tool,
@@ -147,7 +146,7 @@ def project_controls(
         if unlocked
         else "Controls are locked during the active run."
     )
-    fields = list(projected.fields)
+    fields = list(projected)
     gi_paths = {GI_MOTOR, GI_THETA, GI_ORIENTATION, GI_TILT}
     fields = [
         candidate for candidate in fields
@@ -331,7 +330,7 @@ def project_controls(
             ),
         )
     }
-    profile = ControlProfile(
+    return ControlsProjection(
         processing_page=(
             ProcessingPage.VIEWER
             if tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER}
@@ -339,8 +338,7 @@ def project_controls(
             if tool is Tool.INT_1D
             else ProcessingPage.INT_2D
         ),
-        run_enabled=False,
-        run_blockers=("Execution is introduced in E1b.",),
+        fields=tuple(fields),
         section_actions=actions,
         detector_summary=(
             detector_summary(
@@ -350,10 +348,6 @@ def project_controls(
             if detector_summary_override is None
             else detector_summary_override
         ),
-    )
-    return ControlPanelRenderState(
-        profile,
-        BoundControlState(tuple(fields)),
     )
 
 

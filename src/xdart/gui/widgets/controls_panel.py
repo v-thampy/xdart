@@ -11,20 +11,17 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.gui.themes.spacing import SpacingTokens, current_spacing_tokens
 
 from xrd_tools.session.readiness import (
-    AnalysisLauncherSpec,
-    BoundControlState,
     ControlAction,
     ControlActionSpec,
     ControlFieldKind,
     ControlFormEdit,
     ControlFormField,
-    ControlPanelRenderState,
-    ControlProfile,
-    FieldId,
-    FieldStatus,
+    ControlsProjection,
+    ProcessingPage,
     SectionId,
-    StatusKind,
 )
+
+
 def _spaced(base: int, tokens: SpacingTokens) -> int:
     """Scale a base layout value while keeping Normal byte-compatible."""
     return max(0, base + tokens.layout_gap - 8)
@@ -43,13 +40,10 @@ _SECTION_META = {
     SectionId.EXPERIMENT: ("2", "EXPERIMENT", "experiment"),
     SectionId.SOURCE: ("3", "SOURCE", "source"),
     SectionId.PROCESSING: ("4", "PROCESSING", "processing"),
-    SectionId.OUTPUT: ("", "OUTPUT", "neutral"),
-    SectionId.ANALYSIS: ("", "ANALYSIS", "neutral"),
 }
 
 _ACTION_LABELS = {
     ControlAction.CALIBRATE: "⌖ Calibrate",
-    ControlAction.REFINE_GEOMETRY: "◎ Refine",
     ControlAction.MAKE_MASK: "▦ Make Mask",
 }
 
@@ -108,7 +102,6 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
 _ACTION_TOOLTIPS: dict[ControlAction, str] = {
     ControlAction.CALIBRATE: "Run pyFAI calibration to produce a PONI (detector geometry) file.",
     ControlAction.MAKE_MASK: "Build a detector mask from a chosen TIFF image.",
-    ControlAction.REFINE_GEOMETRY: "Refine the diffractometer geometry from the loaded scan.",
     ControlAction.ADVANCED_PROCESSING: "Open the advanced integration settings (full parameter tree).",
     ControlAction.REINTEGRATE_1D: "Re-integrate the loaded scan to 1D with the current settings.",
     ControlAction.REINTEGRATE_2D: "Re-integrate the loaded scan to 2D with the current settings.",
@@ -132,46 +125,6 @@ _SOURCE_ENERGY_OPTIONS = (("PONI", "poni"), ("Metadata", "metadata"))
 _FULL_PATH_DISPLAY_PATHS = {
     ("Project", "project_folder"),
 }
-
-
-class StatusBadge(QtWidgets.QLabel):
-    """Small status label used by card rows."""
-
-    def __init__(self, text: str = "", parent=None):
-        super().__init__(text, parent)
-        self.setObjectName("controlsV2StatusBadge")
-
-    def set_status(self, text: str, severity: str = "info") -> None:
-        self.setText(text)
-        self.setProperty("severity", severity)
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-
-class LauncherButton(QtWidgets.QPushButton):
-    """Analysis launcher button carrying its launcher spec."""
-
-    launched = QtCore.Signal(object)
-
-    def __init__(self, spec: AnalysisLauncherSpec, parent=None):
-        super().__init__(spec.label, parent)
-        self.setObjectName("controlsV2LauncherButton")
-        self._spec = spec
-        self.clicked.connect(lambda: self.launched.emit(self._spec.tool))
-        self.apply_spec(spec)
-
-    @property
-    def spec(self) -> AnalysisLauncherSpec:
-        return self._spec
-
-    def apply_spec(self, spec: AnalysisLauncherSpec) -> None:
-        self._spec = spec
-        self.setText(spec.label)
-        self.setEnabled(bool(spec.enabled))
-        self.setToolTip(spec.reason or "")
-        self.setProperty("productionReady", bool(spec.production_ready))
-        self.style().unpolish(self)
-        self.style().polish(self)
 
 
 class ActionButton(QtWidgets.QPushButton):
@@ -557,40 +510,6 @@ class SubsectionCard(QtWidgets.QFrame):
     def add_header_widget(self, widget: QtWidgets.QWidget) -> None:
         self.header_extra_layout.addWidget(widget)
         self.header_extra.show()
-
-
-class FieldRow(QtWidgets.QWidget):
-    """One typed field row rendered from ``FieldStatus``."""
-
-    def __init__(self, status: FieldStatus, parent=None):
-        super().__init__(parent)
-        self.setObjectName("controlsV2FieldRow")
-        self._status = status
-        lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(5)
-        self.label = QtWidgets.QLabel(status.label)
-        self.label.setObjectName("controlsV2FieldLabel")
-        self.label.setMinimumWidth(72)
-        self.value = QtWidgets.QLabel(status.value or status.reason or status.status.value)
-        self.value.setObjectName("controlsV2FieldValue")
-        self.value.setWordWrap(False)
-        self.value.setSizePolicy(
-            QtWidgets.QSizePolicy.Ignored,
-            QtWidgets.QSizePolicy.Preferred,
-        )
-        self.badge = StatusBadge(status.status.value)
-        self.badge.set_status(status.status.value, status.status.value)
-        self.badge.setMinimumWidth(48)
-        self.badge.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        lay.addWidget(self.label)
-        lay.addWidget(self.value, 1)
-        lay.addWidget(self.badge)
-        self.setToolTip(status.reason or status.headless_key or status.session_key)
-
-    @property
-    def status(self) -> FieldStatus:
-        return self._status
 
 
 class _ComboPopupItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -1150,17 +1069,10 @@ class PillRow(QtWidgets.QWidget):
 
     valueChanged = QtCore.Signal(object, object)
 
-    #: Fallback tooltip for a profile that deliberately mirrors a fact
-    #: whose editor lives elsewhere.  Current vNext controls do not use this
-    #: path: Mask Saturated is an independent editable fact.
-    _DISPLAY_ONLY_TOOLTIP = "Set by another control."
-
     def __init__(
         self,
         fields: Sequence[ControlFormField],
         parent=None,
-        *,
-        display_only_paths: frozenset[tuple[str, ...]] = frozenset(),
     ):
         super().__init__(parent)
         self.setObjectName("controlsV2PillRow")
@@ -1168,9 +1080,6 @@ class PillRow(QtWidgets.QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
         self._pills: list[tuple[tuple[str, ...], QtWidgets.QPushButton]] = []
-        self._display_only = frozenset(
-            tuple(path) for path in display_only_paths
-        )
         for field in fields:
             btn = QtWidgets.QPushButton(field.label)
             # Reuse the accent-when-checked toggle styling, but content-sized and
@@ -1182,12 +1091,8 @@ class PillRow(QtWidgets.QWidget):
             btn.setObjectName("controlsV2PillButton")
             btn.setCheckable(True)
             btn.setChecked(bool(field.value))
-            display_only = tuple(field.path) in self._display_only
-            btn.setEnabled(bool(field.enabled) and not display_only)
-            btn.setToolTip(
-                self._DISPLAY_ONLY_TOOLTIP
-                if display_only
-                else _field_tooltip(field.path, field.reason))
+            btn.setEnabled(bool(field.enabled))
+            btn.setToolTip(_field_tooltip(field.path, field.reason))
             btn.setSizePolicy(
                 QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed
             )
@@ -1203,7 +1108,6 @@ class PillRow(QtWidgets.QWidget):
         return tuple(
             (p, bool(btn.isChecked()))
             for p, btn in self._pills
-            if p not in self._display_only
         )
 
     def apply_fields(
@@ -1221,12 +1125,8 @@ class PillRow(QtWidgets.QWidget):
                     btn.setChecked(checked)
             finally:
                 btn.blockSignals(was_blocked)
-            display_only = path in self._display_only
-            btn.setEnabled(bool(field.enabled) and not display_only)
-            btn.setToolTip(
-                self._DISPLAY_ONLY_TOOLTIP
-                if display_only
-                else _field_tooltip(field.path, field.reason))
+            btn.setEnabled(bool(field.enabled))
+            btn.setToolTip(_field_tooltip(field.path, field.reason))
         return True
 
 
@@ -1312,13 +1212,12 @@ class SegmentedControl(QtWidgets.QWidget):
 
 
 class ControlsPanel(QtWidgets.QWidget):
-    """Render :class:`ControlProfile` and bound field state.
+    """Render one immutable :class:`ControlsProjection`.
 
     It emits intents only. The owning page builds state and decides how to
     handle actions and field edits.
     """
 
-    analysisLaunchRequested = QtCore.Signal(object)
     controlActionRequested = QtCore.Signal(object)
     fieldValueChanged = QtCore.Signal(object, object)
     #: A focused, still-uncommitted line-editor draft (§12.4) — revisioned at
@@ -1349,31 +1248,16 @@ class ControlsPanel(QtWidgets.QWidget):
         # Roomier gap between the workflow sections for visual separation (Vivek).
         lay.setSpacing(12)
 
-        self.top_action_bar = QtWidgets.QWidget()
-        self.top_action_bar.setObjectName("controlsV2TopActionBar")
-        self.top_action_layout = QtWidgets.QHBoxLayout(self.top_action_bar)
-        self.top_action_layout.setContentsMargins(0, 0, 0, 0)
-        self.top_action_layout.setSpacing(7)
-        self.top_action_bar.hide()
-
-        self.summary_card = SectionCard("Run Readiness", collapsible=False)
         self.project_card = self._make_section(SectionId.PROJECT)
         self.source_card = self._make_section(SectionId.SOURCE)
         self.experiment_card = self._make_section(SectionId.EXPERIMENT)
         self.processing_card = self._make_section(SectionId.PROCESSING)
-        self.output_card = self._make_section(SectionId.OUTPUT)
-        self.analysis_card = self._make_section(SectionId.ANALYSIS)
-        lay.addWidget(self.top_action_bar)
-        lay.addWidget(self.summary_card)
         lay.addWidget(self.project_card)
         lay.addWidget(self.experiment_card)
         lay.addWidget(self.source_card)
         lay.addWidget(self.processing_card)
-        lay.addWidget(self.output_card)
-        lay.addWidget(self.analysis_card)
         lay.addStretch(1)
-        self._profile = None
-        self._bound_state: BoundControlState | None = None
+        self._projection: ControlsProjection | None = None
         self._apply_spacing(current_spacing_tokens())
 
     def changeEvent(self, event) -> None:
@@ -1381,7 +1265,7 @@ class ControlsPanel(QtWidgets.QWidget):
         if event.type() in {
             QtCore.QEvent.Type.StyleChange,
             QtCore.QEvent.Type.FontChange,
-        } and hasattr(self, "top_action_layout"):
+        } and hasattr(self, "_root_layout"):
             self._apply_spacing(current_spacing_tokens())
 
     def _apply_spacing(self, tokens: SpacingTokens) -> None:
@@ -1390,7 +1274,6 @@ class ControlsPanel(QtWidgets.QWidget):
             margin, margin, margin, margin
         )
         self._root_layout.setSpacing(tokens.tools_vertical_margin)
-        self.top_action_layout.setSpacing(_spaced(7, tokens))
 
     def _make_section(self, section: SectionId) -> SectionCard:
         number, title, accent = _SECTION_META[section]
@@ -1424,27 +1307,31 @@ class ControlsPanel(QtWidgets.QWidget):
         return self.source_card.embedded_visible()
 
     @property
-    def profile(self) -> ControlProfile | None:
-        return self._profile
+    def projection(self) -> ControlsProjection | None:
+        return self._projection
 
-    def set_bound_state(self, state: BoundControlState | None) -> None:
-        self._bound_state = state
-        if self._profile is not None:
-            self._render_fields(self._profile)
-            self._render_analysis(self._profile.analysis_launchers)
+    def reconcile(self, state: ControlsProjection) -> bool:
+        """Render one projection, retaining rows when its schema is unchanged.
 
-    def set_state(self, state: ControlPanelRenderState) -> None:
-        """Render one immutable Controls V2 state snapshot."""
-        self._bound_state = state.bound_controls
-        self.set_profile(state.profile)
+        Returns ``True`` when the in-place path retained the mounted widgets,
+        otherwise ``False`` after a required schema rebuild.
+        """
 
-    def apply_state_update(self, state: ControlPanelRenderState) -> bool:
+        if type(state) is not ControlsProjection:
+            raise TypeError("ControlsPanel requires an exact ControlsProjection")
+        if self._apply_projection_update(state):
+            return True
+        self._projection = state
+        self._render_projection(state)
+        return False
+
+    def _apply_projection_update(self, state: ControlsProjection) -> bool:
         """Apply a same-schema snapshot without tearing down row widgets."""
 
-        if self._bound_state is None or state.bound_controls is None:
+        if self._projection is None:
             return False
-        current_sequence = tuple(self._bound_state.fields)
-        next_sequence = tuple(state.bound_controls.fields)
+        current_sequence = tuple(self._projection.fields)
+        next_sequence = tuple(state.fields)
         current_fields = {
             tuple(field.path): field
             for field in current_sequence
@@ -1475,11 +1362,6 @@ class ControlsPanel(QtWidgets.QWidget):
 
         if render_schema(current_sequence) != render_schema(next_sequence):
             return False
-        if self._profile is None:
-            return False
-        if self._profile.analysis_launchers != state.profile.analysis_launchers:
-            return False
-
         next_experiment = tuple(
             field for field in next_sequence
             if field.section is SectionId.EXPERIMENT
@@ -1500,7 +1382,7 @@ class ControlsPanel(QtWidgets.QWidget):
                 len(actions),
                 tuple(spec.action for spec in actions),
             )
-            for section, actions in self._profile.section_actions.items()
+            for section, actions in self._projection.section_actions.items()
         )
         next_action_schema = tuple(
             (
@@ -1508,16 +1390,16 @@ class ControlsPanel(QtWidgets.QWidget):
                 len(actions),
                 tuple(spec.action for spec in actions),
             )
-            for section, actions in state.profile.section_actions.items()
+            for section, actions in state.section_actions.items()
         )
         if current_action_schema != next_action_schema:
             return False
 
         mounted_specs = (
-            tuple(self._experiment_producers(state.profile))
-            if state.bound_controls.fields_for(SectionId.EXPERIMENT)
+            tuple(self._experiment_producers(state))
+            if state.fields_for(SectionId.EXPERIMENT)
             else ()
-        ) + state.profile.actions_for(SectionId.PROCESSING)
+        ) + state.actions_for(SectionId.PROCESSING)
         expected_actions: dict[
             tuple[SectionId, ControlAction], ControlActionSpec
         ] = {}
@@ -1591,7 +1473,7 @@ class ControlsPanel(QtWidgets.QWidget):
         experiment_statuses = {}
         if any(field.path in detector_paths for field in next_experiment):
             experiment_statuses["Detector"] = self._detector_status(
-                next_experiment, state.profile.detector_summary,
+                next_experiment, state.detector_summary,
             )
         if any(field.path in gi_paths for field in next_experiment):
             experiment_statuses[self._experiment_title] = (
@@ -1621,11 +1503,10 @@ class ControlsPanel(QtWidgets.QWidget):
         if processing_subsections.keys() != processing_statuses.keys():
             return False
 
-        self._profile = state.profile
-        self._bound_state = state.bound_controls
+        self._projection = state
         fields_by_path = {
             tuple(field.path): field
-            for field in state.bound_controls.fields
+            for field in state.fields
         }
 
         updated = 0
@@ -1695,37 +1576,8 @@ class ControlsPanel(QtWidgets.QWidget):
 
         if fields_by_path and not updated:
             return False
-        self._update_bound_section_statuses(state.profile)
+        self._apply_card_visibility(state)
         return True
-
-    def set_profile(self, profile: ControlProfile) -> None:
-        self._profile = profile
-        self._render_summary(profile)
-        self._render_fields(profile)
-        self._render_analysis(profile.analysis_launchers)
-
-    def current_form_edits(self) -> tuple[ControlFormEdit, ...]:
-        """Return the current visible editor values, including focused line edits.
-
-        §19.9/§21.6 req 7: this is NOT a transaction input.  The no-focus form
-        sweep was deleted — polling every visible editor turned a programmatic
-        ``setText`` into user intent — so the only production caller left is
-        read-only debug reporting.  The commit authority is the revisioned
-        journal plus at most one :meth:`focused_form_edit` flush."""
-
-        edits = [
-            ControlFormEdit(path=row.path, value=row.current_value())
-            for row in self.findChildren(FormRow)
-        ]
-        for row in self.findChildren(RangeRow):
-            edits.extend(
-                ControlFormEdit(path=p, value=v) for p, v in row.current_edits()
-            )
-        for row in self.findChildren(SegmentedControl):
-            edits.extend(
-                ControlFormEdit(path=p, value=v) for p, v in row.current_edits()
-            )
-        return tuple(edits)
 
     def focused_form_edit(self) -> ControlFormEdit | None:
         """The single bound line editor the user is CURRENTLY editing (has
@@ -1754,98 +1606,45 @@ class ControlsPanel(QtWidgets.QWidget):
                     )
         return None
 
-    def _render_summary(self, profile: ControlProfile) -> None:
-        self.summary_card.clear_rows()
-        if profile.run_enabled:
-            badge = StatusBadge("Ready")
-            badge.set_status("Ready", "ok")
-            self.summary_card.add_row(badge)
-            return
-        blockers = profile.run_blockers or ("No run action in this mode.",)
-        for blocker in blockers:
-            badge = StatusBadge(blocker)
-            badge.set_status(blocker, "blocked")
-            self.summary_card.add_row(badge)
-
-    def _render_fields(self, profile: ControlProfile) -> None:
-        self._render_top_actions(profile)
-        if self._bound_state is not None:
-            self._render_bound_fields(profile)
-            return
-        sections = (
-            (self.project_card, SectionId.PROJECT),
-            (self.source_card, SectionId.SOURCE),
-            (self.experiment_card, SectionId.EXPERIMENT),
-            (self.processing_card, SectionId.PROCESSING),
-            (self.output_card, SectionId.OUTPUT),
-        )
-        for card, section in sections:
-            card.clear_rows()
-            for status in profile.fields_for(section):
-                card.add_row(FieldRow(status))
-            if section != SectionId.EXPERIMENT:
-                self._add_actions(card, profile.actions_for(section))
-        self._set_section_markers(profile)
-        self.experiment_card.setVisible(bool(profile.show_experiment_card))
-        self.processing_card.setVisible(bool(profile.show_processing_card))
-
-    def _render_bound_fields(self, profile: ControlProfile) -> None:
-        # Tear down any open GI '…' popup on every rebuild.  Its rows are parented
-        # under this panel, so a findChildren(FormRow) sweep would
-        # otherwise harvest a STALE popup whose displayed value froze at open time
-        # — a later _commit_controls_v2_pending_edits could then clobber a fresher
-        # sample_orientation/tilt_angle back to the old value (F1).  Leaving
-        # Grazing triggers a rebuild too, so this also disposes the orphan popup
-        # (F2).  Popup edits already write through on change, so nothing is lost;
-        # reopening rebuilds its rows from the live profile.
+    def _render_projection(self, state: ControlsProjection) -> None:
+        # Popup rows carry captured field snapshots. A schema rebuild replaces
+        # those owners, so dispose the popup subtree before mounting new rows.
         self._close_gi_more_popup()
         self._close_source_energy_popup()
-        cards = {
-            SectionId.PROJECT: self.project_card,
-            SectionId.SOURCE: self.source_card,
-            SectionId.EXPERIMENT: self.experiment_card,
-            SectionId.PROCESSING: self.processing_card,
-            SectionId.OUTPUT: self.output_card,
-        }
-        for card in cards.values():
-            card.clear_rows()
-            card.set_status_text("")
-
-        state = self._bound_state or BoundControlState()
-        self.summary_card.hide()
-        self._render_plain_bound_section(
-            self.project_card, state.fields_for(SectionId.PROJECT))
-        self._render_source_bound_section(
-            state.fields_for(SectionId.SOURCE))
-        self._render_experiment_bound_section(
-            profile, state.fields_for(SectionId.EXPERIMENT))
-        self._render_processing_bound_section(
-            profile, state.fields_for(SectionId.PROCESSING))
-
-        self._update_bound_section_statuses(profile)
-
-    def _update_bound_section_statuses(self, profile: ControlProfile) -> None:
-        state = self._bound_state or BoundControlState()
-        self.summary_card.hide()
-        self.source_card.set_status_text(self._source_status(profile, state))
-        self.experiment_card.set_status_text(self._experiment_status(
-            state.fields_for(SectionId.EXPERIMENT)))
-        self.processing_card.set_status_text(self._processing_status(profile))
-        self._set_section_markers(profile)
-        viewer_mode = str(getattr(profile.processing_page, "value", "")) == "viewer"
-        project_status = profile.fields.get(FieldId.PROJECT_ROOT)
-        project_ready = (
-            project_status is None
-            or project_status.status not in {StatusKind.MISSING, StatusKind.CONFLICT}
+        cards = (
+            self.project_card,
+            self.source_card,
+            self.experiment_card,
+            self.processing_card,
         )
-        self.source_card.setVisible(not viewer_mode and project_ready)
+        for card in cards:
+            card.clear_rows()
+
+        self._render_plain_bound_section(
+            self.project_card,
+            state.fields_for(SectionId.PROJECT),
+        )
+        self._render_source_bound_section(
+            state.fields_for(SectionId.SOURCE),
+        )
+        self._render_experiment_bound_section(
+            state,
+            state.fields_for(SectionId.EXPERIMENT),
+        )
+        self._render_processing_bound_section(
+            state,
+            state.fields_for(SectionId.PROCESSING),
+        )
+        self._apply_card_visibility(state)
+
+    def _apply_card_visibility(self, state: ControlsProjection) -> None:
+        viewer_mode = state.processing_page is ProcessingPage.VIEWER
+        self.project_card.show()
+        self.source_card.setVisible(not viewer_mode)
         self.experiment_card.setVisible(
-            bool(state.fields_for(SectionId.EXPERIMENT))
-            and not viewer_mode
-            and project_ready)
-        self.processing_card.setVisible(not viewer_mode and project_ready)
-        self.output_card.setVisible(False)
-        self.analysis_card.setVisible(False)
+            bool(state.fields_for(SectionId.EXPERIMENT)) and not viewer_mode
+        )
+        self.processing_card.setVisible(not viewer_mode)
 
     def _render_plain_bound_section(
         self,
@@ -1981,14 +1780,14 @@ class ControlsPanel(QtWidgets.QWidget):
 
     def _render_experiment_bound_section(
         self,
-        profile: ControlProfile,
+        state: ControlsProjection,
         fields: tuple[ControlFormField, ...],
     ) -> None:
         if not fields:
             return
         # Producer actions (Calibrate / Refine / Make Mask) sit at the top of the
         # section they write into — co-located with §3 state, not a top bar.
-        producers = self._experiment_producers(profile)
+        producers = self._experiment_producers(state)
         if producers:
             row = QtWidgets.QWidget()
             row.setObjectName("controlsV2ActionRow")
@@ -2008,8 +1807,8 @@ class ControlsPanel(QtWidgets.QWidget):
         # Sample & measurement shows a Standard | Grazing segmented control (not a
         # group-header checkbox — that was the #56 repaint class).  The GI detail
         # fields (motor, value, orientation, tilt) render inline beneath it, but
-        # only in Grazing mode: the static controls adapter gates their PRESENCE
-        # on the Grazing state (progressive disclosure), so here they are simply
+        # only in Grazing mode: the Controls projection gates their PRESENCE on
+        # the Grazing state (progressive disclosure), so here they are simply
         # rendered when present.
         gi_paths = {
             ("GI", "Grazing"),
@@ -2022,7 +1821,7 @@ class ControlsPanel(QtWidgets.QWidget):
             (
                 "Detector",
                 tuple(field for field in fields if field.path in detector_paths),
-                self._detector_status(fields, profile.detector_summary),
+                self._detector_status(fields, state.detector_summary),
             ),
             (
                 self._experiment_title,
@@ -2051,7 +1850,8 @@ class ControlsPanel(QtWidgets.QWidget):
         """Render the Standard|Grazing segmented control, then a compact GI row:
         the θ motor combo, the manual θ value (manual mode only), and a '…'
         button that opens a small popup with the less-used Orientation + Tilt
-        Angle options.  The static adapter drops detail fields in Standard mode."""
+        Angle options.  The Controls projection drops detail fields in Standard
+        mode."""
         compact_labels = {
             ("GI", "th_motor"): "θ motor",
             ("GI", "th_val"): "θ",
@@ -2139,7 +1939,7 @@ class ControlsPanel(QtWidgets.QWidget):
 
     def _render_processing_bound_section(
         self,
-        profile: ControlProfile,
+        state: ControlsProjection,
         fields: tuple[ControlFormField, ...],
     ) -> None:
         # Advanced (parameter_group-backed) fields are NOT rendered inline:
@@ -2171,7 +1971,7 @@ class ControlsPanel(QtWidgets.QWidget):
 
         self._add_actions(
             self.processing_card,
-            profile.actions_for(SectionId.PROCESSING),
+            state.actions_for(SectionId.PROCESSING),
             expand=True,
         )
 
@@ -2198,14 +1998,10 @@ class ControlsPanel(QtWidgets.QWidget):
         # Consecutive standalone bool toggles render as one compact pill row
         # (mockup), not full-width stacked buttons.
         pending_pills: list[ControlFormField] = []
-        display_only_pills: set[tuple[str, ...]] = set()
 
         def flush_pills() -> None:
             if pending_pills:
-                row = PillRow(
-                    list(pending_pills),
-                    display_only_paths=frozenset(display_only_pills),
-                )
+                row = PillRow(list(pending_pills))
                 if any(
                     field.path in {
                         ("MaskSat", "mask_sentinel"),
@@ -2219,7 +2015,6 @@ class ControlsPanel(QtWidgets.QWidget):
                 row.valueChanged.connect(self.fieldValueChanged)
                 sub.add_row(row)
                 pending_pills.clear()
-                display_only_pills.clear()
 
         for field in fields:
             path = field.path
@@ -2246,16 +2041,11 @@ class ControlsPanel(QtWidgets.QWidget):
                 consumed.add(path)
                 continue
             # Threshold: (Mask, Threshold)=enable + (Mask, min) + (Mask, max).
-            # Older profiles may omit the explicit enable.  Keep their bounded
-            # fallback composition, while current vNext projects both the
-            # direct Threshold enable and independent Mask Saturated pill.
+            # Threshold always has its own explicit enable. Mask Saturated is
+            # a separate projected fact and never substitutes for it.
             if path == ("Mask", "min") and ("Mask", "max") in by_path:
                 flush_pills()
                 toggle_field = by_path.get(("Mask", "Threshold"))
-                if toggle_field is None:
-                    toggle_field = by_path.get(("MaskSat", "mask_sentinel"))
-                    if toggle_field is not None:
-                        display_only_pills.add(("MaskSat", "mask_sentinel"))
                 sub.add_row(self._make_range_row(
                     field, by_path[("Mask", "max")], toggle_field,
                     label="Threshold", display_decimals=0))
@@ -2395,96 +2185,21 @@ class ControlsPanel(QtWidgets.QWidget):
         return ""
 
     @staticmethod
-    def _source_status(
-        profile: ControlProfile,
-        bound_state: BoundControlState | None = None,
-    ) -> str:
-        fields = profile.fields
-        frame_status = fields.get(FieldId.SOURCE_FRAMES)
-        raw_status = fields.get(FieldId.SOURCE_RAW)
-        kind = ""
-        if bound_state is not None:
-            kind = str(bound_state.value_for(("Signal", "inp_type"), "") or "")
-        parts = []
-        if frame_status is not None and frame_status.value:
-            unit = ("files" if getattr(profile, "frame_count_is_files",
-                                       False) else "frames")
-            parts.append(f"{frame_status.value} {unit}")
-        if kind:
-            parts.append(kind)
-        if (
-            raw_status is not None
-            and raw_status.value
-            and raw_status.status is not StatusKind.OK
-        ):
-            parts.append(raw_status.value)
-        return " · ".join(parts)
-
-    def _set_section_markers(self, profile: ControlProfile) -> None:
-        cards = {
-            SectionId.PROJECT: self.project_card,
-            SectionId.SOURCE: self.source_card,
-            SectionId.EXPERIMENT: self.experiment_card,
-            SectionId.PROCESSING: self.processing_card,
-            SectionId.OUTPUT: self.output_card,
-        }
-        ready_fields = {
-            SectionId.PROJECT: (FieldId.PROJECT_ROOT,),
-            SectionId.SOURCE: (FieldId.SOURCE_PATH, FieldId.SOURCE_RAW),
-            SectionId.EXPERIMENT: (FieldId.CALIBRATION_PONI, FieldId.BEAM_ENERGY),
-            SectionId.PROCESSING: (FieldId.PROCESSING_MODE, FieldId.PROCESSING_BACKEND),
-            SectionId.OUTPUT: (FieldId.OUTPUT_SAVE_PATH,),
-        }
-        for section, card in cards.items():
-            fields = tuple(
-                profile.fields.get(field_id)
-                for field_id in ready_fields.get(section, ())
-            )
-            if not fields or any(field is None for field in fields):
-                card.set_valid_marker(False)
-                continue
-            ready = all(field.ok for field in fields)
-            card.set_valid_marker(ready, "Section inputs are ready." if ready else "")
-
-    @staticmethod
-    def _processing_status(profile: ControlProfile) -> str:
-        try:
-            return str(profile.processing_page.value).replace("_", " ")
-        except Exception:
-            return ""
-
-    @staticmethod
     def _group_status(fields: Sequence[ControlFormField]) -> str:
         disabled = sum(1 for field in fields if not field.enabled)
         if disabled and disabled == len(fields):
             return "locked"
         return ""
 
-    def _clear_layout(self, layout: QtWidgets.QLayout) -> None:
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.hide()
-                widget.setParent(None)
-                widget.deleteLater()
-
     _PRODUCER_ORDER = {
         ControlAction.CALIBRATE: 0,
-        ControlAction.REFINE_GEOMETRY: 1,
-        ControlAction.MAKE_MASK: 2,
+        ControlAction.MAKE_MASK: 1,
     }
 
-    def _render_top_actions(self, profile: ControlProfile) -> None:
-        # Producer actions (Calibrate / Refine / Make Mask) now render INSIDE the
-        # Experiment section (they write §3 state), not a separate top bar.
-        self._clear_layout(self.top_action_layout)
-        self.top_action_bar.hide()
-
-    def _experiment_producers(self, profile: ControlProfile):
-        """The instrument-producer actions, sorted Calibrate · Refine · Make Mask."""
+    def _experiment_producers(self, state: ControlsProjection):
+        """The instrument-producer actions, sorted Calibrate · Make Mask."""
         return sorted(
-            profile.actions_for(SectionId.EXPERIMENT),
+            state.actions_for(SectionId.EXPERIMENT),
             key=lambda spec: self._PRODUCER_ORDER.get(spec.action, 99),
         )
 
@@ -2602,17 +2317,3 @@ class ControlsPanel(QtWidgets.QWidget):
             btn.actionRequested.connect(self.controlActionRequested)
             lay.addWidget(btn, 1 if expand else 0)
         card.add_row(row)
-
-    def _render_analysis(self, launchers: tuple[AnalysisLauncherSpec, ...]) -> None:
-        self.analysis_card.clear_rows()
-        if self._bound_state is not None:
-            self.analysis_card.hide()
-            return
-        self.analysis_card.show()
-        for status in (self._profile.fields_for(SectionId.ANALYSIS)
-                       if self._profile is not None else ()):
-            self.analysis_card.add_row(FieldRow(status))
-        for spec in launchers:
-            btn = LauncherButton(spec)
-            btn.launched.connect(self.analysisLaunchRequested)
-            self.analysis_card.add_row(btn)

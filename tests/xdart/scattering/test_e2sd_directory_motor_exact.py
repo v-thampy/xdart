@@ -3036,9 +3036,11 @@ def test_unrelated_edit_during_preview_eventually_populates_matching_motor(
             lambda: workspace._observation is None
             and bool(source.preview_requests),
         )
+        projection = controls.projection
+        assert projection is not None
         field = next(
             value
-            for value in controls._bound_state.fields
+            for value in projection.fields
             if value.path == GI_MOTOR
         )
         assert field.choices == ("Manual", "halpha")

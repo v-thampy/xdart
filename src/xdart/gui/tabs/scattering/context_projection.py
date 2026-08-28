@@ -21,7 +21,7 @@ from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m
 from xrd_tools.session.hydration import (
     HydrationPurpose, HydrationReadKey, HydrationScope, HydrationToken,
 )
-from xrd_tools.session.readiness import ControlPanelRenderState, Tool, tool_from_mode_text
+from xrd_tools.session.readiness import ControlsProjection, Tool, tool_from_mode_text
 from xrd_tools.session.run_configuration import RunIntent
 
 from .browser_catalog import BrowserCatalogEntry
@@ -339,7 +339,7 @@ class ContextProjection:
         self,
         *,
         revision: int,
-        controls: ControlPanelRenderState,
+        controls: ControlsProjection,
         controls_readiness: ControlsReadinessProjection,
         phase: RunPhase,
         intent: RunIntent,
@@ -445,9 +445,6 @@ class ContextProjection:
                 readiness=progress_detail,
                 readiness_tooltip=_terminal_timing_tooltip(progress),
             )
-        controls = replace(controls, profile=replace(
-            controls.profile, run_enabled=run.run_enabled,
-            run_blockers=(() if run.ready else (run.readiness,))))
         current = viewer_navigation.current
         payload = next((item for item in payloads if item.frame_key is current), None)
         viewer_ready = (current is not None

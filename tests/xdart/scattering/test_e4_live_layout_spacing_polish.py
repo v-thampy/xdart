@@ -183,7 +183,7 @@ def test_processing_axis_combos_align_with_range_editors(
     apply_theme(qapp, "dark", spacing="normal")
     shell = ScatteringWorkspaceShell()
     try:
-        shell.controls.set_state(
+        shell.controls.reconcile(
             project_controls(
                 RunIntentStore(_intent()).snapshot(),
                 None,

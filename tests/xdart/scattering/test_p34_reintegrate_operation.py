@@ -206,12 +206,12 @@ def test_parent_red_stable_loaded_browse_enables_reintegrate_1d_start(tmp_path, 
     from xrd_tools.session.readiness import ControlAction, SectionId
     from xdart.gui.tabs.scattering.state_machine import RunPhase
     page, store, _seed, _context = _loaded_page(tmp_path, monkeypatch, qapp)
-    projected = page._project_controls(store.snapshot()).profile; actions = {a.action: a for a in projected.actions_for(SectionId.PROCESSING)}; experiment = {a.action: a for a in projected.actions_for(SectionId.EXPERIMENT)}
+    projected = page._project_controls(store.snapshot()); actions = {a.action: a for a in projected.actions_for(SectionId.PROCESSING)}; experiment = {a.action: a for a in projected.actions_for(SectionId.EXPERIMENT)}
     assert actions[ControlAction.REINTEGRATE_1D].enabled and actions[ControlAction.REINTEGRATE_1D].label == "Reintegrate 1-D"
     assert actions[ControlAction.REINTEGRATE_2D].enabled and actions[ControlAction.REINTEGRATE_2D].label == "Reintegrate 2-D" and experiment[ControlAction.CALIBRATE].label == "Calibrate" and experiment[ControlAction.MAKE_MASK].label == "Make Mask"
-    page._lifecycle._phase = RunPhase.FAILED; page._lifecycle._owners_closed = False; actions = {a.action: a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}
+    page._lifecycle._phase = RunPhase.FAILED; page._lifecycle._owners_closed = False; actions = {a.action: a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}
     assert not actions[ControlAction.REINTEGRATE_1D].enabled and not actions[ControlAction.REINTEGRATE_2D].enabled
-    page._lifecycle._owners_closed = True; actions = {a.action: a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}
+    page._lifecycle._owners_closed = True; actions = {a.action: a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}
     assert actions[ControlAction.REINTEGRATE_1D].enabled and actions[ControlAction.REINTEGRATE_2D].enabled; page.close_workspace()
 
 
@@ -443,7 +443,7 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
             action.action: action
             for action in page._project_controls(
                 page._intents.snapshot()
-            ).profile.actions_for(SectionId.PROCESSING)
+            ).actions_for(SectionId.PROCESSING)
         }
         assert actions[ControlAction.REINTEGRATE_1D].enabled
         assert actions[ControlAction.REINTEGRATE_2D].enabled
@@ -1134,7 +1134,7 @@ def test_xye_loaded_browse_disables_and_refuses_reintegrate(
             action.action: action
             for action in page._project_controls(
                 store.snapshot()
-            ).profile.actions_for(SectionId.PROCESSING)
+            ).actions_for(SectionId.PROCESSING)
         }
         assert not actions[ControlAction.REINTEGRATE_1D].enabled
         assert not actions[ControlAction.REINTEGRATE_2D].enabled
@@ -1517,7 +1517,7 @@ def test_reintegrate_request_accepts_exact_dimensions_but_p34b_gui_is_1d_only(tm
     page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); calls=[]; monkeypatch.setattr(page,"_reintegrate_action",calls.append); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_1d")); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_2d")); assert calls==["1d","2d"]
     rid=OperationIdentity(77); page._operation_slot._identity=rid; page._reintegrate_identity=rid; captured=page._context_controller.capture_reintegrate_browse(); assert captured is not None and page._context_controller.invalidate_reintegrate_browse(*captured)
     for dimension,matching,other in (("1d",ControlAction.REINTEGRATE_1D,ControlAction.REINTEGRATE_2D),("2d",ControlAction.REINTEGRATE_2D,ControlAction.REINTEGRATE_1D)):
-        page._reintegrate_dimension=dimension; actions={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}; assert actions[matching].enabled and actions[matching].label==f"Cancel Reintegrate {dimension[0]}-D" and not actions[other].enabled
+        page._reintegrate_dimension=dimension; actions={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}; assert actions[matching].enabled and actions[matching].label==f"Cancel Reintegrate {dimension[0]}-D" and not actions[other].enabled
     page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_1d")); assert calls==["1d","2d"]; page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_2d")); assert calls==["1d","2d","2d"]
     assert page._consume_reintegrate_update(OperationUpdate(rid,terminal=OperationTerminal(rid,OperationTerminalStatus.CANCELLED))) and all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension")); page._operation_slot._identity=None; page.close_workspace()
 
@@ -1538,7 +1538,7 @@ def test_gui_persisted_science_disclosure_and_no_shared_control_override(tmp_pat
     shown=json.dumps(prep); assert seeded.preparation["requested_shared_science"]["accepted_scientific_assets"]["poni_sha256"] not in shown and "loaded artifact" in page._notice_text and captured["dimension"]=="1d"; page._reintegrate_identity=None; page.close_workspace()
 
 def test_parent_red_stable_loaded_browse_enables_reintegrate_2d_start(tmp_path, monkeypatch, qapp):
-    from xrd_tools.session.readiness import ControlAction, SectionId; page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); action={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}[ControlAction.REINTEGRATE_2D]; assert action.enabled and action.label=="Reintegrate 2-D"; page.close_workspace()
+    from xrd_tools.session.readiness import ControlAction, SectionId; page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); action={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}[ControlAction.REINTEGRATE_2D]; assert action.enabled and action.label=="Reintegrate 2-D"; page.close_workspace()
 def test_reintegrate_2d_uses_exact_existing_worker_builder_and_runner(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.adapters import external_operation as module; from xdart.gui.tabs.scattering.operation_values import OperationTerminalStatus; from xrd_tools.reduction import ReintegrateResult, reintegrate as core
     page,_store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); seen=[]; plan=SimpleNamespace(operation_identity="a"*64); result=core._value(ReintegrateResult,"COMMITTED",(2,),(2,),(),(),"b"*64,"a"*64,"c"*64,None)
@@ -1605,10 +1605,10 @@ def test_reintegrate_dimensions_share_one_slot_cancel_terminal_and_reload(tmp_pa
     page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); entered=threading.Event(); tokens=[]
     def cancelled(_target,**kw): tokens.append(kw["cancel_token"]); entered.set(); kw["cancel_token"].wait(2); raise ReintegrateCancelled()
     monkeypatch.setattr(module.ReintegratePlan,"from_artifact",staticmethod(cancelled)); page._reintegrate_action("2d"); identity=page._reintegrate_identity; request=page._reintegrate_request; target=page._reintegrate_target; reloads=[]; real_reload=page._context_controller.reload_reintegrate_browse; monkeypatch.setattr(page._context_controller,"reload_reintegrate_browse",lambda got_request,got_target:(reloads.append((got_request,got_target)),real_reload(got_request,got_target))[1]); assert entered.wait(2) and page._operation_slot.owned and page._reintegrate_dimension=="2d"
-    actions={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}; assert actions[ControlAction.REINTEGRATE_2D].enabled and actions[ControlAction.REINTEGRATE_2D].label=="Cancel Reintegrate 2-D" and not actions[ControlAction.REINTEGRATE_1D].enabled; page._reintegrate_action("1d"); assert not tokens[0].is_set(); page._reintegrate_action("2d"); assert tokens[0].is_set()
+    actions={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}; assert actions[ControlAction.REINTEGRATE_2D].enabled and actions[ControlAction.REINTEGRATE_2D].label=="Cancel Reintegrate 2-D" and not actions[ControlAction.REINTEGRATE_1D].enabled; page._reintegrate_action("1d"); assert not tokens[0].is_set(); page._reintegrate_action("2d"); assert tokens[0].is_set()
     update=_join(page._operation_slot,identity); assert update.terminal.status is OperationTerminalStatus.CANCELLED and page._consume_reintegrate_update(update) and reloads==[(request,target)] and all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension")) and page._context_controller._browse_request is not request
     outcome=_wait(page._context_controller.poll_browse); assert outcome is not None; page._reintegrate_dimension="2d"; monkeypatch.setattr(page._operation_slot,"begin_reintegrate",lambda **_kw:None); page._reintegrate_action("2d"); assert all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension"))
-    foreign=OperationIdentity(101); page._operation_slot._identity=foreign; actions={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}; assert not actions[ControlAction.REINTEGRATE_1D].enabled and not actions[ControlAction.REINTEGRATE_2D].enabled; page._operation_slot._identity=None; page._reintegrate_identity=foreign; page._reintegrate_request=object(); page._reintegrate_target="/target"; page._reintegrate_dimension="1d"; page.close_workspace(); assert all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension"))
+    foreign=OperationIdentity(101); page._operation_slot._identity=foreign; actions={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}; assert not actions[ControlAction.REINTEGRATE_1D].enabled and not actions[ControlAction.REINTEGRATE_2D].enabled; page._operation_slot._identity=None; page._reintegrate_identity=foreign; page._reintegrate_request=object(); page._reintegrate_target="/target"; page._reintegrate_dimension="1d"; page.close_workspace(); assert all(getattr(page,name) is None for name in ("_reintegrate_identity","_reintegrate_request","_reintegrate_target","_reintegrate_dimension"))
 
 def test_active_reintegrate_progress_and_cancel_preserve_invalidated_browse_science(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.adapters import external_operation as module
@@ -1631,7 +1631,7 @@ def test_active_reintegrate_progress_and_cancel_preserve_invalidated_browse_scie
         return real_project(*args,**kwargs)
     monkeypatch.setattr(page._context_controller,"project_browse_1d_cache",qualified_project); page._refresh_shell(); assert invalidated_calls==[]
     page._drain_executor(); assert page._last_scientific_projection is before and view.trace_history_projections==before_history and page._notice_text.startswith("Reintegrate 2-D: prepare")
-    actions={a.action:a for a in page._project_controls(store.snapshot()).profile.actions_for(SectionId.PROCESSING)}; assert actions[ControlAction.REINTEGRATE_2D].label=="Cancel Reintegrate 2-D" and not actions[ControlAction.REINTEGRATE_1D].enabled
+    actions={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}; assert actions[ControlAction.REINTEGRATE_2D].label=="Cancel Reintegrate 2-D" and not actions[ControlAction.REINTEGRATE_1D].enabled
     progress_notice=page._notice_text; page._reintegrate_action("1d"); assert page._notice_text==progress_notice and not tokens[0].is_set() and page._last_scientific_projection is before and view.trace_history_projections==before_history
     page._reintegrate_action("2d"); assert tokens[0].is_set() and page._notice_text=="Cancelling Reintegrate 2-D…" and page._last_scientific_projection is before and view.trace_history_projections==before_history
     update=_join(page._operation_slot,identity); assert update.terminal.status is OperationTerminalStatus.CANCELLED and page._consume_reintegrate_update(update) and page._context_controller._browse_request is not request

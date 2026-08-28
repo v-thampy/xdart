@@ -65,9 +65,7 @@ def test_production_projection_supplies_source_and_integration_inventory() -> No
         None,
         RunPhase.IDLE,
     )
-    bound = state.bound_controls
-    assert bound is not None
-    fields = {field.path: field for field in bound.fields}
+    fields = {field.path: field for field in state.fields}
 
     required = {
         ("Signal", "inp_type"),
@@ -120,14 +118,14 @@ def test_production_projection_supplies_source_and_integration_inventory() -> No
     assert fields[("Int2D", "azim_high")].value == 90.0
     assert ("Signal", "series_average") not in fields
     assert fields[("BG", "bg_type")].enabled is True
-    actions = state.profile.actions_for(SectionId.PROCESSING)
+    actions = state.actions_for(SectionId.PROCESSING)
     assert tuple(action.action for action in actions) == (
         ControlAction.REINTEGRATE_1D,
         ControlAction.REINTEGRATE_2D,
         ControlAction.ADVANCED_PROCESSING,
     )
     assert all(not action.enabled and action.reason for action in actions)
-    experiment_actions = state.profile.actions_for(SectionId.EXPERIMENT)
+    experiment_actions = state.actions_for(SectionId.EXPERIMENT)
     assert tuple(action.action for action in experiment_actions) == (
         ControlAction.CALIBRATE,
         ControlAction.MAKE_MASK,
@@ -146,9 +144,8 @@ def test_gi_detail_fields_are_inline_only_in_grazing_mode() -> None:
         None,
         RunPhase.IDLE,
     )
-    assert standard.bound_controls is not None
     assert not gi_paths & {
-        candidate.path for candidate in standard.bound_controls.fields
+        candidate.path for candidate in standard.fields
     }
 
     intent.gi.enabled = True
@@ -157,10 +154,9 @@ def test_gi_detail_fields_are_inline_only_in_grazing_mode() -> None:
         None,
         RunPhase.IDLE,
     )
-    assert grazing.bound_controls is not None
     grazing_fields = {
         candidate.path: candidate
-        for candidate in grazing.bound_controls.fields
+        for candidate in grazing.fields
     }
     assert gi_paths <= grazing_fields.keys()
     assert grazing_fields[GI_MOTOR].value == "Manual"
@@ -172,9 +168,8 @@ def test_gi_detail_fields_are_inline_only_in_grazing_mode() -> None:
         None,
         RunPhase.IDLE,
     )
-    assert named.bound_controls is not None
     named_paths = {
-        candidate.path for candidate in named.bound_controls.fields
+        candidate.path for candidate in named.fields
     }
     assert GI_MOTOR in named_paths
     assert GI_THETA not in named_paths
@@ -189,10 +184,9 @@ def test_gi_main_surface_has_one_points_owner_and_edit_resynchronizes_grid(
     snapshot = RunIntentStore(intent).snapshot()
 
     state = project_controls(snapshot, None, RunPhase.IDLE)
-    assert state.bound_controls is not None
     fields = {
         candidate.path: candidate
-        for candidate in state.bound_controls.fields
+        for candidate in state.fields
     }
     assert fields[("Int1D", "points")].value == 128
     assert ("Int1D", "points_oop") not in fields
@@ -240,7 +234,7 @@ def test_standard_grazing_schema_change_rebuilds_exact_axis_choices() -> None:
     )
     panel = ControlsPanel()
     try:
-        panel.set_state(standard)
+        panel.reconcile(standard)
         standard_axis = next(
             row
             for row in panel.findChildren(FormRow)
@@ -253,8 +247,7 @@ def test_standard_grazing_schema_change_rebuilds_exact_axis_choices() -> None:
 
         # Grazing adds fields, so the in-place path must reject the stale
         # schema and let the shell reconstruct it.
-        assert panel.apply_state_update(grazing) is False
-        panel.set_state(grazing)
+        assert panel.reconcile(grazing) is False
         app.processEvents()
         grazing_axis = next(
             row
@@ -273,8 +266,7 @@ def test_standard_grazing_schema_change_rebuilds_exact_axis_choices() -> None:
 
         # Standard removes the GI detail fields and must likewise reconstruct,
         # with no stale GI axis choices surviving the transition.
-        assert panel.apply_state_update(standard) is False
-        panel.set_state(standard)
+        assert panel.reconcile(standard) is False
         app.processEvents()
         restored_axis = next(
             row
@@ -583,7 +575,7 @@ def test_vnext_threshold_fields_are_independent(
     state = project_controls(
         RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
     )
-    by_path = {field.path: field for field in state.bound_controls.fields}
+    by_path = {field.path: field for field in state.fields}
     assert by_path[THRESHOLD_ENABLED].value is False
     assert by_path[THRESHOLD_ENABLED].enabled is True
     assert by_path[MASK_SATURATION].enabled is True
@@ -596,7 +588,7 @@ def test_vnext_threshold_fields_are_independent(
     manual_state = project_controls(
         RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
     )
-    manual = {f.path: f for f in manual_state.bound_controls.fields}
+    manual = {f.path: f for f in manual_state.fields}
     assert manual[THRESHOLD_MIN].enabled is True
     assert manual[THRESHOLD_MAX].enabled is True
     assert manual[MASK_SATURATION].value is True
@@ -617,7 +609,7 @@ def test_vnext_threshold_max_is_blank_until_a_valid_detector(
     state = project_controls(
         RunIntentStore(_intent()).snapshot(), None, RunPhase.IDLE
     )
-    by_path = {field.path: field for field in state.bound_controls.fields}
+    by_path = {field.path: field for field in state.fields}
     assert by_path[THRESHOLD_MIN].value == 0.0
     assert by_path[THRESHOLD_MAX].value is None
 
@@ -642,8 +634,7 @@ def test_unrepresentable_suffix_tuple_is_exact_and_not_editable() -> None:
     )
     snapshot = RunIntentStore(intent).snapshot()
     state = project_controls(snapshot, None, RunPhase.IDLE)
-    assert state.bound_controls is not None
-    fields = {field.path: field for field in state.bound_controls.fields}
+    fields = {field.path: field for field in state.fields}
     suffix = fields[("Signal", "img_ext")]
     assert suffix.value == "_master.hdf5, _master.h5"
     assert suffix.enabled is False
@@ -660,8 +651,7 @@ def test_unrepresentable_suffix_tuple_is_exact_and_not_editable() -> None:
 def test_raw_directory_format_projects_and_replaces_one_complete_source() -> None:
     snapshot = RunIntentStore(_intent()).snapshot()
     state = project_controls(snapshot, None, RunPhase.IDLE)
-    assert state.bound_controls is not None
-    fields = {field.path: field for field in state.bound_controls.fields}
+    fields = {field.path: field for field in state.fields}
     assert "raw" in fields[("Signal", "img_ext")].choices
 
     changed = reduce_control_edit(
@@ -704,7 +694,6 @@ def test_source_edit_replaces_one_complete_immutable_source_without_io(
     monkeypatch.setattr(Path, "iterdir", forbidden)
     snapshot = RunIntentStore(_intent()).snapshot()
     state = project_controls(snapshot, None, RunPhase.IDLE)
-    assert state.bound_controls is not None
     changed = reduce_control_edit(
         snapshot,
         ("Signal", "img_dir"),
@@ -730,8 +719,7 @@ def test_empty_integration_args_project_native_builder_defaults() -> None:
         None,
         RunPhase.IDLE,
     )
-    assert state.bound_controls is not None
-    fields = {field.path: field.value for field in state.bound_controls.fields}
+    fields = {field.path: field.value for field in state.fields}
     assert fields[("Int1D", "points")] == 1000
     assert fields[("Int2D", "radial_points")] == 1000
     assert fields[("Int2D", "azim_points")] == 360
@@ -743,7 +731,7 @@ def test_production_projection_mounts_full_processing_subsections() -> None:
     panel.resize(520, 1000)
     panel.show()
     try:
-        panel.set_state(
+        panel.reconcile(
             project_controls(
                 RunIntentStore(_intent()).snapshot(),
                 None,

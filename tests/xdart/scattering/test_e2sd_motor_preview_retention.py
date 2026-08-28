@@ -82,7 +82,8 @@ def _shell(page: ScatteringWorkspace) -> ScatteringWorkspaceShell:
 
 
 def _choices(page: ScatteringWorkspace) -> tuple[str, ...]:
-    state = _shell(page).controls._bound_state
+    state = _shell(page).controls.projection
+    assert state is not None
     return next(field.choices for field in state.fields if field.path == GI_MOTOR)
 
 

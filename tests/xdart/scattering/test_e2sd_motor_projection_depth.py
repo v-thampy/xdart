@@ -104,9 +104,11 @@ def _shell(page: ScatteringWorkspace) -> ScatteringWorkspaceShell:
 
 
 def _field(page):
+    projection = _shell(page).controls.projection
+    assert projection is not None
     return next(
         field
-        for field in _shell(page).controls._bound_state.fields
+        for field in projection.fields
         if field.path == GI_MOTOR
     )
 
@@ -179,7 +181,7 @@ def _projected_field(store: RunIntentStore, path):
         field
         for field in project_controls(
             store.snapshot(), None, RunPhase.IDLE
-        ).bound_controls.fields
+        ).fields
         if field.path == path
     )
 

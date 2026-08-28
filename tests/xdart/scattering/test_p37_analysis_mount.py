@@ -530,21 +530,16 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
     )
     refreshes = []
     controls = page._shell.controls
-    original_controls_update = controls.apply_state_update
-    original_controls_set = controls.set_state
+    original_controls_reconcile = controls.reconcile
     original_browser = page._shell.browser.reconcile
     original_heavy_residency = (
         page._shell.browser.reconcile_heavy_residency
     )
     original_scientific = page._shell.scientific.reconcile
 
-    def controls_update(state):
+    def controls_reconcile(state):
         refreshes.append("controls")
-        return original_controls_update(state)
-
-    def controls_set(state):
-        refreshes.append("controls-rebuild")
-        return original_controls_set(state)
+        return original_controls_reconcile(state)
 
     def browser_refresh(*args, **kwargs):
         refreshes.append("browser")
@@ -558,8 +553,7 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
         refreshes.append("scientific")
         return original_scientific(*args, **kwargs)
 
-    monkeypatch.setattr(controls, "apply_state_update", controls_update)
-    monkeypatch.setattr(controls, "set_state", controls_set)
+    monkeypatch.setattr(controls, "reconcile", controls_reconcile)
     monkeypatch.setattr(page._shell.browser, "reconcile", browser_refresh)
     monkeypatch.setattr(
         page._shell.browser,
@@ -569,9 +563,11 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
     monkeypatch.setattr(
         page._shell.scientific, "reconcile", scientific_refresh,
     )
+    projection = controls.projection
+    assert projection is not None
     initial_fields = tuple(
         (field.path, field.enabled)
-        for field in controls._bound_state.fields
+        for field in projection.fields
     )
     assert any(enabled for _path, enabled in initial_fields)
 
@@ -582,14 +578,16 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
         assert dialog is not None and dialog.isVisible()
         assert metadata_entered.wait(2)
         assert refreshes == ["controls"]
+        projection = controls.projection
+        assert projection is not None
         assert tuple(
             (field.path, field.enabled)
-            for field in controls._bound_state.fields
+            for field in projection.fields
         ) == initial_fields
         assert not page._shell.scientific.background.isEnabled()
         active_actions = {
             action.action.value: action.enabled
-            for actions in controls.profile.section_actions.values()
+            for actions in projection.section_actions.values()
             for action in actions
         }
         assert not active_actions["calibrate"]
@@ -633,9 +631,11 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
         assert dialog.table.rowCount() == len(table.labels)
         assert dialog.status.text() == "OK"
         assert refreshes == ["controls", "controls", "controls"]
+        projection = controls.projection
+        assert projection is not None
         assert tuple(
             (field.path, field.enabled)
-            for field in controls._bound_state.fields
+            for field in projection.fields
         ) == initial_fields
         assert page._shell.scientific.background.isEnabled()
     finally:
@@ -758,18 +758,13 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
     )
 
     refreshes = []
-    controls_update = controls.apply_state_update
-    controls_set = controls.set_state
+    controls_reconcile = controls.reconcile
     browser_reconcile = page._shell.browser.reconcile
     scientific_reconcile = page._shell.scientific.reconcile
 
-    def update_controls(state):
+    def reconcile_controls(state):
         refreshes.append("controls")
-        return controls_update(state)
-
-    def rebuild_controls(state):
-        refreshes.append("controls-rebuild")
-        return controls_set(state)
+        return controls_reconcile(state)
 
     def reconcile_browser(*args, **kwargs):
         refreshes.append("browser")
@@ -779,8 +774,7 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
         refreshes.append("scientific")
         return scientific_reconcile(*args, **kwargs)
 
-    monkeypatch.setattr(controls, "apply_state_update", update_controls)
-    monkeypatch.setattr(controls, "set_state", rebuild_controls)
+    monkeypatch.setattr(controls, "reconcile", reconcile_controls)
     monkeypatch.setattr(page._shell.browser, "reconcile", reconcile_browser)
     monkeypatch.setattr(
         page._shell.scientific, "reconcile", reconcile_scientific,
@@ -818,9 +812,11 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
             preserve_display=True,
             preserve_scientific=True,
         )
+        projection = controls.projection
+        assert projection is not None
         action_enabled = {
             action.action.value: action.enabled
-            for actions in controls.profile.section_actions.values()
+            for actions in projection.section_actions.values()
             for action in actions
         }
         assert not action_enabled["calibrate"]
@@ -851,9 +847,11 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
             preserve_scientific=True,
         )
         assert analysis_start_allowed(page)
+        projection = controls.projection
+        assert projection is not None
         action_enabled = {
             action.action.value: action.enabled
-            for actions in controls.profile.section_actions.values()
+            for actions in projection.section_actions.values()
             for action in actions
         }
         assert action_enabled["calibrate"]

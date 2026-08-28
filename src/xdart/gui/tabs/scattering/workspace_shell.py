@@ -5,8 +5,7 @@ from __future__ import annotations
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.session.readiness import (
-    BoundControlState,
-    ControlPanelRenderState,
+    ControlsProjection,
     SectionId,
 )
 
@@ -171,14 +170,6 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                 )
             )
         )
-        self.controls.analysisLaunchRequested.connect(
-            lambda action: self._forward(
-                ShellCommand(
-                    ShellCommandKind.ANALYSIS_ACTION,
-                    str(getattr(action, "value", action)),
-                )
-            )
-        )
         self.run_controls.modeChanged.connect(
             lambda value: self._forward(
                 ShellCommand(
@@ -305,8 +296,7 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                             self.replace_scientific_with_blank()
                         raise
             controls = _shell_controls(state.controls)
-            if not self.controls.apply_state_update(controls):
-                self.controls.set_state(controls)
+            self.controls.reconcile(controls)
             apply_vnext_controls_readiness(
                 self.controls,
                 state.controls_readiness,
@@ -420,24 +410,23 @@ def _coerce_scalar(value: object):
 
 
 def _shell_controls(
-    state: ControlPanelRenderState,
-) -> ControlPanelRenderState:
-    bound = state.bound_controls
-    if bound is None:
-        return state
+    state: ControlsProjection,
+) -> ControlsProjection:
     fields = tuple(
         field
-        for field in bound.fields
+        for field in state.fields
         if not (
             field.section is SectionId.PROJECT
             and field.path == ("Project", "output_mode")
         )
     )
-    if len(fields) == len(bound.fields):
+    if len(fields) == len(state.fields):
         return state
-    return ControlPanelRenderState(
-        state.profile,
-        BoundControlState(fields),
+    return ControlsProjection(
+        state.processing_page,
+        fields,
+        state.section_actions,
+        state.detector_summary,
     )
 
 

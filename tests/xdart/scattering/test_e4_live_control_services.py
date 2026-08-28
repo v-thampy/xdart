@@ -106,7 +106,7 @@ def test_page_keeps_and_restores_explicit_single_image_mode(
         state = page._project_controls(store.snapshot())
         fields = {
             field.path: field
-            for field in state.bound_controls.fields
+            for field in state.fields
         }
         assert fields[SOURCE_TYPE].value == "Single Image"
 
@@ -378,7 +378,7 @@ def test_source_form_is_the_only_picker_and_browse_replaces_complete_source(
         state = page._project_controls(store.snapshot())
         fields = {
             field.path: field
-            for field in state.bound_controls.fields
+            for field in state.fields
         }
 
         assert controls.source_widget_visible() is False
@@ -492,7 +492,7 @@ def test_source_mode_switch_is_value_only_and_restores_each_mode(
         state = page._project_controls(store.snapshot())
         fields = {
             field.path: field
-            for field in state.bound_controls.fields
+            for field in state.fields
         }
         assert fields[SOURCE_TYPE].value == "Image Series"
         assert fields[SOURCE_FILE].value == ""
@@ -547,7 +547,7 @@ def test_blank_directory_mode_defaults_meta_auto(
             field.path: field
             for field in page._project_controls(
                 store.snapshot()
-            ).bound_controls.fields
+            ).fields
         }
 
         assert fields[SOURCE_TYPE].value == "Image Directory"
@@ -581,7 +581,7 @@ def test_selected_directory_file_and_meta_edits_persist_by_mode(
             field.path: field
             for field in page._project_controls(
                 store.snapshot()
-            ).bound_controls.fields
+            ).fields
         }
         assert fields[SOURCE_META].enabled is True
         assert fields[SOURCE_META].value == "Auto"
@@ -654,7 +654,7 @@ def test_intent_boundary_materializes_visible_auto_metadata_policy(
             field.path: field
             for field in page._project_controls(
                 store.snapshot()
-            ).bound_controls.fields
+            ).fields
         }
         assert fields[SOURCE_META].value == "Auto"
         assert "metadata_format" not in source.options

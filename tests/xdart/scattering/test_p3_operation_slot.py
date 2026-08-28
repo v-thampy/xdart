@@ -457,7 +457,7 @@ def test_operation_surface_and_owner_censuses_remain_bounded() -> None:
     state = project_controls(
         RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE
     )
-    actions = state.profile.actions_for(SectionId.EXPERIMENT)
+    actions = state.actions_for(SectionId.EXPERIMENT)
     assert tuple(action.action for action in actions) == (
         ControlAction.CALIBRATE, ControlAction.MAKE_MASK
     )

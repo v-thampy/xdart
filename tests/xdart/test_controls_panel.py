@@ -1,16 +1,11 @@
-"""Offscreen tests for the hidden Controls Panel V2 scaffold."""
+"""Offscreen tests for the native Controls panel."""
 
-import copy
 import gc
-import json
 import os
-import time
 from pathlib import Path
-from types import MethodType, SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import numpy as np
 import pytest
 
 pytest.importorskip("pyqtgraph")
@@ -38,48 +33,23 @@ def _user_types(qapp, widget, editor, text):
     qapp.processEvents()
 
 from xrd_tools.session.readiness import (
-    AnalysisLauncherSpec,
-    AnalysisTool,
-    BoundControlState,
     ControlAction,
     ControlFieldKind,
     ControlFormField,
-    ControlPanelRenderState,
-    ControlState,
-    ControlProfile,
-    FieldId,
-    GeomState,
-    MeasMode,
+    ControlsProjection,
     ProcessingPage,
-    ResultCaps,
-    RunTarget,
     SectionId,
-    SourceCaps,
-    StatusKind,
-    Tool,
-    build_control_profile,
     build_native_int_reduction_plan_from_args,
     build_native_int_reduction_plan_from_scan,
 )
 from xdart.gui.widgets.controls_panel import (
     ControlsPanel,
-    FieldRow,
     FormRow,
     PillRow,
     RangeRow,
     SegmentedControl,
     SubsectionCard,
 )
-
-
-def _wait_until(qapp, predicate, timeout=5.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        qapp.processEvents()
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
 
 
 @pytest.fixture(autouse=True)
@@ -104,241 +74,6 @@ def _controls_panel_session_isolation():
     _unlink_session()
 
 
-def _find_pill(widget, path):
-    """Return the pill toggle button for ``path`` in the processing card, or None."""
-    for pill_row in widget.controls_v2.processing_card.body.findChildren(PillRow):
-        for p, btn in pill_row._pills:
-            if p == path:
-                return btn
-    return None
-
-
-def _find_segmented(widget, path):
-    """Return the SegmentedControl for ``path`` in the experiment card, or None."""
-    for seg in widget.controls_v2.experiment_card.body.findChildren(SegmentedControl):
-        if seg.path == tuple(path):
-            return seg
-    return None
-
-
-def _gi_detail_rows(widget):
-    """Paths of the inline GI detail FormRows in Experiment (θ motor + the
-    manual θ value; Orientation/Tilt now live behind the '…' popup)."""
-    gi_detail = {("GI", "th_motor"), ("GI", "th_val")}
-    return {
-        row.path
-        for row in widget.controls_v2.experiment_card.body.findChildren(FormRow)
-        if row.path in gi_detail
-    }
-
-
-def _find_form_row(widget, path):
-    path = tuple(path)
-    for card in (
-        widget.controls_v2.project_card,
-        widget.controls_v2.source_card,
-        widget.controls_v2.experiment_card,
-        widget.controls_v2.processing_card,
-    ):
-        for row in card.body.findChildren(FormRow):
-            if getattr(row, "path", None) == path:
-                return row
-    return None
-
-
-def _find_more_button(widget):
-    """The '…' GI-options button in the Experiment card, or None."""
-    for btn in widget.controls_v2.experiment_card.body.findChildren(
-            QtWidgets.QToolButton):
-        if btn.objectName() == "controlsV2MoreButton":
-            return btn
-    return None
-
-
-def _find_source_energy_button(widget):
-    """The Source-card energy-preference '…' button, or None."""
-    for btn in widget.controls_v2.source_card.body.findChildren(
-            QtWidgets.QToolButton):
-        if (
-            btn.objectName() == "controlsV2MoreButton"
-            and btn.property("role") == "sourceEnergy"
-        ):
-            return btn
-    return None
-
-
-def _plain(value):
-    """Small, stable representation for reduction-plan equivalence tests."""
-    if hasattr(value, "value"):
-        return value.value
-    if isinstance(value, dict):
-        return {str(k): _plain(v) for k, v in sorted(value.items())}
-    if isinstance(value, (list, tuple)):
-        return tuple(_plain(v) for v in value)
-    return value
-
-
-def _plan_snapshot(plan):
-    def _snap(obj, attrs):
-        if obj is None:
-            return None
-        return {name: _plain(getattr(obj, name)) for name in attrs}
-
-    def _mask(mask):
-        if mask is None:
-            return None
-        values = getattr(mask, "values", mask)
-        arr = np.asarray(values)
-        return {
-            "kind": type(mask).__name__,
-            "shape": tuple(arr.shape),
-            "dtype": str(arr.dtype),
-            "values": tuple(arr.ravel().tolist()) if arr.size <= 20 else None,
-            "true_count": (
-                int(arr.astype(bool, copy=False).sum())
-                if arr.dtype == bool
-                else None
-            ),
-        }
-
-    return {
-        "integration_1d": _snap(plan.integration_1d, (
-            "npt",
-            "npt_rad",
-            "unit",
-            "method",
-            "radial_range",
-            "azimuth_range",
-            "monitor_key",
-            "error_model",
-            "polarization_factor",
-            "extra",
-        )),
-        "integration_2d": _snap(plan.integration_2d, (
-            "npt_rad",
-            "npt_azim",
-            "unit",
-            "method",
-            "radial_range",
-            "azimuth_range",
-            "azimuth_offset",
-            "monitor_key",
-            "error_model",
-            "polarization_factor",
-            "extra",
-        )),
-        "gi": _snap(plan.gi, (
-            "incident_angle",
-            "incidence_motor",
-            "tilt_angle",
-            "sample_orientation",
-            "method",
-            "mode_1d",
-            "mode_2d",
-            "npt_oop",
-        )),
-        "mask": _mask(plan.mask),
-        "threshold_min": _plain(plan.threshold_min),
-        "threshold_max": _plain(plan.threshold_max),
-        "mask_saturation": _plain(plan.mask_saturation),
-    }
-
-
-def _threshold_snapshot(widget):
-    cfg = widget.integratorTree.get_threshold_config()
-    return {
-        "apply_threshold": cfg.apply_threshold,
-        "threshold_min": cfg.threshold_min,
-        "threshold_max": cfg.threshold_max,
-        "mask_saturation": cfg.mask_saturation,
-    }
-
-
-def _apply_v2_edits(widget, edits):
-    for path, value in edits:
-        widget._on_controls_v2_field_changed(path, value)
-
-
-def _apply_prepared_run_state(widget):
-    """Drive the post-admission owner with the one staged frozen identity.
-
-    W-1R-D1 split preparation from admission.  Focused projection tests use
-    this seam explicitly instead of relying on the deleted second-freeze
-    fallback in ``_apply_controls_v2_run_state()``.
-    """
-    frozen = widget._prepare_controls_v2_run_configuration()
-    assert frozen is not None
-    return widget._apply_controls_v2_run_state(frozen), frozen
-
-
-def _native_plan_snapshot(widget, *, include_threshold=True,
-                          integrate_1d=True, integrate_2d=True,
-                          commit_pending=True):
-    plan = widget._controls_v2_native_reduction_plan(
-        include_threshold=include_threshold,
-        integrate_1d=integrate_1d,
-        integrate_2d=integrate_2d,
-        commit_pending=commit_pending,
-    )
-    return _plan_snapshot(plan)
-
-
-def _combo_text(widget, name, predicate, *, fallback_current=True):
-    combo = getattr(widget.integratorTree.ui, name)
-    for i in range(combo.count()):
-        text = combo.itemText(i)
-        if predicate(text):
-            return text
-    if fallback_current:
-        return combo.currentText()
-    raise AssertionError(f"No matching choice in {name}")
-
-
-def _field_choice_text(widget, path, predicate, *, fallback_current=True):
-    choices = widget._controls_v2_field_choices().get(tuple(path), ())
-    for text in choices:
-        if predicate(str(text)):
-            return str(text)
-    if fallback_current:
-        return str(widget._controls_v2_field_values().get(tuple(path), ""))
-    raise AssertionError(f"No matching choice for {path}")
-
-
-def _visible_control_value(widget, path):
-    path = tuple(path)
-    cards = (
-        widget.controls_v2.project_card,
-        widget.controls_v2.source_card,
-        widget.controls_v2.experiment_card,
-        widget.controls_v2.processing_card,
-    )
-    for card in cards:
-        for seg in card.body.findChildren(SegmentedControl):
-            if seg.path == path:
-                return seg.current_value()
-        for row in card.body.findChildren(FormRow):
-            if row.path == path:
-                return row.current_value()
-        for row in card.body.findChildren(RangeRow):
-            for row_path, value in row.current_edits():
-                if row_path == path:
-                    return value
-        for row in card.body.findChildren(PillRow):
-            for row_path, value in row.current_edits():
-                if row_path == path:
-                    return value
-    raise AssertionError(f"No visible V2 control for {path!r}")
-
-
-def _reset_controls_v2_gi(*widgets):
-    """Leave GI tests in Standard mode even if an assertion fails midway."""
-    for widget in widgets:
-        try:
-            widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
-        except Exception:
-            pass
-
-
 @pytest.fixture(scope="module")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -354,135 +89,10 @@ def _drain_qt_events_after_test(qapp):
         qapp.processEvents()
 
 
-def test_controls_panel_renders_blockers_and_launchers(qapp):
-    profile = ControlProfile(
-        processing_page=ProcessingPage.RSM,
-        run_enabled=False,
-        run_blockers=("RSM GUI awaits real-data gate.",),
-        analysis_launchers=(
-            AnalysisLauncherSpec(
-                AnalysisTool.PEAK_FIT, "Peak Fitting", enabled=True,
-                live_capable=True),
-            AnalysisLauncherSpec(
-                AnalysisTool.SIN2PSI, "Strain / sin²ψ", enabled=False,
-                reason="Needs ψ metadata.", production_ready=False),
-        ),
-    )
-
-    panel = ControlsPanel()
-    panel.set_profile(profile)
-
-    badges = panel.summary_card.body.findChildren(QtWidgets.QLabel)
-    assert [b.text() for b in badges] == ["RSM GUI awaits real-data gate."]
-
-    buttons = panel.analysis_card.body.findChildren(QtWidgets.QPushButton)
-    assert [b.text() for b in buttons] == ["Peak Fitting", "Strain / sin²ψ"]
-    assert buttons[0].isEnabled()
-    assert not buttons[1].isEnabled()
-    assert buttons[1].toolTip() == "Needs ψ metadata."
-
-
-def test_controls_panel_emits_launcher_intent(qapp):
-    profile = ControlProfile(
-        processing_page=ProcessingPage.INT_1D,
-        run_enabled=True,
-        analysis_launchers=(
-            AnalysisLauncherSpec(AnalysisTool.SCAN_PLOT, "Plot Metadata"),),
-    )
-    panel = ControlsPanel()
-    panel.set_profile(profile)
-    got = []
-    panel.analysisLaunchRequested.connect(got.append)
-    panel.analysis_card.body.findChildren(QtWidgets.QPushButton)[0].click()
-    assert got == [AnalysisTool.SCAN_PLOT]
-
-
-def test_controls_panel_emits_action_intent(qapp):
-    profile = build_control_profile(
-        ControlState(
-            tool=Tool.INT_2D,
-            project_root="/tmp/project",
-            source_caps=SourceCaps(has_frames=True),
-        )
-    )
-    panel = ControlsPanel()
-    panel.set_profile(profile)
-    got = []
-    panel.controlActionRequested.connect(got.append)
-
-    buttons = panel.project_card.body.findChildren(QtWidgets.QPushButton)
-    buttons[0].click()
-
-    assert got == [ControlAction.CHOOSE_PROJECT]
-
-
-def test_controls_panel_backend_conflict_gates_run():
-    profile = build_control_profile(
-        ControlState(
-            tool=Tool.STITCH,
-            mode=MeasMode.GI,
-            backend="multigeometry",
-            source_caps=SourceCaps(has_frames=True, has_energy=True),
-            geom=GeomState(
-                calibrated=True,
-                energy_known=True,
-                gi_enabled=True,
-                sample_orientation_known=True,
-            ),
-            real_data_gates=frozenset({"gi_stitch_real_data"}),
-        )
-    )
-
-    backend = profile.fields[FieldId.PROCESSING_BACKEND]
-
-    assert backend.status is StatusKind.CONFLICT
-    assert "pyfai_hist" in backend.reason
-    assert profile.can_run is False
-    assert profile.run_blockers == (backend.reason,)
-
-
-def test_controls_panel_renders_typed_field_cards(qapp):
-    profile = build_control_profile(
-        ControlState(
-            source_label="/tmp/scan.nxs",
-            project_root="/tmp/project",
-            save_path="/tmp/out",
-            frame_count=5,
-            processing_mode="Int 1D",
-            source_caps=SourceCaps(
-                has_frames=True, has_raw=True, raw_reachable=True,
-                has_metadata=True),
-            result_caps=ResultCaps(has_1d=True),
-        )
-    )
-
-    panel = ControlsPanel()
-    panel.set_profile(profile)
-
-    project_rows = panel.project_card.body.findChildren(FieldRow)
-    assert [row.status.label for row in project_rows] == ["Project folder"]
-    assert project_rows[0].status.value == "/tmp/project"
-
-    source_rows = panel.source_card.body.findChildren(FieldRow)
-    assert [row.status.label for row in source_rows][:2] == ["Source", "Frames"]
-    assert source_rows[0].status.value == "/tmp/scan.nxs"
-    assert source_rows[1].status.value == "5"
-
-    analysis_rows = panel.analysis_card.body.findChildren(FieldRow)
-    assert [row.status.label for row in analysis_rows] == [
-        "1D result", "2D result", "RSM result"]
-
-
 def test_controls_panel_renders_bound_render_state_directly(qapp):
-    profile = build_control_profile(
-        ControlState(
-            source_caps=SourceCaps(has_frames=True),
-            result_caps=ResultCaps(has_1d=True),
-        )
-    )
-    state = ControlPanelRenderState(
-        profile=profile,
-        bound_controls=BoundControlState(fields=(
+    state = ControlsProjection(
+        processing_page=ProcessingPage.INT_2D,
+        fields=(
             ControlFormField(
                 section=SectionId.PROJECT,
                 label="Folder",
@@ -500,11 +110,13 @@ def test_controls_panel_renders_bound_render_state_directly(qapp):
                 enabled=False,
                 reason="locked",
             ),
-        )),
+        ),
+        section_actions={},
+        detector_summary="",
     )
 
     panel = ControlsPanel()
-    panel.set_state(state)
+    panel.reconcile(state)
 
     project_rows = panel.project_card.body.findChildren(FormRow)
     source_rows = panel.source_card.body.findChildren(FormRow)
@@ -512,19 +124,12 @@ def test_controls_panel_renders_bound_render_state_directly(qapp):
     assert [row.label.text() for row in source_rows] == ["Source"]
     assert not source_rows[0].editor.isEnabled()
     assert source_rows[0].toolTip() == "locked"
-    assert panel.analysis_card.isHidden()
 
 
 def test_controls_panel_detector_status_uses_poni_summary(qapp):
-    profile = build_control_profile(
-        ControlState(
-            source_caps=SourceCaps(has_frames=True),
-            detector_summary="Eiger 1M · 200.4mm · fitted",
-        )
-    )
-    state = ControlPanelRenderState(
-        profile=profile,
-        bound_controls=BoundControlState(fields=(
+    state = ControlsProjection(
+        processing_page=ProcessingPage.INT_2D,
+        fields=(
             ControlFormField(
                 section=SectionId.EXPERIMENT,
                 label="Poni",
@@ -532,11 +137,13 @@ def test_controls_panel_detector_status_uses_poni_summary(qapp):
                 value="/tmp/example.poni",
                 browse=True,
             ),
-        )),
+        ),
+        section_actions={},
+        detector_summary="Eiger 1M · 200.4mm · fitted",
     )
 
     panel = ControlsPanel()
-    panel.set_state(state)
+    panel.reconcile(state)
 
     detector = next(
         card for card in panel.experiment_card.body.findChildren(SubsectionCard)
@@ -545,66 +152,10 @@ def test_controls_panel_detector_status_uses_poni_summary(qapp):
     assert detector.status.text() == "Eiger 1M · 200.4mm · fitted"
 
 
-def test_controls_panel_section_ticks_and_source_synopsis(qapp):
-    profile = build_control_profile(
-        ControlState(
-            tool=Tool.INT_2D,
-            project_root_required=True,
-            project_root="/tmp/project",
-            project_root_valid=True,
-            source_label="/tmp/project/raw/scan_0001.tif",
-            processing_mode="Int 2D",
-            source_caps=SourceCaps(
-                has_raw=True,
-                raw_reachable=True,
-                has_energy=True,
-            ),
-            geom=GeomState(calibrated=True, energy_known=True),
-        )
-    )
-    state = ControlPanelRenderState(
-        profile=profile,
-        bound_controls=BoundControlState(fields=(
-            ControlFormField(
-                section=SectionId.PROJECT,
-                label="Folder",
-                path=("Project", "project_folder"),
-                value="/tmp/project",
-                browse=True,
-            ),
-            ControlFormField(
-                section=SectionId.SOURCE,
-                label="Source",
-                path=("Signal", "inp_type"),
-                value="Image Series",
-                kind=ControlFieldKind.COMBO,
-            ),
-            ControlFormField(
-                section=SectionId.EXPERIMENT,
-                label="Poni",
-                path=("Signal", "poni_file"),
-                value="/tmp/project/cal.poni",
-                browse=True,
-            ),
-        )),
-    )
-
-    panel = ControlsPanel()
-    panel.set_state(state)
-
-    assert panel.source_card.status.text() == "Image Series"
-    assert not panel.project_card.valid_marker.isHidden()
-    assert not panel.source_card.valid_marker.isHidden()
-    assert not panel.experiment_card.valid_marker.isHidden()
-
-
 def test_controls_panel_viewer_mode_shows_only_project(qapp):
-    profile = build_control_profile(
-        ControlState(tool=Tool.IMAGE_VIEWER, processing_mode="Image Viewer")
-    )
-    state = ControlPanelRenderState(
-        profile=profile,
-        bound_controls=BoundControlState(fields=(
+    state = ControlsProjection(
+        processing_page=ProcessingPage.VIEWER,
+        fields=(
             ControlFormField(
                 section=SectionId.PROJECT,
                 label="Folder",
@@ -633,63 +184,13 @@ def test_controls_panel_viewer_mode_shows_only_project(qapp):
                 value="None",
                 kind=ControlFieldKind.COMBO,
             ),
-        )),
+        ),
+        section_actions={},
+        detector_summary="",
     )
 
     panel = ControlsPanel()
-    panel.set_state(state)
-
-    assert not panel.project_card.isHidden()
-    assert panel.source_card.isHidden()
-    assert panel.experiment_card.isHidden()
-    assert panel.processing_card.isHidden()
-
-
-def test_controls_panel_requires_valid_project_before_setup_cards(qapp):
-    fields = (
-        ControlFormField(
-            section=SectionId.PROJECT,
-            label="Folder",
-            path=("Project", "project_folder"),
-            value="",
-            browse=True,
-        ),
-        ControlFormField(
-            section=SectionId.SOURCE,
-            label="Source",
-            path=("Signal", "inp_type"),
-            value="Image Series",
-            kind=ControlFieldKind.COMBO,
-        ),
-        ControlFormField(
-            section=SectionId.EXPERIMENT,
-            label="Poni",
-            path=("Signal", "poni_file"),
-            value="",
-            browse=True,
-        ),
-        ControlFormField(
-            section=SectionId.PROCESSING,
-            label="Background",
-            path=("BG", "bg_type"),
-            value="None",
-            kind=ControlFieldKind.COMBO,
-        ),
-    )
-    profile = build_control_profile(
-        ControlState(
-            project_root_required=True,
-            project_root="",
-            project_root_valid=False,
-            processing_mode="Int 2D",
-        )
-    )
-
-    panel = ControlsPanel()
-    panel.set_state(ControlPanelRenderState(
-        profile=profile,
-        bound_controls=BoundControlState(fields=fields),
-    ))
+    panel.reconcile(state)
 
     assert not panel.project_card.isHidden()
     assert panel.source_card.isHidden()
@@ -728,83 +229,6 @@ def test_run_readiness_label_elides_without_widening_controls(qapp):
     finally:
         controls.close()
         controls.deleteLater()
-
-
-def test_controls_panel_native_plan_preserves_monitor_parity():
-    args_1d = {
-        "unit": "q_A^-1",
-        "method": "csr",
-        "numpoints": 250,
-        "radial_range": (0.2, 4.4),
-        "azimuth_range": (-30.0, 30.0),
-        "monitor": "I0",
-        "normalization_factor": 5.0,
-        "error_model": "poisson",
-        "polarization_factor": 0.95,
-    }
-    args_2d = {
-        "unit": "q_A^-1",
-        "method": "csr",
-        "npt_rad": 80,
-        "npt_azim": 90,
-        "radial_range": (0.1, 5.0),
-        "azimuth_range": (-90.0, 90.0),
-        "chi_offset": 2.5,
-        "monitor": "mon",
-        "normalization_factor": 2.0,
-        "error_model": "azimuthal",
-        "polarization_factor": 0.9,
-    }
-
-    native = build_native_int_reduction_plan_from_args(
-        args_1d,
-        args_2d,
-        gi_enabled=False,
-        integrate_1d=True,
-        integrate_2d=True,
-        detector_mask=np.array([1, 4]),
-        detector_shape=(2, 3),
-    )
-
-    snapshot = _plan_snapshot(native)
-    assert snapshot["integration_1d"]["monitor_key"] == "I0"
-    assert snapshot["integration_2d"]["monitor_key"] == "mon"
-    assert snapshot["mask"]["kind"] == "ndarray"
-    assert snapshot["mask"]["shape"] == (2, 3)
-    assert snapshot["mask"]["true_count"] == 2
-    assert "normalization_factor" not in snapshot["integration_1d"]["extra"]
-    assert "normalization_factor" not in snapshot["integration_2d"]["extra"]
-
-
-def test_controls_panel_native_gi_plan_defaults_orientation_to_4():
-    args_plan = build_native_int_reduction_plan_from_args(
-        {},
-        {},
-        gi_enabled=True,
-        gi_incident_angle=0.1,
-        integrate_2d=False,
-    )
-    assert args_plan.gi.sample_orientation == 4
-
-    class FakeFrames:
-        index = []
-
-    class FakeScan:
-        skip_2d = True
-        gi = True
-        _cached_fiber_integrator_angle = 0.1
-        incidence_motor = None
-        global_mask = None
-        detector_shape = (2, 3)
-        frames = FakeFrames()
-        bai_1d_args = {}
-        bai_2d_args = {}
-        gi_config = {}
-
-    scan_plan = build_native_int_reduction_plan_from_scan(
-        FakeScan(), integrate_1d=True, integrate_2d=False
-    )
-    assert scan_plan.gi.sample_orientation == 4
 
 
 @pytest.mark.parametrize(
@@ -931,39 +355,6 @@ def test_rejected_compact_path_edit_restores_authoritative_path(qapp):
         row.deleteLater()
 
 
-def _admit_pending_run_configuration(widget):
-    """Install the run admission a real ``imageWrangler.start()`` performs.
-
-    X1 O-3 (§8.1): the run-state owner requires the handed-off frozen object
-    and all four wrapper/worker carrier-and-ledger references to be ONE object
-    before it will start a wrangler run.  These Controls cases drive
-    ``start_wrangler()`` directly, so they have to stand in for the admission
-    the production Start path would already have done — otherwise the double
-    represents a run whose configuration was never admitted, which is exactly
-    what the gate exists to refuse.
-    """
-    frozen = widget._require_controls_v2_run_handoff()
-    if getattr(getattr(frozen, "source", None), "uri", None) is None:
-        # X1 O-3 (§11.2.1): a wrangler run is refused unless its accepted
-        # configuration names a SOURCE — the acquisition owner takes its source
-        # identity from there and never from the mutable `scan.data_file`.
-        # These cases drive `start_wrangler()` directly and so bypass the
-        # readiness gate that makes a source mandatory before Start; the stand-
-        # in supplies the one a real Start would already have carried.
-        from dataclasses import replace as _replace
-
-        from xrd_tools.session.run_configuration import FrozenSourceSpec
-
-        frozen = _replace(frozen, source=FrozenSourceSpec(
-            family="source", source_kind="image_file", uri="/raw/controls-test-source.h5"))
-        # The handed-off object must be the SAME one: §8.1's five-reference
-        # gate compares by identity, not by content.
-        widget._pending_controls_v2_run_configuration = frozen
-    for owner in (widget.wrangler, widget.wrangler.thread):
-        for name in ("run_configuration", "_admitted_run_configuration"):
-            setattr(owner, name, frozen)
-    return frozen
-
 @pytest.mark.parametrize("theme", ("dark", "light"))
 def test_controls_panel_checked_disabled_matches_disabled_text_color(
     theme,
@@ -986,10 +377,10 @@ def test_controls_panel_checked_disabled_matches_disabled_text_color(
 
 
 
-def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
+def test_reconcile_rebuilds_when_fields_appear(qapp):
     """LV-UI-5: Standard→Grazing ADDS the θ-motor field; the in-place fast
     path must refuse (keys changed) so the full render mounts the new row —
-    production falls back to ``set_state`` exactly as the shell does."""
+    public reconcile rebuilds once when the schema changes."""
     from xrd_tools.session.intent_store import RunIntentStore
     from xrd_tools.session.run_configuration import RunIntent
     from xdart.gui.tabs.scattering.controls_inventory import GI_MOTOR
@@ -999,32 +390,35 @@ def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
     panel = ControlsPanel()
     try:
         intent = RunIntent()
-        panel.set_state(project_controls(
+        panel.reconcile(project_controls(
             RunIntentStore(intent).snapshot(), None, RunPhase.IDLE))
         assert not [r for r in panel.findChildren(FormRow)
                     if tuple(r.path) == GI_MOTOR]
+        panel.experiment_card.set_status_text("standard")
+        panel.experiment_card.set_valid_marker(True, "ready")
 
         intent.gi.enabled = True
         grazing = project_controls(
             RunIntentStore(intent).snapshot(), None, RunPhase.IDLE)
-        assert panel.apply_state_update(grazing) is False
-        panel.set_state(grazing)
+        assert panel.reconcile(grazing) is False
         rows = [r for r in panel.findChildren(FormRow)
                 if tuple(r.path) == GI_MOTOR]
         assert rows, "theta-motor row must mount on the Grazing switch"
+        assert panel.experiment_card.status.text() == "standard"
+        assert not panel.experiment_card.valid_marker.isHidden()
+        assert panel.experiment_card.valid_marker.toolTip() == "ready"
     finally:
         panel.close()
         panel.deleteLater()
 
 
-def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
+def test_reconcile_updates_action_buttons_without_spurious_repolish(
     qapp, monkeypatch,
 ):
     """Unchanged/action-only refreshes avoid polish; style changes do not."""
     from dataclasses import replace
 
     from xrd_tools.session.intent_store import RunIntentStore
-    from xrd_tools.session.readiness import ControlAction
     from xrd_tools.session.run_configuration import RunIntent
     from xdart.gui.tabs.scattering.controls_projection import project_controls
     from xdart.gui.tabs.scattering.state_machine import RunPhase
@@ -1041,7 +435,7 @@ def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
     )
     panel = ControlsPanel()
     try:
-        panel.set_state(disabled)
+        panel.reconcile(disabled)
         before = next(
             button
             for button in panel.findChildren(ActionButton)
@@ -1058,7 +452,7 @@ def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
         )
         assert calibrate_before.text() == "⌖ Calibrate"
 
-        assert panel.apply_state_update(enabled) is True
+        assert panel.reconcile(enabled) is True
         qapp.processEvents()
         after = next(
             button
@@ -1092,7 +486,7 @@ def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
         # A controls-only refresh commonly projects an equal immutable state.
         # It must neither rebuild nor force every action through the style
         # engine: that global repolish is visible as a whole-panel flicker.
-        assert panel.apply_state_update(enabled) is True
+        assert panel.reconcile(enabled) is True
         assert repolished == []
         assert next(
             button
@@ -1106,7 +500,7 @@ def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
             calibration_active=True,
             reintegrate_available=True,
         )
-        assert panel.apply_state_update(active) is True
+        assert panel.reconcile(active) is True
         assert next(
             button
             for button in panel.findChildren(ActionButton)
@@ -1118,7 +512,7 @@ def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
         # ``productionReady`` participates in the stylesheet selector.  A
         # genuine change to it must still update the dynamic property and
         # repolish exactly that one action button.
-        actions = dict(active.profile.section_actions)
+        actions = dict(active.section_actions)
         actions[SectionId.EXPERIMENT] = tuple(
             replace(spec, production_ready=False)
             if spec.action is ControlAction.CALIBRATE
@@ -1127,29 +521,29 @@ def test_apply_state_update_updates_action_buttons_without_spurious_repolish(
         )
         style_changed = replace(
             active,
-            profile=replace(active.profile, section_actions=actions),
+            section_actions=actions,
         )
-        assert panel.apply_state_update(style_changed) is True
+        assert panel.reconcile(style_changed) is True
         assert calibrate_before.property("productionReady") is False
         assert repolished == [
             ("unpolish", calibrate_before),
             ("polish", calibrate_before),
         ]
 
-        actions = dict(style_changed.profile.section_actions)
+        actions = dict(style_changed.section_actions)
         processing = actions[SectionId.PROCESSING]
         actions[SectionId.PROCESSING] = tuple(reversed(processing))
         reordered = replace(
             style_changed,
-            profile=replace(style_changed.profile, section_actions=actions),
+            section_actions=actions,
         )
-        assert panel.apply_state_update(reordered) is False
+        assert panel.reconcile(reordered) is False
     finally:
         panel.close()
         panel.deleteLater()
 
 
-def test_apply_state_update_locks_gi_more_without_rebuilding(qapp):
+def test_reconcile_locks_gi_more_without_rebuilding(qapp):
     """A controls-only operation refresh must not leave the GI popup live."""
     from xrd_tools.session.intent_store import RunIntentStore
     from xrd_tools.session.run_configuration import RunIntent
@@ -1167,7 +561,7 @@ def test_apply_state_update_locks_gi_more_without_rebuilding(qapp):
     )
     panel = ControlsPanel()
     try:
-        panel.set_state(idle)
+        panel.reconcile(idle)
         more = next(
             button
             for button in panel.experiment_card.body.findChildren(
@@ -1180,7 +574,7 @@ def test_apply_state_update_locks_gi_more_without_rebuilding(qapp):
         qapp.processEvents()
         assert panel._gi_options_popup is not None
 
-        assert panel.apply_state_update(busy) is True
+        assert panel.reconcile(busy) is True
         qapp.processEvents()
         assert more is next(
             button
@@ -1207,7 +601,7 @@ def test_apply_state_update_locks_gi_more_without_rebuilding(qapp):
         panel.deleteLater()
 
 
-def test_apply_state_update_refreshes_source_energy_popup_capture(qapp):
+def test_reconcile_refreshes_source_energy_popup_capture(qapp):
     """The Source More button must open the newly projected preference."""
     from dataclasses import replace
 
@@ -1229,26 +623,20 @@ def test_apply_state_update_refreshes_source_energy_popup_capture(qapp):
     )
     before = replace(
         base,
-        bound_controls=replace(
-            base.bound_controls,
-            fields=base.bound_controls.fields + (energy,),
-        ),
+        fields=base.fields + (energy,),
     )
     after = replace(
         before,
-        bound_controls=replace(
-            before.bound_controls,
-            fields=tuple(
-                replace(field, value="metadata")
-                if field.path == energy.path
-                else field
-                for field in before.bound_controls.fields
-            ),
+        fields=tuple(
+            replace(field, value="metadata")
+            if field.path == energy.path
+            else field
+            for field in before.fields
         ),
     )
     panel = ControlsPanel()
     try:
-        panel.set_state(before)
+        panel.reconcile(before)
         button = next(
             candidate
             for candidate in panel.source_card.body.findChildren(
@@ -1256,7 +644,7 @@ def test_apply_state_update_refreshes_source_energy_popup_capture(qapp):
             )
             if candidate.property("role") == "sourceEnergy"
         )
-        assert panel.apply_state_update(after) is True
+        assert panel.reconcile(after) is True
         assert button is next(
             candidate
             for candidate in panel.source_card.body.findChildren(
@@ -1277,7 +665,7 @@ def test_apply_state_update_refreshes_source_energy_popup_capture(qapp):
         panel.deleteLater()
 
 
-def test_apply_state_update_refreshes_derived_subsection_statuses(qapp):
+def test_reconcile_refreshes_derived_subsection_statuses(qapp):
     from dataclasses import replace
 
     from xrd_tools.session.intent_store import RunIntentStore
@@ -1290,11 +678,11 @@ def test_apply_state_update_refreshes_derived_subsection_statuses(qapp):
     )
     after = replace(
         before,
-        profile=replace(before.profile, detector_summary="Eiger4M · fitted"),
+        detector_summary="Eiger4M · fitted",
     )
     panel = ControlsPanel()
     try:
-        panel.set_state(before)
+        panel.reconcile(before)
         detector = next(
             subsection
             for subsection in panel.experiment_card.body.findChildren(
@@ -1303,7 +691,7 @@ def test_apply_state_update_refreshes_derived_subsection_statuses(qapp):
             if subsection.title.text() == "Detector"
         )
         assert detector.status.text() != "Eiger4M · fitted"
-        assert panel.apply_state_update(after) is True
+        assert panel.reconcile(after) is True
         assert detector.status.text() == "Eiger4M · fitted"
         assert detector.status.isVisibleTo(detector)
     finally:
@@ -1311,7 +699,7 @@ def test_apply_state_update_refreshes_derived_subsection_statuses(qapp):
         panel.deleteLater()
 
 
-def test_apply_state_update_refuses_render_schema_change_before_mutation(qapp):
+def test_reconcile_refuses_fast_path_before_schema_rebuild(qapp):
     from dataclasses import replace
 
     from xrd_tools.session.intent_store import RunIntentStore
@@ -1322,27 +710,31 @@ def test_apply_state_update_refuses_render_schema_change_before_mutation(qapp):
     before = project_controls(
         RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE,
     )
-    target = before.bound_controls.fields[0]
+    target = before.fields[0]
     after = replace(
         before,
-        bound_controls=replace(
-            before.bound_controls,
-            fields=(replace(target, label=target.label + " changed"),)
-            + before.bound_controls.fields[1:],
-        ),
+        fields=(replace(target, label=target.label + " changed"),)
+        + before.fields[1:],
     )
     panel = ControlsPanel()
     try:
-        panel.set_state(before)
+        panel.reconcile(before)
         row = next(
             candidate
             for candidate in panel.findChildren(FormRow)
             if candidate.path == target.path
         )
         label = row.label.text()
-        assert panel.apply_state_update(after) is False
-        assert panel._bound_state is before.bound_controls
+        assert panel.reconcile(after) is False
+        assert panel.projection is after
         assert row.label.text() == label
+        replacement = next(
+            candidate
+            for candidate in panel.findChildren(FormRow)
+            if candidate.path == target.path
+        )
+        assert replacement is not row
+        assert replacement.label.text() == target.label + " changed"
     finally:
         panel.close()
         panel.deleteLater()
@@ -1362,7 +754,7 @@ def test_threshold_and_mask_saturated_are_independent_in_vnext(qapp):
 
     panel = ControlsPanel()
     try:
-        panel.set_state(project_controls(
+        panel.reconcile(project_controls(
             RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE))
         row = next(
             r for r in panel.findChildren(RangeRow)
@@ -1415,7 +807,7 @@ def test_threshold_and_mask_saturated_are_independent_in_vnext(qapp):
         manual = RunIntent()
         manual.threshold.mask_saturation = False
         manual.threshold.apply_threshold = True
-        panel.set_state(project_controls(
+        panel.reconcile(project_controls(
             RunIntentStore(manual).snapshot(), None, RunPhase.IDLE))
         manual_row = next(
             r for r in panel.findChildren(RangeRow)
@@ -1465,7 +857,7 @@ def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
         high={"path": ("Int1D", "radial_high"), "value": 4.75},
     )
     try:
-        panel.set_state(project_controls(
+        panel.reconcile(project_controls(
             RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
         ))
         row = _threshold_row(panel)
@@ -1496,7 +888,7 @@ def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
         # A later accepted exact value can share the same rounded display
         # bucket.  It must clear the old draft marker and remain authoritative
         # when the untouched editor is focused/harvested again.
-        assert panel.apply_state_update(project_controls(
+        assert panel.reconcile(project_controls(
             RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
         ))
         row = _threshold_row(panel)
@@ -1523,7 +915,7 @@ def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
         updated.threshold.mask_saturation = False
         updated.threshold.threshold_min = 1.5
         updated.threshold.threshold_max = 100.75
-        assert panel.apply_state_update(project_controls(
+        assert panel.reconcile(project_controls(
             RunIntentStore(updated).snapshot(), None, RunPhase.IDLE
         ))
         row = _threshold_row(panel)
@@ -1563,7 +955,7 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
     panel = ControlsPanel()
     try:
         # Construction while run-locked.
-        panel.set_state(project_controls(
+        panel.reconcile(project_controls(
             store.snapshot(), None, RunPhase.RUNNING))
         locked = _row(panel)
         assert not locked._high.isEnabled()
@@ -1571,15 +963,11 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
         assert "display default" in locked._high.toolTip()
 
         # In-place unlock, then re-lock, through the update path.
-        if not panel.apply_state_update(project_controls(
-                store.snapshot(), None, RunPhase.IDLE)):
-            panel.set_state(project_controls(
-                store.snapshot(), None, RunPhase.IDLE))
+        panel.reconcile(project_controls(
+            store.snapshot(), None, RunPhase.IDLE))
         assert "display default" in _row(panel)._high.toolTip()
-        if not panel.apply_state_update(project_controls(
-                store.snapshot(), None, RunPhase.RUNNING)):
-            panel.set_state(project_controls(
-                store.snapshot(), None, RunPhase.RUNNING))
+        panel.reconcile(project_controls(
+            store.snapshot(), None, RunPhase.RUNNING))
         relocked = _row(panel)
         assert "locked" in relocked._high.toolTip()
         assert "display default" in relocked._high.toolTip()

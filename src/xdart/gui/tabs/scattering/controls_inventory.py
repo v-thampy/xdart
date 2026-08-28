@@ -13,7 +13,6 @@ from xrd_tools.session.control_labels import (
     range_axis_labels_2d,
 )
 from xrd_tools.session.readiness import (
-    BoundControlState,
     ControlFieldKind,
     ControlFormField,
     SectionId,
@@ -295,14 +294,14 @@ SOURCE_FORMAT_SUFFIXES = {
 }
 
 
-def build_native_control_state(
+def project_control_fields(
     values: Mapping[tuple[str, ...], object] | None = None,
     choices: Mapping[tuple[str, ...], Sequence[object]] | None = None,
     *,
     tool: Tool | None = None,
     controls_enabled: bool = True,
-) -> BoundControlState:
-    """Build vNext's renderer state from native field declarations."""
+) -> tuple[ControlFormField, ...]:
+    """Project the current intent values into Controls form fields."""
 
     values = {tuple(path): value for path, value in (values or {}).items()}
     choices = {
@@ -443,7 +442,7 @@ def build_native_control_state(
             BACKGROUND_NORMALIZE,
         )
 
-    return BoundControlState(fields=tuple(projected))
+    return tuple(projected)
 
 
 def _integration_label_overrides(

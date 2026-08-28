@@ -47,12 +47,12 @@ def test_background_control_grammar_projection_and_dormant_fields(tmp_path: Path
     )
     snapshot = _snapshot(tmp_path)
     none = project_controls(snapshot, None, RunPhase.IDLE)
-    paths = {field.path for field in none.bound_controls.fields}
+    paths = {field.path for field in none.fields}
     assert BACKGROUND_TYPE in paths
     assert not paths & {BACKGROUND_FILE, BACKGROUND_DIRECTORY, BACKGROUND_MATCH,
                         BACKGROUND_METADATA_KEY, BACKGROUND_FILTER,
                         BACKGROUND_SCALE, BACKGROUND_NORMALIZE}
-    mode_field = next(field for field in none.bound_controls.fields if field.path == BACKGROUND_TYPE)
+    mode_field = next(field for field in none.fields if field.path == BACKGROUND_TYPE)
     assert mode_field.enabled and mode_field.choices == (
         "None", "Single BG File", "Series Average", "BG Directory")
     dormant = RunIntent(background=FrameBackgroundPlan(scale=-9.0)).freeze()
@@ -61,19 +61,19 @@ def test_background_control_grammar_projection_and_dormant_fields(tmp_path: Path
                         ("Series Average", "Series Member")):
         selected = reduce_control_edit(snapshot, BACKGROUND_TYPE, mode)
         fields = {field.path: field for field in project_controls(
-            RunIntentStore(selected).snapshot(), None, RunPhase.IDLE).bound_controls.fields}
+            RunIntentStore(selected).snapshot(), None, RunPhase.IDLE).fields}
         assert fields[BACKGROUND_FILE].browse and fields[BACKGROUND_FILE].label == label
         assert fields[BACKGROUND_FILE].enabled and BACKGROUND_DIRECTORY not in fields
     candidate = reduce_control_edit(snapshot, BACKGROUND_TYPE, "BG Directory")
     directory = project_controls(RunIntentStore(candidate).snapshot(), None, RunPhase.IDLE)
-    fields = {field.path: field for field in directory.bound_controls.fields}
+    fields = {field.path: field for field in directory.fields}
     assert {BACKGROUND_DIRECTORY, BACKGROUND_MATCH, BACKGROUND_FILTER,
             BACKGROUND_SCALE, BACKGROUND_NORMALIZE} <= set(fields)
     assert BACKGROUND_FILE not in fields and BACKGROUND_METADATA_KEY not in fields
     metadata = reduce_control_edit(RunIntentStore(candidate).snapshot(),
                                    BACKGROUND_MATCH, "Metadata Key")
     fields = {field.path: field for field in project_controls(
-        RunIntentStore(metadata).snapshot(), None, RunPhase.IDLE).bound_controls.fields}
+        RunIntentStore(metadata).snapshot(), None, RunPhase.IDLE).fields}
     assert BACKGROUND_METADATA_KEY in fields
     assert fields[BACKGROUND_METADATA_KEY].enabled
 

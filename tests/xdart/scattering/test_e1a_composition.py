@@ -231,8 +231,8 @@ def test_workspace_uses_real_controls_and_one_cas_per_valid_edit(qapp: QtWidgets
         controls = shell.controls
         source_status = _source_status(workspace)
         assert type(controls) is ControlsPanel
-        assert controls.profile is not None
-        assert controls.profile.run_enabled is False
+        assert controls.projection is not None
+        assert not shell.run_controls.startButton.isEnabled()
         assert (
             shell.run_controls.readinessLabel.text()
             == "Execution is unavailable"

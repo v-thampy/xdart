@@ -7,7 +7,7 @@ from enum import Enum
 
 import numpy as np
 
-from xrd_tools.session.readiness import ControlPanelRenderState
+from xrd_tools.session.readiness import ControlsProjection
 
 from .controls_readiness import ControlsReadinessProjection
 from .display_values import DisplayFrameKey, StandardTerminalTiming
@@ -590,7 +590,7 @@ class ShellProjection:
     browser: BrowserProjection
     scientific: ScientificProjection
     navigation: FrameNavigationProjection
-    controls: ControlPanelRenderState
+    controls: ControlsProjection
     run: RunStripProjection
     progress: ProgressProjection = ProgressProjection()
     controls_readiness: ControlsReadinessProjection = (

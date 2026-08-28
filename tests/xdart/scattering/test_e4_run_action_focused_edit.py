@@ -185,13 +185,6 @@ def test_run_cas_commits_one_focused_point_edit_before_capture(
         _focus(page, row.editor, qapp)
         row.editor.setText(value)
         other.editor.setText("777")
-        monkeypatch.setattr(
-            page._shell.controls,
-            "current_form_edits",
-            lambda: pytest.fail(
-                "diagnostic full-form snapshot must not be polled"
-            ),
-        )
         monkeypatch.setattr(page, "_begin_admission", captures.append)
 
         _run(page)
@@ -324,13 +317,6 @@ def test_unfocused_programmatic_text_is_not_harvested_for_run(
         qapp.processEvents()
         assert not row.editor.hasFocus()
         row.editor.setText("777")
-        monkeypatch.setattr(
-            page._shell.controls,
-            "current_form_edits",
-            lambda: pytest.fail(
-                "diagnostic full-form snapshot must not be polled"
-            ),
-        )
         monkeypatch.setattr(page, "_begin_admission", captures.append)
 
         _run(page)

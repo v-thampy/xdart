@@ -46,9 +46,11 @@ def _series(tmp_path: Path, second_metadata: tuple[str, ...] | None = None):
 def _motor_field(page: ScatteringWorkspace):
     shell = page.findChild(ScatteringWorkspaceShell)
     assert shell is not None
+    projection = shell.controls.projection
+    assert projection is not None
     return next(
         field
-        for field in shell.controls._bound_state.fields
+        for field in projection.fields
         if field.path == GI_MOTOR
     )
 

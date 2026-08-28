@@ -6,8 +6,6 @@ import time
 import pytest
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xrd_tools.session.readiness import BoundControlState, ControlPanelRenderState
-
 from xdart.gui.tabs.scattering.browser_view import BrowserView
 import xdart.gui.tabs.scattering.browser_view as browser_view_module
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
@@ -24,7 +22,7 @@ from xdart.gui.tabs.scattering.shell_values import (
 )
 from xdart.gui.tabs.scattering.shell_widgets import repeated_labels
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
-from xdart.gui.widgets.controls_panel import ControlsPanel
+from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
 
@@ -251,9 +249,11 @@ def test_e3_ui4_shell_has_one_output_control_and_overrides_title_only(
     standalone = ControlsPanel()
     try:
         shell.apply_state(state)
-        shell_paths = {edit.path for edit in shell.controls.current_form_edits()}
+        shell_paths = {
+            row.path for row in shell.controls.findChildren(FormRow)
+        }
         original_paths = {
-            field.path for field in state.controls.bound_controls.fields
+            field.path for field in state.controls.fields
         }
         assert ("Project", "output_mode") not in shell_paths
         assert ("Project", "output_mode") not in original_paths
@@ -261,7 +261,7 @@ def test_e3_ui4_shell_has_one_output_control_and_overrides_title_only(
         assert "Configuration" in _labels(shell.controls)
         assert "Sample & measurement" not in _labels(shell.controls)
 
-        standalone.set_state(state.controls)
+        standalone.reconcile(state.controls)
         assert "Sample & measurement" in _labels(standalone)
         assert "Configuration" not in _labels(standalone)
     finally:

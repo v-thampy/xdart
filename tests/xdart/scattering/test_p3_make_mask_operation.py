@@ -327,14 +327,14 @@ def test_page_focus_selected_assets_cancel_and_projection_are_exact(tmp_path, mo
         assert len(begun) == 1 and begun[0][0].source_path == str(source) and begun[0][0].source_path != displayed.artifact
         assert type(begun[0][1]) is OperationContextStamp and page._mask_identity is identity
         direct = project_controls(store.snapshot(), None, RunPhase.IDLE, mask_available=True, mask_dependency_available=True)
-        action = next(item for item in direct.profile.actions_for(SectionId.EXPERIMENT) if item.action is ControlAction.MAKE_MASK)
+        action = next(item for item in direct.actions_for(SectionId.EXPERIMENT) if item.action is ControlAction.MAKE_MASK)
         assert action.enabled
         assert action.reason == (
             "Choose an explicit TIFF, HDF5, or NeXus image source and create "
             "its beside-source EDF mask."
         )
         active = project_controls(store.snapshot(), None, RunPhase.IDLE, operation_busy=True, mask_active=True)
-        actions = active.profile.actions_for(SectionId.EXPERIMENT); assert actions[1].label == "Cancel Mask" and actions[1].enabled and not actions[0].enabled
+        actions = active.actions_for(SectionId.EXPERIMENT); assert actions[1].label == "Cancel Mask" and actions[1].enabled and not actions[0].enabled
         cancelled = []; monkeypatch.setattr(OperationSlot, "current_identity", property(lambda _slot: identity)); monkeypatch.setattr(page._operation_slot, "cancel", lambda item: cancelled.append(item) or True)
         page._refresh_shell(); page.show(); qapp.processEvents()
         assert any(button.text() == "Cancel Mask" and button.isVisible() for button in page.findChildren(QtWidgets.QPushButton))

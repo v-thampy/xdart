@@ -139,10 +139,9 @@ def test_gi_controls_use_the_production_axis_inventory_and_semantics() -> None:
     store = RunIntentStore(_gi_intent())
     snapshot = store.snapshot()
     state = project_controls(snapshot, None, RunPhase.IDLE)
-    assert state.bound_controls is not None
     fields = {
         field.path: field
-        for field in state.bound_controls.fields
+        for field in state.fields
     }
 
     assert fields[INT_1D_AXIS].choices == (

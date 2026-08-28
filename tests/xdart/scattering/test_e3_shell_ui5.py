@@ -46,7 +46,7 @@ def _form_rows(widget: QtWidgets.QWidget) -> dict[tuple[str, ...], FormRow]:
 def _field_map(state) -> dict[tuple[str, ...], object]:
     return {
         tuple(field.path): field
-        for field in state.controls.bound_controls.fields
+        for field in state.controls.fields
     }
 
 
@@ -81,7 +81,7 @@ def test_e3_ui5_detector_and_directory_source_use_accepted_paths_and_order(
 
         source_paths = tuple(
             field.path
-            for field in state.controls.bound_controls.fields
+            for field in state.controls.fields
             if field.section.value == "source"
         )
         assert source_paths == (
