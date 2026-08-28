@@ -142,18 +142,20 @@ def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selecti
         "dark",
         font_scale="default",
         accent_color="theme_default",
-        spacing="normal",
+        spacing=themes.DEFAULT_SPACING,
     )
     assert explicit == baseline
     assert render_qss(
-        "light", accent_color="theme_default", spacing="normal"
+        "light",
+        accent_color="theme_default",
+        spacing=themes.DEFAULT_SPACING,
     ) == render_qss("light")
 
     mauve = render_qss(
         "dark",
         font_scale="default",
         accent_color="mauve_grey",
-        spacing="normal",
+        spacing=themes.DEFAULT_SPACING,
     )
     assert "background-color: #a49bb0;" in _selector_body(
         mauve, "QPushButton:checked"
