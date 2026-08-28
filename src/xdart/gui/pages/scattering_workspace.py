@@ -223,6 +223,104 @@ def _control_path_chooser(widget):
     return choose
 
 
+def _qualify_mask_hdf_dialog_selection(
+    source: str, data_path: str, frame: int | None,
+) -> str:
+    """Return one policy-qualified HDF URL without decoding its pixels."""
+    from silx.io.url import DataUrl
+    from xdart.gui.tabs.scattering.experiment_authoring import (
+        _mask_hdf_frame,
+        _mask_source,
+    )
+
+    selected = DataUrl(
+        scheme="silx", file_path=source, data_path=data_path,
+        data_slice=None if frame is None else (frame,),
+    ).path()
+    path, exact = _mask_source(selected)
+    if exact is None:
+        raise ValueError("Choose one exact HDF5/NeXus dataset and frame.")
+    _mask_hdf_frame(path, exact, read=False)
+    return exact
+
+
+def _mask_hdf_dialog_type():
+    """Build the xdart-owned, metadata-only HDF frame selector type."""
+    from pyqtgraph.Qt import QtCore, QtWidgets
+
+    class _MaskHdfFrameDialog(QtWidgets.QDialog):
+        def __init__(self, parent, source: str):
+            super().__init__(parent)
+            self._source = source
+            self.selected_source = None
+            self.setWindowTitle("Choose HDF5/NeXus dataset and frame")
+            self.setModal(True)
+
+            layout = QtWidgets.QVBoxLayout(self)
+            source_label = QtWidgets.QLabel(source, self)
+            source_label.setObjectName("maskHdfSource")
+            source_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            source_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            source_label.setWordWrap(True)
+            layout.addWidget(source_label)
+
+            form = QtWidgets.QFormLayout()
+            self.dataset_path = QtWidgets.QLineEdit(
+                "/entry/data/data_000001", self)
+            self.dataset_path.setObjectName("maskHdfDatasetPath")
+            self.dataset_path.setMaxLength(4096)
+            form.addRow("Dataset path", self.dataset_path)
+            self.no_frame = QtWidgets.QCheckBox(
+                "Dataset is one 2-D image (no frame index)", self)
+            self.no_frame.setObjectName("maskHdfNoFrame")
+            form.addRow("", self.no_frame)
+            self.frame_index = QtWidgets.QSpinBox(self)
+            self.frame_index.setObjectName("maskHdfFrameIndex")
+            self.frame_index.setRange(0, 2_147_483_647)
+            self.frame_index.setValue(0)
+            form.addRow("Frame index", self.frame_index)
+            layout.addLayout(form)
+            self.no_frame.toggled.connect(
+                lambda checked: self.frame_index.setEnabled(not checked))
+
+            self.error_label = QtWidgets.QLabel("", self)
+            self.error_label.setObjectName("maskHdfError")
+            self.error_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            self.error_label.setWordWrap(True)
+            layout.addWidget(self.error_label)
+            buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.StandardButton.Open
+                | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+                parent=self,
+            )
+            buttons.button(
+                QtWidgets.QDialogButtonBox.StandardButton.Open,
+            ).setText("Use frame")
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        def accept(self):
+            data_path = self.dataset_path.text().strip()
+            frame = None if self.no_frame.isChecked() \
+                else int(self.frame_index.value())
+            try:
+                selected = _qualify_mask_hdf_dialog_selection(
+                    self._source, data_path, frame)
+            except Exception as exc:
+                message = str(exc).strip()
+                self.error_label.setText(
+                    (message or "The HDF5 selection is unavailable.")[:512])
+                self.selected_source = None
+                return
+            self.error_label.clear()
+            self.selected_source = selected
+            super().accept()
+
+    return _MaskHdfFrameDialog
+
+
 def _authoring_source_chooser(widget):
     """Dedicated source chooser for standalone Calibrate and Make Mask."""
     from pyqtgraph.Qt import QtWidgets
@@ -235,29 +333,28 @@ def _authoring_source_chooser(widget):
                 "*.nexus *.edf *.cbf *.img *.mar3450 *.raw);;All files (*)"
             )
         elif asset == "mask":
-            from silx.gui.dialog.ImageFileDialog import ImageFileDialog
-
-            dialog = ImageFileDialog(widget)
-            dialog.setWindowTitle(
-                "Choose TIFF or HDF5/NeXus frame for mask")
-            if start_directory:
-                dialog.setDirectory(start_directory)
-            if not dialog.exec():
+            selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+                widget, "Choose TIFF or HDF5/NeXus source for mask",
+                start_directory,
+                "Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)",
+            )
+            if not selected:
                 return None
-            selected = dialog.selectedUrl()
-            if type(selected) is not str or not selected:
+            suffix = os.path.splitext(selected)[1].casefold()
+            if suffix in {".tif", ".tiff"}:
+                return selected
+            if suffix not in {".h5", ".hdf5", ".nxs", ".nexus"}:
+                return selected
+            dialog = _mask_hdf_dialog_type()(widget, selected)
+            result = dialog.exec()
+            exact = dialog.selected_source
+            dialog.deleteLater()
+            if result != QtWidgets.QDialog.DialogCode.Accepted:
                 return None
-            try:
-                from silx.io.url import DataUrl
-
-                url = DataUrl(selected)
-                if url.is_valid() and url.scheme() == "fabio":
-                    file_path = url.file_path()
-                    return (file_path if type(file_path) is str
-                            and file_path else None)
-            except Exception:
-                pass
-            return selected
+            if type(exact) is not str or not exact:
+                raise RuntimeError(
+                    "the HDF5 selector accepted without an exact frame")
+            return exact
         else:
             return None
         selected, _filter = QtWidgets.QFileDialog.getOpenFileName(

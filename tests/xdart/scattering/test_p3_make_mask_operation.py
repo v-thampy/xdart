@@ -141,75 +141,165 @@ def test_parent_red_make_mask_command_uses_explicit_tiff_chooser(
     finally: _close(page, qapp)
 
 
-def test_live_mask_chooser_returns_exact_image_dialog_url_without_decoding(
+def test_live_mask_two_step_qualifies_eiger_metadata_then_stages_exact_frame(
     tmp_path, monkeypatch, qapp,
 ) -> None:
-    from xdart.gui.pages.scattering_workspace import _authoring_source_chooser
+    from xdart.gui.pages import scattering_workspace as workspace
 
-    selected = DataUrl(
-        file_path=str(tmp_path / "master.h5"),
-        data_path="/entry/data/data_000001", data_slice=(7,),
-        scheme="silx",
-    ).path()
-    calls = []
-
-    class Dialog:
-        def __init__(self, parent):
-            calls.append(("parent", parent))
-
-        def setWindowTitle(self, title):
-            calls.append(("title", title))
-
-        def setDirectory(self, path):
-            calls.append(("directory", path))
-
-        def exec(self):
-            calls.append(("exec",))
-            return 1
-
-        def selectedUrl(self):
-            calls.append(("selectedUrl",))
-            return selected
-
+    _binary(tmp_path, monkeypatch)
+    target = tmp_path / "scan_data_000001.h5"
+    frames = np.arange(24, dtype=np.uint16).reshape(3, 2, 4)
+    with h5py.File(target, "w") as handle:
+        handle.create_dataset("/entry/data/data", data=frames)
+    master = tmp_path / "scan_master.h5"
+    with h5py.File(master, "w") as handle:
+        handle.require_group("/entry/data")["data_000001"] = \
+            h5py.ExternalLink(target.name, "/entry/data/data")
+    chooser_calls = []
     monkeypatch.setattr(
-        "silx.gui.dialog.ImageFileDialog.ImageFileDialog", Dialog,
+        QtWidgets.QFileDialog, "getOpenFileName",
+        lambda *args: (chooser_calls.append(args) or (str(master), "")),
     )
+    real_qualify = authoring._mask_hdf_frame
+    qualification_reads = []
+
+    def qualify(*args, **kwargs):
+        qualification_reads.append(kwargs.get("read"))
+        return real_qualify(*args, **kwargs)
+
+    monkeypatch.setattr(authoring, "_mask_hdf_frame", qualify)
+    base_dialog = workspace._mask_hdf_dialog_type()
+
+    class Dialog(base_dialog):
+        def exec(self):
+            assert self.findChild(
+                QtWidgets.QLabel, "maskHdfSource").text() == str(master)
+            assert self.dataset_path.text() == "/entry/data/data_000001"
+            assert not self.no_frame.isChecked()
+            assert self.frame_index.value() == 0
+            self.frame_index.setValue(1)
+            self.accept()
+            return self.result()
+
+    monkeypatch.setattr(workspace, "_mask_hdf_dialog_type", lambda: Dialog)
     parent = QtWidgets.QWidget()
     try:
-        chooser = _authoring_source_chooser(parent)
-        assert chooser("mask", str(tmp_path)) == selected
-        assert calls == [
-            ("parent", parent),
-            ("title", "Choose TIFF or HDF5/NeXus frame for mask"),
-            ("directory", str(tmp_path)), ("exec",), ("selectedUrl",),
-        ]
+        selected = workspace._authoring_source_chooser(parent)(
+            "mask", str(tmp_path))
     finally:
+        parent.deleteLater()
+        qapp.processEvents()
+    expected = _hdf_url(master, "/entry/data/data_000001", 1)
+    assert selected == expected
+    assert qualification_reads == [False]
+    assert chooser_calls[0][1:] == (
+        "Choose TIFF or HDF5/NeXus source for mask", str(tmp_path),
+        "Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)",
+    )
+
+    request = prepare_mask_request(selected)
+    assert request.source_path == str(master)
+    assert request.hdf_target_path == str(target)
+    assert request.final_path == str(tmp_path / "scan_master-mask.edf")
+    staged = []
+    calls = _install_process(
+        monkeypatch, np.ones((2, 4), dtype=np.uint8),
+        hook=lambda private, _output: staged.append(tifffile.imread(private)),
+    )
+    terminal, _progress = _direct(request)
+    assert terminal.status is OperationTerminalStatus.RETURNED
+    assert np.array_equal(staged, [frames[1]])
+    assert Path(calls[0][0][1]).name == "scan_master.tiff"
+
+
+def test_hdf_selector_refuses_outside_link_before_target_open_or_pixel_read(
+    tmp_path, monkeypatch, qapp,
+) -> None:
+    from xdart.gui.pages import scattering_workspace as workspace
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-selector.h5"
+    with h5py.File(outside, "w") as handle:
+        handle.create_dataset(
+            "/entry/data/data", data=np.ones((2, 4), dtype="u2"))
+    master = tmp_path / "outside_master.h5"
+    with h5py.File(master, "w") as handle:
+        handle.require_group("/entry/data")["data_000001"] = \
+            h5py.ExternalLink(
+                f"../{outside.name}", "/entry/data/data")
+    opened = []
+    real_file = h5py.File
+
+    def tracked_file(path, *args, **kwargs):
+        opened.append(str(Path(path)))
+        return real_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(h5py, "File", tracked_file)
+    parent = QtWidgets.QWidget()
+    dialog = workspace._mask_hdf_dialog_type()(parent, str(master))
+    try:
+        assert dialog.findChild(
+            QtWidgets.QLabel, "maskHdfSource").text() == str(master)
+        dialog.accept()
+        assert dialog.result() == QtWidgets.QDialog.DialogCode.Rejected
+        assert dialog.selected_source is None
+        assert "same-directory" in dialog.error_label.text()
+        assert opened == [str(master)]
+        dialog.reject()
+    finally:
+        dialog.deleteLater()
         parent.deleteLater()
         qapp.processEvents()
 
 
-def test_live_mask_chooser_unwraps_fabio_tiff_url_to_original_file(
+def test_hdf_selector_explicit_2d_control_omits_frame_slice(
+    tmp_path, qapp,
+) -> None:
+    from xdart.gui.pages import scattering_workspace as workspace
+
+    source = tmp_path / "direct.nxs"
+    with h5py.File(source, "w") as handle:
+        handle.create_dataset(
+            "/entry/image", data=np.ones((2, 4), dtype="u2"))
+    parent = QtWidgets.QWidget()
+    dialog = workspace._mask_hdf_dialog_type()(parent, str(source))
+    try:
+        dialog.dataset_path.setText("/entry/image")
+        dialog.no_frame.setChecked(True)
+        assert not dialog.frame_index.isEnabled()
+        dialog.accept()
+        assert dialog.result() == QtWidgets.QDialog.DialogCode.Accepted
+        assert dialog.error_label.text() == ""
+        selected = DataUrl(dialog.selected_source)
+        assert selected.file_path() == str(source)
+        assert selected.data_path() == "/entry/image"
+        assert selected.data_slice() is None
+    finally:
+        dialog.deleteLater()
+        parent.deleteLater()
+        qapp.processEvents()
+
+
+def test_live_mask_chooser_returns_tiff_after_one_file_dialog(
     tmp_path, monkeypatch, qapp,
 ) -> None:
-    from xdart.gui.pages.scattering_workspace import _authoring_source_chooser
+    from xdart.gui.pages import scattering_workspace as workspace
 
     source = tmp_path / "detector.tiff"
-    selected = DataUrl(file_path=str(source), scheme="fabio").path()
-
-    class Dialog:
-        def __init__(self, _parent): pass
-        def setWindowTitle(self, _title): pass
-        def setDirectory(self, _path): pass
-        def exec(self): return 1
-        def selectedUrl(self): return selected
-
+    calls = []
     monkeypatch.setattr(
-        "silx.gui.dialog.ImageFileDialog.ImageFileDialog", Dialog,
+        QtWidgets.QFileDialog, "getOpenFileName",
+        lambda *args: (calls.append(args) or (str(source), "")),
+    )
+    monkeypatch.setattr(
+        workspace, "_mask_hdf_dialog_type",
+        lambda: pytest.fail("TIFF opened the HDF frame selector"),
     )
     parent = QtWidgets.QWidget()
     try:
-        assert _authoring_source_chooser(parent)("mask", str(tmp_path)) \
+        assert workspace._authoring_source_chooser(parent)(
+            "mask", str(tmp_path)) \
             == str(source)
+        assert len(calls) == 1
     finally:
         parent.deleteLater()
         qapp.processEvents()
