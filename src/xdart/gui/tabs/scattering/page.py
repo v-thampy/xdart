@@ -57,6 +57,19 @@ from xdart.utils.browse import browse_start_dir, remember_browse_path
 from .advanced_editor import AdvancedSettingsDialog
 from .adapters.browse_loader import BrowseLoader
 from .adapters.external_operation import OperationSlot
+from .batch_terminal_presentation import (
+    FULL_READY,
+    FULL_REFUSED,
+    FULL_REQUESTED,
+    PASS_THROUGH,
+    QUALIFY,
+    RETIRE,
+    SELECT,
+    BatchNavigationFacts,
+    BatchTerminalDecision,
+    BatchTerminalPresentation,
+    BatchTerminalPresentationController,
+)
 from .browser_catalog import (
     BrowserCatalogEntry,
     DirectoryModifiedCache,
@@ -438,39 +451,6 @@ class _TerminalBrowsePerf:
     fallback_pending: bool = False
 
 
-@dataclass(frozen=True, slots=True)
-class _BatchTerminalPresentation:
-    run_identity: RunIdentity
-    frame: DisplayFrameKey | None
-    awaiting_full_raw: bool = False
-    full_request_attempted: bool = False
-    painted: bool = False
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.run_identity) is not RunIdentity
-            or self.frame is not None
-            and (
-                type(self.frame) is not DisplayFrameKey
-                or self.frame.run_identity is not self.run_identity
-            )
-            or type(self.awaiting_full_raw) is not bool
-            or type(self.full_request_attempted) is not bool
-            or type(self.painted) is not bool
-            or self.frame is None
-            and (
-                self.awaiting_full_raw
-                or self.full_request_attempted
-                or self.painted
-            )
-            or self.awaiting_full_raw
-            and not self.full_request_attempted
-            or self.awaiting_full_raw
-            and self.painted
-        ):
-            raise TypeError("Batch terminal presentation is invalid")
-
-
 def _browser_suffixes_for_mode(mode: str) -> frozenset[str] | None:
     tool = tool_from_mode_text(mode)
     if tool is Tool.XYE_VIEWER:
@@ -763,14 +743,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._terminal_rebind_artifacts: tuple[
             RunIdentity, str, str
         ] | None = None
-        self._active_batch_mode = False
+        self._batch_terminal = BatchTerminalPresentationController()
         self._run_frame_seen = False
         self._retain_outgoing_display = False
-        self._batch_latest_frame: DisplayFrameKey | None = None
-        self._batch_visible_progress: ProgressProjection | None = None
-        self._batch_terminal_presentation: (
-            _BatchTerminalPresentation | None
-        ) = None
         self._presentation_targets: deque[DisplayFrameKey] = deque(maxlen=1)
         self._presentation_run_identity: RunIdentity | None = None
         self._live_plot_interval_ms = _live_plot_interval_ms()
@@ -2663,7 +2638,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if first:
             self._closing = True
             self._retire_native_plot_axis_transition()
-            self._retire_batch_terminal_presentation(force=True)
+            self._retire_batch_presentation(force=True)
             authored = self._authored_asset_owner
             if authored is not None:
                 self._retire_authored_asset(authored)
@@ -3061,7 +3036,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_browser_catalog()
             return
         if kind is ShellCommandKind.SHOW_ALL:
-            self._retire_batch_terminal_presentation()
+            self._retire_batch_presentation()
             self._retain_outgoing_display = False
             ScatteringWorkspace._clear_presentation_targets(self)
             self._shell.browser.cancel_pending_frame_selection()
@@ -3105,7 +3080,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ShellCommandKind.HYDRATE_FRAME,
             ShellCommandKind.SELECT_BROWSER_FRAMES,
         }:
-            self._retire_batch_terminal_presentation()
+            self._retire_batch_presentation()
             self._retain_outgoing_display = False
             selection = self._context_controller.selection
             if (
@@ -3683,11 +3658,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 else None
             )
             self._begin_browser_follow(outcome.run_identity)
-            self._retire_batch_terminal_presentation(
-                release_display=False,
-                force=True,
+            retirement = self._batch_terminal.begin_run(
+                outcome.run_identity,
+                batch_mode=outcome.configuration.batch_mode,
+                visible_progress=ProgressProjection(detail="Run started"),
             )
-            self._active_batch_mode = outcome.configuration.batch_mode
+            self._apply_batch_retirement(retirement)
             self._run_frame_seen = False
             self._last_live_plot_at = None
             self._scientific_repaint_pending = False
@@ -3700,15 +3676,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 else None
             )
             self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
-            self._batch_latest_frame = None
             self._browser_transient_frame = None
             self._browser_transient_clear_token = None
             self._artifact_progress.clear()
             self._progress = ProgressProjection(
                 detail="Run started"
-            )
-            self._batch_visible_progress = (
-                self._progress if self._active_batch_mode else None
             )
             self._notice("")
             self._refresh_shell(preserve_display=True)
@@ -3825,115 +3797,66 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._progress = replace(
             self._progress, detail="Stopping run…"
         )
-        if self._active_batch_mode:
-            self._batch_visible_progress = self._progress
+        self._batch_terminal.record_stop(self._progress)
         self._refresh_shell()
         self._ensure_timer()
 
-    def _retire_batch_terminal_presentation(
-        self, *, release_display: bool = True, force: bool = False,
-    ) -> bool:
-        terminal = self._batch_terminal_presentation
-        # Batch is a frozen execution fact until its exact terminal arrives.
-        # Presentation edits during RUNNING may not turn later FRAME_READY
-        # events into Live paints or discard the tracked absolute latest.
-        if terminal is None:
-            return False
-        if not force and not terminal.painted:
-            # An unpainted terminal is a durable fail-closed fence.  Ordinary
-            # plot, Auto Last, Show All, and frame-selection commands may
-            # update their intent/internal navigation, but cannot publish the
-            # partial Batch acquisition.  Only page close or a newly admitted
-            # run may replace this custody explicitly.
-            return False
-        owned = True
-        if terminal is not None and terminal.awaiting_full_raw:
-            self._context_controller.clear_full_raw()
-            self._detector_demand_frame = None
-        self._batch_terminal_presentation = None
-        self._active_batch_mode = False
-        self._batch_latest_frame = None
-        self._batch_visible_progress = None
-        if release_display:
-            self._retain_outgoing_display = False
-        return owned
-
-    def _qualify_batch_terminal_frame(
-        self, event: StandardRunEvent,
-    ) -> DisplayFrameKey | None:
-        latest = self._batch_latest_frame
+    def _batch_navigation_facts(
+        self, frame: DisplayFrameKey | None,
+    ) -> BatchNavigationFacts:
         controller = self._context_controller
         navigation = controller.navigation
-        if not (
-            type(latest) is DisplayFrameKey
-            and latest.run_identity is event.run_identity
-            and 0 < event.completed <= event.total
-            and latest.work_ordinal == event.completed
-            and latest.artifact == event.artifact
-            and controller.run_identity is event.run_identity
-            and controller.owns_frame(latest)
-            and bool(navigation.frames)
-            and navigation.frames[-1] is latest
-            and controller.select_navigation(latest, (latest,))
-        ):
-            return None
-        selected = controller.navigation
-        return (
-            latest
-            if (
-                selected.current is latest
-                and selected.selected == (latest,)
-                and controller.owns_frame(latest)
-            )
-            else None
-        )
-
-    def _begin_batch_terminal_presentation(
-        self, event: StandardRunEvent,
-    ) -> _BatchTerminalPresentation:
-        identity = event.run_identity
-        if (
-            event.kind is not StandardEventKind.FINISHED
-            or event.cleanup_status is not CleanupStatus.CLEANED
-        ):
-            self._notice(
-                "Batch did not finish cleanly; prior display retained."
-            )
-            return _BatchTerminalPresentation(identity, None)
-        frame = self._qualify_batch_terminal_frame(event)
-        if frame is None:
-            self._notice(
-                "Batch terminal frame was not exact; prior display retained."
-            )
-            return _BatchTerminalPresentation(identity, None)
-        if self._preferences.detector_mode != "full":
-            return _BatchTerminalPresentation(identity, frame)
-
-        controller = self._context_controller
-        context = controller.acquisition_context
         selection = controller.selection
-        aligned = bool(
-            context is not None
-            and selection is not None
-            and selection.kind is ContextKind.ACQUISITION
-            and selection.names(context)
-            # AcquisitionContext derives a fresh immutable HydrationOwner
-            # value on every access; exact scope custody is its full value,
-            # while the context and selection themselves remain identity-bound.
-            and selection.owner == context.hydration_owner
-            and controller.run_identity is identity
-            and controller.navigation.current is frame
-            and controller.navigation.selected == (frame,)
-            and controller.owns_frame(frame)
+        return (
+            controller.run_identity,
+            navigation.frames[-1] if navigation.frames else None,
+            navigation.current,
+            navigation.selected,
+            bool(frame is not None and controller.owns_frame(frame)),
+            None if selection is None else selection.display_generation,
         )
-        available, reason = controller.full_raw_availability()
-        if not aligned or not available:
-            self._notice(
-                reason
-                or "Batch terminal Full Raw owner was not exact; prior display retained."
-            )
-            return _BatchTerminalPresentation(identity, None)
 
+    def _apply_batch_retirement(
+        self, effect: BatchTerminalDecision, *, release_display: bool = False,
+    ) -> None:
+        owner = effect.presentation
+        if effect.action == RETIRE and owner is not None and owner.awaiting_full_raw:
+            self._context_controller.clear_full_raw()
+            self._detector_demand_frame = None
+        if effect.action == RETIRE and release_display:
+            self._retain_outgoing_display = False
+
+    def _retire_batch_presentation(
+        self, *, release_display: bool = True, force: bool = False,
+    ) -> None:
+        self._apply_batch_retirement(
+            self._batch_terminal.retire(
+                force=force,
+            ),
+            release_display=release_display,
+        )
+
+    def _resolve_batch_full_raw(
+        self, identity: RunIdentity, frame: DisplayFrameKey,
+    ) -> tuple[str, str]:
+        if self._preferences.detector_mode != "full":
+            return FULL_READY, ""
+        controller = self._context_controller
+        selection = controller.selection
+        available, reason = controller.full_raw_availability()
+        navigation = controller.navigation
+        if not (
+            available
+            and selection is not None
+            and controller.run_identity is identity
+            and navigation.current is frame
+            and navigation.selected == (frame,)
+        ):
+            return (
+                FULL_REFUSED,
+                reason
+                or "Batch terminal Full Raw owner was not exact; prior display retained.",
+            )
         self._detector_scope_owner = selection.owner
         self._detector_demand_frame = frame
         resident, _pending, diagnostic = controller.full_raw_status()
@@ -3944,119 +3867,90 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             detector_diagnostic="" if resident else diagnostic or "",
         )
         if resident:
-            return _BatchTerminalPresentation(identity, frame)
-
-        token = controller.request_full_current()
-        if token is None:
-            self._preferences = replace(
-                self._preferences,
-                detector_pending=False,
-                detector_diagnostic=(
-                    diagnostic
-                    or "Batch terminal Full Raw request was refused."
-                ),
-            )
-            self._notice(
-                "Batch terminal Full Raw request was refused; prior display retained."
-            )
-            return _BatchTerminalPresentation(identity, None)
-        self._ensure_timer()
-        return _BatchTerminalPresentation(
-            identity,
-            frame,
-            awaiting_full_raw=True,
-            full_request_attempted=True,
-        )
-
-    def _accept_batch_terminal_display(
-        self, event: StandardRunEvent,
-    ) -> bool:
-        owner = self._batch_terminal_presentation
-        controller = self._context_controller
-        navigation = controller.navigation
-        selection = controller.selection
-        if (
-            not self._active_batch_mode
-            and owner is not None
-            and owner.painted
-            and owner.frame is not None
-            and event.run_identity is owner.run_identity
-            and event.frame_key is owner.frame
-            and event.artifact == owner.frame.artifact
-            and selection is not None
-            and event.selection_generation == selection.display_generation
-            and controller.run_identity is owner.run_identity
-            and navigation.current is owner.frame
-            and navigation.selected == (owner.frame,)
-            and controller.owns_frame(owner.frame)
-        ):
-            # The terminal Full Raw event may already be queued more than
-            # once.  Retain the immutable painted receipt after Batch becomes
-            # inactive so an exact duplicate cannot enter the ordinary
-            # DISPLAY_READY path and repaint the final singleton.
-            return True
-        if (
-            not self._active_batch_mode
-            or owner is None
-            or not owner.awaiting_full_raw
-            or owner.painted
-            or owner.frame is None
-            or event.run_identity is not owner.run_identity
-            or event.frame_key is not owner.frame
-        ):
-            return False
-        if (
-            controller.run_identity is not owner.run_identity
-            or navigation.current is not owner.frame
-            or navigation.selected != (owner.frame,)
-            or not controller.owns_frame(owner.frame)
-        ):
-            return False
-        payload = controller.qualify_display_event(event)
-        if (
-            type(payload) is not StandardDisplayPayload
-            or payload.frame_key is not owner.frame
-        ):
-            return False
-        if self._batch_terminal_presentation is not owner:
-            return False
-        self._batch_terminal_presentation = replace(
-            owner, awaiting_full_raw=False,
-        )
+            return FULL_READY, ""
+        if controller.request_full_current() is not None:
+            self._ensure_timer()
+            return FULL_REQUESTED, ""
+        refused = diagnostic or "Batch terminal Full Raw request was refused."
         self._preferences = replace(
             self._preferences,
-            detector_available=True,
             detector_pending=False,
-            detector_diagnostic="",
+            detector_diagnostic=refused,
         )
-        return True
-
-    def _batch_terminal_ready_to_paint(
-        self,
-    ) -> _BatchTerminalPresentation | None:
-        owner = self._batch_terminal_presentation
-        controller = self._context_controller
-        navigation = controller.navigation
         return (
-            owner
-            if (
-                self._active_batch_mode
-                and owner is not None
-                and owner.frame is not None
-                and not owner.awaiting_full_raw
-                and not owner.painted
-                and controller.run_identity is owner.run_identity
-                and navigation.current is owner.frame
-                and navigation.selected == (owner.frame,)
-                and controller.owns_frame(owner.frame)
+            FULL_REFUSED,
+            "Batch terminal Full Raw request was refused; prior display retained.",
+        )
+
+    def _advance_batch_terminal(self, event: StandardRunEvent) -> BatchTerminalDecision:
+        controller = self._batch_terminal
+        latest = controller.latest_frame
+        context = self._context_controller
+        preparation = controller.begin_terminal(
+            event, self._batch_navigation_facts(latest),
+        )
+        if preparation.notice:
+            self._notice(preparation.notice)
+        frame = preparation.frame
+        if preparation.action != SELECT or frame is None:
+            return preparation
+        selected = context.select_navigation(frame, (frame,))
+        full_raw, diagnostic = (
+            self._resolve_batch_full_raw(event.run_identity, frame)
+            if selected else (FULL_READY, "")
+        )
+        effect = controller.complete_terminal(
+            frame,
+            self._batch_navigation_facts(frame),
+            full_raw=full_raw,
+            diagnostic=diagnostic,
+        )
+        if effect.notice:
+            self._notice(effect.notice)
+        if effect.frame is not None:
+            self._follow_processed_artifact(effect.frame)
+        return effect
+
+    def _consume_batch_display(self, event: StandardRunEvent) -> tuple[bool, bool]:
+        controller = self._context_controller
+        owner = self._batch_terminal.presentation
+        frame = None if owner is None else owner.frame
+        effect = self._batch_terminal.inspect_display_event(
+            event, self._batch_navigation_facts(frame),
+        )
+        if effect.action == PASS_THROUGH:
+            return False, False
+        owner = effect.presentation
+        if effect.action != QUALIFY or owner is None:
+            return True, False
+        payload = controller.qualify_display_event(event)
+        accepted = self._batch_terminal.accept_qualified_display(
+            owner,
+            event,
+            payload.frame_key
+            if type(payload) is StandardDisplayPayload
+            else None,
+        )
+        if accepted:
+            self._preferences = replace(
+                self._preferences,
+                detector_available=True,
+                detector_pending=False,
+                detector_diagnostic="",
             )
-            else None
+        return True, accepted
+
+    def _batch_ready_to_paint(self) -> BatchTerminalPresentation | None:
+        owner = self._batch_terminal.presentation
+        frame = None if owner is None else owner.frame
+        return self._batch_terminal.ready_to_paint(
+            self._batch_navigation_facts(frame)
         )
 
     def _paint_batch_terminal(
-        self, owner: _BatchTerminalPresentation,
+        self, owner: BatchTerminalPresentation,
     ) -> bool:
-        if self._batch_terminal_ready_to_paint() is not owner:
+        if self._batch_ready_to_paint() is not owner:
             return False
         self._consume_native_plot_axis_transition(owner.run_identity)
         retained = self._retain_outgoing_display
@@ -4067,19 +3961,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             allow_batch_terminal_paint=True,
         )
         applied = (
-            self._batch_terminal_presentation is owner
+            self._batch_terminal.presentation is owner
             and self._shell_revision > revision
         )
-        if applied:
-            self._batch_terminal_presentation = replace(
-                owner, painted=True,
-            )
-            self._active_batch_mode = False
-            self._batch_latest_frame = None
-            self._batch_visible_progress = None
-        elif self._batch_terminal_presentation is owner:
+        completed = self._batch_terminal.complete_paint(
+            owner, applied=applied,
+        )
+        if not completed and self._batch_terminal.presentation is owner:
             self._retain_outgoing_display = retained
-        return applied
+        return completed
 
     def _clear_presentation_targets(self) -> None:
         getattr(self, "_presentation_targets", []).clear()
@@ -4094,7 +3984,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._lifecycle.phase is RunPhase.RUNNING
             and self._lifecycle.active_run_identity is identity
             and controller.run_identity is identity
-            and not self._active_batch_mode
+            and not self._batch_terminal.active
             and self._preferences.plot_mode == "Single"
             and self._auto_last
             and context is not None
@@ -4162,7 +4052,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if is_directory:
             self._set_browser_directory(value, explicit=True)
             return
-        self._retire_batch_terminal_presentation()
+        self._retire_batch_presentation()
         normalized = os.path.normcase(os.path.abspath(os.path.expanduser(value)))
         same_terminal_target = (
             terminal_request is not None
@@ -4515,7 +4405,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     frame = event.navigation_delta.appended
                     first_paced_frame = paced and not self._run_frame_seen
                     self._run_frame_seen = True
-                    self._batch_latest_frame = frame
                     self._record_artifact_progress(event)
                     self._progress = ProgressProjection(
                         event.completed,
@@ -4524,7 +4413,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         tuple(self._artifact_progress.values()),
                         _directory_file_progress(event),
                     )
-                    if self._active_batch_mode:
+                    if self._batch_terminal.record_frame(event, frame):
                         # Batch owns the accepted publication internally, but
                         # FRAME_READY is never a GUI projection boundary.  In
                         # particular, do not publish a transient browser row or
@@ -4577,19 +4466,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._follow_processed_artifact(frame)
                 continue
             if event.kind is StandardEventKind.DISPLAY_READY:
-                terminal_owner = self._batch_terminal_presentation
-                if (
-                    self._active_batch_mode
-                    or terminal_owner is not None
-                    and terminal_owner.painted
-                ):
-                    if self._accept_batch_terminal_display(event):
-                        if self._active_batch_mode:
-                            changed = True
-                            force_scientific = True
-                        continue
-                    if self._active_batch_mode:
-                        continue
+                handled, became_ready = self._consume_batch_display(event)
+                if handled:
+                    if became_ready:
+                        changed = True
+                        force_scientific = True
+                    continue
                 payload = self._context_controller.qualify_display_event(
                     event
                 )
@@ -4606,27 +4488,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 StandardEventKind.FAILED,
             }:
                 force_scientific = True
-                was_batch = self._active_batch_mode
+                was_batch = self._batch_terminal.active
                 if was_batch:
-                    owner = self._batch_terminal_presentation
-                    first_terminal = owner is None
-                    if first_terminal:
-                        owner = self._begin_batch_terminal_presentation(event)
-                        self._batch_terminal_presentation = owner
-                        if owner.frame is not None:
-                            self._follow_processed_artifact(owner.frame)
-                    elif owner.run_identity is not event.run_identity:
-                        owner = _BatchTerminalPresentation(
-                            event.run_identity, None,
-                        )
-                        self._batch_terminal_presentation = owner
-                        self._notice(
-                            "Batch terminal owner changed; prior display retained."
-                        )
+                    self._advance_batch_terminal(event)
                 else:
                     ScatteringWorkspace._flush_presentation_target(self)
                     self._retain_outgoing_display = False
-                batch_owner = self._batch_terminal_presentation
+                batch_owner = self._batch_terminal.presentation
                 if (
                     not was_batch
                     or event.kind is not StandardEventKind.FINISHED
@@ -4642,8 +4510,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 batch_notice = (
                     self._notice_text
                     if was_batch
-                    and self._batch_terminal_presentation is not None
-                    and self._batch_terminal_presentation.frame is None
+                    and batch_owner is not None
+                    and batch_owner.frame is None
                     else ""
                 )
                 self._accept_terminal_event(event)
@@ -4664,10 +4532,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if batch_notice:
                     self._notice(batch_notice)
                 self._retry_deferred_gi_motor_default()
-                if was_batch:
-                    # Terminal status may now replace the frozen Batch-visible
-                    # status, independently of whether final science qualifies.
-                    self._batch_visible_progress = None
                 # The writer publishes its atomic final path before emitting
                 # the terminal event.  Re-enumerate here so a non-batch run
                 # whose FRAME_READY preceded that rename becomes visible.
@@ -4676,12 +4540,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     None if catalog_request is None else catalog_request.token
                 )
                 self._run_frame_seen = False
-                if (
-                    not was_batch
-                    or self._batch_terminal_presentation is None
-                    or self._batch_terminal_presentation.frame is None
-                ):
-                    self._batch_latest_frame = None
                 changed = True
 
         operation_slot = getattr(self, "_operation_slot", None)
@@ -4802,7 +4660,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 preserve_display=True,
                 preserve_scientific=True,
             )
-        batch_ready = self._batch_terminal_ready_to_paint()
+        batch_ready = self._batch_ready_to_paint()
         if changed and batch_ready is not None:
             self._scientific_repaint_pending = False
             painted = self._paint_batch_terminal(batch_ready)
@@ -4816,8 +4674,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             # the outer drain must never follow it with a second projection.
             changed = False
         hold_batch_terminal_science = bool(
-            self._active_batch_mode
-            and self._batch_terminal_ready_to_paint() is None
+            self._batch_terminal.active
+            and self._batch_ready_to_paint() is None
         )
         if changed:
             handoff = self._terminal_browse_handoff
@@ -5783,12 +5641,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or self._scientific_repaint_pending
         ):
             return True
-        batch_terminal = self._batch_terminal_presentation
-        if (
-            batch_terminal is not None
-            and batch_terminal.frame is not None
-            and not batch_terminal.painted
-        ):
+        if self._batch_terminal.needs_polling:
             return True
         if self._lifecycle.phase not in {
             RunPhase.IDLE,
@@ -5834,12 +5687,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _set_detector_mode(self, mode: str) -> bool:
         if mode == "thumbnail":
-            terminal = self._batch_terminal_presentation
+            terminal = self._batch_terminal.presentation
             terminal_was_waiting = bool(
                 terminal is not None and terminal.awaiting_full_raw
             )
             if self._preferences.detector_mode != mode:
-                self._retire_batch_terminal_presentation()
+                self._retire_batch_presentation()
             if self._preferences.detector_mode != mode: self._release_display_background()
             if not terminal_was_waiting:
                 self._context_controller.clear_full_raw()
@@ -5861,7 +5714,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             return False
         if self._preferences.detector_mode != mode:
-            self._retire_batch_terminal_presentation()
+            self._retire_batch_presentation()
         if self._preferences.detector_mode != mode: self._release_display_background()
         self._detector_demand_frame = None
         self._preferences = replace(
@@ -5988,10 +5841,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         explicit_preserve_scientific = preserve_scientific
         allow_batch_terminal_paint = bool(
             allow_batch_terminal_paint
-            and self._batch_terminal_ready_to_paint() is not None
+            and self._batch_ready_to_paint() is not None
         )
         batch_science_hold = (
-            self._active_batch_mode and not allow_batch_terminal_paint
+            self._batch_terminal.active and not allow_batch_terminal_paint
             or self._retain_outgoing_display and self._progress.terminal
         )
         # The worker can rescope the one mutable acquisition context after its
@@ -6241,7 +6094,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and any(frame is current for frame in resident_frames)
         )
         if (
-            not self._active_batch_mode
+            not self._batch_terminal.active
             and
             not preserve_scientific
             and self._retain_outgoing_display
@@ -6270,13 +6123,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 observation.file_count_scope
                 is SourceCountScope.SELECTED_PLUS_IMMEDIATE
             )
-        projection_progress = (
-            self._batch_visible_progress
-            if (
-                self._active_batch_mode
-                and self._batch_visible_progress is not None
-            )
-            else self._progress
+        projection_progress = self._batch_terminal.project_progress(
+            self._progress
         )
         projection = self._context_projection.build_shell(
             revision=self._shell_revision,
@@ -6719,7 +6567,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice("1D Viewer cleanup remains pending")
                 return
             if value != candidate.processing_mode:
-                self._retire_batch_terminal_presentation()
+                self._retire_batch_presentation()
                 release_outgoing_display = True
                 self._retain_outgoing_display = False
                 self._release_display_background()
@@ -6778,7 +6626,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         current_path = selected[0] if current_path is None else current_path
         if type(current_path) is not str or current_path not in selected:
             return
-        self._retire_batch_terminal_presentation()
+        self._retire_batch_presentation()
         self._retain_outgoing_display = False
         if (self._context_controller.viewer_2d_owned
                 and not self._clear_viewer_2d_renderer(close=True)):
@@ -6854,7 +6702,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _open_viewer_2d_path(self, selected: str) -> None:
         if type(selected) is not str or not selected:
             return
-        self._retire_batch_terminal_presentation()
+        self._retire_batch_presentation()
         self._retain_outgoing_display = False
         if (getattr(self._context_controller, "viewer_1d_owned", False)
                 and not self._clear_viewer_1d_renderer(close=True)):
@@ -6961,7 +6809,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return False
             prior_mode = self._preferences.plot_mode
             if value != prior_mode:
-                self._retire_batch_terminal_presentation()
+                self._retire_batch_presentation()
             if not viewer_1d:
                 ScatteringWorkspace._clear_presentation_targets(self)
             updates["plot_mode"] = value
@@ -7112,7 +6960,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         elif kind is ShellCommandKind.SET_AUTO_LAST:
             requested = bool(value)
             if requested != self._auto_last:
-                self._retire_batch_terminal_presentation()
+                self._retire_batch_presentation()
             ScatteringWorkspace._clear_presentation_targets(self)
             self._auto_last = requested
             if self._auto_last:
@@ -7121,7 +6969,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             return True
         elif kind is ShellCommandKind.CLEAR_1D:
-            self._retire_batch_terminal_presentation()
+            self._retire_batch_presentation()
             self._retain_outgoing_display = False
             background = self._background_owner.projection()
             if (background is not None and background[0] == "integrated_1d"

@@ -12,6 +12,9 @@ import numpy as np
 import pytest
 
 import xdart.gui.tabs.scattering.hydration_transport as hydration
+from xdart.gui.tabs.scattering.batch_terminal_presentation import (
+    BatchTerminalPresentationController,
+)
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences, build_scientific_projection
 from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions, ShellCommand, ShellCommandKind, SlicePin
@@ -75,7 +78,7 @@ class _Mount:
         self.choice2 = str(self.image)
         self.page = SimpleNamespace(
             _closing=False, _closed=False, _context_controller=self.controller,
-            _batch_terminal_presentation=None,
+            _batch_terminal=BatchTerminalPresentationController(),
             _terminal_browse_handoff=None,
             _terminal_browse_presentation=None,
             _intents=RunIntentStore(RunIntent(processing_mode="Int 2D")),
@@ -91,7 +94,7 @@ class _Mount:
             _refresh_shell=lambda: self.events.append("refresh"))
         for name in ("_viewer_1d_start_directory", "_viewer_2d_start_directory",
                      "_clear_viewer_1d_renderer", "_clear_viewer_2d_renderer",
-                     "_retire_batch_terminal_presentation",
+                     "_apply_batch_retirement", "_retire_batch_presentation",
                      "_open_viewer_1d_paths", "_open_viewer_2d_path",
                      "_select_scan"):
             setattr(self.page, name, partial(getattr(ScatteringWorkspace, name), self.page))

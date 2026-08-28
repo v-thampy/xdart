@@ -2022,12 +2022,14 @@ def test_noop_append_display_ready_replaces_outgoing_paint_while_running(
         page._drain_executor()
         assert page._retain_outgoing_display is True
 
-        page._active_batch_mode = True
+        page._batch_terminal.begin_run(
+            identity, batch_mode=True, visible_progress=page._progress,
+        )
         latest = install_hydrated(5)
         page._drain_executor()
         assert page._retain_outgoing_display is True
 
-        page._active_batch_mode = False
+        page._batch_terminal.retire(force=True)
         executor.events.append(events[-1])
         page._drain_executor()
         assert lifecycle.phase is RunPhase.RUNNING
@@ -2092,8 +2094,8 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
         assert executor.start_calls == 1
         assert executor.last_configuration is not None
         assert executor.last_configuration.batch_mode
-        assert page._active_batch_mode
-        assert page._batch_terminal_presentation is None
+        assert page._batch_terminal.active
+        assert page._batch_terminal.presentation is None
         assert page._retain_outgoing_display
 
         deltas = _batch_display(
@@ -2194,8 +2196,8 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
                 navigation_delta=delta,
             ))
             page._drain_executor()
-            assert page._active_batch_mode
-            assert page._batch_latest_frame is delta.appended
+            assert page._batch_terminal.active
+            assert page._batch_terminal.latest_frame is delta.appended
             assert page._progress.completed == completed
             assert page._progress.total == len(deltas)
             assert shell.browser.frame_model.frames == visible_frames
@@ -2208,8 +2210,8 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
                 page._handle_shell_command(ShellCommand(
                     ShellCommandKind.SET_CORES, 2,
                 ))
-                assert page._active_batch_mode
-                assert page._batch_latest_frame is delta.appended
+                assert page._batch_terminal.active
+                assert page._batch_terminal.latest_frame is delta.appended
                 assert shell.browser.frame_model.frames == visible_frames
                 assert shell.browser._committed_current is visible_current
                 assert shell.run_controls.readinessLabel.full_text() == (
@@ -2229,7 +2231,7 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
             "cake": 0,
             "waterfall": 0,
         }
-        assert page._batch_terminal_presentation is None
+        assert page._batch_terminal.presentation is None
         assert lifecycle.phase is RunPhase.RUNNING
     finally:
         _dispose(page, qapp)
@@ -2379,8 +2381,9 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         page._browser_directory = os.path.dirname(
             deltas[0].appended.artifact
         )
-        page._active_batch_mode = True
-        page._batch_visible_progress = page._progress
+        page._batch_terminal.begin_run(
+            identity, batch_mode=True, visible_progress=page._progress,
+        )
         page._retain_outgoing_display = True
         visible_frames = browser.frame_model.frames
         visible_current = browser._committed_current
@@ -2460,10 +2463,10 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
         page._drain_executor()
 
         assert lifecycle.phase is RunPhase.IDLE
-        assert page._active_batch_mode is False
-        assert page._batch_latest_frame is None
+        assert not page._batch_terminal.active
+        assert page._batch_terminal.latest_frame is None
         assert page._retain_outgoing_display is False
-        terminal_owner = page._batch_terminal_presentation
+        terminal_owner = page._batch_terminal.presentation
         assert terminal_owner is not None
         assert terminal_owner.run_identity is identity
         assert terminal_owner.frame is third
@@ -2535,9 +2538,9 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
             not page._preferences.plot_options.show_legend,
             ("other", "legend"),
         ))
-        assert page._batch_terminal_presentation is terminal_owner
-        assert not page._active_batch_mode
-        assert page._batch_latest_frame is None
+        assert page._batch_terminal.presentation is terminal_owner
+        assert not page._batch_terminal.active
+        assert page._batch_terminal.latest_frame is None
         assert calls["project"] == before_edit["project"] + 1
         assert calls["commit"] == before_edit["commit"] + 1
         assert calls["reconcile"] == before_edit["reconcile"] + 1
@@ -2550,8 +2553,8 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
             ShellCommandKind.SET_PLOT_MODE,
             "Single" if plot_mode != "Single" else "Overlay",
         ))
-        assert page._batch_terminal_presentation is None
-        assert not page._active_batch_mode
+        assert page._batch_terminal.presentation is None
+        assert not page._batch_terminal.active
         assert calls["project"] == before_mode["project"] + 1
         assert calls["commit"] == before_mode["commit"] + 1
         assert calls["reconcile"] == before_mode["reconcile"] + 1
@@ -2625,8 +2628,9 @@ def test_batch_non_success_terminal_retains_prior_display(
         monkeypatch.setattr(controller, "project_navigation", project)
         monkeypatch.setattr(scientific, "reconcile", reconcile)
         monkeypatch.setattr(page, "_request_browser_catalog", lambda: None)
-        page._active_batch_mode = True
-        page._batch_visible_progress = page._progress
+        page._batch_terminal.begin_run(
+            identity, batch_mode=True, visible_progress=page._progress,
+        )
         page._retain_outgoing_display = True
         for completed, delta in enumerate(deltas, start=1):
             executor.events.append(StandardRunEvent(
@@ -2654,10 +2658,10 @@ def test_batch_non_success_terminal_retains_prior_display(
         page._drain_executor()
 
         assert lifecycle.phase is expected_phase
-        assert page._active_batch_mode
-        assert page._batch_latest_frame is None
-        assert page._batch_visible_progress is None
-        owner = page._batch_terminal_presentation
+        assert page._batch_terminal.active
+        assert page._batch_terminal.latest_frame is None
+        assert page._batch_terminal.project_progress(page._progress) is page._progress
+        owner = page._batch_terminal.presentation
         assert owner is not None
         assert owner.run_identity is identity
         assert owner.frame is None
@@ -2699,10 +2703,10 @@ def test_batch_non_success_terminal_retains_prior_display(
                 frames=(first,),
             ))
 
-        assert page._batch_terminal_presentation is owner
-        assert page._active_batch_mode
-        assert page._batch_latest_frame is None
-        assert page._batch_visible_progress is None
+        assert page._batch_terminal.presentation is owner
+        assert page._batch_terminal.active
+        assert page._batch_terminal.latest_frame is None
+        assert page._batch_terminal.project_progress(page._progress) is page._progress
         assert calls == {"project": 0, "reconcile": 0}
         assert browser.frame_model.frames == visible_frames
         assert browser._committed_current is visible_current
@@ -2784,8 +2788,9 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
             plot_mode=plot_mode,
             detector_mode="full",
         )
-        page._active_batch_mode = True
-        page._batch_visible_progress = page._progress
+        page._batch_terminal.begin_run(
+            identity, batch_mode=True, visible_progress=page._progress,
+        )
         page._retain_outgoing_display = True
         for completed, delta in enumerate(deltas, start=1):
             executor.events.append(StandardRunEvent(
@@ -2825,14 +2830,13 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
         ))
         page._drain_executor()
 
-        owner = page._batch_terminal_presentation
+        owner = page._batch_terminal.presentation
         assert owner is not None
         assert owner.frame is third
         assert owner.awaiting_full_raw
-        assert owner.full_request_attempted
         assert not owner.painted
-        assert page._active_batch_mode
-        assert page._batch_latest_frame is third
+        assert page._batch_terminal.active
+        assert page._batch_terminal.latest_frame is third
         assert calls == {
             "project": 0,
             "qualify": 0,
@@ -2848,8 +2852,8 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
         page._handle_shell_command(ShellCommand(
             ShellCommandKind.SET_CORES, 3,
         ))
-        assert page._batch_terminal_presentation is owner
-        assert page._active_batch_mode
+        assert page._batch_terminal.presentation is owner
+        assert page._batch_terminal.active
         assert calls == {
             "project": 0,
             "qualify": 0,
@@ -2862,8 +2866,8 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
             ShellCommandKind.SET_PLOT_MODE,
             "Single" if plot_mode != "Single" else "Overlay",
         ))
-        assert page._batch_terminal_presentation is owner
-        assert page._active_batch_mode
+        assert page._batch_terminal.presentation is owner
+        assert page._batch_terminal.active
         assert calls == {
             "project": 0,
             "qualify": 0,
@@ -2894,7 +2898,7 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
         ))
         page._drain_executor()
         assert calls["qualify"] == 0
-        assert page._batch_terminal_presentation is owner
+        assert page._batch_terminal.presentation is owner
 
         executor.events.append(replace(
             exact_ready,
@@ -2902,17 +2906,17 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
         ))
         page._drain_executor()
         assert calls["qualify"] == 1
-        assert page._batch_terminal_presentation is owner
+        assert page._batch_terminal.presentation is owner
 
         executor.events.append(exact_ready)
         page._drain_executor()
-        painted = page._batch_terminal_presentation
+        painted = page._batch_terminal.presentation
         assert painted is not None
         assert painted.frame is third
         assert painted.painted
         assert not painted.awaiting_full_raw
-        assert not page._active_batch_mode
-        assert page._batch_latest_frame is None
+        assert not page._batch_terminal.active
+        assert page._batch_terminal.latest_frame is None
         assert calls == {
             "project": 1,
             "qualify": 2,
@@ -2929,7 +2933,7 @@ def test_batch_full_raw_waits_for_exact_terminal_display_and_paints_once(
 
         executor.events.extend((exact_ready, exact_ready))
         page._drain_executor()
-        assert page._batch_terminal_presentation is painted
+        assert page._batch_terminal.presentation is painted
         assert calls == {
             "project": 1,
             "qualify": 2,
@@ -3000,8 +3004,9 @@ def test_batch_terminal_accepts_absolute_latest_after_prefix_exceeds_capacity(
             plot_mode="Overlay",
             detector_mode="thumbnail",
         )
-        page._active_batch_mode = True
-        page._batch_visible_progress = page._progress
+        page._batch_terminal.begin_run(
+            identity, batch_mode=True, visible_progress=page._progress,
+        )
         page._retain_outgoing_display = True
         executor.events.append(StandardRunEvent(
             identity,
@@ -3014,7 +3019,7 @@ def test_batch_terminal_accepts_absolute_latest_after_prefix_exceeds_capacity(
         ))
         page._drain_executor()
         assert projects == []
-        assert page._batch_latest_frame is live.appended
+        assert page._batch_terminal.latest_frame is live.appended
 
         executor.events.append(StandardRunEvent(
             identity,
@@ -3027,12 +3032,12 @@ def test_batch_terminal_accepts_absolute_latest_after_prefix_exceeds_capacity(
         ))
         page._drain_executor()
 
-        terminal = page._batch_terminal_presentation
+        terminal = page._batch_terminal.presentation
         assert terminal is not None
         assert terminal.frame is live.appended
         assert terminal.painted
-        assert not page._active_batch_mode
-        assert page._batch_latest_frame is None
+        assert not page._batch_terminal.active
+        assert page._batch_terminal.latest_frame is None
         assert len(projects) == 1
         assert lifecycle.phase is RunPhase.IDLE
         assert controller.navigation.current is live.appended
@@ -3122,8 +3127,9 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
         page._browser_directory = os.path.dirname(
             deltas[0].appended.artifact
         )
-        page._active_batch_mode = True
-        page._batch_visible_progress = page._progress
+        page._batch_terminal.begin_run(
+            identity, batch_mode=True, visible_progress=page._progress,
+        )
         page._retain_outgoing_display = True
         visible_frames = browser.frame_model.frames
         visible_current = browser._committed_current
@@ -3154,7 +3160,15 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
             if terminal_case == "owned_historical":
                 # This is an exact owned member, but not the terminal event's
                 # exact latest frame.  Membership alone must never qualify it.
-                page._batch_latest_frame = deltas[0].appended
+                earlier = deltas[0].appended
+                page._batch_terminal.record_frame(
+                    StandardRunEvent(
+                        identity,
+                        StandardEventKind.FRAME_READY,
+                        frame_key=earlier,
+                    ),
+                    earlier,
+                )
             completed = total = 3
             artifact = deltas[-1].appended.artifact
         else:
@@ -3172,9 +3186,9 @@ def test_batch_terminal_without_exact_latest_preserves_prior_science(
         page._drain_executor()
 
         assert lifecycle.phase is RunPhase.IDLE
-        assert page._active_batch_mode is True
-        assert page._batch_latest_frame is None
-        terminal_owner = page._batch_terminal_presentation
+        assert page._batch_terminal.active
+        assert page._batch_terminal.latest_frame is None
+        terminal_owner = page._batch_terminal.presentation
         assert terminal_owner is not None
         assert terminal_owner.run_identity is identity
         assert terminal_owner.frame is None

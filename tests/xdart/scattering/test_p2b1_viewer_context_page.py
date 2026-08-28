@@ -793,7 +793,7 @@ def test_viewer_1d_clicked_current_seeds_single_but_overlay_keeps_all_paths(
             revision=1,
             thaw=lambda: intent,
         )),
-        _retire_batch_terminal_presentation=lambda: None,
+        _retire_batch_presentation=lambda: None,
         _retain_outgoing_display=True,
         _clear_viewer_2d_renderer=lambda **_kwargs: True,
         _notice=lambda _message: None,
@@ -888,7 +888,7 @@ def test_viewer_1d_single_collapses_membership_without_preclear(
     page = SimpleNamespace(
         _context_controller=controller,
         _preferences=ScientificPreferences(plot_mode="Waterfall"),
-        _retire_batch_terminal_presentation=lambda: calls.append("retire"),
+        _retire_batch_presentation=lambda: calls.append("retire"),
         _shell=SimpleNamespace(browser=SimpleNamespace(
             cancel_pending_frame_selection=lambda: calls.append("cancel"),
         )),
@@ -926,7 +926,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("foreign seam"))
     page = SimpleNamespace(_context_controller=controller,
         _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
-        _retire_batch_terminal_presentation=lambda: None,
+        _retire_batch_presentation=lambda: None,
         _retain_outgoing_display=True,
         _viewer_1d_start_directory=lambda: calls.append("start") or "/viewer",
         _viewer_file_chooser=lambda start: calls.append(("choose", start)) or paths,
@@ -1014,9 +1014,9 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
         _terminal_browse_presentation=None,
         _terminal_browse_perf=None,
         _dispatch_deferred_metadata=lambda: page_module._OperationRefresh.NONE,
-        _batch_terminal_ready_to_paint=lambda: None,
+        _batch_ready_to_paint=lambda: None,
         _show_queued_authored_asset_confirmation=lambda: None,
-        _active_batch_mode=False,
+        _batch_terminal=SimpleNamespace(active=False),
         _polling_needed=lambda: True, _run_timer=SimpleNamespace(stop=forbidden),
         _scientific_repaint_pending=False,
         _retain_outgoing_display=False, _waterfall_candidate_count=0,
@@ -1031,7 +1031,7 @@ def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, t
     preferences = ScientificPreferences(plot_mode="Overlay")
     owner = SimpleNamespace(
         _preferences=preferences,
-        _retire_batch_terminal_presentation=lambda: None,
+        _retire_batch_presentation=lambda: None,
         _retain_outgoing_display=True,
         _context_controller=SimpleNamespace(
             selection=SimpleNamespace(kind=ContextKind.VIEWER_1D),
