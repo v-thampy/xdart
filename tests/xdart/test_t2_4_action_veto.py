@@ -87,7 +87,7 @@ def test_reintegrate_click_refuses_focused_invalid(widget, qapp, monkeypatch, bu
 
 def test_calibrate_refuses_and_skips_autofill_on_focused_invalid(
         widget, qapp, monkeypatch):
-    from xdart.gui.tabs.static_scan.controls_logic import ControlAction
+    from xrd_tools.session.readiness import ControlAction
 
     _type_invalid_points(widget, qapp)
     spy = _SpyButton()
@@ -104,7 +104,7 @@ def test_calibrate_refuses_and_skips_autofill_on_focused_invalid(
 
 
 def test_make_mask_refuses_focused_invalid(widget, qapp, monkeypatch):
-    from xdart.gui.tabs.static_scan.controls_logic import ControlAction
+    from xrd_tools.session.readiness import ControlAction
 
     _type_invalid_points(widget, qapp)
     spy = _SpyButton()

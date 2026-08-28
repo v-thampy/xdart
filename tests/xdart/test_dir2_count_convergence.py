@@ -163,7 +163,7 @@ def test_click_to_count_sweeps_off_gui_and_converges(qapp, monkeypatch, tmp_path
 def test_files_mode_tooltip_hint_and_source_header_unit(qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-    from xdart.gui.tabs.static_scan.controls_logic import build_control_profile
+    from xrd_tools.session.readiness import build_control_profile
     from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
 
     d = _container_dir(tmp_path, n_files=2, frames=2)

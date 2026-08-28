@@ -10,9 +10,11 @@ from xrd_tools.session.readiness import (
     ProcessingPage,
     SectionId,
     Tool,
-    build_bound_control_state,
 )
 
+from xdart.gui.tabs.scattering.controls_inventory import (
+    build_native_control_state,
+)
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.controls_readiness import (
     ControlsReadinessProjection,
@@ -230,7 +232,7 @@ def _control_state(phase: ShellPhase) -> ControlPanelRenderState:
         ("Int2D", "axis"): ("Q-χ", "2θ-χ"),
         ("BG", "bg_type"): ("None", "File"),
     }
-    fields = build_bound_control_state(
+    fields = build_native_control_state(
         values,
         choices,
         tool=Tool.INT_2D,

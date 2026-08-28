@@ -37,7 +37,12 @@ def _user_types(qapp, widget, editor, text):
     QtTest.QTest.keyClicks(editor, text)
     qapp.processEvents()
 
-from xdart.gui.tabs.static_scan.controls_logic import (
+from xdart.gui.tabs.static_scan.static_controls_adapter import (
+    INTEGRATOR_BACKED_CONTROL_SPECS,
+    INTEGRATION_CONTROL_PATHS,
+    build_control_panel_state,
+)
+from xrd_tools.session.readiness import (
     AnalysisLauncherSpec,
     AnalysisTool,
     BoundControlState,
@@ -49,8 +54,6 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     ControlProfile,
     FieldId,
     GeomState,
-    INTEGRATOR_BACKED_CONTROL_SPECS,
-    INTEGRATION_CONTROL_PATHS,
     MeasMode,
     ProcessingPage,
     ResultCaps,
@@ -59,7 +62,6 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     SourceCaps,
     StatusKind,
     Tool,
-    build_control_panel_state,
     build_control_profile,
     build_native_int_reduction_plan_from_args,
     build_native_int_reduction_plan_from_scan,
@@ -1357,7 +1359,7 @@ def test_controls_panel_v2_can_be_hidden_by_env(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_field_edits_update_legacy_parameters(qapp, monkeypatch):
+def test_controls_panel_v2_field_edits_update_static_parameters(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -1456,7 +1458,7 @@ def test_controls_panel_v2_gi_detail_fields_inline_only_in_grazing(qapp, monkeyp
         assert _find_more_button(widget) is None
 
         # Grazing mode -> θ motor inline + the '…' GI-options button (progressive
-        # disclosure, gated in controls_logic on the Grazing state).  With no
+        # disclosure, gated by the static adapter on the Grazing state).  With no
         # source loaded there is no real motor, so the θ-motor defaults to Manual
         # (not a phantom 'th'), which correctly reveals the manual θ-value input
         # inline alongside the motor selector.
@@ -1557,7 +1559,7 @@ def test_dir_container_count_reports_direct_files_without_counting_frames(
         # The summary chip says files, never descriptor-frame totals.
         state = widget._controls_v2_state()
         assert state.frame_count_is_files is True
-        from xdart.gui.tabs.static_scan.controls_logic import (
+        from xrd_tools.session.readiness import (
             build_control_profile,
         )
         profile = build_control_profile(state)

@@ -1,8 +1,8 @@
 """Static-scan GUI package.
 
 Keep package import light so pure helper modules such as
-``xdart.gui.tabs.static_scan.controls_logic`` remain importable in a Qt-free
-test process.  The heavy widget is loaded only when requested.
+``xrd_tools.session.readiness`` remain importable in a Qt-free test process.
+The heavy widget is loaded only when requested.
 """
 
 from __future__ import annotations

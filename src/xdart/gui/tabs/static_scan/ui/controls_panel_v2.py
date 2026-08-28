@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Controls Panel V2 scaffold.
-
-This widget is a thin renderer for the Qt-free
-:mod:`xdart.gui.tabs.static_scan.controls_logic` profile.  During the
-ParameterTree migration it also renders a small set of bound form rows supplied
-by the owning tab; those rows emit field-change intent and do not read wrangler
-objects directly.
-"""
+"""Shared Controls renderer for immutable readiness snapshots."""
 
 from __future__ import annotations
 
@@ -17,7 +10,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.themes.spacing import SpacingTokens, current_spacing_tokens
 
-from ..controls_logic import (
+from xrd_tools.session.readiness import (
     AnalysisLauncherSpec,
     BoundControlState,
     ControlAction,
@@ -31,12 +24,9 @@ from ..controls_logic import (
     FieldStatus,
     SectionId,
     StatusKind,
-    build_bound_control_state,
 )
-
-
 def _spaced(base: int, tokens: SpacingTokens) -> int:
-    """Scale a legacy layout value while keeping Normal byte-compatible."""
+    """Scale a base layout value while keeping Normal byte-compatible."""
     return max(0, base + tokens.layout_gap - 8)
 
 
@@ -653,7 +643,7 @@ class _ControlsComboBox(QtWidgets.QComboBox):
 
 
 class FormRow(QtWidgets.QWidget):
-    """One editable row in the transitional V2 form."""
+    """One editable row in the Controls form."""
 
     valueChanged = QtCore.Signal(object, object)
     #: A still-uncommitted USER draft (line-editor ``textEdited`` — never a
@@ -696,7 +686,7 @@ class FormRow(QtWidgets.QWidget):
         self.label.setMinimumWidth(76)
 
         if kind == "bool":
-            # The legacy integrator panel uses checkable QPushButtons for
+            # The Qt-backed integrator panel uses checkable QPushButtons for
             # GI/threshold/saturation toggles.  Mirroring that behavior keeps
             # checked-but-disabled controls visibly checked during active runs.
             self.label.hide()
@@ -1160,7 +1150,7 @@ class PillRow(QtWidgets.QWidget):
 
     valueChanged = QtCore.Signal(object, object)
 
-    #: Compatibility tooltip for a profile that deliberately mirrors a fact
+    #: Fallback tooltip for a profile that deliberately mirrors a fact
     #: whose editor lives elsewhere.  Current vNext controls do not use this
     #: path: Mask Saturated is an independent editable fact.
     _DISPLAY_ONLY_TOOLTIP = "Set by another control."
@@ -1322,11 +1312,10 @@ class SegmentedControl(QtWidgets.QWidget):
 
 
 class ControlsPanelV2(QtWidgets.QWidget):
-    """Feature-flag-ready renderer for :class:`ControlProfile`.
+    """Render :class:`ControlProfile` and bound field state.
 
-    It emits launcher intent only.  The owning tab decides how to open dialogs,
-    run scans, or map profile changes into the legacy wrangler while V2 is
-    hidden.
+    It emits intents only. The owning page builds state and decides how to
+    handle actions and field edits.
     """
 
     analysisLaunchRequested = QtCore.Signal(object)
@@ -1437,13 +1426,6 @@ class ControlsPanelV2(QtWidgets.QWidget):
     @property
     def profile(self) -> ControlProfile | None:
         return self._profile
-
-    def set_field_values(
-        self,
-        values: dict[tuple[str, ...], object] | None = None,
-        choices: dict[tuple[str, ...], Sequence[str]] | None = None,
-    ) -> None:
-        self.set_bound_state(build_bound_control_state(values, choices))
 
     def set_bound_state(self, state: BoundControlState | None) -> None:
         self._bound_state = state
@@ -2026,9 +2008,9 @@ class ControlsPanelV2(QtWidgets.QWidget):
         # Sample & measurement shows a Standard | Grazing segmented control (not a
         # group-header checkbox — that was the #56 repaint class).  The GI detail
         # fields (motor, value, orientation, tilt) render inline beneath it, but
-        # only in Grazing mode: controls_logic gates their PRESENCE on the Grazing
-        # state (progressive disclosure), so here they are simply rendered when
-        # present.
+        # only in Grazing mode: the static controls adapter gates their PRESENCE
+        # on the Grazing state (progressive disclosure), so here they are simply
+        # rendered when present.
         gi_paths = {
             ("GI", "Grazing"),
             ("GI", "th_motor"),
@@ -2069,7 +2051,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
         """Render the Standard|Grazing segmented control, then a compact GI row:
         the θ motor combo, the manual θ value (manual mode only), and a '…'
         button that opens a small popup with the less-used Orientation + Tilt
-        Angle options.  controls_logic drops the detail fields in Standard mode."""
+        Angle options.  The static adapter drops detail fields in Standard mode."""
         compact_labels = {
             ("GI", "th_motor"): "θ motor",
             ("GI", "th_val"): "θ",

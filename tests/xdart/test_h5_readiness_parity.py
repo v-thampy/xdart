@@ -57,7 +57,7 @@ from xrd_tools.sources.readiness import (
     capabilities_for_processed,
     describe_source_readiness,
 )
-from xdart.gui.tabs.static_scan.controls_logic import RunTarget
+from xrd_tools.session.readiness import RunTarget
 
 SOURCE_FIELDS = (
     "has_frames", "has_raw", "raw_reachable", "has_metadata",

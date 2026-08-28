@@ -1,14 +1,20 @@
 import logging
 
-from xdart.gui.tabs.static_scan.controls_logic import (
-    AnalysisTool,
+from xdart.gui.tabs.static_scan.static_controls_adapter import (
     BOUND_CONTROL_PATHS,
+    INTEGRATOR_BACKED_CONTROL_PATHS,
+    INTEGRATOR_BACKED_CONTROL_SPECS,
+    INTEGRATION_CONTROL_PATHS,
+    build_bound_control_state,
+    build_control_panel_state,
+    coerce_control_edit_value,
+)
+from xrd_tools.session.readiness import (
+    AnalysisTool,
     ControlAction,
     ControlFieldKind,
     ControlState,
     FieldId,
-    INTEGRATOR_BACKED_CONTROL_PATHS,
-    INTEGRATOR_BACKED_CONTROL_SPECS,
     SectionId,
     StatusKind,
     MeasMode,
@@ -18,14 +24,10 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     SourceCaps,
     Tool,
     GeomState,
-    INTEGRATION_CONTROL_PATHS,
     append_config_mismatch_check,
     build_field_statuses,
     build_analysis_launchers,
-    build_bound_control_state,
-    build_control_panel_state,
     build_control_profile,
-    coerce_control_edit_value,
     processing_config_from_mapping,
     run_target_readiness_note,
     run_blockers_from_fields,
@@ -190,7 +192,7 @@ def test_required_project_root_blocks_run_when_missing_or_invalid():
     assert "Choose a valid project folder." in invalid.run_blockers
 
 
-def test_tool_from_legacy_mode_text():
+def test_tool_from_processing_mode_text():
     assert tool_from_mode_text("Int 1D") == Tool.INT_1D
     assert tool_from_mode_text("Int 2D") == Tool.INT_2D
     assert tool_from_mode_text("Int 1D (XYE)") == Tool.INT_1D
@@ -544,7 +546,7 @@ def test_bound_control_state_describes_image_directory_form():
             ("GI", "sample_orientation"): 4,
             ("GI", "tilt_angle"): 0.0,
             ("MaskSat", "mask_sentinel"): False,
-            ("BG", "bg_type"): "File",
+            ("BG", "bg_type"): "Single BG File",
             ("BG", "File"): "/data/bg.tif",
             ("BG", "Scale"): 1.0,
         },
@@ -575,7 +577,7 @@ def test_bound_control_state_describes_image_directory_form():
     assert [field.label for field in processing] == [
         "Mask Saturated",
         "Background",
-        "BG File",
+        "Source File",
         "Scale",
     ]
 
@@ -646,13 +648,13 @@ def test_gi_mode_overrides_stale_hidden_radial_label():
     """P2 (GI label staleness): in GI polar modes the integrator HIDES the radial
     label without resetting its text, so the stale widget text (e.g. 'Qip' left
     over from q_ip) must NOT win over the authoritative gi_mode."""
-    from xdart.gui.tabs.static_scan.controls_logic import (
-        _range_axis_labels_1d,
-        _range_axis_labels_2d,
+    from xrd_tools.session.control_labels import (
+        range_axis_labels_1d,
+        range_axis_labels_2d,
     )
 
     # 1D q_total carrying a STALE 'Qip' radial label -> gi_mode wins -> polar Q.
-    radial, azim = _range_axis_labels_1d({
+    radial, azim = range_axis_labels_1d({
         ("Int1D", "gi_mode"): "q_total",
         ("Int1D", "unit"): "q_A^-1",
         ("Int1D", "radial_label"): "Qip (Å⁻¹)",
@@ -662,7 +664,7 @@ def test_gi_mode_overrides_stale_hidden_radial_label():
     assert azim == "χ (°)"
 
     # 2D q_chi carrying a stale 'Qip' radial label -> gi_mode wins.
-    radial2, azim2 = _range_axis_labels_2d({
+    radial2, azim2 = range_axis_labels_2d({
         ("Int2D", "gi_mode"): "q_chi",
         ("Int2D", "unit"): "q_A^-1",
         ("Int2D", "radial_label"): "Qip (Å⁻¹)",
@@ -671,8 +673,8 @@ def test_gi_mode_overrides_stale_hidden_radial_label():
     assert radial2 == "Q (Å⁻¹)"
     assert azim2 == "χ (°)"
 
-    # Standard mode (no gi_mode) STILL prefers the live legacy label.
-    radial_std, azim_std = _range_axis_labels_1d({
+    # Standard mode (no gi_mode) still prefers the live displayed label.
+    radial_std, azim_std = range_axis_labels_1d({
         ("Int1D", "radial_label"): "2θ (°)",
         ("Int1D", "azim_label"): "χ (°)",
     })
@@ -680,8 +682,8 @@ def test_gi_mode_overrides_stale_hidden_radial_label():
     assert azim_std == "χ (°)"
 
 
-def test_controls_logic_imports_no_heavy_deps():
-    """controls_logic.py MUST stay Qt-free (CLAUDE.md: pure decision layer).
+def test_static_controls_adapter_imports_no_heavy_deps():
+    """The static controls adapter must stay Qt-free.
 
     Import it by dotted path in a clean subprocess and assert it does not pull
     the Qt/pyFAI GUI stack through ``static_scan.__init__``.  Then load the file
@@ -697,7 +699,7 @@ def test_controls_logic_imports_no_heavy_deps():
                     'pyqtgraph', 'pyFAI')
     dotted = textwrap.dedent(f"""
         import sys
-        import xdart.gui.tabs.static_scan.controls_logic
+        import xdart.gui.tabs.static_scan.static_controls_adapter
         bad = [m for m in {qt_forbidden!r} if m in sys.modules]
         if bad:
             print(','.join(bad))
@@ -706,18 +708,18 @@ def test_controls_logic_imports_no_heavy_deps():
     proc = subprocess.run([sys.executable, '-c', dotted],
                           capture_output=True, text=True)
     assert proc.returncode == 0, (
-        f"controls_logic pulled in Qt/pyFAI modules: {proc.stdout.strip()}\n"
+        f"static controls adapter pulled in Qt/pyFAI modules: {proc.stdout.strip()}\n"
         f"{proc.stderr.strip()}"
     )
 
-    import xdart.gui.tabs.static_scan.controls_logic as _cl
+    import xdart.gui.tabs.static_scan.static_controls_adapter as _cl
 
     file_forbidden = ('PySide6', 'PySide2', 'PyQt5', 'PyQt6',
                       'pyqtgraph', 'h5py', 'pyFAI', 'fabio')
     isolated = textwrap.dedent(f"""
         import sys, importlib.util
         spec = importlib.util.spec_from_file_location(
-            "controls_logic_isolated", {_cl.__file__!r})
+            "static_controls_adapter_isolated", {_cl.__file__!r})
         mod = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = mod
         spec.loader.exec_module(mod)
@@ -729,7 +731,7 @@ def test_controls_logic_imports_no_heavy_deps():
     proc = subprocess.run([sys.executable, '-c', isolated],
                           capture_output=True, text=True)
     assert proc.returncode == 0, (
-        f"controls_logic module pulled in forbidden modules: {proc.stdout.strip()}\n"
+        f"static controls adapter pulled in forbidden modules: {proc.stdout.strip()}\n"
         f"{proc.stderr.strip()}"
     )
 
@@ -801,7 +803,7 @@ def test_bound_control_state_uses_axis_labels_for_range_rows():
     assert by_path[("Int2D", "azim_low")].label == "Qoop (Å⁻¹) Low"
 
 
-def test_bound_control_state_uses_hidden_gi_modes_for_legacy_labels():
+def test_bound_control_state_uses_hidden_gi_modes_for_stale_display_labels():
     values = {
         ("Int1D", "axis"): "Qₒₒₚ",
         ("Int1D", "unit"): "q_A^-1",
@@ -896,7 +898,7 @@ def test_bound_control_state_gates_integration_rows_by_tool():
     assert "2D Radial Points" in labels_2d
 
 
-def test_bound_control_paths_cover_transitional_sections():
+def test_bound_control_paths_cover_static_page_sections():
     assert ("Project", "project_folder") in BOUND_CONTROL_PATHS
     assert ("Signal", "inp_type") in BOUND_CONTROL_PATHS
     assert ("NeXus File", "nexus_file") in BOUND_CONTROL_PATHS

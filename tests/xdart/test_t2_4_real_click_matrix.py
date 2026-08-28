@@ -112,7 +112,7 @@ def _assert_journal_retains_invalid_points(widget):
 )
 def test_real_reintegrate_click_focused_invalid(
         widget, qapp, monkeypatch, action_name, ui_button):
-    from xdart.gui.tabs.static_scan.controls_logic import ControlAction
+    from xrd_tools.session.readiness import ControlAction
 
     intent_before, scan_before = _focused_invalid_points(widget, qapp)
     spy = _SpyButton()
@@ -130,7 +130,7 @@ def test_real_reintegrate_click_focused_invalid(
 
 def test_real_calibrate_click_focused_invalid_skips_autofill(
         widget, qapp, monkeypatch):
-    from xdart.gui.tabs.static_scan.controls_logic import ControlAction
+    from xrd_tools.session.readiness import ControlAction
 
     intent_before, scan_before = _focused_invalid_points(widget, qapp)
     spy = _SpyButton()
@@ -153,7 +153,7 @@ def test_real_calibrate_click_focused_invalid_skips_autofill(
 
 
 def test_real_make_mask_click_focused_invalid(widget, qapp, monkeypatch):
-    from xdart.gui.tabs.static_scan.controls_logic import ControlAction
+    from xrd_tools.session.readiness import ControlAction
 
     intent_before, scan_before = _focused_invalid_points(widget, qapp)
     spy = _SpyButton()
@@ -172,7 +172,7 @@ def test_real_make_mask_click_focused_invalid(widget, qapp, monkeypatch):
 
 def test_real_advanced_click_focused_invalid_does_not_open(
         widget, qapp, monkeypatch):
-    from xdart.gui.tabs.static_scan.controls_logic import ControlAction
+    from xrd_tools.session.readiness import ControlAction
 
     intent_before, scan_before = _focused_invalid_points(widget, qapp)
     opened = []

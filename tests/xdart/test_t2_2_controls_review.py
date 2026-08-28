@@ -75,7 +75,7 @@ class _SpyButton:
 # ---------------------------------------------------------------------------
 
 def test_advanced_action_refuses_invalid_focused_edit(widget, monkeypatch):
-    from xdart.gui.tabs.static_scan.controls_logic import ControlAction
+    from xrd_tools.session.readiness import ControlAction
 
     intent = widget._controls_v2_ensure_run_intent()
     intent.bai_1d_args["numpoints"] = 321
@@ -143,7 +143,9 @@ def test_commit_pending_helper_never_raises_on_invalid(widget):
 # ---------------------------------------------------------------------------
 
 def test_invalid_pending_draft_survives_forced_rebuild(widget, qapp):
-    from xdart.gui.tabs.static_scan.controls_logic import build_control_panel_state
+    from xdart.gui.tabs.static_scan.static_controls_adapter import (
+        build_control_panel_state,
+    )
 
     path = ("Int1D", "points")
     row = _form_row(widget, path)

@@ -92,7 +92,7 @@ def _configure_source(w, master):
 
 
 def _roi_enabled(result_caps) -> bool:
-    from xdart.gui.tabs.static_scan.controls_logic import (
+    from xrd_tools.session.readiness import (
         AnalysisTool,
         build_analysis_launchers,
     )
@@ -255,7 +255,7 @@ def test_pending_browser_rescope_fails_closed(widget, tmp_path, monkeypatch):
 def test_stale_missing_data_file_is_not_a_loaded_scan(widget, tmp_path):
     """A nonexistent non-scratch ``scan.data_file`` with no loaded
     frames/publications is not a loaded scan and no LOADED_SCAN target."""
-    from xdart.gui.tabs.static_scan.controls_logic import RunTarget
+    from xrd_tools.session.readiness import RunTarget
 
     widget.scan.data_file = str(tmp_path / "vanished" / "old_session.nxs")
     state = widget._controls_v2_state()

@@ -560,7 +560,9 @@ def test_e1a_exact_ui_and_adapter_allowlists_and_page_ownership():
         if violation.startswith("direct file I/O")
     }
     assert not _page_ownership_violations(page.read_text())
-    assert "static_scan.controls_logic" not in (PACKAGE / "controls_projection.py").read_text()
+    assert "static_scan.static_controls_adapter" not in (
+        PACKAGE / "controls_projection.py"
+    ).read_text()
 
 
 def test_e1a_architecture_finite_mutation_oracles():

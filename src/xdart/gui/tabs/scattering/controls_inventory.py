@@ -8,14 +8,16 @@ import math
 from pathlib import Path
 
 from xrd_tools.core.scan import SourceKind, SourceSpec, coerce_source_kind
+from xrd_tools.session.control_labels import (
+    range_axis_labels_1d,
+    range_axis_labels_2d,
+)
 from xrd_tools.session.readiness import (
     BoundControlState,
     ControlFieldKind,
     ControlFormField,
     SectionId,
     Tool,
-    _range_axis_labels_1d,
-    _range_axis_labels_2d,
 )
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import (
@@ -105,8 +107,8 @@ class ControlFieldSpec:
     """One native vNext field declaration.
 
     The declaration contains only facts consumed by the vNext projection.  It
-    deliberately has no legacy widget names, value roles, or ParameterTree
-    coordinates; the old static-scan adapter owns those separately.
+    deliberately has no Qt widget names, value roles, or ParameterTree
+    coordinates; the Qt-backed static-scan adapter owns those separately.
     """
 
     section: SectionId
@@ -447,8 +449,8 @@ def build_native_control_state(
 def _integration_label_overrides(
     values: Mapping[tuple[str, ...], object],
 ) -> dict[tuple[str, ...], str]:
-    radial_1d, azim_1d = _range_axis_labels_1d(values)
-    radial_2d, azim_2d = _range_axis_labels_2d(values)
+    radial_1d, azim_1d = range_axis_labels_1d(values)
+    radial_2d, azim_2d = range_axis_labels_2d(values)
     return {
         INT_1D_RADIAL_AUTO: f"{radial_1d} Auto",
         INT_1D_RADIAL_LOW: f"{radial_1d} Low",

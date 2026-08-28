@@ -25,7 +25,7 @@ from xrd_tools.session.intent_store import (
 from xrd_tools.session.run_configuration import RunIntent
 
 
-def test_native_control_schema_has_no_legacy_widget_metadata():
+def test_native_control_schema_has_no_static_widget_metadata():
     assert {field.name for field in fields(ControlFieldSpec)} == {
         "section",
         "label",
@@ -41,9 +41,9 @@ def test_native_control_schema_has_no_legacy_widget_metadata():
     assert ("Int2D", "method") not in paths
 
 
-def test_vnext_controls_modules_do_not_import_legacy_binding_schema():
+def test_vnext_controls_modules_do_not_import_static_binding_schema():
     forbidden = {
-        "LegacyWidgetBinding",
+        "StaticWidgetBinding",
         "INTEGRATION_CONTROL_SPECS",
         "INTEGRATOR_BACKED_CONTROL_PATHS",
         "INTEGRATOR_BACKED_CONTROL_SPECS",
@@ -62,9 +62,19 @@ def test_vnext_controls_modules_do_not_import_legacy_binding_schema():
             for alias in node.names
         }
         assert imported.isdisjoint(forbidden), (
-            f"{path.name} imports the legacy static-scan schema: "
+            f"{path.name} imports the static-page binding schema: "
             f"{sorted(imported & forbidden)}"
         )
+
+    controls_renderer = (
+        Path(controls_inventory.__file__).parents[1]
+        / "static_scan"
+        / "ui"
+        / "controls_panel_v2.py"
+    )
+    assert "static_controls_adapter" not in controls_renderer.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_vnext_edit_commits_to_store_and_freezes_same_revision(tmp_path):
