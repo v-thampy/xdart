@@ -318,6 +318,39 @@ def test_active_standard_and_gi_modes_preserve_borrowed_array_identity(
     _close(scope)
 
 
+def test_average_row_projects_averaged_title_without_relabeling_other_rows(
+    tmp_path,
+) -> None:
+    from xdart.gui.tabs.scattering.browse_1d_projection import (
+        Browse1DProjectionStatus,
+    )
+    from xrd_tools.io import FrameScalarRow
+
+    rows = (
+        FrameScalarRow(
+            1, modes_1d=("q",), active_mode_1d="q", averaged=True,
+        ),
+        FrameScalarRow(2, modes_1d=("q",), active_mode_1d="q"),
+    )
+    scope = _scope(
+        tmp_path,
+        rows,
+        (("q", "Q", "A^-1", False),),
+    )
+    _seed_label(scope[7], scope[5], scope[4], 1, 1)
+    _seed_label(scope[7], scope[5], scope[4], 2, 2)
+
+    outcome = _project(scope)
+    assert outcome.status is Browse1DProjectionStatus.COMPLETE
+    assert tuple(payload.title for payload in outcome.payloads) == (
+        "Browse · scan · [averaged]",
+        "Browse · scan · frame 2",
+    )
+
+    outcome.borrow_bundle.release()
+    _close(scope)
+
+
 def test_unknown_and_exact_empty_inventory_are_distinct(tmp_path) -> None:
     from xdart.gui.tabs.scattering.browse_1d_projection import (
         Browse1DProjectionStatus,

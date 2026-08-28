@@ -69,7 +69,7 @@ _MAX_READER_RETAINED_BYTES = 64 * 1024 * 1024
 # ceiling, while refusing object-heap amplification from a million-row file.
 _MAX_SCALAR_CATALOG_ROWS = 100_000
 _MAX_SCALAR_CATALOG_FACTS = 2_000_000
-_SCALAR_CATALOG_FIXED_FACTS_PER_ROW = 12
+_SCALAR_CATALOG_FIXED_FACTS_PER_ROW = 13
 # A 1-D row projection is a caller-owned Python/NumPy graph, not a streaming
 # iterator.  Keep its label/membership graph bounded independently of HDF row
 # width, and cap unique result roots/bytes at the established 64 MiB analysis
@@ -82,6 +82,53 @@ _MAX_1D_RESULT_BYTES = 64 * 1024 * 1024
 
 
 _SCALAR_METADATA_TYPES = (type(None), bool, int, float, str)
+
+
+def _is_current_average_frame_one(entry: object) -> bool:
+    """Recognize the exact current averaged frame without reading counts."""
+
+    if not isinstance(entry, h5py.Group):
+        return False
+    frames_link = entry.get("frames", getlink=True)
+    frames = entry.get("frames")
+    if (
+        type(frames_link) is not h5py.HardLink
+        or not isinstance(frames, h5py.Group)
+        or "frame_0001" not in frames
+    ):
+        return False
+    frame_link = frames.get("frame_0001", getlink=True)
+    frame = frames.get("frame_0001")
+    if (
+        type(frame_link) is not h5py.HardLink
+        or not isinstance(frame, h5py.Group)
+        or "source" in frame
+    ):
+        return False
+    counts_link = frame.get("finite_counts", getlink=True)
+    counts = frame.get("finite_counts")
+    required_attrs = {
+        "average_scan_policy",
+        "contributor_extent",
+        "finite_counts_sha256",
+        "finite_counts_min",
+        "finite_counts_max",
+        "finite_counts_zero_count",
+    }
+    return bool(
+        type(counts_link) is h5py.HardLink
+        and isinstance(counts, h5py.Dataset)
+        and counts.dtype == np.dtype("<u4")
+        and counts.ndim == 2
+        and all(int(part) > 0 for part in counts.shape)
+        and required_attrs.issubset(counts.attrs)
+        and _bounded_text_attr(
+            counts,
+            "average_scan_policy",
+            role=f"{counts.name} Average policy",
+            max_bytes=32,
+        ) == "average_scan_v1"
+    )
 
 
 def _frozen_scalar_metadata(
@@ -192,6 +239,7 @@ class FrameScalarRow:
     source_frame_index: int | None = None
     has_thumbnail: bool = False
     mask_baked: bool = False
+    averaged: bool = False
     modes_1d: tuple[str, ...] = ()
     modes_2d: tuple[str, ...] = ()
     active_mode_1d: str | None = None
@@ -232,8 +280,12 @@ class FrameScalarRow:
             raise TypeError(
                 "source_frame_index must be an exact nonnegative integer or None"
             )
-        if type(self.has_thumbnail) is not bool or type(self.mask_baked) is not bool:
-            raise TypeError("thumbnail facts must be exact booleans")
+        if (
+            type(self.has_thumbnail) is not bool
+            or type(self.mask_baked) is not bool
+            or type(self.averaged) is not bool
+        ):
+            raise TypeError("frame marker facts must be exact booleans")
 
         modes_1d = _exact_mode_tuple(self.modes_1d, role="modes_1d")
         modes_2d = _exact_mode_tuple(self.modes_2d, role="modes_2d")
@@ -3826,6 +3878,9 @@ class FrameViewReader:
                 raise ValueError(
                     "Frame scalar catalog requires a full-inventory reader"
                 )
+            average_frame_one = bundle._callback(
+                _is_current_average_frame_one, self._entry,
+            )
             lower_bound, column_count, mode_memberships = bundle._callback(
                 self._scalar_catalog_projection_counts,
             )
@@ -3892,6 +3947,11 @@ class FrameViewReader:
                     source_frame_index=source_index,
                     has_thumbnail=has_thumbnail,
                     mask_baked=mask_baked,
+                    averaged=(
+                        average_frame_one
+                        and label == 1
+                        and source_path is None
+                    ),
                     modes_1d=modes_1d,
                     modes_2d=modes_2d,
                     active_mode_1d=active_1d,

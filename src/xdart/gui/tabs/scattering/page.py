@@ -19,7 +19,7 @@ import weakref
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xdart.modules.display_context import ContextKind
+from xdart.modules.display_context import BrowseContext, ContextKind, DisplaySelection
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.session.intent_store import (
@@ -2356,11 +2356,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._reintegrate_identity, self._reintegrate_request, self._reintegrate_target, self._reintegrate_dimension = identity, request, target, dimension
         self._notice(f"Reintegrating {dimension[0]}-D from authenticated loaded artifact science…"); self._refresh_shell(); self._ensure_timer()
 
-    def _consume_reintegrate_update(self, update: object) -> bool:
-        if type(update) is not OperationUpdate or update.identity is not self._reintegrate_identity: return False
+    def _consume_reintegrate_update(self, update: object) -> _OperationRefresh:
+        if type(update) is not OperationUpdate or update.identity is not self._reintegrate_identity: return _OperationRefresh.NONE
         if update.terminal is None:
             if update.progress is not None: self._notice(f"Reintegrate {self._reintegrate_dimension[0]}-D: {update.progress.stage} {update.progress.completed}/{update.progress.total}…")
-            return True
+            return _OperationRefresh.CONTROLS
         terminal, request, target = update.terminal, self._reintegrate_request, self._reintegrate_target
         shown = {"1d": "1-D", "2d": "2-D"}.get(self._reintegrate_dimension, "operation"); self._reintegrate_identity = self._reintegrate_request = self._reintegrate_target = self._reintegrate_dimension = None
         result = terminal.payload
@@ -2378,15 +2378,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if committed and commit_identity is None:
             self._notice(
                 f"Reintegrate {shown} returned an invalid commit identity; "
-                "Browse was not reloaded."
+                "reloading the persisted artifact without its terminal seal."
             )
-            self._request_browser_catalog()
-            return True
+            if request is not None and target is not None:
+                self._reload_after_reintegrate(request, target)
+            else:
+                self._request_browser_catalog()
+            return _OperationRefresh.FULL
         if request is not None and target is not None: self._reload_after_reintegrate(
             request, target, commit_identity,
         )
         else: self._request_browser_catalog()
-        return True
+        return _OperationRefresh.FULL
 
     def _consume_average_update(self, update: object) -> bool:
         if type(update) is not OperationUpdate or update.identity is not self._average_identity:
@@ -4173,6 +4176,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                             0.0, poll_ended - poll_started,
                         )
             if outcome is not None:
+                load_outcome = (
+                    outcome if type(outcome) is BrowseLoadOutcome else None
+                )
                 settle_started = (
                     None
                     if exact_browse_perf is None
@@ -4198,18 +4204,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                             0.0, settle_ended - settle_started,
                         )
                         if (
-                            outcome.status is BrowseLoadStatus.READY
-                            and type(outcome.timing) is BrowseLoadTiming
+                            load_outcome is not None
+                            and load_outcome.status is BrowseLoadStatus.READY
+                            and type(load_outcome.timing) is BrowseLoadTiming
                         ):
-                            exact_browse_perf.worker = outcome.timing
+                            exact_browse_perf.worker = load_outcome.timing
                             browse_perf_ready = exact_browse_perf
                         else:
                             self._terminal_browse_perf = None
                 presentation = self._terminal_browse_presentation
                 if (
-                    outcome.status is BrowseLoadStatus.READY
+                    load_outcome is not None
+                    and load_outcome.status is BrowseLoadStatus.READY
                     and presentation is not None
-                    and presentation.request is outcome.request
+                    and presentation.request is load_outcome.request
                     and self._terminal_browse_presentation_is_current(
                         presentation
                     )
@@ -4512,13 +4520,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     operation_refresh = _OperationRefresh.FULL
                 else:
                     operation_refresh = self._consume_analysis_update(update)
+                    if operation_refresh is _OperationRefresh.NONE:
+                        operation_refresh = self._consume_reintegrate_update(
+                            update
+                        )
                     if (
                         operation_refresh is _OperationRefresh.NONE
                         and (
                             self._consume_calibration_update(update)
                             or self._consume_mask_update(update)
                             or self._consume_background_update(update)
-                            or self._consume_reintegrate_update(update)
                             or self._consume_average_update(update)
                         )
                     ):
@@ -5795,6 +5806,32 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             skip_scientific_projection = True
         if batch_science_hold:
             preserve_display = True
+            preserve_scientific = True
+            skip_scientific_projection = True
+            rebind_scientific_navigation = False
+            suppress_detector_demand = True
+        controller = self._context_controller
+        browse = controller.browse_context
+        selection = controller.selection
+        selected_invalidated_browse = (
+            type(browse) is BrowseContext
+            and browse.invalidated
+            and not browse.released
+            and type(selection) is DisplaySelection
+            and selection.kind is ContextKind.BROWSE
+            and selection.names(browse)
+        )
+        pending_browse_replacement = (
+            controller.browse_pending
+            and browse is None
+            and type(selection) is DisplaySelection
+            and selection.kind is ContextKind.BROWSE
+        )
+        if (
+            selected_invalidated_browse
+            or self._pending_reintegrate_reload is not None
+            or pending_browse_replacement
+        ):
             preserve_scientific = True
             skip_scientific_projection = True
             rebind_scientific_navigation = False

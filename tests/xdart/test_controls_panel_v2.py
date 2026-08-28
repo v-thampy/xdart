@@ -5147,6 +5147,27 @@ def test_controls_panel_v2_manual_range_stays_visibly_checked_while_run_locked(
         widget.deleteLater()
 
 
+@pytest.mark.parametrize("theme", ("dark", "light"))
+def test_controls_panel_v2_checked_disabled_matches_disabled_text_color(
+    theme,
+):
+    from xdart.gui.themes import render_qss
+
+    qss = render_qss(theme)
+
+    def color_for(selector):
+        start = qss.index(selector)
+        body = qss[start:qss.index("}", start)]
+        return next(
+            line.strip() for line in body.splitlines()
+            if line.strip().startswith("color:")
+        )
+
+    assert color_for(
+        "QPushButton#controlsV2ToggleButton:checked:disabled"
+    ) == color_for("QPushButton#controlsV2ToggleButton:disabled")
+
+
 
 def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
     """LV-UI-5: Standard→Grazing ADDS the θ-motor field; the in-place fast

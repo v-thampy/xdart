@@ -225,6 +225,43 @@ def test_scalar_catalog_projects_all_rows_modes_and_deeply_frozen_facts(
     assert first.source_path == "raw_2.h5"
 
 
+def test_scalar_catalog_marks_current_average_capability(tmp_path) -> None:
+    path = tmp_path / "average.nxs"
+    record = FrameRecord.from_view(_view(1, 1.0))
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry")
+        write_frame_records(entry, (record,))
+        frame = entry.create_group("frames").create_group("frame_0001")
+        frame.create_dataset(
+            "finite_counts", data=np.ones((2, 3), dtype=np.uint32),
+        )
+        counts = frame["finite_counts"]
+        counts.attrs["average_scan_policy"] = np.bytes_(b"average_scan_v1")
+        counts.attrs["contributor_extent"] = np.uint32(1)
+        counts.attrs["finite_counts_sha256"] = np.bytes_(b"0" * 64)
+        counts.attrs["finite_counts_min"] = np.uint32(1)
+        counts.attrs["finite_counts_max"] = np.uint32(1)
+        counts.attrs["finite_counts_zero_count"] = np.uint64(0)
+
+    with FrameViewReader(
+        path, resolve_source=False, include_thumbnail=False,
+    ) as reader:
+        catalog = reader.read_scalar_catalog()
+
+    assert catalog.labels == (1,)
+    assert catalog.rows[0].averaged is True
+
+    with h5py.File(path, "r+") as handle:
+        handle["entry/frames"].create_group("frame_0002")
+    with FrameViewReader(
+        path, resolve_source=False, include_thumbnail=False,
+    ) as reader:
+        appended = reader.read_scalar_catalog()
+    assert appended.labels == (1, 2)
+    assert appended.rows[0].averaged is True
+    assert appended.rows[1].averaged is False
+
+
 def test_scalar_catalog_never_reads_scientific_or_thumbnail_payloads(
     tmp_path, monkeypatch,
 ) -> None:
@@ -526,6 +563,10 @@ def test_live_scalar_catalog_read_blocks_close_before_hdf_mutation(
                 (FrameScalarRow(2), FrameScalarRow(1)),
             ),
             "strictly increasing",
+        ),
+        (
+            lambda: FrameScalarRow(1, averaged=1),
+            "marker facts",
         ),
     ],
 )

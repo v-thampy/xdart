@@ -1052,7 +1052,7 @@ QPushButton#controlsV2PillButton:checked {
 QPushButton#controlsV2ToggleButton:checked:disabled,
 QPushButton#controlsV2PillButton:checked:disabled {
     background-color: $selection_accent_muted;
-    color: $text_2;
+    color: $text_muted;
     border-color: $selection_accent_muted;
 }
 QPushButton#controlsV2ToggleButton:disabled,

@@ -577,7 +577,11 @@ def _payload(
     return StandardDisplayPayload(
         scope.generation,
         frame,
-        f"Browse · {scope.context.scan_key} · frame {scalar_row.label}",
+        (
+            f"Browse · {scope.context.scan_key} · [averaged]"
+            if scalar_row.averaged
+            else f"Browse · {scope.context.scan_key} · frame {scalar_row.label}"
+        ),
         view,
         "browse",
         measurement_mode="GI" if gi else "Standard",
