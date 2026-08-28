@@ -1,40 +1,23 @@
-"""Source factory and lightweight registry.
+"""Source-kind inference and adapter-backed source opening.
 
-Extension policy (how a new detector/acquisition format is added — the seam the
-post-v1.1 plug-and-play source registry generalises):
+The :class:`~xrd_tools.sources.adapters.SourceFormatAdapter` registry is the
+only source-opening registry.  Built-in and out-of-tree formats both declare
+their discovery, probing, naming, and opening behavior through one
+:func:`~xrd_tools.sources.adapters.register_adapter` call.  Add a
+:class:`~xrd_tools.core.scan.SourceKind` and extend :func:`guess_source_kind`
+only when a new format also needs URI-based kind inference.
 
-1. Add a :class:`~xrd_tools.core.scan.SourceKind` member if the format is a new
-   *kind* of source (``NEXUS_STACK`` already covers Bluesky/NXWriter + Eiger
-   masters; ``TILED`` is reserved for a Tiled client).
-2. Teach :func:`guess_source_kind` to map the URI (directory / extension /
-   sniffed content) to that kind — extension-family first, content-sniff only
-   for the ambiguous cases (SPEC files are extensionless, so they are sniffed).
-3. Provide the opener EITHER as a built-in arm in :func:`open_source` (in-tree
-   formats) OR via :func:`register_source(kind, factory)` (out-of-tree / plugin
-   formats).  The registry is consulted BEFORE the built-in dispatch, so a
-   registered factory OVERRIDES the built-in opener for that kind.
-
-The seam is pinned by ``tests/core/test_source_registry_seam.py`` (H17): adding a
-format is a registration + one classification arm, never a rewrite of
-``open_source``.
-
-R1 generalizes step 3 with :mod:`xrd_tools.sources.adapters`: a
-:class:`~xrd_tools.sources.adapters.SourceFormatAdapter` bundles the opener
-with name-only candidate rules, a canonical scan-name function, and a content
-probe, so a new format is ONE :func:`~xrd_tools.sources.adapters.register_adapter`
-call that also plugs into name-only directory discovery
-(:mod:`xrd_tools.sources.discover`) — not just ``open_source``.  The legacy
-two-argument :func:`register_source` keeps working unchanged and is still
-consulted first (see :func:`open_source`); built-in formats are themselves
-registered through the adapter seam (:func:`_register_builtin_adapters`) so
-one seam serves both in-tree and out-of-tree formats.  Pinned by
-``tests/core/test_source_format_adapters.py``.
+``open_source`` preserves explicitly typed :class:`~xrd_tools.core.scan.SourceSpec`
+values and existing :class:`~xrd_tools.core.scan.FrameSource` objects.  For a
+path it first honors the compatible candidate owner, keeping discovery, probe,
+and opening on the same adapter; virtual sources and explicit processed-output
+paths fall through to the kind owner.  There is no separate opener registry or
+built-in dispatch table.
 """
 
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -45,14 +28,6 @@ from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
 from xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
 from xrd_tools.sources.spec import SpecSource
-
-
-SourceFactory = Callable[[SourceSpec], FrameSource]
-_REGISTRY: dict[SourceKind, SourceFactory] = {}
-
-
-def register_source(kind: SourceKind | str, factory: SourceFactory) -> None:
-    _REGISTRY[coerce_source_kind(kind)] = factory
 
 
 def guess_source_kind(uri: str | Path) -> SourceKind:
@@ -99,12 +74,11 @@ def _path_candidate_owner(uri: str | Path) -> "Any | None":
 def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any) -> FrameSource:
     """Open a source from a URI/spec or return an existing FrameSource.
 
-    Dispatch order: (1) a legacy :func:`register_source` factory for the kind
-    (first global override); (2) R1-R8 — the adapter that CLAIMS the path, when
-    compatible with the requested kind, so a discovered candidate opens through
-    the same adapter that discovered and probed it; (3) the kind-owning adapter
-    (:func:`~xrd_tools.sources.adapters.adapter_for_kind`) for virtual/non-path
-    sources and output-only ``.nexus``; (4) the built-in if-chain fallback."""
+    Dispatch order: (1) the adapter that claims the path, when compatible with
+    the requested kind, so a discovered candidate opens through the same owner
+    that discovered and probed it; (2) the kind-owning adapter for virtual or
+    non-path sources, explicitly typed incompatible candidates, and output-only
+    ``.nexus`` paths.  An unadapted kind raises a clean :class:`ValueError`."""
 
     if hasattr(uri_or_spec, "frame_indices") and hasattr(uri_or_spec, "load_frame"):
         return uri_or_spec  # type: ignore[return-value]
@@ -117,13 +91,7 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
             kind = guess_source_kind(uri_or_spec)
         spec = SourceSpec(uri_or_spec, kind, options=opts)
 
-    # 1) Legacy register_source(kind, factory): the FIRST global kind override,
-    #    preserved exactly (a site can still swap an implementation by kind).
-    factory = _REGISTRY.get(coerce_source_kind(spec.kind))
-    if factory is not None:
-        return factory(spec)
-
-    # 2) R1-R8 path-based ownership: prefer the adapter that CLAIMS this path
+    # R1-R8 path-based ownership: prefer the adapter that CLAIMS this path
     #    (its is_candidate) when that adapter is compatible with the requested
     #    kind, so discovery/probe/open all use the one adapter that owns the
     #    file.  This stops an out-of-tree adapter that declares an existing kind
@@ -137,58 +105,19 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
     if claim_owner is not None and kind in claim_owner.kinds:
         return claim_owner.open(spec)
 
-    # 3) Kind lookup: the adapter that owns the requested kind (external > built-
-    #    in, last-registered wins).  Built-ins are themselves registered through
-    #    this seam, so for every in-tree kind this reproduces the if-chain's own
-    #    construction; the chain below is a dead-but-harmless fallback for any
-    #    kind nothing has adapted yet, and for virtual sources whose owner
-    #    declares the kind without claiming a path.
-    adapter = adapter_for_kind(spec.kind)
+    # Kind lookup: the adapter that owns the requested kind (external > built-in,
+    # last-registered wins).  Built-ins use this same seam; there is no parallel
+    # built-in dispatch table.
+    adapter = adapter_for_kind(kind)
     if adapter is not None:
         return adapter.open(spec)
-
-    if kind is SourceKind.TIFF_SERIES:
-        path = Path(spec.uri)
-        opts = dict(spec.options)
-        files = opts.pop("files", ())
-        opts.pop("selected_file", None)
-        opts.pop("selection_mode", None)
-        scan_name = opts.pop("scan_name", None)
-        if files:
-            opts.pop("pattern", None)
-            return TiffSeriesSource(files, name=scan_name or None, **opts)
-        if path.is_dir():
-            return TiffSeriesSource.from_directory(path, **opts)
-        return TiffSeriesSource([path], **opts)
-    if kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
-        return NexusStackSource(spec.uri, entry=spec.entry or "entry")
-    if kind is SourceKind.PROCESSED_NEXUS:
-        # N1: open_source(nxs, source_root=...) repoints a moved raw tree.
-        return ProcessedNexusSource(
-            spec.uri, entry=spec.entry or "entry",
-            source_root=dict(spec.options).get("source_root"))
-    if kind is SourceKind.IMAGE_FILE:
-        return ImageFileSource(spec.uri, **dict(spec.options))
-    if kind is SourceKind.SPEC:
-        opts = dict(spec.options)
-        return SpecSource(
-            spec.uri, scan=opts.get("scan"), image_dir=opts.get("image_dir"),
-            image_stem=opts.get("image_stem"),
-            read_image_kwargs=opts.get("read_image_kwargs"))
-    if kind is SourceKind.LIVE:
-        return LiveFrameSource(name=str(spec.uri))
     raise ValueError(f"cannot open source {spec.uri!r} with kind {kind.value!r}")
 
 
 # ---------------------------------------------------------------------------
-# R1 built-in format adapters — the seam a new format (in-tree or plugin)
-# declares itself through instead of editing the if-chain above (see
-# xrd_tools.sources.adapters).  Each callable below reproduces EXACTLY the
-# construction the if-chain already performs for that kind, so registering
-# them changes nothing observable: open_source() consults the adapter
-# registry before ever reaching the if-chain, which becomes a dead-but-
-# harmless fallback for any kind nothing has adapted (heavy imports stay
-# lazy, inside each callable, matching the rest of this package).
+# R1 built-in format adapters — the one seam a new format (in-tree or plugin)
+# declares itself through (see xrd_tools.sources.adapters).  Heavy imports stay
+# lazy inside the probe/provider callables.
 # ---------------------------------------------------------------------------
 
 #: Raw-readable NeXus-family container extensions.  ``.cxi`` is included for
@@ -712,5 +641,4 @@ __all__ = [
     "TiffSeriesSource",
     "guess_source_kind",
     "open_source",
-    "register_source",
 ]

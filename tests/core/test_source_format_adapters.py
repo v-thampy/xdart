@@ -3,21 +3,21 @@
 
 Pins the extension policy the R1 mission requires: a new source format is
 declared through ONE :func:`register_adapter` call, never an edit to
-``open_source``'s if-chain or to ``discover.py``'s per-kind branches.  The
+``open_source`` or to ``discover.py``'s per-kind branches.  The
 worked example uses ``SourceKind.TILED`` — reserved but unused by any
-built-in adapter — as the stand-in "synthetic new format" (the same pattern
-``test_source_registry_seam.py`` already uses for the legacy
-``register_source`` seam).
+built-in adapter — as the stand-in "synthetic new format".
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from threading import Barrier, Event, Thread
 
 import numpy as np
 import pytest
@@ -26,6 +26,7 @@ from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.adapters import (
     SourceFormatAdapter,
     _ADAPTERS,
+    _REGISTRY_LOCK,
     adapter_for_kind,
     all_adapters,
     candidate_owner,
@@ -39,16 +40,32 @@ from xrd_tools.sources.registry import open_source
 @contextlib.contextmanager
 def _isolated_adapter_registry():
     """Save/restore the process-global adapter registry so a test's
-    ``register_adapter`` never leaks into the rest of the suite (mirrors
-    ``test_source_registry_seam.py``'s ``_isolated_registry``).  Kind/candidate
+    ``register_adapter`` never leaks into the rest of the suite.  Kind/candidate
     ownership is resolved live from ``_ADAPTERS`` (there is no separate kind
     index to restore), so saving that one dict is sufficient."""
-    saved_adapters = dict(_ADAPTERS)
+    with _REGISTRY_LOCK:
+        saved_adapters = dict(_ADAPTERS)
     try:
         yield
     finally:
-        _ADAPTERS.clear()
-        _ADAPTERS.update(saved_adapters)
+        with _REGISTRY_LOCK:
+            _ADAPTERS.clear()
+            _ADAPTERS.update(saved_adapters)
+
+
+def _run_fresh_process(code: str) -> str:
+    root = str(Path(__file__).resolve().parents[2] / "src")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+    out = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout.strip()
 
 
 class _SyntheticSource:
@@ -121,10 +138,12 @@ def test_synthetic_format_is_named_probed_and_opened_through_the_seam(tmp_path):
         assert result.state is ProbeState.READY
         assert result.kind is SourceKind.TILED
 
-        # open_source() dispatches to the adapter without ANY new branch in
-        # registry.py's if-chain or a call to register_source().
-        source = open_source(SourceSpec(candidate, SourceKind.TILED))
+        # open_source() dispatches to the adapter without a format-specific
+        # branch in registry.py.
+        spec = SourceSpec(candidate, SourceKind.TILED)
+        source = open_source(spec)
         assert isinstance(source, _SyntheticSource)
+        assert source.spec is spec
         assert source.frame_indices == [0]
         assert np.array_equal(source.load_frame(0), np.zeros((2, 2)))
 
@@ -154,43 +173,17 @@ def test_synthetic_format_is_discovered_through_the_real_enumeration_and_index_p
         assert result.kind is SourceKind.TILED
 
 
-def test_synthetic_adapter_overrides_legacy_register_source_kind_symmetrically():
-    """The adapter seam and the legacy register_source() seam both work for
-    the SAME kind; register_source (checked first in open_source) still wins
-    when both are registered — preserving the documented override order."""
-    from xrd_tools.sources.registry import _REGISTRY, register_source
-
-    with _isolated_adapter_registry():
-        register_adapter(_synthetic_adapter())
-
-        class _LegacySource(_SyntheticSource):
-            pass
-
-        saved = dict(_REGISTRY)
-        try:
-            register_source(SourceKind.TILED, lambda spec: _LegacySource(spec))
-            source = open_source(SourceSpec("tiled://x", SourceKind.TILED))
-            assert isinstance(source, _LegacySource)
-        finally:
-            _REGISTRY.clear()
-            _REGISTRY.update(saved)
+# ---- adapter-only open_source dispatch -----------------------------------
 
 
-# ---- legacy register_source(kind, factory) / open_source unchanged ------
-
-
-def test_legacy_register_source_and_open_source_are_unaffected_by_adapters():
-    """A kind with no adapter and no legacy factory still raises the
-    built-in clean error — the adapter seam did not swallow dispatch for
-    unrelated kinds."""
+def test_unadapted_kind_raises_a_clean_error():
+    """A kind with no adapter raises the public opening error."""
     with pytest.raises(ValueError):
         open_source(SourceSpec("/x.weird", SourceKind.UNKNOWN))
 
 
 def test_builtin_kinds_are_all_covered_by_an_adapter():
-    """Every kind open_source's if-chain used to construct directly is now
-    reachable through a registered built-in adapter (the if-chain itself is
-    an untouched, now-dead fallback for anything unadapted)."""
+    """Every built-in source kind is owned by a registered adapter."""
     for kind in (
         SourceKind.NEXUS_STACK,
         SourceKind.EIGER_MASTER,
@@ -201,6 +194,53 @@ def test_builtin_kinds_are_all_covered_by_an_adapter():
         SourceKind.LIVE,
     ):
         assert adapter_for_kind(kind) is not None, kind
+
+
+@pytest.mark.parametrize(("accessor_import", "lookup", "expected"), (
+    (
+        "from xrd_tools.sources import adapter_for_kind",
+        "adapter_for_kind(SourceKind.IMAGE_FILE).id",
+        "image_file",
+    ),
+    (
+        "from xrd_tools.sources import get_adapter",
+        'get_adapter("image_file").id',
+        "image_file",
+    ),
+    (
+        "from xrd_tools.sources.adapters import candidate_owner",
+        'candidate_owner(Path("frame.tif")).id',
+        "image_file",
+    ),
+    (
+        "from xrd_tools.sources.adapters import explicit_source_owner",
+        'explicit_source_owner(Path("frame.tif"), SourceKind.IMAGE_FILE).id',
+        "image_file",
+    ),
+    (
+        "from xrd_tools.sources import all_adapters",
+        '"image_file" in {adapter.id for adapter in all_adapters()}',
+        True,
+    ),
+))
+def test_public_adapter_lookup_bootstraps_builtins_in_a_fresh_process(
+    accessor_import,
+    lookup,
+    expected,
+):
+    code = f"""
+        import json
+        import sys
+        from pathlib import Path
+        from xrd_tools.core.scan import SourceKind
+        {accessor_import}
+
+        assert "xrd_tools.sources.registry" not in sys.modules
+        value = {lookup}
+        assert "xrd_tools.sources.registry" in sys.modules
+        print(json.dumps(value))
+    """
+    assert json.loads(_run_fresh_process(code)) == expected
 
 
 # ===========================================================================
@@ -252,8 +292,6 @@ def test_r1r2_external_registration_survives_later_builtin_bootstrap():
     lazy built-in bootstrap still owns its kind/candidate afterwards; and the
     reverse order (external registered AFTER built-ins) also yields the
     external.  External always outranks built-in, regardless of import order."""
-    root = str(Path(__file__).resolve().parents[2] / "src")
-
     def _run(order: str) -> dict:
         code = textwrap.dedent(f"""
             import json, sys, tempfile
@@ -287,18 +325,276 @@ def test_r1r2_external_registration_survives_later_builtin_bootstrap():
             kind_owner = adapter_for_kind(SourceKind.IMAGE_FILE).id
             print(json.dumps({{"discovery": disc, "kind": kind_owner}}))
         """)
-        env = dict(os.environ)
-        env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-        out = subprocess.run([sys.executable, "-c", code],
-                             capture_output=True, text=True, env=env)
-        assert out.returncode == 0, out.stdout + out.stderr
-        import json
-        return json.loads(out.stdout.strip())
+        return json.loads(_run_fresh_process(code))
 
     before = _run("before")
     after = _run("after")
     assert before == {"discovery": "plugin_image", "kind": "plugin_image"}
     assert after == {"discovery": "plugin_image", "kind": "plugin_image"}
+
+
+def test_same_id_external_registration_survives_builtin_bootstrap():
+    """A pre-bootstrap external entry cannot be replaced by its lower-tier
+    builtin counterpart merely because a public lookup triggers bootstrap."""
+    code = """
+        import json
+        import sys
+        from pathlib import Path
+        from xrd_tools.core.scan import SourceKind, SourceSpec
+        from xrd_tools.sources.adapters import SourceFormatAdapter, register_adapter
+
+        external = SourceFormatAdapter(
+            id="image_file",
+            kinds=(SourceKind.IMAGE_FILE,),
+            is_candidate=lambda path: path.suffix.lower() == ".tif",
+            scan_name=lambda path: "external:" + path.stem,
+            probe=lambda path: None,
+            open=lambda spec: ("EXTERNAL", str(spec.uri)),
+        )
+        register_adapter(external)
+        assert "xrd_tools.sources.registry" not in sys.modules
+
+        from xrd_tools.sources import adapter_for_kind, get_adapter
+        from xrd_tools.sources.adapters import candidate_owner
+
+        kind_owner = adapter_for_kind(SourceKind.IMAGE_FILE)
+        assert "xrd_tools.sources.registry" in sys.modules
+        from xrd_tools.sources import open_source
+        candidate = Path("frame.tif")
+        result = {
+            "same_by_id": get_adapter("image_file") is external,
+            "same_by_kind": kind_owner is external,
+            "same_by_candidate": candidate_owner(candidate) is external,
+            "open": open_source(SourceSpec(candidate, SourceKind.IMAGE_FILE)),
+        }
+        print(json.dumps(result))
+    """
+    assert json.loads(_run_fresh_process(code)) == {
+        "same_by_id": True,
+        "same_by_kind": True,
+        "same_by_candidate": True,
+        "open": ["EXTERNAL", "frame.tif"],
+    }
+
+
+def test_concurrent_lazy_bootstrap_cannot_overwrite_same_id_external():
+    """Force builtin bootstrap to pause after its same-id read while an
+    external registration contends.  The register transaction lock makes the
+    external write occur after the builtin transaction, so it remains final."""
+    code = """
+        import json
+        import sys
+        from pathlib import Path
+        from threading import Event, Thread, current_thread
+        from xrd_tools.core.scan import SourceKind
+        import xrd_tools.sources.adapters as adapters
+
+        builtin_read = Event()
+        release_builtin = Event()
+        external_started = Event()
+        external_entered_get = Event()
+        external_written = Event()
+
+        class ControlledRegistry(dict):
+            def get(self, key, default=None):
+                value = super().get(key, default)
+                if key == "image_file" and current_thread().name == "bootstrap":
+                    builtin_read.set()
+                    assert release_builtin.wait(2)
+                elif key == "image_file" and current_thread().name == "external":
+                    external_entered_get.set()
+                return value
+
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                if key == "image_file" and current_thread().name == "external":
+                    external_written.set()
+
+        adapters._ADAPTERS = ControlledRegistry()
+        external = adapters.SourceFormatAdapter(
+            id="image_file",
+            kinds=(SourceKind.IMAGE_FILE,),
+            is_candidate=lambda path: path.suffix.lower() == ".tif",
+            scan_name=lambda path: "external:" + path.stem,
+            probe=lambda path: None,
+            open=lambda spec: ("EXTERNAL", str(spec.uri)),
+        )
+
+        lookup_result = []
+        lookup_errors = []
+        external_errors = []
+
+        def bootstrap_lookup():
+            try:
+                lookup_result.append(adapters.adapter_for_kind(SourceKind.IMAGE_FILE))
+            except BaseException as exc:
+                lookup_errors.append(repr(exc))
+
+        def register_external():
+            external_started.set()
+            try:
+                adapters.register_adapter(external)
+            except BaseException as exc:
+                external_errors.append(repr(exc))
+
+        bootstrap = Thread(target=bootstrap_lookup, name="bootstrap")
+        external_thread = Thread(target=register_external, name="external")
+        bootstrap.start()
+        assert builtin_read.wait(2)
+        external_thread.start()
+        assert external_started.wait(2)
+
+        # With the transaction lock, the external thread cannot even reach the
+        # registry read while builtin registration is paused inside its lock.
+        entered_before_release = external_entered_get.wait(1)
+        release_builtin.set()
+        bootstrap.join(3)
+        external_thread.join(3)
+
+        assert not entered_before_release
+        assert not bootstrap.is_alive()
+        assert not external_thread.is_alive()
+        assert not lookup_errors
+        assert not external_errors
+        assert external_written.is_set()
+        final = adapters.get_adapter("image_file")
+        print(json.dumps({
+            "final_is_external": final is external,
+            "final_is_builtin": adapters._ADAPTERS["image_file"].builtin,
+        }))
+    """
+    assert json.loads(_run_fresh_process(code)) == {
+        "final_is_external": True,
+        "final_is_builtin": False,
+    }
+
+
+def test_candidate_predicate_runs_outside_the_registry_lock():
+    predicate_entered = Event()
+    release_predicate = Event()
+    registration_done = Event()
+    owners = []
+    errors = []
+
+    def blocking_predicate(path):
+        predicate_entered.set()
+        if not release_predicate.wait(2):
+            raise TimeoutError("predicate release timed out")
+        return path.suffix == ".blocked"
+
+    blocking = SourceFormatAdapter(
+        id="blocking_candidate",
+        kinds=(SourceKind.TILED,),
+        is_candidate=blocking_predicate,
+        scan_name=lambda path: path.stem,
+        probe=lambda path: None,
+        open=lambda spec: None,
+    )
+    concurrent = SourceFormatAdapter(
+        id="concurrent_registration",
+        kinds=(SourceKind.TILED,),
+        is_candidate=lambda path: False,
+        scan_name=lambda path: path.stem,
+        probe=lambda path: None,
+        open=lambda spec: None,
+    )
+
+    def lookup():
+        try:
+            owners.append(candidate_owner(Path("scan.blocked")))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def register_concurrently():
+        try:
+            register_adapter(concurrent)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            registration_done.set()
+
+    with _isolated_adapter_registry():
+        register_adapter(blocking)
+        lookup_thread = Thread(target=lookup)
+        writer_thread = Thread(target=register_concurrently)
+        lookup_thread.start()
+        assert predicate_entered.wait(2)
+        writer_thread.start()
+        try:
+            assert registration_done.wait(1), (
+                "plugin predicate executed while holding the registry lock"
+            )
+        finally:
+            release_predicate.set()
+        lookup_thread.join(3)
+        writer_thread.join(3)
+
+        assert not lookup_thread.is_alive()
+        assert not writer_thread.is_alive()
+        assert not errors
+        assert owners == [blocking]
+
+
+def test_bounded_concurrent_registration_lookup_and_iteration():
+    start = Barrier(5)
+    errors = []
+
+    def concurrent_adapter(index):
+        return SourceFormatAdapter(
+            id=f"concurrent_{index}",
+            kinds=(SourceKind.TILED,),
+            is_candidate=lambda path: path.suffix == ".race",
+            scan_name=lambda path: path.stem,
+            probe=lambda path: None,
+            open=lambda spec: None,
+        )
+
+    def guarded(action):
+        try:
+            start.wait(timeout=2)
+            action()
+        except BaseException as exc:
+            errors.append(exc)
+
+    def write_many():
+        for index in range(64):
+            register_adapter(concurrent_adapter(index))
+
+    def read_kinds():
+        for _ in range(128):
+            adapter_for_kind(SourceKind.TILED)
+
+    def read_candidates():
+        for _ in range(128):
+            candidate_owner(Path("scan.race"))
+
+    def read_ids():
+        for index in range(128):
+            get_adapter(f"concurrent_{index % 64}")
+
+    def iterate_snapshots():
+        for _ in range(128):
+            ids = [adapter.id for adapter in all_adapters()]
+            assert len(ids) == len(set(ids))
+
+    with _isolated_adapter_registry():
+        threads = [
+            Thread(target=guarded, args=(action,))
+            for action in (
+                write_many,
+                read_kinds,
+                read_candidates,
+                read_ids,
+                iterate_snapshots,
+            )
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert not errors
 
 
 def test_r1r2_same_id_replacement_removes_obsolete_kind_mappings():
@@ -333,7 +629,7 @@ def test_r1r2_candidate_owner_and_kind_owner_answer_different_questions(tmp_path
     legitimately differ.  The load-bearing guarantee is that a DISCOVERED
     candidate is probed through its RECORDED owning adapter (never re-resolved
     by kind), so discovery and probe never disagree — the structural fact that
-    keeps a future opener (R2) safe from a kind-hijack."""
+    keeps path-first opening safe from a kind-hijack."""
     from xrd_tools.sources.directory_index import DirectoryIndex
 
     with _isolated_adapter_registry():
@@ -419,24 +715,6 @@ def test_r1r8_fully_overlapping_adapters_open_through_the_precedence_winner(tmp_
         assert open_source(SourceSpec(w, SourceKind.TILED)) == ("OPENED_BY", "second_w")
 
 
-def test_r1r8_legacy_register_source_still_wins_as_first_global_override(tmp_path):
-    """The path-claim preference sits AFTER the legacy register_source(kind,
-    factory) override, which remains the first global kind override."""
-    from xrd_tools.sources.registry import _REGISTRY, register_source
-
-    with _isolated_adapter_registry():
-        register_adapter(_marker_adapter("claimer", (SourceKind.IMAGE_FILE,), ".tif"))
-        saved = dict(_REGISTRY)
-        try:
-            register_source(SourceKind.IMAGE_FILE, lambda spec: ("LEGACY", "wins"))
-            tif = tmp_path / "a.tif"
-            tif.write_bytes(b"x")
-            assert open_source(SourceSpec(tif, SourceKind.IMAGE_FILE)) == ("LEGACY", "wins")
-        finally:
-            _REGISTRY.clear()
-            _REGISTRY.update(saved)
-
-
 def test_r1r8_incompatible_claimer_falls_through_to_kind_owner(tmp_path):
     """When the path-claiming adapter is NOT compatible with the explicitly
     requested kind, opening falls through to the kind owner (the caller's
@@ -451,9 +729,8 @@ def test_r1r8_incompatible_claimer_falls_through_to_kind_owner(tmp_path):
         open_source(SourceSpec(tif, SourceKind.NEXUS_STACK))
 
 
-def test_r1r8_virtual_and_output_only_sources_use_the_kind_owner():
-    """A virtual (non-path) uri and output-only .nexus have no path-claiming
-    adapter, so they open through the kind owner as before."""
+def test_r1r8_virtual_source_uses_the_kind_owner():
+    """A virtual (non-path) URI opens through its kind owner."""
     from xrd_tools.sources.memory import LiveFrameSource
     # LIVE virtual uri -> no candidate claims it -> kind owner (live adapter)
     live = open_source(SourceSpec("live-run-1", SourceKind.LIVE))

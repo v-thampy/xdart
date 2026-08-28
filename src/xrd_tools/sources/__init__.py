@@ -84,7 +84,6 @@ if TYPE_CHECKING:
     from xrd_tools.sources.registry import (
         guess_source_kind,
         open_source,
-        register_source,
     )
     from xrd_tools.sources.spec import SpecSource
     from xrd_tools.sources.selection import (
@@ -156,7 +155,6 @@ _LAZY_EXPORTS = {
     "probe_first_frame": "xrd_tools.sources.probe",
     "raw_is_reachable": "xrd_tools.sources.probe",
     "register_adapter": "xrd_tools.sources.adapters",
-    "register_source": "xrd_tools.sources.registry",
     "single_image_spec": "xrd_tools.sources.selection",
 }
 
@@ -239,6 +237,5 @@ __all__ = [
     "probe_first_frame",
     "raw_is_reachable",
     "register_adapter",
-    "register_source",
     "single_image_spec",
 ]

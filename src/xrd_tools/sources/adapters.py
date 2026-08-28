@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from xrd_tools.core.scan import FrameSource, SourceKind, SourceSpec, coerce_source_kind
@@ -97,11 +98,15 @@ class _Entry:
     seq: int
 
 
-#: id -> entry.  Re-registering an id overwrites its entry, so there is NO
-#: separate kind index that could go stale (R1-R2): every kind/candidate lookup
-#: resolves live against ``adapter.kinds`` / ``is_candidate`` below.
+#: id -> entry.  External registration replaces an existing id; lower-tier
+#: builtin bootstrap never replaces an external entry with the same id.  There
+#: is NO separate kind index that could go stale (R1-R2): every kind/candidate
+#: lookup resolves live against ``adapter.kinds`` / ``is_candidate`` below.
 _ADAPTERS: dict[str, _Entry] = {}
 _next_seq = 0
+#: Protects registry mutation and sequence allocation only.  Readers copy
+#: entries while holding it and run all caller/plugin behavior after release.
+_REGISTRY_LOCK = RLock()
 
 
 def _rank(entry: _Entry) -> tuple[int, int]:
@@ -113,8 +118,7 @@ def _rank(entry: _Entry) -> tuple[int, int]:
       lazy built-in bootstrap is never displaced when the built-ins later
       register, and one registered after still wins;
     * within a tier, the most recently registered adapter wins
-      (last-registered-wins), mirroring
-      :func:`xrd_tools.sources.registry.register_source`'s override semantics.
+      (last-registered-wins), providing deterministic override semantics.
     """
     return (0 if entry.builtin else 1, entry.seq)
 
@@ -125,22 +129,51 @@ def _best(entries: Iterable[_Entry]) -> _Entry | None:
 
 
 def register_adapter(adapter: SourceFormatAdapter, *, builtin: bool = False) -> None:
-    """Register *adapter*, replacing any prior adapter with the same id.
+    """Register *adapter* under its stable id.
 
     ``builtin`` marks the lower-precedence tier used by the in-tree formats
     (see :func:`_rank`); out-of-tree callers leave it False so their adapters
-    outrank the built-ins deterministically.  Re-registering an id simply
-    overwrites its entry; because kind/candidate ownership is resolved live
-    (never cached in a side index), a replacement that declares fewer kinds
-    leaves NO stale kind mapping behind.
+    outrank the built-ins deterministically.  A builtin bootstrap therefore
+    leaves an existing external entry with the same id untouched.  Every other
+    same-id registration replaces its entry; because kind/candidate ownership
+    is resolved live (never cached in a side index), a replacement that declares
+    fewer kinds leaves NO stale kind mapping behind.
     """
     global _next_seq
-    _ADAPTERS[adapter.id] = _Entry(adapter=adapter, builtin=builtin, seq=_next_seq)
-    _next_seq += 1
+    with _REGISTRY_LOCK:
+        existing = _ADAPTERS.get(adapter.id)
+        if builtin and existing is not None and not existing.builtin:
+            return
+        _ADAPTERS[adapter.id] = _Entry(
+            adapter=adapter,
+            builtin=builtin,
+            seq=_next_seq,
+        )
+        _next_seq += 1
+
+
+def _ensure_builtin_adapters() -> None:
+    """Lazily run the builtin bootstrap before reading the registry.
+
+    Importing this module remains light.  The first public lookup imports the
+    bootstrap owner; subsequent calls reuse Python's module cache.
+    """
+    import xrd_tools.sources.registry  # noqa: F401
+
+
+def _snapshot_entries() -> tuple[_Entry, ...]:
+    """Copy the immutable entries while holding the registry lock."""
+    with _REGISTRY_LOCK:
+        return tuple(_ADAPTERS.values())
 
 
 def get_adapter(adapter_id: str) -> SourceFormatAdapter | None:
-    entry = _ADAPTERS.get(adapter_id)
+    _ensure_builtin_adapters()
+    entries = _snapshot_entries()
+    entry = next(
+        (entry for entry in entries if entry.adapter.id == adapter_id),
+        None,
+    )
     return entry.adapter if entry is not None else None
 
 
@@ -148,8 +181,10 @@ def adapter_for_kind(kind: SourceKind | str) -> SourceFormatAdapter | None:
     """The adapter currently owning *kind*, by the shared :func:`_rank`
     precedence (external outranks built-in; within a tier, last-registered
     wins).  ``None`` when no registered adapter declares *kind*."""
+    _ensure_builtin_adapters()
+    entries = _snapshot_entries()
     k = coerce_source_kind(kind)
-    best = _best(e for e in _ADAPTERS.values() if k in e.adapter.kinds)
+    best = _best(e for e in entries if k in e.adapter.kinds)
     return best.adapter if best is not None else None
 
 
@@ -170,9 +205,11 @@ def candidate_owner(path: Path) -> SourceFormatAdapter | None:
     candidate records THIS owner's id and is always probed through it
     (:meth:`DirectoryIndex.probe_candidate` uses ``candidate.adapter_id``,
     never a kind re-resolution), so discovery and probe never disagree; a
-    future opener (R2) must likewise open a discovered candidate through its
-    recorded adapter rather than re-resolving by kind."""
-    best = _best(e for e in _ADAPTERS.values() if e.adapter.is_candidate(path))
+    :func:`xrd_tools.sources.registry.open_source` likewise prefers a compatible
+    candidate owner before falling back to the kind owner."""
+    _ensure_builtin_adapters()
+    entries = _snapshot_entries()
+    best = _best(e for e in entries if e.adapter.is_candidate(path))
     return best.adapter if best is not None else None
 
 
@@ -188,11 +225,14 @@ def explicit_source_owner(
     therefore the authority at this seam.
     """
 
+    _ensure_builtin_adapters()
+    entries = _snapshot_entries()
     source_path = Path(path)
     source_kind = coerce_source_kind(kind)
-    owner = adapter_for_kind(source_kind)
-    if owner is None:
+    best = _best(e for e in entries if source_kind in e.adapter.kinds)
+    if best is None:
         return None
+    owner = best.adapter
     if source_kind is SourceKind.PROCESSED_NEXUS:
         from xrd_tools.io.output_path import is_readable_output_path
 
@@ -205,7 +245,9 @@ def explicit_source_owner(
 
 def all_adapters() -> tuple[SourceFormatAdapter, ...]:
     """All registered adapters, in first-registration order."""
-    return tuple(e.adapter for e in _ADAPTERS.values())
+    _ensure_builtin_adapters()
+    entries = _snapshot_entries()
+    return tuple(e.adapter for e in entries)
 
 
 __all__ = [
