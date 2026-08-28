@@ -14,7 +14,6 @@ from xrd_tools.session.readiness import (
     ProcessingPage,
     SectionId,
     Tool,
-    build_bound_control_state,
     tool_from_mode_text,
 )
 
@@ -79,6 +78,7 @@ from .controls_inventory import (
     THRESHOLD_MAX,
     THRESHOLD_MIN,
     bound_values,
+    build_native_control_state,
     field,
     source_name,
     source_mode,
@@ -135,7 +135,7 @@ def project_controls(
     processing_mode = str(intent.processing_mode or "")
     tool = tool_from_mode_text(processing_mode)
     viewer = tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER}
-    projected = build_bound_control_state(
+    projected = build_native_control_state(
         values,
         choices,
         tool=tool,

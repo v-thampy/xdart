@@ -1,16 +1,21 @@
-"""Pure field inventory projected from one mutable next-run intent."""
+"""Native vNext Controls field inventory projected from ``RunIntent``."""
 
 from __future__ import annotations
 
-from dataclasses import replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
 from xrd_tools.core.scan import SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.session.readiness import (
+    BoundControlState,
     ControlFieldKind,
     ControlFormField,
     SectionId,
+    Tool,
+    _range_axis_labels_1d,
+    _range_axis_labels_2d,
 )
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import (
@@ -94,6 +99,158 @@ INT_PATHS = frozenset({
     INT_2D_AZIM_HIGH,
 })
 
+
+@dataclass(frozen=True, slots=True)
+class ControlFieldSpec:
+    """One native vNext field declaration.
+
+    The declaration contains only facts consumed by the vNext projection.  It
+    deliberately has no legacy widget names, value roles, or ParameterTree
+    coordinates; the old static-scan adapter owns those separately.
+    """
+
+    section: SectionId
+    label: str
+    path: tuple[str, ...]
+    kind: ControlFieldKind = ControlFieldKind.LINE
+    tools: frozenset[Tool] = frozenset({Tool.INT_1D, Tool.INT_2D})
+
+
+_INT_1D_TOOLS = frozenset({Tool.INT_1D, Tool.INT_2D})
+_INT_2D_TOOLS = frozenset({Tool.INT_2D})
+
+
+CONTROL_FIELD_SPECS: tuple[ControlFieldSpec, ...] = (
+    ControlFieldSpec(
+        SectionId.EXPERIMENT,
+        "Grazing",
+        GI_ENABLED,
+        ControlFieldKind.BOOL,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "Threshold",
+        THRESHOLD_ENABLED,
+        ControlFieldKind.BOOL,
+    ),
+    ControlFieldSpec(SectionId.PROCESSING, "Min", THRESHOLD_MIN),
+    ControlFieldSpec(SectionId.PROCESSING, "Max", THRESHOLD_MAX),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "Mask Saturated",
+        MASK_SATURATION,
+        ControlFieldKind.BOOL,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "1D Axis",
+        INT_1D_AXIS,
+        ControlFieldKind.COMBO,
+        _INT_1D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "1D Points",
+        INT_1D_POINTS,
+        tools=_INT_1D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "1D Radial Auto",
+        INT_1D_RADIAL_AUTO,
+        ControlFieldKind.BOOL,
+        _INT_1D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "1D Radial Low",
+        INT_1D_RADIAL_LOW,
+        tools=_INT_1D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "1D Radial High",
+        INT_1D_RADIAL_HIGH,
+        tools=_INT_1D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "1D Azim Auto",
+        INT_1D_AZIM_AUTO,
+        ControlFieldKind.BOOL,
+        _INT_1D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "1D Azim Low",
+        INT_1D_AZIM_LOW,
+        tools=_INT_1D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "1D Azim High",
+        INT_1D_AZIM_HIGH,
+        tools=_INT_1D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Axis",
+        INT_2D_AXIS,
+        ControlFieldKind.COMBO,
+        _INT_2D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Radial Points",
+        INT_2D_RADIAL_POINTS,
+        tools=_INT_2D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Azim Points",
+        INT_2D_AZIM_POINTS,
+        tools=_INT_2D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Radial Auto",
+        INT_2D_RADIAL_AUTO,
+        ControlFieldKind.BOOL,
+        _INT_2D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Radial Low",
+        INT_2D_RADIAL_LOW,
+        tools=_INT_2D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Radial High",
+        INT_2D_RADIAL_HIGH,
+        tools=_INT_2D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Azim Auto",
+        INT_2D_AZIM_AUTO,
+        ControlFieldKind.BOOL,
+        _INT_2D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Azim Low",
+        INT_2D_AZIM_LOW,
+        tools=_INT_2D_TOOLS,
+    ),
+    ControlFieldSpec(
+        SectionId.PROCESSING,
+        "2D Azim High",
+        INT_2D_AZIM_HIGH,
+        tools=_INT_2D_TOOLS,
+    ),
+)
+
 SOURCE_EDIT_PATHS = frozenset({
     SOURCE_DIRECTORY,
     SOURCE_RECURSIVE,
@@ -134,6 +291,206 @@ SOURCE_FORMAT_SUFFIXES = {
     "edf": (".edf",),
     "raw": (".raw",),
 }
+
+
+def build_native_control_state(
+    values: Mapping[tuple[str, ...], object] | None = None,
+    choices: Mapping[tuple[str, ...], Sequence[object]] | None = None,
+    *,
+    tool: Tool | None = None,
+    controls_enabled: bool = True,
+) -> BoundControlState:
+    """Build vNext's renderer state from native field declarations."""
+
+    values = {tuple(path): value for path, value in (values or {}).items()}
+    choices = {
+        tuple(path): tuple(str(value) for value in options)
+        for path, options in (choices or {}).items()
+    }
+    label_overrides = _integration_label_overrides(values)
+    projected: list[ControlFormField] = []
+
+    def add(
+        section: SectionId,
+        label: str,
+        path: tuple[str, ...],
+        *,
+        kind: ControlFieldKind = ControlFieldKind.LINE,
+        browse: bool = False,
+    ) -> None:
+        if path not in values:
+            return
+        enabled, reason = _field_enabled_reason(
+            values,
+            path,
+            controls_enabled=controls_enabled,
+        )
+        projected.append(ControlFormField(
+            section=section,
+            label=label,
+            path=path,
+            value=values[path],
+            kind=kind,
+            choices=choices.get(path, ()),
+            browse=browse,
+            enabled=enabled,
+            reason=reason,
+        ))
+
+    add(SectionId.PROJECT, "Folder", PROJECT_ROOT, browse=True)
+    add(SectionId.PROJECT, "Save Path", SAVE_PATH, browse=True)
+
+    source_type = str(values.get(SOURCE_TYPE, ""))
+    add(SectionId.SOURCE, "Source", SOURCE_TYPE, kind=ControlFieldKind.COMBO)
+    if source_type == "Image Directory":
+        add(SectionId.SOURCE, "Directory", SOURCE_DIRECTORY, browse=True)
+        add(
+            SectionId.SOURCE,
+            "File Type",
+            SOURCE_SUFFIX,
+            kind=ControlFieldKind.COMBO,
+        )
+        add(
+            SectionId.SOURCE,
+            "Subdirs",
+            SOURCE_RECURSIVE,
+            kind=ControlFieldKind.BOOL,
+        )
+        add(SectionId.SOURCE, "Filter", SOURCE_FILTER)
+    else:
+        add(SectionId.SOURCE, "Image File", SOURCE_FILE, browse=True)
+    add(
+        SectionId.SOURCE,
+        "Meta Type",
+        SOURCE_META,
+        kind=ControlFieldKind.COMBO,
+    )
+    add(
+        SectionId.SOURCE,
+        "Energy",
+        SOURCE_ENERGY,
+        kind=ControlFieldKind.COMBO,
+    )
+    add(SectionId.EXPERIMENT, "Poni", PONI_FILE, browse=True)
+    add(SectionId.EXPERIMENT, "Mask File", MASK_FILE, browse=True)
+
+    for spec in CONTROL_FIELD_SPECS:
+        if tool is not None and tool not in spec.tools:
+            continue
+        add(
+            spec.section,
+            label_overrides.get(spec.path, spec.label),
+            spec.path,
+            kind=spec.kind,
+        )
+
+    if source_type != "Single Image" and AVERAGE_SCAN in values:
+        add(
+            SectionId.PROCESSING,
+            "Average Scan",
+            AVERAGE_SCAN,
+            kind=ControlFieldKind.BOOL,
+        )
+    background_mode = str(values.get(BACKGROUND_TYPE, "None"))
+    add(
+        SectionId.PROCESSING,
+        "Background",
+        BACKGROUND_TYPE,
+        kind=ControlFieldKind.COMBO,
+    )
+    if background_mode in {"Single BG File", "Series Average"}:
+        add(
+            SectionId.PROCESSING,
+            (
+                "Source File"
+                if background_mode == "Single BG File"
+                else "Series Member"
+            ),
+            BACKGROUND_FILE,
+            browse=True,
+        )
+    elif background_mode == "BG Directory":
+        add(
+            SectionId.PROCESSING,
+            "Directory",
+            BACKGROUND_DIRECTORY,
+            browse=True,
+        )
+        add(
+            SectionId.PROCESSING,
+            "Match",
+            BACKGROUND_MATCH,
+            kind=ControlFieldKind.COMBO,
+        )
+        if str(values.get(BACKGROUND_MATCH, "")) == "Metadata Key":
+            add(
+                SectionId.PROCESSING,
+                "Metadata Key",
+                BACKGROUND_METADATA_KEY,
+            )
+        add(
+            SectionId.PROCESSING,
+            "Filename Filter",
+            BACKGROUND_FILTER,
+        )
+    if background_mode != "None":
+        add(SectionId.PROCESSING, "Scale", BACKGROUND_SCALE)
+        add(
+            SectionId.PROCESSING,
+            "Normalize",
+            BACKGROUND_NORMALIZE,
+        )
+
+    return BoundControlState(fields=tuple(projected))
+
+
+def _integration_label_overrides(
+    values: Mapping[tuple[str, ...], object],
+) -> dict[tuple[str, ...], str]:
+    radial_1d, azim_1d = _range_axis_labels_1d(values)
+    radial_2d, azim_2d = _range_axis_labels_2d(values)
+    return {
+        INT_1D_RADIAL_AUTO: f"{radial_1d} Auto",
+        INT_1D_RADIAL_LOW: f"{radial_1d} Low",
+        INT_1D_RADIAL_HIGH: f"{radial_1d} High",
+        INT_1D_AZIM_AUTO: f"{azim_1d} Auto",
+        INT_1D_AZIM_LOW: f"{azim_1d} Low",
+        INT_1D_AZIM_HIGH: f"{azim_1d} High",
+        INT_2D_RADIAL_AUTO: f"{radial_2d} Auto",
+        INT_2D_RADIAL_LOW: f"{radial_2d} Low",
+        INT_2D_RADIAL_HIGH: f"{radial_2d} High",
+        INT_2D_AZIM_AUTO: f"{azim_2d} Auto",
+        INT_2D_AZIM_LOW: f"{azim_2d} Low",
+        INT_2D_AZIM_HIGH: f"{azim_2d} High",
+    }
+
+
+def _field_enabled_reason(
+    values: Mapping[tuple[str, ...], object],
+    path: tuple[str, ...],
+    *,
+    controls_enabled: bool,
+) -> tuple[bool, str]:
+    if not controls_enabled:
+        return False, "Controls are locked during the active run."
+    auto_dependencies = {
+        INT_1D_RADIAL_LOW: INT_1D_RADIAL_AUTO,
+        INT_1D_RADIAL_HIGH: INT_1D_RADIAL_AUTO,
+        INT_1D_AZIM_LOW: INT_1D_AZIM_AUTO,
+        INT_1D_AZIM_HIGH: INT_1D_AZIM_AUTO,
+        INT_2D_RADIAL_LOW: INT_2D_RADIAL_AUTO,
+        INT_2D_RADIAL_HIGH: INT_2D_RADIAL_AUTO,
+        INT_2D_AZIM_LOW: INT_2D_AZIM_AUTO,
+        INT_2D_AZIM_HIGH: INT_2D_AZIM_AUTO,
+    }
+    auto_path = auto_dependencies.get(path)
+    if auto_path is not None and bool(values.get(auto_path, False)):
+        return False, "Disable Auto to edit this range."
+    if path in {THRESHOLD_MIN, THRESHOLD_MAX} and not bool(
+        values.get(THRESHOLD_ENABLED, False)
+    ):
+        return False, "Enable Threshold to edit this limit."
+    return True, ""
 
 
 def bound_values(

@@ -758,12 +758,10 @@ class ControlFieldKind(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class ControlFormField:
-    """One editable transitional Controls V2 field.
+    """One immutable Controls field projected for the shared Qt renderer.
 
-    ``path`` is still the legacy wrangler parameter path for now.  Keeping the
-    typed field description here, rather than in Qt, makes the next migration
-    step straightforward: the same object can point to a native ControlState
-    field while the renderer stays unchanged.
+    ``path`` is a presentation-neutral field identifier.  A page owns the
+    value and edit semantics; this object carries only the rendered snapshot.
     """
 
     section: SectionId
@@ -780,7 +778,7 @@ class ControlFormField:
 
 @dataclass(frozen=True, slots=True)
 class ControlFormEdit:
-    """One value-change intent emitted by the transitional control form."""
+    """One value-change intent emitted by the shared Controls renderer."""
 
     path: tuple[str, ...]
     value: object
@@ -788,13 +786,11 @@ class ControlFormEdit:
 
 @dataclass(frozen=True, slots=True)
 class LegacyWidgetBinding:
-    """One transitional Controls V2 field backed by the Int carrier.
+    """One old static-scan field backed by a widget or ParameterTree node.
 
-    This is intentionally just metadata: the Qt-free logic decides what should
-    render, while :mod:`static_scan_widget` maps the widget or ParameterTree
-    names into the existing legacy backend.  Keeping these bindings in one
-    table prevents the render/read/write/membership lists from drifting during
-    the migration.
+    This compatibility metadata belongs to the separate old static-scan page.
+    The native ScatteringWorkspace has its own value-only ``ControlFieldSpec``
+    inventory and must not import this adapter.
     """
 
     section: SectionId
@@ -1534,12 +1530,7 @@ def build_bound_control_state(
     tool: Tool | None = None,
     controls_enabled: bool = True,
 ) -> BoundControlState:
-    """Build the transitional editable Controls V2 state from legacy values.
-
-    The values still come from wrangler parameters, but the section/visibility
-    rules live in this pure function.  That keeps Qt as a renderer and gives the
-    native ControlState migration a stable target.
-    """
+    """Adapt old static-scan widget values to the shared Controls renderer."""
 
     values = {tuple(path): value for path, value in (values or {}).items()}
     choices = {

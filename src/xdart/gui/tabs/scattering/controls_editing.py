@@ -15,11 +15,7 @@ from xrd_tools.session.intent_store import (
     RunIntentSnapshot,
     RunIntentStore,
 )
-from xrd_tools.session.readiness import (
-    INTEGRATION_CONTROL_SPECS,
-    Tool,
-    tool_from_mode_text,
-)
+from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
 
@@ -125,18 +121,10 @@ _ADVANCED_LEAVES = (
     "safe",
 )
 ADVANCED_FIELD_PATHS = tuple(
-    spec.path
-    for spec in INTEGRATION_CONTROL_SPECS
-    if len(spec.path) == 2 and spec.path[1] in _ADVANCED_LEAVES
-)
-if set(ADVANCED_FIELD_PATHS) != {
     (root, leaf)
     for root in ("Int1D", "Int2D")
     for leaf in _ADVANCED_LEAVES
-}:
-    raise RuntimeError(
-        "Advanced integration fields disagree with the shared schema."
-    )
+)
 
 
 @dataclass(frozen=True, slots=True)
