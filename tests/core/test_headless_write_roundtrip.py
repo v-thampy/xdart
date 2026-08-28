@@ -160,7 +160,7 @@ def test_write_integrated_stack_bulk_then_incremental(tmp_path):
     np.testing.assert_allclose(ds2["intensity_1d"].values[1], 9.0)  # row 1 updated
 
 
-def test_monotonic_append_fast_path_falls_back_after_late_frame(tmp_path):
+def test_monotonic_append_refuses_a_late_new_frame_without_mutation(tmp_path):
     import h5py
     from xrd_tools.io.nexus import write_integrated_stack
 
@@ -170,10 +170,14 @@ def test_monotonic_append_fast_path_falls_back_after_late_frame(tmp_path):
         write_integrated_stack(e, frame_indices=[0, 2],
                                results_1d=[_r1d(0), _r1d(2)])
         assert bool(e["integrated_1d"].attrs["_frame_index_strictly_increasing"])
-        write_integrated_stack(e, frame_indices=[1], results_1d=[_r1d(1)])
-        assert not bool(e["integrated_1d"].attrs["_frame_index_strictly_increasing"])
+        f.flush()
+        before = p.read_bytes()
+        with pytest.raises(ValueError, match="strictly increasing"):
+            write_integrated_stack(e, frame_indices=[1], results_1d=[_r1d(1)])
+        f.flush()
+        assert p.read_bytes() == before
         write_integrated_stack(e, frame_indices=[2], results_1d=[_r1d(7)])
-        np.testing.assert_array_equal(e["integrated_1d/frame_index"][()], [0, 2, 1])
+        np.testing.assert_array_equal(e["integrated_1d/frame_index"][()], [0, 2])
 
 
 def test_write_stitched_roundtrips_through_read_stitched(tmp_path):

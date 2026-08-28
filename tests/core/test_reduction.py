@@ -941,7 +941,7 @@ def test_nexus_sink_writes_frame_results(
 ) -> None:
     monkeypatch.setattr(reduction_core, "integrate_1d",
                         lambda image, ai, **kwargs: _r1d(3.0))
-    out = tmp_path / "scan.nxs"
+    out = tmp_path / "scan.nexus"
     scan = Scan(
         "scan",
         [Frame(0, image=np.ones((2, 2)))],
@@ -977,7 +977,7 @@ def test_nexus_sink_persists_non_gi_chi_1d_axis(
         )
 
     monkeypatch.setattr(reduction_core, "integrate_radial", fake_integrate_radial)
-    out = tmp_path / "chi_scan.nxs"
+    out = tmp_path / "chi_scan.nexus"
     plan = ReductionPlan(
         integration_1d=Integration1DPlan(npt=5, unit="chi_deg", radial_range=(1.0, 2.0)),
         integration_2d=None,
@@ -1011,7 +1011,7 @@ def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
         raise RuntimeError("simulated write failure")
 
     monkeypatch.setattr(reduction_core.NexusRecordWriter, "write", fail_write)
-    out = tmp_path / "scan.nxs"
+    out = tmp_path / "scan.nexus"
     original = b"old complete file"
     out.write_bytes(original)
 
@@ -1023,7 +1023,7 @@ def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
         )
 
     assert out.read_bytes() == original
-    assert not list(tmp_path.glob(".scan.nxs.*.tmp"))
+    assert not list(tmp_path.glob(".scan.*.tmp.nexus"))
 
 
 def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
@@ -1063,10 +1063,11 @@ def test_nexus_sink_flush_policy(
     monkeypatch.setattr(reduction_core, "integrate_1d",
                         lambda image, ai, **kwargs: _r1d(float(image[0, 0])))
     calls = []
+    real_open = reduction_core.open_nexus_writer
 
     class FakeH5:
-        def __init__(self, path):
-            self._h5 = h5py.File(path, "w")
+        def __init__(self, path, *args, **kwargs):
+            self._h5 = real_open(path, *args, **kwargs)
 
         def require_group(self, *args, **kwargs):
             return self._h5.require_group(*args, **kwargs)
@@ -1090,7 +1091,8 @@ def test_nexus_sink_flush_policy(
             self._h5.close()
 
     monkeypatch.setattr(
-        reduction_core, "open_nexus_writer", lambda path, *a, **k: FakeH5(path))
+        reduction_core, "open_nexus_writer", FakeH5,
+    )
     result = run_reduction(
         ReductionPlan(),
         Scan(
@@ -1106,7 +1108,7 @@ def test_nexus_sink_flush_policy(
         ),
         # complete_record=False: this test is about flush cadence, not the
         # per-frame record.
-        NexusSink(tmp_path / "scan.nxs", overwrite=True,
+        NexusSink(tmp_path / "scan.nexus", overwrite=True,
                   flush_every=2, atomic=False,
                   complete_record=False),
     )
@@ -1115,7 +1117,7 @@ def test_nexus_sink_flush_policy(
     assert calls == ["flush", "flush", "close"]  # frame 2, finish, close
 
     with pytest.raises(ValueError, match="flush_every"):
-        NexusSink("scan.nxs", flush_every=0).begin(
+        NexusSink("scan.nexus", flush_every=0).begin(
             Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
             ReductionPlan(),
         )
@@ -1188,7 +1190,7 @@ def test_scan_to_scan_data_empty_scan() -> None:
 def test_nexussink_persists_scan_data_roundtrip(tmp_path: Path) -> None:
     from xrd_tools.io.read import get_metadata
 
-    path = tmp_path / "scan_conditions.nxs"
+    path = tmp_path / "scan_conditions.nexus"
     scan = Scan(
         name="ramp",
         frames=[
@@ -1315,7 +1317,7 @@ def test_composite_nexus_sink_prepares_thumbnails_off_writer_thread(
 
     monkeypatch.setattr(NexusSink, "_prepare_frame_thumbnail", observed_prepare)
     monkeypatch.setattr(NexusSink, "_write_frame_record", observed_write)
-    out = tmp_path / "parallel-thumbnails.nxs"
+    out = tmp_path / "parallel-thumbnails.nexus"
     frames = [
         Frame(index, image=np.full((32, 24), index + 1.0))
         for index in range(4)

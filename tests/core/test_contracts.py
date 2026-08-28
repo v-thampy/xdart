@@ -46,10 +46,10 @@ def test_xye_sink_contract(tmp_path, monkeypatch):
 
 def test_nexus_sink_contract(tmp_path, monkeypatch):
     check_sink_contract(
-        lambda: NexusSink(tmp_path / "scan.nxs", overwrite=True),
+        lambda: NexusSink(tmp_path / "scan.nexus", overwrite=True),
         monkeypatch,
     )
-    assert (tmp_path / "scan.nxs").exists()
+    assert (tmp_path / "scan.nexus").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +151,7 @@ def test_processed_scan_source_contract(tmp_path, monkeypatch):
         reduction_core, "integrate_1d",
         lambda image, ai, **kw: _fake_r1d(float(np.sum(image))),
     )
-    out = root / "processed" / "scan.nxs"
+    out = root / "processed" / "scan.nexus"
     session = ReductionSession(
         ReductionPlan(integration_2d=None),
         Scan("s", frames, integrator=object()),

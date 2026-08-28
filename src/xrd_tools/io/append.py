@@ -1057,6 +1057,7 @@ def prepare_append_preflight(
     committed_prefix: AppendCommittedPrefix | None = None,
     file_lock=None,
     refusal_mapper: Callable[[str, AppendDecision], BaseException] | None = None,
+    before_admit: Callable[[], None] | None = None,
 ) -> AppendPreflight:
     from .output_transaction import (
         LeaseOwner,
@@ -1076,6 +1077,8 @@ def prepare_append_preflight(
     decision = None
     try:
         with (nullcontext() if file_lock is None else file_lock):
+            if before_admit is not None:
+                before_admit()
             transaction = coordinator.admit(
                 normalized,
                 transaction_owner=transaction_owner,

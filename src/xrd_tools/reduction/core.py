@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Protocol, runtime_checkable
 from uuid import uuid4
 
+import h5py
 import numpy as np
 
 from xrd_tools.core.containers import (
@@ -92,6 +93,11 @@ from xrd_tools.io.output_transaction import (
     capture_target_snapshot,
     get_output_transaction_coordinator,
 )
+from xrd_tools.io.processed_scan_id import (
+    require_current_output_path,
+    require_current_writable_processed_groups,
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # C4 — tighter Scan.integrator type without forcing the import
@@ -1506,8 +1512,7 @@ class NexusSink:
         self._nexus_record_batch_size = value
 
     def __post_init__(self) -> None:
-        if not isinstance(self.path, Path):
-            self.path = Path(self.path)
+        self.path = require_current_output_path(self.path)
         if type(self.durable_fsync) is not bool:
             raise TypeError("Nexus durable_fsync must be an exact bool")
         if type(self.rollback_until_commit) is not bool:
@@ -1672,11 +1677,21 @@ class NexusSink:
                     self._existing_append_intent,
                     committed_prefix=self._existing_append_prefix,
                     file_lock=self.file_lock,
+                    before_admit=self._require_current_append_target,
                 )
             except AppendPreflightCleanupError as error:
                 self.append_preflight = error.owner
                 raise
         if self.append_preflight is not None:
+            try:
+                with (nullcontext() if self.file_lock is None else self.file_lock):
+                    self._require_current_append_target()
+            except BaseException as primary:
+                try:
+                    self.append_preflight.abort()
+                except BaseException as cleanup:
+                    raise primary from cleanup
+                raise
             binding = self.append_preflight._consume(self.path)
             self._transaction = binding.transaction
             self._lease = binding.lease
@@ -1709,6 +1724,7 @@ class NexusSink:
         target_owner = OwnerToken("nexus-sink-target")
         owners = {role: OwnerToken(f"nexus-sink-{role.value}") for role in LeaseOwner}
         with (nullcontext() if self.file_lock is None else self.file_lock):
+            self._require_current_append_target()
             transaction = coordinator.admit(
                 self.path,
                 transaction_owner=transaction_owner,
@@ -1769,6 +1785,16 @@ class NexusSink:
                 raise primary from cleanup
             raise
         return decision
+
+    def _require_current_append_target(self) -> None:
+        if not self.path.exists() or self.overwrite:
+            return
+        with h5py.File(self.path, "r") as existing:
+            require_current_writable_processed_groups(
+                existing,
+                self.entry,
+                container=self.path,
+            )
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         if self._writer is not None and self._writer.phase.value in {"active", "partial"}:

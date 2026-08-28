@@ -80,7 +80,7 @@ def test_sink_rejects_callback_in_provenance_value_tree(tmp_path):
 
     try:
         sink = NexusSink(
-            tmp_path / "callback.nxs",
+            tmp_path / "callback.nexus",
             run_configuration_provenance=_identity(callback=callback),
         )
     except (TypeError, ValueError):
@@ -94,7 +94,7 @@ def test_sink_rejects_live_authority_that_survives_deepcopy(tmp_path):
 
     try:
         sink = NexusSink(
-            tmp_path / "authority.nxs",
+            tmp_path / "authority.nexus",
             run_configuration_provenance=_identity(authority=authority),
         )
     except (TypeError, ValueError):
@@ -119,7 +119,7 @@ def test_full_accepted_configuration_value_algebra_round_trips(
         tmp_path,
         monkeypatch,
         NexusSink(
-            tmp_path / "tuple-values.nxs",
+            tmp_path / "tuple-values.nexus",
             overwrite=True,
             run_configuration_provenance=projected,
         ),
@@ -135,6 +135,6 @@ def test_full_accepted_configuration_value_algebra_round_trips(
 def test_sink_refuses_non_json_native_authority_values_before_output(tmp_path, value):
     with pytest.raises(ValueError):
         NexusSink(
-            tmp_path / "refused.nxs",
+            tmp_path / "refused.nexus",
             run_configuration_provenance=_identity(value=value),
         )

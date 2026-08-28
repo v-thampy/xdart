@@ -1069,14 +1069,14 @@ def test_nexus_sink_compression_default_honors_env(tmp_path, monkeypatch):
     from xrd_tools.reduction import NexusSink
 
     monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "none")
-    assert NexusSink(tmp_path / "a.nxs", overwrite=True).compression is None
+    assert NexusSink(tmp_path / "a.nexus", overwrite=True).compression is None
 
     # Unset -> the resolved default: lz4 when hdf5plugin is importable, else gzip.
     monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
-    assert NexusSink(tmp_path / "b.nxs", overwrite=True).compression in ("lz4", "gzip")
+    assert NexusSink(tmp_path / "b.nexus", overwrite=True).compression in ("lz4", "gzip")
 
     monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "none")
-    explicit = NexusSink(tmp_path / "c.nxs", overwrite=True, compression="gzip")
+    explicit = NexusSink(tmp_path / "c.nexus", overwrite=True, compression="gzip")
     assert explicit.compression == "gzip"
 
 
@@ -1084,7 +1084,7 @@ def test_nexus_sink_abort_preserves_partial(tmp_path):
     """T0-6/S7: abort preserves every written frame as <output>.partial."""
     from xrd_tools.reduction import NexusSink
 
-    out = tmp_path / "run.nxs"
+    out = tmp_path / "run.nexus"
     sink = NexusSink(out, overwrite=True)
     frames = _frames(1)
     sink.begin(Scan("s", frames, integrator=object()), _plan())
@@ -1106,7 +1106,7 @@ def test_nexus_sink_finish_failure_preserves_partial(tmp_path, monkeypatch):
     from xrd_tools.reduction import NexusSink
     from xrd_tools.reduction.core import Scan as _Scan
 
-    out = tmp_path / "run2.nxs"
+    out = tmp_path / "run2.nexus"
     sink = NexusSink(out, overwrite=True)
     frames = _frames(1)
     scan = _Scan("s", frames, integrator=object())

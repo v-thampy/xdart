@@ -9,6 +9,7 @@ import pytest
 from tests.core._v2_record_fixture import (
     _GI_1D_UNITS,
     _result_1d,
+    _result_2d,
     write_gi_reference_scan,
 )
 from xrd_tools.core import DEFAULT_MODE_KEY
@@ -21,8 +22,11 @@ from xrd_tools.io.append import (
     decode_committed_append_prefix,
 )
 from xrd_tools.io.nexus import (
+    open_nexus_writer,
     read_stitched,
     validate_integrated_stack_write,
+    write_nexus,
+    write_nexus_frame,
     write_integrated_stack,
 )
 from xrd_tools.io.nexus_record import frame_record_from_live_frame
@@ -231,6 +235,342 @@ def test_record_writer_begin_still_creates_a_genuinely_new_target(tmp_path):
     with h5py.File(target, "r") as handle:
         processed = require_current_processed_groups(handle)
         assert processed.modes_1d == (DEFAULT_MODE_KEY,)
+
+
+@pytest.mark.parametrize("layout", ("contiguous", "fixed-chunked"))
+def test_record_writer_begin_refuses_non_appendable_frame_index_before_mutation(
+    tmp_path,
+    layout,
+):
+    target, source_root = _gi_scan(tmp_path)
+    with h5py.File(target, "r+") as handle:
+        group = handle["entry/integrated_1d/q_oop"]
+        values = np.asarray(group["frame_index"][()])
+        attrs = dict(group["frame_index"].attrs)
+        del group["frame_index"]
+        kwargs = (
+            {}
+            if layout == "contiguous"
+            else {"chunks": True, "maxshape": values.shape}
+        )
+        fixed = group.create_dataset("frame_index", data=values, **kwargs)
+        fixed.attrs.update(attrs)
+
+    before = target.read_bytes()
+    writer = NexusRecordWriter(
+        target,
+        atomic=False,
+        overwrite=False,
+        flush_every=None,
+        source_base=source_root,
+    )
+    with pytest.raises(WriterIncomplete) as caught:
+        writer.begin(primary_mode_1d="q_total", primary_mode_2d="qip_qoop")
+    assert caught.value.outcome.pending_owner == "begin"
+    writer.abort()
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "alias", ("same-group", "cross-mode", "cross-dimension"),
+)
+def test_record_writer_begin_refuses_row_semantic_hard_alias_before_mutation(
+    tmp_path,
+    alias,
+):
+    target, source_root = _gi_scan(tmp_path)
+    with h5py.File(target, "r+") as handle:
+        parent = handle["entry/integrated_1d"]
+        group = parent["q_oop"]
+        if alias == "same-group":
+            del group["sigma"]
+            group["sigma"] = group["intensity"]
+        elif alias == "cross-mode":
+            del group["intensity"]
+            group["intensity"] = parent["q_ip/intensity"]
+        else:
+            group_2d = handle["entry/integrated_2d"]
+            del group_2d["frame_index"]
+            group_2d["frame_index"] = group["frame_index"]
+
+    before = target.read_bytes()
+    writer = NexusRecordWriter(
+        target,
+        atomic=False,
+        overwrite=False,
+        flush_every=None,
+        source_base=source_root,
+    )
+    with pytest.raises(WriterIncomplete) as caught:
+        writer.begin(primary_mode_1d="q_total", primary_mode_2d="qip_qoop")
+    assert caught.value.outcome.pending_owner == "begin"
+    writer.abort()
+    assert target.read_bytes() == before
+
+
+def test_complete_shadow_remains_readable_but_ordinary_writer_refuses(tmp_path):
+    target, source_root = _gi_scan(tmp_path)
+    shadow_name = f"integrated_1d{REINTEGRATE_SHADOW_SUFFIX}"
+    with h5py.File(target, "r+") as handle:
+        entry = handle["entry"]
+        entry.move("integrated_1d", shadow_name)
+        entry[shadow_name].attrs[REINTEGRATE_SHADOW_COMPLETE_ATTR] = np.bool_(True)
+    with h5py.File(target, "r") as handle:
+        recovered = require_current_processed_groups(handle)
+        assert recovered.integrated_1d.name.endswith(f"/{shadow_name}")
+
+    before = target.read_bytes()
+    writer = NexusRecordWriter(
+        target,
+        atomic=False,
+        overwrite=False,
+        flush_every=None,
+        source_base=source_root,
+    )
+    with pytest.raises(WriterIncomplete) as caught:
+        writer.begin(primary_mode_1d="q_total", primary_mode_2d="qip_qoop")
+    assert caught.value.outcome.pending_owner == "begin"
+    writer.abort()
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("shape", ("sequential", "batch"))
+def test_record_writer_refuses_decreasing_new_labels_before_mutation(
+    tmp_path,
+    shape,
+):
+    target = tmp_path / f"decreasing-{shape}.nexus"
+    writer = NexusRecordWriter(
+        target,
+        atomic=False,
+        overwrite=False,
+        flush_every=None,
+        complete_record=False,
+    )
+    writer.begin()
+    if shape == "sequential":
+        writer.write(RecordWrite(label=2, result_1d=_result_1d(2)))
+        writer._h5.flush()
+        before = target.read_bytes()
+        with pytest.raises(ValueError, match="strictly increasing"):
+            writer.write(RecordWrite(label=1, result_1d=_result_1d(1)))
+        writer._h5.flush()
+        assert target.read_bytes() == before
+        writer.finish()
+        with h5py.File(target, "r") as handle:
+            processed = require_current_processed_groups(handle)
+            assert tuple(processed.integrated_1d["frame_index"][()]) == (2,)
+    else:
+        writer._h5.flush()
+        before = target.read_bytes()
+        with pytest.raises(ValueError, match="strictly increasing"):
+            writer.write_batch(
+                (
+                    RecordWrite(label=2, result_1d=_result_1d(2)),
+                    RecordWrite(label=1, result_1d=_result_1d(1)),
+                )
+            )
+        writer._h5.flush()
+        assert target.read_bytes() == before
+        writer.abort()
+
+
+@pytest.mark.parametrize("writer_api", ("incremental", "complete"))
+def test_public_nexus_writers_refuse_a_new_label_before_the_cursor_without_mutation(
+    tmp_path,
+    writer_api,
+):
+    target = tmp_path / f"decreasing-{writer_api}.nexus"
+    write_nexus(target, results_1d={2: _result_1d(2)}, overwrite=True)
+
+    if writer_api == "incremental":
+        with open_nexus_writer(target) as handle:
+            handle.flush()
+            before = target.read_bytes()
+            with pytest.raises(ValueError, match="strictly increasing"):
+                write_nexus_frame(handle, 1, result_1d=_result_1d(1))
+            handle.flush()
+            assert target.read_bytes() == before
+    else:
+        before = target.read_bytes()
+        with pytest.raises(ValueError, match="strictly increasing"):
+            write_nexus(target, results_1d={1: _result_1d(1)})
+        assert target.read_bytes() == before
+
+
+def test_incremental_frame_preflights_both_dimensions_before_either_mutates(
+    tmp_path,
+):
+    target = tmp_path / "mixed-cursors.nexus"
+    write_nexus(target, results_1d={0: _result_1d(0)}, overwrite=True)
+    write_nexus(target, results_2d={2: _result_2d(2)})
+
+    with open_nexus_writer(target) as handle:
+        handle.flush()
+        before = target.read_bytes()
+        with pytest.raises(ValueError, match="strictly increasing"):
+            write_nexus_frame(
+                handle,
+                1,
+                result_1d=_result_1d(1),
+                result_2d=_result_2d(1),
+            )
+        handle.flush()
+        assert target.read_bytes() == before
+
+
+def test_incremental_writer_close_requires_a_current_processed_artifact(tmp_path):
+    target = tmp_path / "empty-incremental.nexus"
+    handle = open_nexus_writer(target, overwrite=True)
+    with pytest.raises(ValueError, match="not a current xdart"):
+        handle.close()
+    assert not handle.id.valid
+    with h5py.File(target, "r") as invalid:
+        with pytest.raises(ValueError, match="not a current xdart"):
+            require_current_processed_groups(invalid)
+
+
+@pytest.mark.parametrize(
+    "writer_api", ("record", "incremental", "complete", "sink"),
+)
+def test_public_writers_reject_non_nexus_target_before_creation(
+    tmp_path,
+    writer_api,
+):
+    parent = tmp_path / writer_api
+    target = parent / "processed.nxs"
+    with pytest.raises(ValueError, match=r"\.nexus"):
+        if writer_api == "record":
+            NexusRecordWriter(target, complete_record=False)
+        elif writer_api == "incremental":
+            open_nexus_writer(target, overwrite=True)
+        elif writer_api == "sink":
+            from xrd_tools.reduction import NexusSink
+
+            NexusSink(target, overwrite=True)
+        else:
+            write_nexus(
+                target,
+                results_1d={0: _result_1d(0)},
+                overwrite=True,
+            )
+    assert not parent.exists()
+
+
+def test_nexus_sink_refuses_malformed_existing_target_before_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    from xrd_tools.reduction import NexusSink, ReductionPlan, Scan
+    from xrd_tools.reduction import core as reduction_core
+
+    target, _source_root = _gi_scan(tmp_path)
+    with h5py.File(target, "r+") as handle:
+        group = handle["entry/integrated_1d/q_oop"]
+        values = np.asarray(group["frame_index"][()])
+        del group["frame_index"]
+        group.create_dataset("frame_index", data=values)
+    before = target.read_bytes()
+    transaction_effects = []
+    monkeypatch.setattr(
+        reduction_core,
+        "get_output_transaction_coordinator",
+        lambda: SimpleNamespace(
+            admit=lambda *_args, **_kwargs: transaction_effects.append("admitted"),
+        ),
+    )
+
+    sink = NexusSink(target, overwrite=False)
+    with pytest.raises(ValueError, match="not a current xdart"):
+        sink.begin(Scan("empty", []), ReductionPlan())
+    assert transaction_effects == []
+    assert target.read_bytes() == before
+
+
+def test_existing_append_shadow_refuses_before_preflight_reservation(
+    tmp_path,
+    monkeypatch,
+):
+    from xrd_tools.io import output_transaction as transaction_module
+    from xrd_tools.reduction import NexusSink, ReductionPlan, Scan
+
+    target, _source_root = _gi_scan(tmp_path)
+    shadow_name = f"integrated_1d{REINTEGRATE_SHADOW_SUFFIX}"
+    with h5py.File(target, "r+") as handle:
+        entry = handle["entry"]
+        entry.move("integrated_1d", shadow_name)
+        entry[shadow_name].attrs[REINTEGRATE_SHADOW_COMPLETE_ATTR] = np.bool_(True)
+
+    before = target.read_bytes()
+    before_paths = tuple(sorted(path.name for path in tmp_path.iterdir()))
+    transaction_effects = []
+    monkeypatch.setattr(
+        transaction_module,
+        "get_output_transaction_coordinator",
+        lambda: SimpleNamespace(
+            admit=lambda *_args, **_kwargs: transaction_effects.append("admitted"),
+        ),
+    )
+    intent = AppendIntent(
+        entry="entry",
+        source_base=str(tmp_path),
+        source_identity="raw/scan",
+        science_fingerprint="science-v1",
+        modes=("1d:q_total",),
+        source=AppendSource(
+            path=str(tmp_path / "raw.h5"),
+            adapter_id="nexus_hdf5",
+            size=0,
+            mtime_ns=0,
+            extent=1,
+        ),
+        labels=(0,),
+    )
+
+    sink = NexusSink.for_existing_append(target, intent)
+    with pytest.raises(ValueError, match="read-only recovery"):
+        sink.begin(Scan("existing", []), ReductionPlan(integration_2d=None))
+    assert transaction_effects == []
+    assert sink.append_preflight is None
+    assert sink.abort(None) is None
+    assert target.read_bytes() == before
+    assert tuple(sorted(path.name for path in tmp_path.iterdir())) == before_paths
+
+
+def test_record_writer_finish_requires_strict_current_artifact(tmp_path):
+    target = tmp_path / "empty-finish.nexus"
+    writer = NexusRecordWriter(
+        target,
+        atomic=False,
+        flush_every=None,
+        complete_record=False,
+    )
+    writer.begin()
+    with pytest.raises(WriterIncomplete) as caught:
+        writer.finish()
+    assert caught.value.outcome.pending_owner == "admission"
+    writer.abort()
+
+
+def test_repeated_finish_re_admits_the_published_target(tmp_path):
+    target = tmp_path / "repeat-finish.nexus"
+    writer = NexusRecordWriter(
+        target,
+        atomic=False,
+        flush_every=None,
+        complete_record=False,
+    )
+    writer.begin()
+    writer.write(RecordWrite(label=0, result_1d=_result_1d(0)))
+    writer.finish()
+    with h5py.File(target, "r+") as handle:
+        group = handle["entry/integrated_1d"]
+        values = np.asarray(group["frame_index"][()])
+        del group["frame_index"]
+        group.create_dataset("frame_index", data=values)
+
+    with pytest.raises(ValueError, match="not a current xdart"):
+        writer.finish()
 
 
 @pytest.mark.parametrize("canonical_kind", ("soft", "external", "dataset"))

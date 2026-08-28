@@ -212,23 +212,23 @@ def test_frame_descriptor_roundtrip_and_missing_child_none(tmp_path) -> None:
     pair = (raws[0], hashlib.sha256(raws[0]).hexdigest())
     reduction = FrameReduction(0, result_1d=_r1(1))
     missing = ScanFrame(0, source_path="/raw/sample_1.tif", source_frame_index=0)
-    guarded = NexusSink(tmp_path / "guard.nxs", run_configuration_provenance={"background": plan.to_mapping()})
+    guarded = NexusSink(tmp_path / "guard.nexus", run_configuration_provenance={"background": plan.to_mapping()})
     with pytest.raises(ValueError, match="active Background policy"):
         guarded._write_frame_record(missing, reduction, result_1d=_r1(1), result_2d=None, mode_1d="standard", mode_2d="standard")
     present = ScanFrame(0, source_path="/raw/sample_1.tif", source_frame_index=0,
         background_dependency_bytes=pair[0], background_dependency_fingerprint=pair[1])
-    inactive = NexusSink(tmp_path / "inactive.nxs", run_configuration_provenance={})
+    inactive = NexusSink(tmp_path / "inactive.nexus", run_configuration_provenance={})
     with pytest.raises(ValueError, match="inactive Background"):
         inactive._write_frame_record(present, reduction, result_1d=_r1(1), result_2d=None, mode_1d="standard", mode_2d="standard")
     changed = FrameBackgroundPlan(mode="Single BG File", locator="/data/background.tif", scale=2.0)
-    mismatched = NexusSink(tmp_path / "mismatch.nxs", run_configuration_provenance={"background": changed.to_mapping()})
+    mismatched = NexusSink(tmp_path / "mismatch.nexus", run_configuration_provenance={"background": changed.to_mapping()})
     with pytest.raises(ValueError, match="exact frame dependency"):
         mismatched._write_frame_record(present, reduction, result_1d=_r1(1), result_2d=None, mode_1d="standard", mode_2d="standard")
     from xrd_tools.io.record_writer import RecordWrite
     with pytest.raises(ValueError, match="label differs"):
         RecordWrite(label=9, result_1d=_r1(1), background_dependency_bytes=pair[0], background_dependency_fingerprint=pair[1])
     from xrd_tools.reduction.core import GIMode
-    output = tmp_path / "writer-route.nxs"; present.image = np.ones((2, 2), np.uint16)
+    output = tmp_path / "writer-route.nexus"; present.image = np.ones((2, 2), np.uint16)
     scan = Scan("background", [present]); reduction_plan = ReductionPlan(gi=GIMode(mode_1d="q_total"))
     sink = NexusSink(output, overwrite=True, atomic=False, flush_every=None,
         write_thumbnails=False, run_configuration_provenance={"background": plan.to_mapping()})
@@ -272,7 +272,7 @@ def test_append_replacement_and_live_unseen_descriptor_rules(tmp_path) -> None:
     changed_fact = (3, (3, "/raw/changed.tif", None, 0, (2, 2), ()), first_raw, first[3])
     with pytest.raises(ValueError, match="changed"):
         _merge_background_binding(bindings, changed_fact, limit=64 * 1024 * 1024)
-    prefix = tmp_path / "prefix.nxs"
+    prefix = tmp_path / "prefix.nexus"
     with h5py.File(prefix, "w") as handle:
         frames = handle.create_group("entry/frames")
         for binding in (first, second):

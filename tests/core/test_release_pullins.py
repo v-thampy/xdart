@@ -204,8 +204,8 @@ def test_open_nexus_writer_swmr_refused(tmp_path):
     # The flag was advertised but guaranteed a failure on the first frame
     # append (HDF5 forbids object creation in SWMR-write mode); refuse loudly.
     with pytest.raises(NotImplementedError, match="swmr|SWMR"):
-        open_nexus_writer(tmp_path / "s.nxs", swmr=True)
-    assert not (tmp_path / "s.nxs").exists()
+        open_nexus_writer(tmp_path / "s.nexus", swmr=True)
+    assert not (tmp_path / "s.nexus").exists()
 
 
 # ── S8: monitor-normalization warning ───────────────────────────────────────

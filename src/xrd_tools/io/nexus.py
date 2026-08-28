@@ -79,6 +79,10 @@ from xrd_tools.io.schema import (
     mode_subgroup_name,
     read_current_mode_layout,
 )
+from xrd_tools.io.processed_scan_id import (
+    require_current_output_path,
+    require_current_writable_processed_groups,
+)
 from xrd_tools.transforms import energy_to_wavelength
 
 logger = logging.getLogger(__name__)
@@ -1487,9 +1491,7 @@ def write_nexus(
     Path
         The output file path.
     """
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    mode = "w" if overwrite else "a"
+    p = require_current_output_path(path)
 
     comp_kwargs = _comp_kwargs(compression)
     sorted_1d = _sorted_result_items(results_1d, "results_1d")
@@ -1498,6 +1500,28 @@ def write_nexus(
         _require_uniform_axes_1d([result for _, result in sorted_1d])
     if sorted_2d:
         _require_uniform_axes_2d([result for _, result in sorted_2d])
+
+    if p.exists() and not overwrite:
+        with h5py.File(p, "r") as existing:
+            processed = require_current_writable_processed_groups(
+                existing,
+                entry,
+                container=p,
+            )
+            if sorted_1d:
+                validate_integrated_stack_write(
+                    processed.entry,
+                    frame_indices=[frame for frame, _ in sorted_1d],
+                    results_1d=[result for _, result in sorted_1d],
+                )
+            if sorted_2d:
+                validate_integrated_stack_write(
+                    processed.entry,
+                    frame_indices=[frame for frame, _ in sorted_2d],
+                    results_2d=[result for _, result in sorted_2d],
+                )
+    p.parent.mkdir(parents=True, exist_ok=True)
+    mode = "w" if overwrite else "a"
 
     with h5py.File(p, mode) as f:
         _stamp_root_writer_provenance(f, p)
@@ -1546,6 +1570,12 @@ def write_nexus(
                 compression=compression,
             )
 
+        require_current_writable_processed_groups(
+            f,
+            entry,
+            container=p,
+        )
+
     logger.debug("Wrote NeXus file: %s", p)
     return p
 
@@ -1564,6 +1594,50 @@ def _sorted_result_items(results, name: str) -> list[tuple[int, Any]]:
 # ---------------------------------------------------------------------------
 # Write API — frame-by-frame: for live reduction hot loops
 # ---------------------------------------------------------------------------
+
+
+class _CurrentNexusWriterFile(h5py.File):
+    """Public incremental handle whose successful close re-admits its file."""
+
+    _terminal_admission_required = False
+    _terminal_admission_entry = "entry"
+    _terminal_admission_target: Path | None = None
+
+    def _enable_terminal_admission(self, *, entry: str, target: Path) -> None:
+        self._terminal_admission_entry = str(entry)
+        self._terminal_admission_target = Path(target)
+        self._terminal_admission_required = True
+
+    def _disable_terminal_admission(self) -> None:
+        self._terminal_admission_required = False
+
+    def close(self) -> None:
+        admission_error = None
+        if self.id.valid and self._terminal_admission_required:
+            try:
+                self.flush()
+                require_current_writable_processed_groups(
+                    self,
+                    self._terminal_admission_entry,
+                    container=self._terminal_admission_target,
+                )
+            except BaseException as exc:
+                admission_error = exc
+        try:
+            super().close()
+        except BaseException as close_error:
+            if admission_error is not None:
+                raise admission_error from close_error
+            raise
+        if admission_error is not None:
+            raise admission_error
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        if exc_type is not None:
+            self._disable_terminal_admission()
+        self.close()
+        return False
+
 
 def open_nexus_writer(
     path: Path | str,
@@ -1609,7 +1683,7 @@ def open_nexus_writer(
     --------
     ::
 
-        h5 = open_nexus_writer("scan_001.nxs", metadata=meta)
+        h5 = open_nexus_writer("scan_001.nexus", metadata=meta)
         try:
             for i, (r1d, r2d) in enumerate(process_frames(...)):
                 write_nexus_frame(h5, i, result_1d=r1d, result_2d=r2d)
@@ -1617,7 +1691,15 @@ def open_nexus_writer(
         finally:
             h5.close()
     """
-    p = Path(path)
+    p = require_current_output_path(path)
+
+    if p.exists() and not overwrite:
+        with h5py.File(p, "r") as existing:
+            require_current_writable_processed_groups(
+                existing,
+                entry,
+                container=p,
+            )
     p.parent.mkdir(parents=True, exist_ok=True)
 
     # S6: SWMR-write is advertised but not functional — HDF5 forbids object
@@ -1636,10 +1718,12 @@ def open_nexus_writer(
     file_kwargs: dict[str, Any] = {}
 
     mode = "w" if overwrite else "a"
-    f = h5py.File(p, mode, **file_kwargs)
+    f = _CurrentNexusWriterFile(p, mode, **file_kwargs)
     try:
         _stamp_root_writer_provenance(f, p)
-        return _open_nexus_writer_body(f, entry, metadata, compression)
+        opened = _open_nexus_writer_body(f, entry, metadata, compression)
+        f._enable_terminal_admission(entry=entry, target=p)
+        return opened
     except BaseException:
         # Close-on-construction-failure (same guard as FrameViewReader /
         # open_nexus_image_stack): a header/metadata error otherwise orphans
@@ -1698,6 +1782,13 @@ def write_nexus_frame(
     """
     ck = _comp_kwargs(compression)
     e = h5[entry]
+    validate_integrated_stack_write(
+        e,
+        frame_indices=[int(frame)],
+        results_1d=None if result_1d is None else [result_1d],
+        results_2d=None if result_2d is None else [result_2d],
+        allow_rebuild=False,
+    )
 
     if result_1d is not None:
         _append_stacked_1d(e, frame, result_1d, ck)
@@ -1754,7 +1845,7 @@ def resolve_stack_compression(default: "str | None" = "lz4") -> "str | None":
     raw = os.environ.get("XDART_INTEGRATED_COMPRESSION")
     # An empty value (e.g. a stale ``export XDART_INTEGRATED_COMPRESSION=``) means
     # UNSET -> default, NOT uncompressed: a leftover empty export must never
-    # silently disable compression (~4x larger integrated .nxs -- observed live).
+    # silently disable compression (~4x larger integrated .nexus -- observed live).
     if raw is not None and raw.strip() == "":
         raw = None
     # An EXPLICIT disable from the env var is LOUD (WARNING): the user is opting
@@ -1764,7 +1855,7 @@ def resolve_stack_compression(default: "str | None" = "lz4") -> "str | None":
             "none", "off", "0", "false", "no"):
         logger.warning(
             "integrated-stack compression DISABLED via XDART_INTEGRATED_COMPRESSION"
-            "=%r -- integrated .nxs will be UNCOMPRESSED (~4x larger). Unset the "
+            "=%r -- integrated .nexus will be UNCOMPRESSED (~4x larger). Unset the "
             "variable to restore the lz4 default.", raw)
         return None
     val = raw if raw is not None else default
@@ -1965,6 +2056,11 @@ def _append_stacked_1d(
         di[pos] = intensity
         _upsert_sigma_1d(g, pos, r, n_q, comp_kwargs)
         return
+    if last_idx is not None and idx <= last_idx:
+        raise ValueError(
+            f"new labels for {group_name} must be strictly increasing "
+            f"after persisted cursor {last_idx}"
+        )
     di.resize(n + 1, axis=0)
     di[n] = intensity
     fi.resize(n + 1, axis=0)
@@ -2128,6 +2224,11 @@ def _append_stacked_2d(
         di[pos] = intensity
         _upsert_sigma_2d(g, pos, r, n_chi, n_q, comp_kwargs)
         return
+    if last_idx is not None and idx <= last_idx:
+        raise ValueError(
+            f"new labels for {group_name} must be strictly increasing "
+            f"after persisted cursor {last_idx}"
+        )
     di.resize(n + 1, axis=0)
     di[n] = intensity
     fi.resize(n + 1, axis=0)
@@ -2283,6 +2384,30 @@ def validate_integrated_stack_write(
     fis = [int(x) for x in frame_indices]
     if len(set(fis)) != len(fis):
         raise ValueError(f"frame_indices contains duplicate labels: {fis}")
+    if any(right <= left for left, right in zip(fis, fis[1:])):
+        raise ValueError(
+            "new frame labels must be strictly increasing within one batch"
+        )
+
+    def require_after_cursor(group, group_name):
+        if group is None:
+            return
+        persisted = tuple(
+            int(value) for value in np.asarray(group["frame_index"][()]).ravel()
+        )
+        if any(
+            right <= left for left, right in zip(persisted, persisted[1:])
+        ):
+            raise ValueError(
+                f"{group_name}/frame_index is not strictly increasing"
+            )
+        owned = set(persisted)
+        new_labels = tuple(label for label in fis if label not in owned)
+        if new_labels and persisted and new_labels[0] <= persisted[-1]:
+            raise ValueError(
+                f"new labels for {group_name} must be strictly increasing "
+                f"after persisted cursor {persisted[-1]}"
+            )
 
     if results_1d is not None and len(results_1d):
         if len(results_1d) != len(fis):
@@ -2307,13 +2432,14 @@ def validate_integrated_stack_write(
                 local_hard_dataset(
                     g, "sigma", role=f"{group_name_1d}/sigma",
                 )
+            require_after_cursor(g, group_name_1d)
         if g is not None and (
             g["intensity"].shape[1] != np.asarray(results_1d[0].intensity).shape[0]
             or not _axes_match_1d(g, results_1d[0])
         ):
             if not allow_rebuild:
                 raise ValueError(
-                    f"{group_name_1d} axis or row shape differs from the "
+                    f"{group_name_1d} axis/unit or row shape differs from the "
                     "open writer cursor; dirty writes cannot rebuild a stack"
                 )
             _require_batch_covers_existing(g, group_name_1d, fis)
@@ -2341,6 +2467,7 @@ def validate_integrated_stack_write(
                 local_hard_dataset(
                     g, "sigma", role=f"{group_name_2d}/sigma",
                 )
+            require_after_cursor(g, group_name_2d)
         new_2d_shape = np.asarray(results_2d[0].intensity).T.shape
         if g is not None and (
             tuple(g["intensity"].shape[1:]) != new_2d_shape
@@ -2348,7 +2475,7 @@ def validate_integrated_stack_write(
         ):
             if not allow_rebuild:
                 raise ValueError(
-                    f"{group_name_2d} axis or row shape differs from the "
+                    f"{group_name_2d} axis/unit or row shape differs from the "
                     "open writer cursor; dirty writes cannot rebuild a stack"
                 )
             _require_batch_covers_existing(g, group_name_2d, fis)

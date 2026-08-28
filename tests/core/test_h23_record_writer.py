@@ -23,6 +23,7 @@ from xrd_tools.io.nexus import (
     write_scan_metadata,
 )
 from xrd_tools.io.nexus_record import make_thumbnail_array, stamp_source_base
+from xrd_tools.io.processed_scan_id import require_current_processed_groups
 from xrd_tools.io.schema import PRIMARY_MODE_ATTR
 from xrd_tools.session.stage_accounting import ResultMode, StageReceipt
 
@@ -308,9 +309,13 @@ def test_stale_pending_is_superseded_and_drop_is_explicit(tmp_path):
     writer.bind_session(facade)
     writer.begin()
     writer.write(rw.RecordWrite(label=4, result_1d=_r1(1), result_2d=_r2(1)))
+    facade.set_revision(5, mode_1d, 1)
+    writer.write(rw.RecordWrite(label=5, result_1d=_r1(5)))
     facade.set_revision(4, mode_1d, 2)
     writer.flush(force=True)
-    assert {(r.mode, r.revision) for r in facade.durable} == {(mode_2d, 1)}
+    assert {
+        (r.label, r.mode, r.revision) for r in facade.durable
+    } == {(4, mode_2d, 1), (5, mode_1d, 1)}
     writer.write(rw.RecordWrite(label=4, result_1d=_r1(2)))
     writer.mark_publication_dropped(4, mode_1d, expected_revision=1)
     assert facade.dropped == []
@@ -340,6 +345,8 @@ def test_current_publication_drop_removes_only_exact_mode_row_and_keeps_gi_child
     writer.bind_session(facade)
     writer.begin(primary_mode_1d="q_ip")
     writer.write(rw.RecordWrite(label=0, result_1d=_r1(10), mode_1d="q_ip"))
+    facade.set_revision(1, primary, 1)
+    writer.write(rw.RecordWrite(label=1, result_1d=_r1(11), mode_1d="q_ip"))
     writer.write(rw.RecordWrite(label=0, result_1d=_r1(20), mode_1d="q_oop"))
 
     facade.set_revision(0, primary, 2)
@@ -348,11 +355,39 @@ def test_current_publication_drop_removes_only_exact_mode_row_and_keeps_gi_child
     assert facade.dropped == [(0, primary, 2)]
     with h5py.File(target, "r") as handle:
         top = handle["entry/integrated_1d"]
-        assert tuple(top["frame_index"][()]) == ()
+        assert tuple(top["frame_index"][()]) == (1,)
         child = top["q_oop"]
         assert tuple(child["frame_index"][()]) == (0,)
         np.testing.assert_allclose(child["intensity"][0], 20)
     writer.finish()
+    with h5py.File(target, "r") as handle:
+        require_current_processed_groups(handle)
+
+
+def test_publication_drop_refuses_a_modes_last_row_before_mutation(tmp_path):
+    rw = _api()
+    target = tmp_path / "drop-last-row.nexus"
+    facade = _Facade(target)
+    mode = ResultMode.one_d()
+    facade.set_revision(0, mode, 1)
+    writer = rw.NexusRecordWriter(
+        target, atomic=False, flush_every=None, complete_record=False,
+    )
+    writer.bind_session(facade)
+    writer.begin()
+    writer.write(rw.RecordWrite(label=0, result_1d=_r1(1)))
+    writer.flush(force=True)
+    before = target.read_bytes()
+
+    facade.set_revision(0, mode, 2)
+    with pytest.raises(rw.WriterStateError, match="last row"):
+        writer.mark_publication_dropped(0, mode, expected_revision=2)
+    writer._h5.flush()
+    assert target.read_bytes() == before
+    assert writer.phase is rw.WriterPhase.ACTIVE
+    writer.finish()
+    with h5py.File(target, "r") as handle:
+        require_current_processed_groups(handle)
 
 
 def test_publication_drop_row_removal_failure_is_partial_without_h10_drop(
@@ -367,6 +402,8 @@ def test_publication_drop_row_removal_failure_is_partial_without_h10_drop(
     writer.bind_session(facade)
     writer.begin()
     writer.write(rw.RecordWrite(label=0, result_1d=_r1(1)))
+    facade.set_revision(1, mode, 1)
+    writer.write(rw.RecordWrite(label=1, result_1d=_r1(2)))
     facade.set_revision(0, mode, 2)
     writer._drop_mode_row = lambda *_a, **_k: (_ for _ in ()).throw(
         OSError("row removal failed")
@@ -390,6 +427,8 @@ def test_publication_drop_waits_for_positive_absence_checkpoint(
     writer.bind_session(facade)
     writer.begin()
     writer.write(rw.RecordWrite(label=0, result_1d=_r1(1)))
+    facade.set_revision(1, mode, 1)
+    writer.write(rw.RecordWrite(label=1, result_1d=_r1(2)))
     facade.set_revision(0, mode, 2)
     writer.mark_publication_dropped(0, mode, expected_revision=2)
     assert facade.dropped == []
@@ -1457,7 +1496,7 @@ def test_count_write_or_proof_failure_restores_prior_target(tmp_path, monkeypatc
     original_write = rw.write_average_finite_counts
     original_verify = rw.NexusRecordWriter._verify_dirty_evidence
     for failure in ("write", "proof"):
-        target = tmp_path / f"average-{failure}-rollback.nxs"
+        target = tmp_path / f"average-{failure}-rollback.nexus"
         _seed_target(target, 2)
         before = target.read_bytes()
         writer = rw.NexusRecordWriter(

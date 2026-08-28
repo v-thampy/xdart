@@ -64,7 +64,10 @@ from xrd_tools.io.output_transaction import (
     StreamTerminal,
     TargetLease,
 )
-from xrd_tools.io.processed_scan_id import require_current_processed_groups
+from xrd_tools.io.processed_scan_id import (
+    require_current_output_path,
+    require_current_writable_processed_groups,
+)
 from xrd_tools.io.read import relative_source_path
 from xrd_tools.io.schema import (
     GI_MODE_KEYS_1D,
@@ -793,7 +796,7 @@ class NexusRecordWriter:
             raise ValueError(f"flush_every must be > 0 or None; got {flush_every}")
         if int(replace_attempts) < 1:
             raise ValueError("replace_attempts must be >= 1")
-        self.target = Path(target)
+        self.target = require_current_output_path(target)
         self.entry = str(entry)
         self.compression = compression
         self.overwrite = bool(overwrite)
@@ -2415,7 +2418,7 @@ class NexusRecordWriter:
             if self._replacement_configuration is not None:
                 entry = _replacement_hard_group(h5, self.entry)
             else:
-                admitted = require_current_processed_groups(
+                admitted = require_current_writable_processed_groups(
                     h5,
                     self.entry,
                     container=self.target,
@@ -2560,7 +2563,8 @@ class NexusRecordWriter:
                 self._active_path = self.target
                 if use_atomic:
                     self._active_path = self.target.with_name(
-                        f".{self.target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                        f".{self.target.stem}.{os.getpid()}."
+                        f"{uuid.uuid4().hex}.tmp{self.target.suffix}"
                     )
                 if binding is None:
                     self._pool.pause(self.target)
@@ -2582,6 +2586,13 @@ class NexusRecordWriter:
                         else bool(self.overwrite or (binding is not None and not logical_exists))
                     ),
                 )
+                disable_terminal_admission = getattr(
+                    self._h5,
+                    "_disable_terminal_admission",
+                    None,
+                )
+                if callable(disable_terminal_admission):
+                    disable_terminal_admission()
                 # The opener may be writing an atomic private path.  Root
                 # provenance names the logical record, never that temporary
                 # implementation detail; an Append also refreshes a relocated
@@ -2752,6 +2763,25 @@ class NexusRecordWriter:
             self._row_cursors.setdefault(name, {})
             self._verify_cursor(name, int(record.label))
             groups_2d.setdefault(name, []).append(record)
+        for name, grouped in (*groups_1d.items(), *groups_2d.items()):
+            grouped_labels = tuple(int(record.label) for record in grouped)
+            if any(
+                right <= left
+                for left, right in zip(grouped_labels, grouped_labels[1:])
+            ):
+                raise ValueError(
+                    f"new labels for {name} must be strictly increasing "
+                    "within one batch"
+                )
+            cursor = self._row_cursors[name]
+            new_labels = tuple(
+                label for label in grouped_labels if label not in cursor
+            )
+            if new_labels and cursor and new_labels[0] <= max(cursor):
+                raise ValueError(
+                    f"new labels for {name} must be strictly increasing "
+                    "after its persisted cursor"
+                )
         for record in records:
             label = int(record.label)
             self._verify_cursor("scan_data", label)
@@ -3298,6 +3328,10 @@ class NexusRecordWriter:
             )
         if actual_row is not None:
             row_count = len(labels)
+            if row_count == 1:
+                raise WriterStateError(
+                    f"cannot remove the last row of mode {group_name}"
+                )
             for name in INTEGRATED_ROW_ALIGNED:
                 dataset = local_hard_dataset(
                     group, name, role=f"{group_name}/{name}",
@@ -3366,6 +3400,38 @@ class NexusRecordWriter:
         self._dirty_modes.pop((group_name, label), None)
         self._dirty_absent_modes.add((group_name, label))
 
+    def _preflight_mode_row_drop(self, label: int, mode: ResultMode) -> None:
+        """Refuse a last-row removal before authorizing any mutation."""
+        group_name = self._mode_cursor_name(mode.kind, mode.key)
+        cursor = self._row_cursors.setdefault(group_name, {})
+        group = local_hard_group_path(
+            self._entry_group(), group_name, role=group_name,
+        )
+        if group is None:
+            return
+        if not isinstance(group, h5py.Group):
+            raise WriterStateError(f"{group_name} is not an indexed mode group")
+        labels_ds = local_hard_dataset(
+            group, "frame_index", role=f"{group_name}/frame_index",
+        )
+        if not isinstance(labels_ds, h5py.Dataset):
+            raise WriterStateError(f"{group_name} has no indexed frame_index")
+        labels = tuple(int(value) for value in np.asarray(labels_ds[()]).ravel())
+        if len(labels) != len(set(labels)):
+            raise WriterStateError(
+                f"{group_name}/frame_index contains duplicate labels"
+            )
+        observed_row = cursor.get(int(label))
+        actual_row = labels.index(int(label)) if int(label) in labels else None
+        if observed_row != actual_row:
+            raise WriterStateError(
+                f"{group_name} cached row for label {int(label)} is not exact"
+            )
+        if actual_row is not None and len(labels) == 1:
+            raise WriterStateError(
+                f"cannot remove the last row of mode {group_name}"
+            )
+
     def _current_nexus_receipt(
         self, label: int, mode: ResultMode,
     ) -> StageReceipt | None:
@@ -3387,8 +3453,11 @@ class NexusRecordWriter:
             # refusal without deleting a row that belongs to another revision.
             self._facade.commit_publication_drop(label, mode, expected)
             return
+        validation_complete = False
         try:
             with self._boundary():
+                self._preflight_mode_row_drop(label, mode)
+                validation_complete = True
                 self._authorize_transaction_mutation()
                 self._drop_mode_row(label, mode)
                 self._pending_publication_drops[(label, mode)] = expected
@@ -3399,6 +3468,8 @@ class NexusRecordWriter:
             # absence checkpoint even though it did not append a result row.
             self._since_flush = max(1, self._since_flush)
         except BaseException as exc:
+            if not validation_complete:
+                raise
             self._pending_owner = "publication-drop"
             self.phase = WriterPhase.PARTIAL
             raise WriterIncomplete(
@@ -3701,6 +3772,12 @@ class NexusRecordWriter:
 
     def finish(self, finalization: WriterFinalization | None = None) -> WriterOutcome:
         if self.phase is WriterPhase.FINISHED:
+            with h5py.File(self.target, "r") as finished:
+                require_current_writable_processed_groups(
+                    finished,
+                    self.entry,
+                    container=self.target,
+                )
             return self._outcome()
         if self.phase is WriterPhase.ABORTED:
             raise WriterStateError("an aborted writer cannot finish")
@@ -3715,12 +3792,24 @@ class NexusRecordWriter:
             counts = self._finalization.average_finite_counts
             verified = None if counts is None else self._verify_average_dirty_evidence(counts)
             self._seal_checkpoint_and_receipts(publish_receipts=publish_receipts, verified=verified)
+        def require_terminal_admission() -> None:
+            handle = self._h5
+            if not isinstance(handle, h5py.File):
+                handle = getattr(handle, "_h5", None)
+            if not isinstance(handle, h5py.File):
+                raise WriterStateError("terminal admission lost the writer handle")
+            require_current_writable_processed_groups(
+                handle,
+                self.entry,
+                container=self.target,
+            )
         try:
             with self._boundary():
                 if self._transaction_binding is None:
                     steps = (
                         ("metadata", lambda: self._write_finalization(self._finalization)),
                         ("flush", self._flush_handle),
+                        ("admission", require_terminal_admission),
                         ("checkpoint", lambda: checkpoint(publish_receipts=False)),
                         ("close", self._close_handle),
                         ("replace", self._replace_target),
@@ -3750,7 +3839,7 @@ class NexusRecordWriter:
                         self._stream_terminal = terminal
 
                     steps = (("metadata", lambda: self._write_finalization(self._finalization)), ("flush", self._flush_handle)) + ((("verify", self._verify_replacement_manifest),) if self._replacement_configuration is not None else ())
-                    steps += (("checkpoint", checkpoint), ("close", self._close_handle), ("terminal", seal_terminal))
+                    steps += (("admission", require_terminal_admission), ("checkpoint", checkpoint), ("close", self._close_handle), ("terminal", seal_terminal))
                 while self._finish_step < len(steps):
                     owner, action = steps[self._finish_step]
                     self._pending_owner = owner

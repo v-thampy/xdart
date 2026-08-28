@@ -406,7 +406,7 @@ def test_live_thumbnail_carrier_is_exact_complete_and_snapshot_ordered(
     mask = np.zeros(image.shape, dtype=bool); mask[:2, :2] = True
     frame = Frame(1, image=image, mask=mask)
     plan = ReductionPlan(integration_1d=Integration1DPlan(npt=2), integration_2d=Integration2DPlan() if with_2d else None); scan = Scan("live", [frame], integrator=object())
-    target = tmp_path / "live.nxs"
+    target = tmp_path / "live.nexus"
     run = _StandardRun(None, RunIdentity(1, "perf-c5"), scan, None, None, None, target)
     owner = run.display.add_artifact(target, "live", mask=None, mask_saturation=False, measurement_mode="Standard")
     policy, layout, rows, ceiling, _ = dynamic_output._light_policy_layout(SimpleNamespace(max_cores=1, live_mode=False, gi=SimpleNamespace(enabled=False)), plan, SimpleNamespace(descriptor=None), scan, (1,))
@@ -481,7 +481,7 @@ def test_live_thumbnail_carrier_is_exact_complete_and_snapshot_ordered(
         direct = reduction_core.FrameReduction(2, result_1d=one, thumbnail=supplied,
                                                 _thumbnail_mask_baked=True)
         direct_frame = Frame(2, image=np.ones((2, 3)))
-        direct_sink = NexusSink(tmp_path / "direct.nxs", overwrite=True)
+        direct_sink = NexusSink(tmp_path / "direct.nexus", overwrite=True)
         direct_sink.begin(Scan("direct", [direct_frame]), plan)
         before = len(prepared)
         direct_sink.write_batch(((direct_frame, direct),))
@@ -519,7 +519,7 @@ def test_non_square_thumbnail_uses_true_extent_without_remask_or_cake_drift(tmp_
     from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
     thumbnail = np.array([[np.nan, 1., 2.], [3., 4., 5.]], dtype=np.float32)
     cake = np.arange(6., dtype=float).reshape(2, 3)
-    state, owner = _state(tmp_path / "render.nxs")
+    state, owner = _state(tmp_path / "render.nexus")
     key = state.append_navigation(owner.source_scan, str(owner.artifact), 1).appended
     view = FrameView(label=1, thumbnail=thumbnail, axis_2d_x=Axis("q", "1/angstrom", values=np.array([.1, .2, .3])), axis_2d_y=Axis("chi", "degree", values=np.array([-1., 1.])), intensity_2d=cake, extra={"detector_shape": (8, 12)})
     heavy = heavy_projection(StandardDisplayPayload(0, key, "frame", view))
@@ -548,7 +548,7 @@ def test_detector_projection_is_thumbnail_first_identity_preserving_and_extent_e
     thumbnail = np.array([[np.nan, 1., 2.], [3., 4., 5.]], dtype=np.float32)
     raw = np.arange(20, dtype=np.float32).reshape(4, 5)
     cake = np.arange(6, dtype=np.float32).reshape(2, 3)
-    state, owner = _state(tmp_path / "b2-projection.nxs")
+    state, owner = _state(tmp_path / "b2-projection.nexus")
     key = state.append_navigation(owner.source_scan, str(owner.artifact), 1).appended
     view = FrameView(
         label=1, raw=raw, thumbnail=thumbnail,
@@ -602,7 +602,7 @@ def test_b2_failure_thumbnail_reset_and_context_replacement_are_fail_closed(
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
     from xdart.gui.tabs.scattering.scientific_axes import heavy_projection
     thumbnail = np.arange(6, dtype=np.float32).reshape(2, 3)
-    state, owner = _state(tmp_path / "b2-failure.nxs")
+    state, owner = _state(tmp_path / "b2-failure.nexus")
     key = state.append_navigation(owner.source_scan, str(owner.artifact), 1).appended
     heavy = heavy_projection(
         StandardDisplayPayload(0, key, "frame", FrameView(
@@ -1772,7 +1772,7 @@ def test_empty_integrated_arrays_never_terminalize_detector_absence(
     """A closed record whose integrated arrays are EMPTY has no scientific
     basis for a terminal detector verdict (superseded E2-LV-D claim retained
     against the transport seam)."""
-    processed = tmp_path / "xdart_processed_data" / "empty.nxs"
+    processed = tmp_path / "xdart_processed_data" / "empty.nexus"
     processed.parent.mkdir(parents=True)
     with h5py.File(processed, "w") as handle:
         entry = handle.create_group("entry")

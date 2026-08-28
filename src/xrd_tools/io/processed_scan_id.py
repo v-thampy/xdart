@@ -55,8 +55,10 @@ __all__ = [
     "has_processed_output_markers_path",
     "is_current_processed_xdart_file",
     "is_current_processed_xdart_path",
+    "require_current_output_path",
     "require_current_processed",
     "require_current_processed_groups",
+    "require_current_writable_processed_groups",
     "require_raw_input",
 ]
 
@@ -235,6 +237,14 @@ def _direct_dataset(group: h5py.Group, name: str) -> h5py.Dataset | None:
         return None
 
 
+def require_current_output_path(path: str | Path) -> Path:
+    """Require the one forward processed-output suffix without side effects."""
+    target = Path(path)
+    if target.suffix.casefold() != ".nexus":
+        raise ValueError("current processed output target must end in .nexus")
+    return target
+
+
 def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
     """Qualify one concrete v2 integrated stack, not a name-only marker."""
     try:
@@ -294,6 +304,20 @@ def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
             return False
         if sigma is not None and (
             sigma.dtype != np.dtype(np.float32) or sigma.shape != expected_shape
+        ):
+            return False
+        row_datasets = (labels, intensity) + (() if sigma is None else (sigma,))
+        if any(
+            dataset.chunks is None
+            or dataset.maxshape is None
+            or dataset.maxshape[0] is not None
+            for dataset in row_datasets
+        ):
+            return False
+        if any(
+            left.id == right.id
+            for index, left in enumerate(row_datasets)
+            for right in row_datasets[index + 1:]
         ):
             return False
         previous = -1
@@ -358,6 +382,7 @@ def _qualified_current_processed_entry(
             "integrated_1d": (),
             "integrated_2d": (),
         }
+        row_dataset_owners: list[h5py.Dataset] = []
         present = False
         for name in _PROCESSED_RESULT_GROUPS:
             canonical_present = entry.get(name, getlink=True) is not None
@@ -383,6 +408,19 @@ def _qualified_current_processed_entry(
                     for mode, child in pairs
                 ):
                     return None
+                for _mode, owned_group in pairs:
+                    for dataset_name in ("frame_index", "intensity", "sigma"):
+                        dataset = _direct_dataset(owned_group, dataset_name)
+                        if dataset is None:
+                            if dataset_name == "sigma":
+                                continue
+                            return None
+                        if any(
+                            dataset.id == prior.id
+                            for prior in row_dataset_owners
+                        ):
+                            return None
+                        row_dataset_owners.append(dataset)
                 primaries[name] = primary
                 mode_groups[name] = pairs
             groups[name] = group if isinstance(group, h5py.Group) else None
@@ -499,4 +537,34 @@ def require_current_processed_groups(
     )
     if groups is None:
         raise ValueError("processed input is not a current xdart .nexus record")
+    return groups
+
+
+def require_current_writable_processed_groups(
+    source: h5py.File,
+    entry: str = "entry",
+    *,
+    container: str | Path | None = None,
+) -> CurrentProcessedGroups:
+    """Require canonical current result slots suitable for ordinary append.
+
+    A completed ``__reint`` shadow remains a valid read-recovery surface, but
+    it is not silently repaired or treated as the canonical append target.
+    """
+    groups = require_current_processed_groups(
+        source,
+        entry,
+        container=container,
+    )
+    for name, group in (
+        ("integrated_1d", groups.integrated_1d),
+        ("integrated_2d", groups.integrated_2d),
+    ):
+        if group is None:
+            continue
+        canonical = groups.entry.get(name)
+        if not isinstance(canonical, h5py.Group) or canonical.id != group.id:
+            raise ValueError(
+                f"completed {name} reintegration shadow is read-only recovery"
+            )
     return groups

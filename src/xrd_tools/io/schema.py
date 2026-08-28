@@ -181,8 +181,8 @@ def resolve_integrated_group(entry_grp, group_name: str):
     READ-ONLY (the file is not mutated) so consumers "open sanely" on the
     complete result.  An UNMARKED orphan (a reintegrate crashed mid-write -- its
     rows are partial) is ignored, never presented as the result; else
-    ``(None, False)``.  A writer pass repairs/clears the orphan via
-    ``cleanup_reintegrate_shadow_groups``.
+    ``(None, False)``.  Ordinary append writers refuse this recovery-only state;
+    promotion requires an explicit recovery operation.
     """
     try:
         canonical_link = entry_grp.get(group_name, getlink=True)
@@ -208,8 +208,8 @@ def resolve_integrated_group(entry_grp, group_name: str):
     if is_complete_reintegration_shadow(shadow):
         logger.warning(
             "Adopting completed orphan reintegration shadow %s%s as %s "
-            "(read-only; the file crashed mid-swap -- run a writer pass to "
-            "repair).", group_name, REINTEGRATE_SHADOW_SUFFIX, group_name,
+            "(read-only; the file crashed mid-swap and requires explicit "
+            "recovery).", group_name, REINTEGRATE_SHADOW_SUFFIX, group_name,
         )
         return shadow, True
     logger.warning(

@@ -62,7 +62,7 @@ def test_headless_run_writes_complete_portable_record(project, tmp_path,
     root, frames = project
     expected_raw_1 = np.asarray(frames[1].image).copy()
     expected_raw_2 = np.asarray(frames[2].image).copy()
-    out = root / "processed" / "scan.nxs"
+    out = root / "processed" / "scan.nexus"
     plan = ReductionPlan(
         integration_1d=Integration1DPlan(npt=50),
         integration_2d=Integration2DPlan(npt_rad=50, npt_azim=36),
@@ -113,6 +113,6 @@ def test_headless_run_writes_complete_portable_record(project, tmp_path,
     # N1 portability: MOVE the whole project (sources + output together)
     moved = tmp_path / "relocated"
     shutil.move(str(root), str(moved))
-    moved_out = moved / "processed" / "scan.nxs"
+    moved_out = moved / "processed" / "scan.nexus"
     raw2 = get_raw_frame(moved_out, 2)
     np.testing.assert_allclose(np.asarray(raw2), expected_raw_2)

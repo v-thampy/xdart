@@ -95,7 +95,7 @@ def test_nexus_sink_round_trips_full_frozen_configuration_provenance(tmp_path, m
         tmp_path,
         monkeypatch,
         NexusSink(
-            tmp_path / "configuration.nxs",
+            tmp_path / "configuration.nexus",
             overwrite=True,
             run_configuration_provenance=configuration.as_provenance(),
         ),
@@ -116,12 +116,12 @@ def test_nexus_sink_keeps_generation_and_fingerprint_exact_for_equal_content_con
     first_path = _write_provenance(
         tmp_path,
         monkeypatch,
-        NexusSink(tmp_path / "first.nxs", overwrite=True, run_configuration_provenance=first.as_provenance()),
+        NexusSink(tmp_path / "first.nexus", overwrite=True, run_configuration_provenance=first.as_provenance()),
     )
     second_path = _write_provenance(
         tmp_path,
         monkeypatch,
-        NexusSink(tmp_path / "second.nxs", overwrite=True, run_configuration_provenance=second.as_provenance()),
+        NexusSink(tmp_path / "second.nexus", overwrite=True, run_configuration_provenance=second.as_provenance()),
     )
 
     first_saved = read_provenance(first_path)["config"]["run_configuration"]
@@ -137,7 +137,7 @@ def test_nexus_sink_detaches_caller_provenance_before_output(tmp_path, monkeypat
     configuration = _configuration()
     supplied = configuration.as_provenance()
     sink = NexusSink(
-        tmp_path / "detached.nxs",
+        tmp_path / "detached.nexus",
         overwrite=True,
         run_configuration_provenance=supplied,
     )
@@ -163,7 +163,7 @@ def test_nexus_sink_rejects_malformed_identity_before_output_creation(
     monkeypatch,
     provenance,
 ):
-    output = tmp_path / "refused.nxs"
+    output = tmp_path / "refused.nexus"
     opened: list[object] = []
 
     def unexpected_open(*args, **kwargs):
@@ -195,7 +195,7 @@ def test_nexus_sink_rejects_malformed_identity_before_output_creation(
 
 
 def test_nexus_sink_omits_run_configuration_without_changing_reduction_schema(tmp_path, monkeypatch):
-    path = _write_provenance(tmp_path, monkeypatch, NexusSink(tmp_path / "legacy.nxs", overwrite=True))
+    path = _write_provenance(tmp_path, monkeypatch, NexusSink(tmp_path / "legacy.nexus", overwrite=True))
 
     provenance = read_provenance(path)
     assert "run_configuration" not in provenance["config"]

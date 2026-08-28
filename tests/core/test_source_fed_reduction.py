@@ -130,7 +130,7 @@ def test_public_route_standard_has_no_per_frame_reopen(tmp_path, monkeypatch):
         result = run_reduction(
             ReductionPlan(integration_1d=Integration1DPlan(npt=2)),
             src,
-            NexusSink(path=str(tmp_path / f"out_{n:02d}.nxs"), overwrite=True))
+            NexusSink(path=str(tmp_path / f"out_{n:02d}.nexus"), overwrite=True))
         return len(counter.opens), result
 
     o5, r5 = run(5)
@@ -162,7 +162,7 @@ def test_public_route_gi_has_no_per_frame_reopen(tmp_path, monkeypatch):
             gi=GIMode(incidence_motor="i1", mode_1d="q_oop", npt_oop=3))
         result = run_reduction(
             plan, src,
-            NexusSink(path=str(tmp_path / f"giout_{n:02d}.nxs"), overwrite=True),
+            NexusSink(path=str(tmp_path / f"giout_{n:02d}.nexus"), overwrite=True),
             gi_freeze_mode="scout_union")
         return len(counter.opens), result
 
@@ -186,7 +186,7 @@ def test_public_route_no_open_handle_leaks_after_reduction(tmp_path, monkeypatch
     run_reduction(
         ReductionPlan(integration_1d=Integration1DPlan(npt=2)),
         src,
-        NexusSink(path=str(tmp_path / "leakout.nxs"), overwrite=True))
+        NexusSink(path=str(tmp_path / "leakout.nexus"), overwrite=True))
     # a fresh writable open proves no reader handle is still holding the file
     with h5py.File(p, "r+") as f:
         assert "entry" in f
@@ -204,7 +204,7 @@ def test_preopened_cursor_streams_public_source_and_closes_once(tmp_path, monkey
     source.integrator = object()
     result = run_reduction(
         ReductionPlan(integration_1d=Integration1DPlan(npt=2)), source,
-        NexusSink(path=str(tmp_path / "prepared_out.nxs"), overwrite=True))
+        NexusSink(path=str(tmp_path / "prepared_out.nexus"), overwrite=True))
 
     assert result.n_processed == 4
     assert cursor.closed is True
@@ -278,7 +278,7 @@ def test_public_submit_seam_receives_native_dtype_under_huge_chunk(
     src.integrator = object()
     result = run_reduction(
         ReductionPlan(integration_1d=Integration1DPlan(npt=2)), src,
-        NexusSink(path=str(tmp_path / "submit_out.nxs"), overwrite=True),
+        NexusSink(path=str(tmp_path / "submit_out.nexus"), overwrite=True),
         chunk_size=10_000, inflight_max=1, executor=1)
 
     assert result.n_processed == 5

@@ -270,7 +270,7 @@ def test_replacing_symlink_with_same_target_and_owner_is_not_drift(
         1,
         1,
     )
-    item = _image_item(alias, stamp, tmp_path / "processed.nxs")
+    item = _image_item(alias, stamp, tmp_path / "processed.nexus")
     identity = (
         stamp.execution_identity_v1
         if hasattr(stamp, "execution_identity_v1")
@@ -311,7 +311,7 @@ def test_alias_validator_rejects_missing_broken_and_retargeted_aliases(
         1,
         1,
     )
-    item = _image_item(alias, stamp, tmp_path / "processed.nxs")
+    item = _image_item(alias, stamp, tmp_path / "processed.nexus")
 
     alias.unlink()
     if change == "broken_link":
@@ -340,7 +340,7 @@ def test_alias_validator_rejects_target_revision_and_candidate_owner_change(
     _write_tiff(selected)
     accepted = SourceFileState.capture(selected)
     stamp = SourceExecutionStamp(accepted, "image_file", 1, 1)
-    item = _image_item(selected, stamp, tmp_path / "processed.nxs")
+    item = _image_item(selected, stamp, tmp_path / "processed.nexus")
 
     if changed_field in {"size", "mtime_ns", "ctime_ns", "device", "inode"}:
         changed = replace(
@@ -802,7 +802,7 @@ def test_hardlink_locators_remain_distinct_and_each_blocks_output_collision(
         1,
         dependency_files=(SourceFileState.capture(second),),
     )
-    item = _image_item(first, stamp, tmp_path / "unrelated.nxs")
+    item = _image_item(first, stamp, tmp_path / "unrelated.nexus")
     targets = (
         stamp.canonical_targets
         if hasattr(stamp, "canonical_targets")
@@ -959,7 +959,7 @@ def test_two_sweep_validation_order_and_cancellation_are_exact(
             "cancel", "resolve:second.dat", "capture:second.dat",
         ]
         traces.clear()
-        item = _image_item(first, stamp, tmp_path / "processed.nxs")
+        item = _image_item(first, stamp, tmp_path / "processed.nexus")
         collision_calls = []
 
         def forbidden_collision(*_args, **_kwargs):
@@ -1014,17 +1014,17 @@ def test_preopen_validation_consumes_run_stop_before_reader_construction(
     _write_tiff(source)
     state = SourceFileState.capture(source)
     stamp = SourceExecutionStamp(state, "image_file", 1, 1)
-    item = _image_item(source, stamp, tmp_path / "processed.nxs")
+    item = _image_item(source, stamp, tmp_path / "processed.nexus")
     configuration = SimpleNamespace(
         output_mode="Overwrite",
         poni_file="accepted.poni",
-        save_path=str(tmp_path / "processed.nxs"),
+        save_path=str(tmp_path / "processed.nexus"),
         thaw_source_spec=lambda: item.source_spec,
     )
     run = SimpleNamespace(
         configuration=configuration,
         capture=object(),
-        artifact=tmp_path / "old.nxs",
+        artifact=tmp_path / "old.nexus",
         stop_requested=True,
         source=None,
         scan=None,
@@ -1130,7 +1130,7 @@ def test_raw_frame_path_keeps_legacy_snapshot_and_provenance_shape(
     item = PlannedOutput(
         SourceSpec(alias, SourceKind.NEXUS_STACK),
         alias,
-        tmp_path / "processed.nxs",
+        tmp_path / "processed.nexus",
         stamp,
         descriptor=descriptor,
     )
@@ -1168,7 +1168,7 @@ def test_raw_frame_path_keeps_legacy_snapshot_and_provenance_shape(
     assert "execution_identity_v1" not in legacy
 
     sink = NexusSink(
-        tmp_path / "unused.nxs",
+        tmp_path / "unused.nexus",
         source_execution_provenance=legacy,
         source_snapshots_provenance=snapshots,
     )
@@ -1221,7 +1221,7 @@ def test_shared_source_graph_direct_and_ordinary_projections_are_byte_exact(
     from xrd_tools.sources import execution_graph as graph_api
     graph = _p36_tiff_graph(tmp_path)
     item = PlannedOutput(graph.execution_source, Path(graph.source_path),
-        tmp_path / "out.nxs", graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names)
+        tmp_path / "out.nexus", graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names)
     assert contracts.SourceExecutionStamp is graph_api.SourceExecutionStamp
     assert contracts.SourceFileState is graph_api.SourceFileState
     assert graph_api.source_execution_projection(graph) == graph.stamp.as_dict()
@@ -1283,7 +1283,7 @@ def test_duplicate_snapshot_conflict_refuses_without_changing_valid_append_hashe
 
     valid = _p36_tiff_graph(tmp_path / "valid")
     item = PlannedOutput(valid.execution_source, Path(valid.source_path),
-                         tmp_path / "valid.nxs", valid.stamp)
+                         tmp_path / "valid.nexus", valid.stamp)
     before = append_source_from_execution_graph(valid, generation=1)
     before_snapshots = source_snapshots(item)
     before_writer = dynamic_output._writer_source_snapshots(item)
@@ -1340,7 +1340,7 @@ def test_average_lineage_and_provenance_match_exact_ordinary_projections(
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 
     graph = _p36_tiff_graph(tmp_path / "gráph")
-    target = tmp_path / "average.nxs"
+    target = tmp_path / "average.nexus"
     item = PlannedOutput(graph.execution_source, Path(graph.source_path),
                          target, graph.stamp)
     append = append_source_from_execution_graph(graph, generation=1)
