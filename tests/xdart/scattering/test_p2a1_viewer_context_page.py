@@ -514,6 +514,8 @@ def _fake_scientific(*, failing=False):
         vertical_splitter=vertical, frame_selector=_selector(events), color_map=object(),
         curve=_pane(events=events, name="curve"), waterfall=_pane(events=events, name="waterfall"),
         _processing_mode="", _selector_operations=0, raw_popup_dialog=None,
+        _expected_background_key=None, _rendered_background_key=None,
+        _viewer_2d_known_empty=False,
         _viewer_2d_payload=np.ones((2, 2)), _frame_keys=(object(),),
         _selected_keys=(object(),), _label_indices={1: [0]},
         _heavy_available=frozenset((object(),)), _trace_history_scope=object(),
@@ -532,7 +534,8 @@ def _fake_scientific(*, failing=False):
     view._apply_processing_layout = partial(ScientificView._apply_processing_layout, view)
     return view
 
-def _assert_neutral(view, title, status) -> None:
+def _assert_neutral(view, title, status, *, known_empty=True) -> None:
+    assert view._viewer_2d_known_empty is known_empty
     assert view._viewer_2d_payload is None
     assert view._frame_keys == view._selected_keys == view._rendered_trace_keys == ()
     assert view._label_indices == view._trace_history_by_identity == view._pinned_trace_by_id == {}
@@ -571,7 +574,8 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
     state = SimpleNamespace(
         processing_mode="2D Viewer", heavy=SimpleNamespace(frame=frame, raw=array, detector_shape=None),
         heavy_available=frozenset((frame,)), color_map="plasma", log_scale=True,
-        title="image.npy · frame 7 · NumPy array", status="2D Viewer · NumPy array")
+        title="image.npy · frame 7 · NumPy array", status="2D Viewer · NumPy array",
+        background_set=False)
     navigation = SimpleNamespace(frames=(prior, frame), current=frame, selected=(frame,))
     monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.QtCore.QSignalBlocker", lambda _widget: object())
     monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.set_combo_value", lambda *_args, **_kwargs: "viridis")
@@ -588,7 +592,12 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
     view.raw.clear = lambda: (_ for _ in ()).throw(ValueError("scrub"))
     with pytest.raises(RuntimeError, match="2D Viewer render failed"):
         reconcile()
-    _assert_neutral(view, "2D Viewer · Render failed", "2D Viewer · Render failed; retry available.")
+    _assert_neutral(
+        view,
+        "2D Viewer · Render failed",
+        "2D Viewer · Render failed; retry available.",
+        known_empty=False,
+    )
     view.raw.clear = clear
     view.raw.fail = False
     view.events.clear()
@@ -601,7 +610,7 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
         (0.0, 11.0), array.shape, (0.0, 11.0), 0.0, 11.0, (0.0, 4.0, 0.0, 3.0))
     assert view.progress.value == "2/2" and view.frame_selector.captions == ["2", "7"]
     assert view.cake.rendered is view.curve.rendered is view.waterfall.rendered is None
-    assert view.norm.hidden and view.background.hidden
+    assert view.norm.hidden and not view.background.hidden
     render_at = next(i for i, event in enumerate(view.events) if event[:2] == ("raw", "render"))
     reveal_at = next(i for i, event in enumerate(view.events)
                      if event == ("splitter", "visible", True))
@@ -630,6 +639,15 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
     assert receipt.request is request and receipt.cleared
     assert canonical is array and view.raw.rendered is None
     _assert_neutral(view, "Current", "")
+    view.events.clear()
+    reconcile()
+    render_at = next(i for i, event in enumerate(view.events)
+                     if event[:2] == ("raw", "render"))
+    assert not any(event[:2] == ("splitter", "hide")
+                   for event in view.events[:render_at])
+    assert not any(event[:2] == ("raw", "hide")
+                   for event in view.events[:render_at])
+    assert not view._viewer_2d_known_empty
     interrupt = _fake_scientific()
     interrupt.raw.fail = KeyboardInterrupt()
     with pytest.raises(KeyboardInterrupt):

@@ -851,6 +851,183 @@ def test_one_hdf_census_spans_processed_recursion_and_pre_read_post(tmp_path, mo
     assert len(seen) == 1
 
 
+def test_processed_651_catalog_uses_owned_frame_bound_and_hashes_each_file_once(
+        tmp_path, monkeypatch):
+    h5py = pytest.importorskip("h5py")
+    raw = np.arange(651 * 2 * 3, dtype=np.uint16).reshape(651, 2, 3)
+    master, segments, _ = _eiger_master(
+        tmp_path / "raw", [("data_000001.h5", raw)])
+    processed = tmp_path / "processed.nexus"
+    with h5py.File(processed, "w") as handle:
+        for label in range(651):
+            _processed_source(
+                handle, label, str(master.resolve()), label,
+                "/entry/data/data_000001")
+
+    calls = []
+    original = api._stable_revision
+
+    def stable(path):
+        calls.append(str(Path(path).resolve()))
+        return original(path)
+
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    catalog = api.catalog_viewer_2d(processed)
+
+    assert catalog.frame_labels == tuple(range(651))
+    assert catalog.frame_facts[0].source_frame == 0
+    assert catalog.frame_facts[-1].source_frame == 650
+    assert sorted(calls) == sorted({
+        str(processed.resolve()), str(master.resolve()), str(segments[0].resolve()),
+    })
+
+
+def test_processed_651_pure_thumbnail_catalog_uses_owned_field_budget(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    processed = tmp_path / "processed.nexus"
+    thumbnail = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    with h5py.File(processed, "w") as handle:
+        for label in range(651):
+            _processed_thumbnail(
+                handle, label, thumbnail, vmin=0.0, vmax=5.0)
+
+    catalog = api.catalog_viewer_2d(processed)
+
+    assert catalog.frame_labels == tuple(range(651))
+    assert {fact.source_kind for fact in catalog.frame_facts} == {
+        api.Viewer2DSourceKind.PROCESSED_THUMBNAIL,
+    }
+
+
+def test_processed_651_missing_source_falls_back_to_all_thumbnails(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    processed = tmp_path / "processed.nexus"
+    missing = tmp_path / "missing-master.h5"
+    thumbnail = np.arange(6, dtype=np.uint16).reshape(2, 3)
+    with h5py.File(processed, "w") as handle:
+        for label in range(651):
+            _processed_source(
+                handle, label, str(missing.resolve()), label,
+                "/entry/data/data")
+            _processed_thumbnail(
+                handle, label, thumbnail, vmin=0.0, vmax=5.0)
+
+    catalog = api.catalog_viewer_2d(processed)
+
+    assert catalog.frame_labels == tuple(range(651))
+    assert {fact.source_kind for fact in catalog.frame_facts} == {
+        api.Viewer2DSourceKind.PROCESSED_THUMBNAIL,
+    }
+
+
+def test_processed_fixed_name_misses_do_not_consume_frame_catalog_cap(
+        tmp_path, monkeypatch):
+    h5py = pytest.importorskip("h5py")
+    raw = tmp_path / "raw.h5"
+    value = np.arange(6, dtype=np.uint16).reshape(1, 2, 3)
+    _write_hdf_stack(raw, value)
+    processed = tmp_path / "processed.nexus"
+    with h5py.File(processed, "w") as handle:
+        entry = handle.require_group("entry")
+        entry.require_group("integrated_1d")
+        for label in (1, 2, 3):
+            source = entry.require_group(
+                f"frames/frame_{label:05d}/source")
+            source.create_dataset("path", data=np.bytes_(str(raw.resolve())))
+            source.create_dataset("frame_index", data=0)
+            source.attrs["dataset_path"] = "/entry/data/data"
+    monkeypatch.setattr(api, "_MAX_FRAMES", 3)
+
+    catalog = api.catalog_viewer_2d(processed)
+    frame = api.read_viewer_2d_frame(catalog, 3)
+
+    assert catalog.frame_labels == (1, 2, 3)
+    _assert_canonical(frame, value[0])
+
+
+def test_explicit_hdf_dataset_hint_bypasses_generic_foreign_census(
+        tmp_path):
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "selected.nxs"
+    value = np.arange(6).reshape(1, 2, 3)
+    with h5py.File(path, "w") as handle:
+        for index in range(2100):
+            handle.create_group(f"foreign_{index:04d}")
+        handle.create_dataset("selected", data=value)
+
+    catalog = api._catalog_resolved(
+        path.resolve(), api.Viewer2DFormatPolicy(), preferred="/selected")
+
+    assert catalog.dataset_path == "/selected"
+    assert catalog.frame_labels == (0,)
+    _assert_canonical(api.read_viewer_2d_frame(catalog, 0), value[0])
+
+
+def test_processed_external_preferred_path_bypasses_foreign_master_census(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
+    segment = tmp_path / "segment.h5"
+    _write_hdf_stack(segment, value)
+    master = tmp_path / "master.h5"
+    with h5py.File(master, "w") as handle:
+        for index in range(2100):
+            handle.create_group(f"foreign_{index:04d}")
+        handle["selected"] = h5py.ExternalLink(
+            segment.name, "/entry/data/data")
+    processed = tmp_path / "processed.nexus"
+    with h5py.File(processed, "w") as handle:
+        _processed_source(
+            handle, 7, str(master.resolve()), 1, "/selected")
+
+    catalog = api.catalog_viewer_2d(processed)
+    frame = api.read_viewer_2d_frame(catalog, 7)
+
+    assert catalog.frame_labels == (7,)
+    assert catalog.frame_facts[0].dataset_path == "/selected"
+    assert {dependency.locator for dependency in catalog.dependencies} == {
+        str(master.resolve()), str(segment.resolve()),
+    }
+    _assert_canonical(frame, value[1])
+
+
+@pytest.mark.parametrize("drift", ["before", "during"])
+def test_eiger_frame_read_uses_stat_fences_and_rehashes_only_after_drift(
+        tmp_path, monkeypatch, drift):
+    h5py = pytest.importorskip("h5py")
+    value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
+    master, segments, _ = _eiger_master(
+        tmp_path, [("data_000001.h5", value)])
+    catalog = api.catalog_viewer_2d(master)
+    calls = []
+    original = api._stable_revision
+
+    def stable(path):
+        calls.append(str(Path(path).resolve()))
+        return original(path)
+
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    _assert_canonical(api.read_viewer_2d_frame(catalog, 1), value[1])
+    assert calls == []
+
+    def mutate():
+        with h5py.File(segments[0], "r+") as handle:
+            handle["entry/data/data"][1, 0, 0] += 1
+
+    if drift == "before":
+        mutate()
+    else:
+        original_read = api._read_hdf_dataset
+
+        def read_then_mutate(*args, **kwargs):
+            result = original_read(*args, **kwargs)
+            mutate()
+            return result
+
+        monkeypatch.setattr(api, "_read_hdf_dataset", read_then_mutate)
+    _assert_changed(api.read_viewer_2d_frame, catalog, 1)
+    assert calls == [str(segments[0].resolve())]
+
+
 def _independent_ledger(canonical, *, encoded=17, reservation=_EXPECTED_R,
                         budget=_EXPECTED_B):
     reader = max(3 * canonical, encoded + 4 * canonical)
@@ -1228,7 +1405,7 @@ def test_r30_exported_values_recursively_close_isolated_forgery(tmp_path, axis):
                    "primary_revision": _forge(
                        catalog.primary_revision, canonical_path="/" + "x" * 4097)}
                   if axis == "canonical-path-cap" else
-                  {"member_name": "x" * (128 * 1024) + ".npy"})
+                  {"member_name": "x" * api._MAX_CATALOG_MANIFEST + ".npy"})
         _raises(TypeError, _rehashed_catalog, catalog, **change)
     else:
         dc = importlib.import_module("xdart.modules.display_context")

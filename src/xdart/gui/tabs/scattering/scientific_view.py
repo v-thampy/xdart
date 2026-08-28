@@ -256,6 +256,7 @@ class ScientificView(QtWidgets.QFrame):
         self._waterfall_render_contract: tuple[object, ...] | None = None
         self._processing_mode = ""
         self._viewer_2d_payload = None
+        self._viewer_2d_known_empty = False
         self._expected_background_key = self._rendered_background_key = None
         self.raw_popup_dialog = None
         self.raw_popup_image = None
@@ -447,6 +448,7 @@ class ScientificView(QtWidgets.QFrame):
         try:
             if domain == "raw":
                 self._scrub_detector_pane(self.raw); self._viewer_2d_payload = None
+                self._viewer_2d_known_empty = False
                 if self.raw_popup_image is not None: self._scrub_detector_pane(self.raw_popup_image)
             elif domain == "integrated_2d":
                 self.cake.clear(); self._rendered_cake_x_axis = self._rendered_cake_y_axis = self._rendered_cake_axis_key = self._rendered_image_axis = None
@@ -740,6 +742,8 @@ class ScientificView(QtWidgets.QFrame):
         self.background.setText(("Clear" if state.background_set else "Set") + " " + {"Int 1D": "1D", "1D Viewer": "1D", "Int 2D": "2D", "2D Viewer": "Raw"}.get(state.processing_mode, "BG") + " BG")
         self._rendered_background_key = self._expected_background_key if state.background_set else None
         if state.processing_mode == "2D Viewer":
+            already_empty = (self._processing_mode == "2D Viewer"
+                             and self._viewer_2d_known_empty)
             self._processing_mode = "2D Viewer"
             if state.heavy is None:
                 cleared = ScientificView.clear_viewer_2d(self, None, failure=True)
@@ -750,7 +754,9 @@ class ScientificView(QtWidgets.QFrame):
                 self.progress.setText("0/0")
                 return
             try:
-                if not ScientificView.clear_viewer_2d(self, None, failure=True):
+                if (not already_empty
+                        and not ScientificView.clear_viewer_2d(
+                            self, None, failure=True)):
                     raise ValueError("viewer reset is incomplete")
                 frame = navigation.current
                 heavy = state.heavy
@@ -771,6 +777,7 @@ class ScientificView(QtWidgets.QFrame):
                 set_combo_value(self.color_map, state.color_map, fallback="Default")
                 self.log_scale.setChecked(state.log_scale)
                 self._viewer_2d_payload = heavy.raw
+                self._viewer_2d_known_empty = False
                 self.title.setText(state.title)
                 self.status.setText(state.status)
                 self.progress.setText(f"{completed}/{total}")
@@ -1054,6 +1061,7 @@ class ScientificView(QtWidgets.QFrame):
             (self.progress, "setText", "0/0"),
         ):
             scrub(widget, method, value)
+        self._viewer_2d_known_empty = bool(cleared)
         return cleared if failure else Viewer2DRendererClearReceipt(request, cleared)
 
     def clear_viewer_1d(self, request, *, failure=False):

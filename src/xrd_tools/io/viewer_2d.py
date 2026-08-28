@@ -31,6 +31,9 @@ _MAX_DIMENSION = 65_536
 _MAX_PIXELS = 67_108_864
 _MAX_PATH = 4096
 _MAX_MANIFEST = 128 * 1024
+_MAX_CATALOG_MANIFEST = 4 * 1024 * 1024
+_MAX_PROCESSED_FIELDS = 12 * _MAX_FRAMES
+_MAX_PROCESSED_FIELD_BYTES = 64 * 1024**2
 _MAX_LINE = 1024 * 1024
 _MAX_CSV = 512 * 1024**2
 _MAX_NPY = 64 * 1024**3
@@ -235,7 +238,7 @@ class Viewer2DArtifactCatalog:
                    if value is not None)
             or self.frame_facts and tuple(item.label for item in self.frame_facts) != self.frame_labels
             or not _sha256_text(self.catalog_identity)
-            or len(repr(manifest).encode("utf-8", "strict")) > _MAX_MANIFEST
+            or len(repr(manifest).encode("utf-8", "strict")) > _MAX_CATALOG_MANIFEST
             or self.catalog_identity != _catalog_id(*manifest), "catalog")
         frame_count, _, _ = _shape_fhw(self.source_shape)
         _malformed(not self.frame_facts and frame_count != len(self.frame_labels), "catalog")
@@ -465,6 +468,25 @@ def _revision(path, sha256, info=None):
     )
 
 
+_REVISION_STAT_FIELDS = (
+    "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns",
+)
+
+
+def _revision_stat(revision):
+    return (revision.device, revision.inode, revision.size,
+            revision.mtime_ns, revision.ctime_ns)
+
+
+def _path_stat(path):
+    try:
+        info = path.stat()
+    except OSError:
+        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
+                "viewer source is no longer readable")
+    return tuple(int(getattr(info, name)) for name in _REVISION_STAT_FIELDS)
+
+
 def _descriptor_revision(path, stream, sha256=None):
     before = os.fstat(stream.fileno())
     if sha256 is None:
@@ -478,9 +500,9 @@ def _descriptor_revision(path, stream, sha256=None):
         pathname = path.stat()
     except OSError:
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer source is no longer readable")
-    keys = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
     if any(getattr(before, key) != getattr(after, key)
-           or getattr(after, key) != getattr(pathname, key) for key in keys):
+           or getattr(after, key) != getattr(pathname, key)
+           for key in _REVISION_STAT_FIELDS):
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer descriptor or path changed")
     return _revision(path, sha256, after)
 
@@ -572,11 +594,35 @@ def _validate_catalog_cross_fields(catalog):
                 and chain[0].dataset_path.rsplit("/", 1)[-1][5:].isdigit(), "catalog")
             if len(chain) > 1:
                 total = chain[-1].frame_stop
-                manifest = (chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
-                    tuple(range(total)), (total, *fact.shape), fact.dtype, chain[1:],
-                    "hdf5-eiger", None, chain[0].dataset_path, (), catalog.policy_identity,
-                    chain[0].revision)
-                _malformed(_catalog_id(*manifest) != fact.source_catalog_identity, "catalog")
+                intervals = chain[1:]
+                identities = set()
+                if (len(intervals) == 1 and intervals[0].frame_start == 0
+                        and intervals[0].frame_stop == total
+                        and intervals[0].logical_path == chain[0].dataset_path):
+                    shapes = ((total, *fact.shape),)
+                    if total == 1:
+                        shapes += (fact.shape,)
+                    for source_shape in shapes:
+                        manifest = (
+                            chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
+                            tuple(range(total)), source_shape, fact.dtype, intervals,
+                            "hdf5", None, chain[0].dataset_path, (),
+                            catalog.policy_identity, chain[0].revision)
+                        identities.add(_catalog_id(*manifest))
+                cover = tuple((item.frame_start, item.frame_stop)
+                              for item in intervals)
+                if (all(item.logical_path is not None for item in intervals)
+                        and intervals[0].logical_path == chain[0].dataset_path
+                        and cover == tuple((start, stop) for start, stop in zip(
+                            (0, *(item.frame_stop for item in intervals[:-1])),
+                            (item.frame_stop for item in intervals)))):
+                    manifest = (
+                        chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
+                        tuple(range(total)), (total, *fact.shape), fact.dtype,
+                        intervals, "hdf5-eiger", None, chain[0].dataset_path, (),
+                        catalog.policy_identity, chain[0].revision)
+                    identities.add(_catalog_id(*manifest))
+                _malformed(fact.source_catalog_identity not in identities, "catalog")
         return
     _malformed(catalog.frame_labels != tuple(range(f)), "catalog")
     if fmt == "csv":
@@ -717,9 +763,9 @@ def _make_catalog(path, policy, kind, labels, shape, dtype, revision, dependenci
             encoded = len(repr(item).encode("utf-8"))
             count = len(items) + 1
             projected = item_total + encoded + (3 if count == 1 else 2 * count)
-            if size - 2 + projected > _MAX_MANIFEST:
+            if size - 2 + projected > _MAX_CATALOG_MANIFEST:
                 _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
-                        "catalog manifest exceeds 128 KiB")
+                        "catalog manifest exceeds 4 MiB")
             items.append(item)
             item_total += encoded
         current = tuple(items)
@@ -731,7 +777,7 @@ def _make_catalog(path, policy, kind, labels, shape, dtype, revision, dependenci
         _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED, "catalog labels are empty, duplicate, or over limit")
     manifest = (str(path), kind.value, labels, shape, np.dtype(dtype).str, dependencies,
                 format_name, member, dataset, facts, policy.identity, revision)
-    if len(repr(manifest).encode("utf-8")) > _MAX_MANIFEST:
+    if len(repr(manifest).encode("utf-8")) > _MAX_CATALOG_MANIFEST:
         raise AssertionError("incremental viewer manifest accounting drifted")
     return Viewer2DArtifactCatalog(
         str(path), POLICY_VERSION, policy.identity, kind, labels, shape,
@@ -1093,11 +1139,15 @@ def _decode_scalar(value):
 
 
 class _HdfWalk:
-    __slots__ = ("visits", "external", "path_bytes", "candidates", "attribute_bytes")
+    __slots__ = ("visits", "external", "path_bytes", "candidates", "attribute_bytes",
+                 "processed_frames", "processed_path_bytes", "processed_fields",
+                 "processed_field_bytes")
 
     def __init__(self):
         self.visits = self.external = self.path_bytes = self.candidates = 0
         self.attribute_bytes = 0
+        self.processed_frames = self.processed_path_bytes = 0
+        self.processed_fields = self.processed_field_bytes = 0
 
     def touch(self, path, *, external=False):
         encoded = len(path if type(path) is bytes else path.encode("utf-8", "strict"))
@@ -1117,6 +1167,64 @@ class _HdfWalk:
         if self.external >= 4096:
             _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED, "HDF5 bounded walk exceeded")
         self.external += 1
+
+    def retain_processed_frame(self, path):
+        encoded = len(path if type(path) is bytes else path.encode("utf-8", "strict"))
+        if (self.processed_frames >= _MAX_FRAMES
+                or self.processed_path_bytes + encoded > 4 * 1024**2):
+            _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
+                    "processed HDF5 frame catalog exceeded")
+        self.processed_frames += 1
+        self.processed_path_bytes += encoded
+
+    def retain_processed_field(self, path):
+        encoded = len(path if type(path) is bytes else path.encode("utf-8", "strict"))
+        if (self.processed_fields >= _MAX_PROCESSED_FIELDS
+                or self.processed_field_bytes + encoded > _MAX_PROCESSED_FIELD_BYTES):
+            _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
+                    "processed HDF5 field catalog exceeded")
+        self.processed_fields += 1
+        self.processed_field_bytes += encoded
+
+    def retain_attribute(self, size, *, processed=False):
+        if size > 4096:
+            _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
+                    "selected HDF5 attribute exceeds bounded storage")
+        if processed:
+            if self.processed_field_bytes + size > _MAX_PROCESSED_FIELD_BYTES:
+                _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
+                        "processed HDF5 fields exceed bounded storage")
+            self.processed_field_bytes += size
+        else:
+            if self.attribute_bytes + size > 128 * 1024:
+                _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
+                        "selected HDF5 attributes exceed bounded storage")
+            self.attribute_bytes += size
+
+    def retain_processed_payload(self, size):
+        if size > _MAX_PATH or self.processed_field_bytes + size > _MAX_PROCESSED_FIELD_BYTES:
+            _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
+                    "processed HDF5 fields exceed bounded storage")
+        self.processed_field_bytes += size
+
+
+class _Viewer2DAdmission:
+    """One catalog operation's exact revision and resolved-source cache."""
+
+    __slots__ = ("revisions", "catalogs", "active")
+
+    def __init__(self):
+        self.revisions = {}
+        self.catalogs = {}
+        self.active = set()
+
+    def revision(self, path):
+        key = str(path)
+        revision = self.revisions.get(key)
+        if revision is None:
+            revision = _stable_revision(path)
+            self.revisions[key] = revision
+        return revision
 
 
 def _hnames(group, walk):
@@ -1144,11 +1252,15 @@ def _hdf_dtype_is_fixed(dtype, h5py):
     return True
 
 
-def _hattr(owner, name, walk, default=_HDF_MISSING):
+def _hattr(owner, name, walk, default=_HDF_MISSING, *, processed=False):
     import h5py
     encoded = name.encode("utf-8", "strict")
     owner_path = h5py.h5i.get_name(owner.id).decode("utf-8", "strict")
-    walk.touch(owner_path + "/@" + name)
+    field_path = owner_path + "/@" + name
+    if processed:
+        walk.retain_processed_field(field_path)
+    else:
+        walk.touch(field_path)
     if not h5py.h5a.exists(owner.id, encoded):
         if default is not _HDF_MISSING:
             return default
@@ -1182,10 +1294,7 @@ def _hattr(owner, name, walk, default=_HDF_MISSING):
                 if end < 0:
                     _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
                             "selected HDF5 attribute exceeds bounded storage")
-                if end > 4096 or walk.attribute_bytes + end > 128 * 1024:
-                    _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
-                            "selected HDF5 attributes exceed bounded storage")
-                walk.attribute_bytes += end
+                walk.retain_attribute(end, processed=processed)
                 encoding = "utf-8" if cset == h5py.h5t.CSET_UTF8 else "ascii"
                 return raw[:end].decode(encoding, "strict")
             finally:
@@ -1195,10 +1304,7 @@ def _hattr(owner, name, walk, default=_HDF_MISSING):
                 finally:
                     if source_type is not None:
                         source_type.close()
-        if storage > 4096 or walk.attribute_bytes + storage > 128 * 1024:
-            _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
-                    "selected HDF5 attributes exceed bounded storage")
-        walk.attribute_bytes += storage
+        walk.retain_attribute(storage, processed=processed)
         value = np.empty((), dtype=dtype)
         attribute.read(value)
         return value[()]
@@ -1206,10 +1312,13 @@ def _hattr(owner, name, walk, default=_HDF_MISSING):
         attribute.close()
 
 
-def _hget(group, name, walk):
+def _hget(group, name, walk, *, processed=False):
     import h5py
     full = group.name.rstrip("/") + "/" + name
-    walk.touch(full)
+    if processed:
+        walk.retain_processed_field(full)
+    else:
+        walk.touch(full)
     link = group.get(name, getlink=True)
     if isinstance(link, h5py.ExternalLink):
         walk.retain_external()
@@ -1221,7 +1330,11 @@ def _hget(group, name, walk):
 
 def _hpath(handle, path, walk):
     current = handle
-    for name in path.strip("/").split("/"):
+    names = path.strip("/").split("/")
+    for depth, name in enumerate(names):
+        if depth >= 32 and depth < len(names) - 1:
+            _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
+                    "HDF5 traversal depth exceeds 32")
         current = _hget(current, name, walk)
         if current is None:
             raise KeyError(path)
@@ -1240,6 +1353,20 @@ def _hdf_entry(handle, walk):
 
 def _hdf_dataset(handle, walk, preferred=None):
     import h5py
+    if preferred:
+        selected_path = "/" + preferred.strip("/")
+        try:
+            selected = _hpath(handle, selected_path, walk)
+        except KeyError:
+            _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
+                    "selected HDF5 detector dataset is absent")
+        if not isinstance(selected, h5py.Dataset) or selected.ndim not in (2, 3):
+            _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
+                    "selected HDF5 detector dataset is not rank two or three")
+        _source_dtype(selected.dtype)
+        _shape_fhw(tuple(int(value) for value in selected.shape))
+        walk.retain_candidate()
+        return selected_path, selected
     candidates, seen, stack = [], set(), [(handle, 0)]
     while stack:
         group, depth = stack.pop()
@@ -1265,9 +1392,7 @@ def _hdf_dataset(handle, walk, preferred=None):
                 if address not in seen:
                     seen.add(address)
                     stack.append((obj, depth + 1))
-    preferred = "/" + preferred.strip("/") if preferred else None
-    ordered = ([preferred] if preferred in candidates else [])
-    ordered += [path for path in _RAW_DATASETS if path in candidates and path not in ordered]
+    ordered = [path for path in _RAW_DATASETS if path in candidates]
     signalled = [path for path in candidates if _decode_scalar(
         _hattr(_hpath(handle, path, walk), "signal_type", walk, "")) == "detector"]
     chosen = ordered[:1] or signalled or candidates
@@ -1277,13 +1402,16 @@ def _hdf_dataset(handle, walk, preferred=None):
     return chosen[0], _hpath(handle, chosen[0], walk)
 
 
-def _dependency(locator, dataset, *, start=None, stop=None, logical=None):
+def _dependency(locator, dataset, *, start=None, stop=None, logical=None,
+                admission=None):
     path = _canonical_path(locator)
-    return Viewer2DDependency(str(path), dataset, _stable_revision(path),
+    revision = (_stable_revision(path) if admission is None
+                else admission.revision(path))
+    return Viewer2DDependency(str(path), dataset, revision,
                               start, stop, logical)
 
 
-def _hdf_segments(path, entry, walk):
+def _hdf_segments(path, entry, walk, admission):
     import h5py
     group = _hget(entry, "data", walk)
     if not isinstance(group, h5py.Group):
@@ -1320,14 +1448,72 @@ def _hdf_segments(path, entry, walk):
         if total + frames > _MAX_FRAMES:
             _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED, "Eiger frame count exceeds 10,000")
         dependencies.append(_dependency(actual, dataset_path, start=total,
-                                         stop=total + frames, logical=logical))
+            stop=total + frames, logical=logical, admission=admission))
         total, frame_shape, dtype = total + frames, current_shape, current_dtype
     shape = (total, *frame_shape)
     _admit(shape)
     return shape, dtype, tuple(dependencies), segments[0][1]
 
 
-def _processed_catalog(path, policy, handle, entry, walk):
+def _processed_frame_groups(frames, walk):
+    """Enumerate the owned xdart frame schema outside the foreign-HDF walk cap."""
+    import h5py
+
+    prefix = h5py.h5i.get_name(frames.id).rstrip(b"/")
+    selected, labels = [], set()
+    for raw in frames.id:
+        try:
+            name = raw.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
+                    "processed frame name is not UTF-8")
+        full = prefix + b"/" + raw
+        if not name.startswith("frame_"):
+            walk.touch(full)
+            continue
+        suffix = name[6:]
+        if not suffix.isdigit():
+            _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
+                    "processed frame label is malformed")
+        label = int(suffix)
+        if label in labels:
+            _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
+                    "processed frame labels are not unique")
+        walk.retain_processed_frame(full)
+        labels.add(label)
+        link = frames.get(name, getlink=True)
+        if not isinstance(link, h5py.HardLink):
+            _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
+                    "processed frame must be an owned hard-link group")
+        try:
+            group = frames.get(name)
+        except Exception:
+            group = None
+        if isinstance(group, h5py.Group):
+            selected.append((label, name, group))
+    return tuple(selected)
+
+
+def _processed_frame_group(frames, label, walk):
+    import h5py
+
+    tried = set()
+    for name in (f"frame_{label:04d}", f"frame_{label}", f"frame_{label:06d}"):
+        if name in tried:
+            continue
+        tried.add(name)
+        link = frames.get(name, getlink=True)
+        if isinstance(link, h5py.HardLink):
+            selected = frames.get(name)
+            if isinstance(selected, h5py.Group):
+                return selected
+    for candidate, _name, group in _processed_frame_groups(frames, walk):
+        if candidate == label:
+            return group
+    return None
+
+
+def _processed_catalog(path, policy, handle, entry, walk, admission):
     import h5py
     from xrd_tools.io.read import resolve_source_master
 
@@ -1341,37 +1527,33 @@ def _processed_catalog(path, policy, handle, entry, walk):
     if source_base is not None and len(os.fsencode(source_base)) > _MAX_PATH:
         _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
                 "processed source base is over the path limit")
-    for name in _hnames(frames, walk):
-        group = _hget(frames, name, walk)
-        if not name.startswith("frame_"):
-            continue
-        try:
-            label = int(name[6:])
-        except ValueError:
-            _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "processed frame label is malformed")
-        if not isinstance(group, h5py.Group):
-            continue
-        source = _hget(group, "source", walk)
-        thumbnail = _hget(group, "thumbnail", walk)
+    for label, _name, group in _processed_frame_groups(frames, walk):
+        source = _hget(group, "source", walk, processed=True)
+        thumbnail = _hget(group, "thumbnail", walk, processed=True)
         fact = None
         if isinstance(source, h5py.Group):
-            path_value = _hget(source, "path", walk)
+            path_value = _hget(source, "path", walk, processed=True)
+            path_storage = (path_value.id.get_storage_size()
+                            if isinstance(path_value, h5py.Dataset) else 0)
             if (not isinstance(path_value, h5py.Dataset) or path_value.size != 1
-                    or path_value.id.get_storage_size() > _MAX_PATH):
+                    or path_storage > _MAX_PATH):
                 _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
                         "processed source locator is not a bounded scalar")
+            walk.retain_processed_payload(path_storage)
             stored = path_value[()]
             if isinstance(stored, np.ndarray): stored = stored.item()
             raw = resolve_source_master(_decode_scalar(stored), scan_file=path,
                 source_base=source_base, source_root=policy.source_root)
             if raw is not None:
                 try:
-                    hint = _decode_scalar(_hattr(source, "dataset_path", walk, "")) or None
+                    hint = _decode_scalar(_hattr(
+                        source, "dataset_path", walk, "", processed=True)) or None
                     if hint is not None and len(hint.encode("utf-8")) > _MAX_PATH:
                         _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED,
                                 "processed dataset hint is over the path limit")
-                    source_catalog = _catalog_resolved(_canonical_path(raw), policy, walk, hint)
-                    frame_obj = _hget(source, "frame_index", walk)
+                    source_catalog = _catalog_resolved(
+                        _canonical_path(raw), policy, walk, hint, admission)
+                    frame_obj = _hget(source, "frame_index", walk, processed=True)
                     if frame_obj is not None and (not isinstance(frame_obj, h5py.Dataset)
                             or frame_obj.size != 1 or frame_obj.dtype.kind not in "iu"):
                         _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
@@ -1400,14 +1582,16 @@ def _processed_catalog(path, policy, handle, entry, walk):
         if fact is None and isinstance(thumbnail, h5py.Dataset) and thumbnail.ndim == 2:
             shape = tuple(int(value) for value in thumbnail.shape)
             _shape_fhw(shape)
-            lut_dtype = _decode_scalar(_hattr(thumbnail, "dtype", walk))
+            lut_dtype = _decode_scalar(_hattr(
+                thumbnail, "dtype", walk, processed=True))
             if (lut_dtype not in ("uint8", "uint16")
                     or np.dtype(thumbnail.dtype).str != np.dtype(lut_dtype).str):
                 _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "thumbnail LUT dtype is invalid")
             for attr in ("vmin", "vmax"):
-                if not math.isfinite(float(_hattr(thumbnail, attr, walk))):
+                if not math.isfinite(float(_hattr(
+                        thumbnail, attr, walk, processed=True))):
                     _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "thumbnail LUT is nonfinite")
-            mask = _hget(group, "thumbnail_mask", walk)
+            mask = _hget(group, "thumbnail_mask", walk, processed=True)
             if mask is not None and (not isinstance(mask, h5py.Dataset)
                     or mask.dtype.kind != "b" or tuple(mask.shape) != shape):
                 _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "thumbnail mask is invalid")
@@ -1424,73 +1608,100 @@ def _processed_catalog(path, policy, handle, entry, walk):
     if not facts or len({fact.label for fact in facts}) != len(facts):
         _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
                 "processed catalog has no displayable unique labels")
-    revision = _stable_revision(path)
+    revision = admission.revision(path)
     return _make_catalog(path, policy, facts[0].source_kind,
         (fact.label for fact in facts), facts[0].shape, facts[0].dtype, revision,
         tuple(dependencies), "hdf5-processed", facts=facts)
 
 
-def _catalog_hdf5(path, policy, walk=None, preferred=None):
+def _catalog_hdf5(path, policy, walk=None, preferred=None, admission=None):
     import h5py
     walk = _HdfWalk() if walk is None else walk
+    admission = _Viewer2DAdmission() if admission is None else admission
     try:
         with h5py.File(path, "r") as handle:
-            entry = _hdf_entry(handle, walk)
-            if entry is not None:
-                processed = _processed_catalog(path, policy, handle, entry, walk)
-                if processed is not None: return processed
-                eiger = _hdf_segments(path, entry, walk)
-                if eiger is not None:
-                    shape, dtype, dependencies, dataset_path = eiger
-                    return _make_catalog(path, policy, Viewer2DSourceKind.RAW_DETECTOR,
-                        range(shape[0]), shape, dtype, _stable_revision(path),
-                        dependencies, "hdf5-eiger", dataset=dataset_path)
-            dataset_path, dataset = _hdf_dataset(handle, walk, preferred)
+            if preferred:
+                dataset_path, dataset = _hdf_dataset(handle, walk, preferred)
+            else:
+                entry = _hdf_entry(handle, walk)
+                if entry is not None:
+                    processed = _processed_catalog(
+                        path, policy, handle, entry, walk, admission)
+                    if processed is not None: return processed
+                    eiger = _hdf_segments(path, entry, walk, admission)
+                    if eiger is not None:
+                        shape, dtype, dependencies, dataset_path = eiger
+                        return _make_catalog(
+                            path, policy, Viewer2DSourceKind.RAW_DETECTOR,
+                            range(shape[0]), shape, dtype, admission.revision(path),
+                            dependencies, "hdf5-eiger", dataset=dataset_path)
+                dataset_path, dataset = _hdf_dataset(handle, walk)
             shape = tuple(int(value) for value in dataset.shape)
             dtype, (f, _, _) = _source_dtype(dataset.dtype), _shape_fhw(shape)
             actual = Path(dataset.file.filename).resolve()
             dependencies = (() if actual == path else
-                (_dependency(actual, dataset.name, start=0, stop=f, logical=dataset_path),))
+                (_dependency(actual, dataset.name, start=0, stop=f,
+                             logical=dataset_path, admission=admission),))
     except Viewer2DReadError:
         raise
     except Exception as error:
         _refuse(Viewer2DRefusalCode.FORMAT_INVALID, str(error))
     _admit(shape)
     return _make_catalog(path, policy, Viewer2DSourceKind.RAW_DETECTOR, range(f),
-        shape, dtype, _stable_revision(path), dependencies,
+        shape, dtype, admission.revision(path), dependencies,
         "hdf5", dataset=dataset_path)
 
 
-def _catalog_resolved(path, policy, walk=None, preferred=None):
+def _catalog_resolved(path, policy, walk=None, preferred=None, admission=None):
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_VIEWER_SUFFIXES:
         _refuse(Viewer2DRefusalCode.UNSUPPORTED_FORMAT, "unsupported 2D Viewer suffix")
+    admission = _Viewer2DAdmission() if admission is None else admission
+    key = (str(path), preferred)
+    cached = admission.catalogs.get(key)
+    if cached is not None:
+        return cached
+    if key in admission.active:
+        _refuse(Viewer2DRefusalCode.FORMAT_INVALID,
+                "viewer source catalog contains a cycle")
+    admission.active.add(key)
     walk = _HdfWalk() if suffix in _HDF5_SUFFIXES and walk is None else walk
     descriptor_bound = suffix in {".npy", ".npz"}
     if walk is not None:
         walk.touch(str(path))
-    before = None if descriptor_bound else _stable_revision(path)
-    if suffix == ".csv":
-        catalog = _catalog_csv(path, policy)
-    elif suffix == ".npy":
-        catalog = _catalog_npy(path, policy)
-    elif suffix == ".npz":
-        catalog = _catalog_npz(path, policy)
-    elif suffix in _HDF5_SUFFIXES:
-        catalog = _catalog_hdf5(path, policy, walk, preferred)
-    else:
-        catalog = _catalog_detector(path, policy)
-    if (not descriptor_bound and (_stable_revision(path) != before
-                                  or catalog.primary_revision != before)):
-        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
-                "viewer catalog source changed during metadata census")
-    for dependency in catalog.dependencies:
-        if walk is not None:
-            _cert_revision(dependency.revision, walk)
-        elif _stable_revision(Path(dependency.locator)) != dependency.revision:
+    before = (None if descriptor_bound else admission.revision(path)
+              if suffix in _HDF5_SUFFIXES else _stable_revision(path))
+    try:
+        if suffix == ".csv":
+            catalog = _catalog_csv(path, policy)
+        elif suffix == ".npy":
+            catalog = _catalog_npy(path, policy)
+        elif suffix == ".npz":
+            catalog = _catalog_npz(path, policy)
+        elif suffix in _HDF5_SUFFIXES:
+            catalog = _catalog_hdf5(
+                path, policy, walk, preferred, admission)
+        else:
+            catalog = _catalog_detector(path, policy)
+        if suffix in _HDF5_SUFFIXES:
+            if catalog.primary_revision != before:
+                _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
+                        "viewer catalog source changed during metadata census")
+            _cert_revision(before, walk)
+        elif (not descriptor_bound and (_stable_revision(path) != before
+                                        or catalog.primary_revision != before)):
             _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
-                    "viewer catalog dependency changed during metadata census")
-    return catalog
+                    "viewer catalog source changed during metadata census")
+        for dependency in catalog.dependencies:
+            if walk is not None:
+                _cert_revision(dependency.revision, walk)
+            elif _stable_revision(Path(dependency.locator)) != dependency.revision:
+                _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
+                        "viewer catalog dependency changed during metadata census")
+        admission.catalogs[key] = catalog
+        return catalog
+    finally:
+        admission.active.discard(key)
 
 
 def catalog_viewer_2d(path, *, policy=None):
@@ -1601,10 +1812,16 @@ def _read_numpy(catalog, index):
 def _cert_revision(revision, walk):
     walk.touch(revision.canonical_path)
     try:
-        current = _stable_revision(Path(revision.canonical_path))
-    except OSError:
+        current = _path_stat(Path(revision.canonical_path))
+    except Viewer2DReadError:
         current = None
-    if current != revision:
+    if current != _revision_stat(revision):
+        # A state change is always a refusal.  Rehash it before returning so a
+        # changed path never silently inherits an admitted content identity.
+        try:
+            _stable_revision(Path(revision.canonical_path))
+        except (OSError, Viewer2DReadError):
+            pass
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                 "selected viewer dependency changed")
 
@@ -1650,16 +1867,8 @@ def _cert_processed_pointer(catalog, fact, policy, walk):
     with h5py.File(catalog.canonical_path, "r") as handle:
         entry = _hdf_entry(handle, walk)
         frames = None if entry is None else _hget(entry, "frames", walk)
-        selected = None
-        if isinstance(frames, h5py.Group):
-            for name in _hnames(frames, walk):
-                try:
-                    matches = name.startswith("frame_") and int(name[6:]) == fact.label
-                except ValueError:
-                    matches = False
-                if matches:
-                    selected = _hget(frames, name, walk)
-                    break
+        selected = (_processed_frame_group(frames, fact.label, walk)
+                    if isinstance(frames, h5py.Group) else None)
         source = _hget(selected, "source", walk) if isinstance(selected, h5py.Group) else None
         pointer = _hget(source, "path", walk) if isinstance(source, h5py.Group) else None
         frame = _hget(source, "frame_index", walk) if isinstance(source, h5py.Group) else None
