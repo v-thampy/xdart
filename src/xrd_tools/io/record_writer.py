@@ -73,7 +73,11 @@ from xrd_tools.io.schema import (
     PRIMARY_MODE_ATTR,
     SOURCE_BASE_ATTR,
     THUMBNAIL_LUT_ATTRS,
+    canonical_gi_mode_key,
+    local_hard_dataset,
+    local_hard_group_path,
     mode_subgroup_name,
+    read_current_mode_layout,
 )
 from xrd_tools.session import ResultMode, StageReceipt, get_pool
 
@@ -145,6 +149,13 @@ class RecordWrite:
     background_dependency_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "mode_1d", canonical_gi_mode_key(self.mode_1d, "1d"),
+        )
+        object.__setattr__(
+            self, "mode_2d", canonical_gi_mode_key(self.mode_2d, "2d"),
+        )
+
         def exact_bool(value: Any, name: str) -> bool:
             if not isinstance(value, (bool, np.bool_)):
                 raise TypeError(f"{name} must be an exact boolean")
@@ -937,10 +948,22 @@ class NexusRecordWriter:
             return _CloseModeObservation(
                 close_context, start, observed_labels, observed_intensity, observed_sigma,
             )
-        group = self._entry_group().get(rows[0].group_name)
-        intensity = group.get("intensity") if isinstance(group, h5py.Group) else None
-        radial = group.get("q") if isinstance(group, h5py.Group) else None
-        azimuthal = group.get("chi") if rows[0].dimension == "2d" else None
+        group = local_hard_group_path(
+            self._entry_group(), rows[0].group_name, role=rows[0].group_name,
+        )
+        intensity = local_hard_dataset(
+            group, "intensity", role=f"{rows[0].group_name}/intensity",
+        ) if isinstance(group, h5py.Group) else None
+        radial = local_hard_dataset(
+            group, "q", role=f"{rows[0].group_name}/q",
+        ) if isinstance(group, h5py.Group) else None
+        azimuthal = (
+            local_hard_dataset(
+                group, "chi", role=f"{rows[0].group_name}/chi",
+            )
+            if rows[0].dimension == "2d" and isinstance(group, h5py.Group)
+            else None
+        )
         if not isinstance(intensity, h5py.Dataset) or not isinstance(
             radial, h5py.Dataset,
         ) or (rows[0].dimension == "2d" and not isinstance(
@@ -969,23 +992,31 @@ class NexusRecordWriter:
                 end += 1
             group_proofs = proofs[index:end]
             first = group_proofs[0]
-            group = entry.get(first.group_name)
+            group = local_hard_group_path(
+                entry, first.group_name, role=first.group_name,
+            )
             if not isinstance(group, h5py.Group):
                 raise WriterStateError(f"durable-row proof lost mode group {first.group_name}")
-            labels = group.get("frame_index")
-            intensity = group.get("intensity")
-            radial = group.get("q")
-            sigma = group.get("sigma")
+            labels = local_hard_dataset(group, "frame_index", role=f"{first.group_name}/frame_index")
+            intensity = local_hard_dataset(group, "intensity", role=f"{first.group_name}/intensity")
+            radial = local_hard_dataset(group, "q", role=f"{first.group_name}/q")
+            sigma = local_hard_dataset(group, "sigma", role=f"{first.group_name}/sigma")
             if not all(isinstance(value, h5py.Dataset) for value in (
                 labels, intensity, radial,
             )) or (sigma is not None and not isinstance(sigma, h5py.Dataset)):
                 raise WriterStateError(f"durable-row proof lost arrays for {first.group_name}")
             if any(proof.dimension != first.dimension for proof in group_proofs):
                 raise WriterStateError(f"durable-row proof changed dimension for {first.group_name}")
-            top = entry.get(f"integrated_{first.dimension}")
+            top = local_hard_group_path(
+                entry,
+                f"integrated_{first.dimension}",
+                role=f"integrated_{first.dimension}",
+            )
             if not isinstance(top, h5py.Group):
                 raise WriterStateError(f"durable-row proof lost integrated_{first.dimension}")
-            chi = group.get("chi") if first.dimension == "2d" else None
+            chi = local_hard_dataset(
+                group, "chi", role=f"{first.group_name}/chi",
+            ) if first.dimension == "2d" else None
             if first.dimension == "2d" and not isinstance(chi, h5py.Dataset):
                 raise WriterStateError(
                     f"durable-row proof lost chi for {first.group_name}"
@@ -1415,7 +1446,9 @@ class NexusRecordWriter:
                 sort_keys=True,
             ),
         )
-        sigma = group.get("sigma")
+        sigma = local_hard_dataset(
+            group, "sigma", role=f"{expected.group_name}/sigma",
+        )
         if expected.sigma is None:
             observed_sigma = (
                 None if observed is None and sigma is None
@@ -1809,7 +1842,9 @@ class NexusRecordWriter:
         evidence: _EvidenceBuilder,
         expected: _ExpectedIndexedRow,
     ) -> None:
-        group = self._entry_group().get(expected.group_name)
+        group = local_hard_group_path(
+            self._entry_group(), expected.group_name, role=expected.group_name,
+        )
         if not isinstance(group, h5py.Group):
             raise WriterStateError(
                 f"durability readback missing indexed group {expected.group_name}"
@@ -1821,14 +1856,22 @@ class NexusRecordWriter:
                 f"durability readback lacks {expected.group_name} label {expected.label}"
             )
         role = f"{group.name}[label={expected.label},row={row}]"
-        labels = group["frame_index"]
+        labels = local_hard_dataset(
+            group, "frame_index", role=f"{expected.group_name}/frame_index",
+        )
+        if labels is None:
+            raise WriterStateError(
+                f"durability readback missing {expected.group_name}/frame_index"
+            )
         evidence.array(
             f"{role}/frame_index",
             np.asarray(expected.label, dtype=labels.dtype),
             np.asarray(labels[row]),
         )
         for name, value in expected.values:
-            dataset = group.get(name)
+            dataset = local_hard_dataset(
+                group, name, role=f"{expected.group_name}/{name}",
+            )
             if not isinstance(dataset, h5py.Dataset):
                 raise WriterStateError(f"durability readback missing {role}/{name}")
             observed = dataset[row]
@@ -1851,7 +1894,9 @@ class NexusRecordWriter:
         group_name: str,
         label: int,
     ) -> None:
-        group = self._entry_group().get(group_name)
+        group = local_hard_group_path(
+            self._entry_group(), group_name, role=group_name,
+        )
         role = f"/{self.entry}/{group_name}[label={int(label)}]"
         if group is None:
             evidence.absent(role, True)
@@ -1860,7 +1905,9 @@ class NexusRecordWriter:
             raise WriterStateError(
                 f"durability readback found non-group mode path {group_name}"
             )
-        labels_ds = group.get("frame_index")
+        labels_ds = local_hard_dataset(
+            group, "frame_index", role=f"{group_name}/frame_index",
+        )
         if not isinstance(labels_ds, h5py.Dataset):
             raise WriterStateError(
                 f"durability readback missing {group_name}/frame_index"
@@ -2046,16 +2093,22 @@ class NexusRecordWriter:
             return evidence
         if self._h5 is None:
             raise WriterStateError("durable-row proof has no HDF5 reader")
-        entry = self._h5.get(self.entry)
+        entry = local_hard_group_path(self._h5, self.entry, role=self.entry)
         if not isinstance(entry, h5py.Group):
             raise WriterStateError("durable-row proof lost the NeXus entry")
-        group = entry.get(proof.group_name)
+        group = local_hard_group_path(
+            entry, proof.group_name, role=proof.group_name,
+        )
         if not isinstance(group, h5py.Group):
             raise WriterStateError(
                 f"durable-row proof lost mode group {proof.group_name}"
             )
-        intensity = group.get("intensity")
-        radial = group.get("q")
+        intensity = local_hard_dataset(
+            group, "intensity", role=f"{proof.group_name}/intensity",
+        )
+        radial = local_hard_dataset(
+            group, "q", role=f"{proof.group_name}/q",
+        )
         if not isinstance(intensity, h5py.Dataset) or not isinstance(
             radial, h5py.Dataset,
         ):
@@ -2066,7 +2119,9 @@ class NexusRecordWriter:
             raise WriterStateError(
                 f"durable-row proof lost label {proof.label}"
             )
-        sigma_dataset = group.get("sigma")
+        sigma_dataset = local_hard_dataset(
+            group, "sigma", role=f"{proof.group_name}/sigma",
+        )
         if proof.sigma_expected:
             if not isinstance(sigma_dataset, h5py.Dataset):
                 raise WriterStateError(
@@ -2079,7 +2134,9 @@ class NexusRecordWriter:
         grouped = self._semantic_mode_observation
         azimuthal = None
         if proof.dimension == "2d":
-            chi = group.get("chi")
+            chi = local_hard_dataset(
+                group, "chi", role=f"{proof.group_name}/chi",
+            )
             if not isinstance(chi, h5py.Dataset):
                 raise WriterStateError(
                     f"durable-row proof lost chi for label {proof.label}"
@@ -2272,16 +2329,21 @@ class NexusRecordWriter:
         for name, cursor in self._row_cursors.items():
             if not cursor or not name.startswith("integrated_"):
                 continue
-            group = entry.get(name)
+            group = local_hard_group_path(entry, name, role=name)
             two_d = name.startswith("integrated_2d")
             keys = ("frame_index", "intensity", *(("chi",) if two_d else ()), "q")
-            arrays = tuple(group.get(key) for key in keys) \
+            arrays = tuple(
+                local_hard_dataset(group, key, role=f"{name}/{key}")
+                for key in keys
+            ) \
                 if isinstance(group, h5py.Group) else ()
             if not arrays or not all(isinstance(value, h5py.Dataset)
                                      for value in arrays):
                 raise WriterStateError(f"fast close lost arrays for {name}")
             labels, intensity, *axes = arrays
-            sigma = group.get("sigma")
+            sigma = local_hard_dataset(
+                group, "sigma", role=f"{name}/sigma",
+            )
             expected = (len(cursor), *(axis.shape[0] for axis in axes))
             if (
                 labels.shape != (len(cursor),)
@@ -2314,10 +2376,18 @@ class NexusRecordWriter:
         self._vector = {name: 0 for name in _VECTOR_FIELDS}
 
     def _load_cursor_from(self, entry: h5py.Group, name: str, *, local_hard=False) -> dict[int, int]:
-        group = _replacement_hard_group(entry, name) if local_hard else entry.get(name)
+        group = (
+            _replacement_hard_group(entry, name)
+            if local_hard else local_hard_group_path(entry, name, role=name)
+        )
         if group is None:
             return {}
-        labels_node = _replacement_hard_group(group, "frame_index", h5py.Dataset) if local_hard else group.get("frame_index")
+        labels_node = (
+            _replacement_hard_group(group, "frame_index", h5py.Dataset)
+            if local_hard else local_hard_dataset(
+                group, "frame_index", role=f"{name}/frame_index",
+            )
+        )
         if not isinstance(group, h5py.Group) or not isinstance(labels_node, h5py.Dataset):
             raise WriterStateError(f"{name} has no indexed frame_index")
         values = (_read_replacement_frame_index(labels_node, f"{name}/frame_index") if local_hard else np.asarray(labels_node[()]).ravel())
@@ -2332,7 +2402,11 @@ class NexusRecordWriter:
 
     def _validate_existing_contract(self) -> dict[str, dict[int, int]]:
         with h5py.File(self.target, "r") as h5:
-            entry = _replacement_hard_group(h5, self.entry) if self._replacement_configuration is not None else h5.get(self.entry)
+            entry = (
+                _replacement_hard_group(h5, self.entry)
+                if self._replacement_configuration is not None
+                else local_hard_group_path(h5, self.entry, role=self.entry)
+            )
             if self._replacement_configuration is not None:
                 dimension = self._replacement_configuration[0]; root = entry.name if isinstance(entry, h5py.Group) else f"/{self.entry.strip('/')}"; excluded = (f"{root}/integrated_{dimension}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}", f"{root}/reduction/config/source_execution", f"{root}/reduction/config/append_lineage"); config = _replacement_hard_group(entry, "reduction/config"); (None if isinstance(entry, h5py.Group) and isinstance(config, h5py.Group) else (_ for _ in ()).throw(WriterStateError("replacement entry/config is not local"))); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = config.get("gi_config", getlink=True); (None if gi_link is None or type(gi_link) is h5py.HardLink else (_ for _ in ()).throw(WriterStateError("replacement GI config is not local"))); gi_values = _replacement_json_node(config, "gi_config", "replacement GI config", required=False)
                 gi_values = {} if gi_values is None else gi_values
@@ -2355,13 +2429,21 @@ class NexusRecordWriter:
                 ("integrated_1d", self._primary_mode_1d),
                 ("integrated_2d", self._primary_mode_2d),
             ):
-                group = _replacement_hard_group(entry, name) if self._replacement_configuration is not None else entry.get(name)
+                group = (
+                    _replacement_hard_group(entry, name)
+                    if self._replacement_configuration is not None
+                    else local_hard_group_path(entry, name, role=name)
+                )
                 if group is None:
                     continue
-                existing = group.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)
-                if isinstance(existing, bytes):
-                    existing = existing.decode("utf-8", errors="replace")
-                if self._replacement_configuration is None and str(existing) != requested:
+                existing = (
+                    group.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)
+                    if self._replacement_configuration is not None
+                    else read_current_mode_layout(
+                        group, "1d" if name.endswith("1d") else "2d",
+                    )[0]
+                )
+                if self._replacement_configuration is None and existing != requested:
                     raise ValueError(
                         f"{name} primary mode {existing!r} != requested "
                         f"{requested!r}; sparse writes cannot reinterpret "
@@ -2375,14 +2457,37 @@ class NexusRecordWriter:
                 )
             }
             for name in ("integrated_1d", "integrated_2d"):
-                group = _replacement_hard_group(entry, name) if self._replacement_configuration is not None else entry.get(name)
+                group = (
+                    _replacement_hard_group(entry, name)
+                    if self._replacement_configuration is not None
+                    else local_hard_group_path(entry, name, role=name)
+                )
                 if group is None:
                     continue
-                for child_name in group:
-                    child = _replacement_hard_group(group, child_name) if self._replacement_configuration is not None else group.get(child_name)
-                    if isinstance(child, h5py.Group):
-                        nested = f"{name}/{child_name}"
-                        cursors[nested] = self._load_cursor_from(entry, nested, local_hard=self._replacement_configuration is not None)
+                if self._replacement_configuration is not None:
+                    children = tuple(
+                        (child_name, _replacement_hard_group(group, child_name))
+                        for child_name in group
+                    )
+                    nested_names = tuple(
+                        f"{name}/{child_name}"
+                        for child_name, child in children
+                        if isinstance(child, h5py.Group)
+                    )
+                else:
+                    pairs = read_current_mode_layout(
+                        group, "1d" if name.endswith("1d") else "2d",
+                    )[2]
+                    nested_names = tuple(
+                        f"{name}/{mode_subgroup_name(mode)}"
+                        for mode, _child in pairs[1:]
+                    )
+                for nested in nested_names:
+                    cursors[nested] = self._load_cursor_from(
+                        entry,
+                        nested,
+                        local_hard=self._replacement_configuration is not None,
+                    )
             return cursors
 
     def begin(
@@ -2395,14 +2500,8 @@ class NexusRecordWriter:
         if self._replacement_configuration is not None and metadata is not None: raise WriterStateError("replacement begin forbids metadata mutation")
         if self.phase is not WriterPhase.NEW:
             raise WriterStateError(f"begin requires NEW, got {self.phase.value}")
-        self._primary_mode_1d = str(primary_mode_1d or DEFAULT_MODE_KEY)
-        self._primary_mode_2d = str(primary_mode_2d or DEFAULT_MODE_KEY)
-        if (self._primary_mode_1d != DEFAULT_MODE_KEY
-                and self._primary_mode_1d not in GI_MODE_KEYS_1D):
-            raise ValueError(f"unknown 1d primary mode {self._primary_mode_1d!r}")
-        if (self._primary_mode_2d != DEFAULT_MODE_KEY
-                and self._primary_mode_2d not in GI_MODE_KEYS_2D):
-            raise ValueError(f"unknown 2d primary mode {self._primary_mode_2d!r}")
+        self._primary_mode_1d = canonical_gi_mode_key(primary_mode_1d, "1d")
+        self._primary_mode_2d = canonical_gi_mode_key(primary_mode_2d, "2d")
         try:
             with self._boundary():
                 binding = self._transaction_binding
@@ -2565,7 +2664,11 @@ class NexusRecordWriter:
         row = cursor.get(label)
         if row is None:
             return
-        group = _replacement_hard_group(self._entry_group(), name) if self._replacement_configuration is not None else self._entry_group().get(name)
+        group = (
+            _replacement_hard_group(self._entry_group(), name)
+            if self._replacement_configuration is not None
+            else local_hard_group_path(self._entry_group(), name, role=name)
+        )
         if (group is None or row < 0 or row >= group["frame_index"].shape[0]
                 or int(group["frame_index"][row]) != label):
             raise WriterStateError(
@@ -2581,7 +2684,7 @@ class NexusRecordWriter:
             primary = self._primary_mode_2d
             allowed = GI_MODE_KEYS_2D
             top = "integrated_2d"
-        mode = str(mode or DEFAULT_MODE_KEY)
+        mode = canonical_gi_mode_key(mode, dimension)
         if mode == primary:
             return top
         if primary == DEFAULT_MODE_KEY:
@@ -2621,7 +2724,11 @@ class NexusRecordWriter:
             ("integrated_1d", groups_1d), ("integrated_2d", groups_2d),
         ):
             if any(name != top for name in groups):
-                if (_replacement_hard_group(entry, top) if self._replacement_configuration is not None else entry.get(top)) is None and top not in groups:
+                if (
+                    _replacement_hard_group(entry, top)
+                    if self._replacement_configuration is not None
+                    else local_hard_group_path(entry, top, role=top)
+                ) is None and top not in groups:
                     raise ValueError(
                         f"named modes require an established {top} primary group"
                     )
@@ -2692,9 +2799,9 @@ class NexusRecordWriter:
     def _modes(record: RecordWrite) -> tuple[ResultMode, ...]:
         modes = []
         if record.result_1d is not None:
-            modes.append(ResultMode.one_d(str(record.mode_1d or DEFAULT_MODE_KEY)))
+            modes.append(ResultMode.one_d(canonical_gi_mode_key(record.mode_1d, "1d")))
         if record.result_2d is not None:
-            modes.append(ResultMode.two_d(str(record.mode_2d or DEFAULT_MODE_KEY)))
+            modes.append(ResultMode.two_d(canonical_gi_mode_key(record.mode_2d, "2d")))
         return tuple(modes)
 
     def _target_matches(self, target: str) -> bool:
@@ -2741,20 +2848,20 @@ class NexusRecordWriter:
         two_d = [record for record in batch if record.result_2d is not None]
         primary_1d = [
             record for record in one_d
-            if str(record.mode_1d or DEFAULT_MODE_KEY) == self._primary_mode_1d
+            if canonical_gi_mode_key(record.mode_1d, "1d") == self._primary_mode_1d
         ]
         primary_2d = [
             record for record in two_d
-            if str(record.mode_2d or DEFAULT_MODE_KEY) == self._primary_mode_2d
+            if canonical_gi_mode_key(record.mode_2d, "2d") == self._primary_mode_2d
         ]
         extra_1d: dict[str, list[RecordWrite]] = {}
         extra_2d: dict[str, list[RecordWrite]] = {}
         for record in one_d:
-            mode = str(record.mode_1d or DEFAULT_MODE_KEY)
+            mode = canonical_gi_mode_key(record.mode_1d, "1d")
             if mode != self._primary_mode_1d:
                 extra_1d.setdefault(mode, []).append(record)
         for record in two_d:
-            mode = str(record.mode_2d or DEFAULT_MODE_KEY)
+            mode = canonical_gi_mode_key(record.mode_2d, "2d")
             if mode != self._primary_mode_2d:
                 extra_2d.setdefault(mode, []).append(record)
         validation_complete = False
@@ -3128,7 +3235,9 @@ class NexusRecordWriter:
         if self._replacement_configuration is not None and mode.kind != self._replacement_configuration[0]: raise WriterStateError("replacement publication drop escaped its selected dimension")
         group_name = self._mode_cursor_name(mode.kind, mode.key)
         cursor = self._row_cursors.setdefault(group_name, {})
-        group = self._entry_group().get(group_name)
+        group = local_hard_group_path(
+            self._entry_group(), group_name, role=group_name,
+        )
         if group is None:
             cursor.pop(label, None)
             self._dirty_modes.pop((group_name, label), None)
@@ -3136,7 +3245,9 @@ class NexusRecordWriter:
             return
         if not isinstance(group, h5py.Group):
             raise WriterStateError(f"{group_name} is not an indexed mode group")
-        labels_ds = group.get("frame_index")
+        labels_ds = local_hard_dataset(
+            group, "frame_index", role=f"{group_name}/frame_index",
+        )
         if not isinstance(labels_ds, h5py.Dataset):
             raise WriterStateError(f"{group_name} has no indexed frame_index")
         labels = [int(value) for value in np.asarray(labels_ds[()]).ravel()]
@@ -3151,7 +3262,9 @@ class NexusRecordWriter:
         if actual_row is not None:
             row_count = len(labels)
             for name in INTEGRATED_ROW_ALIGNED:
-                dataset = group.get(name)
+                dataset = local_hard_dataset(
+                    group, name, role=f"{group_name}/{name}",
+                )
                 if dataset is None:
                     if name == "sigma":
                         continue
@@ -3172,7 +3285,9 @@ class NexusRecordWriter:
                         f"{group_name}/{name} is not an appendable aligned stack"
                     )
             for name in INTEGRATED_ROW_ALIGNED:
-                dataset = group.get(name)
+                dataset = local_hard_dataset(
+                    group, name, role=f"{group_name}/{name}",
+                )
                 if not isinstance(dataset, h5py.Dataset):
                     continue
                 if actual_row + 1 < row_count:

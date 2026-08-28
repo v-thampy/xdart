@@ -42,6 +42,11 @@ __all__ = [
     "GI_MODE_KEYS_1D",
     "GI_MODE_KEYS_2D",
     "MODE_SUBGROUP_NAMES",
+    "canonical_gi_mode_key",
+    "local_hard_group",
+    "local_hard_group_path",
+    "local_hard_dataset",
+    "read_current_mode_layout",
     "mode_subgroup_name",
     "subgroup_mode_key",
     "resolve_mode_path",
@@ -97,6 +102,73 @@ def _local_group(parent, name: str):
         return value if isinstance(value, h5py.Group) else None
     except (KeyError, OSError, RuntimeError, TypeError, ValueError):
         return None
+
+
+def local_hard_group(parent, name: str, *, role: str | None = None):
+    """Return one optional local hard-linked group, refusing indirection.
+
+    ``None`` means the component is absent.  A present soft/external link, or
+    a hard-linked non-group, is malformed current generated output and raises.
+    This helper is deliberately for processed-result ownership only; raw
+    detector links (including Eiger ``ExternalLink`` image segments) are not
+    traversed through it.
+    """
+    shown = role or f"{getattr(parent, 'name', '<group>')}/{name}"
+    if type(name) is not str or not name or "/" in name or name in {".", ".."}:
+        raise ValueError(f"{shown} must be one exact group component")
+    try:
+        link = parent.get(name, getlink=True)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(f"cannot inspect generated result group {shown}") from error
+    if link is None:
+        return None
+    if type(link) is not h5py.HardLink:
+        raise ValueError(f"generated result group {shown} is not local hard storage")
+    try:
+        value = parent.get(name)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(f"cannot open generated result group {shown}") from error
+    if not isinstance(value, h5py.Group):
+        raise ValueError(f"generated result node {shown} is not a group")
+    return value
+
+
+def local_hard_group_path(parent, path: str, *, role: str | None = None):
+    """Resolve an optional generated-result path one local-hard component at a time."""
+    if type(path) is not str:
+        raise ValueError("generated result path must be exact text")
+    parts = tuple(path.split("/"))
+    if not parts or any(not part or part in {".", ".."} for part in parts):
+        raise ValueError(f"invalid generated result path {path!r}")
+    current = parent
+    for index, part in enumerate(parts):
+        current = local_hard_group(
+            current,
+            part,
+            role=(role if index == len(parts) - 1 else "/".join(parts[: index + 1])),
+        )
+        if current is None:
+            return None
+    return current
+
+
+def local_hard_dataset(parent, name: str, *, role: str | None = None):
+    """Return one optional local hard-linked generated-result dataset."""
+    shown = role or f"{getattr(parent, 'name', '<group>')}/{name}"
+    if type(name) is not str or not name or "/" in name or name in {".", ".."}:
+        raise ValueError(f"{shown} must be one exact dataset component")
+    try:
+        link = parent.get(name, getlink=True)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(f"cannot inspect generated result dataset {shown}") from error
+    if link is None:
+        return None
+    if type(link) is not h5py.HardLink:
+        raise ValueError(f"generated result dataset {shown} is not local hard storage")
+    value = parent.get(name)
+    if not isinstance(value, h5py.Dataset) or value.is_virtual or value.external:
+        raise ValueError(f"generated result node {shown} is not a local dataset")
+    return value
 
 
 def resolve_integrated_group(entry_grp, group_name: str):
@@ -227,6 +299,138 @@ MODE_SUBGROUP_NAMES: "Mapping[str, str]" = MappingProxyType(
 _SUBGROUP_TO_MODE: "Mapping[str, str]" = MappingProxyType(
     {v: k for k, v in MODE_SUBGROUP_NAMES.items()}
 )
+
+
+def canonical_gi_mode_key(
+    value,
+    dimension: str,
+    *,
+    allow_default: bool = True,
+) -> str:
+    """Return one exact canonical current mode key.
+
+    Enum-like producer values are accepted only through their exact ``.value``
+    string.  Arbitrary values are never stringified, and historical GUI keys
+    such as ``qtotal`` are intentionally not translated.
+    """
+    if dimension not in {"1d", "2d"}:
+        raise ValueError(f"unknown result dimension {dimension!r}")
+    raw = value if type(value) is str else getattr(value, "value", value)
+    if type(raw) is not str:
+        raise ValueError(f"{dimension} mode key requires exact text")
+    allowed = GI_MODE_KEYS_1D if dimension == "1d" else GI_MODE_KEYS_2D
+    if raw == DEFAULT_MODE_KEY:
+        if allow_default:
+            return raw
+        raise ValueError(f"named {dimension} result mode cannot be default")
+    if raw not in allowed:
+        raise ValueError(f"unknown canonical {dimension} mode key {raw!r}")
+    return raw
+
+
+def _exact_text_attr(group: h5py.Group, name: str) -> str:
+    try:
+        attr = group.attrs.get_id(name)
+        if attr.shape != ():
+            raise ValueError
+        value = group.attrs[name]
+        if isinstance(value, (bytes, np.bytes_)):
+            value = bytes(value).decode("utf-8", errors="strict")
+        if type(value) is not str or not value or len(value.encode("utf-8")) > 256:
+            raise ValueError
+        return value
+    except (KeyError, OSError, RuntimeError, TypeError, UnicodeDecodeError, ValueError) as error:
+        raise ValueError(f"{group.name}@{name} requires one bounded text scalar") from error
+
+
+def _exact_text_vector_attr(group: h5py.Group, name: str) -> tuple[str, ...]:
+    try:
+        attr = group.attrs.get_id(name)
+        value = group.attrs[name]
+        if attr.shape != np.asarray(value).shape or len(attr.shape) != 1:
+            raise ValueError
+        raw = np.asarray(value).tolist()
+        if not raw or len(raw) > len(GI_MODE_KEYS_1D | GI_MODE_KEYS_2D):
+            raise ValueError
+        decoded: list[str] = []
+        for item in raw:
+            if isinstance(item, (bytes, np.bytes_)):
+                item = bytes(item).decode("utf-8", errors="strict")
+            if type(item) is not str or not item or len(item.encode("utf-8")) > 256:
+                raise ValueError
+            decoded.append(item)
+        return tuple(decoded)
+    except (KeyError, OSError, RuntimeError, TypeError, UnicodeDecodeError, ValueError) as error:
+        raise ValueError(f"{group.name}@{name} requires a bounded 1-D text vector") from error
+
+
+def read_current_mode_layout(
+    group: h5py.Group,
+    dimension: str,
+) -> tuple[str, tuple[str, ...], tuple[tuple[str, h5py.Group], ...]]:
+    """Authenticate the complete current mode inventory for one result stack.
+
+    Returns ``(primary, ordered_modes, ordered_mode_groups)``.  An attr-free
+    stack is the standard ``default`` layout.  Named GI output must carry both
+    attrs, list the primary first, and own every declared child as a local hard
+    group; undeclared/unknown group siblings and indirect links are refused.
+    """
+    if not isinstance(group, h5py.Group):
+        raise ValueError("current result layout requires an HDF5 group")
+    allowed = GI_MODE_KEYS_1D if dimension == "1d" else GI_MODE_KEYS_2D
+    has_primary = PRIMARY_MODE_ATTR in group.attrs
+    has_modes = MULTI_RESULT_MODES_ATTR in group.attrs
+    if has_primary != has_modes:
+        raise ValueError(f"{group.name} has an incomplete current mode inventory")
+    if has_primary:
+        primary = canonical_gi_mode_key(
+            _exact_text_attr(group, PRIMARY_MODE_ATTR),
+            dimension,
+            allow_default=False,
+        )
+        modes = _exact_text_vector_attr(group, MULTI_RESULT_MODES_ATTR)
+        if (
+            modes[0] != primary
+            or len(modes) != len(set(modes))
+            or any(mode not in allowed for mode in modes)
+        ):
+            raise ValueError(f"{group.name} has a malformed current mode inventory")
+    else:
+        primary = DEFAULT_MODE_KEY
+        modes = (DEFAULT_MODE_KEY,)
+
+    expected_children = {
+        mode_subgroup_name(mode): mode
+        for mode in modes
+        if mode != primary
+    }
+    pairs: list[tuple[str, h5py.Group]] = [(primary, group)]
+    for name in group:
+        try:
+            link = group.get(name, getlink=True)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ValueError(f"cannot inspect generated result node {group.name}/{name}") from error
+        if type(link) is not h5py.HardLink:
+            raise ValueError(
+                f"generated result node {group.name}/{name} is not local hard storage"
+            )
+        node = group.get(name)
+        if isinstance(node, h5py.Group) and name not in expected_children:
+            raise ValueError(f"unrequested generated result sibling {group.name}/{name}")
+    for child_name, mode in expected_children.items():
+        child = local_hard_group(
+            group,
+            child_name,
+            role=f"{group.name}/{child_name}",
+        )
+        if child is None:
+            raise ValueError(f"missing declared result group {group.name}/{child_name}")
+        if any(child.id == owned.id for _key, owned in pairs):
+            raise ValueError(
+                f"declared result group {group.name}/{child_name} aliases another mode"
+            )
+        pairs.append((mode, child))
+    return primary, modes, tuple(pairs)
 
 
 def mode_subgroup_name(mode_key: str) -> str:

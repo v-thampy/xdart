@@ -36,14 +36,8 @@ from xrd_tools.core.physical_memory import (
 )
 from xrd_tools.io.read import _decode
 from xrd_tools.io.schema import (
-    GI_MODE_KEYS_1D,
-    GI_MODE_KEYS_2D,
     MONOTONIC_ATTR,
-    MULTI_RESULT_MODES_ATTR,
-    PRIMARY_MODE_ATTR,
     THUMBNAIL_LUT_ATTRS,
-    mode_subgroup_name,
-    resolve_integrated_group,
 )
 
 
@@ -3346,17 +3340,13 @@ class FrameViewReader:
         handle = self._h5
         if handle is None:
             raise RuntimeError("FrameViewReader has no open HDF handle")
-        entry = _required_direct_group(
-            handle, self.entry_name, role=f"/{self.entry_name}",
-        )
-        if entry is None:
-            raise KeyError(f"No {self.entry_name!r} group in {self.path}")
-        from xrd_tools.io.processed_scan_id import require_current_processed
-        require_current_processed(
+        from xrd_tools.io.processed_scan_id import require_current_processed_groups
+        processed = require_current_processed_groups(
             handle,
             self.entry_name,
             container=self.path,
         )
+        entry = processed.entry
         # N1: the project root the relative source paths point under (None on old
         # absolute-path files; harmless there).
         source_base = _bounded_text_attr(
@@ -3365,11 +3355,10 @@ class FrameViewReader:
             role=f"{entry.name} source base",
             max_bytes=_MAX_SOURCE_PATH_BYTES,
         )
-        # Recover an orphan __reint shadow left by a crash mid-swap (read-only
-        # adoption) so a reintegrate interrupted between del-canonical and
-        # move-shadow still opens on its complete result.
-        g1, _ = resolve_integrated_group(entry, "integrated_1d")
-        g2, _ = resolve_integrated_group(entry, "integrated_2d")
+        # Admission binds canonical-or-complete-shadow groups and the complete
+        # owned mode inventory once; downstream readers do not rediscover it.
+        g1 = processed.integrated_1d
+        g2 = processed.integrated_2d
         geom = _required_direct_group(
             entry,
             "per_frame_geometry",
@@ -3390,20 +3379,11 @@ class FrameViewReader:
             )
             scan_data_items = _scan_data_items(scan_data)
 
-            def primary_attr(group):
-                if group is None or PRIMARY_MODE_ATTR not in group.attrs:
-                    return DEFAULT_MODE_KEY
-                return str(_bounded_text_attr(
-                    group,
-                    PRIMARY_MODE_ATTR,
-                    role=f"{group.name} primary mode",
-                ))
-
-            primary_mode_1d = primary_attr(g1)
-            primary_mode_2d = primary_attr(g2)
+            primary_mode_1d = processed.primary_mode_1d
+            primary_mode_2d = processed.primary_mode_2d
             multi_result_modes = bool(
-                (g1 is not None and MULTI_RESULT_MODES_ATTR in g1.attrs)
-                or (g2 is not None and MULTI_RESULT_MODES_ATTR in g2.attrs)
+                primary_mode_1d != DEFAULT_MODE_KEY
+                or primary_mode_2d != DEFAULT_MODE_KEY
             )
             g1_modes: dict[str, h5py.Group] = {}
             g2_modes: dict[str, h5py.Group] = {}
@@ -3508,32 +3488,10 @@ class FrameViewReader:
                     cu,
                 )
 
-            if g1 is not None:
-                register_1d(primary_mode_1d, g1)
-                for key in GI_MODE_KEYS_1D:
-                    if key == primary_mode_1d:
-                        continue
-                    child_name = mode_subgroup_name(key)
-                    child = _required_direct_group(
-                        g1,
-                        child_name,
-                        role=f"{g1.name}/{child_name}",
-                    )
-                    if child is not None:
-                        register_1d(key, child)
-            if g2 is not None:
-                register_2d(primary_mode_2d, g2)
-                for key in GI_MODE_KEYS_2D:
-                    if key == primary_mode_2d:
-                        continue
-                    child_name = mode_subgroup_name(key)
-                    child = _required_direct_group(
-                        g2,
-                        child_name,
-                        role=f"{g2.name}/{child_name}",
-                    )
-                    if child is not None:
-                        register_2d(key, child)
+            for key, group in processed.mode_groups_1d:
+                register_1d(key, group)
+            for key, group in processed.mode_groups_2d:
+                register_2d(key, group)
 
             axis_1d = axis_1d_modes.get(primary_mode_1d)
             axis_2d_x = axis_2d_x_modes.get(primary_mode_2d)

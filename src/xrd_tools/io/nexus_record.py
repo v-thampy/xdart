@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging, hashlib, json, re, struct
 import os
+from collections.abc import Mapping
 from pathlib import Path
 import uuid
 
@@ -45,6 +46,7 @@ from xrd_tools.io.schema import (
     INTEGRATED_ROW_ALIGNED,
     SOURCE_BASE_ATTR,
     THUMBNAIL_LUT_ATTRS,
+    canonical_gi_mode_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,8 +72,6 @@ __all__ = [
     "write_background_dependency", "read_background_dependency",
     "write_average_finite_counts",
     "drop_integrated_rows",
-    "legacy_to_canonical_1d",
-    "legacy_to_canonical_2d",
     "frame_record_from_live_frame",
     "frame_record_from_reduction",
     "merge_frame_records",
@@ -132,57 +132,47 @@ def write_average_finite_counts(entry_grp: h5py.Group, counts) -> h5py.Dataset:
         "finite_counts_zero_count", np.uint64(evidence.zero_count), dtype="<u8",
     )
     return dataset
-# Legacy GUI dict keys (``LiveFrame.gi_1d`` / ``gi_2d``) -> canonical on-disk
-# mode keys (the same vocabulary as GI*Mode.value and FrameEvent.mode_key).
-_LEGACY_TO_CANONICAL_1D = {
-    "qtotal": "q_total",
-    "qip": "q_ip",
-    "qoop": "q_oop",
-    "exit": "exit_angle",
-    "chigi": "chi_gi",
-}
-_LEGACY_TO_CANONICAL_2D = {
-    "gi2d": "qip_qoop",
-    "polar": "q_chi",
-    "exit2d": "exit_angles",
-}
-
-
-def legacy_to_canonical_1d(key: str) -> str:
-    return _LEGACY_TO_CANONICAL_1D.get(str(key), str(key))
-
-
-def legacy_to_canonical_2d(key: str) -> str:
-    return _LEGACY_TO_CANONICAL_2D.get(str(key), str(key))
-
-
-def _mode_or_default(mode) -> str:
+def _mode_or_default(mode, dimension: str) -> str:
     if mode is None:
         return DEFAULT_MODE_KEY
-    return str(getattr(mode, "value", mode) or DEFAULT_MODE_KEY)
+    return canonical_gi_mode_key(mode, dimension)
 
 
-def _resolve_active_mode(passed, modes, active_result):
-    if active_result is not None:
-        for mode, result in modes.items():
-            if result is active_result:
-                return mode
-    passed = None if passed is None else str(passed)
-    if passed is not None and passed in modes:
-        return passed
-    return next(iter(modes), DEFAULT_MODE_KEY)
+def _owned_result_modes(raw_modes, active_mode, active_result, dimension: str):
+    """Bind result names only from the producer's canonical result mapping."""
+    if not isinstance(raw_modes, Mapping):
+        raise ValueError(f"{dimension} result modes require an exact mapping")
+    modes: dict[str, object] = {}
+    for raw_mode, result in raw_modes.items():
+        mode = canonical_gi_mode_key(raw_mode, dimension, allow_default=False)
+        if mode in modes:
+            raise ValueError(f"duplicate canonical {dimension} result mode {mode!r}")
+        modes[mode] = result
 
-
-def _with_active_result(modes: dict[str, object], active_mode, active_result) -> dict:
-    """Ensure the live frame's active result survives partial GI mode maps."""
-    if active_result is None:
-        return modes
-    if any(result is active_result for result in modes.values()):
-        return modes
-    active = _mode_or_default(active_mode)
-    if active == DEFAULT_MODE_KEY and modes:
-        return modes
-    return {**modes, active: active_result}
+    selected = None if active_mode is None else canonical_gi_mode_key(
+        active_mode,
+        dimension,
+    )
+    if not modes:
+        if selected not in (None, DEFAULT_MODE_KEY):
+            raise ValueError(
+                f"active {dimension} selector {selected!r} has no owned result"
+            )
+        return (
+            {} if active_result is None else {DEFAULT_MODE_KEY: active_result},
+            DEFAULT_MODE_KEY,
+        )
+    if selected is not None and selected not in modes:
+        raise ValueError(
+            f"active {dimension} selector {selected!r} has no owned result"
+        )
+    owners = [mode for mode, result in modes.items() if result is active_result]
+    if active_result is not None and not owners:
+        raise ValueError(f"active {dimension} result is absent from its mode mapping")
+    if len(owners) > 1:
+        raise ValueError(f"active {dimension} result has multiple mode owners")
+    active = owners[0] if owners else (selected or next(iter(modes)))
+    return modes, active
 
 
 def frame_record_from_live_frame(
@@ -197,9 +187,10 @@ def frame_record_from_live_frame(
     """Build the durable multi-mode :class:`FrameRecord` for a LiveFrame-like
     object.
 
-    This is the shared GUI writer/display adapter for ADR-0003: legacy
-    ``gi_1d``/``gi_2d`` keys are normalized here, while non-GI or single-result
-    frames collapse to one active/default mode.
+    This is the shared GUI writer/display adapter for current output.  GI maps
+    must already use canonical keys; the maps own result names.  An empty map
+    collapses an unnamed result to ``default`` and a named selector cannot
+    manufacture an otherwise-unowned result.
     """
     metadata_raw = dict(getattr(frame, "scan_info", None) or {})
     metadata_num = numeric_metadata(metadata_raw)
@@ -231,22 +222,17 @@ def frame_record_from_live_frame(
 
     gi_1d = getattr(frame, "gi_1d", None) or {}
     gi_2d = (getattr(frame, "gi_2d", None) or {}) if include_2d else {}
-    if not gi_1d and not gi_2d:
-        return FrameRecord.from_view(
-            view,
-            mode_1d=_mode_or_default(active_mode_1d),
-            mode_2d=_mode_or_default(active_mode_2d),
-        )
-
-    modes_1d = _with_active_result(
-        {legacy_to_canonical_1d(k): r for k, r in gi_1d.items()},
+    modes_1d, active_1d = _owned_result_modes(
+        gi_1d,
         active_mode_1d,
         result_1d,
+        "1d",
     )
-    modes_2d = _with_active_result(
-        {legacy_to_canonical_2d(k): r for k, r in gi_2d.items()},
+    modes_2d, active_2d = _owned_result_modes(
+        gi_2d,
         active_mode_2d,
         result_2d,
+        "2d",
     )
     results_1d = {
         m: FrameView.from_results(
@@ -268,8 +254,6 @@ def frame_record_from_live_frame(
         )
         for m, r in modes_2d.items()
     }
-    active_1d = _resolve_active_mode(active_mode_1d, modes_1d, result_1d)
-    active_2d = _resolve_active_mode(active_mode_2d, modes_2d, result_2d)
     return FrameRecord(
         label=view.label,
         results_1d=results_1d,
@@ -301,8 +285,14 @@ def frame_record_from_reduction(
     )
     return FrameRecord.from_view(
         view,
-        mode_1d=_mode_or_default(mode_1d),
-        mode_2d=_mode_or_default(mode_2d),
+        mode_1d=_mode_or_default(
+            mode_1d if mode_1d is not None else getattr(reduction, "mode_1d", None),
+            "1d",
+        ),
+        mode_2d=_mode_or_default(
+            mode_2d if mode_2d is not None else getattr(reduction, "mode_2d", None),
+            "2d",
+        ),
     )
 
 

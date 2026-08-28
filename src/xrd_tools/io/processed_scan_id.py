@@ -33,11 +33,15 @@ from h5py._hl.dataset import Dataset as _H5Dataset
 from h5py._hl.group import Group as _H5Group
 
 from xrd_tools.io.schema import (
+    DEFAULT_MODE_KEY,
+    MULTI_RESULT_MODES_ATTR,
+    PRIMARY_MODE_ATTR,
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     REINTEGRATE_SHADOW_SUFFIX,
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
+    read_current_mode_layout,
     resolve_integrated_group,
 )
 
@@ -81,6 +85,26 @@ class CurrentProcessedGroups:
     entry: h5py.Group
     integrated_1d: h5py.Group | None
     integrated_2d: h5py.Group | None
+    primary_mode_1d: str
+    primary_mode_2d: str
+    mode_groups_1d: tuple[tuple[str, h5py.Group], ...]
+    mode_groups_2d: tuple[tuple[str, h5py.Group], ...]
+
+    @property
+    def modes_1d(self) -> tuple[str, ...]:
+        return tuple(mode for mode, _group in self.mode_groups_1d)
+
+    @property
+    def modes_2d(self) -> tuple[str, ...]:
+        return tuple(mode for mode, _group in self.mode_groups_2d)
+
+    def mode_group(self, dimension: str, mode: str) -> h5py.Group | None:
+        pairs = (
+            self.mode_groups_1d if dimension == "1d"
+            else self.mode_groups_2d if dimension == "2d"
+            else ()
+        )
+        return next((group for key, group in pairs if key == mode), None)
 
 
 def has_processed_output_markers_entry(entry: h5py.Group) -> bool:
@@ -293,6 +317,26 @@ def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
         return False
 
 
+def _valid_current_result_leaf(group: h5py.Group, name: str) -> bool:
+    """Qualify one owned result leaf, including its complete local graph."""
+    if not _valid_current_result_group(group, name):
+        return False
+    if (
+        PRIMARY_MODE_ATTR in group.attrs
+        or MULTI_RESULT_MODES_ATTR in group.attrs
+    ):
+        return False
+    try:
+        for child_name in group:
+            if type(group.get(child_name, getlink=True)) is not h5py.HardLink:
+                return False
+            if isinstance(group.get(child_name), h5py.Group):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _qualified_current_processed_entry(
     entry: h5py.Group,
     *,
@@ -306,6 +350,14 @@ def _qualified_current_processed_entry(
         ):
             return None
         groups: dict[str, h5py.Group | None] = {}
+        primaries = {
+            "integrated_1d": DEFAULT_MODE_KEY,
+            "integrated_2d": DEFAULT_MODE_KEY,
+        }
+        mode_groups: dict[str, tuple[tuple[str, h5py.Group], ...]] = {
+            "integrated_1d": (),
+            "integrated_2d": (),
+        }
         present = False
         for name in _PROCESSED_RESULT_GROUPS:
             canonical_present = entry.get(name, getlink=True) is not None
@@ -320,6 +372,19 @@ def _qualified_current_processed_entry(
                 or not _valid_current_result_group(group, name)
             ):
                 return None
+            if isinstance(group, h5py.Group):
+                dimension = "1d" if name == "integrated_1d" else "2d"
+                primary, _modes, pairs = read_current_mode_layout(
+                    group,
+                    dimension,
+                )
+                if any(
+                    mode != primary and not _valid_current_result_leaf(child, name)
+                    for mode, child in pairs
+                ):
+                    return None
+                primaries[name] = primary
+                mode_groups[name] = pairs
             groups[name] = group if isinstance(group, h5py.Group) else None
         if (
             _attr_str(entry.attrs.get(SCHEMA_NAME_ATTR))
@@ -333,6 +398,10 @@ def _qualified_current_processed_entry(
             entry=entry,
             integrated_1d=groups["integrated_1d"],
             integrated_2d=groups["integrated_2d"],
+            primary_mode_1d=primaries["integrated_1d"],
+            primary_mode_2d=primaries["integrated_2d"],
+            mode_groups_1d=mode_groups["integrated_1d"],
+            mode_groups_2d=mode_groups["integrated_2d"],
         )
     except Exception:
         logger.debug(

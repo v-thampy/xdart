@@ -14,15 +14,10 @@ from typing import Any, Callable, Iterable, Mapping
 import h5py
 import numpy as np
 from .schema import (
-    ACCEPTED_SCHEMA_NAMES,
-    DEFAULT_MODE_KEY,
-    GI_MODE_KEYS_1D, GI_MODE_KEYS_2D,
-    MODE_SUBGROUP_NAMES,
-    PRIMARY_MODE_ATTR,
-    PROCESSED_SCHEMA_VERSION,
-    SCHEMA_NAME_ATTR,
-    SCHEMA_VERSION_ATTR,
     SOURCE_BASE_ATTR,
+    canonical_gi_mode_key,
+    local_hard_dataset,
+    local_hard_group_path,
 )
 LINEAGE_DATASET = "append_lineage"
 LINEAGE_VERSION = 1
@@ -625,38 +620,27 @@ def _decode(value: Any) -> Any:
     if isinstance(value, np.generic): value = value.item()
     return value.decode("utf-8", errors="strict") if isinstance(value, bytes) else value
 
-def _mode_group(entry: h5py.Group, mode: str) -> h5py.Group:
+def _mode_group(processed, mode: str) -> h5py.Group:
     try:
         dimension, mode_key = mode.split(":", 1)
     except ValueError as exc:
         raise ValueError(f"malformed Append mode {mode!r}") from exc
     if dimension not in {"1d", "2d"}:
         raise ValueError(f"unknown Append dimension {dimension!r}")
-    allowed = GI_MODE_KEYS_1D if dimension == "1d" else GI_MODE_KEYS_2D
-    top_name = f"integrated_{dimension}"
-    top = entry.get(top_name)
-    if not isinstance(top, h5py.Group):
-        raise ValueError(f"missing {top_name} group")
-    primary = _decode(top.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY))
-    if type(primary) is not str or (primary != DEFAULT_MODE_KEY and primary not in allowed): raise ValueError("Append primary mode requires exact supported text")
-    if mode_key == primary:
-        return top
-    if primary == DEFAULT_MODE_KEY or mode_key not in allowed: raise ValueError(f"unknown {dimension} mode key {mode_key!r}")
-    try:
-        subgroup = MODE_SUBGROUP_NAMES[mode_key]
-    except KeyError as exc:
-        raise ValueError(f"unknown Append mode key {mode_key!r}") from exc
-    group = top.get(subgroup)
+    mode_key = canonical_gi_mode_key(mode_key, dimension)
+    group = processed.mode_group(dimension, mode_key)
     if not isinstance(group, h5py.Group):
-        raise ValueError(f"missing persisted mode group {top_name}/{subgroup}")
+        raise ValueError(f"missing persisted mode group {dimension}:{mode_key}")
     return group
 
-def _disk_labels(entry: h5py.Group, modes: tuple[str, ...]) -> tuple[int, ...]:
+def _disk_labels(processed, modes: tuple[str, ...]) -> tuple[int, ...]:
     selected: tuple[int, ...] | None = None
     for mode in modes:
-        group = _mode_group(entry, mode)
-        dataset = group.get("frame_index")
-        if not isinstance(dataset, h5py.Dataset) or dataset.ndim != 1:
+        group = _mode_group(processed, mode)
+        dataset = local_hard_dataset(
+            group, "frame_index", role=f"{group.name}/frame_index",
+        )
+        if dataset is None or dataset.ndim != 1:
             raise ValueError(f"{group.name}/frame_index is not a rank-1 dataset")
         if dataset.dtype.kind not in "iu":
             raise ValueError(f"{group.name}/frame_index is not integral")
@@ -669,7 +653,18 @@ def _disk_labels(entry: h5py.Group, modes: tuple[str, ...]) -> tuple[int, ...]:
     return selected or ()
 
 def _read_lineage(entry: h5py.Group) -> dict[str, Any]:
-    dataset = entry.get(f"reduction/config/{LINEAGE_DATASET}")
+    config = local_hard_group_path(
+        entry, "reduction/config", role="reduction/config",
+    )
+    dataset = (
+        None
+        if config is None
+        else local_hard_dataset(
+            config,
+            LINEAGE_DATASET,
+            role=f"reduction/config/{LINEAGE_DATASET}",
+        )
+    )
     if not isinstance(dataset, h5py.Dataset) or dataset.shape != ():
         raise ValueError("missing or malformed committed Append lineage")
     raw = _decode(dataset[()])
@@ -938,14 +933,10 @@ def _lineage_labels(lineage: Mapping[str, Any]) -> tuple[int, ...]:
 def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -> AppendCommittedPrefix:
     if not isinstance(handle, h5py.File) or not handle.id.valid:
         raise TypeError("committed Append prefix requires an open h5py.File")
-    group = handle.get(entry)
-    if not isinstance(group, h5py.Group):
-        raise ValueError(f"foreign or missing entry {entry!r}")
-    schema_name, schema_version, source_base = (_decode(group.attrs.get(key, default)) for key, default in ((SCHEMA_NAME_ATTR, ""), (SCHEMA_VERSION_ATTR, -1), (SOURCE_BASE_ATTR, "")))
-    if type(schema_name) is not str or schema_name not in ACCEPTED_SCHEMA_NAMES:
-        raise ValueError("foreign processed schema identity")
-    if type(schema_version) is not int or schema_version != PROCESSED_SCHEMA_VERSION:
-        raise ValueError("foreign processed schema version")
+    from xrd_tools.io.processed_scan_id import require_current_processed_groups
+    processed = require_current_processed_groups(handle, entry)
+    group = processed.entry
+    source_base = _decode(group.attrs.get(SOURCE_BASE_ATTR, ""))
     if type(source_base) is not str: raise ValueError("processed source base requires exact decoded text")
     stored_base = _normalize_base(source_base)
     lineage = _read_lineage(group)
@@ -962,7 +953,7 @@ def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -
     if not isinstance(epochs, list) or not epochs:
         raise ValueError("existing target has no committed Append epoch")
     labels = _lineage_labels(lineage)
-    if _disk_labels(group, tuple(modes)) != labels:
+    if _disk_labels(processed, tuple(modes)) != labels:
         raise ValueError("disk rows do not match exact committed lineage")
     source = _source_from_dict(epochs[-1]["source"])
     intent = AppendIntent(

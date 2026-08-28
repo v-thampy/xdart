@@ -55,16 +55,7 @@ from xrd_tools.core.scan import ScanFrame
 # 2c: the convenience readers consume the declared layout — group and
 # dataset names come from the schema, so writer/reader drift is
 # impossible by construction.
-from xrd_tools.io.schema import SCHEMA, resolve_integrated_group
-
-
-def _group_or_shadow(grp, name: str):
-    """Resolve ``name`` under ``grp``, adopting an orphan ``__reint`` shadow for
-    the integrated groups when a crash left the file mid-swap (read-only)."""
-    if name in ("integrated_1d", "integrated_2d"):
-        g, _ = resolve_integrated_group(grp, name)
-        return g
-    return grp.get(name)
+from xrd_tools.io.schema import SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +91,13 @@ Integrated2D = namedtuple(
 # internal helpers
 # ---------------------------------------------------------------------------
 
-def _entry(f: h5py.File, entry: str) -> h5py.Group:
+def _processed(f: h5py.File, entry: str, *, container=None):
     from xrd_tools.io.processed_scan_id import require_current_processed_groups
-    return require_current_processed_groups(f, entry).entry
+    return require_current_processed_groups(f, entry, container=container)
+
+
+def _entry(f: h5py.File, entry: str) -> h5py.Group:
+    return _processed(f, entry).entry
 
 
 def _decode(v):
@@ -118,7 +113,7 @@ def _dataset_values(ds: h5py.Dataset) -> np.ndarray:
     return arr
 
 
-def _frame_index(grp: h5py.Group, prefer: str | None = None) -> np.ndarray:
+def _frame_index(processed, prefer: str | None = None) -> np.ndarray:
     """Return the frame-label array for an entry.
 
     ``prefer`` names the group whose ``frame_index`` to use first — pass
@@ -133,17 +128,22 @@ def _frame_index(grp: h5py.Group, prefer: str | None = None) -> np.ndarray:
     if prefer is not None:
         order = (prefer,) + tuple(n for n in order if n != prefer)
     for name in order:
-        g = _group_or_shadow(grp, name)
+        g = (
+            processed.integrated_1d if name == "integrated_1d"
+            else processed.integrated_2d if name == "integrated_2d"
+            else processed.entry.get(name)
+        )
         if g is not None and "frame_index" in g:
             return np.asarray(g["frame_index"][()])
     raise KeyError("No frame_index found (integrated_1d/2d/per_frame_geometry)")
 
 
-def _all_frame_index(grp: h5py.Group) -> np.ndarray:
+def _all_frame_index(processed) -> np.ndarray:
     """Return the union of labels with reduced data or raw-source groups."""
     labels: set[int] = set()
-    if "frames" in grp:
-        for name in grp["frames"]:
+    entry = processed.entry
+    if "frames" in entry:
+        for name in entry["frames"]:
             if not name.startswith("frame_"):
                 continue
             try:
@@ -151,12 +151,16 @@ def _all_frame_index(grp: h5py.Group) -> np.ndarray:
             except ValueError:
                 continue
     for name in ("integrated_1d", "integrated_2d"):
-        g = _group_or_shadow(grp, name)
+        g = (
+            processed.integrated_1d
+            if name == "integrated_1d"
+            else processed.integrated_2d
+        )
         if g is not None and "frame_index" in g:
             labels.update(int(x) for x in np.asarray(g["frame_index"][()]).ravel())
     if labels:
         return np.asarray(sorted(labels), dtype=np.int64)
-    return _frame_index(grp)
+    return _frame_index(processed)
 
 
 def _scan_data_for_frames(
@@ -270,8 +274,11 @@ def get_frames(
 ) -> np.ndarray:
     """Return the array of frame labels present in ``scan_file``."""
     with h5py.File(Path(scan_file), "r") as f:
-        e = _entry(f, entry)
-        return _all_frame_index(e) if union else _frame_index(e)
+        processed = _processed(f, entry, container=Path(scan_file))
+        return (
+            _all_frame_index(processed)
+            if union else _frame_index(processed)
+        )
 
 
 def get_average_finite_counts(
@@ -460,12 +467,12 @@ def get_1d(
     spec = SCHEMA.groups["integrated_1d"]
     (q_name,) = spec.axes
     with h5py.File(Path(scan_file), "r") as f:
-        e = _entry(f, entry)
-        g = _group_or_shadow(e, spec.name)
+        processed = _processed(f, entry, container=Path(scan_file))
+        g = processed.integrated_1d
         if g is None:
             raise KeyError(f"{scan_file} has no {spec.name} group")
         positions, frames, single = _resolve_positions(
-            _frame_index(e, prefer=spec.name), frame)
+            np.asarray(g["frame_index"][()]), frame)
 
         q = np.asarray(g[q_name][()])
         q_unit = (_decode(g[q_name].attrs.get("units"))
@@ -495,12 +502,12 @@ def get_2d(
     spec = SCHEMA.groups["integrated_2d"]
     q_name, chi_name = spec.axes
     with h5py.File(Path(scan_file), "r") as f:
-        e = _entry(f, entry)
-        g = _group_or_shadow(e, spec.name)
+        processed = _processed(f, entry, container=Path(scan_file))
+        g = processed.integrated_2d
         if g is None:
             raise KeyError(f"{scan_file} has no {spec.name} group")
         positions, frames, single = _resolve_positions(
-            _frame_index(e, prefer=spec.name), frame)
+            np.asarray(g["frame_index"][()]), frame)
 
         q = np.asarray(g[q_name][()])
         chi = np.asarray(g[chi_name][()])

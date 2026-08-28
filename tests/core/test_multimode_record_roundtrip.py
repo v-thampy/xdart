@@ -5,7 +5,7 @@ through ``write_frame_records``, reload via ``read_frame_records``, and assert
 each ``(frame, mode)`` is byte-equivalent — the multi-mode reload-equivalence
 gate.  Also pins: the nested-subgroup NXdata contract, the reader mode-selection
 rule, the per-scan mode attrs, the byte-compat collapse for standard scans, the
-old-file (no attrs) back-compat read, and the ``FrameView -> IntegrationResult``
+current attr-free Standard layout, and the ``FrameView -> IntegrationResult``
 transpose round-trip.
 """
 
@@ -34,6 +34,12 @@ from xrd_tools.io import (
     read_frame_view,
     write_frame_records,
     write_integrated_stack,
+)
+from xrd_tools.io.schema import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    SCHEMA_NAME_ATTR,
+    SCHEMA_VERSION_ATTR,
 )
 
 
@@ -73,7 +79,11 @@ def _multimode_records(n=3):
 
 def _write(entry_path, records):
     with h5py.File(entry_path, "w") as f:
-        write_frame_records(f.create_group("entry"), records)
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+        write_frame_records(entry, records)
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +92,7 @@ def _write(entry_path, records):
 
 def test_multimode_reload_equivalence(tmp_path):
     records = _multimode_records(3)
-    p = str(tmp_path / "mm.nxs")
+    p = str(tmp_path / "mm.nexus")
     _write(p, records)
 
     reloaded = read_frame_records(p)
@@ -104,7 +114,7 @@ def test_partial_extra_mode_rows_roundtrip(tmp_path):
                 make_active=False,
             )
         records.append(rec)
-    p = str(tmp_path / "partial_extra.nxs")
+    p = str(tmp_path / "partial_extra.nexus")
     _write(p, records)
 
     reloaded = read_frame_records(p)
@@ -118,7 +128,7 @@ def test_partial_extra_mode_rows_roundtrip(tmp_path):
 
 
 def test_nested_subgroup_nxdata_contract(tmp_path):
-    p = str(tmp_path / "mm.nxs")
+    p = str(tmp_path / "mm.nexus")
     _write(p, _multimode_records(2))
     with h5py.File(p, "r") as f:
         for grp_path in (
@@ -148,7 +158,7 @@ def test_frozen_validators_accept_each_group_standalone(tmp_path):
 
 
 def test_reader_mode_selection_rule(tmp_path):
-    p = str(tmp_path / "mm.nxs")
+    p = str(tmp_path / "mm.nexus")
     _write(p, _multimode_records(2))
     with FrameViewReader(p) as rd:
         assert rd.is_multi_mode() is True
@@ -167,7 +177,7 @@ def test_reader_mode_selection_rule(tmp_path):
 
 
 def test_mode_attrs_present_and_ordered(tmp_path):
-    p = str(tmp_path / "mm.nxs")
+    p = str(tmp_path / "mm.nexus")
     _write(p, _multimode_records(2))
     with h5py.File(p, "r") as f:
         g1 = f["entry/integrated_1d"]
@@ -195,7 +205,7 @@ def test_transpose_roundtrip():
 
 
 # --------------------------------------------------------------------------- #
-# byte-compat: standard / single-mode collapse + old-file back-compat
+# current Standard / single-mode collapse
 # --------------------------------------------------------------------------- #
 
 def test_standard_record_collapse_is_byte_identical(tmp_path):
@@ -205,12 +215,16 @@ def test_standard_record_collapse_is_byte_identical(tmp_path):
     from tests.core.h5sig import h5_content_signature
 
     std = [FrameRecord.from_view(_view(fi, 1.0)) for fi in range(2)]  # default mode
-    pa = str(tmp_path / "a.nxs")
-    pb = str(tmp_path / "b.nxs")
+    pa = str(tmp_path / "a.nexus")
+    pb = str(tmp_path / "b.nexus")
     _write(pa, std)
     with h5py.File(pb, "w") as f:
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
         write_integrated_stack(
-            f.create_group("entry"), frame_indices=[0, 1],
+            entry, frame_indices=[0, 1],
             results_1d=[view_to_result_1d(_view(fi, 1.0)) for fi in range(2)],
             results_2d=[view_to_result_2d(_view(fi, 1.0)) for fi in range(2)],
         )
@@ -223,13 +237,16 @@ def test_standard_record_collapse_is_byte_identical(tmp_path):
                        for v in f["entry/integrated_1d"].values())
 
 
-def test_old_single_mode_file_back_compat(tmp_path):
-    """A legacy file (plain write_integrated_stack, no new kwargs) reads as a
-    single DEFAULT-mode record == FrameRecord.from_view(read_frame_view)."""
-    p = str(tmp_path / "legacy.nxs")
+def test_current_standard_single_mode_uses_default_layout(tmp_path):
+    """Current attr-free Standard output reads as one DEFAULT-mode record."""
+    p = str(tmp_path / "standard.nexus")
     with h5py.File(p, "w") as f:
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
         write_integrated_stack(
-            f.create_group("entry"), frame_indices=[0, 1],
+            entry, frame_indices=[0, 1],
             results_1d=[view_to_result_1d(_view(fi, 1.0)) for fi in range(2)],
             results_2d=[view_to_result_2d(_view(fi, 1.0)) for fi in range(2)],
         )
@@ -251,7 +268,7 @@ def test_extra_mode_colliding_with_primary_is_rejected(tmp_path):
     same key at two locations (top-level + subgroup) → silent loss; reject."""
     r1 = [view_to_result_1d(_view(fi, 1.0)) for fi in range(2)]
     r1b = [view_to_result_1d(_view(fi, 9.0, nq=7, x1="qoop_A^-1")) for fi in range(2)]
-    p = str(tmp_path / "x.nxs")
+    p = str(tmp_path / "x.nexus")
     with h5py.File(p, "w") as f:
         with pytest.raises(ValueError, match="must not also appear"):
             write_integrated_stack(
@@ -266,7 +283,7 @@ def test_extras_require_named_primary(tmp_path):
     without its capability marker (is_multi_mode would lie); reject."""
     r1 = [view_to_result_1d(_view(fi, 1.0)) for fi in range(2)]
     r1b = [view_to_result_1d(_view(fi, 9.0, nq=7, x1="qoop_A^-1")) for fi in range(2)]
-    p = str(tmp_path / "x.nxs")
+    p = str(tmp_path / "x.nexus")
     with h5py.File(p, "w") as f:
         with pytest.raises(ValueError, match="named primary_mode_1d"):
             write_integrated_stack(
@@ -283,25 +300,22 @@ def test_partial_mode_set_rejected_with_clear_error(tmp_path):
     only_2d = FrameRecord(
         label=1, results_2d=dict(full.results_2d), active_mode_2d="qip_qoop",
     )  # frame 1 has no 1D results while frame 0 does
-    p = str(tmp_path / "x.nxs")
+    p = str(tmp_path / "x.nexus")
     with h5py.File(p, "w") as f:
         with pytest.raises(ValueError, match="no 1D results"):
             write_frame_records(f.create_group("entry"), [full, only_2d])
 
 
-def test_reader_skips_unreadable_child_mode(tmp_path):
-    """P3-A/P3-B: a registered subgroup missing its intensity is neither
-    advertised in modes_1d() nor crashes read_record (foreign-file robustness)."""
-    p = str(tmp_path / "mm.nxs")
+def test_reader_rejects_unreadable_declared_child_mode(tmp_path):
+    """A malformed declared result invalidates the complete current artifact."""
+    p = str(tmp_path / "mm.nexus")
     _write(p, _multimode_records(2))
     # hand-corrupt: drop the q_oop child's intensity dataset
     with h5py.File(p, "r+") as f:
         del f["entry/integrated_1d/q_oop/intensity"]
-    with FrameViewReader(p) as rd:
-        assert "q_oop" not in rd.modes_1d()       # not advertised
-        rec = rd.read_record(0)                    # must not crash
-        assert "q_oop" not in rec.results_1d
-        assert "q_total" in rec.results_1d         # primary still readable
+    with pytest.raises(ValueError, match="not a current xdart"):
+        with FrameViewReader(p):
+            pass
 
 
 def test_single_named_gi_mode_persists_active_mode(tmp_path):
@@ -309,7 +323,7 @@ def test_single_named_gi_mode_persists_active_mode(tmp_path):
     active mode round-trips (additive on GI files; non-GI stays byte-clean)."""
     recs = [FrameRecord.from_view(_view(fi, 1.0), mode_1d="q_total",
                                   mode_2d="qip_qoop") for fi in range(2)]
-    p = str(tmp_path / "single_gi.nxs")
+    p = str(tmp_path / "single_gi.nexus")
     _write(p, recs)
     with h5py.File(p, "r") as f:
         assert f["entry/integrated_1d"].attrs["primary_mode"] == "q_total"

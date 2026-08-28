@@ -29,8 +29,6 @@ from xrd_tools.core import (
 )
 from xrd_tools.io.nexus_record import (
     frame_record_from_live_frame as _shared_frame_record_from_live_frame,
-    legacy_to_canonical_1d,
-    legacy_to_canonical_2d,
 )
 
 logger = logging.getLogger(__name__)
@@ -2021,8 +2019,6 @@ __all__ = [
     "FramePublication",
     "PublicationDiagnostics",
     "PublicationStore",
-    "legacy_to_canonical_1d",
-    "legacy_to_canonical_2d",
     "publication_from_frame_view",
     "publication_from_live_frame",
     "publication_from_nexus_frame",

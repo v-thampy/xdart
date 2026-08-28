@@ -73,7 +73,11 @@ from xrd_tools.io.schema import (
     SCHEMA,
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
+    canonical_gi_mode_key,
+    local_hard_dataset,
+    local_hard_group_path,
     mode_subgroup_name,
+    read_current_mode_layout,
 )
 from xrd_tools.transforms import energy_to_wavelength
 
@@ -2284,7 +2288,25 @@ def validate_integrated_stack_write(
         if len(results_1d) != len(fis):
             raise ValueError("results_1d length must match frame_indices")
         _require_uniform_axes_1d(results_1d)
-        g = entry_grp.get(group_name_1d)
+        g = local_hard_group_path(
+            entry_grp,
+            group_name_1d,
+            role=group_name_1d,
+        )
+        if g is not None:
+            for dataset_name in ("frame_index", "intensity", "q"):
+                if local_hard_dataset(
+                    g,
+                    dataset_name,
+                    role=f"{group_name_1d}/{dataset_name}",
+                ) is None:
+                    raise ValueError(
+                        f"{group_name_1d}/{dataset_name} is missing"
+                    )
+            if g.get("sigma", getlink=True) is not None:
+                local_hard_dataset(
+                    g, "sigma", role=f"{group_name_1d}/sigma",
+                )
         if g is not None and (
             g["intensity"].shape[1] != np.asarray(results_1d[0].intensity).shape[0]
             or not _axes_match_1d(g, results_1d[0])
@@ -2300,7 +2322,25 @@ def validate_integrated_stack_write(
         if len(results_2d) != len(fis):
             raise ValueError("results_2d length must match frame_indices")
         _require_uniform_axes_2d(results_2d)
-        g = entry_grp.get(group_name_2d)
+        g = local_hard_group_path(
+            entry_grp,
+            group_name_2d,
+            role=group_name_2d,
+        )
+        if g is not None:
+            for dataset_name in ("frame_index", "intensity", "q", "chi"):
+                if local_hard_dataset(
+                    g,
+                    dataset_name,
+                    role=f"{group_name_2d}/{dataset_name}",
+                ) is None:
+                    raise ValueError(
+                        f"{group_name_2d}/{dataset_name} is missing"
+                    )
+            if g.get("sigma", getlink=True) is not None:
+                local_hard_dataset(
+                    g, "sigma", role=f"{group_name_2d}/sigma",
+                )
         new_2d_shape = np.asarray(results_2d[0].intensity).T.shape
         if g is not None and (
             tuple(g["intensity"].shape[1:]) != new_2d_shape
@@ -2314,6 +2354,175 @@ def validate_integrated_stack_write(
             _require_batch_covers_existing(g, group_name_2d, fis)
 
     return fis
+
+
+def _freeze_integrated_stack_write(
+    entry_grp: h5py.Group,
+    *,
+    frame_indices,
+    results_1d,
+    results_2d,
+    extra_modes_1d,
+    extra_modes_2d,
+    extra_mode_indices_1d,
+    extra_mode_indices_2d,
+    primary_mode_1d,
+    primary_mode_2d,
+    group_name_1d,
+    group_name_2d,
+) -> dict[str, object]:
+    """Freeze and validate the complete requested result graph before writes."""
+    fis = tuple(int(value) for value in frame_indices)
+    frozen_1d = None if results_1d is None else tuple(results_1d)
+    frozen_2d = None if results_2d is None else tuple(results_2d)
+
+    def freeze_modes(value, dimension: str):
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError(f"extra_modes_{dimension} requires a mapping")
+        frozen = {}
+        for raw_mode, results in value.items():
+            mode = canonical_gi_mode_key(
+                raw_mode,
+                dimension,
+                allow_default=False,
+            )
+            if mode in frozen:
+                raise ValueError(f"duplicate canonical {dimension} mode {mode!r}")
+            frozen[mode] = tuple(results)
+        return frozen
+
+    modes_1d = freeze_modes(extra_modes_1d, "1d")
+    modes_2d = freeze_modes(extra_modes_2d, "2d")
+
+    def freeze_indices(value, dimension: str, modes):
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError(f"extra_mode_indices_{dimension} requires a mapping")
+        frozen = {}
+        for raw_mode, labels in value.items():
+            mode = canonical_gi_mode_key(
+                raw_mode,
+                dimension,
+                allow_default=False,
+            )
+            if mode not in modes:
+                raise ValueError(
+                    f"extra_mode_indices_{dimension} names unrequested mode {mode!r}"
+                )
+            frozen[mode] = tuple(int(label) for label in labels)
+        return frozen
+
+    indices_1d = freeze_indices(extra_mode_indices_1d, "1d", modes_1d)
+    indices_2d = freeze_indices(extra_mode_indices_2d, "2d", modes_2d)
+    primary_1d = canonical_gi_mode_key(
+        DEFAULT_MODE_KEY if primary_mode_1d is None else primary_mode_1d,
+        "1d",
+    )
+    primary_2d = canonical_gi_mode_key(
+        DEFAULT_MODE_KEY if primary_mode_2d is None else primary_mode_2d,
+        "2d",
+    )
+
+    validate_integrated_stack_write(
+        entry_grp,
+        frame_indices=fis,
+        results_1d=frozen_1d,
+        results_2d=frozen_2d,
+        group_name_1d=group_name_1d,
+        group_name_2d=group_name_2d,
+    )
+
+    def validate_dimension(
+        dimension,
+        group_name,
+        primary,
+        primary_results,
+        extra_modes,
+        extra_indices,
+    ):
+        if not primary_results and not extra_modes:
+            return
+        top = local_hard_group_path(entry_grp, group_name, role=group_name)
+        if top is not None:
+            existing_primary, _existing_modes, pairs = read_current_mode_layout(
+                top,
+                dimension,
+            )
+            if existing_primary != primary:
+                raise ValueError(
+                    f"{group_name} primary mode {existing_primary!r} != requested "
+                    f"{primary!r}; writes cannot reinterpret untouched rows"
+                )
+            schema_name = f"integrated_{dimension}"
+            for existing_mode, owned_group in pairs:
+                problems = validate_group_against_schema(owned_group, schema_name)
+                if problems:
+                    raise ValueError(
+                        f"malformed existing {schema_name} result "
+                        f"{existing_mode!r}: {problems[0]}"
+                    )
+                if existing_mode != existing_primary:
+                    child_primary, child_modes, _children = read_current_mode_layout(
+                        owned_group,
+                        dimension,
+                    )
+                    if (
+                        child_primary != DEFAULT_MODE_KEY
+                        or child_modes != (DEFAULT_MODE_KEY,)
+                    ):
+                        raise ValueError(
+                            f"nested result {owned_group.name} cannot own modes"
+                        )
+        if extra_modes:
+            if primary == DEFAULT_MODE_KEY:
+                raise ValueError(
+                    f"extra_modes_{dimension} requires a named primary_mode_{dimension}"
+                )
+            if primary in extra_modes:
+                raise ValueError(
+                    f"primary_mode_{dimension} {primary!r} must not also appear "
+                    f"in extra_modes_{dimension}"
+                )
+            if top is None and not primary_results:
+                raise ValueError(
+                    f"extra_modes_{dimension} requires results_{dimension} or an "
+                    f"established {group_name} primary group"
+                )
+        for mode, results in extra_modes.items():
+            labels = extra_indices.get(mode, fis)
+            if not results or len(results) != len(labels):
+                raise ValueError(
+                    f"extra_modes_{dimension}[{mode!r}] length must match its "
+                    "frame_indices"
+                )
+            nested_name = f"{group_name}/{mode_subgroup_name(mode)}"
+            kwargs = {
+                "frame_indices": labels,
+                f"results_{dimension}": results,
+                f"group_name_{dimension}": nested_name,
+            }
+            validate_integrated_stack_write(entry_grp, **kwargs)
+
+    validate_dimension(
+        "1d", group_name_1d, primary_1d, frozen_1d, modes_1d, indices_1d,
+    )
+    validate_dimension(
+        "2d", group_name_2d, primary_2d, frozen_2d, modes_2d, indices_2d,
+    )
+    return {
+        "frame_indices": fis,
+        "results_1d": frozen_1d,
+        "results_2d": frozen_2d,
+        "extra_modes_1d": modes_1d,
+        "extra_modes_2d": modes_2d,
+        "extra_mode_indices_1d": indices_1d,
+        "extra_mode_indices_2d": indices_2d,
+        "primary_mode_1d": primary_1d,
+        "primary_mode_2d": primary_2d,
+    }
 
 
 _NP_DTYPES = {"float32": np.float32, "int64": np.int64}
@@ -2436,16 +2645,15 @@ def _stamp_mode_attrs(entry_grp, group_name, primary_mode, extra_modes) -> None:
     the reader and ``modes_*()[0] == primary`` depend on the order)."""
     if primary_mode is None or primary_mode == DEFAULT_MODE_KEY:
         return
-    g = entry_grp.get(group_name)
+    g = local_hard_group_path(entry_grp, group_name, role=group_name)
     if g is None:
         return
     g.attrs[PRIMARY_MODE_ATTR] = primary_mode
     existing = _norm_attr(g.attrs.get(MULTI_RESULT_MODES_ATTR, []))
     if isinstance(existing, str):
         existing = [existing]
-    modes: list[str] = [str(primary_mode)]
+    modes: list[str] = [primary_mode]
     for mode in [*(existing or []), *((extra_modes or {}).keys())]:
-        mode = str(mode)
         if mode != primary_mode and mode not in modes:
             modes.append(mode)
     g.attrs[MULTI_RESULT_MODES_ATTR] = modes
@@ -2505,14 +2713,88 @@ def write_integrated_stack(
     existing group is dropped and rewritten from this batch so the q/chi
     axes refresh — pass *all* frames in that case, not a subset.
     """
-    fis = validate_integrated_stack_write(
+    frozen = _freeze_integrated_stack_write(
         entry_grp,
         frame_indices=frame_indices,
         results_1d=results_1d,
         results_2d=results_2d,
+        extra_modes_1d=extra_modes_1d,
+        extra_modes_2d=extra_modes_2d,
+        extra_mode_indices_1d=extra_mode_indices_1d,
+        extra_mode_indices_2d=extra_mode_indices_2d,
+        primary_mode_1d=primary_mode_1d,
+        primary_mode_2d=primary_mode_2d,
         group_name_1d=group_name_1d,
         group_name_2d=group_name_2d,
     )
+    fis = frozen["frame_indices"]
+    results_1d = frozen["results_1d"]
+    results_2d = frozen["results_2d"]
+    extra_modes_1d = frozen["extra_modes_1d"]
+    extra_modes_2d = frozen["extra_modes_2d"]
+    extra_mode_indices_1d = frozen["extra_mode_indices_1d"]
+    extra_mode_indices_2d = frozen["extra_mode_indices_2d"]
+    primary_mode_1d = frozen["primary_mode_1d"]
+    primary_mode_2d = frozen["primary_mode_2d"]
+
+    def _preflight_known_rows(group_name, labels, known_rows):
+        if known_rows is None:
+            return
+        if not isinstance(known_rows, Mapping):
+            raise ValueError(f"{group_name} known rows require a mapping")
+        group = local_hard_group_path(entry_grp, group_name, role=group_name)
+        if group is None:
+            if known_rows:
+                raise ValueError(f"{group_name} known rows name an absent group")
+            return
+        stored = local_hard_dataset(
+            group, "frame_index", role=f"{group_name}/frame_index",
+        )
+        if stored is None:
+            raise ValueError(f"{group_name}/frame_index is missing")
+        for label in labels:
+            row = known_rows.get(label)
+            if row is None:
+                continue
+            if (
+                isinstance(row, (bool, np.bool_))
+                or not isinstance(row, (int, np.integer))
+                or int(row) < 0
+                or int(row) >= stored.shape[0]
+                or int(stored[int(row)]) != int(label)
+            ):
+                raise ValueError(
+                    f"{group_name} known row {row!r} does not contain frame {label}"
+                )
+
+    _preflight_known_rows(group_name_1d, fis, known_rows_1d)
+    _preflight_known_rows(group_name_2d, fis, known_rows_2d)
+    if known_rows_extra_1d is not None and not isinstance(
+        known_rows_extra_1d, Mapping,
+    ):
+        raise ValueError("known_rows_extra_1d requires a mapping")
+    if known_rows_extra_2d is not None and not isinstance(
+        known_rows_extra_2d, Mapping,
+    ):
+        raise ValueError("known_rows_extra_2d requires a mapping")
+    for mode, _results in extra_modes_1d.items():
+        labels = extra_mode_indices_1d.get(mode, fis)
+        cache = (
+            known_rows_extra_1d.get(mode)
+            if known_rows_extra_1d is not None else None
+        )
+        _preflight_known_rows(
+            f"{group_name_1d}/{mode_subgroup_name(mode)}", labels, cache,
+        )
+    for mode, _results in extra_modes_2d.items():
+        labels = extra_mode_indices_2d.get(mode, fis)
+        cache = (
+            known_rows_extra_2d.get(mode)
+            if known_rows_extra_2d is not None else None
+        )
+        _preflight_known_rows(
+            f"{group_name_2d}/{mode_subgroup_name(mode)}", labels, cache,
+        )
     ck = _comp_kwargs(compression)
 
     def _bulk_create_1d(parent, results, fis_, *, disk_name=None):
@@ -2595,7 +2877,9 @@ def write_integrated_stack(
         # be silently mislabeled.  Validate the whole batch BEFORE touching
         # the file (checking only results[0] missed later divergent rows).
         _require_uniform_axes_1d(results_1d)
-        g = entry_grp.get(group_name_1d)
+        g = local_hard_group_path(
+            entry_grp, group_name_1d, role=group_name_1d,
+        )
         # Rebuild trigger: reintegration that changes the npt (row size) OR
         # the radial axis / unit (e.g. q_A^-1 → 2th_deg, or a different
         # radial range at the same bin count).  The per-frame upsert path
@@ -2629,7 +2913,9 @@ def write_integrated_stack(
         if len(results_2d) != len(fis):
             raise ValueError("results_2d length must match frame_indices")
         _require_uniform_axes_2d(results_2d)
-        g = entry_grp.get(group_name_2d)
+        g = local_hard_group_path(
+            entry_grp, group_name_2d, role=group_name_2d,
+        )
         new_2d_shape = np.asarray(results_2d[0].intensity).T.shape  # (n_chi, n_q)
         # Rebuild on a row-shape change OR a q/chi axis / unit change (see
         # the 1D block) — the upsert path can't refresh the stored axes.
@@ -2678,7 +2964,7 @@ def write_integrated_stack(
                 f"extra_modes_1d[{mode_key!r}] length must match its frame_indices"
             )
         _require_uniform_axes_1d(results)
-        g = parent.get(sub)
+        g = local_hard_group_path(parent, sub, role=f"{parent.name}/{sub}")
         if g is not None and (
             g["intensity"].shape[1] != np.asarray(results[0].intensity).shape[0]
             or not _axes_match_1d(g, results[0])
@@ -2713,7 +2999,7 @@ def write_integrated_stack(
                 f"extra_modes_2d[{mode_key!r}] length must match its frame_indices"
             )
         _require_uniform_axes_2d(results)
-        g = parent.get(sub)
+        g = local_hard_group_path(parent, sub, role=f"{parent.name}/{sub}")
         new_shape = np.asarray(results[0].intensity).T.shape
         if g is not None and (
             tuple(g["intensity"].shape[1:]) != new_shape
@@ -2743,7 +3029,9 @@ def write_integrated_stack(
     # validated INDEPENDENTLY by the frozen uniform-axes validators (a child's
     # axis grid legitimately differs from the primary's).  First-save only.
     if extra_modes_1d:
-        parent = entry_grp.get(group_name_1d)
+        parent = local_hard_group_path(
+            entry_grp, group_name_1d, role=group_name_1d,
+        )
         if parent is None:
             raise ValueError(
                 "extra_modes_1d requires results_1d (the primary 1D mode at "
@@ -2768,7 +3056,9 @@ def write_integrated_stack(
             )
 
     if extra_modes_2d:
-        parent = entry_grp.get(group_name_2d)
+        parent = local_hard_group_path(
+            entry_grp, group_name_2d, role=group_name_2d,
+        )
         if parent is None:
             raise ValueError(
                 "extra_modes_2d requires results_2d (the primary 2D mode at "
@@ -2812,8 +3102,20 @@ def frame_record_write_parts(
     records = list(records)
     fis = [int(r.label) for r in records]
 
-    prim_1d = {r.active_mode_1d for r in records if include_1d and r.results_1d}
-    prim_2d = {r.active_mode_2d for r in records if include_2d and r.results_2d}
+    for record in records:
+        for raw_mode in record.results_1d:
+            canonical_gi_mode_key(raw_mode, "1d")
+        for raw_mode in record.results_2d:
+            canonical_gi_mode_key(raw_mode, "2d")
+
+    prim_1d = {
+        canonical_gi_mode_key(r.active_mode_1d, "1d")
+        for r in records if include_1d and r.results_1d
+    }
+    prim_2d = {
+        canonical_gi_mode_key(r.active_mode_2d, "2d")
+        for r in records if include_2d and r.results_2d
+    }
     if len(prim_1d) > 1 or len(prim_2d) > 1:
         raise ValueError(
             f"FrameRecords disagree on active mode (1D={sorted(prim_1d)}, "

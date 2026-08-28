@@ -600,8 +600,6 @@ from xrd_tools.core import (  # noqa: E402
     FrameRecord,
 )
 from xdart.modules.frame_publication import (  # noqa: E402
-    legacy_to_canonical_1d,
-    legacy_to_canonical_2d,
     publication_from_frame_view,
 )
 from xrd_tools.io.nexus import write_frame_records  # noqa: E402
@@ -615,12 +613,12 @@ def _gi_multimode_frame(idx=7):
         radial=np.linspace(-5.0, 5.0, 8), intensity=np.arange(8.0),
         sigma=None, unit="qip_A^-1",
     )
-    f.gi_1d = {"qtotal": f.int_1d, "qip": qip}
+    f.gi_1d = {"q_total": f.int_1d, "q_ip": qip}
     qchi = IntegrationResult2D(
         radial=np.linspace(0.5, 3.0, 5), azimuthal=np.linspace(-90.0, 90.0, 4),
         intensity=np.ones((5, 4)), unit="q_A^-1", azimuthal_unit="chi_deg",
     )
-    f.gi_2d = {"gi2d": f.int_2d, "polar": qchi}
+    f.gi_2d = {"qip_qoop": f.int_2d, "q_chi": qchi}
     return f
 
 
@@ -665,16 +663,18 @@ def test_active_mode_identity_overrides_a_stale_hint():
 
 
 @pytest.mark.display_logic
-def test_legacy_to_canonical_mode_map_is_dimension_scoped():
-    assert legacy_to_canonical_1d("qtotal") == "q_total"
-    assert legacy_to_canonical_1d("qip") == "q_ip"
-    assert legacy_to_canonical_1d("qoop") == "q_oop"
-    assert legacy_to_canonical_1d("exit") == "exit_angle"
-    assert legacy_to_canonical_2d("gi2d") == "qip_qoop"
-    assert legacy_to_canonical_2d("polar") == "q_chi"          # 2D polar -> q_chi
-    assert legacy_to_canonical_2d("exit2d") == "exit_angles"   # the coercer-gap key
-    # already-canonical keys pass through
-    assert legacy_to_canonical_1d("q_total") == "q_total"
+def test_historical_gi_result_keys_are_rejected():
+    frame = _gi_multimode_frame()
+    frame.gi_1d = {"qtotal": frame.int_1d}
+    with pytest.raises(ValueError, match="unknown canonical 1d mode key"):
+        publication_from_live_frame(frame)
+
+
+def test_unowned_active_selector_cannot_name_a_result():
+    frame = DuckFrame(idx=8, gi=True)
+    frame.gi_1d = {}
+    with pytest.raises(ValueError, match="selector .* has no owned result"):
+        publication_from_live_frame(frame, active_mode_1d="q_oop")
 
 
 def test_exit_angle_2d_mode_does_not_raise():
@@ -685,7 +685,7 @@ def test_exit_angle_2d_mode_does_not_raise():
         unit="exit_angle_horz_deg", azimuthal_unit="exit_angle_vert_deg",
     )
     f.int_2d = exit2d
-    f.gi_2d = {"exit2d": exit2d}
+    f.gi_2d = {"exit_angles": exit2d}
     rec = publication_from_live_frame(f).record
     assert rec.modes_2d == ("exit_angles",)
     assert rec.active_mode_2d == "exit_angles"
@@ -985,15 +985,12 @@ def test_accumulation_first_upsert_is_plain_replace_additive():
 # across a same-scan reintegrate so accumulation is REAL in production.
 # ===================================================================== #
 
-def test_record_keys_under_passed_active_mode_when_gi_dicts_empty():
-    # The v2 reducer leaves gi_1d/gi_2d empty; the active_mode_* hint must key
-    # the single-mode record under the REAL mode, not DEFAULT.
-    rec = publication_from_live_frame(
-        DuckFrame(idx=1, gi=True),
-        active_mode_1d="q_oop", active_mode_2d="q_chi").record
-    assert rec.modes_1d == ("q_oop",)
-    assert rec.modes_2d == ("q_chi",)
-    assert rec.active_mode_1d == "q_oop" and rec.active_mode_2d == "q_chi"
+def test_active_mode_cannot_key_an_unowned_result_when_gi_dicts_are_empty():
+    with pytest.raises(ValueError, match="selector .* has no owned result"):
+        publication_from_live_frame(
+            DuckFrame(idx=1, gi=True),
+            active_mode_1d="q_oop", active_mode_2d="q_chi",
+        )
 
 
 def test_record_stays_default_when_no_active_mode_passed():
@@ -1003,7 +1000,7 @@ def test_record_stays_default_when_no_active_mode_passed():
 
 
 def test_view_unchanged_by_active_mode_keying():
-    f = DuckFrame(idx=2, gi=True)
+    f = _gi_multimode_frame(idx=2)
     base = publication_from_live_frame(f)
     keyed = publication_from_live_frame(f, active_mode_1d="q_ip", active_mode_2d="q_chi")
     assert_frameview_equivalent(base.view, keyed.view)   # display surface unchanged
