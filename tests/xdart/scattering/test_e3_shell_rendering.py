@@ -878,6 +878,252 @@ def test_e3_ui2_image_adapter_prewarms_default_colormap_at_construction(
         qapp.processEvents()
 
 
+def test_plot_mode_reconcile_keeps_identical_detector_and_cake_paint(
+    qapp: QtWidgets.QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(plot_mode="Overlay")
+    raw_updates = []
+    cake_updates = []
+    raw_set_image = shell.scientific.raw.canvas.setImage
+    cake_set_image = shell.scientific.cake.canvas.setImage
+
+    def update_raw(*args, **kwargs):
+        raw_updates.append(True)
+        return raw_set_image(*args, **kwargs)
+
+    def update_cake(*args, **kwargs):
+        cake_updates.append(True)
+        return cake_set_image(*args, **kwargs)
+
+    monkeypatch.setattr(shell.scientific.raw.canvas, "setImage", update_raw)
+    monkeypatch.setattr(shell.scientific.cake.canvas, "setImage", update_cake)
+    try:
+        shell.apply_state(state)
+        assert raw_updates == [True]
+        assert cake_updates == [True]
+
+        shell.apply_state(replace(
+            state,
+            revision=state.revision + 1,
+            scientific=replace(state.scientific, plot_mode="Waterfall"),
+        ))
+
+        assert raw_updates == [True]
+        assert cake_updates == [True]
+        assert shell.scientific.bottom_stack.currentWidget() is (
+            shell.scientific.waterfall
+        )
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_mutable_image_render_never_seeds_identity_reuse_cache(
+    qapp: QtWidgets.QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+
+    pane = ScientificImagePane(lock_aspect=True)
+    source = np.arange(16.0).reshape(4, 4)
+    updates = []
+    set_image = pane.canvas.setImage
+
+    def update(*args, **kwargs):
+        updates.append(np.array(args[0], copy=True))
+        return set_image(*args, **kwargs)
+
+    monkeypatch.setattr(pane.canvas, "setImage", update)
+    try:
+        pane.render(source)
+        source[0, 0] = 999.0
+        source.flags.writeable = False
+        pane.render(source)
+
+        assert len(updates) == 2
+        assert updates[0][0, -1] != updates[1][0, -1]
+        assert pane.render_matches(source)
+    finally:
+        pane.close()
+        pane.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_failed_image_render_retires_contract_before_canvas_mutation(
+    qapp: QtWidgets.QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+
+    pane = ScientificImagePane(lock_aspect=True)
+    first = np.arange(16.0).reshape(4, 4)
+    second = first + 100.0
+    first.flags.writeable = False
+    second.flags.writeable = False
+    pane.render(first)
+    set_image = pane.canvas.setImage
+    set_range = pane.canvas.imageViewBox.setRange
+    updates = []
+
+    def update(*args, **kwargs):
+        updates.append(np.array(args[0], copy=True))
+        return set_image(*args, **kwargs)
+
+    def fail_range(*_args, **_kwargs):
+        raise RuntimeError("injected range failure")
+
+    monkeypatch.setattr(pane.canvas, "setImage", update)
+    monkeypatch.setattr(pane.canvas.imageViewBox, "setRange", fail_range)
+    try:
+        with pytest.raises(RuntimeError, match="injected range failure"):
+            pane.render(second)
+        assert pane._render_contract is None
+        assert len(updates) == 1
+
+        monkeypatch.setattr(pane.canvas.imageViewBox, "setRange", set_range)
+        pane.render(first)
+
+        assert len(updates) == 2
+        assert pane.render_matches(first)
+        np.testing.assert_array_equal(
+            pane.image.image,
+            first.T[:, ::-1],
+        )
+    finally:
+        pane.close()
+        pane.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_viewer_2d_same_source_reconcile_reuses_image_until_exact_scrub(
+    qapp: QtWidgets.QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
+
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(frame_count=1, heavy_indices=(0,))
+    frame = state.navigation.current
+    assert frame is not None and state.scientific.heavy is not None
+    raw = state.scientific.heavy.raw
+    assert raw is not None and not raw.flags.writeable
+    heavy = HeavyProjection(
+        frame,
+        raw,
+        None,
+        detector_shape=raw.shape,
+        detector_source="full",
+    )
+    viewer = replace(
+        state,
+        scientific=replace(
+            state.scientific,
+            processing_mode="2D Viewer",
+            traces=(),
+            heavy=heavy,
+        ),
+    )
+    clears = []
+    updates = []
+    clear_viewer = ScientificView.clear_viewer_2d
+    set_image = shell.scientific.raw.canvas.setImage
+
+    def clear(*args, **kwargs):
+        clears.append(True)
+        return clear_viewer(*args, **kwargs)
+
+    def update(*args, **kwargs):
+        updates.append(True)
+        return set_image(*args, **kwargs)
+
+    monkeypatch.setattr(ScientificView, "clear_viewer_2d", clear)
+    monkeypatch.setattr(shell.scientific.raw.canvas, "setImage", update)
+    try:
+        shell.apply_state(viewer)
+        assert clears == [True]
+        assert updates == [True]
+
+        shell.apply_state(replace(viewer, revision=viewer.revision + 1))
+        assert clears == [True]
+        assert updates == [True]
+
+        replacement = np.array(raw, copy=True)
+        replacement.flags.writeable = False
+        shell.apply_state(replace(
+            viewer,
+            revision=viewer.revision + 2,
+            scientific=replace(
+                viewer.scientific,
+                heavy=replace(heavy, raw=replacement),
+            ),
+        ))
+        assert clears == [True]
+        assert updates == [True, True]
+
+        shell.apply_state(replace(
+            viewer,
+            revision=viewer.revision + 3,
+            scientific=replace(
+                viewer.scientific,
+                heavy=replace(
+                    heavy,
+                    raw=replacement,
+                    detector_source="thumbnail",
+                ),
+            ),
+        ))
+        assert clears == [True, True]
+        assert updates == [True, True, True]
+
+        shell.apply_state(replace(
+            viewer,
+            revision=viewer.revision + 4,
+            scientific=replace(viewer.scientific, heavy=None),
+        ))
+        assert clears == [True, True, True]
+        assert shell.scientific._viewer_2d_known_empty
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_waterfall_to_curve_switch_waits_for_replacement_curve(
+    qapp: QtWidgets.QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(plot_mode="Waterfall")
+    try:
+        shell.apply_state(state)
+        view = shell.scientific
+        assert view.bottom_stack.currentWidget() is view.waterfall
+        active_during_clear = []
+        clear_curve = view.curve.clear
+
+        def clear_replacement_curve():
+            active_during_clear.append(view.bottom_stack.currentWidget())
+            return clear_curve()
+
+        monkeypatch.setattr(view.curve, "clear", clear_replacement_curve)
+        shell.apply_state(replace(
+            state,
+            revision=state.revision + 1,
+            scientific=replace(state.scientific, plot_mode="Overlay"),
+        ))
+
+        assert active_during_clear == [view.waterfall]
+        assert view.bottom_stack.currentWidget() is view.curve
+        assert len(view.curve.listDataItems()) == len(state.scientific.traces)
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
 def test_e3_ui2_processed_cake_keeps_valid_65535_contrast(
     qapp: QtWidgets.QApplication,
 ) -> None:

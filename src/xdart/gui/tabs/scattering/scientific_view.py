@@ -257,6 +257,7 @@ class ScientificView(QtWidgets.QFrame):
         self._processing_mode = ""
         self._viewer_2d_payload = None
         self._viewer_2d_known_empty = False
+        self._rendered_detector_source = "none"
         self._expected_background_key = self._rendered_background_key = None
         self.raw_popup_dialog = None
         self.raw_popup_image = None
@@ -449,6 +450,7 @@ class ScientificView(QtWidgets.QFrame):
             if domain == "raw":
                 self._scrub_detector_pane(self.raw); self._viewer_2d_payload = None
                 self._viewer_2d_known_empty = False
+                self._rendered_detector_source = "none"
                 if self.raw_popup_image is not None: self._scrub_detector_pane(self.raw_popup_image)
             elif domain == "integrated_2d":
                 self.cake.clear(); self._rendered_cake_x_axis = self._rendered_cake_y_axis = self._rendered_cake_axis_key = self._rendered_image_axis = None
@@ -596,6 +598,13 @@ class ScientificView(QtWidgets.QFrame):
             else ""
         )
 
+    def reconcile_action_availability(
+        self, state: ScientificProjection,
+    ) -> None:
+        """Update action gating without touching either scientific canvas."""
+
+        self.background.setEnabled(state.background_enabled)
+
     def _make_plot_bar(self) -> QtWidgets.QHBoxLayout:
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(0)
@@ -739,11 +748,11 @@ class ScientificView(QtWidgets.QFrame):
         total: int,
         detail: str,
     ) -> None:
+        self.reconcile_action_availability(state)
         self.background.setText(("Clear" if state.background_set else "Set") + " " + {"Int 1D": "1D", "1D Viewer": "1D", "Int 2D": "2D", "2D Viewer": "Raw"}.get(state.processing_mode, "BG") + " BG")
         self._rendered_background_key = self._expected_background_key if state.background_set else None
         if state.processing_mode == "2D Viewer":
-            already_empty = (self._processing_mode == "2D Viewer"
-                             and self._viewer_2d_known_empty)
+            entering_viewer = self._processing_mode != "2D Viewer"
             self._processing_mode = "2D Viewer"
             if state.heavy is None:
                 cleared = ScientificView.clear_viewer_2d(self, None, failure=True)
@@ -754,20 +763,29 @@ class ScientificView(QtWidgets.QFrame):
                 self.progress.setText("0/0")
                 return
             try:
-                if (not already_empty
-                        and not ScientificView.clear_viewer_2d(
-                            self, None, failure=True)):
-                    raise ValueError("viewer reset is incomplete")
                 frame = navigation.current
                 heavy = state.heavy
                 if frame is None or heavy.frame is not frame or heavy.raw is None:
                     raise ValueError("viewer projection is incomplete")
+                detector_source = getattr(
+                    heavy, "detector_source", "full",
+                )
+                source_transition = (
+                    not entering_viewer
+                    and not self._viewer_2d_known_empty
+                    and self._rendered_detector_source != detector_source
+                )
+                if ((entering_viewer or source_transition)
+                        and not ScientificView.clear_viewer_2d(
+                            self, None, failure=True)):
+                    raise ValueError("viewer reset is incomplete")
                 blockers = [QtCore.QSignalBlocker(widget) for widget in (
                     self.frame_selector, self.color_map, self.log_scale)]
                 self.raw.render(heavy.raw, detector_shape=heavy.detector_shape,
                                 color_map=state.color_map,
                                 log_scale=state.log_scale,
                                 level_scan_token=(id(frame), id(heavy.raw)))
+                self._rendered_detector_source = detector_source
                 self.raw.canvas.imageItem.pos_label.setText("")
                 self.cake.canvas.imageItem.pos_label.setText("")
                 self._heavy_available = state.heavy_available
@@ -875,7 +893,17 @@ class ScientificView(QtWidgets.QFrame):
         try:
             if state.heavy is not None:
                 if state.heavy.raw is not None and state.processing_mode != "Int 1D":
-                    if state.heavy.detector_source != "full":
+                    raw_matches = self.raw.render_matches(
+                        state.heavy.raw,
+                        detector_shape=state.heavy.detector_shape,
+                        color_map=color_map,
+                        log_scale=state.log_scale,
+                    )
+                    if state.heavy.detector_source != "full" and (
+                        not raw_matches
+                        or self._rendered_detector_source
+                        != state.heavy.detector_source
+                    ):
                         self._scrub_detector_pane(self.raw)
                     self.raw.render(
                         state.heavy.raw,
@@ -887,8 +915,12 @@ class ScientificView(QtWidgets.QFrame):
                             id(state.heavy.raw),
                         ),
                     )
+                    self._rendered_detector_source = (
+                        state.heavy.detector_source
+                    )
                 else:
                     self._scrub_detector_pane(self.raw)
+                    self._rendered_detector_source = "none"
                 if state.heavy.cake is not None:
                     self.cake.render(
                         state.heavy.cake,
@@ -924,6 +956,7 @@ class ScientificView(QtWidgets.QFrame):
                 # An accepted absence is a complete transition, not permission
                 # to leave a stale raw/cake hybrid on screen.
                 self._scrub_detector_pane(self.raw)
+                self._rendered_detector_source = "none"
                 self.cake.clear()
                 self._rendered_cake_axis_key = None
                 self._rendered_cake_x_axis = None
@@ -1038,6 +1071,7 @@ class ScientificView(QtWidgets.QFrame):
             scrub(widget, "hide")
         for name, value in (
             ("_viewer_2d_payload", None), ("_frame_keys", ()), ("_current_key", None),
+            ("_rendered_detector_source", "none"),
             ("_selected_keys", ()),
             ("_trace_selection_keys", ()), ("_trace_history_keys", ()), ("_rendered_trace_keys", ()),
             ("_trace_row_count", 0),
@@ -1624,7 +1658,6 @@ class ScientificView(QtWidgets.QFrame):
         self._bottom_waterfall_active = False
         self._waterfall_source_keys = ()
         self._waterfall_render_contract = None
-        self.bottom_stack.setCurrentWidget(self.curve)
         overlay_step = _overlay_step(
             traces,
             state.plot_options.overlay_offset,
@@ -1718,6 +1751,10 @@ class ScientificView(QtWidgets.QFrame):
         else:
             self.curve.setLabel("bottom", "", units="")
         self.curve.setLabel("left", f"{intensity} (a.u.)")
+        # Keep an accepted waterfall visible until the replacement curve is
+        # fully populated; changing the stack first exposes an empty/stale
+        # curve during the synchronous rebuild.
+        self.bottom_stack.setCurrentWidget(self.curve)
         self.legend.setVisible(state.plot_options.show_legend)
         self._rendered_trace_keys = keys
         self._rendered_plot_mode = state.plot_mode

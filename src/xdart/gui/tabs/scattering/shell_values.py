@@ -440,6 +440,7 @@ class ScientificProjection:
     chi_range: tuple[float, float] = (-180.0, 180.0)
     plot_options: ScientificPlotOptions = ScientificPlotOptions()
     background_set: bool = False
+    background_enabled: bool = True
     status: str = ""
     retain_display: bool = False
     live_update: bool = False
@@ -462,6 +463,8 @@ class ScientificProjection:
             raise TypeError("detector availability must be boolean")
         if type(self.detector_diagnostic) is not str:
             raise TypeError("detector diagnostic must be text")
+        if type(self.background_enabled) is not bool:
+            raise TypeError("background availability must be boolean")
         if (
             self.browse_trace_snapshot is not None
             and type(self.browse_trace_snapshot) is not BrowseTraceSnapshot

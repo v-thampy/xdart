@@ -532,6 +532,9 @@ def _fake_scientific(*, failing=False):
     view._set_share_link = lambda _on: None
     view._rebuild_frames = partial(ScientificView._rebuild_frames, view)
     view._apply_processing_layout = partial(ScientificView._apply_processing_layout, view)
+    view.reconcile_action_availability = partial(
+        ScientificView.reconcile_action_availability, view,
+    )
     return view
 
 def _assert_neutral(view, title, status, *, known_empty=True) -> None:
@@ -575,7 +578,7 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
         processing_mode="2D Viewer", heavy=SimpleNamespace(frame=frame, raw=array, detector_shape=None),
         heavy_available=frozenset((frame,)), color_map="plasma", log_scale=True,
         title="image.npy · frame 7 · NumPy array", status="2D Viewer · NumPy array",
-        background_set=False)
+        background_set=False, background_enabled=True)
     navigation = SimpleNamespace(frames=(prior, frame), current=frame, selected=(frame,))
     monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.QtCore.QSignalBlocker", lambda _widget: object())
     monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.set_combo_value", lambda *_args, **_kwargs: "viridis")

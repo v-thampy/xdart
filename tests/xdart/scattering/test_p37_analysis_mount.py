@@ -30,6 +30,7 @@ from xdart.gui.tabs.scattering.operation_values import (
 )
 from xdart.gui.tabs.scattering.shell_values import (
     AxisProjection,
+    ShellCommand,
     ShellCommandKind,
     ScientificProjection,
     TraceProjection,
@@ -191,7 +192,7 @@ def test_p37b_literal_commands_open_four_singletons_and_share_scan_roi_mount() -
     }
 
 
-def test_p37b_six_specific_requests_use_the_one_existing_operation_slot(monkeypatch) -> None:
+def test_p37b_six_specific_requests_use_the_one_analysis_slot(monkeypatch) -> None:
     import xrd_tools.analysis.scan_operations as scan
     import xrd_tools.analysis.display_fit_operations as fits
 
@@ -262,6 +263,7 @@ def test_p37b_only_exact_idle_without_writer_or_cleanup_can_start() -> None:
 
     page = SimpleNamespace(
         _closing=False, _closed=False, _admission_state=None,
+        _analysis_slot=SimpleNamespace(owned=False),
         _operation_slot=SimpleNamespace(owned=False),
         _lifecycle=SimpleNamespace(phase=SimpleNamespace(value="idle"),
                                    active_run_identity=None,
@@ -270,10 +272,12 @@ def test_p37b_only_exact_idle_without_writer_or_cleanup_can_start() -> None:
             browse_pending=False, viewer_1d_cleanup_pending=False,
             viewer_2d_cleanup_pending=False),
     )
+    page._experiment_operation_busy = lambda: page._operation_slot.owned
     assert analysis_start_allowed(page)
     for owner, name, bad in (
         (page, "_closing", True),
         (page, "_admission_state", object()),
+        (page._analysis_slot, "owned", True),
         (page._operation_slot, "owned", True),
         (page._lifecycle, "active_run_identity", object()),
         (page._context_controller, "browse_pending", True),
@@ -298,10 +302,10 @@ def test_p37b_metadata_direct_and_scheduled_results_match_and_render_detached(
         with monkeypatch.context() as patch:
             patch.setattr(page, "_current_analysis_request",
                           lambda kind, target: facts)
-            patch.setattr(page._operation_slot, "begin_metadata",
+            patch.setattr(page._analysis_slot, "begin_metadata",
                           lambda actual, stamp: identity)
             patch.setattr(
-                page._operation_slot, "begin_metadata_requalification",
+                page._analysis_slot, "begin_metadata_requalification",
                 lambda actual, stamp: requalification_identity,
             )
             assert page._begin_analysis(
@@ -331,10 +335,10 @@ def test_p37b_metadata_direct_and_scheduled_results_match_and_render_detached(
         launches = []
         identities = iter((OperationIdentity(43), OperationIdentity(44)))
         selected_requalification = OperationIdentity(45)
-        monkeypatch.setattr(page._operation_slot, "begin_metadata",
+        monkeypatch.setattr(page._analysis_slot, "begin_metadata",
             lambda actual, stamp: launches.append(actual) or next(identities))
         monkeypatch.setattr(
-            page._operation_slot, "begin_metadata_requalification",
+            page._analysis_slot, "begin_metadata_requalification",
             lambda actual, stamp: selected_requalification,
         )
         page._scan_analysis_action("metadata", syntax)
@@ -443,7 +447,7 @@ def test_metadata_first_click_survives_viewer_cleanup_with_same_dialog(
     launches = []
     identity = OperationIdentity(45)
     monkeypatch.setattr(
-        page._operation_slot,
+        page._analysis_slot,
         "begin_metadata",
         lambda plan, stamp: launches.append((plan, stamp)) or identity,
     )
@@ -578,9 +582,20 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
         assert dialog is not None and dialog.isVisible()
         assert metadata_entered.wait(2)
         assert refreshes == ["controls"]
-        assert not any(
-            field.enabled for field in controls._bound_state.fields
-        )
+        assert tuple(
+            (field.path, field.enabled)
+            for field in controls._bound_state.fields
+        ) == initial_fields
+        assert not page._shell.scientific.background.isEnabled()
+        active_actions = {
+            action.action.value: action.enabled
+            for actions in controls.profile.section_actions.values()
+            for action in actions
+        }
+        assert not active_actions["calibrate"]
+        assert not active_actions["make_mask"]
+        assert not active_actions["reintegrate_1d"]
+        assert not active_actions["reintegrate_2d"]
 
         page._drain_executor()
         qapp.processEvents()
@@ -589,7 +604,7 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
         assert refreshes == ["controls"]
 
         metadata_release.set()
-        worker = page._operation_slot._worker
+        worker = page._analysis_slot._worker
         assert worker is not None
         worker.join(2)
         assert not worker.is_alive()
@@ -597,17 +612,17 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
         qapp.processEvents()
         assert requalification_entered.wait(2)
         assert page._metadata_dialog is dialog and dialog.isVisible()
-        assert refreshes == ["controls"]
+        assert refreshes == ["controls", "controls"]
 
         page._drain_executor()
         qapp.processEvents()
         assert dialog.status.text() == (
             "Analysis: metadata_requalification 1/2"
         )
-        assert refreshes == ["controls"]
+        assert refreshes == ["controls", "controls"]
 
         requalification_release.set()
-        worker = page._operation_slot._worker
+        worker = page._analysis_slot._worker
         assert worker is not None
         worker.join(2)
         assert not worker.is_alive()
@@ -617,14 +632,326 @@ def test_metadata_progress_and_requalification_refresh_only_the_same_dialog(
         assert page._metadata_result is table
         assert dialog.table.rowCount() == len(table.labels)
         assert dialog.status.text() == "OK"
-        assert refreshes == ["controls", "controls"]
+        assert refreshes == ["controls", "controls", "controls"]
         assert tuple(
             (field.path, field.enabled)
             for field in controls._bound_state.fields
         ) == initial_fields
+        assert page._shell.scientific.background.isEnabled()
     finally:
         metadata_release.set()
         requalification_release.set()
+        _close_page(page, qapp)
+
+
+def test_metadata_analysis_owner_accepts_a_real_control_edit(
+    monkeypatch, qapp,
+) -> None:
+    import xrd_tools.analysis.scan_operations as scan_operations
+    from xdart.gui.tabs.scattering.analysis_mount import analysis_request_facts
+
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(processing_mode="2D Viewer")),
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+    )
+    entered, release = Event(), Event()
+    plan = MetadataTablePlan("/tmp/current.nexus")
+    facts = analysis_request_facts(plan)
+
+    def run_metadata(actual, *, cancel_token, progress_callback):
+        assert actual == plan
+        entered.set()
+        assert release.wait(2)
+        return _table("/tmp/current.nexus", fingerprint="edited-stale")
+
+    monkeypatch.setattr(
+        scan_operations, "run_metadata_table", run_metadata,
+    )
+    monkeypatch.setattr(
+        page, "_current_analysis_request", lambda kind, target: facts,
+    )
+    try:
+        identity = page._begin_analysis(
+            "metadata", plan, page._metadata_generation,
+            target="metadata", request=facts,
+        )
+        assert type(identity) is OperationIdentity
+        assert entered.wait(2)
+        assert page._start_permitted() == (
+            False,
+            "Analysis operation is still active",
+        )
+        assert not page._shell.run_controls.startButton.isEnabled()
+        assert page._shell.run_controls.readinessLabel.text() == (
+            "Analysis operation is still active"
+        )
+
+        invoked = []
+        monkeypatch.setattr(
+            page, "_run_action", lambda: invoked.append("run"),
+        )
+        monkeypatch.setattr(
+            page, "_background_action", lambda: invoked.append("background"),
+        )
+        monkeypatch.setattr(
+            page, "_calibrate_action", lambda: invoked.append("calibrate"),
+        )
+        monkeypatch.setattr(
+            page, "_mask_action", lambda: invoked.append("mask"),
+        )
+        monkeypatch.setattr(
+            page, "_reintegrate_action",
+            lambda dimension: invoked.append(f"reintegrate_{dimension}"),
+        )
+        for command in (
+            ShellCommand(ShellCommandKind.RUN_ACTION),
+            ShellCommand(ShellCommandKind.SET_BACKGROUND),
+            ShellCommand(ShellCommandKind.CONTROL_ACTION, "calibrate"),
+            ShellCommand(ShellCommandKind.CONTROL_ACTION, "make_mask"),
+            ShellCommand(ShellCommandKind.CONTROL_ACTION, "reintegrate_1d"),
+            ShellCommand(ShellCommandKind.CONTROL_ACTION, "reintegrate_2d"),
+        ):
+            page._handle_shell_command(command)
+        assert invoked == []
+        assert page._notice_text == "Analysis operation is still active."
+
+        before = page._intents.snapshot()
+        next_cores = 1 if before.thaw().max_cores != 1 else 2
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_CORES, next_cores,
+        ))
+        after = page._intents.snapshot()
+        assert after.revision == before.revision + 1
+        assert after.thaw().max_cores == next_cores
+        assert page._analysis_slot.current_identity is identity
+    finally:
+        release.set()
+        worker = page._analysis_slot._worker
+        if worker is not None:
+            worker.join(2)
+        page._drain_executor()
+        _close_page(page, qapp)
+
+
+def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
+    monkeypatch, qapp,
+) -> None:
+    import xdart.gui.tabs.scattering.page as page_module
+    from xdart.gui.tabs.scattering.analysis_mount import (
+        analysis_request_facts,
+        analysis_start_allowed,
+    )
+
+    page = _page()
+    controls = page._shell.controls
+    monkeypatch.setattr(
+        page_module, "resolve_calibration_executable", lambda: "/tmp/calib2",
+    )
+    monkeypatch.setattr(
+        page_module, "resolve_mask_executable", lambda: "/tmp/drawmask",
+    )
+    monkeypatch.setattr(
+        type(page._context_controller),
+        "capture_reintegrate_browse",
+        lambda _self: object(),
+    )
+
+    refreshes = []
+    controls_update = controls.apply_state_update
+    controls_set = controls.set_state
+    browser_reconcile = page._shell.browser.reconcile
+    scientific_reconcile = page._shell.scientific.reconcile
+
+    def update_controls(state):
+        refreshes.append("controls")
+        return controls_update(state)
+
+    def rebuild_controls(state):
+        refreshes.append("controls-rebuild")
+        return controls_set(state)
+
+    def reconcile_browser(*args, **kwargs):
+        refreshes.append("browser")
+        return browser_reconcile(*args, **kwargs)
+
+    def reconcile_scientific(*args, **kwargs):
+        refreshes.append("scientific")
+        return scientific_reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(controls, "apply_state_update", update_controls)
+    monkeypatch.setattr(controls, "set_state", rebuild_controls)
+    monkeypatch.setattr(page._shell.browser, "reconcile", reconcile_browser)
+    monkeypatch.setattr(
+        page._shell.scientific, "reconcile", reconcile_scientific,
+    )
+
+    plan = MetadataTablePlan("/tmp/current.nexus")
+    request = analysis_request_facts(plan)
+    invoked = []
+    monkeypatch.setattr(page, "_run_action", lambda: invoked.append("run"))
+    monkeypatch.setattr(
+        page, "_calibrate_action", lambda: invoked.append("calibrate"),
+    )
+    monkeypatch.setattr(
+        page, "_mask_action", lambda: invoked.append("make_mask"),
+    )
+    monkeypatch.setattr(
+        page, "_reintegrate_action",
+        lambda dimension: invoked.append(f"reintegrate_{dimension}"),
+    )
+
+    try:
+        assert not page._operation_slot.owned
+        page._pending_reintegrate_reload = (object(), "/tmp/current.nexus", None)
+        assert page._experiment_operation_busy()
+        assert not analysis_start_allowed(page)
+        assert page._begin_analysis(
+            "metadata",
+            plan,
+            page._metadata_generation,
+            target="metadata",
+            request=request,
+        ) is None
+
+        page._refresh_shell(
+            preserve_display=True,
+            preserve_scientific=True,
+        )
+        action_enabled = {
+            action.action.value: action.enabled
+            for actions in controls.profile.section_actions.values()
+            for action in actions
+        }
+        assert not action_enabled["calibrate"]
+        assert not action_enabled["make_mask"]
+        assert not action_enabled["reintegrate_1d"]
+        assert not action_enabled["reintegrate_2d"]
+        assert not page._shell.scientific.background.isEnabled()
+        assert refreshes == ["controls"]
+
+        for command in (
+            ShellCommand(ShellCommandKind.RUN_ACTION),
+            ShellCommand(ShellCommandKind.SET_BACKGROUND),
+            ShellCommand(ShellCommandKind.CONTROL_ACTION, "calibrate"),
+            ShellCommand(ShellCommandKind.CONTROL_ACTION, "make_mask"),
+            ShellCommand(ShellCommandKind.CONTROL_ACTION, "reintegrate_1d"),
+            ShellCommand(ShellCommandKind.CONTROL_ACTION, "reintegrate_2d"),
+        ):
+            page._handle_shell_command(command)
+        assert invoked == []
+        assert set(refreshes) == {"controls"}
+        assert "controls-rebuild" not in refreshes
+        assert "browser" not in refreshes
+        assert "scientific" not in refreshes
+
+        page._pending_reintegrate_reload = None
+        page._refresh_shell(
+            preserve_display=True,
+            preserve_scientific=True,
+        )
+        assert analysis_start_allowed(page)
+        action_enabled = {
+            action.action.value: action.enabled
+            for actions in controls.profile.section_actions.values()
+            for action in actions
+        }
+        assert action_enabled["calibrate"]
+        assert action_enabled["make_mask"]
+        assert action_enabled["reintegrate_1d"]
+        assert action_enabled["reintegrate_2d"]
+        assert page._shell.scientific.background.isEnabled()
+    finally:
+        page._pending_reintegrate_reload = None
+        _close_page(page, qapp)
+
+
+def test_pending_reintegrate_reload_dominates_active_background_mutation(
+    monkeypatch, qapp,
+) -> None:
+    page = _page()
+    original_refresh = page._refresh_shell
+    refreshes = []
+    releases = []
+    science_reconciles = []
+    background_owner = SimpleNamespace(
+        phase="ACTIVE",
+        active_key=None,
+        projection=lambda: None,
+    )
+
+    def refresh(*args, **kwargs):
+        refreshes.append((args, kwargs))
+        return original_refresh(*args, **kwargs)
+
+    scientific_reconcile = page._shell.scientific.reconcile
+
+    def reconcile_scientific(*args, **kwargs):
+        science_reconciles.append((args, kwargs))
+        return scientific_reconcile(*args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(page, "_background_owner", background_owner)
+            patch.setattr(
+                page,
+                "_release_display_background",
+                lambda: releases.append(True) or True,
+            )
+            patch.setattr(page, "_refresh_shell", refresh)
+            patch.setattr(
+                page._shell.scientific,
+                "reconcile",
+                reconcile_scientific,
+            )
+
+            page._pending_reintegrate_reload = (
+                object(), "/tmp/current.nexus", None,
+            )
+            assert not page._operation_slot.owned
+
+            page._handle_shell_command(
+                ShellCommand(ShellCommandKind.SET_BACKGROUND)
+            )
+            page._background_action()
+
+            assert releases == []
+            assert science_reconciles == []
+            assert refreshes == [
+                ((), {
+                    "preserve_display": True,
+                    "preserve_scientific": True,
+                }),
+                ((), {
+                    "preserve_display": True,
+                    "preserve_scientific": True,
+                }),
+            ]
+
+            page._pending_reintegrate_reload = None
+            page._handle_shell_command(
+                ShellCommand(ShellCommandKind.SET_BACKGROUND)
+            )
+            assert releases == [True]
+
+            identity = OperationIdentity(901)
+            active_slot = SimpleNamespace(
+                owned=True,
+                current_identity=identity,
+                observe_stamp=lambda _stamp: None,
+            )
+            page._pending_reintegrate_reload = (
+                object(), "/tmp/current.nexus", None,
+            )
+            page._background_identity = identity
+            patch.setattr(page, "_operation_slot", active_slot)
+            page._handle_shell_command(
+                ShellCommand(ShellCommandKind.SET_BACKGROUND)
+            )
+            assert releases == [True, True]
+    finally:
+        page._pending_reintegrate_reload = None
+        page._background_identity = None
         _close_page(page, qapp)
 
 
@@ -646,13 +973,13 @@ def test_raw_tiff_viewer_metadata_click_uses_auto_sidecar_plan(
         sources=FilesystemSourceAdapter(),
     )
     captured_plans = []
-    begin_metadata = page._operation_slot.begin_metadata
+    begin_metadata = page._analysis_slot.begin_metadata
 
     def begin(plan, stamp):
         captured_plans.append(plan)
         return begin_metadata(plan, stamp)
 
-    monkeypatch.setattr(page._operation_slot, "begin_metadata", begin)
+    monkeypatch.setattr(page._analysis_slot, "begin_metadata", begin)
 
     def wait_for(predicate) -> None:
         deadline = time.monotonic() + 5.0
@@ -762,7 +1089,7 @@ def test_deferred_metadata_permanent_or_stale_state_drops_without_launch(
     )
 
     page = _page()
-    original_slot = page._operation_slot
+    original_slot = page._analysis_slot
     original_dialog = None
     replacement_dialog = None
     try:
@@ -778,7 +1105,7 @@ def test_deferred_metadata_permanent_or_stale_state_drops_without_launch(
             begin_metadata=lambda candidate, stamp:
                 launches.append((candidate, stamp)) or OperationIdentity(46),
         )
-        page._operation_slot = slot
+        page._analysis_slot = slot
         monkeypatch.setattr(
             page, "_current_analysis_request",
             lambda _kind, _target: current[0],
@@ -804,7 +1131,7 @@ def test_deferred_metadata_permanent_or_stale_state_drops_without_launch(
         assert page._deferred_metadata is None
         assert launches == []
     finally:
-        page._operation_slot = original_slot
+        page._analysis_slot = original_slot
         page._admission_state = None
         if replacement_dialog is not None:
             replacement_dialog.close()
@@ -814,13 +1141,13 @@ def test_deferred_metadata_permanent_or_stale_state_drops_without_launch(
         _close_page(page, qapp)
 
 
-def test_busy_shared_slot_keeps_only_latest_metadata_request(
+def test_busy_analysis_slot_keeps_only_latest_metadata_request(
     monkeypatch, qapp,
 ) -> None:
     from xdart.gui.tabs.scattering.analysis_mount import analysis_request_facts
 
     page = _page()
-    original_slot = page._operation_slot
+    original_slot = page._analysis_slot
     try:
         page._open_analysis_mount("metadata")
         first = MetadataTablePlan("/tmp/first.nxs")
@@ -834,7 +1161,7 @@ def test_busy_shared_slot_keeps_only_latest_metadata_request(
             begin_metadata=lambda plan, stamp:
                 launches.append((plan, stamp)) or identity,
         )
-        page._operation_slot = slot
+        page._analysis_slot = slot
         current = [first_facts]
         monkeypatch.setattr(
             page, "_current_analysis_request",
@@ -858,7 +1185,7 @@ def test_busy_shared_slot_keeps_only_latest_metadata_request(
         assert page._deferred_metadata is None
         assert page._analysis_identity is identity
     finally:
-        page._operation_slot = original_slot
+        page._analysis_slot = original_slot
         _close_page(page, qapp)
 
 
@@ -868,7 +1195,7 @@ def test_newer_cross_target_metadata_request_preempts_old_requalification(
     from xdart.gui.tabs.scattering.analysis_mount import analysis_request_facts
 
     page = _page()
-    original_slot = page._operation_slot
+    original_slot = page._analysis_slot
     try:
         page._open_analysis_mount("metadata")
         page._open_analysis_mount("scan_roi")
@@ -886,7 +1213,7 @@ def test_newer_cross_target_metadata_request_preempts_old_requalification(
                 launches.append(("requalification", plan, stamp))
                 or pytest.fail("older result displaced newer request"),
         )
-        page._operation_slot = slot
+        page._analysis_slot = slot
 
         def current(kind, target):
             if kind in {"metadata", "metadata_requalification"}:
@@ -916,7 +1243,7 @@ def test_newer_cross_target_metadata_request_preempts_old_requalification(
         assert launches[-1][0] == "metadata"
         assert launches[-1][1] is latest
     finally:
-        page._operation_slot = original_slot
+        page._analysis_slot = original_slot
         _close_page(page, qapp)
 
 
@@ -926,7 +1253,7 @@ def test_newer_cross_target_metadata_request_suppresses_old_requalified_result(
     from xdart.gui.tabs.scattering.analysis_mount import analysis_request_facts
 
     page = _page()
-    original_slot = page._operation_slot
+    original_slot = page._analysis_slot
     try:
         page._open_analysis_mount("metadata")
         page._open_analysis_mount("scan_roi")
@@ -946,7 +1273,7 @@ def test_newer_cross_target_metadata_request_suppresses_old_requalified_result(
                 launches.append(("requalification", plan, stamp))
                 or old_identity,
         )
-        page._operation_slot = slot
+        page._analysis_slot = slot
 
         def current(kind, target):
             if kind in {"metadata", "metadata_requalification"}:
@@ -987,7 +1314,7 @@ def test_newer_cross_target_metadata_request_suppresses_old_requalified_result(
         assert page._analysis_identity == latest_identity
         assert page._deferred_metadata is None
     finally:
-        page._operation_slot = original_slot
+        page._analysis_slot = original_slot
         _close_page(page, qapp)
 
 
@@ -1080,7 +1407,7 @@ def test_p37b_scan_plot_submits_headless_defaults_normalization_and_roi_kind(
             dialog._vnext_rendering = False
         launches = []
         identity = OperationIdentity(51)
-        monkeypatch.setattr(page._operation_slot, "begin_scan_plot",
+        monkeypatch.setattr(page._analysis_slot, "begin_scan_plot",
             lambda plan, actual_table, roi, stamp:
                 launches.append((plan, actual_table, roi)) or identity)
         values = dialog.vnext_plot_values()
@@ -1153,11 +1480,11 @@ def test_p37b_roi_preview_and_scan_share_slot_and_preserve_typed_diagnostics(
         dialog.set_vnext_metadata(first)
         preview_plans = []
         preview_identities = iter((OperationIdentity(61), OperationIdentity(62)))
-        monkeypatch.setattr(page._operation_slot, "begin_roi_preview",
+        monkeypatch.setattr(page._analysis_slot, "begin_roi_preview",
             lambda plan, stamp: preview_plans.append(plan) or next(preview_identities))
         roi_plans = []
         roi_identity = OperationIdentity(63)
-        monkeypatch.setattr(page._operation_slot, "begin_roi_scan",
+        monkeypatch.setattr(page._analysis_slot, "begin_roi_scan",
             lambda plan, stamp: roi_plans.append(plan) or roi_identity)
 
         dialog.roi_btn.click()
@@ -1258,7 +1585,7 @@ def test_p37b_peak_uses_exact_current_trace_and_headless_selection_policy(
         dialog.adv_centers.setText("")
         plans = []
         identity = OperationIdentity(71)
-        monkeypatch.setattr(page._operation_slot, "begin_peak_fit",
+        monkeypatch.setattr(page._analysis_slot, "begin_peak_fit",
             lambda plan, stamp: plans.append(plan) or identity)
         dialog.fit_btn.click()
         plan = plans[-1]
@@ -1334,7 +1661,7 @@ def test_p37b_phase_captures_paths_only_and_preserves_q_refusal_cif_receipts(
         dialog.set_vnext_trace(trace)
         plans = []
         identity = OperationIdentity(81)
-        monkeypatch.setattr(page._operation_slot, "begin_phase_fit",
+        monkeypatch.setattr(page._analysis_slot, "begin_phase_fit",
             lambda plan, stamp: plans.append(plan) or identity)
         dialog.fit_btn.click()
         plan = plans[-1]
@@ -1476,7 +1803,7 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
         starts = []
         for name in ("begin_metadata", "begin_scan_plot", "begin_roi_preview",
                      "begin_roi_scan", "begin_peak_fit", "begin_phase_fit"):
-            monkeypatch.setattr(page._operation_slot, name,
+            monkeypatch.setattr(page._analysis_slot, name,
                 lambda *args, owner=name: starts.append(owner) or OperationIdentity(999))
         monkeypatch.setattr(mount, "display_anchor_matches", lambda *args: True)
 
@@ -1552,10 +1879,24 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
         page._analysis_kind = "metadata"; page._analysis_target = "metadata"
         page._analysis_generation = page._metadata_generation
         page._analysis_request = facts["metadata"]
+        requalification_identity = OperationIdentity(999)
         with monkeypatch.context() as patch:
             patch.setattr(page, "_current_analysis_request",
                           lambda kind, target: facts["metadata"])
+            patch.setattr(
+                page._analysis_slot, "begin_metadata_requalification",
+                lambda plan, stamp: requalification_identity,
+            )
             assert page._consume_analysis_update(_returned(exact, table))
+            assert page._metadata_result is None
+            assert page._analysis_identity is requalification_identity
+            assert page._consume_analysis_update(_returned(
+                requalification_identity,
+                MetadataTableRequalificationResult(
+                    AnalysisDisposition.COMPLETED, "OK", table.receipt,
+                    table.table_fingerprint,
+                ),
+            ))
         assert page._metadata_result is table
 
         mismatch_identity = OperationIdentity(93)
@@ -1642,14 +1983,14 @@ def test_p37b_dialog_and_app_close_cancel_without_abandoning_source_cleanup(
             return OperationTerminal(identity, OperationTerminalStatus.CANCELLED,
                 payload=MetadataTableResult(
                     AnalysisDisposition.CANCELLED, "CANCELLED"))
-        identity = page._operation_slot._begin(
+        identity = page._analysis_slot._begin(
             Job(), OperationContextStamp(0), body)
         assert type(identity) is OperationIdentity and entered.wait(2)
         page._analysis_identity = identity; page._analysis_kind = "metadata"
         page._analysis_target = "scan_roi"
         dialogs[1].close()
-        assert page._scan_roi_dialog is None and page._operation_slot.owned
-        release.set(); update = _finish(page._operation_slot, identity)
+        assert page._scan_roi_dialog is None and page._analysis_slot.owned
+        release.set(); update = _finish(page._analysis_slot, identity)
         assert update.terminal.status is OperationTerminalStatus.CANCELLED
 
         for dialog in (dialogs[0], dialogs[2], dialogs[3]): dialog.close()

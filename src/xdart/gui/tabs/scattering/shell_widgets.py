@@ -126,14 +126,73 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.plot = self.canvas.image_plot
         self.image = self.canvas.imageItem
         self.color_scale = self.canvas.histogram
+        self._render_contract: tuple[object, ...] | None = None
         layout.addWidget(self.canvas, 1)
 
     def clear(self) -> None:
+        self._render_contract = None
         self.canvas.raw_image = np.zeros(0)
         self.canvas.displayed_image = np.zeros(0)
         self.canvas._level_cache = None
         self.canvas._level_scan_token = None
         self.image.clear()
+
+    @staticmethod
+    def _axis_render_contract(
+        axis: AxisProjection | None,
+    ) -> tuple[object, ...] | None:
+        return (
+            None
+            if axis is None
+            else (
+                id(axis.values), axis.label, axis.unit, axis.values.shape,
+            )
+        )
+
+    @staticmethod
+    def _image_render_contract(
+        data: np.ndarray,
+        *,
+        x_axis: AxisProjection | None,
+        y_axis: AxisProjection | None,
+        detector_shape: tuple[int, int] | None,
+        color_map: str,
+        log_scale: bool,
+    ) -> tuple[object, ...]:
+        source = np.asarray(data)
+        return (
+            id(source), source.shape, source.dtype.str,
+            ScientificImagePane._axis_render_contract(x_axis),
+            ScientificImagePane._axis_render_contract(y_axis),
+            detector_shape, color_map, bool(log_scale),
+        )
+
+    def render_matches(
+        self,
+        data: np.ndarray,
+        *,
+        x_axis: AxisProjection | None = None,
+        y_axis: AxisProjection | None = None,
+        detector_shape: tuple[int, int] | None = None,
+        color_map: str = "viridis",
+        log_scale: bool = False,
+    ) -> bool:
+        source = np.asarray(data)
+        axes = tuple(
+            np.asarray(axis.values)
+            for axis in (x_axis, y_axis)
+            if axis is not None
+        )
+        if source.flags.writeable or any(axis.flags.writeable for axis in axes):
+            return False
+        return self._render_contract == self._image_render_contract(
+            source,
+            x_axis=x_axis,
+            y_axis=y_axis,
+            detector_shape=detector_shape,
+            color_map=color_map,
+            log_scale=log_scale,
+        )
 
     def render(
         self,
@@ -147,6 +206,34 @@ class ScientificImagePane(QtWidgets.QWidget):
         level_scan_token: object | None = None,
     ) -> None:
         source = np.asarray(data)
+        render_contract = ScientificImagePane._image_render_contract(
+            source,
+            x_axis=x_axis,
+            y_axis=y_axis,
+            detector_shape=detector_shape,
+            color_map=color_map,
+            log_scale=log_scale,
+        )
+        # FrameView arrays and axes are immutable.  Plot-mode, selection, and
+        # status-only reconciliations therefore must not resend identical
+        # detector/cake pixels through pyqtgraph's setImage path.
+        axes = tuple(
+            np.asarray(axis.values)
+            for axis in (x_axis, y_axis)
+            if axis is not None
+        )
+        immutable = (
+            not source.flags.writeable
+            and not any(axis.flags.writeable for axis in axes)
+        )
+        if immutable and getattr(self, "_render_contract", None) == render_contract:
+            return
+        # A failed repaint may already have changed pixels, range, or labels.
+        # Retire the prior identity contract before the first mutation so a
+        # later request for the old immutable source cannot incorrectly fast
+        # return against a partially updated canvas.  Publish only after the
+        # complete render succeeds below.
+        self._render_contract = None
         image = source.T
         if x_axis is not None and y_axis is not None:
             x0, x1 = axis_extent(x_axis.values)
@@ -209,6 +296,11 @@ class ScientificImagePane(QtWidgets.QWidget):
                 axis.autoSIPrefixScale = 1.0
                 axis.labelUnitPrefix = ""
                 axis.updateAutoSIPrefix()
+        # A mutable render cannot safely seed the identity-only reuse cache:
+        # a writable alias may mutate the pixels before this array is marked
+        # read-only and presented again.  Only immutable inputs publish a
+        # reusable contract.
+        self._render_contract = render_contract if immutable else None
 
 
 class CompactFrameSelector(QtWidgets.QComboBox):

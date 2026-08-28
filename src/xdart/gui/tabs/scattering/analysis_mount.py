@@ -33,13 +33,15 @@ def mount_target(kind: object, value: object) -> str | None:
 def analysis_start_allowed(page: object) -> bool:
     lifecycle = getattr(page, "_lifecycle", None)
     controller = getattr(page, "_context_controller", None)
-    slot = getattr(page, "_operation_slot", None)
+    slot = getattr(page, "_analysis_slot", None)
+    experiment_busy = getattr(page, "_experiment_operation_busy", None)
     phase = getattr(getattr(lifecycle, "phase", None), "value", None)
     return bool(
         not getattr(page, "_closing", True)
         and not getattr(page, "_closed", True)
         and getattr(page, "_admission_state", None) is None
         and slot is not None and not slot.owned
+        and callable(experiment_busy) and not experiment_busy()
         and phase == "idle"
         and getattr(lifecycle, "active_run_identity", None) is None
         and getattr(lifecycle, "attempt_run_identity", None) is None

@@ -872,6 +872,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             projection=self._context_projection,
         )
         self._operation_slot = OperationSlot()
+        self._analysis_slot = OperationSlot()
         self._background_owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_identity: OperationIdentity | None = None
         self._calibration_identity: OperationIdentity | None = None; self._calibration_revision: int | None = None
@@ -903,7 +904,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_fingerprint = ""; self._analysis_request = None
         self._analysis_candidate = None
         self._deferred_metadata: _DeferredMetadata | None = None
-        self._metadata_busy_projected = False
         self._roi_preview_binding = None
         self._metadata_result = self._scan_roi_result = None
         self._peak_result = self._phase_result = None
@@ -975,30 +975,55 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _experiment_operation_busy(self) -> bool:
         return (self._operation_slot.owned
                 or self._authored_asset_owner is not None
-                or self._pending_reintegrate_reload is not None
-                or self._metadata_busy_projected)
+                or self._pending_reintegrate_reload is not None)
+
+    def _analysis_operation_busy(self) -> bool:
+        return bool(
+            self._analysis_slot.owned
+            or self._analysis_identity is not None
+        )
+
+    def _mutating_operation_busy(self) -> bool:
+        return (
+            self._experiment_operation_busy()
+            or self._analysis_operation_busy()
+        )
 
     def _observe_operation_stamp(self, revision: int | None = None) -> None:
         slot = getattr(self, "_operation_slot", None)
-        if slot is None:
-            return
         average = getattr(self, "_average_identity", None)
-        analysis = getattr(self, "_analysis_identity", None)
-        context_free_analysis = (
-            analysis is not None and slot.current_identity is analysis
-            and getattr(self, "_analysis_kind", None) in {
-                "metadata", "metadata_requalification", "scan_plot",
-                "roi_preview", "roi_scan"})
-        if (average is not None and slot.current_identity is average
-                or context_free_analysis):
+        if slot is not None and (
+            average is not None and slot.current_identity is average
+        ):
             if revision is None:
                 revision = self._intents.snapshot().revision
             stamp = OperationContextStamp(revision)
-        else:
+            slot.observe_stamp(stamp)
+        elif slot is not None:
             stamp = ScatteringWorkspace._operation_context_stamp(
                 self, revision
             )
-        slot.observe_stamp(stamp)
+            slot.observe_stamp(stamp)
+
+        analysis_slot = getattr(self, "_analysis_slot", None)
+        analysis = getattr(self, "_analysis_identity", None)
+        if (
+            analysis_slot is not None
+            and analysis is not None
+            and analysis_slot.current_identity is analysis
+        ):
+            if getattr(self, "_analysis_kind", None) in {
+                "metadata", "metadata_requalification", "scan_plot",
+                "roi_preview", "roi_scan",
+            }:
+                if revision is None:
+                    revision = self._intents.snapshot().revision
+                stamp = OperationContextStamp(revision)
+            else:
+                stamp = ScatteringWorkspace._operation_context_stamp(
+                    self, revision
+                )
+            analysis_slot.observe_stamp(stamp)
 
     def _begin_operation(
         self, frozen: object, body: Callable[..., object]
@@ -1132,15 +1157,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> _OperationRefresh:
         if message is not None:
             self._set_metadata_dialog_status(target, message)
-        if not self._metadata_busy_projected:
-            return _OperationRefresh.DIALOG
-        self._metadata_busy_projected = False
-        return _OperationRefresh.CONTROLS
+        # Metadata never locks editable fields or repaints science.  Its final
+        # transition does, however, release the mutually-exclusive Run and
+        # mutating-action affordances through one controls-only projection.
+        return (
+            _OperationRefresh.DIALOG
+            if self._analysis_operation_busy()
+            else _OperationRefresh.CONTROLS
+        )
 
     def _begin_analysis(self, kind, plan, generation, *, target=None,
                         request=None, anchor=None, table=None, roi=None,
                         candidate=None):
-        if self._authored_asset_owner is not None:
+        if (
+            self._authored_asset_owner is not None
+            or self._analysis_identity is not None
+        ):
             return None
         from .analysis_mount import (analysis_request_facts,
             analysis_start_allowed, display_anchor_matches)
@@ -1160,9 +1192,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                  "roi_preview": "begin_roi_preview",
                  "roi_scan": "begin_roi_scan", "peak": "begin_peak_fit",
                  "phase": "begin_phase_fit"}
-        identity = (self._operation_slot.begin_scan_plot(plan, table, roi, stamp)
+        identity = (self._analysis_slot.begin_scan_plot(plan, table, roi, stamp)
                     if kind == "scan_plot" else
-                    getattr(self._operation_slot, names[kind])(plan, stamp))
+                    getattr(self._analysis_slot, names[kind])(plan, stamp))
         if identity is None: return None
         self._analysis_kind, self._analysis_generation = kind, generation
         self._analysis_target, self._analysis_identity = target, identity
@@ -1173,12 +1205,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._notice(message)
         if kind in {"metadata", "metadata_requalification"}:
             self._set_metadata_dialog_status(target, message)
-            if not self._metadata_busy_projected:
-                self._metadata_busy_projected = True
-                self._refresh_shell(
-                    preserve_display=True,
-                    preserve_scientific=True,
-                )
+        self._refresh_shell(
+            preserve_display=True,
+            preserve_scientific=True,
+        )
         return identity
 
     def _submit_metadata(
@@ -1203,7 +1233,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             candidate=candidate,
         )
         # Install the newest exact request before classifying it.  A transient
-        # Browse/viewer cleanup or operation-slot race must not make the first
+        # Browse/viewer cleanup or analysis-slot race must not make the first
         # click disappear, and a newer cross-target request always supersedes
         # an older one.
         self._deferred_metadata = deferred
@@ -1256,7 +1286,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return "permanent"
         controller = self._context_controller
         if (
-            self._operation_slot.owned
+            self._analysis_slot.owned
             or self._authored_asset_owner is not None
             or controller.browse_pending
             or controller.viewer_1d_cleanup_pending
@@ -1330,7 +1360,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._deferred_metadata = None
         if self._analysis_target == target:
             from .analysis_mount import cancel_owned
-            cancel_owned(self._operation_slot, self._analysis_identity)
+            cancel_owned(self._analysis_slot, self._analysis_identity)
         if target == "scan_roi":
             self._roi_preview_binding = self._scan_roi_result = None
         elif target == "peak": self._peak_result = None
@@ -1642,11 +1672,28 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _background_action(self) -> None:
         owner, slot = self._background_owner, self._operation_slot
+        if self._analysis_operation_busy():
+            self._notice(
+                "Display background is unavailable while analysis is active."
+            )
+            self._refresh_shell(
+                preserve_display=True,
+                preserve_scientific=True,
+            )
+            return
+        background_cancel = (
+            self._background_identity is not None
+            and slot.current_identity is self._background_identity
+        )
+        if self._experiment_operation_busy() and not background_cancel:
+            self._notice("Display background is unavailable while another operation is active.")
+            self._refresh_shell(
+                preserve_display=True,
+                preserve_scientific=True,
+            )
+            return
         if owner.phase in {"RESERVED", "STAGED", "ACTIVE", "CLEANUP_PENDING"}:
             self._release_display_background(); self._notice("Clearing display background…")
-            self._refresh_shell(); return
-        if self._experiment_operation_busy():
-            self._notice("Display background is unavailable while another operation is active.")
             self._refresh_shell(); return
         mode = self._intents.snapshot().thaw().processing_mode
         domain = self._background_domain(mode)
@@ -1727,7 +1774,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not self._commit_focused_control_edit_for_run(): return
         phase = self._lifecycle.phase
         permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
-        if self._closing or self._closed or self._admission_state is not None or self._experiment_operation_busy() or not permitted:
+        if self._closing or self._closed or self._admission_state is not None or self._mutating_operation_busy() or not permitted:
             self._notice("Calibration is unavailable while another operation is active.")
             self._refresh_shell(); return
         if resolve_calibration_executable() is None:
@@ -1740,7 +1787,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._error_notice("Calibration chooser failed", error); return
         if type(selected) is not str or not selected: return
         phase = self._lifecycle.phase
-        if self._closing or self._closed or self._admission_state is not None or self._experiment_operation_busy() or phase not in {RunPhase.IDLE, RunPhase.FAILED} or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted:
+        if self._closing or self._closed or self._admission_state is not None or self._mutating_operation_busy() or phase not in {RunPhase.IDLE, RunPhase.FAILED} or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted:
             self._notice("Calibration context changed while choosing input."); return
         snapshot = self._intents.snapshot()
         try:
@@ -1822,7 +1869,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not self._commit_focused_control_edit_for_run(): return
         phase = self._lifecycle.phase
         permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
-        if self._closing or self._closed or self._admission_state is not None or self._experiment_operation_busy() or not permitted:
+        if self._closing or self._closed or self._admission_state is not None or self._mutating_operation_busy() or not permitted:
             self._notice("Mask creation is unavailable while another operation is active."); self._refresh_shell(); return
         if resolve_mask_executable() is None:
             self._notice("Mask creation is unavailable: pyFAI-drawmask is not on PATH."); self._refresh_shell(); return
@@ -1833,7 +1880,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._error_notice("Mask chooser failed", error); return
         if type(selected) is not str or not selected: return
         phase = self._lifecycle.phase
-        if self._closing or self._closed or self._admission_state is not None or self._experiment_operation_busy() or phase not in {RunPhase.IDLE, RunPhase.FAILED} or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted:
+        if self._closing or self._closed or self._admission_state is not None or self._mutating_operation_busy() or phase not in {RunPhase.IDLE, RunPhase.FAILED} or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted:
             self._notice("Mask context changed while choosing input."); return
         snapshot = self._intents.snapshot(); intent = snapshot.thaw()
         try: request = prepare_mask_request(selected, current_poni=str(intent.poni_file or ""), current_mask=str(intent.mask_file or ""))
@@ -2329,7 +2376,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         phase = self._lifecycle.phase; permitted = phase is RunPhase.IDLE or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
         captured = self._context_controller.capture_reintegrate_browse()
-        if self._closing or self._closed or self._admission_state is not None or self._experiment_operation_busy() or not permitted or captured is None:
+        if self._closing or self._closed or self._admission_state is not None or self._mutating_operation_busy() or not permitted or captured is None:
             self._notice(f"Reintegrate {dimension[0]}-D requires one stable loaded Browse context."); self._refresh_shell(); return
         try: preparation = self._reintegrate_preparation(snapshot.thaw(), dimension)
         except (TypeError, ValueError) as error: self._notice(str(error)); self._refresh_shell(); return
@@ -2486,7 +2533,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         source = intent.source_spec
         phase = self._lifecycle.phase
-        if (self._closing or self._closed or self._admission_state is not None or self._experiment_operation_busy()
+        if (self._closing or self._closed or self._admission_state is not None or self._mutating_operation_busy()
                 or phase not in {RunPhase.IDLE, RunPhase.FAILED}
                 or phase is RunPhase.FAILED and not self._lifecycle.reset_permitted
                 or type(source) is not SourceSpec or not intent.save_path
@@ -2618,6 +2665,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         catalog_clean = self._cancel_browser_catalog()
 
         operation_slot = getattr(self, "_operation_slot", None)
+        analysis_slot = getattr(self, "_analysis_slot", None)
         try:
             operation_close = (
                 None if operation_slot is None else operation_slot.close()
@@ -2634,6 +2682,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._average_identity = self._average_revision = self._average_target = self._average_entry = None
         except Exception:
             operation_clean = False
+
+        try:
+            analysis_close = (
+                None if analysis_slot is None else analysis_slot.close()
+            )
+            analysis_clean = (
+                analysis_slot is None
+                or analysis_close.cleanup_status is CleanupStatus.CLEANED
+            )
+            if analysis_clean:
+                self._analysis_identity = None
+                self._analysis_kind = None
+                self._analysis_target = None
+                self._analysis_generation = None
+                self._analysis_anchor = None
+                self._analysis_request = None
+                self._analysis_fingerprint = ""
+                self._analysis_candidate = None
+        except Exception:
+            analysis_clean = False
 
         if (not self._release_browse_1d_debt()
                 or not self._clear_viewer_1d_renderer(close=True)
@@ -2747,6 +2815,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         components_clean = (
             admission_clean
             and operation_clean
+            and analysis_clean
             and catalog_clean
             and browse.cleanup_status is CleanupStatus.CLEANED
             and executor_clean
@@ -2851,9 +2920,54 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._open_analysis_mount(
                     target, focus_roi=str(command.value) in {"roi_statistics", "roi_stats"})
                 return
-        operation_cancel = kind is ShellCommandKind.CONTROL_ACTION and ((command.value == "calibrate" and self._operation_slot.current_identity is self._calibration_identity) or (command.value == "make_mask" and self._operation_slot.current_identity is self._mask_identity) or (command.value == f"reintegrate_{self._reintegrate_dimension}" and self._operation_slot.current_identity is self._reintegrate_identity))
-        operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
-        if self._experiment_operation_busy() and operation_locked and not operation_cancel: self._notice("Experiment operation is still active."); self._refresh_shell(); return
+        analysis_locked = (
+            kind in {
+                ShellCommandKind.RUN_ACTION,
+                ShellCommandKind.SET_BACKGROUND,
+            }
+            or kind is ShellCommandKind.CONTROL_ACTION
+            and command.value in {
+                "calibrate",
+                "make_mask",
+                "reintegrate_1d",
+                "reintegrate_2d",
+            }
+        )
+        if self._analysis_operation_busy() and analysis_locked:
+            self._notice("Analysis operation is still active.")
+            self._refresh_shell(
+                preserve_display=True,
+                preserve_scientific=True,
+            )
+            return
+        operation_cancel = (
+            kind is ShellCommandKind.SET_BACKGROUND
+            and self._background_identity is not None
+            and self._operation_slot.current_identity
+            is self._background_identity
+            or kind is ShellCommandKind.CONTROL_ACTION
+            and (
+                command.value == "calibrate"
+                and self._calibration_identity is not None
+                and self._operation_slot.current_identity
+                is self._calibration_identity
+                or command.value == "make_mask"
+                and self._mask_identity is not None
+                and self._operation_slot.current_identity is self._mask_identity
+                or command.value == f"reintegrate_{self._reintegrate_dimension}"
+                and self._reintegrate_identity is not None
+                and self._operation_slot.current_identity
+                is self._reintegrate_identity
+            )
+        )
+        operation_locked = kind in {ShellCommandKind.RUN_ACTION, ShellCommandKind.SET_BACKGROUND, ShellCommandKind.CONTROL_DRAFT, ShellCommandKind.CONTROL_EDIT, ShellCommandKind.CONTROL_BROWSE, ShellCommandKind.CONTROL_ACTION, ShellCommandKind.SET_PROCESSING_MODE, ShellCommandKind.SET_BATCH, ShellCommandKind.SET_CORES, ShellCommandKind.SET_LIVE, ShellCommandKind.SET_OUTPUT_POLICY} or kind is ShellCommandKind.MENU and (command.value == "Config:Performance Diagnostics…" or str(command.value).startswith("Config:Heavy residency:"))
+        if self._experiment_operation_busy() and operation_locked and not operation_cancel:
+            self._notice("Experiment operation is still active.")
+            self._refresh_shell(
+                preserve_display=True,
+                preserve_scientific=True,
+            )
+            return
         if kind is ShellCommandKind.RUN_ACTION:
             self._run_action()
             return
@@ -4529,11 +4643,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if self._consume_asset_validation_update(update):
                     operation_refresh = _OperationRefresh.FULL
                 else:
-                    operation_refresh = self._consume_analysis_update(update)
-                    if operation_refresh is _OperationRefresh.NONE:
-                        operation_refresh = self._consume_reintegrate_update(
-                            update
-                        )
+                    operation_refresh = self._consume_reintegrate_update(
+                        update
+                    )
                     if (
                         operation_refresh is _OperationRefresh.NONE
                         and (
@@ -4558,21 +4670,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             elif operation_identity is self._average_identity and not operation_slot.owned:
                 self._average_identity = self._average_revision = self._average_target = self._average_entry = None
                 self._notice("Average failed before terminal publication."); changed = True; force_scientific = True
-            elif operation_identity is self._analysis_identity and not operation_slot.owned:
-                kind, target = self._analysis_kind, self._analysis_target
-                self._analysis_identity = self._analysis_kind = self._analysis_target = None
-                self._analysis_generation = self._analysis_anchor = self._analysis_request = None
-                self._analysis_fingerprint = ""; self._analysis_candidate = None
-                message = "Analysis failed before terminal publication."
-                self._notice(message)
-                if kind in {"metadata", "metadata_requalification"}:
-                    controls_refresh = bool(
-                        self._finish_metadata_refresh(target, message)
-                        is _OperationRefresh.CONTROLS
-                    )
-                else:
-                    changed = True
-                    force_scientific = True
             elif operation_identity is self._asset_validation_identity and not operation_slot.owned:
                 self._asset_validation_identity = None
                 owner = self._authored_asset_owner
@@ -4583,6 +4680,46 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     owner.dialog.set_busy(False)
                 self._notice("Asset validation failed before terminal publication.")
                 changed = True
+
+        analysis_slot = getattr(self, "_analysis_slot", None)
+        analysis_identity = (
+            None
+            if analysis_slot is None
+            else analysis_slot.current_identity
+        )
+        if analysis_identity is not None:
+            ScatteringWorkspace._observe_operation_stamp(self)
+            update = analysis_slot.poll(analysis_identity)
+            if update is not None:
+                analysis_refresh = self._consume_analysis_update(update)
+                if analysis_refresh is _OperationRefresh.CONTROLS:
+                    controls_refresh = True
+                elif analysis_refresh is _OperationRefresh.FULL:
+                    changed = True
+                    force_scientific = True
+            elif (
+                analysis_identity is self._analysis_identity
+                and not analysis_slot.owned
+            ):
+                kind, target = self._analysis_kind, self._analysis_target
+                self._analysis_identity = None
+                self._analysis_kind = None
+                self._analysis_target = None
+                self._analysis_generation = None
+                self._analysis_anchor = None
+                self._analysis_request = None
+                self._analysis_fingerprint = ""
+                self._analysis_candidate = None
+                message = "Analysis failed before terminal publication."
+                self._notice(message)
+                if kind in {"metadata", "metadata_requalification"}:
+                    if self._finish_metadata_refresh(
+                        target, message,
+                    ) is _OperationRefresh.CONTROLS:
+                        controls_refresh = True
+                else:
+                    changed = True
+                    force_scientific = True
 
         deferred_refresh = self._dispatch_deferred_metadata()
         if deferred_refresh is _OperationRefresh.CONTROLS:
@@ -5570,8 +5707,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _polling_needed(self) -> bool:
         operation_slot = getattr(self, "_operation_slot", None)
+        analysis_slot = getattr(self, "_analysis_slot", None)
         try:
-            if operation_slot is not None and operation_slot.owned:
+            if (
+                (operation_slot is not None and operation_slot.owned)
+                or (analysis_slot is not None and analysis_slot.owned)
+            ):
                 return True
         except Exception:
             return True
@@ -5859,9 +6000,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if viewer:
             cleanup = (self._context_controller.viewer_1d_cleanup_pending
                        if viewer_1d else self._context_controller.viewer_2d_cleanup_pending)
+            mutating_busy = self._mutating_operation_busy()
             blocked = (self._closing or self._closed
                        or cleanup
-                       or self._experiment_operation_busy()
+                       or mutating_busy
                        or self._context_controller.browse_pending
                        or self._lifecycle.active_run_identity is not None
                        or self._lifecycle.attempt_run_identity is not None
@@ -5877,6 +6019,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                        else f"{'1D' if viewer_1d else '2D'} Viewer cleanup remains pending" if cleanup
                        else "Browse cleanup remains pending" if self._context_controller.browse_pending
                        else "Workspace is closing" if self._closing or self._closed
+                       else "Analysis operation is still active" if mutating_busy and self._analysis_operation_busy()
+                       else "Experiment operation is still active" if mutating_busy
                        else "Viewer unavailable during active run" if blocked else "")
         navigation = self._context_controller.navigation
         if not suppress_detector_demand:
@@ -6118,6 +6262,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             norm_aggregate=self._context_controller.norm_aggregate,
             presentation_background=self._background_owner.projection(),
         )
+        projection = replace(
+            projection,
+            scientific=replace(
+                projection.scientific,
+                background_enabled=not self._mutating_operation_busy(),
+            ),
+        )
         if cache_adoption_missing:
             prior = self._last_scientific_projection
             retention_compatible = self._browse_snapshot_is_exact_current(
@@ -6321,9 +6472,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._operation_slot, "current_identity", None,
         )
         operation_active = (operation_identity is not None and not self._closing and not self._closed)
-        operation_busy = (operation_identity is not None
-                          or self._authored_asset_owner is not None
-                          or self._metadata_busy_projected)
+        operation_busy = self._experiment_operation_busy()
         calibration_active = operation_active and operation_identity is self._calibration_identity
         mask_active = operation_active and operation_identity is self._mask_identity
         reintegrate_active = operation_active and operation_identity is self._reintegrate_identity
@@ -6362,6 +6511,34 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and self._context_controller.capture_reintegrate_browse() is not None),
             reintegrate_active=reintegrate_active, reintegrate_dimension=self._reintegrate_dimension,
         )
+        if self._analysis_operation_busy():
+            conflicting = {
+                "calibrate",
+                "make_mask",
+                "reintegrate_1d",
+                "reintegrate_2d",
+            }
+            section_actions = {
+                section: tuple(
+                    replace(
+                        action,
+                        enabled=False,
+                        reason="Analysis operation is still active.",
+                    )
+                    if action.action.value in conflicting
+                    else action
+                    for action in actions
+                )
+                for section, actions
+                in controls.profile.section_actions.items()
+            }
+            controls = replace(
+                controls,
+                profile=replace(
+                    controls.profile,
+                    section_actions=section_actions,
+                ),
+            )
         project_key = (
             str(intent.project_root or ""),
             str(intent.save_path or ""),
@@ -6388,8 +6565,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _start_permitted(self) -> tuple[bool, str]:
         if self._closing or self._closed:
             return False, "Workspace is closing"
-        if self._experiment_operation_busy():
-            return False, "Experiment operation is still active"
+        if self._mutating_operation_busy():
+            return False, (
+                "Analysis operation is still active"
+                if self._analysis_operation_busy()
+                else "Experiment operation is still active"
+            )
         if self._run_executor is None or self._pipeline is None:
             return False, "Execution is unavailable"
         admission = self._admission_state

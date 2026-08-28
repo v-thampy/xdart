@@ -231,6 +231,10 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
             return
         self._reconciling = True
         try:
+            if preserve_scientific:
+                self.scientific.reconcile_action_availability(
+                    state.scientific
+                )
             if not preserve_display:
                 self.browser.reconcile(
                     state.browser,
