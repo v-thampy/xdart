@@ -7,7 +7,7 @@ from queue import Empty, SimpleQueue
 from threading import Lock
 
 from xdart.modules.display_context import BrowseContext, HydrationRequest
-from xdart.modules.frame_publication import FramePublication
+from xdart.modules.frame_publication import publication_from_frame_view
 from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord
 from xrd_tools.session.hydration import (
     HydrationCompletion,
@@ -293,11 +293,13 @@ class _BrowseHydrationOwner:
                 else catalog.source_base
             )
             committed = self._store.upsert(
-                FramePublication(
+                publication_from_frame_view(
                     view,
                     record=record,
                     source_identity=source_identity,
                     source_base=source_base,
+                    fallback_path=self._artifact,
+                    validate=False,
                     scan_key=request.owner.scan_key,
                 ),
                 protected=_hydration_locality_protection(

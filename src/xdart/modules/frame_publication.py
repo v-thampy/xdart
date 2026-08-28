@@ -111,6 +111,7 @@ class FramePublication:
     view: FrameView
     record: FrameRecord | None = None
     source_identity: str = ""
+    #: Exact Project root used only to resolve a relative detector locator.
     source_base: str | None = None
     generation: int = 0
     raw_ref: Any | None = None
@@ -126,6 +127,10 @@ class FramePublication:
     #: ownerless publication, never with a stamped scan.  Preserved through
     #: replace, thinning, hydration, merge, and store carryover.
     scan_key: str | None = None
+    #: Independent processed-artifact provenance for a source-less view.  This
+    #: is never reconstructed from ``source_identity``.  Kept last so adding
+    #: the contract does not shift the established positional field order.
+    source_fallback_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.source_base is not None and (
@@ -137,6 +142,16 @@ class FramePublication:
         ):
             raise TypeError(
                 "publication source base must be normalized absolute text or None"
+            )
+        if self.source_fallback_path is not None and (
+            type(self.source_fallback_path) is not str
+            or not self.source_fallback_path
+            or not os.path.isabs(self.source_fallback_path)
+            or os.path.normcase(os.path.normpath(self.source_fallback_path))
+            != self.source_fallback_path
+        ):
+            raise TypeError(
+                "publication fallback path must be normalized absolute text or None"
             )
         if self.record is None:
             object.__setattr__(self, "record", FrameRecord.from_view(self.view))
@@ -253,6 +268,7 @@ def publication_from_live_frame(
     generation: int = 0,
     source_identity: str | None = None,
     source_base: str | None = None,
+    fallback_path: str | os.PathLike[str] | None = None,
     include_raw: bool = False,
     include_2d: bool = True,
     include_thumbnail: bool = True,
@@ -308,6 +324,14 @@ def publication_from_live_frame(
         raw_status = "1d-only"
     else:
         raw_status = "missing"
+    canonical_fallback = (
+        None
+        if fallback_path is None
+        else canonical_frame_source_path(
+            fallback_path,
+            source_base=source_base,
+        )
+    )
     publication = FramePublication(
         view=view,
         record=record,
@@ -317,9 +341,11 @@ def publication_from_live_frame(
             else canonical_frame_source_identity(
                 view,
                 source_base=source_base,
+                fallback_path=canonical_fallback,
             )
         ),
         source_base=source_base,
+        source_fallback_path=canonical_fallback,
         generation=generation,
         raw_ref=raw_ref,
         raw_status=raw_status,
@@ -355,6 +381,14 @@ def publication_from_frame_view(
     ``record`` carries every persisted GI mode (from the mode-aware reader);
     when omitted it is the single-mode ``FrameRecord.from_view(view)``."""
 
+    canonical_fallback = (
+        None
+        if fallback_path is None
+        else canonical_frame_source_path(
+            fallback_path,
+            source_base=source_base,
+        )
+    )
     publication = FramePublication(
         view=view,
         record=record if record is not None else FrameRecord.from_view(view),
@@ -364,10 +398,11 @@ def publication_from_frame_view(
             else canonical_frame_source_identity(
                 view,
                 source_base=source_base,
-                fallback_path=fallback_path,
+                fallback_path=canonical_fallback,
             )
         ),
         source_base=source_base,
+        source_fallback_path=canonical_fallback,
         generation=generation,
         raw_ref=raw_ref,
         raw_status=raw_status,
@@ -765,6 +800,38 @@ def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
     return acc
 
 
+def canonical_frame_source_path(
+    value: str | os.PathLike[str],
+    *,
+    source_base: str | None = None,
+) -> str:
+    """Resolve one source path under explicit authority and normalize it."""
+
+    if source_base is not None and (
+        type(source_base) is not str
+        or not source_base
+        or not os.path.isabs(source_base)
+        or os.path.normcase(os.path.normpath(source_base)) != source_base
+    ):
+        raise TypeError(
+            "publication source base must be normalized absolute text or None"
+        )
+    source = os.fspath(value)
+    if type(source) is not str or not source:
+        raise TypeError("publication source path must be nonempty text")
+    if not os.path.isabs(source):
+        if source_base is None:
+            raise ValueError("relative publication source has no Project-root owner")
+        from xrd_tools.io.read import resolve_project_source_path
+
+        source = str(resolve_project_source_path(
+            source,
+            source_base,
+            must_exist=False,
+        ))
+    return os.path.normcase(os.path.normpath(source))
+
+
 def canonical_frame_source_identity(
     view: object,
     *,
@@ -782,33 +849,14 @@ def canonical_frame_source_identity(
     still present.
     """
 
-    if source_base is not None and (
-        type(source_base) is not str
-        or not source_base
-        or not os.path.isabs(source_base)
-        or os.path.normcase(os.path.normpath(source_base)) != source_base
-    ):
-        raise TypeError(
-            "publication source base must be normalized absolute text or None"
-        )
     view_source = getattr(view, "source_path", None)
     source_value = view_source if view_source is not None else fallback_path
     if source_value is None:
         raise ValueError("publication has no source path identity")
-    source = os.fspath(source_value)
-    if type(source) is not str or not source:
-        raise TypeError("publication source path must be nonempty text")
-    if not os.path.isabs(source):
-        if source_base is None:
-            raise ValueError("relative publication source has no Project-root owner")
-        from xrd_tools.io.read import resolve_project_source_path
-
-        source = str(resolve_project_source_path(
-            source,
-            source_base,
-            must_exist=False,
-        ))
-    canonical_path = os.path.normcase(os.path.normpath(source))
+    canonical_path = canonical_frame_source_path(
+        source_value,
+        source_base=source_base,
+    )
     source_frame_index = getattr(view, "source_frame_index", None)
     if view_source is not None and source_frame_index is None:
         raise ValueError("detector publication source has no frame index")
@@ -841,16 +889,11 @@ def _publication_has_canonical_source_identity(
     parts = _canonical_source_identity_parts(publication.source_identity)
     if parts is None:
         return False
-    canonical_path, _member = parts
     try:
         expected = canonical_frame_source_identity(
             publication.view,
             source_base=publication.source_base,
-            fallback_path=(
-                canonical_path
-                if publication.view.source_path is None
-                else None
-            ),
+            fallback_path=publication.source_fallback_path,
         )
     except (TypeError, ValueError, OSError):
         return False
@@ -886,9 +929,14 @@ def _scan_owners_compatible(a, b) -> bool:
     publication never merges with an unstamped one; matching source text alone
     is not sufficient evidence to inherit or erase a scan owner.
     """
-    if a in (None, "") or b in (None, ""):
-        return a in (None, "") and b in (None, "")
-    return type(a) is str and type(b) is str and a == b
+    if a is None or b is None:
+        return a is None and b is None
+    return (
+        type(a) is str
+        and type(b) is str
+        and bool(a)
+        and a == b
+    )
 
 
 # MEM-2: sentinel so an unspecified heavy cap resolves to the RAM-aware window
@@ -1247,8 +1295,11 @@ class PublicationStore:
     def _protected_candidate_locked(existing, incoming, protected, keep=False):
         if existing is None or incoming.label not in protected or not _publication_has_raw(existing):
             return incoming
-        if ((existing.generation, existing.source_identity, existing.scan_key) !=
-                (incoming.generation, incoming.source_identity, incoming.scan_key)):
+        if (
+            existing.generation != incoming.generation
+            or not _same_source(existing, incoming)
+            or not _scan_owners_compatible(existing.scan_key, incoming.scan_key)
+        ):
             raise ValueError("protected raw publication identity changed")
         raw = next((view.raw for view in (existing.view,
             *existing.record.results_1d.values(), *existing.record.results_2d.values())
@@ -1738,8 +1789,15 @@ class PublicationStore:
                 pair = self._light_1d_items.get(label)
                 if pair is not None and not (
                     incoming_generation == self._generation
-                    and publication.source_identity == pair.shell.source_identity
-                    and publication.scan_key == pair.scan_key
+                    and _same_source_id(
+                        publication.source_identity,
+                        pair.shell.source_identity,
+                    )
+                    and _scan_owners_compatible(
+                        publication.scan_key,
+                        pair.scan_key,
+                    )
+                    and _publication_has_canonical_source_identity(publication)
                 ):
                     self._retire_light_pair_locked(label)
                     foreign_pair = True
@@ -2137,6 +2195,7 @@ class PublicationStore:
 
 
 __all__ = [
+    "canonical_frame_source_path",
     "canonical_frame_source_identity",
     "FramePublication",
     "PublicationDiagnostics",

@@ -25,6 +25,7 @@ from xdart.modules.frame_publication import (
     PublicationStore,
     _publication_has_heavy_payload,
     canonical_frame_source_identity,
+    publication_from_frame_view,
 )
 from xrd_tools.core import FrameRecord, FrameView
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
@@ -700,9 +701,10 @@ class RunDisplayState:
             display_record = FrameRecord(
                 record.label, results_1d=dict(record.results_1d),
                 active_mode_1d=record.active_mode_1d)
-            publication = FramePublication(
+            publication = publication_from_frame_view(
                 display_record.active_view(), record=display_record,
                 source_identity=source_identity, source_base=owner.source_base,
+                fallback_path=owner.artifact, validate=False,
                 generation=owner.publications.generation,
                 scan_key=owner.source_scan)
             protected = self._protected_raw_labels_locked(owner, publication)
@@ -1377,11 +1379,13 @@ class RunDisplayState:
                 fallback_path=art.artifact,
             )
         )
-        candidate = FramePublication(
+        candidate = publication_from_frame_view(
             view,
             record=record,
             source_identity=source_identity,
             source_base=art.source_base,
+            fallback_path=art.artifact,
+            validate=False,
             generation=art.publications.generation,
             raw_status="ready" if preview.raw is not None else "thumbnail" if view.thumbnail is not None else "missing",
             scan_key=art.source_scan,
@@ -1505,11 +1509,13 @@ class RunDisplayState:
             else preview.source_base
         )
         store.upsert(
-            FramePublication(
+            publication_from_frame_view(
                 view,
                 record=record,
                 source_identity=source_identity,
                 source_base=source_base,
+                fallback_path=prepared.request.read_key.artifact_identity,
+                validate=False,
                 scan_key=prepared.request.owner.scan_key,
             ),
             protected=_hydration_locality_protection(

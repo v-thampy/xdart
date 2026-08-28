@@ -10,9 +10,9 @@ from time import monotonic
 from typing import Any, Callable, Mapping
 import numpy as np
 from xdart.modules.frame_publication import (
-    FramePublication,
     PublicationStore,
     canonical_frame_source_identity,
+    publication_from_frame_view,
 )
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
@@ -2564,11 +2564,13 @@ class StandardRunExecutor:
             source_base=owner.source_base,
             fallback_path=owner.artifact,
         )
-        publication = FramePublication(
+        publication = publication_from_frame_view(
             view,
             record=record,
             source_identity=source_identity,
             source_base=owner.source_base,
+            fallback_path=owner.artifact,
+            validate=False,
             scan_key=owner.source_scan,
         )
         run.display.retain_frame(

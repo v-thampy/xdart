@@ -787,6 +787,7 @@ def _mode_pub(
     source_path=None,
     source_frame_index=None,
     source_base=None,
+    fallback_path="/test/frame-publication.nexus",
 ):
     r1 = r2 = None
     if mode_1d is not None:
@@ -806,7 +807,7 @@ def _mode_pub(
     publication = publication_from_frame_view(
         view, record=rec, generation=generation,
         source_base=source_base,
-        fallback_path="/test/frame-publication.nexus",
+        fallback_path=fallback_path,
         scan_key=scan_key)
     return (
         publication
@@ -978,9 +979,11 @@ def test_accumulation_different_source_identity_does_not_merge():
     # source_identity) after a missed clear must NOT accumulate into one record.
     store = PublicationStore()
     store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
-                           source_identity="/test/scan-a.nexus#0"))
+                           source_identity="/test/scan-a.nexus#0",
+                           fallback_path="/test/scan-a.nexus"))
     store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
-                           source_identity="/test/scan-b.nexus#0"))
+                           source_identity="/test/scan-b.nexus#0",
+                           fallback_path="/test/scan-b.nexus"))
     assert store.get(0).record.modes_1d == ("q_ip",)    # plain replace, no merge
 
 
@@ -1133,6 +1136,8 @@ def test_project_anchored_relative_and_absolute_source_merge(
         source_identity=relative_id,
         scan_key="scan-a",
         source_base=source_root,
+        source_path=relative.source_path,
+        source_frame_index=relative.source_frame_index,
     ))
     if carryover:
         store.begin_reintegrate()
@@ -1142,6 +1147,8 @@ def test_project_anchored_relative_and_absolute_source_merge(
         generation=store.generation,
         source_identity=absolute_id,
         scan_key="scan-a",
+        source_path=absolute.source_path,
+        source_frame_index=absolute.source_frame_index,
     ))
     assert set(merged.record.modes_1d) == {"q_total", "q_ip"}
 
@@ -1267,6 +1274,115 @@ def test_processed_only_source_identity_uses_label_not_orphaned_source_index(
     expected = f"{os.path.normcase(os.path.normpath(artifact))}#1"
     assert live_identity == expected
     assert reloaded_identity == expected
+
+
+def test_processed_only_builder_binds_identity_to_independent_fallback(tmp_path):
+    artifact = tmp_path / "real" / "average.nexus"
+    forged = tmp_path / "forged" / "average.nexus"
+    view = FrameView.from_results(
+        label=4,
+        result_1d=IntegrationResult1D(
+            radial=np.linspace(1.0, 2.0, 4),
+            intensity=np.arange(4.0),
+            unit="q_A^-1",
+        ),
+    )
+
+    publication = publication_from_frame_view(
+        view,
+        fallback_path=artifact,
+    )
+    expected_path = os.path.normcase(os.path.normpath(artifact))
+    assert publication.source_fallback_path == expected_path
+    assert publication.source_identity == f"{expected_path}#4"
+
+    with pytest.raises(ValueError, match="exact canonical provenance"):
+        publication_from_frame_view(
+            view,
+            fallback_path=artifact,
+            source_identity=(
+                f"{os.path.normcase(os.path.normpath(forged))}#4"
+            ),
+        )
+
+
+@pytest.mark.parametrize("carryover", (False, True), ids=("upsert", "carryover"))
+def test_processed_only_forged_equal_identity_never_accumulates(
+    tmp_path,
+    carryover,
+):
+    artifact_a = os.path.normcase(os.path.normpath(tmp_path / "a.nexus"))
+    artifact_b = os.path.normcase(os.path.normpath(tmp_path / "b.nexus"))
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    first = _mode_pub(
+        0,
+        mode_1d="q_total",
+        generation=store.generation,
+        scan_key="scan-a",
+        fallback_path=artifact_a,
+    )
+    store.upsert(first)
+    if carryover:
+        store.begin_reintegrate()
+    incoming = _mode_pub(
+        0,
+        mode_1d="q_ip",
+        generation=store.generation,
+        scan_key="scan-a",
+        fallback_path=artifact_b,
+    )
+    forged = replace(incoming, source_identity=first.source_identity)
+
+    stored = store.upsert(forged)
+
+    assert stored.source_fallback_path == artifact_b
+    assert stored.record.modes_1d == ("q_ip",)
+
+
+def test_processed_only_fallback_survives_store_thinning(tmp_path):
+    artifact = os.path.normcase(os.path.normpath(tmp_path / "average.nexus"))
+    store = PublicationStore(
+        max_items=None,
+        max_heavy_items=0,
+        max_thumbnail_items=0,
+    )
+    store.upsert(_mode_pub(
+        1,
+        mode_1d="q_total",
+        generation=store.generation,
+        fallback_path=artifact,
+    ))
+
+    assert store.get(1).source_fallback_path == artifact
+
+
+def test_protected_raw_refuses_forged_processed_fallback(tmp_path):
+    artifact_a = os.path.normcase(os.path.normpath(tmp_path / "a.nexus"))
+    artifact_b = os.path.normcase(os.path.normpath(tmp_path / "b.nexus"))
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    first = _mode_pub(
+        0,
+        mode_1d="q_total",
+        generation=store.generation,
+        fallback_path=artifact_a,
+    )
+    first = replace(
+        first,
+        view=replace(first.view, raw=np.ones((2, 2))),
+    )
+    store.upsert(first)
+    incoming = _mode_pub(
+        0,
+        mode_1d="q_ip",
+        generation=store.generation,
+        fallback_path=artifact_b,
+    )
+    forged = replace(incoming, source_identity=first.source_identity)
+
+    with pytest.raises(ValueError, match="protected raw publication identity"):
+        store.upsert(forged, protected=(0,))
+
+    assert store.get(0) is first
 
 
 @pytest.mark.parametrize("carryover", (False, True), ids=("upsert", "carryover"))
@@ -1413,18 +1529,52 @@ def test_scan_owner_preserved_through_thinning_tiers():
     assert thinned.scan_key == "run_a"              # owner survives eviction
 
 
+@pytest.mark.parametrize("carryover", (False, True), ids=("upsert", "carryover"))
+@pytest.mark.parametrize(
+    ("prior_owner", "incoming_owner"),
+    ((None, ""), ("", None), ("", "")),
+    ids=("none-to-empty", "empty-to-none", "empty-to-empty"),
+)
+def test_empty_scan_owner_never_normalizes_to_an_ownership_class(
+    carryover,
+    prior_owner,
+    incoming_owner,
+):
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    store.upsert(_mode_pub(
+        1,
+        mode_1d="q_total",
+        generation=store.generation,
+        scan_key=prior_owner,
+    ))
+    if carryover:
+        store.begin_reintegrate()
+    replaced = store.upsert(_mode_pub(
+        1,
+        mode_1d="q_ip",
+        generation=store.generation,
+        scan_key=incoming_owner,
+    ))
+
+    assert replaced.scan_key == incoming_owner
+    assert replaced.record.modes_1d == ("q_ip",)
+
+
 def test_scan_owner_requires_the_same_explicit_ownership_class():
     store = PublicationStore(max_items=None, max_heavy_items=None)
     source = "/raw/root-a/frame_0001.tif#1"
     store.upsert(_mode_pub(
-        1, mode_1d="q_total", source_identity=source, scan_key="run_a"))
+        1, mode_1d="q_total", source_identity=source, scan_key="run_a",
+        fallback_path="/raw/root-a/frame_0001.tif"))
     merged = store.upsert(_mode_pub(
-        1, mode_1d="q_ip", source_identity=source, scan_key="run_a"))
+        1, mode_1d="q_ip", source_identity=source, scan_key="run_a",
+        fallback_path="/raw/root-a/frame_0001.tif"))
     assert merged.scan_key == "run_a"
     assert set(merged.record.modes_1d) == {"q_total", "q_ip"}
 
     replaced = store.upsert(_mode_pub(
-        1, mode_1d="q_oop", source_identity=source, scan_key=None))
+        1, mode_1d="q_oop", source_identity=source, scan_key=None,
+        fallback_path="/raw/root-a/frame_0001.tif"))
     assert replaced.scan_key is None
     assert replaced.record.modes_1d == ("q_oop",)
 
@@ -1513,6 +1663,42 @@ def test_scan_owner_preserved_through_hydration_replacement():
     assert hydrated is not None
     assert hydrated.view.intensity_1d is not None    # payload restored
     assert hydrated.scan_key == "run_a"              # owner survived
+
+
+def test_bound_light_pair_refuses_forged_view_provenance():
+    store, _lease, _allocation, _authority, build = _bound_gui_light_graph()
+    publication, light_record = build(0)
+    store.publish_gui_light_1d(publication, light_record)
+    incoming, _unused = build(0, heavy=False)
+    incoming = _without_1d(incoming)
+    incoming = replace(
+        incoming,
+        view=replace(incoming.view, source_path="/test/foreign.tif"),
+    )
+
+    stored = store.upsert(incoming)
+
+    assert not stored.view.has_1d
+    assert store.get_light_1d_shell(0) is None
+
+
+def test_bound_light_pair_requires_exact_scan_owner_type():
+    class ScanAlias(str):
+        pass
+
+    store, _lease, _allocation, _authority, build = _bound_gui_light_graph()
+    publication, light_record = build(0)
+    store.publish_gui_light_1d(publication, light_record)
+    incoming, _unused = build(
+        0,
+        heavy=False,
+        publication_scan=ScanAlias("scan-owner"),
+    )
+
+    stored = store.upsert(_without_1d(incoming))
+
+    assert not stored.view.has_1d
+    assert store.get_light_1d_shell(0) is None
 
 
 def test_gui_light_1d_completeness_query_does_not_compose_publications(
