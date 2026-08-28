@@ -328,7 +328,7 @@ def test_thread_per_frame_scan_info_from_bluesky(bluesky_file):
 
 
 def test_thread_wavelength_stamped_on_scan(bluesky_file):
-    from xdart.modules.wavelength import DEFAULT_WAVELENGTH_SENTINEL_M
+    from xrd_tools.core.energy import DEFAULT_WAVELENGTH_SENTINEL_M
 
     worker = _bare_thread(bluesky_file)
     scan = types.SimpleNamespace(
@@ -1044,7 +1044,7 @@ def test_real_gui_motor_options():
 
 @real_data
 def test_real_thread_per_frame_and_wavelength():
-    from xdart.modules.wavelength import DEFAULT_WAVELENGTH_SENTINEL_M
+    from xrd_tools.core.energy import DEFAULT_WAVELENGTH_SENTINEL_M
 
     worker = _bare_thread(_REAL)
     si0 = worker._frame_scan_info(worker.run_configuration, str(_REAL), 0)

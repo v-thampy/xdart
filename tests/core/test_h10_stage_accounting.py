@@ -2776,7 +2776,6 @@ _LEDGER_DEFINITION = "xrd_tools/session/stage_accounting.py"
 _LEDGER_COMPOSITION_SITE = "xrd_tools/session/scan_session.py"
 _OWNER_MODULE = "xrd_tools.session.stage_accounting"
 _OWNER_PACKAGE = "xrd_tools.session"
-_CADENCE_COMPAT_SHIM = "xrd_tools/reduction/cadence.py"
 _OWNER_NAME = "StageLedger"
 
 
@@ -2878,19 +2877,14 @@ def test_owner_graph_census_allows_exactly_one_stage_ledger_owner():
 
     importers: set[str] = set()
     constructors: dict[str, int] = {}
-    reduction_imports_session: set[str] = set()
     for path, name in relative.items():
-        imports_owner, constructions, modules = _census_file(path)
+        imports_owner, constructions, _modules = _census_file(path)
         if imports_owner and name != _LEDGER_DEFINITION:
             importers.add(name)
         # §13.3: a construction counts EVERYWHERE — the definition module is
         # not exempt from the constructor census.
         if constructions:
             constructors[name] = constructions
-        if name.startswith("xrd_tools/reduction/") and any(
-                module == _OWNER_PACKAGE or module.startswith(_OWNER_PACKAGE + ".")
-                for module in modules):
-            reduction_imports_session.add(name)
 
     assert importers == {_LEDGER_COMPOSITION_SITE}, (
         f"StageLedger is imported outside its declared composition site: "
@@ -2900,22 +2894,6 @@ def test_owner_graph_census_allows_exactly_one_stage_ledger_owner():
         f"{sorted(set(constructors) - {_LEDGER_COMPOSITION_SITE})}")
     assert constructors[_LEDGER_COMPOSITION_SITE] == 1, (
         "the composition site must build exactly one ledger per session")
-    # H10-C2-A moved the cadence DEFINITION behind the session policy owner,
-    # so exactly ONE reduction module may import the session layer: the
-    # compatibility re-export shim.  It must define nothing of its own.
-    assert reduction_imports_session == {_CADENCE_COMPAT_SHIM}, (
-        f"the engine must not import the session layer beyond the one cadence "
-        f"compatibility shim: {sorted(reduction_imports_session)}")
-    shim = ast.parse((_SRC_ROOT / _CADENCE_COMPAT_SHIM).read_text(encoding="utf-8"))
-    assert [node for node in shim.body if isinstance(node, ast.ClassDef)] == [], (
-        "the shim RE-EXPORTS the one policy definition; it defines nothing")
-    assert any(isinstance(node, ast.ImportFrom)
-               and node.module == "xrd_tools.session.policy"
-               and any(alias.name == "FlushPolicy" for alias in node.names)
-               for node in shim.body), (
-        "the shim must re-export FlushPolicy from its new session owner")
-
-
 def test_stage_accounting_is_qt_free_in_fresh_interpreter():
     """The accounting owner is headless (§4.4 boundary): importing it and the
     composed ScanSession in a clean interpreter must load no Qt/pyqtgraph."""

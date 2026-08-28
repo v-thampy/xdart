@@ -55,7 +55,7 @@ The shim is scheduled for removal; update imports.
 | old | new | notes |
 |---|---|---|
 | `ssrl_xrd_tools.*` | `xrd_tools.*` | mechanical rename, shimmed |
-| `io.read.Scan` | `io.read.ProcessedScan` | `Scan` alias kept (deprecated); collided with the reduction-input `Scan` |
+| `io.read.Scan` (removed) | `io.read.ProcessedScan` | use the explicit read-side type; the old name collided with the reduction-input `Scan` |
 | `reduction/core.py` legacy `Frame/MaskSpec/FrameSource/Scan` block | deleted | the names remain as aliases to the `xrd_tools.core.scan` contracts (same runtime classes) |
 | `NexusSink.swmr` | removed | was dead: `open_nexus_writer(swmr=True)` has refused since 0.41 |
 | — | `Scan.geometry` (new field) | `DiffractometerGeometry`; lets the headless `NexusSink` derive `/entry/per_frame_geometry` at finish |

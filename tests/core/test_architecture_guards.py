@@ -170,10 +170,10 @@ def test_wavelength_sentinel_has_one_headless_owner():
     "sentinel stays in xdart" pin): the 1.0 Å default-wavelength sentinel is a
     legacy acquisition artifact whose handling now lives in EXACTLY ONE
     headless module, ``xrd_tools.core.energy`` (so the projection and the GUI
-    share a single definition; ``xdart.modules.wavelength`` is a re-export
-    shim).  No OTHER xrd_tools module may reference the sentinel API — the
-    crossing points remain the explicit ``allow_default_sentinel`` helpers,
-    and None stays the only missing-value sentinel at headless API
+    share a single definition).  The retired ``xdart.modules.wavelength`` shim
+    must stay absent, and no OTHER xrd_tools module may reference the sentinel
+    API — the crossing points remain the explicit ``allow_default_sentinel``
+    helpers, and None stays the only missing-value sentinel at headless API
     boundaries."""
     owner = PACKAGE / "core" / "energy.py"
     offenders = []
@@ -188,3 +188,11 @@ def test_wavelength_sentinel_has_one_headless_owner():
     assert offenders == []
     owner_text = owner.read_text(encoding="utf-8", errors="replace")
     assert "DEFAULT_WAVELENGTH_SENTINEL_M" in owner_text   # the one owner
+    retired_shim = ROOT / "src/xdart/modules/wavelength.py"
+    assert not retired_shim.exists()
+    xdart_offenders = []
+    for path in (ROOT / "src/xdart").rglob("*.py"):
+        if "xdart.modules.wavelength" in path.read_text(
+                encoding="utf-8", errors="replace"):
+            xdart_offenders.append(str(path.relative_to(ROOT)))
+    assert xdart_offenders == []

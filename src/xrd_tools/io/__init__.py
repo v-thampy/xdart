@@ -156,7 +156,6 @@ _EXPORTS = {
     "resolve_source_master": ("xrd_tools.io.read", "resolve_source_master"),
     "resolved_raw_source": ("xrd_tools.io.read", "resolved_raw_source"),
     "RetryAction": ("xrd_tools.io.output_transaction", "RetryAction"),
-    "Scan": ("xrd_tools.io.read", "Scan"),
     "SCHEMA": ("xrd_tools.io.schema", "SCHEMA"),
     "science_fingerprint": ("xrd_tools.io.append", "science_fingerprint"),
     "stage_append_lineage": ("xrd_tools.io.append", "stage_append_lineage"),

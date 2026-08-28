@@ -73,8 +73,7 @@ def canonical_wavelength_m(value, unit: "WavelengthUnit | None") -> float | None
     return wl
 
 
-# ── historical default-sentinel handling (moved from xdart.modules.wavelength;
-#    that module is now a compatibility re-export shim) ────────────────────────
+# ── historical default-sentinel handling (formerly in xdart) ────────────────
 #
 # ``LiveScan.mg_args`` historically defaults to ``{"wavelength": 1e-10}``,
 # which is 1.0 Angstrom in pyFAI's metre convention.  That value is only a

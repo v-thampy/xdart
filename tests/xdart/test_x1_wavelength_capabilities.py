@@ -106,21 +106,6 @@ def _wavelength_warnings(caplog):
 
 
 # --------------------------------------------------------------------------- #
-# 3a0 shim: xdart.modules.wavelength re-exports the headless owner
-# --------------------------------------------------------------------------- #
-
-def test_wavelength_shim_reexports_headless_owner():
-    import xdart.modules.wavelength as shim
-    import xrd_tools.core.energy as owner
-    for name in ("DEFAULT_WAVELENGTH_SENTINEL_M",
-                 "is_default_wavelength_sentinel_m",
-                 "normalize_wavelength_m",
-                 "wavelength_angstrom_to_m",
-                 "wavelength_m_to_angstrom"):
-        assert getattr(shim, name) is getattr(owner, name)
-
-
-# --------------------------------------------------------------------------- #
 # R3-P5: the per-selection GUI-thread HDF5 tier is DELETED (standing guard)
 # --------------------------------------------------------------------------- #
 

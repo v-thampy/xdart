@@ -1063,14 +1063,6 @@ def test_g15_one_ledger_construction_site_and_one_cadence_definition():
         "xrd_tools/session/policy.py", (
         "the cadence DEFINITION moves behind the session policy owner; a "
         f"second one is mutation 19.  Got {definitions}")
-    cadence = src / "xrd_tools/reduction/cadence.py"
-    reexports = [node for node in _tree(cadence).body
-                 if isinstance(node, ast.ImportFrom)
-                 and any(alias.name == "FlushPolicy" for alias in node.names)]
-    assert reexports, (
-        "xrd_tools.reduction.cadence becomes a COMPATIBILITY RE-EXPORT")
-
-
 _CADENCE_CONTROLLERS = (
     "xdart/gui/tabs/static_scan/wranglers/image_wrangler_thread.py",
     "xdart/gui/tabs/static_scan/wranglers/nexus_wrangler_thread.py",

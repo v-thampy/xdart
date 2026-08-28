@@ -83,7 +83,6 @@ __all__ = [
     "RawSourceObservation",
     "observe_resolved_raw_source",
     "resolved_raw_source",
-    "Scan",
 ]
 
 
@@ -1380,11 +1379,6 @@ class ProcessedScan:
 
     def __repr__(self) -> str:
         return f"ProcessedScan({self.path.name!r}, n_frames={len(self)})"
-
-
-# Deprecated alias (S5 rename, monorepo 1.0): prefer ProcessedScan — the bare
-# name collides with the reduction-input Scan in xrd_tools.reduction.
-Scan = ProcessedScan
 
 
 def open_scan(scan_file: str | Path, *, entry: str = "entry",

@@ -128,7 +128,7 @@ _AVERAGE_EXPORTS = {
 
 def __getattr__(name: str) -> Any:
     if name == "FlushPolicy":
-        value = getattr(import_module("xrd_tools.reduction.cadence"), name)
+        value = getattr(import_module("xrd_tools.session.policy"), name)
     elif name in _BACKGROUND_EXPORTS:
         value = getattr(import_module("xrd_tools.reduction.background"), name)
     elif name in _REINTEGRATE_EXPORTS:

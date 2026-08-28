@@ -48,7 +48,7 @@ from xrd_tools.reduction import (
     run_reduction,
 )
 from xrd_tools.reduction.masks import _flat_mask_as_bool, _mask_for_plan
-from xdart.modules.wavelength import wavelength_m_to_angstrom
+from xrd_tools.core.energy import wavelength_m_to_angstrom
 
 # S4: GI-only scan kwargs that must NOT flow through to the standard
 # pyFAI integrator path.  Derived from :class:`GIMode` (so adding a GIMode

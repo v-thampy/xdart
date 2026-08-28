@@ -2,7 +2,7 @@
 
 Hand-crafts a small v2 NXroot with pure h5py (no xdart dependency) and
 round-trips it through ``get_1d`` / ``get_2d`` / ``get_thumbnail`` /
-``get_metadata`` / ``get_frames`` and the ``Scan`` sugar.
+``get_metadata`` / ``get_frames`` and the ``ProcessedScan`` sugar.
 
 The fixture deliberately uses **gapped, 1-based frame labels**
 (``[1, 2, 4, 7, 8]``) so the label→position resolution is actually
@@ -18,7 +18,7 @@ import pytest
 from xrd_tools.io import (
     Integrated1D,
     Integrated2D,
-    Scan,
+    ProcessedScan,
     get_1d,
     get_2d,
     get_frames,
@@ -309,7 +309,7 @@ def test_get_2d_resolves_against_its_own_frame_labels(tmp_path):
 def test_scan_sugar(scan_file):
     p, ref = scan_file
     scan = open_scan(p)
-    assert isinstance(scan, Scan)
+    assert isinstance(scan, ProcessedScan)
     assert len(scan) == N_FRAMES
     np.testing.assert_array_equal(scan.frames, FRAME_LABELS)
     np.testing.assert_array_equal(scan.get_1d(1).intensity, ref["intensity_1d"][0])

@@ -84,19 +84,12 @@ def test_grid_matches_reference():
 
 
 def test_module_is_pure():
-    """cadence.py's OWN imports pull no Qt/h5py/numpy.  Loaded BY FILE PATH
-    (not via the package) so the reduction __init__ — which does import the
-    heavy core — doesn't mask the check (same trick as the display-logic
-    purity guard)."""
-    import os
-    path = os.path.join(
-        os.path.dirname(__file__), "..", "..",
-        "src", "xrd_tools", "reduction", "cadence.py")
+    """The public reduction export resolves to the stdlib-only session owner."""
     code = (
-        "import sys, importlib.util;"
-        f"spec=importlib.util.spec_from_file_location('cadence_isolated', {path!r});"
-        "mod=importlib.util.module_from_spec(spec);"
-        "sys.modules[spec.name]=mod; spec.loader.exec_module(mod);"
+        "import sys;"
+        "from xrd_tools.reduction import FlushPolicy as public;"
+        "from xrd_tools.session.policy import FlushPolicy as owner;"
+        "assert public is owner;"
         "bad=[m for m in ('PySide6','pyqtgraph','h5py','numpy','pyFAI','fabio')"
         " if m in sys.modules];"
         "print(','.join(bad))"
@@ -104,4 +97,4 @@ def test_module_is_pure():
     out = subprocess.run([sys.executable, "-c", code],
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.strip() == "", f"cadence pulled heavy deps: {out.stdout!r}"
+    assert out.stdout.strip() == "", f"FlushPolicy export pulled heavy deps: {out.stdout!r}"

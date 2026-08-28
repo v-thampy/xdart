@@ -13,7 +13,7 @@ from .frame_series import LiveFrameSeries
 from xrd_tools.io.output_path import default_output_path
 from xdart import utils
 from xdart.modules.live_compat import normalize_live_class_names
-from xdart.modules.wavelength import (
+from xrd_tools.core.energy import (
     DEFAULT_WAVELENGTH_SENTINEL_M,
     wavelength_angstrom_to_m,
 )

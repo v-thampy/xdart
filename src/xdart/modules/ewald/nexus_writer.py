@@ -1835,7 +1835,7 @@ def _write_instrument(f, scan, *, entry: str) -> None:
     # initial empty-file save at run start legitimately predates the
     # integrator, so a warning here is routine noise (the per-run saves
     # that follow stamp the real value).
-    from xdart.modules.wavelength import normalize_wavelength_m
+    from xrd_tools.core.energy import normalize_wavelength_m
     wavelength = normalize_wavelength_m(
         getattr(getattr(scan, "_cached_integrator", None), "wavelength", None),
         allow_default_sentinel=True,

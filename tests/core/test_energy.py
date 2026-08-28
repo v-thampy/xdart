@@ -81,9 +81,9 @@ def test_canonical_wavelength_m_explicit_one_angstrom_is_valid():
 
 
 def test_migrated_sentinel_helpers_keep_legacy_behavior():
-    """The generic helpers moved from ``xdart.modules.wavelength`` keep their
-    exact semantics: the legacy untrusted metre placeholder is rejected by
-    default and admitted only for authoritative sources."""
+    """The canonical helpers keep their exact legacy-placeholder semantics:
+    the untrusted metre placeholder is rejected by default and admitted only
+    for authoritative sources."""
     assert DEFAULT_WAVELENGTH_SENTINEL_M == 1.0e-10
     assert is_default_wavelength_sentinel_m(1.0e-10) is True
     assert is_default_wavelength_sentinel_m(1.5e-10) is False

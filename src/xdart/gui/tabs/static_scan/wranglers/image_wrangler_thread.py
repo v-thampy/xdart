@@ -3212,7 +3212,7 @@ class imageThread(wranglerThread):
             mg = getattr(scan, 'mg_args', None)
             if not isinstance(mg, dict):
                 return
-            from xdart.modules.wavelength import is_default_wavelength_sentinel_m
+            from xrd_tools.core.energy import is_default_wavelength_sentinel_m
             cur = mg.get('wavelength')
             if cur is None or is_default_wavelength_sentinel_m(cur):
                 mg['wavelength'] = float(wl_A) * 1e-10
