@@ -43,29 +43,29 @@ def test_nxs_h5_hdf5_are_nexus_family_candidates(tmp_path):
     assert {c.adapter_id for c in candidates} == {"nexus_hdf5"}
 
 
-def test_dot_nexus_output_extension_is_excluded_from_raw_candidates(tmp_path):
-    """.nexus is a reserved future xdart OUTPUT extension (O/H23) — openable
-    explicitly (see test_source_format_adapters / registry.guess_source_kind)
-    but never a raw directory candidate."""
+def test_dot_nexus_is_a_structure_probed_raw_candidate(tmp_path):
+    """Raw ``.nexus`` containers reach the structural admission probe."""
     _touch(tmp_path / "raw.nxs")
     _touch(tmp_path / "processed.nexus")
 
     candidates = enumerate_candidates(tmp_path)
 
-    assert [c.path.name for c in candidates] == ["raw.nxs"]
+    assert [c.path.name for c in candidates] == ["processed.nexus", "raw.nxs"]
 
 
-def test_r1r4_cxi_is_a_nexus_family_candidate_but_nexus_is_not(tmp_path):
+def test_r1r4_cxi_and_nexus_are_nexus_family_candidates(tmp_path):
     """Gate 7: .cxi is a NeXus-family raw candidate (parity with
     guess_source_kind/discover_scans/_NEXUS_EXTS — the held defect returned 0
-    .cxi candidates); .nexus stays excluded from raw discovery."""
+    .cxi candidates); ``.nexus`` likewise reaches structural discovery."""
     _touch(tmp_path / "scan.cxi")
     _touch(tmp_path / "raw.nxs")
     _touch(tmp_path / "out.nexus")
 
     candidates = enumerate_candidates(tmp_path)
 
-    assert {c.path.name for c in candidates} == {"scan.cxi", "raw.nxs"}
+    assert {c.path.name for c in candidates} == {
+        "scan.cxi", "raw.nxs", "out.nexus"
+    }
     assert {c.adapter_id for c in candidates} == {"nexus_hdf5"}
     # the .cxi candidate is owned by the nexus adapter, same as .nxs/.h5/.hdf5
     cxi = next(c for c in candidates if c.path.name == "scan.cxi")

@@ -87,6 +87,7 @@ def _qualified_browse_resolution(resolution, identity, current, generation,
         and type(read_key) is HydrationReadKey
         and read_key.scope == request.scope
         and read_key.artifact_identity == browse.requested_path
+        and read_key.source_root == browse.load_request.source_root
         and read_key.frame_identity == label
         and read_key.purpose is HydrationPurpose.PREVIEW
         and type(request.token) is HydrationToken

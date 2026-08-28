@@ -100,13 +100,13 @@ def _stamp_root_writer_provenance(handle, path=None) -> None:
 
 
 def warn_if_newer_schema(entry_grp, path="") -> None:
-    """C1: warn when a file's ``ssrl_schema_version`` is NEWER than this
-    library supports.
+    """Diagnose a schema version newer than this library supports.
 
     The writer stamps the version on every file; until now no reader ever
-    looked at it, so a v3 file hit today's readers with opaque downstream
-    KeyErrors or silently missing features.  Absent/old stamps pass silently
-    (back-compat); only a newer stamp warns."""
+    looked at it, so a v3 file hit lower-level readers with opaque downstream
+    KeyErrors or silently missing features.  Current processed-output admission
+    separately requires the exact current schema identity and version; this
+    helper only improves errors for direct low-level reads."""
     encoded_name = SCHEMA_VERSION_ATTR.encode("utf-8")
     if not h5py.h5a.exists(entry_grp.id, encoded_name):
         return
@@ -222,6 +222,8 @@ def read_nexus(
                 f"Entry group {entry!r} not found in {p}. "
                 f"Available top-level keys: {list(f.keys())}"
             )
+        from xrd_tools.io.processed_scan_id import require_raw_input
+        require_raw_input(f, entry)
         return _read_scan_metadata_from_entry(
             f[entry], scan_id=p.stem,
             motor_names=motor_names, counter_names=counter_names,
@@ -320,6 +322,9 @@ def _reject_unsupported_detector_rank(h5f: h5py.File, entry: str) -> None:
             obj = h5f.get(cand)
         except Exception:
             continue
+        if isinstance(obj, h5py.Dataset):
+            from xrd_tools.io.processed_scan_id import require_raw_input
+            require_raw_input(obj)
         if isinstance(obj, h5py.Dataset) and obj.ndim > 3:
             raise UnsupportedDetectorRankError(
                 f"/{cand} has rank {obj.ndim}; detector data must be 2-D "
@@ -348,11 +353,10 @@ def find_nexus_image_dataset(
     4. ``/{entry}/instrument/*/data``  (any detector sub-group, 3-D)
     5. A dataset flagged ``@signal_type='detector'`` (Bluesky/NXWriter)
 
-    Before the weak largest-3-D fallback, a processed xdart scan file is
-    rejected with :class:`~xrd_tools.io.processed_scan_id.ProcessedXdartInputError`
-    (it carries only reduced ``integrated_1d`` / ``integrated_2d`` stacks, never a
-    raw detector frame), so its integrated cake can never be re-ingested as raw
-    input.
+    Before every selector, processed-output markers are rejected with
+    :class:`~xrd_tools.io.processed_scan_id.ProcessedXdartInputError`.  A
+    canonical detector-shaped dataset or ExternalLink cannot override that
+    negative guard.
 
     6. Largest 3-D dataset anywhere under ``/{entry}/``
     7. Last resort: a single 2-D detector frame at a canonical location
@@ -380,6 +384,8 @@ def find_nexus_image_dataset(
         if entry not in f:
             logger.warning("Entry %r not found in %s", entry, p)
             return None
+        from xrd_tools.io.processed_scan_id import require_raw_input
+        require_raw_input(f, entry)
 
         # Eiger external-link pattern: /entry/data/data_NNNNNN.  Return the
         # *first* link path so the caller can enumerate siblings to build the
@@ -397,6 +403,8 @@ def find_nexus_image_dataset(
                 )
             for link_path in ext_paths:
                 ds = f.get(link_path)
+                if isinstance(ds, h5py.Dataset):
+                    require_raw_input(ds)
                 if not isinstance(ds, h5py.Dataset) or ds.ndim != 3:
                     rank = getattr(ds, "ndim", None)
                     raise UnsupportedDetectorRankError(
@@ -543,6 +551,8 @@ class _ResolvedNexusStack:
             value = owner[str(name)]
             if not isinstance(value, h5py.Dataset):
                 raise TypeError(f"dependency {name!r} is not a Dataset")
+            from xrd_tools.io.processed_scan_id import require_raw_input
+            require_raw_input(value)
             self._dependency_dataset = value
             return value
         except BaseException as primary:
@@ -585,6 +595,8 @@ def _bind_nexus_stack_from_entry(
     """Resolve detector datasets relative to one captured entry group."""
     if not isinstance(entry_group, h5py.Group):
         raise TypeError("captured entry must be an HDF5 Group")
+    from xrd_tools.io.processed_scan_id import require_raw_input
+    require_raw_input(entry_group)
     binding = _ResolvedNexusStack(entry_group)
     owner_slot.owner = binding
 
@@ -594,7 +606,10 @@ def _bind_nexus_stack_from_entry(
             return None
         if not isinstance(link, (h5py.HardLink, h5py.ExternalLink)):
             raise ValueError("detector indirection is unsupported")
-        return group[name]
+        value = group[name]
+        if isinstance(value, h5py.Dataset):
+            require_raw_input(value)
+        return value
 
     def direct(path: str) -> Any:
         current: Any = entry_group
@@ -609,6 +624,7 @@ def _bind_nexus_stack_from_entry(
     def acquire(selector: str, dataset: Any) -> None:
         if not isinstance(dataset, h5py.Dataset):
             raise TypeError(f"{selector} is not a Dataset")
+        require_raw_input(dataset)
         binding.append(selector, dataset)
         rank = int(dataset.ndim)
         if rank == 2 and len(binding._datasets) == 1:
@@ -625,9 +641,6 @@ def _bind_nexus_stack_from_entry(
             raise ValueError("Inconsistent detector dtypes across segments")
 
     try:
-        from xrd_tools.io.processed_scan_id import (
-            ProcessedXdartInputError, is_processed_xdart_entry,
-        )
         data_group = direct("data")
         external_names: list[str] = []
         if isinstance(data_group, h5py.Group):
@@ -638,7 +651,8 @@ def _bind_nexus_stack_from_entry(
         if external_names:
             for name in external_names:
                 acquire(
-                    f"/{declared_entry_name}/data/{name}", data_group[name],
+                    f"/{declared_entry_name}/data/{name}",
+                    hard(data_group, name),
                 )
             return binding
 
@@ -670,12 +684,13 @@ def _bind_nexus_stack_from_entry(
                         ))
                         break
         if not candidates:
-            if is_processed_xdart_entry(entry_group):
-                raise ProcessedXdartInputError("processed xdart entry has no raw detector")
             best: tuple[str, h5py.Dataset] | None = None
             def visit(name: str, value: Any) -> None:
                 nonlocal best
-                if isinstance(value, h5py.Dataset) and value.ndim in (2, 3):
+                if not isinstance(value, h5py.Dataset):
+                    return
+                require_raw_input(value)
+                if value.ndim in (2, 3):
                     size = int(np.prod(value.shape))
                     if best is None or size > int(np.prod(best[1].shape)):
                         best = (f"/{declared_entry_name}/{name}", value)
@@ -735,6 +750,8 @@ class NexusImageStack:
     def __init__(self, h5f: h5py.File, paths: list[str]):
         if not paths:
             raise ValueError("NexusImageStack requires at least one path")
+        from xrd_tools.io.processed_scan_id import require_raw_input
+        require_raw_input(h5f)
         # F6: a SINGLE 2-D detector dataset is a one-frame stack (the finder /
         # classifier already accept ndim >= 2); normalize it to (1, H, W) here
         # instead of raising.  Multi-segment (Eiger links) stays strict-3D.
@@ -754,11 +771,13 @@ class NexusImageStack:
     ) -> None:
         if not paths or len(paths) != len(datasets):
             raise ValueError("NexusImageStack requires aligned bound datasets")
+        from xrd_tools.io.processed_scan_id import require_raw_input
         squeeze2d = False
         dsets = []
         for p, obj in zip(paths, datasets, strict=True):
             if not isinstance(obj, h5py.Dataset):
                 raise TypeError(f"{p} is not a Dataset (got {type(obj).__name__})")
+            require_raw_input(obj)
             if obj.ndim == 2 and len(paths) == 1:
                 squeeze2d = True
             elif obj.ndim != 3:
@@ -1097,6 +1116,8 @@ def _exact_entry_stack_paths(
             f"entry {name!r} in {p} is not an HDF5 group "
             f"(got {type(node).__name__})"
         )
+    from xrd_tools.io.processed_scan_id import require_raw_input
+    require_raw_input(node)
     ext_paths = _find_eiger_external_link_paths(h5f, name)
     if ext_paths:
         # Same provisional-link contract as the shared opener (NXS-LINK-1).
@@ -1218,6 +1239,8 @@ def open_nexus_image_stack(
     h5f = h5py.File(p, "r")
     try:
         entry = _resolved_entry_name(h5f, entry)
+        from xrd_tools.io.processed_scan_id import require_raw_input
+        require_raw_input(h5f, entry)
         ext_paths = _find_eiger_external_link_paths(h5f, entry)
         if ext_paths:
             # ANY declared-but-unlanded segment makes the whole open typed
@@ -1265,6 +1288,8 @@ def find_nexus_image_dataset_in_open_file(
     entry = _resolved_entry_name(h5f, entry)
     if entry not in h5f:
         return None
+    from xrd_tools.io.processed_scan_id import require_raw_input
+    require_raw_input(h5f, entry)
     _reject_unsupported_detector_rank(h5f, entry)
     grp = h5f[entry]
 
@@ -1276,11 +1301,15 @@ def find_nexus_image_dataset_in_open_file(
     # acquisition) is accepted by the canonical-location LAST-RESORT pass at the
     # bottom, only when nothing else resolves.
     candidate = f"{entry}/instrument/detector/data"
-    if isinstance(_candidate_obj := h5f.get(candidate), h5py.Dataset) and _candidate_obj.ndim == 3:
+    if isinstance(_candidate_obj := h5f.get(candidate), h5py.Dataset):
+        require_raw_input(_candidate_obj)
+    if isinstance(_candidate_obj, h5py.Dataset) and _candidate_obj.ndim == 3:
         return f"/{candidate}"
 
     candidate = f"{entry}/data/data"
-    if isinstance(_candidate_obj := h5f.get(candidate), h5py.Dataset) and _candidate_obj.ndim == 3:
+    if isinstance(_candidate_obj := h5f.get(candidate), h5py.Dataset):
+        require_raw_input(_candidate_obj)
+    if isinstance(_candidate_obj, h5py.Dataset) and _candidate_obj.ndim == 3:
         return f"/{candidate}"
 
     if "instrument" in grp:
@@ -1290,7 +1319,9 @@ def find_nexus_image_dataset_in_open_file(
             if not isinstance(sub, h5py.Group):
                 continue
             inner = f"{entry}/instrument/{subname}/data"
-            if isinstance(_inner_obj := h5f.get(inner), h5py.Dataset) and _inner_obj.ndim == 3:
+            if isinstance(_inner_obj := h5f.get(inner), h5py.Dataset):
+                require_raw_input(_inner_obj)
+            if isinstance(_inner_obj, h5py.Dataset) and _inner_obj.ndim == 3:
                 return f"/{inner}"
 
     # Bluesky / apstools NXWriter: the NXdata ``@signal`` points at a scalar
@@ -1301,6 +1332,7 @@ def find_nexus_image_dataset_in_open_file(
     from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
     det = find_detector_signal_dataset(grp)
     if det is not None:
+        require_raw_input(det)
         if det.ndim > 3:
             raise UnsupportedDetectorRankError(
                 f"{det.name} has rank {det.ndim}; detector data must be 2-D "
@@ -1312,29 +1344,18 @@ def find_nexus_image_dataset_in_open_file(
     # reduced ``integrated_1d`` / ``integrated_2d`` stacks.  The largest-3-D
     # fallback below would otherwise select ``/entry/integrated_2d/intensity``
     # (a 3-D cake) and hand back an integrated pattern as a detector frame.
-    # Reject BEFORE that fallback so a processed output can never be re-ingested
-    # as raw input.  Arms 1-5 above (explicit detector paths / signal_type) still
-    # win when — impossibly for a real processed file — a true detector dataset
-    # is also present.  A raw acquisition never carries these groups, so raw
-    # resolution is unaffected.
-    from xrd_tools.io.processed_scan_id import (
-        ProcessedXdartInputError,
-        is_processed_xdart_file,
-    )
-    if is_processed_xdart_file(h5f, entry):
-        raise ProcessedXdartInputError(
-            f"{getattr(h5f, 'filename', '<file>')} is a processed xdart scan "
-            "file (integrated results, no raw detector image); it cannot be read "
-            "as a raw detector container. Use xrd_tools.io.read.get_raw_frame to "
-            "read the original raw frames via the stored source pointer."
-        )
-
+    # The marker guard above runs before every selector, including explicit
+    # detector paths and signal_type datasets.  Reaching this fallback therefore
+    # proves the entry has no processed-output marker.
     best_path: str | None = None
     best_size = 0
 
     def _visit(name: str, obj: Any) -> None:
         nonlocal best_path, best_size
-        if not isinstance(obj, h5py.Dataset) or obj.ndim != 3:
+        if not isinstance(obj, h5py.Dataset):
+            return
+        require_raw_input(obj)
+        if obj.ndim != 3:
             return
         size = int(np.prod(obj.shape))
         if size > best_size:
@@ -1352,7 +1373,9 @@ def find_nexus_image_dataset_in_open_file(
     # real stack.  The largest-dataset fallback stays strict-3D — a lone 2-D
     # array of unknown provenance is more likely a table than a frame.
     for cand in (f"{entry}/instrument/detector/data", f"{entry}/data/data"):
-        if isinstance(_cand_obj := h5f.get(cand), h5py.Dataset) and _cand_obj.ndim == 2:
+        if isinstance(_cand_obj := h5f.get(cand), h5py.Dataset):
+            require_raw_input(_cand_obj)
+        if isinstance(_cand_obj, h5py.Dataset) and _cand_obj.ndim == 2:
             return f"/{cand}"
     if "instrument" in grp:
         instr = grp["instrument"]
@@ -1361,7 +1384,9 @@ def find_nexus_image_dataset_in_open_file(
             if not isinstance(sub, h5py.Group):
                 continue
             inner = f"{entry}/instrument/{subname}/data"
-            if isinstance(_inner_obj := h5f.get(inner), h5py.Dataset) and _inner_obj.ndim == 2:
+            if isinstance(_inner_obj := h5f.get(inner), h5py.Dataset):
+                require_raw_input(_inner_obj)
+            if isinstance(_inner_obj, h5py.Dataset) and _inner_obj.ndim == 2:
                 return f"/{inner}"
 
     # Nothing resolved.  If a canonical detector LINK exists but its target
@@ -3871,6 +3896,20 @@ def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
     return out
 
 
+def _current_processed_groups(
+    handle: h5py.File,
+    entry: str,
+    path: Path,
+):
+    """Return the exact local entry/result groups from one admission pass."""
+    from xrd_tools.io.processed_scan_id import require_current_processed_groups
+    return require_current_processed_groups(
+        handle,
+        entry,
+        container=path,
+    )
+
+
 def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                   include_thumbnails: bool):
     """v2-schema reader.  Body of public ``read_scan``."""
@@ -3884,13 +3923,13 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
     attrs_per_var: dict[str, dict] = {}
 
     with h5py.File(path, "r") as f:
-        if entry not in f:
-            raise KeyError(f"No {entry!r} group in {path}")
-        e = f[entry]
+        processed = _current_processed_groups(f, entry, path)
+        e = processed.entry
+        g1 = processed.integrated_1d
+        g2 = processed.integrated_2d
         warn_if_newer_schema(e, str(path))
 
-        if "1d" in groups and "integrated_1d" in e:
-            g1 = e["integrated_1d"]
+        if "1d" in groups and g1 is not None:
             data_vars["intensity_1d"] = (
                 ("frame", "q"),
                 np.asarray(g1["intensity"][()]),
@@ -3907,8 +3946,7 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
             if "frame_index" in g1:
                 coords["frame"] = np.asarray(g1["frame_index"][()])
 
-        if "2d" in groups and "integrated_2d" in e:
-            g2 = e["integrated_2d"]
+        if "2d" in groups and g2 is not None:
             fidx_2d = (
                 np.asarray(g2["frame_index"][()])
                 if "frame_index" in g2 else None
@@ -4094,19 +4132,17 @@ def read_scan_metadata(
     attrs_per_coord: dict[str, dict] = {}
 
     with h5py.File(path, "r") as f:
-        if entry not in f:
-            raise KeyError(f"No {entry!r} group in {path}")
-        e = f[entry]
+        processed = _current_processed_groups(f, entry, path)
+        e = processed.entry
+        g1 = processed.integrated_1d
+        g2 = processed.integrated_2d
         warn_if_newer_schema(e, str(path))
 
         # frame_index — try integrated_1d first, then integrated_2d,
         # then per_frame_geometry.  Cheap; no intensity is loaded.
-        for grp_name in ("integrated_1d", "integrated_2d",
-                         "per_frame_geometry"):
-            if grp_name in e and "frame_index" in e[grp_name]:
-                coords["frame"] = np.asarray(
-                    e[grp_name]["frame_index"][()]
-                )
+        for group in (g1, g2, e.get("per_frame_geometry")):
+            if isinstance(group, h5py.Group) and "frame_index" in group:
+                coords["frame"] = np.asarray(group["frame_index"][()])
                 break
 
         # Consistency with read_scan: if 1D and 2D were reduced over
@@ -4115,22 +4151,21 @@ def read_scan_metadata(
         # silently report only the 1D labels (the get_metadata "frames"
         # would otherwise disagree with read_scan / get_2d).
         if (
-            "integrated_1d" in e and "frame_index" in e["integrated_1d"]
-            and "integrated_2d" in e and "frame_index" in e["integrated_2d"]
+            g1 is not None and "frame_index" in g1
+            and g2 is not None and "frame_index" in g2
         ):
-            f1 = np.asarray(e["integrated_1d"]["frame_index"][()])
-            f2 = np.asarray(e["integrated_2d"]["frame_index"][()])
+            f1 = np.asarray(g1["frame_index"][()])
+            f2 = np.asarray(g2["frame_index"][()])
             if f1.shape != f2.shape or not np.array_equal(f1, f2):
                 coords["frame_2d"] = f2
 
         # q / chi axes (small).
-        if "integrated_1d" in e and "q" in e["integrated_1d"]:
-            coords["q"] = np.asarray(e["integrated_1d/q"][()])
-            u = e["integrated_1d/q"].attrs.get("units", None)
+        if g1 is not None and "q" in g1:
+            coords["q"] = np.asarray(g1["q"][()])
+            u = g1["q"].attrs.get("units", None)
             if u is not None:
                 attrs_per_coord["q"] = {"units": _v2_decode_str(u)}
-        if "integrated_2d" in e:
-            g2 = e["integrated_2d"]
+        if g2 is not None:
             if "q" in g2:
                 coords["q_2d"] = np.asarray(g2["q"][()])
                 u_q2 = g2["q"].attrs.get("units", None)
@@ -4223,7 +4258,7 @@ def read_scan(
     Parameters
     ----------
     path
-        Path to the ``.nxs`` file.
+        Path to the current ``.nexus`` file.
     entry
         NXentry group name (default ``"entry"``).
     groups
@@ -4271,9 +4306,7 @@ def read_stitched(
             return str(raw)
 
     with h5py.File(path, "r") as f:
-        if entry not in f:
-            raise KeyError(f"No {entry!r} group in {path}")
-        e = f[entry]
+        e = _current_processed_groups(f, entry, path).entry
         has_1d = "stitched_1d" in e
         has_2d = "stitched_2d" in e
         if not (has_1d or has_2d):

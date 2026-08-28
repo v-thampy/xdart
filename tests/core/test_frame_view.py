@@ -15,6 +15,32 @@ from xrd_tools.core import (
 )
 from xrd_tools.io import read_frame_view, read_frame_views, iter_frame_views
 from xrd_tools.io.nexus import read_scan, write_integrated_stack
+from xrd_tools.io.schema import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    SCHEMA_NAME_ATTR,
+    SCHEMA_VERSION_ATTR,
+)
+
+
+def _current_entry(handle):
+    entry = handle.create_group("entry")
+    entry.attrs["NX_class"] = "NXentry"
+    entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+    entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+    return entry
+
+
+def _qualify_current_processed_entry(handle):
+    entry = handle["entry"]
+    entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+    entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+    write_integrated_stack(
+        entry,
+        frame_indices=[1],
+        results_1d=[_r1d()],
+    )
+    return entry
 
 
 def _r1d(scale: float = 1.0) -> IntegrationResult1D:
@@ -62,13 +88,13 @@ def test_frame_view_from_results_uses_display_orientation():
 
 
 def test_write_read_frame_view_roundtrips_gi_2d_sigma_kind_and_metadata(tmp_path):
-    path = tmp_path / "gi_frame_view.nxs"
+    path = tmp_path / "gi_frame_view.nexus"
     r1d = _r1d()
     r2d = _gi_2d()
     thumbnail = np.array([[0, 127], [255, 64]], dtype=np.uint8)
 
     with h5py.File(path, "w") as f:
-        entry = f.create_group("entry")
+        entry = _current_entry(f)
         write_integrated_stack(
             entry,
             frame_indices=[5],
@@ -117,14 +143,14 @@ def test_write_read_frame_view_roundtrips_gi_2d_sigma_kind_and_metadata(tmp_path
 
 
 def test_read_frame_views_reads_many_labels_with_one_contract(tmp_path):
-    path = tmp_path / "many_frame_views.nxs"
+    path = tmp_path / "many_frame_views.nexus"
     r1 = _r1d(1.0)
     r2 = _r1d(2.0)
     g1 = _gi_2d(1.0)
     g2 = _gi_2d(3.0)
 
     with h5py.File(path, "w") as f:
-        entry = f.create_group("entry")
+        entry = _current_entry(f)
         write_integrated_stack(
             entry,
             frame_indices=[5, 7],
@@ -167,9 +193,9 @@ def test_frame_view_reader_caches_scan_data_columns_per_open(tmp_path):
     # Values must stay correct per frame.
     from xrd_tools.io.frame_view import FrameViewReader
 
-    path = tmp_path / "cache_cols.nxs"
+    path = tmp_path / "cache_cols.nexus"
     with h5py.File(path, "w") as f:
-        entry = f.create_group("entry")
+        entry = _current_entry(f)
         write_integrated_stack(
             entry, frame_indices=[5, 7], results_1d=[_r1d(1.0), _r1d(2.0)],
         )
@@ -191,11 +217,11 @@ def test_frame_view_reader_caches_scan_data_columns_per_open(tmp_path):
 @pytest.mark.parametrize(
     ("case", "node_name", "message"),
     (
-        ("inventory", "/entry/integrated_1d/frame_index", "item count"),
-        ("axis", "/entry/integrated_1d/q", "item count"),
+        ("inventory", "/entry/integrated_1d/frame_index", "current xdart"),
+        ("axis", "/entry/integrated_1d/q", "current xdart"),
         ("scan_data", "/entry/scan_data/oversized", "columns exceed"),
-        ("row_1d", "/entry/integrated_1d/intensity", "1-D row stack"),
-        ("row_2d", "/entry/integrated_2d/intensity", "2-D row stack"),
+        ("row_1d", "/entry/integrated_1d/intensity", "current xdart"),
+        ("row_2d", "/entry/integrated_2d/intensity", "current xdart"),
     ),
 )
 def test_frame_view_refuses_malformed_or_oversized_nodes_before_getitem(
@@ -205,9 +231,9 @@ def test_frame_view_refuses_malformed_or_oversized_nodes_before_getitem(
 
     from xrd_tools.io.frame_view import FrameViewReader
 
-    path = tmp_path / f"bounded_{case}.nxs"
+    path = tmp_path / f"bounded_{case}.nexus"
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry,
             frame_indices=[5],
@@ -261,9 +287,9 @@ def test_frame_view_bounds_source_path_and_text_attributes_without_getitem(
 ):
     from xrd_tools.io.frame_view import FrameViewReader
 
-    path = tmp_path / "bounded_text.nxs"
+    path = tmp_path / "bounded_text.nexus"
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry, frame_indices=[5], results_1d=[_r1d()],
         )
@@ -301,15 +327,15 @@ def test_frame_view_bounds_source_base_without_attribute_getitem_or_file_name(
 ):
     from xrd_tools.io.frame_view import FrameViewReader
 
-    oversized = tmp_path / "oversized_source_base.nxs"
-    ordinary = tmp_path / "ordinary_source_base.nxs"
+    oversized = tmp_path / "oversized_source_base.nexus"
+    ordinary = tmp_path / "ordinary_source_base.nexus"
     for path, source_base in (
         (oversized, "x" * 4097),
         (ordinary, "/relocated/raw"),
     ):
         with h5py.File(path, "w") as handle:
             handle.attrs["file_name"] = "must-not-be-read" * 5000
-            entry = handle.create_group("entry")
+            entry = _current_entry(handle)
             entry.attrs["source_base"] = source_base
             write_integrated_stack(
                 entry, frame_indices=[5], results_1d=[_r1d()],
@@ -349,16 +375,16 @@ def test_frame_view_rejects_external_processed_tables(tmp_path):
         source.create_dataset("path", data=np.bytes_("foreign.raw"))
         source.create_dataset("frame_index", data=np.int64(0))
 
-    path = tmp_path / "external_tables.nxs"
+    path = tmp_path / "external_tables.nexus"
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry, frame_indices=[5], results_1d=[_r1d()],
         )
         for name in ("per_frame_geometry", "scan_data", "frames"):
             entry[name] = h5py.ExternalLink(str(foreign), f"/{name}")
 
-    with pytest.raises(ValueError, match="local hard-linked"):
+    with pytest.raises(ValueError, match="current xdart|local hard-linked"):
         with FrameViewReader(path):
             pass
 
@@ -368,9 +394,9 @@ def test_frame_view_applies_one_aggregate_budget_across_vlen_columns(
 ):
     from xrd_tools.io import frame_view as module
 
-    path = tmp_path / "bounded_vlen_aggregate.nxs"
+    path = tmp_path / "bounded_vlen_aggregate.nexus"
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry, frame_indices=[5], results_1d=[_r1d()],
         )
@@ -397,10 +423,10 @@ def test_frame_view_does_not_decode_second_vlen_column_after_budget_spent(
 ):
     from xrd_tools.io import frame_view as module
 
-    path = tmp_path / "bounded_vlen_remaining_allowance.nxs"
+    path = tmp_path / "bounded_vlen_remaining_allowance.nexus"
     value = "first"
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry, frame_indices=[5], results_1d=[_r1d()],
         )
@@ -436,10 +462,10 @@ def test_frame_view_vlen_preflight_charges_empty_python_cells_before_read(
 ):
     from xrd_tools.io import frame_view as module
 
-    path = tmp_path / "bounded_vlen_empty_cells.nxs"
+    path = tmp_path / "bounded_vlen_empty_cells.nexus"
     rows = 100
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry, frame_indices=[5], results_1d=[_r1d()],
         )
@@ -475,18 +501,18 @@ def test_frame_view_rejects_external_scientific_ancestry(tmp_path, node):
 
     foreign = tmp_path / f"foreign_{node}.h5"
     with h5py.File(foreign, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry, frame_indices=[5], results_1d=[_r1d()],
         )
         entry["integrated_1d"].create_group("q_ip")
 
-    path = tmp_path / f"external_{node}.nxs"
+    path = tmp_path / f"external_{node}.nexus"
     with h5py.File(path, "w") as handle:
         if node == "entry":
             handle["entry"] = h5py.ExternalLink(str(foreign), "/entry")
         else:
-            entry = handle.create_group("entry")
+            entry = _current_entry(handle)
             write_integrated_stack(
                 entry, frame_indices=[5], results_1d=[_r1d()],
             )
@@ -505,7 +531,10 @@ def test_frame_view_rejects_external_scientific_ancestry(tmp_path, node):
                     str(foreign), "/entry/integrated_1d/q",
                 )
 
-    with pytest.raises(ValueError, match="local hard-linked"):
+    with pytest.raises(
+        ValueError,
+        match="current xdart|local hard-linked",
+    ):
         with FrameViewReader(path):
             pass
 
@@ -522,9 +551,9 @@ def test_frame_view_refuses_unbounded_or_foreign_thumbnail_before_getitem(
     with h5py.File(foreign, "w") as handle:
         handle.create_dataset("mask", data=np.zeros((2, 2), dtype=bool))
 
-    path = tmp_path / f"bounded_thumbnail_{case}.nxs"
+    path = tmp_path / f"bounded_thumbnail_{case}.nexus"
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry, frame_indices=[5], results_1d=[_r1d()],
         )
@@ -572,10 +601,10 @@ def test_frame_view_refuses_unbounded_or_foreign_thumbnail_before_getitem(
 
 
 def test_frame_view_accepts_bounded_uint16_thumbnail_and_direct_mask(tmp_path):
-    path = tmp_path / "bounded_uint16_thumbnail.nxs"
+    path = tmp_path / "bounded_uint16_thumbnail.nexus"
     encoded = np.array([[0, 65535], [32768, 16384]], dtype=np.uint16)
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = _current_entry(handle)
         write_integrated_stack(
             entry, frame_indices=[5], results_1d=[_r1d()],
         )
@@ -603,7 +632,7 @@ def test_browse_presentation_is_exact_bounded_projection(tmp_path):
     from xrd_tools.core.provenance import read_provenance, write_provenance
     from xrd_tools.io.browse_presentation import read_browse_presentation
 
-    path = tmp_path / "presentation.nxs"
+    path = tmp_path / "presentation.nexus"
     config = {
         "poni_file": "/calibration/beam.poni",
         "gi": {"enabled": True, "resolved_motor": "th"},
@@ -619,6 +648,7 @@ def test_browse_presentation_is_exact_bounded_projection(tmp_path):
             handle, config=config, inputs={"raw_files": ["raw.h5"]},
             program_version="test", host="",
         )
+        _qualify_current_processed_entry(handle)
         mono = handle["entry"].create_group("instrument/monochromator")
         mono.create_dataset("wavelength", data=np.float64(1.239841984))
 
@@ -644,12 +674,13 @@ def test_browse_presentation_does_not_follow_external_geometry(tmp_path):
         group.create_dataset(
             "mapping_json", data="{}", dtype=h5py.string_dtype("utf-8"),
         )
-    path = tmp_path / "external_geometry.nxs"
+    path = tmp_path / "external_geometry.nexus"
     with h5py.File(path, "w") as handle:
         write_provenance(
             handle, config={"poni_file": "beam.poni"},
             program_version="test", host="",
         )
+        _qualify_current_processed_entry(handle)
         handle["entry/reduction/config"]["geometry"] = h5py.ExternalLink(
             str(foreign), "/geometry",
         )
@@ -675,12 +706,13 @@ def test_browse_presentation_rejects_external_ancestry(tmp_path, node):
             group = handle.create_group("monochromator")
             group.create_dataset("wavelength", data=np.float64(1.0))
 
-    path = tmp_path / f"external_presentation_{node}.nxs"
+    path = tmp_path / f"external_presentation_{node}.nexus"
     with h5py.File(path, "w") as handle:
         write_provenance(
             handle, config={"poni_file": "beam.poni"},
             program_version="test", host="",
         )
+        _qualify_current_processed_entry(handle)
         entry = handle["entry"]
         if node == "config":
             del entry["reduction/config"]
@@ -702,14 +734,34 @@ def test_browse_presentation_rejects_external_ancestry(tmp_path, node):
         read_browse_presentation(path)
 
 
+def test_browse_presentation_rejects_unstamped_integrated_artifact(tmp_path):
+    from xrd_tools.core.provenance import write_provenance
+    from xrd_tools.io.browse_presentation import read_browse_presentation
+
+    path = tmp_path / "unstamped-presentation.nexus"
+    with h5py.File(path, "w") as handle:
+        write_provenance(
+            handle, config={"poni_file": "historical.poni"},
+            program_version="test", host="",
+        )
+        write_integrated_stack(
+            handle["entry"],
+            frame_indices=[1],
+            results_1d=[_r1d()],
+        )
+
+    with pytest.raises(ValueError, match="current xdart"):
+        read_browse_presentation(path)
+
+
 def test_iter_frame_views_streams_one_at_a_time(tmp_path):
     # P3 #6: iter_frame_views must yield frame-by-frame from one open reader
     # (a generator), not materialise the whole scan first.
     import types
 
-    path = tmp_path / "stream.nxs"
+    path = tmp_path / "stream.nexus"
     with h5py.File(path, "w") as f:
-        entry = f.create_group("entry")
+        entry = _current_entry(f)
         write_integrated_stack(
             entry, frame_indices=[5, 7], results_1d=[_r1d(1.0), _r1d(2.0)],
         )
@@ -728,10 +780,10 @@ def test_iter_frame_views_streams_one_at_a_time(tmp_path):
 
 
 def test_frame_view_infers_gi_kind_for_old_files_without_explicit_attr(tmp_path):
-    path = tmp_path / "old_gi_no_kind.nxs"
+    path = tmp_path / "old_gi_no_kind.nexus"
     r2d = _gi_2d()
     with h5py.File(path, "w") as f:
-        entry = f.create_group("entry")
+        entry = _current_entry(f)
         write_integrated_stack(entry, frame_indices=[1], results_2d=[r2d])
         del entry["integrated_2d"].attrs["two_d_kind"]
 

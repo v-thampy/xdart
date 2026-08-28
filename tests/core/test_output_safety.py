@@ -27,8 +27,10 @@ from xrd_tools.io.output_safety import (
 )
 from xrd_tools.io.processed_scan_id import (
     ProcessedXdartInputError,
-    is_processed_xdart_file,
-    is_processed_xdart_path,
+    has_processed_output_markers_file,
+    has_processed_output_markers_path,
+    is_current_processed_xdart_file,
+    is_current_processed_xdart_path,
 )
 from xrd_tools.io.nexus import (
     find_nexus_image_dataset,
@@ -113,25 +115,30 @@ def _write_raw_detector_nxs(path):
 
 class TestProcessedClassifier:
     def test_classifier_true_for_processed(self, tmp_path):
-        p = _write_processed_xdart(tmp_path / "proc.nxs")
-        assert is_processed_xdart_path(p) is True
+        p = _write_processed_xdart(tmp_path / "proc.nexus")
+        assert has_processed_output_markers_path(p) is True
+        assert is_current_processed_xdart_path(p) is True
         with h5py.File(p, "r") as f:
-            assert is_processed_xdart_file(f) is True
+            assert has_processed_output_markers_file(f) is True
+            assert is_current_processed_xdart_file(f) is True
 
     def test_classifier_true_for_legacy_no_schema_stamp(self, tmp_path):
         # Real field files (nexusformat round-trip) carry the integrated groups
         # but NO ssrl_schema stamp — the content signal must still classify them.
         p = _write_processed_xdart(tmp_path / "legacy.nxs", stamp_schema=False)
-        assert is_processed_xdart_path(p) is True
+        assert has_processed_output_markers_path(p) is True
+        assert is_current_processed_xdart_path(p) is False
 
     def test_classifier_false_for_raw(self, tmp_path):
         p = _write_raw_detector_nxs(tmp_path / "raw.nxs")
-        assert is_processed_xdart_path(p) is False
+        assert has_processed_output_markers_path(p) is False
+        assert is_current_processed_xdart_path(p) is False
 
     def test_classifier_false_for_unreadable(self, tmp_path):
         p = tmp_path / "torn.nxs"
         p.write_bytes(b"\x89HDF\r\n not really hdf5")
-        assert is_processed_xdart_path(p) is False
+        assert has_processed_output_markers_path(p) is False
+        assert is_current_processed_xdart_path(p) is False
 
 
 class TestFinderRejectsProcessed:

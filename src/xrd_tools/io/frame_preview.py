@@ -14,7 +14,9 @@ __all__ = ["DetectorPreviewProjection", "FramePreview", "read_frame_preview"]
 def _check(condition, message, error=TypeError):
     if not condition:
         raise error(message)
-def _source_projection_matches(locator, projected, *, source_base, artifact):
+def _source_projection_matches(
+    locator, projected, *, source_base, source_root, artifact,
+):
     if locator is None or projected is None:
         return locator is projected, False
     stored_text = locator.replace("\\", "/")
@@ -23,19 +25,14 @@ def _source_projection_matches(locator, projected, *, source_base, artifact):
     if ".." in stored.parts:
         return False, False
     try:
-        strong = resolve_source_master(
+        resolved = resolve_source_master(
             locator, scan_file=artifact, source_base=source_base,
-            allow_basename_fallbacks=False,
+            source_root=source_root,
         )
-        if strong is not None:
-            return str(strong).replace("\\", "/") == projected_text, True
-        weak = resolve_source_master(
-            locator, scan_file=artifact, source_base=source_base,
-        )
+        if resolved is not None:
+            return str(resolved).replace("\\", "/") == projected_text, True
     except Exception:
         return False, False
-    if weak is not None:
-        return str(weak).replace("\\", "/") == projected_text, False
     return stored_text == projected_text, False
 @dataclass(frozen=True, slots=True)
 class DetectorPreviewProjection:
@@ -111,6 +108,7 @@ class FramePreview:
         projection = _source_projection_matches(
             self.raw_locator, self.view.source_path,
             source_base=self.source_base,
+            source_root=self.read_key.source_root,
             artifact=self.read_key.artifact_identity,
         )
         _check(
@@ -126,7 +124,7 @@ class FramePreview:
         _check(not has_raw or purpose is HydrationPurpose.FULL, "purpose does not authorize detector raw", ValueError)
         _check(not has_raw or self.detector_diagnostic is None, "detector success cannot carry a diagnostic", ValueError)
         _check(not has_raw or (self.raw_locator is not None and self.source_frame_index is not None), "detector success requires exact provenance", ValueError)
-        hdf_raw = has_raw and Path(self.raw_locator).suffix.lower() in {".h5", ".hdf5", ".nxs"}
+        hdf_raw = has_raw and Path(self.raw_locator).suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus"}
         _check(not hdf_raw or self.raw_dataset_path is not None, "HDF detector success requires a dataset anchor", ValueError)
         _check(has_raw or bool(self.detector_diagnostic) == requested, "detector absence/diagnostic facts are inconsistent", ValueError)
 def _source_provenance(reader, frame):
@@ -172,7 +170,13 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
     if type(read_key.frame_identity) is not int or read_key.frame_identity < 0:
         raise TypeError("preview frame identity must be an exact nonnegative integer")
     frame, artifact = read_key.frame_identity, Path(read_key.artifact_identity)
-    with FrameViewReader(artifact, entry=entry, resolve_source=True, target_frame=frame) as reader:
+    with FrameViewReader(
+        artifact,
+        entry=entry,
+        resolve_source=True,
+        target_frame=frame,
+        source_root=read_key.source_root,
+    ) as reader:
         if not reader.has_frame(frame):
             raise KeyError(f"processed frame {frame} is absent")
         view = reader.read(frame)
@@ -195,10 +199,15 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
         elif source_index is None:
             diagnostic = source_error or "raw frame identity unavailable"
         else:
-            resolved = resolve_source_master(locator, scan_file=artifact, source_base=source_base, allow_basename_fallbacks=False)
+            resolved = resolve_source_master(
+                locator,
+                scan_file=artifact,
+                source_base=source_base,
+                source_root=read_key.source_root,
+            )
             if resolved is None:
                 diagnostic = "raw source unavailable"
-            elif resolved.suffix.lower() in {".h5", ".hdf5", ".nxs"} and dataset_path is None:
+            elif resolved.suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus"} and dataset_path is None:
                 diagnostic = "raw dataset identity unavailable"
             else:
                 try:

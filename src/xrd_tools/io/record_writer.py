@@ -71,6 +71,7 @@ from xrd_tools.io.schema import (
     INTEGRATED_ROW_ALIGNED,
     MONOTONIC_ATTR,
     PRIMARY_MODE_ATTR,
+    SOURCE_BASE_ATTR,
     THUMBNAIL_LUT_ATTRS,
     mode_subgroup_name,
 )
@@ -774,6 +775,8 @@ class NexusRecordWriter:
         replacement_audit: bytes | None = None,
         replacement_selected_plan: Mapping[str, Any] | None = None,
         replacement_gi_mode: str | None = None,
+        replacement_source_execution: Mapping[str, Any] | None = None,
+        replacement_append_lineage: bytes | None = None,
     ) -> None:
         if flush_every is not None and int(flush_every) <= 0:
             raise ValueError(f"flush_every must be > 0 or None; got {flush_every}")
@@ -801,8 +804,22 @@ class NexusRecordWriter:
         self._defer_epoch_durability = defer_epoch_durability
         self._append_decision = append_decision
         replacement_values = (replacement_dimension, replacement_labels, replacement_audit, replacement_selected_plan)
-        if any(value is not None for value in replacement_values) and (not all(value is not None for value in replacement_values) or transaction_binding is None or fast_regenerable): raise ValueError("selected-dimension replacement configuration is incomplete or unbound")
-        self._replacement_configuration = None if replacement_dimension is None else (replacement_dimension, tuple(replacement_labels), bytes(replacement_audit), dict(replacement_selected_plan), replacement_gi_mode)
+        if any(value is not None for value in replacement_values) and (not all(value is not None for value in replacement_values) or transaction_binding is None or fast_regenerable or replacement_source_execution is None or not self.source_base): raise ValueError("selected-dimension replacement configuration is incomplete or unbound")
+        if replacement_dimension is None and (replacement_source_execution is not None or replacement_append_lineage is not None): raise ValueError("replacement source context requires a selected dimension")
+        if replacement_dimension is not None:
+            try:
+                source_execution = dict(_validate_replacement_execution(dict(replacement_source_execution)))
+                source_base_text = os.fspath(self.source_base)
+                if (not os.path.isabs(source_base_text)
+                        or os.path.normcase(os.path.normpath(source_base_text)) != source_base_text):
+                    raise ValueError
+                append_bytes = None if replacement_append_lineage is None else bytes(replacement_append_lineage)
+                append_value = None if append_bytes is None else json.loads(append_bytes.decode("utf-8", errors="strict"))
+                if append_value is not None and (type(append_value) is not dict or append_bytes != json.dumps(append_value, sort_keys=True, separators=(",", ":")).encode() or append_value.get("source_base") != source_base_text):
+                    raise ValueError
+            except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, WriterStateError) as error:
+                raise ValueError("replacement source context is malformed") from error
+        self._replacement_configuration = None if replacement_dimension is None else (replacement_dimension, tuple(replacement_labels), bytes(replacement_audit), dict(replacement_selected_plan), replacement_gi_mode, source_execution, append_bytes, append_value)
         self._replacement_labels: tuple[int, ...] = ()
         self._replacement_read_context = self._replacement_manifest = self._replacement_expected = None
         if append_decision is not None and (
@@ -1763,7 +1780,15 @@ class NexusRecordWriter:
         digest = hashlib.sha256(b"xrd-tools-replacement-manifest-v1\0"); root = self._h5 if handle is None else handle; config = _replacement_hard_group(root, f"{self.entry}/reduction/config"); config_prefix = "" if config is None else f"{config.name.rstrip('/')}/"
         def update(role, value): payload = value if isinstance(value, bytes) else repr(value).encode(); digest.update(len(role).to_bytes(8, "big") + role.encode() + len(payload).to_bytes(8, "big") + payload)
         def walk(group, prefix, active=()):
-            for name in sorted(group.attrs): update(f"{prefix}@{name}", _replacement_value_signature(_read_replacement_attribute_value(group, name, f"replacement manifest {group.name}@{name}"), group.attrs.get_id(name).dtype))
+            entry_path = "/" + "/".join(
+                part for part in self.entry.split("/") if part
+            )
+            for name in sorted(group.attrs):
+                if (self._replacement_configuration is not None
+                        and group.name == entry_path
+                        and name == SOURCE_BASE_ATTR):
+                    continue
+                update(f"{prefix}@{name}", _replacement_value_signature(_read_replacement_attribute_value(group, name, f"replacement manifest {group.name}@{name}"), group.attrs.get_id(name).dtype))
             for name in sorted(group):
                 path = f"{group.name.rstrip('/')}/{name}"
                 if path in exclude: continue
@@ -2309,7 +2334,7 @@ class NexusRecordWriter:
         with h5py.File(self.target, "r") as h5:
             entry = _replacement_hard_group(h5, self.entry) if self._replacement_configuration is not None else h5.get(self.entry)
             if self._replacement_configuration is not None:
-                dimension = self._replacement_configuration[0]; root = entry.name if isinstance(entry, h5py.Group) else f"/{self.entry.strip('/')}"; excluded = (f"{root}/integrated_{dimension}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}"); config = _replacement_hard_group(entry, "reduction/config"); (None if isinstance(entry, h5py.Group) and isinstance(config, h5py.Group) else (_ for _ in ()).throw(WriterStateError("replacement entry/config is not local"))); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = config.get("gi_config", getlink=True); (None if gi_link is None or type(gi_link) is h5py.HardLink else (_ for _ in ()).throw(WriterStateError("replacement GI config is not local"))); gi_values = _replacement_json_node(config, "gi_config", "replacement GI config", required=False)
+                dimension = self._replacement_configuration[0]; root = entry.name if isinstance(entry, h5py.Group) else f"/{self.entry.strip('/')}"; excluded = (f"{root}/integrated_{dimension}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}", f"{root}/reduction/config/source_execution", f"{root}/reduction/config/append_lineage"); config = _replacement_hard_group(entry, "reduction/config"); (None if isinstance(entry, h5py.Group) and isinstance(config, h5py.Group) else (_ for _ in ()).throw(WriterStateError("replacement entry/config is not local"))); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = config.get("gi_config", getlink=True); (None if gi_link is None or type(gi_link) is h5py.HardLink else (_ for _ in ()).throw(WriterStateError("replacement GI config is not local"))); gi_values = _replacement_json_node(config, "gi_config", "replacement GI config", required=False)
                 gi_values = {} if gi_values is None else gi_values
                 gi_name = f"gi_mode_{dimension}"; (None if type(gi_values) is dict else (_ for _ in ()).throw(WriterStateError("replacement GI config is malformed"))); self._replacement_manifest = excluded, self._replacement_manifest_digest(excluded, h5), gi_name, self._replacement_node_signature(gi_node), json.dumps({key: value for key, value in gi_values.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode()
             if entry is None:
@@ -2320,7 +2345,11 @@ class NexusRecordWriter:
                     )
                 }
             if self._replacement_configuration is None and entry.get("frames/frame_0001/finite_counts", getlink=True) is not None: self.write_batch = self._write_batch_preserving_average_counts
-            if self.complete_record and self.source_base:
+            if (
+                self._replacement_configuration is None
+                and self.complete_record
+                and self.source_base
+            ):
                 validate_source_base(entry, self.source_base)
             for name, requested in (
                 ("integrated_1d", self._primary_mode_1d),
@@ -2456,7 +2485,9 @@ class NexusRecordWriter:
                     self._replacement_read_context = (source_base, lineage, execution)
             self.phase = WriterPhase.ACTIVE
             if self._replacement_configuration is not None:
-                dimension, labels, audit, selected, gi_mode = self._replacement_configuration
+                dimension, labels, audit, selected, gi_mode = (
+                    self._replacement_configuration[:5]
+                )
                 self._reset_selected_dimension(
                     dimension, labels, audit, selected_plan=selected,
                     selected_gi_mode=gi_mode,
@@ -2478,16 +2509,36 @@ class NexusRecordWriter:
         except UnicodeDecodeError as error: raise WriterStateError("replacement audit is not UTF-8") from error
         audit_text = _bounded_replacement_config_text(audit_text, "replacement audit")
         bai_text = _bounded_replacement_config_text(json.dumps(dict(selected_plan), sort_keys=True, separators=(",", ":")), "replacement selected BAI")
+        (_dimension, _labels, _audit, _selected, _gi_mode,
+         source_execution, append_bytes,
+         append_value) = self._replacement_configuration
+        execution_text = json.dumps(
+            source_execution, sort_keys=True, separators=(",", ":"),
+        )
+        if len(execution_text.encode("utf-8")) > _MAX_REPLACEMENT_LINEAGE_UTF8_BYTES:
+            raise WriterStateError("replacement source execution exceeds its byte ceiling")
+        append_text = None if append_bytes is None else append_bytes.decode("utf-8")
         top = f"integrated_{dimension}"
         with self._boundary():
             entry = self._entry_group()
             if tuple(self._load_cursor_from(entry, top, local_hard=True)) != labels: raise WriterStateError("replacement label inventory changed")
-            root = entry.name; excluded = (f"{root}/{top}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}")
+            root = entry.name; excluded = (f"{root}/{top}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}", f"{root}/reduction/config/source_execution", f"{root}/reduction/config/append_lineage")
             frozen = self._replacement_manifest
             if frozen is None or frozen[0] != excluded or self._replacement_manifest_digest(excluded) != frozen[1]: raise WriterStateError("replacement opener changed preserved artifact")
             config = _replacement_hard_group(entry, "reduction/config"); gi_config = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = None if config is None else config.get("gi_config", getlink=True)
             if (gi_link is not None and type(gi_link) is not h5py.HardLink) or self._replacement_node_signature(gi_config) != frozen[3]: raise WriterStateError("replacement opener changed physical GI config")
-            self._authorize_transaction_mutation(); del entry[top]
+            self._authorize_transaction_mutation()
+            entry.attrs[SOURCE_BASE_ATTR] = Path(os.fspath(self.source_base)).as_posix()
+            for name in ("source_execution", "append_lineage"):
+                if name in config:
+                    del config[name]
+            config.create_dataset("source_execution", data=execution_text)
+            if append_text is not None:
+                config.create_dataset("append_lineage", data=append_text)
+            self._replacement_read_context = (
+                os.fspath(self.source_base), append_value, source_execution,
+            )
+            del entry[top]
             bai_name = f"bai_{dimension}_args"; (config.__delitem__(bai_name) if bai_name in config else None); config.create_dataset(bai_name, data=bai_text)
             gi_name, gi_values = f"gi_mode_{dimension}", {}
             if gi_config is not None:
@@ -2499,15 +2550,16 @@ class NexusRecordWriter:
             stored_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); stored_gi = {} if stored_node is None else json.loads(_replacement_utf8_scalar(stored_node, "replacement GI config")); stored_signature = self._replacement_node_signature(stored_node); (None if json.dumps({key: value for key, value in stored_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode() == gi_preserved and (None if stored_signature is None else stored_signature[:-1]) == (None if frozen[3] is None else frozen[3][:-1]) else (_ for _ in ()).throw(WriterStateError("replacement changed sibling GI config")))
             audit_name = f"dimension_replacement_{dimension}"; (config.__delitem__(audit_name) if audit_name in config else None); config.create_dataset(audit_name, data=audit_text)
             self._row_cursors = {name: cursor for name, cursor in self._row_cursors.items() if name != top and not name.startswith(f"{top}/")}; self._row_cursors[top] = {}
-            self._replacement_labels = labels; self._replacement_manifest = frozen; self._replacement_expected = (bai_name, self._replacement_node_signature(config.get(bai_name)), "gi_config", self._replacement_node_signature(config.get("gi_config")), audit_name, self._replacement_node_signature(config.get(audit_name)), gi_name, gi_preserved)
-    def _replacement_node_signature(self, node): return None if node is None else (_replacement_dtype_signature(node.dtype), node.shape, node.maxshape, node.chunks, node.compression, node.compression_opts, tuple((name, _replacement_value_signature(_read_replacement_attribute_value(node, name, f"replacement config {node.name}@{name}"), node.attrs.get_id(name).dtype)) for name in sorted(node.attrs)), _replacement_value_signature(_replacement_utf8_scalar(node, f"replacement config {node.name}"), node.dtype)) if isinstance(node, h5py.Dataset) else ("invalid",)
+            self._replacement_labels = labels; self._replacement_manifest = frozen; self._replacement_expected = (bai_name, self._replacement_node_signature(config.get(bai_name)), "gi_config", self._replacement_node_signature(config.get("gi_config")), audit_name, self._replacement_node_signature(config.get(audit_name)), gi_name, gi_preserved, os.fspath(self.source_base), self._replacement_node_signature(config.get("source_execution"), max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES), self._replacement_node_signature(config.get("append_lineage"), max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES))
+    def _replacement_node_signature(self, node, *, max_bytes=None): return None if node is None else (_replacement_dtype_signature(node.dtype), node.shape, node.maxshape, node.chunks, node.compression, node.compression_opts, tuple((name, _replacement_value_signature(_read_replacement_attribute_value(node, name, f"replacement config {node.name}@{name}"), node.attrs.get_id(name).dtype)) for name in sorted(node.attrs)), _replacement_value_signature(_replacement_utf8_scalar(node, f"replacement config {node.name}", max_bytes=max_bytes), node.dtype)) if isinstance(node, h5py.Dataset) else ("invalid",)
     def _verify_replacement_manifest(self) -> None:
         entry, selected_expected = self._entry_group(), self._replacement_expected; excluded, manifest_expected, _gi_name, gi_original, _gi_preserved = self._replacement_manifest
         if self._replacement_manifest_digest(excluded) != manifest_expected: raise WriterStateError("replacement final verification changed preserved artifact")
-        config = _replacement_hard_group(entry, "reduction/config"); bai, bai_expected, gi, gi_expected, audit, audit_expected, gi_name, gi_preserved = selected_expected; nodes = {name: _replacement_hard_group(config, name, h5py.Dataset) for name in (bai, gi, audit)}
+        config = _replacement_hard_group(entry, "reduction/config"); bai, bai_expected, gi, gi_expected, audit, audit_expected, gi_name, gi_preserved, source_base, execution_expected, lineage_expected = selected_expected; nodes = {name: _replacement_hard_group(config, name, h5py.Dataset) for name in (bai, gi, audit)}
         if config is None or any(config.get(name, getlink=True) is not None and type(config.get(name, getlink=True)) is not h5py.HardLink for name in nodes): raise WriterStateError("replacement selected science/audit link changed")
         raw_gi = {} if nodes[gi] is None else json.loads(_replacement_utf8_scalar(nodes[gi], "replacement GI config")); gi_signature = self._replacement_node_signature(nodes[gi]); preserved = json.dumps({key: value for key, value in raw_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode()
-        if self._replacement_node_signature(nodes[bai]) != bai_expected or gi_signature != gi_expected or self._replacement_node_signature(nodes[audit]) != audit_expected or preserved != gi_preserved or (None if gi_signature is None else gi_signature[:-1]) != (None if gi_original is None else gi_original[:-1]): raise WriterStateError("replacement selected science/audit final verification changed")
+        execution = _replacement_hard_group(config, "source_execution", h5py.Dataset); lineage = _replacement_hard_group(config, "append_lineage", h5py.Dataset); stored_base = entry.attrs.get(SOURCE_BASE_ATTR); stored_base = stored_base.decode("utf-8", errors="strict") if isinstance(stored_base, bytes) else stored_base
+        if self._replacement_node_signature(nodes[bai]) != bai_expected or gi_signature != gi_expected or self._replacement_node_signature(nodes[audit]) != audit_expected or preserved != gi_preserved or (None if gi_signature is None else gi_signature[:-1]) != (None if gi_original is None else gi_original[:-1]) or stored_base != Path(source_base).as_posix() or self._replacement_node_signature(execution, max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES) != execution_expected or self._replacement_node_signature(lineage, max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES) != lineage_expected: raise WriterStateError("replacement selected science/audit/source final verification changed")
     def _verify_cursor(self, name: str, label: int) -> None:
         cursor = self._row_cursors[name]
         row = cursor.get(label)

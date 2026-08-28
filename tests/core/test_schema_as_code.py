@@ -35,7 +35,7 @@ def test_schema_identity_and_back_compat_names():
     assert SCHEMA.version == PROCESSED_SCHEMA_VERSION == 2
     assert SCHEMA.name == PROCESSED_SCHEMA_NAME == "xrd_tools.processed_scan"
     # files written before the monorepo rename carry the old name
-    assert "ssrl_xrd_tools.processed_scan" in SCHEMA.accepted_names
+    assert SCHEMA.accepted_names == ("xrd_tools.processed_scan",)
     assert SCHEMA.name in SCHEMA.accepted_names
 
 
@@ -296,7 +296,7 @@ def test_accepted_schema_names_consumed():
     from xrd_tools.io.schema import is_known_schema_name
 
     assert is_known_schema_name("xrd_tools.processed_scan")
-    assert is_known_schema_name(b"ssrl_xrd_tools.processed_scan")
+    assert not is_known_schema_name(b"ssrl_xrd_tools.processed_scan")
     assert not is_known_schema_name("somebody.else")
 
 

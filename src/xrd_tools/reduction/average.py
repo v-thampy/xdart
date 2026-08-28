@@ -915,7 +915,7 @@ def _average_sink(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph):
         run_configuration.pop('background')
     return NexusSink(plan.recipe.target, entry=plan.recipe.entry, overwrite=True, source_base=plan.recipe.source_base, run_configuration_provenance=run_configuration, source_execution_provenance=source_execution_projection(graph), source_snapshots_provenance=source_snapshots_projection(graph, writer=True), same_run_intent=_append_intent(plan, graph), rollback_until_commit=True)
 def _resolved_lineage_path(stored: str, artifact: str | Path, source_base: str) -> str:
-    value = resolve_source_master(stored, scan_file=artifact, source_base=source_base, allow_basename_fallbacks=False)
+    value = resolve_source_master(stored, scan_file=artifact, source_base=source_base)
     _reject(value is None, 'Average lineage source is unavailable')
     return str(value.resolve(strict=True))
 def iter_average_contributors(path, *, entry='entry', label=1) -> Iterator[AverageContributor]:

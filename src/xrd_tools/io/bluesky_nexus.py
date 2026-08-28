@@ -933,12 +933,21 @@ def find_detector_signal_dataset(group: h5py.File | h5py.Group,
     largest such dataset with ``ndim >= 2`` (the pixel stack wins over any
     small detector-tagged stat), or *None*.
     """
+    from xrd_tools.io.processed_scan_id import (
+        ProcessedXdartInputError,
+        require_raw_input,
+    )
+
+    require_raw_input(group)
     best: h5py.Dataset | None = None
     best_size = -1
 
     def _visit(_name: str, obj: Any) -> None:
         nonlocal best, best_size
-        if not isinstance(obj, h5py.Dataset) or obj.ndim < 2:
+        if not isinstance(obj, h5py.Dataset):
+            return
+        require_raw_input(obj)
+        if obj.ndim < 2:
             return
         if _to_str(obj.attrs.get("signal_type", "")) != "detector":
             return
@@ -949,6 +958,8 @@ def find_detector_signal_dataset(group: h5py.File | h5py.Group,
 
     try:
         group.visititems(_visit)
+    except ProcessedXdartInputError:
+        raise
     except Exception:
         logger.debug("find_detector_signal_dataset: traversal error", exc_info=True)
     return best

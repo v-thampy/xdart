@@ -44,8 +44,12 @@ def _write_processed(path: Path, *, q_len: int = 9, n_frames: int = 2) -> Path:
     frames = np.arange(n_frames, dtype=np.int64)
     with h5py.File(path, "w") as f:
         entry = f.create_group("entry")
+        entry.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
         entry.attrs["ssrl_schema_version"] = 2
         g = entry.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ("frame_index", "q")
         g.create_dataset("frame_index", data=frames)
         q_ds = g.create_dataset("q", data=q)
         q_ds.attrs["units"] = "q_A^-1"
@@ -83,7 +87,7 @@ def test_row1_owner_module_and_public_api_exist():
 
     assert owner.NEW_OUTPUT_SUFFIX == ".nexus"
     assert owner.LEGACY_OUTPUT_SUFFIX == ".nxs"
-    assert owner.READABLE_OUTPUT_SUFFIXES == (".nexus", ".nxs")
+    assert owner.READABLE_OUTPUT_SUFFIXES == (".nexus",)
     for name in ("default_output_path", "resolve_output_target",
                  "is_readable_output_path"):
         assert callable(getattr(owner, name)), name
@@ -94,7 +98,7 @@ def test_row1_surface_is_exported_through_xrd_tools_io():
 
     assert io.NEW_OUTPUT_SUFFIX == ".nexus"
     assert io.LEGACY_OUTPUT_SUFFIX == ".nxs"
-    assert io.READABLE_OUTPUT_SUFFIXES == (".nexus", ".nxs")
+    assert io.READABLE_OUTPUT_SUFFIXES == (".nexus",)
     assert callable(io.default_output_path)
     assert callable(io.resolve_output_target)
     assert callable(io.is_readable_output_path)
@@ -244,8 +248,7 @@ def test_row5_time_resolved_discovery_orders_mixed_suffixes(tmp_path):
 
     found = discover_processed_scans(tmp_path)
 
-    assert [p.name for p in found] == [
-        "scan_1.nxs", "scan_2.nexus", "scan_10.nxs"]
+    assert [p.name for p in found] == ["scan_2.nexus"]
 
 
 def test_row5_explicit_pattern_still_narrows_discovery(tmp_path):
@@ -292,17 +295,17 @@ def test_row6_read_image_rejects_a_processed_nexus_like_a_processed_nxs(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# Row 8 — explicit ``.nxs`` remains readable and writable
+# Row 8 — processed targets normalize to ``.nexus``
 # ---------------------------------------------------------------------------
 
-def test_row8_explicit_legacy_target_is_preserved_by_the_resolver(tmp_path):
+def test_row8_explicit_legacy_target_is_normalized_by_the_resolver(tmp_path):
     from xrd_tools.io import resolve_output_target
 
     explicit = tmp_path / "operator_choice.nxs"
     for mode in ("Append", "Overwrite"):
         assert resolve_output_target(
             tmp_path, "scan_042", mode=mode,
-            explicit_target=explicit) == explicit
+            explicit_target=explicit) == explicit.with_suffix(".nexus")
 
 
 def test_row8_explicit_new_target_is_preserved_by_the_resolver(tmp_path):
@@ -314,48 +317,43 @@ def test_row8_explicit_new_target_is_preserved_by_the_resolver(tmp_path):
         explicit_target=explicit) == explicit
 
 
-def test_row8_legacy_nxs_stays_readable(tmp_path):
-    from xrd_tools.io import get_frames, is_readable_output_path
+def test_row8_legacy_nxs_is_not_a_processed_output_path(tmp_path):
+    from xrd_tools.io import is_readable_output_path
 
     legacy = _write_processed(tmp_path / "legacy.nxs")
-    assert is_readable_output_path(legacy)
-    assert list(get_frames(legacy)) == [0, 1]
+    assert not is_readable_output_path(legacy)
 
 
 def test_row8_suffix_recognition_is_case_insensitive(tmp_path):
     from xrd_tools.io import is_readable_output_path
 
-    assert is_readable_output_path(tmp_path / "a.NXS")
+    assert not is_readable_output_path(tmp_path / "a.NXS")
     assert is_readable_output_path(tmp_path / "b.Nexus")
     assert not is_readable_output_path(tmp_path / "c.h5")
     assert not is_readable_output_path(tmp_path / "d.tif")
 
 
 # ---------------------------------------------------------------------------
-# Row 9 — a real existing ``.nxs`` Append is reused; refusal preserves bytes
+# Row 9 — Append ignores a historical ``.nxs`` sibling
 # ---------------------------------------------------------------------------
 
-def test_row9_append_reuses_a_sole_existing_legacy_file(tmp_path):
+def test_row9_append_ignores_a_sole_existing_legacy_file(tmp_path):
     from xrd_tools.io import resolve_output_target
 
     legacy = _write_processed(tmp_path / "scan_042.nxs")
     target = resolve_output_target(tmp_path, "scan_042", mode="Append")
-    assert target == legacy
+    assert target == legacy.with_suffix(".nexus")
 
 
-def test_row9_refused_append_leaves_the_legacy_bytes_intact(tmp_path):
-    """The collision guard runs on the RESOLVED target and preserves bytes."""
+def test_row9_append_selects_a_distinct_target_and_preserves_legacy_bytes(tmp_path):
     from xrd_tools.io import resolve_output_target
-    from xrd_tools.io.output_safety import (
-        OutputCollisionError, check_output_not_source,
-    )
+    from xrd_tools.io.output_safety import check_output_not_source
 
     legacy = _write_processed(tmp_path / "scan_042.nxs")
     before = legacy.read_bytes()
 
     target = resolve_output_target(tmp_path, "scan_042", mode="Append")
-    with pytest.raises(OutputCollisionError):
-        check_output_not_source(target, input_files=[legacy])
+    check_output_not_source(target, input_files=[legacy])
 
     assert legacy.read_bytes() == before
 
@@ -374,7 +372,7 @@ def test_row10_nexus_wins_when_both_siblings_exist(tmp_path):
         tmp_path, "scan_042", mode="Append") == tmp_path / "scan_042.nexus"
 
 
-def test_row10_explicit_legacy_wins_over_an_existing_nexus(tmp_path):
+def test_row10_explicit_legacy_normalizes_to_existing_nexus(tmp_path):
     from xrd_tools.io import resolve_output_target
 
     legacy = _write_processed(tmp_path / "scan_042.nxs")
@@ -382,7 +380,7 @@ def test_row10_explicit_legacy_wins_over_an_existing_nexus(tmp_path):
 
     assert resolve_output_target(
         tmp_path, "scan_042", mode="Append",
-        explicit_target=legacy) == legacy
+        explicit_target=legacy) == legacy.with_suffix(".nexus")
 
 
 # ---------------------------------------------------------------------------
@@ -407,10 +405,10 @@ def test_row11_open_source_opens_a_nexus_processed_record(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Row 12 — raw discovery excludes ``.nexus``
+# Row 12 — raw discovery includes ``.nexus`` for structure-based admission
 # ---------------------------------------------------------------------------
 
-def test_row12_enumerate_candidates_excludes_nexus(tmp_path):
+def test_row12_enumerate_candidates_includes_nexus_for_probe(tmp_path):
     from xrd_tools.sources.discover import enumerate_candidates
 
     _write_processed(tmp_path / "out.nexus")
@@ -418,11 +416,10 @@ def test_row12_enumerate_candidates_excludes_nexus(tmp_path):
 
     names = {Path(c.path).name for c in enumerate_candidates(tmp_path)}
     assert "raw.nxs" in names
-    assert "out.nexus" not in names
+    assert "out.nexus" in names
 
 
-def test_row12_discover_scans_excludes_nexus_from_raw_containers(tmp_path):
-    """The raw NeXus-family directory scan must not surface a ``.nexus``."""
+def test_row12_discover_scans_includes_nexus_for_structure_probe(tmp_path):
     from xrd_tools.sources.discover import discover_scans
 
     _write_raw_master(tmp_path / "raw.nxs")
@@ -431,7 +428,7 @@ def test_row12_discover_scans_excludes_nexus_from_raw_containers(tmp_path):
     names = {Path(spec.uri).name
              for spec in discover_scans(tmp_path, "nexus_stack")}
     assert "raw.nxs" in names
-    assert "out.nexus" not in names
+    assert "out.nexus" in names
 
 
 def test_row12_nexus_is_not_a_supported_raw_image_extension():
@@ -592,16 +589,15 @@ def test_c2row1_append_preserves_a_real_uppercase_nexus_path(tmp_path):
     assert real.read_bytes() == before          # selection never rewrites bytes
 
 
-def test_c2row2_append_reuses_a_sole_uppercase_legacy_file(tmp_path):
-    """C2 row 2a — a sole ``scan.NXS`` is reused, spelling preserved."""
+def test_c2row2_append_ignores_a_sole_uppercase_legacy_file(tmp_path):
     from xrd_tools.io import resolve_output_target
 
     real = _write_processed(tmp_path / "scan_042.NXS")
 
     resolved = resolve_output_target(tmp_path, "scan_042", mode="Append")
 
-    assert resolved.name == "scan_042.NXS"
-    assert resolved == real
+    assert resolved.name == "scan_042.nexus"
+    assert resolved != real
 
 
 def test_c2row2_mixed_case_both_siblings_prefer_the_new_suffix(tmp_path):
@@ -645,8 +641,7 @@ def test_c2row2_the_scan_stem_itself_is_never_case_folded(tmp_path):
     assert resolved.name == "scan_042.nexus"        # a different scan entirely
 
 
-def test_c2row2_an_explicit_target_is_still_returned_unchanged(tmp_path):
-    """Case-insensitive lookup must not touch the explicit-target path."""
+def test_c2row2_an_explicit_legacy_target_is_normalized(tmp_path):
     from xrd_tools.io import resolve_output_target
 
     _write_processed(tmp_path / "scan_042.NEXUS")
@@ -655,11 +650,10 @@ def test_c2row2_an_explicit_target_is_still_returned_unchanged(tmp_path):
     resolved = resolve_output_target(
         tmp_path, "scan_042", mode="Append", explicit_target=explicit)
 
-    assert resolved == explicit
+    assert resolved == explicit.with_suffix(".nexus")
 
 
-def test_c2row3_default_discovery_finds_mixed_case_processed_records(tmp_path):
-    """C2 row 3a — default discovery is case-insensitive over both suffixes."""
+def test_c2row3_default_discovery_finds_only_nexus_records(tmp_path):
     from xrd_tools.analysis.time_resolved import discover_processed_scans
 
     _write_processed(tmp_path / "scan_1.NEXUS")
@@ -668,8 +662,7 @@ def test_c2row3_default_discovery_finds_mixed_case_processed_records(tmp_path):
 
     found = discover_processed_scans(tmp_path)
 
-    assert [p.name for p in found] == [
-        "scan_1.NEXUS", "scan_2.NXS", "scan_3.nexus"]
+    assert [p.name for p in found] == ["scan_1.NEXUS", "scan_3.nexus"]
 
 
 def test_c2row3_explicit_pattern_narrowing_stays_exact(tmp_path):
@@ -715,7 +708,7 @@ def test_pd_row6_non_file_entries_are_never_returned_as_siblings(tmp_path):
     legacy = _write_processed(tmp_path / "scan_042.nxs")
 
     assert resolve_output_target(
-        tmp_path, "scan_042", mode="Append") == legacy
+        tmp_path, "scan_042", mode="Append") == tmp_path / "scan_042.nexus"
 
     legacy.unlink()
     assert resolve_output_target(

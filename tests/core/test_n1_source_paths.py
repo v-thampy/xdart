@@ -1,12 +1,13 @@
-"""N1 — portable raw-source paths: relative ``source/path`` + ``@source_base``,
-reader resolution with a ``source_root=`` override, and back-compat.
+"""N1 — portable raw-source paths: relative ``source/path`` + ``@source_base``
+and reader resolution with an exact ``source_root=`` override.
 
-The processed ``.nxs`` stores each frame's raw pointer RELATIVE to the project
+The processed ``.nexus`` stores each frame's raw pointer RELATIVE to the project
 root (``entry/@source_base``) so the file resolves its raw images after the data
 moves machines.  ``relative_source_path`` is the write side; ``resolve_source_master``
 / ``get_raw_frame`` are the read side.  Precedence for a relative path:
-explicit ``source_root`` > stored ``@source_base`` > the scan file's directory.
-Absolute stored paths (old files / out-of-tree raw) keep loading unchanged.
+explicit ``source_root`` > stored ``@source_base``.  There is no scan-directory,
+basename, parent-directory, or CWD fallback.  Absolute out-of-tree raw paths are
+used exactly as stored.
 """
 import os
 from pathlib import Path
@@ -51,14 +52,14 @@ def test_relative_source_path_no_root_is_absolute(tmp_path):
     assert relative_source_path(src, None) == Path(src).resolve().as_posix()
 
 
-# ── read-side: resolve_source_master precedence + back-compat ────────────────
+# ── read-side: resolve_source_master precedence ─────────────────────────────
 
 def test_resolve_relative_against_source_base(tmp_path):
     root = tmp_path / "proj"
     raw = root / "raw" / "m.h5"
     raw.parent.mkdir(parents=True)
     raw.touch()
-    nxs = tmp_path / "other" / "scan.nxs"          # .nxs NOT near the raw
+    nxs = tmp_path / "other" / "scan.nexus"        # output NOT near the raw
     nxs.parent.mkdir(parents=True)
     got = resolve_source_master("raw/m.h5", scan_file=nxs, source_base=str(root))
     assert got == raw.resolve()
@@ -69,32 +70,31 @@ def test_resolve_source_root_overrides_source_base(tmp_path):
     moved = tmp_path / "moved" / "raw" / "m.h5"
     moved.parent.mkdir(parents=True)
     moved.touch()
-    nxs = tmp_path / "scan.nxs"
+    nxs = tmp_path / "scan.nexus"
     got = resolve_source_master(
         "raw/m.h5", scan_file=nxs,
         source_base="/old/gone/proj", source_root=str(tmp_path / "moved"))
     assert got == moved.resolve()
 
 
-def test_resolve_absolute_back_compat(tmp_path):
+def test_resolve_absolute_out_of_tree_source(tmp_path):
     raw = tmp_path / "m.h5"
     raw.touch()
-    nxs = tmp_path / "scan.nxs"
-    # No source_base at all (old file): absolute stored path is used as-is.
+    nxs = tmp_path / "scan.nexus"
+    # An explicitly stored absolute source is used as-is.
     got = resolve_source_master(str(raw), scan_file=nxs)
     assert got == raw.resolve()
 
 
-def test_resolve_falls_back_to_scan_dir_when_no_base(tmp_path):
+def test_resolve_relative_without_root_refuses(tmp_path):
     raw = tmp_path / "m.h5"
     raw.touch()
-    nxs = tmp_path / "scan.nxs"
-    got = resolve_source_master("m.h5", scan_file=nxs)   # relative, scan-dir
-    assert got == raw.resolve()
+    nxs = tmp_path / "scan.nexus"
+    assert resolve_source_master("m.h5", scan_file=nxs) is None
 
 
 def test_resolve_missing_returns_none(tmp_path):
-    nxs = tmp_path / "scan.nxs"
+    nxs = tmp_path / "scan.nexus"
     assert resolve_source_master("nope/m.h5", scan_file=nxs,
                                  source_base=str(tmp_path)) is None
 
@@ -121,9 +121,21 @@ def _write_processed(nxs, *, source_path, source_base=None, frame_label=0,
     )
     with h5py.File(nxs, "w") as f:
         e = f.create_group("entry")
+        from xrd_tools.io.schema import (
+            PROCESSED_SCHEMA_NAME,
+            PROCESSED_SCHEMA_VERSION,
+            SCHEMA_NAME_ATTR,
+            SCHEMA_VERSION_ATTR,
+        )
+        e.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        e.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
         norm_base = stamp_source_base(e, source_base)
         g = e.create_group("integrated_1d")
-        g.create_dataset("intensity", data=np.zeros((1, 5)))
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ("frame_index", "q")
+        g.create_dataset("intensity", data=np.zeros((1, 5), np.float32))
+        g.create_dataset("q", data=np.arange(5, dtype=np.float32))
         g.create_dataset("frame_index", data=np.array([frame_label], dtype=np.int64))
         write_frame_record(
             ensure_frames_container(e), f"frame_{frame_label:04d}",
@@ -134,14 +146,14 @@ def _write_processed(nxs, *, source_path, source_base=None, frame_label=0,
 
 def test_get_raw_frame_resolves_relative_via_source_base(tmp_path):
     """The portable round-trip: a RELATIVE source/path + @source_base, with the
-    .nxs in a DIFFERENT directory than the raw, still loads the full-res raw."""
+    .nexus in a DIFFERENT directory than the raw, still loads the full-res raw."""
     root = tmp_path / "proj"
     raw_arr = np.arange(2 * 4 * 4, dtype=float).reshape(2, 4, 4)
     master = root / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
     _write_master(master, raw_arr)
 
-    nxs = tmp_path / "processed" / "scan.nxs"
+    nxs = tmp_path / "processed" / "scan.nexus"
     nxs.parent.mkdir(parents=True)
     _write_processed(nxs, source_path=master, source_base=str(root))
     with h5py.File(nxs, "r") as f:                 # stored RELATIVE = portable
@@ -161,7 +173,7 @@ def test_get_raw_frame_source_root_overrides_moved_tree(tmp_path):
     master.parent.mkdir(parents=True)
     _write_master(master, raw_arr)
 
-    nxs = tmp_path / "scan.nxs"
+    nxs = tmp_path / "scan.nexus"
     _write_processed(nxs, source_path="/original/gone/proj/raw/m.h5",
                      source_base="/original/gone/proj", master_frame=0)
 
@@ -184,7 +196,7 @@ def test_read_frame_view_resolves_source_path_via_source_base(tmp_path):
     master = root / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
     _write_master(master, np.arange(2 * 2 * 2, dtype=float).reshape(2, 2, 2))
-    nxs = tmp_path / "other" / "scan.nxs"          # .nxs NOT near the raw
+    nxs = tmp_path / "other" / "scan.nexus"        # output NOT near the raw
     nxs.parent.mkdir(parents=True)
     _write_processed(nxs, source_path=master, source_base=str(root))
 
@@ -198,7 +210,7 @@ def test_read_frame_view_source_root_override(tmp_path):
     master = moved / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
     _write_master(master, np.zeros((1, 2, 2)))
-    nxs = tmp_path / "scan.nxs"
+    nxs = tmp_path / "scan.nexus"
     _write_processed(nxs, source_path="/old/gone/proj/raw/m.h5",
                      source_base="/old/gone/proj")
     fv = read_frame_view(nxs, 0, source_root=str(moved))
@@ -209,7 +221,7 @@ def test_read_frame_view_unresolved_keeps_stored_string(tmp_path):
     """When nothing resolves, source_path keeps the stored relpath (provenance
     preserved, never silently blanked)."""
     from xrd_tools.io import read_frame_view
-    nxs = tmp_path / "scan.nxs"
+    nxs = tmp_path / "scan.nexus"
     _write_processed(nxs, source_path=tmp_path / "raw" / "missing.h5",
                      source_base=str(tmp_path))
     fv = read_frame_view(nxs, 0)
@@ -226,7 +238,7 @@ def test_processed_nexus_source_load_frame_returns_full_res_master(tmp_path):
     master.parent.mkdir(parents=True)
     raw = np.arange(2 * 4 * 4, dtype=float).reshape(2, 4, 4)
     _write_master(master, raw)
-    nxs = tmp_path / "processed" / "scan.nxs"
+    nxs = tmp_path / "processed" / "scan.nexus"
     nxs.parent.mkdir(parents=True)
     _write_processed(nxs, source_path=master, source_base=str(root),
                      master_frame=1)
@@ -244,7 +256,7 @@ def test_processed_nexus_source_source_root_repoints_moved_tree(tmp_path):
     master.parent.mkdir(parents=True)
     raw = np.arange(4 * 4, dtype=float).reshape(1, 4, 4)
     _write_master(master, raw)
-    nxs = tmp_path / "scan.nxs"
+    nxs = tmp_path / "scan.nexus"
     _write_processed(nxs, source_path="/old/gone/raw/m.h5",
                      source_base="/old/gone", master_frame=0)
     src = ProcessedNexusSource(nxs, source_root=str(moved))
@@ -267,7 +279,7 @@ def test_harvest_from_processed_nexus_carries_resolvable_pointer(tmp_path):
     master = root / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
     _write_master(master, np.arange(2 * 4 * 4, dtype=float).reshape(2, 4, 4))
-    nxs = tmp_path / "processed" / "scan.nxs"
+    nxs = tmp_path / "processed" / "scan.nexus"
     nxs.parent.mkdir(parents=True)
     _write_processed(nxs, source_path=master, source_base=str(root), master_frame=1)
 
@@ -277,7 +289,7 @@ def test_harvest_from_processed_nexus_carries_resolvable_pointer(tmp_path):
     assert recs[0]["source_frame_index"] == 1
 
     # and the written records are NOT skipped by the Frames-panel label builder
-    out = tmp_path / "stitch.nxs"
+    out = tmp_path / "stitch.nexus"
     with h5py.File(out, "w") as f:
         write_contributing_frames(f.create_group("entry"), recs)
     with h5py.File(out, "r") as f:
@@ -293,7 +305,7 @@ def test_open_scan_source_root_load_frame(tmp_path):
     master.parent.mkdir(parents=True)
     raw = np.arange(4 * 4, dtype=float).reshape(1, 4, 4)
     _write_master(master, raw)
-    nxs = tmp_path / "scan.nxs"
+    nxs = tmp_path / "scan.nexus"
     _write_processed(nxs, source_path="/old/gone/raw/m.h5",
                      source_base="/old/gone", master_frame=0)
     scan = open_scan(nxs, source_root=str(moved))
@@ -309,14 +321,26 @@ def test_open_scan_iter_chunks_reuses_processed_file_handle(tmp_path, monkeypatc
     master.parent.mkdir(parents=True)
     raw = np.arange(3 * 4 * 4, dtype=float).reshape(3, 4, 4)
     _write_master(master, raw)
-    nxs = tmp_path / "processed" / "scan.nxs"
+    nxs = tmp_path / "processed" / "scan.nexus"
     nxs.parent.mkdir(parents=True)
 
     with h5py.File(nxs, "w") as f:
         e = f.create_group("entry")
+        from xrd_tools.io.schema import (
+            PROCESSED_SCHEMA_NAME,
+            PROCESSED_SCHEMA_VERSION,
+            SCHEMA_NAME_ATTR,
+            SCHEMA_VERSION_ATTR,
+        )
+        e.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        e.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
         e.attrs["source_base"] = str(root)
         g = e.create_group("integrated_1d")
-        g.create_dataset("intensity", data=np.zeros((3, 5)))
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ("frame_index", "q")
+        g.create_dataset("intensity", data=np.zeros((3, 5), np.float32))
+        g.create_dataset("q", data=np.arange(5, dtype=np.float32))
         g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
         frames = e.create_group("frames")
         for idx in range(3):
@@ -353,7 +377,7 @@ def test_processed_nexus_source_load_frame_strict_raises_without_master(tmp_path
     from xrd_tools.sources.nexus import ProcessedNexusSource
     from xrd_tools.io.image_source import load_processed_raw_or_thumbnail
 
-    nxs = tmp_path / "scan.nxs"
+    nxs = tmp_path / "scan.nexus"
     _write_processed(nxs, source_path="/gone/missing_master.h5",
                      master_frame=0, thumbnail=np.ones((4, 4)))
 

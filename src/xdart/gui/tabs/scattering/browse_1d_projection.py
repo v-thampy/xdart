@@ -402,6 +402,7 @@ def _current_heavy(scope: _ProjectionScope, frame: DisplayFrameKey, scalar_row):
         scalar_row,
         scope.artifact,
         source_base=scope.catalog.source_base,
+        source_root=scope.context.load_request.source_root,
     )
     record = publication.record
     view = publication.view
@@ -426,6 +427,7 @@ def _current_heavy(scope: _ProjectionScope, frame: DisplayFrameKey, scalar_row):
             view,
             scope.artifact,
             source_base=scope.catalog.source_base,
+            source_root=scope.context.load_request.source_root,
         )
         != expected_source
         or type(publication.scan_key) is not str

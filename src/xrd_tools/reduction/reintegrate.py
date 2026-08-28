@@ -13,8 +13,8 @@ _MAX_HDF_EXTERNAL_SLOTS = 65_536
 _MAX_HDF_EXTERNAL_PATH_BYTES = 4096
 _MAX_HDF_EXTERNAL_PATHS_BYTES = 64 << 20
 _MAX_HDF_EXTERNAL_ADDRESS = (1 << 63) - 1
-_REINTEGRATE_PLAN_API_VERSION = 2
-_REINTEGRATE_RECIPE_VERSION = 2
+_REINTEGRATE_PLAN_API_VERSION = 3
+_REINTEGRATE_RECIPE_VERSION = 3
 _REINTEGRATE_SCIENCE_API_VERSION = 1
 class ReintegrateCancelled(RuntimeError): pass
 class _PersistedMaskSpec(NamedTuple): retained_bytes: int; decode_bytes: int
@@ -34,13 +34,163 @@ def _freeze(value: Any) -> Any:
 def _canonical(value: Any) -> bytes: return json.dumps(_plain(value), sort_keys=True, separators=(",", ":")).encode()
 def _digest(value: Any) -> str: return hashlib.sha256(_canonical(value)).hexdigest()
 def _event(token: threading.Event | None, *, honor: bool = True) -> None: (None if token is None or type(token) is threading.Event else (_ for _ in ()).throw(TypeError("cancellation token must be an exact threading.Event or None"))); (None if not honor or token is None or not token.is_set() else (_ for _ in ()).throw(ReintegrateCancelled("reintegration cancelled")))
+
+
+def _relocated_path(value: str, stored_root: str, selected_root: str) -> str:
+    """Lexically relocate only paths owned by the persisted Project root."""
+    current = _normalized_absolute_path(
+        value, "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+    if not stored_root:
+        return current
+    old = _normalized_absolute_path(
+        stored_root, "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+    new = _normalized_absolute_path(
+        selected_root, "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+    try:
+        owned = os.path.commonpath((old, current)) == old
+    except ValueError:
+        owned = False
+    if not owned:
+        return current
+    relative = os.path.relpath(current, old)
+    _reject(relative == os.pardir or relative.startswith(os.pardir + os.sep),
+            "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+    return os.path.normcase(os.path.abspath(os.path.join(new, relative)))
+
+
+def _refresh_state(state: dict[str, Any], stored_root: str,
+                   selected_root: str) -> None:
+    path = _relocated_path(state["path"], stored_root, selected_root)
+    try:
+        observed = os.stat(path)
+    except OSError as error:
+        raise ValueError("REPLACEMENT_SOURCE_REVISION_UNAVAILABLE") from error
+    _reject(
+        int(observed.st_size) != state["size"]
+        or int(observed.st_mtime_ns) != state["mtime_ns"],
+        "REPLACEMENT_SOURCE_REVISION_CHANGED",
+    )
+    state.update({
+        "path": path,
+        "ctime_ns": int(observed.st_ctime_ns),
+        "device": int(observed.st_dev),
+        "inode": int(observed.st_ino),
+    })
+
+
+def _refresh_append_member(member: dict[str, Any], stored_root: str,
+                           selected_root: str) -> None:
+    path = _relocated_path(member["path"], stored_root, selected_root)
+    try:
+        observed = os.stat(path)
+    except OSError as error:
+        raise ValueError("REPLACEMENT_SOURCE_REVISION_UNAVAILABLE") from error
+    _reject(
+        int(observed.st_size) != member["size"]
+        or int(observed.st_mtime_ns) != member["mtime_ns"],
+        "REPLACEMENT_SOURCE_REVISION_CHANGED",
+    )
+    member["path"] = path
+
+
+def _relocate_source_context(
+    stored_root: str,
+    selected_root: str | None,
+    execution: Mapping[str, Any],
+    lineage: Mapping[str, Any] | None,
+) -> tuple[str, Mapping[str, Any], Mapping[str, Any] | None, bytes | None]:
+    """Freeze a moved raw graph under one exact selected Project root."""
+    if selected_root is None:
+        selected_root = stored_root
+    selected = _normalized_absolute_path(
+        selected_root, "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+    if stored_root:
+        _normalized_absolute_path(
+            stored_root, "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+    relocated = _plain(execution)
+    _reject(type(relocated) is not dict,
+            "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+    _refresh_state(relocated, stored_root, selected)
+    for key in ("member_stamps", "dependency_files"):
+        for state in relocated[key]:
+            _refresh_state(state, stored_root, selected)
+    for member in relocated["external_members"]:
+        _refresh_state(member["file"], stored_root, selected)
+    for value in relocated["admitted_motor_values"]:
+        value["source_path"] = _relocated_path(
+            value["source_path"], stored_root, selected)
+    for value in relocated["metadata_sources"]:
+        value["source_path"] = _relocated_path(
+            value["source_path"], stored_root, selected)
+        if value["metadata_file"] is not None:
+            _refresh_state(value["metadata_file"], stored_root, selected)
+    from xrd_tools.io.record_writer import (
+        WriterStateError, _validate_replacement_execution,
+    )
+    try:
+        relocated = _validate_replacement_execution(relocated)
+    except WriterStateError as error:
+        raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
+
+    relocated_lineage = None
+    lineage_bytes = None
+    if lineage is not None:
+        relocated_lineage = _plain(lineage)
+        _reject(type(relocated_lineage) is not dict,
+                "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+        relocated_lineage["source_base"] = selected
+        for epoch in relocated_lineage["epochs"]:
+            source = epoch["source"]
+            _refresh_append_member(source, stored_root, selected)
+            for key in ("image_members", "external_members"):
+                for member in source[key]:
+                    _refresh_append_member(member, stored_root, selected)
+        from xrd_tools.io.append import _lineage_labels
+        try:
+            _lineage_labels(relocated_lineage)
+        except (TypeError, ValueError, KeyError) as error:
+            raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
+        lineage_bytes = _canonical(relocated_lineage)
+    return selected, relocated, relocated_lineage, lineage_bytes
 def _mask_spec(retained, decode, shape, role="persisted-mask resources"):
     pixels = int(shape[0]) * int(shape[1]) if type(shape) in {tuple, list} and len(shape) == 2 and all(type(value) is int and value > 0 for value in shape) else -1
     _reject(any(type(value) is not int or value < 0 for value in (retained, decode)) or bool(retained) != bool(decode) or retained > _MAX_PERSISTED_MASK_BYTES or decode > _MAX_PERSISTED_MASK_BYTES or retained and (retained != pixels or decode < 8 or decode % 8 or decode > 8 * pixels), f"{role} are malformed")
     return _PersistedMaskSpec(retained, decode)
-def _resolve_source_locator(locator: str, source_base: str, root: Path) -> Path:
-    _reject(type(locator) is not str or type(source_base) is not str or source_base and (not os.path.isabs(source_base) or os.path.abspath(os.path.normpath(source_base)) != source_base), "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED"); shown = PurePosixPath(locator); relative = not shown.is_absolute(); _reject(relative and (not source_base or str(shown) != locator or ".." in shown.parts), "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED"); return Path(str(shown)) if not relative else Path(source_base, *shown.parts)
-def _source_route(path: Path) -> str: suffix = path.suffix.lower(); route = "fabio" if suffix in {".tif", ".tiff", ".edf", ".cbf", ".img"} or path.name.lower().endswith(".mar3450") else "raw" if suffix == ".raw" else "hdf5" if suffix in {".h5", ".hdf5", ".nxs", ".cxi"} else None; _reject(route is None, "REPLACEMENT_SOURCE_FORMAT_UNSUPPORTED"); return route
+def _normalized_absolute_path(value, role: str) -> str:
+    _reject(type(value) is not str or not value or not os.path.isabs(value), role)
+    normalized = os.path.normcase(os.path.abspath(os.path.normpath(value)))
+    _reject(normalized != value, role)
+    return value
+
+
+def _resolve_source_locator(locator: str, source_root: str) -> Path:
+    _reject(type(locator) is not str or not locator or "\\" in locator,
+            "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+    shown = PurePosixPath(locator)
+    if shown.is_absolute():
+        _reject(str(shown) != locator or "." in shown.parts or ".." in shown.parts,
+                "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+        return Path(str(shown))
+    from xrd_tools.io.read import resolve_project_source_path
+    try:
+        return resolve_project_source_path(
+            locator, source_root, must_exist=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED") from error
+
+
+def _source_route(path: Path) -> str:
+    suffix = path.suffix.lower()
+    route = (
+        "fabio" if suffix in {".tif", ".tiff", ".edf", ".cbf", ".img"}
+        or path.name.lower().endswith(".mar3450")
+        else "raw" if suffix == ".raw"
+        else "hdf5" if suffix in {".h5", ".hdf5", ".nxs", ".nexus", ".cxi"}
+        else None
+    )
+    _reject(route is None, "REPLACEMENT_SOURCE_FORMAT_UNSUPPORTED")
+    return route
 def _decoder_input_paths(fact):
     execution = fact["source_execution"]; adapter = execution["adapter_id"]
     paths = [fact["path"], execution["path"]]
@@ -941,7 +1091,7 @@ def _qualified_fact(fact, topology=None):
         "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
     )
     path = _resolve_source_locator(
-        fact["path"], fact["source_base"], Path("/"))
+        fact["path"], fact["source_base"])
     _reject(
         os.path.normcase(os.path.normpath(os.path.abspath(path)))
         != os.path.normcase(os.path.normpath(os.path.abspath(
@@ -1714,7 +1864,8 @@ def _load_persisted_mask(target, entry, shape, snapshot, target_revision,
 
 
 def _inspect_artifact(target: Path, entry: str, dimension: str,
-                      snapshot: TargetSnapshot, target_revision, *,
+                      snapshot: TargetSnapshot, target_revision,
+                      source_root: str | None = None, *,
                       read_mask: bool = True) -> _ArtifactInspection:
     import h5py, numpy as np; from xrd_tools.io.append import _MAX_REPLACEMENT_PATH_UTF8_BYTES, _replacement_utf8_attribute, _replacement_utf8_scalar; from xrd_tools.io.record_writer import WriterStateError, _decode_replacement_fact, _read_replacement_frame_index, _replacement_json_node, _replacement_scalar
     def text(node, expected, role):
@@ -1723,13 +1874,20 @@ def _inspect_artifact(target: Path, entry: str, dimension: str,
         _reject(observed != expected, f"{role} is noncanonical")
     with _open_target_hdf(target) as handle:
         _target_hdf_fence(handle, target, snapshot, target_revision)
+        from xrd_tools.io.processed_scan_id import (
+            is_current_processed_xdart_file,
+        )
+        _reject(
+            not is_current_processed_xdart_file(handle, entry),
+            "replacement target is not a current xdart .nexus record",
+        )
         group = _replacement_hard_group(handle, entry); _reject(group is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); top = _replacement_hard_group(group, f"integrated_{dimension}"); index = _replacement_hard_group(top, "frame_index", h5py.Dataset)
         try: values = _read_replacement_frame_index(index, "selected frame inventory", require_nonempty=True)
         except WriterStateError as error: raise ValueError("selected frame inventory is not exact") from error
         labels = tuple(int(x) for x in values); _reject(not labels or any(v < 0 for v in labels) or labels != tuple(sorted(set(labels))), "selected frame inventory is not exact")
-        try: source_base, lineage, _decoded = decode_replacement_lineage(handle, entry=entry)
+        try: source_base, persisted_lineage, decoded_lineage = decode_replacement_lineage(handle, entry=entry)
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
-        config = _replacement_hard_group(group, "reduction/config"); _reject(_replacement_hard_group(config, "source_execution", h5py.Dataset) is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); run_node = _replacement_hard_group(config, "run_configuration", h5py.Dataset); run = _replacement_json_node(config, "run_configuration", "run configuration"); text(run_node, _canonical(run).decode(), "run configuration")
+        config = _replacement_hard_group(group, "reduction/config"); execution_node = _replacement_hard_group(config, "source_execution", h5py.Dataset); _reject(execution_node is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); execution = _replacement_json_node(config, "source_execution", "source execution"); source_base, execution, decoded_lineage, lineage = _relocate_source_context(source_base, source_root, execution, decoded_lineage); run_node = _replacement_hard_group(config, "run_configuration", h5py.Dataset); run = _replacement_json_node(config, "run_configuration", "run configuration"); text(run_node, _canonical(run).decode(), "run configuration")
         geom_node = _replacement_hard_group(config, "geometry"); geom_keys = {"convention", "mapping_json", "motor_sources"}
         _reject(geom_node is not None and len(geom_node) != 3, "selected BAI/GI/geometry is malformed")
         geom_leaves = () if geom_node is None else tuple(_replacement_hard_group(geom_node, name, h5py.Dataset) for name in ("convention", "mapping_json", "motor_sources")); _reject(geom_node is not None and (set(geom_node) != geom_keys or any(node is None for node in geom_leaves)), "selected BAI/GI/geometry is malformed"); geometry = None if geom_node is None else {"convention": _replacement_utf8_scalar(geom_leaves[0], "geometry convention"), "mapping_json": _replacement_utf8_scalar(geom_leaves[1], "geometry mapping"), "motor_sources": _replacement_json_node(geom_node, "motor_sources", "geometry motors")}
@@ -1741,9 +1899,9 @@ def _inspect_artifact(target: Path, entry: str, dimension: str,
         primary = ("default" if "primary_mode" not in top.attrs else _replacement_utf8_attribute(top, "primary_mode", "selected primary mode", max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES)); _reject(type(primary) is not str or primary != (gi_mode or "default") or ((bai_mode != gi_mode) if prior is None else bai_mode is not None), "selected GI mode/BAI differs"); selected = {"version": 1, "dimension": dimension, "bai_args": bai, "gi_mode": gi_mode}; _validate_science(selected, shared, dimension); acquisition = _canonical_acquisition_selected(run, shared, dimension)
         if prior is None: _reject(selected != acquisition, "selected dimension differs from acquisition provenance")
         else:
-            _keys(prior, {"schema_version", "operation", "dimension", "operation_identity", "science_identity", "acquisition_fingerprint", "shared_science_fingerprint", "selected_plan", "selected_gi_mode", "append_lineage_action", "append_lineage_sha256"}, "prior dimension audit"); sha = lambda value: type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value); prior_science = _digest({"api_version": _REINTEGRATE_SCIENCE_API_VERSION, "dimension": dimension, "selected_plan": selected, "requested_shared_science": shared}); lineage_hash = None if lineage is None else hashlib.sha256(lineage).hexdigest()
-            _reject(prior["schema_version"] != 1 or prior["operation"] != "existing_dimension_replacement" or prior["dimension"] != dimension or prior["selected_plan"] != selected or prior["selected_gi_mode"] != selected["gi_mode"] or not sha(prior["operation_identity"]) or prior["science_identity"] != prior_science or prior["acquisition_fingerprint"] != run.get("fingerprint") or prior["shared_science_fingerprint"] != science_fingerprint(shared) or prior["append_lineage_action"] != ("already_absent" if lineage is None else "preserved_append_disabled") or prior["append_lineage_sha256"] != lineage_hash, "prior dimension audit differs")
-        try: first = _decode_replacement_fact(handle, labels[0], entry=entry)
+            _keys(prior, {"schema_version", "operation", "dimension", "operation_identity", "science_identity", "acquisition_fingerprint", "shared_science_fingerprint", "selected_plan", "selected_gi_mode", "append_lineage_action", "append_lineage_sha256"}, "prior dimension audit"); sha = lambda value: type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value); prior_science = _digest({"api_version": _REINTEGRATE_SCIENCE_API_VERSION, "dimension": dimension, "selected_plan": selected, "requested_shared_science": shared}); lineage_hash = None if persisted_lineage is None else hashlib.sha256(persisted_lineage).hexdigest()
+            _reject(prior["schema_version"] != 1 or prior["operation"] != "existing_dimension_replacement" or prior["dimension"] != dimension or prior["selected_plan"] != selected or prior["selected_gi_mode"] != selected["gi_mode"] or not sha(prior["operation_identity"]) or prior["science_identity"] != prior_science or prior["acquisition_fingerprint"] != run.get("fingerprint") or prior["shared_science_fingerprint"] != science_fingerprint(shared) or prior["append_lineage_action"] != ("already_absent" if persisted_lineage is None else "preserved_append_disabled") or prior["append_lineage_sha256"] != lineage_hash, "prior dimension audit differs")
+        try: first = _decode_replacement_fact(handle, labels[0], entry=entry, context=(source_base, decoded_lineage, execution))
         except WriterStateError as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
         _reject(raw is None and any(_source_route(Path(path)) == "raw" for path in _decoder_input_paths(first)), "REPLACEMENT_RAW_DECODER_UNRECORDED"); topology = _admit_source_topology(first, full_inventory=True, selected_labels=labels); described, dtype, _path, _image = _source_fact(first, raw_options=raw, topology=topology); detector = _replacement_hard_group(group, "instrument/detector/detector_shape", h5py.Dataset)
         _reject(detector is not None and (detector.shape != (2,) or detector.dtype != np.dtype(np.int64)), "processed detector descriptor is malformed")
@@ -1857,12 +2015,12 @@ def _resolve_persisted_selected(selected, shared, dimension, mask):
 def _value(cls, *values): obj = object.__new__(cls); [object.__setattr__(obj, f.name, v) for f, v in zip(fields(cls), values)]; return obj
 @dataclass(frozen=True, slots=True, init=False)
 class ReintegratePlan:
-    api_version: int; target: str; entry: str; expected_target_snapshot: TargetSnapshot; dimension: Literal["1d", "2d"]; labels: tuple[int, ...]; detector_shape: tuple[int, int]; native_dtype: str; selected_plan: Mapping[str, Any]; requested_shared_science: Mapping[str, Any]; gi_bootstrap_incidence: float | None; retained_mask_bytes: int; mask_decode_bytes: int; session_policy: SessionPolicy; rollback_policy: Literal["ROLLBACK_ON_STOP"]; science_identity: str; operation_identity: str
+    api_version: int; target: str; entry: str; source_root: str; expected_target_snapshot: TargetSnapshot; dimension: Literal["1d", "2d"]; labels: tuple[int, ...]; detector_shape: tuple[int, int]; native_dtype: str; selected_plan: Mapping[str, Any]; requested_shared_science: Mapping[str, Any]; gi_bootstrap_incidence: float | None; retained_mask_bytes: int; mask_decode_bytes: int; session_policy: SessionPolicy; rollback_policy: Literal["ROLLBACK_ON_STOP"]; science_identity: str; operation_identity: str
     def __new__(cls, *args, **kwargs): raise TypeError("ReintegratePlan is factory-constructed")
     @property
     def resource_allocation(self) -> SessionResourceAllocation: return self.session_policy.allocation
     @classmethod
-    def from_artifact(cls, target: str | os.PathLike[str], *, entry: str, dimension: Literal["1d", "2d"], preparation: Mapping[str, object], expected_target_snapshot: TargetSnapshot | None = None, expected_terminal_identity: StreamTerminal | None = None, expected_labels: tuple[int, ...] | None = None, cancel_token: threading.Event | None = None) -> ReintegratePlan:
+    def from_artifact(cls, target: str | os.PathLike[str], *, entry: str, dimension: Literal["1d", "2d"], preparation: Mapping[str, object], source_root: str | os.PathLike[str] | None = None, expected_target_snapshot: TargetSnapshot | None = None, expected_terminal_identity: StreamTerminal | None = None, expected_labels: tuple[int, ...] | None = None, cancel_token: threading.Event | None = None) -> ReintegratePlan:
         _event(cancel_token); preparation = _plain(_freeze(preparation)); _keys(preparation, {"api_version", "selected_plan", "requested_shared_science", "resource_policy"}, "preparation"); selected, shared = preparation["selected_plan"], preparation["requested_shared_science"]; persisted = type(shared) is dict and set(shared) == {"version", "kind"} and type(shared["version"]) is int and shared["version"] == 1 and shared["kind"] == "persisted_target"; _reject(type(preparation["api_version"]) is not int or preparation["api_version"] != 1, "preparation version/dimension")
         if persisted: _validate_persisted_selected(selected, dimension); _reject(type(expected_target_snapshot) is not TargetSnapshot or not expected_target_snapshot.exists or type(expected_labels) is not tuple or not expected_labels or expected_labels != tuple(sorted(set(expected_labels))) or any(type(v) is not int or v < 0 for v in expected_labels), "expected target/labels are malformed")
         else: _validate_science(selected, shared, dimension); _reject(expected_target_snapshot is not None and type(expected_target_snapshot) is not TargetSnapshot or expected_labels is not None and (type(expected_labels) is not tuple or any(type(v) is not int or v < 0 for v in expected_labels)), "expected target/labels are malformed")
@@ -1876,20 +2034,24 @@ class ReintegratePlan:
         snapshot = capture_target_snapshot(path)
         if sealed is not None:
             _reject(revalidate_stream_terminal(path, expected_terminal_identity) != sealed, "TARGET_SNAPSHOT_CHANGED")
-        _reject(not snapshot.exists, "replacement target must exist"); _reject(sealed is None and expected_target_snapshot is not None and snapshot != expected_target_snapshot, "TARGET_SNAPSHOT_CHANGED"); target_revision = _target_object_revision(path, snapshot); _event(cancel_token); observed = _inspect_artifact(path, entry, dimension, snapshot, target_revision, read_mask=False); _event(cancel_token); labels = tuple(observed.labels)
+        if source_root is not None:
+            source_root = os.fspath(source_root)
+            _normalized_absolute_path(
+                source_root, "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
+        _reject(not snapshot.exists, "replacement target must exist"); _reject(sealed is None and expected_target_snapshot is not None and snapshot != expected_target_snapshot, "TARGET_SNAPSHOT_CHANGED"); target_revision = _target_object_revision(path, snapshot); _event(cancel_token); observed = _inspect_artifact(path, entry, dimension, snapshot, target_revision, source_root, read_mask=False); _event(cancel_token); labels = tuple(observed.labels)
         _reject(expected_labels is not None and labels != expected_labels, "EXPECTED_LABELS_CHANGED")
         if persisted: shared = _plain(observed.persisted_shared_science); selected = _resolve_persisted_selected(selected, shared, dimension, None)
         else: _reject(_plain(observed.persisted_shared_science) != shared, "shared science differs")
         req = _requirements(observed.detector_shape, observed.native_dtype, selected, shared); policy = _policy(req, preparation["resource_policy"], observed.mask_spec)
         mask = _load_persisted_mask(path, entry, observed.detector_shape, snapshot, target_revision, observed.mask_spec) if observed.mask_spec.retained_bytes else None
         observed = observed._replace(mask=mask)
-        selected, bootstrap = _prepare_gi_scouts(path, entry, observed, selected, shared, snapshot, target_revision, cancel_token=cancel_token); _event(cancel_token); _reject(capture_target_snapshot(path) != snapshot or _target_object_revision(path, snapshot) != target_revision, "TARGET_SNAPSHOT_CHANGED"); _event(cancel_token); return _make_plan(str(path), entry, dimension, labels, observed.detector_shape, observed.native_dtype, selected, shared, bootstrap, observed.mask_spec.retained_bytes, observed.mask_spec.decode_bytes, policy, snapshot=snapshot)
+        selected, bootstrap = _prepare_gi_scouts(path, entry, observed, selected, shared, snapshot, target_revision, cancel_token=cancel_token); _event(cancel_token); _reject(capture_target_snapshot(path) != snapshot or _target_object_revision(path, snapshot) != target_revision, "TARGET_SNAPSHOT_CHANGED"); _event(cancel_token); return _make_plan(str(path), entry, observed.source_base, dimension, labels, observed.detector_shape, observed.native_dtype, selected, shared, bootstrap, observed.mask_spec.retained_bytes, observed.mask_spec.decode_bytes, policy, snapshot=snapshot)
     def as_recipe(self) -> dict[str, object]: return {"schema": "xrd_tools.reintegrate.plan", "version": _REINTEGRATE_RECIPE_VERSION, "plan": _plan_mapping(self)}
     @classmethod
     def from_recipe(cls, recipe: Mapping[str, object]) -> ReintegratePlan:
         recipe = _plain(_freeze(recipe)); _keys(recipe, {"schema", "version", "plan"}, "recipe")
         _reject(recipe["schema"] != "xrd_tools.reintegrate.plan" or type(recipe["version"]) is not int or recipe["version"] != _REINTEGRATE_RECIPE_VERSION, "recipe schema/version")
-        value = recipe["plan"]; _keys(value, {"api_version", "target", "entry", "expected_target_snapshot", "dimension", "labels", "detector_shape", "native_dtype", "selected_plan", "requested_shared_science", "gi_bootstrap_incidence", "retained_mask_bytes", "mask_decode_bytes", "session_policy", "rollback_policy", "science_identity", "operation_identity"}, "recipe plan"); _reject(type(value["api_version"]) is not int or value["api_version"] != _REINTEGRATE_PLAN_API_VERSION or value["rollback_policy"] != "ROLLBACK_ON_STOP" or any(type(value[key]) is not str or len(value[key]) != 64 or any(char not in "0123456789abcdef" for char in value[key]) for key in ("science_identity", "operation_identity")), "recipe plan version/rollback")
+        value = recipe["plan"]; _keys(value, {"api_version", "target", "entry", "source_root", "expected_target_snapshot", "dimension", "labels", "detector_shape", "native_dtype", "selected_plan", "requested_shared_science", "gi_bootstrap_incidence", "retained_mask_bytes", "mask_decode_bytes", "session_policy", "rollback_policy", "science_identity", "operation_identity"}, "recipe plan"); _reject(type(value["api_version"]) is not int or value["api_version"] != _REINTEGRATE_PLAN_API_VERSION or value["rollback_policy"] != "ROLLBACK_ON_STOP" or any(type(value[key]) is not str or len(value[key]) != 64 or any(char not in "0123456789abcdef" for char in value[key]) for key in ("science_identity", "operation_identity")), "recipe plan version/rollback")
         snap = value["expected_target_snapshot"]; _keys(snap, {"exists", "size", "mtime_ns", "device", "inode", "digest"}, "target snapshot")
         _reject(snap["exists"] is not True or any(type(snap[k]) is not int or snap[k] < 0 for k in ("size", "mtime_ns", "device", "inode")) or type(snap["digest"]) is not str or len(snap["digest"]) != 64 or any(c not in "0123456789abcdef" for c in snap["digest"]), "recipe target snapshot")
         snapshot = TargetSnapshot(**snap); session = value["session_policy"]; _keys(session, {"flush", "allocation"}, "session_policy"); _keys(session["flush"], {"interval", "cap", "margin"}, "flush")
@@ -1897,10 +2059,10 @@ class ReintegratePlan:
         _reject(type(value["labels"]) is not list or type(value["detector_shape"]) is not list, "recipe tuple fields are not JSON arrays"); selected, shared = _plain(_freeze(value["selected_plan"])), _plain(_freeze(value["requested_shared_science"])); _validate_science(selected, shared, value["dimension"])
         mask_spec = _mask_spec(value["retained_mask_bytes"], value["mask_decode_bytes"], value["detector_shape"], "recipe persisted-mask resources")
         req = _requirements(tuple(value["detector_shape"]), value["native_dtype"], selected, shared); policy = _policy(req, {"version": 1, "kind": "explicit", "allocation": session["allocation"]}, mask_spec)
-        return _make_plan(value["target"], value["entry"], value["dimension"], tuple(value["labels"]), tuple(value["detector_shape"]), value["native_dtype"], selected, shared, value["gi_bootstrap_incidence"], value["retained_mask_bytes"], value["mask_decode_bytes"], policy, snapshot=snapshot, expected_science=value["science_identity"], expected_operation=value["operation_identity"])
-def _plan_mapping(plan: ReintegratePlan) -> dict[str, Any]: return {"api_version": _REINTEGRATE_PLAN_API_VERSION, "target": plan.target, "entry": plan.entry, "expected_target_snapshot": _snapshot_mapping(plan.expected_target_snapshot), "dimension": plan.dimension, "labels": list(plan.labels), "detector_shape": list(plan.detector_shape), "native_dtype": plan.native_dtype, "selected_plan": _plain(plan.selected_plan), "requested_shared_science": _plain(plan.requested_shared_science), "gi_bootstrap_incidence": plan.gi_bootstrap_incidence, "retained_mask_bytes": plan.retained_mask_bytes, "mask_decode_bytes": plan.mask_decode_bytes, "session_policy": {"flush": {"interval": 8, "cap": 64, "margin": 8}, "allocation": _allocation_recipe(plan.resource_allocation)}, "rollback_policy": plan.rollback_policy, "science_identity": plan.science_identity, "operation_identity": plan.operation_identity}
-def _make_plan(path, entry, dimension, labels, shape, dtype, selected, shared, bootstrap, retained_mask_bytes, mask_decode_bytes, policy, *, snapshot=None, expected_science=None, expected_operation=None):
-    replay = snapshot is not None; target = str(path) if replay else str(Path(path).resolve()); _reject(replay and (type(path) is not str or not os.path.isabs(path) or os.path.abspath(os.path.normpath(path)) != path), "recipe target/dtype is noncanonical"); snapshot = snapshot or capture_target_snapshot(target); native = _native_dtype(dtype); gi = shared["gi"]; _reject(type(entry) is not str or not entry or dimension not in {"1d", "2d"} or type(labels) is not tuple or not labels or labels != tuple(sorted(set(labels))) or any(type(v) is not int or v < 0 for v in labels) or type(shape) is not tuple or len(shape) != 2 or any(type(v) is not int or v <= 0 for v in shape) or native.kind not in "iuf" or native.str != dtype or (bootstrap is not None if not gi["enabled"] or gi["resolved_motor"] == "Manual" else type(bootstrap) is not float or not math.isfinite(bootstrap)), "plan facts are malformed")
+        return _make_plan(value["target"], value["entry"], value["source_root"], value["dimension"], tuple(value["labels"]), tuple(value["detector_shape"]), value["native_dtype"], selected, shared, value["gi_bootstrap_incidence"], value["retained_mask_bytes"], value["mask_decode_bytes"], policy, snapshot=snapshot, expected_science=value["science_identity"], expected_operation=value["operation_identity"])
+def _plan_mapping(plan: ReintegratePlan) -> dict[str, Any]: return {"api_version": _REINTEGRATE_PLAN_API_VERSION, "target": plan.target, "entry": plan.entry, "source_root": plan.source_root, "expected_target_snapshot": _snapshot_mapping(plan.expected_target_snapshot), "dimension": plan.dimension, "labels": list(plan.labels), "detector_shape": list(plan.detector_shape), "native_dtype": plan.native_dtype, "selected_plan": _plain(plan.selected_plan), "requested_shared_science": _plain(plan.requested_shared_science), "gi_bootstrap_incidence": plan.gi_bootstrap_incidence, "retained_mask_bytes": plan.retained_mask_bytes, "mask_decode_bytes": plan.mask_decode_bytes, "session_policy": {"flush": {"interval": 8, "cap": 64, "margin": 8}, "allocation": _allocation_recipe(plan.resource_allocation)}, "rollback_policy": plan.rollback_policy, "science_identity": plan.science_identity, "operation_identity": plan.operation_identity}
+def _make_plan(path, entry, source_root, dimension, labels, shape, dtype, selected, shared, bootstrap, retained_mask_bytes, mask_decode_bytes, policy, *, snapshot=None, expected_science=None, expected_operation=None):
+    replay = snapshot is not None; target = str(path) if replay else str(Path(path).resolve()); _reject(replay and (type(path) is not str or not os.path.isabs(path) or os.path.abspath(os.path.normpath(path)) != path), "recipe target/dtype is noncanonical"); source_root = _normalized_absolute_path(source_root, "recipe source root is noncanonical"); snapshot = snapshot or capture_target_snapshot(target); native = _native_dtype(dtype); gi = shared["gi"]; _reject(type(entry) is not str or not entry or dimension not in {"1d", "2d"} or type(labels) is not tuple or not labels or labels != tuple(sorted(set(labels))) or any(type(v) is not int or v < 0 for v in labels) or type(shape) is not tuple or len(shape) != 2 or any(type(v) is not int or v <= 0 for v in shape) or native.kind not in "iuf" or native.str != dtype or (bootstrap is not None if not gi["enabled"] or gi["resolved_motor"] == "Manual" else type(bootstrap) is not float or not math.isfinite(bootstrap)), "plan facts are malformed")
     selected, shared = _freeze(selected), _freeze(shared); science = _digest({"api_version": _REINTEGRATE_SCIENCE_API_VERSION, "dimension": dimension, "selected_plan": selected, "requested_shared_science": shared})
     mask_spec = _mask_spec(retained_mask_bytes, mask_decode_bytes, shape,
                            "plan persisted-mask resources")
@@ -1909,9 +2071,9 @@ def _make_plan(path, entry, dimension, labels, shape, dtype, selected, shared, b
     _reject(expected_owner is not None
             and policy.allocation.owner_block_bytes != expected_owner,
             "REINTEGRATE_MASK_OWNER_BLOCK_GRANT_CHANGED")
-    payload = {"target": target, "entry": entry, "snapshot": _snapshot_mapping(snapshot), "labels": labels, "shape": shape, "dtype": dtype, "bootstrap": bootstrap, "retained_mask_bytes": retained_mask_bytes, "mask_decode_bytes": mask_decode_bytes, "rollback": "ROLLBACK_ON_STOP", "flush": {"interval": 8, "cap": 64, "margin": 8}, "allocation": _allocation_recipe(policy.allocation), "science": science}
+    payload = {"target": target, "entry": entry, "source_root": source_root, "snapshot": _snapshot_mapping(snapshot), "labels": labels, "shape": shape, "dtype": dtype, "bootstrap": bootstrap, "retained_mask_bytes": retained_mask_bytes, "mask_decode_bytes": mask_decode_bytes, "rollback": "ROLLBACK_ON_STOP", "flush": {"interval": 8, "cap": 64, "margin": 8}, "allocation": _allocation_recipe(policy.allocation), "science": science}
     operation = _digest(payload); _reject(expected_science is not None and science != expected_science, "SCIENCE_IDENTITY"); _reject(expected_operation is not None and operation != expected_operation, "OPERATION_IDENTITY"); obj = object.__new__(ReintegratePlan)
-    values = (_REINTEGRATE_PLAN_API_VERSION, target, entry, snapshot, dimension, labels, shape, str(dtype), selected, shared, bootstrap, retained_mask_bytes, mask_decode_bytes, policy, "ROLLBACK_ON_STOP", science, operation); [object.__setattr__(obj, field.name, value) for field, value in zip(fields(ReintegratePlan), values)]; return obj
+    values = (_REINTEGRATE_PLAN_API_VERSION, target, entry, source_root, snapshot, dimension, labels, shape, str(dtype), selected, shared, bootstrap, retained_mask_bytes, mask_decode_bytes, policy, "ROLLBACK_ON_STOP", science, operation); [object.__setattr__(obj, field.name, value) for field, value in zip(fields(ReintegratePlan), values)]; return obj
 @dataclass(frozen=True, slots=True, init=False)
 class ReintegrateProgress:
     operation_identity: str; stage: str; completed: int; total: int; revision: int
@@ -2006,7 +2168,7 @@ class _ExecutionRuntime:
         if capture_target_snapshot(path) != self.plan.expected_target_snapshot: raise ValueError("TARGET_SNAPSHOT_CHANGED")
         target_revision = _target_object_revision(path, self.plan.expected_target_snapshot)
         _event(self.token)
-        from xrd_tools.reduction.core import NexusSink; from xrd_tools.session import DynamicAccountingLimits, DynamicFrameIdentity, DynamicRunAccounting, StageLedger, required_result_modes; from xrd_tools.session.scan_session import ScanSession; inspected = _inspect_artifact(path, self.plan.entry, self.plan.dimension, self.plan.expected_target_snapshot, target_revision, read_mask=False); _event(self.token)
+        from xrd_tools.reduction.core import NexusSink; from xrd_tools.session import DynamicAccountingLimits, DynamicFrameIdentity, DynamicRunAccounting, StageLedger, required_result_modes; from xrd_tools.session.scan_session import ScanSession; inspected = _inspect_artifact(path, self.plan.entry, self.plan.dimension, self.plan.expected_target_snapshot, target_revision, self.plan.source_root, read_mask=False); _event(self.token)
         if capture_target_snapshot(path) != self.plan.expected_target_snapshot or _target_object_revision(path, self.plan.expected_target_snapshot) != target_revision: raise ValueError("TARGET_SNAPSHOT_CHANGED")
         _event(self.token)
         expected_mask = _PersistedMaskSpec(
@@ -2020,7 +2182,7 @@ class _ExecutionRuntime:
         inspected = inspected._replace(mask=mask)
         _event(self.token)
         audit = _dimension_audit(dimension=self.plan.dimension, operation_identity=self.plan.operation_identity, science_identity=self.plan.science_identity, acquisition_fingerprint=inspected.acquisition_fingerprint, requested_shared_science=self.plan.requested_shared_science, selected_plan=self.plan.selected_plan, append_lineage=inspected.append_lineage); self.audit = _audit_identity(audit); background = self.plan.requested_shared_science["background"]; run = {} if background["mode"] == "None" else {"background": _plain(background)}
-        lock = threading.RLock(); self.source = _ReintegrateFrameSource(self.plan, self.token, inspected.raw_options, inspected.topology); self.sink = NexusSink.for_existing_replacement(path, expected_target_snapshot=self.plan.expected_target_snapshot, dimension=self.plan.dimension, labels=self.plan.labels, audit_bytes=_canonical(audit), selected_plan=self.plan.selected_plan["bai_args"], selected_gi_mode=self.plan.selected_plan["gi_mode"], cancel_token=self.token, entry=self.plan.entry, source_base=inspected.source_base, run_configuration_provenance=run, write_thumbnails=False, flush_every=None, file_lock=lock)
+        lock = threading.RLock(); self.source = _ReintegrateFrameSource(self.plan, self.token, inspected.raw_options, inspected.topology); self.sink = NexusSink.for_existing_replacement(path, expected_target_snapshot=self.plan.expected_target_snapshot, dimension=self.plan.dimension, labels=self.plan.labels, audit_bytes=_canonical(audit), selected_plan=self.plan.selected_plan["bai_args"], selected_gi_mode=self.plan.selected_plan["gi_mode"], source_execution=dict(inspected.topology.execution), append_lineage=inspected.append_lineage, cancel_token=self.token, entry=self.plan.entry, source_base=inspected.source_base, run_configuration_provenance=run, write_thumbnails=False, flush_every=None, file_lock=lock)
         self.source.bind_fact_reader(lambda label, **kwargs: self.sink._writer._detach_replacement_fact(label, **kwargs)); core_plan = _core_plan(self.plan.selected_plan, self.plan.requested_shared_science, inspected.mask); modes = required_result_modes(core_plan); targets = {mode: (f"nexus:{path}",) for mode in modes}; ledger = StageLedger(required_modes=modes, targets_by_mode=targets); self.accounting = DynamicRunAccounting(ledger, run_generation=1, limits=DynamicAccountingLimits(1, 1, len(self.plan.labels)))
         try: self.session = ScanSession(core_plan, self.source, self.sink, policy=self.plan.session_policy, cancel_token=self.token, clear_frame_images=True, accounting=ledger, dynamic_accounting=self.accounting, targets_by_mode=targets)
         except BaseException as error: self.primary = error; return self._settle()

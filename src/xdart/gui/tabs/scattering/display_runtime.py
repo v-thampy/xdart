@@ -1487,6 +1487,7 @@ class RunDisplayState:
             view,
             prepared.request.read_key.artifact_identity,
             source_base=preview.source_base,
+            source_root=prepared.request.read_key.source_root,
         )
         store.upsert(
             FramePublication(

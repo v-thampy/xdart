@@ -1083,7 +1083,14 @@ class BrowseLoader:
         if cancelled.is_set():
             return None
         started = stage_start()
-        scan = self._open_scan(canonical_path)
+        scan = (
+            self._open_scan(canonical_path)
+            if request.source_root is None
+            else self._open_scan(
+                canonical_path,
+                source_root=request.source_root,
+            )
+        )
         stage_finish("scan_open_s", started)
         records = FrameRecordStore(max_items=self._max_items)
         publications = PublicationStore(

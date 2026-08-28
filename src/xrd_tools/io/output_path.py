@@ -1,8 +1,9 @@
 # xrd_tools/io/output_path.py
 """The single shared owner of generated-output *path selection* (P4/OUT-1).
 
-New generated output is written as ``.nexus``; readers accept ``.nxs`` and
-``.nexus`` indefinitely; an explicit legacy target is preserved exactly.  Before
+New generated output is written as ``.nexus`` and only current ``.nexus``
+artifacts participate in processed Browse/Append reuse.  Raw ``.nxs`` remains
+supported by structure-aware source discovery.  Before
 this owner existed the decision was duplicated as a hard-coded ``+ ".nxs"`` in
 every producer — the headless series/watcher, ``LiveScan``, both wranglers, the
 scratch placeholder and the run-end fallback — so the suffix could not be
@@ -22,10 +23,8 @@ touches is a name and an existence test:
 * **Out of scope** — a race between selection and the writer opening the file.
   That belongs to the future output-transaction owner (H23).
 
-``.nexus`` is output-only: it is deliberately absent from raw-source discovery
-(``xrd_tools.sources.discover``) and from the raw candidate extensions
-(``xrd_tools.sources.registry``), while ``guess_source_kind``/``open_source``
-route it explicitly as processed output.
+NeXus-family suffixes are raw candidates too: content probing, not a filename,
+separates raw detector containers from current processed output.
 
 Pure: depends only on :mod:`os` and :mod:`pathlib` — no h5py, no numpy, no Qt,
 no ``xdart``, no writer and no schema import.
@@ -39,13 +38,12 @@ from pathlib import Path
 #: Suffix for every newly generated output file.
 NEW_OUTPUT_SUFFIX = ".nexus"
 
-#: The historical output suffix.  Still read forever, and still written when the
-#: operator explicitly appends to an existing legacy file.
+#: Historical/raw NeXus spelling.  It remains a raw-source suffix but is no
+#: longer a processed Browse or Append target.
 LEGACY_OUTPUT_SUFFIX = ".nxs"
 
-#: Every suffix a reader accepts, most-preferred first.  ``.nexus`` precedes
-#: ``.nxs`` so a both-siblings-exist Append resolves to the new file.
-READABLE_OUTPUT_SUFFIXES = (NEW_OUTPUT_SUFFIX, LEGACY_OUTPUT_SUFFIX)
+#: Current processed-output suffixes accepted by Browse/Append.
+READABLE_OUTPUT_SUFFIXES = (NEW_OUTPUT_SUFFIX,)
 
 #: The two existing write-mode spellings.
 APPEND_MODE = "Append"
@@ -76,11 +74,8 @@ def is_readable_output_path(path: "os.PathLike[str] | str") -> bool:
 def _is_append(mode: object) -> bool:
     """Whether *mode* is the explicit Append policy.
 
-    Only an explicit Append may reuse an existing legacy file, so anything that
-    is not recognisably ``"Append"`` — including ``"Overwrite"``, ``None`` and
-    any unknown spelling — falls through to a freshly generated ``.nexus``
-    target.  That is the safe direction: an unrecognised mode can never cause a
-    legacy file to be selected implicitly.
+    Anything that is not recognisably ``"Append"`` falls through to a freshly
+    generated ``.nexus`` target.
     """
     return str(mode).strip().lower() == APPEND_MODE.lower()
 
@@ -93,8 +88,8 @@ def _existing_sibling(directory: "os.PathLike[str] | str",
     directory is enumerated rather than probed so the answer carries the file's
     REAL spelling: probing ``<stem>.nexus`` is True for a stored ``<stem>.NEXUS``
     on a case-insensitive filesystem, which silently respelled the path.
-    ``.nexus`` outranks ``.nxs`` (§2 rule 4); within a class the exact canonical
-    lowercase spelling wins, and remaining ties resolve in sorted order.
+    Within the current suffix class the exact canonical lowercase spelling wins,
+    and remaining ties resolve in sorted order.
     """
     root = Path(os.fspath(directory))
     try:
@@ -150,21 +145,17 @@ def resolve_output_target(
         The run's write mode — the existing ``"Append"`` / ``"Overwrite"``
         spellings.
     explicit_target
-        A complete path the operator (or a loaded scan) already chose.  When
-        given it is returned unchanged, whatever its suffix: explicit ``.nxs``
-        and ``.nexus`` targets are preserved and never silently rewritten.
+        A complete requested path.  Its stem and directory are retained, while
+        any non-current suffix is normalized to ``.nexus``.
 
     Policy
     ------
-    1. An explicit target always wins and is preserved exactly.
+    1. An explicit target keeps its directory/stem and uses ``.nexus``.
     2. ``Overwrite`` always selects ``<scan_name>.nexus``.  It never discovers
        or replaces a sibling legacy ``.nxs`` implicitly.
-    3. ``Append`` prefers an existing ``.nexus``; otherwise it reuses an
-       existing ``.nxs`` (legacy append under the operator's explicit Append
-       policy); otherwise it selects a new ``.nexus``.
-    4. When both siblings exist ``.nexus`` wins — the sole way to select the
-       legacy file in that case is to pass it as *explicit_target*.
-    5. Sibling discovery matches the suffix case-insensitively and returns the
+    3. ``Append`` reuses an existing ``.nexus`` or selects a new one.  A sibling
+       ``.nxs`` is raw/foreign to this policy and is never reused.
+    4. Sibling discovery matches the suffix case-insensitively and returns the
        file's real on-disk spelling; the scan stem is matched exactly.
 
     Returns the selected path.  The file is neither created nor opened, and the
@@ -172,7 +163,12 @@ def resolve_output_target(
     on this resolved target before any writer opens it.
     """
     if explicit_target is not None and os.fspath(explicit_target) != "":
-        return Path(os.fspath(explicit_target))
+        requested = Path(os.fspath(explicit_target))
+        return (
+            requested
+            if requested.suffix.casefold() == NEW_OUTPUT_SUFFIX
+            else requested.with_suffix(NEW_OUTPUT_SUFFIX)
+        )
 
     if _is_append(mode):
         existing = _existing_sibling(directory, scan_name)

@@ -1679,6 +1679,7 @@ def _eiger_append_source(
     *,
     generation: int,
 ):
+    import xrd_tools.sources.registry  # noqa: F401  (register built-in owners)
     from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.sources.execution_graph import (
         append_source_from_execution_graph,
@@ -2223,7 +2224,7 @@ def test_append_writer_lineage_n_to_m_to_k_and_final_noop(tmp_path):
     assert final.disposition is Disposition.SKIP
 
 
-def test_legacy_empty_dataset_paths_normalize_for_same_extent_eiger_skip(
+def test_legacy_empty_dataset_paths_refuse_same_extent_eiger_skip(
     tmp_path,
 ):
     from dataclasses import replace
@@ -2253,13 +2254,12 @@ def test_legacy_empty_dataset_paths_normalize_for_same_extent_eiger_skip(
     )
     decision = qualify(target, current)
 
-    assert decision.disposition is Disposition.SKIP
-    assert decision.committed_labels == (0, 1)
-    assert decision.write_labels == ()
+    assert decision.disposition is Disposition.REFUSE
+    assert decision.reason == "persisted source has no exact dataset selectors"
     assert target.read_bytes() == before
 
 
-def test_legacy_empty_dataset_paths_normalize_for_eiger_growth_write(tmp_path):
+def test_legacy_empty_dataset_paths_refuse_eiger_growth_write(tmp_path):
     from dataclasses import replace
 
     (Disposition, _Member, _Intent, _Source, commit_lineage,
@@ -2286,13 +2286,8 @@ def test_legacy_empty_dataset_paths_normalize_for_eiger_growth_write(tmp_path):
     )
     decision = qualify(target, current)
 
-    assert decision.disposition is Disposition.WRITE
-    assert decision.committed_labels == (0, 1)
-    assert decision.write_labels == (2, 3, 4)
-    assert decision.lineage["epochs"][-1]["source"]["dataset_paths"] == [
-        "/entry/data/data_000001",
-        "/entry/data/data_000002",
-    ]
+    assert decision.disposition is Disposition.REFUSE
+    assert decision.reason == "persisted source has no exact dataset selectors"
 
 
 def test_legacy_empty_dataset_paths_refuse_unmatched_eiger_growth_selectors(
@@ -2334,9 +2329,7 @@ def test_legacy_empty_dataset_paths_refuse_unmatched_eiger_growth_selectors(
     decision = qualify(target, mismatched)
 
     assert decision.disposition is Disposition.REFUSE
-    assert decision.reason == (
-        "legacy empty dataset paths cannot authenticate current selectors"
-    )
+    assert decision.reason == "persisted source has no exact dataset selectors"
     assert target.read_bytes() == before
 
 

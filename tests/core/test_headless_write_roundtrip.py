@@ -12,12 +12,35 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io.nexus import (
     open_nexus_writer,
     read_scan,
+    write_integrated_stack,
     write_nexus,
     write_nexus_frame,
+)
+from xrd_tools.io.schema import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    SCHEMA_NAME_ATTR,
+    SCHEMA_VERSION_ATTR,
 )
 
 N_Q = 20
 N_CHI = 8
+
+
+def _current_entry(handle):
+    entry = handle.create_group("entry")
+    entry.attrs["NX_class"] = "NXentry"
+    entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+    entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+    return entry
+
+
+def _add_current_result(entry) -> None:
+    write_integrated_stack(
+        entry,
+        frame_indices=[0],
+        results_1d=[_r1d(0)],
+    )
 
 
 def _r1d(seed: int) -> IntegrationResult1D:
@@ -42,7 +65,7 @@ def _r2d(seed: int) -> IntegrationResult2D:
 
 
 def test_write_nexus_batch_roundtrips_through_read_scan(tmp_path):
-    p = tmp_path / "batch.nxs"
+    p = tmp_path / "batch.nexus"
     r1 = {0: _r1d(0), 1: _r1d(1), 2: _r1d(2)}
     r2 = {0: _r2d(0), 1: _r2d(1), 2: _r2d(2)}
     write_nexus(p, results_1d=r1, results_2d=r2, overwrite=True)
@@ -62,7 +85,7 @@ def test_write_nexus_batch_roundtrips_through_read_scan(tmp_path):
 def test_write_nexus_frame_incremental_roundtrips(tmp_path):
     """open_nexus_writer + write_nexus_frame (the NexusSink hot loop) must
     append rows that read_scan reads back in order."""
-    p = tmp_path / "live.nxs"
+    p = tmp_path / "live.nexus"
     h5 = open_nexus_writer(p, overwrite=True)
     try:
         for i in (5, 6, 7):  # non-zero-based labels
@@ -81,7 +104,7 @@ def test_write_nexus_frame_incremental_roundtrips(tmp_path):
 def test_rewriting_a_frame_upserts_not_duplicates(tmp_path):
     """Writing the same frame label twice updates the row in place (no
     duplicate frame_index) — keeps reruns/partial reprocessing idempotent."""
-    p = tmp_path / "rerun.nxs"
+    p = tmp_path / "rerun.nexus"
     h5 = open_nexus_writer(p, overwrite=True)
     try:
         write_nexus_frame(h5, 0, result_1d=_r1d(0), result_2d=_r2d(0))
@@ -106,9 +129,9 @@ def test_write_integrated_stack_bulk_then_incremental(tmp_path):
     import h5py
     from xrd_tools.io.nexus import write_integrated_stack
 
-    p = tmp_path / "stack.nxs"
+    p = tmp_path / "stack.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
         # bulk create: 3 frames, 1D + 2D, compressed
         write_integrated_stack(
             e, frame_indices=[0, 1, 2],
@@ -141,9 +164,9 @@ def test_monotonic_append_fast_path_falls_back_after_late_frame(tmp_path):
     import h5py
     from xrd_tools.io.nexus import write_integrated_stack
 
-    p = tmp_path / "late_frame.nxs"
+    p = tmp_path / "late_frame.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
         write_integrated_stack(e, frame_indices=[0, 2],
                                results_1d=[_r1d(0), _r1d(2)])
         assert bool(e["integrated_1d"].attrs["_frame_index_strictly_increasing"])
@@ -159,7 +182,7 @@ def test_write_stitched_roundtrips_through_read_stitched(tmp_path):
     import h5py
     from xrd_tools.io.nexus import write_stitched, read_stitched
 
-    p = tmp_path / "stitched.nxs"
+    p = tmp_path / "stitched.nexus"
     s1 = _r1d(0)                       # (N_Q,)
     s2 = IntegrationResult2D(          # intensity (N_Q, N_CHI) — q-major, as-is
         radial=np.linspace(0.5, 4.0, N_Q),
@@ -168,7 +191,9 @@ def test_write_stitched_roundtrips_through_read_stitched(tmp_path):
         unit="q_A^-1", azimuthal_unit="chi_deg",
     )
     with h5py.File(p, "w") as f:
-        write_stitched(f.create_group("entry"), stitched_1d=s1, stitched_2d=s2)
+        entry = _current_entry(f)
+        _add_current_result(entry)
+        write_stitched(entry, stitched_1d=s1, stitched_2d=s2)
 
     ds = read_stitched(p)
     assert ds["stitched_1d"].dims == ("q",)
@@ -192,10 +217,10 @@ def test_write_stitched_rejects_transposed_cake(tmp_path):
         unit="q_A^-1", azimuthal_unit="chi_deg",
     )
     s2.intensity = s2.intensity.T            # (chi, q) — transposed (slots dataclass)
-    p = tmp_path / "bad.nxs"
+    p = tmp_path / "bad.nexus"
     with h5py.File(p, "w") as f:
         with pytest.raises(ValueError, match=r"n_q.*n_chi|len\(radial\)"):
-            write_stitched(f.create_group("entry"), stitched_2d=s2)
+            write_stitched(_current_entry(f), stitched_2d=s2)
 
 
 def test_write_stitched_persists_provenance(tmp_path):
@@ -214,9 +239,11 @@ def test_write_stitched_persists_provenance(tmp_path):
     assert prov["backend"] == "pyfai_hist" and prov["npt_1d"] == 321
     assert prov["corrections"]["polarization_factor"] == 0.97   # CorrectionStack serialized
 
-    p = tmp_path / "prov.nxs"
+    p = tmp_path / "prov.nexus"
     with h5py.File(p, "w") as f:
-        write_stitched(f.create_group("entry"), stitched_1d=_r1d(0),
+        entry = _current_entry(f)
+        _add_current_result(entry)
+        write_stitched(entry, stitched_1d=_r1d(0),
                        stitched_2d=_r2d(1), provenance=prov)
 
     ds = read_stitched(p)
@@ -238,9 +265,10 @@ def test_stitched_groups_are_registered_capabilities(tmp_path):
     assert "stitched_1d" in CAPABILITIES and "stitched_2d" in CAPABILITIES
     assert "stitched_1d" in SCHEMA.groups and "stitched_2d" in SCHEMA.groups
 
-    p = tmp_path / "cap.nxs"
+    p = tmp_path / "cap.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
+        _add_current_result(e)
         write_stitched(e, stitched_1d=_r1d(0), stitched_2d=_r2d(1),
                        provenance={"backend": "multigeometry"})
         # feature-detect + schema-validate the written groups
@@ -250,9 +278,11 @@ def test_stitched_groups_are_registered_capabilities(tmp_path):
         assert validate_group_against_schema(e["stitched_2d"], "stitched_2d") == []
 
     # a file WITHOUT stitched groups must not advertise the capability (optional)
-    q = tmp_path / "nostitch.nxs"
+    q = tmp_path / "nostitch.nexus"
     with h5py.File(q, "w") as f:
-        assert "stitched_1d" not in detect_capabilities(f.create_group("entry"))
+        entry = _current_entry(f)
+        _add_current_result(entry)
+        assert "stitched_1d" not in detect_capabilities(entry)
     # read_stitched on a stitch-less entry raises (unchanged contract)
     import pytest
     with pytest.raises(KeyError):
@@ -265,9 +295,9 @@ def test_write_integrated_stack_shape_change_rewrites(tmp_path):
     import h5py
     from xrd_tools.io.nexus import write_integrated_stack
 
-    p = tmp_path / "reint.nxs"
+    p = tmp_path / "reint.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
         write_integrated_stack(e, frame_indices=[0, 1, 2],
                                results_1d=[_r1d(0), _r1d(1), _r1d(2)])  # npt=N_Q
     # reintegrate all frames at a different npt
@@ -292,9 +322,9 @@ def test_write_integrated_stack_partial_shape_change_raises(tmp_path):
     import pytest
     from xrd_tools.io.nexus import write_integrated_stack
 
-    p = tmp_path / "partial_reint.nxs"
+    p = tmp_path / "partial_reint.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
         write_integrated_stack(e, frame_indices=[0, 1, 2],
                                results_1d=[_r1d(0), _r1d(1), _r1d(2)])  # npt=N_Q
     big = lambda s: IntegrationResult1D(
@@ -316,9 +346,9 @@ def test_write_integrated_stack_rejects_duplicate_labels(tmp_path):
     import h5py
     import pytest
     from xrd_tools.io.nexus import write_integrated_stack
-    p = tmp_path / "dup.nxs"
+    p = tmp_path / "dup.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
         with pytest.raises(ValueError, match="duplicate"):
             write_integrated_stack(
                 e, frame_indices=[0, 0], results_1d=[_r1d(0), _r1d(1)],
@@ -329,7 +359,7 @@ def test_write_nexus_validates_complete_batch_before_creating_file(tmp_path):
     """A divergent later row must fail before the output is mutated."""
     import pytest
 
-    p = tmp_path / "atomic_batch.nxs"
+    p = tmp_path / "atomic_batch.nexus"
     bad = IntegrationResult1D(
         radial=np.linspace(0.5, 6.0, N_Q),
         intensity=np.ones(N_Q),
@@ -345,7 +375,7 @@ def test_write_nexus_rejects_normalized_duplicate_labels(tmp_path):
 
     with pytest.raises(ValueError, match="duplicate normalized"):
         write_nexus(
-            tmp_path / "duplicate_labels.nxs",
+            tmp_path / "duplicate_labels.nexus",
             results_1d={1: _r1d(0), "1": _r1d(1)},
             overwrite=True,
         )
@@ -356,7 +386,7 @@ def test_write_nexus_preflights_existing_1d_2d_before_mutation(tmp_path):
     import h5py
     import pytest
 
-    p = tmp_path / "no_half_commit.nxs"
+    p = tmp_path / "no_half_commit.nexus"
     write_nexus(
         p,
         results_1d={0: _r1d(0)},
@@ -383,7 +413,7 @@ def test_nexus_sink_roundtrips_through_read_scan(tmp_path):
     from xrd_tools.reduction import NexusSink
     from xrd_tools.reduction.core import FrameReduction, Frame, Scan
 
-    p = tmp_path / "sink.nxs"
+    p = tmp_path / "sink.nexus"
     sink = NexusSink(path=p, overwrite=True)
     scan = Scan(name="s", frames=[Frame(index=0, image=np.zeros((2, 2))),
                                   Frame(index=1, image=np.zeros((2, 2)))])
@@ -406,7 +436,7 @@ def test_nexus_sink_persists_named_extra_modes(tmp_path):
     from xrd_tools.reduction import GIMode, NexusSink, ReductionPlan
     from xrd_tools.reduction.core import FrameReduction, Frame, Scan
 
-    p = tmp_path / "sink_modes.nxs"
+    p = tmp_path / "sink_modes.nexus"
     sink = NexusSink(path=p, overwrite=True)
     scan = Scan(name="s", frames=[Frame(index=0, image=np.zeros((2, 2)))])
     plan = ReductionPlan(gi=GIMode(mode_1d="q_total", mode_2d="qip_qoop"))
@@ -458,10 +488,10 @@ def test_write_integrated_stack_axis_change_same_bincount_rewrites(tmp_path):
     import h5py
     from xrd_tools.io.nexus import write_integrated_stack
 
-    p = tmp_path / "axis_change.nxs"
+    p = tmp_path / "axis_change.nexus"
     q = np.linspace(0.5, 5.0, N_Q)
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
         write_integrated_stack(
             e, frame_indices=[0, 1, 2],
             results_1d=[IntegrationResult1D(radial=q, intensity=np.full(N_Q, s),
@@ -484,7 +514,7 @@ def test_write_integrated_stack_marks_and_guards_azimuthal_1d_axis(tmp_path):
     import pytest
     from xrd_tools.io.nexus import write_integrated_stack, write_nexus_frame
 
-    p = tmp_path / "chi_axis.nxs"
+    p = tmp_path / "chi_axis.nexus"
     chi = np.linspace(-180.0, 180.0, N_Q)
 
     def _chi_result(seed: int) -> IntegrationResult1D:
@@ -495,7 +525,7 @@ def test_write_integrated_stack_marks_and_guards_azimuthal_1d_axis(tmp_path):
         )
 
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
         write_integrated_stack(
             e,
             frame_indices=[0, 1],
@@ -522,9 +552,9 @@ def test_write_integrated_stack_sigma_stays_row_aligned(tmp_path):
     import h5py
     from xrd_tools.io.nexus import write_integrated_stack
 
-    p = tmp_path / "sigma_align.nxs"
+    p = tmp_path / "sigma_align.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = _current_entry(f)
         write_integrated_stack(
             e, frame_indices=[0, 1],
             results_1d=[_r1d(0), _r1d(1)],   # _r1d carries sigma

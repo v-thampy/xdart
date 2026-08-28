@@ -130,8 +130,8 @@ def _resolve_source_master(scan_file: Path, src, *, source_base=None,
     """Resolve a frame's ``source`` group to an existing master path.
 
     Thin wrapper over :func:`xrd_tools.io.read.resolve_source_master` (the
-    single N1 resolver) so classification + display agree on precedence
-    (``source_root`` > ``@source_base`` > scan dir) and absolute back-compat."""
+    single resolver) so classification + display agree on explicit precedence
+    (``source_root`` > ``@source_base``) and absolute stored paths."""
     from xrd_tools.io.read import _decode, resolve_source_master
 
     if src is None or "path" not in src:
@@ -178,18 +178,6 @@ def classify_image_source(path) -> ImageSourceInfo:
             kind=ImageSourceKind.RAW_MASTER, path=str(p),
             frame_labels=tuple(range(n)), has_raw=True, has_thumbnail=False)
 
-    # An Eiger master (.h5 ending in ``_master``) is raw detector data — its
-    # frames live in linked data files, and it carries a NATIVE ``entry/frames``
-    # group that must NOT be mistaken for xdart's processed frames.
-    if _is_eiger_master(p):
-        try:
-            n = max(int(count_frames(p)), 1)
-        except Exception:
-            n = 1
-        return ImageSourceInfo(
-            kind=ImageSourceKind.RAW_MASTER, path=str(p),
-            frame_labels=tuple(range(n)), has_raw=True, has_thumbnail=False)
-
     try:
         with h5py.File(p, "r") as f:
             # NXS-ENTRY-1/PROC-1: resolve the NXentry NXclass-aware (the same
@@ -197,19 +185,54 @@ def classify_image_source(path) -> ImageSourceInfo:
             # identically here and in the probe/descriptor.
             from xrd_tools.io.bluesky_nexus import resolve_nxentry
             entry = resolve_nxentry(f, "entry")
+            from xrd_tools.io.processed_scan_id import (
+                ProcessedXdartInputError,
+                has_processed_output_markers_entry,
+                is_current_processed_xdart_file,
+                require_raw_input,
+            )
+            current_processed = is_current_processed_xdart_file(f, "entry")
             # ``entry/frames`` ALONE is NOT an xdart-processed marker — Eiger
             # data files carry a native ``entry/frames`` group alongside the raw
             # ``entry/data/data`` stack.  Only integrated data, or frames that
             # actually carry source/thumbnail content, mark a processed file.
-            has_integrated = entry is not None and (
-                "integrated_1d" in entry or "integrated_2d" in entry
+            has_processed_markers = bool(
+                entry is not None
+                and has_processed_output_markers_entry(entry)
             )
-            if not has_integrated:
-                # A genuine raw detector dataset wins over a native frames group.
+            if has_processed_markers and not current_processed:
+                return ImageSourceInfo(
+                    kind=ImageSourceKind.UNKNOWN,
+                    path=str(p),
+                )
+            # A marker-free Eiger master remains raw detector data.  Its frames
+            # live in linked data files, and its native ``entry/frames`` group
+            # is not a processed marker.
+            if _is_eiger_master(p):
+                try:
+                    n = max(int(count_frames(p)), 1)
+                except ProcessedXdartInputError:
+                    return ImageSourceInfo(
+                        kind=ImageSourceKind.UNKNOWN,
+                        path=str(p),
+                    )
+                except Exception:
+                    n = 1
+                return ImageSourceInfo(
+                    kind=ImageSourceKind.RAW_MASTER,
+                    path=str(p),
+                    frame_labels=tuple(range(n)),
+                    has_raw=True,
+                    has_thumbnail=False,
+                )
+            if not current_processed:
+                # Only a marker-free detector dataset can be admitted as raw.
                 for cand in _RAW_DATASET_CANDIDATES:
                     obj = f.get(cand)
                     if obj is None and entry is not None and cand.startswith("entry/"):
                         obj = entry.get(cand[len("entry/"):])
+                    if isinstance(obj, h5py.Dataset):
+                        require_raw_input(obj)
                     if isinstance(obj, h5py.Dataset) and 2 <= obj.ndim <= 3:
                         n = obj.shape[0] if obj.ndim == 3 else 1
                         return ImageSourceInfo(
@@ -220,6 +243,8 @@ def classify_image_source(path) -> ImageSourceInfo:
                 # ``@signal_type='detector'`` under a non-canonical name.
                 from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
                 det = find_detector_signal_dataset(f)
+                if det is not None:
+                    require_raw_input(det)
                 if det is not None and 2 <= det.ndim <= 3:
                     n = det.shape[0] if det.ndim == 3 else 1
                     return ImageSourceInfo(
@@ -250,11 +275,12 @@ def classify_image_source(path) -> ImageSourceInfo:
                     if has_raw and has_thumbnail:
                         break
 
-            # A real processed-xdart file has integrated data, OR frame groups
-            # carrying source/thumbnail.  A reduction/provenance group by itself
-            # is not displayable and should remain UNKNOWN, otherwise interrupted
-            # partial writes look like empty processed scans in the Image Viewer.
-            if not (has_integrated or has_raw or has_thumbnail):
+            # Positive admission is current-schema ``.nexus`` only.  Broad
+            # integrated-content detection remains a raw-negative guard but
+            # never claims a foreign or historical container as processed.
+            if not current_processed or not (
+                has_processed_markers or has_raw or has_thumbnail
+            ):
                 return ImageSourceInfo(kind=ImageSourceKind.UNKNOWN, path=str(p))
 
             if has_raw:
@@ -287,6 +313,8 @@ def _read_thumbnail_direct(path, frame) -> "np.ndarray | None":
     from xrd_tools.io.read import _dequantize_thumbnail
     try:
         with h5py.File(Path(path), "r") as f:
+            from xrd_tools.io.processed_scan_id import require_current_processed
+            require_current_processed(f)
             key = f"entry/frames/frame_{int(frame):04d}/thumbnail"
             if key not in f:
                 return None
@@ -305,7 +333,7 @@ def load_processed_raw_or_thumbnail(
     strict=None,
     preserve_raw_dtype: bool = False,
 ) -> RawFrameResult:
-    """For a processed ``.nxs``: return the full-resolution raw image for a
+    """For a processed ``.nexus``: return the full-resolution raw image for a
     frame **label** if the per-frame source master resolves, else the
     dequantized thumbnail, else nothing — recording which in ``source``.
 
@@ -326,8 +354,10 @@ def load_processed_raw_or_thumbnail(
     Thumbnails and the default API remain floating point.
     """
     from xrd_tools.io.read import get_raw_frame
+    from xrd_tools.io.processed_scan_id import require_current_processed
     from xrd_tools.core.strictness import StrictPolicy
 
+    require_current_processed(path)
     if strict is None:
         strict = StrictPolicy.graceful()
     frame = int(frame)

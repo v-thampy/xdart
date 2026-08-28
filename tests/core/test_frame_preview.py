@@ -42,7 +42,7 @@ def _write_processed(
     raw_path = root / "raw" / "image.tif"
     raw_path.parent.mkdir(parents=True)
     tifffile.imwrite(raw_path, raw)
-    processed = root / "xdart_processed_data" / "scan.nxs"
+    processed = root / "xdart_processed_data" / "scan.nexus"
     processed.parent.mkdir()
     one_d = IntegrationResult1D(
         radial=np.array([0.1, 0.2, 0.3]),
@@ -58,6 +58,8 @@ def _write_processed(
     )
     with h5py.File(processed, "w") as handle:
         entry = handle.create_group("entry")
+        entry.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
+        entry.attrs["ssrl_schema_version"] = 2
         if detector_shape is not None:
             entry.create_dataset(
                 "instrument/detector/detector_shape", data=detector_shape
@@ -80,13 +82,14 @@ def _write_processed(
     return processed, raw_path
 
 
-def _read_key(path: Path, purpose):
+def _read_key(path: Path, purpose, *, source_root: Path | None = None):
     hydration = _hydration()
     return hydration.HydrationReadKey(
         hydration.HydrationScope("context-a", "scan-7", "/raw/source", 3),
         str(path),
         17,
         purpose,
+        None if source_root is None else str(source_root),
     )
 
 
@@ -683,7 +686,11 @@ def test_relative_raw_locator_uses_moved_project_root_not_cwd(
     counts = _instrument_reads(monkeypatch, moved_processed)
     api = _api()
     result = api.read_frame_preview(
-        _read_key(moved_processed, _hydration().HydrationPurpose.FULL),
+        _read_key(
+            moved_processed,
+            _hydration().HydrationPurpose.FULL,
+            source_root=moved,
+        ),
         detector_projection=api.DetectorPreviewProjection.without_static_mask(),
     )
     assert result.raw_locator == "raw/image.tif"

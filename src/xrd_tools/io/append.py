@@ -7,7 +7,7 @@ from enum import Enum
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from contextlib import nullcontext
 from typing import Any, Callable, Iterable, Mapping
 
@@ -745,73 +745,10 @@ def _member_extends(
             return False
     return True
 
-def _authenticate_legacy_external_selectors(
-    current: Mapping[str, Any],
-) -> None:
-    reason = "legacy empty dataset paths cannot authenticate current selectors"
-    selectors = tuple(current.get("dataset_paths") or ())
-    members = tuple(current.get("external_members") or ())
-    if (
-        current.get("adapter_id") != "nexus_hdf5"
-        or not selectors
-        or not members
-        or len(selectors) != len(members)
-    ):
-        raise ValueError(reason)
-    master = Path(str(current.get("path", "")))
-    expected_revision = (
-        int(current.get("size", -1)),
-        int(current.get("mtime_ns", -1)),
-    )
-
-    def revision() -> tuple[str, int, int]:
-        resolved = str(master.resolve(strict=True))
-        state = master.stat()
-        return resolved, int(state.st_size), int(state.st_mtime_ns)
-
-    try:
-        before = revision()
-        if before[1:] != expected_revision:
-            raise ValueError(reason)
-        with h5py.File(master, "r") as handle:
-            for selector, member in zip(selectors, members):
-                shown = PurePosixPath(selector)
-                if not shown.is_absolute() or str(shown) != selector:
-                    raise ValueError(reason)
-                parent = _replacement_hard_group(handle, str(shown.parent))
-                link = (
-                    None
-                    if parent is None
-                    else parent.get(shown.name, getlink=True)
-                )
-                if type(link) is not h5py.ExternalLink:
-                    raise ValueError(reason)
-                filename = link.filename
-                if type(filename) is not str or type(link.path) is not str:
-                    raise ValueError(reason)
-                linked = Path(filename)
-                if not linked.is_absolute():
-                    linked = master.parent / linked
-                if (
-                    _normalize(linked) != _normalize(member.get("path", ""))
-                    or link.path != member.get("dataset_path")
-                ):
-                    raise ValueError(reason)
-        after = revision()
-        if after != before:
-            raise ValueError(reason)
-    except (OSError, KeyError, TypeError, ValueError) as error:
-        if isinstance(error, ValueError) and str(error) == reason:
-            raise
-        raise ValueError(reason) from error
-
-
 def _source_extends(
     prior: Mapping[str, Any],
     current: Mapping[str, Any],
-    *,
-    authenticate_current: bool = False,
-) -> bool:
+) -> None:
     for key in ("path", "adapter_id"):
         if prior.get(key) != current.get(key):
             raise ValueError(f"source does not extend exact {key}")
@@ -819,22 +756,8 @@ def _source_extends(
     current_paths = list(current.get("dataset_paths") or ())
     prior_external = list(prior.get("external_members") or ())
     current_external = list(current.get("external_members") or ())
-    legacy_dataset_path_upgrade = False
     if not prior_paths and current_paths:
-        if (current.get("adapter_id") != "nexus_hdf5"
-                or not prior_external
-                or not current_external
-                or len(current_paths) != len(current_external)
-                or not _member_extends(
-                    prior_external, current_external, grow_last=True
-                )):
-            raise ValueError(
-                "legacy empty dataset paths cannot authenticate current selectors"
-            )
-        if authenticate_current:
-            _authenticate_legacy_external_selectors(current)
-        prior_paths = list(current_paths)
-        legacy_dataset_path_upgrade = True
+        raise ValueError("persisted source has no exact dataset selectors")
     if current_paths[:len(prior_paths)] != prior_paths:
         raise ValueError("source does not extend exact dataset paths")
     for key in ("size", "mtime_ns", "extent"):
@@ -852,12 +775,9 @@ def _source_extends(
         comparable_prior = {
             key: value for key, value in prior.items() if key != "generation"
         }
-        if legacy_dataset_path_upgrade:
-            comparable_prior["dataset_paths"] = current_paths
         if ({key: value for key, value in current.items() if key != "generation"}
                 != comparable_prior):
             raise ValueError("same-extent source identity changed")
-    return legacy_dataset_path_upgrade
 
 def _extend_pending_decision(
     prior_decision: AppendDecision,
@@ -882,7 +802,6 @@ def _extend_pending_decision(
         _source_extends(
             _source_dict(prior_intent.source),
             _source_dict(current_intent.source),
-            authenticate_current=True,
         )
         committed = prior_decision.skip_labels
         if new_labels[:len(committed)] != committed:
@@ -1068,7 +987,6 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
             _source_extends(
                 _source_dict(observed.source),
                 _source_dict(intent.source),
-                authenticate_current=True,
             )
         if not target.exists():
             if committed_prefix is not None:
@@ -1101,7 +1019,6 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
         _source_extends(
             prior_source,
             current_source,
-            authenticate_current=True,
         )
         prior_extent = int(prior_source.get("extent", -1))
         if intent.labels[:len(labels)] != labels:

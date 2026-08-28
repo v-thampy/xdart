@@ -8,11 +8,11 @@ their discovery, probing, naming, and opening behavior through one
 only when a new format also needs URI-based kind inference.
 
 ``open_source`` preserves explicitly typed :class:`~xrd_tools.core.scan.SourceSpec`
-values and existing :class:`~xrd_tools.core.scan.FrameSource` objects.  For a
-path it first honors the compatible candidate owner, keeping discovery, probe,
-and opening on the same adapter; virtual sources and explicit processed-output
-paths fall through to the kind owner.  There is no separate opener registry or
-built-in dispatch table.
+values and existing :class:`~xrd_tools.core.scan.FrameSource` objects.  A
+processed kind first requires exact current-schema qualification.  Other paths
+first honor the compatible candidate owner, keeping discovery, probing, and
+opening on the same adapter; virtual sources fall through to the kind owner.
+There is no separate opener registry or built-in dispatch table.
 """
 
 from __future__ import annotations
@@ -23,7 +23,11 @@ from typing import Any
 
 from xrd_tools.core.scan import FrameSource, SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.io.image_source import ImageSourceKind, classify_image_source
-from xrd_tools.sources.adapters import adapter_for_kind, candidate_owner
+from xrd_tools.sources.adapters import (
+    adapter_for_kind,
+    candidate_owner,
+    explicit_source_owner,
+)
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
 from xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
@@ -43,14 +47,7 @@ def guess_source_kind(uri: str | Path) -> SourceKind:
     info = classify_image_source(path)
     if info.kind is ImageSourceKind.PROCESSED_XDART or info.kind is ImageSourceKind.THUMBNAIL_ONLY:
         return SourceKind.PROCESSED_NEXUS
-    if path.suffix.lower() == ".nexus":
-        # Reserved future xdart output extension (O/H23, not yet written by any
-        # producer): structurally a processed-record container, so it opens the
-        # same way a processed .nxs does.  Directory discovery excludes it from
-        # RAW candidates (xrd_tools.sources.discover) — this only governs
-        # explicit open_source()/guess_source_kind() routing.
-        return SourceKind.PROCESSED_NEXUS
-    if path.suffix.lower() in {".h5", ".hdf5", ".nxs", ".cxi"}:
+    if path.suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus", ".cxi"}:
         return SourceKind.NEXUS_STACK
     if path.suffix.lower() in {".tif", ".tiff"}:
         return SourceKind.IMAGE_FILE
@@ -62,9 +59,7 @@ def _path_candidate_owner(uri: str | Path) -> "Any | None":
 
     Name-only (suffix/stem inspection via each adapter's ``is_candidate``) — no
     file is opened and existence is not required.  Returns ``None`` for a
-    virtual/non-path uri (no adapter's predicate matches) and for a directory
-    or output-only ``.nexus`` (also unclaimed), so :func:`open_source` cleanly
-    falls through to the kind lookup for those."""
+    virtual/non-path URI, a directory, or any path no adapter claims."""
     try:
         return candidate_owner(Path(uri))
     except Exception:
@@ -74,11 +69,12 @@ def _path_candidate_owner(uri: str | Path) -> "Any | None":
 def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any) -> FrameSource:
     """Open a source from a URI/spec or return an existing FrameSource.
 
-    Dispatch order: (1) the adapter that claims the path, when compatible with
-    the requested kind, so a discovered candidate opens through the same owner
-    that discovered and probed it; (2) the kind-owning adapter for virtual or
-    non-path sources, explicitly typed incompatible candidates, and output-only
-    ``.nexus`` paths.  An unadapted kind raises a clean :class:`ValueError`."""
+    Dispatch order: current processed outputs first require strict explicit
+    qualification; otherwise (1) the adapter that claims the path, when
+    compatible with the requested kind, so a discovered candidate opens through
+    the same owner that discovered and probed it; (2) the kind-owning adapter
+    for virtual/non-path sources and explicitly typed incompatible candidates.
+    An unadapted kind raises a clean :class:`ValueError`."""
 
     if hasattr(uri_or_spec, "frame_indices") and hasattr(uri_or_spec, "load_frame"):
         return uri_or_spec  # type: ignore[return-value]
@@ -91,16 +87,24 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
             kind = guess_source_kind(uri_or_spec)
         spec = SourceSpec(uri_or_spec, kind, options=opts)
 
-    # R1-R8 path-based ownership: prefer the adapter that CLAIMS this path
+    kind = coerce_source_kind(spec.kind)
+    if kind is SourceKind.PROCESSED_NEXUS:
+        # A caller-supplied kind and a .nexus suffix are not admission.  Current
+        # processed records must pass exact schema/structure qualification
+        # before any global registry or name-only adapter can construct one.
+        owner = explicit_source_owner(Path(spec.uri), kind)
+        if owner is None:
+            raise ValueError("processed source is not a current xdart .nexus record")
+        return owner.open(spec)
+
+    # Path-based ownership: prefer the adapter that CLAIMS this path
     #    (its is_candidate) when that adapter is compatible with the requested
     #    kind, so discovery/probe/open all use the one adapter that owns the
     #    file.  This stops an out-of-tree adapter that declares an existing kind
     #    for an UNRELATED predicate (e.g. IMAGE_FILE for *.xyz) from hijacking
     #    the open of a .tif that the built-in image_file adapter claimed.
-    #    Skipped for virtual/non-path uris (no adapter claims them -> owner None)
-    #    and for output-only .nexus (excluded from candidates -> owner None),
-    #    both of which fall through to the kind lookup below.
-    kind = coerce_source_kind(spec.kind)
+    #    Skipped for virtual/non-path URIs (no adapter claims them -> owner
+    #    None); those fall through to the kind lookup below.
     claim_owner = _path_candidate_owner(spec.uri)
     if claim_owner is not None and kind in claim_owner.kinds:
         return claim_owner.open(spec)
@@ -120,12 +124,9 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
 # lazy inside the probe/provider callables.
 # ---------------------------------------------------------------------------
 
-#: Raw-readable NeXus-family container extensions.  ``.cxi`` is included for
-#: parity with the existing guess_source_kind()/discover_scans() rules and
-#: discover._NEXUS_EXTS (R1-R4); ``.nexus`` is deliberately ABSENT — it is a
-#: reserved output-only extension, openable explicitly but excluded from raw
-#: directory discovery (see guess_source_kind and discover.enumerate_candidates).
-_NEXUS_CANDIDATE_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
+#: Raw-readable NeXus-family container extensions.  Content probing, not the
+#: suffix, separates raw ``.nexus`` from current processed output.
+_NEXUS_CANDIDATE_EXTS = {".nxs", ".h5", ".hdf5", ".nexus", ".cxi"}
 
 
 def _nexus_is_candidate(path: Path) -> bool:

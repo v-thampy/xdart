@@ -1463,10 +1463,11 @@ class NexusSink:
         cls, path: Path | str, *, expected_target_snapshot: TargetSnapshot,
         dimension: str, labels: tuple[int, ...], audit_bytes: bytes,
         selected_plan: Mapping[str, Any], selected_gi_mode: str | None,
+        source_execution: Mapping[str, Any], append_lineage: bytes | None,
         cancel_token: threading.Event | None = None, **sink_values: Any,
     ) -> "NexusSink":
         """Bind one selected-dimension rewrite to an admitted existing target."""
-        if type(expected_target_snapshot) is not TargetSnapshot or cancel_token is not None and type(cancel_token) is not threading.Event: raise TypeError("replacement requires exact target/cancellation objects")
+        if type(expected_target_snapshot) is not TargetSnapshot or type(source_execution) is not dict or append_lineage is not None and type(append_lineage) is not bytes or cancel_token is not None and type(cancel_token) is not threading.Event: raise TypeError("replacement requires exact target/source/cancellation objects")
         if any(name in sink_values for name in (
             "overwrite", "append_preflight", "same_run_intent",
             "allow_unbound_same_run",
@@ -1474,7 +1475,7 @@ class NexusSink:
             raise ValueError("existing replacement owns its output policy")
         sink = cls(path, overwrite=False, **sink_values)
         sink._replacement = (
-            expected_target_snapshot, dimension, tuple(labels), bytes(audit_bytes), dict(selected_plan), selected_gi_mode, cancel_token,
+            expected_target_snapshot, dimension, tuple(labels), bytes(audit_bytes), dict(selected_plan), selected_gi_mode, cancel_token, dict(source_execution), append_lineage,
         )
         return sink
 
@@ -1819,6 +1820,8 @@ class NexusSink:
                 replacement_audit=None if replacement is None else replacement[3],
                 replacement_selected_plan=None if replacement is None else replacement[4],
                 replacement_gi_mode=None if replacement is None else replacement[5],
+                replacement_source_execution=None if replacement is None else replacement[7],
+                replacement_append_lineage=None if replacement is None else replacement[8],
             )
             self._writer = writer
             if self._session_facade is not None:

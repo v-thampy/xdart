@@ -14,6 +14,12 @@ import pytest
 from xrd_tools.core.geometry import DiffractometerGeometry
 from xrd_tools.core.provenance import write_provenance
 from xrd_tools.io.nexus import read_scan, read_stitched
+from xrd_tools.io.schema import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    SCHEMA_NAME_ATTR,
+    SCHEMA_VERSION_ATTR,
+)
 
 
 N_FRAMES = 5
@@ -21,15 +27,47 @@ N_Q = 64
 N_CHI = 32
 
 
+def _stamp_current_entry(entry):
+    entry.attrs["NX_class"] = "NXentry"
+    entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+    entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+    return entry
+
+
+def _stamp_current_1d(group):
+    group.attrs["NX_class"] = "NXdata"
+    group.attrs["signal"] = "intensity"
+    group.attrs["axes"] = ("frame_index", "q")
+    return group
+
+
+def _stamp_current_2d(group):
+    group.attrs["NX_class"] = "NXdata"
+    group.attrs["signal"] = "intensity"
+    group.attrs["axes"] = ("frame_index", "chi", "q")
+    return group
+
+
+def _add_minimal_current_1d(entry, labels):
+    labels = np.asarray(labels, dtype=np.int64)
+    group = _stamp_current_1d(entry.create_group("integrated_1d"))
+    group.create_dataset(
+        "intensity", data=np.zeros((labels.size, 2), dtype=np.float32),
+    )
+    group.create_dataset("q", data=np.linspace(0.5, 1.0, 2, dtype=np.float32))
+    group.create_dataset("frame_index", data=labels)
+    return group
+
+
 @pytest.fixture
 def v2_fixture(tmp_path):
     """A minimal v2-conformant NXroot file for a 5-frame psic scan."""
-    p = tmp_path / "psic_5frame.nxs"
+    p = tmp_path / "psic_5frame.nexus"
 
     rng = np.random.default_rng(0)
     q = np.linspace(0.5, 5.0, N_Q).astype(np.float32)
     chi = np.linspace(-180.0, 180.0, N_CHI, endpoint=False).astype(np.float32)
-    frame_index = np.arange(N_FRAMES, dtype=np.int32)
+    frame_index = np.arange(N_FRAMES, dtype=np.int64)
 
     intensity_1d = rng.random((N_FRAMES, N_Q), dtype=np.float32)
     sigma_1d = np.sqrt(intensity_1d).astype(np.float32)
@@ -49,15 +87,11 @@ def v2_fixture(tmp_path):
     )
 
     with h5py.File(p, "w") as f:
-        entry = f.create_group("entry")
-        entry.attrs["NX_class"] = "NXentry"
+        entry = _stamp_current_entry(f.create_group("entry"))
         entry.attrs["default"] = "integrated_1d"
 
         # integrated_1d ------------------------------------------------
-        g1 = entry.create_group("integrated_1d")
-        g1.attrs["NX_class"] = "NXdata"
-        g1.attrs["signal"] = "intensity"
-        g1.attrs["axes"] = ["frame_index", "q"]
+        g1 = _stamp_current_1d(entry.create_group("integrated_1d"))
         g1.create_dataset("intensity", data=intensity_1d)
         g1.create_dataset("sigma", data=sigma_1d)
         q_ds = g1.create_dataset("q", data=q)
@@ -65,10 +99,7 @@ def v2_fixture(tmp_path):
         g1.create_dataset("frame_index", data=frame_index)
 
         # integrated_2d ------------------------------------------------
-        g2 = entry.create_group("integrated_2d")
-        g2.attrs["NX_class"] = "NXdata"
-        g2.attrs["signal"] = "intensity"
-        g2.attrs["axes"] = ["frame_index", "chi", "q"]
+        g2 = _stamp_current_2d(entry.create_group("integrated_2d"))
         g2.create_dataset("intensity", data=intensity_2d)
         g2.create_dataset("q", data=q)
         chi_ds = g2.create_dataset("chi", data=chi)
@@ -205,7 +236,7 @@ class TestReadSphere:
         )
 
     def test_missing_entry_raises(self, tmp_path):
-        p = tmp_path / "empty.nxs"
+        p = tmp_path / "empty.nexus"
         with h5py.File(p, "w") as f:
             f.create_group("not_entry")
         with pytest.raises(KeyError):
@@ -230,9 +261,10 @@ class TestReadStitched:
         assert ds.sizes["q"] == N_Q
 
     def test_raises_when_no_stitched_present(self, tmp_path):
-        p = tmp_path / "no_stitch.nxs"
+        p = tmp_path / "no_stitch.nexus"
         with h5py.File(p, "w") as f:
-            f.create_group("entry")
+            entry = _stamp_current_entry(f.create_group("entry"))
+            _add_minimal_current_1d(entry, [0])
         with pytest.raises(KeyError):
             read_stitched(p)
 
@@ -250,7 +282,7 @@ class TestMixedQResolution:
     """
 
     def test_separate_q_and_q_2d_when_sizes_differ(self, tmp_path):
-        p = tmp_path / "mixed_q.nxs"
+        p = tmp_path / "mixed_q.nexus"
         n_frames = 3
         n_q_1d = 2000
         n_q_2d = 500
@@ -258,20 +290,17 @@ class TestMixedQResolution:
         rng = np.random.default_rng(2)
 
         with h5py.File(p, "w") as f:
-            entry = f.create_group("entry")
-            entry.attrs["NX_class"] = "NXentry"
+            entry = _stamp_current_entry(f.create_group("entry"))
 
-            g1 = entry.create_group("integrated_1d")
-            g1.attrs["NX_class"] = "NXdata"
+            g1 = _stamp_current_1d(entry.create_group("integrated_1d"))
             g1.create_dataset("intensity",
                               data=rng.random((n_frames, n_q_1d), dtype=np.float32))
             g1.create_dataset("q",
                               data=np.linspace(0.1, 5.0, n_q_1d, dtype=np.float32))
             g1.create_dataset("frame_index",
-                              data=np.arange(n_frames, dtype=np.int32))
+                              data=np.arange(n_frames, dtype=np.int64))
 
-            g2 = entry.create_group("integrated_2d")
-            g2.attrs["NX_class"] = "NXdata"
+            g2 = _stamp_current_2d(entry.create_group("integrated_2d"))
             g2.create_dataset("intensity",
                               data=rng.random((n_frames, n_chi, n_q_2d),
                                               dtype=np.float32))
@@ -280,6 +309,9 @@ class TestMixedQResolution:
             g2.create_dataset("chi",
                               data=np.linspace(-180.0, 180.0, n_chi,
                                                endpoint=False, dtype=np.float32))
+            g2.create_dataset(
+                "frame_index", data=np.arange(n_frames, dtype=np.int64),
+            )
 
         ds = read_scan(p)
         # Both q axes present with their own sizes
@@ -299,22 +331,26 @@ def _write_1d2d(path, fidx_1d, fidx_2d, *, nq=6, nchi=4):
     """Minimal v2 file with independent 1D/2D frame_index vectors."""
     rng = np.random.default_rng(0)
     with h5py.File(path, "w") as f:
-        e = f.create_group("entry")
-        g1 = e.create_group("integrated_1d")
+        e = _stamp_current_entry(f.create_group("entry"))
+        g1 = _stamp_current_1d(e.create_group("integrated_1d"))
         g1.create_dataset("intensity", data=rng.random((len(fidx_1d), nq)).astype("f4"))
-        g1.create_dataset("q", data=np.linspace(1, 5, nq))
-        g1.create_dataset("frame_index", data=np.asarray(fidx_1d, "i4"))
-        g2 = e.create_group("integrated_2d")
+        g1.create_dataset("q", data=np.linspace(1, 5, nq, dtype=np.float32))
+        g1.create_dataset("frame_index", data=np.asarray(fidx_1d, "i8"))
+        g2 = _stamp_current_2d(e.create_group("integrated_2d"))
         # distinct value per 2D row so mislabeling would be detectable
         i2 = np.stack([np.full((nchi, nq), float(k)) for k in range(len(fidx_2d))])
         g2.create_dataset("intensity", data=i2.astype("f4"))
-        g2.create_dataset("q", data=np.linspace(1, 5, nq))
-        g2.create_dataset("chi", data=np.linspace(-180, 180, nchi, endpoint=False))
-        g2.create_dataset("frame_index", data=np.asarray(fidx_2d, "i4"))
+        g2.create_dataset("q", data=np.linspace(1, 5, nq, dtype=np.float32))
+        g2.create_dataset(
+            "chi", data=np.linspace(
+                -180, 180, nchi, endpoint=False, dtype=np.float32,
+            ),
+        )
+        g2.create_dataset("frame_index", data=np.asarray(fidx_2d, "i8"))
 
 
 def test_read_scan_shared_frame_when_labels_match(tmp_path):
-    p = tmp_path / "match.nxs"
+    p = tmp_path / "match.nexus"
     _write_1d2d(p, [0, 1, 2], [0, 1, 2])
     ds = read_scan(p)
     assert ds["intensity_1d"].dims == ("frame", "q")
@@ -325,7 +361,7 @@ def test_read_scan_shared_frame_when_labels_match(tmp_path):
 def test_read_scan_separate_dim_when_labels_differ(tmp_path):
     """1D and 2D reduced over different frame labels must NOT be forced
     onto one 'frame' coord (silent mislabel) — 2D gets its own dim."""
-    p = tmp_path / "mismatch.nxs"
+    p = tmp_path / "mismatch.nexus"
     _write_1d2d(p, [0, 1, 2], [10, 11, 12])
     ds = read_scan(p)
     assert list(ds["frame"].values) == [0, 1, 2]
@@ -339,12 +375,12 @@ def test_read_scan_metadata_surfaces_frame_2d_on_mismatch(tmp_path):
     """The lightweight metadata path mirrors read_scan: divergent 2D labels
     appear on a frame_2d coord (so get_metadata doesn't disagree)."""
     from xrd_tools.io.nexus import read_scan_metadata
-    p = tmp_path / "meta_mismatch.nxs"
+    p = tmp_path / "meta_mismatch.nexus"
     _write_1d2d(p, [0, 1, 2], [10, 11, 12])
     ds = read_scan_metadata(p)
     assert list(ds["frame"].values) == [0, 1, 2]
     assert list(ds["frame_2d"].values) == [10, 11, 12]
-    p2 = tmp_path / "meta_match.nxs"
+    p2 = tmp_path / "meta_match.nexus"
     _write_1d2d(p2, [0, 1, 2], [0, 1, 2])
     assert "frame_2d" not in read_scan_metadata(p2).coords
 
@@ -360,13 +396,13 @@ def test_write_positioners_and_geometry_roundtrip(tmp_path):
     fis = [1, 2, 4]  # gapped + 1-based to exercise reindex/alignment
     sd = pd.DataFrame({"tth": [10.0, 11.0, 12.0], "th": [0.1, 0.2, 0.3]}, index=fis)
 
-    p = tmp_path / "geom.nxs"
+    p = tmp_path / "geom.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g1 = e.create_group("integrated_1d")
+        e = _stamp_current_entry(f.create_group("entry"))
+        g1 = _stamp_current_1d(e.create_group("integrated_1d"))
         g1.create_dataset("intensity", data=np.zeros((3, 5), "f4"))
-        g1.create_dataset("q", data=np.linspace(1, 5, 5))
-        g1.create_dataset("frame_index", data=np.asarray(fis, "i4"))
+        g1.create_dataset("q", data=np.linspace(1, 5, 5, dtype=np.float32))
+        g1.create_dataset("frame_index", data=np.asarray(fis, "i8"))
         write_positioners(e, sd, fis, geom)
         write_per_frame_geometry(e, sd, fis, geom)
 
@@ -386,13 +422,13 @@ def test_write_positioners_reindexes_out_of_order(tmp_path):
     fis = [0, 1, 2]
     # scan_data rows are in REVERSE order vs fis
     sd = pd.DataFrame({"tth": [12.0, 11.0, 10.0], "th": [0.3, 0.2, 0.1]}, index=[2, 1, 0])
-    p = tmp_path / "ooo.nxs"
+    p = tmp_path / "ooo.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g1 = e.create_group("integrated_1d")
+        e = _stamp_current_entry(f.create_group("entry"))
+        g1 = _stamp_current_1d(e.create_group("integrated_1d"))
         g1.create_dataset("intensity", data=np.zeros((3, 5), "f4"))
-        g1.create_dataset("q", data=np.linspace(1, 5, 5))
-        g1.create_dataset("frame_index", data=np.asarray(fis, "i4"))
+        g1.create_dataset("q", data=np.linspace(1, 5, 5, dtype=np.float32))
+        g1.create_dataset("frame_index", data=np.asarray(fis, "i8"))
         write_positioners(e, sd, fis, geom)
     ds = read_scan_metadata(p)
     # th for frame 0 must be 0.1 (its scan_data row), not 0.3 (positional row 0)
@@ -409,7 +445,7 @@ def test_replacement_metadata_writers_clear_empty_authoritative_state(tmp_path):
 
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
     sd = pd.DataFrame({"tth": [10.0], "th": [0.1], "i0": [1.0]}, index=[0])
-    p = tmp_path / "metadata_clear.nxs"
+    p = tmp_path / "metadata_clear.nexus"
     with h5py.File(p, "w") as f:
         e = f.create_group("entry")
         write_positioners(e, sd, [0], geom)
@@ -429,7 +465,7 @@ def test_write_scan_metadata_rejects_duplicate_labels(tmp_path):
     import pytest
     from xrd_tools.io.nexus import write_scan_metadata
 
-    p = tmp_path / "duplicate_metadata_write.nxs"
+    p = tmp_path / "duplicate_metadata_write.nexus"
     with h5py.File(p, "w") as f:
         e = f.create_group("entry")
         with pytest.raises(ValueError, match="duplicate labels"):
@@ -458,7 +494,7 @@ def test_dup_label_write_preserves_existing_metadata(tmp_path):
     dup = pd.DataFrame({"tth": [9.0, 9.0], "th": [0.0, 0.0], "i0": [9.0, 9.0]},
                        index=[0, 0])
 
-    p = tmp_path / "preserve.nxs"
+    p = tmp_path / "preserve.nexus"
     with h5py.File(p, "w") as f:
         e = f.create_group("entry")
         write_scan_metadata(e, good, [0, 1])
@@ -494,9 +530,10 @@ def test_scan_data_string_columns_survive_roundtrip(tmp_path):
          "temp": [300.0, 301.0, 302.0]}, index=fis)
 
     # full writer + both readers
-    p = tmp_path / "full.nxs"
+    p = tmp_path / "full.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry"); e.attrs["NX_class"] = "NXentry"
+        e = _stamp_current_entry(f.create_group("entry"))
+        _add_minimal_current_1d(e, fis)
         write_scan_metadata(e, sd, fis)
     ds = read_scan_metadata(p)
     assert list(np.asarray(ds["keith_I"].values)) == ["0V", "1V", "2V"]
@@ -505,9 +542,10 @@ def test_scan_data_string_columns_survive_roundtrip(tmp_path):
     assert list(dct["keith_I"]) == ["0V", "1V", "2V"]
 
     # incremental upsert (create, then append a row) keeps the string column
-    p2 = tmp_path / "upsert.nxs"
+    p2 = tmp_path / "upsert.nexus"
     with h5py.File(p2, "w") as f:
-        e = f.create_group("entry"); e.attrs["NX_class"] = "NXentry"
+        e = _stamp_current_entry(f.create_group("entry"))
+        _add_minimal_current_1d(e, fis)
         upsert_scan_metadata(e, sd.iloc[:2], [0, 1])
         upsert_scan_metadata(
             e, pd.DataFrame({"i0": [3.0], "keith_I": ["2V"], "temp": [302.0]},

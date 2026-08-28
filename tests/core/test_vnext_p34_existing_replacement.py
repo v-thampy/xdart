@@ -1,6 +1,6 @@
 """Finite P3-4A oracle for existing-dimension headless replacement."""
 from __future__ import annotations
-import copy, hashlib, json, threading, weakref; from dataclasses import FrozenInstanceError, fields, replace
+import copy, hashlib, json, shutil, threading, weakref; from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path; from types import SimpleNamespace; import h5py
 import numpy as np
 import pytest
@@ -69,7 +69,7 @@ def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, monitor
     from xrd_tools.reduction.provenance_config import _integration_1d_args, _integration_2d_args
     from xrd_tools.session.run_configuration import GIIntent, RunIntent, ThresholdIntent
     root = tmp_path / name; root.mkdir()
-    target, source = root / "existing.nxs", root / "raw.nxs"
+    target, source = root / "existing.nexus", root / "raw.nxs"
     shape, count = (5, 7), max(labels) + 1; raw = np.arange(count * np.prod(shape), dtype=np.uint16).reshape(count, *shape)
     with h5py.File(source, "w") as handle:
         entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
@@ -222,6 +222,59 @@ def _preserved_signature(path):
                 else: result[name] += ("dataset", dtype(obj.dtype), obj.shape, obj.maxshape, obj.chunks, obj.compression, obj.compression_opts, attrs, payload(obj[()], obj.dtype))
         walk(handle)
     return {name: value for name, value in result.items() if name != "entry/reduction/config/dimension_replacement_1d"}
+
+
+def test_selected_project_root_relocates_reintegrate_and_restamps_context(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+    from xrd_tools.io.read import ProcessedScan
+
+    module = _module()
+    seeded = _seed_existing(
+        tmp_path, name="old-project", labels=(2, 3), append=True,
+    )
+    old_root = seeded.target.parent.resolve()
+    new_root = (tmp_path / "new-project").resolve()
+    shutil.copytree(old_root, new_root)
+    moved_target = new_root / seeded.target.name
+    old_root.rename(tmp_path / "retired-old-project")
+
+    _stub_integrators(monkeypatch)
+    plan = module.ReintegratePlan.from_artifact(
+        moved_target,
+        entry="entry",
+        dimension="1d",
+        preparation=seeded.preparation,
+        source_root=str(new_root),
+        expected_target_snapshot=capture_target_snapshot(moved_target),
+        expected_labels=seeded.labels,
+    )
+    assert plan.source_root == str(new_root)
+    result = module.run_reintegrate(plan)
+    assert result.disposition == "COMMITTED"
+    assert result.committed_labels == seeded.labels
+
+    with h5py.File(moved_target, "r") as handle:
+        entry = handle["entry"]
+        assert entry.attrs["source_base"] == new_root.as_posix()
+        execution = json.loads(
+            entry["reduction/config/source_execution"].asstr()[()]
+        )
+        assert execution["path"] == str(new_root / seeded.source.name)
+        lineage = json.loads(
+            entry["reduction/config/append_lineage"].asstr()[()]
+        )
+        assert lineage["source_base"] == str(new_root)
+        assert all(
+            epoch["source"]["path"] == str(new_root / seeded.source.name)
+            for epoch in lineage["epochs"]
+        )
+
+    scan = ProcessedScan(moved_target, source_root=new_root)
+    np.testing.assert_array_equal(scan.load_frame(2), seeded.raw[2])
+
+
 def test_target_snapshot_mismatch_abandons_before_stream_and_releases_lease(tmp_path, monkeypatch):
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.reduction import NexusSink, ReductionPlan, Scan
@@ -274,7 +327,7 @@ def test_processed_target_transient_replacement_is_refused_before_inspection(
     module = _module()
     seeded = _seed_existing(tmp_path, name="target-inspection")
     foreign = _seed_existing(tmp_path, name="target-inspection-foreign")
-    parked = tmp_path / "target-inspection-parked.nxs"
+    parked = tmp_path / "target-inspection-parked.nexus"
     original = seeded.target.read_bytes()
     real_file = module._open_target_hdf
     swaps = []
@@ -317,7 +370,7 @@ def test_processed_target_transient_replacement_is_refused_before_gi_scout(
     foreign = _seed_existing(
         tmp_path, name="target-scout-foreign", gi=gi,
     )
-    parked = tmp_path / "target-scout-parked.nxs"
+    parked = tmp_path / "target-scout-parked.nexus"
     original = seeded.target.read_bytes()
     real_file = module._open_target_hdf
     opens = []
@@ -895,7 +948,7 @@ def test_provenance_writer_enforces_replacement_read_ceiling(
     from xrd_tools.core.provenance import write_provenance
 
     monkeypatch.setattr(append_module, "_MAX_REPLACEMENT_CONFIG_UTF8_BYTES", 32)
-    target = tmp_path / "bounded-provenance.nxs"
+    target = tmp_path / "bounded-provenance.nexus"
     with h5py.File(target, "w") as handle:
         with pytest.raises(ValueError, match="persisted UTF-8 byte ceiling"):
             write_provenance(
@@ -903,7 +956,7 @@ def test_provenance_writer_enforces_replacement_read_ceiling(
             )
         config = handle["entry/reduction/config"]
         assert "run_configuration" not in config
-    geometry_target = tmp_path / "bounded-geometry-provenance.nxs"
+    geometry_target = tmp_path / "bounded-geometry-provenance.nexus"
     with h5py.File(geometry_target, "w") as handle:
         with pytest.raises(ValueError, match="persisted UTF-8 byte ceiling"):
             write_provenance(handle, config={"geometry": {

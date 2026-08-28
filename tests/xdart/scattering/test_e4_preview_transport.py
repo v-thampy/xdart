@@ -101,7 +101,7 @@ def _write_processed(
     raw_path = root / "raw" / "image.tif"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(raw_path, raw)
-    processed = root / "xdart_processed_data" / "scan.nxs"
+    processed = root / "xdart_processed_data" / "scan.nexus"
     processed.parent.mkdir(exist_ok=True)
     one_d = [
         IntegrationResult1D(
@@ -123,6 +123,8 @@ def _write_processed(
     ]
     with h5py.File(processed, "w") as handle:
         entry = handle.create_group("entry")
+        entry.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
+        entry.attrs["ssrl_schema_version"] = 2
         write_integrated_stack(
             entry,
             frame_indices=list(labels),

@@ -179,7 +179,9 @@ def image_series_spec(
     """
     selected = Path(selected_file).expanduser()
     metadata_policy = normalize_metadata_format(metadata_format)
-    if selected.suffix.lower() in {".h5", ".hdf5", ".nxs", ".cxi"}:
+    if selected.suffix.lower() in {
+        ".h5", ".hdf5", ".nxs", ".nexus", ".cxi",
+    }:
         return SourceSpec(
             selected,
             SourceKind.NEXUS_STACK,

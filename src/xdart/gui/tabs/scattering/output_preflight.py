@@ -1776,9 +1776,11 @@ def _external_link_inventory(
         if entry is None:
             return False
         try:
-            from xrd_tools.io.processed_scan_id import is_processed_xdart_file
+            from xrd_tools.io.processed_scan_id import (
+                has_processed_output_markers_file,
+            )
             entry_name = entry.name.strip("/").split("/")[-1]
-            if is_processed_xdart_file(entry.file, entry_name):
+            if has_processed_output_markers_file(entry.file, entry_name):
                 return True
         except Exception:
             pass
@@ -2741,9 +2743,9 @@ def _selected_tiff_gi_motor(
 def _resolved_generated_target(save_path: str, scan_name: str) -> Path:
     """Delegate vNext's one generated-output naming decision to the shared owner.
 
-    vNext admission is Overwrite-only.  A suffix-shaped requested path is the
-    operator's explicit target and is preserved byte-for-byte; a directory
-    request generates ``<scan>.nexus`` (P4/OUT-1).  This helper only decides
+    vNext admission is Overwrite-only.  A suffix-shaped requested path keeps
+    its directory/stem but is normalized to ``.nexus``; a directory request
+    generates ``<scan>.nexus`` (P4/OUT-1).  This helper only decides
     how the captured ``save_path`` is supplied to the shared API — suffix,
     collision, writer and transaction policy stay with their owners.
     """

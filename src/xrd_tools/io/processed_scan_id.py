@@ -1,20 +1,18 @@
 # xrd_tools/io/processed_scan_id.py
-"""Canonical classifier: is this HDF5 file a *processed* xdart scan?
+"""Separate processed-result rejection from current-output admission.
 
-A processed xdart ``.nxs`` stores REDUCED results (the ``integrated_1d`` /
+A processed xdart output stores REDUCED results (the ``integrated_1d`` /
 ``integrated_2d`` NXdata stacks) and carries NO raw detector frames.  Fed to a
 raw-detector resolver it is dangerous: the generic "largest 3-D dataset" fallback
 happily returns ``/entry/integrated_2d/intensity`` — an integrated cake — as
 though it were a detector stack (v1.1.2 finding F-NXS-2).
 
-This module concentrates the "is-processed" test in ONE place so every seam that
-must not re-ingest a processed output agrees, and by SCHEMA/CONTENT rather than
-by filename suffix (a legacy processed ``.nxs`` and a future ``.nexus`` output
-both classify correctly).  Ground truth: real processed files in the field carry
-the ``integrated_1d`` / ``integrated_2d`` groups but do NOT always carry the
-``ssrl_schema`` entry stamp (e.g. ones round-tripped through nexusformat), so the
-content-group signal is primary and the schema stamp is a secondary sufficient
-marker.
+Raw-input guards must reject integrated result groups regardless of suffix or
+schema stamp.  Positive processed-output admission is intentionally stricter:
+only a ``.nexus`` file carrying the current schema name/version and integrated
+results is a current xdart output.  Keeping the two questions separate prevents
+a raw ``.nxs`` with unrelated result groups from being positively claimed while
+still preventing those groups from being mistaken for detector frames.
 
 Import-light: depends only on :mod:`h5py` and the frozen schema-identity
 constants — so :mod:`xrd_tools.io.image`, :mod:`~xrd_tools.io.nexus` and Qt-free
@@ -24,25 +22,46 @@ callers can all import it without a cycle or a heavy dependency.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 
 import h5py
+import numpy as np
+from h5py._hl.files import File as _H5File
+from h5py._hl.dataset import Dataset as _H5Dataset
+from h5py._hl.group import Group as _H5Group
 
-from xrd_tools.io.schema import ACCEPTED_SCHEMA_NAMES, SCHEMA_NAME_ATTR
+from xrd_tools.io.schema import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    REINTEGRATE_SHADOW_SUFFIX,
+    SCHEMA_NAME_ATTR,
+    SCHEMA_VERSION_ATTR,
+    resolve_integrated_group,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ProcessedXdartInputError",
-    "is_processed_xdart_entry",
-    "is_processed_xdart_file",
-    "is_processed_xdart_path",
+    "CurrentProcessedGroups",
+    "has_processed_output_markers_entry",
+    "has_processed_output_markers_file",
+    "has_processed_output_markers_path",
+    "is_current_processed_xdart_file",
+    "is_current_processed_xdart_path",
+    "require_current_processed",
+    "require_current_processed_groups",
+    "require_raw_input",
 ]
 
 # xdart's own reduced-result group names.  These are the output layout the GUI /
 # headless writer produces; a raw acquisition (Eiger master, Bluesky NXWriter,
 # plain detector NeXus) never contains them.
 _PROCESSED_RESULT_GROUPS = ("integrated_1d", "integrated_2d")
+_MAX_CURRENT_RESULT_ROWS = 1_000_000
+_LABEL_VALIDATION_CHUNK = 65_536
 
 
 class ProcessedXdartInputError(ValueError):
@@ -55,16 +74,34 @@ class ProcessedXdartInputError(ValueError):
     """
 
 
-def is_processed_xdart_entry(entry: h5py.Group) -> bool:
-    """Classify one already-resolved entry without reacquiring it by name."""
+@dataclass(frozen=True)
+class CurrentProcessedGroups:
+    """Exact bound groups certified together by current-output admission."""
+
+    entry: h5py.Group
+    integrated_1d: h5py.Group | None
+    integrated_2d: h5py.Group | None
+
+
+def has_processed_output_markers_entry(entry: h5py.Group) -> bool:
+    """Broad raw-negative guard for a schema stamp or result groups.
+
+    A current-schema stamp is sufficient even when a write was interrupted
+    before either integrated group was created.  Historical unstamped outputs
+    remain identifiable by their result groups.  This deliberately says only
+    "unsafe as raw"; strict positive admission remains a separate decision.
+    """
     try:
-        if not isinstance(entry, h5py.Group):
-            return False
-        if any(group in entry for group in _PROCESSED_RESULT_GROUPS):
-            return True
-        return _attr_str(entry.attrs.get(SCHEMA_NAME_ATTR)) in ACCEPTED_SCHEMA_NAMES
+        return isinstance(entry, h5py.Group) and (
+            _attr_str(entry.attrs.get(SCHEMA_NAME_ATTR))
+            == PROCESSED_SCHEMA_NAME
+            or any(group in entry for group in _PROCESSED_RESULT_GROUPS)
+        )
     except Exception:
-        logger.debug("is_processed_xdart_entry: traversal error", exc_info=True)
+        logger.debug(
+            "has_processed_output_markers_entry: traversal error",
+            exc_info=True,
+        )
         return False
 
 
@@ -76,47 +113,321 @@ def _attr_str(value: object) -> str:
     return "" if value is None else str(value)
 
 
-def is_processed_xdart_file(f: h5py.File, entry: str = "entry") -> bool:
-    """True when the OPEN file *f* is a processed xdart scan.
-
-    Positive when either signal is present:
-
-    * an ``integrated_1d`` / ``integrated_2d`` group under the entry (content —
-      the primary, always-present signal), or
-    * the entry's ``ssrl_schema`` stamp names a processed schema
-      (:data:`~xrd_tools.io.schema.ACCEPTED_SCHEMA_NAMES`, covering the
-      pre-monorepo name too).
-
-    The entry is resolved NXclass-aware (the same ``resolve_nxentry`` route the
-    descriptor and finder use), so a processed record whose entry is named
-    ``/entry1`` classifies identically on every seam (NXS-PROC-1) — the *entry*
-    argument is a hint, not a literal requirement.
-
-    Never raises: any traversal error answers ``False`` (let the raw path report
-    a genuinely broken file its own way).
-    """
+def _resolved_entry(f: h5py.File, entry: str) -> h5py.Group | None:
     try:
         grp = f.get(entry)
         if not isinstance(grp, h5py.Group):
-            # Literal hint absent — resolve the NXentry the canonical way.
             from xrd_tools.io.bluesky_nexus import resolve_nxentry
             grp = resolve_nxentry(f, entry)
-        if isinstance(grp, h5py.Group):
-            return is_processed_xdart_entry(grp)
+        return grp if isinstance(grp, h5py.Group) else None
     except Exception:
-        logger.debug("is_processed_xdart_file: traversal error", exc_info=True)
+        logger.debug("processed entry resolution failed", exc_info=True)
+        return None
+
+
+def has_processed_output_markers_file(
+    f: h5py.File,
+    entry: str = "entry",
+) -> bool:
+    """Broad negative guard across the owning HDF5 file's local entries."""
+    grp = _resolved_entry(f, entry)
+    if grp is not None and has_processed_output_markers_entry(grp):
+        return True
+    try:
+        for name in f:
+            if type(f.get(name, getlink=True)) is not h5py.HardLink:
+                continue
+            value = f.get(name)
+            if (
+                isinstance(value, h5py.Group)
+                and has_processed_output_markers_entry(value)
+            ):
+                return True
+    except Exception:
+        logger.debug("processed marker file census failed", exc_info=True)
     return False
 
 
-def is_processed_xdart_path(path, entry: str = "entry") -> bool:
-    """True when *path* is a processed xdart scan file.
+def has_processed_output_markers_path(path, entry: str = "entry") -> bool:
+    """Broad negative guard for a path; never raises on open failure."""
+    try:
+        with h5py.File(Path(path), "r") as f:
+            return has_processed_output_markers_file(f, entry)
+    except OSError:
+        return False
 
-    Opens *path* read-only.  A path that cannot be opened as HDF5 answers
-    ``False`` (it is not identifiable as processed, and the raw path will report
-    the real problem).
+
+def require_raw_input(
+    source: h5py.File | h5py.Group | h5py.Dataset | str | Path,
+    entry: str = "entry",
+) -> None:
+    """Reject every processed-output marker before a raw HDF traversal.
+
+    A bound :class:`h5py.Dataset` may belong to a different file after an
+    ``ExternalLink`` dereference.  Authenticate that owning file and the
+    dataset's actual top-level entry, rather than assuming the already-checked
+    master also owns the pixels.
+    """
+    if isinstance(source, _H5File):
+        marked = has_processed_output_markers_file(source, entry)
+        shown = source.filename
+    elif isinstance(source, (_H5Dataset, _H5Group)):
+        owner = source.file
+        parts = tuple(part for part in source.name.split("/") if part)
+        owner_entry = parts[0] if parts else entry
+        marked = has_processed_output_markers_file(owner, owner_entry)
+        shown = owner.filename
+    else:
+        shown = Path(source)
+        try:
+            with h5py.File(shown, "r") as handle:
+                marked = has_processed_output_markers_file(handle, entry)
+        except OSError:
+            return
+    if marked:
+        raise ProcessedXdartInputError(
+            f"{shown} carries processed-output markers and cannot be opened "
+            "as raw detector data"
+        )
+
+
+def _attr_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        return None
+    return int(value)
+
+
+def _direct_dataset(group: h5py.Group, name: str) -> h5py.Dataset | None:
+    """Return one directly stored local dataset, never indirect storage."""
+    try:
+        if type(group.get(name, getlink=True)) is not h5py.HardLink:
+            return None
+        value = group.get(name)
+        if not isinstance(value, h5py.Dataset):
+            return None
+        external = tuple(value.external or ())
+        return None if value.is_virtual or external else value
+    except Exception:
+        return None
+
+
+def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
+    """Qualify one concrete v2 integrated stack, not a name-only marker."""
+    try:
+        expected_axes = (
+            ("frame_index", "q")
+            if name == "integrated_1d"
+            else ("frame_index", "chi", "q")
+        )
+        axes = group.attrs.get("axes")
+        if isinstance(axes, np.ndarray):
+            axes = tuple(_attr_str(value) for value in axes.tolist())
+        elif isinstance(axes, (tuple, list)):
+            axes = tuple(_attr_str(value) for value in axes)
+        else:
+            axes = (_attr_str(axes),)
+        if (
+            _attr_str(group.attrs.get("NX_class")) != "NXdata"
+            or _attr_str(group.attrs.get("signal")) != "intensity"
+            or axes != expected_axes
+        ):
+            return False
+        labels = _direct_dataset(group, "frame_index")
+        intensity = _direct_dataset(group, "intensity")
+        q = _direct_dataset(group, "q")
+        chi = None if name == "integrated_1d" else _direct_dataset(group, "chi")
+        if (
+            labels is None
+            or intensity is None
+            or q is None
+            or labels.ndim != 1
+            or labels.shape[0] < 1
+            or labels.shape[0] > _MAX_CURRENT_RESULT_ROWS
+            or labels.dtype != np.dtype(np.int64)
+            or q.ndim != 1
+            or q.shape[0] < 1
+            or q.dtype != np.dtype(np.float32)
+            or intensity.dtype != np.dtype(np.float32)
+        ):
+            return False
+        if name == "integrated_2d" and (
+            chi is None
+            or chi.ndim != 1
+            or chi.shape[0] < 1
+            or chi.dtype != np.dtype(np.float32)
+        ):
+            return False
+        expected_shape = (
+            (labels.shape[0], q.shape[0])
+            if name == "integrated_1d"
+            else (labels.shape[0], chi.shape[0], q.shape[0])
+        )
+        if intensity.shape != expected_shape:
+            return False
+        sigma_link = group.get("sigma", getlink=True)
+        sigma = _direct_dataset(group, "sigma")
+        if sigma_link is not None and sigma is None:
+            return False
+        if sigma is not None and (
+            sigma.dtype != np.dtype(np.float32) or sigma.shape != expected_shape
+        ):
+            return False
+        previous = -1
+        for start in range(0, labels.shape[0], _LABEL_VALIDATION_CHUNK):
+            rows = np.asarray(
+                labels[start:start + _LABEL_VALIDATION_CHUNK],
+                dtype=np.int64,
+            )
+            if (
+                rows.ndim != 1
+                or rows.size < 1
+                or int(rows[0]) <= previous
+                or np.any(rows < 0)
+                or (rows.size > 1 and np.any(rows[1:] <= rows[:-1]))
+            ):
+                return False
+            previous = int(rows[-1])
+        return True
+    except Exception:
+        logger.debug("current result-group qualification failed", exc_info=True)
+        return False
+
+
+def _qualified_current_processed_entry(
+    entry: h5py.Group,
+    *,
+    container: str | Path,
+) -> CurrentProcessedGroups | None:
+    """Qualify one local entry against its caller-supplied container path."""
+    try:
+        if (
+            not isinstance(entry, h5py.Group)
+            or Path(container).suffix.casefold() != ".nexus"
+        ):
+            return None
+        groups: dict[str, h5py.Group | None] = {}
+        present = False
+        for name in _PROCESSED_RESULT_GROUPS:
+            canonical_present = entry.get(name, getlink=True) is not None
+            shadow_present = entry.get(
+                f"{name}{REINTEGRATE_SHADOW_SUFFIX}", getlink=True,
+            ) is not None
+            group, _adopted = resolve_integrated_group(entry, name)
+            slot_present = canonical_present or shadow_present
+            present = present or slot_present
+            if slot_present and (
+                not isinstance(group, h5py.Group)
+                or not _valid_current_result_group(group, name)
+            ):
+                return None
+            groups[name] = group if isinstance(group, h5py.Group) else None
+        if (
+            _attr_str(entry.attrs.get(SCHEMA_NAME_ATTR))
+            != PROCESSED_SCHEMA_NAME
+            or _attr_int(entry.attrs.get(SCHEMA_VERSION_ATTR))
+            != PROCESSED_SCHEMA_VERSION
+            or not present
+        ):
+            return None
+        return CurrentProcessedGroups(
+            entry=entry,
+            integrated_1d=groups["integrated_1d"],
+            integrated_2d=groups["integrated_2d"],
+        )
+    except Exception:
+        logger.debug(
+            "current processed-entry qualification failed",
+            exc_info=True,
+        )
+        return None
+
+
+def _local_requested_entry(
+    f: h5py.File,
+    entry: str,
+) -> h5py.Group | None:
+    """Resolve the requested entry only when its link is local and hard."""
+    try:
+        if not isinstance(entry, str):
+            return None
+        name = entry[1:] if entry.startswith("/") else entry
+        if not name or "/" in name or name in {".", ".."}:
+            return None
+        if type(f.get(name, getlink=True)) is not h5py.HardLink:
+            return None
+        value = f.get(name)
+        return value if isinstance(value, h5py.Group) else None
+    except Exception:
+        return None
+
+
+def _current_processed_groups_file(
+    f: h5py.File,
+    entry: str,
+    *,
+    container: str | Path | None = None,
+) -> CurrentProcessedGroups | None:
+    group = _local_requested_entry(f, entry)
+    if group is None:
+        return None
+    container_path = Path(f.filename) if container is None else Path(container)
+    return _qualified_current_processed_entry(group, container=container_path)
+
+
+def is_current_processed_xdart_file(
+    f: h5py.File,
+    entry: str = "entry",
+) -> bool:
+    """Strict positive admission for an already-open current output."""
+    return _current_processed_groups_file(f, entry) is not None
+
+
+def is_current_processed_xdart_path(path, entry: str = "entry") -> bool:
+    """Strict positive admission for a current ``.nexus`` path.
+
+    Suffix alone is never sufficient; the current schema name/version and
+    integrated result content must all be present.
     """
     try:
         with h5py.File(Path(path), "r") as f:
-            return is_processed_xdart_file(f, entry)
+            return _current_processed_groups_file(
+                f,
+                entry,
+                container=Path(path),
+            ) is not None
     except OSError:
         return False
+
+
+def require_current_processed(
+    source: h5py.File | str | Path,
+    entry: str = "entry",
+    *,
+    container: str | Path | None = None,
+) -> None:
+    """Require one exact current processed record at a public read boundary."""
+    if isinstance(source, _H5File):
+        accepted = _current_processed_groups_file(
+            source, entry, container=container,
+        ) is not None
+    else:
+        accepted = is_current_processed_xdart_path(source, entry)
+    if not accepted:
+        raise ValueError("processed input is not a current xdart .nexus record")
+
+
+def require_current_processed_groups(
+    source: h5py.File,
+    entry: str = "entry",
+    *,
+    container: str | Path | None = None,
+) -> CurrentProcessedGroups:
+    """Return the exact entry/result groups certified by one admission pass."""
+    groups = _current_processed_groups_file(
+        source,
+        entry,
+        container=container,
+    )
+    if groups is None:
+        raise ValueError("processed input is not a current xdart .nexus record")
+    return groups

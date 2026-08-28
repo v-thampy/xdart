@@ -41,10 +41,9 @@ from xrd_tools.io.schema import (
     MONOTONIC_ATTR,
     MULTI_RESULT_MODES_ATTR,
     PRIMARY_MODE_ATTR,
-    REINTEGRATE_SHADOW_COMPLETE_ATTR,
-    REINTEGRATE_SHADOW_SUFFIX,
     THUMBNAIL_LUT_ATTRS,
     mode_subgroup_name,
+    resolve_integrated_group,
 )
 
 
@@ -618,28 +617,6 @@ def _required_direct_dataset(
     if value is None:
         raise ValueError(f"{role} is not a bounded local hard-linked dataset")
     return value
-
-
-def _integrated_group(
-    entry: h5py.Group, name: str,
-) -> h5py.Group | None:
-    """Local-hard equivalent of schema orphan-shadow recovery."""
-
-    canonical = _required_direct_group(entry, name, role=f"/{name}")
-    if canonical is not None:
-        return canonical
-    shadow_name = f"{name}{REINTEGRATE_SHADOW_SUFFIX}"
-    shadow = _required_direct_group(
-        entry, shadow_name, role=f"/{shadow_name}",
-    )
-    if shadow is None:
-        return None
-    complete = _bounded_bool_attr(
-        shadow,
-        REINTEGRATE_SHADOW_COMPLETE_ATTR,
-        role=f"{shadow.name} completion marker",
-    )
-    return shadow if complete else None
 
 
 def _bounded_text_attr(
@@ -3374,10 +3351,12 @@ class FrameViewReader:
         )
         if entry is None:
             raise KeyError(f"No {self.entry_name!r} group in {self.path}")
-        # C1: surface a newer-than-supported schema before any dataset access
-        # fails with an opaque KeyError.
-        from xrd_tools.io.nexus import warn_if_newer_schema
-        warn_if_newer_schema(entry, str(self.path))
+        from xrd_tools.io.processed_scan_id import require_current_processed
+        require_current_processed(
+            handle,
+            self.entry_name,
+            container=self.path,
+        )
         # N1: the project root the relative source paths point under (None on old
         # absolute-path files; harmless there).
         source_base = _bounded_text_attr(
@@ -3389,8 +3368,8 @@ class FrameViewReader:
         # Recover an orphan __reint shadow left by a crash mid-swap (read-only
         # adoption) so a reintegrate interrupted between del-canonical and
         # move-shadow still opens on its complete result.
-        g1 = _integrated_group(entry, "integrated_1d")
-        g2 = _integrated_group(entry, "integrated_2d")
+        g1, _ = resolve_integrated_group(entry, "integrated_1d")
+        g2, _ = resolve_integrated_group(entry, "integrated_2d")
         geom = _required_direct_group(
             entry,
             "per_frame_geometry",

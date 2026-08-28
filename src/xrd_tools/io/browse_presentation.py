@@ -17,6 +17,7 @@ import h5py
 import numpy as np
 
 from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m
+from xrd_tools.io.processed_scan_id import require_current_processed
 from xrd_tools.transforms import energy_to_wavelength
 
 
@@ -157,6 +158,7 @@ def read_browse_presentation(
     presentation: dict[str, Any] = {}
     mask: Any | None = None
     with h5py.File(Path(path), "r") as handle:
+        require_current_processed(handle, entry)
         entry_group = _optional_group(handle, entry, role=f"/{entry}")
         if entry_group is None:
             return presentation, mask

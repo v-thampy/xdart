@@ -20,6 +20,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
 
+import h5py
+import numpy as np
+
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY  # "default"; the top-level slot
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,7 @@ __all__ = [
     "SCHEMA",
     "REINTEGRATE_SHADOW_SUFFIX",
     "REINTEGRATE_SHADOW_COMPLETE_ATTR",
+    "is_complete_reintegration_shadow",
     "resolve_integrated_group",
 ]
 
@@ -72,6 +76,29 @@ REINTEGRATE_SHADOW_SUFFIX = "__reint"
 REINTEGRATE_SHADOW_COMPLETE_ATTR = "reintegrate_shadow_complete"
 
 
+def is_complete_reintegration_shadow(group) -> bool:
+    """Accept only the scalar boolean ``True`` written by the current writer."""
+    try:
+        attr = group.attrs.get_id(REINTEGRATE_SHADOW_COMPLETE_ATTR)
+        if attr.shape != () or attr.dtype != np.dtype(np.bool_):
+            return False
+        value = group.attrs[REINTEGRATE_SHADOW_COMPLETE_ATTR]
+        return isinstance(value, (bool, np.bool_)) and bool(value)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _local_group(parent, name: str):
+    """Return one local hard-linked group without following indirection."""
+    try:
+        if type(parent.get(name, getlink=True)) is not h5py.HardLink:
+            return None
+        value = parent.get(name)
+        return value if isinstance(value, h5py.Group) else None
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def resolve_integrated_group(entry_grp, group_name: str):
     """Resolve a canonical integrated group, recovering from a crash mid-swap.
 
@@ -85,13 +112,16 @@ def resolve_integrated_group(entry_grp, group_name: str):
     ``(None, False)``.  A writer pass repairs/clears the orphan via
     ``cleanup_reintegrate_shadow_groups``.
     """
-    g = entry_grp.get(group_name)
+    g = _local_group(entry_grp, group_name)
     if g is not None:
         return g, False
-    shadow = entry_grp.get(f"{group_name}{REINTEGRATE_SHADOW_SUFFIX}")
+    shadow = _local_group(
+        entry_grp,
+        f"{group_name}{REINTEGRATE_SHADOW_SUFFIX}",
+    )
     if shadow is None:
         return None, False
-    if shadow.attrs.get(REINTEGRATE_SHADOW_COMPLETE_ATTR):
+    if is_complete_reintegration_shadow(shadow):
         logger.warning(
             "Adopting completed orphan reintegration shadow %s%s as %s "
             "(read-only; the file crashed mid-swap -- run a writer pass to "
@@ -162,13 +192,10 @@ CAPABILITIES: "Mapping[str, CapabilityAttr]" = None  # set below GroupSchema
 
 #: stamped on every newly written file.
 PROCESSED_SCHEMA_NAME = "xrd_tools.processed_scan"
-#: names a reader should treat as this schema — files written before the
-#: monorepo rename (xdart ≤0.40 / ssrl_xrd_tools ≤0.41) carry the old name.
-ACCEPTED_SCHEMA_NAMES = (
-    PROCESSED_SCHEMA_NAME,
-    "ssrl_xrd_tools.processed_scan",
-)
-#: current schema version; readers warn (never refuse) on newer files.
+#: Exact schema identities accepted by the forward-only reader.
+ACCEPTED_SCHEMA_NAMES = (PROCESSED_SCHEMA_NAME,)
+#: current schema version; positive processed-output admission requires this
+#: exact version.  Lower-level readers may still diagnose newer stamps.
 PROCESSED_SCHEMA_VERSION = 2
 
 # ── row-aligned datasets ─────────────────────────────────────────────────────

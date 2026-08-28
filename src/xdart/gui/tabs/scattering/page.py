@@ -2365,6 +2365,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Reintegrate context changed before dispatch."); self._refresh_shell(); return
         context, request, _selection, target, entry, target_snapshot, labels = captured
         identity = slot.begin_reintegrate(target=target, entry=entry,
+            source_root=request.source_root,
             expected_target_snapshot=target_snapshot, expected_labels=labels,
             dimension=dimension, preparation_values=preparation, stamp=stamp,
             expected_terminal_identity=(
@@ -2495,6 +2496,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._context_controller.begin_browse(
                 target,
                 terminal_commit_identity=commit_identity,
+                source_root=(
+                    self._intents.snapshot().thaw().project_root or None
+                ),
             )
         except Exception as error:
             self._error_notice(
@@ -4075,7 +4079,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell()
             return
         try:
-            request = self._context_controller.begin_browse(value)
+            request = self._context_controller.begin_browse(
+                value,
+                source_root=(
+                    self._intents.snapshot().thaw().project_root or None
+                ),
+            )
         except Exception as error:
             self._error_notice("Browse refused", error)
             if self._context_controller.browse_pending:
@@ -4974,11 +4983,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return False
             commit_identity = event.terminal_commit_identity
             request = (
-                controller.begin_browse(artifact)
+                controller.begin_browse(
+                    artifact,
+                    source_root=(
+                        self._intents.snapshot().thaw().project_root or None
+                    ),
+                )
                 if commit_identity is None
                 else controller.begin_browse(
                     artifact,
                     terminal_commit_identity=commit_identity,
+                    source_root=(
+                        self._intents.snapshot().thaw().project_root or None
+                    ),
                 )
             )
         except RuntimeError:

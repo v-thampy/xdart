@@ -1,6 +1,6 @@
 """Simple, notebook-friendly readers for processed xdart v2 NeXus scan files.
 
-A processed ``.nxs`` file is a **scan**: a stack of integrated **frames**.
+A processed ``.nexus`` file is a **scan**: a stack of integrated **frames**.
 These helpers pull 1D / 2D integrated patterns, thumbnails, and scan
 metadata out of a scan file with a single function call and no xarray
 knowledge required — the intent is "open a file, get arrays I can plot."
@@ -23,13 +23,13 @@ frame stacked.  Use :func:`get_frames` to see which labels exist.
 Examples
 --------
 >>> from xrd_tools.io import get_1d, get_2d, get_frames, open_scan
->>> get_frames("scan_42.nxs")
+>>> get_frames("scan_42.nexus")
 array([1, 2, 3, 4, 5])
->>> r = get_1d("scan_42.nxs", frame=3)
+>>> r = get_1d("scan_42.nexus", frame=3)
 >>> r.q.shape, r.intensity.shape
 ((2000,), (2000,))
 >>> # object-style sugar:
->>> scan = open_scan("scan_42.nxs")
+>>> scan = open_scan("scan_42.nexus")
 >>> len(scan)
 5
 >>> all_1d = scan.get_1d()          # (n_frames, q)
@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import os
 import struct
 from collections import namedtuple
 from collections.abc import Mapping
@@ -83,6 +84,7 @@ __all__ = [
     "RawSourceObservation",
     "observe_resolved_raw_source",
     "resolved_raw_source",
+    "resolve_project_source_path",
 ]
 
 
@@ -99,15 +101,8 @@ Integrated2D = namedtuple(
 # ---------------------------------------------------------------------------
 
 def _entry(f: h5py.File, entry: str) -> h5py.Group:
-    if entry not in f:
-        raise KeyError(f"No {entry!r} group in {f.filename}")
-    grp = f[entry]
-    # C1: every convenience reader funnels through here -- warn once per call
-    # when the file is NEWER than this library supports, before dataset access
-    # fails with an opaque KeyError.
-    from xrd_tools.io.nexus import warn_if_newer_schema
-    warn_if_newer_schema(grp, str(f.filename))
-    return grp
+    from xrd_tools.io.processed_scan_id import require_current_processed_groups
+    return require_current_processed_groups(f, entry).entry
 
 
 def _decode(v):
@@ -176,7 +171,13 @@ def _scan_data_for_frames(
     if not frames:
         return out
     with h5py.File(Path(scan_file), "r") as f:
-        e = _entry(f, entry)
+        from xrd_tools.io.processed_scan_id import require_current_processed_groups
+        processed = require_current_processed_groups(
+            f,
+            entry,
+            container=Path(scan_file),
+        )
+        e = processed.entry
         if "scan_data" not in e or "frame_index" not in e["scan_data"]:
             return out
         sd = e["scan_data"]
@@ -444,7 +445,7 @@ def get_1d(
     Parameters
     ----------
     scan_file
-        Path to the processed ``.nxs`` file.
+        Path to the current processed ``.nexus`` file.
     frame
         A single frame label, an iterable of labels, or ``None`` for all
         frames.  See module docstring on frame addressing.
@@ -558,13 +559,52 @@ def _dequantize_thumbnail(ds: h5py.Dataset) -> np.ndarray:
     return result
 
 
+def resolve_project_source_path(
+    locator: str,
+    source_root: str | Path,
+    *,
+    must_exist: bool,
+) -> Path:
+    """Resolve one relative POSIX locator beneath an authenticated Project root.
+
+    Both the root and candidate are resolved before containment is checked, so
+    a symlink inside the Project cannot redirect a relative locator outside it.
+    """
+    if type(locator) is not str or not locator or "\\" in locator:
+        raise ValueError("source locator is not canonical relative POSIX text")
+    if type(must_exist) is not bool:
+        raise TypeError("must_exist must be an exact bool")
+    shown = PurePosixPath(locator)
+    if (
+        shown.is_absolute()
+        or str(shown) != locator
+        or locator == "."
+        or "." in shown.parts
+        or ".." in shown.parts
+    ):
+        raise ValueError("source locator is not canonical relative POSIX text")
+    root_text = os.fspath(source_root)
+    root = Path(root_text)
+    normalized_root = os.path.normcase(
+        os.path.abspath(os.path.normpath(root_text))
+    )
+    if not root.is_absolute() or normalized_root != root_text:
+        raise ValueError("source root must be normalized absolute text")
+    try:
+        resolved_root = root.resolve(strict=False)
+        resolved = root.joinpath(*shown.parts).resolve(strict=must_exist)
+        resolved.relative_to(resolved_root)
+    except (OSError, ValueError) as error:
+        raise ValueError("relative source locator escapes Project root") from error
+    return resolved
+
+
 def resolve_source_master(
     stored_path,
     *,
     scan_file: str | Path,
     source_base: str | None = None,
     source_root: str | Path | None = None,
-    allow_basename_fallbacks: bool = True,
 ) -> "Path | None":
     """Resolve a stored frame ``source/path`` to an EXISTING raw master (N1).
 
@@ -573,64 +613,42 @@ def resolve_source_master(
     relpath against a project root).  Relative paths are joined against each
     root in PRECEDENCE order and the first existing candidate wins:
 
-        explicit ``source_root``  >  the file's stored ``@source_base``  >  the
-        scan file's own directory.
+        explicit ``source_root``  >  the file's stored ``@source_base``.
 
-    POSIX-stored relatives convert cross-OS via :class:`PurePosixPath`.  A few
-    basename fallbacks (raw sitting next to the ``.nxs`` / directly under a
-    root) keep moved/flattened trees loading.  Returns ``None`` if nothing
-    exists -- callers fall back to the stored thumbnail.
+    POSIX-stored relatives convert cross-OS via :class:`PurePosixPath`.  No
+    basename, output-directory, parent-directory, or CWD guess is allowed: a
+    moved tree must supply the newly selected Project root as ``source_root``.
+    Returns ``None`` if neither explicit root resolves the exact stored path.
 
     This is the single source of N1 path resolution; every reader
     (``get_raw_frame``, ``image_source``, the frame-view reader) routes through
-    it so they agree on precedence + back-compat.
+    it so they agree on the explicit relocation contract.
     """
     if not stored_path:
         return None
     raw = str(stored_path)
-    rel_path = Path(raw).expanduser()
-    if not rel_path.is_absolute() and "\\" not in raw:
-        # POSIX-stored relative -> native (identity on POSIX).
-        rel_path = Path(PurePosixPath(raw))
-
-    candidates: list[Path] = []
-    if rel_path.is_absolute():
-        candidates.append(rel_path)
+    if not raw or "\\" in raw:
+        return None
+    shown = PurePosixPath(raw)
+    if shown.is_absolute():
+        if str(shown) != raw or "." in shown.parts or ".." in shown.parts:
+            return None
+        candidate = Path(str(shown))
     else:
-        scan_dir = Path(scan_file).parent
-        # ``scan_dir.parent`` (N1 cross-OS, deep-review S9): an xdart-processed
-        # ``.nxs`` lives in ``<root>/xdart_processed_data/`` and its relative
-        # ``source/path`` is relative to ``<root>``.  When the stored
-        # ``@source_base`` is a FOREIGN absolute path (e.g. a macOS root opened
-        # on Windows) it won't exist locally, and ``scan_dir`` is one level too
-        # deep -- so the project root derived from the .nxs location resolves a
-        # co-moved tree with no explicit ``source_root``.
-        for root in (source_root, source_base, scan_dir, scan_dir.parent):
-            if root:
-                candidates.append(Path(root).expanduser() / rel_path)
-        if allow_basename_fallbacks:
-            # Display/back-compat recovery for moved or flattened trees.  This
-            # is deliberately excluded from strong provenance observations:
-            # a same-basename file elsewhere may help a user recover pixels,
-            # but cannot authorize ROI controls for a processed record.
-            candidates.append(scan_dir / rel_path.name)
-            candidates.append(scan_dir.parent / rel_path.name)
-            if source_root:
-                candidates.append(Path(source_root).expanduser() / rel_path.name)
-            candidates.append(rel_path)          # cwd-relative, last resort
-
-    seen: set[Path] = set()
-    for cand in candidates:
+        selected_root = source_root if source_root is not None else source_base
+        if selected_root is None:
+            return None
         try:
-            resolved = cand.resolve()
-        except OSError:
-            resolved = cand
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if resolved.exists():
-            return resolved
-    return None
+            return resolve_project_source_path(
+                raw, selected_root, must_exist=True,
+            )
+        except (TypeError, ValueError):
+            return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.exists() else None
 
 
 _OUTSIDE_ROOT_WARNED: set = set()    # (source_dir, root) pairs already warned
@@ -683,7 +701,6 @@ def observe_resolved_raw_source(
                 entry_grp,
                 frame_group,
                 source_root=source_root,
-                allow_basename_fallbacks=False,
             )
     except TRANSIENT_PROBE_ERRORS as exc:
         return RawSourceObservation(
@@ -702,9 +719,9 @@ def resolved_raw_source(
 ):
     """Return strict stored raw provenance, or ``None``.
 
-    Unlike pixel-loading recovery, this identity accessor never uses basename
-    or cwd fallbacks.  Use :func:`observe_resolved_raw_source` when transient
-    sharing failures must be retried instead of collapsed to ``None``.
+    Uses the same explicit Project-root/source-base contract as pixel loading.
+    Use :func:`observe_resolved_raw_source` when transient sharing failures
+    must be retried instead of collapsed to ``None``.
     """
     return observe_resolved_raw_source(
         scan_file,
@@ -758,13 +775,13 @@ def get_raw_frame(
 ) -> np.ndarray:
     """Return the raw detector image for one ``frame`` of a processed scan.
 
-    A processed v2 ``.nxs`` stores integrated patterns, not raw detector
+    A processed v2 ``.nexus`` stores integrated patterns, not raw detector
     images — but each frame carries a *source pointer*
     (``frames/frame_NNNN/source/{path,frame_index}``) back to the original
     detector master plus a quantized *thumbnail*.  This resolves the source
     pointer via :func:`resolve_source_master` (N1: a relative ``path`` joins
-    against ``source_root`` > the file's ``@source_base`` > the scan file's
-    directory; an absolute ``path`` is used as-is) and reads the full-resolution
+    against the selected ``source_root`` when supplied, otherwise the file's
+    ``@source_base``; an absolute ``path`` is used as-is) and reads the full-resolution
     raw image via :func:`xrd_tools.io.image.read_image`.  If the master
     can't be located or read, it falls back to the stored thumbnail
     (dequantized) unless ``allow_thumbnail=False``.
@@ -920,7 +937,6 @@ def _raw_frame_parts_from_group(
     frame_group: h5py.Group,
     *,
     source_root: str | Path | None = None,
-    allow_basename_fallbacks: bool = True,
 ) -> tuple[Path | None, int, np.ndarray | None]:
     """Resolve raw parts from an already-selected stored frame group."""
     source_base = (
@@ -941,7 +957,6 @@ def _raw_frame_parts_from_group(
             scan_file=scan_file,
             source_base=source_base,
             source_root=source_root,
-            allow_basename_fallbacks=allow_basename_fallbacks,
         )
 
     thumb: np.ndarray | None = None
@@ -1069,6 +1084,8 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
         _be = resolve_nxentry(_bf, entry)
         if _be is not None and is_bluesky_nxwriter(_be):
             return _bluesky_metadata(_be)
+        from xrd_tools.io.processed_scan_id import require_current_processed
+        require_current_processed(_bf, entry)
 
     # Reuse the canonical metadata-only reader for axes / positioners /
     # provenance, then add the instrument/sample scalars it doesn't carry.
@@ -1095,7 +1112,15 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
     # counters folded into the full scan_data table.
 
     with h5py.File(Path(scan_file), "r") as f:
-        e = _entry(f, entry)
+        from xrd_tools.io.processed_scan_id import (
+            require_current_processed_groups,
+        )
+        processed = require_current_processed_groups(
+            f,
+            entry,
+            container=Path(scan_file),
+        )
+        e = processed.entry
         positioners: dict = {}
         for path_in in ("sample/positioners",
                         "instrument/detector/positioners",
@@ -1110,8 +1135,8 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
         capabilities = sorted(detect_capabilities(e))
         meta = {
             "frames": np.asarray(ds["frame"].values) if "frame" in ds.coords else np.array([]),
-            "has_1d": "integrated_1d" in e,
-            "has_2d": "integrated_2d" in e,
+            "has_1d": processed.integrated_1d is not None,
+            "has_2d": processed.integrated_2d is not None,
             "sample_name": _read_sample_name(e),
             "energy_keV": float(energy) if np.isfinite(energy) else None,
             "wavelength_A": (float(wavelength) if np.isfinite(wavelength)
@@ -1160,19 +1185,15 @@ def _slice_stack(dset: h5py.Dataset, positions: np.ndarray, single: bool) -> np.
 def get_diffractometer(scan_file: str | Path, *, entry: str = "entry"):
     """Read the persisted canonical :class:`Diffractometer`, or ``None``.
 
-    Returns ``None`` when the ``diffractometer`` group is absent (every file
-    written before the group existed — the back-compat contract, mirroring
-    :func:`_read_ub_matrix`); never raises on an old file and never
-    synthesizes a default geometry.  Reconstructs the full instrument (both
+    Returns ``None`` when the current record has no ``diffractometer`` group;
+    never synthesizes a default geometry.  Reconstructs the full instrument (both
     adapter views + the fitted ``DetectorCalibration`` + preset + motor map)
     from the ``config_json`` blob for offline stitch/RSM.
     """
     from xrd_tools.core.geometry import Diffractometer
 
     with h5py.File(Path(scan_file), "r") as f:
-        if entry not in f:
-            return None
-        grp = f[entry]
+        grp = _entry(f, entry)
         ds = grp.get("diffractometer/config_json")
         if ds is None:
             return None
@@ -1209,6 +1230,8 @@ class ProcessedScan:
                  source_root: str | Path | None = None):
         self.path = Path(scan_file)
         self.entry = entry
+        from xrd_tools.io.processed_scan_id import require_current_processed
+        require_current_processed(self.path, entry)
         # N1: repoint a moved raw tree for load_frame/iter_chunks (overrides the
         # stored @source_base).
         self.source_root = source_root

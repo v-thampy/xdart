@@ -645,6 +645,7 @@ class ContextProjection:
                 context.requested_path,
                 label,
                 HydrationPurpose.PREVIEW,
+                context.load_request.source_root,
             )
             request = HydrationRequest(
                 label,

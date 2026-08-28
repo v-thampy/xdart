@@ -514,6 +514,7 @@ class ContextController:
             return self.begin_browse(
                 target,
                 terminal_commit_identity=terminal_commit_identity,
+                source_root=request.source_root,
             )
         except RuntimeError: return None
 
@@ -1495,6 +1496,7 @@ class ContextController:
         source_path: str,
         *,
         terminal_commit_identity: StreamTerminal | None = None,
+        source_root: str | None = None,
     ) -> BrowseLoadRequest:
         if self.viewer_1d_owned:
             raise RuntimeError("1D Viewer cleanup remains pending")
@@ -1509,11 +1511,19 @@ class ContextController:
             or type(source_path) is not str
             or not source_path
             or (
+                source_root is not None
+                and (type(source_root) is not str or not source_root)
+            )
+            or (
                 terminal_commit_identity is not None
                 and type(terminal_commit_identity) is not StreamTerminal
             )
         ):
             raise RuntimeError("Browse is not allowed in the current lifecycle")
+        if source_root is not None:
+            source_root = os.path.normcase(os.path.abspath(os.path.expanduser(
+                source_root
+            )))
         if terminal_commit_identity is None:
             source_path = os.path.normcase(os.path.abspath(os.path.expanduser(
                 source_path
@@ -1536,6 +1546,7 @@ class ContextController:
             generation,
             source_path,
             terminal_commit_identity,
+            source_root,
         )
         accepted = self._browse_loader.begin(request)
         if accepted is not request:

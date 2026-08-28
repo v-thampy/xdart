@@ -608,21 +608,26 @@ class TestReadSphereMetadata:
         """Hand-craft a minimal v2 NXroot with frame_index, q/chi,
         positioners, and an ``integrated_2d`` that is intentionally
         big so 'metadata-only' has something to refuse to load."""
-        p = tmp_path / "sphere.nxs"
+        p = tmp_path / "sphere.nexus"
         with h5py.File(p, "w") as f:
             e = f.create_group("entry")
             e.attrs["NX_class"] = "NXentry"
+            e.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
+            e.attrs["ssrl_schema_version"] = 2
 
             # 1D stack — 100 frames × 32 q.  Frame IDs 1-based to
             # mimic SPEC (the C4 alignment case).
             g1 = e.create_group("integrated_1d")
+            g1.attrs["NX_class"] = "NXdata"
+            g1.attrs["signal"] = "intensity"
+            g1.attrs["axes"] = ("frame_index", "q")
             g1.create_dataset(
                 "intensity",
                 data=np.ones((100, 32), dtype=np.float32),
             )
             g1.create_dataset(
                 "frame_index",
-                data=np.arange(1, 101, dtype=np.int32),
+                data=np.arange(1, 101, dtype=np.int64),
             )
             q = g1.create_dataset("q",
                                   data=np.linspace(0.5, 5.0, 32,
@@ -632,6 +637,9 @@ class TestReadSphereMetadata:
             # 2D stack — 100 × 16 × 32.  Bigger ndim; this is the
             # one the metadata loader must NOT pull into memory.
             g2 = e.create_group("integrated_2d")
+            g2.attrs["NX_class"] = "NXdata"
+            g2.attrs["signal"] = "intensity"
+            g2.attrs["axes"] = ("frame_index", "chi", "q")
             g2.create_dataset(
                 "intensity",
                 data=np.ones((100, 16, 32), dtype=np.float32),
@@ -645,6 +653,9 @@ class TestReadSphereMetadata:
                                         dtype=np.float32),
             )
             chi.attrs["units"] = b"deg"
+            g2.create_dataset(
+                "frame_index", data=np.arange(1, 101, dtype=np.int64),
+            )
 
             # Positioner.
             samp = e.create_group("sample")

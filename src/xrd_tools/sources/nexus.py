@@ -266,6 +266,8 @@ class ProcessedNexusSource(BaseFrameSource):
                  source_root: str | Path | None = None) -> None:
         self.path = Path(path)
         self.entry = entry
+        from xrd_tools.io.processed_scan_id import require_current_processed
+        require_current_processed(self.path, entry)
         # N1: repoint a moved raw tree (overrides the stored @source_base) so
         # load_frame resolves the full-res master after the data relocates.
         self.source_root = source_root
@@ -301,10 +303,11 @@ class ProcessedNexusSource(BaseFrameSource):
     def load_frame(self, index: int) -> np.ndarray:
         """STRICT full-resolution raw load via the per-frame source pointer.
 
-        Resolves the relative ``source/path`` against ``@source_base`` /
-        ``source_root`` (absolute back-compat) and reads the full-res master.
+        Resolves the relative ``source/path`` against the selected
+        ``source_root`` (or the stored ``@source_base`` when no relocated root
+        is supplied) and reads the full-res master.
         A headless analysis consumer (RSM / stitching / fitting) reading a
-        processed ``.nxs`` as a FrameSource must NEVER silently get a downsampled,
+        processed ``.nexus`` as a FrameSource must NEVER silently get a downsampled,
         mask-baked THUMBNAIL in place of the raw — that would analyze preview
         data.  So ``allow_thumbnail=False``: if the master can't be resolved this
         raises ``KeyError`` (a clean error), rather than degrading.  The display
@@ -324,9 +327,9 @@ class ProcessedNexusSource(BaseFrameSource):
     def frame_for(self, index: int) -> ScanFrame:
         """Attach the ORIGINAL raw-master pointer (carried by the FrameView's
         ``source_path``/``source_frame_index``) so a stitch/RSM built from a
-        processed ``.nxs`` persists resolvable contributing-frame records — the
-        raw popup resolves the true master two hops out (stitch.nxs → this
-        processed.nxs's per-frame source pointer → the master), not this
+        processed ``.nexus`` persists resolvable contributing-frame records — the
+        raw popup resolves the true master two hops out (stitch.nexus → this
+        processed.nexus's per-frame source pointer → the master), not this
         already-reduced file.  (One reader open per frame; harvest is a one-time
         per-result step, not a hot loop.)"""
         view = self.read_view(int(index), include_thumbnail=False)

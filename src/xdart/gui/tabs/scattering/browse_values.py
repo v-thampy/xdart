@@ -72,6 +72,7 @@ class BrowseLoadRequest:
     load_generation: int
     source_path: str
     terminal_commit_identity: StreamTerminal | None = None
+    source_root: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -81,6 +82,16 @@ class BrowseLoadRequest:
             or self.load_generation < 1
             or type(self.source_path) is not str
             or not self.source_path
+            or (
+                self.source_root is not None
+                and (
+                    type(self.source_root) is not str
+                    or not self.source_root
+                    or not os.path.isabs(self.source_root)
+                    or os.path.normcase(os.path.normpath(self.source_root))
+                    != self.source_root
+                )
+            )
             or (
                 self.terminal_commit_identity is not None
                 and type(self.terminal_commit_identity) is not StreamTerminal
@@ -154,6 +165,7 @@ def canonical_browse_source_identity(
     artifact_path: str,
     *,
     source_base: str | None = None,
+    source_root: str | None = None,
 ) -> str:
     """Name one persisted frame identically before and after hydration.
 
@@ -164,25 +176,27 @@ def canonical_browse_source_identity(
 
     if type(artifact_path) is not str or not artifact_path:
         raise TypeError("browse artifact identity must be a nonempty string")
-    if source_base is not None and (
-        type(source_base) is not str or not source_base
-    ):
-        raise TypeError("browse source base must be nonempty text or None")
+    for role, root in (("source base", source_base), ("source root", source_root)):
+        if root is not None and (
+            type(root) is not str
+            or not root
+            or not os.path.isabs(root)
+            or os.path.normcase(os.path.normpath(root)) != root
+        ):
+            raise TypeError(f"browse {role} must be normalized absolute text or None")
     source_path = getattr(view, "source_path", None) or artifact_path
     source = str(source_path)
     if not os.path.isabs(source):
-        # NeXus detector-source members are stored relative to the processed
-        # entry's authenticated source_base/project root, while hydration
-        # presents the same member as an absolute path.  Legacy artifacts
-        # without source_base fall back to their own directory.  Keep this
-        # lexical: the helper also runs on the GUI projection path and must
-        # not touch the filesystem.
-        base = (
-            source_base
-            if source_base is not None
-            else os.path.dirname(artifact_path)
-        )
-        source = os.path.join(base, source)
+        # The selected Project root is authoritative for a moved tree.  Only
+        # when none was selected may the record's authenticated source_base
+        # own the relative locator.  Never guess from the artifact directory.
+        base = source_root if source_root is not None else source_base
+        if base is None:
+            raise ValueError("relative Browse source has no Project-root owner")
+        from xrd_tools.io.read import resolve_project_source_path
+        source = str(resolve_project_source_path(
+            source, base, must_exist=False,
+        ))
     source_path = os.path.normcase(os.path.normpath(source))
     source_frame_index = getattr(view, "source_frame_index", None)
     member = (

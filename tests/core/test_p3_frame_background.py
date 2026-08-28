@@ -483,17 +483,17 @@ def test_shape_nonfinite_and_stable_read_refusals(monkeypatch, tmp_path: Path) -
         assert all(value is None for value in (outcome.background,
             outcome.descriptor_bytes, outcome.fingerprint))
     from xrd_tools.io import processed_scan_id
-    real_processed = processed_scan_id.is_processed_xdart_file
+    real_processed = processed_scan_id.has_processed_output_markers_file
     event = Event()
-    monkeypatch.setattr(processed_scan_id, "is_processed_xdart_file",
+    monkeypatch.setattr(processed_scan_id, "has_processed_output_markers_file",
                         lambda handle: (event.set() or False))
     cancelled = resolve_frame_background(FrameBackgroundPlan(mode="Single BG File",
         locator=str(master), dataset_path="/entry/data/data_000001", frame_index=0),
         _fact(target), cancelled=event)
     assert cancelled.disposition == "CANCELLED"
-    monkeypatch.setattr(processed_scan_id, "is_processed_xdart_file", lambda handle: True)
+    monkeypatch.setattr(processed_scan_id, "has_processed_output_markers_file", lambda handle: True)
     processed = resolve_frame_background(FrameBackgroundPlan(
         mode="Single BG File", locator=str(master),
         dataset_path="/entry/data/data_000001", frame_index=0), _fact(target))
     assert processed.disposition == "REFUSED"
-    monkeypatch.setattr(processed_scan_id, "is_processed_xdart_file", real_processed)
+    monkeypatch.setattr(processed_scan_id, "has_processed_output_markers_file", real_processed)

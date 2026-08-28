@@ -1,5 +1,6 @@
 """Import-pure values for one exact hydration read and presentation."""
 from __future__ import annotations
+import os
 from threading import Lock
 from dataclasses import dataclass
 from enum import StrEnum
@@ -39,6 +40,7 @@ class HydrationReadKey:
     artifact_identity: str
     frame_identity: int | str
     purpose: HydrationPurpose
+    source_root: str | None = None
     def __post_init__(self):
         if type(self.scope) is not HydrationScope or not self.scope.qualified:
             raise TypeError("read key requires a qualified HydrationScope")
@@ -47,6 +49,16 @@ class HydrationReadKey:
             raise TypeError("frame_identity must be an exact nonempty value")
         if type(self.purpose) is not HydrationPurpose:
             raise TypeError("read key purpose must be a HydrationPurpose")
+        if self.source_root is not None and (
+            type(self.source_root) is not str
+            or not self.source_root
+            or not os.path.isabs(self.source_root)
+            or os.path.normcase(os.path.normpath(self.source_root))
+            != self.source_root
+        ):
+            raise TypeError(
+                "read key source root must be normalized absolute text or None"
+            )
 @dataclass(frozen=True, slots=True)
 class HydrationToken:
     read_key: HydrationReadKey

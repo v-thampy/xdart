@@ -188,9 +188,14 @@ def resolve_stack_paths(h5f: Any, entry: str) -> tuple[list[str], bool]:
         _find_eiger_external_link_paths,
         find_nexus_image_dataset_in_open_file,
     )
+    from xrd_tools.io.processed_scan_id import require_raw_input
+
+    require_raw_input(h5f, entry)
 
     links = _find_eiger_external_link_paths(h5f, entry)
     if links:
+        for link in links:
+            require_raw_input(h5f[link])
         return list(links), False
     path = find_nexus_image_dataset_in_open_file(h5f, entry)
     if path is None:
@@ -211,6 +216,7 @@ def resolve_stack_paths(h5f: Any, entry: str) -> tuple[list[str], bool]:
             return [], False
         path = ds.name
     ds = h5f[path]
+    require_raw_input(ds)
     return [path], bool(getattr(ds, "ndim", 0) == 2)
 
 
@@ -218,6 +224,8 @@ def _stack_facts(h5f: Any, paths: list[str]) -> dict[str, Any]:
     """Layout facts (dtype/chunks/compression/shape/frame_count) from the OPEN
     handle, reading only dataset METADATA — never a detector pixel."""
     first = h5f[paths[0]]
+    from xrd_tools.io.processed_scan_id import require_raw_input
+    require_raw_input(first)
     dtype = np.dtype(first.dtype)
     chunks = tuple(int(c) for c in first.chunks) if first.chunks else None
     compression = _filter_summary(first)
@@ -252,6 +260,7 @@ def _stack_facts(h5f: Any, paths: list[str]) -> dict[str, Any]:
     frame_shape: tuple[int, ...] | None = None
     for p in paths:
         d = h5f[p]
+        require_raw_input(d)
         if d.ndim != 3:
             raise UnsupportedDetectorRankError(
                 f"{p} has rank {d.ndim}; Eiger segments must be 3-D"
@@ -329,6 +338,9 @@ def _apstools_flat_stack_paths(entry_grp: Any) -> list[str]:
         _dangling_detector_links,
         _reject_unsupported_detector_rank,
     )
+    from xrd_tools.io.processed_scan_id import require_raw_input
+
+    require_raw_input(entry_grp)
 
     data_grp = entry_grp.get("data")
     best_path: str | None = None
@@ -351,6 +363,7 @@ def _apstools_flat_stack_paths(entry_grp: Any) -> list[str]:
             continue
         if obj is None or obj.__class__.__name__ != "Dataset":
             continue
+        require_raw_input(obj)
         if text(obj.attrs.get("signal_type", "")) != "detector":
             continue
         rank = int(getattr(obj, "ndim", 0))
@@ -423,7 +436,8 @@ def describe_container_from_open(
     )
     from xrd_tools.io.processed_scan_id import (
         ProcessedXdartInputError,
-        is_processed_xdart_file,
+        has_processed_output_markers_file,
+        is_current_processed_xdart_file,
     )
 
     path = Path(path)
@@ -483,14 +497,23 @@ def describe_container_from_open(
 
     # Processed xdart output is a decisive terminal skip — never raw input.
     processed = False
+    processed_markers = False
     try:
-        processed = bool(is_processed_xdart_file(h5f, entry_name))
+        processed = bool(is_current_processed_xdart_file(h5f, entry_name))
+        processed_markers = bool(
+            has_processed_output_markers_file(h5f, entry_name)
+        )
     except Exception:
-        processed = False
+        processed = processed_markers = False
     if processed:
         return ContainerDescriptor(
             state=ProbeState.PROCESSED_OUTPUT, kind=SourceKind.PROCESSED_NEXUS,
-            reason="processed xdart record (integrated_1d/2d or schema stamp)",
+            reason="current processed xdart .nexus record",
+            **common)
+    if processed_markers:
+        return ContainerDescriptor(
+            state=ProbeState.INVALID, kind=SourceKind.NEXUS_STACK,
+            reason="integrated result groups are not raw detector frames",
             **common)
 
     kind = SourceKind.EIGER_MASTER if _is_eiger_master(path) else SourceKind.NEXUS_STACK
@@ -502,8 +525,9 @@ def describe_container_from_open(
             paths, _ = resolve_stack_paths(h5f, entry_name)
     except ProcessedXdartInputError:
         return ContainerDescriptor(
-            state=ProbeState.PROCESSED_OUTPUT, kind=SourceKind.PROCESSED_NEXUS,
-            reason="processed xdart record", **common)
+            state=ProbeState.INVALID, kind=SourceKind.NEXUS_STACK,
+            reason="integrated result groups are not raw detector frames",
+            **common)
     except UnsupportedDetectorRankError as exc:
         return ContainerDescriptor(
             state=ProbeState.INVALID, kind=kind,
@@ -597,7 +621,6 @@ def _describe_container_from_open_with_binding(
         _bind_nexus_stack_from_entry, _read_energy, _read_wavelength,
     )
     from xrd_tools.io.image import _is_eiger_master
-    from xrd_tools.io.processed_scan_id import is_processed_xdart_entry
 
     selected = Path(path)
     if candidate is not None:
@@ -611,8 +634,6 @@ def _describe_container_from_open_with_binding(
     scanned, all_names = prevalidated_motor_names
     if type(scanned) is not tuple or type(all_names) is not tuple:
         raise TypeError("prevalidated motor names must be exact tuples")
-    if is_processed_xdart_entry(resolved_entry_group):
-        raise ValueError("processed xdart entry cannot be an Average source")
     binding = _bind_nexus_stack_from_entry(
         resolved_entry_group, declared_entry_name=entry,
         prefer_apstools_flat=False, owner_slot=owner_slot,

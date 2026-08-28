@@ -38,6 +38,7 @@ class _BackgroundPreterminalAbort(RuntimeError): pass
 class _ReintegrateRequest:
     target: str
     entry: str
+    source_root: str
     expected_target_snapshot: TargetSnapshot
     expected_terminal_identity: StreamTerminal | None
     expected_labels: tuple[int, ...]
@@ -264,7 +265,7 @@ class OperationSlot:
         return self._begin(plan, stamp, body,
             finalize=lambda outcome: owner.finalize(reservation, outcome))
 
-    def begin_reintegrate(self, *, target: str, entry: str,
+    def begin_reintegrate(self, *, target: str, entry: str, source_root: str,
                           expected_target_snapshot: TargetSnapshot,
                           expected_labels: tuple[int, ...], dimension: str,
                           preparation_values: Mapping[str, object],
@@ -272,6 +273,9 @@ class OperationSlot:
                           expected_terminal_identity: StreamTerminal | None = None,
                           ) -> OperationIdentity | None:
         valid = (type(target) is str and bool(target) and type(entry) is str and bool(entry)
+                 and type(source_root) is str and bool(source_root)
+                 and os.path.isabs(source_root)
+                 and os.path.normcase(os.path.normpath(source_root)) == source_root
                  and type(expected_target_snapshot) is TargetSnapshot and expected_target_snapshot.exists
                  and (expected_terminal_identity is None
                       or type(expected_terminal_identity) is StreamTerminal)
@@ -288,7 +292,7 @@ class OperationSlot:
             if type(detached) is not dict or detached != preparation_values: return None
         except (TypeError, ValueError, OverflowError): return None
         request = _ReintegrateRequest(
-            target, entry, expected_target_snapshot,
+            target, entry, source_root, expected_target_snapshot,
             expected_terminal_identity, expected_labels, dimension,
             preparation_json,
         )
@@ -299,6 +303,7 @@ class OperationSlot:
         try:
             plan = ReintegratePlan.from_artifact(request.target, entry=request.entry,
                 dimension=request.dimension, preparation=json.loads(request.preparation_json),
+                source_root=request.source_root,
                 expected_target_snapshot=request.expected_target_snapshot,
                 expected_terminal_identity=request.expected_terminal_identity,
                 expected_labels=request.expected_labels, cancel_token=cancelled)

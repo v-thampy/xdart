@@ -450,11 +450,13 @@ def _metadata(path: Path, plan: FrameBackgroundPlan, keys: tuple[str, ...], canc
         raise ValueError("required Background metadata is invalid")
     return projected, {"locator": str(source), "state": list(before[0]), "sha256": before[1]}
 def _hdf_proof(path: Path, selector: str, frame: int, shape: tuple[int, int], cancelled) -> dict:
-    from xrd_tools.io.processed_scan_id import is_processed_xdart_file
+    from xrd_tools.io.processed_scan_id import (
+        has_processed_output_markers_file,
+    )
     components = tuple(part for part in selector.split("/") if part)
     _poll(cancelled)
     with h5py.File(path, "r") as handle:
-        _poll(cancelled); processed = is_processed_xdart_file(handle); _poll(cancelled)
+        _poll(cancelled); processed = has_processed_output_markers_file(handle); _poll(cancelled)
         if processed: raise ValueError("processed xdart source is refused")
         owner: h5py.Group = handle
         for index, name in enumerate(components):

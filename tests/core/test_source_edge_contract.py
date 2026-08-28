@@ -166,28 +166,32 @@ def test_alternate_entry_stack_source_default_hint(tmp_path):
 
 # ── NXS-PROC-1: alternate processed NXentry never re-ingested ─────────────
 
-def test_alternate_entry_processed_never_raw(tmp_path):
+def test_alternate_entry_historical_processed_is_invalid_never_raw(tmp_path):
     from xrd_tools.io.image import read_image
     from xrd_tools.io.image_source import classify_image_source
     from xrd_tools.io.processed_scan_id import (
         ProcessedXdartInputError,
-        is_processed_xdart_file,
-        is_processed_xdart_path,
+        has_processed_output_markers_file,
+        has_processed_output_markers_path,
+        is_current_processed_xdart_file,
+        is_current_processed_xdart_path,
     )
 
     path = _processed_entry1(tmp_path)
 
     with h5py.File(path, "r") as f:
-        assert is_processed_xdart_file(f) is True, \
+        assert has_processed_output_markers_file(f) is True, \
             "the open-file classifier must resolve the NXentry (NXS-PROC-1)"
-    assert is_processed_xdart_path(path) is True
+        assert is_current_processed_xdart_file(f) is False
+    assert has_processed_output_markers_path(path) is True
+    assert is_current_processed_xdart_path(path) is False
 
     desc = describe_container(str(path))
-    assert desc.state is ProbeState.PROCESSED_OUTPUT
+    assert desc.state is ProbeState.INVALID
 
     result = _probe(path)
-    assert result.state is ProbeState.PROCESSED_OUTPUT, \
-        "the R1 probe must never call a processed record READY"
+    assert result.state is ProbeState.INVALID, \
+        "the R1 probe must never call an historical result record READY"
 
     info = classify_image_source(str(path))
     assert getattr(info, "has_raw", True) is False or \

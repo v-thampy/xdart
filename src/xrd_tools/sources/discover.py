@@ -30,7 +30,7 @@ from natsort import os_sorted
 from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.scan import SourceKind, SourceSpec, coerce_source_kind
 
-_NEXUS_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
+_NEXUS_EXTS = {".nxs", ".h5", ".hdf5", ".nexus", ".cxi"}
 
 
 def _walk_files(directory: Path, recursive: bool) -> list[Path]:

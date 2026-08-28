@@ -104,6 +104,8 @@ class _BrowseHydrationOwner:
             and request.owner.as_tuple() == self._scope
             and request.read_key.scope == HydrationScope(*self._scope)
             and request.read_key.artifact_identity == self._artifact
+            and request.read_key.source_root
+            == self._browse.load_request.source_root
         )
 
     def derive_target(self, _request: HydrationRequest):
@@ -115,6 +117,7 @@ class _BrowseHydrationOwner:
             and read_key.scope == HydrationScope(*self._scope)
             and read_key.artifact_identity == self._artifact
             and read_key.purpose is HydrationPurpose.PREVIEW
+            and read_key.source_root == self._browse.load_request.source_root
         )
 
     def _terminalize(self, read_key: object) -> None:
@@ -179,6 +182,7 @@ class _BrowseHydrationOwner:
                 self._artifact,
                 label,
                 HydrationPurpose.PREVIEW,
+                browse.load_request.source_root,
             )
         except (TypeError, ValueError):
             return None
@@ -281,6 +285,7 @@ class _BrowseHydrationOwner:
                 view,
                 self._artifact,
                 source_base=catalog.source_base,
+                source_root=request.read_key.source_root,
             )
             committed = self._store.upsert(
                 FramePublication(

@@ -37,6 +37,7 @@ def _loaded_page(
         )
     request = page._context_controller.begin_browse(
         str(seeded.target.resolve()),
+        source_root=str(seeded.target.parent.resolve()),
         terminal_commit_identity=(
             seeded.terminal.commit_identity if terminal_browse else None
         ),
@@ -103,7 +104,7 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
         ReintegrateRunner, run_reintegrate,
     ))
     assert tuple(field.name for field in fields(ReintegratePlan)) == (
-        "api_version", "target", "entry", "expected_target_snapshot", "dimension",
+        "api_version", "target", "entry", "source_root", "expected_target_snapshot", "dimension",
         "labels", "detector_shape", "native_dtype", "selected_plan",
         "requested_shared_science", "gi_bootstrap_incidence",
         "retained_mask_bytes", "mask_decode_bytes", "session_policy",
@@ -118,7 +119,7 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
         "operation_identity", "audit_identity", "commit_identity",
     )
     assert tuple(inspect.signature(ReintegratePlan.from_artifact).parameters) == (
-        "target", "entry", "dimension", "preparation", "expected_target_snapshot",
+        "target", "entry", "dimension", "preparation", "source_root", "expected_target_snapshot",
         "expected_terminal_identity", "expected_labels", "cancel_token",
     )
     assert tuple(inspect.signature(ReintegratePlan.from_recipe).parameters) == ("recipe",)
@@ -1449,9 +1450,9 @@ def test_private_request_prepares_plan_only_on_existing_operation_worker(monkeyp
     def build(target, **kw): entered.set(); release.wait(2); seen.append((threading.current_thread().name, target, kw)); return plan
     def run(got, **kw): seen.append((got, kw)); return result
     monkeypatch.setattr(module.ReintegratePlan, "from_artifact", staticmethod(build)); monkeypatch.setattr(module, "run_reintegrate", run)
-    values = _persisted({"version": 1, "dimension": "1d", "bai_args": {}, "gi_mode": "q_total"}); slot = module.OperationSlot(); identity = slot.begin_reintegrate(target="/detached", entry="entry", expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64), expected_labels=(2,), dimension="1d", preparation_values=values, stamp=OperationContextStamp(0))
+    values = _persisted({"version": 1, "dimension": "1d", "bai_args": {}, "gi_mode": "q_total"}); slot = module.OperationSlot(); identity = slot.begin_reintegrate(target="/detached", entry="entry", source_root="/", expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64), expected_labels=(2,), dimension="1d", preparation_values=values, stamp=OperationContextStamp(0))
     assert entered.wait(2); values["selected_plan"]["bai_args"]["npt"] = 99; release.set(); update = _join(slot, identity)
-    assert update.terminal.status is OperationTerminalStatus.RETURNED and seen[0][0].startswith("scattering-operation-") and "npt" not in seen[0][2]["preparation"]["selected_plan"]["bai_args"] and seen[1][0] is plan and seen[0][2]["cancel_token"] is seen[1][1]["cancel_token"]
+    assert update.terminal.status is OperationTerminalStatus.RETURNED and seen[0][0].startswith("scattering-operation-") and seen[0][2]["source_root"] == "/" and "npt" not in seen[0][2]["preparation"]["selected_plan"]["bai_args"] and seen[1][0] is plan and seen[0][2]["cancel_token"] is seen[1][1]["cancel_token"]
 def test_expected_labels_are_rederived_and_exactly_compared(tmp_path):
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.reduction import ReintegratePlan
@@ -1466,7 +1467,7 @@ def test_direct_and_gui_scheduled_1d_match_after_reopen(tmp_path, monkeypatch):
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.reduction import ReintegratePlan, run_reintegrate
     first = _seed_existing(tmp_path, name="direct"); second = _seed_existing(tmp_path, name="gui"); _stub_integrators(monkeypatch)
-    direct = run_reintegrate(ReintegratePlan.from_artifact(first.target, entry="entry", dimension="1d", preparation=first.preparation)); slot = OperationSlot(); identity = slot.begin_reintegrate(target=str(second.target.resolve()), entry="entry", expected_target_snapshot=capture_target_snapshot(second.target), expected_labels=second.labels, dimension="1d", preparation_values=_persisted(second.preparation["selected_plan"]), stamp=OperationContextStamp(0)); gui = _join(slot, identity)
+    direct = run_reintegrate(ReintegratePlan.from_artifact(first.target, entry="entry", dimension="1d", preparation=first.preparation)); slot = OperationSlot(); identity = slot.begin_reintegrate(target=str(second.target.resolve()), entry="entry", source_root=str(second.target.parent.resolve()), expected_target_snapshot=capture_target_snapshot(second.target), expected_labels=second.labels, dimension="1d", preparation_values=_persisted(second.preparation["selected_plan"]), stamp=OperationContextStamp(0)); gui = _join(slot, identity)
     assert gui.terminal.status is OperationTerminalStatus.RETURNED and direct.disposition == gui.terminal.payload.disposition == "COMMITTED"
     with h5py.File(first.target) as a, h5py.File(second.target) as b: assert np.array_equal(a["entry/integrated_1d/intensity"], b["entry/integrated_1d/intensity"]) and np.array_equal(a["entry/integrated_2d/intensity"], b["entry/integrated_2d/intensity"])
 def test_browse_invalidation_terminal_reload_and_foreign_stale_refusal(tmp_path, monkeypatch, qapp):
@@ -1486,7 +1487,7 @@ def test_same_event_cancels_prepare_and_run_without_false_terminal(monkeypatch):
     from xrd_tools.reduction import reintegrate as core; from xrd_tools.reduction.reintegrate import ReintegrateCancelled
     seen = []; entered = threading.Event()
     def cancelled(_target, **kw): seen.append(kw["cancel_token"]); entered.set(); kw["cancel_token"].wait(2); raise ReintegrateCancelled()
-    monkeypatch.setattr(module.ReintegratePlan, "from_artifact", staticmethod(cancelled)); slot = module.OperationSlot(); identity = slot.begin_reintegrate(target="/cancel", entry="entry", expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64), expected_labels=(1,), dimension="1d", preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}), stamp=OperationContextStamp(0))
+    monkeypatch.setattr(module.ReintegratePlan, "from_artifact", staticmethod(cancelled)); slot = module.OperationSlot(); identity = slot.begin_reintegrate(target="/cancel", entry="entry", source_root="/", expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64), expected_labels=(1,), dimension="1d", preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}), stamp=OperationContextStamp(0))
     assert entered.wait(2) and slot.cancel(identity); update = _join(slot, identity)
     assert update.terminal.status is OperationTerminalStatus.CANCELLED and seen[0].is_set()
 def test_reintegrate_progress_result_close_and_control_projection(monkeypatch):
@@ -1496,7 +1497,7 @@ def test_reintegrate_progress_result_close_and_control_projection(monkeypatch):
     plan = SimpleNamespace(operation_identity="a"*64); result = core._value(ReintegrateResult,"COMMITTED",(1,),(1,),(),(),"b"*64,"a"*64,"c"*64,None)
     monkeypatch.setattr(module.ReintegratePlan,"from_artifact",staticmethod(lambda *_a,**_k: plan))
     def run(_plan, **kw): kw["progress_cb"](core._progress("a"*64,"read",0,1,1)); kw["progress_cb"](core._progress("a"*64,"write",1,1,2)); kw["progress_cb"](core._progress("x"*64,"settle",1,1,3)); return result
-    monkeypatch.setattr(module,"run_reintegrate",run); slot=module.OperationSlot(); identity=slot.begin_reintegrate(target="/progress",entry="entry",expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64),expected_labels=(1,),dimension="1d",preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}),stamp=OperationContextStamp(0)); update=_join(slot,identity)
+    monkeypatch.setattr(module,"run_reintegrate",run); slot=module.OperationSlot(); identity=slot.begin_reintegrate(target="/progress",entry="entry",source_root="/",expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64),expected_labels=(1,),dimension="1d",preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}),stamp=OperationContextStamp(0)); update=_join(slot,identity)
     assert update.terminal.status is OperationTerminalStatus.RETURNED and update.progress.identity is identity and (update.progress.stage,update.progress.revision)==("write",4) and all(getattr(slot,n) is None for n in ("_frozen","_worker","_cancel_event"))
 
 def test_reintegrate_gui_owner_import_writer_and_snapshot_frequency_census():
@@ -1511,8 +1512,8 @@ def test_reintegrate_request_accepts_exact_dimensions_but_p34b_gui_is_1d_only(tm
     from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
     from xrd_tools.session.readiness import ControlAction, SectionId; from xrd_tools.reduction import reintegrate as core
     slot=OperationSlot(); seen=[]; monkeypatch.setattr(slot,"_begin",lambda value,stamp,body: seen.append(value) or object())
-    kwargs=dict(target="/target",entry="entry",expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64),expected_labels=(1,),preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}),stamp=OperationContextStamp(0))
-    assert slot.begin_reintegrate(dimension="1d",**kwargs) is not None and slot.begin_reintegrate(dimension="2d",**kwargs) is not None and slot.begin_reintegrate(dimension="3d",**kwargs) is None and tuple(f.name for f in fields(type(seen[0]))) == ("target","entry","expected_target_snapshot","expected_terminal_identity","expected_labels","dimension","preparation_json")
+    kwargs=dict(target="/target",entry="entry",source_root="/",expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64),expected_labels=(1,),preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}),stamp=OperationContextStamp(0))
+    assert slot.begin_reintegrate(dimension="1d",**kwargs) is not None and slot.begin_reintegrate(dimension="2d",**kwargs) is not None and slot.begin_reintegrate(dimension="3d",**kwargs) is None and tuple(f.name for f in fields(type(seen[0]))) == ("target","entry","source_root","expected_target_snapshot","expected_terminal_identity","expected_labels","dimension","preparation_json")
     page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); calls=[]; monkeypatch.setattr(page,"_reintegrate_action",calls.append); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_1d")); page._handle_shell_command(ShellCommand(ShellCommandKind.CONTROL_ACTION,"reintegrate_2d")); assert calls==["1d","2d"]
     rid=OperationIdentity(77); page._operation_slot._identity=rid; page._reintegrate_identity=rid; captured=page._context_controller.capture_reintegrate_browse(); assert captured is not None and page._context_controller.invalidate_reintegrate_browse(*captured)
     for dimension,matching,other in (("1d",ControlAction.REINTEGRATE_1D,ControlAction.REINTEGRATE_2D),("2d",ControlAction.REINTEGRATE_2D,ControlAction.REINTEGRATE_1D)):
@@ -1588,7 +1589,7 @@ def test_default_browse_retains_651_scalar_catalog_without_eager_rows(tmp_path):
 
 def test_direct_and_gui_scheduled_2d_match_after_reopen_and_preserve_1d(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.adapters import external_operation; from xdart.gui.tabs.scattering.operation_values import OperationTerminalStatus; from xrd_tools.io.output_transaction import StreamTerminal, capture_target_snapshot; from xrd_tools.reduction import ReintegratePlan, run_reintegrate, reintegrate as module
-    seed=_seed_existing(tmp_path,labels=(0,1,2),append=True); direct_path=tmp_path/"direct.nxs"; gui_path=tmp_path/"gui.nxs"; direct_path.write_bytes(seed.target.read_bytes()); gui_path.write_bytes(seed.target.read_bytes()); before=(_tree_manifest(direct_path,"entry/integrated_1d"),_tree_manifest(gui_path,"entry/integrated_1d")); request=_resolved_2d()
+    seed=_seed_existing(tmp_path,labels=(0,1,2),append=True); direct_path=tmp_path/"direct.nexus"; gui_path=tmp_path/"gui.nexus"; direct_path.write_bytes(seed.target.read_bytes()); gui_path.write_bytes(seed.target.read_bytes()); before=(_tree_manifest(direct_path,"entry/integrated_1d"),_tree_manifest(gui_path,"entry/integrated_1d")); request=_resolved_2d()
     direct_plan=ReintegratePlan.from_artifact(direct_path,entry="entry",dimension="2d",preparation=copy.deepcopy(request),expected_target_snapshot=capture_target_snapshot(direct_path),expected_labels=seed.labels); plans=[]; real_build=ReintegratePlan.from_artifact
     def build(target,**kw): plans.append((copy.deepcopy(kw["preparation"]),real_build(target,**kw))); return plans[-1][1]
     bound=[]; real_bind=module._ReintegrateFrameSource.bind_allocation

@@ -31,7 +31,7 @@ SUPPORTED_EXTS = {".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450",
 # SUPPORTED_EXTS, which drives RAW discovery (find_image_files,
 # sources.discover, sources.registry._image_is_candidate) — .nexus is
 # output-only and must never be discovered as a raw input (P4/OUT-1).
-_HDF5_READ_EXTS = {".h5", ".hdf5", ".nxs", NEW_OUTPUT_SUFFIX}
+_HDF5_READ_EXTS = {".h5", ".hdf5", ".nxs", ".cxi", NEW_OUTPUT_SUFFIX}
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +139,20 @@ def read_detector_image_layout(
     """Read only detector header/layout facts, never a pixel allocation."""
     selected = Path(path)
     suffix = selected.suffix.lower()
-    if suffix in {".tif", ".tiff"}:
+    if suffix in _HDF5_READ_EXTS:
+        if suffix in {".h5", ".hdf5"} and _is_eiger_master(selected):
+            from xrd_tools.io.nexus import open_nexus_image_stack
+            with open_nexus_image_stack(selected) as stack:
+                shape = tuple(int(value) for value in stack.shape[1:])
+                dtype = np.dtype(stack.dtype)
+                frame_count = int(stack.shape[0])
+        else:
+            with h5py.File(selected, "r") as handle:
+                dataset = _find_hdf5_image_dataset(handle)
+                shape = tuple(int(value) for value in dataset.shape[-2:])
+                dtype = np.dtype(dataset.dtype)
+                frame_count = int(dataset.shape[0]) if dataset.ndim == 3 else 1
+    elif suffix in {".tif", ".tiff"}:
         import tifffile
 
         with tifffile.TiffFile(selected) as handle:
@@ -328,23 +341,21 @@ def read_image(
             arr = arr[frame]
         elif exact_frame and frame:
             raise IndexError("single-frame source has only frame 0")
-    elif dataset_path is not None and ext in {".h5", ".hdf5", ".nxs"}:
+    elif dataset_path is not None and ext in {
+        ".h5", ".hdf5", ".nxs", NEW_OUTPUT_SUFFIX,
+    }:
         if not exact_frame:
             _reject_if_processed_xdart(path)
         arr = _read_hdf5_frame(path, frame, dataset_path, exact=exact_frame)
     elif ext in {".h5", ".hdf5"} and _is_eiger_master(path):
-        arr = _read_fabio_frame(path, frame, exact=exact_frame)
+        from xrd_tools.io.nexus import open_nexus_image_stack
+        with open_nexus_image_stack(path) as stack:
+            arr = np.asarray(stack[frame])
     elif ext in _HDF5_READ_EXTS:
-        # Reject processed xdart scan files up front (before fabio, which
-        # might otherwise pick up a reduced dataset) — they carry no raw
-        # detector image; callers should use io.read.get_raw_frame.
-        _reject_if_processed_xdart(path)
-        # Other HDF5 (NeXus, etc.) — try fabio first, fall back to h5py
-        try:
-            arr = _read_fabio_frame(path, frame, exact=exact_frame)
-        except Exception:
-            logger.debug("fabio could not open %s, falling back to h5py", path)
-            arr = _read_hdf5_frame(path, frame)
+        # Keep HDF traversal on the guarded h5py route.  A fabio fallback can
+        # dereference an ExternalLink behind the checked master without exposing
+        # the target owner for processed-output authentication.
+        arr = _read_hdf5_frame(path, frame, exact=exact_frame)
     else:
         # EDF, TIFF, CBF, raw, etc. — try fabio, fall back to raw binary
         try:
@@ -388,7 +399,7 @@ def read_image_stack(
     ext = path.suffix.lower()
 
     if reduce in {"mean", "sum"}:
-        if ext in _HDF5_READ_EXTS and not _is_eiger_master(path):
+        if ext in _HDF5_READ_EXTS:
             _reject_if_processed_xdart(path)
         return _reduce_image_stack(
             path,
@@ -398,13 +409,12 @@ def read_image_stack(
             reduce=reduce,
         )
 
-    if ext in _HDF5_READ_EXTS and not _is_eiger_master(path):
-        _reject_if_processed_xdart(path)
-        # Non-Eiger HDF5 / NeXus — try fabio first, fall back to h5py
-        try:
-            arr = _read_fabio_stack(path)
-        except Exception:
-            logger.debug("fabio could not stack %s, falling back to h5py", path)
+    if ext in _HDF5_READ_EXTS:
+        if ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+            from xrd_tools.io.nexus import open_nexus_image_stack
+            with open_nexus_image_stack(path) as stack:
+                arr = np.asarray(stack[:])
+        else:
             arr = _read_hdf5_stack(path)
     else:
         # Eiger master files + all non-HDF5 formats go through fabio
@@ -549,10 +559,13 @@ def read_nexus_frame(
     """
     path = Path(path)
     with h5py.File(path, "r") as f:
+        from xrd_tools.io.processed_scan_id import require_raw_input
+        require_raw_input(f)
         if dataset_path is not None:
             ds = f[dataset_path]
         else:
             ds = _find_hdf5_image_dataset(f)
+        require_raw_input(ds)
         if ds.ndim == 2:
             return np.asarray(ds[:], dtype=float)
         return np.asarray(ds[frame], dtype=float)
@@ -613,53 +626,21 @@ def count_frames(path: Path | str) -> int:
     path = Path(path)
     ext = path.suffix.lower()
     try:
-        if ext in {".nxs", NEW_OUTPUT_SUFFIX} and not _is_eiger_master(path):
-            # .nxs: h5py FIRST — fabio has no reader for NeXus container
-            # layouts (Bluesky/NXWriter, beamline scan files) and fails
-            # SLOWLY (a full per-format parse attempt, ~0.5 s/file on a
-            # network share — the bl17-2 directory-mode freeze, 2026-07-12),
-            # while the h5py finder answers in milliseconds.  Same rationale
-            # as the wrangler's _eiger_open_master.
-            try:
-                with h5py.File(path, "r") as f:
-                    ds = _find_hdf5_image_dataset(f)
-                    return ds.shape[0] if ds.ndim >= 3 else 1
-            except ValueError as exc:
-                # A readable detectorless NeXus file is a valid zero-frame
-                # source.  Preserve this typed result for the outer handler;
-                # fabio cannot add information for a NeXus tree with no 2-D
-                # dataset and would replace it with a misleading reader error.
-                if str(exc).startswith("No 2-D+ dataset found"):
-                    raise
-                with fabio.open(path) as f:
-                    return f.nframes
-            except Exception:
-                with fabio.open(path) as f:
-                    return f.nframes
-        elif ext in {".h5", ".hdf5"} and not _is_eiger_master(path):
-            # Non-Eiger HDF5 — try fabio, fall back to h5py
-            try:
-                with fabio.open(path) as f:
-                    return f.nframes
-            except Exception:
-                with h5py.File(path, "r") as f:
-                    ds = _find_hdf5_image_dataset(f)
-                    return ds.shape[0] if ds.ndim >= 3 else 1
-        elif ext in _HDF5_READ_EXTS:
-            # Eiger-master-named HDF5: fabio first, h5py fallback — the
-            # bl17-2 *_master.h5 NXWriter files are not Eiger-shaped and
-            # fabio rejects them (DIR-2b); the h5py finder reads them.
-            try:
-                with fabio.open(path) as f:
-                    return f.nframes
-            except Exception:
-                with h5py.File(path, "r") as f:
-                    ds = _find_hdf5_image_dataset(f)
-                    return ds.shape[0] if ds.ndim >= 3 else 1
+        if ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+            from xrd_tools.io.nexus import open_nexus_image_stack
+            with open_nexus_image_stack(path) as stack:
+                return int(stack.shape[0])
+        if ext in _HDF5_READ_EXTS:
+            with h5py.File(path, "r") as f:
+                ds = _find_hdf5_image_dataset(f)
+                return ds.shape[0] if ds.ndim >= 3 else 1
         else:
             with fabio.open(path) as f:
                 return f.nframes
     except ValueError as exc:
+        from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
+        if isinstance(exc, ProcessedXdartInputError):
+            raise
         # A valid HDF5/NeXus acquisition may intentionally contain no detector
         # frames (alignment/diode-only scans are common in mixed beamline
         # directories).  That is a normal zero-frame classification, not a
@@ -712,34 +693,21 @@ def _reject_if_processed_xdart(path: Path) -> None:
     canonical schema/content test in :mod:`xrd_tools.io.processed_scan_id`
     (shared with the directory-watch NeXus resolver).
     """
-    from xrd_tools.io.processed_scan_id import (
-        ProcessedXdartInputError,
-        is_processed_xdart_file,
-    )
-    try:
-        with h5py.File(path, "r") as f:
-            processed = is_processed_xdart_file(f)
-    except OSError:
-        return  # not openable as HDF5 here — let the normal path report it
-    if processed:
-        raise ProcessedXdartInputError(
-            f"{path} is a processed xdart scan file (no raw detector image "
-            "inside); use io.read.get_raw_frame to read raw frames via the "
-            "stored source pointer."
-        )
+    from xrd_tools.io.processed_scan_id import require_raw_input
+    require_raw_input(path)
 
 
 def _read_hdf5_frame(path: Path, frame: int, dataset_path: str | None = None, *, exact: bool = False) -> np.ndarray:
     """Read a single frame via raw h5py (fallback for non-Eiger HDF5)."""
     with h5py.File(path, "r") as f:
+        from xrd_tools.io.processed_scan_id import require_raw_input
+        require_raw_input(f)
         anchor = dataset_path or ""
         parent, _, name = anchor.rpartition("/")
         dataset = f[dataset_path] if dataset_path is not None else _find_hdf5_image_dataset(f)
+        require_raw_input(dataset)
         if exact:
             from xrd_tools.io.nexus import NexusImageStack
-            from xrd_tools.io.processed_scan_id import ProcessedXdartInputError, is_processed_xdart_file
-            if is_processed_xdart_file(f):
-                raise ProcessedXdartInputError(f"{path} is a processed xdart scan file")
             if not anchor:
                 anchor = dataset.name
                 parent, _, name = anchor.rpartition("/")
@@ -805,6 +773,9 @@ def _resolvable_children(grp: h5py.Group):
             item = grp[name]
         except KeyError:
             continue
+        if isinstance(item, (h5py.Group, h5py.Dataset)):
+            from xrd_tools.io.processed_scan_id import require_raw_input
+            require_raw_input(item)
         yield name, item
 
 
@@ -829,16 +800,8 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     # master; use ``xrd_tools.io.read.get_raw_frame`` (it resolves the
     # per-frame source pointer) instead.  Same canonical classifier as the
     # directory-watch NeXus resolver (xrd_tools.io.processed_scan_id).
-    from xrd_tools.io.processed_scan_id import (
-        ProcessedXdartInputError,
-        is_processed_xdart_file,
-    )
-    if is_processed_xdart_file(f):
-        raise ProcessedXdartInputError(
-            f"{f.filename} is a processed xdart scan file (no raw detector "
-            "image inside); use io.read.get_raw_frame to read raw frames via "
-            "the stored source pointer."
-        )
+    from xrd_tools.io.processed_scan_id import require_raw_input
+    require_raw_input(f)
 
     # --- 0b. Reject unsupported detector rank (NXS-DIM-1) -------------------
     # Same canonical-location rank gate as the NeXus finder, so a rank-4
@@ -870,6 +833,8 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
         # (membership would answer True for the latter and getitem would
         # raise a bare KeyError — the NXS-LINK-1 escape).
         obj = f.get(candidate)
+        if isinstance(obj, h5py.Dataset):
+            require_raw_input(obj)
         if isinstance(obj, h5py.Dataset) and 2 <= obj.ndim <= 3:
             return obj  # type: ignore[return-value]
 
@@ -881,6 +846,7 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
     det = find_detector_signal_dataset(f)
     if det is not None:
+        require_raw_input(det)
         if det.ndim > 3:
             raise UnsupportedDetectorRankError(
                 f"{det.name} has rank {det.ndim}; detector data must be 2-D "
@@ -902,6 +868,8 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
                     # get(): membership answers True for a dangling link and
                     # getitem then raises a bare KeyError (NXS-LINK-1).
                     ds = item.get(signal_name)
+                    if isinstance(ds, h5py.Dataset):
+                        require_raw_input(ds)
                     if isinstance(ds, h5py.Dataset) and 2 <= ds.ndim <= 3:
                         return ds  # type: ignore[return-value]
                 # No signal attribute — pick first 2-D/3-D dataset
@@ -930,6 +898,7 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
                 # getitem raises a bare KeyError (NXS-LINK-1).
                 ds = item.get("data")
                 if isinstance(ds, h5py.Dataset):
+                    require_raw_input(ds)
                     if ds.ndim > 3:
                         raise UnsupportedDetectorRankError(
                             f"{ds.name} has rank {ds.ndim}; detector data "
@@ -964,6 +933,8 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     found: dict[str, h5py.Dataset] = {}
 
     def _visitor(name: str, obj: object) -> None:
+        if isinstance(obj, h5py.Dataset):
+            require_raw_input(obj)
         if isinstance(obj, h5py.Dataset) and 2 <= obj.ndim <= 3:
             found[name] = obj  # type: ignore[assignment]
 

@@ -219,10 +219,9 @@ def explicit_source_owner(
 ) -> SourceFormatAdapter | None:
     """Resolve one explicitly selected typed source through the registry.
 
-    Explicit processed outputs deliberately do not reuse name-only raw
-    discovery: ``.nexus`` is Browse-readable but is not a raw directory
-    candidate.  The requested kind and the registered output capability are
-    therefore the authority at this seam.
+    Explicit processed outputs require strict current-schema admission rather
+    than inheriting the broader raw-candidate suffix set.  The requested kind,
+    registered output capability, and current processed identity must agree.
     """
 
     _ensure_builtin_adapters()
@@ -235,10 +234,13 @@ def explicit_source_owner(
     owner = best.adapter
     if source_kind is SourceKind.PROCESSED_NEXUS:
         from xrd_tools.io.output_path import is_readable_output_path
+        from xrd_tools.io.processed_scan_id import (
+            is_current_processed_xdart_path,
+        )
 
         if not owner.is_output_format or not is_readable_output_path(
             source_path
-        ):
+        ) or not is_current_processed_xdart_path(source_path):
             return None
     return owner
 
