@@ -83,10 +83,16 @@ def _processed(
             group.attrs["signal"] = "intensity"
             group.attrs["axes"] = ("frame_index", "chi", "q")
             group.create_dataset(
-                "intensity", data=np.ones((2, 3, 4), dtype=np.float32)
+                "intensity",
+                data=np.ones((2, 3, 4), dtype=np.float32),
+                chunks=(1, 3, 4),
+                maxshape=(None, 3, 4),
             )
             group.create_dataset(
-                "frame_index", data=np.arange(2, dtype=np.int64)
+                "frame_index",
+                data=np.arange(2, dtype=np.int64),
+                chunks=(2,),
+                maxshape=(None,),
             )
             group.create_dataset("chi", data=np.arange(3, dtype=np.float32))
             group.create_dataset("q", data=np.arange(4, dtype=np.float32))
