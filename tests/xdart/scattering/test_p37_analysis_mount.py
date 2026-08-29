@@ -24,6 +24,7 @@ from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.operation_values import (
     OperationContextStamp,
     OperationIdentity,
+    OperationProgress,
     OperationTerminal,
     OperationTerminalStatus,
     OperationUpdate,
@@ -37,7 +38,8 @@ from xdart.gui.tabs.scattering.shell_values import (
 )
 from xdart.gui.tabs.scattering.tools_view import ToolsView
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
-from xdart.gui.tabs.scattering.events import RunIdentity
+from xdart.gui.tabs.scattering.events import CleanupStatus, RunIdentity
+from xdart.gui.tabs.scattering.metadata_operations import MetadataLifecycle
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
 from xdart.gui.tabs.scattering.processed_browser import (
@@ -181,6 +183,39 @@ def _close_page(page, qapp):
 def _returned(identity, payload, *, stale=False):
     return OperationUpdate(identity, terminal=OperationTerminal(
         identity, OperationTerminalStatus.RETURNED, payload=payload), stale=stale)
+
+
+def _start_metadata_process(
+    page,
+    identity,
+    plan,
+    request,
+    *,
+    target="metadata",
+    candidate=None,
+):
+    if candidate is not None:
+        plan = MetadataTableRequalificationPlan(
+            candidate.receipt,
+            candidate.table_fingerprint,
+        )
+    token = page._metadata_operations.dialog_identity(target)
+    assert token is not None
+    captured = page._metadata_operations.capture(
+        plan,
+        request,
+        target=target,
+        dialog=token,
+        candidate=candidate,
+    )
+    assert captured is not None
+    process = page._metadata_operations.start(
+        captured,
+        identity,
+        page._metadata_context_stamp(),
+    )
+    assert process is not None
+    return process
 
 
 def _check_item(widget, name, checked=True):
@@ -330,13 +365,16 @@ def test_p37b_metadata_direct_and_scheduled_results_match_and_render_detached(
                 page._analysis_slot, "begin_metadata_requalification",
                 lambda actual, stamp: requalification_identity,
             )
-            assert page._begin_analysis(
-                "metadata", plan, page._metadata_generation,
-                target="metadata", request=facts) is identity
+            assert page._submit_metadata(
+                plan, target="metadata", request=facts,
+            ) is identity
             current = _table("/tmp/current.nxs", fingerprint="current-table")
             assert page._consume_analysis_update(_returned(identity, current))
             assert page._metadata_result is None
-            assert page._analysis_identity is requalification_identity
+            assert (
+                page._metadata_operations.active_identity
+                is requalification_identity
+            )
             validation = MetadataTableRequalificationResult(
                 AnalysisDisposition.COMPLETED, "OK", current.receipt,
                 current.table_fingerprint,
@@ -364,7 +402,7 @@ def test_p37b_metadata_direct_and_scheduled_results_match_and_render_detached(
             lambda actual, stamp: selected_requalification,
         )
         page._scan_analysis_action("metadata", syntax)
-        candidate_identity = page._analysis_identity
+        candidate_identity = page._metadata_operations.active_identity
         assert launches[-1].selection == "directory"
         spec = SourceSpec("/tmp/folder/scan.nxs", SourceKind.PROCESSED_NEXUS)
         refused = MetadataTableResult(
@@ -377,7 +415,7 @@ def test_p37b_metadata_direct_and_scheduled_results_match_and_render_detached(
         assert page._metadata_result is current
 
         dialog.source_widget.scan_combo.setCurrentIndex(1)
-        exact_identity = page._analysis_identity
+        exact_identity = page._metadata_operations.active_identity
         assert launches[-1].selection == "exact" and launches[-1].source == spec
         selected = _table(spec, fingerprint="selected-table")
         assert page._consume_analysis_update(_returned(exact_identity, selected))
@@ -415,31 +453,21 @@ def test_metadata_button_requeries_after_current_artifact_changes(
         assert current is not None
 
         stale = _table("/tmp/stale-metadata.nxs")
-        page._metadata_result = stale
-        from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog
-        dialog = MetadataResultDialog(page)
-        page._metadata_dialog = dialog
-        dialog.adopt_result(stale)
-        assert dialog.table.rowCount() == len(stale.labels)
-        assert dialog.table.columnCount() == len(stale.columns)
-        assert dialog.status.text() == stale.code
         launches = []
         monkeypatch.setattr(
             page,
-            "_begin_analysis",
-            lambda kind, plan, generation, **kwargs:
-                launches.append((kind, plan, generation, kwargs)),
+            "_submit_metadata",
+            lambda plan, **kwargs: launches.append((plan, kwargs)),
         )
-        import xdart.gui.tabs.scattering.analysis_mount as mount
-        monkeypatch.setattr(mount, "analysis_start_allowed", lambda _page: True)
+        page._metadata_result = stale
 
         page._open_analysis_mount("metadata")
 
         assert len(launches) == 1
-        assert launches[0][0] == "metadata"
-        assert str(launches[0][1].source) == current.artifact
+        assert str(launches[0][0].source) == current.artifact
         assert page._metadata_result is None
-        assert page._metadata_dialog is dialog
+        dialog = page._metadata_dialog
+        assert dialog is not None
         assert dialog.table.rowCount() == 0
         assert dialog.table.columnCount() == 0
         assert dialog.status.text() == ""
@@ -478,10 +506,12 @@ def test_metadata_first_click_survives_viewer_cleanup_with_same_dialog(
         qapp.processEvents()
 
         dialog = page._metadata_dialog
-        deferred = page._deferred_metadata
+        deferred = page._metadata_operations.deferred
         assert dialog is not None and dialog.isVisible()
-        assert deferred is not None and deferred.dialog is dialog
-        assert deferred.generation == page._metadata_generation
+        assert deferred is not None
+        assert deferred.dialog is page._metadata_operations.dialog_identity(
+            "metadata"
+        )
         assert deferred.request == page._current_analysis_request(
             "metadata", "metadata",
         )
@@ -493,8 +523,8 @@ def test_metadata_first_click_survives_viewer_cleanup_with_same_dialog(
 
         assert page._metadata_dialog is dialog and dialog.isVisible()
         assert len(launches) == 1
-        assert page._analysis_identity is identity
-        assert page._deferred_metadata is None
+        assert page._metadata_operations.active_identity is identity
+        assert page._metadata_operations.deferred is None
         page._drain_executor()
         assert len(launches) == 1
     finally:
@@ -694,9 +724,9 @@ def test_metadata_analysis_owner_accepts_a_real_control_edit(
         page, "_current_analysis_request", lambda kind, target: facts,
     )
     try:
-        identity = page._begin_analysis(
-            "metadata", plan, page._metadata_generation,
-            target="metadata", request=facts,
+        page._open_analysis_mount("metadata")
+        identity = page._submit_metadata(
+            plan, target="metadata", request=facts,
         )
         assert type(identity) is OperationIdentity
         assert entered.wait(2)
@@ -774,9 +804,9 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
         page_module, "resolve_mask_executable", lambda: "/tmp/drawmask",
     )
     monkeypatch.setattr(
-        type(page._context_controller),
-        "capture_loaded_browse",
-        lambda _self, _request: object(),
+        page,
+        "_capture_current_loaded_browse",
+        lambda: object(),
     )
 
     refreshes = []
@@ -818,14 +848,13 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
     )
 
     try:
+        page._open_analysis_mount("metadata")
         assert not page._workspace_operations.owned
         _set_pending_reintegrate_reload(page)
         assert page._experiment_operation_busy()
         assert not analysis_start_allowed(page)
-        assert page._begin_analysis(
-            "metadata",
+        assert page._submit_metadata(
             plan,
-            page._metadata_generation,
             target="metadata",
             request=request,
         ) is None
@@ -1050,7 +1079,9 @@ def test_raw_tiff_viewer_metadata_click_uses_auto_sidecar_plan(
         request = analysis_request_facts(plan)
         assert request is not None
         assert request[1][-1] == "auto"
-        assert page._analysis_request == request
+        process = page._metadata_operations.active
+        assert process is not None
+        assert process.request.request == request
         wait_for(lambda: page._metadata_result is not None)
 
         result = page._metadata_result
@@ -1100,14 +1131,12 @@ def test_deferred_metadata_permanent_or_stale_state_drops_without_launch(
     stale, monkeypatch, qapp,
 ) -> None:
     from xdart.gui.tabs.scattering.analysis_mount import (
-        MetadataResultDialog,
         analysis_request_facts,
     )
 
     page = _page()
     original_slot = page._analysis_slot
     original_dialog = None
-    replacement_dialog = None
     try:
         page._open_analysis_mount("metadata")
         original_dialog = page._metadata_dialog
@@ -1127,31 +1156,33 @@ def test_deferred_metadata_permanent_or_stale_state_drops_without_launch(
             lambda _kind, _target: current[0],
         )
         assert page._submit_metadata(
-            plan, page._metadata_generation, request=exact,
+            plan, request=exact,
         ) is None
-        deferred = page._deferred_metadata
+        deferred = page._metadata_operations.deferred
         assert deferred is not None
 
         slot.owned = False
         if stale == "dialog":
-            replacement_dialog = MetadataResultDialog(page)
-            page._metadata_dialog = replacement_dialog
+            page._metadata_operations.close_dialog(deferred.dialog)
         elif stale == "generation":
-            page._metadata_generation += 1
+            page._metadata_operations.close_dialog(deferred.dialog)
+            assert page._metadata_operations.open_dialog("metadata") is not None
         elif stale == "request":
             current[0] = changed
         else:
             page._admission_state = object()
 
-        assert page._dispatch_deferred_metadata()
-        assert page._deferred_metadata is None
+        effect = page._dispatch_deferred_metadata()
+        assert effect is (
+            WorkspaceRefreshEffect.NONE
+            if stale in {"dialog", "generation"}
+            else WorkspaceRefreshEffect.CONTROLS
+        )
+        assert page._metadata_operations.deferred is None
         assert launches == []
     finally:
         page._analysis_slot = original_slot
         page._admission_state = None
-        if replacement_dialog is not None:
-            replacement_dialog.close()
-            replacement_dialog.deleteLater()
         if original_dialog is not None:
             page._metadata_dialog = original_dialog
         _close_page(page, qapp)
@@ -1185,22 +1216,158 @@ def test_busy_analysis_slot_keeps_only_latest_metadata_request(
         )
 
         assert page._submit_metadata(
-            first, page._metadata_generation, request=first_facts,
+            first, request=first_facts,
         ) is None
         current[0] = latest_facts
         assert page._submit_metadata(
-            latest, page._metadata_generation, request=latest_facts,
+            latest, request=latest_facts,
         ) is None
-        assert page._deferred_metadata is not None
-        assert page._deferred_metadata.plan is latest
+        assert page._metadata_operations.deferred is not None
+        assert page._metadata_operations.deferred.plan is latest
         assert launches == []
 
         slot.owned = False
         assert page._dispatch_deferred_metadata()
         assert launches and launches[0][0] is latest
-        assert page._deferred_metadata is None
-        assert page._analysis_identity is identity
+        assert page._metadata_operations.deferred is None
+        assert page._metadata_operations.active_identity is identity
     finally:
+        page._analysis_slot = original_slot
+        _close_page(page, qapp)
+
+
+def test_metadata_lost_owner_preserves_newer_request_and_stale_token_cannot_paint(
+    qapp,
+) -> None:
+    from xdart.gui.tabs.scattering.analysis_mount import analysis_request_facts
+
+    page = _page()
+    try:
+        page._open_analysis_mount("metadata")
+        page._open_analysis_mount("scan_roi")
+        original_dialog = page._metadata_dialog
+        original_token = page._metadata_operations.dialog_identity("metadata")
+        assert original_dialog is not None and original_token is not None
+
+        old_plan = MetadataTablePlan("/tmp/lost-owner.nxs")
+        old_facts = analysis_request_facts(old_plan)
+        identity = OperationIdentity(47)
+        process = _start_metadata_process(
+            page, identity, old_plan, old_facts,
+        )
+        latest_plan = MetadataTablePlan("/tmp/latest-owner.nxs")
+        latest_facts = analysis_request_facts(latest_plan)
+        latest_dialog = page._metadata_operations.dialog_identity("scan_roi")
+        latest = page._metadata_operations.capture(
+            latest_plan,
+            latest_facts,
+            target="scan_roi",
+            dialog=latest_dialog,
+        )
+        assert latest is not None
+
+        assert page._metadata_operations.lost(identity) is process
+        assert page._metadata_operations.deferred is latest
+        assert page._finish_metadata_refresh(
+            original_token,
+            "Analysis failed before terminal publication.",
+        ) is WorkspaceRefreshEffect.DIALOG
+
+        original_dialog.close()
+        qapp.processEvents()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete,
+        )
+        page._open_analysis_mount("metadata")
+        reopened = page._metadata_dialog
+        assert reopened is not None and reopened is not original_dialog
+        assert (
+            page._metadata_operations.dialog_identity("metadata")
+            is not original_token
+        )
+        before = reopened.status.text()
+        page._set_metadata_dialog_status(original_token, "stale terminal")
+        assert reopened.status.text() == before
+        assert page._metadata_operations.deferred is latest
+    finally:
+        _close_page(page, qapp)
+
+
+def test_lost_metadata_owner_handoff_reconciles_controls_once(
+    monkeypatch, qapp,
+) -> None:
+    from xdart.gui.tabs.scattering.analysis_mount import analysis_request_facts
+
+    page = _page()
+    original_slot = page._analysis_slot
+    latest_identity = OperationIdentity(902)
+    try:
+        page._open_analysis_mount("metadata")
+        page._open_analysis_mount("scan_roi")
+        old_plan = MetadataTablePlan("/tmp/aborted-owner.nxs")
+        latest_plan = MetadataTablePlan("/tmp/replacement-owner.nxs")
+        old_facts = analysis_request_facts(old_plan)
+        latest_facts = analysis_request_facts(latest_plan)
+        old_identity = OperationIdentity(901)
+        _start_metadata_process(
+            page, old_identity, old_plan, old_facts,
+        )
+        latest_dialog = page._metadata_operations.dialog_identity("scan_roi")
+        latest = page._metadata_operations.capture(
+            latest_plan,
+            latest_facts,
+            target="scan_roi",
+            dialog=latest_dialog,
+        )
+        assert latest is not None
+
+        launches = []
+        slot = SimpleNamespace(
+            current_identity=old_identity,
+            owned=True,
+            observe_stamp=lambda _stamp: None,
+            cancel=lambda _identity: False,
+        )
+
+        def poll(identity):
+            assert identity is old_identity
+            slot.current_identity = None
+            slot.owned = False
+            return None
+
+        def begin_metadata(plan, stamp):
+            launches.append((plan, stamp))
+            slot.current_identity = latest_identity
+            slot.owned = True
+            return latest_identity
+
+        slot.poll = poll
+        slot.begin_metadata = begin_metadata
+        page._analysis_slot = slot
+        monkeypatch.setattr(
+            page,
+            "_current_analysis_request",
+            lambda _kind, target:
+                old_facts if target == "metadata" else latest_facts,
+        )
+        refreshes = []
+        monkeypatch.setattr(
+            page,
+            "_refresh_shell",
+            lambda **kwargs: refreshes.append(kwargs),
+        )
+
+        page._drain_executor()
+
+        assert launches == [(latest_plan, page._metadata_context_stamp())]
+        assert page._metadata_operations.deferred is None
+        assert page._metadata_operations.active_identity is latest_identity
+        assert refreshes == [{
+            "preserve_display": True,
+            "preserve_scientific": True,
+        }]
+    finally:
+        page._metadata_operations.finish(latest_identity)
         page._analysis_slot = original_slot
         _close_page(page, qapp)
 
@@ -1237,23 +1404,32 @@ def test_newer_cross_target_metadata_request_preempts_old_requalification(
             return None
 
         monkeypatch.setattr(page, "_current_analysis_request", current)
-        first_identity = page._begin_analysis(
-            "metadata", first, page._metadata_generation,
-            target="metadata", request=first_facts,
+        first_identity = page._submit_metadata(
+            first, target="metadata", request=first_facts,
         )
         assert first_identity == OperationIdentity(47)
         slot.owned = True
         assert page._submit_metadata(
-            latest, page._scan_roi_generation,
             target="scan_roi", request=latest_facts,
+            plan=latest,
         ) is None
-        assert page._deferred_metadata.plan is latest
+        assert page._metadata_operations.deferred.plan is latest
+        old_status = page._metadata_dialog.status.text()
+        assert page._notice_text == "Metadata queued…"
+        assert page._consume_analysis_update(OperationUpdate(
+            first_identity,
+            progress=OperationProgress(
+                first_identity, "metadata", 1, 2, 1,
+            ),
+        )) is WorkspaceRefreshEffect.DIALOG
+        assert page._notice_text == "Metadata queued…"
+        assert page._metadata_dialog.status.text() == old_status
 
         slot.owned = False
         assert page._consume_analysis_update(
             _returned(first_identity, _table("/tmp/first.nxs"))
         )
-        assert page._deferred_metadata.plan is latest
+        assert page._metadata_operations.deferred.plan is latest
         assert [kind for kind, _plan, _stamp in launches] == ["metadata"]
         assert page._dispatch_deferred_metadata()
         assert launches[-1][0] == "metadata"
@@ -1297,20 +1473,17 @@ def test_newer_cross_target_metadata_request_suppresses_old_requalified_result(
             return None
 
         monkeypatch.setattr(page, "_current_analysis_request", current)
-        requalification = MetadataTableRequalificationPlan(
-            old_candidate.receipt, old_candidate.table_fingerprint,
-        )
-        assert page._begin_analysis(
-            "metadata_requalification", requalification,
-            page._metadata_generation, target="metadata", request=old_facts,
+        assert page._submit_metadata(
+            None,
+            target="metadata",
+            request=old_facts,
             candidate=old_candidate,
         ) == old_identity
         slot.owned = True
         assert page._submit_metadata(
-            latest, page._scan_roi_generation,
-            target="scan_roi", request=latest_facts,
+            latest, target="scan_roi", request=latest_facts,
         ) is None
-        assert page._deferred_metadata.plan is latest
+        assert page._metadata_operations.deferred.plan is latest
 
         slot.owned = False
         validation = MetadataTableRequalificationResult(
@@ -1322,13 +1495,13 @@ def test_newer_cross_target_metadata_request_suppresses_old_requalified_result(
         )
         assert page._metadata_result is None
         assert page._metadata_dialog.table.rowCount() == 0
-        assert page._deferred_metadata.plan is latest
+        assert page._metadata_operations.deferred.plan is latest
 
         assert page._dispatch_deferred_metadata()
         assert launches[-1][0] == "metadata"
         assert launches[-1][1] is latest
-        assert page._analysis_identity == latest_identity
-        assert page._deferred_metadata is None
+        assert page._metadata_operations.active_identity == latest_identity
+        assert page._metadata_operations.deferred is None
     finally:
         page._analysis_slot = original_slot
         _close_page(page, qapp)
@@ -1816,6 +1989,7 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
     anchor = SimpleNamespace(frame=_frame())
     page = _page()
     try:
+        page._open_analysis_mount("metadata")
         starts = []
         for name in ("begin_metadata", "begin_scan_plot", "begin_roi_preview",
                      "begin_roi_scan", "begin_peak_fit", "begin_phase_fit"):
@@ -1832,10 +2006,20 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
                 with monkeypatch.context() as patch:
                     patch.setattr(page, "_current_analysis_request",
                                   lambda _kind, _target, value=changed: value)
-                    assert page._begin_analysis(
-                        kind, plans[kind], page._analysis_generation_for(targets[kind]),
-                        target=targets[kind], request=request, anchor=anchor,
-                        **extra.get(kind, {})) is None
+                    if kind == "metadata":
+                        assert page._submit_metadata(
+                            plans[kind],
+                            target=targets[kind],
+                            request=request,
+                        ) is None
+                    else:
+                        assert page._begin_analysis(
+                            kind, plans[kind],
+                            page._analysis_generation_for(targets[kind]),
+                            target=targets[kind], request=request,
+                            anchor=anchor,
+                            **extra.get(kind, {}),
+                        ) is None
         assert not starts
 
         for kind, request in facts.items():
@@ -1888,14 +2072,13 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
         assert results["peak"].plan_fingerprint == "opaque-peak"
 
         exact = OperationIdentity(91)
-        page._analysis_identity = exact
+        exact_process = _start_metadata_process(
+            page, exact, plans["metadata"], facts["metadata"],
+        )
         assert page._consume_analysis_update(
             _returned(OperationIdentity(92), table)
         ) is WorkspaceRefreshEffect.NONE
-        assert page._analysis_identity is exact
-        page._analysis_kind = "metadata"; page._analysis_target = "metadata"
-        page._analysis_generation = page._metadata_generation
-        page._analysis_request = facts["metadata"]
+        assert page._metadata_operations.active is exact_process
         requalification_identity = OperationIdentity(999)
         with monkeypatch.context() as patch:
             patch.setattr(page, "_current_analysis_request",
@@ -1906,7 +2089,10 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
             )
             assert page._consume_analysis_update(_returned(exact, table))
             assert page._metadata_result is None
-            assert page._analysis_identity is requalification_identity
+            assert (
+                page._metadata_operations.active_identity
+                is requalification_identity
+            )
             assert page._consume_analysis_update(_returned(
                 requalification_identity,
                 MetadataTableRequalificationResult(
@@ -1917,10 +2103,12 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
         assert page._metadata_result is table
 
         mismatch_identity = OperationIdentity(93)
-        page._analysis_identity = mismatch_identity
-        page._analysis_kind = page._analysis_target = "metadata"
-        page._analysis_generation = page._metadata_generation
-        page._analysis_request = facts["metadata"]
+        _start_metadata_process(
+            page,
+            mismatch_identity,
+            plans["metadata"],
+            facts["metadata"],
+        )
         mismatched_table = replace(
             table, receipt=_receipt("/tmp/mismatched.nxs"))
         with monkeypatch.context() as patch:
@@ -1939,11 +2127,20 @@ def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
                                *request[1][index + 1:])
                 changed = (request[0], changed_row, request[2])
                 target = targets[kind]
-                page._analysis_identity = identity; page._analysis_kind = kind
-                page._analysis_target = target
-                page._analysis_generation = page._analysis_generation_for(target)
-                page._analysis_request = request; page._analysis_anchor = anchor
-                page._analysis_fingerprint = trace.trace_fingerprint
+                if kind == "metadata":
+                    _start_metadata_process(
+                        page, identity, plans[kind], request, target=target,
+                    )
+                else:
+                    page._analysis_identity = identity
+                    page._analysis_kind = kind
+                    page._analysis_target = target
+                    page._analysis_generation = (
+                        page._analysis_generation_for(target)
+                    )
+                    page._analysis_request = request
+                    page._analysis_anchor = anchor
+                    page._analysis_fingerprint = trace.trace_fingerprint
                 with monkeypatch.context() as patch:
                     patch.setattr(page, "_current_analysis_request",
                                   lambda _kind, _target, value=changed: value)
@@ -2003,12 +2200,28 @@ def test_p37b_dialog_and_app_close_cancel_without_abandoning_source_cleanup(
         identity = page._analysis_slot._begin(
             Job(), OperationContextStamp(0), body)
         assert type(identity) is OperationIdentity and entered.wait(2)
-        page._analysis_identity = identity; page._analysis_kind = "metadata"
-        page._analysis_target = "scan_roi"
+        plan = MetadataTablePlan("/tmp/cancel.nexus")
+        from xdart.gui.tabs.scattering.analysis_mount import (
+            analysis_request_facts,
+        )
+        token = page._metadata_operations.dialog_identity("scan_roi")
+        captured = page._metadata_operations.capture(
+            plan,
+            analysis_request_facts(plan),
+            target="scan_roi",
+            dialog=token,
+        )
+        assert page._metadata_operations.start(
+            captured, identity, OperationContextStamp(0),
+        ) is not None
         dialogs[1].close()
         assert page._scan_roi_dialog is None and page._analysis_slot.owned
         release.set(); update = _finish(page._analysis_slot, identity)
         assert update.terminal.status is OperationTerminalStatus.CANCELLED
+        assert page._consume_analysis_update(
+            update
+        ) is WorkspaceRefreshEffect.CONTROLS
+        assert page._metadata_operations.active is None
 
         for dialog in (dialogs[0], dialogs[2], dialogs[3]): dialog.close()
         QtCore.QCoreApplication.sendPostedEvents(
@@ -2023,16 +2236,117 @@ def test_p37b_dialog_and_app_close_cancel_without_abandoning_source_cleanup(
         release.set(); _close_page(page, qapp)
 
 
+def test_metadata_page_close_retries_exact_cleanup_to_closed(qapp) -> None:
+    page = _page()
+    entered = Event()
+    release = Event()
+
+    @dataclass(frozen=True)
+    class Job:
+        pass
+
+    def body(job, identity, cancelled, publish):
+        entered.set()
+        assert release.wait(2)
+        assert cancelled.is_set()
+        return OperationTerminal(
+            identity,
+            OperationTerminalStatus.CANCELLED,
+            payload=MetadataTableResult(
+                AnalysisDisposition.CANCELLED,
+                "CANCELLED",
+            ),
+        )
+
+    try:
+        page._open_analysis_mount("metadata")
+        identity = page._analysis_slot._begin(
+            Job(), OperationContextStamp(0), body,
+        )
+        assert type(identity) is OperationIdentity and entered.wait(2)
+        plan = MetadataTablePlan("/tmp/close-retry.nexus")
+        from xdart.gui.tabs.scattering.analysis_mount import (
+            analysis_request_facts,
+        )
+        token = page._metadata_operations.dialog_identity("metadata")
+        captured = page._metadata_operations.capture(
+            plan,
+            analysis_request_facts(plan),
+            target="metadata",
+            dialog=token,
+        )
+        assert page._metadata_operations.start(
+            captured, identity, OperationContextStamp(0),
+        ) is not None
+
+        first = page.close_workspace()
+        assert first.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert page._metadata_operations.lifecycle is MetadataLifecycle.CLOSING
+        assert not page._closed
+
+        release.set()
+        worker = page._analysis_slot._worker
+        assert worker is not None
+        worker.join(2)
+        assert not worker.is_alive()
+        second = page.close_workspace()
+        assert second.cleanup_status is CleanupStatus.CLEANED
+        assert page._metadata_operations.lifecycle is MetadataLifecycle.CLOSED
+        assert page._closed
+    finally:
+        release.set()
+        if not page._closed:
+            page.close_workspace()
+        page.deleteLater()
+        qapp.processEvents()
+
+
 def test_p37b_close_reopen_reuses_only_self_contained_metadata_and_discharges_transient_results(
-        qapp) -> None:
+        monkeypatch, qapp) -> None:
+    from xdart.gui.tabs.scattering.analysis_mount import analysis_request_facts
+
     page = _page(); table = _table(fingerprint="reopen-table")
+    facts = analysis_request_facts(
+        MetadataTablePlan(table.receipt.source_spec)
+    )
+    identities = iter((OperationIdentity(170), OperationIdentity(171)))
+    monkeypatch.setattr(
+        page,
+        "_current_analysis_request",
+        lambda kind, target: facts
+        if kind in {"metadata", "metadata_requalification"}
+        else None,
+    )
+    monkeypatch.setattr(
+        page._analysis_slot,
+        "begin_metadata_requalification",
+        lambda plan, stamp: next(identities),
+    )
+
+    def finish_requalification():
+        identity = page._metadata_operations.active_identity
+        assert identity is not None
+        assert page._consume_analysis_update(_returned(
+            identity,
+            MetadataTableRequalificationResult(
+                AnalysisDisposition.COMPLETED,
+                "OK",
+                table.receipt,
+                table.table_fingerprint,
+            ),
+        ))
+
     try:
         page._metadata_result = table; page._open_analysis_mount("metadata")
         metadata = page._metadata_dialog
+        assert metadata.table.rowCount() == 0
+        finish_requalification()
         assert metadata.table.rowCount() == len(table.labels)
         metadata.close(); qapp.processEvents()
         QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
         assert page._metadata_dialog is None and page._metadata_result is table; page._open_analysis_mount("metadata")
+        assert page._metadata_dialog.table.rowCount() == 0
+        finish_requalification()
         assert (page._metadata_dialog is not metadata
                 and page._metadata_dialog.table.rowCount() == len(table.labels))
 
@@ -2085,17 +2399,63 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
         try: _check_item(dialog.r_list, "signal")
         finally: dialog._vnext_rendering = False
 
+        current_request = [None]
+
+        def begin_requalification(_plan, _stamp):
+            nonlocal serial
+            serial += 1
+            return OperationIdentity(serial)
+
+        monkeypatch.setattr(
+            page._analysis_slot,
+            "begin_metadata_requalification",
+            begin_requalification,
+        )
+
         def consume(kind, payload, request, *, target="scan_roi"):
             nonlocal serial
+            current_request[0] = request
             serial += 1; identity = OperationIdentity(serial)
+            if kind == "metadata":
+                plan = MetadataTablePlan(
+                    payload.receipt.source_spec
+                    if payload.receipt is not None
+                    else "/tmp/refused.nexus"
+                )
+                _start_metadata_process(
+                    page, identity, plan, request, target=target,
+                )
+                effect = page._consume_analysis_update(
+                    _returned(identity, payload)
+                )
+                active = page._metadata_operations.active
+                if (
+                    type(payload) is MetadataTableResult
+                    and payload.disposition is AnalysisDisposition.COMPLETED
+                    and active is not None
+                    and active.request.candidate is payload
+                ):
+                    effect = page._consume_analysis_update(_returned(
+                        active.identity,
+                        MetadataTableRequalificationResult(
+                            AnalysisDisposition.COMPLETED,
+                            "OK",
+                            payload.receipt,
+                            payload.table_fingerprint,
+                        ),
+                    ))
+                return effect
             page._analysis_identity = identity; page._analysis_kind = kind
             page._analysis_target = target
             page._analysis_generation = page._analysis_generation_for(target)
             page._analysis_request = request
             return page._consume_analysis_update(_returned(identity, payload))
 
-        monkeypatch.setattr(page, "_current_analysis_request",
-                            lambda _kind, _target: page._analysis_request)
+        monkeypatch.setattr(
+            page,
+            "_current_analysis_request",
+            lambda _kind, _target: current_request[0],
+        )
         scan_request = ("scan_plot", (), (table.table_fingerprint, None,
                         "motor", ("signal",), None))
         scan = ScanPlotResult(
@@ -2188,7 +2548,19 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
         dialog.set_vnext_metadata(replacement)
         page._scan_roi_result = scan
         dialog.set_vnext_scan_result(scan, scan_request[2])
+        current_request[0] = replacement_facts
         page._open_analysis_mount("metadata")
+        retained_requalification = page._metadata_operations.active
+        assert retained_requalification is not None
+        assert page._consume_analysis_update(_returned(
+            retained_requalification.identity,
+            MetadataTableRequalificationResult(
+                AnalysisDisposition.COMPLETED,
+                "OK",
+                replacement.receipt,
+                replacement.table_fingerprint,
+            ),
+        ))
         standalone = replace(_table(fingerprint="standalone-table"),
                              storage_bytes=64 << 20)
         standalone_facts = analysis_request_facts(

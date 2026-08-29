@@ -222,7 +222,7 @@ def test_cancelled_cleanup_has_one_typed_nonterminal_architecture() -> None:
             ):
                 page_uses[method.name] = True
     assert set(page_uses) == {
-        "_classify_deferred_metadata",
+        "_classify_metadata_request",
         "_retry_pending_average_reload",
         "_select_scan",
         "_drain_executor",

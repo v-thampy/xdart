@@ -45,6 +45,7 @@ UI_SOURCE_NAMES = {
 ADAPTER_SOURCE = PACKAGE / "adapters" / "source.py"
 RUN_EXECUTOR_SOURCE = PACKAGE / "adapters" / "run_executor.py"
 OUTPUT_PREFLIGHT_SOURCE = PACKAGE / "output_preflight.py"
+METADATA_OWNER_SOURCE = PACKAGE / "metadata_operations.py"
 FORBIDDEN_MODULES = (
     "xdart.gui.tabs.static_scan_vnext",
     "xdart.gui.tabs.static_scan",
@@ -585,6 +586,57 @@ def test_e1a_architecture_finite_mutation_oracles():
     assert illegal_page == {"xdart.gui.tabs.static_scan.static_scan_widget.staticWidget"}
 
 
+def test_metadata_owner_is_value_only_and_page_has_no_retired_metadata_authority():
+    owner_source = METADATA_OWNER_SOURCE.read_text()
+    owner_imports = _imports_from(owner_source)
+    assert not any(
+        name == forbidden or name.startswith(f"{forbidden}.")
+        for name in owner_imports
+        for forbidden in ("qtpy", "PySide6", "PyQt5", "PyQt6", "pyqtgraph")
+    )
+
+    page_source = (PACKAGE / "page.py").read_text()
+    page_tree = ast.parse(page_source)
+    retired = {
+        "_DeferredMetadata",
+        "_deferred_metadata",
+        "_metadata_generation",
+        "_analysis_candidate",
+        "_classify_deferred_metadata",
+    }
+    names = {
+        node.id for node in ast.walk(page_tree) if isinstance(node, ast.Name)
+    }
+    attributes = {
+        node.attr
+        for node in ast.walk(page_tree)
+        if isinstance(node, ast.Attribute)
+    }
+    assert not retired & (names | attributes)
+
+    metadata_methods = {
+        "_finish_metadata_refresh",
+        "_start_metadata_request",
+        "_submit_metadata",
+        "_dispatch_deferred_metadata",
+        "_consume_metadata_update",
+    }
+    methods = {
+        node.name: node
+        for node in ast.walk(page_tree)
+        if isinstance(node, ast.FunctionDef) and node.name in metadata_methods
+    }
+    assert set(methods) == metadata_methods
+    for name, method in methods.items():
+        assert not any(
+            isinstance(node, ast.Attribute)
+            and node.attr == "FULL"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "WorkspaceRefreshEffect"
+            for node in ast.walk(method)
+        ), name
+
+
 def test_e0b_guard_allows_ephemeral_decision_input_but_rejects_intent_ownership():
     assert not _guard_violations(
         "def decide(candidate: RunIntent, store: RunIntentStore):\n    store.commit(candidate, expected_revision=0)\n",
@@ -812,4 +864,7 @@ def test_e2_output_and_directory_owners_remain_on_the_exact_two_port_boundary():
     assert {
         path for path, names in imports.items()
         if "h5py" in names
-    } == {Path("output_preflight.py")}
+    } == {
+        Path("experiment_authoring.py"),
+        Path("output_preflight.py"),
+    }

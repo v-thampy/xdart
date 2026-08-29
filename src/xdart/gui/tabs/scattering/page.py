@@ -179,6 +179,14 @@ from .operation_values import (
     OperationContextStamp, OperationIdentity,
     OperationTerminalStatus, OperationUpdate,
 )
+from .metadata_operations import (
+    MetadataDialogIdentity,
+    MetadataDisposition,
+    MetadataLifecycle,
+    MetadataOperationOwner,
+    MetadataProcess,
+    MetadataRequest,
+)
 from .presentation_background import (DisplayBackgroundTransferReceipt,
     PresentationBackgroundOwner, prepare_background_plan)
 from .start_outcomes import (
@@ -335,16 +343,6 @@ def _directory_file_progress(
         event.files_pending,
         event.files_discovered,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class _DeferredMetadata:
-    plan: object
-    request: tuple[object, ...]
-    target: str
-    generation: int
-    dialog: object
-    candidate: object | None = None
 
 
 def _terminal_frame_signature(
@@ -681,18 +679,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             AuthoredAssetDialogIdentity | None
         ) = None
         self._analysis_slot = OperationSlot()
+        self._metadata_operations = MetadataOperationOwner()
         self._background_owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_identity: OperationIdentity | None = None
         self._metadata_dialog = self._scan_roi_dialog = None
         self._peak_dialog = self._phase_dialog = None
-        self._metadata_generation = self._scan_roi_generation = 0
+        self._scan_roi_generation = 0
         self._peak_generation = self._phase_generation = 0
         self._analysis_identity = None; self._analysis_kind = None
         self._analysis_target = None
         self._analysis_generation = None; self._analysis_anchor = None
         self._analysis_fingerprint = ""; self._analysis_request = None
-        self._analysis_candidate = None
-        self._deferred_metadata: _DeferredMetadata | None = None
         self._roi_preview_binding = None
         self._metadata_result = self._scan_roi_result = None
         self._peak_result = self._phase_result = None
@@ -777,6 +774,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return bool(
             self._analysis_slot.owned
             or self._analysis_identity is not None
+            or self._metadata_operations.busy
         )
 
     def _mutating_operation_busy(self) -> bool:
@@ -798,13 +796,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
 
         analysis_slot = getattr(self, "_analysis_slot", None)
-        analysis = getattr(self, "_analysis_identity", None)
+        metadata = self._metadata_operations.active
+        analysis = (
+            metadata.identity
+            if metadata is not None
+            else getattr(self, "_analysis_identity", None)
+        )
         if (
             analysis_slot is not None
             and analysis is not None
             and analysis_slot.current_identity is analysis
         ):
-            if getattr(self, "_analysis_kind", None) in {
+            kind = (
+                metadata.request.kind
+                if metadata is not None
+                else getattr(self, "_analysis_kind", None)
+            )
+            if kind in {
                 "metadata", "metadata_requalification", "scan_plot",
                 "roi_preview", "roi_scan",
             }:
@@ -818,10 +826,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             analysis_slot.observe_stamp(stamp)
 
     def _analysis_generation_for(self, kind: str) -> int:
-        return (self._metadata_generation if kind in {
-                    "metadata", "metadata_requalification"} else
+        if kind in {"metadata", "metadata_requalification"}:
+            dialog = self._metadata_operations.dialog_identity("metadata")
+            return -1 if dialog is None else dialog.generation
+        return (
                 self._scan_roi_generation if kind in {"scan_roi", "scan_plot", "roi_preview", "roi_scan"} else
-                self._peak_generation if kind == "peak" else self._phase_generation)
+                self._peak_generation if kind == "peak" else self._phase_generation
+        )
 
     def _metadata_plan_for_current(self):
         controller = self._context_controller
@@ -926,31 +937,49 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return None
         return None
 
-    def _set_metadata_dialog_status(self, target, message) -> None:
-        dialog = getattr(self, f"_{target}_dialog", None)
+    def _metadata_dialog_for(
+        self, identity: object,
+    ) -> object | None:
+        if (
+            type(identity) is not MetadataDialogIdentity
+            or self._metadata_operations.dialog_identity(identity.target)
+            is not identity
+        ):
+            return None
+        return getattr(self, f"_{identity.target}_dialog", None)
+
+    def _set_metadata_dialog_status(
+        self, identity: object, message: object,
+    ) -> None:
+        dialog = self._metadata_dialog_for(identity)
         status = None if dialog is None else getattr(dialog, "status", None)
         if status is not None:
             status.setText(str(message or ""))
 
     def _finish_metadata_refresh(
-        self, target, message=None,
+        self, identity: object, message=None,
     ) -> WorkspaceRefreshEffect:
         if message is not None:
-            self._set_metadata_dialog_status(target, message)
+            self._set_metadata_dialog_status(identity, message)
         # Metadata never locks editable fields or repaints science.  Its final
         # transition does, however, release the mutually-exclusive Run and
         # mutating-action affordances through one controls-only projection.
+        # A newer deferred request owns that handoff and either starts with its
+        # own projection or is dropped with a controls effect by dispatch.
         return (
             WorkspaceRefreshEffect.DIALOG
-            if self._analysis_operation_busy()
+            if (
+                self._analysis_operation_busy()
+                or self._metadata_operations.deferred is not None
+            )
             else WorkspaceRefreshEffect.CONTROLS
         )
 
     def _begin_analysis(self, kind, plan, generation, *, target=None,
-                        request=None, anchor=None, table=None, roi=None,
-                        candidate=None):
+                        request=None, anchor=None, table=None, roi=None):
         if (
-            self._authored_assets.busy
+            kind in {"metadata", "metadata_requalification"}
+            or self._authored_assets.busy
             or self._analysis_identity is not None
         ):
             return None
@@ -967,9 +996,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self, anchor, fingerprint, generation): return None
         stamp = (self._operation_context_stamp() if fit else
                  OperationContextStamp(self._intents.snapshot().revision))
-        names = {"metadata": "begin_metadata",
-                 "metadata_requalification": "begin_metadata_requalification",
-                 "roi_preview": "begin_roi_preview",
+        names = {"roi_preview": "begin_roi_preview",
                  "roi_scan": "begin_roi_scan", "peak": "begin_peak_fit",
                  "phase": "begin_phase_fit"}
         identity = (self._analysis_slot.begin_scan_plot(plan, table, roi, stamp)
@@ -979,12 +1006,66 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_kind, self._analysis_generation = kind, generation
         self._analysis_target, self._analysis_identity = target, identity
         self._analysis_anchor, self._analysis_fingerprint = anchor, fingerprint
-        self._analysis_request = request; self._analysis_candidate = candidate
+        self._analysis_request = request
         self._ensure_timer()
         message = f"Running {kind.replace('_', ' ')}…"
         self._notice(message)
-        if kind in {"metadata", "metadata_requalification"}:
-            self._set_metadata_dialog_status(target, message)
+        self._refresh_shell(
+            preserve_display=True,
+            preserve_scientific=True,
+        )
+        return identity
+
+    def _metadata_context_stamp(self) -> OperationContextStamp:
+        return OperationContextStamp(self._intents.snapshot().revision)
+
+    def _classify_metadata_request(
+        self, captured: MetadataRequest,
+    ) -> MetadataDisposition:
+        controller = self._context_controller
+        kind = captured.kind
+        from .analysis_mount import analysis_start_allowed
+        return self._metadata_operations.classify(
+            captured,
+            current_request=self._current_analysis_request(
+                kind, captured.target,
+            ),
+            blocked=bool(
+                self._analysis_slot.owned
+                or self._analysis_identity is not None
+                or self._authored_assets.busy
+                or controller.browse_pending
+                or controller.viewer_1d_cleanup_pending
+                or controller.viewer_2d_cleanup_pending
+            ),
+            start_allowed=analysis_start_allowed(self),
+            closing=self._closing or self._closed,
+        )
+
+    def _start_metadata_request(
+        self, captured: MetadataRequest,
+    ) -> OperationIdentity | None:
+        if self._classify_metadata_request(captured) is not MetadataDisposition.READY:
+            return None
+        method = (
+            self._analysis_slot.begin_metadata_requalification
+            if captured.kind == "metadata_requalification"
+            else self._analysis_slot.begin_metadata
+        )
+        context = self._metadata_context_stamp()
+        identity = method(captured.plan, context)
+        if identity is None:
+            return None
+        process = self._metadata_operations.start(
+            captured, identity, context,
+        )
+        if process is None:
+            self._analysis_slot.cancel(identity)
+            return None
+        self._ensure_timer()
+        message = f"Running {captured.kind.replace('_', ' ')}…"
+        self._notice(message)
+        self._set_metadata_dialog_status(captured.dialog, message)
         self._refresh_shell(
             preserve_display=True,
             preserve_scientific=True,
@@ -992,8 +1073,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return identity
 
     def _submit_metadata(
-        self, plan, generation, *, target="metadata", request=None,
-        candidate=None,
+        self, plan, *, target="metadata", request=None, candidate=None,
     ):
         from .analysis_mount import analysis_request_facts
         request = analysis_request_facts(plan) if request is None else request
@@ -1004,110 +1084,67 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             plan = MetadataTableRequalificationPlan(
                 candidate.receipt, candidate.table_fingerprint,
             )
-        deferred = _DeferredMetadata(
-            plan=plan,
-            request=request,
+        dialog = self._metadata_operations.dialog_identity(target)
+        captured = self._metadata_operations.capture(
+            plan,
+            request,
             target=target,
-            generation=generation,
-            dialog=getattr(self, f"_{target}_dialog", None),
+            dialog=dialog,
             candidate=candidate,
         )
+        if captured is None:
+            return None
         # Install the newest exact request before classifying it.  A transient
         # Browse/viewer cleanup or analysis-slot race must not make the first
         # click disappear, and a newer cross-target request always supersedes
         # an older one.
-        self._deferred_metadata = deferred
-        disposition = self._classify_deferred_metadata(deferred)
-        if disposition == "transient":
+        disposition = self._classify_metadata_request(captured)
+        if disposition is MetadataDisposition.TRANSIENT:
             self._notice("Metadata queued…")
             self._ensure_timer()
             return None
-        if disposition != "ready":
-            if self._deferred_metadata is deferred:
-                self._deferred_metadata = None
+        if disposition is not MetadataDisposition.READY:
+            self._metadata_operations.drop(captured)
             return None
-        kind = (
-            "metadata_requalification" if candidate is not None else "metadata"
-        )
-        identity = self._begin_analysis(
-            kind, plan, generation, target=target, request=request,
-            candidate=candidate,
-        )
+        identity = self._start_metadata_request(captured)
         if identity is not None:
-            if self._deferred_metadata is deferred:
-                self._deferred_metadata = None
             return identity
         # begin_* owns the final CAS.  If another owner won between the
         # readiness check and that CAS, retain the exact request only for a
         # recognized transient blocker.
-        if self._classify_deferred_metadata(deferred) != "transient":
-            if self._deferred_metadata is deferred:
-                self._deferred_metadata = None
+        if (
+            self._classify_metadata_request(captured)
+            is not MetadataDisposition.TRANSIENT
+        ):
+            self._metadata_operations.drop(captured)
         else:
             self._notice("Metadata queued…")
             self._ensure_timer()
         return None
 
-    def _classify_deferred_metadata(self, deferred: _DeferredMetadata) -> str:
-        kind = (
-            "metadata_requalification"
-            if deferred.candidate is not None else "metadata"
-        )
-        dialog = getattr(self, f"_{deferred.target}_dialog", None)
-        if (
-            self._closing
-            or self._closed
-            or dialog is not deferred.dialog
-            or deferred.generation
-            != self._analysis_generation_for(deferred.target)
-            or deferred.request
-            != self._current_analysis_request(kind, deferred.target)
-        ):
-            return "permanent"
-        controller = self._context_controller
-        if (
-            self._analysis_slot.owned
-            or self._authored_assets.busy
-            or controller.browse_pending
-            or controller.viewer_1d_cleanup_pending
-            or controller.viewer_2d_cleanup_pending
-        ):
-            return "transient"
-        from .analysis_mount import analysis_start_allowed
-        return "ready" if analysis_start_allowed(self) else "permanent"
-
     def _dispatch_deferred_metadata(self) -> WorkspaceRefreshEffect:
-        deferred = self._deferred_metadata
-        if deferred is None:
+        captured = self._metadata_operations.deferred
+        if captured is None:
             return WorkspaceRefreshEffect.NONE
-        disposition = self._classify_deferred_metadata(deferred)
-        if disposition == "transient":
+        disposition = self._classify_metadata_request(captured)
+        if disposition is MetadataDisposition.TRANSIENT:
             return WorkspaceRefreshEffect.NONE
-        if disposition != "ready":
-            if self._deferred_metadata is deferred:
-                self._deferred_metadata = None
+        if disposition is not MetadataDisposition.READY:
+            self._metadata_operations.drop(captured)
             return self._finish_metadata_refresh(
-                deferred.target,
+                captured.dialog,
                 "Metadata request is no longer current.",
             )
-        kind = (
-            "metadata_requalification"
-            if deferred.candidate is not None else "metadata"
-        )
-        identity = self._begin_analysis(
-            kind, deferred.plan, deferred.generation,
-            target=deferred.target, request=deferred.request,
-            candidate=deferred.candidate,
-        )
+        identity = self._start_metadata_request(captured)
         if identity is not None:
-            if self._deferred_metadata is deferred:
-                self._deferred_metadata = None
             return WorkspaceRefreshEffect.DIALOG
-        if self._classify_deferred_metadata(deferred) != "transient":
-            if self._deferred_metadata is deferred:
-                self._deferred_metadata = None
+        if (
+            self._classify_metadata_request(captured)
+            is not MetadataDisposition.TRANSIENT
+        ):
+            self._metadata_operations.drop(captured)
             return self._finish_metadata_refresh(
-                deferred.target,
+                captured.dialog,
                 "Metadata request is no longer current.",
             )
         self._ensure_timer()
@@ -1128,16 +1165,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         field = f"_{target}_dialog"
         if getattr(self, field, None) is not dialog: return
         setattr(self, field, None)
-        generation = f"_{target}_generation"
-        closing_generation = getattr(self, generation)
-        setattr(self, generation, closing_generation + 1)
-        if (
-            self._deferred_metadata is not None
-            and self._deferred_metadata.target == target
-            and self._deferred_metadata.dialog is dialog
-            and self._deferred_metadata.generation == closing_generation
-        ):
-            self._deferred_metadata = None
+        if target in {"metadata", "scan_roi"}:
+            from .analysis_mount import cancel_owned
+            token = self._metadata_operations.dialog_identity(target)
+            cancel_owned(
+                self._analysis_slot,
+                self._metadata_operations.close_dialog(token),
+            )
+        if target != "metadata":
+            generation = f"_{target}_generation"
+            setattr(self, generation, getattr(self, generation) + 1)
         if self._analysis_target == target:
             from .analysis_mount import cancel_owned
             cancel_owned(self._analysis_slot, self._analysis_identity)
@@ -1164,6 +1201,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
             dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
             setattr(self, field, dialog)
+            if target in {"metadata", "scan_roi"}:
+                if self._metadata_operations.open_dialog(target) is None:
+                    dialog.close()
+                    setattr(self, field, None)
+                    return
             dialog.finished.connect(lambda _value, t=target, d=dialog:
                                     self._analysis_dialog_closed(t, d))
         dialog.show(); dialog.raise_(); dialog.activateWindow()
@@ -1180,7 +1222,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 dialog.clear_result()
                 self._submit_metadata(
-                    None, self._metadata_generation, target="metadata",
+                    None, target="metadata",
                     request=current_request, candidate=retained,
                 )
             else:
@@ -1201,7 +1243,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         request = analysis_request_facts(plan)
         self._submit_metadata(
             plan,
-            self._metadata_generation,
             request=request,
         )
 
@@ -1213,7 +1254,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             plan = metadata_plan_from_syntax(value)
             if plan is not None:
                 self._submit_metadata(
-                    plan, self._scan_roi_generation, target="scan_roi",
+                    plan, target="scan_roi",
                     request=analysis_request_facts(plan),
                 )
             return
@@ -1283,130 +1324,217 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             target="scan_roi", request=analysis_request_facts(
                 plan, picker=(*binding[1:-1], id(picker))))
 
-    def _consume_analysis_update(self, update):
-        if type(update) is not OperationUpdate or update.identity is not self._analysis_identity:
-            return WorkspaceRefreshEffect.NONE
+    def _consume_metadata_update(
+        self, update: OperationUpdate, process: MetadataProcess,
+    ) -> WorkspaceRefreshEffect:
+        captured = process.request
+        dialog = self._metadata_dialog_for(captured.dialog)
+        current = self._metadata_operations.process_is_current(
+            process,
+            current_request=self._current_analysis_request(
+                captured.kind, captured.target,
+            ),
+            current_context=self._metadata_context_stamp(),
+        )
+        newer = self._metadata_operations.has_newer_request(process)
         if update.terminal is None:
-            if update.progress is not None:
-                message = f"Analysis: {update.progress.stage} {update.progress.completed}/{update.progress.total}"
+            if (
+                update.progress is not None
+                and current
+                and not update.stale
+                and not newer
+            ):
+                message = (
+                    f"Analysis: {update.progress.stage} "
+                    f"{update.progress.completed}/{update.progress.total}"
+                )
                 self._notice(message)
-                if self._analysis_kind in {
-                    "metadata", "metadata_requalification",
-                }:
-                    self._set_metadata_dialog_status(
-                        self._analysis_target, message,
-                    )
-            return (
-                WorkspaceRefreshEffect.DIALOG
-                if self._analysis_kind in {
-                    "metadata", "metadata_requalification",
-                }
-                else WorkspaceRefreshEffect.FULL
-            )
-        kind, target = self._analysis_kind, self._analysis_target
-        metadata_operation = kind in {
-            "metadata", "metadata_requalification",
-        }
-        request = self._analysis_request
-        current = self._analysis_generation == self._analysis_generation_for(target)
-        current = bool(current and request is not None
-                       and request == self._current_analysis_request(kind, target))
-        if kind in {"peak", "phase"}:
-            from .analysis_mount import display_anchor_matches
-            current = current and display_anchor_matches(
-                self, self._analysis_anchor, self._analysis_fingerprint,
-                self._analysis_generation)
+                self._set_metadata_dialog_status(captured.dialog, message)
+            return WorkspaceRefreshEffect.DIALOG
+
+        from xrd_tools.analysis.scan_operations import (
+            AnalysisDisposition,
+            MetadataTableRequalificationResult,
+            MetadataTableResult,
+        )
         terminal_payload = update.terminal.payload
-        from xrd_tools.analysis.scan_operations import AnalysisDisposition
-        if (current and kind == "metadata" and target == "scan_roi"
-                and getattr(terminal_payload, "disposition", None)
-                    is AnalysisDisposition.REFUSED
-                and getattr(terminal_payload, "code", "") == "SOURCE_SELECTION_REQUIRED"
-                and self._scan_roi_dialog is not None):
-            candidates = getattr(terminal_payload, "candidates", ())
-            self._analysis_identity = self._analysis_kind = self._analysis_target = None
-            self._analysis_generation = self._analysis_anchor = self._analysis_request = None
-            self._analysis_fingerprint = ""; self._analysis_candidate = None
+        if (
+            current
+            and not update.stale
+            and not newer
+            and captured.kind == "metadata"
+            and captured.target == "scan_roi"
+            and type(terminal_payload) is MetadataTableResult
+            and terminal_payload.disposition is AnalysisDisposition.REFUSED
+            and terminal_payload.code == "SOURCE_SELECTION_REQUIRED"
+            and dialog is not None
+        ):
+            self._metadata_operations.finish(update.identity)
             self._roi_preview_binding = self._scan_roi_result = None
-            self._scan_roi_dialog.clear_vnext_metadata()
-            if candidates: self._scan_roi_dialog.source_widget.set_external_candidates(candidates)
+            dialog.clear_vnext_metadata()
+            if terminal_payload.candidates:
+                dialog.source_widget.set_external_candidates(
+                    terminal_payload.candidates,
+                )
             message = "Choose one headless-qualified source."
             self._notice(message)
-            return self._finish_metadata_refresh(target, message)
-        from .analysis_mount import (analysis_result_matches,
-            retention_admission, terminal_adoption)
+            return self._finish_metadata_refresh(captured.dialog, message)
+
+        from .analysis_mount import (
+            analysis_result_matches,
+            retention_admission,
+            terminal_adoption,
+        )
         payload, diagnostic = terminal_adoption(update, current=current)
-        candidate = self._analysis_candidate
-        requalification = kind == "metadata_requalification"
+        candidate = captured.candidate
+        requalification = captured.kind == "metadata_requalification"
         if requalification:
-            from xrd_tools.analysis.scan_operations import (
-                MetadataTableRequalificationResult, MetadataTableResult,
-            )
             valid = (
                 type(payload) is MetadataTableRequalificationResult
                 and type(candidate) is MetadataTableResult
                 and payload.receipt == candidate.receipt
                 and payload.table_fingerprint == candidate.table_fingerprint
-                and analysis_result_matches(candidate, request)
+                and analysis_result_matches(candidate, captured.request)
             )
             if valid:
                 payload = candidate
-                kind = "metadata"
             else:
                 payload, diagnostic = (
-                    None, diagnostic or "P3_7_ANALYSIS_RESULT_IDENTITY_MISMATCH"
+                    None,
+                    diagnostic
+                    or "P3_7_ANALYSIS_RESULT_IDENTITY_MISMATCH",
                 )
-        elif payload is not None and not analysis_result_matches(payload, request):
-            payload, diagnostic = None, "P3_7_ANALYSIS_RESULT_IDENTITY_MISMATCH"
-        generation = self._analysis_generation
-        self._analysis_identity = self._analysis_kind = self._analysis_target = None
-        self._analysis_generation = self._analysis_anchor = self._analysis_request = None
-        self._analysis_fingerprint = ""; self._analysis_candidate = None
+        elif payload is not None and not analysis_result_matches(
+            payload, captured.request,
+        ):
+            payload = None
+            diagnostic = "P3_7_ANALYSIS_RESULT_IDENTITY_MISMATCH"
+
+        if self._metadata_operations.finish(update.identity) is not process:
+            return WorkspaceRefreshEffect.NONE
+        if newer:
+            # A later request owns both initial and requalified precedence.
+            return WorkspaceRefreshEffect.DIALOG
         if payload is None:
             self._notice(diagnostic)
-            return (
-                self._finish_metadata_refresh(target, diagnostic)
-                if metadata_operation else WorkspaceRefreshEffect.FULL
+            return self._finish_metadata_refresh(
+                captured.dialog, diagnostic,
             )
-        if kind == "metadata" and self._deferred_metadata is not None:
-            # A newer user request already owns latest-only precedence.  Do
-            # not let this older terminal candidate erase it, either while
-            # chaining or after completing the candidate's requalification.
-            return WorkspaceRefreshEffect.DIALOG
-        if kind == "metadata" and not requalification:
+        if not requalification:
             identity = self._submit_metadata(
-                None, generation, target=target, request=request,
+                None,
+                target=captured.target,
+                request=captured.request,
                 candidate=payload,
             )
-            if identity is None and self._deferred_metadata is None:
-                return self._finish_metadata_refresh(target)
+            if (
+                identity is None
+                and self._metadata_operations.deferred is None
+            ):
+                return self._finish_metadata_refresh(captured.dialog)
             return WorkspaceRefreshEffect.DIALOG
-        retained = {"metadata": self._metadata_result,
-                    "scan_roi": self._scan_roi_result,
-                    "peak": self._peak_result, "phase": self._phase_result}
-        if kind == "metadata": retained["scan_roi"] = None
-        replacing = "metadata" if kind == "metadata" else (
-            "scan_roi" if kind in {"scan_plot", "roi_preview", "roi_scan"} else kind)
+
+        retained = {
+            "metadata": self._metadata_result,
+            "scan_roi": None,
+            "peak": self._peak_result,
+            "phase": self._phase_result,
+        }
+        admitted, reason = retention_admission(
+            retained, "metadata", payload,
+        )
+        if not admitted:
+            self._notice(reason)
+            return self._finish_metadata_refresh(captured.dialog, reason)
+        self._roi_preview_binding = None
+        self._metadata_result = payload
+        self._scan_roi_result = None
+        if captured.target == "metadata" and dialog is not None:
+            dialog.adopt_result(payload)
+            if self._scan_roi_dialog is not None:
+                self._scan_roi_dialog.clear_vnext_metadata()
+        elif captured.target == "scan_roi" and dialog is not None:
+            dialog.set_vnext_metadata(payload)
+        self._notice("")
+        return self._finish_metadata_refresh(captured.dialog)
+
+    def _consume_analysis_update(self, update):
+        metadata = self._metadata_operations.active
+        if (
+            type(update) is OperationUpdate
+            and metadata is not None
+            and update.identity is metadata.identity
+        ):
+            return self._consume_metadata_update(update, metadata)
+        if (
+            type(update) is not OperationUpdate
+            or update.identity is not self._analysis_identity
+        ):
+            return WorkspaceRefreshEffect.NONE
+        if update.terminal is None:
+            if update.progress is not None:
+                message = (
+                    f"Analysis: {update.progress.stage} "
+                    f"{update.progress.completed}/{update.progress.total}"
+                )
+                self._notice(message)
+            return WorkspaceRefreshEffect.FULL
+
+        kind, target = self._analysis_kind, self._analysis_target
+        request = self._analysis_request
+        current = self._analysis_generation == self._analysis_generation_for(
+            target,
+        )
+        current = bool(
+            current
+            and request is not None
+            and request == self._current_analysis_request(kind, target)
+        )
+        if kind in {"peak", "phase"}:
+            from .analysis_mount import display_anchor_matches
+            current = current and display_anchor_matches(
+                self,
+                self._analysis_anchor,
+                self._analysis_fingerprint,
+                self._analysis_generation,
+            )
+        from .analysis_mount import (
+            analysis_result_matches,
+            retention_admission,
+            terminal_adoption,
+        )
+        payload, diagnostic = terminal_adoption(update, current=current)
+        if payload is not None and not analysis_result_matches(payload, request):
+            payload = None
+            diagnostic = "P3_7_ANALYSIS_RESULT_IDENTITY_MISMATCH"
+        self._analysis_identity = self._analysis_kind = self._analysis_target = None
+        self._analysis_generation = self._analysis_anchor = None
+        self._analysis_request = None
+        self._analysis_fingerprint = ""
+        if payload is None:
+            self._notice(diagnostic)
+            return WorkspaceRefreshEffect.FULL
+
+        retained = {
+            "metadata": self._metadata_result,
+            "scan_roi": self._scan_roi_result,
+            "peak": self._peak_result,
+            "phase": self._phase_result,
+        }
+        replacing = (
+            "scan_roi"
+            if kind in {"scan_plot", "roi_preview", "roi_scan"}
+            else kind
+        )
         admitted, reason = retention_admission(retained, replacing, payload)
         if not admitted:
             self._notice(reason)
-            return (
-                self._finish_metadata_refresh(target, reason)
-                if metadata_operation else WorkspaceRefreshEffect.FULL
-            )
+            return WorkspaceRefreshEffect.FULL
         if kind in {"scan_plot", "roi_preview", "roi_scan"}:
             self._roi_preview_binding = None
             if self._scan_roi_dialog is not None:
                 self._scan_roi_dialog._retire_vnext_result()
-        if kind == "metadata":
-            self._roi_preview_binding = None
-            self._metadata_result = payload; self._scan_roi_result = None
-            if target == "metadata":
-                if self._metadata_dialog is not None: self._metadata_dialog.adopt_result(payload)
-                if self._scan_roi_dialog is not None: self._scan_roi_dialog.clear_vnext_metadata()
-            elif self._scan_roi_dialog is not None:
-                self._scan_roi_dialog.set_vnext_metadata(payload)
-        elif kind == "scan_plot":
+        if kind == "scan_plot":
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None: self._scan_roi_dialog.set_vnext_scan_result(payload, request[2])
         elif kind == "roi_preview":
@@ -1436,10 +1564,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._phase_result = payload
             if self._phase_dialog is not None: self._phase_dialog.set_vnext_result(payload)
         self._notice("")
-        return (
-            self._finish_metadata_refresh(target)
-            if metadata_operation else WorkspaceRefreshEffect.FULL
-        )
+        return WorkspaceRefreshEffect.FULL
 
     @staticmethod
     def _background_domain(mode: str) -> str | None:
@@ -2155,7 +2280,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._apply_authored_asset_transition(
                 self._authored_assets.begin_close()
             )
-            self._deferred_metadata = None
+            self._metadata_operations.begin_close()
             self._processed_browser.retire_terminal(force=True)
             for dialog in (self._metadata_dialog, self._scan_roi_dialog,
                            self._peak_dialog, self._phase_dialog):
@@ -2223,12 +2348,46 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             operation_clean = False
 
         try:
+            metadata_cleanup_identity = (
+                self._metadata_operations.cleanup_identity
+            )
+            analysis_identity_before_close = (
+                None
+                if analysis_slot is None
+                else analysis_slot.current_identity
+            )
             analysis_close = (
                 None if analysis_slot is None else analysis_slot.close()
             )
             analysis_clean = (
                 analysis_slot is None
                 or analysis_close.cleanup_status is CleanupStatus.CLEANED
+            )
+            if (
+                analysis_close is not None
+                and metadata_cleanup_identity is not None
+            ):
+                anonymous_clean_retirement = (
+                    analysis_identity_before_close
+                    is metadata_cleanup_identity
+                    and analysis_close.cleanup_status
+                    is CleanupStatus.CLEANED
+                    and analysis_close.identity is None
+                    and not analysis_slot.owned
+                    and analysis_slot.current_identity is None
+                )
+                if anonymous_clean_retirement:
+                    self._metadata_operations.lost(
+                        metadata_cleanup_identity
+                    )
+                else:
+                    self._metadata_operations.consume_close_receipt(
+                        analysis_close
+                    )
+            analysis_clean = (
+                analysis_clean
+                and self._metadata_operations.lifecycle
+                is MetadataLifecycle.CLOSED
             )
             if analysis_clean:
                 self._analysis_identity = None
@@ -2238,7 +2397,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._analysis_anchor = None
                 self._analysis_request = None
                 self._analysis_fingerprint = ""
-                self._analysis_candidate = None
         except Exception:
             analysis_clean = False
 
@@ -4129,10 +4287,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     changed = True
                     force_scientific = True
             elif (
+                self._metadata_operations.active_identity
+                is analysis_identity
+                and not analysis_slot.owned
+            ):
+                process = self._metadata_operations.lost(
+                    analysis_identity
+                )
+                if process is not None:
+                    message = (
+                        "Analysis failed before terminal publication."
+                    )
+                    self._notice(message)
+                    if self._finish_metadata_refresh(
+                        process.request.dialog, message,
+                    ) is WorkspaceRefreshEffect.CONTROLS:
+                        controls_refresh = True
+            elif (
                 analysis_identity is self._analysis_identity
                 and not analysis_slot.owned
             ):
-                kind, target = self._analysis_kind, self._analysis_target
                 self._analysis_identity = None
                 self._analysis_kind = None
                 self._analysis_target = None
@@ -4140,17 +4314,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._analysis_anchor = None
                 self._analysis_request = None
                 self._analysis_fingerprint = ""
-                self._analysis_candidate = None
                 message = "Analysis failed before terminal publication."
                 self._notice(message)
-                if kind in {"metadata", "metadata_requalification"}:
-                    if self._finish_metadata_refresh(
-                        target, message,
-                    ) is WorkspaceRefreshEffect.CONTROLS:
-                        controls_refresh = True
-                else:
-                    changed = True
-                    force_scientific = True
+                changed = True
+                force_scientific = True
 
         deferred_refresh = self._dispatch_deferred_metadata()
         if deferred_refresh is WorkspaceRefreshEffect.CONTROLS:
@@ -5032,7 +5199,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         }:
             return True
         if (
-            self._deferred_metadata is not None
+            self._metadata_operations.polling_needed
             or self._admission is not None
             or getattr(self._context_controller, "viewer_1d_loading", False)
             or getattr(self._context_controller, "viewer_1d_cleanup_pending", False)
