@@ -17,10 +17,8 @@ from xrd_tools.core.staging import browse_publication_max_items
 from xrd_tools.io import (
     Browse1DCache,
     FrameScalarCatalog,
-    FrameScalarRow,
     FrameViewReader,
     ProcessedScan,
-    iter_frame_records,
 )
 from xrd_tools.io.browse_1d_cache import Browse1DCachePhase
 from xrd_tools.io.browse_presentation import read_browse_presentation
@@ -51,13 +49,6 @@ from ..events import CleanupStatus, DetachedDiagnostic, detach_exception
 _CLEANUP_PENDING = "pending"
 _CLEANUP_IN_PROGRESS = "in_progress"
 _CLEANUP_CLEANED = "cleaned"
-_DEFAULT_RECORD_READER = object()
-
-
-def _iter_browse_records(source: str):
-    """Read every cheap 1-D row while deferring current-frame heavy pixels."""
-
-    yield from iter_frame_records(source, include_heavy=False)
 
 
 @dataclass(slots=True)
@@ -95,7 +86,6 @@ class BrowseLoader:
         max_items: int | None = None,
         join_timeout: float = 5.0,
         open_scan=ProcessedScan,
-        read_records=_DEFAULT_RECORD_READER,
         open_reader=FrameViewReader,
         open_cache=Browse1DCache,
         clock: Callable[[], float] = monotonic,
@@ -108,15 +98,6 @@ class BrowseLoader:
         self._max_items = max_items
         self._join_timeout = float(join_timeout)
         self._open_scan = open_scan
-        # Omitted/default construction is the scalar-only production path.
-        # Explicit read_records remains a compatibility seam for old focused
-        # tests; it is projected to the same scalar catalog and never fills a
-        # GUI publication/record store.
-        self._read_records = (
-            None if read_records is _DEFAULT_RECORD_READER else read_records
-        )
-        if self._read_records is not None and not callable(self._read_records):
-            raise TypeError("browse legacy record reader must be callable")
         if not callable(open_reader):
             raise TypeError("browse scalar reader factory must be callable")
         self._open_reader = open_reader
@@ -323,6 +304,8 @@ class BrowseLoader:
         canonical_path: str,
         cancelled: Event,
     ) -> FrameScalarCatalog:
+        if type(operation) is not _BrowseOperation:
+            raise TypeError("browse scalar catalog requires its operation owner")
         reader = self._open_reader(
             canonical_path,
             resolve_source=False,
@@ -365,53 +348,6 @@ class BrowseLoader:
         if not self._close_operation_reader(operation, attempts=2):
             raise RuntimeError("browse scalar reader cleanup remains pending")
         return catalog
-
-    def _catalog_from_legacy_records(
-        self,
-        canonical_path: str,
-        entry: str,
-        cancelled: Event,
-    ) -> FrameScalarCatalog:
-        """Project the explicit legacy injection seam to scalar rows only."""
-
-        rows: list[FrameScalarRow] = []
-        assert self._read_records is not None
-        for record in self._read_records(canonical_path):
-            if cancelled.is_set():
-                raise InterruptedError("Browse scalar catalog read cancelled")
-            if type(record.label) is not int:
-                raise TypeError("processed frame labels must be integers")
-            view = record.active_view()
-            modes_1d = tuple(record.results_1d)
-            modes_2d = tuple(record.results_2d)
-            rows.append(FrameScalarRow(
-                label=record.label,
-                metadata_raw=view.metadata_raw,
-                geometry=None,
-                source_path=(
-                    None
-                    if view.source_path is None
-                    else str(view.source_path)
-                ),
-                source_frame_index=(
-                    None
-                    if view.source_frame_index is None
-                    else int(view.source_frame_index)
-                ),
-                has_thumbnail=view.thumbnail is not None,
-                mask_baked=bool(view.mask_baked),
-                modes_1d=modes_1d,
-                modes_2d=modes_2d,
-                active_mode_1d=record.active_mode_1d,
-                active_mode_2d=record.active_mode_2d,
-                two_d_kinds=tuple(
-                    (mode, record.results_2d[mode].two_d_kind)
-                    for mode in modes_2d
-                ),
-            ))
-        if cancelled.is_set():
-            raise InterruptedError("Browse scalar catalog read cancelled")
-        return FrameScalarCatalog(canonical_path, str(entry), tuple(rows))
 
     @property
     def _context(self) -> BrowseContext | None:
@@ -1032,7 +968,7 @@ class BrowseLoader:
         cancelled: Event,
         *,
         _timing: dict[str, object] | None = None,
-        _operation: _BrowseOperation | None = None,
+        _operation: _BrowseOperation,
     ) -> BrowseContext | None:
         def stage_start() -> float | None:
             if _timing is None or not bool(_timing.get("valid")):
@@ -1104,20 +1040,8 @@ class BrowseLoader:
             (request.token, scan_key, request.source_path)
         )
         started = stage_start()
-        if self._read_records is None and type(_operation) is not _BrowseOperation:
-            raise RuntimeError(
-                "production scalar Browse requires its operation owner"
-            )
-        catalog = (
-            self._catalog_from_reader(
-                _operation, canonical_path, cancelled,
-            )
-            if self._read_records is None
-            else self._catalog_from_legacy_records(
-                canonical_path,
-                str(getattr(scan, "entry", "entry")),
-                cancelled,
-            )
+        catalog = self._catalog_from_reader(
+            _operation, canonical_path, cancelled,
         )
         if type(catalog) is not FrameScalarCatalog:
             raise TypeError("Browse requires an exact FrameScalarCatalog")
