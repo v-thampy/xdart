@@ -2536,7 +2536,8 @@ def _ticket_state_compares(tree: ast.AST) -> set[tuple[str, tuple, tuple]]:
 
 
 def test_g12_only_an_exact_rejected_decision_drops_an_item():
-    """§19.5.4 — worker and writer drop on exactly ``_TICKET_REJECTED``; no
+    """§19.5.4 — worker and writer resolver drop on exactly
+    ``_TICKET_REJECTED``; no
     branch anywhere uses ``!= ACCEPTED``; absence is represented only by a
     missing immutable receipt, and ``await_decision`` keeps waiting for one."""
     tree = _parse_source(_CORE_SITE)
@@ -2547,7 +2548,7 @@ def test_g12_only_an_exact_rejected_decision_drops_an_item():
     assert not negations, (
         "an observer still drops on 'not ACCEPTED', so an undecided item has "
         f"an autonomous drop effect: {negations}")
-    for observer in ("_ticketed_stream_reduce", "_writer_loop"):
+    for observer in ("_ticketed_stream_reduce", "_resolve_writer_ticket"):
         exact = [c for c in compares if c[0] == observer
                  and c[2] == ("_TICKET_REJECTED",) and c[1] == ("Eq",)]
         assert exact, (
@@ -2771,9 +2772,14 @@ def test_generation_is_excluded_from_persistence_identity():
 
 _SRC_ROOT = pathlib.Path(__file__).resolve().parents[2] / "src"
 
-# The ONE declared StageLedger owner/composition site, repo-relative.
+# Declared StageLedger run-owner composition sites, repo-relative.
 _LEDGER_DEFINITION = "xrd_tools/session/stage_accounting.py"
 _LEDGER_COMPOSITION_SITE = "xrd_tools/session/scan_session.py"
+_LEDGER_RUN_COMPOSITION_SITES = frozenset({
+    "xdart/gui/tabs/scattering/adapters/dynamic_output.py",
+    "xrd_tools/reduction/reintegrate.py",
+    _LEDGER_COMPOSITION_SITE,
+})
 _OWNER_MODULE = "xrd_tools.session.stage_accounting"
 _OWNER_PACKAGE = "xrd_tools.session"
 _OWNER_NAME = "StageLedger"
@@ -2862,13 +2868,12 @@ def _census_file(path: pathlib.Path) -> tuple[bool, int, set[str]]:
     return imports_owner, constructions, imported_modules
 
 
-def test_owner_graph_census_allows_exactly_one_stage_ledger_owner():
+def test_owner_graph_census_allows_only_declared_stage_ledger_composers():
     """§6/§12.3.8/§13.3 owner-graph guard: an AST census of the PRODUCTION tree
-    proves exactly one declared StageLedger owner/composition site — catching a
-    second owner introduced through a relative, aliased or INTERMEDIARY-module
-    import (``from .scan_session import StageLedger as _X``), an assignment
-    alias, or a construction inside the definition module itself — and that the
-    dependency direction stays session→reduction."""
+    proves that only the declared run owners compose one StageLedger each —
+    catching another owner introduced through a relative, aliased or
+    INTERMEDIARY-module import, assignment alias, or a construction inside the
+    definition module itself."""
     files = sorted(_SRC_ROOT.rglob("*.py"))
     relative = {path: path.relative_to(_SRC_ROOT).as_posix() for path in files}
     assert _LEDGER_COMPOSITION_SITE in relative.values()
@@ -2886,14 +2891,17 @@ def test_owner_graph_census_allows_exactly_one_stage_ledger_owner():
         if constructions:
             constructors[name] = constructions
 
-    assert importers == {_LEDGER_COMPOSITION_SITE}, (
-        f"StageLedger is imported outside its declared composition site: "
-        f"{sorted(importers - {_LEDGER_COMPOSITION_SITE})}")
-    assert set(constructors) == {_LEDGER_COMPOSITION_SITE}, (
-        f"a second StageLedger owner exists: "
-        f"{sorted(set(constructors) - {_LEDGER_COMPOSITION_SITE})}")
-    assert constructors[_LEDGER_COMPOSITION_SITE] == 1, (
-        "the composition site must build exactly one ledger per session")
+    assert importers == _LEDGER_RUN_COMPOSITION_SITES, (
+        "StageLedger imports differ from the declared run composition sites: "
+        f"{sorted(importers ^ _LEDGER_RUN_COMPOSITION_SITES)}")
+    assert set(constructors) == _LEDGER_RUN_COMPOSITION_SITES, (
+        "StageLedger constructors differ from the declared run composition sites: "
+        f"{sorted(set(constructors) ^ _LEDGER_RUN_COMPOSITION_SITES)}")
+    assert all(constructors[site] == 1
+               for site in _LEDGER_RUN_COMPOSITION_SITES), (
+        f"each declared run owner must build exactly one ledger: {constructors}")
+
+
 def test_stage_accounting_is_qt_free_in_fresh_interpreter():
     """The accounting owner is headless (§4.4 boundary): importing it and the
     composed ScanSession in a clean interpreter must load no Qt/pyqtgraph."""
@@ -3370,9 +3378,9 @@ def test_r8_d1_atomic_owner_and_acceptance_api_census():
                      and node.func.attr == "release"]
     assert len(wake_calls) == 2
     assert len(release_calls) == 1
-    writer = next(node for node in session_class.body
-                  if isinstance(node, ast.FunctionDef)
-                  and node.name == "_writer_loop")
+    writer_resolver = next(node for node in session_class.body
+                           if isinstance(node, ast.FunctionDef)
+                           and node.name == "_resolve_writer_ticket")
     completion = next(node for node in session_class.body
                       if isinstance(node, ast.FunctionDef)
                       and node.name == "_complete_stream_publication")
@@ -3382,7 +3390,7 @@ def test_r8_d1_atomic_owner_and_acceptance_api_census():
                and isinstance(node.func, ast.Attribute)
                and node.func.attr == "task_done"
                for node in ast.walk(outer_tries[0].finalbody[0]))
-    rejected = next(node for node in ast.walk(writer)
+    rejected = next(node for node in ast.walk(writer_resolver)
                     if isinstance(node, ast.If)
                     and any(isinstance(inner, ast.Name)
                             and inner.id == "_TICKET_REJECTED"

@@ -627,9 +627,9 @@ def test_g6_exact_outcome_replay_restores_the_unchanged_certification():
 
 
 @pytest.mark.parametrize(
-    "leg", ("contradiction", "projection-exception", "failed-upsert"))
+    "leg", ("contradiction", "projection-exception"))
 def test_g6_conservative_block_survives_an_unrelated_later_receipt(leg):
-    """A contradiction, an owner exception or a failed upsert leaves the pair
+    """A contradiction or an owner exception leaves the pair
     blocked: real heavy pressure AND the post-terminal sweep retain its data
     even when the RAW store projection could not be cleared."""
     _requires_session_projection()
@@ -658,15 +658,11 @@ def test_g6_conservative_block_survives_an_unrelated_later_receipt(leg):
                 ItemDisposition.COMPLETED, (
                     "a contradictory outcome for the same attempt is rejected")
         else:
-            if leg == "projection-exception":
-                store.fail_projection = {0}
-            else:
-                store.fail_upsert = {0}
+            store.fail_projection = {0}
             session.resume()
             session.submit(Frame(0, image=np.full((4, 4), 9.0)))
             _drain(session)
             store.fail_projection = set()
-            store.fail_upsert = set()
 
         # Only NOW exceed the bound.  A raw stale durable projection would
         # select label 0, while the session-local block must retain it.
@@ -686,6 +682,46 @@ def test_g6_conservative_block_survives_an_unrelated_later_receipt(leg):
         session.finish(raise_on_failure=False)
     assert store.has_heavy_payload(0), (
         f"the post-terminal final sweep must honour the {leg} fence too")
+
+
+def test_g6_failed_upsert_is_sticky_and_retains_the_blocked_pair():
+    """A failed replacement upsert sticky-fails the run; the original durable
+    pair remains uncertified for the replacement and retains its heavy data."""
+    _requires_session_projection()
+    store = _InstrumentedStore(max_heavy_items=2)
+    frames = _frames(3)
+    session = _session(frames, store=store, **NX1)
+    result = None
+    try:
+        for frame in frames[:2]:
+            session.submit(frame)
+        _drain(session)
+        session.record_durable([session.accounting.receipt(0, M1, NEXUS)])
+        assert K1 in store.durable_modes(0)
+        assert store.has_heavy_payload(0)
+
+        store.fail_upsert = {0}
+        session.resume()
+        session.submit(Frame(0, image=np.full((4, 4), 9.0)))
+        _drain(session)
+        store.fail_upsert = set()
+
+        failure = session._session._current_failure()
+        assert isinstance(failure, RuntimeError)
+        assert str(failure) == "injected upsert failure for 0"
+        with pytest.raises(RuntimeError) as raised:
+            session.submit(frames[2])
+        assert raised.value is failure
+    finally:
+        store.fail_upsert = set()
+        session.resume()
+        result = session.finish(raise_on_failure=False)
+
+    assert result.failed is True
+    assert result.error == "injected upsert failure for 0"
+    assert K1 not in store.durable_modes(0)
+    assert store.has_heavy_payload(0), (
+        "the post-terminal final sweep must retain the failed replacement pair")
 
 
 # ══ G7 — the in-flight hydration fence (BEHAVIOURAL ONLY) ══════════════════
@@ -1049,13 +1085,16 @@ def _tokens(node) -> set[str]:
         child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
 
 
-def test_g15_one_ledger_construction_site_and_one_cadence_definition():
+def test_g15_declared_ledger_construction_sites_and_one_cadence_definition():
     src = _src_root()
     sites = [(rel, where, line) for rel, path in _py_files(src)
              for _name, where, line in _constructor_calls(path, {"StageLedger"})]
     assert [(rel, where) for rel, where, _line in sites] == [
-        ("xrd_tools/session/scan_session.py", "__init__")], (
-        f"exactly ONE ledger CONSTRUCTION SITE (not one file); got {sites}")
+        ("xdart/gui/tabs/scattering/adapters/dynamic_output.py",
+         "_activate_owned"),
+        ("xrd_tools/reduction/reintegrate.py", "run"),
+        ("xrd_tools/session/scan_session.py", "__init__"),
+    ], f"exactly the declared ledger composition sites; got {sites}"
 
     definitions = [(rel, node.lineno) for rel, path in _py_files(src)
                    for node in ast.walk(_tree(path))
@@ -1065,40 +1104,29 @@ def test_g15_one_ledger_construction_site_and_one_cadence_definition():
         "xrd_tools/session/policy.py", (
         "the cadence DEFINITION moves behind the session policy owner; a "
         f"second one is mutation 19.  Got {definitions}")
-_POLICY_NAMES = {"FlushPolicy", "SessionPolicy"}
-_CADENCE_COUNTERS = {"_since_save", "_frames_since_save", "frames_since_save"}
-_CADENCE_THRESHOLDS = {"LIVE_SAVE_INTERVAL", "_LIVE_SAVE_INTERVAL",
-                       "live_save_interval", "_flush_interval",
-                       "_in_memory_cap", "hard_threshold"}
-
-
 _PROJECTION_WRITES = {"mark_persisted", "mark_durable", "mark_dropped",
                       "replace_projection"}
-_STORE_RECEIVERS = ("record_store", "_record_store", "_streaming_record_store",
-                    "store", "_store")
 
 
 def test_g15_scan_session_is_the_only_production_store_projection_writer():
-    """Owner-aware census keeps noncanonical light/display owners legal."""
+    """Only ScanSession mutates the canonical FrameRecordStore projection."""
     offenders: list[tuple] = []
-    live_series: list[tuple] = []
-    display_light: list[tuple] = []
+    canonical: list[tuple] = []
     display_notifications: list[tuple] = []
     for rel, path in _py_files(_src_root()):
         for attr, recv, where, line in _method_calls(path, _PROJECTION_WRITES):
-            tail = "" if recv is None else recv.rsplit(".", 1)[-1]
-            if tail == "frames":
-                live_series.append((rel, attr, recv))
-            elif tail == "light_records":
-                display_light.append((rel, attr, recv))
-            elif attr == "mark_durable" and recv == "run.display":
+            if attr == "mark_durable" and recv == "run.display":
                 display_notifications.append((rel, attr, recv))
-            elif rel != "xrd_tools/session/scan_session.py":
+            elif rel == "xrd_tools/session/scan_session.py":
+                canonical.append((rel, attr, recv, where))
+            else:
                 offenders.append((rel, attr, recv, where, line))
-    assert live_series, (
-        "the acquisition staging owner stays distinguishable from the store API")
-    assert display_light, (
-        "the GUI-light cache stays distinguishable from the canonical store")
+    assert canonical == [(
+        "xrd_tools/session/scan_session.py",
+        "replace_projection",
+        "store",
+        "_reconcile_locked",
+    )], "the canonical projection has one exact mutation boundary"
     assert display_notifications == [(
         "xdart/gui/tabs/scattering/adapters/run_executor.py",
         "mark_durable",
