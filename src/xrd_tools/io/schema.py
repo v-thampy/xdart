@@ -544,10 +544,9 @@ def _stitched_datasets(axes: tuple[str, ...]) -> "Mapping[str, DatasetSpec]":
         specs[axes[1]] = DatasetSpec(
             axes[1], "float32", "axis", row_aligned=False,
             units_from="azimuthal_unit")
-    else:
-        specs["sigma"] = DatasetSpec(
-            "sigma", "float32", "error", row_aligned=False, required=False,
-            compressed=True)
+    specs["sigma"] = DatasetSpec(
+        "sigma", "float32", "error", row_aligned=False, required=False,
+        compressed=True)
     return MappingProxyType(specs)
 
 

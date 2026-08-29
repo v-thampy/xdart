@@ -10,6 +10,21 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "admit_analysis_artifact": ("xrd_tools.io.analysis_artifact", "admit_analysis_artifact"),
+    "AnalysisArtifactCleanupPending": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactCleanupPending"),
+    "AnalysisArtifactError": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactError"),
+    "AnalysisArtifactInspection": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactInspection"),
+    "AnalysisArtifactInvalid": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactInvalid"),
+    "AnalysisArtifactKind": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactKind"),
+    "AnalysisArtifactOutput": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactOutput"),
+    "AnalysisArtifactOutputSnapshot": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactOutputSnapshot"),
+    "AnalysisArtifactOverwrite": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactOverwrite"),
+    "AnalysisArtifactPayload": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactPayload"),
+    "AnalysisArtifactReceipt": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactReceipt"),
+    "AnalysisArtifactRequest": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactRequest"),
+    "canonical_analysis_provenance": ("xrd_tools.io.analysis_artifact", "canonical_analysis_provenance"),
+    "inspect_analysis_artifact": ("xrd_tools.io.analysis_artifact", "inspect_analysis_artifact"),
+    "read_analysis_artifact": ("xrd_tools.io.analysis_artifact", "read_analysis_artifact"),
     "aggregate_1d": ("xrd_tools.io.aggregate", "aggregate_1d"),
     "aggregate_2d": ("xrd_tools.io.aggregate", "aggregate_2d"),
     "Aggregated1D": ("xrd_tools.io.aggregate", "Aggregated1D"),

@@ -66,6 +66,9 @@ __all__ = [
 # headless writer produces; a raw acquisition (Eiger master, Bluesky NXWriter,
 # plain detector NeXus) never contains them.
 _PROCESSED_RESULT_GROUPS = ("integrated_1d", "integrated_2d")
+_ANALYSIS_RESULT_GROUPS = ("stitched_1d", "stitched_2d", "rsm")
+_ANALYSIS_SCHEMA_ATTR = "ssrl_schema"
+_ANALYSIS_SCHEMA_NAME = "xrd_tools.analysis_artifact"
 _MAX_CURRENT_RESULT_ROWS = 1_000_000
 _LABEL_VALIDATION_CHUNK = 65_536
 
@@ -121,7 +124,10 @@ def has_processed_output_markers_entry(entry: h5py.Group) -> bool:
         return isinstance(entry, h5py.Group) and (
             _attr_str(entry.attrs.get(SCHEMA_NAME_ATTR))
             == PROCESSED_SCHEMA_NAME
+            or _attr_str(entry.attrs.get(_ANALYSIS_SCHEMA_ATTR))
+            == _ANALYSIS_SCHEMA_NAME
             or any(group in entry for group in _PROCESSED_RESULT_GROUPS)
+            or any(group in entry for group in _ANALYSIS_RESULT_GROUPS)
         )
     except Exception:
         logger.debug(

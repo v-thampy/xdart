@@ -3337,6 +3337,72 @@ def write_frame_records(entry_grp: h5py.Group, records, *, compression=None) -> 
     )
 
 
+_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES = 4096
+_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_ITEMS = 16
+_MAX_BOUNDED_ARTIFACT_PROVENANCE_BYTES = 1 << 20
+
+
+def _bounded_artifact_text(value, name: str, *, max_bytes: int) -> bytes:
+    if type(value) is not str or not value:
+        raise TypeError(f"{name} must be an exact nonempty string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{name} must be valid UTF-8") from error
+    if len(encoded) > max_bytes:
+        raise ValueError(f"{name} exceeds the bounded artifact size")
+    return encoded
+
+
+def _bounded_artifact_provenance(provenance) -> str:
+    _bounded_artifact_text(
+        provenance,
+        "bounded artifact provenance",
+        max_bytes=_MAX_BOUNDED_ARTIFACT_PROVENANCE_BYTES,
+    )
+    return provenance
+
+
+def _bounded_text_attr(owner, name: str, value) -> None:
+    """Write one fixed-width UTF-8 attribute for strict analysis artifacts."""
+    if type(value) is str:
+        data = np.bytes_(
+            _bounded_artifact_text(
+                value,
+                f"analysis attribute {name}",
+                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
+            )
+        )
+    else:
+        if (
+            type(value) is not tuple
+            or not value
+            or len(value) > _MAX_BOUNDED_ARTIFACT_ATTRIBUTE_ITEMS
+        ):
+            raise TypeError(
+                f"analysis attribute {name} must be a bounded exact tuple"
+            )
+        encoded = tuple(
+            _bounded_artifact_text(
+                item,
+                f"analysis attribute {name}",
+                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
+            )
+            for item in value
+        )
+        width = max(1, *(len(item) for item in encoded))
+        data = np.asarray(encoded, dtype=f"S{width}")
+    if name in owner.attrs:
+        del owner.attrs[name]
+    owner.attrs.create(name, data)
+
+
+def _bound_analysis_nxdata(group: h5py.Group, axes: tuple[str, ...]) -> None:
+    _bounded_text_attr(group, "NX_class", "NXdata")
+    _bounded_text_attr(group, "signal", "intensity")
+    _bounded_text_attr(group, "axes", axes)
+
+
 def write_stitched(
     entry_grp: h5py.Group,
     *,
@@ -3346,6 +3412,7 @@ def write_stitched(
     frame_records=None,
     source_base=None,
     compression: str | None = None,
+    bounded_artifact: bool = False,
 ) -> None:
     """Write ``/entry/stitched_1d`` / ``/entry/stitched_2d`` — the symmetric
     counterpart to :func:`read_stitched`.
@@ -3358,13 +3425,45 @@ def write_stitched(
 
     ``provenance`` (the StitchPlan + applied CorrectionStack — typically
     ``StitchPlan.provenance()``) is stamped into each written group as a
-    ``provenance_json`` vlen-UTF8 blob, the same idiom as the diffractometer
-    ``config_json``; ``None`` writes no blob.  A dict is JSON-encoded; a str is
-    written verbatim (assumed already-JSON).
+    ``provenance_json`` blob; ``None`` writes no blob.  A dict is JSON-encoded;
+    a str is written verbatim (assumed already-JSON).  The analysis-artifact
+    boundary passes ``bounded_artifact=True`` so detached readers can reject
+    oversized fixed-width provenance and schema attributes before allocating
+    their contents.  The default retains the historical vlen-UTF8
+    representation for ordinary scan files.
     """
     ck = _comp_kwargs(compression)
+    if type(bounded_artifact) is not bool:
+        raise TypeError("bounded_artifact must be an exact bool")
     prov_json: str | None = None
-    if provenance is not None:
+    if bounded_artifact:
+        if (stitched_1d is None) == (stitched_2d is None):
+            raise ValueError(
+                "bounded analysis artifact requires exactly one stitched result"
+            )
+        if frame_records is not None or source_base is not None:
+            raise ValueError(
+                "bounded analysis artifact does not accept unbound frame records"
+            )
+        prov_json = _bounded_artifact_provenance(provenance)
+        if stitched_1d is not None:
+            _bounded_artifact_text(
+                stitched_1d.unit,
+                "stitched radial units",
+                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
+            )
+        if stitched_2d is not None:
+            _bounded_artifact_text(
+                stitched_2d.unit,
+                "stitched radial units",
+                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
+            )
+            _bounded_artifact_text(
+                stitched_2d.azimuthal_unit,
+                "stitched azimuthal units",
+                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
+            )
+    elif provenance is not None:
         prov_json = provenance if isinstance(provenance, str) else json.dumps(
             provenance, default=str)
 
@@ -3375,13 +3474,23 @@ def write_stitched(
         # (byte-identical to the hand-written form); only the per-axis units and
         # the provenance_json blob (an additive extra) are stamped by hand.
         g = _create_group_from_schema(entry_grp, "stitched_1d")
+        if bounded_artifact:
+            _bound_analysis_nxdata(g, ("q",))
         _schema_dataset(g, "stitched_1d", "intensity", stitched_1d.intensity, ck=ck)
         qd = _schema_dataset(g, "stitched_1d", "q", stitched_1d.radial, ck=ck)
         qd.attrs["units"] = stitched_1d.unit            # units_from="radial_unit"
+        if bounded_artifact:
+            _bounded_text_attr(qd, "units", stitched_1d.unit)
         if stitched_1d.sigma is not None:
             _schema_dataset(g, "stitched_1d", "sigma", stitched_1d.sigma, ck=ck)
         if prov_json is not None:
-            g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
+            if bounded_artifact:
+                g.create_dataset(
+                    "provenance_json",
+                    data=np.bytes_(prov_json.encode("utf-8")),
+                )
+            else:
+                g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
     if stitched_2d is not None:
         # Fail loud on a transposed cake: read_stitched blindly applies (q, chi)
@@ -3401,13 +3510,26 @@ def write_stitched(
         # intensity is stored as-is — see docstring.  Per-axis units + the
         # provenance_json blob stay hand-stamped.
         g = _create_group_from_schema(entry_grp, "stitched_2d")
+        if bounded_artifact:
+            _bound_analysis_nxdata(g, ("q", "chi"))
         _schema_dataset(g, "stitched_2d", "intensity", _i2d, ck=ck)
         qd = _schema_dataset(g, "stitched_2d", "q", stitched_2d.radial, ck=ck)
         qd.attrs["units"] = stitched_2d.unit            # units_from="radial_unit"
         cd = _schema_dataset(g, "stitched_2d", "chi", stitched_2d.azimuthal, ck=ck)
         cd.attrs["units"] = stitched_2d.azimuthal_unit  # units_from="azimuthal_unit"
+        if stitched_2d.sigma is not None:
+            _schema_dataset(g, "stitched_2d", "sigma", stitched_2d.sigma, ck=ck)
+        if bounded_artifact:
+            _bounded_text_attr(qd, "units", stitched_2d.unit)
+            _bounded_text_attr(cd, "units", stitched_2d.azimuthal_unit)
         if prov_json is not None:
-            g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
+            if bounded_artifact:
+                g.create_dataset(
+                    "provenance_json",
+                    data=np.bytes_(prov_json.encode("utf-8")),
+                )
+            else:
+                g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
     if frame_records:
         from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
@@ -3422,6 +3544,7 @@ def write_rsm(
     frame_records=None,
     source_base=None,
     compression: str | None = None,
+    bounded_artifact: bool = False,
 ) -> None:
     """Write ``/entry/rsm`` — a gridded :class:`~xrd_tools.rsm.RSMVolume` as an
     NXdata group (``h``/``k``/``l`` axes + the 3D ``intensity``), plus an optional
@@ -3429,6 +3552,19 @@ def write_rsm(
     idiom as :func:`write_stitched` / the diffractometer ``config_json``.  The
     group is replaced atomically (idempotent).
     """
+    if type(bounded_artifact) is not bool:
+        raise TypeError("bounded_artifact must be an exact bool")
+    if bounded_artifact:
+        if frame_records is not None or source_base is not None:
+            raise ValueError(
+                "bounded analysis artifact does not accept unbound frame records"
+            )
+        prov = _bounded_artifact_provenance(provenance)
+    elif provenance is not None:
+        prov = provenance if isinstance(provenance, str) else json.dumps(
+            provenance, default=str)
+    else:
+        prov = None
     ck = _comp_kwargs(compression)
     intensity = np.asarray(volume.intensity, np.float32)
     expected = (len(volume.h), len(volume.k), len(volume.l))
@@ -3443,13 +3579,19 @@ def write_rsm(
     # 2b: schema-routed group + datasets (byte-identical).  h/k/l carry NO units
     # (no units_from in the schema) — do not add any, it would change the bytes.
     g = _create_group_from_schema(entry_grp, "rsm")
+    if bounded_artifact:
+        _bound_analysis_nxdata(g, ("h", "k", "l"))
     _schema_dataset(g, "rsm", "intensity", intensity, ck=ck)
     for name, axis in (("h", volume.h), ("k", volume.k), ("l", volume.l)):
         _schema_dataset(g, "rsm", name, axis, ck=ck)
-    if provenance is not None:
-        prov = provenance if isinstance(provenance, str) else json.dumps(
-            provenance, default=str)
-        g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
+    if prov is not None:
+        if bounded_artifact:
+            g.create_dataset(
+                "provenance_json",
+                data=np.bytes_(prov.encode("utf-8")),
+            )
+        else:
+            g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
 
     if frame_records:
         from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
@@ -4758,6 +4900,10 @@ def read_stitched(
             data_vars["stitched_2d"] = (
                 ("q", "chi"), np.asarray(g["intensity"][()])
             )
+            if "sigma" in g:
+                data_vars["stitched_2d_sigma"] = (
+                    ("q", "chi"), np.asarray(g["sigma"][()])
+                )
             prov = _read_provenance(g)
             if prov is not None:
                 attrs["stitched_2d_provenance"] = prov

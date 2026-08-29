@@ -13,6 +13,7 @@ import math
 import os
 import struct
 import threading
+from contextlib import contextmanager
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -30,11 +31,13 @@ from xrd_tools.sources.discover import discover_scans
 from xrd_tools.sources.registry import guess_source_kind, open_source
 from xrd_tools.sources.selection import image_series_spec
 __all__ = [
-    "AnalysisDisposition", "AnalysisSourceReceipt", "MetadataColumn", "MetadataTablePlan",
+    "AnalysisDisposition", "AnalysisSourceLeaseRefused", "AnalysisSourceReceipt",
+    "MetadataColumn", "MetadataTablePlan",
     "MetadataTableResult", "MetadataTableRequalificationPlan",
     "MetadataTableRequalificationResult", "ScanPlotPlan", "ScanPlotResult", "RoiPreviewPlan",
     "RoiPreviewResult", "RoiScanPlan", "RoiScanResult", "run_metadata_table",
     "run_metadata_table_requalification", "run_scan_plot", "run_roi_preview", "run_roi_scan",
+    "analysis_canonical_fingerprint", "requalified_analysis_source",
 ]
 _MAX_TABLE_ROWS, _MAX_TABLE_COLUMNS = 100_000, 128
 _MAX_CANDIDATES, _MAX_CANDIDATE_BYTES = 256, 1 << 20
@@ -51,6 +54,11 @@ _CANONICAL_TAGS = {
 FileRevision = tuple[int, int, int, int, int, int]
 class InvalidCanonicalValue(ValueError):
     pass
+class AnalysisSourceLeaseRefused(RuntimeError):
+    """An exact retained source could not remain qualified for one body."""
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
 class AnalysisDisposition(str, Enum):
     COMPLETED = "completed"
     REFUSED = "refused"
@@ -176,6 +184,56 @@ def _digest(value: Any, *, allow_missing: bool = False) -> str:
     digest = hashlib.sha256()
     _canonical_stream(value, digest.update, allow_missing=allow_missing)
     return digest.hexdigest()
+class _PublicFingerprintContainer(Enum):
+    LIST = "list"
+    TUPLE = "tuple"
+    MAPPING = "mapping"
+def _public_fingerprint_projection(value: Any, active: set[int]) -> Any:
+    recursive = type(value) in {list, tuple} or isinstance(value, Mapping)
+    marker = id(value)
+    if recursive:
+        if marker in active:
+            raise InvalidCanonicalValue("cyclic canonical value")
+        active.add(marker)
+    try:
+        if type(value) is list:
+            return (
+                _PublicFingerprintContainer.LIST,
+                tuple(_public_fingerprint_projection(item, active) for item in value),
+            )
+        if type(value) is tuple:
+            return (
+                _PublicFingerprintContainer.TUPLE,
+                tuple(_public_fingerprint_projection(item, active) for item in value),
+            )
+        if isinstance(value, Mapping):
+            return (
+                _PublicFingerprintContainer.MAPPING,
+                {
+                    key: _public_fingerprint_projection(item, active)
+                    for key, item in value.items()
+                },
+            )
+        return value
+    finally:
+        if recursive:
+            active.remove(marker)
+def analysis_canonical_fingerprint(
+    domain: str, value: Any, *, allow_missing: bool = False,
+) -> str:
+    """Hash one type-framed value in an explicit public identity domain."""
+    if type(domain) is not str or not domain or domain.strip() != domain:
+        raise InvalidCanonicalValue("fingerprint domain must be an exact token")
+    if type(allow_missing) is not bool:
+        raise InvalidCanonicalValue("allow_missing must be an exact bool")
+    return _digest(
+        (
+            "analysis-public-fingerprint-v1",
+            domain,
+            _public_fingerprint_projection(value, set()),
+        ),
+        allow_missing=allow_missing,
+    )
 def _missing_numeric_array(size: int) -> np.ndarray:
     result = np.empty(int(size), dtype="<f8")
     result.view("<u8")[:] = _OUTPUT_QNAN_BITS
@@ -1143,6 +1201,28 @@ def run_scan_plot(
         )
     except _Refusal as error:
         return ScanPlotResult(AnalysisDisposition.REFUSED, error.code)
+def _source_close_note(cleanup: BaseException) -> str:
+    try:
+        message = str(cleanup)
+    except BaseException:
+        message = "exception message unavailable"
+    kind = type(cleanup)
+    return (
+        "source close also failed: "
+        f"{kind.__module__}.{kind.__qualname__}: {message[:4096]}"
+    )
+
+
+def _lease_refusal(refusal: _Refusal) -> AnalysisSourceLeaseRefused:
+    converted = AnalysisSourceLeaseRefused(refusal.code)
+    for note in getattr(refusal, "__notes__", ()):
+        try:
+            converted.add_note(note)
+        except BaseException:
+            pass
+    return converted
+
+
 def _requalify(receipt: AnalysisSourceReceipt) -> _Snapshot:
     snapshot = _snapshot(receipt.source_spec)
     exact_fields = (
@@ -1155,9 +1235,64 @@ def _requalify(receipt: AnalysisSourceReceipt) -> _Snapshot:
         getattr(snapshot.receipt, name) != getattr(receipt, name)
         for name in exact_fields
     ):
-        _close(snapshot.source)
-        raise _Refusal("SOURCE_IDENTITY_MISMATCH")
+        refusal = _Refusal("SOURCE_IDENTITY_MISMATCH")
+        try:
+            _close(snapshot.source)
+        except BaseException as cleanup:
+            refusal.add_note(_source_close_note(cleanup))
+        raise refusal
     return snapshot
+@contextmanager
+def requalified_analysis_source(
+    receipt: AnalysisSourceReceipt, *,
+    cancel_token: threading.Event | None = None,
+):
+    """Yield one exact reopened source under before/after revision fences.
+
+    The source handle is closed exactly once.  A body exception remains the
+    primary outcome; terminal fencing is applied only when the body returns
+    normally, so cleanup never disguises a scientific failure.
+    """
+    if type(receipt) is not AnalysisSourceReceipt:
+        raise TypeError("source lease requires an exact AnalysisSourceReceipt")
+    if not _valid_cancel(cancel_token):
+        raise TypeError("source lease requires a threading.Event cancellation token")
+    if cancel_token is not None and cancel_token.is_set():
+        raise AnalysisSourceLeaseRefused("CANCELLED")
+    snapshot = None
+    primary: BaseException | None = None
+    try:
+        try:
+            snapshot = _requalify(receipt)
+        except _Refusal as error:
+            raise _lease_refusal(error) from None
+        if cancel_token is not None and cancel_token.is_set():
+            raise AnalysisSourceLeaseRefused("CANCELLED")
+        try:
+            yield snapshot.source
+        except BaseException:
+            raise
+        else:
+            if cancel_token is not None and cancel_token.is_set():
+                raise AnalysisSourceLeaseRefused("CANCELLED")
+            try:
+                _terminal_fence(snapshot)
+            except _Refusal as error:
+                raise _lease_refusal(error) from None
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        if snapshot is not None:
+            try:
+                _close(snapshot.source)
+            except BaseException as cleanup:
+                if primary is None:
+                    raise
+                try:
+                    primary.add_note(_source_close_note(cleanup))
+                except BaseException:
+                    pass
 class _RoiSourceView:
     def __init__(self, source: Any, labels: tuple[int, ...]):
         self._source = source

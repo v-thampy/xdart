@@ -71,6 +71,38 @@ def _prepared(
     )
 
 
+def test_untouched_integrity_hold_can_abandon_only_after_exact_restore(
+    tmp_path: Path,
+) -> None:
+    (
+        api,
+        target,
+        _coordinator,
+        transaction,
+        _transaction_owner,
+        _target_owner,
+        owners,
+        lease,
+    ) = _prepared(tmp_path, prior=None)
+
+    target.write_bytes(b"foreign occupant")
+    with pytest.raises(api.TargetChanged, match="changed before abandonment"):
+        transaction.abandon(lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert target.read_bytes() == b"foreign occupant"
+    with pytest.raises(api.TargetChanged, match="changed before abandonment"):
+        transaction.abandon(lease)
+
+    target.unlink()
+    retired = transaction.abandon(lease)
+    assert retired.phase is api.TransactionPhase.ABORTED
+    released = None
+    for role in api.LeaseOwner:
+        released = transaction.release_lease_owner(lease, role, owners[role])
+    assert released is not None
+    assert released.remaining_owners == ()
+
+
 @pytest.mark.parametrize(
     ("durable_fsync", "expected_calls"),
     ((True, 2), (False, 0)),
@@ -226,6 +258,7 @@ def _execute(
     target_owner,
     lease,
     pool=None,
+    validate_writer_result=None,
 ):
     return transaction.execute(
         write,
@@ -234,7 +267,178 @@ def _execute(
         target_owner=target_owner,
         lease=lease,
         pool=pool or _Pool(),
+        validate_writer_result=validate_writer_result,
     )
+
+
+def test_writer_result_validator_observes_one_exact_captured_candidate(
+    tmp_path: Path,
+) -> None:
+    (
+        api,
+        target,
+        _coordinator,
+        transaction,
+        transaction_owner,
+        target_owner,
+        _owners_by_role,
+        lease,
+    ) = _prepared(tmp_path)
+    seen = []
+
+    def validator(path, captured):
+        seen.append((Path(path), captured))
+        assert Path(path) == transaction._candidate
+        assert api._capture_target(str(path)) == captured
+
+    outcome = _execute(
+        transaction,
+        lambda path: path.write_bytes(b"validated result"),
+        transaction_owner=transaction_owner,
+        target_owner=target_owner,
+        lease=lease,
+        validate_writer_result=validator,
+    )
+    assert outcome.phase is api.TransactionPhase.COMMITTED
+    assert target.read_bytes() == b"validated result"
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("prior", (None, b"exact prior"))
+def test_writer_result_validator_exception_rolls_back_exact_prior(
+    tmp_path: Path,
+    prior: bytes | None,
+) -> None:
+    (
+        api,
+        target,
+        _coordinator,
+        transaction,
+        transaction_owner,
+        target_owner,
+        _owners_by_role,
+        lease,
+    ) = _prepared(tmp_path, prior=prior)
+    writes = []
+
+    def refuse(_path, _captured):
+        raise ValueError("semantic refusal")
+
+    with pytest.raises(ValueError, match="semantic refusal"):
+        _execute(
+            transaction,
+            lambda path: (writes.append("writer"), path.write_bytes(b"candidate")),
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            validate_writer_result=refuse,
+        )
+    assert (target.read_bytes() if target.exists() else None) == prior
+    assert transaction.snapshot().phase is api.TransactionPhase.READY_TO_RETRY
+    assert writes == ["writer"]
+
+
+def test_writer_result_validator_mutation_is_caught_before_publication(
+    tmp_path: Path,
+) -> None:
+    (
+        api,
+        target,
+        _coordinator,
+        transaction,
+        transaction_owner,
+        target_owner,
+        _owners_by_role,
+        lease,
+    ) = _prepared(tmp_path, prior=None)
+
+    def mutate(path, _captured):
+        path.write_bytes(b"changed after semantic receipt")
+
+    with pytest.raises(api.TargetChanged, match="validated writer result"):
+        _execute(
+            transaction,
+            lambda path: path.write_bytes(b"validated candidate"),
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            validate_writer_result=mutate,
+        )
+    assert not target.exists()
+    assert transaction.snapshot().phase is api.TransactionPhase.READY_TO_RETRY
+
+
+def test_invalid_writer_result_validator_consumes_no_state(tmp_path: Path) -> None:
+    (
+        api,
+        target,
+        _coordinator,
+        transaction,
+        transaction_owner,
+        target_owner,
+        _owners_by_role,
+        lease,
+    ) = _prepared(tmp_path)
+    writes = []
+    with pytest.raises(TypeError, match="validator"):
+        _execute(
+            transaction,
+            lambda path: writes.append(path),
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            validate_writer_result=object(),
+        )
+    assert writes == []
+    assert target.read_bytes() == b"prior"
+    assert transaction.snapshot().phase is api.TransactionPhase.LEASED
+
+
+def test_validator_primary_survives_retryable_rollback_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        api,
+        target,
+        _coordinator,
+        transaction,
+        transaction_owner,
+        target_owner,
+        _owners_by_role,
+        lease,
+    ) = _prepared(tmp_path, prior=None)
+    real_unlink = api._unlink
+    failed = []
+    writes = []
+
+    def fail_candidate_once(path):
+        if Path(path) == transaction._candidate and not failed:
+            failed.append("candidate")
+            raise OSError("candidate cleanup fault")
+        return real_unlink(path)
+
+    monkeypatch.setattr(api, "_unlink", fail_candidate_once)
+    with pytest.raises(ValueError, match="semantic refusal") as raised:
+        _execute(
+            transaction,
+            lambda path: (writes.append("writer"), path.write_bytes(b"candidate")),
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            validate_writer_result=lambda _path, _snapshot: (
+                _ for _ in ()
+            ).throw(ValueError("semantic refusal")),
+        )
+    assert isinstance(raised.value.__cause__, OSError)
+    pending = transaction.snapshot()
+    assert pending.phase is api.TransactionPhase.CLEANUP_PENDING
+    assert pending.pending_actions == (api.RetryAction.CANDIDATE_UNLINK,)
+    assert pending.cleanup_token is not None
+    recovered = transaction.retry_cleanup(pending.cleanup_token)
+    assert recovered.phase is api.TransactionPhase.READY_TO_RETRY
+    assert not target.exists()
+    assert writes == ["writer"]
 
 
 @pytest.mark.parametrize(
@@ -3464,6 +3668,7 @@ def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
     allowed = {
         module_path,
         (module_path.parent / "__init__.py").resolve(),
+        (module_path.parent / "analysis_artifact.py").resolve(),
     }
     public_names = (
         "OutputTransactionCoordinator",
@@ -3512,6 +3717,7 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
     )
     allowed = {
         "xrd_tools/io/__init__.py",
+        "xrd_tools/io/analysis_artifact.py",
         "xrd_tools/io/append.py",
         "xrd_tools/io/record_writer.py",
         "xrd_tools/reduction/core.py",

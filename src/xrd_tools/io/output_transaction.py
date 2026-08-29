@@ -1070,10 +1070,30 @@ class OutputTransaction:
     def abandon(self, lease: TargetLease) -> TransactionSnapshot:
         with self._lock:
             self._require_lease(lease)
-            if self._phase not in {
-                TransactionPhase.LEASED,
-                TransactionPhase.READY_TO_RETRY,
-            } or self._pending:
+            untouched_integrity_hold = (
+                self._phase is TransactionPhase.INTEGRITY_HOLD
+                and not self._pending
+                and not self._published
+                and not self._writer_succeeded
+                and not self._writer_returned
+                and self._candidate_reservation is None
+                and self._candidate_snapshot is None
+                and self._backup_reservation is None
+                and self._captured_prior is None
+                and self._writer_receipt is None
+                and self._publication_receipt is None
+                and self._rollback_receipt is None
+                and self._stream_attempt is None
+                and self._stream_epoch_receipt is None
+                and self._stream_durable_floor is None
+            )
+            if (
+                self._phase not in {
+                    TransactionPhase.LEASED,
+                    TransactionPhase.READY_TO_RETRY,
+                }
+                and not untouched_integrity_hold
+            ) or self._pending:
                 raise TransactionStateError(
                     "only an untouched or exactly restored lease can be abandoned"
                 )
@@ -3267,6 +3287,7 @@ class OutputTransaction:
         target_owner: OwnerToken,
         lease: TargetLease,
         pool=None,
+        validate_writer_result: Callable[[Path, TargetSnapshot], object] | None = None,
     ) -> TransactionSnapshot:
         """Execute one writer under the admitted target and H10 pool boundary.
 
@@ -3274,6 +3295,8 @@ class OutputTransaction:
         pre-commit work is rolled back to the admitted prior target (or to
         absence) before this transaction can accept another explicit execute.
         """
+        if validate_writer_result is not None and not callable(validate_writer_result):
+            raise TypeError("writer-result validator must be callable")
         with self._lock:
             self._require_admission_owners(
                 admission=admission,
@@ -3369,6 +3392,22 @@ class OutputTransaction:
                     if observation_error is not None:
                         raise observation_error.with_traceback(
                             observation_error.__traceback__
+                        )
+
+                    if validate_writer_result is not None:
+                        writer_receipt = self._writer_receipt
+                        if writer_receipt is None or writer_receipt.result is None:
+                            raise TransactionStateError(
+                                "writer-result validation lacks an exact receipt"
+                            )
+                        validate_writer_result(
+                            self._candidate,
+                            writer_receipt.result.snapshot,
+                        )
+                        self._require_owned_snapshot(
+                            self._candidate,
+                            writer_receipt.result.snapshot,
+                            "validated writer result",
                         )
 
                     if self._captured_prior is not None:
