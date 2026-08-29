@@ -78,7 +78,7 @@ def test_tools_have_symmetric_breathing_room_and_scroll_reachability(
         assert layout.spacing() >= 8
 
         buttons = tools.tool_content.findChildren(QtWidgets.QPushButton)
-        assert len(buttons) == 12
+        assert len(buttons) == 12 + len(tools._EXTERNAL_VIEWERS)
         for before, after in zip(buttons, buttons[1:]):
             gap = after.geometry().top() - before.geometry().bottom() - 1
             assert gap >= 8

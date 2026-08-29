@@ -179,7 +179,7 @@ def test_e3_ui6_tools_are_heading_free_dynamic_and_scrollable(
         qapp.processEvents()
         assert not tools.findChildren(QtWidgets.QLabel, "toolsHeader")
         buttons = tools.findChildren(QtWidgets.QPushButton)
-        assert len(buttons) == 12
+        assert len(buttons) == 12 + len(tools._EXTERNAL_VIEWERS)
         assert all(button.parentWidget() is tools.tool_content for button in buttons)
         scroll = tools.tool_scroll.verticalScrollBar()
         assert tools.tool_scroll.verticalScrollBarPolicy() == (

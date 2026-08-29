@@ -11,6 +11,10 @@ from xrd_tools.session.readiness import ControlsProjection
 
 from .controls_readiness import ControlsReadinessProjection
 from .display_values import DisplayFrameKey, StandardTerminalTiming
+from .external_tools import (
+    ExternalToolsProjection,
+    unavailable_external_tools,
+)
 
 
 Scalar = str | int | float | bool | None
@@ -26,6 +30,7 @@ class ShellCommandKind(str, Enum):
     SHOW_METADATA = "show_metadata"
     SET_AUTO_LAST = "set_auto_last"
     LAUNCH_TOOL = "launch_tool"
+    LAUNCH_EXTERNAL_VIEWER = "launch_external_viewer"
     SET_NORM_CHANNEL = "set_norm_channel"
     SET_BACKGROUND = "set_background"
     SET_COLOR_MAP = "set_color_map"
@@ -596,6 +601,7 @@ class ShellProjection:
     controls_readiness: ControlsReadinessProjection = (
         ControlsReadinessProjection()
     )
+    external_tools: ExternalToolsProjection = unavailable_external_tools()
 
     def __post_init__(self) -> None:
         if type(self.revision) is not int or self.revision < 0:
@@ -604,6 +610,8 @@ class ShellProjection:
             raise TypeError("shell navigation must be exact")
         if type(self.controls_readiness) is not ControlsReadinessProjection:
             raise TypeError("shell Controls readiness must be exact")
+        if type(self.external_tools) is not ExternalToolsProjection:
+            raise TypeError("shell external viewer projection must be exact")
 
 
 def _scalar_is_valid(value: object) -> bool:

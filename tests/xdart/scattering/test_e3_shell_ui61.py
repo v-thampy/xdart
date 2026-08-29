@@ -318,7 +318,7 @@ def test_e3_ui61_tools_have_symmetric_padding_and_added_tool_is_reachable(
         assert margins.top() >= 8
 
         buttons = tools.findChildren(QtWidgets.QPushButton)
-        assert len(buttons) == 10
+        assert len(buttons) == 10 + len(tools._EXTERNAL_VIEWERS)
         scroll = tools.tool_scroll.verticalScrollBar()
         assert scroll.maximum() > 0
         scroll.setValue(scroll.maximum())

@@ -274,6 +274,8 @@ def test_e3_ui6_compact_shell_continuity_at_review_viewports(
             "≈ Phase Fitting",
             "▤ Plot Metadata",
             "▣ ROI Statistics",
+            "◇ Open Selected in NeXpy",
+            "▦ DashPVA HDF5 Viewer…",
         ]
         assert all(
             shell.tools.tool_content.rect().contains(

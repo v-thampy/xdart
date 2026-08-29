@@ -8,6 +8,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 from typing import Any, Callable
@@ -72,6 +73,7 @@ from .browse_values import (
     BrowseLoadOutcome,
     BrowseLoadRequest,
     BrowseLoadStatus,
+    LoadedBrowseCapture,
 )
 from .contracts import (
     AdmissionFailure,
@@ -142,6 +144,12 @@ from .experiment_authoring import (
     prepare_calibration_request, prepare_mask_request,
     resolve_calibration_executable,
     resolve_mask_executable,
+)
+from .external_tools import (
+    ExternalNexusQualification,
+    ExternalToolId,
+    ExternalToolRegistry,
+    external_tool_id,
 )
 from .shell_projection import (
     ScientificPreferences,
@@ -542,16 +550,30 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         profile_path_chooser: (
             Callable[[str, str], str | None] | None
         ) = None,
+        external_tool_registry: ExternalToolRegistry | None = None,
         browse_clock: Callable[[], float] = time.monotonic,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         if not callable(browse_clock):
             raise TypeError("terminal Browse clock must be callable")
+        if (
+            external_tool_registry is not None
+            and type(external_tool_registry) is not ExternalToolRegistry
+        ):
+            raise TypeError("external viewer registry must be exact")
         self.setObjectName("scatteringWorkspace")
         self._intents = intents
         self._lifecycle = lifecycle
         self._run_executor = executor
+        self._external_tools = (
+            ExternalToolRegistry()
+            if external_tool_registry is None
+            else external_tool_registry
+        )
+        self._external_nexus_refusal: (
+            tuple[LoadedBrowseCapture, ExternalNexusQualification] | None
+        ) = None
         self._pipeline = (
             StartPipeline(
                 intents=intents,
@@ -1999,6 +2021,81 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else self._context_controller.capture_loaded_browse(request)
         )
 
+    def _qualify_external_nexus(
+        self, *, validate_disk: bool,
+    ) -> ExternalNexusQualification:
+        """Return only a fresh selected loaded-Browse processed target."""
+
+        if type(validate_disk) is not bool:
+            raise TypeError("external NeXus validation flag must be exact")
+        if self._closing or self._closed:
+            self._external_nexus_refusal = None
+            return ExternalNexusQualification.refused(
+                "The workspace is closing; external viewers are unavailable."
+            )
+        capture = self._capture_current_loaded_browse()
+        held = self._external_nexus_refusal
+        held_is_current = (
+            type(capture) is LoadedBrowseCapture
+            and type(held) is tuple
+            and len(held) == 2
+            and type(held[0]) is LoadedBrowseCapture
+            and type(held[1]) is ExternalNexusQualification
+            and held[1].target is None
+            and held[0].is_exactly(capture)
+        )
+        if not held_is_current:
+            self._external_nexus_refusal = None
+            held = None
+        if self._workspace_operations.busy:
+            return ExternalNexusQualification.refused(
+                "A workspace operation is active; wait for it to finish."
+            )
+        if self._lifecycle.phase not in {RunPhase.IDLE, RunPhase.FAILED}:
+            return ExternalNexusQualification.refused(
+                "An acquisition writer is active; wait for it to finish."
+            )
+        if type(capture) is not LoadedBrowseCapture:
+            return ExternalNexusQualification.refused(
+                "Select one stable current processed .nexus file in Browse."
+            )
+        if held is not None:
+            return held[1]
+        if Path(capture.target).suffix.casefold() != ".nexus":
+            return ExternalNexusQualification.refused(
+                "The selected Browse target is not a processed .nexus file."
+            )
+        if validate_disk:
+            try:
+                state = Path(capture.target).stat()
+            except FileNotFoundError:
+                refusal = ExternalNexusQualification.refused(
+                    "The selected processed .nexus file is no longer available."
+                )
+                self._external_nexus_refusal = (capture, refusal)
+                return refusal
+            except OSError:
+                refusal = ExternalNexusQualification.refused(
+                    "The selected processed .nexus file could not be revalidated."
+                )
+                self._external_nexus_refusal = (capture, refusal)
+                return refusal
+            snapshot = capture.target_snapshot
+            if (
+                not stat.S_ISREG(state.st_mode)
+                or int(state.st_size) != snapshot.size
+                or int(state.st_mtime_ns) != snapshot.mtime_ns
+                or int(state.st_dev) != snapshot.device
+                or int(state.st_ino) != snapshot.inode
+            ):
+                refusal = ExternalNexusQualification.refused(
+                    "The selected processed .nexus file changed after it was "
+                    "loaded; refresh Browse before opening it."
+                )
+                self._external_nexus_refusal = (capture, refusal)
+                return refusal
+        return ExternalNexusQualification.ready(capture.target)
+
     def _retry_pending_reintegrate_reload(self) -> bool:
         browser = self._processed_browser
         directive = browser.pending_reintegrate_reload
@@ -2590,6 +2687,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._connections.clear()
         self._source_selection.finalize_close()
         self._processed_browser.retry_close()
+        self._external_nexus_refusal = None
         self._source_status.close()
         self._closed = True
 
@@ -2602,6 +2700,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return
         kind = command.kind
+        if kind is ShellCommandKind.LAUNCH_EXTERNAL_VIEWER:
+            tool = external_tool_id(command.value)
+            if tool is None:
+                return
+            nexus = (
+                self._qualify_external_nexus(validate_disk=True)
+                if tool is ExternalToolId.NEXPY_SELECTED
+                else None
+            )
+            receipt = self._external_tools.launch(
+                tool, nexus=nexus,
+            )
+            self._notice(receipt.diagnostic)
+            self._shell.tools.reconcile_external_tool(
+                self._external_tools.availability(
+                    tool, nexus=nexus,
+                )
+            )
+            return
         if kind in {ShellCommandKind.SHOW_METADATA, ShellCommandKind.LAUNCH_TOOL,
                     ShellCommandKind.ANALYSIS_ACTION}:
             from .analysis_mount import mount_target
@@ -5744,6 +5861,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             scientific=replace(
                 projection.scientific,
                 background_enabled=not self._mutating_operation_busy(),
+            ),
+            external_tools=self._external_tools.project(
+                nexus=self._qualify_external_nexus(
+                    validate_disk=False,
+                ),
             ),
         )
         pending_average = self._workspace_operations.average_pending

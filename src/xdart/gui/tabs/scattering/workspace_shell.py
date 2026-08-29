@@ -226,6 +226,7 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                 self.scientific.reconcile_action_availability(
                     state.scientific
                 )
+            self.tools.reconcile_external(state.external_tools)
             if not preserve_display:
                 self.browser.reconcile(
                     state.browser,

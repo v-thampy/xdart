@@ -240,7 +240,9 @@ def test_default_tools_panel_fits_every_tool_without_inner_scroll(
 
             tools = shell.tools
             buttons = tools.tool_content.findChildren(QtWidgets.QPushButton)
-            assert len(buttons) == len(tools._TOOLS)
+            assert len(buttons) == (
+                len(tools._TOOLS) + len(tools._EXTERNAL_VIEWERS)
+            )
             assert tools.tool_scroll.verticalScrollBar().maximum() == 0
             viewport = tools.tool_scroll.viewport()
             for button in buttons:

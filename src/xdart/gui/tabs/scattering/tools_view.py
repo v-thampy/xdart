@@ -6,6 +6,11 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.themes.spacing import current_spacing_tokens
 
+from .external_tools import (
+    ExternalToolAvailability,
+    ExternalToolsProjection,
+    unavailable_external_tools,
+)
 from .shell_values import ShellCommand, ShellCommandKind
 
 
@@ -17,6 +22,10 @@ class ToolsView(QtWidgets.QFrame):
         ("≈ Phase Fitting", "phase_fitting"),
         ("▤ Plot Metadata", "plot_metadata"),
         ("▣ ROI Statistics", "roi_statistics"),
+    )
+    _EXTERNAL_VIEWERS = (
+        ("◇ Open Selected in NeXpy", "nexpy_selected"),
+        ("▦ DashPVA HDF5 Viewer…", "dashpva_h5viewer"),
     )
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
@@ -39,6 +48,7 @@ class ToolsView(QtWidgets.QFrame):
         self.tool_content.setObjectName("e3ToolsContent")
         tools_layout = QtWidgets.QVBoxLayout(self.tool_content)
         self._tools_layout = tools_layout
+        self._tool_buttons: dict[str, QtWidgets.QPushButton] = {}
         for label, value in self._TOOLS:
             button = QtWidgets.QPushButton(label)
             button.setObjectName(f"e3Tool_{value}")
@@ -48,6 +58,19 @@ class ToolsView(QtWidgets.QFrame):
                 )
             )
             tools_layout.addWidget(button)
+            self._tool_buttons[value] = button
+        for label, value in self._EXTERNAL_VIEWERS:
+            button = QtWidgets.QPushButton(label)
+            button.setObjectName(f"e3Tool_{value}")
+            button.clicked.connect(
+                lambda _checked=False, target=value: self.commandRequested.emit(
+                    ShellCommand(
+                        ShellCommandKind.LAUNCH_EXTERNAL_VIEWER, target
+                    )
+                )
+            )
+            tools_layout.addWidget(button)
+            self._tool_buttons[value] = button
         self.tool_scroll.setWidget(self.tool_content)
         layout.addWidget(self.tool_scroll)
         self._natural_height: int | None = None
@@ -59,6 +82,24 @@ class ToolsView(QtWidgets.QFrame):
             QtWidgets.QSizePolicy.Policy.Maximum,
         )
         self._apply_spacing()
+        self.reconcile_external(unavailable_external_tools())
+
+    def reconcile_external(self, projection: ExternalToolsProjection) -> None:
+        if type(projection) is not ExternalToolsProjection:
+            raise TypeError("external viewer projection must be exact")
+        for status in projection.tools:
+            self.reconcile_external_tool(status)
+
+    def reconcile_external_tool(
+        self, status: ExternalToolAvailability,
+    ) -> None:
+        if type(status) is not ExternalToolAvailability:
+            raise TypeError("external viewer availability must be exact")
+        button = self._tool_buttons.get(status.tool.value)
+        if button is None:
+            raise RuntimeError("external viewer button inventory changed")
+        button.setEnabled(status.enabled)
+        button.setToolTip(status.reason)
 
     def sizeHint(self) -> QtCore.QSize:
         hint = super().sizeHint()
