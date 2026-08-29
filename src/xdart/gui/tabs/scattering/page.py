@@ -8,7 +8,6 @@ import logging
 import math
 import os
 from pathlib import Path
-import stat
 import tempfile
 import time
 from typing import Any, Callable
@@ -81,13 +80,22 @@ from .contracts import (
     AdmissionToken,
     RunExecutorPort,
     SourceCountScope,
-    SourceFileState,
     SourceObservation,
     SourcePort,
     SourceSelection,
 )
 from .context_controller import ContextController
 from .context_projection import ContextProjection
+from .authored_assets import (
+    AuthoredAssetDialogCommand,
+    AuthoredAssetDialogEffect,
+    AuthoredAssetDialogIdentity,
+    AuthoredAssetOwner,
+    AuthoredAssetOwnerLifecycle,
+    AuthoredAssetPhase,
+    AuthoredAssetRefreshEffect,
+    AuthoredAssetTransition,
+)
 from .controls_projection import (
     AdvancedSettingsValues,
     EditNoChange,
@@ -131,10 +139,6 @@ from .events import (
     detached_exception_strings,
 )
 from .experiment_authoring import (
-    AssetValidationRequest, AssetValidationResult, AuthoredAssetCandidate,
-    CalibrationRequest, CalibrationResult, MaskProof, MaskRequest, MaskResult,
-    authoring_source_context_current,
-    mask_terminal_result_valid,
     prepare_calibration_request, prepare_mask_request,
     resolve_calibration_executable,
     resolve_mask_executable,
@@ -492,22 +496,6 @@ class _AuthoredAssetDialog(QtWidgets.QDialog):
             self.cancelRequested.emit()
 
 
-@dataclass(slots=True)
-class _AuthoredAssetOwner:
-    token: int
-    asset: str
-    stamp: OperationContextStamp
-    source_directory: str
-    source_request: CalibrationRequest | MaskRequest
-    candidates: tuple[AuthoredAssetCandidate, ...]
-    expected_shape: tuple[int, int] | None
-    dialog: _AuthoredAssetDialog
-    queued: bool = True
-    validation_identity: OperationIdentity | None = None
-    validation_request: AssetValidationRequest | None = None
-    requested_path: str | None = None
-
-
 class ScatteringWorkspace(QtWidgets.QWidget):
     """One command owner around one passive shell and one context controller."""
 
@@ -687,18 +675,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             projection=self._context_projection,
         )
         self._workspace_operations = WorkspaceOperationOwner()
+        self._authored_assets = AuthoredAssetOwner(intents)
+        self._authored_asset_dialog: _AuthoredAssetDialog | None = None
+        self._authored_asset_dialog_identity: (
+            AuthoredAssetDialogIdentity | None
+        ) = None
         self._analysis_slot = OperationSlot()
         self._background_owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_identity: OperationIdentity | None = None
-        self._calibration_identity: OperationIdentity | None = None; self._calibration_revision: int | None = None
-        self._calibration_stamp: OperationContextStamp | None = None
-        self._calibration_request: object | None = None
-        self._mask_identity: OperationIdentity | None = None; self._mask_revision: int | None = None
-        self._mask_stamp: OperationContextStamp | None = None
-        self._mask_request: object | None = None
-        self._authored_asset_token = 0
-        self._authored_asset_owner: _AuthoredAssetOwner | None = None
-        self._asset_validation_identity: OperationIdentity | None = None
         self._metadata_dialog = self._scan_roi_dialog = None
         self._peak_dialog = self._phase_dialog = None
         self._metadata_generation = self._scan_roi_generation = 0
@@ -786,7 +770,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _experiment_operation_busy(self) -> bool:
         return (self._workspace_operations.busy
                 or self._processed_browser.busy
-                or self._authored_asset_owner is not None
+                or self._authored_assets.busy
         )
 
     def _analysis_operation_busy(self) -> bool:
@@ -966,7 +950,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         request=None, anchor=None, table=None, roi=None,
                         candidate=None):
         if (
-            self._authored_asset_owner is not None
+            self._authored_assets.busy
             or self._analysis_identity is not None
         ):
             return None
@@ -1083,7 +1067,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         controller = self._context_controller
         if (
             self._analysis_slot.owned
-            or self._authored_asset_owner is not None
+            or self._authored_assets.busy
             or controller.browse_pending
             or controller.viewer_1d_cleanup_pending
             or controller.viewer_2d_cleanup_pending
@@ -1564,8 +1548,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._ensure_timer(); return False
 
     def _calibrate_action(self) -> None:
-        operations, identity = self._workspace_operations, self._calibration_identity
-        if identity is not None and operations.current_identity is identity:
+        operations = self._workspace_operations
+        authored = self._authored_assets
+        identity = authored.operation_identity
+        if (authored.phase is AuthoredAssetPhase.RUNNING
+                and authored.asset == "poni"
+                and identity is not None
+                and operations.current_identity is identity):
             accepted = operations.cancel(identity)
             self._notice("Cancelling calibration…" if accepted else "Calibration cancellation was not accepted.")
             self._refresh_shell(); return
@@ -1597,71 +1586,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         identity = operations.begin_calibrate(request, stamp)
         if identity is None:
             self._notice("Calibration operation was not started."); return
-        self._calibration_identity, self._calibration_revision = identity, snapshot.revision
-        self._calibration_stamp = stamp
-        self._calibration_request = request
+        transition = authored.adopt_operation("poni", request, stamp, identity)
+        if authored.operation_identity is not identity:
+            operations.cancel(identity)
+            self._notice("Calibration operation lost authored-asset custody.")
+            self._ensure_timer(); return
+        self._apply_authored_asset_transition(transition)
         self._notice(f"Calibrating from {os.path.basename(request.source_path)}…")
-        self._refresh_shell(); self._ensure_timer()
-    def _consume_calibration_update(self, update: object) -> bool:
-        if type(update) is not OperationUpdate or update.identity is not self._calibration_identity: return False
-        if update.terminal is None:
-            if update.progress is not None: self._notice(f"Calibration: {update.progress.stage}…")
-            return True
-        terminal, stamp, request = (
-            update.terminal, self._calibration_stamp, self._calibration_request,
-        )
-        self._calibration_identity = self._calibration_revision = None
-        self._calibration_stamp = self._calibration_request = None
-        if terminal.status is not OperationTerminalStatus.RETURNED:
-            self._notice("Calibration cancelled." if terminal.status is OperationTerminalStatus.CANCELLED else f"Calibration failed: {terminal.diagnostic}")
-            return True
-        result = terminal.payload
-        try:
-            expected_argv = (
-                (request.executable, request.source_path)
-                if (type(request) is CalibrationRequest
-                    and Path(request.source_path).suffix.casefold()
-                    not in {".h5", ".hdf5", ".nxs", ".nexus"})
-                else (request.executable, request.exact_hdf_url)
-                if (type(request) is CalibrationRequest
-                    and request.exact_hdf_url is not None)
-                else (request.executable,)
-                if type(request) is CalibrationRequest else ()
-            )
-            valid = (type(result) is CalibrationResult
-                     and result.request is request and stamp is not None
-                     and result.exit_code == 0
-                     and result.argv == expected_argv
-                     and result.diagnostic == "")
-            if valid: result.__post_init__()
-        except (AttributeError, TypeError, ValueError):
-            valid = False
-        if not valid:
-            self._notice("Calibration returned without exact discovery proof."); return True
-        if update.stale or self._operation_context_stamp() != stamp:
-            self._notice("Calibration finished but context changed; PONI was not adopted.")
-            return True
-        if not authoring_source_context_current(request):
-            self._notice("Calibration source context changed; PONI was not adopted.")
-            return True
-        candidates = tuple(AuthoredAssetCandidate(
-            "poni", candidate.path, candidate.proof, candidate.proof.state,
-        ) for candidate in result.candidates)
-        self._queue_authored_asset_confirmation(
-            "poni", stamp, result.request.monitored_directory,
-            result.request, candidates,
-            expected_shape=None,
-        )
-        self._notice(
-            "Choose whether to adopt the authored PONI."
-            if candidates else
-            "No new valid PONI was found; choose an existing PONI or cancel."
-        )
-        return True
 
     def _mask_action(self) -> None:
-        operations, identity = self._workspace_operations, self._mask_identity
-        if identity is not None and operations.current_identity is identity:
+        operations = self._workspace_operations
+        authored = self._authored_assets
+        identity = authored.operation_identity
+        if (authored.phase is AuthoredAssetPhase.RUNNING
+                and authored.asset == "mask"
+                and identity is not None
+                and operations.current_identity is identity):
             accepted = operations.cancel(identity); self._notice("Cancelling mask…" if accepted else "Mask cancellation was not accepted.")
             self._refresh_shell(); return
         if not self._commit_focused_control_edit_for_run(): return
@@ -1689,408 +1629,228 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         identity = operations.begin_mask(request, stamp)
         if identity is None:
             self._notice("Mask operation was not started."); return
-        self._mask_identity, self._mask_revision = identity, snapshot.revision
-        self._mask_stamp = stamp
-        self._mask_request = request
-        self._notice(f"Making {os.path.basename(request.final_path)}…"); self._refresh_shell(); self._ensure_timer()
-    def _consume_mask_update(self, update: object) -> bool:
-        if type(update) is not OperationUpdate or update.identity is not self._mask_identity: return False
-        if update.terminal is None:
-            if update.progress is not None: self._notice(f"Mask: {update.progress.stage}…")
-            return True
-        terminal, stamp, request = (
-            update.terminal, self._mask_stamp, self._mask_request,
-        )
-        self._mask_identity = self._mask_revision = None
-        self._mask_stamp = self._mask_request = None
-        result = terminal.payload
-        exact = (type(request) is MaskRequest
-                 and mask_terminal_result_valid(terminal, request))
-        generic_failure = (terminal.status is OperationTerminalStatus.FAILED
-                           and result is None)
-        if not exact and not generic_failure:
-            self._notice("Mask returned without exact publication proof.")
-            return True
-        if terminal.status is not OperationTerminalStatus.RETURNED:
-            self._notice("Mask cancelled." if terminal.status is OperationTerminalStatus.CANCELLED else f"Mask failed: {terminal.diagnostic}"); return True
-        if update.stale or stamp is None or self._operation_context_stamp() != stamp:
-            self._notice("Mask was published but context changed; mask was not adopted."); return True
-        if not authoring_source_context_current(request):
-            self._notice("Mask source context changed; mask was not adopted.")
-            return True
-        candidate = AuthoredAssetCandidate(
-            "mask", result.request.final_path, result.proof, result.final_state,
-            result.request.source_path,
-        )
-        self._queue_authored_asset_confirmation(
-            "mask", stamp, str(Path(result.request.source_path).parent),
-            result.request, (candidate,), expected_shape=result.proof.shape,
-        )
-        self._notice("Choose whether to adopt the generated mask.")
-        return True
+        transition = authored.adopt_operation("mask", request, stamp, identity)
+        if authored.operation_identity is not identity:
+            operations.cancel(identity)
+            self._notice("Mask operation lost authored-asset custody.")
+            self._ensure_timer(); return
+        self._apply_authored_asset_transition(transition)
+        self._notice(f"Making {os.path.basename(request.final_path)}…")
 
-    def _queue_authored_asset_confirmation(
-        self, asset: str, stamp: OperationContextStamp,
-        source_directory: str,
-        source_request: CalibrationRequest | MaskRequest,
-        candidates: tuple[AuthoredAssetCandidate, ...], *,
-        expected_shape: tuple[int, int] | None,
+    def _apply_authored_asset_transition(
+        self, transition: AuthoredAssetTransition,
     ) -> None:
-        if self._authored_asset_owner is not None:
-            self._notice("Another authored-asset confirmation is pending.")
+        if type(transition) is not AuthoredAssetTransition:
             return
-        try:
-            valid = (asset in {"poni", "mask"}
-                     and type(stamp) is OperationContextStamp
-                     and type(source_directory) is str
-                     and os.path.isabs(source_directory)
-                     and 0 < len(source_directory.encode("utf-8")) <= 16 << 10
-                     and type(candidates) is tuple
-                     and len(candidates) <= 256
-                     and (asset == "poni") == (expected_shape is None)
-                     and (expected_shape is None or type(expected_shape) is tuple
-                          and len(expected_shape) == 2
-                          and all(type(value) is int and value > 0
-                                  for value in expected_shape))
-                     and (asset == "poni" or len(candidates) == 1))
-            valid = (valid
-                     and type(source_request) in {CalibrationRequest, MaskRequest}
-                     and (asset == "poni")
-                     == (type(source_request) is CalibrationRequest)
-                     and source_request.source_path
-                     == source_request.source_state.path
-                     and Path(source_request.source_path).parent
-                     == Path(source_directory)
-                     and authoring_source_context_current(source_request))
-            if valid:
-                stamp.__post_init__()
-                for candidate in candidates:
-                    if type(candidate) is not AuthoredAssetCandidate:
-                        valid = False
-                        break
-                    candidate.__post_init__()
-                    if (candidate.asset != asset
-                            or Path(candidate.path).parent
-                            != Path(source_directory)
-                            or expected_shape is not None
-                            and candidate.proof.shape != expected_shape):
-                        valid = False
-                        break
-            if (valid and asset == "poni"
-                    and sum(candidate.state.size for candidate in candidates)
-                    > 16 << 20):
-                valid = False
-        except (AttributeError, TypeError, ValueError, OverflowError,
-                UnicodeEncodeError):
-            valid = False
-        if not valid:
-            self._notice("Authored asset confirmation proof is invalid.")
-            return
-        self._authored_asset_token += 1
-        token = self._authored_asset_token
-        dialog = _AuthoredAssetDialog(
-            asset, tuple(candidate.path for candidate in candidates), self,
-        )
-        owner = _AuthoredAssetOwner(
-            token, asset, stamp, source_directory, source_request, candidates,
-            expected_shape, dialog,
-        )
-        self._authored_asset_owner = owner
-        dialog.acceptRequested.connect(
-            lambda path, t=token, d=dialog:
-            self._accept_authored_asset(t, d, path)
-        )
-        dialog.chooseRequested.connect(
-            lambda t=token, d=dialog:
-            self._choose_another_authored_asset(t, d)
-        )
-        dialog.cancelRequested.connect(
-            lambda t=token, d=dialog:
-            self._cancel_authored_asset(t, d)
-        )
-        dialog.destroyed.connect(
-            lambda _object=None, t=token, d=dialog:
-            self._authored_asset_dialog_destroyed(t, d)
-        )
-
-    def _authored_asset_context_current(
-        self, owner: _AuthoredAssetOwner,
-    ) -> bool:
-        return (not self._closing and not self._closed
-                and self._authored_asset_owner is owner
-                and self._operation_context_stamp() == owner.stamp
-                and authoring_source_context_current(owner.source_request))
-
-    def _show_queued_authored_asset_confirmation(self) -> None:
-        owner = self._authored_asset_owner
-        if owner is None or not owner.queued:
-            return
-        if not self._authored_asset_context_current(owner):
-            self._retire_authored_asset(
-                owner, "Authored asset context changed; nothing was adopted.",
+        adoption = transition.adoption
+        if (
+            adoption is not None
+            and type(adoption.result)
+            in {IntentCommitAccepted, IntentRecaptureRequired}
+        ):
+            self._reconcile_snapshot(
+                adoption.before, adoption.result.snapshot,
             )
+            if adoption.remember_path:
+                remember_browse_path(adoption.path)
+        if transition.notice:
+            self._notice(transition.notice)
+        if transition.cancel_identity is not None:
+            self._workspace_operations.cancel(transition.cancel_identity)
+        issue = transition.issue
+        if issue is not None:
+            dialog = _AuthoredAssetDialog(issue.asset, issue.paths, self)
+            self._authored_asset_dialog = dialog
+            self._authored_asset_dialog_identity = issue.identity
+            identity = issue.identity
+            dialog.acceptRequested.connect(
+                lambda path, i=identity, d=dialog:
+                self._accept_authored_asset(i, d, path)
+            )
+            dialog.chooseRequested.connect(
+                lambda i=identity, d=dialog:
+                self._choose_another_authored_asset(i, d)
+            )
+            dialog.cancelRequested.connect(
+                lambda i=identity, d=dialog:
+                self._cancel_authored_asset(i, d)
+            )
+            dialog.destroyed.connect(
+                lambda _object=None, i=identity, d=dialog:
+                self._authored_asset_dialog_destroyed(i, d)
+            )
+        if transition.dialog is not None:
+            self._apply_authored_asset_dialog_command(transition.dialog)
+        if self._closing or self._closed:
             return
-        owner.queued = False
-        owner.dialog.open()
-        (owner.dialog.accept_button
-         if owner.dialog.accept_button.isEnabled()
-         else owner.dialog.choose_button).setFocus(
-            QtCore.Qt.FocusReason.OtherFocusReason,
-        )
-        owner.dialog.raise_()
-        owner.dialog.activateWindow()
-
-    def _retire_authored_asset(
-        self, owner: _AuthoredAssetOwner, notice: str = "",
-    ) -> None:
-        if self._authored_asset_owner is not owner:
-            return
-        self._authored_asset_owner = None
-        if self._asset_validation_identity is owner.validation_identity:
-            self._asset_validation_identity = None
-        owner.dialog.close_inert()
-        if notice:
-            self._notice(notice)
-        if not self._closing and not self._closed:
-            self._refresh_shell(preserve_scientific=True)
+        if transition.refresh is AuthoredAssetRefreshEffect.CONTROLS:
+            self._refresh_shell(
+                preserve_display=True,
+                preserve_scientific=True,
+            )
             self._ensure_timer()
+        elif transition.refresh is AuthoredAssetRefreshEffect.DIALOG:
+            self._ensure_timer()
+
+    def _apply_authored_asset_dialog_command(
+        self, command: AuthoredAssetDialogCommand,
+    ) -> None:
+        dialog = self._authored_asset_dialog
+        if (dialog is None
+                or command.identity is not self._authored_asset_dialog_identity):
+            return
+        if command.effect is AuthoredAssetDialogEffect.OPEN:
+            dialog.open()
+            (dialog.accept_button if dialog.accept_button.isEnabled()
+             else dialog.choose_button).setFocus(
+                QtCore.Qt.FocusReason.OtherFocusReason,
+            )
+            dialog.raise_(); dialog.activateWindow()
+        elif command.effect is AuthoredAssetDialogEffect.CLOSE:
+            dialog.close_inert()
+        elif command.effect is AuthoredAssetDialogEffect.SET_BUSY:
+            dialog.set_busy(True)
+        elif command.effect is AuthoredAssetDialogEffect.SET_IDLE:
+            dialog.set_busy(False)
+
+    def _advance_authored_asset_confirmation(self) -> None:
+        authored = self._authored_assets
+        stamp = self._operation_context_stamp()
+        if authored.phase is AuthoredAssetPhase.TERMINAL_READY:
+            evidence = authored.evidence_identity
+            if evidence is not None:
+                self._apply_authored_asset_transition(
+                    authored.issue_confirmation(evidence, stamp)
+                )
+            return
+        if (authored.phase is AuthoredAssetPhase.CONFIRM_ISSUED
+                and authored.dialog_identity
+                is self._authored_asset_dialog_identity):
+            identity = authored.dialog_identity
+            if identity is not None:
+                self._apply_authored_asset_transition(
+                    authored.present_confirmation(identity, stamp)
+                )
 
     def _authored_asset_dialog_destroyed(
-        self, token: int, dialog: _AuthoredAssetDialog,
+        self, identity: AuthoredAssetDialogIdentity,
+        dialog: _AuthoredAssetDialog,
     ) -> None:
-        owner = self._authored_asset_owner
-        if (owner is None or owner.token != token
-                or owner.dialog is not dialog):
+        if (identity is not self._authored_asset_dialog_identity
+                or dialog is not self._authored_asset_dialog):
             return
-        if owner.validation_identity is not None:
-            self._workspace_operations.cancel(owner.validation_identity)
-        self._authored_asset_owner = None
-        self._asset_validation_identity = None
-        if not self._closing and not self._closed:
-            self._notice("Authored asset was not adopted.")
-            self._refresh_shell()
-            self._ensure_timer()
+        self._authored_asset_dialog = None
+        self._authored_asset_dialog_identity = None
+        self._apply_authored_asset_transition(
+            self._authored_assets.detach_dialog(identity)
+        )
 
     def _cancel_authored_asset(
-        self, token: int, dialog: _AuthoredAssetDialog,
+        self, identity: AuthoredAssetDialogIdentity,
+        dialog: _AuthoredAssetDialog,
     ) -> None:
-        owner = self._authored_asset_owner
-        if (owner is None or owner.token != token
-                or owner.dialog is not dialog
-                or owner.validation_identity is not None):
+        if (identity is not self._authored_asset_dialog_identity
+                or dialog is not self._authored_asset_dialog):
             return
-        label = "PONI" if owner.asset == "poni" else "mask"
-        self._retire_authored_asset(owner, f"{label} was not adopted.")
+        self._apply_authored_asset_transition(
+            self._authored_assets.cancel_confirmation(identity)
+        )
 
     def _accept_authored_asset(
-        self, token: int, dialog: _AuthoredAssetDialog, path: str,
+        self, identity: AuthoredAssetDialogIdentity,
+        dialog: _AuthoredAssetDialog, path: str,
     ) -> None:
-        owner = self._authored_asset_owner
-        if (owner is None or owner.token != token
-                or owner.dialog is not dialog
-                or owner.validation_identity is not None):
+        if (identity is not self._authored_asset_dialog_identity
+                or dialog is not self._authored_asset_dialog):
             return
-        if not self._authored_asset_context_current(owner):
-            self._retire_authored_asset(
-                owner, "Authored asset context changed; nothing was adopted.",
+        request = self._authored_assets.validation_request(
+            identity, path, self._operation_context_stamp(),
+        )
+        if request is None:
+            self._apply_authored_asset_transition(
+                self._authored_assets.cancel_confirmation(identity)
             )
             return
-        candidate = next(
-            (item for item in owner.candidates if item.path == path), None,
-        )
-        if candidate is None:
-            self._notice("The selected authored asset is unavailable.")
-            return
-        self._begin_authored_asset_validation(
-            owner, AssetValidationRequest(
-                owner.asset, candidate.path, owner.expected_shape, candidate,
-                owner.source_request,
-            ),
-        )
+        self._begin_authored_validation(identity, dialog, request)
 
     def _choose_another_authored_asset(
-        self, token: int, dialog: _AuthoredAssetDialog,
+        self, identity: AuthoredAssetDialogIdentity,
+        dialog: _AuthoredAssetDialog,
     ) -> None:
-        owner = self._authored_asset_owner
-        if (owner is None or owner.token != token
-                or owner.dialog is not dialog
-                or owner.validation_identity is not None):
+        authored = self._authored_assets
+        if (identity is not self._authored_asset_dialog_identity
+                or dialog is not self._authored_asset_dialog
+                or authored.phase is not AuthoredAssetPhase.CONFIRM_PRESENTED):
             return
-        if not self._authored_asset_context_current(owner):
-            self._retire_authored_asset(
-                owner, "Authored asset context changed; nothing was adopted.",
-            )
+        asset = authored.asset
+        directory = authored.source_directory
+        if asset not in {"poni", "mask"} or directory is None:
             return
         chooser = self._control_path_chooser
-        control = PONI_FILE if owner.asset == "poni" else MASK_FILE
-        snapshot = self._intents.snapshot(); intent = snapshot.thaw()
-        current_value = (intent.poni_file if owner.asset == "poni"
-                         else intent.mask_file)
+        control = PONI_FILE if asset == "poni" else MASK_FILE
+        intent = self._intents.snapshot().thaw()
+        current_value = intent.poni_file if asset == "poni" else intent.mask_file
         current = "" if current_value is None else str(current_value)
         try:
-            selected = (chooser(control, current, owner.source_directory)
+            selected = (chooser(control, current, directory)
                         if chooser is not None else
                         QtWidgets.QFileDialog.getOpenFileName(
                             self,
-                            "Choose existing PONI" if owner.asset == "poni"
+                            "Choose existing PONI" if asset == "poni"
                             else "Choose existing detector mask",
-                            owner.source_directory,
+                            directory,
                             "PONI files (*.poni);;All files (*)"
-                            if owner.asset == "poni" else
+                            if asset == "poni" else
                             "Detector masks (*.edf *.tif *.tiff *.npy);;All files (*)",
                         )[0])
         except Exception as error:
             self._error_notice("Asset chooser failed", error); return
         if type(selected) is not str or not selected:
             return
-        if (not os.path.isabs(selected)
-                or not self._authored_asset_context_current(owner)):
-            self._retire_authored_asset(
-                owner, "Authored asset context changed; nothing was adopted.",
+        request = authored.validation_request(
+            identity, selected, self._operation_context_stamp(),
+        )
+        if request is None:
+            self._apply_authored_asset_transition(
+                authored.cancel_confirmation(identity)
             )
             return
-        self._begin_authored_asset_validation(
-            owner, AssetValidationRequest(
-                owner.asset, selected, owner.expected_shape,
-                source_request=owner.source_request,
-            ),
-        )
+        self._begin_authored_validation(identity, dialog, request)
 
-    def _begin_authored_asset_validation(
-        self, owner: _AuthoredAssetOwner,
-        request: AssetValidationRequest,
+    def _begin_authored_validation(
+        self, identity: AuthoredAssetDialogIdentity,
+        dialog: _AuthoredAssetDialog, request: object,
     ) -> None:
-        if (not self._authored_asset_context_current(owner)
+        if (identity is not self._authored_asset_dialog_identity
+                or dialog is not self._authored_asset_dialog
                 or self._workspace_operations.owned):
-            self._retire_authored_asset(
-                owner, "Authored asset context changed; nothing was adopted.",
-            )
-            return
-        identity = self._workspace_operations.begin_asset_validation(
-            request, owner.stamp,
-        )
-        if identity is None:
             self._notice("Asset validation operation was not started.")
             return
-        owner.validation_identity = identity
-        owner.validation_request = request
-        owner.requested_path = request.path
-        self._asset_validation_identity = identity
-        owner.dialog.set_busy(True)
-        self._notice("Validating the selected authored asset…")
-        self._refresh_shell(); self._ensure_timer()
+        operation_identity = self._workspace_operations.begin_asset_validation(
+            request, self._operation_context_stamp(),
+        )
+        if operation_identity is None:
+            self._notice("Asset validation operation was not started.")
+            return
+        transition = self._authored_assets.adopt_validation(
+            identity, request, operation_identity,
+        )
+        if self._authored_assets.operation_identity is not operation_identity:
+            self._workspace_operations.cancel(operation_identity)
+            self._notice("Asset validation lost authored-asset custody.")
+            self._ensure_timer(); return
+        self._apply_authored_asset_transition(transition)
 
-    @staticmethod
-    def _authored_candidate_state_current(
-        candidate: AuthoredAssetCandidate,
-    ) -> bool:
-        try:
-            if type(candidate) is not AuthoredAssetCandidate:
-                return False
-            candidate.__post_init__()
-            path = Path(candidate.path)
-            raw = path.lstat()
-            state = candidate.state
-            return (not stat.S_ISLNK(raw.st_mode)
-                    and stat.S_ISREG(raw.st_mode)
-                    and (raw.st_dev, raw.st_ino, raw.st_size,
-                         raw.st_mtime_ns, raw.st_ctime_ns)
-                    == (state.device, state.inode, state.size,
-                        state.mtime_ns, state.ctime_ns)
-                    and SourceFileState.capture(path) == state)
-        except (OSError, ValueError):
-            return False
-
-    def _consume_asset_validation_update(self, update: object) -> bool:
+    def _consume_authored_asset_update(self, update: object) -> bool:
+        authored = self._authored_assets
         if (type(update) is not OperationUpdate
-                or update.identity is not self._asset_validation_identity):
+                or update.identity is not authored.operation_identity):
             return False
-        owner = self._authored_asset_owner
-        if update.terminal is None:
-            if update.progress is not None:
-                self._notice("Validating the selected authored asset…")
-            return True
-        self._asset_validation_identity = None
-        if owner is None or owner.validation_identity is not update.identity:
-            return True
-        owner.validation_identity = None
-        terminal = update.terminal
-        if (update.stale or not self._authored_asset_context_current(owner)
-                or terminal.status is OperationTerminalStatus.CANCELLED):
-            self._retire_authored_asset(
-                owner, "Authored asset context changed; nothing was adopted.",
+        self._apply_authored_asset_transition(
+            authored.consume_operation_update(
+                update, self._operation_context_stamp(),
             )
-            return True
-        if terminal.status is not OperationTerminalStatus.RETURNED:
-            owner.requested_path = None
-            owner.validation_request = None
-            owner.dialog.set_busy(False)
-            self._notice(f"Asset validation failed: {terminal.diagnostic}")
-            return True
-        result = terminal.payload
-        try:
-            valid = (type(result) is AssetValidationResult
-                     and result.request is owner.validation_request
-                     and result.request.path == owner.requested_path
-                     and result.candidate.asset == owner.asset
-                     and result.candidate.path == owner.requested_path)
-            if valid:
-                terminal.__post_init__()
-                result.__post_init__()
-                valid = self._authored_candidate_state_current(
-                    result.candidate,
-                )
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            valid = False
-        if not valid:
-            owner.requested_path = None
-            owner.validation_request = None
-            owner.dialog.set_busy(False)
-            self._notice("Asset validation returned an inexact result.")
-            return True
-        if not self._authored_asset_context_current(owner):
-            self._retire_authored_asset(
-                owner, "Authored asset context changed; nothing was adopted.",
-            )
-            return True
-        snapshot = self._intents.snapshot()
-        control = PONI_FILE if owner.asset == "poni" else MASK_FILE
-        reduced = reduce_control_edit(snapshot, control, result.candidate.path)
-        if isinstance(reduced, EditRefusal):
-            self._retire_authored_asset(
-                owner, "The selected authored asset could not be adopted.",
-            )
-            return True
-        if isinstance(reduced, EditNoChange):
-            path = result.candidate.path
-            self._retire_authored_asset(owner, f"Already selected: {path}")
-            return True
-        if not self._authored_asset_context_current(owner):
-            self._retire_authored_asset(
-                owner, "Authored asset context changed; nothing was adopted.",
-            )
-            return True
-        if not self._authored_candidate_state_current(result.candidate):
-            self._retire_authored_asset(
-                owner, "Authored asset changed before adoption.",
-            )
-            return True
-        try:
-            committed = self._intents.commit(
-                reduced, expected_revision=owner.stamp.intent_revision,
-            )
-        except Exception as error:
-            self._retire_authored_asset(owner)
-            self._error_notice("Authored asset adoption failed", error)
-            return True
-        path = result.candidate.path
-        self._retire_authored_asset(owner)
-        if type(committed) is IntentCommitAccepted:
-            self._reconcile_snapshot(snapshot, committed.snapshot)
-            remember_browse_path(path)
-            self._notice(f"{'PONI' if control == PONI_FILE else 'Mask'} adopted: {path}")
-        else:
-            self._notice("Authored asset adoption was superseded.")
+        )
         return True
 
     @staticmethod
@@ -2171,7 +1931,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             accepted = operations.cancel_reintegrate(dimension)
             self._notice(f"Cancelling Reintegrate {dimension[0]}-D…" if accepted else "Reintegrate cancellation was not accepted."); self._refresh_shell(); return
-        if self._authored_asset_owner is not None:
+        if self._authored_assets.busy:
             self._notice("Reintegrate is unavailable while authored-asset confirmation is pending.")
             self._refresh_shell(); return
         if not self._commit_focused_control_edit_for_run(): return
@@ -2284,7 +2044,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return browser.retire_reload(directive)
 
     def _average_action(self, snapshot: RunIntentSnapshot) -> None:
-        if self._authored_asset_owner is not None:
+        if self._authored_assets.busy:
             self._notice("Average is unavailable while authored-asset confirmation is pending.")
             self._refresh_shell(); return
         operations = self._workspace_operations
@@ -2392,9 +2152,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._closing = True
             self._retire_native_plot_axis_transition()
             self._retire_batch_presentation(force=True)
-            authored = self._authored_asset_owner
-            if authored is not None:
-                self._retire_authored_asset(authored)
+            self._apply_authored_asset_transition(
+                self._authored_assets.begin_close()
+            )
             self._deferred_metadata = None
             self._processed_browser.retire_terminal(force=True)
             for dialog in (self._metadata_dialog, self._scan_roi_dialog,
@@ -2417,6 +2177,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         operations = getattr(self, "_workspace_operations", None)
         analysis_slot = getattr(self, "_analysis_slot", None)
         try:
+            authored_cleanup_identity = self._authored_assets.cleanup_identity
+            operation_identity_before_close = (
+                None
+                if (
+                    operations is None
+                    or type(authored_cleanup_identity)
+                    is not OperationIdentity
+                )
+                else operations.current_identity
+            )
             operation_close = (
                 None if operations is None else operations.close()
             )
@@ -2424,10 +2194,31 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 operations is None
                 or operation_close.cleanup_status is CleanupStatus.CLEANED
             )
-            if operation_clean:
-                self._calibration_identity = self._calibration_revision = self._calibration_stamp = self._calibration_request = None
-                self._mask_identity = self._mask_revision = self._mask_stamp = self._mask_request = None
-                self._asset_validation_identity = None
+            if operation_close is not None:
+                anonymous_clean_retirement = (
+                    type(authored_cleanup_identity) is OperationIdentity
+                    and operation_identity_before_close
+                    is authored_cleanup_identity
+                    and operation_close.cleanup_status
+                    is CleanupStatus.CLEANED
+                    and operation_close.identity is None
+                    and not operations.owned
+                    and operations.current_identity is None
+                )
+                self._apply_authored_asset_transition(
+                    self._authored_assets.operation_lost(
+                        authored_cleanup_identity
+                    )
+                    if anonymous_clean_retirement
+                    else self._authored_assets.consume_close_receipt(
+                        operation_close
+                    )
+                )
+            operation_clean = (
+                operation_clean
+                and self._authored_assets.lifecycle
+                is AuthoredAssetOwnerLifecycle.CLOSED
+            )
         except Exception:
             operation_clean = False
 
@@ -2689,12 +2480,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or kind is ShellCommandKind.CONTROL_ACTION
             and (
                 command.value == "calibrate"
-                and self._calibration_identity is not None
+                and self._authored_assets.asset == "poni"
+                and self._authored_assets.phase is AuthoredAssetPhase.RUNNING
+                and self._authored_assets.operation_identity is not None
                 and self._workspace_operations.current_identity
-                is self._calibration_identity
+                is self._authored_assets.operation_identity
                 or command.value == "make_mask"
-                and self._mask_identity is not None
-                and self._workspace_operations.current_identity is self._mask_identity
+                and self._authored_assets.asset == "mask"
+                and self._authored_assets.phase is AuthoredAssetPhase.RUNNING
+                and self._authored_assets.operation_identity is not None
+                and self._workspace_operations.current_identity
+                is self._authored_assets.operation_identity
                 or command.value == f"reintegrate_{self._workspace_operations.reintegrate_dimension}"
                 and self._workspace_operations.reintegrate_identity is not None
                 and self._workspace_operations.current_identity
@@ -4270,18 +4066,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ScatteringWorkspace._observe_operation_stamp(self)
             update = operations.poll(operation_identity)
             if update is not None:
-                if self._consume_asset_validation_update(update):
-                    operation_refresh = WorkspaceRefreshEffect.FULL
+                if self._consume_authored_asset_update(update):
+                    operation_refresh = WorkspaceRefreshEffect.NONE
                 else:
                     operation_refresh = self._consume_reintegrate_update(
                         update
                     )
                     if operation_refresh is WorkspaceRefreshEffect.NONE:
-                        if (
-                            self._consume_calibration_update(update)
-                            or self._consume_mask_update(update)
-                            or self._consume_background_update(update)
-                        ):
+                        if self._consume_background_update(update):
                             operation_refresh = WorkspaceRefreshEffect.FULL
                         else:
                             operation_refresh = (
@@ -4294,16 +4086,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     force_scientific = True
             elif operation_identity is self._background_identity and not operations.owned:
                 self._background_identity = None; self._notice("Display background failed before terminal publication."); changed = True; force_scientific = True
-            elif operation_identity is self._asset_validation_identity and not operations.owned:
-                self._asset_validation_identity = None
-                owner = self._authored_asset_owner
-                if owner is not None:
-                    owner.validation_identity = None
-                    owner.validation_request = None
-                    owner.requested_path = None
-                    owner.dialog.set_busy(False)
-                self._notice("Asset validation failed before terminal publication.")
-                changed = True
+            elif (operation_identity is self._authored_assets.operation_identity
+                    and not operations.owned):
+                self._apply_authored_asset_transition(
+                    self._authored_assets.operation_lost(operation_identity)
+                )
             elif not operations.owned:
                 transition = operations.consume_lost_owner(
                     operation_identity
@@ -4508,7 +4295,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         paint,
                         applied=self._shell_revision > prior_revision,
                     )
-        self._show_queued_authored_asset_confirmation()
+        self._advance_authored_asset_confirmation()
         if not self._polling_needed():
             self._run_timer.stop()
 
@@ -5237,6 +5024,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ):
                 return True
         except Exception:
+            return True
+        authored = getattr(self, "_authored_assets", None)
+        if getattr(authored, "phase", None) in {
+            AuthoredAssetPhase.TERMINAL_READY,
+            AuthoredAssetPhase.CONFIRM_ISSUED,
+        }:
             return True
         if (
             self._deferred_metadata is not None
@@ -6011,8 +5804,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         operation_identity = self._workspace_operations.current_identity
         operation_active = (operation_identity is not None and not self._closing and not self._closed)
         operation_busy = self._experiment_operation_busy()
-        calibration_active = operation_active and operation_identity is self._calibration_identity
-        mask_active = operation_active and operation_identity is self._mask_identity
+        authored_active = (
+            operation_active
+            and operation_identity is self._authored_assets.operation_identity
+            and self._authored_assets.phase is AuthoredAssetPhase.RUNNING
+        )
+        calibration_active = authored_active and self._authored_assets.asset == "poni"
+        mask_active = authored_active and self._authored_assets.asset == "mask"
         reintegrate_active = (
             operation_active
             and operation_identity
@@ -7231,8 +7029,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 "*.nexus *.edf *.cbf *.img *.mar3450 *.raw);;All files (*)"
             )
         elif asset == "mask":
-            title = "Choose TIFF for mask"
-            file_filter = "TIFF image (*.tif *.tiff)"
+            title = "Choose TIFF or HDF5/NeXus source for mask"
+            file_filter = (
+                "Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)"
+            )
         else:
             return None
         selected, _filter = QtWidgets.QFileDialog.getOpenFileName(

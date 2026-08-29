@@ -373,7 +373,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _settle_browse_1d_before_drain=lambda: True,
         _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
         _batch_ready_to_paint=lambda: None,
-        _show_queued_authored_asset_confirmation=lambda: None,
+        _advance_authored_asset_confirmation=lambda: None,
         _run_executor=SimpleNamespace(drain_events=lambda: (StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)),
         _lifecycle=SimpleNamespace(active_run_identity=identity, attempt_run_identity=None),
         _refresh_shell=lambda: calls.append("refresh"), _polling_needed=lambda: True,

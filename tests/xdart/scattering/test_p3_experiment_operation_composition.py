@@ -15,6 +15,7 @@ from xdart.gui.tabs.scattering import experiment_authoring as authoring
 from xdart.gui.tabs.scattering import page as page_module
 from xdart.gui.tabs.scattering.adapters import external_operation
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+from xdart.gui.tabs.scattering.authored_assets import AuthoredAssetPhase
 from xdart.gui.tabs.scattering.controls_inventory import PONI_FILE
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.experiment_authoring import (
@@ -104,10 +105,11 @@ def _queue_calibration(
     request = prepare_calibration_request(str(source))
     stamp = page._operation_context_stamp(store.revision)
     identity = OperationIdentity(101)
-    page._calibration_identity = identity
-    page._calibration_revision = store.revision
-    page._calibration_stamp = stamp
-    page._calibration_request = request
+    page._apply_authored_asset_transition(
+        page._authored_assets.adopt_operation(
+            "poni", request, stamp, identity,
+        )
+    )
     result = CalibrationResult(
         request if result_request is None else result_request,
         tuple(candidates),
@@ -122,11 +124,23 @@ def _queue_calibration(
         ),
         stale=stale,
     )
-    return page._consume_calibration_update(update), request
+    return page._consume_authored_asset_update(update), request
+
+
+def _present_confirmation(page: ScatteringWorkspace):
+    assert page._authored_assets.phase is AuthoredAssetPhase.TERMINAL_READY
+    assert page._authored_asset_dialog is None
+    page._advance_authored_asset_confirmation()
+    assert page._authored_assets.phase is AuthoredAssetPhase.CONFIRM_ISSUED
+    dialog = page._authored_asset_dialog
+    assert dialog is not None
+    page._advance_authored_asset_confirmation()
+    assert page._authored_assets.phase is AuthoredAssetPhase.CONFIRM_PRESENTED
+    return dialog
 
 
 def _finish_validation(page: ScatteringWorkspace) -> OperationUpdate:
-    identity = page._asset_validation_identity
+    identity = page._authored_assets.operation_identity
     assert type(identity) is OperationIdentity
     worker = page._workspace_operations._slot._worker
     assert worker is not None
@@ -137,7 +151,7 @@ def _finish_validation(page: ScatteringWorkspace) -> OperationUpdate:
     )
     update = page._workspace_operations._slot.poll(identity)
     assert type(update) is OperationUpdate
-    assert page._consume_asset_validation_update(update)
+    assert page._consume_authored_asset_update(update)
     return update
 
 
@@ -196,9 +210,9 @@ def test_calibrate_uses_dedicated_source_chooser_after_focus_settlement(
         request, stamp = begun[0]
         assert request.source_path == str(source)
         assert request.exact_hdf_url is None
-        assert page._calibration_request is request
-        assert page._calibration_stamp is stamp
-        assert page._calibration_identity is identity
+        assert page._authored_assets.asset == "poni"
+        assert page._authored_assets.phase is AuthoredAssetPhase.RUNNING
+        assert page._authored_assets.operation_identity is identity
     finally:
         _close(page, qapp)
 
@@ -225,20 +239,19 @@ def test_one_and_many_candidates_show_same_nonblocking_dialog_then_accept_worker
             page, store, source, (newest, older),
         )
         assert consumed
-        owner = page._authored_asset_owner
-        assert owner is not None and owner.queued
-        dialog = owner.dialog
+        owner = page._authored_assets
+        assert owner.phase is AuthoredAssetPhase.TERMINAL_READY
+        assert page._authored_asset_dialog is None
+        dialog = _present_confirmation(page)
         assert dialog.selected_path == newest.path
         assert dialog.full_path.text() == newest.path
         assert dialog.full_path.isReadOnly()
         assert store.snapshot().thaw().poni_file == ""
 
         page._refresh_shell()
-        assert page._authored_asset_owner is owner
-        assert owner.dialog is dialog and owner.queued
-        page._show_queued_authored_asset_confirmation()
         qapp.processEvents()
-        assert not owner.queued and owner.dialog is dialog
+        assert page._authored_assets is owner
+        assert page._authored_asset_dialog is dialog
         assert dialog.isVisible() and dialog.parent() is page
         assert (dialog.windowModality()
                 is QtCore.Qt.WindowModality.WindowModal)
@@ -249,13 +262,13 @@ def test_one_and_many_candidates_show_same_nonblocking_dialog_then_accept_worker
         assert dialog.full_path.text() == older.path
         dialog.paths.setCurrentIndex(0)
         assert dialog.full_path.text() == newest.path
-        owner.dialog.accept_button.click()
+        dialog.accept_button.click()
         _finish_validation(page)
         assert threads and threads[0].startswith("scattering-operation-")
         assert store.snapshot().thaw().poni_file == newest.path
         revision = store.revision
         foreign = OperationIdentity(999)
-        assert page._consume_calibration_update(
+        assert page._consume_authored_asset_update(
             OperationUpdate(
                 foreign,
                 terminal=OperationTerminal(
@@ -283,12 +296,11 @@ def test_zero_candidate_choose_another_uses_existing_chooser_at_exact_root(
     try:
         consumed, _request = _queue_calibration(page, store, source, ())
         assert consumed
-        owner = page._authored_asset_owner
-        assert owner is not None
-        page._show_queued_authored_asset_confirmation()
+        owner = page._authored_assets
+        dialog = _present_confirmation(page)
         qapp.processEvents()
-        assert not owner.dialog.accept_button.isEnabled()
-        owner.dialog.choose_button.click()
+        assert not dialog.accept_button.isEnabled()
+        dialog.choose_button.click()
         _finish_validation(page)
         assert chooser_calls == [(
             PONI_FILE, "", str(tmp_path), current_thread().name,
@@ -310,12 +322,12 @@ def test_cancel_duplicate_stale_and_forged_result_are_zero_write(
     page, store = _page(tmp_path, monkeypatch)
     try:
         assert _queue_calibration(page, store, source, (candidate,))[0]
-        owner = page._authored_asset_owner
-        assert owner is not None
-        token, dialog = owner.token, owner.dialog
+        owner = page._authored_assets
+        dialog = _present_confirmation(page)
+        identity = page._authored_asset_dialog_identity
+        assert identity is not None
         destroyed = []
         dialog.destroyed.connect(lambda *_args: destroyed.append(True))
-        page._show_queued_authored_asset_confirmation()
         qapp.processEvents()
         assert dialog.isVisible() and dialog.paths.count() == 1
         assert dialog.selected_path == candidate.path
@@ -330,36 +342,37 @@ def test_cancel_duplicate_stale_and_forged_result_are_zero_write(
             None, QtCore.QEvent.Type.DeferredDelete,
         )
         assert destroyed == [True]
-        assert page._authored_asset_owner is None
+        assert owner.phase is AuthoredAssetPhase.IDLE
+        assert page._authored_asset_dialog is None
         assert store.snapshot().thaw().poni_file == ""
         assert Path(candidate.path).read_text(encoding="utf-8") == _PONI
-        page._cancel_authored_asset(token, dialog)
+        page._cancel_authored_asset(identity, dialog)
         assert store.revision == 0
 
         assert _queue_calibration(
             page, store, source, (candidate,), stale=True,
         )[0]
-        assert page._authored_asset_owner is None
+        assert owner.phase is AuthoredAssetPhase.IDLE
 
         original = prepare_calibration_request(str(source))
         forged = replace(original)
         assert forged == original and forged is not original
         stamp = page._operation_context_stamp(store.revision)
         identity = OperationIdentity(202)
-        page._calibration_identity = identity
-        page._calibration_stamp = stamp
-        page._calibration_request = original
+        page._authored_assets.adopt_operation(
+            "poni", original, stamp, identity,
+        )
         result = CalibrationResult(
             forged, (candidate,), 0,
             (forged.executable, forged.source_path), forged.monitored_directory,
         )
-        assert page._consume_calibration_update(OperationUpdate(
+        assert page._consume_authored_asset_update(OperationUpdate(
             identity,
             terminal=OperationTerminal(
                 identity, OperationTerminalStatus.RETURNED, payload=result,
             ),
         ))
-        assert page._authored_asset_owner is None
+        assert owner.phase is AuthoredAssetPhase.IDLE
         assert store.revision == 0
     finally:
         _close(page, qapp)
@@ -380,18 +393,18 @@ def test_calibration_result_candidate_count_and_aggregate_caps_precede_dialog(
 
     def consume(result, serial):
         identity = OperationIdentity(serial)
-        page._calibration_identity = identity
-        page._calibration_revision = store.revision
-        page._calibration_stamp = page._operation_context_stamp(store.revision)
-        page._calibration_request = request
-        assert page._consume_calibration_update(OperationUpdate(
+        stamp = page._operation_context_stamp(store.revision)
+        page._authored_assets.adopt_operation(
+            "poni", request, stamp, identity,
+        )
+        assert page._consume_authored_asset_update(OperationUpdate(
             identity,
             terminal=OperationTerminal(
                 identity, OperationTerminalStatus.RETURNED,
                 payload=result,
             ),
         ))
-        assert page._authored_asset_owner is None
+        assert page._authored_assets.phase is AuthoredAssetPhase.IDLE
         assert store.snapshot().thaw().poni_file == ""
 
     try:
@@ -410,7 +423,7 @@ def test_calibration_result_candidate_count_and_aggregate_caps_precede_dialog(
             )
             rows.append(CalibrationCandidate(path, proof))
         consume(_forge(baseline, candidates=tuple(rows)), 602)
-        assert "exact discovery proof" in page._notice_text.lower()
+        assert "exact publication proof" in page._notice_text.lower()
     finally:
         _close(page, qapp)
 
@@ -423,21 +436,19 @@ def test_context_and_candidate_drift_refuse_before_adoption(
     page, store = _page(tmp_path, monkeypatch)
     try:
         assert _queue_calibration(page, store, source, (candidate,))[0]
-        owner = page._authored_asset_owner
-        assert owner is not None
+        owner = page._authored_assets
         changed = store.snapshot().thaw()
         changed.project_root = str(tmp_path / "other")
         store.commit(changed, expected_revision=store.revision)
-        page._show_queued_authored_asset_confirmation()
-        assert page._authored_asset_owner is None
+        page._advance_authored_asset_confirmation()
+        assert owner.phase is AuthoredAssetPhase.IDLE
+        assert page._authored_asset_dialog is None
         assert store.snapshot().thaw().poni_file == ""
 
         browse_candidate = _candidate(tmp_path / "browse-drift.poni")
         assert _queue_calibration(
             page, store, source, (browse_candidate,),
         )[0]
-        owner = page._authored_asset_owner
-        assert owner is not None
         current_stamp = page._operation_context_stamp
         monkeypatch.setattr(
             page, "_operation_context_stamp",
@@ -446,23 +457,23 @@ def test_context_and_candidate_drift_refuse_before_adoption(
                 "different-browse", 1,
             ),
         )
-        page._show_queued_authored_asset_confirmation()
-        assert page._authored_asset_owner is None
+        page._advance_authored_asset_confirmation()
+        assert owner.phase is AuthoredAssetPhase.IDLE
+        assert page._authored_asset_dialog is None
         assert store.snapshot().thaw().poni_file == ""
         monkeypatch.setattr(page, "_operation_context_stamp", current_stamp)
 
         candidate = _candidate(tmp_path / "replacement.poni")
         assert _queue_calibration(page, store, source, (candidate,))[0]
-        owner = page._authored_asset_owner
-        assert owner is not None
-        page._show_queued_authored_asset_confirmation()
+        dialog = _present_confirmation(page)
         Path(candidate.path).write_text(
             _PONI.replace("0.1234", "0.9234"), encoding="utf-8",
         )
-        owner.dialog.accept_button.click()
+        dialog.accept_button.click()
         update = _finish_validation(page)
         assert update.terminal.status is OperationTerminalStatus.FAILED
-        assert page._authored_asset_owner is owner
+        assert owner.phase is AuthoredAssetPhase.CONFIRM_PRESENTED
+        assert page._authored_asset_dialog is dialog
         assert store.snapshot().thaw().poni_file == ""
     finally:
         _close(page, qapp)
@@ -480,10 +491,10 @@ def test_calibration_source_custody_survives_through_popup_and_accept(
     page, store = _page(tmp_path, monkeypatch)
     try:
         assert _queue_calibration(page, store, source, (candidate,))[0]
-        owner = page._authored_asset_owner
-        assert owner is not None
+        owner = page._authored_assets
+        dialog = None
         if moment == "accept":
-            page._show_queued_authored_asset_confirmation()
+            dialog = _present_confirmation(page)
 
         if drift == "source":
             source.unlink()
@@ -496,11 +507,21 @@ def test_calibration_source_custody_survives_through_popup_and_accept(
             source_dir.symlink_to(moved, target_is_directory=True)
 
         if moment == "popup":
-            page._show_queued_authored_asset_confirmation()
+            page._advance_authored_asset_confirmation()
         else:
-            owner.dialog.accept_button.click()
-        assert page._authored_asset_owner is None
-        assert page._asset_validation_identity is None
+            assert dialog is not None
+            dialog.accept_button.click()
+            QtCore.QCoreApplication.sendPostedEvents(
+                None, QtCore.QEvent.Type.DeferredDelete,
+            )
+            qapp.processEvents()
+        if moment == "popup":
+            assert owner.phase is AuthoredAssetPhase.IDLE
+            assert page._authored_asset_dialog is None
+        else:
+            assert owner.phase is AuthoredAssetPhase.IDLE
+            assert owner.operation_identity is None
+            assert page._authored_asset_dialog is None
         assert store.snapshot().thaw().poni_file == ""
     finally:
         _close(page, qapp)
@@ -536,17 +557,17 @@ def test_worker_scientifically_requalifies_admitted_poni_before_commit(
     page, store = _page(tmp_path, monkeypatch)
     try:
         assert _queue_calibration(page, store, source, (forged,))[0]
-        owner = page._authored_asset_owner
-        assert owner is not None
-        page._show_queued_authored_asset_confirmation()
-        owner.dialog.accept_button.click()
+        owner = page._authored_assets
+        dialog = _present_confirmation(page)
+        dialog.accept_button.click()
         update = _finish_validation(page)
         assert update.terminal.status is OperationTerminalStatus.FAILED
         assert store.revision == 0
         assert store.snapshot().thaw().poni_file == ""
         assert Path(forged.path).read_bytes() == before
-        assert page._authored_asset_owner is owner
-        assert not owner.dialog._busy
+        assert owner.phase is AuthoredAssetPhase.CONFIRM_PRESENTED
+        assert page._authored_asset_dialog is dialog
+        assert not dialog._busy
     finally:
         _close(page, qapp)
 
@@ -575,18 +596,18 @@ def test_calibration_result_resource_caps_precede_parser_deep_validation_and_qt(
 
     def consume(result, serial):
         identity = OperationIdentity(serial)
-        page._calibration_identity = identity
-        page._calibration_revision = store.revision
-        page._calibration_stamp = page._operation_context_stamp(store.revision)
-        page._calibration_request = request
-        assert page._consume_calibration_update(OperationUpdate(
+        stamp = page._operation_context_stamp(store.revision)
+        page._authored_assets.adopt_operation(
+            "poni", request, stamp, identity,
+        )
+        assert page._consume_authored_asset_update(OperationUpdate(
             identity,
             terminal=OperationTerminal(
                 identity, OperationTerminalStatus.RETURNED,
                 payload=result,
             ),
         ))
-        assert page._authored_asset_owner is None
+        assert page._authored_assets.phase is AuthoredAssetPhase.IDLE
 
     try:
         oversized = _forge(
@@ -616,7 +637,7 @@ def test_calibration_result_resource_caps_precede_parser_deep_validation_and_qt(
         consume(_forge(baseline, candidates=tuple(rows)), 702)
         assert parses == deep == []
         assert store.revision == 0
-        assert "exact discovery proof" in page._notice_text.lower()
+        assert "exact publication proof" in page._notice_text.lower()
     finally:
         _close(page, qapp)
 
@@ -629,8 +650,7 @@ def test_post_worker_replacement_and_pending_direct_entrypoints_are_blocked(
     page, store = _page(tmp_path, monkeypatch)
     try:
         assert _queue_calibration(page, store, source, (admitted,))[0]
-        owner = page._authored_asset_owner
-        assert owner is not None
+        owner = page._authored_assets
 
         assert page._start_permitted() == (
             False, "Experiment operation is still active",
@@ -641,7 +661,7 @@ def test_post_worker_replacement_and_pending_direct_entrypoints_are_blocked(
             lambda *_args: pytest.fail("calibration chooser was reached"),
         )
         page._calibrate_action()
-        assert page._calibration_identity is None
+        assert owner.operation_identity is None
         assert "unavailable while another operation" in page._notice_text
         assert page._begin_analysis(
             "metadata", object(), 0, request=("blocked",),
@@ -666,19 +686,25 @@ def test_post_worker_replacement_and_pending_direct_entrypoints_are_blocked(
         candidate = AuthoredAssetCandidate(
             "poni", admitted.path, admitted.proof, admitted.proof.state,
         )
-        request = AssetValidationRequest(
-            "poni", candidate.path, candidate=candidate,
+        dialog = _present_confirmation(page)
+        dialog_identity = page._authored_asset_dialog_identity
+        assert dialog_identity is not None
+        request = owner.validation_request(
+            dialog_identity,
+            candidate.path,
+            page._operation_context_stamp(),
         )
-        result = AssetValidationResult(request, candidate)
+        assert type(request) is AssetValidationRequest
+        assert request.candidate is not None
+        result = AssetValidationResult(request, request.candidate)
         identity = OperationIdentity(303)
-        owner.validation_identity = identity
-        owner.validation_request = request
-        owner.requested_path = candidate.path
-        page._asset_validation_identity = identity
+        page._apply_authored_asset_transition(
+            owner.adopt_validation(dialog_identity, request, identity)
+        )
         Path(candidate.path).write_text(
             _PONI.replace("0.1234", "0.8234"), encoding="utf-8",
         )
-        assert page._consume_asset_validation_update(OperationUpdate(
+        assert page._consume_authored_asset_update(OperationUpdate(
             identity,
             terminal=OperationTerminal(
                 identity, OperationTerminalStatus.RETURNED, payload=result,
@@ -687,11 +713,9 @@ def test_post_worker_replacement_and_pending_direct_entrypoints_are_blocked(
         assert store.snapshot().thaw().poni_file == ""
         assert "inexact" in page._notice_text.lower()
 
-        dialog = owner.dialog
         page.close_workspace()
         qapp.processEvents()
-        assert page._authored_asset_owner is None
-        assert not dialog.isVisible()
+        assert page._authored_asset_dialog is None
         assert store.snapshot().thaw().poni_file == ""
     finally:
         page.close_workspace()

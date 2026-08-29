@@ -19,6 +19,9 @@ from xdart.gui.tabs.scattering import page as page_module
 from xdart.gui.tabs.scattering.adapters import external_operation
 from xdart.gui.tabs.scattering.adapters.external_operation import OperationSlot
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+from xdart.gui.tabs.scattering.authored_assets import (
+    AuthoredAssetOwnerLifecycle, AuthoredAssetPhase,
+)
 from xdart.gui.tabs.scattering.contracts import SourceFileState
 from xdart.gui.tabs.scattering.controls_inventory import MASK_FILE
 from xdart.gui.tabs.scattering.controls_projection import project_controls
@@ -325,7 +328,9 @@ def test_page_focus_selected_assets_cancel_and_projection_are_exact(tmp_path, mo
         assert len(chosen) == 1 and chosen[0][0] == "mask" and Path(chosen[0][1]).is_dir()
         assert prepared == [(str(source), str(poni), str(mask))]
         assert len(begun) == 1 and begun[0][0].source_path == str(source) and begun[0][0].source_path != displayed.artifact
-        assert type(begun[0][1]) is OperationContextStamp and page._mask_identity is identity
+        assert type(begun[0][1]) is OperationContextStamp
+        assert page._authored_assets.operation_identity is identity
+        assert page._authored_assets.phase is AuthoredAssetPhase.RUNNING
         direct = project_controls(store.snapshot(), None, RunPhase.IDLE, mask_available=True, mask_dependency_available=True)
         action = next(item for item in direct.actions_for(SectionId.EXPERIMENT) if item.action is ControlAction.MAKE_MASK)
         assert action.enabled
@@ -923,12 +928,13 @@ def test_forged_current_generated_mask_proof_never_adopts(
         forged_proof = _forge(proof, **changes)
         forged = _forge(result, proof=forged_proof)
         _queue_published_mask(page, store, identity, forged)
-        owner = page._authored_asset_owner
-        assert owner is not None
-        page._show_queued_authored_asset_confirmation()
-        owner.dialog.accept_button.click()
+        dialog = _present_mask_confirmation(page)
+        dialog.accept_button.click()
         update = _finish_mask_validation(page)
         assert update.terminal.status is OperationTerminalStatus.FAILED
+        assert page._authored_assets.phase \
+            is AuthoredAssetPhase.CONFIRM_PRESENTED
+        assert page._authored_asset_dialog is dialog
         assert store.snapshot().thaw().mask_file == ""
         assert Path(result.request.final_path).exists()
     finally:
@@ -937,10 +943,11 @@ def test_forged_current_generated_mask_proof_never_adopts(
 
 def _queue_published_mask(page, store, identity, result, *, stale=False):
     stamp = page._operation_context_stamp(store.revision)
-    page._mask_identity = identity
-    page._mask_revision = store.revision
-    page._mask_stamp = stamp
-    page._mask_request = result.request
+    page._apply_authored_asset_transition(
+        page._authored_assets.adopt_operation(
+            "mask", result.request, stamp, identity,
+        )
+    )
     update = OperationUpdate(
         identity,
         terminal=OperationTerminal(
@@ -948,11 +955,23 @@ def _queue_published_mask(page, store, identity, result, *, stale=False):
         ),
         stale=stale,
     )
-    assert page._consume_mask_update(update)
+    assert page._consume_authored_asset_update(update)
+
+
+def _present_mask_confirmation(page):
+    assert page._authored_assets.phase is AuthoredAssetPhase.TERMINAL_READY
+    assert page._authored_asset_dialog is None
+    page._advance_authored_asset_confirmation()
+    assert page._authored_assets.phase is AuthoredAssetPhase.CONFIRM_ISSUED
+    dialog = page._authored_asset_dialog
+    assert dialog is not None
+    page._advance_authored_asset_confirmation()
+    assert page._authored_assets.phase is AuthoredAssetPhase.CONFIRM_PRESENTED
+    return dialog
 
 
 def _finish_mask_validation(page):
-    identity = page._asset_validation_identity
+    identity = page._authored_assets.operation_identity
     assert type(identity) is OperationIdentity
     worker = page._workspace_operations._slot._worker
     assert worker is not None
@@ -963,14 +982,14 @@ def _finish_mask_validation(page):
     )
     update = page._workspace_operations._slot.poll(identity)
     assert type(update) is OperationUpdate
-    assert page._consume_asset_validation_update(update)
+    assert page._consume_authored_asset_update(update)
     return update
 
 
 def test_timer_poll_dispatches_exact_mask_update(tmp_path, monkeypatch, qapp) -> None:
     page = ScatteringWorkspace(intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter())
     identity, result = _published(tmp_path); update = OperationUpdate(identity, terminal=OperationTerminal(identity, OperationTerminalStatus.RETURNED, payload=result))
-    observed, polled, consumed = [], [], []; page._mask_identity = identity
+    observed, polled, consumed = [], [], []
     monkeypatch.setattr(
         type(page._workspace_operations),
         "current_identity",
@@ -978,8 +997,7 @@ def test_timer_poll_dispatches_exact_mask_update(tmp_path, monkeypatch, qapp) ->
     )
     monkeypatch.setattr(page._workspace_operations, "observe_stamp", lambda stamp, *, intent_revision: observed.append((stamp, intent_revision)))
     monkeypatch.setattr(page._workspace_operations, "poll", lambda item: polled.append(item) or update)
-    monkeypatch.setattr(page, "_consume_calibration_update", lambda _update: False)
-    monkeypatch.setattr(page, "_consume_mask_update", lambda item: consumed.append(item) or True)
+    monkeypatch.setattr(page, "_consume_authored_asset_update", lambda item: consumed.append(item) or True)
     try:
         page._drain_executor()
         assert len(observed) == 1 and polled == [identity] and consumed == [update]
@@ -1013,32 +1031,39 @@ def test_mask_confirmation_accept_cancel_and_choose_alternate_are_transactional(
     try:
         identity, result = _published(tmp_path / "accept", 1)
         _queue_published_mask(page, store, identity, result)
-        owner = page._authored_asset_owner
-        assert owner is not None and owner.asset == "mask" and owner.queued
-        assert owner.dialog.full_path.text() == result.request.final_path
+        owner = page._authored_assets
+        assert owner.asset == "mask"
+        assert owner.phase is AuthoredAssetPhase.TERMINAL_READY
+        dialog = _present_mask_confirmation(page)
+        assert dialog.full_path.text() == result.request.final_path
         assert store.snapshot().thaw().mask_file == ""
-        page._show_queued_authored_asset_confirmation()
-        owner.dialog.accept_button.click()
+        dialog.accept_button.click()
         _finish_mask_validation(page)
         assert threads[-1].startswith("scattering-operation-")
         assert store.snapshot().thaw().mask_file == result.request.final_path
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete,
+        )
+        qapp.processEvents()
+        assert owner.phase is AuthoredAssetPhase.IDLE
 
         identity2, result2 = _published(tmp_path / "cancel", 2)
         _queue_published_mask(page, store, identity2, result2)
-        owner = page._authored_asset_owner
-        assert owner is not None
-        page._show_queued_authored_asset_confirmation()
-        owner.dialog.cancel_button.click()
+        dialog = _present_mask_confirmation(page)
+        dialog.cancel_button.click()
         qapp.processEvents()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete,
+        )
+        qapp.processEvents()
+        assert owner.phase is AuthoredAssetPhase.IDLE
         assert store.snapshot().thaw().mask_file == result.request.final_path
         assert Path(result2.request.final_path).exists()
 
         identity3, result3 = _published(tmp_path / "alternate", 3)
         _queue_published_mask(page, store, identity3, result3)
-        owner = page._authored_asset_owner
-        assert owner is not None
-        page._show_queued_authored_asset_confirmation()
-        owner.dialog.choose_button.click()
+        dialog = _present_mask_confirmation(page)
+        dialog.choose_button.click()
         _finish_mask_validation(page)
         assert chooser_calls == [(
             MASK_FILE, result.request.final_path,
@@ -1065,10 +1090,10 @@ def test_mask_source_custody_survives_through_popup_and_accept(
     )
     try:
         _queue_published_mask(page, store, identity, result)
-        owner = page._authored_asset_owner
-        assert owner is not None
+        owner = page._authored_assets
+        dialog = None
         if moment == "accept":
-            page._show_queued_authored_asset_confirmation()
+            dialog = _present_mask_confirmation(page)
 
         source = Path(result.request.source_path)
         if drift == "source":
@@ -1080,11 +1105,21 @@ def test_mask_source_custody_survives_through_popup_and_accept(
             source_dir.symlink_to(moved, target_is_directory=True)
 
         if moment == "popup":
-            page._show_queued_authored_asset_confirmation()
+            page._advance_authored_asset_confirmation()
         else:
-            owner.dialog.accept_button.click()
-        assert page._authored_asset_owner is None
-        assert page._asset_validation_identity is None
+            assert dialog is not None
+            dialog.accept_button.click()
+            QtCore.QCoreApplication.sendPostedEvents(
+                None, QtCore.QEvent.Type.DeferredDelete,
+            )
+            qapp.processEvents()
+        if moment == "popup":
+            assert owner.phase is AuthoredAssetPhase.IDLE
+            assert page._authored_asset_dialog is None
+        else:
+            assert owner.phase is AuthoredAssetPhase.IDLE
+            assert owner.operation_identity is None
+            assert page._authored_asset_dialog is None
         assert store.snapshot().thaw().mask_file == ""
     finally:
         _close(page, qapp)
@@ -1105,10 +1140,8 @@ def test_real_published_mask_proof_survives_cleanup_and_is_adoptable(
     )
     try:
         _queue_published_mask(page, store, terminal.identity, result)
-        owner = page._authored_asset_owner
-        assert owner is not None
-        page._show_queued_authored_asset_confirmation()
-        owner.dialog.accept_button.click()
+        dialog = _present_mask_confirmation(page)
+        dialog.accept_button.click()
         update = _finish_mask_validation(page)
         assert update.terminal.status is OperationTerminalStatus.RETURNED
         assert store.snapshot().thaw().mask_file == request.final_path
@@ -1139,11 +1172,9 @@ def test_busy_single_mask_popup_suppresses_escape_and_close_until_exact_cleanup(
         qapp.processEvents()
         identity, result = _published(tmp_path, 81)
         _queue_published_mask(page, store, identity, result)
-        owner = page._authored_asset_owner
-        assert owner is not None and len(owner.candidates) == 1
-        dialog = owner.dialog
+        owner = page._authored_assets
+        dialog = _present_mask_confirmation(page)
         dialog.destroyed.connect(lambda *_args: destroyed.append(True))
-        page._show_queued_authored_asset_confirmation()
         qapp.processEvents()
         assert dialog.isVisible()
         assert (dialog.windowModality()
@@ -1158,10 +1189,12 @@ def test_busy_single_mask_popup_suppresses_escape_and_close_until_exact_cleanup(
 
         QtTest.QTest.keyClick(dialog, QtCore.Qt.Key.Key_Escape)
         qapp.processEvents()
-        assert page._authored_asset_owner is owner and dialog.isVisible()
+        assert owner.phase is AuthoredAssetPhase.VALIDATING
+        assert page._authored_asset_dialog is dialog and dialog.isVisible()
         dialog.close()
         qapp.processEvents()
-        assert page._authored_asset_owner is owner and dialog.isVisible()
+        assert owner.phase is AuthoredAssetPhase.VALIDATING
+        assert page._authored_asset_dialog is dialog and dialog.isVisible()
         assert store.snapshot().thaw().mask_file == ""
         assert Path(result.request.final_path).exists()
 
@@ -1172,10 +1205,8 @@ def test_busy_single_mask_popup_suppresses_escape_and_close_until_exact_cleanup(
         release.set()
         update = _finish_mask_validation(page)
         assert update.stale
-        assert page._authored_asset_owner is None
         assert page._workspace_operations.owned is False
-        assert page._experiment_operation_busy() is False
-        assert page._consume_asset_validation_update(update) is False
+        assert page._consume_authored_asset_update(update) is False
         assert store.snapshot().thaw().mask_file == ""
         assert Path(result.request.final_path).exists()
         QtCore.QCoreApplication.sendPostedEvents(
@@ -1186,6 +1217,9 @@ def test_busy_single_mask_popup_suppresses_escape_and_close_until_exact_cleanup(
             None, QtCore.QEvent.Type.DeferredDelete,
         )
         assert destroyed == [True]
+        assert owner.phase is AuthoredAssetPhase.IDLE
+        assert page._authored_asset_dialog is None
+        assert page._experiment_operation_busy() is False
     finally:
         release.set()
         _close(page, qapp)
@@ -1215,13 +1249,11 @@ def test_busy_delete_later_autonomously_closes_after_worker_join(
     try:
         identity, result = _published(tmp_path, 91)
         _queue_published_mask(page, store, identity, result)
-        owner = page._authored_asset_owner
-        assert owner is not None
-        dialog = owner.dialog
-        page._show_queued_authored_asset_confirmation()
+        owner = page._authored_assets
+        dialog = _present_mask_confirmation(page)
         dialog.accept_button.click()
         assert entered.wait(2)
-        validation_identity = owner.validation_identity
+        validation_identity = owner.operation_identity
         worker = page._workspace_operations._slot._worker
         assert validation_identity is not None and worker is not None
         page.deleteLater()
@@ -1235,10 +1267,10 @@ def test_busy_delete_later_autonomously_closes_after_worker_join(
         assert page._deferred_delete_pending
         assert page._deferred_delete_retry_timer.isActive()
         assert slot._clean_receipt is None
-        assert slot._close_cancel_accepted
+        assert not slot._close_cancel_accepted
         assert slot._cancel_event is not None
         assert slot._cancel_event.is_set()
-        assert page._authored_asset_owner is None
+        assert owner.lifecycle is AuthoredAssetOwnerLifecycle.CLOSING
         assert slot.owned
         assert slot.current_identity is validation_identity
         assert worker.is_alive()
@@ -1274,6 +1306,7 @@ def test_busy_delete_later_autonomously_closes_after_worker_join(
                 is OperationTerminalStatus.CANCELLED)
         assert slot.owned is False
         assert slot._worker is None
+        assert owner.lifecycle is AuthoredAssetOwnerLifecycle.CLOSED
         assert store.snapshot().thaw().mask_file == ""
         assert Path(result.request.final_path).exists()
     finally:
@@ -1309,14 +1342,14 @@ def test_failed_published_mask_terminal_preserves_output_and_recovery_without_ad
     )
     try:
         stamp = page._operation_context_stamp(store.revision)
-        page._mask_identity = terminal.identity
-        page._mask_revision = store.revision
-        page._mask_stamp = stamp
-        page._mask_request = request
-        assert page._consume_mask_update(OperationUpdate(
+        page._authored_assets.adopt_operation(
+            "mask", request, stamp, terminal.identity,
+        )
+        assert page._consume_authored_asset_update(OperationUpdate(
             terminal.identity, terminal=terminal,
         ))
-        assert page._authored_asset_owner is None
+        assert page._authored_assets.phase is AuthoredAssetPhase.IDLE
+        assert page._authored_asset_dialog is None
         assert store.revision == 0
         assert store.snapshot().thaw().mask_file == prior
         assert Path(request.final_path).exists()
@@ -1338,20 +1371,21 @@ def test_mask_stale_and_context_drift_preserve_field_and_published_file(
     try:
         identity, result = _published(tmp_path / "stale", 4)
         _queue_published_mask(page, store, identity, result, stale=True)
-        assert page._authored_asset_owner is None
+        assert page._authored_assets.phase is AuthoredAssetPhase.IDLE
+        assert page._authored_asset_dialog is None
         assert store.snapshot().thaw().mask_file == prior
         assert Path(result.request.final_path).exists()
 
         identity2, result2 = _published(tmp_path / "drift", 5)
         _queue_published_mask(page, store, identity2, result2)
-        owner = page._authored_asset_owner
-        assert owner is not None
+        owner = page._authored_assets
         snapshot = store.snapshot()
         changed = snapshot.thaw()
         changed.project_root = str(tmp_path / "other")
         store.commit(changed, expected_revision=snapshot.revision)
-        page._show_queued_authored_asset_confirmation()
-        assert page._authored_asset_owner is None
+        page._advance_authored_asset_confirmation()
+        assert owner.phase is AuthoredAssetPhase.IDLE
+        assert page._authored_asset_dialog is None
         assert store.snapshot().thaw().mask_file == prior
         assert Path(result2.request.final_path).exists()
     finally:
