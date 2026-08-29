@@ -48,6 +48,21 @@ def _reconcile(
     )
 
 
+def _preference_owner(
+    preferences: ScientificPreferences | None = None,
+    **fields: object,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        _preferences=(
+            ScientificPreferences()
+            if preferences is None
+            else preferences
+        ),
+        _background_owner=SimpleNamespace(projection=lambda: None),
+        **fields,
+    )
+
+
 def test_plot_options_are_frozen_and_projected_by_identity() -> None:
     options = ScientificPlotOptions(
         waterfall_y_axis="Time (s)",
@@ -91,7 +106,7 @@ def test_page_owns_each_typed_plot_option_edit(
     field: str,
     expected: object,
 ) -> None:
-    owner = SimpleNamespace(_preferences=ScientificPreferences())
+    owner = _preference_owner()
     accepted = ScatteringWorkspace._edit_scientific_preference(
         owner,
         ShellCommand(ShellCommandKind.SET_PLOT_OPTION, value, path),
@@ -119,7 +134,7 @@ def test_page_rejects_invalid_plot_option_edits_without_mutation(
     path: tuple[str, ...],
     value: object,
 ) -> None:
-    owner = SimpleNamespace(_preferences=ScientificPreferences())
+    owner = _preference_owner()
     before = owner._preferences
     command = ShellCommand(ShellCommandKind.SET_PLOT_OPTION, value, path)
 
@@ -141,8 +156,8 @@ def test_share_axis_intent_repoints_plot_axis_to_rendered_cake_identity(
     image_axis: str,
     expected_plot_axis: str,
 ) -> None:
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             image_axis=image_axis,
             plot_axis=("2theta" if expected_plot_axis == "Q" else "Q"),
         )
@@ -157,8 +172,8 @@ def test_share_axis_intent_repoints_plot_axis_to_rendered_cake_identity(
 
 
 def test_share_axis_intent_is_refused_for_nonsharing_qz_qxy_image() -> None:
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             image_axis="Qz-Qxy",
             plot_axis="Q",
         )
@@ -173,8 +188,8 @@ def test_share_axis_intent_is_refused_for_nonsharing_qz_qxy_image() -> None:
 
 
 def test_share_axis_intent_uses_rendered_gi_cake_not_stale_preference() -> None:
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             image_axis="Q-Chi",
             plot_axis="Q",
         ),
@@ -190,8 +205,8 @@ def test_share_axis_intent_uses_rendered_gi_cake_not_stale_preference() -> None:
 
 
 def test_live_image_axis_flip_keeps_shared_plot_axis_converged() -> None:
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             image_axis="Q-Chi",
             plot_axis="Q",
             share_axis=True,
