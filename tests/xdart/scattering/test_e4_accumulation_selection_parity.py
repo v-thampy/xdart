@@ -35,6 +35,30 @@ def qapp() -> QtWidgets.QApplication:
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+def _preference_owner(
+    preferences: ScientificPreferences,
+    **fields: object,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        _preferences=preferences,
+        _background_owner=SimpleNamespace(projection=lambda: None),
+        **fields,
+    )
+
+
+def _idle_command_owner(**fields: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        _workspace_operations=None,
+        _analysis_slot=None,
+        _metadata_operations=SimpleNamespace(active=None),
+        _analysis_operation_busy=lambda: False,
+        _experiment_operation_busy=lambda: False,
+        _background_owner=SimpleNamespace(projection=lambda: None),
+        _release_display_background=lambda: True,
+        **fields,
+    )
+
+
 def _selected_browser_rows(
     shell: ScatteringWorkspaceShell,
 ) -> tuple[int, ...]:
@@ -1090,7 +1114,8 @@ def test_page_preserves_explicit_single_multiselection_but_mode_entry_collapses(
             calls.append((current, selected))
             return True
 
-    owner = SimpleNamespace(
+    owner = _preference_owner(
+        ScientificPreferences(plot_mode="Single"),
         _shell=SimpleNamespace(
             browser=SimpleNamespace(
                 cancel_pending_frame_selection=lambda: events.append(
@@ -1099,7 +1124,12 @@ def test_page_preserves_explicit_single_multiselection_but_mode_entry_collapses(
             )
         ),
         _context_controller=Controller(),
-        _preferences=ScientificPreferences(plot_mode="Single"),
+        _processed_browser=SimpleNamespace(
+            terminal_handoff=None,
+            set_auto_last=lambda _value: True,
+        ),
+        _retire_batch_presentation=lambda: None,
+        _release_display_background=lambda: True,
         _refresh_shell=lambda: None,
         _ensure_timer=lambda: None,
     )
@@ -1142,8 +1172,9 @@ def test_show_all_page_dispatch_preserves_current_order_and_skips_empty_noop(
         navigation=FrameNavigationProjection(frames, frames[1], (frames[1],)),
         select_navigation=select_navigation,
     )
-    owner = SimpleNamespace(
+    owner = _idle_command_owner(
         _closing=False, _closed=False,
+        _retire_batch_presentation=lambda: None,
         _shell=SimpleNamespace(
             browser=SimpleNamespace(
                 cancel_pending_frame_selection=lambda: events.append(("cancel",))
@@ -1360,8 +1391,8 @@ def test_pin_slice_command_is_owned_instead_of_silently_dropped() -> None:
         slice_center=0.0,
         slice_width=5.0,
     )
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             plot_mode="Overlay",
             slice_enabled=True,
             slice_center=0.0,
@@ -1404,8 +1435,8 @@ def test_pin_slice_uses_only_the_singular_accepted_heavy_frame() -> None:
     )
     assert scientific.heavy is not None
     assert scientific.heavy.frame is navigation.current
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             plot_mode="Overlay",
             slice_enabled=True,
             slice_center=0.5,
@@ -1440,12 +1471,14 @@ def test_slice_pins_survive_accumulating_mode_switch_and_clear_together() -> Non
     frame = state.navigation.frames[0]
     pin = SlicePin(frame, "Q", 0.0, 5.0)
     selected: list[tuple[object, tuple[object, ...]]] = []
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             plot_mode="Overlay",
             slice_enabled=True,
             slice_pins=(pin,),
         ),
+        _retire_batch_presentation=lambda: None,
+        _release_display_background=lambda: True,
         _shell=SimpleNamespace(
             browser=SimpleNamespace(
                 cancel_pending_frame_selection=lambda: None,
@@ -1475,8 +1508,8 @@ def test_slice_pins_survive_accumulating_mode_switch_and_clear_together() -> Non
 def test_direct_plot_axis_change_retargets_compatible_pins_and_clears_others() -> None:
     state = make_shell_projection(frame_count=1, heavy_indices=(0,))
     pin = SlicePin(state.navigation.frames[0], "Q", 0.5, 2.0)
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             plot_axis="Q",
             plot_mode="Overlay",
             slice_pins=(pin,),
@@ -1503,8 +1536,8 @@ def test_direct_plot_axis_change_retargets_compatible_pins_and_clears_others() -
 def test_shared_image_axis_changes_apply_the_same_slice_pin_policy() -> None:
     state = make_shell_projection(frame_count=1, heavy_indices=(0,))
     pin = SlicePin(state.navigation.frames[0], "Q", 0.5, 2.0)
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             image_axis="Q-Chi",
             plot_axis="Q",
             plot_mode="Overlay",
@@ -1532,8 +1565,8 @@ def test_shared_image_axis_changes_apply_the_same_slice_pin_policy() -> None:
 def test_enabling_share_axis_retargets_compatible_slice_pins() -> None:
     state = make_shell_projection(frame_count=1, heavy_indices=(0,))
     pin = SlicePin(state.navigation.frames[0], "Q", 0.5, 2.0)
-    owner = SimpleNamespace(
-        _preferences=ScientificPreferences(
+    owner = _preference_owner(
+        ScientificPreferences(
             image_axis="2Th-Chi",
             plot_axis="Q",
             plot_mode="Overlay",
@@ -1555,9 +1588,11 @@ def test_explicit_footer_selection_cancels_older_browser_debounce() -> None:
     state = make_shell_projection(plot_mode="Single")
     frame = state.navigation.frames[2]
     events: list[str] = []
-    owner = SimpleNamespace(
+    owner = _idle_command_owner(
         _closing=False,
         _closed=False,
+        _retire_batch_presentation=lambda: None,
+        _context_controller=SimpleNamespace(selection=None),
         _shell=SimpleNamespace(
             browser=SimpleNamespace(
                 cancel_pending_frame_selection=lambda: events.append(

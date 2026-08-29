@@ -318,6 +318,14 @@ def test_show_all_clears_exclusions_and_auto_last_preserves_them() -> None:
     owner = SimpleNamespace(
         _closing=False,
         _closed=False,
+        _workspace_operations=None,
+        _analysis_slot=None,
+        _metadata_operations=SimpleNamespace(active=None),
+        _analysis_operation_busy=lambda: False,
+        _experiment_operation_busy=lambda: False,
+        _retire_batch_presentation=lambda: None,
+        _background_owner=SimpleNamespace(projection=lambda: None),
+        _release_display_background=lambda: True,
         _shell=SimpleNamespace(
             browser=SimpleNamespace(
                 cancel_pending_frame_selection=lambda: events.append(
