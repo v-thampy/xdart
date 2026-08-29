@@ -28,7 +28,3 @@ except PackageNotFoundError:
 
 del _pkg_version, PackageNotFoundError
 del _os
-
-from . import modules
-from . import utils
-from . import gui
