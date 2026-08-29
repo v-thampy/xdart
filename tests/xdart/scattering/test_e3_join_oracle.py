@@ -53,9 +53,9 @@ from xdart.gui.tabs.scattering.workspace_shell import (
 from xdart.modules.display_context import ContextKind
 from xrd_tools.core.scan import Scan, ScanFrame
 from xrd_tools.io import (
+    FrameViewReader,
     ProcessedScan,
     get_raw_frame,
-    iter_frame_records,
 )
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
@@ -148,6 +148,36 @@ class _RecordingSource:
 
     def close(self) -> None:
         self._facts.append(("source-close", current_thread().name))
+
+
+class _RecordingScalarReader:
+    def __init__(
+        self,
+        reader: FrameViewReader,
+        facts: list[tuple[str, str]],
+        entered: Event | None,
+        release: Event | None,
+    ) -> None:
+        self._reader = reader
+        self._facts = facts
+        self._entered = entered
+        self._release = release
+
+    def __enter__(self) -> "_RecordingScalarReader":
+        if self._reader.__enter__() is not self._reader:
+            raise RuntimeError("FrameViewReader changed identity")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._reader.__exit__(exc_type, exc, tb)
+
+    def read_scalar_catalog(self, *, cancelled):
+        self._facts.append(("read-scalar-catalog", current_thread().name))
+        if self._entered is not None:
+            self._entered.set()
+        if self._release is not None:
+            self._release.wait(timeout=10.0)
+        return self._reader.read_scalar_catalog(cancelled=cancelled)
 
 
 @dataclass(slots=True)
@@ -257,23 +287,23 @@ def _mount(
 
     monkeypatch.setattr(output_module, "NexusSink", sink_factory)
 
-    def open_scan(source):
+    def open_scan(source, **kwargs):
         browse_facts.append(("open-scan", current_thread().name))
-        return ProcessedScan(source)
+        return ProcessedScan(source, **kwargs)
 
-    def read_records(source):
-        browse_facts.append(("read-records", current_thread().name))
-        if browse_entered is not None:
-            browse_entered.set()
-        if browse_release is not None:
-            browse_release.wait(timeout=10.0)
-        yield from iter_frame_records(source)
+    def open_reader(source, **kwargs):
+        return _RecordingScalarReader(
+            FrameViewReader(source, **kwargs),
+            browse_facts,
+            browse_entered,
+            browse_release,
+        )
 
     loader = BrowseLoader(
         max_items=32,
         join_timeout=browse_join_timeout,
         open_scan=open_scan,
-        read_records=read_records,
+        open_reader=open_reader,
     )
     # The parent has no loader at all.  Patching the future production factory
     # preserves a meaningful parent-red assertion: no mounted shell, rather
@@ -357,7 +387,7 @@ def _produce_browse_artifact(monkeypatch, root: Path) -> Path:
         _run(rig)
         _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
         assert rig.output.is_file()
-        result = rig.output.with_name("browse.with.dots.nxs")
+        result = rig.output.with_name("browse.with.dots.nexus")
         if result != rig.output:
             rig.output.rename(result)
         return result
@@ -544,7 +574,10 @@ def test_j0_04_browse_b_is_off_gui_and_selected_only_after_ready(
                 ShellCommandKind.SELECT_SCAN, str(browse)
             )
         )
-        assert entered.wait(timeout=5.0)
+        assert entered.wait(timeout=5.0), (
+            rig.browse_facts,
+            None if rig.loader._active is None else rig.loader._active.outcome,
+        )
         rig.app.processEvents()
         assert rig.controller.selection is a_selection
         release.set()
@@ -563,7 +596,7 @@ def test_j0_04_browse_b_is_off_gui_and_selected_only_after_ready(
         )
         assert rig.browse_facts == [
             ("open-scan", "scattering-browse"),
-            ("read-records", "scattering-browse"),
+            ("read-scalar-catalog", "scattering-browse"),
         ]
         assert rig.shell.scientific.frame_selector.currentData() is (
             rig.controller.frame_keys[0]

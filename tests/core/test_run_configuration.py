@@ -654,6 +654,7 @@ def test_nonaverage_paths_have_zero_average_reachability_and_allocations(tmp_pat
     from xrd_tools.sources import execution_graph
     from xdart.gui.tabs.scattering.adapters import external_operation, run_executor
     from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
     from xdart.gui.tabs.scattering.display_values import StandardEventKind
     from xdart.gui.tabs.scattering.state_machine import RunPhase
     monkeypatch.setattr(run_executor, "NexusSink", NexusSink, raising=False)
@@ -694,8 +695,20 @@ def test_nonaverage_paths_have_zero_average_reachability_and_allocations(tmp_pat
         try:
             _run(rig); _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
             request = rig.controller.begin_browse(str(rig.output))
-            _wait(rig.app, lambda: (rig.controller.poll_browse() is not None
-                                    and rig.controller.browse_context is not None))
+            outcomes = []
+
+            def browse_finished():
+                outcome = rig.controller.poll_browse()
+                if outcome is None:
+                    return False
+                outcomes.append(outcome)
+                return True
+
+            _wait(rig.app, browse_finished)
+            assert len(outcomes) == 1
+            assert outcomes[0].request is request
+            assert outcomes[0].status is BrowseLoadStatus.READY
+            assert rig.controller.browse_context is not None
             assert rig.controller.browse_context.load_request is request
         finally:
             assert rig.close().cleanup_status.value == "cleaned"
