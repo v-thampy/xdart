@@ -4807,6 +4807,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or self._background_owner.active_key is not None
             or scientific is None
             or scientific.plot_mode != preferences.plot_mode
+            or scientific.plot_options != preferences.plot_options
             or scientific.slice_pins
             or scientific.pinned_traces
             or view.presentation_plot_mode != preferences.plot_mode
@@ -4844,8 +4845,29 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 frame, canonical_by_artifact,
             )[0] == artifact
         )
+        waterfall_exact = True
+        if view.bottom_waterfall_active:
+            options = scientific.plot_options
+            expected_waterfall = view.trace_history_keys[
+                options.waterfall_start - 1:
+                options.waterfall_stop or None:
+                options.waterfall_step
+            ]
+            painted_waterfall = view.waterfall_source_frame_keys
+            waterfall_exact = (
+                len(painted_waterfall) == len(expected_waterfall)
+                and all(
+                    painted is expected
+                    for painted, expected in zip(
+                        painted_waterfall,
+                        expected_waterfall,
+                        strict=True,
+                    )
+                )
+            )
         matches = (
-            _terminal_frame_signature(
+            waterfall_exact
+            and _terminal_frame_signature(
                 current, canonical_by_artifact,
             )[0] == artifact
             and _terminal_frame_signature(

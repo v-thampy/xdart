@@ -838,6 +838,178 @@ def test_terminal_browse_single_rebind_refuses_multi_selected_or_foreign(
         page.close_workspace()
 
 
+def test_terminal_waterfall_match_requires_exact_painted_source_receipt(
+    tmp_path, monkeypatch, qapp,
+):
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.events import RunIdentity
+    from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
+    from xrd_tools.io.output_transaction import StreamTerminal
+
+    page, _store, _seeded, context = _loaded_page(
+        tmp_path, monkeypatch, qapp, terminal_browse=True,
+    )
+    try:
+        controller = page._context_controller
+        latest = controller.navigation.frames[-1]
+        assert controller.select_navigation(latest, (latest,))
+        page._preferences = replace(page._preferences, plot_mode="Single")
+        view = page._shell.scientific
+
+        def complete_template():
+            page._drain_executor()
+            page._refresh_shell()
+            projection = page._last_scientific_projection
+            return (
+                projection
+                if (
+                    projection is not None
+                    and projection.traces
+                    and projection.heavy is not None
+                )
+                else None
+            )
+
+        template = _wait(complete_template)
+        run_identity = latest.run_identity
+        frames = tuple(
+            DisplayFrameKey(
+                run_identity,
+                latest.source_scan,
+                latest.artifact,
+                1_000 + index,
+                1_000 + index,
+            )
+            for index in range(1, 22)
+        )
+        navigation = FrameNavigationProjection(
+            frames, frames[-1], frames,
+        )
+        options = replace(
+            page._preferences.plot_options,
+            waterfall_start=2,
+            waterfall_stop=20,
+            waterfall_step=3,
+        )
+        scientific = replace(
+            template,
+            traces=tuple(
+                replace(template.traces[0], frame=frame)
+                for frame in frames
+            ),
+            heavy=replace(template.heavy, frame=frames[-1]),
+            heavy_available=frozenset(frames),
+            plot_mode="Waterfall",
+            plot_options=options,
+            slice_pins=(),
+            pinned_traces=(),
+            retain_display=False,
+            live_update=False,
+            browse_trace_snapshot=None,
+        )
+        page._preferences = replace(
+            page._preferences,
+            plot_mode="Waterfall",
+            plot_options=options,
+        )
+        page._last_scientific_projection = scientific
+        view.reconcile(
+            scientific,
+            navigation,
+            completed=len(frames),
+            total=len(frames),
+            detail="Ready",
+        )
+        assert view.bottom_waterfall_active
+        assert len(view.trace_history_keys) == len(frames)
+        assert all(
+            painted is expected
+            for painted, expected in zip(
+                view.trace_history_keys, frames, strict=True,
+            )
+        )
+        full_waterfall_source = view._waterfall_source_keys
+        assert len(full_waterfall_source) == 7
+
+        clones = tuple(
+            DisplayFrameKey(
+                frame.run_identity,
+                frame.source_scan,
+                frame.artifact,
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in frames
+        )
+        rebound = FrameNavigationProjection(
+            clones, clones[-1], clones,
+        )
+        request = context.load_request
+        commit_identity = request.terminal_commit_identity
+        assert type(commit_identity) is StreamTerminal
+        handoff = _begin_terminal_handoff(
+            page,
+            TerminalBrowseHandoff(
+                request,
+                run_identity,
+                latest.artifact,
+                clones[-1].local_frame_label,
+                tuple(frame.local_frame_label for frame in clones),
+                commit_identity,
+            ),
+        )
+        assert page._terminal_scientific_matches(handoff, rebound)
+        page._last_scientific_projection = replace(
+            scientific,
+            plot_options=replace(options, waterfall_step=1),
+        )
+        assert not page._terminal_scientific_matches(handoff, rebound)
+        page._last_scientific_projection = scientific
+        view._waterfall_source_keys = full_waterfall_source[:-1]
+        assert not page._terminal_scientific_matches(handoff, rebound)
+        view._waterfall_source_keys = full_waterfall_source
+        assert page._terminal_scientific_matches(handoff, rebound)
+
+        foreign_identity = RunIdentity(
+            run_identity.generation,
+            run_identity.fingerprint,
+        )
+        assert foreign_identity == run_identity
+        assert foreign_identity is not run_identity
+        foreign = tuple(
+            DisplayFrameKey(
+                foreign_identity,
+                frame.source_scan,
+                frame.artifact,
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in clones
+        )
+        assert not page._terminal_scientific_matches(
+            handoff,
+            FrameNavigationProjection(foreign, foreign[-1], foreign),
+        )
+        assert view.rebind_navigation(
+            rebound,
+            heavy_available=frozenset(clones),
+        )
+        expected_rebound_source = clones[1:20:3]
+        assert len(view.waterfall_source_frame_keys) == len(
+            expected_rebound_source
+        )
+        assert all(
+            painted is expected
+            for painted, expected in zip(
+                view.waterfall_source_frame_keys,
+                expected_rebound_source,
+                strict=True,
+            )
+        )
+    finally:
+        page.close_workspace()
+
+
 def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
     tmp_path, monkeypatch, qapp,
 ):

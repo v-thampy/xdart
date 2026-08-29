@@ -435,6 +435,30 @@ class ScientificView(QtWidgets.QFrame):
 
         return self._bottom_waterfall_active
 
+    @property
+    def waterfall_source_frame_keys(self) -> tuple[DisplayFrameKey, ...]:
+        """Exact source domain of the last successfully painted Waterfall."""
+
+        if not self._bottom_waterfall_active:
+            return ()
+        frames_by_identity = {
+            id(frame): frame for frame in self._trace_history_keys
+        }
+        resolved = []
+        for key in self._waterfall_source_keys:
+            if (
+                type(key) is not tuple
+                or len(key) != 2
+                or key[0] != "live"
+                or type(key[1]) is not int
+            ):
+                return ()
+            frame = frames_by_identity.get(key[1])
+            if frame is None or id(frame) != key[1]:
+                return ()
+            resolved.append(frame)
+        return tuple(resolved)
+
     def expect_display_background(self, active_key) -> None:
         key = active_key if type(active_key) is tuple else None
         if key != self._expected_background_key:

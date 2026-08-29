@@ -56,6 +56,24 @@ def test_3621_overlay_keeps_exact_history_but_paints_at_most_256_rows() -> None:
 
         assert view._trace_history_keys == shell.navigation.selected
         assert len(view._trace_history_keys) == 3621
+        assert len(view.waterfall_source_frame_keys) == 3621
+        assert all(
+            painted is expected
+            for painted, expected in zip(
+                view.waterfall_source_frame_keys,
+                shell.navigation.selected,
+                strict=True,
+            )
+        )
+        source_keys = view._waterfall_source_keys
+        foreign = object()
+        view._waterfall_source_keys = (("live", id(foreign)),)
+        assert view.waterfall_source_frame_keys == ()
+        view._waterfall_source_keys = (
+            ("pin", id(shell.navigation.selected[0])),
+        )
+        assert view.waterfall_source_frame_keys == ()
+        view._waterfall_source_keys = source_keys
         assert view.bottom_stack.currentWidget() is view.waterfall
         assert view.waterfall.image.image.shape[1] <= 256
         assert len(view._waterfall_y_values) <= 256
@@ -69,6 +87,12 @@ def test_live_waterfall_throttles_before_transform_but_terminal_catches_up(
     monkeypatch,
 ) -> None:
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    clock = {"now": 100.0}
+    monkeypatch.setattr(
+        scientific_view_module.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
     shell = make_shell_projection(
         frame_count=17,
         selected_index=16,
@@ -102,6 +126,14 @@ def test_live_waterfall_throttles_before_transform_but_terminal_catches_up(
             total=20,
         )
         assert view.waterfall.image.image.shape == (64, 16)
+        assert all(
+            painted is expected
+            for painted, expected in zip(
+                view.waterfall_source_frame_keys,
+                frames[:16],
+                strict=True,
+            )
+        )
 
         calls = {"scale": 0, "stack": 0}
         original_scale = scientific_view_module._scaled_intensity
@@ -126,6 +158,7 @@ def test_live_waterfall_throttles_before_transform_but_terminal_catches_up(
             counted_stack,
         )
 
+        clock["now"] = 100.1
         _reconcile(
             view,
             delta_scientific,
@@ -136,8 +169,18 @@ def test_live_waterfall_throttles_before_transform_but_terminal_catches_up(
 
         assert calls == {"scale": 0, "stack": 0}
         assert view._trace_history_keys == shell.navigation.selected
+        assert len(view.waterfall_source_frame_keys) == 16
+        assert all(
+            painted is expected
+            for painted, expected in zip(
+                view.waterfall_source_frame_keys,
+                frames[:16],
+                strict=True,
+            )
+        )
         assert view.waterfall.image.image.shape == (64, 16)
 
+        clock["now"] = 100.6
         _reconcile(
             view,
             replace(delta_scientific, live_update=False),
@@ -150,6 +193,15 @@ def test_live_waterfall_throttles_before_transform_but_terminal_catches_up(
         assert calls["stack"] == 1
         assert view.waterfall.image.image.shape == (64, 17)
         assert view._waterfall_y_values[-1] == 17.0
+        assert len(view.waterfall_source_frame_keys) == 17
+        assert all(
+            painted is expected
+            for painted, expected in zip(
+                view.waterfall_source_frame_keys,
+                frames,
+                strict=True,
+            )
+        )
     finally:
         view.close()
 
