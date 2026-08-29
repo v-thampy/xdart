@@ -124,10 +124,14 @@ def test_c2_has_exactly_the_h10_and_bounded_xye_stage_queues():
         and node.func.value.id == "queue"
         and node.func.attr == "Queue"
     ]
-    assert len(queues) == 2
+    assert len(queues) == 3
     assert sorted(
         ast.unparse(node) for node in queues
-    ) == ["queue.Queue()", "queue.Queue(maxsize=16)"]
+    ) == [
+        "queue.Queue()",
+        "queue.Queue(maxsize=16)",
+        "queue.Queue(maxsize=16)",
+    ]
     classes = {
         node.name: node for node in tree.body if isinstance(node, ast.ClassDef)
     }
@@ -142,6 +146,13 @@ def test_c2_has_exactly_the_h10_and_bounded_xye_stage_queues():
     xye_begin = method("XYESink", "begin")
     xye_queues = [node for node in ast.walk(xye_begin) if node in queues]
     assert [ast.unparse(node) for node in xye_queues] == [
+        "queue.Queue(maxsize=16)",
+    ]
+    transactional_xye_begin = method("TransactionalXYESink", "begin")
+    transactional_xye_queues = [
+        node for node in ast.walk(transactional_xye_begin) if node in queues
+    ]
+    assert [ast.unparse(node) for node in transactional_xye_queues] == [
         "queue.Queue(maxsize=16)",
     ]
     streaming_init = method("ReductionSession", "_init_streaming")
