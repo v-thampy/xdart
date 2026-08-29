@@ -31,7 +31,7 @@ from xdart.gui.tabs.scattering.events import (
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.modules.display_context import BrowseContext
 from xdart.modules.frame_publication import PublicationStore
-from xrd_tools.core import FrameRecord
+from xrd_tools.io import FrameScalarCatalog, FrameScalarRow
 from xrd_tools.session.frame_record_store import FrameRecordStore
 
 from tests.xdart.scattering.test_e3_context_contract import (
@@ -40,7 +40,6 @@ from tests.xdart.scattering.test_e3_context_contract import (
     _current_key,
     _running_controller,
     _select_browse,
-    _view,
 )
 
 
@@ -57,17 +56,22 @@ def _wait_for(predicate, *, timeout: float = 2.0):
 def _real_loader_controller(
     monkeypatch,
     *,
-    read_records,
+    open_reader,
     join_timeout: float = 0.05,
 ):
     monkeypatch.setattr(
         loader_module, "read_browse_presentation", lambda _path: ({}, None),
     )
+    monkeypatch.setattr(
+        loader_module,
+        "canonical_browse_scan_key",
+        lambda path: Path(path).stem,
+    )
     _, lifecycle, executor, _, acquisition = _running_controller()
     loader = BrowseLoader(
         join_timeout=join_timeout,
         open_scan=lambda _path: object(),
-        read_records=read_records,
+        open_reader=open_reader,
     )
     controller = ContextController(
         lifecycle=lifecycle,
@@ -80,8 +84,48 @@ def _real_loader_controller(
     return controller, lifecycle, executor, loader, acquisition
 
 
-def _one_record(_path):
-    yield FrameRecord.from_view(_view(1, 5.0))
+def _catalog(path, value: float = 5.0):
+    return FrameScalarCatalog(
+        str(Path(path).resolve()),
+        "entry",
+        (FrameScalarRow(1, metadata_raw={"value": value}),),
+    )
+
+
+class _ScalarReader:
+    def __init__(self, path, *, resolve_source, read_catalog):
+        assert resolve_source is False
+        self._path = path
+        self._read_catalog = read_catalog
+
+    def __enter__(self):
+        return self
+
+    def read_scalar_catalog(self, *, cancelled):
+        return self._read_catalog(self._path, cancelled)
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        return None
+
+
+def _reader_factory(read_catalog):
+    def open_reader(path, *, resolve_source):
+        return _ScalarReader(
+            path,
+            resolve_source=resolve_source,
+            read_catalog=read_catalog,
+        )
+
+    return open_reader
+
+
+def _one_catalog(path, cancelled):
+    if cancelled():
+        raise InterruptedError("Browse scalar catalog read cancelled")
+    return _catalog(path)
+
+
+_ONE_READER = _reader_factory(_one_catalog)
 
 
 @pytest.mark.parametrize("equal_distinct", (False, True))
@@ -270,20 +314,21 @@ def test_pending_b_is_cancelled_then_exact_c_starts_automatically(
 ):
     entered_b = Event()
     release_b = Event()
-    path_b = tmp_path / "browse-b.nxs"
-    path_c = tmp_path / "browse-c.nxs"
+    path_b = tmp_path / "browse-b.nexus"
+    path_c = tmp_path / "browse-c.nexus"
     path_b.write_bytes(b"b")
     path_c.write_bytes(b"c")
 
-    def records(path):
+    def read_catalog(path, cancelled):
         if Path(path) == path_b:
             entered_b.set()
             release_b.wait(timeout=2.0)
-            return
-        yield FrameRecord.from_view(_view(1, 7.0))
+        if cancelled():
+            raise InterruptedError("Browse scalar catalog read cancelled")
+        return _catalog(path, 7.0)
 
     controller, _, _, loader, _ = _real_loader_controller(
-        monkeypatch, read_records=records
+        monkeypatch, open_reader=_reader_factory(read_catalog)
     )
     request_b = controller.begin_browse(str(path_b))
     assert entered_b.wait(timeout=1.0)
@@ -302,10 +347,10 @@ def test_close_fail_once_release_is_truthful_exact_and_retryable(
     monkeypatch,
     tmp_path: Path,
 ):
-    path = tmp_path / "browse.nxs"
+    path = tmp_path / "browse.nexus"
     path.write_bytes(b"b")
     controller, _, _, loader, _ = _real_loader_controller(
-        monkeypatch, read_records=_one_record
+        monkeypatch, open_reader=_ONE_READER
     )
     request = controller.begin_browse(str(path))
     _wait_for(controller.poll_browse)
@@ -338,10 +383,10 @@ def test_persistent_release_failure_remains_visible_and_owned(
     monkeypatch,
     tmp_path: Path,
 ):
-    path = tmp_path / "browse.nxs"
+    path = tmp_path / "browse.nexus"
     path.write_bytes(b"b")
     controller, _, _, _, _ = _real_loader_controller(
-        monkeypatch, read_records=_one_record
+        monkeypatch, open_reader=_ONE_READER
     )
     request = controller.begin_browse(str(path))
     _wait_for(controller.poll_browse)
@@ -372,17 +417,19 @@ def test_close_live_cancelled_worker_retains_retry_identity(
 ):
     entered = Event()
     release = Event()
-    path = tmp_path / "pending.nxs"
+    path = tmp_path / "pending.nexus"
     path.write_bytes(b"pending")
 
-    def records(_path):
+    def read_catalog(path, cancelled):
         entered.set()
         release.wait(timeout=2.0)
-        return iter(())
+        if cancelled():
+            raise InterruptedError("Browse scalar catalog read cancelled")
+        return _catalog(path)
 
     controller, _, _, loader, acquisition = _real_loader_controller(
         monkeypatch,
-        read_records=records,
+        open_reader=_reader_factory(read_catalog),
         join_timeout=0.001,
     )
     request = controller.begin_browse(str(path))
@@ -411,22 +458,28 @@ def test_baseexception_at_browse_worker_boundary_has_one_terminal_outcome(
     class WorkerPoison(BaseException):
         pass
 
-    path = tmp_path / "poison.nxs"
+    path = tmp_path / "poison.nexus"
     path.write_bytes(b"poison")
     monkeypatch.setattr(
         loader_module, "read_browse_presentation", lambda _path: ({}, None),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "canonical_browse_scan_key",
+        lambda source: Path(source).stem,
     )
 
     def fail_open(_path):
         raise WorkerPoison("open poison")
 
-    def fail_read(_path):
+    def fail_read(_path, _cancelled):
         raise WorkerPoison("read poison")
-        yield
 
     loader = BrowseLoader(
         open_scan=fail_open if seam == "open" else lambda _path: object(),
-        read_records=fail_read if seam == "read" else _one_record,
+        open_reader=_reader_factory(
+            fail_read if seam == "read" else _one_catalog
+        ),
     )
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
     from xdart.modules.display_context import ContextKind, new_context_token

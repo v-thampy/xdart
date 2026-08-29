@@ -12,6 +12,7 @@ import pytest
 
 from pyqtgraph.Qt import QtWidgets
 
+from xdart.gui.tabs.scattering.adapters import browse_loader as browse_module
 from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
 from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
@@ -34,7 +35,7 @@ from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
 from xrd_tools.sources.discover import enumerate_candidates
-from xrd_tools.io import ProcessedScan, iter_frame_records
+from xrd_tools.io import FrameScalarCatalog, FrameViewReader, ProcessedScan
 
 from tests.xdart.scattering._admission import await_admission
 from tests.xdart.scattering.test_e2p_rapid_navigation import (
@@ -307,18 +308,30 @@ def test_real_browse_load_is_off_thread_exact_and_independently_owned(
 
     monkeypatch.setattr(h5py, "File", counted_file)
 
-    def open_scan(source):
+    def open_scan(source, **kwargs):
         calls.append(("open_scan", current_thread().name))
-        return ProcessedScan(source)
+        return ProcessedScan(source, **kwargs)
 
-    def read_records(source):
-        calls.append(("read_records", current_thread().name))
-        yield from iter_frame_records(source)
+    class RecordingReader:
+        def __init__(self, source, **kwargs):
+            self._reader = FrameViewReader(source, **kwargs)
+
+        def __enter__(self):
+            if self._reader.__enter__() is not self._reader:
+                raise RuntimeError("FrameViewReader changed identity")
+            return self
+
+        def read_scalar_catalog(self, *, cancelled):
+            calls.append(("read_scalar_catalog", current_thread().name))
+            return self._reader.read_scalar_catalog(cancelled=cancelled)
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._reader.__exit__(exc_type, exc, tb)
 
     loader = BrowseLoader(
         max_items=32,
         open_scan=open_scan,
-        read_records=read_records,
+        open_reader=RecordingReader,
     )
     request = BrowseLoadRequest(
         new_context_token(ContextKind.BROWSE),
@@ -335,21 +348,16 @@ def test_real_browse_load_is_off_thread_exact_and_independently_owned(
     assert context.load_request is request
     assert context.scan_key == "Combi4_Angledependence_samz_4p9_03271005"
     assert tuple(context.frame_ids) == tuple(range(1, 17))
-    publication = context.publication_store.get(1)
-    assert publication is not None
-    assert publication.scan_key == context.scan_key
-    assert publication.view.intensity_1d is not None
-    assert publication.view.intensity_2d is not None
-    assert (
-        publication.view.raw is not None
-        or publication.view.thumbnail is not None
-    )
+    assert context.scalar_catalog is not None
+    assert context.scalar_catalog.labels == tuple(range(1, 17))
+    assert len(context.publication_store) == 0
+    assert len(context.record_store) == 0
     assert context.calibration_identity
     assert context.mask_identity == "True"
     assert context.result_identity == str(path)
     assert calls == [
         ("open_scan", "scattering-browse"),
-        ("read_records", "scattering-browse"),
+        ("read_scalar_catalog", "scattering-browse"),
     ]
     assert 2 <= len(file_opens) <= 4
     assert all(
@@ -478,20 +486,39 @@ def test_real_browse_resume_keeps_exact_a_and_rejects_late_projection():
 
 def test_cancelled_load_retires_exact_worker_after_inert_completion(
     tmp_path: Path,
+    monkeypatch,
 ):
     entered = Event()
     release = Event()
 
-    def read_records(_source):
-        entered.set()
-        release.wait(timeout=5.0)
-        return iter(())
+    class BlockingReader:
+        def __init__(self, source, *, resolve_source):
+            assert resolve_source is False
+            self._path = str(Path(source).resolve())
 
-    path = tmp_path / "pending.nxs"
+        def __enter__(self):
+            return self
+
+        def read_scalar_catalog(self, *, cancelled):
+            entered.set()
+            release.wait(timeout=5.0)
+            if cancelled():
+                raise InterruptedError("Browse scalar catalog read cancelled")
+            return FrameScalarCatalog(self._path, "entry", ())
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return None
+
+    path = tmp_path / "pending.nexus"
     path.write_bytes(b"not opened by the injected reader")
+    monkeypatch.setattr(
+        browse_module,
+        "canonical_browse_scan_key",
+        lambda source: Path(source).stem,
+    )
     loader = BrowseLoader(
         open_scan=lambda source: object(),
-        read_records=read_records,
+        open_reader=BlockingReader,
     )
     request = BrowseLoadRequest(
         new_context_token(ContextKind.BROWSE),

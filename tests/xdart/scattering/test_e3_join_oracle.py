@@ -157,11 +157,13 @@ class _RecordingScalarReader:
         facts: list[tuple[str, str]],
         entered: Event | None,
         release: Event | None,
+        gate_path: Path | None,
     ) -> None:
         self._reader = reader
         self._facts = facts
         self._entered = entered
         self._release = release
+        self._gate_path = gate_path
 
     def __enter__(self) -> "_RecordingScalarReader":
         if self._reader.__enter__() is not self._reader:
@@ -173,9 +175,13 @@ class _RecordingScalarReader:
 
     def read_scalar_catalog(self, *, cancelled):
         self._facts.append(("read-scalar-catalog", current_thread().name))
-        if self._entered is not None:
+        gated = (
+            self._gate_path is None
+            or self._reader.path.resolve() == self._gate_path.resolve()
+        )
+        if gated and self._entered is not None:
             self._entered.set()
-        if self._release is not None:
+        if gated and self._release is not None:
             self._release.wait(timeout=10.0)
         return self._reader.read_scalar_catalog(cancelled=cancelled)
 
@@ -236,6 +242,7 @@ def _mount(
     reduction_delay: float = 0.0,
     browse_entered: Event | None = None,
     browse_release: Event | None = None,
+    browse_gate_path: Path | None = None,
     browse_join_timeout: float = 5.0,
 ) -> _MountedRig:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -297,6 +304,7 @@ def _mount(
             browse_facts,
             browse_entered,
             browse_release,
+            browse_gate_path,
         )
 
     loader = BrowseLoader(

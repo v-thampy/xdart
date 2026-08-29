@@ -6,6 +6,7 @@ from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
+from shutil import copy2
 from threading import Event, Lock, Timer, current_thread
 import time
 
@@ -41,8 +42,8 @@ from xdart.gui.tabs.scattering.workspace_shell import (
 from xdart.modules.display_context import ContextKind
 from xrd_tools.core import Axis, FrameRecord, FrameView
 from xrd_tools.io import (
+    FrameViewReader,
     ProcessedScan,
-    iter_frame_records,
     read_xye,
     write_frame_records,
 )
@@ -373,27 +374,44 @@ def test_j3_real_mounted_run_pause_browse_resume_stop_close(
         reduction_core, "_reduce_frame", latched_reduce
     )
 
-    def open_browse(source):
+    def open_browse(source, **kwargs):
         browse_facts.append(
             ("open-scan", current_thread().name, str(source))
         )
-        return ProcessedScan(source)
+        return ProcessedScan(source, **kwargs)
 
-    def read_browse(source):
-        browse_facts.append(
-            ("read-records", current_thread().name, str(source))
-        )
-        if Path(source) == replacement_path:
-            c_entered.set()
-            if not release_c.wait(timeout=60.0):
-                raise TimeoutError("J3 Browse C latch timed out")
-        yield from iter_frame_records(source)
+    class BrowseReader:
+        def __init__(self, source, **kwargs):
+            self._source = str(source)
+            self._reader = FrameViewReader(source, **kwargs)
+
+        def __enter__(self):
+            if self._reader.__enter__() is not self._reader:
+                raise RuntimeError("FrameViewReader changed identity")
+            return self
+
+        def read_scalar_catalog(self, *, cancelled):
+            browse_facts.append(
+                (
+                    "read-scalar-catalog",
+                    current_thread().name,
+                    self._source,
+                )
+            )
+            if Path(self._source) == replacement_path:
+                c_entered.set()
+                if not release_c.wait(timeout=60.0):
+                    raise TimeoutError("J3 Browse C latch timed out")
+            return self._reader.read_scalar_catalog(cancelled=cancelled)
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._reader.__exit__(exc_type, exc, tb)
 
     loader = BrowseLoader(
         max_items=32,
         join_timeout=60.0,
         open_scan=open_browse,
-        read_records=read_browse,
+        open_reader=BrowseReader,
     )
     monkeypatch.setattr(
         page_module, "BrowseLoader", lambda **_kwargs: loader
@@ -404,7 +422,7 @@ def test_j3_real_mounted_run_pause_browse_resume_stop_close(
     # evidence window.
     browse_path = _accepted_browse_nxs()
     replacement_path = tmp_path / "accepted-browse-c.nxs"
-    replacement_path.symlink_to(browse_path)
+    copy2(browse_path, replacement_path)
     intent = _real_intent(mode, tmp_path)
     expected_image_paths = (
         frozenset(
@@ -577,7 +595,11 @@ def test_j3_real_mounted_run_pause_browse_resume_stop_close(
         assert a_publications.residency_snapshot() == a_residency
         assert browse_facts == [
             ("open-scan", "scattering-browse", str(browse_path)),
-            ("read-records", "scattering-browse", str(browse_path)),
+            (
+                "read-scalar-catalog",
+                "scattering-browse",
+                str(browse_path),
+            ),
         ]
 
         b_selection = controller.selection
@@ -667,10 +689,14 @@ def test_j3_real_mounted_run_pause_browse_resume_stop_close(
         assert first_non_b.navigation.current is c_key
         assert browse_facts == [
             ("open-scan", "scattering-browse", str(browse_path)),
-            ("read-records", "scattering-browse", str(browse_path)),
+            (
+                "read-scalar-catalog",
+                "scattering-browse",
+                str(browse_path),
+            ),
             ("open-scan", "scattering-browse", str(replacement_path)),
             (
-                "read-records",
+                "read-scalar-catalog",
                 "scattering-browse",
                 str(replacement_path),
             ),

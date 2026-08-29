@@ -27,18 +27,19 @@ import h5py
 import numpy as np
 import pytest
 
+from xdart.gui.tabs.scattering.adapters import browse_loader as loader_module
 from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
 from xdart.gui.tabs.scattering.browse_values import (
     BrowseLoadRequest,
     BrowseLoadStatus,
-    canonical_browse_scan_key,
 )
 from xdart.gui.tabs.scattering.display_runtime import RunDisplayState
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
-from xdart.gui.tabs.scattering.events import RunIdentity
+from xdart.gui.tabs.scattering.events import CleanupStatus, RunIdentity
 from xdart.modules.display_context import BrowseContext, DisplayContextError
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core import Axis, FrameRecord, FrameView
+from xrd_tools.io import FrameScalarCatalog, FrameScalarRow
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.scan_norm import (
     ScanNormAggregate,
@@ -152,6 +153,7 @@ def _expected(rows):
 class _BrowseScan:
     """Minimal open-scan stand-in for the loader's injected seam."""
 
+    entry = "entry"
     metadata: dict = {}
 
 
@@ -162,42 +164,80 @@ def _artifact_file(tmp_path: Path, name: str) -> str:
     return str(path)
 
 
-def _records(rows):
-    return [
-        FrameRecord.from_view(_view(index, row))
-        for index, row in enumerate(rows, start=1)
-    ]
+def _catalog(source, rows):
+    return FrameScalarCatalog(
+        str(Path(source).resolve()),
+        "entry",
+        tuple(
+            FrameScalarRow(index, metadata_raw=row)
+            for index, row in enumerate(rows, start=1)
+        ),
+    )
 
 
-def _read_browse_context(
+class _CatalogReader:
+    def __init__(self, source, *, resolve_source, read_catalog):
+        assert resolve_source is False
+        self._source = str(source)
+        self._read_catalog = read_catalog
+
+    def __enter__(self):
+        return self
+
+    def read_scalar_catalog(self, *, cancelled):
+        return self._read_catalog(self._source, cancelled)
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        return None
+
+
+def _reader_factory(read_catalog):
+    def open_reader(source, *, resolve_source):
+        return _CatalogReader(
+            source,
+            resolve_source=resolve_source,
+            read_catalog=read_catalog,
+        )
+
+    return open_reader
+
+
+def _rows_reader(rows):
+    def read_catalog(source, cancelled):
+        if cancelled():
+            raise InterruptedError("Browse scalar catalog read cancelled")
+        return _catalog(source, rows)
+
+    return _reader_factory(read_catalog)
+
+
+def _load_via_loader(
+    monkeypatch,
     tmp_path: Path,
     rows,
     *,
     token: str,
     generation: int,
-    name: str = "scan_0001.nxs",
+    name: str | None = None,
 ):
-    source = _artifact_file(tmp_path, name)
+    source = _artifact_file(
+        tmp_path,
+        name or f"{token}.nexus",
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "canonical_browse_scan_key",
+        lambda path: Path(path).stem,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "read_browse_presentation",
+        lambda _path: ({}, None),
+    )
     request = BrowseLoadRequest(token, generation, source)
-    records = _records(rows)
     loader = BrowseLoader(
         open_scan=lambda _path: _BrowseScan(),
-        read_records=lambda _path: iter(records),
-    )
-    context = loader._read_context(
-        request, canonical_browse_scan_key(source), Event()
-    )
-    assert type(context) is BrowseContext
-    return request, context
-
-
-def _load_via_loader(tmp_path: Path, rows, *, token: str, generation: int):
-    source = _artifact_file(tmp_path, f"{token}.nxs")
-    request = BrowseLoadRequest(token, generation, source)
-    records = _records(rows)
-    loader = BrowseLoader(
-        open_scan=lambda _path: _BrowseScan(),
-        read_records=lambda _path: iter(records),
+        open_reader=_rows_reader(rows),
     )
     loader.begin(request)
     worker = loader._worker
@@ -312,10 +352,10 @@ def test_injected_retain_failure_leaves_the_exact_prior_aggregate():
     armed = {"on": False}
 
     class _FailingPublicationStore(PublicationStore):
-        def upsert(self, publication):
+        def upsert(self, publication, *, protected=()):
             if armed["on"]:
                 raise _InjectedRetainFailure("armed retain failure")
-            return super().upsert(publication)
+            return super().upsert(publication, protected=protected)
 
     display, owner = _display(
         publication_store_factory=_FailingPublicationStore
@@ -340,7 +380,8 @@ def test_late_residency_failure_leaves_the_exact_prior_aggregate(monkeypatch):
     _retain(display, owner, 1, {"mon": 2.0})
     prior = owner.norm_aggregate
 
-    def fail_after_publication():
+    def fail_after_publication(*, protected):
+        del protected
         raise _InjectedRetainFailure("armed late residency failure")
 
     monkeypatch.setattr(display._residency, "enforce", fail_after_publication)
@@ -419,33 +460,48 @@ def test_exact_frame_read_rejects_foreign_run_artifact_and_source():
 # --------------------------------------------------------------------- #
 
 
-def test_browse_and_reload_publish_revision_one_after_one_full_pass(tmp_path):
+def test_browse_and_reload_publish_revision_one_after_one_full_pass(
+    tmp_path, monkeypatch,
+):
     rows = [{"i0": 1.0}, {"I0": 2.0}, {"i0": 4.0}]
-    _, context, _, _, _ = _load_via_loader(
-        tmp_path, rows, token="browse-first", generation=1
+    _, context, loader, _, _ = _load_via_loader(
+        monkeypatch, tmp_path, rows, token="browse-first", generation=1
     )
     aggregate = context.norm_aggregate
     assert type(aggregate) is ScanNormAggregate
     assert (aggregate.revision, aggregate.row_count) == (1, 3)
     assert dict(aggregate.channels) == {"i0": (7.0, 3)}
-    _, reloaded = _read_browse_context(
-        tmp_path, rows, token="browse-reload", generation=2,
-        name="scan_0002.nxs",
+    _, reloaded, reload_loader, _, _ = _load_via_loader(
+        monkeypatch,
+        tmp_path,
+        rows,
+        token="browse-reload",
+        generation=2,
+        name="scan_0002.nexus",
     )
     again = reloaded.norm_aggregate
     assert (again.revision, again.row_count) == (1, 3)
     assert dict(again.channels) == dict(aggregate.channels)
     assert again.identity != aggregate.identity
+    assert loader.release_context(context).cleanup_status.value == "cleaned"
+    assert reload_loader.release_context(reloaded).cleanup_status.value == "cleaned"
+    loader.close()
+    reload_loader.close()
 
 
 def test_browse_identity_is_exactly_token_scan_key_and_requested_path(
     tmp_path,
+    monkeypatch,
 ):
-    request, context = _read_browse_context(
-        tmp_path, [{"mon": 2.0}], token="browse-ident", generation=4
+    request, context, loader, _, _ = _load_via_loader(
+        monkeypatch,
+        tmp_path,
+        [{"mon": 2.0}],
+        token="browse-ident",
+        generation=4,
     )
     aggregate = context.norm_aggregate
-    scan_key = canonical_browse_scan_key(request.source_path)
+    scan_key = Path(request.source_path).stem
     assert scan_key
     assert aggregate.identity == (
         request.token,
@@ -454,81 +510,115 @@ def test_browse_identity_is_exactly_token_scan_key_and_requested_path(
     )
     assert context.scan_key == scan_key
     assert context.requested_path == request.source_path
+    assert loader.release_context(context).cleanup_status.value == "cleaned"
+    loader.close()
 
 
 def test_browse_cancellation_failure_and_empty_input_publish_nothing(
     tmp_path,
+    monkeypatch,
 ):
     rows = [{"mon": 2.0}, {"mon": 3.0}]
-    records = _records(rows)
-    source = _artifact_file(tmp_path, "scan_0003.nxs")
-    scan_key = canonical_browse_scan_key(source)
-
-    cancelled = Event()
-
-    def _cancelling_records(_path):
-        yield records[0]
-        cancelled.set()
-        yield records[1]
-
-    request = BrowseLoadRequest("browse-cancel", 6, source)
-    loader = BrowseLoader(
-        open_scan=lambda _path: _BrowseScan(),
-        read_records=_cancelling_records,
+    source = _artifact_file(tmp_path, "scan_0003.nexus")
+    monkeypatch.setattr(
+        loader_module,
+        "canonical_browse_scan_key",
+        lambda path: Path(path).stem,
     )
-    assert loader._read_context(request, scan_key, cancelled) is None
-
-    exhausted = Event()
-
-    def _cancel_after_final_record(_path):
-        yield records[0]
-        exhausted.set()
-
-    exhausted_request = BrowseLoadRequest("browse-tail-cancel", 7, source)
-    exhausted_loader = BrowseLoader(
-        open_scan=lambda _path: _BrowseScan(),
-        read_records=_cancel_after_final_record,
+    monkeypatch.setattr(
+        loader_module,
+        "read_browse_presentation",
+        lambda _path: ({}, None),
     )
-    exhausted_context = exhausted_loader._read_context(
-        exhausted_request, scan_key, exhausted
-    )
-    assert exhausted.is_set()
-    assert exhausted_context is None
 
-    def _failing_records(_path):
-        yield records[0]
+    for token, generation, build_before_wait in (
+        ("browse-cancel", 6, False),
+        ("browse-tail-cancel", 7, True),
+    ):
+        entered = Event()
+        release = Event()
+
+        def blocked_catalog(path, cancelled):
+            catalog = _catalog(path, rows) if build_before_wait else None
+            entered.set()
+            assert release.wait(timeout=5.0)
+            if cancelled():
+                raise InterruptedError("Browse scalar catalog read cancelled")
+            return catalog if catalog is not None else _catalog(path, rows)
+
+        request = BrowseLoadRequest(token, generation, source)
+        loader = BrowseLoader(
+            join_timeout=0.001,
+            open_scan=lambda _path: _BrowseScan(),
+            open_reader=_reader_factory(blocked_catalog),
+        )
+        loader.begin(request)
+        assert entered.wait(timeout=2.0)
+        pending = loader.cancel(request)
+        assert pending.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        release.set()
+        worker = loader._worker
+        assert worker is not None
+        worker.join(timeout=5.0)
+        assert loader.cancel(request).cleanup_status.value == "cleaned"
+        assert loader.poll(request) is None
+        assert loader._active is None
+        loader.close()
+
+    def fail_catalog(_path, _cancelled):
         raise RuntimeError("reader failure")
 
     failing_request = BrowseLoadRequest("browse-fail", 8, source)
     failing_loader = BrowseLoader(
         open_scan=lambda _path: _BrowseScan(),
-        read_records=_failing_records,
+        open_reader=_reader_factory(fail_catalog),
     )
-    with pytest.raises(RuntimeError):
-        failing_loader._read_context(failing_request, scan_key, Event())
+    failing_loader.begin(failing_request)
+    failing_worker = failing_loader._worker
+    assert failing_worker is not None
+    failing_worker.join(timeout=5.0)
+    failed = failing_loader.poll(failing_request)
+    assert failed is not None and failed.status is BrowseLoadStatus.FAILED
+    assert failed.detail == "reader failure"
+    assert failing_loader.consume(failed) is None
+    failing_loader.close()
 
     empty_request = BrowseLoadRequest("browse-empty", 9, source)
     empty_loader = BrowseLoader(
         open_scan=lambda _path: _BrowseScan(),
-        read_records=lambda _path: iter(()),
+        open_reader=_rows_reader(()),
     )
-    with pytest.raises(ValueError):
-        empty_loader._read_context(empty_request, scan_key, Event())
+    empty_loader.begin(empty_request)
+    empty_worker = empty_loader._worker
+    assert empty_worker is not None
+    empty_worker.join(timeout=5.0)
+    empty = empty_loader.poll(empty_request)
+    assert empty is not None and empty.status is BrowseLoadStatus.FAILED
+    assert empty.detail == "processed browse artifact has no frames"
+    assert empty_loader.consume(empty) is None
+    empty_loader.close()
 
 
-def test_browse_aggregate_reassignment_is_refused(tmp_path):
-    _, context = _read_browse_context(
-        tmp_path, [{"mon": 2.0}], token="browse-once", generation=9
+def test_browse_aggregate_reassignment_is_refused(tmp_path, monkeypatch):
+    _, context, loader, _, _ = _load_via_loader(
+        monkeypatch,
+        tmp_path,
+        [{"mon": 2.0}],
+        token="browse-once",
+        generation=9,
     )
     held = context.norm_aggregate
     assert type(held) is ScanNormAggregate
     with pytest.raises(DisplayContextError):
         context.norm_aggregate = next_norm_revision(held)
     assert context.norm_aggregate is held
+    assert loader.release_context(context).cleanup_status.value == "cleaned"
+    loader.close()
 
 
 def test_acquisition_browse_and_reload_agree_on_row_count_and_channels(
     tmp_path,
+    monkeypatch,
 ):
     rows = [
         {"i0": 1.5, "bstop": 3.0},
@@ -539,13 +629,21 @@ def test_acquisition_browse_and_reload_agree_on_row_count_and_channels(
     for label, row in enumerate(rows, start=1):
         _retain(display, owner, label, row)
     acquisition = owner.norm_aggregate
-    _, browse = _read_browse_context(
-        tmp_path, rows, token="browse-parity", generation=11,
-        name="scan_0004.nxs",
+    _, browse, browse_loader, _, _ = _load_via_loader(
+        monkeypatch,
+        tmp_path,
+        rows,
+        token="browse-parity",
+        generation=11,
+        name="scan_0004.nexus",
     )
-    _, reloaded = _read_browse_context(
-        tmp_path, rows, token="browse-parity-reload", generation=12,
-        name="scan_0004.nxs",
+    _, reloaded, reload_loader, _, _ = _load_via_loader(
+        monkeypatch,
+        tmp_path,
+        rows,
+        token="browse-parity-reload",
+        generation=12,
+        name="scan_0004.nexus",
     )
     first, second, third = (
         acquisition,
@@ -561,6 +659,10 @@ def test_acquisition_browse_and_reload_agree_on_row_count_and_channels(
     assert first.revision == len(rows)
     assert second.revision == third.revision == 1
     assert len({first.identity, second.identity, third.identity}) == 3
+    assert browse_loader.release_context(browse).cleanup_status.value == "cleaned"
+    assert reload_loader.release_context(reloaded).cleanup_status.value == "cleaned"
+    browse_loader.close()
+    reload_loader.close()
 
 
 # --------------------------------------------------------------------- #
@@ -568,18 +670,21 @@ def test_acquisition_browse_and_reload_agree_on_row_count_and_channels(
 # --------------------------------------------------------------------- #
 
 
-def test_no_attachment_beyond_the_two_retention_owners(tmp_path):
+def test_no_attachment_beyond_the_two_retention_owners(tmp_path, monkeypatch):
     display, owner = _display()
     _retain(display, owner, 1, {"mon": 2.0})
     for carrier in (
         owner.records,
-        owner.light_records,
         owner.publications,
         display,
     ):
         assert not hasattr(carrier, "norm_aggregate")
     request, context, loader, operation, outcome = _load_via_loader(
-        tmp_path, [{"mon": 2.0}], token="browse-attach", generation=13
+        monkeypatch,
+        tmp_path,
+        [{"mon": 2.0}],
+        token="browse-attach",
+        generation=13,
     )
     for carrier in (
         loader,
@@ -591,27 +696,45 @@ def test_no_attachment_beyond_the_two_retention_owners(tmp_path):
     ):
         assert not hasattr(carrier, "norm_aggregate")
     assert type(context.norm_aggregate) is ScanNormAggregate
+    assert loader.release_context(context).cleanup_status.value == "cleaned"
+    loader.close()
 
 
-def test_browse_record_reader_is_invoked_once(tmp_path):
-    source = _artifact_file(tmp_path, "scan_0005.nxs")
+def test_browse_scalar_reader_is_invoked_once(tmp_path, monkeypatch):
+    source = _artifact_file(tmp_path, "scan_0005.nexus")
+    monkeypatch.setattr(
+        loader_module,
+        "canonical_browse_scan_key",
+        lambda path: Path(path).stem,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "read_browse_presentation",
+        lambda _path: ({}, None),
+    )
     request = BrowseLoadRequest("browse-one-reader", 14, source)
-    records = _records([{"mon": 2.0}, {"mon": 3.0}])
     calls = []
 
-    def read_records(path):
+    def read_catalog(path, cancelled):
         calls.append(path)
-        return iter(records)
+        assert not cancelled()
+        return _catalog(path, [{"mon": 2.0}, {"mon": 3.0}])
 
     loader = BrowseLoader(
         open_scan=lambda _path: _BrowseScan(),
-        read_records=read_records,
+        open_reader=_reader_factory(read_catalog),
     )
-    context = loader._read_context(
-        request, canonical_browse_scan_key(source), Event()
-    )
+    loader.begin(request)
+    worker = loader._worker
+    assert worker is not None
+    worker.join(timeout=5.0)
+    outcome = loader.poll(request)
+    assert outcome is not None and outcome.status is BrowseLoadStatus.READY
+    context = loader.consume(outcome)
     assert type(context) is BrowseContext
     assert calls == [source]
+    assert loader.release_context(context).cleanup_status.value == "cleaned"
+    loader.close()
 
 
 def test_census_single_fold_sites_one_browse_pass_no_forbidden_routes():

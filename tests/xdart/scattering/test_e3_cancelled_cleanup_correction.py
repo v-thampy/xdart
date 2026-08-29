@@ -36,12 +36,44 @@ from xdart.gui.tabs.scattering.shell_values import (
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.modules.display_context import BrowseContext
+from xrd_tools.io import FrameScalarCatalog
 
 from tests.xdart.scattering.test_e3_context_contract import (
     _browse,
     _running_controller,
     _select_browse,
 )
+
+
+class _EmptyScalarReader:
+    def __init__(self, source, *, resolve_source, callback=None):
+        assert resolve_source is False
+        self._path = str(Path(source).resolve())
+        self._callback = callback
+
+    def __enter__(self):
+        return self
+
+    def read_scalar_catalog(self, *, cancelled):
+        if self._callback is not None:
+            self._callback(self._path, cancelled)
+        if cancelled():
+            raise InterruptedError("Browse scalar catalog read cancelled")
+        return FrameScalarCatalog(self._path, "entry", ())
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        return None
+
+
+def _empty_reader_factory(callback=None):
+    def open_reader(source, *, resolve_source):
+        return _EmptyScalarReader(
+            source,
+            resolve_source=resolve_source,
+            callback=callback,
+        )
+
+    return open_reader
 from tests.xdart.scattering.test_e3_join_oracle import (
     _mount,
     _pause,
@@ -644,13 +676,15 @@ def test_latest_queued_d_cleanup_drains_active_c_without_d_io_and_foreign_is_ine
     )
     operation_c = _ready_operation(request_c, context_c)
     io_facts: list[tuple[str, str]] = []
+
+    def read_catalog(source, _cancelled):
+        io_facts.append(("read", str(source)))
+
     loader = BrowseLoader(
         open_scan=lambda source: io_facts.append(
             ("open", str(source))
         ),
-        read_records=lambda source: (
-            io_facts.append(("read", str(source))) or ()
-        ),
+        open_reader=_empty_reader_factory(read_catalog),
     )
     loader._active = operation_c
     request_d = BrowseLoadRequest(
@@ -752,13 +786,15 @@ def test_cancel_d_after_promotion_check_performs_no_d_io(
     )
     operation_c.terminal = True
     io_facts: list[tuple[str, str]] = []
+
+    def read_catalog(source, _cancelled):
+        io_facts.append(("read", str(source)))
+
     loader = BrowseLoader(
         open_scan=lambda source: (
             io_facts.append(("open", str(source))) or object()
         ),
-        read_records=lambda source: (
-            io_facts.append(("read", str(source))) or ()
-        ),
+        open_reader=_empty_reader_factory(read_catalog),
     )
     loader._active = operation_c
     loader._queued = _BrowseOperation(request_d, Event())
@@ -832,9 +868,9 @@ def test_cleaned_d_waits_for_terminal_c_worker_epilogue_and_retry(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    path_c = tmp_path / "c.nxs"
-    path_d = tmp_path / "d.nxs"
-    path_e = tmp_path / "e.nxs"
+    path_c = tmp_path / "c.nexus"
+    path_d = tmp_path / "d.nexus"
+    path_e = tmp_path / "e.nexus"
     path_c.write_bytes(b"c")
     path_d.write_bytes(b"d")
     path_e.write_bytes(b"e")
@@ -843,16 +879,21 @@ def test_cleaned_d_waits_for_terminal_c_worker_epilogue_and_retry(
     epilogue_entered = Event()
     finish_epilogue = Event()
 
-    def blocked_records(source):
+    def blocked_catalog(source, _cancelled):
         if Path(source) == path_c:
             load_entered.set()
             if not finish_load.wait(timeout=10.0):
                 raise TimeoutError("C load gate timed out")
-        return iter(())
+
+    monkeypatch.setattr(
+        loader_module,
+        "canonical_browse_scan_key",
+        lambda source: Path(source).stem,
+    )
 
     loader = BrowseLoader(
         open_scan=lambda _source: object(),
-        read_records=blocked_records,
+        open_reader=_empty_reader_factory(blocked_catalog),
     )
     request_c = BrowseLoadRequest("browse-c", 1, str(path_c))
     request_d = BrowseLoadRequest("browse-d", 2, str(path_d))

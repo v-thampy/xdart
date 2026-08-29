@@ -30,6 +30,7 @@ from xdart.gui.tabs.scattering.shell_values import (
 )
 from xdart.modules.display_context import BrowseContext, ContextKind
 from xdart.modules.display_context import new_context_token
+from xrd_tools.io import FrameScalarCatalog
 
 from tests.xdart.scattering.test_e3_context_contract import (
     _api,
@@ -45,6 +46,45 @@ from tests.xdart.scattering.test_e3_join_oracle import (
     _run,
     _wait,
 )
+
+
+class _EmptyScalarReader:
+    def __init__(self, source, *, resolve_source, callback=None):
+        assert resolve_source is False
+        self._path = str(Path(source).resolve())
+        self._callback = callback
+
+    def __enter__(self):
+        return self
+
+    def read_scalar_catalog(self, *, cancelled):
+        if self._callback is not None:
+            self._callback(self._path, cancelled)
+        if cancelled():
+            raise InterruptedError("Browse scalar catalog read cancelled")
+        return FrameScalarCatalog(self._path, "entry", ())
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        return None
+
+
+def _empty_reader_factory(callback=None):
+    def open_reader(source, *, resolve_source):
+        return _EmptyScalarReader(
+            source,
+            resolve_source=resolve_source,
+            callback=callback,
+        )
+
+    return open_reader
+
+
+def _admit_fake_browse(monkeypatch):
+    monkeypatch.setattr(
+        loader_module,
+        "canonical_browse_scan_key",
+        lambda source: Path(source).stem,
+    )
 
 
 def _begin_replacement():
@@ -573,24 +613,25 @@ def test_third_request_rejection_preserves_exact_queued_d_hold() -> None:
 
 def test_cancelled_active_and_queued_replacement_retire_all_loader_owners(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    _admit_fake_browse(monkeypatch)
     entered_c = Event()
     release_c = Event()
-    c = tmp_path / "c.nxs"
-    d = tmp_path / "d.nxs"
+    c = tmp_path / "c.nexus"
+    d = tmp_path / "d.nexus"
     c.write_bytes(b"c")
     d.write_bytes(b"d")
 
-    def blocked_records(source):
+    def blocked_catalog(source, _cancelled):
         if Path(source) == c:
             entered_c.set()
             release_c.wait(timeout=30.0)
-        return iter(())
 
     loader = BrowseLoader(
         join_timeout=0.01,
         open_scan=lambda _source: object(),
-        read_records=blocked_records,
+        open_reader=_empty_reader_factory(blocked_catalog),
     )
     request_c = BrowseLoadRequest(
         new_context_token(ContextKind.BROWSE), 1, str(c)
@@ -624,21 +665,23 @@ def test_cancelled_active_and_queued_replacement_retire_all_loader_owners(
 
 def test_close_never_waits_for_blocked_active_browse_and_keeps_latest_identity(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    _admit_fake_browse(monkeypatch)
     entered = Event()
     release = Event()
-    active_path = tmp_path / "active.nxs"
-    queued_path = tmp_path / "latest.nxs"
+    active_path = tmp_path / "active.nexus"
+    queued_path = tmp_path / "latest.nexus"
     active_path.write_bytes(b"active")
     queued_path.write_bytes(b"latest")
 
-    def blocked_records(_source):
+    def blocked_catalog(_source, _cancelled):
         entered.set()
         assert release.wait(timeout=5.0)
-        return iter(())
 
     loader = BrowseLoader(
-        open_scan=lambda _source: object(), read_records=blocked_records,
+        open_scan=lambda _source: object(),
+        open_reader=_empty_reader_factory(blocked_catalog),
     )
     active = BrowseLoadRequest("active", 1, str(active_path))
     latest = BrowseLoadRequest("latest", 2, str(queued_path))
@@ -688,13 +731,12 @@ def test_cancel_d_during_promotion_cannot_launch_unowned_d(
         io_calls.append(("open", str(source)))
         return object()
 
-    def read_records(source):
+    def read_catalog(source, _cancelled):
         io_calls.append(("read", str(source)))
-        return ()
 
     loader = BrowseLoader(
         open_scan=open_scan,
-        read_records=read_records,
+        open_reader=_empty_reader_factory(read_catalog),
     )
     active = _BrowseOperation(c, Event())
     active.cancelled.set()
@@ -832,24 +874,25 @@ def test_malformed_exact_ready_cleanup_retry_clears_hold_once(
 def test_close_correlates_active_c_and_queued_d_to_exact_d(
     tmp_path: Path,
     cancel_queued: bool,
+    monkeypatch,
 ) -> None:
+    _admit_fake_browse(monkeypatch)
     entered_c = Event()
     release_c = Event()
-    c = tmp_path / "c.nxs"
-    d = tmp_path / "d.nxs"
+    c = tmp_path / "c.nexus"
+    d = tmp_path / "d.nexus"
     c.write_bytes(b"c")
     d.write_bytes(b"d")
 
-    def blocked_records(source):
+    def blocked_catalog(source, _cancelled):
         if Path(source) == c:
             entered_c.set()
             release_c.wait(timeout=30.0)
-        return iter(())
 
     loader = BrowseLoader(
         join_timeout=0.001,
         open_scan=lambda _source: object(),
-        read_records=blocked_records,
+        open_reader=_empty_reader_factory(blocked_catalog),
     )
     request_c = BrowseLoadRequest(
         new_context_token(ContextKind.BROWSE), 1, str(c)
@@ -952,13 +995,17 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
 ) -> None:
     b = _produce_browse_artifact(monkeypatch, tmp_path / "b")
     c = _produce_browse_artifact(monkeypatch, tmp_path / "c")
+    entered_c = Event()
+    release_c = Event()
     rig = _mount(
         monkeypatch,
         tmp_path / "a",
         labels=tuple(range(1, 100)),
         reduction_delay=0.001,
+        browse_entered=entered_c,
+        browse_release=release_c,
+        browse_gate_path=c,
     )
-    release_c = Event()
     try:
         _run(rig)
         _pause(rig)
@@ -1021,19 +1068,6 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
             )
 
         monkeypatch.setattr(rig.shell, "apply_state", observe)
-        entered_c = Event()
-        real_read_records = rig.loader._read_records
-
-        def blocked_read_records(source):
-            if Path(source) == c:
-                entered_c.set()
-                if not release_c.wait(timeout=30.0):
-                    raise TimeoutError("C release was not signalled")
-            yield from real_read_records(source)
-
-        monkeypatch.setattr(
-            rig.loader, "_read_records", blocked_read_records
-        )
         rig.command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(c)))
         _wait(rig.app, entered_c.is_set)
         request_c = rig.controller._browse_request

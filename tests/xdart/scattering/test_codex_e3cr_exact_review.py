@@ -7,9 +7,11 @@ from threading import Event, Thread
 
 import pytest
 
-from tests.xdart.scattering.test_e3_context_contract import _view
 from tests.xdart.scattering.test_e3_context_correction_boundaries import (
+    _ONE_READER,
+    _catalog,
     _real_loader_controller,
+    _reader_factory,
     _wait_for,
 )
 from xdart.gui.tabs.scattering import adapters
@@ -25,7 +27,6 @@ from xdart.modules.display_context import (
     ContextKind,
     new_context_token,
 )
-from xrd_tools.core import FrameRecord
 
 
 def _context(scan: object) -> AcquisitionContext:
@@ -44,12 +45,6 @@ def _context(scan: object) -> AcquisitionContext:
         viewer_rows_2d={},
         publication_store={},
     )
-
-
-def _one_record(_path):
-    yield FrameRecord.from_view(_view(1, 5.0))
-
-
 def test_rescope_selection_and_epoch_are_not_observable_partially(
     monkeypatch,
 ):
@@ -182,10 +177,10 @@ def test_rejected_ready_browse_retains_failed_cleanup_owner(
     monkeypatch,
     tmp_path: Path,
 ):
-    path = tmp_path / "browse.nxs"
+    path = tmp_path / "browse.nexus"
     path.write_bytes(b"browse")
     controller, _, _, loader, _ = _real_loader_controller(
-        monkeypatch, read_records=_one_record
+        monkeypatch, open_reader=_ONE_READER
     )
     request = controller.begin_browse(str(path))
     outcome = _wait_for(lambda: loader.poll(request))
@@ -219,21 +214,22 @@ def test_close_keeps_one_identity_across_active_and_queued_requests(
 
     entered = Event()
     release = Event()
-    path_b = tmp_path / "b.nxs"
-    path_c = tmp_path / "c.nxs"
+    path_b = tmp_path / "b.nexus"
+    path_c = tmp_path / "c.nexus"
     path_b.write_bytes(b"b")
     path_c.write_bytes(b"c")
 
-    def records(path):
+    def read_catalog(path, cancelled):
         if Path(path) == path_b:
             entered.set()
             release.wait(timeout=2.0)
-            return
-        yield FrameRecord.from_view(_view(1, 7.0))
+        if cancelled():
+            raise InterruptedError("Browse scalar catalog read cancelled")
+        return _catalog(path, 7.0)
 
     controller, _, _, loader, _ = _real_loader_controller(
         monkeypatch,
-        read_records=records,
+        open_reader=_reader_factory(read_catalog),
         join_timeout=0.001,
     )
     request_b = controller.begin_browse(str(path_b))
@@ -258,12 +254,12 @@ def test_thread_construction_failure_does_not_leave_released_b_selected(
 ):
     from xdart.gui.tabs.scattering.adapters import browse_loader as loader_module
 
-    first = tmp_path / "first.nxs"
-    second = tmp_path / "second.nxs"
+    first = tmp_path / "first.nexus"
+    second = tmp_path / "second.nexus"
     first.write_bytes(b"first")
     second.write_bytes(b"second")
     controller, _, _, _, acquisition = _real_loader_controller(
-        monkeypatch, read_records=_one_record
+        monkeypatch, open_reader=_ONE_READER
     )
     controller.begin_browse(str(first))
     _wait_for(controller.poll_browse)
