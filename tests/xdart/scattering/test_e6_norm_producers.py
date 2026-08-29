@@ -737,6 +737,59 @@ def test_browse_scalar_reader_is_invoked_once(tmp_path, monkeypatch):
     loader.close()
 
 
+def test_browse_loader_has_one_exact_scalar_catalog_route():
+    source = PRODUCTION["browse_loader"].read_text()
+    for token in (
+        "iter_frame_records",
+        "FrameScalarRow",
+        "_iter_browse_records",
+        "_DEFAULT_RECORD_READER",
+        "read_records",
+        "_read_records",
+        "_catalog_from_legacy_records",
+    ):
+        assert token not in source, token
+
+    tree = ast.parse(source)
+    loader_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BrowseLoader"
+    )
+    methods = {
+        node.name: node
+        for node in loader_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    constructor = methods["__init__"]
+    constructor_parameters = {
+        argument.arg
+        for argument in (
+            *constructor.args.args,
+            *constructor.args.kwonlyargs,
+        )
+    }
+    assert "open_reader" in constructor_parameters
+    assert "read_records" not in constructor_parameters
+
+    read_context = methods["_read_context"]
+    keyword_names = [
+        argument.arg for argument in read_context.args.kwonlyargs
+    ]
+    operation_index = keyword_names.index("_operation")
+    assert read_context.args.kw_defaults[operation_index] is None
+
+    scalar_catalog_calls = [
+        node
+        for node in ast.walk(read_context)
+        if (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "attr", "") == "_catalog_from_reader"
+        )
+    ]
+    assert len(scalar_catalog_calls) == 1
+
+
 def test_census_single_fold_sites_one_browse_pass_no_forbidden_routes():
     sources = {name: path.read_text() for name, path in PRODUCTION.items()}
     for name, source in sources.items():
@@ -817,29 +870,3 @@ def test_census_single_fold_sites_one_browse_pass_no_forbidden_routes():
     assert "fold_norm_metadata" not in sources["run_executor"]
     assert "norm_aggregate" not in sources["run_executor"]
     assert "metadata_numeric" in sources["display_runtime"]
-
-    read_loops = [
-        node
-        for node in ast.walk(browse_tree)
-        if isinstance(node, ast.For)
-        and isinstance(node.iter, ast.Call)
-        and getattr(node.iter.func, "attr", "") == "_read_records"
-    ]
-    read_calls = [
-        node
-        for node in ast.walk(browse_tree)
-        if isinstance(node, ast.Call)
-        and getattr(node.func, "attr", "") == "_read_records"
-    ]
-    assert len(read_loops) == 1
-    assert len(read_calls) == 1
-    read_symbol_loads = [
-        node
-        for node in ast.walk(browse_tree)
-        if (
-            isinstance(node, ast.Attribute)
-            and node.attr == "_read_records"
-            and isinstance(node.ctx, ast.Load)
-        )
-    ]
-    assert len(read_symbol_loads) == 1
