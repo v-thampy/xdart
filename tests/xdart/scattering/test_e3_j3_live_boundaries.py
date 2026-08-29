@@ -453,9 +453,16 @@ def test_j3_real_mounted_run_pause_browse_resume_stop_close(
         state: ShellProjection,
         *,
         preserve_display: bool = False,
+        preserve_scientific: bool = False,
+        replace_scientific_on_failure: bool = False,
     ) -> None:
         applied.append(state)
-        apply_state(state, preserve_display=preserve_display)
+        apply_state(
+            state,
+            preserve_display=preserve_display,
+            preserve_scientific=preserve_scientific,
+            replace_scientific_on_failure=replace_scientific_on_failure,
+        )
 
     monkeypatch.setattr(shell, "apply_state", observe)
 
@@ -867,10 +874,17 @@ def test_j3_mounted_qualified_xye_only_replaces_images_and_renders_trace(
         state: ShellProjection,
         *,
         preserve_display: bool = False,
+        preserve_scientific: bool = False,
+        replace_scientific_on_failure: bool = False,
     ) -> None:
         applied.append(state)
         preserved.append(preserve_display)
-        apply_state(state, preserve_display=preserve_display)
+        apply_state(
+            state,
+            preserve_display=preserve_display,
+            preserve_scientific=preserve_scientific,
+            replace_scientific_on_failure=replace_scientific_on_failure,
+        )
 
     monkeypatch.setattr(shell, "apply_state", observe)
     try:

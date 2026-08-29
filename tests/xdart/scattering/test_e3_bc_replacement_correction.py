@@ -1039,8 +1039,17 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
             state: ShellProjection,
             *,
             preserve_display: bool = False,
+            preserve_scientific: bool = False,
+            replace_scientific_on_failure: bool = False,
         ) -> None:
-            real_apply(state, preserve_display=preserve_display)
+            real_apply(
+                state,
+                preserve_display=preserve_display,
+                preserve_scientific=preserve_scientific,
+                replace_scientific_on_failure=(
+                    replace_scientific_on_failure
+                ),
+            )
             current_index = rig.shell.browser.frames.currentIndex()
             selected_scans = tuple(
                 item.data(QtCore.Qt.ItemDataRole.UserRole)

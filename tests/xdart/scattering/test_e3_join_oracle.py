@@ -772,8 +772,17 @@ def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
             state,
             *,
             preserve_display: bool = False,
+            preserve_scientific: bool = False,
+            replace_scientific_on_failure: bool = False,
         ) -> None:
-            apply_state(state, preserve_display=preserve_display)
+            apply_state(
+                state,
+                preserve_display=preserve_display,
+                preserve_scientific=preserve_scientific,
+                replace_scientific_on_failure=(
+                    replace_scientific_on_failure
+                ),
+            )
             presentations.append(
                 (
                     state.navigation.current,
