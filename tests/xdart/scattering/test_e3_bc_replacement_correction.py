@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
+from shutil import copy2
 from threading import Event, Lock, Thread
 import time
 
@@ -993,8 +994,11 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    b = _produce_browse_artifact(monkeypatch, tmp_path / "b")
-    c = _produce_browse_artifact(monkeypatch, tmp_path / "c")
+    source_b = _produce_browse_artifact(monkeypatch, tmp_path / "b")
+    source_c = _produce_browse_artifact(monkeypatch, tmp_path / "c")
+    active_catalog = tmp_path / "a" / "project" / "processed"
+    b = active_catalog / "browse-b.nexus"
+    c = active_catalog / "browse-c.nexus"
     entered_c = Event()
     release_c = Event()
     rig = _mount(
@@ -1007,6 +1011,25 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
         browse_gate_path=c,
     )
     try:
+        copy2(source_b, b)
+        copy2(source_c, c)
+        rig.command(ShellCommand(ShellCommandKind.REFRESH_BROWSER))
+
+        def browser_artifacts() -> set[str]:
+            return {
+                str(
+                    rig.shell.browser.scans.item(index).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                )
+                for index in range(rig.shell.browser.scans.count())
+            }
+
+        _wait(
+            rig.app,
+            lambda: {str(b), str(c)} <= browser_artifacts(),
+            diagnostic=lambda: sorted(browser_artifacts()),
+        )
         _run(rig)
         _pause(rig)
         rig.command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(b)))
@@ -1032,7 +1055,10 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
         raw_b = _image_copy(rig.shell.scientific.raw.image)
         cake_b = _image_copy(rig.shell.scientific.cake.image)
         traces_b = _trace_copy(rig.shell)
-        observations: list[tuple[ShellProjection, tuple]] = []
+        observations: list[
+            tuple[ShellCommandKind, ShellProjection, tuple]
+        ] = []
+        active_command = [ShellCommandKind.SELECT_SCAN]
         real_apply = rig.shell.apply_state
 
         def observe(
@@ -1057,6 +1083,7 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
             )
             observations.append(
                 (
+                    active_command[0],
                     state,
                     (
                         rig.controller.selection,
@@ -1077,7 +1104,14 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
             )
 
         monkeypatch.setattr(rig.shell, "apply_state", observe)
-        rig.command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(c)))
+
+        def dispatch(command: ShellCommand) -> int:
+            active_command[0] = command.kind
+            before = len(observations)
+            rig.command(command)
+            return before
+
+        dispatch(ShellCommand(ShellCommandKind.SELECT_SCAN, str(c)))
         _wait(rig.app, entered_c.is_set)
         request_c = rig.controller._browse_request
         assert request_c is not None
@@ -1099,9 +1133,13 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
             ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"),
             ShellCommand(ShellCommandKind.SELECT_SCAN, frame_b.artifact),
         ):
-            before = len(observations)
-            rig.command(command)
+            before = dispatch(command)
             assert len(observations) > before
+            assert all(
+                triggering_kind is command.kind
+                for triggering_kind, _state, _rendered
+                in observations[before:]
+            )
 
         before = len(observations)
         browse_facts = tuple(rig.browse_facts)
@@ -1110,15 +1148,19 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
             ShellCommandKind.HYDRATE_FRAME,
             ShellCommandKind.SELECT_BROWSER_FRAMES,
         ):
-            rig.command(
-                ShellCommand(kind, frame=frame_b, frames=(frame_b,))
+            dispatch(
+                ShellCommand(
+                    kind,
+                    frame=frame_b,
+                    frames=(frame_b,),
+                )
             )
         assert len(observations) == before
         assert tuple(rig.browse_facts) == browse_facts
 
         interim = list(observations)
         assert interim
-        for state, rendered in interim:
+        for _triggering_kind, state, rendered in interim:
             (
                 selection,
                 navigation,
@@ -1166,7 +1208,7 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
         assert frame_c is not None
         transitions = [
             state.navigation.current
-            for state, _rendered in observations
+            for _triggering_kind, state, _rendered in observations
             if state.navigation.current is not frame_b
         ]
         assert transitions
