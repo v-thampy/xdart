@@ -538,10 +538,19 @@ def test_publication_store_default_total_bound():
 def test_publication_from_nexus_frame_matches_live_style_view(tmp_path):
     frame = DuckFrame(idx=8)
     live_publication = publication_from_live_frame(frame, include_raw=False)
-    path = tmp_path / "published.nxs"
+    path = tmp_path / "published.nexus"
 
     with h5py.File(path, "w") as h5:
+        from xrd_tools.io.schema import (
+            PROCESSED_SCHEMA_NAME,
+            PROCESSED_SCHEMA_VERSION,
+            SCHEMA_NAME_ATTR,
+            SCHEMA_VERSION_ATTR,
+        )
+
         entry = h5.create_group("entry")
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
         write_integrated_stack(
             entry,
             frame_indices=[8],
