@@ -57,6 +57,16 @@ class _ScalarReader:
 def _fake_loader(monkeypatch, path: Path, reader_factory):
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
 
+    admitted_path = path.resolve()
+    monkeypatch.setattr(
+        module,
+        "canonical_browse_scan_key",
+        lambda source: (
+            path.stem
+            if Path(source).resolve() == admitted_path
+            else ""
+        ),
+    )
     monkeypatch.setattr(
         module, "read_browse_presentation", lambda _path: ({}, None),
     )
@@ -138,7 +148,7 @@ def test_scalar_reader_cancellation_closes_before_terminal_cleanup(
         BrowseLoadStatus,
     )
 
-    path = tmp_path / "cancel.nxs"
+    path = tmp_path / "cancel.nexus"
     path.write_bytes(b"catalog")
     entered = Event()
     readers = []
@@ -180,7 +190,7 @@ def test_scalar_reader_fail_once_close_retries_before_ready(
         BrowseLoadStatus,
     )
 
-    path = tmp_path / "retry-close.nxs"
+    path = tmp_path / "retry-close.nexus"
     path.write_bytes(b"catalog")
     readers = []
 
@@ -220,10 +230,10 @@ def test_scalar_catalog_or_artifact_drift_refuses_without_context(
         BrowseLoadStatus,
     )
 
-    path = tmp_path / f"{kind}.nxs"
+    path = tmp_path / f"{kind}.nexus"
     path.write_bytes(b"catalog-before")
     readers = []
-    foreign = str((tmp_path / "foreign.nxs").resolve())
+    foreign = str((tmp_path / "foreign.nexus").resolve())
 
     def factory(source, *, resolve_source):
         reader = _ScalarReader(
@@ -257,7 +267,7 @@ def test_context_release_is_retryable_and_detaches_catalog_last() -> None:
     from xdart.modules.display_context import BrowseContext, DisplayContextError
     from xrd_tools.io import Browse1DCache
 
-    path = Path("/tmp/release-catalog.nxs")
+    path = Path("/tmp/release-catalog.nexus")
     catalog = _catalog(path)
 
     class Owned:

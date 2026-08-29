@@ -55,6 +55,16 @@ class _Reader:
 def _loader(monkeypatch, path: Path, catalog, *, open_cache):
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
 
+    admitted_path = path.resolve()
+    monkeypatch.setattr(
+        module,
+        "canonical_browse_scan_key",
+        lambda source: (
+            path.stem
+            if Path(source).resolve() == admitted_path
+            else ""
+        ),
+    )
     monkeypatch.setattr(
         module, "read_browse_presentation", lambda _path: ({}, None),
     )
@@ -88,7 +98,7 @@ def test_worker_constructs_exact_empty_cache_for_651_catalog_and_detaches(
         default_browse_1d_cache_budget,
     )
 
-    path = tmp_path / "cache-651.nxs"
+    path = tmp_path / "cache-651.nexus"
     path.write_bytes(b"catalog")
     catalog = _catalog(path, 651)
     main_thread = get_ident()
@@ -143,7 +153,7 @@ def test_worker_refuses_foreign_cache_before_context_publication(
         BrowseLoadStatus,
     )
 
-    path = tmp_path / "foreign-cache.nxs"
+    path = tmp_path / "foreign-cache.nexus"
     path.write_bytes(b"catalog")
     loader, _readers = _loader(
         monkeypatch,
@@ -174,7 +184,7 @@ def test_cancelled_or_failed_context_construction_closes_exact_allocated_cache(
     from xrd_tools.io import Browse1DCache
     from xrd_tools.io.browse_1d_cache import Browse1DCachePhase
 
-    path = tmp_path / f"cache-{outcome_kind}.nxs"
+    path = tmp_path / f"cache-{outcome_kind}.nexus"
     path.write_bytes(b"catalog")
     catalog = _catalog(path)
     allocated = Event()
@@ -243,7 +253,7 @@ def test_release_cut_retains_exact_cache_and_catalog_for_retry(
     from xrd_tools.io import Browse1DCache
     from xrd_tools.io.browse_1d_cache import Browse1DCachePhase
 
-    path = tmp_path / f"release-{cut}.nxs"
+    path = tmp_path / f"release-{cut}.nexus"
     path.write_bytes(b"catalog")
     catalog = _catalog(path)
     caches = []
@@ -327,7 +337,7 @@ def test_context_refuses_release_or_foreign_detach_while_cache_attached(
     from xdart.modules.display_context import BrowseContext, DisplayContextError
     from xrd_tools.io import Browse1DCache
 
-    path = tmp_path / "direct-release.nxs"
+    path = tmp_path / "direct-release.nexus"
     catalog = _catalog(path)
     cache = Browse1DCache(1 << 20)
     foreign = Browse1DCache(1 << 20)
