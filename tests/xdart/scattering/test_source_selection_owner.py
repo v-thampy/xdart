@@ -347,6 +347,9 @@ def test_page_has_one_source_owner_and_no_source_executor_or_port_calls() -> Non
     owner = (
         root / "src/xdart/gui/tabs/scattering/source_selection.py"
     ).read_text()
+    browser = (
+        root / "src/xdart/gui/tabs/scattering/processed_browser.py"
+    ).read_text()
 
     for retired in (
         "self._sources",
@@ -361,8 +364,9 @@ def test_page_has_one_source_owner_and_no_source_executor_or_port_calls() -> Non
         "self._source_history",
     ):
         assert retired not in page
-    assert page.count("ThreadPoolExecutor(max_workers=1)") == 1
+    assert page.count("ThreadPoolExecutor(max_workers=1)") == 0
     assert owner.count("ThreadPoolExecutor(max_workers=1)") == 1
+    assert browser.count("ThreadPoolExecutor(max_workers=1)") == 1
     assert owner.count("self._intents.commit(") == 1
     assert "self._sources.observe" in owner
     assert "self._sources.preview_motors" in owner

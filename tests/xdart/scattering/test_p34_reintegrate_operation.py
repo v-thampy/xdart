@@ -105,7 +105,7 @@ def test_ordinary_output_routes_group_target_through_one_borrowed_lock(tmp_path)
     adapter = dynamic_output.DynamicOutputAdapter(SimpleNamespace())
     def prepared(shown):
         item = SimpleNamespace(target=shown, group=SimpleNamespace(target=target))
-        value = dynamic_output._PreparedAdmission(adapter, object(), object(), item, object(), object(), threading.Event(), (None,) * 6, (None,) * 5, None)
+        value = dynamic_output._PreparedAdmission(adapter, object(), object(), item, object(), object(), threading.Event(), (None,) * 5, (None,) * 5, None)
         object.__setattr__(value, "identity", value); return value
     with pytest.raises(TypeError, match="exact run provenance"):
         adapter._activate_owned(prepared(alias), record_store=None, run_provenance=object(), cancelled=lambda: False)
@@ -507,36 +507,73 @@ def test_finished_run_auto_browse_enables_reintegration_without_second_click(
 def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
     tmp_path, monkeypatch, qapp,
 ):
-    from xdart.gui.tabs.scattering.browse_values import (
-        BrowseLoadOutcome, BrowseLoadStatus,
+    from tests.xdart.scattering.test_e3_context_contract import (
+        _acquisition, _display, _view,
     )
-    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
-    from xdart.gui.tabs.scattering.shell_values import (
-        FrameNavigationProjection, ShellCommandKind,
-    )
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
+    from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
+    from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
+    from xdart.modules.frame_publication import FramePublication
+    from xrd_tools.core import FrameRecord
     from xrd_tools.io.output_transaction import StreamTerminal
 
-    page, _store, _seeded, context = _loaded_page(
-        tmp_path, monkeypatch, qapp, terminal_browse=True,
-    )
+    seed = _seed_existing(tmp_path, labels=tuple(range(1, 66)))
+    page, _store = _page(tmp_path, monkeypatch)
     try:
-        controller = page._context_controller
-        original = controller.navigation
-        latest = original.frames[-1]
-        synthetic = tuple(
-            DisplayFrameKey(
-                latest.run_identity,
-                latest.source_scan,
-                latest.artifact,
-                10_000 + index,
-                10_000 + index,
+        target = str(seed.target.resolve())
+        identity, template = _acquisition()
+        display = _display(
+            identity,
+            artifact=target,
+            scan_key="existing",
+            value=1.0,
+        )
+        display.catalog.resize(65)
+        owner = display.artifacts[target]
+        for label in seed.labels[1:]:
+            frame_view = _view(label, float(label))
+            record = FrameRecord.from_view(frame_view)
+            publication = FramePublication(
+                frame_view,
+                record=record,
+                source_identity=f"{frame_view.source_path}#{label}",
+                scan_key="existing",
             )
-            for index in range(64)
+            frame = display.append_navigation(
+                "existing", target, label,
+            ).appended
+            display.retain_frame(
+                owner,
+                frame,
+                record,
+                publication,
+                source_identity=publication.source_identity,
+                frame_mask_qualified=False,
+            )
+            if label == seed.labels[-1]:
+                display.put_payload(StandardDisplayPayload(
+                    0,
+                    frame,
+                    f"Standard · existing · frame {label}",
+                    frame_view,
+                ))
+        acquisition = replace(
+            template,
+            run_scan_key="existing",
+            source_path="/data/scan_1.tif",
+            frame_ids=display.catalog,
+            frames=display.artifacts,
+            publication_store=display,
+            record_store=None,
         )
-        expanded = FrameNavigationProjection(
-            (*synthetic, latest), latest, (latest,),
-        )
-        controller._runtime._set_browse_navigation(expanded)
+        acquisition.adopt_record_store(display)
+
+        controller = page._context_controller
+        controller._runtime.adopt_acquisition(identity, acquisition)
+        original = controller.navigation
+        assert len(original.frames) == 65
+        latest = original.frames[-1]
+        assert controller.select_navigation(latest, (latest,))
         page._preferences = replace(page._preferences, plot_mode="Single")
         view = page._shell.scientific
 
@@ -547,7 +584,7 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
             return (
                 projection
                 if projection is not None
-                and view.navigation_frame_keys == expanded.frames
+                and view.navigation_frame_keys == original.frames
                 and view.navigation_current_key is latest
                 and view.navigation_selected_keys == (latest,)
                 and view.trace_history_keys == (latest,)
@@ -558,6 +595,10 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
             )
 
         before = _wait(complete_single)
+        # This oracle drives the private terminal-paint transaction directly.
+        # Leave no page-owned drain timer able to start a competing ordinary
+        # paint for the same presentation while that transaction is staged.
+        page._run_timer.stop()
         before_history = view.trace_history_projections
         before_items = tuple(view.curve.listDataItems())
         assert len(before_history) == len(before_items) == 1
@@ -568,22 +609,17 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
         before_raw_widget = view.raw
         before_cake_widget = view.cake
         before_bottom = view.bottom_stack.currentWidget()
-        preference_before = page._preferences
 
-        clones = tuple(
-            DisplayFrameKey(
-                frame.run_identity,
-                frame.source_scan,
-                frame.artifact,
-                frame.local_frame_label,
-                frame.work_ordinal,
-            )
-            for frame in expanded.frames
+        request = controller.begin_browse(
+            target,
+            source_root=str(seed.target.parent.resolve()),
+            terminal_commit_identity=seed.terminal.commit_identity,
         )
-        rebound = FrameNavigationProjection(
-            clones, clones[-1], (clones[-1],),
-        )
-        request = context.load_request
+        outcome = _wait(controller.poll_browse)
+        assert outcome.request is request
+        assert outcome.status is BrowseLoadStatus.READY
+        context = controller.browse_context
+        assert context is not None and context.loaded
         commit_identity = request.terminal_commit_identity
         assert type(commit_identity) is StreamTerminal
         expected_handoff = TerminalBrowseHandoff(
@@ -595,15 +631,23 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
             commit_identity,
         )
         handoff = _begin_terminal_handoff(page, expected_handoff)
-        assert page._terminal_scientific_matches(handoff, rebound)
-        controller._runtime._set_browse_navigation(rebound)
         capture = controller.capture_loaded_browse(request)
         assert capture is not None and capture.context is context
-        assert page._settle_terminal_browse(BrowseLoadOutcome(
-            request, BrowseLoadStatus.READY,
-        ))
+        assert page._settle_terminal_browse(outcome)
+        rebound = controller.navigation
+        clones = rebound.frames
+        assert len(clones) == len(original.frames) == 65
+        assert tuple(frame.local_frame_label for frame in clones) == seed.labels
+        assert all(
+            old is not new
+            for old, new in zip(original.frames, clones, strict=True)
+        )
+        assert rebound.current is clones[-1]
+        assert rebound.selected == (clones[-1],)
+        assert page._terminal_scientific_matches(handoff, rebound)
         presentation = page._processed_browser.terminal_presentation
         assert presentation is not None
+        preference_before = page._preferences
 
         controller._runtime._committed_trace_scope = ("stale",)
         controller._runtime._committed_trace_selection = (clones[-1],)
@@ -682,7 +726,12 @@ def test_terminal_browse_rebind_reuses_exact_single_latest_across_65_frames(
         assert view.raw.canvas.displayed_image is before_raw
         assert view.cake.canvas.displayed_image is before_cake
         assert view.bottom_stack.currentWidget() is before_bottom
-        assert page._preferences is preference_before
+        assert replace(
+            page._preferences,
+            detector_available=preference_before.detector_available,
+            detector_pending=preference_before.detector_pending,
+            detector_diagnostic=preference_before.detector_diagnostic,
+        ) == preference_before
         assert controller._runtime._committed_trace_scope is None
         assert controller._runtime._committed_trace_selection == ()
         assert controller._runtime._pending_trace_projection is None
@@ -1858,7 +1907,7 @@ def test_default_browse_retains_651_scalar_catalog_without_eager_rows(tmp_path):
 
 def test_direct_and_gui_scheduled_2d_match_after_reopen_and_preserve_1d(tmp_path, monkeypatch, qapp):
     from xdart.gui.tabs.scattering.adapters import external_operation; from xdart.gui.tabs.scattering.operation_values import OperationTerminalStatus; from xrd_tools.io.output_transaction import StreamTerminal, capture_target_snapshot; from xrd_tools.reduction import ReintegratePlan, run_reintegrate, reintegrate as module
-    seed=_seed_existing(tmp_path,labels=(0,1,2),append=True); direct_path=tmp_path/"direct.nexus"; gui_path=tmp_path/"gui.nexus"; direct_path.write_bytes(seed.target.read_bytes()); gui_path.write_bytes(seed.target.read_bytes()); before=(_tree_manifest(direct_path,"entry/integrated_1d"),_tree_manifest(gui_path,"entry/integrated_1d")); request=_resolved_2d()
+    seed=_seed_existing(tmp_path,labels=(0,1,2),append=True); direct_path=seed.target.parent/"direct.nexus"; gui_path=seed.target.parent/"gui.nexus"; direct_path.write_bytes(seed.target.read_bytes()); gui_path.write_bytes(seed.target.read_bytes()); before=(_tree_manifest(direct_path,"entry/integrated_1d"),_tree_manifest(gui_path,"entry/integrated_1d")); request=_resolved_2d()
     direct_plan=ReintegratePlan.from_artifact(direct_path,entry="entry",dimension="2d",preparation=copy.deepcopy(request),expected_target_snapshot=capture_target_snapshot(direct_path),expected_labels=seed.labels); plans=[]; real_build=ReintegratePlan.from_artifact
     def build(target,**kw): plans.append((copy.deepcopy(kw["preparation"]),real_build(target,**kw))); return plans[-1][1]
     bound=[]; real_bind=module._ReintegrateFrameSource.bind_allocation
