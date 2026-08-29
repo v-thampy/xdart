@@ -35,7 +35,7 @@ def _set_certified_hydrator(store, hydrate):
         record = hydrate(request.label)
         return None if record is None else FrameHydrationResult(request, record)
 
-    store.set_hydrator(certified, revision_qualified=True)
+    store.set_hydrator(certified)
 
 
 def _view(label=0, *, source: "str | None" = "/data/scan_0001.tif",
@@ -233,11 +233,24 @@ def test_get_or_hydrate_restores_every_written_mode_from_nexus(tmp_path):
     import h5py
 
     from xrd_tools.io import read_frame_record, write_frame_records
+    from xrd_tools.io.schema import (
+        PROCESSED_SCHEMA_NAME,
+        PROCESSED_SCHEMA_VERSION,
+        SCHEMA_NAME_ATTR,
+        SCHEMA_VERSION_ATTR,
+    )
 
-    records = [_multi_mode_record(0, scale=1.0), _multi_mode_record(1, scale=2.0)]
-    path = tmp_path / "multi_mode.nxs"
+    records = [
+        _multi_mode_record(0, scale=1.0),
+        _multi_mode_record(1, scale=2.0),
+    ]
+    path = tmp_path / "multi_mode.nexus"
     with h5py.File(path, "w") as h5:
-        write_frame_records(h5.create_group("entry"), records)
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+        write_frame_records(entry, records)
 
     store = FrameRecordStore(max_heavy_items=1)
     store.upsert(records[0], persisted=True)
@@ -272,6 +285,55 @@ def test_get_or_hydrate_refuses_source_identity_when_captured_row_had_none():
     assert rec is not None
     assert store.source_identity(1) == ""
     assert not store.has_heavy_payload(1)
+
+
+def test_get_or_hydrate_refuses_uncertified_raw_record_without_source():
+    store = FrameRecordStore(
+        max_heavy_items=0,
+        require_persisted_for_eviction=False,
+    )
+    installed = store.upsert(
+        _record(label=1, source=None, source_frame=None)
+    )
+    assert not store.has_heavy_payload(1)
+
+    store.set_hydrator(
+        lambda _request: _record(
+            label=1,
+            source=None,
+            source_frame=None,
+            scale=9.0,
+        )
+    )
+    returned = store.get_or_hydrate(1)
+
+    assert returned is installed
+    assert returned is store.get(1)
+    assert not store.has_heavy_payload(1)
+
+
+def test_hydrator_none_returns_locked_current_replacement():
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, source="/data/a.tif"), persisted=True)
+    assert store.release_heavy(1)
+    replacements = []
+
+    def replace_then_refuse(_request):
+        replacements.append(
+            store.upsert(
+                _record(label=1, source="/data/b.tif", scale=7.0),
+                persisted=True,
+            )
+        )
+        return None
+
+    store.set_hydrator(replace_then_refuse)
+    returned = store.get_or_hydrate(1)
+
+    assert len(replacements) == 1
+    assert returned is replacements[0]
+    assert returned is store.get(1)
+    assert store.source_identity(1) == "/data/b.tif#0"
 
 
 def test_get_or_hydrate_refuses_conflicting_source_without_replacement():
@@ -312,7 +374,7 @@ def test_get_or_hydrate_requires_exact_returned_revision_authority(
             foreign, _record(label=1, source="/data/a.tif", scale=9.0),
         )
 
-    store.set_hydrator(hydrate, revision_qualified=True)
+    store.set_hydrator(hydrate)
     returned = store.get_or_hydrate(1)
     assert returned is store.get(1)
     assert not store.has_heavy_payload(1)
@@ -329,7 +391,7 @@ def test_get_or_hydrate_requires_the_exact_request_object_not_equal_replay():
             _record(label=1, source="/data/a.tif", scale=9.0),
         )
 
-    store.set_hydrator(hydrate, revision_qualified=True)
+    store.set_hydrator(hydrate)
     returned = store.get_or_hydrate(1)
     assert returned is store.get(1)
     assert not store.has_heavy_payload(1)
@@ -346,7 +408,7 @@ def test_certified_source_less_result_cannot_inherit_qualified_source():
             _record(label=1, source=None, source_frame=None, scale=9.0),
         )
 
-    store.set_hydrator(hydrate, revision_qualified=True)
+    store.set_hydrator(hydrate)
     returned = store.get_or_hydrate(1)
     assert returned is store.get(1)
     assert store.source_identity(1) == "/data/a.tif#0"
@@ -366,7 +428,7 @@ def test_hydration_rechecks_projected_membership_not_only_projection_sets():
             _record(label=1, source="/data/a.tif", scale=9.0),
         )
 
-    store.set_hydrator(hydrate, revision_qualified=True)
+    store.set_hydrator(hydrate)
     returned = store.get_or_hydrate(1)
     assert returned is store.get(1)
     assert not store.has_heavy_payload(1)
@@ -491,14 +553,13 @@ def test_hydration_request_cannot_replay_across_commit_epoch_aba():
             pass
 
     gate = Gate()
-    store.set_hydrator(capture, revision_qualified=True)
+    store.set_hydrator(capture)
     store.get_or_hydrate(1, commit_gate=gate, commit_epoch=1)
     assert len(captured) == 1
     store.set_hydrator(
         lambda _request: FrameHydrationResult(
             captured[0], _record(label=1, source="/data/a.tif", scale=9.0),
         ),
-        revision_qualified=True,
     )
     returned = store.get_or_hydrate(1, commit_gate=gate, commit_epoch=2)
     assert returned is store.get(1)

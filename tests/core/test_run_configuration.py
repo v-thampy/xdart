@@ -133,6 +133,10 @@ def test_accessors_preserve_gi_motor_and_processing_signature():
     assert kwargs["threshold_max"] == 60_000
     assert kwargs["mask_sentinel"] is False
 
+    native = frozen.native_int_snapshot()
+    assert native["incidence_motor"] == "halpha"
+    assert "th_mtr" not in native
+
     mapping = frozen.processing_mapping()
     assert mapping["gi_config"] == {
         "gi_mode_1d": "q_ip",

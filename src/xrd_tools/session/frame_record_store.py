@@ -225,8 +225,10 @@ class FrameRecordStore:
         self._max_items = max_items
         self._max_heavy_items = max_heavy_items
         self._require_persisted_for_eviction = bool(require_persisted_for_eviction)
-        self._hydrator: Callable[[int | str], FrameRecord | None] | None = None
-        self._hydrator_revision_qualified = False
+        self._hydrator: (
+            Callable[[FrameHydrationRequest], FrameHydrationResult | None]
+            | None
+        ) = None
 
     def clear(self) -> None:
         self._checkpoint_hydration.revoke()
@@ -246,9 +248,17 @@ class FrameRecordStore:
             self._heavy_labels.clear()
 
     def set_hydrator(
-        self, hydrator: Callable | None, *, revision_qualified: bool = False,
+        self,
+        hydrator: (
+            Callable[[FrameHydrationRequest], FrameHydrationResult | None]
+            | None
+        ),
     ) -> None:
-        """Register a synchronous hydrator for thinned records.
+        """Register the certified synchronous hydrator for thinned records.
+
+        The hydrator receives one exact :class:`FrameHydrationRequest` and may
+        return ``None`` or a :class:`FrameHydrationResult` carrying that same
+        request object.  Raw records and replayed/equal requests are refused.
 
         Disk-backed hydrators must be called from a worker thread, never a GUI
         render thread.  The store deliberately does not hide I/O behind an
@@ -257,7 +267,6 @@ class FrameRecordStore:
         """
         with self._lock:
             self._hydrator = hydrator
-            self._hydrator_revision_qualified = bool(revision_qualified)
 
     def upsert(
         self,
@@ -656,7 +665,7 @@ class FrameRecordStore:
             if label in self._projected and not (prev_persisted or prev_recoverable):
                 return record
         if hydrator is None:
-            return record
+            return self.get(label)
         request = FrameHydrationRequest(
             label=label,
             source_identity=captured[1],
@@ -669,32 +678,28 @@ class FrameRecordStore:
             projected=captured[7],
             commit_epoch=commit_epoch,
         )
-        returned = hydrator(request if self._hydrator_revision_qualified else label)
+        returned = hydrator(request)
         if returned is None:
-            return record
-        certified_return = isinstance(returned, FrameHydrationResult)
-        if certified_return:
-            if returned.request is not request:
-                return record
-            fresh = returned.record
-        else:
-            # Documented compatibility only for an unqualified legacy row.
-            # It can never certify a source-qualified stored revision.
-            if captured[1] or self._hydrator_revision_qualified:
-                return record
-            fresh = returned
+            return self.get(label)
+        if (
+            type(returned) is not FrameHydrationResult
+            or returned.request is not request
+            or not isinstance(returned.record, FrameRecord)
+        ):
+            return self.get(label)
+        fresh = returned.record
         # Hydration is a read of the exact captured logical row.  A hydrator
         # may fill payloads, but it may not redirect that read to a different
         # label or source identity.
         if fresh.label != label:
-            return record
+            return self.get(label)
         captured_source_identity = captured[1]
         fresh_source_identity = _source_identity_from_record(fresh)
         if captured_source_identity and not fresh_source_identity:
-            return record
+            return self.get(label)
         if fresh_source_identity and not _same_source_id(
                 captured_source_identity, fresh_source_identity):
-            return record
+            return self.get(label)
         with self._lock:
             current = self._records.get(label)
             if current is None or self._capture_locked(
@@ -702,7 +707,7 @@ class FrameRecordStore:
             ) != captured:
                 return current
         if commit_gate is not None and not commit_gate.enter(request.commit_epoch):
-            return record
+            return self.get(label)
         try:
             with self._lock:
                 current = self._records.get(label)

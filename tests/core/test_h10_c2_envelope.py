@@ -190,7 +190,6 @@ def test_g10_simultaneous_hydration_and_staging_hold_distinct_arrays():
         lambda request: FrameHydrationResult(
             request, _heavy(request.label),
         ),
-        revision_qualified=True,
     )
     staged = _heavy(0)
     store.upsert(staged)

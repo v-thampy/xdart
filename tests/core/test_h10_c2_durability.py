@@ -29,7 +29,7 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.reduction import (
     Frame, Integration2DPlan, MemorySink, ReductionPlan, Scan)
 import xrd_tools.reduction.core as reduction_core
-from xrd_tools.session import FrameRecordStore, ScanSession
+from xrd_tools.session import FrameHydrationResult, FrameRecordStore, ScanSession
 from xrd_tools.session.stage_accounting import (
     ItemDisposition, ResultMode, StageLedger, StageReceipt)
 
@@ -461,9 +461,15 @@ def _hydratable_run(store, targets, store_targets):
     disk: dict = {}
     hydrations: list = []
 
-    def _hydrator(label):
+    def _hydrator(request):
+        label = request.label
         hydrations.append(label)
-        return disk.get(label)
+        record = disk.get(label)
+        return (
+            None
+            if record is None
+            else FrameHydrationResult(request, record)
+        )
 
     store.set_hydrator(_hydrator)           # the real registered-hydrator seam
     with _run(frames, store=store, targets_by_mode=targets,
@@ -720,8 +726,6 @@ def test_g7_event_gated_hydration_cannot_resurrect_the_stale_revision():
             f"revision N's captured projection is exact: persisted "
             f"{stale_persisted}, dropped 2-D, resident heavy {stale_heavy}")
 
-        from xrd_tools.session import FrameHydrationResult
-
         def _hydrator(request):
             entered.set()
             assert release.wait(WAIT), "hydrator gate never released"
@@ -729,7 +733,7 @@ def test_g7_event_gated_hydration_cannot_resurrect_the_stale_revision():
                 request, stale_record,
             )                            # what revision N had on disk
 
-        store.set_hydrator(_hydrator, revision_qualified=True)
+        store.set_hydrator(_hydrator)
         stale_hydratable = set(store.hydratable_modes(0))
         assert stale_hydratable == {K1}, "revision N is store-hydratable"
         worker = threading.Thread(
@@ -915,13 +919,11 @@ def test_g14_final_sweep_runs_once_after_the_terminal_boundary():
     assert not store.has_heavy_payload(0), (
         "ONE post-terminal sweep releases current durable heavy data (18)")
     hydrations: list[int] = []
-    from xrd_tools.session import FrameHydrationResult
     store.set_hydrator(
         lambda request: (
             hydrations.append(int(request.label)),
             FrameHydrationResult(request, heavy),
         )[1],
-        revision_qualified=True,
     )
     store.get_or_hydrate(0)                 # same certified revision, re-armed
     assert hydrations == [0]

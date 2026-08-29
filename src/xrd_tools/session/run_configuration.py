@@ -1005,7 +1005,6 @@ class FrozenRunConfiguration:
             "gi": gi_enabled,
             "gi_config": self.gi.scan_config() if gi_enabled else {},
             "incidence_motor": incidence,
-            "th_mtr": incidence,
             "sample_orientation": int(self.gi.sample_orientation),
             "tilt_angle": float(self.gi.tilt_angle),
         }

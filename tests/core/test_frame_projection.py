@@ -23,7 +23,7 @@ import pytest
 
 from xrd_tools.core import FrameRecord, FrameView
 from xrd_tools.core.energy import WavelengthUnit
-from xrd_tools.session import FrameRecordStore
+from xrd_tools.session import FrameHydrationResult, FrameRecordStore
 from xrd_tools.session.frame_projection import (
     Capability,
     CapabilityDisposition,
@@ -420,7 +420,10 @@ def test_thinned_lookup_preserves_metadata_then_hydrates():
     assert thinner.has_heavy_payload(7) is False
 
     store = FrameRecordStore()                           # default cap: has headroom
-    store.set_hydrator(lambda label: resident)           # synchronous hydrator
+    # Explicit synchronous hydration uses the exact certified request/result.
+    store.set_hydrator(
+        lambda request: FrameHydrationResult(request, resident)
+    )
     store.upsert(thinned, persisted=True)                # thinned AND on disk → hydratable
 
     # resident-only projection: metadata + capabilities without heavy arrays
