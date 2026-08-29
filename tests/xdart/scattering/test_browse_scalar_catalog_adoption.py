@@ -322,6 +322,8 @@ def test_context_release_is_retryable_and_detaches_catalog_last() -> None:
     receipt = loader.release_context(context)
     assert receipt.cleanup_status.value == "cleaned"
     assert context.scalar_catalog is None and context.released
+    assert context.frame_ids is context.loaded_labels
+    assert context.frame_ids == ()
     assert records.clears == 1
     with pytest.raises(DisplayContextError):
         context.mark_loaded()
