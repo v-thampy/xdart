@@ -1494,13 +1494,16 @@ class BrowseContext(_WriteOnceIdentity):
             self.publication_store,
             self.record_store,
             self.frames,
-            self.frame_ids,
             self.viewer_rows_1d,
             self.viewer_rows_2d,
         ):
             _clear(owned)
-        # This is deliberately the final payload detachment.  If any clear
-        # above fails, the exact catalog remains owned for a retry and the
-        # context is not falsely reported released.
+        # The catalog and its exact shared labels detach together only after
+        # every fallible clear succeeds.  A cut above therefore retains the
+        # complete inventory for one exact retry instead of publishing a
+        # half-released context.
+        empty_labels: tuple[int, ...] = ()
+        object.__setattr__(self, "frame_ids", empty_labels)
+        object.__setattr__(self, "loaded_labels", empty_labels)
         object.__setattr__(self, "scalar_catalog", None)
         self.released = True
