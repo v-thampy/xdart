@@ -391,6 +391,7 @@ baseline = set(sys.modules)
 import xdart.gui.tabs.scattering
 forbidden = (
     "qtpy", "PySide6", "PyQt5", "PyQt6", "pyqtgraph",
+    "h5py", "fabio",
     "xdart.gui.tabs.static_scan",
 )
 leaked = sorted(name for name in set(sys.modules) - baseline if any(name == item or name.startswith(item + ".") for item in forbidden))
