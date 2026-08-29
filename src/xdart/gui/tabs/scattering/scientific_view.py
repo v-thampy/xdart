@@ -1682,9 +1682,13 @@ class ScientificView(QtWidgets.QFrame):
         self._bottom_waterfall_active = False
         self._waterfall_source_keys = ()
         self._waterfall_render_contract = None
-        overlay_step = _overlay_step(
-            traces,
-            state.plot_options.overlay_offset,
+        overlay_step = (
+            _overlay_step(
+                traces,
+                state.plot_options.overlay_offset,
+            )
+            if stacked_selection
+            else 0.0
         )
         incremental = (
             state.plot_mode in {"Overlay", "Waterfall"}

@@ -274,6 +274,82 @@ def test_prefix_overlay_curve_adds_only_the_new_item_when_range_is_stable(
         view.close()
 
 
+def test_single_skips_unused_offset_scan_but_stacked_curve_retains_it(
+    monkeypatch,
+) -> None:
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    original = scientific_view_module._overlay_step
+    single = make_shell_projection(
+        frame_count=1,
+        selected_index=0,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    single_view = ScientificView()
+    try:
+        monkeypatch.setattr(
+            scientific_view_module,
+            "_overlay_step",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(
+                    "Single presentation computed an unused overlay offset"
+                )
+            ),
+        )
+        _reconcile(
+            single_view,
+            single.scientific,
+            single.navigation,
+            completed=1,
+            total=1,
+        )
+        _reconcile(
+            single_view,
+            single.scientific,
+            single.navigation,
+            completed=1,
+            total=1,
+        )
+    finally:
+        single_view.close()
+
+    stacked = make_shell_projection(
+        frame_count=2,
+        selected_index=1,
+        heavy_indices=(0, 1),
+        plot_mode="Overlay",
+    )
+    stacked_view = ScientificView()
+    calls = []
+
+    def counted(traces, offset_percent):
+        calls.append((traces, offset_percent))
+        return original(traces, offset_percent)
+
+    monkeypatch.setattr(scientific_view_module, "_overlay_step", counted)
+    try:
+        _reconcile(
+            stacked_view,
+            stacked.scientific,
+            stacked.navigation,
+            completed=2,
+            total=2,
+        )
+        assert len(calls) == 1
+        assert len(calls[0][0]) == len(stacked.scientific.traces)
+        assert all(
+            actual.frame is expected.frame
+            for actual, expected in zip(
+                calls[0][0],
+                stacked.scientific.traces,
+                strict=True,
+            )
+        )
+        assert calls[0][1] == stacked.scientific.plot_options.overlay_offset
+    finally:
+        stacked_view.close()
+
+
 def test_projection_marks_only_active_lifecycle_as_live_update() -> None:
     navigation = FrameNavigationProjection()
     preferences = ScientificPreferences(plot_mode="Overlay")
