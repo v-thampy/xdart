@@ -30,19 +30,29 @@ from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.gui.tabs.scattering.start_outcomes import StartLaunched
 from xdart.gui.tabs.scattering.start_pipeline import StartPipeline
 from xdart.modules.display_context import ContextKind, new_context_token
-from xrd_tools.reduction import Integration1DPlan, ReductionPlan
+from xrd_tools.core import TwoDKind
+from xrd_tools.core.containers import IntegrationResult1D
+import xrd_tools.reduction.core as reduction_core
 from xrd_tools.session.intent_store import RunIntentStore
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import (
+    FrozenRunConfiguration,
+    RunIntent,
+)
 from xrd_tools.sources.selection import image_series_spec
 from xrd_tools.sources.discover import enumerate_candidates
-from xrd_tools.io import FrameScalarCatalog, FrameViewReader, ProcessedScan
+from xrd_tools.io import (
+    FrameScalarCatalog,
+    FrameScalarRow,
+    FrameViewReader,
+    ProcessedScan,
+)
 
 from tests.xdart.scattering._admission import await_admission
 from tests.xdart.scattering.test_e2p_rapid_navigation import (
-    _DroppingSink,
     _TinyIntegrator,
     _TinySource,
     _accepted_admission,
+    _write_synthetic_series,
 )
 from tests.xdart.scattering.test_e3_context_contract import (
     _current_key,
@@ -100,21 +110,14 @@ def _wait_outcome(
     raise AssertionError("processed browse load did not finish")
 
 
-def test_default_browse_retains_all_651_light_traces(
+def test_default_browse_retains_all_651_scalar_rows_without_eager_frames(
     tmp_path, monkeypatch,
 ) -> None:
-    """Browse keeps the full 1-D stack while current-frame heavy data hydrates."""
+    """Browse owns all scalar rows without eagerly hydrating frame arrays."""
 
     from tests.xdart.scattering.test_e4_preview_transport import (
         _write_processed,
     )
-    from xdart.gui.tabs.scattering.context_projection import _browse_payload
-    from xdart.gui.tabs.scattering.display_runtime import (
-        publication_needs_hydration,
-    )
-    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
-    from xdart.gui.tabs.scattering.events import RunIdentity
-
     monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
     labels = tuple(range(1, 652))
     processed, _raw = _write_processed(tmp_path, labels=labels)
@@ -131,39 +134,27 @@ def test_default_browse_retains_all_651_light_traces(
         assert outcome.status is BrowseLoadStatus.READY
         context = loader.consume(outcome)
         assert context is not None
-        assert context.loaded_labels == labels
+        catalog = context.scalar_catalog
+        assert type(catalog) is FrameScalarCatalog
+        assert catalog.labels == labels
+        assert context.frame_ids is catalog.labels
+        assert context.loaded_labels is catalog.labels
         assert context.publication_store._max_items >= len(labels)
-        assert context.publication_store.labels() == labels
+        assert context.publication_store.labels() == ()
         assert context.publication_store._heavy_labels == []
+        assert context.record_store.labels() == ()
+        assert context.browse_1d_cache.resident_keys == ()
 
-        first = context.publication_store.get(labels[0])
-        last = context.publication_store.get(labels[-1])
-        assert first is not None and last is not None
-        assert first.view.has_1d and last.view.has_1d
-        assert first.source_identity == f"{_raw.resolve()}#0"
-        assert first.view.thumbnail is None and first.view.mask_baked
-        assert first.record.results_2d
-        assert all(
-            not view.has_2d
-            for view in first.record.results_2d.values()
-        )
-        assert publication_needs_hydration(first, None)
-
-        # The independent record-store heavy bound thins this old copy.  It
-        # must not overwrite the complete light publication used by Waterfall.
-        stored = context.record_store.get(labels[0])
-        assert stored is not None and not stored.active_view().has_1d
-        identity = RunIdentity(1, "browse-651-light")
-        frame = DisplayFrameKey(
-            identity,
-            context.scan_key,
-            context.requested_path,
-            labels[0],
-            1,
-        )
-        payload = _browse_payload(context, first, frame, 1)
-        assert payload.view.has_1d
-        assert payload.view.intensity_2d is None
+        for label in (labels[0], labels[len(labels) // 2], labels[-1]):
+            row = catalog.row(label)
+            assert type(row) is FrameScalarRow
+            assert row.active_mode_1d in row.modes_1d
+            assert row.active_mode_2d in row.modes_2d
+            assert row.source_path is not None
+            assert Path(row.source_path).name == _raw.name
+            assert row.source_frame_index == 0
+            assert row.has_thumbnail is True
+            assert row.mask_baked is True
     finally:
         if context is not None:
             loader.release_context(context)
@@ -204,6 +195,21 @@ def test_browse_heavy_hydration_preserves_named_active_modes() -> None:
         new_context_token(ContextKind.BROWSE),
         1,
         scan_key="named-gi",
+        scalar_row=FrameScalarRow(
+            1,
+            modes_1d=("q_ip", "q_oop"),
+            modes_2d=("q_ip_q_oop", "q_chi"),
+            active_mode_1d="q_ip",
+            active_mode_2d="q_ip_q_oop",
+            two_d_kinds=(
+                ("q_ip_q_oop", TwoDKind.QIP_QOOP),
+                ("q_chi", TwoDKind.Q_CHI),
+            ),
+        ),
+        axes_1d=(
+            ("q_ip", "q_ip", "A^-1", False),
+            ("q_oop", "q_oop", "A^-1", False),
+        ),
     )
     store = browse.publication_store
     initial = store.get(1)
@@ -422,7 +428,7 @@ def test_explicit_processed_nexus_browse_reload_does_not_enter_raw_discovery(
     loader.close()
 
 
-def test_explicit_malformed_nexus_browse_fails_truthfully(
+def test_explicit_malformed_nexus_browse_is_refused_by_admission(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "malformed.nexus"
@@ -435,8 +441,9 @@ def test_explicit_malformed_nexus_browse_fails_truthfully(
     )
     loader.begin(request)
     outcome = _wait_outcome(loader, request)
-    assert outcome.status is BrowseLoadStatus.FAILED
-    assert outcome.detail
+    assert outcome.request is request
+    assert outcome.status is BrowseLoadStatus.REFUSED
+    assert outcome.detail == "No processed-scan format owns this path."
     assert loader.consume(outcome) is None
     loader.close()
 
@@ -571,41 +578,58 @@ def test_real_executor_pauses_at_durable_store_boundary(
     )
     assert qapp is not None
     selected = tmp_path / "tiny_0001.tif"
-    import fabio
     import numpy as np
 
-    fabio.tifimage.TifImage(
-        data=np.ones((2, 2), dtype=np.uint16)
-    ).write(str(selected))
+    members = _write_synthetic_series(selected)
     poni = tmp_path / "tiny.poni"
     poni.write_text("deterministic test calibration")
-    output = tmp_path / "tiny.nxs"
+    output = tmp_path / "tiny.nexus"
     source_facts = []
+    plan_configurations = []
+    native_plan = executor_module.native_int_reduction_plan
     monkeypatch.setattr(
         executor_module, "build_admission_receipt", _accepted_admission
     )
     monkeypatch.setattr(
         executor_module,
         "open_source",
-        lambda _spec: _TinySource(selected, source_facts),
+        lambda _spec: _TinySource(members, source_facts),
     )
     monkeypatch.setattr(
         executor_module,
         "poni_to_integrator",
         lambda _poni: _TinyIntegrator(),
     )
+
+    def tiny_plan(configuration):
+        assert type(configuration) is FrozenRunConfiguration
+        plan_configurations.append(configuration)
+        plan = native_plan(configuration)
+        assert plan.integration_1d is not None
+        assert plan.integration_1d.npt == 2
+        assert plan.integration_2d is None
+        return plan
+
     monkeypatch.setattr(
-        executor_module,
-        "build_native_int_reduction_plan_from_args",
-        lambda *_args, **_kwargs: ReductionPlan(
-            integration_1d=Integration1DPlan(npt=2),
-            integration_2d=None,
-        ),
+        reduction_core,
+        "poni_to_fiber_integrator",
+        lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
+        reduction_core,
+        "integrate_gi_polar_1d",
+        lambda image, _integrator, **kwargs: IntegrationResult1D(
+            radial=np.linspace(0.0, 1.0, kwargs["npt"]),
+            intensity=np.full(kwargs["npt"], float(np.asarray(image).mean())),
+            sigma=None,
+            unit=kwargs["unit"],
+        )
+    )
+
+    monkeypatch.setattr(
         executor_module,
-        "NexusSink",
-        lambda *_args, **_kwargs: _DroppingSink(),
+        "native_int_reduction_plan",
+        tiny_plan,
     )
     lifecycle = ScatteringCoordinator()
     executor = StandardRunExecutor(max_display_items=4)
@@ -616,8 +640,11 @@ def test_real_executor_pauses_at_durable_store_boundary(
                 poni_file=str(poni),
                 project_root=str(tmp_path),
                 save_path=str(output),
+                processing_mode="Int 1D",
                 output_mode="Overwrite",
                 max_cores=1,
+                bai_1d_args={"npt": 2},
+                bai_2d_args={},
                 gi=(
                     {
                         "enabled": True,
@@ -641,7 +668,9 @@ def test_real_executor_pauses_at_durable_store_boundary(
     assert isinstance(launched, StartLaunched)
     deadline = time.monotonic() + 5.0
     context = None
+    observed = ()
     while time.monotonic() < deadline:
+        observed += executor.drain_events()
         context = executor.acquisition_context(launched.run_identity)
         if (
             context is not None
@@ -649,7 +678,12 @@ def test_real_executor_pauses_at_durable_store_boundary(
         ):
             break
         time.sleep(0.002)
-    assert context is not None
+    assert context is not None, tuple(
+        (event.kind, event.detail, event.primary, event.cleanup_failures)
+        for event in observed
+    )
+    assert len(plan_configurations) == 1
+    assert plan_configurations[0] is context.run_configuration
     controller = ContextController(
         lifecycle=lifecycle,
         executor=executor,
@@ -690,7 +724,7 @@ def test_real_executor_pauses_at_durable_store_boundary(
     )
     controller.stop()
     deadline = time.monotonic() + 10.0
-    terminal = ()
+    terminal = observed
     while time.monotonic() < deadline:
         terminal += executor.drain_events()
         if any(

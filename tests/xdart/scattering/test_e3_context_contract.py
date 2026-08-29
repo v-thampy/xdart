@@ -208,6 +208,8 @@ def _browse(
     *,
     scan_key: str = "browse.b",
     request=None,
+    scalar_row: FrameScalarRow | None = None,
+    axes_1d: tuple[tuple[str, str, str, bool], ...] = (),
 ):
     _, _, browse_values = _api()
     request = request or browse_values.BrowseLoadRequest(
@@ -226,10 +228,12 @@ def _browse(
             scan_key=scan_key,
         )
     )
+    catalog_row = FrameScalarRow(1) if scalar_row is None else scalar_row
     catalog = FrameScalarCatalog(
         request.source_path,
         "entry",
-        (FrameScalarRow(1),),
+        (catalog_row,),
+        axes_1d=axes_1d,
     )
     context = BrowseContext(
         context_token=context_token,
@@ -957,14 +961,21 @@ def test_case_10_equal_frame_labels_never_cross_contexts():
         controller.project(a.frame_key)
 
 
-def test_case_11_dotted_stems_keep_one_canonical_scan_key():
+def test_case_11_dotted_stems_keep_one_canonical_scan_key(tmp_path):
+    from tests.xdart.scattering.test_e4_preview_transport import (
+        _write_processed,
+    )
+
+    processed, _raw = _write_processed(tmp_path)
+    dotted = processed.with_name("run.with.dots.nexus")
+    processed.rename(dotted)
     _, _, browse_values = _api()
     request = browse_values.BrowseLoadRequest(
         "browse-token",
         1,
-        "/processed/run.with.dots.nxs",
+        str(dotted),
     )
-    assert request.source_path.endswith("run.with.dots.nxs")
+    assert request.source_path.endswith("run.with.dots.nexus")
     assert browse_values.canonical_browse_scan_key(
         request.source_path
     ) == "run.with.dots"

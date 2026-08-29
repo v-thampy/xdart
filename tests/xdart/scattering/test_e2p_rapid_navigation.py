@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from threading import current_thread
 from types import SimpleNamespace
@@ -15,15 +17,17 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from tests.xdart.scattering import test_e2lv_live_display as lv_support
 from xrd_tools.core.scan import Scan, ScanFrame
-from xrd_tools.reduction import Integration1DPlan, ReductionPlan
-from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.core.staging import (
     browse_publication_max_items,
-    heavy_window,
     live_record_store_max_items,
 )
+from xrd_tools.session import headless_scan as headless_scan_module
+from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.intent_store import RunIntentStore
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import (
+    FrozenRunConfiguration,
+    RunIntent,
+)
 from xrd_tools.session.scan_session import ScanSession
 from xrd_tools.sources.selection import image_series_spec
 from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
@@ -54,6 +58,23 @@ _DISPLAY_LIMIT = 2
 # retain ample platform headroom while rejecting a user-visible GUI stall.
 _HEARTBEAT_P95_LIMIT_S = 0.25
 _HEARTBEAT_MAX_LIMIT_S = 0.50
+
+
+def _write_synthetic_series(selected: Path) -> tuple[Path, ...]:
+    fabio.tifimage.TifImage(
+        data=np.ones((2, 2), dtype=np.uint16)
+    ).write(str(selected))
+    prefix = selected.stem.rsplit("_", 1)[0]
+    members = tuple(
+        selected.with_name(f"{prefix}_{label:04d}{selected.suffix}")
+        for label in range(1, _FRAME_COUNT + 1)
+    )
+    for member in members[1:]:
+        os.link(
+            selected,
+            member,
+        )
+    return members
 
 
 def _wait(
@@ -91,10 +112,12 @@ class _TinyIntegrator:
 class _TinySource:
     def __init__(
         self,
-        selected: Path,
+        members: tuple[Path, ...],
         lifecycle_facts: list[tuple[str, str]],
     ) -> None:
-        self._selected = selected
+        if len(members) != _FRAME_COUNT:
+            raise ValueError("synthetic source requires the exact 651 members")
+        self._members = members
         self._lifecycle_facts = lifecycle_facts
         lifecycle_facts.append(("construct", current_thread().name))
 
@@ -104,10 +127,11 @@ class _TinySource:
             ScanFrame(
                 label,
                 image=np.full((2, 2), label, dtype=np.float32),
-                source_path=self._selected,
-                source_frame_index=label,
+                source_path=member,
+                source_frame_index=0,
+                source_identity=str(member),
             )
-            for label in range(1, _FRAME_COUNT + 1)
+            for label, member in enumerate(self._members, start=1)
         ]
         return Scan(
             "tiny-651",
@@ -119,26 +143,6 @@ class _TinySource:
 
     def close(self) -> None:
         self._lifecycle_facts.append(("close", current_thread().name))
-
-
-class _DroppingSink:
-    def __init__(self, *_args, **_kwargs) -> None:
-        self.begin_calls = 0
-        self.write_calls = 0
-        self.finish_calls = 0
-        self.abort_calls = 0
-
-    def begin(self, _scan, _plan) -> None:
-        self.begin_calls += 1
-
-    def write(self, _frame, _reduction) -> None:
-        self.write_calls += 1
-
-    def finish(self, _result) -> None:
-        self.finish_calls += 1
-
-    def abort(self, _result) -> None:
-        self.abort_calls += 1
 
 
 class _TrackingRecordStore(FrameRecordStore):
@@ -213,23 +217,30 @@ def _accepted_admission(
     *,
     cancelled,
     session_owner,
-    targets_owner,
 ) -> AdmissionReceipt:
     del session_owner
     if cancelled():
         raise RuntimeError("admission cancelled")
+    configuration = capture.intent_snapshot.thaw()
+    poni_bytes = Path(configuration.poni_file).read_bytes()
     assets = AcceptedScientificAssets(
         (0.1, 0.01, 0.01, 0.0, 0.0, 0.0, 1e-10, "Tiny"),
         None,
         None,
         None,
-        "tiny-poni",
+        hashlib.sha256(poni_bytes).hexdigest(),
         None,
         "{\"orientation\":3}",
     )
     candidate = OutputCandidate.from_start_capture(capture, assets, ())
-    selected = Path(capture.source_capture.source.options["selected_file"])
-    state = SourceFileState.capture(selected)
+    source_options = capture.source_capture.source.options
+    selected = Path(source_options["selected_file"])
+    states = tuple(
+        SourceFileState.capture(Path(value))
+        for value in source_options["files"]
+    )
+    assert len(states) == _FRAME_COUNT
+    state = states[0]
     target = Path(capture.intent_snapshot.thaw().save_path)
     item = PlannedOutput(
         candidate.source,
@@ -238,16 +249,16 @@ def _accepted_admission(
         SourceExecutionStamp(
             state,
             "tiff_series",
-            _FRAME_COUNT,
+            len(states),
             1,
-            (state,),
-            metadata_sources=(
-                AdmittedMetadataSource(state.path, None),
+            states,
+            metadata_sources=tuple(
+                AdmittedMetadataSource(member.path, None)
+                for member in states
             ),
         ),
         motor_names=(),
     )
-    targets_owner((target,))
     return AdmissionReceipt(
         capture.request_id,
         capture.intent_snapshot.revision,
@@ -289,15 +300,13 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
 ) -> None:
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     selected = tmp_path / "tiny_0001.tif"
-    fabio.tifimage.TifImage(
-        data=np.ones((2, 2), dtype=np.uint16)
-    ).write(str(selected))
+    members = _write_synthetic_series(selected)
     poni = tmp_path / "tiny.poni"
     poni.write_text("deterministic test calibration")
-    output = tmp_path / "tiny.nxs"
+    output = tmp_path / "tiny.nexus"
     source_lifecycle: list[tuple[str, str]] = []
     source_references: list[weakref.ReferenceType[_TinySource]] = []
-    sinks: list[_DroppingSink] = []
+    plan_configurations: list[FrozenRunConfiguration] = []
     _TrackingRecordStore.instances.clear()
     _TrackingScanSession.references.clear()
 
@@ -306,7 +315,7 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
     )
 
     def open_source(_spec):
-        source = _TinySource(selected, source_lifecycle)
+        source = _TinySource(members, source_lifecycle)
         source_references.append(weakref.ref(source))
         return source
 
@@ -314,33 +323,37 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
     monkeypatch.setattr(
         executor_module, "poni_to_integrator", lambda _poni: _TinyIntegrator()
     )
+    native_plan = executor_module.native_int_reduction_plan
+
+    def observed_plan(configuration):
+        assert type(configuration) is FrozenRunConfiguration
+        plan_configurations.append(configuration)
+        plan = native_plan(configuration)
+        assert plan.integration_1d is not None
+        assert plan.integration_1d.npt == 2
+        assert plan.integration_2d is None
+        return plan
+
     monkeypatch.setattr(
-        executor_module,
-        "build_native_int_reduction_plan_from_args",
-        lambda *_args, **_kwargs: ReductionPlan(
-            integration_1d=Integration1DPlan(npt=2),
-            integration_2d=None,
-        ),
+        executor_module, "native_int_reduction_plan", observed_plan,
     )
-
-    def sink_factory(*args, **kwargs):
-        sink = _DroppingSink(*args, **kwargs)
-        sinks.append(sink)
-        return sink
-
-    monkeypatch.setattr(executor_module, "NexusSink", sink_factory)
     monkeypatch.setattr(
         executor_module, "FrameRecordStore", _TrackingRecordStore
     )
-    monkeypatch.setattr(executor_module, "ScanSession", _TrackingScanSession)
+    monkeypatch.setattr(
+        headless_scan_module, "ScanSession", _TrackingScanSession,
+    )
 
     intent = RunIntent(
         source_spec=image_series_spec(selected),
         poni_file=str(poni),
         project_root=str(tmp_path),
         save_path=str(output),
+        processing_mode="Int 1D",
         output_mode="Overwrite",
         max_cores=1,
+        bai_1d_args={"npt": 2},
+        bai_2d_args={},
     )
     lifecycle = ScatteringCoordinator()
     executor = _TrackingExecutor()
@@ -392,7 +405,15 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
                 f"{lv_support._shell_diagnostic(shell, lifecycle)}"
             ),
         )
-        qapp.processEvents()
+        _wait(
+            qapp,
+            lambda: bool(rendered_labels)
+            and rendered_labels[-1] == _FRAME_COUNT,
+            diagnostic=lambda: (
+                f"terminal render={rendered_labels[-1:]}; "
+                f"delivered={len(executor.delivered_labels)}"
+            ),
+        )
         elapsed = time.perf_counter() - started
         heartbeat_timer.stop()
 
@@ -407,28 +428,56 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
             controller.frame_keys[-1].local_frame_label
             == _FRAME_COUNT
         )
-        assert shell.scientific.title.text() == "tiny_0001.tif"
+        assert shell.scientific.title.text() == members[-1].name
         assert executor.publication_peak <= _DISPLAY_LIMIT
 
         records = _TrackingRecordStore.instances
-        assert len(records) == 2
-        scientific_records, light_records = records
+        assert len(records) == 1
+        scientific_records = records[0]
         identity = controller.run_identity
         assert identity is not None
         assert identity is executor.observed_identity
         run = executor._exact_run(identity)
         assert run is not None
+        assert len(run.display.artifacts) == 1
+        artifact_owner = next(iter(run.display.artifacts.values()))
+        assert artifact_owner.records is scientific_records
+        assert artifact_owner.publications.labels() == tuple(
+            range(1, _FRAME_COUNT + 1)
+        )
         residency = run.display.residency_snapshot()
-        assert residency.limits.live == live_record_store_max_items(0)
-        assert residency.limits.heavy == heavy_window()
-        assert residency.limits.browse == browse_publication_max_items(0)
+        assert residency.limits.live == live_record_store_max_items(2)
+        assert len(run.resource_facts) == 1
+        fact = run.resource_facts[0]
+        assert (
+            residency.limits.heavy
+            == fact.effective_display_count
+        )
+        assert residency.limits.browse == browse_publication_max_items(2)
         assert scientific_records._max_items is None
         assert scientific_records._max_heavy_items is None
-        assert scientific_records.item_peak <= residency.limits.live + 1
-        assert scientific_records.heavy_peak <= residency.limits.heavy + 1
-        assert light_records._max_items is None
-        assert light_records._max_heavy_items is None
-        assert light_records.item_peak == _FRAME_COUNT
+        allocation = artifact_owner.publications.allocation
+        assert allocation is not None
+        assert fact.granted_staging_count == allocation.staging_items
+        assert fact.granted_record_heavy_count == allocation.record_heavy_items
+        assert (
+            fact.granted_publication_heavy_count
+            == allocation.publication_heavy_items
+        )
+        # This route has only a 1-D result.  The allocation charges every
+        # resident integrated trace to record_items; record_heavy_items is the
+        # separate 2-D grant and must not be used as a proxy for these arrays.
+        transient_heavy_bound = allocation.record_items
+        assert allocation.record_items == residency.limits.live
+        assert scientific_records.item_peak <= allocation.record_items
+        assert scientific_records.heavy_peak <= transient_heavy_bound
+        assert scientific_records._heavy_labels == []
+        publication_heavy = artifact_owner.publications.heavy_labels()
+        assert len(publication_heavy) == min(
+            _FRAME_COUNT,
+            fact.granted_publication_heavy_count,
+        )
+        assert residency.heavy == len(publication_heavy)
         assert executor.terminal_owners(identity) == (
             True,
             CleanupStatus.CLEANED,
@@ -442,14 +491,10 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
             ("to_scan", "scattering-standard"),
             ("close", "scattering-standard"),
         ]
+        assert len(plan_configurations) == 1
         assert len(source_references) == 1
-        assert len(sinks) == 1
-        assert (
-            sinks[0].begin_calls,
-            sinks[0].write_calls,
-            sinks[0].finish_calls,
-            sinks[0].abort_calls,
-        ) == (1, _FRAME_COUNT, 1, 0)
+        assert output.is_file()
+        assert output.stat().st_size > 0
 
         ordered = sorted(lateness)
         assert len(ordered) >= 8
@@ -466,8 +511,13 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
                     "rendered_final": rendered_labels[-1],
                     "publication_peak": executor.publication_peak,
                     "record_peak": scientific_records.item_peak,
-                    "heavy_record_peak": scientific_records.heavy_peak,
-                    "light_record_peak": light_records.item_peak,
+                    "transient_record_array_peak": (
+                        scientific_records.heavy_peak
+                    ),
+                    "transient_record_array_bound": transient_heavy_bound,
+                    "light_publication_count": len(
+                        artifact_owner.publications.labels()
+                    ),
                     "heartbeat_count": len(ordered),
                     "heartbeat_p95_limit_s": _HEARTBEAT_P95_LIMIT_S,
                     "heartbeat_max_limit_s": _HEARTBEAT_MAX_LIMIT_S,
@@ -492,16 +542,30 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
     assert lifecycle.closed
     assert not any(isinstance(value, np.ndarray) for value in vars(page).values())
     session_refs = tuple(_TrackingScanSession.references)
+    _TrackingRecordStore.instances.clear()
+    _TrackingScanSession.references.clear()
     del heartbeat_timer
     del original_apply_state
     del record_apply_state
     del shell
     del controller
+    del artifact_owner
+    del publication_heavy
+    del scientific_records
+    del records
+    del residency
+    del identity
     del page
     del executor
     del run
-    gc.collect()
-    qapp.processEvents()
+    deadline = time.monotonic() + 2.0
+    while page_ref() is not None and time.monotonic() < deadline:
+        gc.collect()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete
+        )
+        qapp.processEvents()
+        time.sleep(0.005)
     assert page_ref() is None
     assert all(reference() is None for reference in source_references)
     assert all(reference() is None for reference in session_refs)

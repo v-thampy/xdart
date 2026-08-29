@@ -11,7 +11,6 @@ from threading import current_thread
 import time
 import weakref
 
-import fabio.tifimage
 import numpy as np
 import psutil
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -29,18 +28,19 @@ from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xrd_tools.core.scan import Scan, ScanFrame
 from xrd_tools.core.staging import (
     browse_publication_max_items,
-    heavy_window,
     live_record_store_max_items,
 )
-from xrd_tools.reduction import Integration1DPlan, ReductionPlan
+from xrd_tools.session import headless_scan as headless_scan_module
 from xrd_tools.session.intent_store import RunIntentStore
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import (
+    FrozenRunConfiguration,
+    RunIntent,
+)
 from xrd_tools.sources.selection import image_series_spec
 
 from tests.xdart.scattering import test_e2lv_live_display as lv_support
 from tests.xdart.scattering.test_e2p_rapid_navigation import (
     _DISPLAY_LIMIT,
-    _DroppingSink,
     _HEARTBEAT_MAX_LIMIT_S,
     _HEARTBEAT_P95_LIMIT_S,
     _TinyIntegrator,
@@ -50,10 +50,14 @@ from tests.xdart.scattering.test_e2p_rapid_navigation import (
     _accepted_admission,
     _heartbeat,
     _wait,
+    _write_synthetic_series,
 )
 
 
-_RSS_LIMIT_BYTES = 160 * 1024**2
+# The current-owner gate includes the exact Nexus transaction/writer graph;
+# the retired 160 MiB bound covered only the mounted display with a dropping
+# sink.  Retain a fixed full-route ceiling with platform headroom.
+_RSS_LIMIT_BYTES = 256 * 1024**2
 _SHUTDOWN_LIMIT_S = 5.0
 _J3_FRAME_COUNT = 651
 _SHARED_SHAPE = (384, 384)
@@ -64,10 +68,12 @@ class _SharedImageSource:
 
     def __init__(
         self,
-        selected: Path,
+        members: tuple[Path, ...],
         lifecycle_facts: list[tuple[str, str]],
     ) -> None:
-        self._selected = selected
+        if len(members) != _J3_FRAME_COUNT:
+            raise ValueError("synthetic source requires the exact 651 members")
+        self._members = members
         self._lifecycle_facts = lifecycle_facts
         image = np.arange(
             int(np.prod(_SHARED_SHAPE)), dtype=np.float32
@@ -86,10 +92,11 @@ class _SharedImageSource:
                 ScanFrame(
                     label,
                     image=self._image,
-                    source_path=self._selected,
-                    source_frame_index=label,
+                    source_path=member,
+                    source_frame_index=0,
+                    source_identity=str(member),
                 )
-                for label in range(1, _J3_FRAME_COUNT + 1)
+                for label, member in enumerate(self._members, start=1)
             ],
             poni=poni,
             integrator=integrator,
@@ -109,17 +116,15 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
     monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     selected = tmp_path / "rss_0001.tif"
-    fabio.tifimage.TifImage(
-        data=np.ones((2, 2), dtype=np.uint16)
-    ).write(str(selected))
+    members = _write_synthetic_series(selected)
     poni = tmp_path / "rss.poni"
     poni.write_text("deterministic resource calibration")
-    output = tmp_path / "rss.nxs"
+    output = tmp_path / "rss.nexus"
     source_lifecycle: list[tuple[str, str]] = []
     source_references: list[
         weakref.ReferenceType[_SharedImageSource]
     ] = []
-    sinks: list[_DroppingSink] = []
+    plan_configurations: list[FrozenRunConfiguration] = []
     _TrackingRecordStore.instances.clear()
     _TrackingScanSession.references.clear()
 
@@ -128,7 +133,7 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
     )
 
     def open_source(_spec):
-        source = _SharedImageSource(selected, source_lifecycle)
+        source = _SharedImageSource(members, source_lifecycle)
         source_references.append(weakref.ref(source))
         return source
 
@@ -138,26 +143,25 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         "poni_to_integrator",
         lambda _poni: _TinyIntegrator(),
     )
+    native_plan = executor_module.native_int_reduction_plan
+
+    def observed_plan(configuration):
+        assert type(configuration) is FrozenRunConfiguration
+        plan_configurations.append(configuration)
+        plan = native_plan(configuration)
+        assert plan.integration_1d is not None
+        assert plan.integration_1d.npt == 2
+        assert plan.integration_2d is None
+        return plan
+
     monkeypatch.setattr(
-        executor_module,
-        "build_native_int_reduction_plan_from_args",
-        lambda *_args, **_kwargs: ReductionPlan(
-            integration_1d=Integration1DPlan(npt=2),
-            integration_2d=None,
-        ),
+        executor_module, "native_int_reduction_plan", observed_plan,
     )
-
-    def sink_factory(*args, **kwargs):
-        sink = _DroppingSink(*args, **kwargs)
-        sinks.append(sink)
-        return sink
-
-    monkeypatch.setattr(executor_module, "NexusSink", sink_factory)
     monkeypatch.setattr(
         executor_module, "FrameRecordStore", _TrackingRecordStore
     )
     monkeypatch.setattr(
-        executor_module, "ScanSession", _TrackingScanSession
+        headless_scan_module, "ScanSession", _TrackingScanSession
     )
 
     intent = RunIntent(
@@ -165,8 +169,11 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         poni_file=str(poni),
         project_root=str(tmp_path),
         save_path=str(output),
+        processing_mode="Int 1D",
         output_mode="Overwrite",
         max_cores=1,
+        bai_1d_args={"npt": 2},
+        bai_2d_args={},
     )
     lifecycle = ScatteringCoordinator()
     executor = _TrackingExecutor()
@@ -240,25 +247,54 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         )
         assert executor.publication_peak <= _DISPLAY_LIMIT
         residency = run.display.residency_snapshot()
-        assert residency.limits.heavy == 8 == heavy_window()
+        assert len(run.resource_facts) == 1
+        fact = run.resource_facts[0]
+        assert residency.limits.heavy == fact.effective_display_count
         assert (
             residency.limits.live
-            == live_record_store_max_items(0)
+            == live_record_store_max_items(2)
         )
         assert (
             residency.limits.browse
-            == browse_publication_max_items(0)
+            == browse_publication_max_items(2)
         )
 
         records = _TrackingRecordStore.instances
-        assert len(records) == 2
-        scientific_records, light_records = records
-        assert scientific_records.item_peak <= residency.limits.live + 1
-        assert scientific_records.heavy_peak <= 9
-        assert light_records.item_peak == _J3_FRAME_COUNT
+        assert len(records) == 1
+        scientific_records = records[0]
+        assert len(run.display.artifacts) == 1
+        artifact_owner = next(iter(run.display.artifacts.values()))
+        assert artifact_owner.records is scientific_records
+        assert artifact_owner.publications.labels() == tuple(
+            range(1, _J3_FRAME_COUNT + 1)
+        )
+        allocation = artifact_owner.publications.allocation
+        assert allocation is not None
+        assert fact.granted_staging_count == allocation.staging_items
+        assert fact.granted_record_heavy_count == allocation.record_heavy_items
+        assert (
+            fact.granted_publication_heavy_count
+            == allocation.publication_heavy_items
+        )
+        assert scientific_records.item_peak <= allocation.record_items
+        # J3 exercises the full large-frame/checkpoint transient route: its
+        # array-bearing record population must stay within the exact staging
+        # grant, while the RSS ceiling below covers every resource category.
+        transient_heavy_bound = fact.granted_staging_count
+        assert scientific_records.heavy_peak <= transient_heavy_bound
+        assert scientific_records._heavy_labels == []
+        publication_heavy = artifact_owner.publications.heavy_labels()
+        assert len(publication_heavy) == min(
+            _J3_FRAME_COUNT,
+            fact.granted_publication_heavy_count,
+        )
+        assert residency.heavy == len(publication_heavy)
         record_peak = scientific_records.item_peak
-        heavy_record_peak = scientific_records.heavy_peak
-        light_record_peak = light_records.item_peak
+        transient_record_array_peak = scientific_records.heavy_peak
+        light_publication_count = len(
+            artifact_owner.publications.labels()
+        )
+        assert len(plan_configurations) == 1
         assert len(source_references) == 1
         assert len(_TrackingScanSession.references) == 1
         session_references = tuple(_TrackingScanSession.references)
@@ -275,13 +311,8 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
             ("to_scan", "scattering-standard"),
             ("close", "scattering-standard"),
         ]
-        assert len(sinks) == 1
-        assert (
-            sinks[0].begin_calls,
-            sinks[0].write_calls,
-            sinks[0].finish_calls,
-            sinks[0].abort_calls,
-        ) == (1, _J3_FRAME_COUNT, 1, 0)
+        assert output.is_file()
+        assert output.stat().st_size > 0
 
         ordered = sorted(lateness)
         assert len(ordered) >= 8
@@ -300,6 +331,14 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
 
         shutdown_started = time.perf_counter()
         terminal = page.close_workspace()
+        shutdown_deadline = shutdown_started + _SHUTDOWN_LIMIT_S
+        while (
+            terminal.cleanup_status is not CleanupStatus.CLEANED
+            and time.perf_counter() < shutdown_deadline
+        ):
+            qapp.processEvents()
+            time.sleep(0.005)
+            terminal = page.close_workspace()
         duplicate = page.close_workspace()
         shutdown_elapsed = time.perf_counter() - shutdown_started
         assert terminal is duplicate
@@ -308,7 +347,8 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         assert lifecycle.closed is True
         _TrackingRecordStore.instances.clear()
         del scientific_records
-        del light_records
+        del artifact_owner
+        del publication_heavy
         del records
         gc.collect()
         qapp.processEvents()
@@ -348,8 +388,11 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
                     "heartbeat_max_lateness_s": maximum,
                     "publication_peak": executor.publication_peak,
                     "record_peak": record_peak,
-                    "heavy_record_peak": heavy_record_peak,
-                    "light_record_peak": light_record_peak,
+                    "transient_record_array_peak": (
+                        transient_record_array_peak
+                    ),
+                    "transient_record_array_bound": transient_heavy_bound,
+                    "light_publication_count": light_publication_count,
                     "delivery_wall_s": elapsed,
                     "shutdown_wall_s": shutdown_elapsed,
                     "shutdown_limit_s": _SHUTDOWN_LIMIT_S,
