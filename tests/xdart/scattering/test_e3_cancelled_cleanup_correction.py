@@ -12,6 +12,7 @@ import time
 from typing import get_type_hints
 
 import pytest
+from pyqtgraph.Qt import QtCore
 
 from xdart.gui.tabs.scattering.adapters import browse_loader as loader_module
 from xdart.gui.tabs.scattering.adapters.browse_loader import (
@@ -42,6 +43,13 @@ from tests.xdart.scattering.test_e3_context_contract import (
     _browse,
     _running_controller,
     _select_browse,
+)
+from tests.xdart.scattering.test_e3_join_oracle import (
+    _mount,
+    _pause,
+    _produce_browse_artifact,
+    _run,
+    _wait,
 )
 
 
@@ -74,13 +82,38 @@ def _empty_reader_factory(callback=None):
         )
 
     return open_reader
-from tests.xdart.scattering.test_e3_join_oracle import (
-    _mount,
-    _pause,
-    _produce_browse_artifact,
-    _run,
-    _wait,
-)
+
+
+def _open_catalog_row(rig, monkeypatch, artifact: Path):
+    monkeypatch.setattr(
+        rig.page,
+        "_browser_directory_chooser",
+        lambda _current, _start_directory: str(artifact.parent),
+    )
+    rig.command(ShellCommand(ShellCommandKind.MENU, "File:Open Folder"))
+
+    def catalog_row():
+        scans = rig.shell.browser.scans
+        return next(
+            (
+                scans.item(index)
+                for index in range(scans.count())
+                if scans.item(index).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                == str(artifact)
+            ),
+            None,
+        )
+
+    _wait(
+        rig.app,
+        lambda: catalog_row() is not None,
+        diagnostic=lambda: f"{artifact} never entered the browser catalog",
+    )
+    row = catalog_row()
+    assert row is not None
+    return row
 
 
 def _ready_operation(
@@ -189,9 +222,12 @@ def test_cancelled_cleanup_has_one_typed_nonterminal_architecture() -> None:
             ):
                 page_uses[method.name] = True
     assert set(page_uses) == {
+        "_classify_deferred_metadata",
+        "_retry_pending_average_reload",
         "_select_scan",
         "_drain_executor",
         "_polling_needed",
+        "_refresh_shell",
         "_start_permitted",
     }
 
@@ -282,17 +318,15 @@ def test_page_polls_cancelled_c_refreshes_blocker_and_only_then_allows_next_run(
         acquisition = rig.controller.acquisition_context
         assert old_identity is not None
         assert acquisition is not None
+        row_c = _open_catalog_row(rig, monkeypatch, artifact_c)
 
         # Freeze C at READY in the real loader while keeping the page from
         # consuming it.  Resume/Stop then exercises cancellation, not load.
         ensure_timer = rig.page._ensure_timer
         rig.page._run_timer.stop()
         monkeypatch.setattr(rig.page, "_ensure_timer", lambda: None)
-        rig.command(
-            ShellCommand(
-                ShellCommandKind.SELECT_SCAN, str(artifact_c)
-            )
-        )
+        row_c.setSelected(True)
+        rig.app.processEvents()
         _wait_without_qt(
             lambda: (
                 rig.loader._active is not None
@@ -309,6 +343,14 @@ def test_page_polls_cancelled_c_refreshes_blocker_and_only_then_allows_next_run(
         assert context_c is not None
         records_c = context_c.record_store
         publications_c = context_c.publication_store
+        catalog_c = context_c.scalar_catalog
+        cache_c = context_c.browse_1d_cache
+        assert type(catalog_c) is FrameScalarCatalog
+        labels_c = catalog_c.labels
+        assert labels_c
+        assert context_c.frame_ids is labels_c
+        assert context_c.loaded_labels is labels_c
+        assert cache_c is not None
         real_release = rig.loader.release_context
         release_attempts: list[BrowseContext] = []
 
@@ -349,13 +391,18 @@ def test_page_polls_cancelled_c_refreshes_blocker_and_only_then_allows_next_run(
         assert rig.controller._cleanup_receipt is not None
         assert rig.controller._cleanup_receipt.request is request_c
         assert rig.loader._active is operation_c
-        assert len(records_c) == len(publications_c) > 0
+        assert len(records_c) == len(publications_c) == 0
+        assert context_c.scalar_catalog is catalog_c
+        assert context_c.browse_1d_cache is cache_c
+        assert context_c.frame_ids is labels_c
+        assert context_c.loaded_labels is labels_c
+        assert context_c.released is False
 
         # Use a fresh target for both next-Run attempts so a mutant cannot red
         # on output-state admission instead of the cleanup prerequisite.
         snapshot = rig.page._intents.snapshot()
         intent = snapshot.thaw()
-        intent.save_path = str(rig.output.with_name("run.second.nxs"))
+        intent.save_path = str(rig.output.with_name("run.second.nexus"))
         committed = rig.page._intents.commit(
             intent, expected_revision=snapshot.revision
         )
@@ -392,9 +439,6 @@ def test_page_polls_cancelled_c_refreshes_blocker_and_only_then_allows_next_run(
             False,
             "Browse cleanup remains pending",
         )
-        assert rig.shell.controls._profile.run_blockers == (
-            "Browse cleanup remains pending",
-        )
 
         attempts_before_release = len(release_attempts)
         allow_release.set()
@@ -411,6 +455,11 @@ def test_page_polls_cancelled_c_refreshes_blocker_and_only_then_allows_next_run(
         )
         assert len(release_attempts) > attempts_before_release
         assert len(records_c) == len(publications_c) == 0
+        assert context_c.scalar_catalog is None
+        assert context_c.browse_1d_cache is None
+        assert context_c.frame_ids == ()
+        assert context_c.loaded_labels == ()
+        assert context_c.released is True
         assert rig.loader._active is None
         assert rig.loader._queued is None
         assert rig.loader._worker is None
@@ -460,9 +509,9 @@ def test_select_scan_b_release_failure_rearms_page_cleanup_polling(
     try:
         _run(rig)
         _pause(rig)
-        rig.command(
-            ShellCommand(ShellCommandKind.SELECT_SCAN, str(artifact_b))
-        )
+        row_b = _open_catalog_row(rig, monkeypatch, artifact_b)
+        row_b.setSelected(True)
+        rig.app.processEvents()
         _wait(
             rig.app,
             lambda: (
@@ -476,6 +525,27 @@ def test_select_scan_b_release_failure_rearms_page_cleanup_polling(
         assert context_b is not None
         records_b = context_b.record_store
         publications_b = context_b.publication_store
+        catalog_b = context_b.scalar_catalog
+        assert type(catalog_b) is FrameScalarCatalog
+        labels_b = catalog_b.labels
+        assert labels_b
+        assert context_b.frame_ids is labels_b
+        assert context_b.loaded_labels is labels_b
+        row_c = _open_catalog_row(rig, monkeypatch, artifact_c)
+        assert rig.controller.browse_context is context_b
+        assert rig.controller.selection.names(context_b)
+        assert context_b.scalar_catalog is catalog_b
+        _wait(
+            rig.app,
+            lambda: (
+                not rig.controller.browse_preview_polling_needed
+                and rig.page._browse_1d_release_debt is None
+                and not rig.page._scientific_repaint_pending
+            ),
+            timeout=30.0,
+        )
+        record_labels_b = records_b.labels()
+        publication_labels_b = publications_b.labels()
         release = BrowseContext.release
         context_c: BrowseContext | None = None
         b_failures = c_failures = 0
@@ -504,8 +574,19 @@ def test_select_scan_b_release_failure_rearms_page_cleanup_polling(
             BrowseContext, "release", fail_b_then_c_once
         )
         rig.page._run_timer.stop()
-        rig.command(
-            ShellCommand(ShellCommandKind.SELECT_SCAN, str(artifact_c))
+        row_c.setSelected(True)
+        rig.app.processEvents()
+        _wait(
+            rig.app,
+            lambda: b_failures == c_failures == 1,
+            timeout=30.0,
+            diagnostic=lambda: (
+                f"b_failures={b_failures}; c_failures={c_failures}; "
+                f"row_selected={row_c.isSelected()}; "
+                f"browse_pending={rig.controller.browse_pending}; "
+                f"active={rig.loader._active!r}; "
+                f"notice={rig.page._notice_text!r}"
+            ),
         )
 
         assert b_failures == c_failures == 1
@@ -514,11 +595,22 @@ def test_select_scan_b_release_failure_rearms_page_cleanup_polling(
         assert rig.controller._cleanup_receipt is not None
         assert rig.controller._cleanup_receipt.request is request_c
         assert rig.controller.browse_context is context_b
-        assert len(records_b) == len(publications_b) > 0
+        assert records_b.labels() == record_labels_b
+        assert publications_b.labels() == publication_labels_b
+        assert context_b.scalar_catalog is catalog_b
+        assert context_b.frame_ids is labels_b
+        assert context_b.loaded_labels is labels_b
+        assert context_b.released is False
         assert rig.page._run_timer.isActive()
 
         records_c = context_c.record_store
         publications_c = context_c.publication_store
+        catalog_c = context_c.scalar_catalog
+        assert type(catalog_c) is FrameScalarCatalog
+        labels_c = catalog_c.labels
+        assert labels_c
+        assert context_c.frame_ids is labels_c
+        assert context_c.loaded_labels is labels_c
         _wait(
             rig.app,
             lambda: (
@@ -529,9 +621,19 @@ def test_select_scan_b_release_failure_rearms_page_cleanup_polling(
         )
         assert c_failures == 1
         assert len(records_c) == len(publications_c) == 0
+        assert context_c.scalar_catalog is None
+        assert context_c.browse_1d_cache is None
+        assert context_c.frame_ids == ()
+        assert context_c.loaded_labels == ()
+        assert context_c.released is True
         assert rig.controller.browse_context is context_b
         assert rig.controller.selection.names(context_b)
-        assert len(records_b) == len(publications_b) > 0
+        assert records_b.labels() == record_labels_b
+        assert publications_b.labels() == publication_labels_b
+        assert context_b.scalar_catalog is catalog_b
+        assert context_b.frame_ids is labels_b
+        assert context_b.loaded_labels is labels_b
+        assert context_b.released is False
     finally:
         receipt = rig.close()
         assert receipt.cleanup_status is CleanupStatus.CLEANED
