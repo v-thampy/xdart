@@ -244,6 +244,64 @@ def test_geometry_capture_is_hash_bound_and_rejects_duplicate_json(tmp_path):
     assert invalid_number.value.code == "GEOMETRY_PARSE_FAILED"
 
 
+@pytest.mark.parametrize(
+    "source_motors",
+    (
+        (("del_angle", "del"),),
+        (
+            ("del_angle", "del"),
+            ("nu_angle", "nu"),
+            ("other", "eta"),
+        ),
+    ),
+)
+def test_json_geometry_requires_exact_declared_position_mapping(
+    tmp_path,
+    source_motors,
+):
+    path = tmp_path / "geometry.json"
+    path.write_text(json.dumps(_goniometer_record()), encoding="utf-8")
+
+    with pytest.raises(StitchOperationRefused) as refused:
+        capture_stitch_geometry(
+            StitchGeometryInput(
+                path,
+                StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+                source_motors=source_motors,
+            )
+        )
+    assert refused.value.code == "GEOMETRY_MOTOR_MAPPING_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "positions",
+    (
+        ["del_angle", "del_angle"],
+        ["del_angle", ""],
+        [],
+    ),
+)
+def test_json_geometry_rejects_invalid_declared_positions(tmp_path, positions):
+    record = _goniometer_record()
+    record["pos_names"] = positions
+    record["trans_function"]["pos_names"] = positions
+    path = tmp_path / "geometry.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(StitchOperationRefused) as refused:
+        capture_stitch_geometry(
+            StitchGeometryInput(
+                path,
+                StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+                source_motors=(
+                    ("del_angle", "del"),
+                    ("nu_angle", "nu"),
+                ),
+            )
+        )
+    assert refused.value.code == "GEOMETRY_PARSE_FAILED"
+
+
 def test_poni_capture_requires_one_strict_configured_record(tmp_path):
     record = _poni_record()
     path = tmp_path / "geometry.poni"

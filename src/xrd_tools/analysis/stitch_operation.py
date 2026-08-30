@@ -201,6 +201,39 @@ def _range(value: object, name: str, *, required: bool) -> tuple[float, float] |
     return float(value[0]), float(value[1])
 
 
+def _json_position_names(value: Mapping[str, object]) -> tuple[str, ...]:
+    transformation = value.get("trans_function")
+    if type(transformation) is not dict:
+        raise StitchOperationRefused(
+            "GEOMETRY_PARSE_FAILED",
+            "goniometer JSON has no exact transformation object",
+        )
+    raw_positions = transformation.get("pos_names")
+    if (
+        type(raw_positions) is not list
+        or not 1 <= len(raw_positions) <= 32
+        or any(
+            type(name) is not str
+            or not name
+            or name.strip() != name
+            or len(name) > 128
+            for name in raw_positions
+        )
+        or len(set(raw_positions)) != len(raw_positions)
+    ):
+        raise StitchOperationRefused(
+            "GEOMETRY_PARSE_FAILED",
+            "goniometer JSON position names are invalid",
+        )
+    top_level = value.get("pos_names")
+    if top_level is not None and top_level != raw_positions:
+        raise StitchOperationRefused(
+            "GEOMETRY_PARSE_FAILED",
+            "goniometer JSON position-name declarations disagree",
+        )
+    return tuple(raw_positions)
+
+
 def _json_mapping(raw: bytes) -> dict[str, object]:
     def no_duplicates(pairs):
         result = dict(pairs)
@@ -284,6 +317,7 @@ def _json_mapping(raw: bytes) -> dict[str, object]:
         raise StitchOperationRefused(
             "GEOMETRY_PARSE_FAILED", "detector binning must contain two positive integers"
         )
+    _json_position_names(value)
     return value
 
 
@@ -450,7 +484,14 @@ def capture_stitch_geometry(request: StitchGeometryInput) -> StitchGeometryRecei
             "GEOMETRY_HASH_MISMATCH", "geometry digest does not match expectation"
         )
     if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
-        _json_mapping(raw)
+        declared_positions = _json_position_names(_json_mapping(raw))
+        bound_positions = tuple(name for name, _source in request.source_motors)
+        if set(bound_positions) != set(declared_positions):
+            raise StitchOperationRefused(
+                "GEOMETRY_MOTOR_MAPPING_MISMATCH",
+                "goniometer JSON source mapping must bind every declared "
+                "position exactly once and no others",
+            )
     else:
         try:
             from xrd_tools.integrate.calibration import load_detector_calibration
