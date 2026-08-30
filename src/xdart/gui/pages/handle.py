@@ -9,7 +9,7 @@ from .values import ActionOutcome, CloseReceipt, PageCapability, PageKey
 
 if TYPE_CHECKING:
     from pyqtgraph import QtWidgets
-    from .descriptors import PageDescriptor
+    from .descriptors import PageDescriptor, ToolDescriptor
 
 
 class OpenFolderPort(Protocol):
@@ -102,3 +102,32 @@ def validate_page_handle(descriptor: "PageDescriptor", handle: PageHandle) -> No
             raise CapabilityContractError(
                 f"{descriptor.key}: {field_name} presence does not match "
                 f"{capability.name}")
+
+
+def validate_tool_handle(descriptor: "ToolDescriptor", handle: PageHandle) -> None:
+    """Validate the deliberately small standalone-tool handle surface.
+
+    Tools own their dialog controls and may expose activity to the application
+    updater/exit guard.  Page-selection commands and application-menu mount
+    points remain page-only so opening an analysis tool cannot silently acquire
+    workspace authority.
+    """
+
+    if handle.key != descriptor.key:
+        raise CapabilityContractError(
+            f"handle key {handle.key!r} != descriptor key {descriptor.key!r}"
+        )
+    forbidden = (
+        "open_folder",
+        "settings_io",
+        "run_control",
+        "write_mode",
+        "slice_pin",
+        "app_menus",
+        "diagnostics",
+    )
+    for field_name in forbidden:
+        if object.__getattribute__(handle, field_name) is not None:
+            raise CapabilityContractError(
+                f"{descriptor.key}: standalone tool cannot expose {field_name}"
+            )

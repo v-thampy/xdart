@@ -9,6 +9,7 @@ from xdart.gui.pages.handle import (
     CapabilityContractError,
     PageHandle,
     validate_page_handle,
+    validate_tool_handle,
 )
 from xdart.gui.pages.registry import (
     DuplicatePageKeyError,
@@ -161,3 +162,29 @@ def test_handle_presence_must_match_every_declared_capability():
     )
     with pytest.raises(CapabilityContractError, match="run_control"):
         validate_page_handle(descriptor, handle)
+
+
+def test_tool_handle_allows_only_activity_beside_widget_and_close():
+    descriptor = ToolDescriptor(
+        key=PageKey("analysis-tool"),
+        label="Analysis Tool",
+        order=0,
+        build=_build,
+        tool_kind="analysis",
+    )
+    valid = PageHandle(
+        key=descriptor.key,
+        widget=object(),
+        close=lambda: CloseReceipt(PageCleanup.CLEAN, "verified"),
+        activity=object(),
+    )
+    validate_tool_handle(descriptor, valid)
+
+    invalid = PageHandle(
+        key=descriptor.key,
+        widget=object(),
+        close=lambda: CloseReceipt(PageCleanup.CLEAN, "verified"),
+        run_control=object(),
+    )
+    with pytest.raises(CapabilityContractError, match="run_control"):
+        validate_tool_handle(descriptor, invalid)

@@ -203,8 +203,8 @@ from xdart.gui.pages.catalog import (
     DEFAULT_PAGE_KEY,
     SCATTERING_WORKSPACE_PAGE,
 )
-from xdart.gui.pages.descriptors import PageDescriptor
-from xdart.gui.pages.handle import validate_page_handle
+from xdart.gui.pages.descriptors import PageDescriptor, ToolDescriptor
+from xdart.gui.pages.handle import validate_page_handle, validate_tool_handle
 from xdart.gui.pages.registry import PageRegistry
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import (
@@ -335,6 +335,8 @@ class Main(QMainWindow):
         self._menus_initialized = False
         self._close_retry_scheduled = False
         self._process_exit_requested = False
+        self._tool_handles = {}
+        self._tool_actions = {}
 
         descriptors = tuple(
             BUILTIN_PAGES if page_descriptors is None else page_descriptors)
@@ -550,7 +552,7 @@ class Main(QMainWindow):
             QtWidgets.QMessageBox.information(self, "Log Location", str(path))
 
     # ── In-app updater (Help → Check for Updates…) — spec section 4 ───────────
-    def _run_active(self, *, require_known=False):
+    def _page_run_active(self, *, require_known=False):
         """Query selected-page activity without inspecting its widget."""
         if PageCapability.RUN_ACTIVITY not in self.page_descriptor.capabilities:
             return bool(require_known)
@@ -559,6 +561,24 @@ class Main(QMainWindow):
         except Exception:
             logger.exception("Selected page activity query failed")
             return True
+
+    def _tool_run_active(self):
+        for key, handle in tuple(self._tool_handles.items()):
+            if handle.activity is None:
+                continue
+            try:
+                if handle.activity.active():
+                    return True
+            except Exception:
+                logger.exception("Tool %s activity query failed", key)
+                return True
+        return False
+
+    def _run_active(self, *, require_known=False):
+        """Aggregate selected-page and every constructed tool's activity."""
+        return self._page_run_active(
+            require_known=require_known
+        ) or self._tool_run_active()
 
     def _check_for_updates(self):
         from xdart.modules import updater
@@ -797,6 +817,32 @@ class Main(QMainWindow):
             self._shortcut_pin_slice_cut,
         )
 
+        analysis_tools = tuple(
+            descriptor
+            for descriptor in self.page_registry
+            if (
+                isinstance(descriptor, ToolDescriptor)
+                and descriptor.tool_kind == "analysis"
+            )
+        )
+        self.ui.menuAnalysis = None
+        if analysis_tools:
+            self.ui.menuAnalysis = QtWidgets.QMenu(self.ui.menubar)
+            self.ui.menuAnalysis.setObjectName("menuAnalysis")
+            self.ui.menuAnalysis.setTitle("Analysis")
+            self.ui.menubar.addAction(self.ui.menuAnalysis.menuAction())
+            for descriptor in analysis_tools:
+                action = QtGui.QAction(descriptor.label, self)
+                action.setObjectName(
+                    "actionAnalysisTool_" + str(descriptor.key).replace("-", "_")
+                )
+                action.triggered.connect(
+                    lambda _checked=False, key=descriptor.key:
+                    self.open_tool(key)
+                )
+                self.ui.menuAnalysis.addAction(action)
+                self._tool_actions[descriptor.key] = action
+
     @staticmethod
     def _set_capability_actions(actions, enabled, reason):
         for action in actions:
@@ -961,7 +1007,7 @@ class Main(QMainWindow):
         if self.page_descriptor.lifecycle is PageLifecycle.EXIT_ONLY:
             return ActionRefused(EXIT_ONLY_PAGE)
         if (PageCapability.RUN_ACTIVITY in self.page_descriptor.capabilities
-                and self._run_active()):
+                and self._page_run_active()):
             return ActionRefused(PAGE_ACTIVE)
         receipt = self._close_page()
         if receipt.status is PageCleanup.PENDING:
@@ -978,9 +1024,64 @@ class Main(QMainWindow):
             from xdart.gui.pages.values import CloseReceipt
             return CloseReceipt(PageCleanup.PENDING, f"close failed: {exc}")
 
+    def open_tool(self, key):
+        descriptor = self.page_registry.get(PageKey(str(key)))
+        if not isinstance(descriptor, ToolDescriptor):
+            return ActionRefused(UNKNOWN_PAGE)
+        handle = self._tool_handles.get(descriptor.key)
+        if handle is None:
+            try:
+                services = self._host_services.for_page(descriptor.key)
+                handle = descriptor.build(services, self)
+                validate_tool_handle(descriptor, handle)
+                if (
+                    not isinstance(handle.widget, QtWidgets.QDialog)
+                    or not handle.widget.isWindow()
+                    or handle.widget.parent() is not self
+                ):
+                    raise TypeError(
+                        "tool factory must return one parented top-level QDialog"
+                    )
+                handle.widget.setAttribute(
+                    QtCore.Qt.WidgetAttribute.WA_DeleteOnClose,
+                    False,
+                )
+                if not handle.widget.windowTitle():
+                    handle.widget.setWindowTitle(descriptor.label)
+                self._tool_handles[descriptor.key] = handle
+            except Exception as exc:
+                logger.exception("Tool %s construction failed", descriptor.key)
+                self._host_services.status.show(
+                    f"Could not open {descriptor.label}: {exc}", 8000
+                )
+                return ActionRefused(
+                    f"tool construction failed: {descriptor.key}"
+                )
+        handle.widget.show()
+        handle.widget.raise_()
+        handle.widget.activateWindow()
+        return ActionCompleted(str(descriptor.key))
+
+    @staticmethod
+    def _close_tool(key, handle):
+        try:
+            return handle.close()
+        except Exception as exc:
+            logger.exception("Tool %s close failed", key)
+            from xdart.gui.pages.values import CloseReceipt
+            return CloseReceipt(PageCleanup.PENDING, f"close failed: {exc}")
+
+    def _close_page_and_tools(self):
+        receipts = [self._close_page()]
+        receipts.extend(
+            self._close_tool(key, handle)
+            for key, handle in tuple(self._tool_handles.items())
+        )
+        return receipts
+
     def closeEvent(self, event):
-        receipt = self._close_page()
-        if receipt.status is PageCleanup.PENDING:
+        receipts = self._close_page_and_tools()
+        if any(receipt.status is PageCleanup.PENDING for receipt in receipts):
             event.ignore()
             if not self._close_retry_scheduled:
                 self._close_retry_scheduled = True

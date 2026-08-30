@@ -227,6 +227,47 @@ def _descriptor(
     )
 
 
+def _tool_descriptor(
+    key,
+    built,
+    *,
+    order=0,
+    calls=None,
+    receipts=None,
+    activity=None,
+):
+    calls = [] if calls is None else calls
+    receipts = [CloseReceipt(PageCleanup.CLEAN, "verified")] if receipts is None else receipts
+
+    def build(services, parent):
+        built.append(key)
+        assert services.run_intents.store_for(PageKey(key)) == (
+            "intent", PageKey(key)
+        )
+        dialog = QtWidgets.QDialog(parent)
+        dialog.setObjectName(key)
+
+        def close():
+            receipt = receipts.pop(0) if len(receipts) > 1 else receipts[0]
+            calls.append(("tool-close", receipt.status))
+            return receipt
+
+        return PageHandle(
+            key=PageKey(key),
+            widget=dialog,
+            close=close,
+            activity=None if activity is None else _Activity(activity),
+        )
+
+    return ToolDescriptor(
+        key=PageKey(key),
+        label=key,
+        order=order,
+        build=build,
+        tool_kind="analysis",
+    )
+
+
 def _action_texts(menu):
     return [action.text() for action in menu.actions() if not action.isSeparator()]
 
@@ -414,6 +455,136 @@ def test_unknown_or_tool_selection_falls_back_without_constructing_it(qapp, tmp_
         assert built == ["default-page"]
     finally:
         window.close()
+
+
+def test_analysis_tools_build_lazily_and_reuse_one_hidden_dialog(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    from xdart import _gui_main
+
+    monkeypatch.setenv("XDART_SETTINGS_FILE", str(tmp_path / "settings.ini"))
+    built, provider_calls, tool_calls = [], [], []
+    page = _descriptor("default-page", built)
+    later = _tool_descriptor(
+        "later-tool", built, order=2, calls=tool_calls
+    )
+    first = _tool_descriptor(
+        "first-tool", built, order=1, calls=tool_calls
+    )
+    window = _gui_main.Main(
+        page_descriptors=(later, page, first),
+        host_services=_services(provider_calls),
+    )
+    try:
+        assert built == ["default-page"]
+        assert _action_texts(window.ui.menuAnalysis) == [
+            "first-tool",
+            "later-tool",
+        ]
+        assert window.open_tool(first.key) == ActionCompleted("first-tool")
+        handle = window._tool_handles[first.key]
+        dialog = handle.widget
+        assert built == ["default-page", "first-tool"]
+        assert dialog.isVisible()
+
+        dialog.close()
+        qapp.processEvents()
+        assert not dialog.isVisible()
+        assert window.open_tool(first.key) == ActionCompleted("first-tool")
+        assert window._tool_handles[first.key] is handle
+        assert built == ["default-page", "first-tool"]
+    finally:
+        window.close()
+    assert [call[0] for call in tool_calls] == ["tool-close"]
+
+
+def test_exit_aggregates_page_and_built_tool_cleanup_every_pass(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    from xdart import _gui_main
+
+    monkeypatch.setenv("XDART_SETTINGS_FILE", str(tmp_path / "settings.ini"))
+    built, page_calls, tool_calls = [], [], []
+    page = _descriptor(
+        "default-page",
+        built,
+        calls=page_calls,
+        receipts=[
+            CloseReceipt(PageCleanup.PENDING, "page"),
+            CloseReceipt(PageCleanup.CLEAN, "page"),
+        ],
+    )
+    tool = _tool_descriptor(
+        "analysis-tool",
+        built,
+        calls=tool_calls,
+        receipts=[
+            CloseReceipt(PageCleanup.PENDING, "tool"),
+            CloseReceipt(PageCleanup.CLEAN, "tool"),
+        ],
+    )
+    window = _gui_main.Main(
+        page_descriptors=(page, tool),
+        host_services=_services([]),
+    )
+    window.open_tool(tool.key)
+
+    first = QtGui.QCloseEvent()
+    window.closeEvent(first)
+    assert not first.isAccepted()
+    second = QtGui.QCloseEvent()
+    window.closeEvent(second)
+    assert second.isAccepted()
+    assert [call[0] for call in page_calls] == ["close", "close"]
+    assert [call[0] for call in tool_calls] == ["tool-close", "tool-close"]
+
+
+def test_tool_activity_blocks_updates_but_not_page_switching(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    from xdart import _gui_main
+
+    monkeypatch.setenv("XDART_SETTINGS_FILE", str(tmp_path / "settings.ini"))
+    built = []
+    first_page = _descriptor("first-page", built)
+    next_page = _descriptor("next-page", built)
+    active = [True]
+    tool = _tool_descriptor("analysis-tool", built, activity=active)
+    window = _gui_main.Main(
+        page_descriptors=(first_page, next_page, tool),
+        host_services=_services([]),
+        selected_page_key=first_page.key,
+    )
+    try:
+        window.open_tool(tool.key)
+        assert window._run_active() is True
+        assert window.select_page(next_page.key) == ActionCompleted("next-page")
+        active[0] = False
+        assert window._run_active() is False
+    finally:
+        window.close()
+
+
+def test_unbuilt_tool_is_never_constructed_or_closed(qapp, tmp_path, monkeypatch):
+    from xdart import _gui_main
+
+    monkeypatch.setenv("XDART_SETTINGS_FILE", str(tmp_path / "settings.ini"))
+    built, calls = [], []
+    page = _descriptor("default-page", built)
+    tool = _tool_descriptor("analysis-tool", built, calls=calls)
+    window = _gui_main.Main(
+        page_descriptors=(page, tool),
+        host_services=_services([]),
+    )
+    window.close()
+    assert built == ["default-page"]
+    assert calls == []
 
 
 def test_host_owned_application_actions_stay_enabled_during_page_activity(qapp, tmp_path, monkeypatch):
