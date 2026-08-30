@@ -35,6 +35,7 @@ from .stitch_values import StitchFrameSelector, StitchToolForm
 
 logger = logging.getLogger(__name__)
 _PAIR_SEPARATOR = re.compile(r"[,;\n]+")
+_CURRENT_FORM_REVISION = object()
 
 
 class StitchToolDialog(QtWidgets.QDialog):
@@ -48,6 +49,7 @@ class StitchToolDialog(QtWidgets.QDialog):
         self._active_action = None
         self._form_revision = 0
         self._active_form_revision = None
+        self._execution_form_revision = None
         self._painted_result_fingerprint = None
         self._shutdown_complete = False
         self._suppress_form_changes = False
@@ -550,6 +552,11 @@ class StitchToolDialog(QtWidgets.QDialog):
             self._prepared_form_fingerprint = None
             self._sync_actions()
             return
+        # Finalization retries retain this exact execution even though the
+        # inputs become editable after a pending terminal.  Preserve the
+        # revision that launched science so a later cleanup/verification retry
+        # cannot paint that old result under newly edited controls.
+        self._execution_form_revision = self._form_revision
         self._begin_polling(StitchOwnerAction.RUN, "Running Stitch…")
 
     def _begin_retry_cleanup(self):
@@ -558,7 +565,9 @@ class StitchToolDialog(QtWidgets.QDialog):
             self._notice("No retryable Stitch cleanup is available")
             return
         self._begin_polling(
-            StitchOwnerAction.RETRY_CLEANUP, "Retrying cleanup only…"
+            StitchOwnerAction.RETRY_CLEANUP,
+            "Retrying cleanup only…",
+            form_revision=self._execution_form_revision,
         )
 
     def _begin_retry_verification(self):
@@ -569,11 +578,22 @@ class StitchToolDialog(QtWidgets.QDialog):
         self._begin_polling(
             StitchOwnerAction.RETRY_VERIFICATION,
             "Retrying strict reload only…",
+            form_revision=self._execution_form_revision,
         )
 
-    def _begin_polling(self, action, message):
+    def _begin_polling(
+        self,
+        action,
+        message,
+        *,
+        form_revision=_CURRENT_FORM_REVISION,
+    ):
         self._active_action = action
-        self._active_form_revision = self._form_revision
+        self._active_form_revision = (
+            self._form_revision
+            if form_revision is _CURRENT_FORM_REVISION
+            else form_revision
+        )
         self.progress.setRange(0, 0)
         self.status_label.setText(message)
         self._poll_timer.start()

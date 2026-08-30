@@ -237,6 +237,75 @@ def test_form_revision_change_during_run_refuses_stale_committed_paint(
         dialog.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("retry_method", "action", "finalization"),
+    (
+        (
+            "_begin_retry_cleanup",
+            StitchOwnerAction.RETRY_CLEANUP,
+            StitchOwnerFinalization.CLEANUP_PENDING,
+        ),
+        (
+            "_begin_retry_verification",
+            StitchOwnerAction.RETRY_VERIFICATION,
+            StitchOwnerFinalization.VERIFICATION_PENDING,
+        ),
+    ),
+)
+def test_finalization_retry_after_form_edit_never_paints_retained_result(
+    qapp,
+    monkeypatch,
+    retry_method,
+    action,
+    finalization,
+):
+    from xdart.gui.tools import stitch_owner, stitch_tool
+
+    dialog, owner, _status = _dialog(qapp)
+
+    class _Result:
+        pass
+
+    result = _Result()
+    result.terminal = SimpleNamespace(disposition=ModuleDisposition.COMMITTED)
+    result.payload = object()
+    monkeypatch.setattr(stitch_owner, "StitchOperationResult", _Result)
+    monkeypatch.setattr(stitch_tool, "StitchOperationResult", _Result)
+    painted = []
+    monkeypatch.setattr(dialog, "_paint_result", painted.append)
+    identity = OperationIdentity(1, object())
+    retry_name = (
+        "begin_retry_cleanup"
+        if action is StitchOwnerAction.RETRY_CLEANUP
+        else "begin_retry_verification"
+    )
+    monkeypatch.setattr(owner, retry_name, lambda: identity)
+    owner.finalization = finalization
+    dialog._execution_form_revision = 4
+    dialog._form_revision = 4
+    dialog._form_changed()
+    assert dialog._form_revision == 5
+    try:
+        getattr(dialog, retry_method)()
+        dialog._poll_timer.stop()
+        assert dialog._active_form_revision == 4
+        dialog._accept_update(
+            StitchOwnerUpdate(
+                identity,
+                action,
+                terminal_status=OperationTerminalStatus.RETURNED,
+                outcome=StitchOwnerOutcome(
+                    StitchOwnerOutcomeKind.RESULT,
+                    result=result,
+                ),
+            )
+        )
+        assert painted == []
+        assert "was not painted" in dialog.status_label.text()
+    finally:
+        dialog.shutdown()
+
+
 def test_committed_payload_replaces_all_three_curves_in_one_frozen_update(
     qapp, monkeypatch
 ):
