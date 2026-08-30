@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from .descriptors import PageDescriptor
+from .descriptors import PageDescriptor, ToolDescriptor
 from .values import (
     PageCapability,
     PageLifecycle,
     SCATTERING_PAGE_KEY,
+    STITCH_TOOL_KEY,
 )
 
 
@@ -16,6 +17,11 @@ DEFAULT_PAGE_KEY = SCATTERING_PAGE_KEY
 def _build_scattering_workspace(services, parent):
     from .scattering_workspace import build_scattering_workspace
     return build_scattering_workspace(services, parent)
+
+
+def _build_stitch_tool(services, parent):
+    from xdart.gui.tools.stitch_tool import build_stitch_tool
+    return build_stitch_tool(services, parent)
 
 
 SCATTERING_WORKSPACE_PAGE = PageDescriptor(
@@ -39,3 +45,16 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
 )
 
 BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE,)
+
+STITCH_TOOL = ToolDescriptor(
+    key=STITCH_TOOL_KEY,
+    label="Stitching",
+    description="Combine an exact scan selection into one stitched pattern",
+    icon_key="stitch",
+    category="analysis",
+    order=100,
+    build=_build_stitch_tool,
+    tool_kind="analysis",
+)
+
+BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, STITCH_TOOL)

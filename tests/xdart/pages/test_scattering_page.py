@@ -21,9 +21,11 @@ pytest.importorskip("pyqtgraph")
 from pyqtgraph import QtCore, QtWidgets
 
 from xdart.gui.pages.catalog import (
+    BUILTIN_DESCRIPTORS,
     BUILTIN_PAGES,
     DEFAULT_PAGE_KEY,
     SCATTERING_WORKSPACE_PAGE,
+    STITCH_TOOL,
 )
 from xdart.gui.pages.registry import PageRegistry
 from xdart.gui.pages.values import PageCapability, PageCleanup, PageLifecycle
@@ -55,6 +57,9 @@ def test_catalog_registers_current_workspace_first_and_as_default():
     )
     assert DEFAULT_PAGE_KEY == "scattering-workspace"
     assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
+    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, STITCH_TOOL)
+    assert STITCH_TOOL.key == "stitch"
+    assert STITCH_TOOL.tool_kind == "analysis"
 
 
 def test_scattering_descriptor_declares_the_frozen_adoption_ports():
@@ -89,7 +94,8 @@ def test_catalog_import_does_not_import_the_scattering_package():
     code = (
         "import sys\n"
         "import xdart.gui.pages.catalog\n"
-        "loaded = [m for m in sys.modules if 'gui.tabs.scattering' in m]\n"
+        "loaded = [m for m in sys.modules if "
+        "'gui.tabs.scattering' in m or 'gui.tools.stitch' in m]\n"
         "assert not loaded, loaded\n"
         "print('lazy-ok')\n"
     )
@@ -101,6 +107,31 @@ def test_catalog_import_does_not_import_the_scattering_package():
     )
     assert result.returncode == 0, result.stderr
     assert "lazy-ok" in result.stdout
+
+
+def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
+        qapp, isolated_settings):
+    from xdart.gui.pages.values import ActionCompleted
+
+    window = _mounted_host(None)
+    try:
+        assert STITCH_TOOL.key not in window._tool_handles
+        assert [action.text() for action in window.ui.menuAnalysis.actions()] == [
+            "Stitching"
+        ]
+        assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
+        handle = window._tool_handles[STITCH_TOOL.key]
+        assert handle.widget.objectName() == "stitchToolDialog"
+        assert handle.widget.source_widget._external_execution is True
+        assert handle.widget.source_widget._probe_executor is None
+        assert handle.activity.active() is False
+        assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
+        assert window._tool_handles[STITCH_TOOL.key] is handle
+        assert handle.close().status is PageCleanup.CLEAN
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
 
 
 # ---------------------------------------------------------------------------

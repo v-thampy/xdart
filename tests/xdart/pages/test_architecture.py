@@ -144,8 +144,10 @@ def test_catalog_is_the_only_builtin_registration_point():
     assert "STATIC_SCAN_PAGE_KEY" not in catalog
     assert "build_legacy_static" not in catalog
     assert catalog.count("PageDescriptor(") == 1
+    assert catalog.count("ToolDescriptor(") == 1
     assert "BUILTIN_PAGES" in catalog
-    assert "BUILTIN_PAGES" in main
+    assert "BUILTIN_DESCRIPTORS" in catalog
+    assert "BUILTIN_DESCRIPTORS" in main
     assert "PageDescriptor(" not in main
 
 

@@ -199,7 +199,7 @@ else:
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
 from xdart.gui.pages.catalog import (
-    BUILTIN_PAGES,
+    BUILTIN_DESCRIPTORS,
     DEFAULT_PAGE_KEY,
     SCATTERING_WORKSPACE_PAGE,
 )
@@ -339,7 +339,10 @@ class Main(QMainWindow):
         self._tool_actions = {}
 
         descriptors = tuple(
-            BUILTIN_PAGES if page_descriptors is None else page_descriptors)
+            BUILTIN_DESCRIPTORS
+            if page_descriptors is None
+            else page_descriptors
+        )
         self.page_registry = PageRegistry(descriptors).freeze()
         default = self.page_registry.get(DEFAULT_PAGE_KEY)
         if not isinstance(default, PageDescriptor):
