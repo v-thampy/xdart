@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ from xrd_tools.analysis import (
     PeakFitPlan,
     RSMPlan,
     Sin2PsiPlan,
+    StitchCancelled,
     StitchPlan,
     run_peak_fit,
     run_rsm,
@@ -33,6 +35,22 @@ def _r1d(value: float = 1.0) -> IntegrationResult1D:
         sigma=None,
         unit="q_A^-1",
     )
+
+
+def test_stitch_plan_streaming_flag_round_trips_exactly():
+    plan = StitchPlan(streaming_multigeometry=True)
+    restored = StitchPlan.from_provenance(plan.provenance())
+    assert restored.streaming_multigeometry is True
+
+    legacy = dict(plan.provenance())
+    del legacy["streaming_multigeometry"]
+    assert StitchPlan.from_provenance(legacy).streaming_multigeometry is False
+
+    for invalid in (1, "true", None):
+        malformed = dict(plan.provenance())
+        malformed["streaming_multigeometry"] = invalid
+        with pytest.raises(TypeError, match="exact bool"):
+            StitchPlan.from_provenance(malformed)
 
 
 def test_run_stitch_collects_images_and_metadata(monkeypatch):
@@ -73,6 +91,88 @@ def test_run_stitch_collects_images_and_metadata(monkeypatch):
     assert calls["kwargs"]["rot2_angles"].tolist() == [0.5, 0.7]
     assert calls["kwargs"]["normalization"].tolist() == [10.0, 20.0]
     assert calls["kwargs"]["npt_1d"] == 7
+
+
+def test_run_stitch_reports_bounded_progress_and_polls_cancellation(monkeypatch):
+    monkeypatch.setattr(
+        plan_mod,
+        "stitch_images",
+        lambda *_args, **_kwargs: _r1d(5.0),
+    )
+    source = MemoryFrameSource(
+        [
+            ScanFrame(0, image=np.ones((2, 2)), metadata={"rot1": 0.0}),
+            ScanFrame(1, image=np.ones((2, 2)), metadata={"rot1": 1.0}),
+        ],
+        name="progress",
+    )
+    progress = []
+    result = run_stitch(
+        StitchPlan(base_poni=object(), rot1_key="rot1"),
+        source,
+        progress_callback=lambda done, total: progress.append((done, total)),
+        cancel_token=threading.Event(),
+    )
+    assert result.kind == "stitch"
+    assert progress == [(0, 3), (1, 3), (2, 3), (3, 3)]
+
+    cancel = threading.Event()
+    real_load = source.load_frame
+    loads = 0
+
+    def cancel_after_first_load(label):
+        nonlocal loads
+        image = real_load(label)
+        loads += 1
+        cancel.set()
+        return image
+
+    monkeypatch.setattr(source, "load_frame", cancel_after_first_load)
+
+    with pytest.raises(StitchCancelled, match="cancelled"):
+        run_stitch(
+            StitchPlan(base_poni=object(), rot1_key="rot1"),
+            source,
+            cancel_token=cancel,
+        )
+
+
+def test_run_stitch_rejects_noncallable_runtime_hooks():
+    source = MemoryFrameSource(
+        [ScanFrame(0, image=np.ones((2, 2)), metadata={"rot1": 0.0})],
+        name="hooks",
+    )
+    with pytest.raises(TypeError, match="progress callback"):
+        run_stitch(
+            StitchPlan(base_poni=object()), source, progress_callback=object()
+        )
+    with pytest.raises(TypeError, match="cancellation token"):
+        run_stitch(
+            StitchPlan(base_poni=object()), source, cancel_token=object()
+        )
+    with pytest.raises(TypeError, match="collect_frame_records"):
+        run_stitch(
+            StitchPlan(base_poni=object()), source, collect_frame_records=1
+        )
+
+
+def test_run_stitch_rejects_nonpositive_monitor_before_integration(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        plan_mod,
+        "stitch_images",
+        lambda *_args, **_kwargs: called.append("science"),
+    )
+    source = MemoryFrameSource(
+        [ScanFrame(0, image=np.ones((2, 2)), metadata={"I0": 0.0})],
+        name="invalid-monitor",
+    )
+    with pytest.raises(ValueError, match="non-positive"):
+        run_stitch(
+            StitchPlan(base_poni=object(), monitor_key="I0"),
+            source,
+        )
+    assert called == []
 
 
 def test_run_stitch_runs_real_synthetic_multigeometry():
@@ -142,6 +242,41 @@ def _ring_source(name, *, n, rot_base, source_path):
                         source_path=source_path, source_frame_index=i)
               for i in range(1, n + 1)]
     return MemoryFrameSource(frames, name=name)
+
+
+def test_run_stitch_legacy_geometry_honors_streaming_without_eager_frames():
+    _, base_poni = _pilatus_poni()
+    source = _ring_source(
+        "legacy-streaming",
+        n=3,
+        rot_base=0,
+        source_path="/data/legacy.h5",
+    )
+    common = dict(
+        base_poni=base_poni,
+        rot1_key="rot1",
+        monitor_key="I0",
+        mode="1d",
+        npt_1d=120,
+        radial_range=(0.1, 6.0),
+    )
+    eager = run_stitch(StitchPlan(**common), source)
+    streamed = run_stitch(
+        StitchPlan(
+            **common,
+            streaming_multigeometry=True,
+            max_eager_bytes=1,
+        ),
+        source,
+    )
+
+    np.testing.assert_array_equal(streamed.payload.radial, eager.payload.radial)
+    np.testing.assert_array_equal(
+        streamed.payload.intensity,
+        eager.payload.intensity,
+    )
+    assert streamed.auxiliary.coverage.shape == (120,)
+    assert streamed.auxiliary.normalization.shape == (120,)
 
 
 def test_run_stitch_single_in_a_list_is_equivalent_to_bare_source():

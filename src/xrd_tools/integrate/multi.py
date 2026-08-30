@@ -12,7 +12,9 @@ gets its own AzimuthalIntegrator with the detector angle encoded.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+import math
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -31,11 +33,436 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def create_multigeometry_integrators(
+@dataclass(frozen=True, slots=True)
+class StitchDiagnostics:
+    """Detached per-bin MultiGeometry coverage and normalization weight."""
+
+    coverage: np.ndarray
+    normalization: np.ndarray
+
+    def __post_init__(self) -> None:
+        coverage = np.array(self.coverage, dtype=np.float64, order="C", copy=True)
+        normalization = np.array(
+            self.normalization, dtype=np.float64, order="C", copy=True
+        )
+        if (
+            coverage.shape != normalization.shape
+            or coverage.ndim not in {1, 2}
+            or not np.all(np.isfinite(coverage))
+            or not np.all(np.isfinite(normalization))
+            or np.any(coverage < 0)
+            or np.any(normalization < 0)
+        ):
+            raise ValueError("Stitch diagnostics must be finite nonnegative peers")
+        coverage.setflags(write=False)
+        normalization.setflags(write=False)
+        object.__setattr__(self, "coverage", coverage)
+        object.__setattr__(self, "normalization", normalization)
+
+
+def _normalization_factors(
+    normalization: np.ndarray | Sequence[float] | None,
+    count: int,
+) -> np.ndarray | None:
+    if normalization is None:
+        return None
+    values = np.asarray(normalization, dtype=float)
+    if values.shape != (count,):
+        raise ValueError(
+            f"normalization length {values.shape} != number of images {count}"
+        )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("normalization contains non-finite (nan/inf) values")
+    if np.any(values <= 0):
+        raise ValueError(
+            "normalization contains zero or negative values "
+            f"(monitor must be > 0): {values[values <= 0].tolist()}"
+        )
+    return values
+
+
+def _resolve_streaming_ranges(
+    integrator_factory: Callable[[], Iterator[AzimuthalIntegrator]],
+    image_count: int,
+    *,
+    unit: str,
+    radial_range: tuple[float, float] | None,
+    azimuth_range: tuple[float, float] | None,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Match MultiGeometry's global range guesses with O(one-AI) residency."""
+
+    if radial_range is not None and azimuth_range is not None:
+        return radial_range, azimuth_range
+    from pyFAI import units
+
+    radial_unit = units.to_unit(unit)
+    radial_min = math.inf
+    radial_max = -math.inf
+    azimuth_min = math.inf
+    azimuth_max = -math.inf
+    observed = 0
+    for integrator in integrator_factory():
+        observed += 1
+        try:
+            # MultiGeometry defaults to chi_disc=180 and mutates every member
+            # before integrating.  Scout in that same convention; otherwise a
+            # caller-supplied AI using chiDiscAtZero can produce a 0..360 range
+            # which is then paired with -180..180 integration values, dropping
+            # half the detector.
+            integrator.setChiDiscAtPi()
+            if radial_range is None:
+                values = np.asarray(
+                    integrator.array_from_unit(unit=radial_unit), dtype=float
+                )
+                radial_min = min(radial_min, float(values.min()))
+                radial_max = max(radial_max, float(values.max()))
+            if azimuth_range is None:
+                values = np.asarray(
+                    integrator.array_from_unit(unit=units.CHI_DEG), dtype=float
+                )
+                azimuth_min = min(azimuth_min, float(values.min()))
+                azimuth_max = max(azimuth_max, float(values.max()))
+        finally:
+            integrator.reset(collect_garbage=False)
+    if observed != image_count:
+        raise ValueError(
+            f"streaming Stitch received {observed} integrators; "
+            f"expected {image_count}"
+        )
+    resolved_radial = (
+        radial_range if radial_range is not None else (radial_min, radial_max)
+    )
+    resolved_azimuth = (
+        azimuth_range if azimuth_range is not None else (azimuth_min, azimuth_max)
+    )
+    if any(
+        not math.isfinite(value)
+        for value in (*resolved_radial, *resolved_azimuth)
+    ) or any(low >= high for low, high in (resolved_radial, resolved_azimuth)):
+        raise ValueError("streaming Stitch could not resolve finite geometry ranges")
+    return resolved_radial, resolved_azimuth
+
+
+def _streaming_multigeometry(
+    images: Iterable[np.ndarray],
+    image_count: int,
+    integrator_factory: Callable[[], Iterator[AzimuthalIntegrator]],
+    *,
+    mode: str,
+    npt_rad: int,
+    npt_azim: int,
+    unit: str,
+    method: str,
+    radial_range: tuple[float, float] | None,
+    azimuth_range: tuple[float, float] | None,
+    mask: np.ndarray | None,
+    normalization: np.ndarray | Sequence[float] | None,
+    correct_solid_angle: bool,
+    error_model: str | None,
+    polarization_factor: float | None,
+):
+    from pyFAI.multi_geometry import MultiGeometry
+
+    if type(image_count) is not int or image_count < 1:
+        raise ValueError("streaming Stitch image count must be positive")
+    if mode not in {"1d", "2d"}:
+        raise ValueError(f"mode must be '1d' or '2d', got {mode!r}")
+    factors = _normalization_factors(normalization, image_count)
+    fixed_radial, fixed_azimuth = _resolve_streaming_ranges(
+        integrator_factory,
+        image_count,
+        unit=unit,
+        radial_range=radial_range,
+        azimuth_range=azimuth_range,
+    )
+    image_iterator = iter(images)
+    integrator_iterator = iter(integrator_factory())
+    signal = normalization_sum = count = variance = None
+    radial = azimuthal = None
+    radial_unit = unit
+    azimuthal_unit = "chi_deg"
+    for index in range(image_count):
+        try:
+            image = np.asarray(next(image_iterator), dtype=float)
+        except StopIteration as error:
+            raise ValueError(
+                f"streaming Stitch received {index} images; expected {image_count}"
+            ) from error
+        try:
+            integrator = next(integrator_iterator)
+        except StopIteration as error:
+            raise ValueError(
+                f"streaming Stitch received {index} integrators; "
+                f"expected {image_count}"
+            ) from error
+        if image.ndim != 2:
+            integrator.reset(collect_garbage=False)
+            raise ValueError(
+                f"streaming Stitch image must be 2-D, got shape {image.shape}"
+            )
+        try:
+            frame_mask = (
+                None
+                if mask is None
+                else np.asarray(mask_with_detector(integrator, mask), dtype=bool)
+            )
+        except BaseException:
+            integrator.reset(collect_garbage=False)
+            raise
+        monitor = 1.0 if factors is None else float(factors[index])
+        try:
+            multigeometry = MultiGeometry(
+                [integrator],
+                unit=unit,
+                radial_range=fixed_radial,
+                azimuth_range=fixed_azimuth,
+                threadpoolsize=0,
+            )
+        except BaseException:
+            integrator.reset(collect_garbage=False)
+            raise
+        try:
+            if mode == "1d":
+                result = multigeometry.integrate1d(
+                    [image],
+                    npt_rad,
+                    correctSolidAngle=correct_solid_angle,
+                    error_model=error_model,
+                    polarization_factor=polarization_factor,
+                    normalization_factor=[monitor],
+                    lst_mask=None if frame_mask is None else [frame_mask],
+                    method=method,
+                )
+                current_shape = (npt_rad,)
+            else:
+                result = multigeometry.integrate2d(
+                    [image],
+                    npt_rad,
+                    npt_azim,
+                    correctSolidAngle=correct_solid_angle,
+                    error_model=error_model,
+                    polarization_factor=polarization_factor,
+                    normalization_factor=[monitor],
+                    lst_mask=None if frame_mask is None else [frame_mask],
+                    method=method,
+                )
+                current_shape = (npt_azim, npt_rad)
+            current_signal = np.asarray(result.sum_signal, dtype=np.float64)
+            current_normalization = np.asarray(
+                result.sum_normalization, dtype=np.float64
+            )
+            current_count = np.asarray(result.count, dtype=np.float64)
+            if any(
+                values.shape != current_shape
+                for values in (
+                    current_signal,
+                    current_normalization,
+                    current_count,
+                )
+            ):
+                raise ValueError("pyFAI returned an unexpected Stitch accumulator shape")
+            if signal is None:
+                signal = np.zeros(current_shape, dtype=np.float64)
+                normalization_sum = np.zeros_like(signal)
+                count = np.zeros_like(signal)
+            signal += current_signal
+            normalization_sum += current_normalization
+            count += current_count
+            if result.sigma is not None:
+                current_variance = np.asarray(result.sum_variance, dtype=np.float64)
+                if current_variance.shape != current_shape:
+                    raise ValueError("pyFAI returned an unexpected Stitch variance shape")
+                if variance is None:
+                    variance = current_variance.copy()
+                else:
+                    variance += current_variance
+            elif variance is not None:
+                raise ValueError("pyFAI returned inconsistent Stitch variance")
+            current_radial = np.asarray(result.radial, dtype=float)
+            if radial is None:
+                radial = current_radial.copy()
+            elif not np.array_equal(radial, current_radial):
+                raise ValueError("pyFAI returned inconsistent Stitch radial axes")
+            if mode == "2d":
+                current_azimuthal = np.asarray(result.azimuthal, dtype=float)
+                if azimuthal is None:
+                    azimuthal = current_azimuthal.copy()
+                elif not np.array_equal(azimuthal, current_azimuthal):
+                    raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
+                radial_unit = str(result.radial_unit)
+                azimuthal_unit = str(result.azimuthal_unit)
+            else:
+                radial_unit = str(result.unit) if result.unit is not None else unit
+        finally:
+            integrator.reset(collect_garbage=False)
+    try:
+        next(image_iterator)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("streaming Stitch received more images than declared")
+    try:
+        next(integrator_iterator)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("streaming Stitch received more integrators than declared")
+    if any(value is None for value in (signal, normalization_sum, count, radial)):
+        raise ValueError("streaming Stitch produced no result")
+    norm = np.maximum(normalization_sum, np.finfo("float32").tiny)
+    invalid = count <= 0
+    intensity = signal / norm
+    intensity[invalid] = 0.0
+    sigma = None
+    if variance is not None:
+        sigma = np.sqrt(variance) / norm
+        sigma[invalid] = 0.0
+    return (
+        radial,
+        azimuthal,
+        intensity,
+        sigma,
+        count,
+        normalization_sum,
+        radial_unit,
+        azimuthal_unit,
+    )
+
+
+def stitch_1d_streaming(
+    images: Iterable[np.ndarray],
+    image_count: int,
+    integrator_factory: Callable[[], Iterator[AzimuthalIntegrator]],
+    npt: int = 1000,
+    unit: str = "q_A^-1",
+    method: str = "BBox",
+    radial_range: tuple[float, float] | None = None,
+    mask: np.ndarray | None = None,
+    normalization: np.ndarray | Sequence[float] | None = None,
+    correct_solid_angle: bool = True,
+    error_model: str | None = None,
+    polarization_factor: float | None = None,
+) -> tuple[IntegrationResult1D, StitchDiagnostics]:
+    """Sequential MultiGeometry merge that retains only one detector frame."""
+
+    (
+        radial,
+        _azimuthal,
+        intensity,
+        sigma,
+        coverage,
+        normalization_sum,
+        radial_unit,
+        _azimuthal_unit,
+    ) = _streaming_multigeometry(
+        images,
+        image_count,
+        integrator_factory,
+        mode="1d",
+        npt_rad=npt,
+        npt_azim=1,
+        unit=unit,
+        method=method,
+        radial_range=radial_range,
+        azimuth_range=None,
+        mask=mask,
+        normalization=normalization,
+        correct_solid_angle=correct_solid_angle,
+        error_model=error_model,
+        polarization_factor=polarization_factor,
+    )
+    payload = IntegrationResult1D(
+        radial=radial,
+        intensity=intensity,
+        sigma=sigma,
+        unit=radial_unit,
+    )
+    diagnostics = StitchDiagnostics(coverage, normalization_sum)
+    return payload, diagnostics
+
+
+def stitch_2d_streaming(
+    images: Iterable[np.ndarray],
+    image_count: int,
+    integrator_factory: Callable[[], Iterator[AzimuthalIntegrator]],
+    npt_rad: int = 1000,
+    npt_azim: int = 1000,
+    unit: str = "q_A^-1",
+    method: str = "BBox",
+    radial_range: tuple[float, float] | None = None,
+    azimuth_range: tuple[float, float] | None = None,
+    mask: np.ndarray | None = None,
+    normalization: np.ndarray | Sequence[float] | None = None,
+    correct_solid_angle: bool = True,
+    error_model: str | None = None,
+    polarization_factor: float | None = None,
+) -> tuple[IntegrationResult2D, StitchDiagnostics]:
+    """Sequential 2-D MultiGeometry merge retaining one detector frame."""
+
+    (
+        radial,
+        azimuthal,
+        intensity,
+        sigma,
+        coverage,
+        normalization_sum,
+        radial_unit,
+        azimuthal_unit,
+    ) = _streaming_multigeometry(
+        images,
+        image_count,
+        integrator_factory,
+        mode="2d",
+        npt_rad=npt_rad,
+        npt_azim=npt_azim,
+        unit=unit,
+        method=method,
+        radial_range=radial_range,
+        azimuth_range=azimuth_range,
+        mask=mask,
+        normalization=normalization,
+        correct_solid_angle=correct_solid_angle,
+        error_model=error_model,
+        polarization_factor=polarization_factor,
+    )
+    payload = IntegrationResult2D(
+        radial=radial,
+        azimuthal=azimuthal,
+        intensity=intensity.T,
+        sigma=None if sigma is None else sigma.T,
+        unit=radial_unit,
+        azimuthal_unit=azimuthal_unit,
+    )
+    diagnostics = StitchDiagnostics(
+        coverage.T,
+        normalization_sum.T,
+    )
+    return payload, diagnostics
+
+
+@dataclass(frozen=True, slots=True)
+class PONIIntegratorSeries:
+    """Repeatable, lazy legacy PONI-plus-angle integrator series."""
+
+    base_poni: PONI
+    rotations: tuple[tuple[float, float], ...]
+
+    def __len__(self) -> int:
+        return len(self.rotations)
+
+    def __iter__(self) -> Iterator[AzimuthalIntegrator]:
+        for rot1, rot2 in self.rotations:
+            integrator = poni_to_integrator(self.base_poni)
+            integrator.rot1 = rot1
+            integrator.rot2 = rot2
+            yield integrator
+
+
+def create_multigeometry_integrator_series(
     base_poni: PONI,
     rot1_angles: np.ndarray | Sequence[float],
     rot2_angles: np.ndarray | Sequence[float] | None = None,
-) -> list[AzimuthalIntegrator]:
+) -> PONIIntegratorSeries:
     """
     Build a per-image list of AzimuthalIntegrators for a detector-angle scan.
 
@@ -53,10 +480,8 @@ def create_multigeometry_integrators(
         Per-image out-of-plane detector rotation offsets **in degrees**
         (e.g. the ``nu`` motor values).  If ``None``, only ``rot1`` varies.
 
-    Returns
-    -------
-    list of AzimuthalIntegrator
-        One integrator per image, ready to pass to :class:`MultiGeometry`.
+    Iterating the result creates fresh integrators, so callers can make a
+    bounded geometry-scout pass and then integrate one frame at a time.
     """
     rot1 = np.asarray(rot1_angles, dtype=float)
     rot2 = np.zeros_like(rot1) if rot2_angles is None else np.asarray(rot2_angles, dtype=float)
@@ -85,28 +510,70 @@ def create_multigeometry_integrators(
     base_rot1 = float(base_ai.rot1)
     base_rot2 = float(base_ai.rot2)
 
-    integrators: list[AzimuthalIntegrator] = []
-    for r1_deg, r2_deg in zip(rot1, rot2):
-        ai = poni_to_integrator(base_poni)
-        ai.rot1 = base_rot1 + float(np.deg2rad(r1_deg))
-        ai.rot2 = base_rot2 + float(np.deg2rad(r2_deg))
-        integrators.append(ai)
+    base_ai.reset(collect_garbage=False)
+    rotations = tuple(
+        (
+            base_rot1 + float(np.deg2rad(r1_deg)),
+            base_rot2 + float(np.deg2rad(r2_deg)),
+        )
+        for r1_deg, r2_deg in zip(rot1, rot2)
+    )
 
     logger.debug(
-        "Created %d per-angle integrators (rot2_varied=%s)",
-        len(integrators),
+        "Prepared %d lazy per-angle integrators (rot2_varied=%s)",
+        len(rotations),
         rot2_angles is not None,
     )
-    return integrators
+    return PONIIntegratorSeries(base_poni, rotations)
 
 
-def create_multigeometry_integrators_from_geometry(
+def create_multigeometry_integrators(
+    base_poni: PONI,
+    rot1_angles: np.ndarray | Sequence[float],
+    rot2_angles: np.ndarray | Sequence[float] | None = None,
+) -> list[AzimuthalIntegrator]:
+    """Materialize the legacy PONI-plus-angle integrator series."""
+
+    return list(
+        create_multigeometry_integrator_series(
+            base_poni,
+            rot1_angles=rot1_angles,
+            rot2_angles=rot2_angles,
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GeometryIntegratorSeries:
+    """Repeatable, lazy per-frame pyFAI integrator series."""
+
+    calibration: Any
+    rotations: tuple[tuple[float, float, float], ...]
+
+    def __len__(self) -> int:
+        return len(self.rotations)
+
+    def __iter__(self) -> Iterator[AzimuthalIntegrator]:
+        from xrd_tools.integrate.calibration import (  # noqa: PLC0415
+            detector_calibration_to_integrator,
+        )
+
+        for rot1, rot2, rot3 in self.rotations:
+            yield detector_calibration_to_integrator(
+                self.calibration,
+                rot1=rot1,
+                rot2=rot2,
+                rot3=rot3,
+            )
+
+
+def create_multigeometry_integrator_series_from_geometry(
     diffractometer: Any,
     motors: Any,
     *,
     base_calibration: Any = None,
-) -> list[AzimuthalIntegrator]:
-    """Per-frame integrators from a :class:`Diffractometer` — the calibrated path.
+) -> GeometryIntegratorSeries:
+    """Build a repeatable lazy calibrated-integrator series.
 
     Closes stitching GAP A + GAP B vs :func:`create_multigeometry_integrators`:
 
@@ -132,15 +599,10 @@ def create_multigeometry_integrators_from_geometry(
         The base detector calibration; defaults to
         ``diffractometer.calibration``.
 
-    Returns
-    -------
-    list of AzimuthalIntegrator
-        One per frame, ready for :class:`MultiGeometry` / the histogram backends.
+    Iterating the result creates fresh integrators.  This lets the streaming
+    Stitch path make a bounded geometry-scout pass and then integrate one frame
+    without retaining every pyFAI geometry cache.
     """
-    from xrd_tools.integrate.calibration import (  # noqa: PLC0415
-        detector_calibration_to_integrator,
-    )
-
     cal = base_calibration if base_calibration is not None else getattr(
         diffractometer, "calibration", None)
     if cal is None:
@@ -182,19 +644,40 @@ def create_multigeometry_integrators_from_geometry(
     if nframes is None:  # no active detector rotation — use any motor column length
         col = next(iter(motors.values()), None)
         nframes = len(np.atleast_1d(np.asarray(col))) if col is not None else 1
+    if any(len(values) != nframes for values in (r1, r2, r3) if values is not None):
+        raise ValueError("stitch geometry motor columns have different lengths")
     base = cal.poni
-    integrators: list[AzimuthalIntegrator] = []
+    rotations: list[tuple[float, float, float]] = []
     for i in range(nframes):
-        integrators.append(detector_calibration_to_integrator(
-            cal,
-            rot1=float(base.rot1) + (float(r1[i]) if r1 is not None else 0.0),
-            rot2=float(base.rot2) + (float(r2[i]) if r2 is not None else 0.0),
-            rot3=float(base.rot3) + (float(r3[i]) if r3 is not None else 0.0),
-        ))
-    logger.debug("Created %d per-frame integrators from a Diffractometer "
-                 "(preset=%s)", len(integrators),
+        rotations.append(
+            (
+                float(base.rot1) + (float(r1[i]) if r1 is not None else 0.0),
+                float(base.rot2) + (float(r2[i]) if r2 is not None else 0.0),
+                float(base.rot3) + (float(r3[i]) if r3 is not None else 0.0),
+            )
+        )
+    series = GeometryIntegratorSeries(cal, tuple(rotations))
+    logger.debug("Prepared %d lazy per-frame integrators from a Diffractometer "
+                 "(preset=%s)", len(series),
                  getattr(diffractometer, "preset", "?"))
-    return integrators
+    return series
+
+
+def create_multigeometry_integrators_from_geometry(
+    diffractometer: Any,
+    motors: Any,
+    *,
+    base_calibration: Any = None,
+) -> list[AzimuthalIntegrator]:
+    """Materialize the calibrated integrator series for eager callers."""
+
+    return list(
+        create_multigeometry_integrator_series_from_geometry(
+            diffractometer,
+            motors,
+            base_calibration=base_calibration,
+        )
+    )
 
 
 def stitch_1d(
@@ -229,8 +712,9 @@ def stitch_1d(
     mask : ndarray or None, optional
         Single detector mask applied to every image.
     normalization : array-like of float or None, optional
-        Per-image monitor counts.  Each image is divided by its corresponding
-        value before integration.
+        Per-image monitor counts passed to pyFAI's ``normalization_factor``.
+        MultiGeometry therefore accumulates raw signal over monitor-weighted
+        normalization, matching its notebook/API convention.
     **kwargs
         Extra keyword arguments forwarded to ``mg.integrate1d``.
 
@@ -240,14 +724,26 @@ def stitch_1d(
     """
     from pyFAI.multi_geometry import MultiGeometry
 
-    img_list = _prepare_images(images, normalization)
+    img_list = _prepare_images(images, None)
+    factors = _normalization_factors(normalization, len(img_list))
+    if "normalization_factor" in kwargs:
+        raise ValueError(
+            "pass monitor counts through normalization, not normalization_factor"
+        )
     # Geometric gaps stay masked per-integrator even with an explicit mask
     # (with lst_mask=None pyFAI already falls back to each detector mask).
     lst_mask = ([mask_with_detector(ai, mask) for ai in integrators]
                 if mask is not None else None)
 
     mg = MultiGeometry(integrators, unit=unit, radial_range=radial_range)
-    result = mg.integrate1d(img_list, npt, lst_mask=lst_mask, method=method, **kwargs)
+    result = mg.integrate1d(
+        img_list,
+        npt,
+        lst_mask=lst_mask,
+        method=method,
+        normalization_factor=factors,
+        **kwargs,
+    )
 
     sigma = result.sigma if result.sigma is not None else None
     unit_str = str(result.unit) if result.unit is not None else unit
@@ -297,11 +793,7 @@ def stitch_2d(
     mask : ndarray or None, optional
         Single detector mask applied to every image.
     normalization : array-like of float or None, optional
-        Per-image monitor counts.  Each image is divided by its
-        corresponding value before integration.  Matches the
-        ``normalization`` parameter on :func:`stitch_1d` — both stitching
-        paths share the same :func:`_prepare_images` helper so the math
-        is identical.
+        Per-image monitor counts passed to pyFAI's ``normalization_factor``.
     **kwargs
         Extra keyword arguments forwarded to ``mg.integrate2d``.
 
@@ -312,7 +804,12 @@ def stitch_2d(
     """
     from pyFAI.multi_geometry import MultiGeometry
 
-    img_list = _prepare_images(images, normalization)
+    img_list = _prepare_images(images, None)
+    factors = _normalization_factors(normalization, len(img_list))
+    if "normalization_factor" in kwargs:
+        raise ValueError(
+            "pass monitor counts through normalization, not normalization_factor"
+        )
     # Geometric gaps stay masked per-integrator even with an explicit mask
     # (with lst_mask=None pyFAI already falls back to each detector mask).
     lst_mask = ([mask_with_detector(ai, mask) for ai in integrators]
@@ -325,7 +822,13 @@ def stitch_2d(
         azimuth_range=azimuth_range,
     )
     result = mg.integrate2d(
-        img_list, npt_rad, npt_azim, lst_mask=lst_mask, method=method, **kwargs
+        img_list,
+        npt_rad,
+        npt_azim,
+        lst_mask=lst_mask,
+        method=method,
+        normalization_factor=factors,
+        **kwargs,
     )
 
     # pyFAI returns intensity (npt_azim, npt_rad); transpose to (npt_rad, npt_azim)
@@ -510,9 +1013,16 @@ def _stitch_pyfai_hist(
 
 
 __all__ = [
+    "GeometryIntegratorSeries",
+    "PONIIntegratorSeries",
+    "StitchDiagnostics",
+    "create_multigeometry_integrator_series",
     "create_multigeometry_integrators",
+    "create_multigeometry_integrator_series_from_geometry",
     "create_multigeometry_integrators_from_geometry",
     "stitch_1d",
+    "stitch_1d_streaming",
     "stitch_2d",
+    "stitch_2d_streaming",
     "stitch_images",
 ]

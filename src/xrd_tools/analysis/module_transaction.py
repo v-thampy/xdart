@@ -672,11 +672,14 @@ class ModuleArtifactOutput:
         write_result: Callable[[object], object],
         *,
         cancel_token: threading.Event | None = None,
+        prepublish_check: Callable[[], object] | None = None,
     ) -> ModuleTerminalResult:
         if cancel_token is not None and type(cancel_token) is not threading.Event:
             raise TypeError("module cancellation token must be threading.Event")
         if not callable(write_result):
             raise TypeError("module artifact writer must be callable")
+        if prepublish_check is not None and not callable(prepublish_check):
+            raise TypeError("module prepublication check must be callable")
         if self._publish_started:
             raise RuntimeError("module artifact publication is one-shot")
         self._publish_started = True
@@ -695,6 +698,11 @@ class ModuleArtifactOutput:
                 raise _ModuleCommitCancelled("CANCELLED")
             if result.disposition is not AnalysisDisposition.COMPLETED:
                 raise _ModuleCommitRefused(result.code)
+            if prepublish_check is not None:
+                try:
+                    prepublish_check()
+                except ModuleArtifactRefused as error:
+                    raise _ModuleCommitRefused(error.code) from error
 
         def guarded_writer(entry: object) -> object:
             try:

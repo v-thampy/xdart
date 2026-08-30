@@ -317,6 +317,10 @@ def test_result_fingerprint_is_scientific_and_storage_independent(tmp_path):
         ).inspection.result_fingerprint
 
     baseline = publish("baseline")
+    assert baseline == (
+        "357e3a6c2b07dbdfa4a5a4f6865a8dee"
+        "5b09dfb7ee6521a0f0cad77eb42c4fc7"
+    )
     assert publish("same-compressed", compression="gzip") == baseline
 
     changed_axis = q.copy()
@@ -346,6 +350,75 @@ def test_result_fingerprint_is_scientific_and_storage_independent(tmp_path):
     assert rsm.inspection.result_fingerprint != baseline
 
 
+def test_stitch_diagnostics_round_trip_and_bind_result_fingerprint(tmp_path):
+    q = np.linspace(0.1, 2.0, 7)
+    value = IntegrationResult1D(q, np.linspace(1.0, 2.0, 7), None, "q_A^-1")
+    coverage = np.linspace(0.0, 6.0, 7)
+    normalization = np.linspace(1.0, 7.0, 7)
+
+    def publish(label, coverage_values, normalization_values):
+        request = _request(
+            tmp_path / f"diagnostics-{label}.nexus",
+            AnalysisArtifactKind.STITCH_1D,
+        )
+        receipt = admit_analysis_artifact(
+            request,
+            coordinator=OutputTransactionCoordinator(),
+        ).publish(
+            lambda entry: write_stitched(
+                entry,
+                stitched_1d=value,
+                provenance=request.provenance_json,
+                coverage=coverage_values,
+                normalization=normalization_values,
+                bounded_artifact=True,
+            )
+        )
+        return receipt, read_analysis_artifact(
+            request.target,
+            expected_receipt=receipt,
+        )
+
+    receipt, payload = publish("baseline", coverage, normalization)
+    assert receipt.inspection.has_stitch_diagnostics is True
+    np.testing.assert_allclose(payload.coverage, coverage.astype(np.float32))
+    np.testing.assert_allclose(
+        payload.normalization,
+        normalization.astype(np.float32),
+    )
+    assert payload.coverage.flags.writeable is False
+    assert payload.normalization.flags.writeable is False
+
+    changed_coverage = coverage.copy()
+    changed_coverage[2] += 1.0
+    changed_normalization = normalization.copy()
+    changed_normalization[3] += 1.0
+    coverage_receipt, _ = publish(
+        "coverage",
+        changed_coverage,
+        normalization,
+    )
+    normalization_receipt, _ = publish(
+        "normalization",
+        coverage,
+        changed_normalization,
+    )
+    assert coverage_receipt.inspection.result_fingerprint != (
+        receipt.inspection.result_fingerprint
+    )
+    assert normalization_receipt.inspection.result_fingerprint != (
+        receipt.inspection.result_fingerprint
+    )
+
+    with h5py.File(tmp_path / "unpaired.h5", "w") as handle:
+        entry = handle.create_group("entry")
+        with pytest.raises(ValueError, match="must be paired"):
+            write_stitched(
+                entry,
+                stitched_1d=value,
+                coverage=coverage,
+                bounded_artifact=True,
+            )
 def test_bounded_writer_refuses_unbounded_inputs_before_hdf_mutation(tmp_path):
     q = np.linspace(0.1, 1.0, 7)
     value = IntegrationResult1D(q, q, None, "q_A^-1")

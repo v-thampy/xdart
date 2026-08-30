@@ -265,6 +265,7 @@ class AnalysisArtifactInspection:
     axes: tuple[tuple[str, int], ...]
     axis_units: tuple[tuple[str, str | None], ...]
     has_sigma: bool
+    has_stitch_diagnostics: bool
     request_fingerprint: str
     source_fingerprint: str
     plan_fingerprint: str
@@ -282,16 +283,22 @@ class AnalysisArtifactPayload:
     _axis_values: InitVar[tuple[tuple[str, np.ndarray], ...]]
     _intensity_values: InitVar[np.ndarray]
     _sigma_values: InitVar[np.ndarray | None]
+    _coverage_values: InitVar[np.ndarray | None]
+    _normalization_values: InitVar[np.ndarray | None]
     _claim: InitVar[object] = None
     _axis_buffers: tuple[tuple[str, bytes], ...] = field(init=False, repr=False)
     _intensity_buffer: bytes = field(init=False, repr=False)
     _sigma_buffer: bytes | None = field(init=False, repr=False)
+    _coverage_buffer: bytes | None = field(init=False, repr=False)
+    _normalization_buffer: bytes | None = field(init=False, repr=False)
 
     def __post_init__(
         self,
         _axis_values: tuple[tuple[str, np.ndarray], ...],
         _intensity_values: np.ndarray,
         _sigma_values: np.ndarray | None,
+        _coverage_values: np.ndarray | None,
+        _normalization_values: np.ndarray | None,
         _claim: object,
     ) -> None:
         if (
@@ -302,6 +309,14 @@ class AnalysisArtifactPayload:
             or (
                 _sigma_values is not None
                 and type(_sigma_values) is not np.ndarray
+            )
+            or (
+                _coverage_values is not None
+                and type(_coverage_values) is not np.ndarray
+            )
+            or (
+                _normalization_values is not None
+                and type(_normalization_values) is not np.ndarray
             )
         ):
             raise TypeError("analysis artifact payload is invalid")
@@ -325,6 +340,10 @@ class AnalysisArtifactPayload:
             or _intensity_values.flags.writeable
             or not _intensity_values.flags.c_contiguous
             or (_sigma_values is None) is self.inspection.has_sigma
+            or (_coverage_values is None)
+            is not (_normalization_values is None)
+            or (_coverage_values is not None)
+            is not self.inspection.has_stitch_diagnostics
             or (
                 _sigma_values is not None
                 and (
@@ -333,6 +352,18 @@ class AnalysisArtifactPayload:
                     or _sigma_values.flags.writeable
                     or not _sigma_values.flags.c_contiguous
                 )
+            )
+            or any(
+                values is not None
+                and (
+                    values.shape != self.inspection.shape
+                    or values.dtype != np.dtype(np.float32)
+                    or values.flags.writeable
+                    or not values.flags.c_contiguous
+                    or not np.isfinite(values).all()
+                    or np.any(values < 0)
+                )
+                for values in (_coverage_values, _normalization_values)
             )
         ):
             raise TypeError("analysis artifact payload arrays are invalid")
@@ -353,6 +384,20 @@ class AnalysisArtifactPayload:
             self,
             "_sigma_buffer",
             None if _sigma_values is None else _sigma_values.tobytes(order="C"),
+        )
+        object.__setattr__(
+            self,
+            "_coverage_buffer",
+            None
+            if _coverage_values is None
+            else _coverage_values.tobytes(order="C"),
+        )
+        object.__setattr__(
+            self,
+            "_normalization_buffer",
+            None
+            if _normalization_values is None
+            else _normalization_values.tobytes(order="C"),
         )
 
     @property
@@ -390,6 +435,18 @@ class AnalysisArtifactPayload:
         if self._sigma_buffer is None:
             return None
         return self._view(self._sigma_buffer, self.inspection.shape)
+
+    @property
+    def coverage(self) -> np.ndarray | None:
+        if self._coverage_buffer is None:
+            return None
+        return self._view(self._coverage_buffer, self.inspection.shape)
+
+    @property
+    def normalization(self) -> np.ndarray | None:
+        if self._normalization_buffer is None:
+            return None
+        return self._view(self._normalization_buffer, self.inspection.shape)
 
     def axis(self, name: str) -> np.ndarray:
         if type(name) is not str:
@@ -686,6 +743,8 @@ def _require_bounded_values(
     *,
     digest=None,
     digest_name: str = "",
+    require_finite: bool = False,
+    require_nonnegative: bool = False,
 ) -> None:
     if (
         _hdf_type_class(dataset.id) != h5py.h5t.FLOAT
@@ -712,8 +771,14 @@ def _require_bounded_values(
     )
     for piece in pieces:
         values = np.asarray(piece)
-        if np.isinf(values).any():
+        if np.isinf(values).any() or (
+            require_finite and not np.isfinite(values).all()
+        ):
             raise AnalysisArtifactInvalid(f"{dataset.name} contains infinity")
+        if require_nonnegative and np.any(values < 0):
+            raise AnalysisArtifactInvalid(
+                f"{dataset.name} contains negative values"
+            )
         finite_seen = finite_seen or bool(np.isfinite(values).any())
         if digest is not None:
             digest.update(
@@ -752,7 +817,12 @@ def _freeze_float32(values: np.ndarray) -> np.ndarray:
     return frozen.reshape(contiguous.shape)
 
 
-def _materialize_bounded_values(dataset: h5py.Dataset) -> np.ndarray:
+def _materialize_bounded_values(
+    dataset: h5py.Dataset,
+    *,
+    require_finite: bool = False,
+    require_nonnegative: bool = False,
+) -> np.ndarray:
     if (
         _hdf_type_class(dataset.id) != h5py.h5t.FLOAT
         or dataset.dtype != np.dtype(np.float32)
@@ -771,8 +841,14 @@ def _materialize_bounded_values(dataset: h5py.Dataset) -> np.ndarray:
     for start in range(0, dataset.shape[0], rows):
         stop = min(dataset.shape[0], start + rows)
         piece = np.asarray(dataset[start:stop], dtype=np.float32)
-        if np.isinf(piece).any():
+        if np.isinf(piece).any() or (
+            require_finite and not np.isfinite(piece).all()
+        ):
             raise AnalysisArtifactInvalid(f"{dataset.name} contains infinity")
+        if require_nonnegative and np.any(piece < 0):
+            raise AnalysisArtifactInvalid(
+                f"{dataset.name} contains negative values"
+            )
         finite_seen = finite_seen or bool(np.isfinite(piece).any())
         values[start:stop] = piece
     if not finite_seen:
@@ -937,17 +1013,26 @@ def inspect_analysis_artifact(
                 AnalysisArtifactKind.STITCH_1D,
                 AnalysisArtifactKind.STITCH_2D,
             }:
-                allowed_result.add("sigma")
-            expected_result_sizes = (
-                {len(allowed_result) - 1, len(allowed_result)}
-                if "sigma" in allowed_result
-                else {len(allowed_result)}
-            )
-            if len(result) not in expected_result_sizes:
+                allowed_result.update({"sigma", "coverage", "normalization"})
+            if any(name not in allowed_result for name in result):
                 raise AnalysisArtifactInvalid(
                     "analysis result contains an unknown graph"
                 )
-            if any(name not in allowed_result for name in result):
+            has_sigma = "sigma" in result
+            has_stitch_diagnostics = (
+                "coverage" in result and "normalization" in result
+            )
+            if ("coverage" in result) != ("normalization" in result):
+                raise AnalysisArtifactInvalid(
+                    "stitched coverage and normalization must be paired"
+                )
+            expected_result_size = (
+                2
+                + len(axis_names)
+                + int(has_sigma)
+                + 2 * int(has_stitch_diagnostics)
+            )
+            if len(result) != expected_result_size:
                 raise AnalysisArtifactInvalid(
                     "analysis result contains an unknown graph"
                 )
@@ -1005,13 +1090,6 @@ def inspect_analysis_artifact(
                 digest=result_digest,
                 digest_name="intensity",
             )
-            has_sigma = (
-                kind in {
-                    AnalysisArtifactKind.STITCH_1D,
-                    AnalysisArtifactKind.STITCH_2D,
-                }
-                and "sigma" in result
-            )
             if has_sigma:
                 sigma = _direct(result, "sigma", h5py.Dataset)
                 if len(sigma.attrs) != 0:
@@ -1029,6 +1107,20 @@ def inspect_analysis_artifact(
                 )
             else:
                 _digest_text(result_digest, "sigma:absent")
+            if has_stitch_diagnostics:
+                for name in ("coverage", "normalization"):
+                    values = _direct(result, name, h5py.Dataset)
+                    if len(values.attrs) != 0 or values.shape != expected_shape:
+                        raise AnalysisArtifactInvalid(
+                            f"stitched {name} must be an exact result-shaped dataset"
+                        )
+                    _require_bounded_values(
+                        values,
+                        digest=result_digest,
+                        digest_name=name,
+                        require_finite=True,
+                        require_nonnegative=True,
+                    )
             seen: set[int] = set()
             _require_local_graph(entry, seen)
             inspection = AnalysisArtifactInspection(
@@ -1040,6 +1132,7 @@ def inspect_analysis_artifact(
                 axes=tuple((name, len(values)) for name, values in axes),
                 axis_units=tuple(axis_units),
                 has_sigma=has_sigma,
+                has_stitch_diagnostics=has_stitch_diagnostics,
                 request_fingerprint=identity_fingerprints["request_fingerprint"],
                 source_fingerprint=identity_fingerprints["source_fingerprint"],
                 plan_fingerprint=identity_fingerprints["plan_fingerprint"],
@@ -1155,6 +1248,25 @@ def read_analysis_artifact(
                     raise AnalysisArtifactInvalid(
                         "analysis sigma shape changed after admission"
                     )
+            coverage = normalization = None
+            if inspection.has_stitch_diagnostics:
+                coverage = _materialize_bounded_values(
+                    _direct(result, "coverage", h5py.Dataset),
+                    require_finite=True,
+                    require_nonnegative=True,
+                )
+                normalization = _materialize_bounded_values(
+                    _direct(result, "normalization", h5py.Dataset),
+                    require_finite=True,
+                    require_nonnegative=True,
+                )
+                if (
+                    coverage.shape != inspection.shape
+                    or normalization.shape != inspection.shape
+                ):
+                    raise AnalysisArtifactInvalid(
+                        "stitched diagnostics changed shape after admission"
+                    )
 
             result_digest = hashlib.sha256(_RESULT_FINGERPRINT_PREFIX)
             _digest_text(result_digest, inspection.kind.value)
@@ -1189,6 +1301,9 @@ def read_analysis_artifact(
                 _digest_text(result_digest, "sigma:absent")
             else:
                 _digest_array(result_digest, "sigma", sigma)
+            if inspection.has_stitch_diagnostics:
+                _digest_array(result_digest, "coverage", coverage)
+                _digest_array(result_digest, "normalization", normalization)
             if result_digest.hexdigest() != inspection.result_fingerprint:
                 raise TargetChanged(
                     "analysis payload changed after detached admission"
@@ -1211,6 +1326,8 @@ def read_analysis_artifact(
             axes,
             intensity,
             sigma,
+            coverage,
+            normalization,
             _ANALYSIS_PAYLOAD_FACTORY,
         )
     except AnalysisArtifactInvalid:

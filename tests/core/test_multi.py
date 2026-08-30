@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 import pytest
 from pyFAI.detectors import Detector
@@ -10,8 +12,11 @@ from xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResu
 from xrd_tools.integrate.multi import (
     create_multigeometry_integrators,
     stitch_1d,
+    stitch_1d_streaming,
     stitch_2d,
+    stitch_2d_streaming,
 )
+from xrd_tools.integrate.detector_mask import mask_with_detector
 
 
 def _small_base_poni(poni_fixture: PONI) -> PONI:
@@ -160,12 +165,9 @@ def test_stitch_2d_runs(poni_fixture):
 
 
 def test_stitch_2d_normalization(poni_fixture):
-    """``normalization=`` on stitch_2d must match pre-dividing the images.
+    """Monitor normalization follows pyFAI MultiGeometry/notebook semantics."""
+    from pyFAI.multi_geometry import MultiGeometry
 
-    Regression test for the stitch_1d / stitch_2d asymmetry: prior to the
-    fix, stitch_2d ignored normalization entirely.  Both paths go through
-    the same ``_prepare_images`` helper now.
-    """
     integrators = _make_small_integrators(poni_fixture, rot1_angles=[0.0, 5.0, 10.0])
     images = _synthetic_images(n=3, shape=(100, 100), seed=42)
     norm = np.array([1.0, 2.0, 0.5])
@@ -181,24 +183,22 @@ def test_stitch_2d_normalization(poni_fixture):
         correctSolidAngle=False,
     )
 
-    pre_divided = [img / n for img, n in zip(images, norm)]
-    via_premul = stitch_2d(
-        pre_divided,
-        integrators,
-        npt_rad=100,
-        npt_azim=50,
-        unit="q_A^-1",
+    reference = MultiGeometry(integrators, unit="q_A^-1").integrate2d(
+        images,
+        100,
+        50,
         method="BBox",
         correctSolidAngle=False,
+        normalization_factor=norm,
     )
 
     assert isinstance(via_param, IntegrationResult2D)
     np.testing.assert_allclose(
-        via_param.intensity, via_premul.intensity,
+        via_param.intensity, np.asarray(reference.intensity).T,
         rtol=1e-10, atol=1e-12,
     )
-    np.testing.assert_allclose(via_param.radial, via_premul.radial)
-    np.testing.assert_allclose(via_param.azimuthal, via_premul.azimuthal)
+    np.testing.assert_allclose(via_param.radial, reference.radial)
+    np.testing.assert_allclose(via_param.azimuthal, reference.azimuthal)
 
 
 def test_stitch_2d_normalization_mismatched_length(poni_fixture):
@@ -217,6 +217,192 @@ def test_stitch_2d_normalization_mismatched_length(poni_fixture):
             normalization=[1.0, 2.0],  # only 2 for 3 images
             correctSolidAngle=False,
         )
+
+
+@pytest.mark.parametrize("mode", ("1d", "2d"))
+def test_one_ai_streaming_matches_multigeometry_raw_accumulators(
+    poni_fixture,
+    mode,
+):
+    from pyFAI.multi_geometry import MultiGeometry
+
+    angles = [0.0, 4.0, 9.0]
+    images = _synthetic_images(n=3, shape=(100, 100), seed=91)
+    monitor = np.asarray([1.0, 2.5, 0.75])
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[8:11, 17:23] = True
+    radial_range = (0.1, 6.0)
+    azimuth_range = (-85.0, 85.0) if mode == "2d" else None
+    reference_integrators = _make_small_integrators(poni_fixture, angles)
+    reference = MultiGeometry(
+        reference_integrators,
+        unit="q_A^-1",
+        radial_range=radial_range,
+        azimuth_range=azimuth_range,
+        threadpoolsize=0,
+    )
+    masks = [mask_with_detector(ai, mask) for ai in reference_integrators]
+    if mode == "1d":
+        eager = reference.integrate1d(
+            images,
+            120,
+            method="BBox",
+            error_model="poisson",
+            normalization_factor=monitor,
+            lst_mask=masks,
+        )
+        streamed, diagnostics = stitch_1d_streaming(
+            images,
+            len(images),
+            lambda: iter(_make_small_integrators(poni_fixture, angles)),
+            npt=120,
+            unit="q_A^-1",
+            method="BBox",
+            radial_range=radial_range,
+            mask=mask,
+            normalization=monitor,
+            error_model="poisson",
+        )
+        np.testing.assert_array_equal(streamed.radial, eager.radial)
+        np.testing.assert_array_equal(streamed.intensity, eager.intensity)
+        np.testing.assert_array_equal(streamed.sigma, eager.sigma)
+        np.testing.assert_array_equal(diagnostics.coverage, eager.count)
+        np.testing.assert_array_equal(
+            diagnostics.normalization,
+            eager.sum_normalization,
+        )
+    else:
+        eager = reference.integrate2d(
+            images,
+            80,
+            36,
+            method="BBox",
+            error_model="poisson",
+            normalization_factor=monitor,
+            lst_mask=masks,
+        )
+        streamed, diagnostics = stitch_2d_streaming(
+            images,
+            len(images),
+            lambda: iter(_make_small_integrators(poni_fixture, angles)),
+            npt_rad=80,
+            npt_azim=36,
+            unit="q_A^-1",
+            method="BBox",
+            radial_range=radial_range,
+            azimuth_range=azimuth_range,
+            mask=mask,
+            normalization=monitor,
+            error_model="poisson",
+        )
+        np.testing.assert_array_equal(streamed.radial, eager.radial)
+        np.testing.assert_array_equal(streamed.azimuthal, eager.azimuthal)
+        np.testing.assert_array_equal(streamed.intensity, eager.intensity.T)
+        np.testing.assert_array_equal(streamed.sigma, eager.sigma.T)
+        np.testing.assert_array_equal(diagnostics.coverage, eager.count.T)
+        np.testing.assert_array_equal(
+            diagnostics.normalization,
+            eager.sum_normalization.T,
+        )
+
+
+def test_one_ai_streaming_uses_bounded_range_scout_and_cache_residency(
+    poni_fixture,
+    monkeypatch,
+):
+    from pyFAI.multi_geometry import MultiGeometry
+
+    real_integrate = MultiGeometry.integrate1d
+    references = []
+    active_cache_counts = []
+    factory_calls = []
+
+    def factory():
+        factory_calls.append("factory")
+        for integrator in _make_small_integrators(
+            poni_fixture,
+            [0.0, 4.0, 9.0],
+        ):
+            references.append(weakref.ref(integrator))
+            yield integrator
+
+    def observe_caches(owner, *args, **kwargs):
+        result = real_integrate(owner, *args, **kwargs)
+        active_cache_counts.append(
+            sum(
+                bool(getattr(value, "_cached_array", {}))
+                for reference in references
+                if (value := reference()) is not None
+            )
+        )
+        return result
+
+    def forbidden_guess(_owner):
+        raise AssertionError("one-AI integration must receive globally fixed ranges")
+
+    monkeypatch.setattr(MultiGeometry, "integrate1d", observe_caches)
+    monkeypatch.setattr(MultiGeometry, "_guess_radial_range", forbidden_guess)
+    monkeypatch.setattr(MultiGeometry, "_guess_azimuth_range", forbidden_guess)
+    result, diagnostics = stitch_1d_streaming(
+        _synthetic_images(n=3, shape=(100, 100), seed=101),
+        3,
+        factory,
+        npt=120,
+        radial_range=(0.1, 6.0),
+        method="BBox",
+    )
+    assert result.intensity.shape == (120,)
+    assert diagnostics.coverage.shape == (120,)
+    assert factory_calls == ["factory", "factory"]
+    assert active_cache_counts and max(active_cache_counts) == 1
+
+
+def test_one_ai_streaming_scout_matches_multigeometry_chi_convention(
+    poni_fixture,
+):
+    """A caller's 0..360 AIs must not poison the default -180..180 scout."""
+    from pyFAI.multi_geometry import MultiGeometry
+
+    angles = [0.0, 7.0, 13.0]
+    images = _synthetic_images(n=3, shape=(100, 100), seed=303)
+
+    def factory():
+        integrators = _make_small_integrators(poni_fixture, angles)
+        for integrator in integrators:
+            integrator.setChiDiscAtZero()
+            yield integrator
+
+    eager_integrators = list(factory())
+    eager = MultiGeometry(
+        eager_integrators,
+        unit="q_A^-1",
+        threadpoolsize=0,
+    ).integrate2d(
+        images,
+        80,
+        72,
+        method="BBox",
+        correctSolidAngle=False,
+    )
+    streamed, diagnostics = stitch_2d_streaming(
+        images,
+        len(images),
+        factory,
+        npt_rad=80,
+        npt_azim=72,
+        unit="q_A^-1",
+        method="BBox",
+        correct_solid_angle=False,
+    )
+
+    np.testing.assert_array_equal(streamed.radial, eager.radial)
+    np.testing.assert_array_equal(streamed.azimuthal, eager.azimuthal)
+    np.testing.assert_array_equal(streamed.intensity, eager.intensity.T)
+    np.testing.assert_array_equal(diagnostics.coverage, eager.count.T)
+    np.testing.assert_array_equal(
+        diagnostics.normalization,
+        eager.sum_normalization.T,
+    )
 
 
 def test_stitch_images_routes_and_handles_rot2(monkeypatch):

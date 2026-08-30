@@ -726,6 +726,43 @@ def test_writer_cannot_impersonate_cleanup_pending(tmp_path):
     assert output.snapshot.remaining_lease_owners == ()
 
 
+def test_module_prepublish_check_runs_after_writer_and_can_refuse_commit(tmp_path):
+    request = _request(tmp_path)
+    provenance = _provenance(request)
+    bound = module_artifact_request(request, provenance)
+    output = admit_module_artifact(
+        request,
+        provenance,
+        coordinator=OutputTransactionCoordinator(),
+    )
+    order = []
+
+    def write(entry):
+        order.append("writer")
+        write_stitched(
+            entry,
+            stitched_1d=IntegrationResult1D(
+                radial=np.linspace(0.1, 1.0, 8),
+                intensity=np.linspace(2.0, 3.0, 8),
+                unit="q_A^-1",
+            ),
+            provenance=bound.provenance_json,
+            bounded_artifact=True,
+        )
+
+    def refuse():
+        order.append("prepublish")
+        raise ModuleArtifactRefused("GEOMETRY_IDENTITY_MISMATCH")
+
+    terminal = output.publish(write, prepublish_check=refuse)
+    assert terminal.disposition is ModuleDisposition.REFUSED
+    assert terminal.code == "GEOMETRY_IDENTITY_MISMATCH"
+    assert order == ["writer", "prepublish"]
+    assert not Path(request.output.target).exists()
+    assert output.snapshot.phase is TransactionPhase.ABORTED
+    assert output.snapshot.remaining_lease_owners == ()
+
+
 @pytest.mark.parametrize(
     "control_exception",
     ("_ModuleCommitCancelled", "_ModuleCommitRefused"),

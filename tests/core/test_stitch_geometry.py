@@ -234,6 +234,42 @@ def test_run_stitch_geometry_dispatch_equals_legacy_uncalibrated():
     np.testing.assert_allclose(geom.payload.radial, legacy.payload.radial)
 
 
+@pytest.mark.parametrize("mode", ("1d", "2d"))
+def test_streaming_multigeometry_matches_eager_and_retains_diagnostics(mode):
+    pytest.importorskip("pyFAI")
+    from xrd_tools.analysis.plans import StitchPlan, run_stitch
+
+    diff, src = _stitch_diff_and_src()
+    common = dict(
+        diffractometer=diff,
+        backend="multigeometry",
+        mode=mode,
+        npt_1d=180,
+        npt_rad_2d=90,
+        npt_azim_2d=48,
+        radial_range=(0.1, 6.0),
+        azimuth_range=(-90.0, 90.0) if mode == "2d" else None,
+    )
+    eager = run_stitch(StitchPlan(**common), src)
+    streamed = run_stitch(
+        StitchPlan(**common, streaming_multigeometry=True),
+        src,
+    )
+    np.testing.assert_allclose(
+        streamed.payload.intensity,
+        eager.payload.intensity,
+        rtol=1e-12,
+        atol=1e-12,
+        equal_nan=True,
+    )
+    assert streamed.auxiliary.coverage.shape == streamed.payload.intensity.shape
+    assert streamed.auxiliary.normalization.shape == streamed.payload.intensity.shape
+    assert streamed.auxiliary.coverage.flags.writeable is False
+    assert streamed.auxiliary.normalization.flags.writeable is False
+    assert np.any(streamed.auxiliary.coverage > 0)
+    assert np.any(streamed.auxiliary.normalization > 0)
+
+
 def test_run_stitch_backend_dispatch():
     """run_stitch(backend='pyfai_hist') routes to the streaming histogram merge and
     shape-matches the multigeometry backend; 'xu_hist' is a clear NotImplementedError."""

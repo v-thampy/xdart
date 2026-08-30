@@ -39,7 +39,10 @@ __all__ = [
     "run_metadata_table_requalification", "run_scan_plot", "run_roi_preview", "run_roi_scan",
     "analysis_canonical_fingerprint", "requalified_analysis_source",
 ]
-_MAX_TABLE_ROWS, _MAX_TABLE_COLUMNS = 100_000, 128
+# SSRL SPEC scans commonly expose roughly 60 point columns plus the complete
+# 159-motor #O/#P snapshot.  Keep that physical catalog admissible while the
+# independent 64 MiB canonical table budget remains the actual memory bound.
+_MAX_TABLE_ROWS, _MAX_TABLE_COLUMNS = 100_000, 256
 _MAX_CANDIDATES, _MAX_CANDIDATE_BYTES = 256, 1 << 20
 _MAX_TABLE_BYTES = _MAX_PLOT_BYTES = 64 << 20
 _MAX_PREVIEW_BYTES = _MAX_ROI_BYTES = 64 << 20

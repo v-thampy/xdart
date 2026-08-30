@@ -261,7 +261,7 @@ def test_metadata_table_runner_is_qt_free_ordered_bounded_and_direct(
 ):
     ops = _scan_ops()
     assert ops._MAX_TABLE_ROWS == 100_000
-    assert ops._MAX_TABLE_COLUMNS == 128
+    assert ops._MAX_TABLE_COLUMNS == 256
     assert ops._MAX_TABLE_BYTES == 64 * 1024 * 1024
 
     before_qt = {name for name in sys.modules if name.startswith(("PyQt", "PySide"))}
@@ -301,12 +301,12 @@ def test_metadata_table_runner_is_qt_free_ordered_bounded_and_direct(
 
     column_boundary, _ = _run_table(
         monkeypatch, tmp_path,
-        {0: {f"c{index}": index for index in range(127)}},
+        {0: {f"c{index}": index for index in range(255)}},
     )
     _assert_terminal(column_boundary, "COMPLETED", "OK")
-    assert len(column_boundary.columns) == 128
+    assert len(column_boundary.columns) == 256
 
-    too_many_columns = {0: {f"c{index}": index for index in range(128)}}
+    too_many_columns = {0: {f"c{index}": index for index in range(256)}}
     result, _ = _run_table(monkeypatch, tmp_path, too_many_columns)
     _assert_terminal(result, "REFUSED", "METADATA_COLUMN_LIMIT_EXCEEDED")
 

@@ -3411,6 +3411,8 @@ def write_stitched(
     provenance: "Mapping[str, object] | str | None" = None,
     frame_records=None,
     source_base=None,
+    coverage: np.ndarray | None = None,
+    normalization: np.ndarray | None = None,
     compression: str | None = None,
     bounded_artifact: bool = False,
 ) -> None:
@@ -3433,6 +3435,36 @@ def write_stitched(
     representation for ordinary scan files.
     """
     ck = _comp_kwargs(compression)
+    if (coverage is None) != (normalization is None):
+        raise ValueError(
+            "stitched coverage and normalization diagnostics must be paired"
+        )
+    diagnostics: tuple[np.ndarray, np.ndarray] | None = None
+    if coverage is not None:
+        expected_shape = (
+            None
+            if (stitched_1d is None) == (stitched_2d is None)
+            else (
+                np.asarray(stitched_1d.intensity).shape
+                if stitched_1d is not None
+                else np.asarray(stitched_2d.intensity).shape
+            )
+        )
+        coverage_values = np.asarray(coverage, dtype=np.float32)
+        normalization_values = np.asarray(normalization, dtype=np.float32)
+        if (
+            expected_shape is None
+            or coverage_values.shape != expected_shape
+            or normalization_values.shape != expected_shape
+            or not np.all(np.isfinite(coverage_values))
+            or not np.all(np.isfinite(normalization_values))
+            or np.any(coverage_values < 0)
+            or np.any(normalization_values < 0)
+        ):
+            raise ValueError(
+                "stitched diagnostics must be finite nonnegative result-shaped peers"
+            )
+        diagnostics = coverage_values, normalization_values
     if type(bounded_artifact) is not bool:
         raise TypeError("bounded_artifact must be an exact bool")
     prov_json: str | None = None
@@ -3483,6 +3515,9 @@ def write_stitched(
             _bounded_text_attr(qd, "units", stitched_1d.unit)
         if stitched_1d.sigma is not None:
             _schema_dataset(g, "stitched_1d", "sigma", stitched_1d.sigma, ck=ck)
+        if diagnostics is not None:
+            g.create_dataset("coverage", data=diagnostics[0], **ck)
+            g.create_dataset("normalization", data=diagnostics[1], **ck)
         if prov_json is not None:
             if bounded_artifact:
                 g.create_dataset(
@@ -3519,6 +3554,9 @@ def write_stitched(
         cd.attrs["units"] = stitched_2d.azimuthal_unit  # units_from="azimuthal_unit"
         if stitched_2d.sigma is not None:
             _schema_dataset(g, "stitched_2d", "sigma", stitched_2d.sigma, ck=ck)
+        if diagnostics is not None:
+            g.create_dataset("coverage", data=diagnostics[0], **ck)
+            g.create_dataset("normalization", data=diagnostics[1], **ck)
         if bounded_artifact:
             _bounded_text_attr(qd, "units", stitched_2d.unit)
             _bounded_text_attr(cd, "units", stitched_2d.azimuthal_unit)
