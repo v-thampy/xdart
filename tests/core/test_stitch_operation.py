@@ -570,6 +570,91 @@ def test_xu_asset_drift_after_prepare_refuses_before_science_or_output(tmp_path)
     assert result.terminal.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
     assert not Path(request.module.output.target).exists()
 
+
+def test_xu_pre_cancel_retains_request_and_writes_nothing(tmp_path):
+    request = _xu_prepared(tmp_path)
+    cancel = threading.Event()
+    cancel.set()
+    result = run_stitch_operation(request, cancel_token=cancel)
+    assert result.terminal.disposition is ModuleDisposition.CANCELLED
+    assert result.terminal.request is request.module
+    assert result.terminal.code == "CANCELLED"
+    assert not Path(request.module.output.target).exists()
+
+
+def test_xu_effective_geometry_drift_at_prepublish_refuses_commit(
+    tmp_path,
+    monkeypatch,
+):
+    request = _xu_prepared(tmp_path)
+    asset = Path(
+        request.plan.calibration.project_root,
+        request.plan.calibration.lexical_relative_path,
+    )
+    real_resolve = stitch_operation.resolve_xu_stitch_effective_geometry
+    calls = []
+
+    def mutate_before_prepublish(receipt, session):
+        calls.append("resolve")
+        asset.touch()
+        return real_resolve(receipt, session)
+
+    monkeypatch.setattr(
+        stitch_operation,
+        "resolve_xu_stitch_effective_geometry",
+        mutate_before_prepublish,
+    )
+    result = run_stitch_operation(request)
+    assert calls == ["resolve"]
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
+    assert not Path(request.module.output.target).exists()
+
+
+def test_xu_transient_reload_retry_never_replays_science_or_writer(
+    tmp_path,
+    monkeypatch,
+):
+    request = _xu_prepared(tmp_path)
+    real_read = stitch_operation.read_analysis_artifact
+    real_write = stitch_operation.write_stitched
+    real_science = stitch_operation.run_xu_hist_stitch_1d
+    reads = []
+    writes = []
+    science = []
+
+    def fail_read_once(*args, **kwargs):
+        reads.append("read")
+        if len(reads) == 1:
+            raise OSError("transient strict reload fault")
+        return real_read(*args, **kwargs)
+
+    def write_once(*args, **kwargs):
+        writes.append("write")
+        return real_write(*args, **kwargs)
+
+    def science_once(*args, **kwargs):
+        science.append("science")
+        return real_science(*args, **kwargs)
+
+    monkeypatch.setattr(stitch_operation, "read_analysis_artifact", fail_read_once)
+    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
+    monkeypatch.setattr(
+        stitch_operation,
+        "run_xu_hist_stitch_1d",
+        science_once,
+    )
+    with pytest.raises(StitchOperationVerificationError) as failed:
+        run_stitch_operation(request)
+    execution = failed.value.execution
+    recovered = execution.retry_verification()
+    assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
+    assert recovered.payload.schema_version == 2
+    assert execution.retry_verification() is recovered
+    assert reads == ["read", "read"]
+    assert writes == ["write"]
+    assert science == ["science"]
+
     wrong = ModuleOutputRequest(
         tmp_path / "wrong.nexus",
         AnalysisArtifactKind.STITCH_2D,
