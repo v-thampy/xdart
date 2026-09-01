@@ -51,8 +51,12 @@ from xrd_tools.io import (
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MODULE_SOURCE_FACTORY = object()
+_MODULE_SOURCE_GROUP_FACTORY = object()
 _MODULE_RECEIPT_FACTORY = object()
 _XU_STITCH_REQUEST_FACTORY = object()
+_RSM_V2_REQUEST_FACTORY = object()
+_MAX_RSM_GROUP_MEMBERS = 16
+_MAX_RSM_GROUP_FRAMES = 4096
 _XU_INTENT_TOP_KEYS = {
     "schema_version",
     "kind",
@@ -263,6 +267,64 @@ class ModuleSourceReceipt:
 
 
 @dataclass(eq=False, frozen=True, slots=True)
+class ModuleSourceGroupReceipt:
+    """Ordered exact RSM source receipts for one grouped transaction."""
+
+    kind: ModuleKind
+    members: tuple[ModuleSourceReceipt, ...]
+    fingerprint: str = field(init=False)
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        members = _exact_tuple(self.members, "module source group members")
+        if (
+            _claim is not _MODULE_SOURCE_GROUP_FACTORY
+            or self.kind is not ModuleKind.RSM
+            or not 1 <= len(members) <= _MAX_RSM_GROUP_MEMBERS
+            or any(type(member) is not ModuleSourceReceipt for member in members)
+            or any(member.kind is not ModuleKind.RSM for member in members)
+            or len({member.fingerprint for member in members}) != len(members)
+        ):
+            raise TypeError("module source group receipt is invalid")
+        if sum(len(member.selected_labels) for member in members) > _MAX_RSM_GROUP_FRAMES:
+            raise ValueError("module source group exceeds 4096 selected frames")
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint(
+                "module-source-group-v1",
+                tuple(member.fingerprint for member in members),
+            ),
+        )
+
+    @property
+    def selected_frame_count(self) -> int:
+        return sum(len(member.selected_labels) for member in self.members)
+
+    @classmethod
+    def from_members(
+        cls,
+        members: tuple[ModuleSourceReceipt, ...],
+    ) -> "ModuleSourceGroupReceipt":
+        return cls(ModuleKind.RSM, members, _MODULE_SOURCE_GROUP_FACTORY)
+
+    def __copy__(self):
+        raise TypeError("module source group receipt is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("module source group receipt is not copyable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("module source group receipt is not replaceable")
+
+    def __reduce__(self):
+        raise TypeError("module source group receipt is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("module source group receipt is not serializable")
+
+
+@dataclass(eq=False, frozen=True, slots=True)
 class ModuleOutputRequest:
     """Intent for one fixed-entry standalone analysis artifact."""
 
@@ -320,20 +382,29 @@ def module_provenance_digest(
 
 @dataclass(eq=False, frozen=True, slots=True)
 class ModuleOperationRequest:
-    source: ModuleSourceReceipt
+    source: ModuleSourceReceipt | ModuleSourceGroupReceipt
     output: ModuleOutputRequest
     plan_fingerprint: str
     provenance_digest: str
     fingerprint: str = field(init=False)
     _xu_stitch_claim: InitVar[object] = None
     _xu_stitch_v2_bound: bool = field(init=False, default=False, repr=False)
+    _rsm_v2_bound: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self, _xu_stitch_claim: object) -> None:
-        if (
-            type(self.source) is not ModuleSourceReceipt
-            or type(self.output) is not ModuleOutputRequest
-        ):
+        single_source = type(self.source) is ModuleSourceReceipt
+        group_source = type(self.source) is ModuleSourceGroupReceipt
+        xu_bound = _xu_stitch_claim is _XU_STITCH_REQUEST_FACTORY
+        rsm_v2_bound = _xu_stitch_claim is _RSM_V2_REQUEST_FACTORY
+        if type(self.output) is not ModuleOutputRequest:
             raise TypeError("module request requires exact source and output values")
+        if xu_bound and rsm_v2_bound:
+            raise TypeError("module request cannot bind two private branches")
+        if rsm_v2_bound:
+            if not group_source:
+                raise TypeError("RSM v2 request requires an exact source group")
+        elif not single_source:
+            raise TypeError("module request requires one exact source receipt")
         _require_sha256(self.plan_fingerprint, "plan fingerprint")
         _require_sha256(self.provenance_digest, "provenance digest")
         compatible = (
@@ -348,27 +419,40 @@ class ModuleOperationRequest:
         )
         if not compatible:
             raise ValueError("module source and artifact kinds do not match")
-        xu_bound = _xu_stitch_claim is _XU_STITCH_REQUEST_FACTORY
         if xu_bound and (
             self.source.kind is not ModuleKind.STITCH
             or self.output.kind is not AnalysisArtifactKind.STITCH_1D
         ):
             raise TypeError("XU Stitch request requires exact Stitch 1-D intent")
+        if rsm_v2_bound and (
+            self.source.kind is not ModuleKind.RSM
+            or self.output.kind is not AnalysisArtifactKind.RSM
+        ):
+            raise TypeError("RSM v2 request requires exact RSM artifact intent")
         object.__setattr__(self, "_xu_stitch_v2_bound", xu_bound)
+        object.__setattr__(self, "_rsm_v2_bound", rsm_v2_bound)
         object.__setattr__(
             self,
             "fingerprint",
             analysis_canonical_fingerprint(
                 "module-request-v1",
                 (
+                    "module-request-v2-rsm-bound",
                     self.source.fingerprint,
                     self.output.fingerprint,
                     self.plan_fingerprint,
                     self.provenance_digest,
                 )
-                if not xu_bound
+                if rsm_v2_bound
                 else (
                     "xu-stitch-v2-bound",
+                    self.source.fingerprint,
+                    self.output.fingerprint,
+                    self.plan_fingerprint,
+                    self.provenance_digest,
+                )
+                if xu_bound
+                else (
                     self.source.fingerprint,
                     self.output.fingerprint,
                     self.plan_fingerprint,
@@ -380,6 +464,12 @@ class ModuleOperationRequest:
     @property
     def kind(self) -> ModuleKind:
         return self.source.kind
+
+    @property
+    def artifact_source_fingerprint(self) -> str:
+        if type(self.source) is ModuleSourceGroupReceipt:
+            return self.source.fingerprint
+        return self.source.analysis.source_fingerprint
 
     def __copy__(self):
         raise TypeError("module operation request is not copyable")
@@ -411,6 +501,23 @@ def xu_stitch_module_request(
         plan_fingerprint,
         provenance_digest,
         _XU_STITCH_REQUEST_FACTORY,
+    )
+
+
+def _rsm_v2_module_request(
+    source: ModuleSourceGroupReceipt,
+    output: ModuleOutputRequest,
+    plan_fingerprint: str,
+    provenance_digest: str,
+) -> ModuleOperationRequest:
+    """Construct the one private request branch authorized for RSM v2."""
+
+    return ModuleOperationRequest(
+        source,
+        output,
+        plan_fingerprint,
+        provenance_digest,
+        _RSM_V2_REQUEST_FACTORY,
     )
 
 
@@ -751,10 +858,19 @@ class ModuleArtifactOutputSnapshot:
 
 
 def _source_requalification(
-    source: ModuleSourceReceipt,
+    source: ModuleSourceReceipt | ModuleSourceGroupReceipt,
     *,
     cancel_token: threading.Event | None = None,
 ):
+    if type(source) is ModuleSourceGroupReceipt:
+        result = None
+        for member in source.members:
+            result = _source_requalification(member, cancel_token=cancel_token)
+            if result.disposition is not AnalysisDisposition.COMPLETED:
+                return result
+        return result
+    if type(source) is not ModuleSourceReceipt:
+        raise TypeError("source requalification requires an exact source receipt")
     result = run_metadata_table_requalification(
         MetadataTableRequalificationPlan(
             source.analysis,
@@ -782,6 +898,8 @@ def module_artifact_request(
 ) -> AnalysisArtifactRequest:
     if type(request) is not ModuleOperationRequest:
         raise TypeError("artifact binding requires exact ModuleOperationRequest")
+    if request._rsm_v2_bound:
+        raise ModuleArtifactRefused("RSM_V2_ARTIFACT_NOT_IMPLEMENTED")
     if type(provenance) is not dict:
         raise TypeError("module provenance must be an exact dictionary")
     carries_attestation = (
@@ -1162,6 +1280,7 @@ __all__ = [
     "ModuleOperationRequest",
     "ModuleOutputRequest",
     "ModuleProgress",
+    "ModuleSourceGroupReceipt",
     "ModuleSourceReceipt",
     "ModuleTerminalResult",
     "admit_module_artifact",

@@ -32,18 +32,30 @@ from xrd_tools.analysis.module_transaction import (
     ModuleOperationRequest,
     ModuleOutputRequest,
     ModuleProgress,
+    ModuleSourceGroupReceipt,
     ModuleSourceReceipt,
     ModuleTerminalResult,
     admit_module_artifact,
     module_artifact_request,
     module_plan_fingerprint,
     module_provenance_digest,
+    _rsm_v2_module_request,
+)
+from xrd_tools.analysis.rsm_geometry_asset import (
+    RSMEffectiveGeometry,
+    RSMGeometryAssetReceipt,
+    RSMMemberGeometryBinding,
+    bind_rsm_member_geometry,
+    lower_rsm_effective_geometry,
+    revalidate_rsm_geometry_asset,
+    rsm_effective_pixel_q_map,
 )
 from xrd_tools.analysis.plans import RSMPlan, run_rsm
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
     AnalysisSourceLeaseRefused,
     MetadataTablePlan,
+    analysis_canonical_fingerprint,
     requalified_analysis_source,
     run_metadata_table,
 )
@@ -59,6 +71,7 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
     AnalysisArtifactPayload,
     AnalysisArtifactProjectionInvalid,
+    canonical_analysis_provenance,
     project_analysis_artifact_result,
     read_analysis_artifact,
 )
@@ -74,9 +87,26 @@ _MAX_CHUNK_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 512 * 1024
 _MAX_MANIFEST_FILES = 8192
 _MAX_CONTRIBUTIONS = 4096
+_MAX_AXIS_POINTS = 1_000_000
+_MAX_PROVENANCE_BYTES = 1024 * 1024
 _MAX_JSON_DEPTH = 32
 _PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
 _REQUEST_FACTORY = object()
+_RSM_V2_FACTORY = object()
+_RSM_V2_HOLDS = (
+    "gi-q-coordinate-correction",
+    "gi-intensity-corrections",
+    "incidence-angle-convention-beyond-accepted-non-gi",
+    "live-partial-volume-directory-live-and-tiled-streaming",
+    "volume-rendering-isosurfaces-vtk-ui-and-gpu-opencl",
+    "non-psic-custom-fourc-two-circle-and-sixc-geometry-assets",
+    "non-identity-raw-image-orientation",
+    "authored-arbitrary-detector-masks-and-mask-editing-ui",
+    "nexus-tiled-and-processed-scan-members",
+    "heterogeneous-detector-geometry-or-roi",
+    "windows-smb-unc-linux-and-intel-macos-validation",
+    "broad-test-battery-launcher-replacement-canonical-merge-push-tag-and-release",
+)
 
 
 class RSMNormalizationMode(str, Enum):
@@ -1135,20 +1165,57 @@ def _numeric_lookup(
     return positions, tuple(selected)
 
 
-def _capture_preflight(
+@dataclass(frozen=True, slots=True)
+class _RSMCapturedMemberFacts:
+    project_root: str
+    source_relative_path: str
+    source_scan: str
+    source_options_json: str
+    primary_revision: tuple[int, int, int, int, int, int]
+    files: tuple[RSMManifestFile, ...]
+    contributions: tuple[RSMContribution, ...]
+    energy_eV: float
+    ub: tuple[tuple[float, float, float], ...]
+    q_bounds: tuple[
+        tuple[float, float], tuple[float, float], tuple[float, float]
+    ]
+    detector_shape: tuple[int, int]
+    cropped_shape: tuple[int, int]
+    source_fingerprint: str
+    module_source_fingerprint: str
+    table_fingerprint: str
+
+
+def _capture_preflight_facts(
     source: ModuleSourceReceipt,
-    plan: RSMOperationPlan,
     table,
     project_root: str | Path,
     *,
+    selectors: tuple[MetadataColumnSelector, ...],
+    motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...],
+    detector_header: DetectorHeader,
+    roi: tuple[int, int, int, int] | None,
+    conditioning: RSMImageConditioning,
+    normalization: RSMNormalizationPolicy,
+    chunk_size: int,
+    max_frame_bytes: int,
+    max_chunk_bytes: int,
+    expected_detector_shape: tuple[int, int] | None = None,
+    invalid_energy_code: str | None = None,
+    invalid_ub_code: str = "UB_INVALID",
+    normalize_source_fact_errors: bool = False,
+    normalize_ub_errors: bool = False,
+    mapper: PixelQMap | None = None,
+    active_runtime_session: object | None = None,
+    allow_single_static_hot: bool = False,
     cancel_token: threading.Event | None = None,
-) -> RSMPreflightReceipt:
+) -> _RSMCapturedMemberFacts:
     root = _project_root(project_root)
     analysis = source.analysis
-    selectors = required_rsm_selectors(plan)
     if (
-        plan.conditioning.static_hot_threshold is not None
+        conditioning.static_hot_threshold is not None
         and len(source.selected_labels) < 2
+        and not allow_single_static_hot
     ):
         raise RSMOperationRefused(
             "STATIC_MASK_REQUIRES_MULTIPLE_FRAMES",
@@ -1156,6 +1223,20 @@ def _capture_preflight(
         )
     source_relative = _relative_locator(analysis.resolved_root, root, "source")
     source_options_json = _project_source_options(analysis, root, selectors)
+    if expected_detector_shape is not None:
+        try:
+            read_options = json.loads(source_options_json)["read_image_kwargs"]
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
+        if (
+            type(read_options) is not dict
+            or tuple(read_options.get("detector_shape", ()))
+            != expected_detector_shape
+        ):
+            raise RSMOperationRefused(
+                "RSM_MEMBER_IDENTITY_MISMATCH",
+                "member detector shape differs from effective geometry",
+            )
     if analysis.primary_post_state is None or not analysis.resolved_scan:
         raise RSMOperationRefused(
             "SOURCE_IDENTITY_MISMATCH",
@@ -1233,14 +1314,14 @@ def _capture_preflight(
             "selected RSM label is outside the exact metadata table",
         ) from error
     foil = exposure = None
-    if plan.normalization.foil_selector is not None:
-        selector = plan.normalization.foil_selector
+    if normalization.foil_selector is not None:
+        selector = normalization.foil_selector
         foil = selected_by_key[(selector.name, selector.occurrence)][rows]
-    if plan.normalization.exposure_selector is not None:
-        selector = plan.normalization.exposure_selector
+    if normalization.exposure_selector is not None:
+        selector = normalization.exposure_selector
         exposure = selected_by_key[(selector.name, selector.occurrence)][rows]
     divisors = rsm_normalization_divisors(
-        plan.normalization,
+        normalization,
         len(source.selected_labels),
         foil_status=foil,
         exposure_seconds=exposure,
@@ -1250,7 +1331,7 @@ def _capture_preflight(
             selected_by_key[(selector.name, selector.occurrence)][rows],
             dtype=np.float64,
         )
-        for _role, selector in plan.geometry.motor_selectors
+        for _role, selector in motor_selectors
     )
     contributions: list[RSMContribution] = []
     try:
@@ -1258,14 +1339,43 @@ def _capture_preflight(
             analysis,
             cancel_token=cancel_token,
         ) as opened:
-            energy, ub_value = get_energy_and_UB(
-                analysis.resolved_root,
-                analysis.resolved_scan,
-            )
-            energy = _finite_float(energy, "RSM energy", positive=True)
-            ub = np.asarray(ub_value, dtype=np.float64)
+            if normalize_source_fact_errors:
+                try:
+                    energy, ub_value = get_energy_and_UB(
+                        analysis.resolved_root,
+                        analysis.resolved_scan,
+                    )
+                except KeyError as error:
+                    code = (
+                        invalid_ub_code
+                        if error.args and error.args[0] == "G3"
+                        else invalid_energy_code
+                    )
+                    raise RSMOperationRefused(
+                        code or "RSM_MEMBER_ENERGY_INVALID"
+                    ) from error
+                except ValueError as error:
+                    raise RSMOperationRefused(invalid_ub_code) from error
+            else:
+                energy, ub_value = get_energy_and_UB(
+                    analysis.resolved_root,
+                    analysis.resolved_scan,
+                )
+            try:
+                energy = _finite_float(energy, "RSM energy", positive=True)
+            except (TypeError, ValueError) as error:
+                if invalid_energy_code is None:
+                    raise
+                raise RSMOperationRefused(invalid_energy_code) from error
+            if normalize_ub_errors:
+                try:
+                    ub = np.asarray(ub_value, dtype=np.float64)
+                except (TypeError, ValueError) as error:
+                    raise RSMOperationRefused(invalid_ub_code) from error
+            else:
+                ub = np.asarray(ub_value, dtype=np.float64)
             if ub.shape != (3, 3) or not np.all(np.isfinite(ub)):
-                raise RSMOperationRefused("UB_INVALID")
+                raise RSMOperationRefused(invalid_ub_code)
             for contribution_index, label in enumerate(source.selected_labels):
                 if cancel_token is not None and cancel_token.is_set():
                     raise RSMOperationRefused("CANCELLED")
@@ -1336,20 +1446,41 @@ def _capture_preflight(
                     }
                 )
                 contributions.append(contribution)
-            bounds = resolve_exact_rsm_q_bounds(
-                PixelQMap(Diffractometer.psic(), plan.geometry.header),
-                angles,
-                energy,
-                ub,
-                roi=plan.geometry.roi,
-                chunk_size=plan.chunk_size,
-                max_frame_bytes=plan.max_frame_bytes,
-                max_chunk_bytes=plan.max_chunk_bytes,
-                cancel_token=cancel_token,
+            selected_mapper = (
+                PixelQMap(Diffractometer.psic(), detector_header)
+                if mapper is None
+                else mapper
+            )
+            bounds = (
+                resolve_exact_rsm_q_bounds(
+                    selected_mapper,
+                    angles,
+                    energy,
+                    ub,
+                    roi=roi,
+                    chunk_size=chunk_size,
+                    max_frame_bytes=max_frame_bytes,
+                    max_chunk_bytes=max_chunk_bytes,
+                    cancel_token=cancel_token,
+                )
+                if active_runtime_session is None
+                else _resolve_exact_rsm_q_bounds_active(
+                    selected_mapper,
+                    angles,
+                    energy,
+                    ub,
+                    roi=roi,
+                    chunk_size=chunk_size,
+                    max_frame_bytes=max_frame_bytes,
+                    max_chunk_bytes=max_chunk_bytes,
+                    runtime_session=active_runtime_session,
+                    cancel_token=cancel_token,
+                )
             )
     except AnalysisSourceLeaseRefused as error:
         raise RSMOperationRefused(error.code) from error
-    return RSMPreflightReceipt(
+    cropped_header = detector_header if roi is None else detector_header.with_roi(roi)
+    return _RSMCapturedMemberFacts(
         str(root),
         source_relative,
         analysis.resolved_scan,
@@ -1360,13 +1491,1488 @@ def _capture_preflight(
         float(energy),
         tuple(tuple(float(value) for value in row) for row in ub),
         bounds,
-        (plan.geometry.header.Nch1, plan.geometry.header.Nch2),
-        plan.geometry.cropped_shape,
+        (detector_header.Nch1, detector_header.Nch2),
+        (cropped_header.Nch1, cropped_header.Nch2),
         analysis.source_fingerprint,
         source.fingerprint,
         source.table_fingerprint,
+    )
+
+
+def _capture_preflight(
+    source: ModuleSourceReceipt,
+    plan: RSMOperationPlan,
+    table,
+    project_root: str | Path,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> RSMPreflightReceipt:
+    facts = _capture_preflight_facts(
+        source,
+        table,
+        project_root,
+        selectors=required_rsm_selectors(plan),
+        motor_selectors=plan.geometry.motor_selectors,
+        detector_header=plan.geometry.header,
+        roi=plan.geometry.roi,
+        conditioning=plan.conditioning,
+        normalization=plan.normalization,
+        chunk_size=plan.chunk_size,
+        max_frame_bytes=plan.max_frame_bytes,
+        max_chunk_bytes=plan.max_chunk_bytes,
+        cancel_token=cancel_token,
+    )
+    return RSMPreflightReceipt(
+        facts.project_root,
+        facts.source_relative_path,
+        facts.source_scan,
+        facts.source_options_json,
+        facts.primary_revision,
+        facts.files,
+        facts.contributions,
+        facts.energy_eV,
+        facts.ub,
+        facts.q_bounds,
+        facts.detector_shape,
+        facts.cropped_shape,
+        facts.source_fingerprint,
+        facts.module_source_fingerprint,
+        facts.table_fingerprint,
         plan.fingerprint,
         _REQUEST_FACTORY,
+    )
+
+
+def _require_rsm_v2_digest(value: object, name: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise TypeError(f"{name} must be lowercase SHA-256")
+    return value
+
+
+def _rsm_v2_uncopyable(kind: str):
+    def copy_value(self):
+        raise TypeError(f"{kind} is not copyable")
+
+    def deepcopy_value(self, _memo):
+        raise TypeError(f"{kind} is not copyable")
+
+    def reduce_value(self):
+        raise TypeError(f"{kind} is not serializable")
+
+    def reduce_ex_value(self, _protocol):
+        raise TypeError(f"{kind} is not serializable")
+
+    def replace_value(self, /, **_changes):
+        raise TypeError(f"{kind} is not replaceable")
+
+    return (
+        copy_value,
+        deepcopy_value,
+        reduce_value,
+        reduce_ex_value,
+        replace_value,
+    )
+
+
+def _conditioning_provenance(
+    conditioning: RSMImageConditioning,
+) -> dict[str, object]:
+    return {
+        "additive_offset": conditioning.additive_offset,
+        "high_threshold": conditioning.high_threshold,
+        "static_hot_threshold": conditioning.static_hot_threshold,
+        "static_rule": "exact-all-selected-frames-static-hot-v1",
+    }
+
+
+def _normalization_provenance(
+    normalization: RSMNormalizationPolicy,
+) -> dict[str, object]:
+    return {
+        "mode": normalization.mode.value,
+        "foil_selector": (
+            None
+            if normalization.foil_selector is None
+            else {
+                "name": normalization.foil_selector.name,
+                "occurrence": normalization.foil_selector.occurrence,
+            }
+        ),
+        "exposure_selector": (
+            None
+            if normalization.exposure_selector is None
+            else {
+                "name": normalization.exposure_selector.name,
+                "occurrence": normalization.exposure_selector.occurrence,
+            }
+        ),
+        "absorption_lengths": list(normalization.absorption_lengths),
+        "placement": "conditioned-numerator-before-grid",
+    }
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMCommonGrid:
+    """One exact union grid fixed before any detector frame is decoded."""
+
+    bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
+    bins: tuple[int, int, int]
+    linspace_policy: str
+    accumulation_policy: str
+    empty_policy: str
+    fingerprint: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _RSM_V2_FACTORY
+            or type(self.bounds) is not tuple
+            or len(self.bounds) != 3
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or any(type(value) is not float for value in item)
+                or not all(math.isfinite(value) for value in item)
+                or item[1] <= item[0]
+                for item in self.bounds
+            )
+            or type(self.bins) is not tuple
+            or len(self.bins) != 3
+            or any(
+                type(value) is not int or not 2 <= value <= _MAX_AXIS_POINTS
+                for value in self.bins
+            )
+            or math.prod(self.bins) > _MAX_RSM_VOXELS
+            or self.linspace_policy != "numpy-linspace-f8-v1"
+            or self.accumulation_policy
+            != "xrayutilities-gridder3d-sum-raw-sum-norm-v1"
+            or self.empty_policy != "NaN-empty-v1"
+        ):
+            raise TypeError("RSM common grid is not factory-owned")
+        _require_rsm_v2_digest(self.fingerprint, "RSM common-grid fingerprint")
+        for bounds, count in zip(self.bounds, self.bins, strict=True):
+            axis64 = np.linspace(bounds[0], bounds[1], count, dtype=np.float64)
+            axis32 = np.ascontiguousarray(axis64, dtype="<f4")
+            if (
+                axis32.shape != (count,)
+                or not np.all(np.isfinite(axis32))
+                or not np.all(np.diff(axis32.astype(np.float64)) > 0.0)
+            ):
+                raise RSMOperationRefused(
+                    "RSM_COMMON_GRID_INVALID",
+                    "common grid collapses or becomes nonfinite in float32",
+                )
+
+    def to_provenance(self) -> dict[str, object]:
+        return {
+            "bounds": [list(item) for item in self.bounds],
+            "bins": list(self.bins),
+            "linspace_policy": self.linspace_policy,
+            "accumulation_policy": self.accumulation_policy,
+            "empty_policy": self.empty_policy,
+            "fingerprint": self.fingerprint,
+        }
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _rsm_v2_uncopyable("RSM common grid")
+
+
+def make_rsm_common_grid(
+    member_bounds: tuple[
+        tuple[tuple[float, float], tuple[float, float], tuple[float, float]], ...
+    ],
+    bins: tuple[int, int, int],
+) -> RSMCommonGrid:
+    if type(member_bounds) is not tuple or not member_bounds:
+        raise TypeError("RSM common grid requires exact ordered member bounds")
+    if type(bins) is not tuple:
+        raise TypeError("RSM common grid bins must be an exact tuple")
+    try:
+        bounds = tuple(
+            (
+                float(min(item[axis][0] for item in member_bounds)),
+                float(max(item[axis][1] for item in member_bounds)),
+            )
+            for axis in range(3)
+        )
+    except (IndexError, TypeError, ValueError) as error:
+        raise RSMOperationRefused(
+            "RSM_MEMBER_Q_BOUNDS_INVALID",
+            "member q bounds cannot form one exact union",
+        ) from error
+    policies = (
+        "numpy-linspace-f8-v1",
+        "xrayutilities-gridder3d-sum-raw-sum-norm-v1",
+        "NaN-empty-v1",
+    )
+    fingerprint = analysis_canonical_fingerprint(
+        "rsm-common-grid-v1",
+        (bounds, bins, *policies),
+    )
+    return RSMCommonGrid(bounds, bins, *policies, fingerprint, _RSM_V2_FACTORY)
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMPreflightMemberV2:
+    """One detector-image-free, source- and geometry-bound member receipt."""
+
+    ordinal: int
+    member_form_fingerprint: str
+    module_source_fingerprint: str
+    source_fingerprint: str
+    table_fingerprint: str
+    source_relative_path: str
+    source_scan: str
+    source_options_json: str = field(repr=False)
+    primary_revision: tuple[int, int, int, int, int, int]
+    dependency_files: tuple[RSMManifestFile, ...]
+    contributions: tuple[RSMContribution, ...]
+    energy_eV: float
+    ub: tuple[tuple[float, float, float], ...]
+    member_q_bounds: tuple[
+        tuple[float, float], tuple[float, float], tuple[float, float]
+    ]
+    detector_shape: tuple[int, int]
+    cropped_shape: tuple[int, int]
+    geometry_binding: RSMMemberGeometryBinding
+    normalization_policy: RSMNormalizationPolicy
+    mask_policy_intent: tuple[object, ...]
+    fingerprint: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        try:
+            options = json.loads(self.source_options_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise TypeError("RSM v2 member source options are invalid") from error
+        canonical_options = json.dumps(
+            options,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        digests = (
+            self.member_form_fingerprint,
+            self.module_source_fingerprint,
+            self.source_fingerprint,
+            self.table_fingerprint,
+            self.fingerprint,
+        )
+        if (
+            _claim is not _RSM_V2_FACTORY
+            or type(self.ordinal) is not int
+            or not 0 <= self.ordinal < 16
+            or any(
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in digests
+            )
+            or canonical_options != self.source_options_json
+            or type(options) is not dict
+            or type(self.source_scan) is not str
+            or not self.source_scan
+            or type(self.dependency_files) is not tuple
+            or not self.dependency_files
+            or len(self.dependency_files) > _MAX_MANIFEST_FILES
+            or any(type(item) is not RSMManifestFile for item in self.dependency_files)
+            or len({item.relative_path for item in self.dependency_files})
+            != len(self.dependency_files)
+            or type(self.contributions) is not tuple
+            or not self.contributions
+            or len(self.contributions) > _MAX_CONTRIBUTIONS
+            or any(type(item) is not RSMContribution for item in self.contributions)
+            or any(
+                item.file_ordinal >= len(self.dependency_files)
+                for item in self.contributions
+            )
+            or len({item.label for item in self.contributions})
+            != len(self.contributions)
+            or type(self.energy_eV) is not float
+            or not math.isfinite(self.energy_eV)
+            or self.energy_eV <= 0.0
+            or type(self.ub) is not tuple
+            or len(self.ub) != 3
+            or any(type(row) is not tuple or len(row) != 3 for row in self.ub)
+            or any(
+                type(value) is not float or not math.isfinite(value)
+                for row in self.ub
+                for value in row
+            )
+            or type(self.member_q_bounds) is not tuple
+            or len(self.member_q_bounds) != 3
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or any(type(value) is not float for value in item)
+                or not all(math.isfinite(value) for value in item)
+                or item[1] <= item[0]
+                for item in self.member_q_bounds
+            )
+            or type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(value) is not int or value < 2 for value in self.detector_shape)
+            or type(self.cropped_shape) is not tuple
+            or len(self.cropped_shape) != 2
+            or any(type(value) is not int or value < 2 for value in self.cropped_shape)
+            or any(
+                cropped > detector
+                for cropped, detector in zip(
+                    self.cropped_shape, self.detector_shape, strict=True
+                )
+            )
+            or type(self.geometry_binding) is not RSMMemberGeometryBinding
+            or self.geometry_binding.member_ordinal != self.ordinal
+            or type(self.normalization_policy) is not RSMNormalizationPolicy
+            or type(self.mask_policy_intent) is not tuple
+            or not self.mask_policy_intent
+            or self.mask_policy_intent[0]
+            not in {"none", "exact-all-selected-frames-static-hot-v1"}
+        ):
+            raise TypeError("RSM v2 preflight member is not factory-owned")
+        object.__setattr__(
+            self,
+            "source_relative_path",
+            _manifest_relative_path(self.source_relative_path, "RSM v2 source path"),
+        )
+        _revision(self.primary_revision, "RSM v2 source primary revision")
+        if self.mask_policy_intent[0] == "none":
+            if self.mask_policy_intent != ("none",):
+                raise ValueError("RSM none-mask intent has unexpected fields")
+        elif (
+            len(self.mask_policy_intent) != 3
+            or type(self.mask_policy_intent[1]) is not float
+            or not math.isfinite(self.mask_policy_intent[1])
+            or self.mask_policy_intent[1] <= 0.0
+        ):
+            raise ValueError("RSM static-mask intent is invalid")
+        else:
+            _require_rsm_v2_digest(
+                self.mask_policy_intent[2],
+                "RSM conditioning fingerprint",
+            )
+
+    def _canonical_value(self) -> tuple[object, ...]:
+        return (
+            self.ordinal,
+            self.member_form_fingerprint,
+            self.module_source_fingerprint,
+            self.source_fingerprint,
+            self.table_fingerprint,
+            self.source_relative_path,
+            self.source_scan,
+            json.loads(self.source_options_json),
+            self.primary_revision,
+            tuple(
+                (item.relative_path, item.revision)
+                for item in self.dependency_files
+            ),
+            tuple(
+                (
+                    item.label,
+                    item.file_ordinal,
+                    item.source_frame_index,
+                    item.values,
+                    item.normalization_divisor,
+                )
+                for item in self.contributions
+            ),
+            self.energy_eV,
+            self.ub,
+            self.member_q_bounds,
+            self.detector_shape,
+            self.cropped_shape,
+            self.geometry_binding.fingerprint,
+            self.normalization_policy._canonical_value(),
+            self.mask_policy_intent,
+        )
+
+    def to_provenance(self) -> dict[str, object]:
+        return {
+            "ordinal": self.ordinal,
+            "member_form_fingerprint": self.member_form_fingerprint,
+            "module_source_fingerprint": self.module_source_fingerprint,
+            "source_fingerprint": self.source_fingerprint,
+            "table_fingerprint": self.table_fingerprint,
+            "source_relative_path": self.source_relative_path,
+            "source_scan": self.source_scan,
+            "source_options": json.loads(self.source_options_json),
+            "primary_revision": list(self.primary_revision),
+            "dependency_files": [
+                {
+                    "relative_path": item.relative_path,
+                    "revision": None if item.revision is None else list(item.revision),
+                }
+                for item in self.dependency_files
+            ],
+            "contributions": [
+                {
+                    "label": item.label,
+                    "file_ordinal": item.file_ordinal,
+                    "source_frame_index": item.source_frame_index,
+                    "values": [
+                        {
+                            "name": name,
+                            "occurrence": occurrence,
+                            "value": value,
+                        }
+                        for name, occurrence, value in item.values
+                    ],
+                    "normalization_divisor": item.normalization_divisor,
+                }
+                for item in self.contributions
+            ],
+            "energy_eV": self.energy_eV,
+            "ub": [list(row) for row in self.ub],
+            "member_q_bounds": [list(item) for item in self.member_q_bounds],
+            "detector_shape": list(self.detector_shape),
+            "cropped_shape": list(self.cropped_shape),
+            "geometry_binding": {
+                "member_ordinal": self.geometry_binding.member_ordinal,
+                "effective_geometry_fingerprint": (
+                    self.geometry_binding.effective_geometry_fingerprint
+                ),
+                "motor_selectors": [
+                    {
+                        "role": role,
+                        "name": selector.name,
+                        "occurrence": selector.occurrence,
+                    }
+                    for role, selector in self.geometry_binding.motor_selectors
+                ],
+                "fingerprint": self.geometry_binding.fingerprint,
+            },
+            "normalization_policy": _normalization_provenance(
+                self.normalization_policy
+            ),
+            "mask_policy_intent": list(self.mask_policy_intent),
+            "fingerprint": self.fingerprint,
+        }
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _rsm_v2_uncopyable("RSM v2 preflight member")
+
+
+def _make_rsm_preflight_member_v2(
+    facts: _RSMCapturedMemberFacts,
+    *,
+    ordinal: int,
+    member_form_fingerprint: str,
+    binding: RSMMemberGeometryBinding,
+    normalization: RSMNormalizationPolicy,
+    conditioning: RSMImageConditioning,
+) -> RSMPreflightMemberV2:
+    conditioning_fingerprint = analysis_canonical_fingerprint(
+        "rsm-conditioning-v2",
+        conditioning._canonical_value(),
+    )
+    mask_intent = (
+        ("none",)
+        if conditioning.static_hot_threshold is None
+        else (
+            "exact-all-selected-frames-static-hot-v1",
+            conditioning.static_hot_threshold,
+            conditioning_fingerprint,
+        )
+    )
+    canonical = (
+        ordinal,
+        member_form_fingerprint,
+        facts.module_source_fingerprint,
+        facts.source_fingerprint,
+        facts.table_fingerprint,
+        facts.source_relative_path,
+        facts.source_scan,
+        json.loads(facts.source_options_json),
+        facts.primary_revision,
+        tuple((item.relative_path, item.revision) for item in facts.files),
+        tuple(
+            (
+                item.label,
+                item.file_ordinal,
+                item.source_frame_index,
+                item.values,
+                item.normalization_divisor,
+            )
+            for item in facts.contributions
+        ),
+        facts.energy_eV,
+        facts.ub,
+        facts.q_bounds,
+        facts.detector_shape,
+        facts.cropped_shape,
+        binding.fingerprint,
+        normalization._canonical_value(),
+        mask_intent,
+    )
+    fingerprint = analysis_canonical_fingerprint(
+        "rsm-preflight-member-v2", canonical
+    )
+    return RSMPreflightMemberV2(
+        ordinal,
+        member_form_fingerprint,
+        facts.module_source_fingerprint,
+        facts.source_fingerprint,
+        facts.table_fingerprint,
+        facts.source_relative_path,
+        facts.source_scan,
+        facts.source_options_json,
+        facts.primary_revision,
+        facts.files,
+        facts.contributions,
+        facts.energy_eV,
+        facts.ub,
+        facts.q_bounds,
+        facts.detector_shape,
+        facts.cropped_shape,
+        binding,
+        normalization,
+        mask_intent,
+        fingerprint,
+        _RSM_V2_FACTORY,
+    )
+
+
+def _require_unique_rsm_physical_contributions_v2(
+    members: tuple[RSMPreflightMemberV2, ...],
+) -> None:
+    physical: set[tuple[tuple[int, int, int, int, int, int], int]] = set()
+    for member in members:
+        for contribution in member.contributions:
+            revision = member.dependency_files[contribution.file_ordinal].revision
+            if revision is None:
+                raise RSMOperationRefused(
+                    "RSM_MEMBER_IDENTITY_MISMATCH",
+                    "selected contribution has no exact file revision",
+                )
+            identity = (revision, contribution.source_frame_index)
+            if identity in physical:
+                raise RSMOperationRefused(
+                    "RSM_SOURCE_GROUP_INVALID",
+                    "two members select the same physical contribution",
+                )
+            physical.add(identity)
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMOperationPlanV2:
+    """Effective-geometry and ordered-member-bound RSM v2 plan."""
+
+    effective_geometry: RSMEffectiveGeometry
+    ordered_geometry_bindings: tuple[RSMMemberGeometryBinding, ...]
+    common_grid: RSMCommonGrid
+    conditioning: RSMImageConditioning
+    normalization: RSMNormalizationPolicy
+    chunk_size: int
+    max_frame_bytes: int
+    max_chunk_bytes: int
+    fingerprint: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _RSM_V2_FACTORY
+            or type(self.effective_geometry) is not RSMEffectiveGeometry
+            or type(self.ordered_geometry_bindings) is not tuple
+            or not 1 <= len(self.ordered_geometry_bindings) <= 16
+            or any(
+                type(item) is not RSMMemberGeometryBinding
+                for item in self.ordered_geometry_bindings
+            )
+            or tuple(
+                item.member_ordinal for item in self.ordered_geometry_bindings
+            )
+            != tuple(range(len(self.ordered_geometry_bindings)))
+            or any(
+                item.effective_geometry_fingerprint
+                != self.effective_geometry.fingerprint
+                for item in self.ordered_geometry_bindings
+            )
+            or type(self.common_grid) is not RSMCommonGrid
+            or type(self.conditioning) is not RSMImageConditioning
+            or type(self.normalization) is not RSMNormalizationPolicy
+            or type(self.chunk_size) is not int
+            or not 1 <= self.chunk_size <= _MAX_CHUNK_SIZE
+            or type(self.max_frame_bytes) is not int
+            or not 1 <= self.max_frame_bytes <= _MAX_FRAME_BYTES
+            or type(self.max_chunk_bytes) is not int
+            or not 1 <= self.max_chunk_bytes <= _MAX_CHUNK_BYTES
+        ):
+            raise TypeError("RSM v2 operation plan is not factory-owned")
+        _require_rsm_v2_digest(self.fingerprint, "RSM v2 plan fingerprint")
+        normalization_keys = {
+            (selector.name, selector.occurrence)
+            for selector in (
+                self.normalization.foil_selector,
+                self.normalization.exposure_selector,
+            )
+            if selector is not None
+        }
+        for binding in self.ordered_geometry_bindings:
+            motor_keys = {
+                (selector.name, selector.occurrence)
+                for _role, selector in binding.motor_selectors
+            }
+            if motor_keys & normalization_keys:
+                raise ValueError(
+                    "RSM normalization selectors must be disjoint from motor selectors"
+                )
+
+    @property
+    def bins(self) -> tuple[int, int, int]:
+        return self.common_grid.bins
+
+    def _canonical_value(self) -> tuple[object, ...]:
+        return (
+            "rsm-operation-plan-v2",
+            self.effective_geometry.fingerprint,
+            tuple(item.fingerprint for item in self.ordered_geometry_bindings),
+            self.common_grid.fingerprint,
+            self.conditioning._canonical_value(),
+            self.normalization._canonical_value(),
+            self.common_grid.bins,
+            self.chunk_size,
+            self.max_frame_bytes,
+            self.max_chunk_bytes,
+            "exact-all-selected-pixel-q-bounds-v2",
+            "ordered-one-common-grid-v1",
+            "numerator-first-normalization-v1",
+            "bounded-chunk-working-set-v1",
+            None,
+            None,
+        )
+
+    def to_provenance(self) -> dict[str, object]:
+        return {
+            "bins": list(self.bins),
+            "chunk_size": self.chunk_size,
+            "max_frame_bytes": self.max_frame_bytes,
+            "max_chunk_bytes": self.max_chunk_bytes,
+            "q_bounds_policy": "exact-all-selected-pixel-q-bounds-v2",
+            "grid_policy": "ordered-one-common-grid-v1",
+            "normalization_placement": "numerator-first-normalization-v1",
+            "working_set_policy": "bounded-chunk-working-set-v1",
+            "gi_q_correction": None,
+            "gi_intensity_correction": None,
+            "fingerprint": self.fingerprint,
+        }
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _rsm_v2_uncopyable("RSM v2 operation plan")
+
+
+def _make_rsm_operation_plan_v2(
+    effective_geometry: RSMEffectiveGeometry,
+    bindings: tuple[RSMMemberGeometryBinding, ...],
+    common_grid: RSMCommonGrid,
+    conditioning: RSMImageConditioning,
+    normalization: RSMNormalizationPolicy,
+    *,
+    chunk_size: int,
+    max_frame_bytes: int,
+    max_chunk_bytes: int,
+) -> RSMOperationPlanV2:
+    canonical = (
+        "rsm-operation-plan-v2",
+        effective_geometry.fingerprint,
+        tuple(item.fingerprint for item in bindings),
+        common_grid.fingerprint,
+        conditioning._canonical_value(),
+        normalization._canonical_value(),
+        common_grid.bins,
+        chunk_size,
+        max_frame_bytes,
+        max_chunk_bytes,
+        "exact-all-selected-pixel-q-bounds-v2",
+        "ordered-one-common-grid-v1",
+        "numerator-first-normalization-v1",
+        "bounded-chunk-working-set-v1",
+        None,
+        None,
+    )
+    fingerprint = module_plan_fingerprint(ModuleKind.RSM, canonical)
+    return RSMOperationPlanV2(
+        effective_geometry,
+        bindings,
+        common_grid,
+        conditioning,
+        normalization,
+        chunk_size,
+        max_frame_bytes,
+        max_chunk_bytes,
+        fingerprint,
+        _RSM_V2_FACTORY,
+    )
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMGroupPreflightReceiptV2:
+    """Ordered group preflight with exact contribution and grid identity."""
+
+    project_root: str
+    geometry_asset_receipt: RSMGeometryAssetReceipt
+    effective_geometry: RSMEffectiveGeometry
+    ordered_geometry_bindings: tuple[RSMMemberGeometryBinding, ...]
+    ordered_members: tuple[RSMPreflightMemberV2, ...]
+    group_source_fingerprint: str
+    common_grid: RSMCommonGrid
+    plan_fingerprint: str
+    fingerprint: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _RSM_V2_FACTORY
+            or type(self.project_root) is not str
+            or not Path(self.project_root).is_absolute()
+            or type(self.geometry_asset_receipt) is not RSMGeometryAssetReceipt
+            or self.geometry_asset_receipt.project_root != self.project_root
+            or type(self.effective_geometry) is not RSMEffectiveGeometry
+            or self.effective_geometry.asset_receipt_fingerprint
+            != self.geometry_asset_receipt.receipt_fingerprint
+            or type(self.ordered_geometry_bindings) is not tuple
+            or type(self.ordered_members) is not tuple
+            or not 1 <= len(self.ordered_members) <= 16
+            or len(self.ordered_geometry_bindings) != len(self.ordered_members)
+            or any(
+                type(item) is not RSMMemberGeometryBinding
+                for item in self.ordered_geometry_bindings
+            )
+            or any(type(item) is not RSMPreflightMemberV2 for item in self.ordered_members)
+            or tuple(item.ordinal for item in self.ordered_members)
+            != tuple(range(len(self.ordered_members)))
+            or any(
+                member.geometry_binding is not binding
+                for member, binding in zip(
+                    self.ordered_members,
+                    self.ordered_geometry_bindings,
+                    strict=True,
+                )
+            )
+            or type(self.common_grid) is not RSMCommonGrid
+        ):
+            raise TypeError("RSM v2 group preflight is not factory-owned")
+        _require_rsm_v2_digest(
+            self.group_source_fingerprint,
+            "RSM group source fingerprint",
+        )
+        _require_rsm_v2_digest(self.plan_fingerprint, "RSM v2 plan fingerprint")
+        _require_rsm_v2_digest(self.fingerprint, "RSM v2 preflight fingerprint")
+        if sum(len(item.dependency_files) for item in self.ordered_members) > _MAX_MANIFEST_FILES:
+            raise RSMOperationRefused(
+                "RSM_SOURCE_GROUP_LIMIT_EXCEEDED",
+                "RSM group exceeds 8192 dependency files",
+            )
+        if sum(len(item.contributions) for item in self.ordered_members) > _MAX_CONTRIBUTIONS:
+            raise RSMOperationRefused(
+                "RSM_SOURCE_GROUP_LIMIT_EXCEEDED",
+                "RSM group exceeds 4096 selected frames",
+            )
+        _require_unique_rsm_physical_contributions_v2(self.ordered_members)
+        encoded = json.dumps(
+            self.to_provenance(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > _MAX_MANIFEST_BYTES:
+            raise RSMOperationRefused(
+                "RSM_SOURCE_GROUP_LIMIT_EXCEEDED",
+                "canonical group preflight exceeds 512 KiB",
+            )
+
+    @property
+    def members(self) -> tuple[RSMPreflightMemberV2, ...]:
+        return self.ordered_members
+
+    def to_provenance(self) -> dict[str, object]:
+        return {
+            "schema_version": "rsm-preflight-v2",
+            "project_root": self.project_root,
+            "geometry_asset_receipt_fingerprint": (
+                self.geometry_asset_receipt.receipt_fingerprint
+            ),
+            "effective_geometry_fingerprint": self.effective_geometry.fingerprint,
+            "ordered_geometry_binding_fingerprints": [
+                item.fingerprint for item in self.ordered_geometry_bindings
+            ],
+            "ordered_members": [item.to_provenance() for item in self.ordered_members],
+            "group_source_fingerprint": self.group_source_fingerprint,
+            "common_grid": self.common_grid.to_provenance(),
+            "plan_fingerprint": self.plan_fingerprint,
+            "fingerprint": self.fingerprint,
+        }
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _rsm_v2_uncopyable("RSM v2 group preflight")
+
+
+def _make_rsm_group_preflight_v2(
+    *,
+    project_root: Path,
+    asset: RSMGeometryAssetReceipt,
+    effective: RSMEffectiveGeometry,
+    bindings: tuple[RSMMemberGeometryBinding, ...],
+    members: tuple[RSMPreflightMemberV2, ...],
+    group: ModuleSourceGroupReceipt,
+    common_grid: RSMCommonGrid,
+    plan: RSMOperationPlanV2,
+) -> RSMGroupPreflightReceiptV2:
+    expected_member_sources = tuple(item.fingerprint for item in group.members)
+    observed_member_sources = tuple(
+        item.module_source_fingerprint for item in members
+    )
+    expected_bounds = tuple(
+        (
+            float(min(item.member_q_bounds[axis][0] for item in members)),
+            float(max(item.member_q_bounds[axis][1] for item in members)),
+        )
+        for axis in range(3)
+    )
+    expected_grid_fingerprint = analysis_canonical_fingerprint(
+        "rsm-common-grid-v1",
+        (
+            expected_bounds,
+            common_grid.bins,
+            common_grid.linspace_policy,
+            common_grid.accumulation_policy,
+            common_grid.empty_policy,
+        ),
+    )
+    if (
+        observed_member_sources != expected_member_sources
+        or plan.effective_geometry is not effective
+        or plan.ordered_geometry_bindings != bindings
+        or plan.common_grid is not common_grid
+        or common_grid.bounds != expected_bounds
+        or common_grid.fingerprint != expected_grid_fingerprint
+    ):
+        raise RSMOperationRefused(
+            "RSM_MEMBER_IDENTITY_MISMATCH",
+            "RSM v2 group preflight inputs are not one exact ordered relation",
+        )
+    canonical = (
+        str(project_root),
+        asset.receipt_fingerprint,
+        effective.fingerprint,
+        tuple(item.fingerprint for item in bindings),
+        tuple(item.fingerprint for item in members),
+        group.fingerprint,
+        common_grid.fingerprint,
+        plan.fingerprint,
+    )
+    fingerprint = analysis_canonical_fingerprint("rsm-preflight-v2", canonical)
+    return RSMGroupPreflightReceiptV2(
+        str(project_root),
+        asset,
+        effective,
+        bindings,
+        members,
+        group.fingerprint,
+        common_grid,
+        plan.fingerprint,
+        fingerprint,
+        _RSM_V2_FACTORY,
+    )
+
+
+def _effective_geometry_provenance(
+    effective: RSMEffectiveGeometry,
+) -> dict[str, object]:
+    diffractometer = effective.diffractometer_projection
+
+    def motor(value: object) -> dict[str, object]:
+        return {
+            "source_motor": value.source_motor,
+            "sign": value.sign,
+            "offset": value.offset,
+        }
+
+    from xrd_tools.core.geometry.xu_runtime import (
+        xu_runtime_requirements_projection,
+    )
+
+    header = effective.detector_header
+    orientation = effective.image_orientation
+    return {
+        "asset_receipt_fingerprint": effective.asset_receipt_fingerprint,
+        "asset_semantic_fingerprint": effective.asset_semantic_fingerprint,
+        "diffractometer": {
+            "preset": diffractometer.preset,
+            "rot1": motor(diffractometer.rot1),
+            "rot2": motor(diffractometer.rot2),
+            "rot3": motor(diffractometer.rot3),
+            "incident_angle": motor(diffractometer.incident_angle),
+            "sample_circles": list(diffractometer.sample_circles),
+            "detector_circles": list(diffractometer.detector_circles),
+            "r_i": list(diffractometer.r_i),
+            "camera": list(diffractometer.camera),
+            "hxrd_n": list(diffractometer.hxrd_n),
+            "hxrd_q": list(diffractometer.hxrd_q),
+            "hxrd_geometry": diffractometer.hxrd_geometry,
+            "circle_motors": [motor(item) for item in diffractometer.circle_motors],
+            "sample_motors": list(diffractometer.sample_motors),
+            "detector_motors": list(diffractometer.detector_motors),
+            "qconv_kwargs": dict(diffractometer.qconv_kwargs),
+            "hxrd_kwargs": dict(diffractometer.hxrd_kwargs),
+            "ang2q_kwargs": dict(diffractometer.ang2q_kwargs),
+            "calibration": diffractometer.calibration,
+        },
+        "detector_header": {
+            name: getattr(header, name)
+            for name in (
+                "cch1",
+                "cch2",
+                "pwidth1",
+                "pwidth2",
+                "distance",
+                "Nch1",
+                "Nch2",
+            )
+        },
+        "image_orientation": {
+            "rotation": orientation.rotation,
+            "flip_vertical": orientation.flip_vertical,
+            "flip_horizontal": orientation.flip_horizontal,
+            "transpose": orientation.transpose,
+        },
+        "roi": list(effective.roi),
+        "runtime_requirements": list(
+            xu_runtime_requirements_projection(effective.runtime_requirements)
+        ),
+        "fingerprint": effective.fingerprint,
+    }
+
+
+def _rsm_v2_provenance(
+    group: ModuleSourceGroupReceipt,
+    output: ModuleOutputRequest,
+    output_authority: RSMOutputAuthorityReceipt,
+    asset: RSMGeometryAssetReceipt,
+    effective: RSMEffectiveGeometry,
+    plan: RSMOperationPlanV2,
+    preflight: RSMGroupPreflightReceiptV2,
+) -> dict[str, object]:
+    from xrd_tools.core.geometry.xu_runtime import (
+        xu_runtime_requirements_projection,
+    )
+
+    return {
+        "schema_version": "rsm-operation-v2-intent",
+        "kind": "rsm",
+        "source_group": {
+            "member_fingerprints": [item.fingerprint for item in group.members],
+            "group_fingerprint": group.fingerprint,
+            "preflight_fingerprint": preflight.fingerprint,
+        },
+        "asset": {
+            "lexical_relative_path": asset.lexical_relative_path,
+            "resolved_relative_path": asset.resolved_relative_path,
+            "byte_count": asset.byte_count,
+            "raw_sha256": asset.raw_sha256,
+            "semantic_fingerprint": asset.semantic_fingerprint,
+            "receipt_fingerprint": asset.receipt_fingerprint,
+        },
+        "effective_geometry": _effective_geometry_provenance(effective),
+        "members": [item.to_provenance() for item in preflight.members],
+        "common_grid": preflight.common_grid.to_provenance(),
+        "conditioning": _conditioning_provenance(plan.conditioning),
+        "normalization": _normalization_provenance(plan.normalization),
+        "plan": plan.to_provenance(),
+        "runtime_requirements": list(
+            xu_runtime_requirements_projection(effective.runtime_requirements)
+        ),
+        "output": {
+            "kind": output.kind.value,
+            "target": output.target,
+            "overwrite": output.overwrite.value,
+            "output_fingerprint": output.fingerprint,
+            **output_authority.to_provenance(),
+        },
+        "holds": list(_RSM_V2_HOLDS),
+    }
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMOperationRequestV2:
+    """One immutable image-free RSM v2 Preview result."""
+
+    module: ModuleOperationRequest
+    plan: RSMOperationPlanV2
+    preflight: RSMGroupPreflightReceiptV2
+    output_authority: RSMOutputAuthorityReceipt
+    provenance_json: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _RSM_V2_FACTORY
+            or type(self.module) is not ModuleOperationRequest
+            or self.module._rsm_v2_bound is not True
+            or type(self.module.source) is not ModuleSourceGroupReceipt
+            or self.module.kind is not ModuleKind.RSM
+            or self.module.output.kind is not AnalysisArtifactKind.RSM
+            or type(self.plan) is not RSMOperationPlanV2
+            or type(self.preflight) is not RSMGroupPreflightReceiptV2
+            or type(self.output_authority) is not RSMOutputAuthorityReceipt
+            or type(self.provenance_json) is not str
+            or self.module.plan_fingerprint != self.plan.fingerprint
+            or self.preflight.plan_fingerprint != self.plan.fingerprint
+            or self.preflight.group_source_fingerprint
+            != self.module.source.fingerprint
+            or self.preflight.effective_geometry is not self.plan.effective_geometry
+            or self.preflight.common_grid is not self.plan.common_grid
+            or self.preflight.ordered_geometry_bindings
+            != self.plan.ordered_geometry_bindings
+        ):
+            raise TypeError("RSM v2 operation request is not factory-owned")
+        try:
+            provenance = json.loads(self.provenance_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise TypeError("RSM v2 operation provenance is invalid") from error
+        expected = _rsm_v2_provenance(
+            self.module.source,
+            self.module.output,
+            self.output_authority,
+            self.preflight.geometry_asset_receipt,
+            self.preflight.effective_geometry,
+            self.plan,
+            self.preflight,
+        )
+        if (
+            type(provenance) is not dict
+            or set(provenance)
+            != {
+                "schema_version",
+                "kind",
+                "source_group",
+                "asset",
+                "effective_geometry",
+                "members",
+                "common_grid",
+                "conditioning",
+                "normalization",
+                "plan",
+                "runtime_requirements",
+                "output",
+                "holds",
+            }
+            or provenance != expected
+            or canonical_analysis_provenance(provenance) != self.provenance_json
+            or module_provenance_digest(ModuleKind.RSM, provenance)
+            != self.module.provenance_digest
+        ):
+            raise ValueError("RSM v2 provenance does not match its exact request")
+
+    @property
+    def provenance(self) -> dict[str, object]:
+        return json.loads(self.provenance_json)
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _rsm_v2_uncopyable("RSM v2 operation request")
+
+
+def required_rsm_selectors_v2(
+    motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...],
+    normalization: RSMNormalizationPolicy,
+) -> tuple[MetadataColumnSelector, ...]:
+    if type(motor_selectors) is not tuple or type(normalization) is not RSMNormalizationPolicy:
+        raise TypeError("RSM v2 selector projection requires exact values")
+    requested = [selector for _role, selector in motor_selectors]
+    if normalization.foil_selector is not None:
+        requested.append(normalization.foil_selector)
+    if normalization.exposure_selector is not None:
+        requested.append(normalization.exposure_selector)
+    unique = {
+        (selector.name, selector.occurrence): selector for selector in requested
+    }
+    return tuple(sorted(unique.values(), key=lambda item: (item.name, item.occurrence)))
+
+
+def _resolve_exact_rsm_q_bounds_active(
+    mapper: PixelQMap,
+    angles: tuple[np.ndarray, ...] | list[np.ndarray],
+    energy_eV: float,
+    ub: np.ndarray,
+    *,
+    roi: tuple[int, int, int, int] | None,
+    chunk_size: int,
+    max_frame_bytes: int,
+    max_chunk_bytes: int,
+    runtime_session: object,
+    cancel_token: threading.Event | None = None,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Resolve q bounds under one already-active group runtime owner."""
+
+    from xrd_tools.core.geometry.xu_runtime import (
+        require_active_xu_runtime_session,
+    )
+
+    session = require_active_xu_runtime_session(runtime_session)
+    if type(mapper) is not PixelQMap:
+        raise TypeError("RSM v2 q-bound resolution requires exact PixelQMap")
+    energy = _finite_float(energy_eV, "RSM energy", positive=True)
+    matrix = np.asarray(ub, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise RSMOperationRefused("RSM_MEMBER_UB_INVALID")
+    if type(chunk_size) is not int or not 1 <= chunk_size <= _MAX_CHUNK_SIZE:
+        raise ValueError("RSM q-bound chunk size is outside the R2 bound")
+    if (
+        type(max_frame_bytes) is not int
+        or not 1 <= max_frame_bytes <= _MAX_FRAME_BYTES
+        or type(max_chunk_bytes) is not int
+        or not 1 <= max_chunk_bytes <= _MAX_CHUNK_BYTES
+    ):
+        raise ValueError("RSM q-bound memory limit is outside the R2 bound")
+    if cancel_token is not None and type(cancel_token) is not threading.Event:
+        raise TypeError("RSM cancellation token must be exact threading.Event")
+    if type(angles) not in {tuple, list} or len(angles) != 6:
+        raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+    values = tuple(np.asarray(item, dtype=np.float64) for item in angles)
+    if not values or values[0].ndim != 1 or len(values[0]) < 1:
+        raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+    frame_count = len(values[0])
+    if any(
+        item.ndim != 1
+        or len(item) != frame_count
+        or not np.all(np.isfinite(item))
+        for item in values
+    ):
+        raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+    header = mapper.header if roi is None else mapper.header.with_roi(roi)
+    if header.Nch1 < 2 or header.Nch2 < 2:
+        raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+    conditioned_frame_bytes = (
+        mapper.header.Nch1
+        * mapper.header.Nch2
+        * np.dtype(np.float64).itemsize
+    )
+    if conditioned_frame_bytes > max_frame_bytes:
+        raise RSMOperationRefused(
+            "FRAME_MEMORY_LIMIT_EXCEEDED",
+            "RSM full conditioned detector frame exceeds max_frame_bytes",
+        )
+    q_plane_bytes = header.Nch1 * header.Nch2 * np.dtype(np.float64).itemsize
+    q_chunk_bytes = 3 * q_plane_bytes * min(frame_count, chunk_size)
+    if q_chunk_bytes > max_chunk_bytes:
+        raise RSMOperationRefused(
+            "Q_MEMORY_LIMIT_EXCEEDED",
+            "RSM exact q preflight exceeds max_chunk_bytes",
+        )
+    session.require_active()
+    hxrd = mapper.diff_config.make_hxrd(energy)
+    session.require_active()
+    hxrd.Ang2Q.init_area(
+        mapper.diff_config.init_area_detrot,
+        mapper.diff_config.init_area_tiltazimuth,
+        cch1=float(header.cch1),
+        cch2=float(header.cch2),
+        pwidth1=float(header.pwidth1),
+        pwidth2=float(header.pwidth2),
+        distance=float(header.distance),
+        Nch1=int(header.Nch1),
+        Nch2=int(header.Nch2),
+    )
+    lows = np.full(3, np.inf, dtype=np.float64)
+    highs = np.full(3, -np.inf, dtype=np.float64)
+    for start in range(0, frame_count, chunk_size):
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMOperationRefused("CANCELLED")
+        session.require_active()
+        stop = min(start + chunk_size, frame_count)
+        q_values = hxrd.Ang2Q.area(
+            *(item[start:stop] for item in values),
+            UB=matrix,
+            **mapper.diff_config.ang2q_kwargs,
+        )
+        expected = (stop - start, header.Nch1, header.Nch2)
+        admitted: list[np.ndarray] = []
+        for value in q_values:
+            array = np.asarray(value)
+            if expected[0] == 1 and array.shape == expected[1:]:
+                array = array.reshape(expected)
+            if array.shape != expected or not np.all(np.isfinite(array)):
+                raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+            admitted.append(array)
+        if len(admitted) != 3:
+            raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+        for axis, item in enumerate(admitted):
+            lows[axis] = min(lows[axis], float(np.min(item)))
+            highs[axis] = max(highs[axis], float(np.max(item)))
+    if any(
+        not math.isfinite(float(lo))
+        or not math.isfinite(float(hi))
+        or hi <= lo
+        for lo, hi in zip(lows, highs, strict=True)
+    ):
+        raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+    return tuple(
+        (float(lo), float(hi)) for lo, hi in zip(lows, highs, strict=True)
+    )  # type: ignore[return-value]
+
+
+def prepare_rsm_operation_v2(
+    source_group: ModuleSourceGroupReceipt,
+    output: ModuleOutputRequest,
+    geometry_asset_receipt: RSMGeometryAssetReceipt,
+    member_form_fingerprints: tuple[str, ...],
+    member_motor_selectors: tuple[
+        tuple[tuple[str, MetadataColumnSelector], ...], ...
+    ],
+    conditioning: RSMImageConditioning,
+    normalization: RSMNormalizationPolicy,
+    bins: tuple[int, int, int],
+    *,
+    chunk_size: int,
+    max_frame_bytes: int,
+    max_chunk_bytes: int,
+    project_root: str | Path,
+    cancel_token: threading.Event | None = None,
+) -> RSMOperationRequestV2:
+    """Build one ordered, image-free RSM v2 Preview transaction."""
+
+    if (
+        type(source_group) is not ModuleSourceGroupReceipt
+        or source_group.kind is not ModuleKind.RSM
+        or type(output) is not ModuleOutputRequest
+        or output.kind is not AnalysisArtifactKind.RSM
+        or type(geometry_asset_receipt) is not RSMGeometryAssetReceipt
+        or type(member_form_fingerprints) is not tuple
+        or type(member_motor_selectors) is not tuple
+        or len(member_form_fingerprints) != len(source_group.members)
+        or len(member_motor_selectors) != len(source_group.members)
+        or any(
+            type(item) is not str
+            or len(item) != 64
+            or any(character not in "0123456789abcdef" for character in item)
+            for item in member_form_fingerprints
+        )
+        or type(conditioning) is not RSMImageConditioning
+        or type(normalization) is not RSMNormalizationPolicy
+        or type(bins) is not tuple
+        or type(chunk_size) is not int
+        or type(max_frame_bytes) is not int
+        or type(max_chunk_bytes) is not int
+    ):
+        raise TypeError("RSM v2 preparation requires exact grouped values")
+    if len(set(member_form_fingerprints)) != len(member_form_fingerprints):
+        raise RSMOperationRefused(
+            "RSM_SOURCE_GROUP_INVALID",
+            "RSM v2 member form fingerprints must be unique",
+        )
+    if (
+        len(bins) != 3
+        or any(
+            type(value) is not int or not 2 <= value <= _MAX_AXIS_POINTS
+            for value in bins
+        )
+        or math.prod(bins) > _MAX_RSM_VOXELS
+    ):
+        raise RSMOperationRefused(
+            "RSM_COMMON_GRID_INVALID",
+            "RSM v2 bins are outside the common-grid bounds",
+        )
+    if not 1 <= chunk_size <= _MAX_CHUNK_SIZE:
+        raise RSMOperationRefused(
+            "Q_MEMORY_LIMIT_EXCEEDED",
+            "RSM v2 chunk size is outside the q-memory bound",
+        )
+    if not 1 <= max_frame_bytes <= _MAX_FRAME_BYTES:
+        raise RSMOperationRefused(
+            "FRAME_MEMORY_LIMIT_EXCEEDED",
+            "RSM v2 frame byte limit is outside the absolute bound",
+        )
+    if not 1 <= max_chunk_bytes <= _MAX_CHUNK_BYTES:
+        raise RSMOperationRefused(
+            "Q_MEMORY_LIMIT_EXCEEDED",
+            "RSM v2 chunk byte limit is outside the absolute bound",
+        )
+    if cancel_token is not None and type(cancel_token) is not threading.Event:
+        raise TypeError("RSM cancellation token must be exact threading.Event")
+    root = _project_root(project_root)
+    if geometry_asset_receipt.project_root != str(root):
+        raise RSMOperationRefused(
+            "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH",
+            "geometry asset is not bound to the selected Project",
+        )
+    output = _bind_project_output(output, root)
+    output_authority = _capture_output_authority(output, root)
+
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+    with xu_runtime_session() as runtime_session:
+        effective = lower_rsm_effective_geometry(geometry_asset_receipt)
+        mapper = rsm_effective_pixel_q_map(effective)
+        bindings = tuple(
+            bind_rsm_member_geometry(
+                effective,
+                member_ordinal=ordinal,
+                motor_selectors=motor_selectors,
+            )
+            for ordinal, motor_selectors in enumerate(member_motor_selectors)
+        )
+        members: list[RSMPreflightMemberV2] = []
+        for ordinal, (source, binding, form_fingerprint) in enumerate(
+            zip(
+                source_group.members,
+                bindings,
+                member_form_fingerprints,
+                strict=True,
+            )
+        ):
+            if cancel_token is not None and cancel_token.is_set():
+                raise RSMOperationRefused("CANCELLED")
+            required = required_rsm_selectors_v2(
+                binding.motor_selectors,
+                normalization,
+            )
+            if source.resolved_selectors != required:
+                raise RSMOperationRefused(
+                    "SOURCE_PROJECTION_MISMATCH",
+                    "member source selectors do not match the RSM v2 policies",
+                )
+            expected_shape = (
+                effective.detector_header.Nch1,
+                effective.detector_header.Nch2,
+            )
+            facts = _capture_preflight_facts(
+                source,
+                _fresh_table(source, cancel_token=cancel_token),
+                root,
+                selectors=required,
+                motor_selectors=binding.motor_selectors,
+                detector_header=effective.detector_header,
+                roi=effective.roi,
+                conditioning=conditioning,
+                normalization=normalization,
+                chunk_size=chunk_size,
+                max_frame_bytes=max_frame_bytes,
+                max_chunk_bytes=max_chunk_bytes,
+                expected_detector_shape=expected_shape,
+                invalid_energy_code="RSM_MEMBER_ENERGY_INVALID",
+                invalid_ub_code="RSM_MEMBER_UB_INVALID",
+                normalize_source_fact_errors=True,
+                normalize_ub_errors=True,
+                mapper=mapper,
+                active_runtime_session=runtime_session,
+                allow_single_static_hot=True,
+                cancel_token=cancel_token,
+            )
+            try:
+                read_options = json.loads(facts.source_options_json)[
+                    "read_image_kwargs"
+                ]
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
+            if (
+                type(read_options) is not dict
+                or tuple(read_options.get("detector_shape", ())) != expected_shape
+                or facts.detector_shape != expected_shape
+            ):
+                raise RSMOperationRefused(
+                    "RSM_MEMBER_IDENTITY_MISMATCH",
+                    "member detector shape differs from effective geometry",
+                )
+            members.append(
+                _make_rsm_preflight_member_v2(
+                    facts,
+                    ordinal=ordinal,
+                    member_form_fingerprint=form_fingerprint,
+                    binding=binding,
+                    normalization=normalization,
+                    conditioning=conditioning,
+                )
+            )
+        member_tuple = tuple(members)
+        _require_unique_rsm_physical_contributions_v2(member_tuple)
+        common_grid = make_rsm_common_grid(
+            tuple(item.member_q_bounds for item in member_tuple),
+            bins,
+        )
+        plan = _make_rsm_operation_plan_v2(
+            effective,
+            bindings,
+            common_grid,
+            conditioning,
+            normalization,
+            chunk_size=chunk_size,
+            max_frame_bytes=max_frame_bytes,
+            max_chunk_bytes=max_chunk_bytes,
+        )
+        preflight = _make_rsm_group_preflight_v2(
+            project_root=root,
+            asset=geometry_asset_receipt,
+            effective=effective,
+            bindings=bindings,
+            members=member_tuple,
+            group=source_group,
+            common_grid=common_grid,
+            plan=plan,
+        )
+
+    revalidate_rsm_geometry_asset(geometry_asset_receipt)
+    for source in source_group.members:
+        _fresh_table(source, cancel_token=cancel_token)
+    _requalify_project_output(output, root, output_authority)
+    provenance = _rsm_v2_provenance(
+        source_group,
+        output,
+        output_authority,
+        geometry_asset_receipt,
+        effective,
+        plan,
+        preflight,
+    )
+    canonical = canonical_analysis_provenance(provenance)
+    if len(canonical.encode("utf-8")) > _MAX_PROVENANCE_BYTES:
+        raise RSMOperationRefused(
+            "RSM_SOURCE_GROUP_LIMIT_EXCEEDED",
+            "canonical RSM v2 provenance exceeds 1 MiB",
+        )
+    module = _rsm_v2_module_request(
+        source_group,
+        output,
+        plan.fingerprint,
+        module_provenance_digest(ModuleKind.RSM, provenance),
+    )
+    return RSMOperationRequestV2(
+        module,
+        plan,
+        preflight,
+        output_authority,
+        canonical,
+        _RSM_V2_FACTORY,
     )
 
 
@@ -2553,6 +4159,7 @@ def run_rsm_operation(
 
 
 __all__ = [
+    "RSMCommonGrid",
     "RSMContribution",
     "RSMDetectorGeometry",
     "RSMImageConditioning",
@@ -2562,15 +4169,22 @@ __all__ = [
     "RSMOperationCleanupPending",
     "RSMOperationExecution",
     "RSMOperationPlan",
+    "RSMOperationPlanV2",
     "RSMOperationRefused",
     "RSMOperationRequest",
+    "RSMOperationRequestV2",
     "RSMOperationResult",
     "RSMOperationVerificationError",
     "RSMOutputAuthorityReceipt",
     "RSMPreflightReceipt",
+    "RSMPreflightMemberV2",
+    "RSMGroupPreflightReceiptV2",
     "condition_rsm_images",
     "prepare_rsm_operation",
+    "prepare_rsm_operation_v2",
     "required_rsm_selectors",
+    "required_rsm_selectors_v2",
+    "make_rsm_common_grid",
     "resolve_exact_rsm_q_bounds",
     "run_rsm_operation",
     "rsm_normalization_divisors",

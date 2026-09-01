@@ -22,7 +22,13 @@ from xrd_tools.analysis.module_transaction import (
     MetadataColumnSelector,
     ModuleKind,
     ModuleOutputRequest,
+    ModuleSourceGroupReceipt,
     ModuleSourceReceipt,
+)
+from xrd_tools.analysis.rsm_geometry_asset import (
+    RSMGeometryAssetInput,
+    RSMGeometryAssetRefused,
+    capture_rsm_geometry_asset,
 )
 from xrd_tools.analysis.rsm_operation import (
     RSMDetectorGeometry,
@@ -32,8 +38,11 @@ from xrd_tools.analysis.rsm_operation import (
     RSMOperationPlan,
     RSMOperationRefused,
     RSMOperationRequest,
+    RSMOperationRequestV2,
     prepare_rsm_operation,
+    prepare_rsm_operation_v2,
     required_rsm_selectors,
+    required_rsm_selectors_v2,
 )
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
@@ -42,6 +51,7 @@ from xrd_tools.analysis.scan_operations import (
     run_metadata_table,
 )
 from xrd_tools.core.geometry import DetectorHeader, ImageOrientation
+from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
@@ -52,7 +62,13 @@ from xrd_tools.io.analysis_artifact import (
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SCAN = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _PREFLIGHT_FACTORY = object()
+_PREFLIGHT_V2_FACTORY = object()
 _MAX_SELECTED_FRAMES = 4096
+_MAX_RSM_MEMBERS = 16
+_MAX_RSM_AXIS_POINTS = 1_000_000
+_MAX_RSM_VOXELS = 8_000_000
+_MAX_CHUNK_SIZE = 1024
+_MAX_FRAME_OR_CHUNK_BYTES = 4 * 1024 * 1024 * 1024
 _PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
 
 
@@ -259,6 +275,191 @@ class RSMToolForm:
             self,
             "fingerprint",
             analysis_canonical_fingerprint("rsm-tool-form-v1", canonical),
+        )
+
+
+def _rsm_member_motor_selectors(
+    value: object,
+) -> tuple[tuple[str, MetadataColumnSelector], ...]:
+    if type(value) is not tuple or len(value) != len(_PSIC_ROLES):
+        raise TypeError("RSM member motor selectors must be one exact six-tuple")
+    admitted: list[tuple[str, MetadataColumnSelector]] = []
+    for expected, item in zip(_PSIC_ROLES, value, strict=True):
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or item[0] != expected
+            or type(item[1]) is not MetadataColumnSelector
+        ):
+            raise TypeError("RSM member motor selector binding is invalid")
+        admitted.append((expected, item[1]))
+    if len({(item.name, item.occurrence) for _role, item in admitted}) != 6:
+        raise ValueError("RSM member motor selector occurrences must be unique")
+    return tuple(admitted)
+
+
+@dataclass(frozen=True, slots=True)
+class RSMScanMemberForm:
+    """One visible ordered SPEC member for an RSM v2 group."""
+
+    spec_path: str | Path
+    scan: str
+    image_dir: str | Path
+    image_stem: str
+    frame_selector: RSMFrameSelector
+    detector_shape: tuple[int, int]
+    raw_dtype: str
+    raw_header_skip: int
+    motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        spec = _absolute_path(self.spec_path, "RSM member SPEC path")
+        image_dir = _absolute_path(self.image_dir, "RSM member image directory")
+        if Path(spec).suffix:
+            raise ValueError("RSM member SPEC path must be extensionless")
+        if type(self.scan) is not str or _SCAN.fullmatch(self.scan) is None:
+            raise ValueError("RSM member scan must be an exact N or N.M selector")
+        if (
+            type(self.image_stem) is not str
+            or not self.image_stem
+            or self.image_stem.strip() != self.image_stem
+            or len(self.image_stem.encode("utf-8")) > 4096
+            or any(mark in self.image_stem for mark in ("\0", "/", "\\"))
+        ):
+            raise ValueError("RSM member image stem is invalid")
+        if type(self.frame_selector) is not RSMFrameSelector:
+            raise TypeError("RSM member frame selector must be exact")
+        if (
+            type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(item) is not int or item < 2 for item in self.detector_shape)
+        ):
+            raise ValueError("RSM member detector shape is invalid")
+        if type(self.raw_dtype) is not str or not self.raw_dtype:
+            raise TypeError("RSM member raw dtype must be a nonempty string")
+        try:
+            dtype = np.dtype(self.raw_dtype)
+        except TypeError as error:
+            raise ValueError("RSM member raw dtype is invalid") from error
+        if dtype.fields is not None or dtype.subdtype is not None or dtype.kind not in "biuf":
+            raise ValueError("RSM member raw dtype must be scalar real numeric")
+        if (
+            type(self.raw_header_skip) is not int
+            or not 0 <= self.raw_header_skip <= (1 << 30)
+        ):
+            raise ValueError("RSM member raw header skip is outside the bound")
+        motors = _rsm_member_motor_selectors(self.motor_selectors)
+        object.__setattr__(self, "spec_path", spec)
+        object.__setattr__(self, "image_dir", image_dir)
+        object.__setattr__(self, "detector_shape", tuple(self.detector_shape))
+        object.__setattr__(self, "raw_dtype", dtype.str)
+        object.__setattr__(self, "motor_selectors", motors)
+        canonical = (
+            spec,
+            self.scan,
+            image_dir,
+            self.image_stem,
+            self.frame_selector.fingerprint_value,
+            self.detector_shape,
+            dtype.str,
+            self.raw_header_skip,
+            tuple(
+                (role, selector.name, selector.occurrence)
+                for role, selector in motors
+            ),
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint("rsm-scan-member-form-v1", canonical),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RSMToolFormV2:
+    """Complete ordered RSM v2 Preview intent; R1 form stays unchanged."""
+
+    project_root: str | Path
+    geometry_asset: RSMGeometryAssetInput
+    members: tuple[RSMScanMemberForm, ...]
+    conditioning: RSMImageConditioning
+    normalization: RSMNormalizationPolicy
+    bins: tuple[int, int, int]
+    chunk_size: int
+    max_frame_bytes: int
+    max_chunk_bytes: int
+    output_path: str | Path
+    overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        project = _absolute_path(self.project_root, "Project root")
+        output = _absolute_path(self.output_path, "RSM v2 output path")
+        if Path(output).suffix.casefold() != ".nexus":
+            raise ValueError("RSM v2 output path must end in .nexus")
+        if (
+            type(self.geometry_asset) is not RSMGeometryAssetInput
+            or type(self.members) is not tuple
+            or not 1 <= len(self.members) <= _MAX_RSM_MEMBERS
+            or any(type(item) is not RSMScanMemberForm for item in self.members)
+            or len({item.fingerprint for item in self.members}) != len(self.members)
+            or type(self.conditioning) is not RSMImageConditioning
+            or type(self.normalization) is not RSMNormalizationPolicy
+            or type(self.bins) is not tuple
+            or len(self.bins) != 3
+            or any(
+                type(item) is not int
+                or not 2 <= item <= _MAX_RSM_AXIS_POINTS
+                for item in self.bins
+            )
+            or math.prod(self.bins) > _MAX_RSM_VOXELS
+            or type(self.chunk_size) is not int
+            or not 1 <= self.chunk_size <= _MAX_CHUNK_SIZE
+            or type(self.max_frame_bytes) is not int
+            or not 1 <= self.max_frame_bytes <= _MAX_FRAME_OR_CHUNK_BYTES
+            or type(self.max_chunk_bytes) is not int
+            or not 1 <= self.max_chunk_bytes <= _MAX_FRAME_OR_CHUNK_BYTES
+            or type(self.overwrite) is not AnalysisArtifactOverwrite
+        ):
+            raise TypeError("RSM v2 tool form is invalid")
+        normalization_keys = {
+            (selector.name, selector.occurrence)
+            for selector in (
+                self.normalization.foil_selector,
+                self.normalization.exposure_selector,
+            )
+            if selector is not None
+        }
+        for member in self.members:
+            motor_keys = {
+                (selector.name, selector.occurrence)
+                for _role, selector in member.motor_selectors
+            }
+            if motor_keys & normalization_keys:
+                raise ValueError(
+                    "RSM normalization selectors must be disjoint from motor selectors"
+                )
+        object.__setattr__(self, "project_root", project)
+        object.__setattr__(self, "output_path", output)
+        canonical = (
+            "rsm-tool-form-v2",
+            project,
+            self.geometry_asset.locator,
+            tuple(item.fingerprint for item in self.members),
+            self.conditioning._canonical_value(),
+            self.normalization._canonical_value(),
+            self.bins,
+            self.chunk_size,
+            self.max_frame_bytes,
+            self.max_chunk_bytes,
+            output,
+            self.overwrite,
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint("rsm-tool-form-v2", canonical),
         )
 
 
@@ -936,15 +1137,544 @@ def prepare_rsm_tool(
     return RSMToolPreflight(form, request, summary, _PREFLIGHT_FACTORY)
 
 
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMToolPreflightMemberSummaryV2:
+    ordinal: int
+    member_form_fingerprint: str
+    module_source_fingerprint: str
+    source_fingerprint: str
+    table_fingerprint: str
+    member_preflight_fingerprint: str
+    geometry_binding_fingerprint: str
+    source_relative_path: str
+    source_scan: str
+    selected_labels: tuple[int, ...]
+    selected_frame_count: int
+    dependency_files: tuple[str, ...]
+    dependency_file_count: int
+    energy_eV: float
+    ub: tuple[tuple[float, float, float], ...]
+    q_bounds: tuple[tuple[float, float], ...]
+    normalization_divisor_range: tuple[float, float]
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        hashes = (
+            self.member_form_fingerprint,
+            self.module_source_fingerprint,
+            self.source_fingerprint,
+            self.table_fingerprint,
+            self.member_preflight_fingerprint,
+            self.geometry_binding_fingerprint,
+        )
+        if (
+            _claim is not _PREFLIGHT_V2_FACTORY
+            or type(self.ordinal) is not int
+            or not 0 <= self.ordinal < _MAX_RSM_MEMBERS
+            or any(type(item) is not str or _SHA256.fullmatch(item) is None for item in hashes)
+            or type(self.source_relative_path) is not str
+            or not self.source_relative_path
+            or type(self.source_scan) is not str
+            or _SCAN.fullmatch(self.source_scan) is None
+            or type(self.selected_labels) is not tuple
+            or not self.selected_labels
+            or any(type(item) is not int or item < 0 for item in self.selected_labels)
+            or len(set(self.selected_labels)) != len(self.selected_labels)
+            or type(self.selected_frame_count) is not int
+            or self.selected_frame_count != len(self.selected_labels)
+            or type(self.dependency_files) is not tuple
+            or not self.dependency_files
+            or any(type(item) is not str or not item for item in self.dependency_files)
+            or type(self.dependency_file_count) is not int
+            or self.dependency_file_count != len(self.dependency_files)
+            or type(self.energy_eV) is not float
+            or not math.isfinite(self.energy_eV)
+            or self.energy_eV <= 0.0
+            or type(self.ub) is not tuple
+            or len(self.ub) != 3
+            or any(type(row) is not tuple or len(row) != 3 for row in self.ub)
+            or any(
+                type(value) is not float or not math.isfinite(value)
+                for row in self.ub
+                for value in row
+            )
+            or type(self.q_bounds) is not tuple
+            or len(self.q_bounds) != 3
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or any(type(value) is not float for value in item)
+                or not all(math.isfinite(value) for value in item)
+                or item[1] <= item[0]
+                for item in self.q_bounds
+            )
+            or type(self.normalization_divisor_range) is not tuple
+            or len(self.normalization_divisor_range) != 2
+            or any(
+                type(value) is not float
+                or not math.isfinite(value)
+                or value <= 0.0
+                for value in self.normalization_divisor_range
+            )
+            or self.normalization_divisor_range[1]
+            < self.normalization_divisor_range[0]
+        ):
+            raise TypeError("RSM v2 member summary is invalid")
+        _relative_path(self.source_relative_path, "RSM v2 summary source")
+
+    def __copy__(self):
+        raise TypeError("RSM v2 member summary is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM v2 member summary is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM v2 member summary is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM v2 member summary is not serializable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("RSM v2 member summary is not replaceable")
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMToolPreflightSummaryV2:
+    form_fingerprint: str
+    request_fingerprint: str
+    group_source_fingerprint: str
+    group_preflight_fingerprint: str
+    plan_fingerprint: str
+    output_fingerprint: str
+    geometry_asset_raw_sha256: str
+    geometry_asset_semantic_fingerprint: str
+    geometry_asset_receipt_fingerprint: str
+    effective_geometry_fingerprint: str
+    common_grid_fingerprint: str
+    project_root: str
+    output_relative_path: str
+    members: tuple[RSMToolPreflightMemberSummaryV2, ...]
+    union_q_bounds: tuple[tuple[float, float], ...]
+    bins: tuple[int, int, int]
+    detector_shape: tuple[int, int]
+    total_selected_frames: int
+    normalization_mode: RSMNormalizationMode
+    normalization_divisor_range: tuple[float, float]
+    mask_intent: str
+    holds: tuple[str, ...]
+    fingerprint: str = field(init=False)
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        hashes = (
+            self.form_fingerprint,
+            self.request_fingerprint,
+            self.group_source_fingerprint,
+            self.group_preflight_fingerprint,
+            self.plan_fingerprint,
+            self.output_fingerprint,
+            self.geometry_asset_raw_sha256,
+            self.geometry_asset_semantic_fingerprint,
+            self.geometry_asset_receipt_fingerprint,
+            self.effective_geometry_fingerprint,
+            self.common_grid_fingerprint,
+        )
+        if (
+            _claim is not _PREFLIGHT_V2_FACTORY
+            or any(type(item) is not str or _SHA256.fullmatch(item) is None for item in hashes)
+            or type(self.project_root) is not str
+            or not Path(self.project_root).is_absolute()
+            or _relative_path(self.output_relative_path, "RSM v2 output path")
+            != self.output_relative_path
+            or type(self.members) is not tuple
+            or not 1 <= len(self.members) <= _MAX_RSM_MEMBERS
+            or any(type(item) is not RSMToolPreflightMemberSummaryV2 for item in self.members)
+            or tuple(item.ordinal for item in self.members)
+            != tuple(range(len(self.members)))
+            or type(self.union_q_bounds) is not tuple
+            or len(self.union_q_bounds) != 3
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or any(type(value) is not float for value in item)
+                or not all(math.isfinite(value) for value in item)
+                or item[1] <= item[0]
+                for item in self.union_q_bounds
+            )
+            or type(self.bins) is not tuple
+            or len(self.bins) != 3
+            or any(type(item) is not int or item < 2 for item in self.bins)
+            or type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(item) is not int or item < 2 for item in self.detector_shape)
+            or type(self.total_selected_frames) is not int
+            or self.total_selected_frames
+            != sum(len(item.selected_labels) for item in self.members)
+            or not 1 <= self.total_selected_frames <= _MAX_SELECTED_FRAMES
+            or type(self.normalization_mode) is not RSMNormalizationMode
+            or type(self.normalization_divisor_range) is not tuple
+            or len(self.normalization_divisor_range) != 2
+            or any(
+                type(value) is not float
+                or not math.isfinite(value)
+                or value <= 0.0
+                for value in self.normalization_divisor_range
+            )
+            or self.normalization_divisor_range[1]
+            < self.normalization_divisor_range[0]
+            or self.mask_intent not in {"derived during Run", "none"}
+            or type(self.holds) is not tuple
+            or any(type(item) is not str or not item for item in self.holds)
+        ):
+            raise TypeError("RSM v2 preflight summary is invalid")
+        canonical = (
+            "rsm-tool-preflight-summary-v2",
+            hashes,
+            self.project_root,
+            self.output_relative_path,
+            tuple(
+                (
+                    item.ordinal,
+                    item.member_form_fingerprint,
+                    item.module_source_fingerprint,
+                    item.source_fingerprint,
+                    item.table_fingerprint,
+                    item.member_preflight_fingerprint,
+                    item.geometry_binding_fingerprint,
+                    item.source_relative_path,
+                    item.source_scan,
+                    item.selected_labels,
+                    item.selected_frame_count,
+                    item.dependency_files,
+                    item.dependency_file_count,
+                    item.energy_eV,
+                    item.ub,
+                    item.q_bounds,
+                    item.normalization_divisor_range,
+                )
+                for item in self.members
+            ),
+            self.union_q_bounds,
+            self.bins,
+            self.detector_shape,
+            self.total_selected_frames,
+            self.normalization_mode,
+            self.normalization_divisor_range,
+            self.mask_intent,
+            self.holds,
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint(
+                "rsm-tool-preflight-summary-v2",
+                canonical,
+            ),
+        )
+
+    def __copy__(self):
+        raise TypeError("RSM v2 preflight summary is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM v2 preflight summary is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM v2 preflight summary is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM v2 preflight summary is not serializable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("RSM v2 preflight summary is not replaceable")
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMToolPreflightV2:
+    form: RSMToolFormV2
+    request: RSMOperationRequestV2
+    summary: RSMToolPreflightSummaryV2
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _PREFLIGHT_V2_FACTORY
+            or type(self.form) is not RSMToolFormV2
+            or type(self.request) is not RSMOperationRequestV2
+            or type(self.summary) is not RSMToolPreflightSummaryV2
+            or self.summary.form_fingerprint != self.form.fingerprint
+            or self.summary.request_fingerprint != self.request.module.fingerprint
+            or self.summary.group_source_fingerprint
+            != self.request.module.source.fingerprint
+            or self.summary.group_preflight_fingerprint
+            != self.request.preflight.fingerprint
+            or self.summary.plan_fingerprint != self.request.plan.fingerprint
+            or self.summary.output_fingerprint
+            != self.request.module.output.fingerprint
+            or self.summary.geometry_asset_raw_sha256
+            != self.request.preflight.geometry_asset_receipt.raw_sha256
+            or self.summary.geometry_asset_semantic_fingerprint
+            != self.request.preflight.geometry_asset_receipt.semantic_fingerprint
+            or self.summary.geometry_asset_receipt_fingerprint
+            != self.request.preflight.geometry_asset_receipt.receipt_fingerprint
+            or self.summary.effective_geometry_fingerprint
+            != self.request.preflight.effective_geometry.fingerprint
+            or self.summary.common_grid_fingerprint
+            != self.request.preflight.common_grid.fingerprint
+        ):
+            raise TypeError("RSM v2 tool preflight is invalid")
+
+    def is_current(self, form: RSMToolFormV2 | None) -> bool:
+        return type(form) is RSMToolFormV2 and form.fingerprint == self.form.fingerprint
+
+    def __copy__(self):
+        raise TypeError("RSM v2 tool preflight is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM v2 tool preflight is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM v2 tool preflight is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM v2 tool preflight is not serializable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("RSM v2 tool preflight is not replaceable")
+
+
+def prepare_rsm_tool_v2(
+    form: RSMToolFormV2,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> RSMToolPreflightV2:
+    """Perform one ordered, detector-image-free RSM v2 Preview."""
+
+    if type(form) is not RSMToolFormV2:
+        raise TypeError("RSM v2 preflight requires exact RSMToolFormV2")
+    if cancel_token is not None and type(cancel_token) is not threading.Event:
+        raise TypeError("RSM v2 preflight cancellation must be threading.Event")
+    try:
+        project = Path(form.project_root).resolve(strict=True)
+    except OSError as error:
+        raise RSMToolPreflightRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is unavailable"
+        ) from error
+    if not project.is_dir():
+        raise RSMToolPreflightRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is not a directory"
+        )
+    output_relative = _inside_project(form.output_path, project, "output")
+    if Path(form.output_path).is_symlink():
+        raise RSMToolPreflightRefused(
+            "OUTPUT_SYMLINK_UNSUPPORTED",
+            "RSM output target must not be a symbolic link",
+        )
+    if not (project / output_relative).parent.is_dir():
+        raise RSMToolPreflightRefused(
+            "OUTPUT_PARENT_UNAVAILABLE",
+            "RSM output parent directory must already exist",
+        )
+    try:
+        asset = capture_rsm_geometry_asset(
+            form.geometry_asset,
+            project_root=project,
+        )
+    except RSMGeometryAssetRefused as error:
+        raise RSMToolPreflightRefused(error.code, str(error)) from error
+    detector = asset.projection.value["detector"]["header"]
+    expected_shape = (detector["Nch1"], detector["Nch2"])
+    if any(member.detector_shape != expected_shape for member in form.members):
+        raise RSMToolPreflightRefused(
+            "RSM_MEMBER_IDENTITY_MISMATCH",
+            "every member detector shape must match the geometry asset",
+        )
+
+    sources: list[ModuleSourceReceipt] = []
+    for member in form.members:
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMToolPreflightRefused("CANCELLED")
+        spec_relative = _inside_project(member.spec_path, project, "spec")
+        image_relative = _inside_project(
+            member.image_dir,
+            project,
+            "image_directory",
+        )
+        selectors = required_rsm_selectors_v2(
+            member.motor_selectors,
+            form.normalization,
+        )
+        source_spec = SourceSpec(
+            project / spec_relative,
+            SourceKind.SPEC,
+            options={
+                "scan": member.scan,
+                "image_dir": project / image_relative,
+                "image_stem": member.image_stem,
+                "read_image_kwargs": {
+                    "detector_shape": member.detector_shape,
+                    "raw_dtype": member.raw_dtype,
+                    "raw_header_skip": member.raw_header_skip,
+                    "threshold": None,
+                    "rotation": 0,
+                },
+                "metadata_column_projection": tuple(
+                    (selector.name, selector.occurrence) for selector in selectors
+                ),
+            },
+        )
+        table = run_metadata_table(
+            MetadataTablePlan(source_spec),
+            cancel_token=cancel_token,
+        )
+        if table.disposition is not AnalysisDisposition.COMPLETED:
+            raise RSMToolPreflightRefused(
+                table.code or "SOURCE_PREFLIGHT_REFUSED",
+                "SPEC source could not be admitted for RSM v2",
+                diagnostics=table.diagnostics,
+            )
+        selected = member.frame_selector.select(table.labels)
+        try:
+            sources.append(
+                ModuleSourceReceipt.from_metadata_table(
+                    table,
+                    kind=ModuleKind.RSM,
+                    selected_labels=selected,
+                    resolved_selectors=selectors,
+                )
+            )
+        except ValueError as error:
+            if str(error) != "metadata table is no longer an exact source fact":
+                raise
+            raise RSMToolPreflightRefused(
+                "SOURCE_REVISION_CHANGED",
+                "SPEC source changed while binding the RSM v2 Preview",
+                diagnostics=(str(error),),
+            ) from error
+    try:
+        group = ModuleSourceGroupReceipt.from_members(tuple(sources))
+        output = ModuleOutputRequest(
+            project / output_relative,
+            AnalysisArtifactKind.RSM,
+            form.overwrite,
+        )
+        request = prepare_rsm_operation_v2(
+            group,
+            output,
+            asset,
+            tuple(member.fingerprint for member in form.members),
+            tuple(member.motor_selectors for member in form.members),
+            form.conditioning,
+            form.normalization,
+            form.bins,
+            chunk_size=form.chunk_size,
+            max_frame_bytes=form.max_frame_bytes,
+            max_chunk_bytes=form.max_chunk_bytes,
+            project_root=project,
+            cancel_token=cancel_token,
+        )
+    except (
+        RSMOperationRefused,
+        RSMGeometryAssetRefused,
+        XuRuntimeUnsupported,
+    ) as error:
+        raise RSMToolPreflightRefused(error.code, str(error)) from error
+    except ValueError as error:
+        if "4096 selected frames" not in str(error):
+            raise
+        raise RSMToolPreflightRefused(
+            "RSM_SOURCE_GROUP_LIMIT_EXCEEDED",
+            str(error),
+        ) from error
+
+    member_summaries = tuple(
+        RSMToolPreflightMemberSummaryV2(
+            item.ordinal,
+            item.member_form_fingerprint,
+            item.module_source_fingerprint,
+            item.source_fingerprint,
+            item.table_fingerprint,
+            item.fingerprint,
+            item.geometry_binding.fingerprint,
+            item.source_relative_path,
+            item.source_scan,
+            source.selected_labels,
+            len(source.selected_labels),
+            tuple(file.relative_path for file in item.dependency_files),
+            len(item.dependency_files),
+            item.energy_eV,
+            item.ub,
+            item.member_q_bounds,
+            (
+                min(
+                    contribution.normalization_divisor
+                    for contribution in item.contributions
+                ),
+                max(
+                    contribution.normalization_divisor
+                    for contribution in item.contributions
+                ),
+            ),
+            _PREFLIGHT_V2_FACTORY,
+        )
+        for item, source in zip(
+            request.preflight.members,
+            request.module.source.members,
+            strict=True,
+        )
+    )
+    holds_value = request.provenance["holds"]
+    all_divisors = tuple(
+        contribution.normalization_divisor
+        for item in request.preflight.members
+        for contribution in item.contributions
+    )
+    summary = RSMToolPreflightSummaryV2(
+        form.fingerprint,
+        request.module.fingerprint,
+        request.module.source.fingerprint,
+        request.preflight.fingerprint,
+        request.plan.fingerprint,
+        request.module.output.fingerprint,
+        request.preflight.geometry_asset_receipt.raw_sha256,
+        request.preflight.geometry_asset_receipt.semantic_fingerprint,
+        request.preflight.geometry_asset_receipt.receipt_fingerprint,
+        request.preflight.effective_geometry.fingerprint,
+        request.preflight.common_grid.fingerprint,
+        str(project),
+        output_relative,
+        member_summaries,
+        request.preflight.common_grid.bounds,
+        request.preflight.common_grid.bins,
+        expected_shape,
+        request.module.source.selected_frame_count,
+        request.plan.normalization.mode,
+        (min(all_divisors), max(all_divisors)),
+        (
+            "none"
+            if request.plan.conditioning.static_hot_threshold is None
+            else "derived during Run"
+        ),
+        tuple(holds_value),
+        _PREFLIGHT_V2_FACTORY,
+    )
+    return RSMToolPreflightV2(form, request, summary, _PREFLIGHT_V2_FACTORY)
+
+
 __all__ = [
     "RSMFrameSelector",
     "RSMPreflightMember",
+    "RSMScanMemberForm",
     "RSMScanPreset",
     "RSMToolForm",
+    "RSMToolFormV2",
     "RSMToolPreflight",
+    "RSMToolPreflightMemberSummaryV2",
     "RSMToolPreflightRefused",
     "RSMToolPreflightSummary",
+    "RSMToolPreflightSummaryV2",
+    "RSMToolPreflightV2",
     "RSMToolPresetValues",
     "prepare_rsm_tool",
+    "prepare_rsm_tool_v2",
     "rsm_tool_preset",
 ]

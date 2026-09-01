@@ -22,12 +22,14 @@ from xrd_tools.analysis.module_transaction import (
     ModuleOperationRequest,
     ModuleOutputRequest,
     ModuleProgress,
+    ModuleSourceGroupReceipt,
     ModuleSourceReceipt,
     ModuleTerminalResult,
     admit_module_artifact,
     module_artifact_request,
     module_plan_fingerprint,
     module_provenance_digest,
+    _rsm_v2_module_request,
     xu_stitch_module_request,
 )
 from xrd_tools.analysis.scan_operations import (
@@ -83,6 +85,19 @@ def _multi_table(tmp_path: Path):
     )
     assert result.disposition is AnalysisDisposition.COMPLETED
     assert len(result.labels) == 3
+    return images, result
+
+
+def _many_table(tmp_path: Path, count: int):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    images = tuple(tmp_path / f"scan_{index:04d}.tif" for index in range(count))
+    for index, image in enumerate(images):
+        tifffile.imwrite(image, np.full((2, 2), index, dtype=np.uint16))
+    result = run_metadata_table(
+        MetadataTablePlan(image_series_spec(images[0], metadata_format=None))
+    )
+    assert result.disposition is AnalysisDisposition.COMPLETED
+    assert len(result.labels) == count
     return images, result
 
 
@@ -330,6 +345,232 @@ def test_module_source_receipt_is_factory_only_and_revalidates_table(tmp_path):
             kind=ModuleKind.RSM,
             resolved_selectors=(MetadataColumnSelector("Seconds", 0),),
         )
+
+
+def test_rsm_source_group_is_factory_owned_ordered_and_bounded(tmp_path):
+    _images, table = _multi_table(tmp_path)
+    members = tuple(
+        ModuleSourceReceipt.from_metadata_table(
+            table,
+            kind=ModuleKind.RSM,
+            selected_labels=(label,),
+        )
+        for label in table.labels
+    )
+    group = ModuleSourceGroupReceipt.from_members(members)
+    assert group.kind is ModuleKind.RSM
+    assert group.members == members
+    assert group.selected_frame_count == len(members)
+    assert group.fingerprint == analysis_canonical_fingerprint(
+        "module-source-group-v1",
+        tuple(member.fingerprint for member in members),
+    )
+    reversed_group = ModuleSourceGroupReceipt.from_members(tuple(reversed(members)))
+    assert reversed_group.members == tuple(reversed(members))
+    assert reversed_group.fingerprint != group.fingerprint
+
+    with pytest.raises(TypeError, match="factory|invalid"):
+        ModuleSourceGroupReceipt(ModuleKind.RSM, members)
+    with pytest.raises(TypeError, match="exact tuple"):
+        ModuleSourceGroupReceipt.from_members(list(members))
+    with pytest.raises(TypeError, match="invalid"):
+        ModuleSourceGroupReceipt.from_members(())
+    with pytest.raises(TypeError, match="invalid"):
+        ModuleSourceGroupReceipt.from_members((members[0], members[0]))
+    stitch = ModuleSourceReceipt.from_metadata_table(
+        table,
+        kind=ModuleKind.STITCH,
+        selected_labels=(table.labels[0],),
+    )
+    with pytest.raises(TypeError, match="invalid"):
+        ModuleSourceGroupReceipt.from_members((stitch,))
+
+    with pytest.raises(TypeError, match="not copyable"):
+        copy.copy(group)
+    with pytest.raises(TypeError, match="not copyable"):
+        copy.deepcopy(group)
+    with pytest.raises(TypeError, match="not serializable"):
+        pickle.dumps(group)
+    with pytest.raises(TypeError):
+        replace(group)
+    if hasattr(copy, "replace"):
+        with pytest.raises(TypeError, match="not replaceable"):
+            copy.replace(group)
+
+
+def test_rsm_source_group_enforces_member_and_aggregate_frame_bounds(tmp_path):
+    _images, table = _many_table(tmp_path / "member-bound", 17)
+    members = tuple(
+        ModuleSourceReceipt.from_metadata_table(
+            table,
+            kind=ModuleKind.RSM,
+            selected_labels=(label,),
+        )
+        for label in table.labels
+    )
+    assert len(ModuleSourceGroupReceipt.from_members(members[:16]).members) == 16
+    with pytest.raises(TypeError, match="invalid"):
+        ModuleSourceGroupReceipt.from_members(members)
+    with pytest.raises(TypeError, match="invalid"):
+        ModuleSourceGroupReceipt.from_members((object(),))
+
+    _images, large_table = _many_table(tmp_path / "frame-bound", 272)
+    oversized = tuple(
+        ModuleSourceReceipt.from_metadata_table(
+            large_table,
+            kind=ModuleKind.RSM,
+            selected_labels=large_table.labels[: 257 + ordinal],
+        )
+        for ordinal in range(16)
+    )
+    assert sum(len(member.selected_labels) for member in oversized) > 4096
+    with pytest.raises(ValueError, match="4096 selected frames"):
+        ModuleSourceGroupReceipt.from_members(oversized)
+
+
+def test_rsm_group_requalification_is_ordered_and_stops_on_first_failure(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.module_transaction as module_transaction
+    from xrd_tools.analysis.scan_operations import MetadataTableRequalificationResult
+
+    members = tuple(
+        ModuleSourceReceipt.from_metadata_table(
+            _table(tmp_path / f"member-{ordinal}")[1],
+            kind=ModuleKind.RSM,
+        )
+        for ordinal in range(3)
+    )
+    group = ModuleSourceGroupReceipt.from_members(members)
+
+    calls = []
+
+    def completed(plan, *, cancel_token=None):
+        ordinal = len(calls)
+        calls.append((ordinal, plan.receipt, cancel_token))
+        member = members[ordinal]
+        return MetadataTableRequalificationResult(
+            AnalysisDisposition.COMPLETED,
+            "OK",
+            member.analysis,
+            member.table_fingerprint,
+        )
+
+    token = Event()
+    monkeypatch.setattr(
+        module_transaction,
+        "run_metadata_table_requalification",
+        completed,
+    )
+    result = module_transaction._source_requalification(
+        group,
+        cancel_token=token,
+    )
+    assert result.disposition is AnalysisDisposition.COMPLETED
+    assert [item[1] for item in calls] == [member.analysis for member in members]
+    assert all(item[2] is token for item in calls)
+
+    for stop_at, disposition in (
+        (0, AnalysisDisposition.REFUSED),
+        (1, AnalysisDisposition.CANCELLED),
+        (2, AnalysisDisposition.REFUSED),
+    ):
+        calls.clear()
+
+        def stop(plan, *, cancel_token=None):
+            ordinal = len(calls)
+            calls.append((ordinal, plan.receipt, cancel_token))
+            member = members[ordinal]
+            state = disposition if ordinal == stop_at else AnalysisDisposition.COMPLETED
+            return MetadataTableRequalificationResult(
+                state,
+                "STOP" if state is not AnalysisDisposition.COMPLETED else "OK",
+                member.analysis if state is AnalysisDisposition.COMPLETED else None,
+                member.table_fingerprint if state is AnalysisDisposition.COMPLETED else "",
+            )
+
+        monkeypatch.setattr(
+            module_transaction,
+            "run_metadata_table_requalification",
+            stop,
+        )
+        result = module_transaction._source_requalification(group)
+        assert result.disposition is disposition
+        assert len(calls) == stop_at + 1
+
+    calls.clear()
+
+    def foreign_completed(plan, *, cancel_token=None):
+        ordinal = len(calls)
+        calls.append(ordinal)
+        member = members[ordinal]
+        return MetadataTableRequalificationResult(
+            AnalysisDisposition.COMPLETED,
+            "OK",
+            members[(ordinal + 1) % len(members)].analysis,
+            member.table_fingerprint,
+        )
+
+    monkeypatch.setattr(
+        module_transaction,
+        "run_metadata_table_requalification",
+        foreign_completed,
+    )
+    with pytest.raises(ModuleArtifactRefused, match="SOURCE_IDENTITY_MISMATCH"):
+        module_transaction._source_requalification(group)
+    assert calls == [0]
+
+
+def test_rsm_v2_module_request_is_private_tagged_and_fail_closed(tmp_path):
+    _images, table = _multi_table(tmp_path / "source")
+    members = tuple(
+        ModuleSourceReceipt.from_metadata_table(
+            table,
+            kind=ModuleKind.RSM,
+            selected_labels=(label,),
+        )
+        for label in table.labels[:2]
+    )
+    group = ModuleSourceGroupReceipt.from_members(members)
+    output = ModuleOutputRequest(
+        tmp_path / "output" / "result.nexus",
+        AnalysisArtifactKind.RSM,
+    )
+    plan = module_plan_fingerprint(ModuleKind.RSM, ("rsm-operation-plan-v2",))
+    provenance = {"schema_version": "rsm-operation-v2-intent", "kind": "rsm"}
+    provenance_digest = module_provenance_digest(ModuleKind.RSM, provenance)
+
+    with pytest.raises(TypeError, match="one exact source receipt"):
+        ModuleOperationRequest(group, output, plan, provenance_digest)
+    with pytest.raises(TypeError, match="exact source group"):
+        _rsm_v2_module_request(members[0], output, plan, provenance_digest)
+    wrong_output = ModuleOutputRequest(
+        tmp_path / "output" / "wrong.nexus",
+        AnalysisArtifactKind.STITCH_1D,
+    )
+    with pytest.raises(ValueError, match="do not match"):
+        _rsm_v2_module_request(group, wrong_output, plan, provenance_digest)
+    request = _rsm_v2_module_request(group, output, plan, provenance_digest)
+    assert request.source is group
+    assert request.kind is ModuleKind.RSM
+    assert request._rsm_v2_bound is True
+    assert request._xu_stitch_v2_bound is False
+    assert request.artifact_source_fingerprint == group.fingerprint
+    assert request.fingerprint == analysis_canonical_fingerprint(
+        "module-request-v1",
+        (
+            "module-request-v2-rsm-bound",
+            group.fingerprint,
+            output.fingerprint,
+            plan,
+            provenance_digest,
+        ),
+    )
+    with pytest.raises(TypeError):
+        replace(request)
+    with pytest.raises(ModuleArtifactRefused, match="RSM_V2_ARTIFACT_NOT_IMPLEMENTED"):
+        module_artifact_request(request, provenance)
 
 
 def test_module_source_membership_is_nonempty_unique_subset_in_admitted_order(
