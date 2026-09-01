@@ -33,6 +33,7 @@ from xrd_tools.analysis.stitch_operation import (
     StitchManifestFile,
     StitchContribution,
     StitchOperationPlan,
+    XuStitchOperationPlan,
     StitchOperationCleanupPending,
     StitchOperationRefused,
     StitchOperationVerificationError,
@@ -40,6 +41,13 @@ from xrd_tools.analysis.stitch_operation import (
     prepare_stitch_operation,
     run_stitch_operation,
 )
+from xrd_tools.analysis.xu_stitch_calibration import (
+    XuStitchCalibrationInput,
+    canonical_surface_resource_bytes,
+    capture_xu_stitch_calibration,
+)
+from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
@@ -196,6 +204,88 @@ def _prepared(
             if mode == "1d"
             else AnalysisArtifactKind.STITCH_2D
         ),
+        AnalysisArtifactOverwrite.CREATE_NEW,
+    )
+    return prepare_stitch_operation(
+        source,
+        output,
+        plan,
+        project_root=tmp_path,
+    )
+
+
+def _xu_prepared(
+    tmp_path: Path,
+    *,
+    del_value: float = 14.0,
+    nu_value: float = -10.0,
+    energy_eV: float | None = 17000.018,
+):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "xu-source"
+    root.mkdir()
+    image = root / "scan_0001.tif"
+    tifffile.imwrite(image, np.ones((195, 1475), dtype=np.uint16))
+    counter_line = (
+        "I0 = 2\n"
+        if energy_eV is None
+        else f"I0 = 2, energy = {energy_eV}\n"
+    )
+    image.with_suffix(".txt").write_text(
+        "# Counters\n"
+        f"{counter_line}"
+        "# Motors\n"
+        f"del = {del_value}, nu = {nu_value}\n"
+        "User: stitch, time: Mon Jan 15 10:30:00 2024  # Temp\n",
+        encoding="utf-8",
+    )
+    table = run_metadata_table(
+        MetadataTablePlan(
+            image_series_spec(image, metadata_format="txt")
+        )
+    )
+    assert table.disposition is AnalysisDisposition.COMPLETED
+    selectors = [
+        MetadataColumnSelector("I0"),
+        MetadataColumnSelector("del"),
+        MetadataColumnSelector("nu"),
+    ]
+    if energy_eV is not None:
+        selectors.append(MetadataColumnSelector("energy"))
+    source = ModuleSourceReceipt.from_metadata_table(
+        table,
+        kind=ModuleKind.STITCH,
+        selected_labels=(1,),
+        resolved_selectors=tuple(selectors),
+    )
+    asset_path = tmp_path / "calibration" / "xu" / "surface.json"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(canonical_surface_resource_bytes())
+    calibration = capture_xu_stitch_calibration(
+        XuStitchCalibrationInput("calibration/xu/surface.json"),
+        project_root=tmp_path,
+    )
+    owner = xu_runtime_session()
+    with owner as session:
+        effective = resolve_xu_stitch_effective_geometry(
+            calibration,
+            session,
+        ).projection
+    assert owner.execution_record is not None
+    plan = XuStitchOperationPlan(
+        calibration,
+        effective,
+        1.0,
+        5.2,
+        npt_1d=64,
+        monitor_selector=MetadataColumnSelector("I0"),
+        max_frame_bytes=4 * 1024 * 1024,
+    )
+    output_root = tmp_path / "xu-output"
+    output_root.mkdir()
+    output = ModuleOutputRequest(
+        output_root / "stitched.nexus",
+        AnalysisArtifactKind.STITCH_1D,
         AnalysisArtifactOverwrite.CREATE_NEW,
     )
     return prepare_stitch_operation(
@@ -418,6 +508,67 @@ def test_prepare_binds_mode_source_selectors_and_provenance(tmp_path):
 
     assert absolute_strings(manifest.to_provenance()) == []
     assert provenance["geometry"]["relative_path"] == "geometry.json"
+
+
+def test_xu_prepare_binds_exact_intent_and_commits_v2_artifact(tmp_path):
+    request = _xu_prepared(tmp_path)
+    assert type(request.plan) is XuStitchOperationPlan
+    assert request.plan.backend == "xu_hist"
+    assert request.module._xu_stitch_v2_bound is True
+    assert request.provenance["schema_version"] == (
+        "stitch-operation-v2-xu-intent"
+    )
+    assert request.provenance["output"] == {
+        "target": request.module.output.target,
+        "kind": request.module.output.kind.value,
+        "overwrite": request.module.output.overwrite.value,
+        "output_fingerprint": request.module.output.fingerprint,
+    }
+    assert request.provenance["observations"]["source_energy_range_eV"] == [
+        17000.018,
+        17000.018,
+    ]
+
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert result.terminal.request is request.module
+    assert result.terminal.commit.request is request.module
+    assert result.payload.schema_version == 2
+    assert result.payload.execution_attestation_digest == (
+        result.terminal.commit.execution_attestation_digest
+    )
+    attestation = json.loads(result.payload.execution_attestation_json)
+    assert attestation["module_request_fingerprint"] == request.module.fingerprint
+    assert attestation["selected_frame_count"] == 1
+    assert attestation["release_check_frame_count"] == 1
+    assert attestation["release_check_passed"] is True
+    assert attestation["xu_runtime"]["restore_passed"] is True
+    assert np.array_equal(
+        result.payload.coverage,
+        np.floor(result.payload.coverage),
+    )
+
+
+def test_xu_prepare_refuses_energy_and_domain_before_operation_request(tmp_path):
+    with pytest.raises(StitchOperationRefused) as energy:
+        _xu_prepared(tmp_path / "energy", energy_eV=18000.0)
+    assert energy.value.code == "XU_SOURCE_ENERGY_CONFLICT"
+
+    with pytest.raises(StitchOperationRefused) as domain:
+        _xu_prepared(tmp_path / "domain", del_value=46.0)
+    assert domain.value.code == "XU_CALIBRATION_DOMAIN_EXCEEDED"
+
+
+def test_xu_asset_drift_after_prepare_refuses_before_science_or_output(tmp_path):
+    request = _xu_prepared(tmp_path)
+    Path(
+        request.plan.calibration.project_root,
+        request.plan.calibration.lexical_relative_path,
+    ).touch()
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
+    assert not Path(request.module.output.target).exists()
 
     wrong = ModuleOutputRequest(
         tmp_path / "wrong.nexus",

@@ -32,23 +32,28 @@ class XuRuntimeRequirements:
     platform_machine: str = "arm64"
 
     def __post_init__(self) -> None:
+        strings = (
+            self.distribution_version,
+            self.module_version,
+            self.numpy_version,
+            self.python_implementation,
+            self.python_version,
+            self.platform_system,
+            self.platform_machine,
+        )
         if (
-            any(
-                type(value) is not str or not value
-                for value in (
-                    self.distribution_version,
-                    self.module_version,
-                    self.numpy_version,
-                    self.python_implementation,
-                    self.python_version,
-                    self.platform_system,
-                    self.platform_machine,
-                )
-            )
+            any(type(value) is not str for value in strings)
+            or self.distribution_version != "1.7.12"
+            or self.module_version != "1.7.12"
+            or self.numpy_version != "2.5.1"
             or type(self.config_epsilon) is not float
             or self.config_epsilon != 1e-8
             or type(self.config_digits) is not int
             or self.config_digits != 8
+            or self.python_implementation != "CPython"
+            or self.python_version != "3.13.14"
+            or self.platform_system != "Darwin"
+            or self.platform_machine != "arm64"
         ):
             raise TypeError("XU runtime requirements are invalid")
 
@@ -146,7 +151,7 @@ def xu_runtime_availability(
     try:
         distribution = importlib.metadata.version("xrayutilities")
         numpy_version = importlib.metadata.version("numpy")
-    except importlib.metadata.PackageNotFoundError:
+    except BaseException:
         return XuRuntimeAvailability(
             False,
             "XU_RUNTIME_UNSUPPORTED",
@@ -177,6 +182,7 @@ class XuRuntimeSession:
         self.execution_record: XuRuntimeExecutionRecord | None = None
         self._config = None
         self._before: int | None = None
+        self._mutation_attempted = False
         self._entered = False
 
     def __copy__(self):
@@ -184,6 +190,27 @@ class XuRuntimeSession:
 
     def __deepcopy__(self, _memo):
         raise TypeError("XU runtime session is not copyable")
+
+    def _restore_config(self) -> int:
+        if self._config is None or self._before is None:
+            raise XuRuntimeUnsupported(
+                "XU_RUNTIME_CONFIG_RESTORE_FAILED",
+                "XU runtime owner has no captured global state",
+            )
+        try:
+            self._config.NTHREADS = self._before
+            restored = self._config.NTHREADS
+        except BaseException as error:
+            raise XuRuntimeUnsupported(
+                "XU_RUNTIME_CONFIG_RESTORE_FAILED",
+                "xrayutilities NTHREADS restoration failed",
+            ) from error
+        if type(restored) is not int or restored != self._before:
+            raise XuRuntimeUnsupported(
+                "XU_RUNTIME_CONFIG_RESTORE_FAILED",
+                "xrayutilities NTHREADS restoration did not hold",
+            )
+        return restored
 
     def __enter__(self) -> "XuRuntimeSession":
         if self._entered:
@@ -214,63 +241,64 @@ class XuRuntimeSession:
                 )
             self._config = config
             self._before = config.NTHREADS
+            self._mutation_attempted = True
             config.NTHREADS = 1
             if type(config.NTHREADS) is not int or config.NTHREADS != 1:
                 raise XuRuntimeUnsupported(
-                    "XU_RUNTIME_UNSUPPORTED",
+                    "XU_RUNTIME_CONFIG_RESTORE_FAILED",
                     "xrayutilities NTHREADS could not be set to one",
                 )
             self.xu = xu
             self.numpy = np
             return self
-        except BaseException:
+        except BaseException as primary:
+            restore_error = None
             try:
-                if self._config is not None and self._before is not None:
-                    self._config.NTHREADS = self._before
+                if self._mutation_attempted:
+                    try:
+                        self._restore_config()
+                    except XuRuntimeUnsupported as error:
+                        restore_error = error
             finally:
+                self.xu = None
+                self.numpy = None
                 XU_RUNTIME_LOCK.release()
-            raise
+            if restore_error is not None:
+                raise restore_error from primary
+            if isinstance(primary, XuRuntimeUnsupported):
+                raise
+            raise XuRuntimeUnsupported(
+                "XU_RUNTIME_UNSUPPORTED",
+                "xrayutilities runtime import or configuration failed",
+            ) from primary
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
-        restore_error = None
+        restore_error: BaseException | None = None
         try:
-            if self._config is None or self._before is None:
-                restore_error = XuRuntimeUnsupported(
-                    "XU_RUNTIME_RESTORE_FAILED",
-                    "XU runtime owner has no captured global state",
-                )
+            try:
+                restored = self._restore_config()
+            except BaseException as error:
+                restore_error = error
             else:
-                try:
-                    self._config.NTHREADS = self._before
-                    restored = self._config.NTHREADS
-                except BaseException as error:
-                    restore_error = error
-                else:
-                    if type(restored) is not int or restored != self._before:
-                        restore_error = XuRuntimeUnsupported(
-                            "XU_RUNTIME_RESTORE_FAILED",
-                            "xrayutilities NTHREADS restoration did not hold",
-                        )
-                    else:
-                        self.execution_record = XuRuntimeExecutionRecord(
-                            _LOCK_POLICY,
-                            self.requirements.distribution_version,
-                            self.requirements.module_version,
-                            self.requirements.numpy_version,
-                            self.requirements.config_epsilon,
-                            self.requirements.config_digits,
-                            self._before,
-                            1,
-                            restored,
-                            True,
-                        )
+                self.execution_record = XuRuntimeExecutionRecord(
+                    _LOCK_POLICY,
+                    self.requirements.distribution_version,
+                    self.requirements.module_version,
+                    self.requirements.numpy_version,
+                    self.requirements.config_epsilon,
+                    self.requirements.config_digits,
+                    self._before,
+                    1,
+                    restored,
+                    True,
+                )
         finally:
             self.xu = None
             self.numpy = None
             XU_RUNTIME_LOCK.release()
         if restore_error is not None:
             raise XuRuntimeUnsupported(
-                "XU_RUNTIME_RESTORE_FAILED",
+                "XU_RUNTIME_CONFIG_RESTORE_FAILED",
                 "xrayutilities NTHREADS restoration failed",
             ) from restore_error
         return False

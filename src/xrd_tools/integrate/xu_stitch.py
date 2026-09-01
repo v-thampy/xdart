@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 import hashlib
 import importlib.metadata
 import math
@@ -139,11 +139,11 @@ class XuStitchRuntimeGeometry:
     hxrd: object
     mask: np.ndarray
     solid_angle: np.ndarray
-    _claim: object = field(default=None, repr=False)
+    _claim: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _claim: object) -> None:
         if (
-            self._claim is not _RUNTIME_GEOMETRY_FACTORY
+            _claim is not _RUNTIME_GEOMETRY_FACTORY
             or type(self.projection) is not XuStitchEffectiveGeometryProjection
             or type(self.mask) is not np.ndarray
             or self.mask.shape != self.projection.shape
@@ -525,11 +525,74 @@ def _checked_frame_histograms(
 
 
 @dataclass(frozen=True, slots=True)
+class XuStitchScienceObservations:
+    source_del_range_deg: tuple[float, float]
+    source_nu_range_deg: tuple[float, float]
+    source_energy_range_eV: tuple[float, float] | None
+    control_domain_extrapolation_frame_count: int
+    warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        ranges = (self.source_del_range_deg, self.source_nu_range_deg)
+        if (
+            any(
+                type(value) is not tuple
+                or len(value) != 2
+                or any(type(item) is not float or not math.isfinite(item) for item in value)
+                or value[0] > value[1]
+                for value in ranges
+            )
+            or (
+                self.source_energy_range_eV is not None
+                and (
+                    type(self.source_energy_range_eV) is not tuple
+                    or len(self.source_energy_range_eV) != 2
+                    or any(
+                        type(item) is not float
+                        or not math.isfinite(item)
+                        or item <= 0
+                        for item in self.source_energy_range_eV
+                    )
+                    or self.source_energy_range_eV[0]
+                    > self.source_energy_range_eV[1]
+                )
+            )
+            or type(self.control_domain_extrapolation_frame_count) is not int
+            or self.control_domain_extrapolation_frame_count < 0
+            or type(self.warnings) is not tuple
+            or self.warnings
+            not in {
+                (),
+                ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",),
+            }
+            or bool(self.control_domain_extrapolation_frame_count)
+            != bool(self.warnings)
+        ):
+            raise TypeError("XU Stitch observations are invalid")
+
+    def to_provenance(self) -> dict[str, object]:
+        return {
+            "source_del_range_deg": list(self.source_del_range_deg),
+            "source_nu_range_deg": list(self.source_nu_range_deg),
+            "source_energy_range_eV": (
+                None
+                if self.source_energy_range_eV is None
+                else list(self.source_energy_range_eV)
+            ),
+            "control_domain_extrapolation_frame_count": (
+                self.control_domain_extrapolation_frame_count
+            ),
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class XuStitchScienceResult:
     payload: IntegrationResult1D
     diagnostics: StitchDiagnostics
     effective_geometry: XuStitchEffectiveGeometryProjection
     runtime: XuRuntimeExecutionRecord
+    observations: XuStitchScienceObservations
     selected_frame_count: int
     release_check_frame_count: int
 
@@ -540,6 +603,7 @@ class XuStitchScienceResult:
             or type(self.effective_geometry)
             is not XuStitchEffectiveGeometryProjection
             or type(self.runtime) is not XuRuntimeExecutionRecord
+            or type(self.observations) is not XuStitchScienceObservations
             or type(self.selected_frame_count) is not int
             or self.selected_frame_count < 1
             or self.release_check_frame_count != self.selected_frame_count
@@ -556,6 +620,7 @@ def run_xu_hist_stitch_1d(
     q_max_A_inverse: float,
     npt: int,
     monitor_key: str | None,
+    source_energy_key: str | None = None,
     max_frame_bytes: int,
     cancel_token: threading.Event | None = None,
     progress_callback: Callable[[int, int], object] | None = None,
@@ -574,15 +639,137 @@ def run_xu_hist_stitch_1d(
         or type(npt) is not int
         or not 1 <= npt <= 1_000_000
         or (monitor_key is not None and (type(monitor_key) is not str or not monitor_key))
+        or (
+            source_energy_key is not None
+            and source_energy_key != "energy"
+        )
         or type(max_frame_bytes) is not int
         or not 1 <= max_frame_bytes <= 4 * 1024 * 1024 * 1024
     ):
         raise TypeError("XU Stitch science inputs are invalid")
     if cancel_token is not None and type(cancel_token) is not threading.Event:
         raise TypeError("XU Stitch cancel token must be exact Event")
+    try:
+        available_labels = tuple(source.frame_indices)
+    except (AttributeError, TypeError) as error:
+        raise TypeError("XU Stitch source must expose exact frame indices") from error
+    if (
+        any(type(label) is not int for label in available_labels)
+        or len(set(available_labels)) != len(available_labels)
+    ):
+        raise TypeError("XU Stitch source frame indices are invalid")
+    available_positions = {
+        label: position for position, label in enumerate(available_labels)
+    }
+    if (
+        len(set(labels)) != len(labels)
+        or any(label not in available_positions for label in labels)
+        or tuple(available_positions[label] for label in labels)
+        != tuple(sorted(available_positions[label] for label in labels))
+    ):
+        raise XuStitchScienceRefused(
+            "SOURCE_SELECTION_IDENTITY_MISMATCH",
+            "XU Stitch labels must be a unique in-source ordered selection",
+        )
     asset = receipt.projection.value
     acquisition = asset["acquisition"]
     validation = asset["validation"]
+    frame_inputs: list[tuple[int, float, float, float]] = []
+    del_values: list[float] = []
+    nu_values: list[float] = []
+    energy_values: list[float] = []
+    extrapolation_count = 0
+    validated_domain = validation["validated_scan_domain_source_deg"]
+    control_domain = validation["control_domain_source_deg"]
+    for label in labels:
+        if cancel_token is not None and cancel_token.is_set():
+            raise XuStitchCancelled("CANCELLED")
+        metadata = source.metadata_for(label)
+        if not isinstance(metadata, Mapping):
+            raise XuStitchScienceRefused(
+                "INVALID_METADATA_VALUE", "frame metadata is not a mapping"
+            )
+        try:
+            del_value = float(metadata[acquisition["source_motors"]["del"]])
+            nu_value = float(metadata[acquisition["source_motors"]["nu"]])
+        except (KeyError, TypeError, ValueError) as error:
+            raise XuStitchScienceRefused(
+                "INVALID_METADATA_VALUE", "required XU angle is unavailable"
+            ) from error
+        if not math.isfinite(del_value) or not math.isfinite(nu_value):
+            raise XuStitchScienceRefused(
+                "INVALID_METADATA_VALUE", "required XU angle is nonfinite"
+            )
+        if not (
+            float(validated_domain["del"][0])
+            <= del_value
+            <= float(validated_domain["del"][1])
+            and float(validated_domain["nu"][0])
+            <= nu_value
+            <= float(validated_domain["nu"][1])
+        ):
+            raise XuStitchScienceRefused(
+                "XU_CALIBRATION_DOMAIN_EXCEEDED",
+                "frame lies outside the validated SURFACE angle domain",
+            )
+        if not (
+            float(control_domain["del"][0])
+            <= del_value
+            <= float(control_domain["del"][1])
+            and float(control_domain["nu"][0])
+            <= nu_value
+            <= float(control_domain["nu"][1])
+        ):
+            extrapolation_count += 1
+        monitor = 1.0
+        if monitor_key is not None:
+            try:
+                monitor = float(metadata[monitor_key])
+            except (KeyError, TypeError, ValueError) as error:
+                raise XuStitchScienceRefused(
+                    "INVALID_MONITOR_VALUE", "monitor value is unavailable"
+                ) from error
+            if not math.isfinite(monitor) or monitor <= 0:
+                raise XuStitchScienceRefused(
+                    "INVALID_MONITOR_VALUE", "monitor must be finite and positive"
+                )
+        if source_energy_key is not None:
+            try:
+                energy = float(metadata[source_energy_key])
+            except (KeyError, TypeError, ValueError) as error:
+                raise XuStitchScienceRefused(
+                    "XU_SOURCE_ENERGY_CONFLICT",
+                    "source energy is unavailable",
+                ) from error
+            expected_energy = float(acquisition["energy_eV"])
+            if (
+                not math.isfinite(energy)
+                or energy <= 0
+                or abs(energy - expected_energy) > 0.001 * expected_energy
+            ):
+                raise XuStitchScienceRefused(
+                    "XU_SOURCE_ENERGY_CONFLICT",
+                    "source energy conflicts with the calibrated XU energy",
+                )
+            energy_values.append(energy)
+        del_values.append(del_value)
+        nu_values.append(nu_value)
+        frame_inputs.append((label, del_value, nu_value, monitor))
+    observations = XuStitchScienceObservations(
+        (float(min(del_values)), float(max(del_values))),
+        (float(min(nu_values)), float(max(nu_values))),
+        (
+            None
+            if not energy_values
+            else (float(min(energy_values)), float(max(energy_values)))
+        ),
+        extrapolation_count,
+        (
+            ()
+            if extrapolation_count == 0
+            else ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",)
+        ),
+    )
     q_edges = np.linspace(
         q_min_A_inverse,
         q_max_A_inverse,
@@ -608,46 +795,9 @@ def run_xu_hist_stitch_1d(
     with runtime_owner as session:
         geometry = resolve_xu_stitch_effective_geometry(receipt, session)
         provider = XuPowderQProvider(geometry, acquisition)
-        for index, label in enumerate(labels):
+        for index, (label, del_value, nu_value, monitor) in enumerate(frame_inputs):
             if cancel_token is not None and cancel_token.is_set():
                 raise XuStitchCancelled("CANCELLED")
-            metadata = source.metadata_for(label)
-            if not isinstance(metadata, Mapping):
-                raise XuStitchScienceRefused(
-                    "INVALID_METADATA_VALUE", "frame metadata is not a mapping"
-                )
-            try:
-                del_value = float(metadata[acquisition["source_motors"]["del"]])
-                nu_value = float(metadata[acquisition["source_motors"]["nu"]])
-            except (KeyError, TypeError, ValueError) as error:
-                raise XuStitchScienceRefused(
-                    "INVALID_METADATA_VALUE", "required XU angle is unavailable"
-                ) from error
-            if not math.isfinite(del_value) or not math.isfinite(nu_value):
-                raise XuStitchScienceRefused(
-                    "INVALID_METADATA_VALUE", "required XU angle is nonfinite"
-                )
-            domain = validation["validated_scan_domain_source_deg"]
-            if not (
-                float(domain["del"][0]) <= del_value <= float(domain["del"][1])
-                and float(domain["nu"][0]) <= nu_value <= float(domain["nu"][1])
-            ):
-                raise XuStitchScienceRefused(
-                    "XU_CALIBRATION_DOMAIN_EXCEEDED",
-                    "frame lies outside the validated SURFACE angle domain",
-                )
-            monitor = 1.0
-            if monitor_key is not None:
-                try:
-                    monitor = float(metadata[monitor_key])
-                except (KeyError, TypeError, ValueError) as error:
-                    raise XuStitchScienceRefused(
-                        "INVALID_MONITOR_VALUE", "monitor value is unavailable"
-                    ) from error
-                if not math.isfinite(monitor) or monitor <= 0:
-                    raise XuStitchScienceRefused(
-                        "INVALID_MONITOR_VALUE", "monitor must be finite and positive"
-                    )
             d_signal, d_normalization, d_count = _checked_frame_histograms(
                 source,
                 label,
@@ -727,6 +877,7 @@ def run_xu_hist_stitch_1d(
         diagnostics,
         effective_projection,
         runtime_owner.execution_record,
+        observations,
         len(labels),
         release_count,
     )
@@ -739,6 +890,7 @@ __all__ = [
     "XuStitchEffectiveGeometryProjection",
     "XuStitchRuntimeGeometry",
     "XuStitchScienceRefused",
+    "XuStitchScienceObservations",
     "XuStitchScienceResult",
     "resolve_xu_stitch_effective_geometry",
     "run_xu_hist_stitch_1d",

@@ -38,6 +38,7 @@ from xrd_tools.analysis.module_transaction import (
     module_artifact_request,
     module_plan_fingerprint,
     module_provenance_digest,
+    xu_stitch_module_request,
 )
 from xrd_tools.analysis.plans import (
     StitchCancelled,
@@ -52,6 +53,7 @@ from xrd_tools.analysis.scan_operations import (
     run_metadata_table,
 )
 from xrd_tools.analysis.xu_stitch_calibration import (
+    XuStitchCalibrationRefused,
     XuStitchCalibrationReceipt,
     revalidate_xu_stitch_calibration,
 )
@@ -73,11 +75,16 @@ from xrd_tools.integrate.multi import StitchDiagnostics
 from xrd_tools.integrate.xu_stitch import (
     XuStitchCancelled,
     XuStitchEffectiveGeometryProjection,
+    XuStitchScienceObservations,
     XuStitchScienceRefused,
     resolve_xu_stitch_effective_geometry,
     run_xu_hist_stitch_1d,
 )
-from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+from xrd_tools.core.geometry.xu_runtime import (
+    XuRuntimeRequirements,
+    XuRuntimeUnsupported,
+    xu_runtime_session,
+)
 from xrd_tools.sources.base import BaseFrameSource
 
 
@@ -1349,12 +1356,32 @@ class XuStitchOperationPlan:
 
 
 def _required_stitch_selectors(
-    plan: StitchOperationPlan,
+    plan: StitchOperationPlan | XuStitchOperationPlan,
+    table_names: tuple[str, ...] = (),
 ) -> tuple[MetadataColumnSelector, ...]:
-    requested = tuple(
-        MetadataColumnSelector(name, 0)
-        for _position, name in plan.geometry.request.source_motors
-    ) + (() if plan.monitor_selector is None else (plan.monitor_selector,))
+    if type(plan) is StitchOperationPlan:
+        requested = tuple(
+            MetadataColumnSelector(name, 0)
+            for _position, name in plan.geometry.request.source_motors
+        )
+    elif type(plan) is XuStitchOperationPlan:
+        acquisition = plan.calibration.projection.value["acquisition"]
+        requested = tuple(
+            MetadataColumnSelector(str(name), 0)
+            for name in acquisition["source_motors"].values()
+        )
+        energy_name = str(acquisition["source_energy_selector"])
+        energy_count = table_names.count(energy_name)
+        if energy_count > 1:
+            raise StitchOperationRefused(
+                "AMBIGUOUS_METADATA_SELECTOR",
+                f"metadata column {energy_name!r} must occur at most once",
+            )
+        if energy_count == 1:
+            requested += (MetadataColumnSelector(energy_name, 0),)
+    else:
+        raise TypeError("stitch selectors require an exact Stitch plan")
+    requested += (() if plan.monitor_selector is None else (plan.monitor_selector,))
     return tuple(
         sorted(
             {
@@ -1363,6 +1390,120 @@ def _required_stitch_selectors(
             }.values(),
             key=lambda selector: (selector.name, selector.occurrence),
         )
+    )
+
+
+def _xu_energy_selector(
+    plan: XuStitchOperationPlan,
+    table_names: tuple[str, ...],
+) -> MetadataColumnSelector | None:
+    name = str(
+        plan.calibration.projection.value["acquisition"][
+            "source_energy_selector"
+        ]
+    )
+    count = table_names.count(name)
+    if count > 1:
+        raise StitchOperationRefused(
+            "AMBIGUOUS_METADATA_SELECTOR",
+            f"metadata column {name!r} must occur at most once",
+        )
+    return None if count == 0 else MetadataColumnSelector(name, 0)
+
+
+def _xu_observations(
+    plan: XuStitchOperationPlan,
+    manifest: StitchInputManifestReceipt,
+    energy_selector: MetadataColumnSelector | None,
+) -> XuStitchScienceObservations:
+    asset = plan.calibration.projection.value
+    acquisition = asset["acquisition"]
+    validation = asset["validation"]
+    del_key = (str(acquisition["source_motors"]["del"]), 0)
+    nu_key = (str(acquisition["source_motors"]["nu"]), 0)
+    monitor_key = (
+        None
+        if plan.monitor_selector is None
+        else (plan.monitor_selector.name, plan.monitor_selector.occurrence)
+    )
+    energy_key = (
+        None
+        if energy_selector is None
+        else (energy_selector.name, energy_selector.occurrence)
+    )
+    del_values: list[float] = []
+    nu_values: list[float] = []
+    energy_values: list[float] = []
+    extrapolation_count = 0
+    validated = validation["validated_scan_domain_source_deg"]
+    control = validation["control_domain_source_deg"]
+    expected_energy = float(acquisition["energy_eV"])
+    for contribution in manifest.contributions:
+        values = {
+            (name, occurrence): value
+            for name, occurrence, value in contribution.values
+        }
+        try:
+            del_value = float(values[del_key])
+            nu_value = float(values[nu_key])
+        except KeyError as error:
+            raise StitchOperationRefused(
+                "UNBOUND_METADATA_SELECTOR",
+                "XU angle metadata is absent from the exact input manifest",
+            ) from error
+        if not (
+            float(validated["del"][0])
+            <= del_value
+            <= float(validated["del"][1])
+            and float(validated["nu"][0])
+            <= nu_value
+            <= float(validated["nu"][1])
+        ):
+            raise StitchOperationRefused(
+                "XU_CALIBRATION_DOMAIN_EXCEEDED",
+                "selected source angles exceed the validated XU domain",
+            )
+        if not (
+            float(control["del"][0])
+            <= del_value
+            <= float(control["del"][1])
+            and float(control["nu"][0])
+            <= nu_value
+            <= float(control["nu"][1])
+        ):
+            extrapolation_count += 1
+        if monitor_key is not None and values[monitor_key] <= 0:
+            raise StitchOperationRefused(
+                "INVALID_MONITOR_VALUE",
+                "Stitch monitor values must be finite and strictly positive",
+            )
+        if energy_key is not None:
+            energy = float(values[energy_key])
+            if (
+                energy <= 0
+                or abs(energy - expected_energy) > 0.001 * expected_energy
+            ):
+                raise StitchOperationRefused(
+                    "XU_SOURCE_ENERGY_CONFLICT",
+                    "source energy conflicts with the calibrated XU energy",
+                )
+            energy_values.append(energy)
+        del_values.append(del_value)
+        nu_values.append(nu_value)
+    return XuStitchScienceObservations(
+        (float(min(del_values)), float(max(del_values))),
+        (float(min(nu_values)), float(max(nu_values))),
+        (
+            None
+            if not energy_values
+            else (float(min(energy_values)), float(max(energy_values)))
+        ),
+        extrapolation_count,
+        (
+            ()
+            if extrapolation_count == 0
+            else ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",)
+        ),
     )
 
 
@@ -1491,10 +1632,121 @@ def _provenance(
     }
 
 
+def _xu_provenance(
+    source: ModuleSourceReceipt,
+    output: ModuleOutputRequest,
+    plan: XuStitchOperationPlan,
+    manifest: StitchInputManifestReceipt,
+    observations: XuStitchScienceObservations,
+    energy_selector: MetadataColumnSelector | None,
+) -> dict[str, object]:
+    receipt = plan.calibration
+    asset = receipt.projection.value
+    requirements = XuRuntimeRequirements()
+    monitor = plan.monitor_selector
+    effective = plan.effective_geometry.to_provenance()
+    effective["asset_semantic_fingerprint"] = receipt.semantic_fingerprint
+    effective["acquisition"] = _portable_json_value(asset["acquisition"])
+    effective["xrayutilities"] = _portable_json_value(asset["xrayutilities"])
+    observed = observations.to_provenance()
+    observed.update(
+        {
+            "selected_frame_count": len(source.selected_labels),
+            "source_energy_selector": (
+                None
+                if energy_selector is None
+                else {
+                    "name": energy_selector.name,
+                    "occurrence": energy_selector.occurrence,
+                }
+            ),
+            "monitor_selector": (
+                None
+                if monitor is None
+                else {"name": monitor.name, "occurrence": monitor.occurrence}
+            ),
+        }
+    )
+    return {
+        "schema_version": "stitch-operation-v2-xu-intent",
+        "kind": "stitch",
+        "backend": "xu_hist",
+        "source": {
+            "source_fingerprint": source.analysis.source_fingerprint,
+            "module_source_fingerprint": source.fingerprint,
+            "metadata_table_fingerprint": source.table_fingerprint,
+            "selected_labels": list(source.selected_labels),
+            "input_manifest": manifest.to_provenance(),
+        },
+        "asset": {
+            "lexical_relative_path": receipt.lexical_relative_path,
+            "resolved_relative_path": receipt.resolved_relative_path,
+            "byte_count": receipt.byte_count,
+            "raw_sha256": receipt.raw_sha256,
+            "semantic_fingerprint": receipt.semantic_fingerprint,
+            "receipt_fingerprint": receipt.fingerprint,
+        },
+        "effective_geometry": effective,
+        "detector": _portable_json_value(asset["detector"]),
+        "corrections": _portable_json_value(asset["corrections"]),
+        "plan": {
+            "backend": plan.backend,
+            "mode": plan.mode,
+            "unit": plan.unit,
+            "method": plan.method,
+            "radial_range": list(plan.radial_range),
+            "npt_1d": plan.npt_1d,
+            "monitor_selector": (
+                None
+                if monitor is None
+                else {"name": monitor.name, "occurrence": monitor.occurrence}
+            ),
+            "use_detector_mask": plan.use_detector_mask,
+            "max_frame_bytes": plan.max_frame_bytes,
+            "asset_receipt_fingerprint": receipt.fingerprint,
+            "effective_geometry_fingerprint": plan.effective_geometry.fingerprint,
+            "plan_fingerprint": plan.fingerprint,
+        },
+        "observations": observed,
+        "runtime_requirements": {
+            "xrayutilities_distribution_version": requirements.distribution_version,
+            "xrayutilities_module_version": requirements.module_version,
+            "numpy_version": requirements.numpy_version,
+            "config_epsilon": requirements.config_epsilon,
+            "config_digits": requirements.config_digits,
+            "nthreads_effective": 1,
+            "python_implementation": requirements.python_implementation,
+            "python_version": requirements.python_version,
+            "platform_system": requirements.platform_system,
+            "platform_machine": requirements.platform_machine,
+            "runtime_policy": asset["xrayutilities"]["runtime_policy"],
+        },
+        "output": {
+            "target": output.target,
+            "kind": output.kind.value,
+            "overwrite": output.overwrite.value,
+            "output_fingerprint": output.fingerprint,
+        },
+        "holds": [
+            "xu-2d-and-chi",
+            "gi-stitch-on-xu",
+            "explicit-ub-and-sample-placement",
+            "operator-configured-sample-circles",
+            "generic-xu-diffractometers-and-detectors",
+            "external-or-combined-masks",
+            "sensor-parallax-xu-geometry",
+            "new-corrections-and-variance",
+            "mixed-energy-grouped-xu-stitch",
+            "historical-json-migration",
+            "unvalidated-platforms-and-live-gates",
+        ],
+    }
+
+
 @dataclass(eq=False, frozen=True, slots=True)
 class StitchOperationRequest:
     module: ModuleOperationRequest
-    plan: StitchOperationPlan
+    plan: StitchOperationPlan | XuStitchOperationPlan
     manifest: StitchInputManifestReceipt
     provenance_json: str
     _claim: InitVar[object] = None
@@ -1504,7 +1756,7 @@ class StitchOperationRequest:
             _claim is not _REQUEST_FACTORY
             or type(self.module) is not ModuleOperationRequest
             or self.module.kind is not ModuleKind.STITCH
-            or type(self.plan) is not StitchOperationPlan
+            or type(self.plan) not in {StitchOperationPlan, XuStitchOperationPlan}
             or type(self.manifest) is not StitchInputManifestReceipt
             or type(self.provenance_json) is not str
             or self.module.plan_fingerprint != self.plan.fingerprint
@@ -1514,11 +1766,14 @@ class StitchOperationRequest:
             != self.module.source.selected_labels
         ):
             raise TypeError("stitch operation request is invalid")
+        table = _fresh_table(self.module.source)
+        table_names = tuple(column.name for column in table.columns)
+        required = _required_stitch_selectors(self.plan, table_names)
         expected_manifest = _capture_input_manifest(
             self.module.source,
-            _fresh_table(self.module.source),
+            table,
             self.manifest.project_root,
-            _required_stitch_selectors(self.plan),
+            required,
         )
         if expected_manifest.fingerprint != self.manifest.fingerprint:
             raise ValueError(
@@ -1534,18 +1789,40 @@ class StitchOperationRequest:
             != self.module.provenance_digest
         ):
             raise ValueError("stitch provenance does not match module request")
-        geometry_relative = _relative_locator(
-            self.plan.geometry.resolved_path,
-            Path(self.manifest.project_root),
-            "geometry",
-        )
-        expected = _provenance(
-            self.module.source,
-            self.module.output,
-            self.plan,
-            self.manifest,
-            geometry_relative,
-        )
+        if type(self.plan) is StitchOperationPlan:
+            geometry_relative = _relative_locator(
+                self.plan.geometry.resolved_path,
+                Path(self.manifest.project_root),
+                "geometry",
+            )
+            expected = _provenance(
+                self.module.source,
+                self.module.output,
+                self.plan,
+                self.manifest,
+                geometry_relative,
+            )
+        else:
+            if (
+                self.module._xu_stitch_v2_bound is not True
+                or self.plan.calibration.project_root
+                != self.manifest.project_root
+            ):
+                raise ValueError("XU Stitch request lacks exact Project authority")
+            energy_selector = _xu_energy_selector(self.plan, table_names)
+            observations = _xu_observations(
+                self.plan,
+                self.manifest,
+                energy_selector,
+            )
+            expected = _xu_provenance(
+                self.module.source,
+                self.module.output,
+                self.plan,
+                self.manifest,
+                observations,
+                energy_selector,
+            )
         if provenance != expected:
             raise ValueError("stitch provenance is not the exact request projection")
 
@@ -1577,7 +1854,7 @@ def _fresh_table(source: ModuleSourceReceipt):
 def prepare_stitch_operation(
     source: ModuleSourceReceipt,
     output: ModuleOutputRequest,
-    plan: StitchOperationPlan,
+    plan: StitchOperationPlan | XuStitchOperationPlan,
     *,
     project_root: str | Path,
 ) -> StitchOperationRequest:
@@ -1587,7 +1864,7 @@ def prepare_stitch_operation(
         type(source) is not ModuleSourceReceipt
         or source.kind is not ModuleKind.STITCH
         or type(output) is not ModuleOutputRequest
-        or type(plan) is not StitchOperationPlan
+        or type(plan) not in {StitchOperationPlan, XuStitchOperationPlan}
     ):
         raise TypeError("stitch preparation requires exact Stitch module values")
     if source.analysis.resolved_kind not in {
@@ -1600,7 +1877,7 @@ def prepare_stitch_operation(
         )
     expected_kind = (
         AnalysisArtifactKind.STITCH_1D
-        if plan.mode == "1d"
+        if type(plan) is XuStitchOperationPlan or plan.mode == "1d"
         else AnalysisArtifactKind.STITCH_2D
     )
     if output.kind is not expected_kind:
@@ -1609,7 +1886,7 @@ def prepare_stitch_operation(
         )
     table = _fresh_table(source)
     names = tuple(column.name for column in table.columns)
-    required = _required_stitch_selectors(plan)
+    required = _required_stitch_selectors(plan, names)
     for selector in required:
         if selector.occurrence != 0 or names.count(selector.name) != 1:
             raise StitchOperationRefused(
@@ -1630,41 +1907,88 @@ def prepare_stitch_operation(
             "SOURCE_ORIENTATION_CONFLICT",
             "source rotation must be zero; Stitch owns the recorded image orientation",
         )
-    _revalidate_geometry(plan.geometry)
     manifest = _capture_input_manifest(source, table, project_root, required)
-    if plan.monitor_selector is not None:
-        monitor_key = (
-            plan.monitor_selector.name,
-            plan.monitor_selector.occurrence,
+    if type(plan) is StitchOperationPlan:
+        _revalidate_geometry(plan.geometry)
+        if plan.monitor_selector is not None:
+            monitor_key = (
+                plan.monitor_selector.name,
+                plan.monitor_selector.occurrence,
+            )
+            for contribution in manifest.contributions:
+                values = {
+                    (name, occurrence): value
+                    for name, occurrence, value in contribution.values
+                }
+                if values[monitor_key] <= 0:
+                    raise StitchOperationRefused(
+                        "INVALID_MONITOR_VALUE",
+                        "Stitch monitor values must be finite and strictly positive",
+                    )
+        geometry_relative = _relative_locator(
+            plan.geometry.resolved_path,
+            Path(manifest.project_root),
+            "geometry",
         )
-        for contribution in manifest.contributions:
-            values = {
-                (name, occurrence): value
-                for name, occurrence, value in contribution.values
-            }
-            if values[monitor_key] <= 0:
-                raise StitchOperationRefused(
-                    "INVALID_MONITOR_VALUE",
-                    "Stitch monitor values must be finite and strictly positive",
-                )
-    geometry_relative = _relative_locator(
-        plan.geometry.resolved_path,
-        Path(manifest.project_root),
-        "geometry",
-    )
-    provenance = _provenance(
-        source,
-        output,
-        plan,
-        manifest,
-        geometry_relative,
-    )
-    module = ModuleOperationRequest(
-        source,
-        output,
-        plan.fingerprint,
-        module_provenance_digest(ModuleKind.STITCH, provenance),
-    )
+        provenance = _provenance(
+            source,
+            output,
+            plan,
+            manifest,
+            geometry_relative,
+        )
+        module = ModuleOperationRequest(
+            source,
+            output,
+            plan.fingerprint,
+            module_provenance_digest(ModuleKind.STITCH, provenance),
+        )
+    else:
+        if plan.calibration.project_root != manifest.project_root:
+            raise StitchOperationRefused(
+                "XU_CALIBRATION_PROJECT_MISMATCH",
+                "XU calibration and source must share the exact Project root",
+            )
+        energy_selector = _xu_energy_selector(plan, names)
+        observations = _xu_observations(plan, manifest, energy_selector)
+        try:
+            revalidate_xu_stitch_calibration(plan.calibration)
+            runtime_owner = xu_runtime_session()
+            with runtime_owner as session:
+                effective = resolve_xu_stitch_effective_geometry(
+                    plan.calibration,
+                    session,
+                ).projection
+        except (
+            XuRuntimeUnsupported,
+            XuStitchCalibrationRefused,
+            XuStitchScienceRefused,
+        ) as error:
+            raise StitchOperationRefused(error.code) from error
+        if (
+            runtime_owner.execution_record is None
+            or effective.fingerprint != plan.effective_geometry.fingerprint
+            or effective.to_provenance()
+            != plan.effective_geometry.to_provenance()
+        ):
+            raise StitchOperationRefused(
+                "XU_EFFECTIVE_GEOMETRY_MISMATCH",
+                "effective XU geometry differs from the frozen operation plan",
+            )
+        provenance = _xu_provenance(
+            source,
+            output,
+            plan,
+            manifest,
+            observations,
+            energy_selector,
+        )
+        module = xu_stitch_module_request(
+            source,
+            output,
+            plan.fingerprint,
+            module_provenance_digest(ModuleKind.STITCH, provenance),
+        )
     canonical = module_artifact_request(module, provenance).provenance_json
     return StitchOperationRequest(
         module,
@@ -1832,6 +2156,8 @@ class StitchOperationExecution:
         self._output: ModuleArtifactOutput | None = None
         self._result: StitchOperationResult | None = None
         self._verification_terminal: ModuleTerminalResult | None = None
+        self._execution_attestation_json: str | None = None
+        self._execution_attestation_digest: str | None = None
         self._revision = 0
         self._progress_callback: Callable[[ModuleProgress], object] | None = None
 
@@ -1944,12 +2270,243 @@ class StitchOperationExecution:
             raise StitchOperationVerificationError(
                 self, "strict Stitch provenance no longer matches its request"
             )
+        if type(self.request.plan) is XuStitchOperationPlan:
+            if (
+                payload.schema_version != 2
+                or payload.execution_attestation_json
+                != self._execution_attestation_json
+                or payload.execution_attestation_digest
+                != self._execution_attestation_digest
+                or terminal.commit.execution_attestation_digest
+                != self._execution_attestation_digest
+            ):
+                self._verification_terminal = terminal
+                self._state = "verification_failed"
+                raise StitchOperationVerificationError(
+                    self,
+                    "strict XU Stitch attestation no longer matches execution",
+                )
+        elif (
+            payload.schema_version != 1
+            or payload.execution_attestation_json is not None
+            or payload.execution_attestation_digest is not None
+            or terminal.commit.execution_attestation_digest is not None
+        ):
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise StitchOperationVerificationError(
+                self,
+                "strict MultiGeometry Stitch unexpectedly changed artifact version",
+            )
         self._emit("reload", total, total)
         value = StitchOperationResult(self.request, terminal, payload)
         self._result = value
         self._verification_terminal = terminal
         self._state = "done"
         return value
+
+    def _run_xu(
+        self,
+        *,
+        cancel_token: threading.Event | None,
+    ) -> StitchOperationResult:
+        plan = self.request.plan
+        if type(plan) is not XuStitchOperationPlan:
+            raise TypeError("XU execution requires an exact XU Stitch plan")
+        labels = self.request.module.source.selected_labels
+        total = len(labels) + 4
+        self._emit("calibration", 0, total)
+        if cancel_token is not None and cancel_token.is_set():
+            return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+        provenance = self.request.provenance
+        energy_projection = provenance["observations"]["source_energy_selector"]
+        energy_key = (
+            None
+            if energy_projection is None
+            else energy_projection["name"]
+        )
+        try:
+            revalidate_xu_stitch_calibration(plan.calibration)
+            self._emit("calibration", 1, total)
+            with requalified_analysis_source(
+                self.request.module.source.analysis,
+                cancel_token=cancel_token,
+            ) as source:
+
+                def science_progress(done: int, _inner_total: int) -> None:
+                    self._emit("science", 1 + done, total)
+
+                scientific = run_xu_hist_stitch_1d(
+                    plan.calibration,
+                    source,
+                    frame_indices=labels,
+                    q_min_A_inverse=plan.q_min_A_inverse,
+                    q_max_A_inverse=plan.q_max_A_inverse,
+                    npt=plan.npt_1d,
+                    monitor_key=(
+                        None
+                        if plan.monitor_selector is None
+                        else plan.monitor_selector.name
+                    ),
+                    source_energy_key=energy_key,
+                    max_frame_bytes=plan.max_frame_bytes,
+                    cancel_token=cancel_token,
+                    progress_callback=science_progress,
+                )
+            revalidate_xu_stitch_calibration(plan.calibration)
+        except XuStitchCancelled:
+            return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+        except AnalysisSourceLeaseRefused as error:
+            if error.code == "CANCELLED":
+                return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+            return self._terminal(ModuleDisposition.REFUSED, error.code)
+        except (
+            XuRuntimeUnsupported,
+            XuStitchCalibrationRefused,
+            XuStitchScienceRefused,
+        ) as error:
+            return self._terminal(ModuleDisposition.REFUSED, error.code)
+        except BaseException as error:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "SCIENCE_FAILED",
+                _failure_diagnostic(error),
+            )
+        if cancel_token is not None and cancel_token.is_set():
+            return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+        expected_observations = {
+            name: provenance["observations"][name]
+            for name in scientific.observations.to_provenance()
+        }
+        if (
+            scientific.effective_geometry.fingerprint
+            != plan.effective_geometry.fingerprint
+            or scientific.effective_geometry.to_provenance()
+            != plan.effective_geometry.to_provenance()
+            or scientific.observations.to_provenance()
+            != expected_observations
+            or scientific.selected_frame_count != len(labels)
+            or scientific.release_check_frame_count != len(labels)
+        ):
+            return self._terminal(
+                ModuleDisposition.REFUSED,
+                "XU_EXECUTION_INTENT_MISMATCH",
+            )
+        payload = scientific.payload
+        diagnostics = scientific.diagnostics
+        try:
+            result_projection = project_analysis_artifact_result(
+                kind=AnalysisArtifactKind.STITCH_1D,
+                axes=(("q", payload.radial),),
+                axis_units=(("q", payload.unit),),
+                intensity=payload.intensity,
+                sigma=payload.sigma,
+                coverage=diagnostics.coverage,
+                normalization=diagnostics.normalization,
+            )
+        except AnalysisArtifactProjectionInvalid:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "STITCH_RESULT_STORAGE_PROJECTION_INVALID",
+            )
+        attestation = {
+            "schema_version": "analysis-execution-attestation-v1",
+            "module_request_fingerprint": self.request.module.fingerprint,
+            "result_projection_policy": result_projection.policy,
+            "result_fingerprint": result_projection.result_fingerprint,
+            "selected_frame_count": scientific.selected_frame_count,
+            "release_check_frame_count": scientific.release_check_frame_count,
+            "release_check_passed": True,
+            "q_root_policy": "shared_ultimate_ndarray_root_weakref_v1",
+            "xu_runtime": scientific.runtime.to_attestation(),
+        }
+        attestation_digest = analysis_execution_attestation_digest(
+            self.request.module.output.kind,
+            attestation,
+            request_fingerprint=self.request.module.fingerprint,
+        )
+        try:
+            bound = module_artifact_request(
+                self.request.module,
+                provenance,
+                execution_attestation=attestation,
+                execution_attestation_digest=attestation_digest,
+            )
+            self._execution_attestation_json = bound.execution_attestation_json
+            self._execution_attestation_digest = attestation_digest
+            self._emit("projection", total - 2, total)
+            self._output = admit_module_artifact(
+                self.request.module,
+                provenance,
+                execution_attestation=attestation,
+                execution_attestation_digest=attestation_digest,
+                cancel_token=cancel_token,
+                coordinator=self.coordinator,
+            )
+        except ModuleArtifactRefused as error:
+            disposition = (
+                ModuleDisposition.CANCELLED
+                if error.code == "CANCELLED"
+                else ModuleDisposition.REFUSED
+            )
+            return self._terminal(disposition, error.code)
+        except FileExistsError:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+        except BaseException as error:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "OUTPUT_ADMISSION_FAILED",
+                _failure_diagnostic(error),
+            )
+
+        def require_current_effective_geometry() -> None:
+            try:
+                revalidate_xu_stitch_calibration(plan.calibration)
+                runtime_owner = xu_runtime_session()
+                with runtime_owner as session:
+                    current = resolve_xu_stitch_effective_geometry(
+                        plan.calibration,
+                        session,
+                    ).projection
+                if (
+                    runtime_owner.execution_record is None
+                    or current.fingerprint != plan.effective_geometry.fingerprint
+                    or current.to_provenance()
+                    != plan.effective_geometry.to_provenance()
+                ):
+                    raise ModuleArtifactRefused(
+                        "XU_EFFECTIVE_GEOMETRY_MISMATCH"
+                    )
+            except ModuleArtifactRefused:
+                raise
+            except (
+                XuRuntimeUnsupported,
+                XuStitchCalibrationRefused,
+                XuStitchScienceRefused,
+            ) as error:
+                raise ModuleArtifactRefused(error.code) from error
+
+        def writer(entry) -> None:
+            revalidate_xu_stitch_calibration(plan.calibration)
+            write_stitched(
+                entry,
+                result_projection=result_projection,
+                provenance=bound.provenance_json,
+                bounded_artifact=True,
+            )
+            revalidate_xu_stitch_calibration(plan.calibration)
+
+        try:
+            terminal = self._output.publish(
+                writer,
+                cancel_token=cancel_token,
+                prepublish_check=require_current_effective_geometry,
+            )
+        except AnalysisArtifactCleanupPending as error:
+            self._state = "cleanup_pending"
+            raise StitchOperationCleanupPending(self) from error
+        self._emit("publish", total - 1, total)
+        return self._strict_result(terminal, total=total)
 
     def run(
         self,
@@ -1965,6 +2522,8 @@ class StitchOperationExecution:
             raise TypeError("Stitch progress callback must be callable")
         self._state = "running"
         self._progress_callback = progress_callback
+        if type(self.request.plan) is XuStitchOperationPlan:
+            return self._run_xu(cancel_token=cancel_token)
         labels = self.request.module.source.selected_labels
         science_total = len(labels) + 1
         total = science_total + 3
@@ -2196,6 +2755,7 @@ __all__ = [
     "StitchOperationRequest",
     "StitchOperationResult",
     "StitchOperationVerificationError",
+    "XuStitchOperationPlan",
     "capture_stitch_geometry",
     "prepare_stitch_operation",
     "run_stitch_operation",

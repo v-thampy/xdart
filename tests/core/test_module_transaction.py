@@ -248,6 +248,8 @@ def test_module_values_freeze_content_but_keep_runtime_authority_exact(tmp_path)
         copy.copy(request)
     with pytest.raises(TypeError, match="not copyable"):
         copy.deepcopy(request)
+    with pytest.raises(TypeError, match="not replaceable"):
+        copy.replace(request)
     with pytest.raises(TypeError, match="not serializable"):
         pickle.dumps(request)
 
@@ -668,13 +670,27 @@ def test_module_v2_commit_binds_separate_attestation_and_same_request(tmp_path):
         request.provenance_digest,
     )
     assert clone is not request
-    assert clone.fingerprint == request.fingerprint
+    assert clone.fingerprint != request.fingerprint
+    replaced = replace(request)
+    assert replaced is not request
+    assert replaced._xu_stitch_v2_bound is False
+    assert replaced.fingerprint == clone.fingerprint
     with pytest.raises(
         ModuleArtifactRefused,
         match="XU_INTENT_PROVENANCE_MISMATCH",
     ):
         module_artifact_request(
             clone,
+            provenance,
+            execution_attestation=attestation,
+            execution_attestation_digest=digest,
+        )
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="XU_INTENT_PROVENANCE_MISMATCH",
+    ):
+        module_artifact_request(
+            replaced,
             provenance,
             execution_attestation=attestation,
             execution_attestation_digest=digest,

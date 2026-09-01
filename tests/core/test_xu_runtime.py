@@ -8,9 +8,19 @@ import pytest
 from xrd_tools.core.geometry.xu_runtime import (
     XU_RUNTIME_LOCK,
     XuRuntimeExecutionRecord,
+    XuRuntimeRequirements,
+    XuRuntimeUnsupported,
     xu_runtime_availability,
     xu_runtime_session,
 )
+
+
+def test_xu_runtime_requirements_are_the_exact_validated_platform_contract():
+    assert XuRuntimeRequirements().distribution_version == "1.7.12"
+    with pytest.raises(TypeError, match="requirements are invalid"):
+        XuRuntimeRequirements(distribution_version="future")
+    with pytest.raises(TypeError, match="requirements are invalid"):
+        XuRuntimeRequirements(platform_machine="x86_64")
 
 
 def test_xu_runtime_availability_is_engine_light(monkeypatch):
@@ -28,6 +38,35 @@ def test_xu_runtime_availability_is_engine_light(monkeypatch):
     assert availability.available is True
     assert availability.code == "OK"
     assert imported == []
+
+
+def test_xu_runtime_availability_normalizes_metadata_failure(monkeypatch):
+    import importlib.metadata
+
+    def fail(_name):
+        raise RuntimeError("metadata backend failed")
+
+    monkeypatch.setattr(importlib.metadata, "version", fail)
+    availability = xu_runtime_availability()
+    assert availability.available is False
+    assert availability.code == "XU_RUNTIME_UNSUPPORTED"
+
+
+def test_xu_runtime_session_normalizes_import_failure_and_releases_lock(monkeypatch):
+    real_import = __import__
+
+    def fail_xu(name, *args, **kwargs):
+        if name == "xrayutilities":
+            raise RuntimeError("import backend failed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fail_xu)
+    with pytest.raises(XuRuntimeUnsupported) as raised:
+        with xu_runtime_session():
+            pass
+    assert raised.value.code == "XU_RUNTIME_UNSUPPORTED"
+    assert XU_RUNTIME_LOCK.acquire(timeout=1)
+    XU_RUNTIME_LOCK.release()
 
 
 def test_xu_runtime_sets_one_and_restores_on_success_and_error():

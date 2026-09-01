@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -37,6 +39,7 @@ class _OneFrameSource:
             "monitor": monitor,
         }
         self.loads = 0
+        self.frame_indices = (7,)
 
     def metadata_for(self, label):
         assert label == 7
@@ -56,6 +59,8 @@ def test_xu_effective_geometry_and_q_provider_use_one_shared_root(tmp_path):
         assert geometry.projection.shape == (195, 1475)
         assert geometry.projection.mask_count == 2730
         assert geometry.projection.energy_eV == 17000.018
+        with pytest.raises(TypeError, match="invalid"):
+            replace(geometry, hxrd=object())
         provider = XuPowderQProvider(
             geometry,
             receipt.projection.value["acquisition"],
@@ -88,6 +93,10 @@ def test_xu_hist_science_releases_each_frame_and_restores_runtime(tmp_path):
     assert result.selected_frame_count == 1
     assert result.release_check_frame_count == 1
     assert result.runtime.restore_passed is True
+    assert result.observations.source_del_range_deg == (14.0, 14.0)
+    assert result.observations.source_nu_range_deg == (-10.0, -10.0)
+    assert result.observations.source_energy_range_eV is None
+    assert result.observations.control_domain_extrapolation_frame_count == 0
     assert result.payload.unit == "q_A^-1"
     assert result.payload.radial.shape == (64,)
     assert result.diagnostics.coverage.shape == (64,)
@@ -136,4 +145,63 @@ def test_xu_hist_refuses_invalid_monitor_before_loading_frame(tmp_path):
             max_frame_bytes=4 * 1024 * 1024,
         )
     assert raised.value.code == "INVALID_MONITOR_VALUE"
+    assert source.loads == 0
+
+
+def test_xu_hist_checks_optional_energy_and_control_domain_before_frame_load(tmp_path):
+    receipt = _receipt(tmp_path)
+    source = _OneFrameSource(del_value=45.0, nu_value=29.0)
+    source.metadata["energy"] = 17000.018
+    result = run_xu_hist_stitch_1d(
+        receipt,
+        source,
+        frame_indices=(7,),
+        q_min_A_inverse=1.0,
+        q_max_A_inverse=5.2,
+        npt=64,
+        monitor_key="monitor",
+        source_energy_key="energy",
+        max_frame_bytes=4 * 1024 * 1024,
+    )
+    assert result.observations.source_energy_range_eV == (17000.018, 17000.018)
+    assert result.observations.control_domain_extrapolation_frame_count == 1
+    assert result.observations.warnings == (
+        "XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",
+    )
+
+    conflict = _OneFrameSource()
+    conflict.metadata["energy"] = 18000.0
+    with pytest.raises(XuStitchScienceRefused) as raised:
+        run_xu_hist_stitch_1d(
+            receipt,
+            conflict,
+            frame_indices=(7,),
+            q_min_A_inverse=1.0,
+            q_max_A_inverse=5.2,
+            npt=64,
+            monitor_key="monitor",
+            source_energy_key="energy",
+            max_frame_bytes=4 * 1024 * 1024,
+        )
+    assert raised.value.code == "XU_SOURCE_ENERGY_CONFLICT"
+    assert conflict.loads == 0
+
+
+def test_xu_hist_refuses_duplicate_reordered_or_foreign_source_selection(tmp_path):
+    receipt = _receipt(tmp_path)
+    source = _OneFrameSource()
+    source.frame_indices = (7, 8)
+    for labels in ((7, 7), (8, 7), (9,)):
+        with pytest.raises(XuStitchScienceRefused) as raised:
+            run_xu_hist_stitch_1d(
+                receipt,
+                source,
+                frame_indices=labels,
+                q_min_A_inverse=1.0,
+                q_max_A_inverse=5.2,
+                npt=64,
+                monitor_key="monitor",
+                max_frame_bytes=4 * 1024 * 1024,
+            )
+        assert raised.value.code == "SOURCE_SELECTION_IDENTITY_MISMATCH"
     assert source.loads == 0

@@ -365,6 +365,14 @@ class ModuleOperationRequest:
                     self.output.fingerprint,
                     self.plan_fingerprint,
                     self.provenance_digest,
+                )
+                if not xu_bound
+                else (
+                    "xu-stitch-v2-bound",
+                    self.source.fingerprint,
+                    self.output.fingerprint,
+                    self.plan_fingerprint,
+                    self.provenance_digest,
                 ),
             ),
         )
@@ -378,6 +386,9 @@ class ModuleOperationRequest:
 
     def __deepcopy__(self, _memo):
         raise TypeError("module operation request is not copyable")
+
+    def __replace__(self, **_changes):
+        raise TypeError("module operation request is not replaceable")
 
     def __reduce__(self):
         raise TypeError("module operation request is not serializable")
