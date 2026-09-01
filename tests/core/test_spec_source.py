@@ -6,7 +6,19 @@ import pytest
 
 pytest.importorskip("silx")
 
-from xrd_tools.io.spec import get_spec_scanned_axes, is_spec_file
+from xrd_tools.core.scan import SourceSpec
+from xrd_tools.analysis.scan_operations import (
+    AnalysisDisposition,
+    MetadataTablePlan,
+    MetadataTableRequalificationPlan,
+    run_metadata_table,
+    run_metadata_table_requalification,
+)
+from xrd_tools.io.spec import (
+    get_spec_scanned_axes,
+    is_spec_file,
+    read_spec_scan_columns,
+)
 from xrd_tools.sources import (SourceKind, SpecSource, guess_source_kind,
                                open_source)
 
@@ -159,3 +171,152 @@ def test_spec_frame_for_carries_raw_source_pointer(tmp_path):
     # metadata-only SPEC (no image_dir) → no raw → source_path stays None
     bare = SpecSource(p, scan=5)
     assert bare.frame_for(1).source_path is None
+
+
+def test_spec_occurrence_projection_preserves_duplicate_columns_and_fixed_motors(
+    tmp_path,
+):
+    path = tmp_path / "duplicate_columns"
+    path.write_text(
+        """#F duplicate_columns
+#E 1
+#O0 eta  chi  mu
+
+#S 1 ascan eta 0 1 1 1
+#P0 0 5 6
+#N 4
+#L eta  Seconds  Seconds  foil status
+0 1 10 101
+1 2 20 110
+"""
+    )
+
+    physical, fixed, npts = read_spec_scan_columns(path, "1.1")
+    assert npts == 2
+    assert [name for name, _values in physical] == [
+        "eta",
+        "Seconds",
+        "Seconds",
+        "foil status",
+    ]
+    np.testing.assert_allclose(physical[1][1], [1, 2])
+    np.testing.assert_allclose(physical[2][1], [10, 20])
+    assert fixed == (("eta", 0.0), ("chi", 5.0), ("mu", 6.0))
+
+    source = SpecSource(path, scan=1)
+    occurrence_names = [
+        name for name, _values in source.physical_metadata_columns
+    ]
+    assert occurrence_names == [
+        "eta",
+        "Seconds",
+        "Seconds",
+        "foil status",
+    ]
+    assert source.fixed_motor_positions == fixed
+    assert "chi" not in source.motors
+    np.testing.assert_allclose(source.motor_series("eta"), [0, 1])
+    np.testing.assert_allclose(source.motor_series("chi"), [5, 5])
+    np.testing.assert_allclose(source.motor_series("mu"), [6, 6])
+
+    table = run_metadata_table(
+        MetadataTablePlan(
+            path,
+            kind=SourceKind.SPEC,
+            scan="1",
+            column_projection=(
+                ("eta", 0),
+                ("Seconds", 1),
+                ("foil status", 0),
+                ("chi", 0),
+                ("mu", 0),
+            ),
+        )
+    )
+    assert table.disposition is AnalysisDisposition.COMPLETED
+    assert [column.name for column in table.columns] == [
+        "frame_index",
+        "eta",
+        "Seconds",
+        "Seconds",
+        "foil status",
+        "chi",
+        "mu",
+    ]
+    seconds = [
+        column.numeric for column in table.columns if column.name == "Seconds"
+    ]
+    np.testing.assert_allclose(seconds[0], [1, 2])
+    np.testing.assert_allclose(seconds[1], [10, 20])
+
+    requalified = run_metadata_table_requalification(
+        MetadataTableRequalificationPlan(table.receipt, table.table_fingerprint)
+    )
+    assert requalified.disposition is AnalysisDisposition.COMPLETED
+    assert requalified.table_fingerprint == table.table_fingerprint
+
+    missing_occurrence = run_metadata_table(
+        MetadataTablePlan(
+            path,
+            kind=SourceKind.SPEC,
+            scan="1",
+            column_projection=(("Seconds", 2),),
+        )
+    )
+    assert missing_occurrence.disposition is AnalysisDisposition.REFUSED
+    assert missing_occurrence.code == "METADATA_COLUMN_PROJECTION_INVALID"
+
+
+@pytest.mark.parametrize(
+    "projection",
+    (
+        (("Seconds", 1), ("Seconds", 1)),
+        (("Seconds", True),),
+        ((" Seconds", 0),),
+        (["Seconds", 0],),
+        [("Seconds", 0)],
+        None,
+    ),
+)
+def test_embedded_spec_projection_rejects_noncanonical_selectors(
+    tmp_path,
+    projection,
+):
+    source = SourceSpec(
+        tmp_path / "source",
+        SourceKind.SPEC,
+        options={
+            "scan": "1.1",
+            "metadata_column_projection": projection,
+        },
+    )
+    with pytest.raises(ValueError):
+        MetadataTablePlan(source)
+
+
+def test_embedded_spec_projection_respects_metadata_table_column_bound(
+    tmp_path,
+):
+    allowed = tuple((f"motor_{index}", 0) for index in range(127))
+    source = SourceSpec(
+        tmp_path / "source",
+        SourceKind.SPEC,
+        options={
+            "scan": "1.1",
+            "metadata_column_projection": allowed,
+        },
+    )
+    plan = MetadataTablePlan(source)
+    assert dict(plan.source.options)["metadata_column_projection"] == allowed
+
+    too_many = tuple((f"motor_{index}", 0) for index in range(128))
+    source = SourceSpec(
+        tmp_path / "source",
+        SourceKind.SPEC,
+        options={
+            "scan": "1.1",
+            "metadata_column_projection": too_many,
+        },
+    )
+    with pytest.raises(ValueError, match="exceeds the table column bound"):
+        MetadataTablePlan(source)

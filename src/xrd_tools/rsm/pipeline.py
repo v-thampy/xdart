@@ -300,6 +300,21 @@ class _ScanLike(Protocol):
 _LEGACY_DEFAULT_WAVELENGTH_M = 1.0e-10
 
 
+def _scan_frame_labels(scan: _ScanLike) -> tuple[int, ...]:
+    """Resolve the supported frame-label views once and reject ambiguity."""
+
+    indices = getattr(scan, "frame_indices", None)
+    if indices is None:
+        frames = getattr(scan, "frames", None)
+        indices = None if frames is None else getattr(frames, "index", None)
+    if indices is None:
+        raise ValueError("scan has no frame index")
+    labels = tuple(int(label) for label in indices)
+    if len(set(labels)) != len(labels):
+        raise ValueError("scan frame labels are not unique")
+    return labels
+
+
 def _is_legacy_default_wavelength(value: Any) -> bool:
     try:
         wl = float(value)
@@ -391,6 +406,31 @@ def _angles_for_indices(
     each of length ``len(indices)`` (or len(scan_data) if indices is None).
     Raises :class:`KeyError` if any motor is missing from the DataFrame.
     """
+    motor_series = getattr(scan, "motor_series", None)
+    if callable(motor_series):
+        full: list[np.ndarray] = []
+        missing: list[str] = []
+        for motor in diff_motors:
+            try:
+                values = np.asarray(motor_series(motor), dtype=float)
+            except KeyError:
+                missing.append(motor)
+                continue
+            full.append(values)
+        if missing:
+            raise KeyError(f"motors {missing!r} are unavailable from motor_series")
+        labels = _scan_frame_labels(scan)
+        if any(values.ndim != 1 or len(values) != len(labels) for values in full):
+            raise ValueError("motor_series returned an invalid per-frame array")
+        if indices is None:
+            return full
+        row_of = {label: row for row, label in enumerate(labels)}
+        try:
+            rows = [row_of[int(index)] for index in indices]
+        except KeyError as error:
+            raise KeyError("requested frame is outside motor_series") from error
+        return [values[rows] for values in full]
+
     scan_data = getattr(scan, "scan_data", None)
     if scan_data is None:
         metadata = getattr(scan, "metadata", {}) or {}
@@ -418,13 +458,29 @@ def _angles_for_indices(
             np.asarray(scan_data.loc[indices, m].values, dtype=float)
             for m in diff_motors
         ]
-    labels = [int(idx) for idx in getattr(scan, "frame_indices")]
+    labels = _scan_frame_labels(scan)
     row_of = {label: row for row, label in enumerate(labels)}
     rows = [row_of[int(idx)] for idx in indices]
     return [
         np.asarray(scan_data[m], dtype=float)[rows]
         for m in diff_motors
     ]
+
+
+def _slice_angle_arrays(
+    angles: list[np.ndarray],
+    row_of: dict[int, int],
+    indices: list[int],
+) -> list[np.ndarray]:
+    """Slice already-resolved full-scan angles by exact frame labels."""
+
+    if any(values.ndim != 1 or len(values) != len(row_of) for values in angles):
+        raise ValueError("full-scan angle arrays are invalid")
+    try:
+        rows = [row_of[int(index)] for index in indices]
+    except KeyError as error:
+        raise KeyError("requested frame is outside full-scan angles") from error
+    return [values[rows] for values in angles]
 
 
 def _iter_scan_chunks(
@@ -455,10 +511,7 @@ def _iter_scan_chunks(
         yield from source_iter(chunk_size)
         return
 
-    indices = getattr(scan, "frame_indices", None)
-    if indices is None:
-        indices = scan.frames.index
-    indices = list(indices)
+    indices = list(_scan_frame_labels(scan))
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
 
@@ -559,6 +612,9 @@ def process_scan_from_nexus(
     if energy is None:
         energy = _energy_from_scan(scan)
     angles_full = _angles_for_indices(scan, diff_motors)
+    angle_rows = {
+        label: row for row, label in enumerate(_scan_frame_labels(scan))
+    }
 
     from xrd_tools.rsm.corrections import rsm_correction_weight  # noqa: PLC0415
     weight = rsm_correction_weight(mapper.header, corrections, gi=gi, roi=roi)
@@ -577,7 +633,7 @@ def process_scan_from_nexus(
         sg.set_bounds(*q_bounds)
 
     for img_chunk, chunk_indices in _iter_scan_chunks(scan, chunk_size):
-        angles_chunk = _angles_for_indices(scan, diff_motors, chunk_indices)
+        angles_chunk = _slice_angle_arrays(angles_full, angle_rows, chunk_indices)
         sg.add(
             img_chunk,
             angles_chunk,
@@ -637,11 +693,16 @@ def grid_scans_streaming(
         raise ValueError("scan_inputs must not be empty")
 
     # Resolve per-scan energies up-front so the scout pass has them.
-    resolved: list[tuple[ScanInput, float, list[np.ndarray]]] = []
+    resolved: list[
+        tuple[ScanInput, float, list[np.ndarray], dict[int, int]]
+    ] = []
     for si in scan_inputs:
         e = si.energy if si.energy is not None else _energy_from_scan(si.scan)
         angles_full = _angles_for_indices(si.scan, diff_motors)
-        resolved.append((si, e, angles_full))
+        angle_rows = {
+            label: row for row, label in enumerate(_scan_frame_labels(si.scan))
+        }
+        resolved.append((si, e, angles_full, angle_rows))
 
     sg = StreamingGridder(mapper, bins)
     if q_bounds is None:
@@ -649,7 +710,7 @@ def grid_scans_streaming(
             [
                 (angles_full, energy, si.UB,
                  (mapper.header.Nch1, mapper.header.Nch2))
-                for (si, energy, angles_full) in resolved
+                for (si, energy, angles_full, _angle_rows) in resolved
             ],
             roi=None,  # ROI is per-scan; union across all without it
             pad=scout_pad,
@@ -658,12 +719,12 @@ def grid_scans_streaming(
         sg.set_bounds(*q_bounds)
 
     from xrd_tools.rsm.corrections import rsm_correction_weight  # noqa: PLC0415
-    for si, energy, _full_angles in resolved:
+    for si, energy, full_angles, angle_rows in resolved:
         # the weight is ROI-cropped to match this scan's chunk images
         weight = rsm_correction_weight(mapper.header, corrections, gi=gi, roi=si.roi)
         for img_chunk, chunk_indices in _iter_scan_chunks(si.scan, chunk_size):
-            angles_chunk = _angles_for_indices(
-                si.scan, diff_motors, chunk_indices,
+            angles_chunk = _slice_angle_arrays(
+                full_angles, angle_rows, chunk_indices,
             )
             sg.add(
                 img_chunk,

@@ -61,7 +61,7 @@ class SpecSource(BaseFrameSource):
         from xrd_tools.io.spec import (
             get_spec_scanned_axes,
             list_spec_scans,
-            read_spec_scan_table,
+            read_spec_scan_columns,
         )
 
         self.path = Path(path)
@@ -70,11 +70,21 @@ class SpecSource(BaseFrameSource):
 
         columns: dict[str, np.ndarray] = {}
         motors: dict[str, float] = {}
+        physical_columns: tuple[tuple[str, np.ndarray], ...] = ()
         npts = 0
         if self.scan_key is not None:
-            columns, motors, npts = read_spec_scan_table(self.path, self.scan_key)
+            physical_columns, motor_positions, npts = read_spec_scan_columns(
+                self.path, self.scan_key
+            )
+            # Compatibility mapping: a Mapping cannot carry repeated physical
+            # names, so retain the first occurrence just as silx's
+            # data_column_by_name historically did here.
+            for column_name, values in physical_columns:
+                columns.setdefault(column_name, values)
+            motors = dict(motor_positions)
         self._columns = columns
         self._motors = motors
+        self._physical_columns = physical_columns
         self._scanned_axes = (
             get_spec_scanned_axes(self.path, self.scan_key)
             if self.scan_key is not None else ()
@@ -152,8 +162,42 @@ class SpecSource(BaseFrameSource):
     # ---- FrameSource API ------------------------------------------------
     @property
     def motors(self) -> dict[str, np.ndarray]:
-        """The per-point ``#L`` columns as whole arrays (one value per frame)."""
+        """The legacy name-keyed ``#L`` mapping view."""
+
         return dict(self._columns)
+
+    @property
+    def physical_metadata_columns(self) -> tuple[tuple[str, np.ndarray], ...]:
+        """Ordered physical ``#L`` columns, including repeated names.
+
+        Fixed motors remain scalar in :attr:`fixed_motor_positions`; exact
+        table projection broadcasts only the requested ones, avoiding an eager
+        all-motors allocation for large scans.
+        """
+
+        size = len(self._frame_indices)
+        return tuple(
+            (name, np.asarray(values[:size]))
+            for name, values in self._physical_columns
+        )
+
+    @property
+    def fixed_motor_positions(self) -> tuple[tuple[str, float], ...]:
+        """Ordered scalar ``#O``/``#P`` motor positions."""
+
+        return tuple(self._motors.items())
+
+    def motor_series(self, name: str) -> np.ndarray:
+        """Resolve one motor lazily, preferring its per-point ``#L`` values."""
+
+        if type(name) is not str or not name:
+            raise KeyError(name)
+        size = len(self._frame_indices)
+        if name in self._columns:
+            return np.asarray(self._columns[name][:size])
+        if name in self._motors:
+            return np.full(size, self._motors[name], dtype=float)
+        raise KeyError(name)
 
     @property
     def scanned_axes(self) -> tuple[str, ...]:
@@ -181,6 +225,15 @@ class SpecSource(BaseFrameSource):
             read_image(path, frame=frame, **self._read_image_kwargs),
             dtype=float)
 
+    def raw_locator_for(self, index: int) -> tuple[Path | None, int | None]:
+        """Return one raw member locator without constructing frame metadata."""
+
+        i = int(index)
+        if not self._frame_map:
+            return None, None
+        path, frame_in_file = self._frame_map[i]
+        return path, frame_in_file
+
     def frame_for(self, index: int) -> ScanFrame:
         """Attach the raw-image source pointer (from the in-memory ``_frame_map``)
         so a stitch/RSM built from this source can persist resolvable
@@ -188,9 +241,7 @@ class SpecSource(BaseFrameSource):
         (no ``image_dir``) has no ``_frame_map`` → ``source_path`` stays ``None``
         (correctly — there is no raw image to point at)."""
         i = int(index)
-        path = frame_in_file = None
-        if self._frame_map:
-            path, frame_in_file = self._frame_map[i]
+        path, frame_in_file = self.raw_locator_for(i)
         return ScanFrame(
             index=i,
             metadata=dict(self.metadata_for(i)),

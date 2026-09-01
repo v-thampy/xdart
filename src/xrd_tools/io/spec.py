@@ -56,23 +56,53 @@ def read_spec_scan_table(
     to a length-``npts`` array; ``motors`` maps each ``#O``/``#P`` motor to its
     constant scan-start position.  The complete per-frame metadata for a SPEC
     scan, with no column pre-selection (cf. :func:`get_from_spec_file`)."""
+    physical_columns, motor_positions, npts = read_spec_scan_columns(
+        spec_file, scan_num
+    )
+    columns: dict[str, np.ndarray] = {}
+    for name, values in physical_columns:
+        # This legacy mapping cannot express duplicate physical #L names.
+        # Preserve its historical first-occurrence behavior; occurrence-aware
+        # consumers use read_spec_scan_columns instead.
+        columns.setdefault(name, values)
+    return columns, dict(motor_positions), npts
+
+
+def read_spec_scan_columns(
+    spec_file: Path | str, scan_num: str
+) -> tuple[
+    tuple[tuple[str, np.ndarray], ...],
+    tuple[tuple[str, float], ...],
+    int,
+]:
+    """Read one scan without collapsing physical ``#L`` occurrences.
+
+    The first result is ordered exactly like the physical SPEC table and may
+    therefore contain repeated names (for example two distinct ``Seconds``
+    columns).  The second result retains the ``#O``/``#P`` motor order.  This
+    occurrence-aware form is the source of truth for exact analysis preflight;
+    :func:`read_spec_scan_table` remains the compatibility mapping view.
+    """
+
     scan_data = _get_spec_scan(spec_file, scan_num)
     data = np.asarray(scan_data.data)
-    npts = int(data.shape[1]) if data.ndim == 2 else 0
-    columns: dict[str, np.ndarray] = {}
-    for label in scan_data.labels:
-        try:
-            columns[str(label)] = np.asarray(
-                scan_data.data_column_by_name(label), dtype=float)
-        except Exception:
-            logger.debug("read_spec_scan_table: column %r unreadable", label)
-    motors: dict[str, float] = {}
+    labels = tuple(str(label) for label in scan_data.labels)
+    if data.ndim != 2 or data.shape[0] != len(labels):
+        raise ValueError("SPEC #L labels do not match the physical data table")
+    npts = int(data.shape[1])
+    columns = tuple(
+        (name, np.array(data[index], dtype=float, copy=True))
+        for index, name in enumerate(labels)
+    )
+    motors: list[tuple[str, float]] = []
     for motor in scan_data.motor_names:
         try:
-            motors[str(motor)] = float(scan_data.motor_position_by_name(motor))
+            motors.append(
+                (str(motor), float(scan_data.motor_position_by_name(motor)))
+            )
         except Exception:
-            logger.debug("read_spec_scan_table: motor %r unreadable", motor)
-    return columns, motors, npts
+            logger.debug("read_spec_scan_columns: motor %r unreadable", motor)
+    return columns, tuple(motors), npts
 
 
 def get_scan_path_info(scan: str) -> tuple[str, str]:

@@ -655,6 +655,25 @@ class TestProcessScanData:
         )
         assert calls == ["single_shot"]
 
+    def test_angle_lookup_uses_lazy_motor_series_for_fixed_axes(self) -> None:
+        from xrd_tools.rsm.pipeline import _angles_for_indices
+
+        class _Source:
+            frame_indices = [10, 20, 30]
+            motors = {"mu": np.asarray([-999.0])}
+
+            @staticmethod
+            def motor_series(name):
+                if name == "mu":
+                    return np.asarray([5.0, 5.0, 5.0])
+                if name == "eta":
+                    return np.asarray([1.0, 2.0, 3.0])
+                raise KeyError(name)
+
+        angles = _angles_for_indices(_Source(), ("mu", "eta"), [30, 10])
+        np.testing.assert_allclose(angles[0], [5.0, 5.0])
+        np.testing.assert_allclose(angles[1], [3.0, 1.0])
+
 
 class TestProcessScan:
     @pytest.mark.skip(reason="requires SPEC data and detector images")

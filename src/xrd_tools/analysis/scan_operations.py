@@ -284,6 +284,42 @@ def _tuple_once(value: Any) -> tuple[Any, ...]:
     if type(value) not in {tuple, list}:
         raise InvalidCanonicalValue("value must be an exact tuple or list")
     return tuple(value)
+
+
+def _metadata_column_projection(
+    value: object,
+) -> tuple[tuple[str, int], ...] | None:
+    if value is None:
+        return None
+    if type(value) is not tuple:
+        raise InvalidCanonicalValue(
+            "metadata column projection must be an exact tuple"
+        )
+    if len(value) + 1 > _MAX_TABLE_COLUMNS:
+        raise InvalidCanonicalValue(
+            "metadata column projection exceeds the table column bound"
+        )
+    projection: list[tuple[str, int]] = []
+    for item in value:
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or not item[0]
+            or item[0].strip() != item[0]
+            or type(item[1]) is not int
+            or item[1] < 0
+        ):
+            raise InvalidCanonicalValue(
+                "metadata column projection contains an invalid selector"
+            )
+        projection.append((item[0], item[1]))
+    result = tuple(projection)
+    if len(set(result)) != len(result):
+        raise InvalidCanonicalValue(
+            "metadata column projection contains a duplicate selector"
+        )
+    return result
 def _path_revision(path: Path) -> FileRevision | None:
     try:
         state = Path(path).stat()
@@ -340,9 +376,38 @@ class MetadataTablePlan:
     image_stem: str | None = None
     source_root: str | Path | None = None
     metadata_format: str | None = None
+    column_projection: tuple[tuple[str, int], ...] | None = None
     def __post_init__(self) -> None:
         if isinstance(self.source, SourceSpec):
-            object.__setattr__(self, "source", _freeze_spec(self.source))
+            options = dict(self.source.options)
+            if "metadata_column_projection" in options:
+                if options["metadata_column_projection"] is None:
+                    raise InvalidCanonicalValue(
+                        "embedded metadata column projection cannot be None"
+                    )
+                options["metadata_column_projection"] = (
+                    _metadata_column_projection(
+                        options["metadata_column_projection"]
+                    )
+                )
+            object.__setattr__(
+                self,
+                "source",
+                _freeze_spec(
+                    SourceSpec(
+                        self.source.uri,
+                        self.source.kind,
+                        metadata_uri=self.source.metadata_uri,
+                        entry=self.source.entry,
+                        options=options,
+                    )
+                ),
+            )
+        object.__setattr__(
+            self,
+            "column_projection",
+            _metadata_column_projection(self.column_projection),
+        )
 @dataclass(frozen=True, slots=True)
 class MetadataTableResult:
     disposition: AnalysisDisposition
@@ -531,11 +596,32 @@ def _select(plan: MetadataTablePlan) -> tuple[
     try:
         if type(plan.selection) is not str or plan.selection not in {"exact", "image_series", "directory"} or type(plan.recursive) is not bool:
             raise _Refusal("INVALID_SOURCE_SELECTION")
+        if (
+            plan.column_projection is not None
+            and plan.selection != "exact"
+        ):
+            raise _Refusal("INVALID_SOURCE_SELECTION")
         series_container = False
         if isinstance(plan.source, SourceSpec):
             if plan.selection != "exact" or plan.recursive or any(value is not None for value in (plan.kind, plan.entry, plan.scan, plan.image_dir, plan.image_stem, plan.source_root, plan.metadata_format)):
                 raise _Refusal("INVALID_SOURCE_SELECTION")
             spec = _freeze_spec(plan.source)
+            if plan.column_projection is not None:
+                options = dict(spec.options)
+                existing = options.get("metadata_column_projection")
+                if (
+                    existing is not None
+                    and tuple(existing) != plan.column_projection
+                ):
+                    raise _Refusal("INVALID_SOURCE_SELECTION")
+                options["metadata_column_projection"] = plan.column_projection
+                spec = SourceSpec(
+                    spec.uri,
+                    spec.kind,
+                    metadata_uri=spec.metadata_uri,
+                    entry=spec.entry,
+                    options=options,
+                )
         elif plan.selection == "image_series":
             spec = image_series_spec(plan.source, metadata_format=plan.metadata_format)
             options = dict(spec.options)
@@ -574,10 +660,16 @@ def _select(plan: MetadataTablePlan) -> tuple[
                     "scan": plan.scan, "image_dir": plan.image_dir,
                     "image_stem": plan.image_stem, "source_root": plan.source_root,
                     "metadata_format": plan.metadata_format,
+                    "metadata_column_projection": plan.column_projection,
                 }.items() if value is not None
             }
             spec = SourceSpec(plan.source, kind, entry=plan.entry, options=options)
         kind = coerce_source_kind(spec.kind)
+        if (
+            "metadata_column_projection" in dict(spec.options)
+            and kind is not SourceKind.SPEC
+        ):
+            raise _Refusal("INVALID_SOURCE_SELECTION")
         if kind in {SourceKind.MEMORY, SourceKind.TILED, SourceKind.LIVE, SourceKind.UNKNOWN}:
             raise _Refusal("SOURCE_KIND_UNSUPPORTED")
         if kind is SourceKind.SPEC:
@@ -637,21 +729,140 @@ def _select(plan: MetadataTablePlan) -> tuple[
     except BaseException:
         _close(selected_source); _close(opened)
         raise
+def _metadata_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        if value.dtype.kind not in "biuf":
+            raise _Refusal("INVALID_CANONICAL_VALUE")
+        value = value.item()
+    if type(value) is float and not math.isfinite(value):
+        return None
+    if type(value) not in {type(None), bool, int, float, str, bytes}:
+        raise _Refusal("INVALID_CANONICAL_VALUE")
+    return value
+
+
 def _metadata_row(values: Mapping[str, Any]) -> dict[str, Any]:
     row: dict[str, Any] = {}
     for key, value in values.items():
         if type(key) is not str:
             raise _Refusal("INVALID_CANONICAL_VALUE")
-        if isinstance(value, np.generic):
-            if value.dtype.kind not in "biuf":
-                raise _Refusal("INVALID_CANONICAL_VALUE")
-            value = value.item()
-        if type(value) is float and not math.isfinite(value):
-            value = None
-        elif type(value) not in {type(None), bool, int, float, str, bytes}:
-            raise _Refusal("INVALID_CANONICAL_VALUE")
-        row[key] = value
+        row[key] = _metadata_scalar(value)
     return row
+
+
+def _physical_metadata_catalog(
+    source: Any,
+    labels: tuple[int, ...],
+    projection: object = None,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> tuple[tuple[str, tuple[Any, ...]], ...] | None:
+    """Detach an occurrence-aware source table without collapsing names."""
+
+    raw = getattr(source, "physical_metadata_columns", None)
+    if raw is None:
+        if projection is not None:
+            raise _Refusal("METADATA_COLUMN_PROJECTION_UNSUPPORTED")
+        return None
+    raw = raw() if callable(raw) else raw
+    if type(raw) is not tuple:
+        raise _Refusal("INVALID_CANONICAL_VALUE")
+    fixed = getattr(source, "fixed_motor_positions", ())
+    fixed = fixed() if callable(fixed) else fixed
+    if type(fixed) is not tuple:
+        raise _Refusal("INVALID_CANONICAL_VALUE")
+    physical_names: set[str] = set()
+    combined: list[tuple[str, object, bool]] = []
+    for item in raw:
+        if cancel_token is not None and cancel_token.is_set():
+            raise _Refusal("CANCELLED")
+        if type(item) is not tuple or len(item) != 2 or type(item[0]) is not str:
+            raise _Refusal("INVALID_CANONICAL_VALUE")
+        physical_names.add(item[0])
+        combined.append((item[0], item[1], False))
+    fixed_names: set[str] = set()
+    for item in fixed:
+        if cancel_token is not None and cancel_token.is_set():
+            raise _Refusal("CANCELLED")
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or not item[0]
+            or item[0].strip() != item[0]
+            or type(item[1]) is not float
+            or not math.isfinite(item[1])
+            or item[0] in fixed_names
+        ):
+            raise _Refusal("INVALID_CANONICAL_VALUE")
+        fixed_names.add(item[0])
+        if item[0] not in physical_names:
+            combined.append((item[0], item[1], True))
+    if projection is not None:
+        try:
+            projection = _metadata_column_projection(projection)
+        except InvalidCanonicalValue:
+            raise _Refusal("INVALID_CANONICAL_VALUE")
+        assert projection is not None
+        requested: dict[str, int] = {}
+        for name, occurrence in projection:
+            requested[name] = max(requested.get(name, -1), occurrence)
+        seen: dict[str, int] = {}
+        selected = []
+        for item in combined:
+            occurrence = seen.get(item[0], 0)
+            seen[item[0]] = occurrence + 1
+            if item[0] in requested and occurrence <= requested[item[0]]:
+                selected.append(item)
+        if any(seen.get(name, 0) <= occurrence for name, occurrence in projection):
+            raise _Refusal("METADATA_COLUMN_PROJECTION_INVALID")
+        combined = selected
+    if len(combined) + 1 > _MAX_TABLE_COLUMNS:
+        raise _Refusal("METADATA_COLUMN_LIMIT_EXCEEDED")
+    result: list[tuple[str, tuple[Any, ...]]] = []
+    value_floor_extra = 0
+    for name, source_values, is_fixed in combined:
+        if cancel_token is not None and cancel_token.is_set():
+            raise _Refusal("CANCELLED")
+        if (
+            type(name) is not str
+            or not name
+            or name.strip() != name
+            or (
+                not is_fixed
+                and (
+                    type(source_values) is not np.ndarray
+                    or source_values.ndim != 1
+                    or len(source_values) != len(labels)
+                )
+            )
+        ):
+            raise _Refusal("INVALID_CANONICAL_VALUE")
+        values: list[Any] = []
+        raw_values = (
+            (source_values for _index in labels)
+            if is_fixed
+            else source_values
+        )
+        for row_index, raw_value in enumerate(raw_values):
+            if (
+                cancel_token is not None
+                and row_index % 1024 == 0
+                and cancel_token.is_set()
+            ):
+                raise _Refusal("CANCELLED")
+            value = _metadata_scalar(raw_value)
+            values.append(value)
+            if type(value) not in {int, float}:
+                text = None if value is None else str(value)
+                value_floor_extra += max(
+                    0, _canonical_frame_charge(text) - 8
+                )
+        result.append((name, tuple(values)))
+        floor = len(labels) * (len(result) + 1) * 8 + value_floor_extra
+        if len(_CANONICAL_PREFIX) + floor > _MAX_TABLE_BYTES:
+            raise _Refusal("METADATA_TABLE_LIMIT_EXCEEDED")
+    return tuple(result)
 class _CursorSource:
     def __init__(self, cursor):
         self.cursor = cursor
@@ -704,6 +915,16 @@ def _snapshot(
         )
         if len(labels) > _MAX_TABLE_ROWS:
             raise _Refusal("METADATA_ROW_LIMIT_EXCEEDED")
+        physical_catalog = (
+            _physical_metadata_catalog(
+                source,
+                labels,
+                dict(spec.options).get("metadata_column_projection"),
+                cancel_token=cancel_token,
+            )
+            if actual_kind is SourceKind.SPEC
+            else None
+        )
         column_values: dict[str, list[Any]] = {}
         row_count = 0
         value_floor_extra = 0
@@ -798,11 +1019,21 @@ def _snapshot(
             for label in labels:
                 if cancel_token is not None and cancel_token.is_set():
                     raise _Refusal("CANCELLED")
-                frame = source.frame_for(label)
-                append_row(_metadata_row(frame.metadata))
+                if physical_catalog is None:
+                    frame = source.frame_for(label)
+                    append_row(_metadata_row(frame.metadata))
+                    locator = frame.source_path
+                    source_frame_index = frame.source_frame_index
+                else:
+                    raw_locator = getattr(source, "raw_locator_for", None)
+                    if callable(raw_locator):
+                        locator, source_frame_index = raw_locator(label)
+                    else:
+                        frame = source.frame_for(label)
+                        locator = frame.source_path
+                        source_frame_index = frame.source_frame_index
                 modes.append("provider_only")
                 observed_states.append(None)
-                locator = frame.source_path
                 if locator is not None:
                     candidate = Path(locator).expanduser().resolve(strict=False)
                     if candidate in member_revisions:
@@ -815,7 +1046,7 @@ def _snapshot(
                     revision = None
                 raw_facts.append(
                     (int(label), None if locator is None else str(locator),
-                     frame.source_frame_index, revision)
+                     source_frame_index, revision)
                 )
         else:
             method = source.metadata_for
@@ -833,8 +1064,10 @@ def _snapshot(
                 append_row(_metadata_row(values))
                 modes.append("provider_only")
                 observed_states.append(None)
-        catalog = tuple(
-            (key, tuple(values)) for key, values in column_values.items()
+        catalog = (
+            physical_catalog
+            if physical_catalog is not None
+            else tuple((key, tuple(values)) for key, values in column_values.items())
         )
         post = _path_revision(resolved)
         if before != post:
