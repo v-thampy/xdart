@@ -11,6 +11,7 @@ gets its own AzimuthalIntegrator with the detector angle encoded.
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -177,10 +178,8 @@ def _streaming_multigeometry(
     )
     image_iterator = iter(images)
     integrator_iterator = iter(integrator_factory())
-    signal = normalization_sum = count = variance = None
+    aggregate = None
     radial = azimuthal = None
-    radial_unit = unit
-    azimuthal_unit = "chi_deg"
     for index in range(image_count):
         try:
             image = np.asarray(next(image_iterator), dtype=float)
@@ -247,11 +246,9 @@ def _streaming_multigeometry(
                     method=method,
                 )
                 current_shape = (npt_azim, npt_rad)
-            current_signal = np.asarray(result.sum_signal, dtype=np.float64)
-            current_normalization = np.asarray(
-                result.sum_normalization, dtype=np.float64
-            )
-            current_count = np.asarray(result.count, dtype=np.float64)
+            current_signal = np.asarray(result.sum_signal)
+            current_normalization = np.asarray(result.sum_normalization)
+            current_count = np.asarray(result.count)
             if any(
                 values.shape != current_shape
                 for values in (
@@ -261,23 +258,15 @@ def _streaming_multigeometry(
                 )
             ):
                 raise ValueError("pyFAI returned an unexpected Stitch accumulator shape")
-            if signal is None:
-                signal = np.zeros(current_shape, dtype=np.float64)
-                normalization_sum = np.zeros_like(signal)
-                count = np.zeros_like(signal)
-            signal += current_signal
-            normalization_sum += current_normalization
-            count += current_count
-            if result.sigma is not None:
-                current_variance = np.asarray(result.sum_variance, dtype=np.float64)
-                if current_variance.shape != current_shape:
-                    raise ValueError("pyFAI returned an unexpected Stitch variance shape")
-                if variance is None:
-                    variance = current_variance.copy()
-                else:
-                    variance += current_variance
-            elif variance is not None:
-                raise ValueError("pyFAI returned inconsistent Stitch variance")
+            for value, label in (
+                (result.sum_variance, "variance"),
+                (result.sum_normalization2, "squared normalization"),
+                (result.sigma, "sigma"),
+            ):
+                if value is not None and np.asarray(value).shape != current_shape:
+                    raise ValueError(
+                        f"pyFAI returned an unexpected Stitch {label} shape"
+                    )
             current_radial = np.asarray(result.radial, dtype=float)
             if radial is None:
                 radial = current_radial.copy()
@@ -289,12 +278,16 @@ def _streaming_multigeometry(
                     azimuthal = current_azimuthal.copy()
                 elif not np.array_equal(azimuthal, current_azimuthal):
                     raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
-                radial_unit = str(result.radial_unit)
-                azimuthal_unit = str(result.azimuthal_unit)
-            else:
-                radial_unit = str(result.unit) if result.unit is not None else unit
+            aggregate = (
+                copy.deepcopy(result)
+                if aggregate is None
+                else aggregate.union(result)
+            )
         finally:
             integrator.reset(collect_garbage=False)
+        # Release the detector-sized frame before asking the source for its
+        # successor.  The aggregate retains only pyFAI's O(nbin) result arrays.
+        del image
     try:
         next(image_iterator)
     except StopIteration:
@@ -307,26 +300,9 @@ def _streaming_multigeometry(
         pass
     else:
         raise ValueError("streaming Stitch received more integrators than declared")
-    if any(value is None for value in (signal, normalization_sum, count, radial)):
+    if aggregate is None or radial is None:
         raise ValueError("streaming Stitch produced no result")
-    norm = np.maximum(normalization_sum, np.finfo("float32").tiny)
-    invalid = count <= 0
-    intensity = signal / norm
-    intensity[invalid] = 0.0
-    sigma = None
-    if variance is not None:
-        sigma = np.sqrt(variance) / norm
-        sigma[invalid] = 0.0
-    return (
-        radial,
-        azimuthal,
-        intensity,
-        sigma,
-        count,
-        normalization_sum,
-        radial_unit,
-        azimuthal_unit,
-    )
+    return aggregate
 
 
 def stitch_1d_streaming(
@@ -345,16 +321,7 @@ def stitch_1d_streaming(
 ) -> tuple[IntegrationResult1D, StitchDiagnostics]:
     """Sequential MultiGeometry merge that retains only one detector frame."""
 
-    (
-        radial,
-        _azimuthal,
-        intensity,
-        sigma,
-        coverage,
-        normalization_sum,
-        radial_unit,
-        _azimuthal_unit,
-    ) = _streaming_multigeometry(
+    result = _streaming_multigeometry(
         images,
         image_count,
         integrator_factory,
@@ -371,13 +338,15 @@ def stitch_1d_streaming(
         error_model=error_model,
         polarization_factor=polarization_factor,
     )
+    sigma = result.sigma if result.sigma is not None else None
+    radial_unit = str(result.unit) if result.unit is not None else unit
     payload = IntegrationResult1D(
-        radial=radial,
-        intensity=intensity,
-        sigma=sigma,
+        radial=np.asarray(result.radial, dtype=float),
+        intensity=np.asarray(result.intensity, dtype=float),
+        sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
         unit=radial_unit,
     )
-    diagnostics = StitchDiagnostics(coverage, normalization_sum)
+    diagnostics = StitchDiagnostics(result.count, result.sum_normalization)
     return payload, diagnostics
 
 
@@ -399,16 +368,7 @@ def stitch_2d_streaming(
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
     """Sequential 2-D MultiGeometry merge retaining one detector frame."""
 
-    (
-        radial,
-        azimuthal,
-        intensity,
-        sigma,
-        coverage,
-        normalization_sum,
-        radial_unit,
-        azimuthal_unit,
-    ) = _streaming_multigeometry(
+    result = _streaming_multigeometry(
         images,
         image_count,
         integrator_factory,
@@ -425,17 +385,20 @@ def stitch_2d_streaming(
         error_model=error_model,
         polarization_factor=polarization_factor,
     )
+    sigma = result.sigma if result.sigma is not None else None
+    radial_unit = str(result.radial_unit)
+    azimuthal_unit = str(result.azimuthal_unit)
     payload = IntegrationResult2D(
-        radial=radial,
-        azimuthal=azimuthal,
-        intensity=intensity.T,
-        sigma=None if sigma is None else sigma.T,
+        radial=np.asarray(result.radial, dtype=float),
+        azimuthal=np.asarray(result.azimuthal, dtype=float),
+        intensity=np.asarray(result.intensity, dtype=float).T,
+        sigma=None if sigma is None else np.asarray(sigma, dtype=float).T,
         unit=radial_unit,
         azimuthal_unit=azimuthal_unit,
     )
     diagnostics = StitchDiagnostics(
-        coverage.T,
-        normalization_sum.T,
+        np.asarray(result.count).T,
+        np.asarray(result.sum_normalization).T,
     )
     return payload, diagnostics
 

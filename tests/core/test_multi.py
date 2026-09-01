@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import weakref
 
 import numpy as np
@@ -10,6 +11,7 @@ from pyFAI.detectors import Detector
 
 from xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
 from xrd_tools.integrate.multi import (
+    _streaming_multigeometry,
     create_multigeometry_integrators,
     stitch_1d,
     stitch_1d_streaming,
@@ -232,7 +234,7 @@ def test_one_ai_streaming_matches_multigeometry_raw_accumulators(
     mask = np.zeros((100, 100), dtype=bool)
     mask[8:11, 17:23] = True
     radial_range = (0.1, 6.0)
-    azimuth_range = (-85.0, 85.0) if mode == "2d" else None
+    azimuth_range = (-180.0, 180.0) if mode == "2d" else None
     reference_integrators = _make_small_integrators(poni_fixture, angles)
     reference = MultiGeometry(
         reference_integrators,
@@ -306,6 +308,201 @@ def test_one_ai_streaming_matches_multigeometry_raw_accumulators(
         )
 
 
+@pytest.mark.parametrize("error_model", (None, "poisson", "azimuthal"))
+@pytest.mark.parametrize("mode", ("1d", "2d"))
+def test_streaming_multigeometry_matches_native_union_result(
+    poni_fixture,
+    mode,
+    error_model,
+):
+    """The bounded fold is the exact native pyFAI 2026 union operation."""
+    from pyFAI.multi_geometry import MultiGeometry
+
+    angles = [0.0, 4.0, 9.0]
+    images = _synthetic_images(n=3, shape=(100, 100), seed=191)
+    monitor = np.asarray([1.0, 2.5, 0.75])
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[8:11, 17:23] = True
+    radial_range = (0.1, 6.0)
+    azimuth_range = (-180.0, 180.0) if mode == "2d" else None
+    reference_integrators = _make_small_integrators(poni_fixture, angles)
+    reference = MultiGeometry(
+        reference_integrators,
+        unit="q_A^-1",
+        radial_range=radial_range,
+        azimuth_range=azimuth_range,
+        threadpoolsize=0,
+    )
+    masks = [mask_with_detector(ai, mask) for ai in reference_integrators]
+    common = dict(
+        method="BBox",
+        error_model=error_model,
+        normalization_factor=monitor,
+        lst_mask=masks,
+        correctSolidAngle=False,
+    )
+    if mode == "1d":
+        eager = reference.integrate1d(images, 120, **common)
+        npt_rad = 120
+        npt_azim = 1
+    else:
+        eager = reference.integrate2d(images, 80, 36, **common)
+        npt_rad = 80
+        npt_azim = 36
+
+    streamed = _streaming_multigeometry(
+        images,
+        len(images),
+        lambda: iter(_make_small_integrators(poni_fixture, angles)),
+        mode=mode,
+        npt_rad=npt_rad,
+        npt_azim=npt_azim,
+        unit="q_A^-1",
+        method="BBox",
+        radial_range=radial_range,
+        azimuth_range=azimuth_range,
+        mask=mask,
+        normalization=monitor,
+        correct_solid_angle=False,
+        error_model=error_model,
+        polarization_factor=None,
+    )
+
+    np.testing.assert_array_equal(streamed.radial, eager.radial)
+    if mode == "2d":
+        np.testing.assert_array_equal(streamed.azimuthal, eager.azimuthal)
+    for field in (
+        "intensity",
+        "sum_signal",
+        "sum_normalization",
+        "count",
+        "sigma",
+        "sum_variance",
+        "sum_normalization2",
+        "sem",
+        "std",
+    ):
+        actual = getattr(streamed, field)
+        expected = getattr(eager, field)
+        if expected is None:
+            assert actual is None
+        else:
+            assert actual is not None
+            assert actual.dtype == expected.dtype
+            np.testing.assert_array_equal(actual, expected)
+
+    assert streamed.intensity.dtype == eager.intensity.dtype == np.dtype(np.float32)
+    assert streamed.error_model == eager.error_model
+    if mode == "1d":
+        assert np.isnan(eager.dummy)
+    else:
+        assert eager.dummy == np.float32(0.0)
+    if np.isnan(eager.dummy):
+        assert np.isnan(streamed.dummy)
+    else:
+        assert streamed.dummy == eager.dummy
+    empty = eager.sum_normalization == 0
+    assert np.any(empty)
+    assert np.any(~empty)
+    if np.isnan(eager.dummy):
+        np.testing.assert_array_equal(np.isnan(streamed.intensity), empty)
+    else:
+        np.testing.assert_array_equal(
+            streamed.intensity[empty],
+            np.full(np.count_nonzero(empty), eager.dummy, dtype=eager.intensity.dtype),
+        )
+    if error_model is None:
+        assert streamed.sigma is None
+        assert streamed.sum_variance is None
+        assert streamed.sum_normalization2 is None
+    else:
+        assert streamed.sigma is not None
+        assert streamed.sum_variance is not None
+        assert streamed.sum_normalization2 is not None
+
+
+def test_streaming_multigeometry_preserves_native_mixed_variance_union(
+    poni_fixture,
+    monkeypatch,
+):
+    """A missing variance contributor follows pyFAI's native union contract."""
+    from pyFAI.multi_geometry import MultiGeometry
+
+    angles = [0.0, 4.0]
+    images = _synthetic_images(n=2, shape=(100, 100), seed=291)
+    radial_range = (0.1, 6.0)
+    azimuth_range = (-180.0, 180.0)
+    native_results = []
+    for integrator, image in zip(
+        _make_small_integrators(poni_fixture, angles),
+        images,
+        strict=True,
+    ):
+        native_results.append(
+            MultiGeometry(
+                [integrator],
+                unit="q_A^-1",
+                radial_range=radial_range,
+                azimuth_range=azimuth_range,
+                threadpoolsize=0,
+            ).integrate1d(
+                [image],
+                120,
+                method="BBox",
+                error_model="poisson",
+                correctSolidAngle=False,
+            )
+        )
+
+    # The public streaming API applies one error model to every frame, so make
+    # the otherwise-unreachable mixed upstream state from genuine pyFAI
+    # results.  union() deliberately drops the aggregate raw variance when any
+    # contributor lacks it while preserving pyFAI's own recalculated payload.
+    native_results[1]._set_sum_variance(None)
+    native_results[1]._set_sum_normalization2(None)
+    expected = native_results[0].union(native_results[1])
+    results = iter(native_results)
+    monkeypatch.setattr(
+        MultiGeometry,
+        "integrate1d",
+        lambda _owner, *_args, **_kwargs: next(results),
+    )
+
+    streamed = _streaming_multigeometry(
+        images,
+        len(images),
+        lambda: iter(_make_small_integrators(poni_fixture, angles)),
+        mode="1d",
+        npt_rad=120,
+        npt_azim=1,
+        unit="q_A^-1",
+        method="BBox",
+        radial_range=radial_range,
+        azimuth_range=azimuth_range,
+        mask=None,
+        normalization=None,
+        correct_solid_angle=False,
+        error_model="poisson",
+        polarization_factor=None,
+    )
+
+    assert streamed.sum_variance is None
+    assert streamed.sum_normalization2 is None
+    for field in (
+        "intensity",
+        "sum_signal",
+        "sum_normalization",
+        "count",
+        "sigma",
+        "sem",
+        "std",
+    ):
+        actual = getattr(streamed, field)
+        reference = getattr(expected, field)
+        assert actual.dtype == reference.dtype
+        np.testing.assert_array_equal(actual, reference)
+
+
 def test_one_ai_streaming_uses_bounded_range_scout_and_cache_residency(
     poni_fixture,
     monkeypatch,
@@ -314,8 +511,21 @@ def test_one_ai_streaming_uses_bounded_range_scout_and_cache_residency(
 
     real_integrate = MultiGeometry.integrate1d
     references = []
+    image_references = []
+    released_image_counts = []
     active_cache_counts = []
     factory_calls = []
+
+    def image_stream():
+        for seed in (101, 102, 103):
+            image = _synthetic_images(n=1, shape=(100, 100), seed=seed)[0]
+            image_references.append(weakref.ref(image))
+            yield image
+            del image
+            gc.collect()
+            released = sum(reference() is None for reference in image_references)
+            released_image_counts.append(released)
+            assert released == len(image_references)
 
     def factory():
         factory_calls.append("factory")
@@ -344,7 +554,7 @@ def test_one_ai_streaming_uses_bounded_range_scout_and_cache_residency(
     monkeypatch.setattr(MultiGeometry, "_guess_radial_range", forbidden_guess)
     monkeypatch.setattr(MultiGeometry, "_guess_azimuth_range", forbidden_guess)
     result, diagnostics = stitch_1d_streaming(
-        _synthetic_images(n=3, shape=(100, 100), seed=101),
+        image_stream(),
         3,
         factory,
         npt=120,
@@ -355,6 +565,8 @@ def test_one_ai_streaming_uses_bounded_range_scout_and_cache_residency(
     assert diagnostics.coverage.shape == (120,)
     assert factory_calls == ["factory", "factory"]
     assert active_cache_counts and max(active_cache_counts) == 1
+    assert released_image_counts == [1, 2, 3]
+    assert all(reference() is None for reference in image_references)
 
 
 def test_one_ai_streaming_scout_matches_multigeometry_chi_convention(
