@@ -54,10 +54,13 @@ _MAX_RESULT_ELEMENTS = 64_000_000
 _MAX_READ_BLOCK_BYTES = 8 << 20
 _MAX_ARTIFACT_FILE_BYTES = 1 << 30
 _RESULT_FINGERPRINT_PREFIX = b"xrd_tools.analysis-artifact-result.v1\0"
+_STORED_RESULT_PROJECTION_POLICY = "analysis_artifact_stored_le_f4_v1"
+_STORED_QNAN_F4_BITS = np.uint32(0x7FC00000)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ANALYSIS_RECEIPT_FACTORY = object()
 _ANALYSIS_PAYLOAD_FACTORY = object()
 _ANALYSIS_CANDIDATE_INSPECTION = object()
+_ANALYSIS_PROJECTION_FACTORY = object()
 
 
 class AnalysisArtifactKind(str, Enum):
@@ -85,6 +88,12 @@ class AnalysisArtifactError(RuntimeError):
 
 class AnalysisArtifactInvalid(AnalysisArtifactError):
     pass
+
+
+class AnalysisArtifactProjectionInvalid(AnalysisArtifactError, ValueError):
+    """A scientific result cannot be represented by the stored artifact schema."""
+
+    code = "STITCH_RESULT_STORAGE_PROJECTION_INVALID"
 
 
 class AnalysisArtifactCleanupPending(AnalysisArtifactError):
@@ -273,6 +282,55 @@ class AnalysisArtifactInspection:
     provenance_json: str = field(repr=False)
     provenance_sha256: str
     result_fingerprint: str
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class AnalysisArtifactResultProjection:
+    """The one exact little-endian float32 projection stored in an artifact."""
+
+    kind: AnalysisArtifactKind
+    axes: tuple[tuple[str, np.ndarray], ...]
+    axis_units: tuple[tuple[str, str | None], ...]
+    intensity: np.ndarray
+    sigma: np.ndarray | None
+    coverage: np.ndarray | None
+    normalization: np.ndarray | None
+    result_fingerprint: str
+    policy: str = field(init=False, default=_STORED_RESULT_PROJECTION_POLICY)
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        arrays = tuple(values for _name, values in self.axes) + (
+            self.intensity,
+        ) + (() if self.sigma is None else (self.sigma,)) + (
+            ()
+            if self.coverage is None
+            else (self.coverage, self.normalization)
+        )
+        if (
+            _claim is not _ANALYSIS_PROJECTION_FACTORY
+            or type(self.kind) is not AnalysisArtifactKind
+            or type(self.axes) is not tuple
+            or type(self.axis_units) is not tuple
+            or type(self.intensity) is not np.ndarray
+            or (self.sigma is not None and type(self.sigma) is not np.ndarray)
+            or (self.coverage is None) is not (self.normalization is None)
+            or any(
+                type(values) is not np.ndarray
+                or values.dtype != np.dtype("<f4")
+                or not values.flags.c_contiguous
+                or values.flags.writeable
+                for values in arrays
+            )
+        ):
+            raise TypeError("analysis artifact result projection is invalid")
+        _sha256(self.result_fingerprint, "result fingerprint")
+
+    def __copy__(self):
+        raise TypeError("analysis artifact result projection is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("analysis artifact result projection is not copyable")
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -817,6 +875,191 @@ def _freeze_float32(values: np.ndarray) -> np.ndarray:
     return frozen.reshape(contiguous.shape)
 
 
+def _project_stored_float32(
+    values: object,
+    *,
+    name: str,
+    require_finite: bool,
+    require_nonnegative: bool = False,
+) -> np.ndarray:
+    if (
+        type(values) is not np.ndarray
+        or values.dtype.kind not in "biuf"
+        or values.dtype.fields is not None
+        or values.ndim < 1
+        or values.size < 1
+        or values.size > _MAX_RESULT_ELEMENTS
+    ):
+        raise AnalysisArtifactProjectionInvalid(
+            f"{name} is not an exact bounded real ndarray"
+        )
+    source = np.asarray(values)
+    if np.isinf(source).any() or (require_finite and not np.isfinite(source).all()):
+        raise AnalysisArtifactProjectionInvalid(f"{name} contains a nonfinite value")
+    if require_nonnegative and np.any(source < 0):
+        raise AnalysisArtifactProjectionInvalid(f"{name} contains a negative value")
+    with np.errstate(over="ignore", invalid="ignore"):
+        projected = np.array(source, dtype=np.dtype("<f4"), order="C", copy=True)
+    if np.isinf(projected).any() or (
+        require_finite and not np.isfinite(projected).all()
+    ):
+        raise AnalysisArtifactProjectionInvalid(
+            f"{name} overflows the stored float32 representation"
+        )
+    if not require_finite:
+        if not np.isfinite(projected).any():
+            raise AnalysisArtifactProjectionInvalid(f"{name} has no finite result")
+        projected.view(np.uint32)[np.isnan(projected)] = _STORED_QNAN_F4_BITS
+    projected.setflags(write=False)
+    return projected
+
+
+def project_analysis_artifact_result(
+    *,
+    kind: AnalysisArtifactKind,
+    axes: tuple[tuple[str, np.ndarray], ...],
+    axis_units: tuple[tuple[str, str | None], ...],
+    intensity: np.ndarray,
+    sigma: np.ndarray | None,
+    coverage: np.ndarray | None,
+    normalization: np.ndarray | None,
+) -> AnalysisArtifactResultProjection:
+    """Project one result exactly once to the bytes stored by the artifact.
+
+    The function deliberately retains the v1 result-fingerprint framing.  It
+    is shared by runners, writers, strict inspection, and payload hydration so
+    a pre-publication fingerprint cannot describe different bytes from those
+    admitted after publication.
+    """
+
+    if type(kind) is not AnalysisArtifactKind:
+        raise TypeError("analysis result kind must be exact AnalysisArtifactKind")
+    expected_axis_names = {
+        AnalysisArtifactKind.STITCH_1D: ("q",),
+        AnalysisArtifactKind.STITCH_2D: ("q", "chi"),
+        AnalysisArtifactKind.RSM: ("h", "k", "l"),
+    }[kind]
+    if (
+        type(axes) is not tuple
+        or len(axes) != len(expected_axis_names)
+        or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or item[0] != expected_axis_names[index]
+            or type(item[1]) is not np.ndarray
+            for index, item in enumerate(axes)
+        )
+        or type(axis_units) is not tuple
+        or len(axis_units) != len(expected_axis_names)
+        or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or item[0] != expected_axis_names[index]
+            or (
+                kind in {
+                    AnalysisArtifactKind.STITCH_1D,
+                    AnalysisArtifactKind.STITCH_2D,
+                }
+                and (type(item[1]) is not str or not item[1])
+            )
+            or (kind is AnalysisArtifactKind.RSM and item[1] is not None)
+            for index, item in enumerate(axis_units)
+        )
+        or (coverage is None) is not (normalization is None)
+        or (
+            kind is AnalysisArtifactKind.RSM
+            and (coverage is not None or sigma is not None)
+        )
+    ):
+        raise AnalysisArtifactProjectionInvalid(
+            "analysis result axes, units, or optional channels are invalid"
+        )
+    projected_axes: list[tuple[str, np.ndarray]] = []
+    for name, values in axes:
+        projected = _project_stored_float32(
+            values,
+            name=name,
+            require_finite=True,
+        )
+        if projected.ndim != 1 or (
+            projected.size > 1
+            and not np.all(np.diff(projected.astype(np.float64)) > 0)
+        ):
+            raise AnalysisArtifactProjectionInvalid(
+                f"{name} is not strictly increasing after float32 projection"
+            )
+        projected_axes.append((name, projected))
+    expected_shape = tuple(values.size for _name, values in projected_axes)
+    projected_intensity = _project_stored_float32(
+        intensity,
+        name="intensity",
+        require_finite=False,
+    )
+    if projected_intensity.shape != expected_shape:
+        raise AnalysisArtifactProjectionInvalid(
+            "analysis intensity shape does not match projected axes"
+        )
+    projected_sigma = None
+    if sigma is not None:
+        projected_sigma = _project_stored_float32(
+            sigma,
+            name="sigma",
+            require_finite=False,
+        )
+        if projected_sigma.shape != expected_shape:
+            raise AnalysisArtifactProjectionInvalid(
+                "analysis sigma shape does not match projected axes"
+            )
+    projected_coverage = projected_normalization = None
+    if coverage is not None:
+        projected_coverage = _project_stored_float32(
+            coverage,
+            name="coverage",
+            require_finite=True,
+            require_nonnegative=True,
+        )
+        projected_normalization = _project_stored_float32(
+            normalization,
+            name="normalization",
+            require_finite=True,
+            require_nonnegative=True,
+        )
+        if (
+            projected_coverage.shape != expected_shape
+            or projected_normalization.shape != expected_shape
+        ):
+            raise AnalysisArtifactProjectionInvalid(
+                "analysis diagnostics shape does not match projected axes"
+            )
+    digest = hashlib.sha256(_RESULT_FINGERPRINT_PREFIX)
+    _digest_text(digest, kind.value)
+    for name, values in projected_axes:
+        _digest_array(digest, name, values)
+    for _name, units in axis_units:
+        if units is not None:
+            _digest_text(digest, units)
+    _digest_array(digest, "intensity", projected_intensity)
+    if projected_sigma is None:
+        _digest_text(digest, "sigma:absent")
+    else:
+        _digest_array(digest, "sigma", projected_sigma)
+    if projected_coverage is not None:
+        _digest_array(digest, "coverage", projected_coverage)
+        _digest_array(digest, "normalization", projected_normalization)
+    return AnalysisArtifactResultProjection(
+        kind,
+        tuple(projected_axes),
+        axis_units,
+        projected_intensity,
+        projected_sigma,
+        projected_coverage,
+        projected_normalization,
+        digest.hexdigest(),
+        _ANALYSIS_PROJECTION_FACTORY,
+    )
+
+
 def _materialize_bounded_values(
     dataset: h5py.Dataset,
     *,
@@ -854,6 +1097,11 @@ def _materialize_bounded_values(
     if not finite_seen:
         raise AnalysisArtifactInvalid(f"{dataset.name} has no finite result")
     return _freeze_float32(values)
+
+
+# Detached admission and later payload hydration deliberately retain separate
+# race seams even though both feed the same public stored-result projection.
+_materialize_inspection_values = _materialize_bounded_values
 
 
 def inspect_analysis_artifact(
@@ -1053,10 +1301,6 @@ def inspect_analysis_artifact(
                     raise AnalysisArtifactInvalid(
                         f"analysis axis {name} attributes are not exact"
                     )
-            result_digest = hashlib.sha256(_RESULT_FINGERPRINT_PREFIX)
-            _digest_text(result_digest, kind.value)
-            for name, values in axes:
-                _digest_array(result_digest, name, values)
             axis_units: list[tuple[str, str | None]] = [
                 (name, None) for name, _values in axes
             ]
@@ -1068,14 +1312,12 @@ def inspect_analysis_artifact(
                 q_units = _bounded_attr_text(q, "units")
                 if not q_units:
                     raise AnalysisArtifactInvalid("stitched q units are invalid")
-                _digest_text(result_digest, q_units)
                 axis_units[0] = ("q", q_units)
             if kind is AnalysisArtifactKind.STITCH_2D:
                 chi = _direct(result, "chi", h5py.Dataset)
                 chi_units = _bounded_attr_text(chi, "units")
                 if not chi_units:
                     raise AnalysisArtifactInvalid("stitched chi units are invalid")
-                _digest_text(result_digest, chi_units)
                 axis_units[1] = ("chi", chi_units)
             intensity = _direct(result, "intensity", h5py.Dataset)
             if len(intensity.attrs) != 0:
@@ -1085,11 +1327,8 @@ def inspect_analysis_artifact(
             expected_shape = tuple(len(values) for _name, values in axes)
             if intensity.shape != expected_shape:
                 raise AnalysisArtifactInvalid("analysis intensity shape does not match axes")
-            _require_bounded_values(
-                intensity,
-                digest=result_digest,
-                digest_name="intensity",
-            )
+            intensity_values = _materialize_inspection_values(intensity)
+            sigma_values = None
             if has_sigma:
                 sigma = _direct(result, "sigma", h5py.Dataset)
                 if len(sigma.attrs) != 0:
@@ -1100,13 +1339,8 @@ def inspect_analysis_artifact(
                     raise AnalysisArtifactInvalid(
                         "stitched sigma shape does not match axes"
                     )
-                _require_bounded_values(
-                    sigma,
-                    digest=result_digest,
-                    digest_name="sigma",
-                )
-            else:
-                _digest_text(result_digest, "sigma:absent")
+                sigma_values = _materialize_inspection_values(sigma)
+            coverage_values = normalization_values = None
             if has_stitch_diagnostics:
                 for name in ("coverage", "normalization"):
                     values = _direct(result, name, h5py.Dataset)
@@ -1114,13 +1348,28 @@ def inspect_analysis_artifact(
                         raise AnalysisArtifactInvalid(
                             f"stitched {name} must be an exact result-shaped dataset"
                         )
-                    _require_bounded_values(
-                        values,
-                        digest=result_digest,
-                        digest_name=name,
-                        require_finite=True,
-                        require_nonnegative=True,
-                    )
+                coverage_values = _materialize_inspection_values(
+                    _direct(result, "coverage", h5py.Dataset),
+                    require_finite=True,
+                    require_nonnegative=True,
+                )
+                normalization_values = _materialize_inspection_values(
+                    _direct(result, "normalization", h5py.Dataset),
+                    require_finite=True,
+                    require_nonnegative=True,
+                )
+            try:
+                projection = project_analysis_artifact_result(
+                    kind=kind,
+                    axes=axes,
+                    axis_units=tuple(axis_units),
+                    intensity=intensity_values,
+                    sigma=sigma_values,
+                    coverage=coverage_values,
+                    normalization=normalization_values,
+                )
+            except AnalysisArtifactProjectionInvalid as error:
+                raise AnalysisArtifactInvalid(str(error)) from error
             seen: set[int] = set()
             _require_local_graph(entry, seen)
             inspection = AnalysisArtifactInspection(
@@ -1141,7 +1390,7 @@ def inspect_analysis_artifact(
                 provenance_sha256=hashlib.sha256(
                     provenance.encode("utf-8")
                 ).hexdigest(),
-                result_fingerprint=result_digest.hexdigest(),
+                result_fingerprint=projection.result_fingerprint,
             )
             if (
                 _opened_hdf_revision(handle) != admitted_revision
@@ -1229,7 +1478,7 @@ def read_analysis_artifact(
             entry = _direct(handle, _ENTRY, h5py.Group)
             result = _direct(entry, inspection.group, h5py.Group)
             axes = tuple(
-                (name, _freeze_float32(_axis(result, name)))
+                (name, _axis(result, name))
                 for name, _length in inspection.axes
             )
             intensity = _materialize_bounded_values(
@@ -1268,10 +1517,6 @@ def read_analysis_artifact(
                         "stitched diagnostics changed shape after admission"
                     )
 
-            result_digest = hashlib.sha256(_RESULT_FINGERPRINT_PREFIX)
-            _digest_text(result_digest, inspection.kind.value)
-            for name, values in axes:
-                _digest_array(result_digest, name, values)
             units = dict(inspection.axis_units)
             if inspection.kind in {
                 AnalysisArtifactKind.STITCH_1D,
@@ -1285,7 +1530,6 @@ def read_analysis_artifact(
                     raise AnalysisArtifactInvalid(
                         "analysis q units changed after admission"
                     )
-                _digest_text(result_digest, q_units)
             if inspection.kind is AnalysisArtifactKind.STITCH_2D:
                 chi_units = _bounded_attr_text(
                     _direct(result, "chi", h5py.Dataset),
@@ -1295,16 +1539,19 @@ def read_analysis_artifact(
                     raise AnalysisArtifactInvalid(
                         "analysis chi units changed after admission"
                     )
-                _digest_text(result_digest, chi_units)
-            _digest_array(result_digest, "intensity", intensity)
-            if sigma is None:
-                _digest_text(result_digest, "sigma:absent")
-            else:
-                _digest_array(result_digest, "sigma", sigma)
-            if inspection.has_stitch_diagnostics:
-                _digest_array(result_digest, "coverage", coverage)
-                _digest_array(result_digest, "normalization", normalization)
-            if result_digest.hexdigest() != inspection.result_fingerprint:
+            try:
+                projection = project_analysis_artifact_result(
+                    kind=inspection.kind,
+                    axes=axes,
+                    axis_units=inspection.axis_units,
+                    intensity=intensity,
+                    sigma=sigma,
+                    coverage=coverage,
+                    normalization=normalization,
+                )
+            except AnalysisArtifactProjectionInvalid as error:
+                raise AnalysisArtifactInvalid(str(error)) from error
+            if projection.result_fingerprint != inspection.result_fingerprint:
                 raise TargetChanged(
                     "analysis payload changed after detached admission"
                 )
@@ -1323,11 +1570,11 @@ def read_analysis_artifact(
             revalidate_stream_terminal(shown, expected_receipt.terminal)
         return AnalysisArtifactPayload(
             inspection,
-            axes,
-            intensity,
-            sigma,
-            coverage,
-            normalization,
+            projection.axes,
+            projection.intensity,
+            projection.sigma,
+            projection.coverage,
+            projection.normalization,
             _ANALYSIS_PAYLOAD_FACTORY,
         )
     except AnalysisArtifactInvalid:
@@ -1792,10 +2039,13 @@ __all__ = [
     "AnalysisArtifactOutputSnapshot",
     "AnalysisArtifactOverwrite",
     "AnalysisArtifactPayload",
+    "AnalysisArtifactProjectionInvalid",
     "AnalysisArtifactReceipt",
+    "AnalysisArtifactResultProjection",
     "AnalysisArtifactRequest",
     "admit_analysis_artifact",
     "canonical_analysis_provenance",
     "inspect_analysis_artifact",
+    "project_analysis_artifact_result",
     "read_analysis_artifact",
 ]

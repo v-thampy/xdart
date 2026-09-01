@@ -25,11 +25,14 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactOutputSnapshot,
     AnalysisArtifactOverwrite,
     AnalysisArtifactPayload,
+    AnalysisArtifactProjectionInvalid,
     AnalysisArtifactReceipt,
+    AnalysisArtifactResultProjection,
     AnalysisArtifactRequest,
     admit_analysis_artifact,
     canonical_analysis_provenance,
     inspect_analysis_artifact,
+    project_analysis_artifact_result,
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import (
@@ -61,10 +64,14 @@ def test_analysis_artifact_types_are_public_lazy_io_exports():
     assert io_api.AnalysisArtifactError is AnalysisArtifactError
     assert io_api.AnalysisArtifactOutputSnapshot is AnalysisArtifactOutputSnapshot
     assert io_api.AnalysisArtifactPayload is AnalysisArtifactPayload
+    assert io_api.AnalysisArtifactResultProjection is AnalysisArtifactResultProjection
+    assert io_api.project_analysis_artifact_result is project_analysis_artifact_result
     assert io_api.read_analysis_artifact is read_analysis_artifact
     assert "AnalysisArtifactError" in io_api.__all__
     assert "AnalysisArtifactOutputSnapshot" in io_api.__all__
     assert "AnalysisArtifactPayload" in io_api.__all__
+    assert "AnalysisArtifactResultProjection" in io_api.__all__
+    assert "project_analysis_artifact_result" in io_api.__all__
     assert "read_analysis_artifact" in io_api.__all__
 
 
@@ -348,6 +355,76 @@ def test_result_fingerprint_is_scientific_and_storage_independent(tmp_path):
         coordinator=OutputTransactionCoordinator(),
     ).publish(_writer(rsm_request))
     assert rsm.inspection.result_fingerprint != baseline
+
+
+def test_public_result_projection_owns_exact_stored_bytes_and_fingerprint(tmp_path):
+    q = np.linspace(0.1, 2.0, 7, dtype=np.float64)
+    intensity = np.linspace(1.0, 2.0, 7, dtype=np.float64)
+    intensity[3] = np.nan
+    coverage = np.arange(7, dtype=np.float64)
+    normalization = np.linspace(1.0, 7.0, 7, dtype=np.float64)
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.STITCH_1D,
+        axes=(("q", q),),
+        axis_units=(("q", "q_A^-1"),),
+        intensity=intensity,
+        sigma=None,
+        coverage=coverage,
+        normalization=normalization,
+    )
+    assert projection.policy == "analysis_artifact_stored_le_f4_v1"
+    for values in (
+        projection.axes[0][1],
+        projection.intensity,
+        projection.coverage,
+        projection.normalization,
+    ):
+        assert values.dtype == np.dtype("<f4")
+        assert values.flags.c_contiguous
+        assert values.flags.writeable is False
+    assert projection.intensity.view("<u4")[3] == np.uint32(0x7FC00000)
+    q[:] = 99.0
+    intensity[:] = 99.0
+    assert projection.axes[0][1][0] != np.float32(99.0)
+    assert np.isnan(projection.intensity[3])
+
+    request = _request(tmp_path / "projected-fingerprint.nexus", AnalysisArtifactKind.STITCH_1D)
+    receipt = admit_analysis_artifact(
+        request,
+        coordinator=OutputTransactionCoordinator(),
+    ).publish(
+        lambda entry: write_stitched(
+            entry,
+            result_projection=projection,
+            provenance=request.provenance_json,
+            bounded_artifact=True,
+        )
+    )
+    assert receipt.inspection.result_fingerprint == projection.result_fingerprint
+
+
+@pytest.mark.parametrize(
+    "q,intensity",
+    [
+        (np.array([1.0, 1.0 + 1e-9]), np.ones(2)),
+        (np.array([1.0, 2.0]), np.array([1.0, np.finfo(np.float64).max])),
+        (np.array([1.0, 2.0]), np.array([1.0, np.inf])),
+    ],
+)
+def test_public_result_projection_refuses_unstorable_science(q, intensity):
+    with pytest.raises(
+        AnalysisArtifactProjectionInvalid,
+        match="increasing|overflow|nonfinite",
+    ):
+        project_analysis_artifact_result(
+            kind=AnalysisArtifactKind.STITCH_1D,
+            axes=(("q", q),),
+            axis_units=(("q", "q_A^-1"),),
+            intensity=intensity,
+            sigma=None,
+            coverage=None,
+            normalization=None,
+        )
 
 
 def test_stitch_diagnostics_round_trip_and_bind_result_fingerprint(tmp_path):

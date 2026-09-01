@@ -3408,6 +3408,7 @@ def write_stitched(
     *,
     stitched_1d: IntegrationResult1D | None = None,
     stitched_2d: IntegrationResult2D | None = None,
+    result_projection: object | None = None,
     provenance: "Mapping[str, object] | str | None" = None,
     frame_records=None,
     source_base=None,
@@ -3435,6 +3436,75 @@ def write_stitched(
     representation for ordinary scan files.
     """
     ck = _comp_kwargs(compression)
+    if result_projection is not None:
+        from xrd_tools.io.analysis_artifact import (
+            AnalysisArtifactKind,
+            AnalysisArtifactResultProjection,
+        )
+
+        if (
+            type(result_projection) is not AnalysisArtifactResultProjection
+            or result_projection.kind not in {
+                AnalysisArtifactKind.STITCH_1D,
+                AnalysisArtifactKind.STITCH_2D,
+            }
+        ):
+            raise TypeError(
+                "result_projection must be an exact stored Stitch projection"
+            )
+        if (
+            not bounded_artifact
+            or stitched_1d is not None
+            or stitched_2d is not None
+            or coverage is not None
+            or normalization is not None
+            or frame_records is not None
+            or source_base is not None
+        ):
+            raise ValueError(
+                "stored Stitch projection is exclusive to a bounded artifact"
+            )
+        prov_json = _bounded_artifact_provenance(provenance)
+        group_name = result_projection.kind.group
+        if group_name in entry_grp:
+            del entry_grp[group_name]
+        group = _create_group_from_schema(entry_grp, group_name)
+        axis_names = tuple(name for name, _values in result_projection.axes)
+        _bound_analysis_nxdata(group, axis_names)
+        _schema_dataset(
+            group,
+            group_name,
+            "intensity",
+            result_projection.intensity,
+            ck=ck,
+        )
+        for (name, values), (_unit_name, units) in zip(
+            result_projection.axes,
+            result_projection.axis_units,
+            strict=True,
+        ):
+            dataset = _schema_dataset(group, group_name, name, values, ck=ck)
+            _bounded_text_attr(dataset, "units", units)
+        if result_projection.sigma is not None:
+            _schema_dataset(
+                group,
+                group_name,
+                "sigma",
+                result_projection.sigma,
+                ck=ck,
+            )
+        if result_projection.coverage is not None:
+            group.create_dataset(
+                "coverage", data=result_projection.coverage, **ck
+            )
+            group.create_dataset(
+                "normalization", data=result_projection.normalization, **ck
+            )
+        group.create_dataset(
+            "provenance_json",
+            data=np.bytes_(prov_json.encode("utf-8")),
+        )
+        return
     if (coverage is None) != (normalization is None):
         raise ValueError(
             "stitched coverage and normalization diagnostics must be paired"
