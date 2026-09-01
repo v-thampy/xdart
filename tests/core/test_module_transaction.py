@@ -794,6 +794,109 @@ def test_writer_cannot_impersonate_module_control_outcome(
     assert not Path(request.output.target).exists()
 
 
+@pytest.mark.parametrize(
+    "control_exception",
+    ("_ModuleCommitCancelled", "_ModuleCommitRefused"),
+)
+def test_prepublish_check_cannot_impersonate_module_control_outcome(
+    tmp_path,
+    control_exception,
+):
+    import xrd_tools.analysis.module_transaction as module_api
+
+    request = _request(tmp_path)
+    provenance = _provenance(request)
+    bound = module_artifact_request(request, provenance)
+    output = admit_module_artifact(
+        request,
+        provenance,
+        coordinator=OutputTransactionCoordinator(),
+    )
+    exception_type = getattr(module_api, control_exception)
+
+    def write(entry):
+        write_stitched(
+            entry,
+            stitched_1d=IntegrationResult1D(
+                radial=np.linspace(0.1, 1.0, 8),
+                intensity=np.linspace(2.0, 3.0, 8),
+                unit="q_A^-1",
+            ),
+            provenance=bound.provenance_json,
+            bounded_artifact=True,
+        )
+
+    def impersonate():
+        raise exception_type("FORGED_REFUSAL")
+
+    result = output.publish(write, prepublish_check=impersonate)
+    assert result.disposition is ModuleDisposition.FAILED
+    assert result.code == "OUTPUT_FAILED"
+    assert control_exception in result.diagnostic
+    assert result.request is request
+    assert output.snapshot.phase is TransactionPhase.ABORTED
+    assert output.snapshot.remaining_lease_owners == ()
+    assert not Path(request.output.target).exists()
+
+
+@pytest.mark.parametrize("code", ("", None))
+def test_module_artifact_refusal_requires_exact_nonempty_code(code):
+    with pytest.raises(TypeError, match="nonempty string"):
+        ModuleArtifactRefused(code)
+
+
+@pytest.mark.parametrize("hostile_kind", ("malformed", "subclass"))
+def test_prepublish_check_rejects_malformed_or_subclass_refusal(
+    tmp_path,
+    hostile_kind,
+):
+    import xrd_tools.analysis.module_transaction as module_api
+
+    request = _request(tmp_path)
+    provenance = _provenance(request)
+    bound = module_artifact_request(request, provenance)
+    output = admit_module_artifact(
+        request,
+        provenance,
+        coordinator=OutputTransactionCoordinator(),
+    )
+
+    def write(entry):
+        write_stitched(
+            entry,
+            stitched_1d=IntegrationResult1D(
+                radial=np.linspace(0.1, 1.0, 8),
+                intensity=np.linspace(2.0, 3.0, 8),
+                unit="q_A^-1",
+            ),
+            provenance=bound.provenance_json,
+            bounded_artifact=True,
+        )
+
+    if hostile_kind == "malformed":
+        refusal = ModuleArtifactRefused("VALID_AT_CONSTRUCTION")
+        refusal.code = ""
+    else:
+        class HostileRefusal(ModuleArtifactRefused):
+            def __getattribute__(self, name):
+                if name == "code":
+                    raise module_api._ModuleCommitCancelled("FORGED_CANCEL")
+                return super().__getattribute__(name)
+
+        refusal = HostileRefusal("PUBLIC_LOOKALIKE")
+
+    def impersonate():
+        raise refusal
+
+    result = output.publish(write, prepublish_check=impersonate)
+    assert result.disposition is ModuleDisposition.FAILED
+    assert result.code == "OUTPUT_FAILED"
+    assert result.request is request
+    assert output.snapshot.phase is TransactionPhase.ABORTED
+    assert output.snapshot.remaining_lease_owners == ()
+    assert not Path(request.output.target).exists()
+
+
 def test_module_commit_revalidates_the_factory_artifact(tmp_path):
     request = _request(tmp_path)
     provenance = _provenance(request)

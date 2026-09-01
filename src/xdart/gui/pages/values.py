@@ -10,6 +10,7 @@ from typing import NewType, TypeAlias
 PageKey = NewType("PageKey", str)
 SCATTERING_PAGE_KEY = PageKey("scattering-workspace")
 STITCH_TOOL_KEY = PageKey("stitch")
+RSM_TOOL_KEY = PageKey("rsm")
 
 
 class PageCapability(str, Enum):

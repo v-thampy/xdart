@@ -514,6 +514,147 @@ def _relative_locator(
     return value
 
 
+def _project_root(value: str | Path) -> Path:
+    try:
+        root = Path(value).expanduser().resolve(strict=True)
+    except (OSError, TypeError) as error:
+        raise RSMOperationRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is unavailable"
+        ) from error
+    if not root.is_dir():
+        raise RSMOperationRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is not a directory"
+        )
+    return root
+
+
+def _bind_project_output(
+    output: ModuleOutputRequest,
+    project_root: str | Path,
+) -> ModuleOutputRequest:
+    """Bind lexical output intent to one canonical path inside Project."""
+
+    if type(output) is not ModuleOutputRequest:
+        raise TypeError("RSM output binding requires exact ModuleOutputRequest")
+    root = _project_root(project_root)
+    lexical = Path(output.target)
+    if lexical.is_symlink():
+        raise RSMOperationRefused(
+            "OUTPUT_SYMLINK_UNSUPPORTED",
+            "RSM output target must not be a symbolic link",
+        )
+    try:
+        resolved = lexical.resolve(strict=False)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise RSMOperationRefused(
+            "OUTPUT_OUTSIDE_PROJECT",
+            "RSM output must resolve inside the selected Project root",
+        ) from error
+    if (
+        not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or len(relative.as_posix().encode("utf-8")) > 4096
+    ):
+        raise RSMOperationRefused(
+            "OUTPUT_PATH_INVALID", "RSM output has no bounded Project path"
+        )
+    return ModuleOutputRequest(resolved, output.kind, output.overwrite)
+
+
+@dataclass(frozen=True, slots=True)
+class RSMOutputAuthorityReceipt:
+    """Preview-time identity of the canonical directory owning RSM output."""
+
+    parent_relative_path: str
+    parent_identity: tuple[int, int, int]
+
+    def __post_init__(self) -> None:
+        relative = self.parent_relative_path
+        if relative != ".":
+            relative = _manifest_relative_path(
+                relative,
+                "RSM output parent path",
+            )
+        if (
+            type(self.parent_relative_path) is not str
+            or relative != self.parent_relative_path
+            or type(self.parent_identity) is not tuple
+            or len(self.parent_identity) != 3
+            or any(type(item) is not int for item in self.parent_identity)
+            or not stat.S_ISDIR(self.parent_identity[0])
+        ):
+            raise TypeError("RSM output authority receipt is invalid")
+
+    def to_provenance(self) -> dict[str, object]:
+        mode, device, inode = self.parent_identity
+        return {
+            "parent_relative_path": self.parent_relative_path,
+            "parent_identity": {
+                "mode": mode,
+                "device": device,
+                "inode": inode,
+            },
+        }
+
+
+def _capture_output_authority(
+    output: ModuleOutputRequest,
+    project_root: str | Path,
+) -> RSMOutputAuthorityReceipt:
+    root = _project_root(project_root)
+    parent = Path(output.target).parent
+    try:
+        relative = parent.relative_to(root)
+        observed = os.stat(parent, follow_symlinks=False)
+    except (OSError, ValueError) as error:
+        raise RSMOperationRefused(
+            "OUTPUT_PARENT_UNAVAILABLE",
+            "RSM output parent directory is unavailable inside Project",
+        ) from error
+    if not stat.S_ISDIR(observed.st_mode):
+        raise RSMOperationRefused(
+            "OUTPUT_PARENT_UNAVAILABLE",
+            "RSM output parent must be one ordinary directory",
+        )
+    relative_path = "." if not relative.parts else relative.as_posix()
+    return RSMOutputAuthorityReceipt(
+        relative_path,
+        (int(observed.st_mode), int(observed.st_dev), int(observed.st_ino)),
+    )
+
+
+def _requalify_project_output(
+    output: ModuleOutputRequest,
+    project_root: str | Path,
+    authority: RSMOutputAuthorityReceipt,
+) -> None:
+    """Refuse completed namespace changes under the trusted-Project boundary.
+
+    This is deliberately not a descriptor-bound publication claim.  Concurrent
+    mutation by an untrusted actor in a shared-writable Project remains held for
+    the common Stitch/RSM output namespace owner.
+    """
+
+    try:
+        current = _bind_project_output(output, project_root)
+        current_authority = _capture_output_authority(current, project_root)
+    except RSMOperationRefused as error:
+        raise RSMOperationRefused(
+            "OUTPUT_IDENTITY_MISMATCH",
+            "RSM output path authority changed after Preview",
+        ) from error
+    if (
+        type(authority) is not RSMOutputAuthorityReceipt
+        or current.fingerprint != output.fingerprint
+        or current_authority != authority
+    ):
+        raise RSMOperationRefused(
+            "OUTPUT_IDENTITY_MISMATCH",
+            "RSM output path authority changed after Preview",
+        )
+
+
 def _manifest_relative_path(value: object, name: str) -> str:
     if type(value) is not str or not value or len(value.encode("utf-8")) > 4096:
         raise TypeError(f"{name} must be a bounded relative path")
@@ -1000,16 +1141,7 @@ def _capture_preflight(
     *,
     cancel_token: threading.Event | None = None,
 ) -> RSMPreflightReceipt:
-    try:
-        root = Path(project_root).expanduser().resolve(strict=True)
-    except (OSError, TypeError) as error:
-        raise RSMOperationRefused(
-            "PROJECT_UNAVAILABLE", "selected Project root is unavailable"
-        ) from error
-    if not root.is_dir():
-        raise RSMOperationRefused(
-            "PROJECT_UNAVAILABLE", "selected Project root is not a directory"
-        )
+    root = _project_root(project_root)
     analysis = source.analysis
     selectors = required_rsm_selectors(plan)
     if (
@@ -1246,6 +1378,7 @@ def _engine_version() -> str:
 def _provenance(
     source: ModuleSourceReceipt,
     output: ModuleOutputRequest,
+    output_authority: RSMOutputAuthorityReceipt,
     plan: RSMOperationPlan,
     preflight: RSMPreflightReceipt,
 ) -> dict[str, object]:
@@ -1331,9 +1464,13 @@ def _provenance(
             "xrayutilities": _engine_version(),
             "numpy": np.__version__,
         },
-        "output": {"kind": output.kind.value},
+        "output": {
+            "kind": output.kind.value,
+            **output_authority.to_provenance(),
+        },
         "holds": [
             "gi-and-refraction-corrections",
+            "hostile-shared-project-output-namespace",
             "multi-scan-rsm",
             "volume-rendering",
         ],
@@ -1345,6 +1482,7 @@ class RSMOperationRequest:
     module: ModuleOperationRequest
     plan: RSMOperationPlan
     preflight: RSMPreflightReceipt
+    output_authority: RSMOutputAuthorityReceipt
     provenance_json: str
     _claim: InitVar[object] = None
     _cancel_token: InitVar[threading.Event | None] = None
@@ -1365,6 +1503,7 @@ class RSMOperationRequest:
             or self.module.output.kind is not AnalysisArtifactKind.RSM
             or type(self.plan) is not RSMOperationPlan
             or type(self.preflight) is not RSMPreflightReceipt
+            or type(self.output_authority) is not RSMOutputAuthorityReceipt
             or type(self.provenance_json) is not str
             or self.module.plan_fingerprint != self.plan.fingerprint
             or self.preflight.plan_fingerprint != self.plan.fingerprint
@@ -1392,6 +1531,19 @@ class RSMOperationRequest:
             raise ValueError(
                 "RSM preflight is not the exact bound source projection"
             )
+        expected_output = _bind_project_output(
+            self.module.output,
+            self.preflight.project_root,
+        )
+        expected_authority = _capture_output_authority(
+            expected_output,
+            self.preflight.project_root,
+        )
+        if (
+            expected_output.fingerprint != self.module.output.fingerprint
+            or expected_authority != self.output_authority
+        ):
+            raise ValueError("RSM output is not canonically bound to Project")
         try:
             provenance = json.loads(self.provenance_json)
         except (TypeError, ValueError, json.JSONDecodeError) as error:
@@ -1404,6 +1556,7 @@ class RSMOperationRequest:
             != _provenance(
                 self.module.source,
                 self.module.output,
+                self.output_authority,
                 self.plan,
                 self.preflight,
             )
@@ -1450,6 +1603,9 @@ def prepare_rsm_operation(
             "OUTPUT_KIND_MISMATCH",
             "RSM requires an RSM analysis artifact output",
         )
+    root = _project_root(project_root)
+    output = _bind_project_output(output, root)
+    output_authority = _capture_output_authority(output, root)
     required = required_rsm_selectors(plan)
     if tuple(source.resolved_selectors) != required:
         raise RSMOperationRefused(
@@ -1461,10 +1617,16 @@ def prepare_rsm_operation(
         source,
         plan,
         table,
-        project_root,
+        root,
         cancel_token=cancel_token,
     )
-    provenance = _provenance(source, output, plan, preflight)
+    provenance = _provenance(
+        source,
+        output,
+        output_authority,
+        plan,
+        preflight,
+    )
     module = ModuleOperationRequest(
         source,
         output,
@@ -1476,6 +1638,7 @@ def prepare_rsm_operation(
         module,
         plan,
         preflight,
+        output_authority,
         canonical,
         _REQUEST_FACTORY,
         cancel_token,
@@ -2183,6 +2346,14 @@ class RSMOperationExecution:
         if cancel_token is not None and cancel_token.is_set():
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         try:
+            _requalify_project_output(
+                self.request.module.output,
+                self.request.preflight.project_root,
+                self.request.output_authority,
+            )
+        except RSMOperationRefused as error:
+            return self._terminal(ModuleDisposition.REFUSED, error.code)
+        try:
             with requalified_analysis_source(
                 self.request.module.source.analysis,
                 cancel_token=cancel_token,
@@ -2250,6 +2421,14 @@ class RSMOperationExecution:
             volume = _validate_science_volume(scientific.payload, self.request)
         except RSMOperationRefused as error:
             return self._terminal(ModuleDisposition.FAILED, error.code)
+        try:
+            _requalify_project_output(
+                self.request.module.output,
+                self.request.preflight.project_root,
+                self.request.output_authority,
+            )
+        except RSMOperationRefused as error:
+            return self._terminal(ModuleDisposition.REFUSED, error.code)
         provenance = self.request.provenance
         bound = module_artifact_request(self.request.module, provenance)
         try:
@@ -2283,8 +2462,22 @@ class RSMOperationExecution:
                 bounded_artifact=True,
             )
 
+        def prepublish_check() -> None:
+            try:
+                _requalify_project_output(
+                    self.request.module.output,
+                    self.request.preflight.project_root,
+                    self.request.output_authority,
+                )
+            except RSMOperationRefused as error:
+                raise ModuleArtifactRefused(error.code) from error
+
         try:
-            terminal = self._output.publish(writer, cancel_token=cancel_token)
+            terminal = self._output.publish(
+                writer,
+                cancel_token=cancel_token,
+                prepublish_check=prepublish_check,
+            )
         except AnalysisArtifactCleanupPending as error:
             self._state = "cleanup_pending"
             raise RSMOperationCleanupPending(self) from error
@@ -2356,6 +2549,7 @@ __all__ = [
     "RSMOperationRequest",
     "RSMOperationResult",
     "RSMOperationVerificationError",
+    "RSMOutputAuthorityReceipt",
     "RSMPreflightReceipt",
     "condition_rsm_images",
     "prepare_rsm_operation",

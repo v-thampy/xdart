@@ -173,17 +173,21 @@ def _float32_sha256(values: np.ndarray) -> str:
 @pytest.mark.parametrize("bins", tuple(_ORACLES))
 def test_scan43_matches_authenticated_notebook_rsm(tmp_path, bins):
     root = _rsm_root()
-    request = _scan43_request(
-        root,
-        tmp_path / f"scan43-{bins[0]}.nexus",
-        bins,
+    output = root / (
+        f".xdart-rsm-science-{os.getpid()}-{tmp_path.name}-{bins[0]}.nexus"
     )
-    result = run_rsm_operation(request)
-    assert result.terminal.disposition is ModuleDisposition.COMMITTED
-    assert result.payload is not None
-    expected_occupied, expected_sha = _ORACLES[bins]
-    assert int(np.isfinite(result.payload.intensity).sum()) == expected_occupied
-    assert _float32_sha256(result.payload.intensity) == expected_sha
-    assert result.payload.inspection.result_fingerprint == (
-        result.terminal.commit.result_fingerprint
-    )
+    assert not output.exists()
+    try:
+        request = _scan43_request(root, output, bins)
+        result = run_rsm_operation(request)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED
+        assert result.payload is not None
+        expected_occupied, expected_sha = _ORACLES[bins]
+        assert int(np.isfinite(result.payload.intensity).sum()) == expected_occupied
+        assert _float32_sha256(result.payload.intensity) == expected_sha
+        assert result.payload.inspection.result_fingerprint == (
+            result.terminal.commit.result_fingerprint
+        )
+    finally:
+        if output.exists():
+            output.unlink()

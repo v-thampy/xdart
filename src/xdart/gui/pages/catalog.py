@@ -6,6 +6,7 @@ from .descriptors import PageDescriptor, ToolDescriptor
 from .values import (
     PageCapability,
     PageLifecycle,
+    RSM_TOOL_KEY,
     SCATTERING_PAGE_KEY,
     STITCH_TOOL_KEY,
 )
@@ -21,7 +22,14 @@ def _build_scattering_workspace(services, parent):
 
 def _build_stitch_tool(services, parent):
     from xdart.gui.tools.stitch_tool import build_stitch_tool
+
     return build_stitch_tool(services, parent)
+
+
+def _build_rsm_tool(services, parent):
+    from xdart.gui.tools.rsm_tool import build_rsm_tool
+
+    return build_rsm_tool(services, parent)
 
 
 SCATTERING_WORKSPACE_PAGE = PageDescriptor(
@@ -57,4 +65,15 @@ STITCH_TOOL = ToolDescriptor(
     tool_kind="analysis",
 )
 
-BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, STITCH_TOOL)
+RSM_TOOL = ToolDescriptor(
+    key=RSM_TOOL_KEY,
+    label="Reciprocal Space Map",
+    description="Grid one exact psic SPEC scan in reciprocal space",
+    icon_key="rsm",
+    category="analysis",
+    order=110,
+    build=_build_rsm_tool,
+    tool_kind="analysis",
+)
+
+BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)

@@ -77,6 +77,8 @@ class ModuleDisposition(str, Enum):
 
 class ModuleArtifactRefused(RuntimeError):
     def __init__(self, code: str):
+        if type(code) is not str or not code:
+            raise TypeError("module artifact refusal code must be a nonempty string")
         self.code = code
         super().__init__(code)
 
@@ -95,6 +97,12 @@ class _ModuleWriterFailed(RuntimeError):
     def __init__(self, error: BaseException):
         self.error = error
         super().__init__("module writer failed")
+
+
+class _ModulePrepublishFailed(RuntimeError):
+    def __init__(self, error: BaseException):
+        self.error = error
+        super().__init__("module prepublication check failed")
 
 
 def _failure_diagnostic(error: BaseException) -> str:
@@ -702,7 +710,17 @@ class ModuleArtifactOutput:
                 try:
                     prepublish_check()
                 except ModuleArtifactRefused as error:
-                    raise _ModuleCommitRefused(error.code) from error
+                    if type(error) is not ModuleArtifactRefused:
+                        raise _ModulePrepublishFailed(error) from error
+                    try:
+                        code = error.code
+                    except BaseException as code_error:
+                        raise _ModulePrepublishFailed(code_error) from code_error
+                    if type(code) is not str or not code:
+                        raise _ModulePrepublishFailed(error) from error
+                    raise _ModuleCommitRefused(code) from error
+                except BaseException as error:
+                    raise _ModulePrepublishFailed(error) from error
 
         def guarded_writer(entry: object) -> object:
             try:
@@ -726,7 +744,7 @@ class ModuleArtifactOutput:
                 guarded_writer,
                 prepublish=prepublish,
             )
-        except _ModuleWriterFailed as error:
+        except (_ModuleWriterFailed, _ModulePrepublishFailed) as error:
             self._pending = (
                 ModuleDisposition.FAILED,
                 "OUTPUT_FAILED",
@@ -757,7 +775,9 @@ class ModuleArtifactOutput:
             snapshot = self._output.snapshot
             if self._pending is None:
                 primary = error.__cause__
-                if isinstance(primary, _ModuleWriterFailed):
+                if isinstance(
+                    primary, (_ModuleWriterFailed, _ModulePrepublishFailed)
+                ):
                     self._pending = (
                         ModuleDisposition.FAILED,
                         "OUTPUT_FAILED",

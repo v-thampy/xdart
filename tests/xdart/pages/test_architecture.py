@@ -37,6 +37,12 @@ import xdart.gui.pages.services
 for name in (
     'xdart.gui.tabs.scattering',
     'xdart.gui.tabs.scattering.page',
+    'xdart.gui.tools.stitch_tool',
+    'xdart.gui.tools.stitch_owner',
+    'xdart.gui.tools.rsm_tool',
+    'xdart.gui.tools.rsm_owner',
+    'xrd_tools.analysis.stitch_operation',
+    'xrd_tools.analysis.rsm_operation',
     'xrd_tools.session.experiment_state',
 ):
     assert name not in sys.modules, name
@@ -144,7 +150,7 @@ def test_catalog_is_the_only_builtin_registration_point():
     assert "STATIC_SCAN_PAGE_KEY" not in catalog
     assert "build_legacy_static" not in catalog
     assert catalog.count("PageDescriptor(") == 1
-    assert catalog.count("ToolDescriptor(") == 1
+    assert catalog.count("ToolDescriptor(") == 2
     assert "BUILTIN_PAGES" in catalog
     assert "BUILTIN_DESCRIPTORS" in catalog
     assert "BUILTIN_DESCRIPTORS" in main

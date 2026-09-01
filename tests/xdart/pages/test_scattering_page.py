@@ -24,11 +24,18 @@ from xdart.gui.pages.catalog import (
     BUILTIN_DESCRIPTORS,
     BUILTIN_PAGES,
     DEFAULT_PAGE_KEY,
+    RSM_TOOL,
     SCATTERING_WORKSPACE_PAGE,
     STITCH_TOOL,
 )
 from xdart.gui.pages.registry import PageRegistry
-from xdart.gui.pages.values import PageCapability, PageCleanup, PageLifecycle
+from xdart.gui.pages.values import (
+    PageCapability,
+    PageCleanup,
+    PageLifecycle,
+    RSM_TOOL_KEY,
+    STITCH_TOOL_KEY,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -57,9 +64,21 @@ def test_catalog_registers_current_workspace_first_and_as_default():
     )
     assert DEFAULT_PAGE_KEY == "scattering-workspace"
     assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
-    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, STITCH_TOOL)
-    assert STITCH_TOOL.key == "stitch"
-    assert STITCH_TOOL.tool_kind == "analysis"
+    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)
+    assert STITCH_TOOL.key == STITCH_TOOL_KEY == "stitch"
+    assert (
+        STITCH_TOOL.label,
+        STITCH_TOOL.category,
+        STITCH_TOOL.order,
+        STITCH_TOOL.tool_kind,
+    ) == ("Stitching", "analysis", 100, "analysis")
+    assert RSM_TOOL.key == RSM_TOOL_KEY == "rsm"
+    assert (
+        RSM_TOOL.label,
+        RSM_TOOL.category,
+        RSM_TOOL.order,
+        RSM_TOOL.tool_kind,
+    ) == ("Reciprocal Space Map", "analysis", 110, "analysis")
 
 
 def test_scattering_descriptor_declares_the_frozen_adoption_ports():
@@ -78,12 +97,16 @@ def test_scattering_descriptor_declares_the_frozen_adoption_ports():
 
 
 def test_default_selection_is_the_current_workspace():
-    registry = PageRegistry(BUILTIN_PAGES).freeze()
+    registry = PageRegistry(BUILTIN_DESCRIPTORS).freeze()
     assert registry.select(None, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
     assert registry.select(
         "unknown-page", DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
     assert registry.select(
         "scattering-workspace", DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
+    assert registry.select(
+        STITCH_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
+    assert registry.select(
+        RSM_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +118,11 @@ def test_catalog_import_does_not_import_the_scattering_package():
         "import sys\n"
         "import xdart.gui.pages.catalog\n"
         "loaded = [m for m in sys.modules if "
-        "'gui.tabs.scattering' in m or 'gui.tools.stitch' in m]\n"
+        "'gui.tabs.scattering' in m "
+        "or m.startswith('xdart.gui.tools.stitch') "
+        "or m.startswith('xdart.gui.tools.rsm') "
+        "or m == 'xrd_tools.analysis.stitch_operation' "
+        "or m == 'xrd_tools.analysis.rsm_operation']\n"
         "assert not loaded, loaded\n"
         "print('lazy-ok')\n"
     )
@@ -117,8 +144,12 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
     try:
         assert STITCH_TOOL.key not in window._tool_handles
         assert [action.text() for action in window.ui.menuAnalysis.actions()] == [
-            "Stitching"
+            "Stitching",
+            "Reciprocal Space Map",
         ]
+        assert window.ui.menuAnalysis.actions()[0].objectName() == (
+            "actionAnalysisTool_stitch"
+        )
         assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
         handle = window._tool_handles[STITCH_TOOL.key]
         assert handle.widget.objectName() == "stitchToolDialog"
@@ -127,7 +158,47 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
         assert handle.activity.active() is False
         assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
         assert window._tool_handles[STITCH_TOOL.key] is handle
+        assert RSM_TOOL.key not in window._tool_handles
         assert handle.close().status is PageCleanup.CLEAN
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_builtin_rsm_action_constructs_one_idle_tool_only_when_opened(
+        qapp, isolated_settings):
+    from xdart.gui.pages.values import ActionCompleted
+
+    window = _mounted_host(None)
+    try:
+        page_widget = window.main_widget
+        selected_page_key = window.selected_page_key
+        assert RSM_TOOL.key not in window._tool_handles
+        assert [action.text() for action in window.ui.menuAnalysis.actions()] == [
+            "Stitching",
+            "Reciprocal Space Map",
+        ]
+        assert window.ui.menuAnalysis.actions()[1].objectName() == (
+            "actionAnalysisTool_rsm"
+        )
+        assert window.open_tool(RSM_TOOL.key) == ActionCompleted("rsm")
+        handle = window._tool_handles[RSM_TOOL.key]
+        dialog = handle.widget
+        assert handle.key == RSM_TOOL_KEY
+        assert dialog.objectName() == "rsmToolDialog"
+        assert dialog.isWindow()
+        assert dialog.parent() is window
+        assert handle.activity.active() is False
+        dialog.close()
+        qapp.processEvents()
+        assert not dialog.isVisible()
+        assert window.open_tool(RSM_TOOL.key) == ActionCompleted("rsm")
+        assert window._tool_handles[RSM_TOOL.key] is handle
+        assert window._tool_handles[RSM_TOOL.key].widget is dialog
+        assert window.main_widget is page_widget
+        assert window.selected_page_key == selected_page_key
+        assert STITCH_TOOL.key not in window._tool_handles
     finally:
         window.close()
         window.deleteLater()

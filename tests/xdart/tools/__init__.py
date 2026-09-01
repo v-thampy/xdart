@@ -1,1 +1,1 @@
-
+"""Standalone vNext tool tests."""

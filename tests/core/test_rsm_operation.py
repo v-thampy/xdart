@@ -589,6 +589,156 @@ def test_prepare_is_image_free_and_binds_exact_spec_science(tmp_path, monkeypatc
     assert request.module.plan_fingerprint == plan.fingerprint
 
 
+@pytest.mark.parametrize(
+    "overwrite",
+    (
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        AnalysisArtifactOverwrite.REPLACE,
+    ),
+)
+def test_prepare_refuses_symbolic_link_output_target(tmp_path, overwrite):
+    source, _output, plan, _frames = _synthetic_spec_source(tmp_path)
+    target = tmp_path / "output" / "rsm.nexus"
+    target.symlink_to(tmp_path / "operator-owned.nexus")
+    output = ModuleOutputRequest(
+        target,
+        AnalysisArtifactKind.RSM,
+        overwrite,
+    )
+
+    with pytest.raises(RSMOperationRefused) as refused:
+        prepare_rsm_operation(source, output, plan, project_root=tmp_path)
+
+    assert refused.value.code == "OUTPUT_SYMLINK_UNSUPPORTED"
+
+
+def test_prepare_canonicalizes_output_parent_alias(tmp_path):
+    source, _output, plan, _frames = _synthetic_spec_source(tmp_path)
+    admitted = tmp_path / "admitted"
+    outside = tmp_path / "outside"
+    admitted.mkdir()
+    outside.mkdir()
+    alias = tmp_path / "output-alias"
+    alias.symlink_to(admitted, target_is_directory=True)
+    output = ModuleOutputRequest(
+        alias / "rsm.nexus",
+        AnalysisArtifactKind.RSM,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+    )
+
+    request = prepare_rsm_operation(
+        source,
+        output,
+        plan,
+        project_root=tmp_path,
+    )
+    assert request.module.output.target == str(admitted / "rsm.nexus")
+
+    alias.unlink()
+    alias.symlink_to(outside, target_is_directory=True)
+    result = run_rsm_operation(request)
+
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert (admitted / "rsm.nexus").is_file()
+    assert not (outside / "rsm.nexus").exists()
+
+
+def test_run_refuses_replaced_canonical_output_parent_before_science(
+    tmp_path,
+    monkeypatch,
+):
+    source, _output, plan, _frames = _synthetic_spec_source(tmp_path)
+    admitted = tmp_path / "admitted"
+    outside = tmp_path / "outside"
+    admitted.mkdir()
+    outside.mkdir()
+    output = ModuleOutputRequest(
+        admitted / "rsm.nexus",
+        AnalysisArtifactKind.RSM,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+    )
+    request = prepare_rsm_operation(
+        source,
+        output,
+        plan,
+        project_root=tmp_path,
+    )
+    held = tmp_path / "admitted-before-retarget"
+    admitted.rename(held)
+    admitted.symlink_to(outside, target_is_directory=True)
+    science_calls = []
+
+    def forbidden_science(*_args, **_kwargs):
+        science_calls.append(True)
+        raise AssertionError("output authority must be requalified before science")
+
+    monkeypatch.setattr(rsm_operation, "run_rsm", forbidden_science)
+    result = run_rsm_operation(request)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "OUTPUT_IDENTITY_MISMATCH"
+    assert science_calls == []
+    assert not (outside / "rsm.nexus").exists()
+
+
+def test_run_refuses_same_path_replacement_output_parent_before_science(
+    tmp_path,
+    monkeypatch,
+):
+    request, _frames = _prepared_rsm(tmp_path)
+    parent = Path(request.module.output.target).parent
+    held = tmp_path / "output-before-ordinary-replacement"
+    parent.rename(held)
+    parent.mkdir()
+    science_calls = []
+
+    def forbidden_science(*_args, **_kwargs):
+        science_calls.append(True)
+        raise AssertionError("replacement directory inherited Preview authority")
+
+    monkeypatch.setattr(rsm_operation, "run_rsm", forbidden_science)
+    result = run_rsm_operation(request)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "OUTPUT_IDENTITY_MISMATCH"
+    assert science_calls == []
+    assert tuple(parent.iterdir()) == ()
+    assert tuple(held.iterdir()) == ()
+
+
+def test_output_retarget_during_admission_is_refused_before_publication(
+    tmp_path,
+    monkeypatch,
+):
+    request, _frames = _prepared_rsm(tmp_path)
+    parent = Path(request.module.output.target).parent
+    held = tmp_path / "output-before-admission-retarget"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_admit = rsm_operation.admit_module_artifact
+    retargets = []
+
+    def admit_then_retarget(*args, **kwargs):
+        output = original_admit(*args, **kwargs)
+        parent.rename(held)
+        parent.symlink_to(outside, target_is_directory=True)
+        retargets.append(True)
+        return output
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "admit_module_artifact",
+        admit_then_retarget,
+    )
+    result = run_rsm_operation(request)
+
+    assert retargets == [True]
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "OUTPUT_IDENTITY_MISMATCH"
+    assert tuple(outside.iterdir()) == ()
+    assert tuple(held.iterdir()) == ()
+
+
 def test_request_factory_rejects_foreign_preflight(tmp_path):
     request, _frames = _prepared_rsm(tmp_path)
     original = request.preflight
@@ -621,6 +771,7 @@ def test_request_factory_rejects_foreign_preflight(tmp_path):
             request.module,
             request.plan,
             forged,
+            request.output_authority,
             request.provenance_json,
             rsm_operation._REQUEST_FACTORY,
         )
