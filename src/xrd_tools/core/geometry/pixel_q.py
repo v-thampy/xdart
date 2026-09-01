@@ -295,43 +295,51 @@ class PixelQMap:
                 f"DetectorHeader.Nch1/Nch2 explicitly."
             )
 
-        hxrd = self.diff_config.make_hxrd(energy)
-        hxrd.Ang2Q.init_area(
-            self.diff_config.init_area_detrot,
-            self.diff_config.init_area_tiltazimuth,
-            cch1=float(header.cch1),
-            cch2=float(header.cch2),
-            pwidth1=float(header.pwidth1),
-            pwidth2=float(header.pwidth2),
-            distance=float(header.distance),
-            Nch1=int(header.Nch1),
-            Nch2=int(header.Nch2),
-        )
-        qx, qy, qz = hxrd.Ang2Q.area(
-            *angles,
-            UB=UB,
-            **self.diff_config.ang2q_kwargs,
-        )
-        if not angles:
-            raise ValueError("pixel_q requires at least one per-frame angle array")
-        frame_count = len(np.asarray(angles[0]))
-        expected = (frame_count, int(header.Nch1), int(header.Nch2))
-        values: list[np.ndarray] = []
-        for value in (qx, qy, qz):
-            array = np.asarray(value)
-            # xrayutilities squeezes the leading axis for a one-frame area
-            # call even though PixelQMap's public contract is always
-            # (N_frame, Nch1, Nch2).  Restore that axis at this boundary so a
-            # chunk_size of one (or a final one-frame remainder) is valid.
-            if frame_count == 1 and array.shape == expected[1:]:
-                array = array.reshape(expected)
-            if array.shape != expected:
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+        # make_hxrd, area initialization, mapping, and shape admission are one
+        # indivisible use of xrayutilities global configuration.  Stitch and
+        # every PixelQMap/RSM caller therefore share the exact same RLock and
+        # NTHREADS=1/restore lifecycle.
+        with xu_runtime_session():
+            hxrd = self.diff_config.make_hxrd(energy)
+            hxrd.Ang2Q.init_area(
+                self.diff_config.init_area_detrot,
+                self.diff_config.init_area_tiltazimuth,
+                cch1=float(header.cch1),
+                cch2=float(header.cch2),
+                pwidth1=float(header.pwidth1),
+                pwidth2=float(header.pwidth2),
+                distance=float(header.distance),
+                Nch1=int(header.Nch1),
+                Nch2=int(header.Nch2),
+            )
+            qx, qy, qz = hxrd.Ang2Q.area(
+                *angles,
+                UB=UB,
+                **self.diff_config.ang2q_kwargs,
+            )
+            if not angles:
                 raise ValueError(
-                    "pixel_q backend returned shape "
-                    f"{array.shape}; expected {expected}"
+                    "pixel_q requires at least one per-frame angle array"
                 )
-            values.append(array)
-        return values[0], values[1], values[2]
+            frame_count = len(np.asarray(angles[0]))
+            expected = (frame_count, int(header.Nch1), int(header.Nch2))
+            values: list[np.ndarray] = []
+            for value in (qx, qy, qz):
+                array = np.asarray(value)
+                # xrayutilities squeezes the leading axis for a one-frame area
+                # call even though PixelQMap's public contract is always
+                # (N_frame, Nch1, Nch2).  Restore that axis at this boundary.
+                if frame_count == 1 and array.shape == expected[1:]:
+                    array = array.reshape(expected)
+                if array.shape != expected:
+                    raise ValueError(
+                        "pixel_q backend returned shape "
+                        f"{array.shape}; expected {expected}"
+                    )
+                values.append(array)
+            return values[0], values[1], values[2]
 
 
 __all__ = [
