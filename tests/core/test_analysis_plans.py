@@ -394,6 +394,104 @@ def test_run_rsm_delegates_single_and_multi_source(monkeypatch):
     assert calls[1][1][0].scan is source
 
 
+def test_run_rsm_gi_persists_single_source_inferred_mapping_wavelength(
+    monkeypatch,
+):
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.corrections.grazing import GISettings
+
+    calls = []
+    source = MemoryFrameSource([np.ones((2, 2))], name="inferred-rsm")
+    source.energy_eV = 10500.0
+    monkeypatch.setattr(
+        plan_mod,
+        "process_scan_from_nexus",
+        lambda *args, **kwargs: calls.append(kwargs) or "volume-single",
+    )
+
+    result = run_rsm(
+        RSMPlan(
+            mapper=object(),
+            diff_motors=("th",),
+            bins=(3, 4, 5),
+            energy=None,
+            gi=GISettings(),
+        ),
+        source,
+    )
+
+    assert calls[0]["energy"] == 10500.0
+    assert result.provenance["plan"]["energy"] == 10500.0
+    assert result.provenance["plan"]["gi"]["integrator_wavelength_m"] == (
+        energy_eV_to_wavelength_m(10500.0)
+    )
+
+
+def test_run_rsm_grouped_gi_refuses_mismatched_inferred_wavelengths(
+    monkeypatch,
+):
+    from xrd_tools.corrections.grazing import GISettings
+
+    first = MemoryFrameSource([np.ones((2, 2))], name="rsm-first")
+    second = MemoryFrameSource([np.ones((2, 2))], name="rsm-second")
+    first.energy_eV = 10000.0
+    second.energy_eV = 10200.0
+    monkeypatch.setattr(
+        plan_mod,
+        "grid_scans_streaming",
+        lambda *args, **kwargs: pytest.fail("mismatched GI sources reached grid"),
+    )
+
+    with pytest.raises(ValueError, match="matching X-ray wavelengths"):
+        run_rsm(
+            RSMPlan(
+                mapper=object(),
+                diff_motors=("th",),
+                bins=(3, 4, 5),
+                energy=None,
+                gi=GISettings(),
+            ),
+            [first, second],
+        )
+
+
+def test_run_rsm_grouped_gi_uses_and_persists_one_admitted_wavelength(
+    monkeypatch,
+):
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.corrections.grazing import GISettings
+
+    calls = []
+    first = MemoryFrameSource([np.ones((2, 2))], name="rsm-first")
+    second = MemoryFrameSource([np.ones((2, 2))], name="rsm-second")
+    first.energy_eV = 10000.0
+    second.energy_eV = 10001.0  # within the canonical 0.1% policy
+    monkeypatch.setattr(
+        plan_mod,
+        "grid_scans_streaming",
+        lambda _mapper, inputs, *args, **kwargs: (
+            calls.append(list(inputs)) or "volume-group"
+        ),
+    )
+
+    result = run_rsm(
+        RSMPlan(
+            mapper=object(),
+            diff_motors=("th",),
+            bins=(3, 4, 5),
+            energy=None,
+            gi=GISettings(),
+        ),
+        [first, second],
+    )
+
+    assert [item.energy for item in calls[0]] == [10000.0, 10000.0]
+    assert result.provenance["plan"]["energy"] == 10000.0
+    assert result.provenance["plan"]["gi"]["integrator_wavelength_m"] == (
+        energy_eV_to_wavelength_m(10000.0)
+    )
+
+
 def test_run_rsm_attaches_scan_tagged_frame_records(monkeypatch):
     """run_rsm carries the raw-popup records too — a grouped RSM tags each
     contributing frame by its scan (RSM has the raw popup as well)."""

@@ -313,6 +313,47 @@ def _gi_settings_provenance(settings: Any, *, wavelength_m: float | None) -> Any
     return values
 
 
+def _rsm_source_energy_eV(source: Any) -> float:
+    """Use the RSM pipeline's one canonical source-energy resolver."""
+    from xrd_tools.rsm.pipeline import _energy_from_scan  # noqa: PLC0415
+
+    energy = float(_energy_from_scan(source))
+    if not np.isfinite(energy) or energy <= 0.0:
+        raise ValueError("GI RSM requires a positive finite X-ray energy")
+    return energy
+
+
+def _common_grouped_rsm_gi_energy_eV(
+    energies: Sequence[float], *, rtol: float = 1.0e-3,
+) -> float:
+    """Admit one canonical energy for a grouped GI map or refuse divergence."""
+    if not energies:
+        raise ValueError("grouped GI RSM requires at least one source")
+    ref = float(energies[0])
+    if not np.isfinite(ref) or ref <= 0.0:
+        raise ValueError("GI RSM requires a positive finite X-ray energy")
+    from xrd_tools.core.energy import check_energy_consistency  # noqa: PLC0415
+
+    for index, value in enumerate(energies[1:], 1):
+        energy = float(value)
+        if not np.isfinite(energy) or energy <= 0.0:
+            raise ValueError("GI RSM requires a positive finite X-ray energy")
+        check_energy_consistency(
+            energy,
+            ref,
+            what_a=f"grouped GI RSM member[{index}] energy",
+            what_b="grouped GI RSM member[0] energy",
+            rtol=rtol,
+        )
+        if abs(energy - ref) > rtol * max(abs(energy), abs(ref), 1.0):
+            raise ValueError(
+                "grouped GI RSM requires matching X-ray wavelengths "
+                f"within {rtol * 100.0:.2f}%: member[{index}] energy="
+                f"{energy:.9g} eV differs from member[0] energy={ref:.9g} eV"
+            )
+    return ref
+
+
 def _assert_members_same_wavelength(members: Sequence[Any], *, rtol: float = 1.0e-3) -> None:
     """Fail loud if grouped stitch members were taken at different X-ray
     wavelengths.
@@ -842,12 +883,24 @@ def run_rsm(
     """
 
     grouped = isinstance(source, Sequence) and not isinstance(source, (str, bytes))
+    effective_gi_energy: float | None = None
     if grouped:
         from xrd_tools.rsm.pipeline import ScanInput
 
         members = [ensure_frame_source(scan) for scan in source]
+        if plan.gi is not None:
+            if plan.energy is None:
+                inferred = [_rsm_source_energy_eV(member) for member in members]
+            else:
+                inferred = [float(plan.energy)] * len(members)
+            effective_gi_energy = _common_grouped_rsm_gi_energy_eV(inferred)
         inputs = [
-            ScanInput(scan=m, energy=plan.energy, UB=plan.UB, roi=plan.roi)
+            ScanInput(
+                scan=m,
+                energy=(effective_gi_energy if plan.gi is not None else plan.energy),
+                UB=plan.UB,
+                roi=plan.roi,
+            )
             for m in members
         ]
         payload = grid_scans_streaming(
@@ -867,13 +920,19 @@ def run_rsm(
     else:
         src = ensure_frame_source(source)  # type: ignore[arg-type]
         _harvest = src
+        if plan.gi is not None:
+            effective_gi_energy = (
+                _rsm_source_energy_eV(src)
+                if plan.energy is None
+                else _common_grouped_rsm_gi_energy_eV((float(plan.energy),))
+            )
         payload = process_scan_from_nexus(
             src,
             plan.mapper,
             plan.diff_motors,
             plan.bins,
             UB=plan.UB,
-            energy=plan.energy,
+            energy=(effective_gi_energy if plan.gi is not None else plan.energy),
             chunk_size=plan.chunk_size,
             q_bounds=plan.q_bounds,
             roi=plan.roi,
@@ -883,21 +942,21 @@ def run_rsm(
             gi=plan.gi,
         )
         n_sources = 1
+    plan_provenance = _plan_dict(plan)
+    if plan.gi is not None and effective_gi_energy is not None:
+        plan_provenance = {
+            **plan_provenance,
+            "energy": effective_gi_energy,
+            "gi": _gi_settings_provenance(
+                plan.gi,
+                wavelength_m=energy_eV_to_wavelength_m(effective_gi_energy),
+            ),
+        }
     return AnalysisResult(
         kind="rsm",
         payload=payload,
         provenance={
-            "plan": {
-                **_plan_dict(plan),
-                "gi": _gi_settings_provenance(
-                    plan.gi,
-                    wavelength_m=(
-                        None
-                        if plan.energy is None
-                        else energy_eV_to_wavelength_m(plan.energy)
-                    ),
-                ),
-            },
+            "plan": plan_provenance,
             "n_sources": n_sources,
         },
         frame_records=_harvest_frame_records(_harvest, scan_labels),
