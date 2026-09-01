@@ -119,6 +119,132 @@ def _unit_str(unit: Any) -> str:
     return str(unit[0]) if isinstance(unit, tuple) else str(unit)
 
 
+def _oriented_detector_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    sample_orientation: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply pyFAI's documented EXIF detector orientation as pure array math."""
+    so = int(sample_orientation)
+    mappings = {
+        1: (x, y),
+        2: (-x, y),
+        3: (-x, -y),
+        4: (x, -y),
+        5: (-y, -x),
+        6: (-y, x),
+        7: (y, x),
+        8: (y, -x),
+    }
+    try:
+        return mappings[so]
+    except KeyError as exc:
+        raise ValueError("sample_orientation must be between 1 and 8") from exc
+
+
+def _xdart_exit_angle_horz_equation(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    wavelength: float | None = None,
+    incident_angle: float = 0.0,
+    tilt_angle: float = 0.0,
+    sample_orientation: int = 1,
+) -> np.ndarray:
+    """Xdart's reflection-geometry horizontal exit coordinate.
+
+    This is the explicit matrix form of the historical xdart/pyFAI-2025
+    coordinate: orient the detector, pitch the outgoing ray toward the sample by
+    positive incidence, then roll the horizon.  It is intentionally independent
+    of pyFAI-2026's changed exit-angle equation.
+    """
+    del wavelength
+    xo, yo = _oriented_detector_xy(
+        np.asarray(x, dtype=float),
+        np.asarray(y, dtype=float),
+        sample_orientation,
+    )
+    z = np.asarray(z, dtype=float)
+    ci, si = np.cos(incident_angle), np.sin(incident_angle)
+    ct, st = np.cos(tilt_angle), np.sin(tilt_angle)
+    pitched_y = ci * yo - si * z
+    pitched_z = si * yo + ci * z
+    rolled_x = ct * xo - st * pitched_y
+    return np.arctan2(rolled_x, pitched_z)
+
+
+def _xdart_exit_angle_vert_equation(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    wavelength: float | None = None,
+    incident_angle: float = 0.0,
+    tilt_angle: float = 0.0,
+    sample_orientation: int = 1,
+) -> np.ndarray:
+    """Xdart physical alpha-f reconstructed from the stable q-oop product."""
+    import pyFAI.units as U  # noqa: PLC0415
+    from xrd_tools.corrections.grazing import (  # noqa: PLC0415
+        physical_exit_angle_from_qoop,
+    )
+
+    q_oop_per_A = 0.1 * np.asarray(
+        U.eq_qvert(
+            x,
+            y,
+            z,
+            wavelength=wavelength,
+            incident_angle=incident_angle,
+            tilt_angle=tilt_angle,
+            sample_orientation=sample_orientation,
+        ),
+        dtype=float,
+    )
+    return physical_exit_angle_from_qoop(
+        q_oop_per_A,
+        incident_angle_rad=incident_angle,
+        wavelength_m=wavelength,
+    )
+
+
+def _xdart_exit_angle_units(
+    *,
+    incident_angle: float,
+    tilt_angle: float,
+    sample_orientation: int,
+    degrees: bool,
+) -> tuple[Any, Any]:
+    """Build private FiberUnits with the public historical unit names."""
+    from pyFAI.units import UnitFiber  # noqa: PLC0415
+
+    suffix = "deg" if degrees else "rad"
+    scale = 180.0 / np.pi if degrees else 1.0
+    symbol = "degree" if degrees else "rad"
+    common = {
+        "scale": scale,
+        "incident_angle": incident_angle,
+        "tilt_angle": tilt_angle,
+        "sample_orientation": sample_orientation,
+        "positive": False,
+        "unit_symbol": symbol,
+    }
+    horizontal = UnitFiber(
+        f"exit_angle_horz_{suffix}",
+        label=f"Horizontal exit angle ({symbol})",
+        equation=_xdart_exit_angle_horz_equation,
+        short_name=f"exitangle_horz_{suffix}",
+        **common,
+    )
+    vertical = UnitFiber(
+        f"exit_angle_vert_{suffix}",
+        label=f"Physical vertical exit angle ({symbol})",
+        equation=_xdart_exit_angle_vert_equation,
+        short_name=f"exitangle_vert_{suffix}",
+        **common,
+    )
+    return horizontal, vertical
+
+
 def _to_result_2d(result: Any, unit_fallback: str,
                   azim_unit_fallback: str = "qoop_A^-1") -> IntegrationResult2D:
     """Convert pyFAI grazing-incidence 2D result → ``IntegrationResult2D``.
@@ -532,11 +658,13 @@ def integrate_gi_exitangles(
     incident_angle: float | None = None,
     tilt_angle: float | None = None,
     sample_orientation: int | None = None,
+    gi_exit_angle_convention: str = "xdart_reflection_qoop_v1",
     **kwargs: Any,
 ) -> IntegrationResult2D:
     """
-    2-D exit-angle map ``(horizontal exit angle, vertical exit angle)`` via
-    ``FiberIntegrator.integrate2d_exitangles``.
+    2-D xdart physical exit-angle map ``(horizontal, vertical)``.  The vertical
+    coordinate is reconstructed from q-oop and the exact integrator wavelength;
+    pyFAI's version-specific exit-angle map is not used.
 
     The direct reciprocal-space map ``(Q_xy, Q_z)`` for GIWAXS.  Units are
     exit-angles in degrees by default; pass ``angle_degrees=False`` in
@@ -574,13 +702,27 @@ def integrate_gi_exitangles(
     """
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     angle_degrees = kwargs.pop("angle_degrees", True)
+    from xrd_tools.corrections.grazing import (  # noqa: PLC0415
+        GI_EXIT_ANGLE_CONVENTION,
+        validate_gi_exit_angle_convention,
+    )
+    convention = validate_gi_exit_angle_convention(gi_exit_angle_convention)
+    if convention != GI_EXIT_ANGLE_CONVENTION:
+        raise ValueError("legacy GI exit-angle axes are preserved, not recomputed")
+    unit_ip, unit_oop = _xdart_exit_angle_units(
+        incident_angle=inc,
+        tilt_angle=tilt,
+        sample_orientation=orient,
+        degrees=angle_degrees,
+    )
 
     mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
-    result = fi.integrate2d_exitangles(
-        angle_degrees=angle_degrees,
+    result = fi.integrate2d_fiber(
         data=image,
         npt_ip=npt_rad,
         npt_oop=npt_azim,
+        unit_ip=unit_ip,
+        unit_oop=unit_oop,
         sample_orientation=orient,
         method=method,
         mask=mask,
@@ -808,14 +950,15 @@ def integrate_gi_exitangles_1d(
     incident_angle: float | None = None,
     tilt_angle: float | None = None,
     sample_orientation: int | None = None,
+    gi_exit_angle_convention: str = "xdart_reflection_qoop_v1",
     **kwargs: Any,
 ) -> IntegrationResult1D:
     """
-    1-D exit-angle integration: intensity vs horizontal exit angle (vertically integrated).
+    1-D exit-angle integration: intensity vs physical vertical exit angle
+    (horizontally integrated).
 
-    Wraps ``FiberIntegrator.integrate1d_exitangles``, which integrates the
-    ``(2θ_h, 2θ_v)`` exit-angle space and returns a single profile vs the
-    horizontal exit angle.
+    Integrates xdart's physical exit-angle space.  The vertical output is the
+    q-oop-derived reflected ``alpha_f`` axis.
 
     Parameters
     ----------
@@ -834,25 +977,39 @@ def integrate_gi_exitangles_1d(
     sample_orientation : int or None, optional
         Override sample orientation for this call.
     **kwargs
-        Forwarded to ``fi.integrate1d_exitangles``.  Pass
+        Forwarded to ``fi.integrate_fiber``.  Pass
         ``angle_degrees=False`` to get radian output, or
-        ``vertical_integration=False`` to integrate along the horizontal
-        axis instead.
+        ``vertical_integration=False`` to return the horizontal axis instead.
 
     Returns
     -------
     IntegrationResult1D
-        ``radial`` = horizontal exit-angle axis (degrees by default),
-        ``intensity`` = vertically integrated profile.
+        ``radial`` = physical vertical exit-angle axis (degrees by default),
+        ``intensity`` = horizontally integrated profile.
     """
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     angle_degrees = kwargs.pop("angle_degrees", True)
+    from xrd_tools.corrections.grazing import (  # noqa: PLC0415
+        GI_EXIT_ANGLE_CONVENTION,
+        validate_gi_exit_angle_convention,
+    )
+    convention = validate_gi_exit_angle_convention(gi_exit_angle_convention)
+    if convention != GI_EXIT_ANGLE_CONVENTION:
+        raise ValueError("legacy GI exit-angle axes are preserved, not recomputed")
+    unit_ip, unit_oop = _xdart_exit_angle_units(
+        incident_angle=inc,
+        tilt_angle=tilt,
+        sample_orientation=orient,
+        degrees=angle_degrees,
+    )
 
-    result = fi.integrate1d_exitangles(
-        angle_degrees=angle_degrees,
+    mask = mask_with_detector(fi, mask)
+    result = fi.integrate_fiber(
         data=image,
         npt_ip=npt,
         npt_oop=npt,
+        unit_ip=unit_ip,
+        unit_oop=unit_oop,
         sample_orientation=orient,
         method=method,
         mask=mask,

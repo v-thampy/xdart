@@ -96,6 +96,105 @@ def _tree_manifest(path, root):
 def _audit(path):
     with __import__("h5py").File(path,"r") as handle: return json.loads(handle["entry/reduction/config/dimension_replacement_2d"].asstr()[()])
 
+
+def test_reintegration_gi_identity_decodes_exact_current_and_historical_outer_maps():
+    from xrd_tools.corrections.grazing import (
+        GI_EXIT_ANGLE_CONVENTION,
+        LEGACY_GI_EXIT_ANGLE_CONVENTION,
+    )
+    from xrd_tools.reduction import reintegrate as module
+
+    legacy_gi = {
+        "enabled": True,
+        "incidence_motor": "Manual",
+        "resolved_motor": "Manual",
+        "th_val": 0.3,
+        "sample_orientation": 4,
+        "tilt_angle": 0.0,
+        "mode_1d": "q_oop",
+        "mode_2d": "qip_qoop",
+    }
+    assets = {
+        "poni_values": None,
+        "poni_detector_config_json": None,
+        "poni_sha256": None,
+        "mask_sha256": None,
+    }
+
+    def persisted(gi):
+        outer = {
+            "schema_version": 1,
+            "generation": 1,
+            "fingerprint": "f" * 64,
+            "source": None,
+            "processing_mode": "Int 2D",
+            "output_mode": "Overwrite",
+            "live_mode": False,
+            "batch_mode": False,
+            "max_cores": 1,
+            "gi": dict(gi),
+            "threshold": {
+                "apply_threshold": False,
+                "threshold_min": None,
+                "threshold_max": None,
+                "mask_saturation": False,
+            },
+            "poni_file": "",
+            "poni_values": None,
+            "mask_file": "",
+            "project_root": "",
+            "save_path": "",
+            "bai_1d_args": {},
+            "bai_2d_args": {},
+            "run_options": {},
+        }
+        outer["scientific_signature"] = {
+            **copy.deepcopy(outer),
+            "accepted_scientific_assets": dict(assets),
+        }
+        return outer
+
+    historical_run = persisted(legacy_gi)
+    historical = module._validated_shared_science(historical_run)
+    assert historical["gi"]["gi_exit_angle_convention"] == (
+        LEGACY_GI_EXIT_ANGLE_CONVENTION
+    )
+    assert historical_run["gi"] == legacy_gi
+    assert len(historical_run["gi"]) == 8
+
+    current_run = persisted({
+        **legacy_gi,
+        "gi_exit_angle_convention": GI_EXIT_ANGLE_CONVENTION,
+    })
+    current = module._validated_shared_science(current_run)
+    assert current["gi"]["gi_exit_angle_convention"] == (
+        GI_EXIT_ANGLE_CONVENTION
+    )
+    assert len(current_run["gi"]) == 9
+
+    selected = {
+        "version": 1,
+        "dimension": "1d",
+        "bai_args": {
+            "npt": 1000,
+            "unit": "qoop_A^-1",
+            "method": "csr",
+            "radial_range": None,
+            "azimuth_range": None,
+            "gi_method_1d": "cython",
+        },
+        "gi_mode": "q_oop",
+    }
+    module._validate_science(selected, historical, "1d")
+    module._validate_science(selected, current, "1d")
+    assert module._digest(historical) != module._digest(current)
+
+    with pytest.raises(ValueError, match="persisted GI is malformed"):
+        module._validated_shared_science(persisted({
+            **legacy_gi,
+            "third_schema": True,
+        }))
+
 def test_ordinary_output_routes_group_target_through_one_borrowed_lock(tmp_path):
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 

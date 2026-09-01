@@ -42,6 +42,62 @@ class TestOpticalConstants:
 
 
 class TestPrimitiveGates:
+    def test_reflection_qoop_vector_oracle_direct_horizon_specular(self):
+        """The xdart exit axis follows the reflected outgoing ray, not pyFAI's
+        version-specific exit-angle array.
+
+        In the sample frame the incident ray has normal component ``-sin(ai)``.
+        Direct beam, sample horizon, and specular reflection therefore have
+        outgoing normal components ``-sin(ai)``, ``0``, and ``+sin(ai)`` and
+        q-oop components ``0``, ``k0*sin(ai)``, and ``2*k0*sin(ai)``.
+        """
+        from xrd_tools.corrections.grazing import physical_exit_angle_from_qoop
+
+        ai = np.deg2rad(0.3)
+        wavelength_m = 1.0e-10
+        k0 = 2.0 * np.pi / (wavelength_m * 1.0e10)
+        qoop = k0 * np.array([0.0, np.sin(ai), 2.0 * np.sin(ai)])
+
+        actual = physical_exit_angle_from_qoop(
+            qoop,
+            incident_angle_rad=ai,
+            wavelength_m=wavelength_m,
+        )
+        np.testing.assert_allclose(actual, [-ai, 0.0, ai], atol=2.0e-15)
+
+    def test_reflection_qoop_yoneda_maps_to_critical_angle(self):
+        """The q-space Yoneda position reconstructs the same physical alpha-f
+        used by the correction stack, independent of any pyFAI exit map."""
+        pytest.importorskip("xrayutilities")
+        from xrd_tools.corrections.grazing import physical_exit_angle_from_qoop
+
+        ai = np.deg2rad(0.3)
+        ac = _stack().optical_constants()["ac_rad"]
+        wavelength_m = 1.2398419843320026e-10
+        k0 = 2.0 * np.pi / (wavelength_m * 1.0e10)
+        qoop_yoneda = k0 * (np.sin(ac) + np.sin(ai))
+
+        actual = physical_exit_angle_from_qoop(
+            qoop_yoneda,
+            incident_angle_rad=ai,
+            wavelength_m=wavelength_m,
+        )
+        assert float(actual) == pytest.approx(ac, abs=2.0e-15)
+
+    def test_reflection_qoop_refuses_nonfinite_and_materially_impossible_rays(self):
+        from xrd_tools.corrections.grazing import physical_exit_angle_from_qoop
+
+        kwargs = {"incident_angle_rad": 0.0, "wavelength_m": 1.0e-10}
+        with pytest.raises(ValueError, match="finite"):
+            physical_exit_angle_from_qoop(np.nan, **kwargs)
+        with pytest.raises(ValueError, match="physical domain"):
+            physical_exit_angle_from_qoop(2.0 * np.pi * 1.01, **kwargs)
+
+        # One binary64 ulp outside +1 is a representational edge, not a new ray.
+        edge = 2.0 * np.pi * np.nextafter(1.0, 2.0)
+        actual = physical_exit_angle_from_qoop(edge, **kwargs)
+        assert float(actual) == pytest.approx(np.pi / 2.0)
+
     def test_footprint_proportional_to_inv_sin(self):
         from xrd_tools.corrections.grazing import footprint_weight
         ai = np.radians(np.array([0.25, 0.5, 1.0]))

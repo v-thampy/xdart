@@ -737,6 +737,7 @@ def build_native_int_reduction_plan_from_args(
     incidence_motor: Any = None,
     tilt_angle: Any = 0.0,
     sample_orientation: Any = 4,
+    gi_exit_angle_convention: str = "xdart_reflection_qoop_v1",
     integrate_1d: bool = True,
     integrate_2d: bool = True,
     threshold_min: Any = None,
@@ -836,6 +837,7 @@ def build_native_int_reduction_plan_from_args(
             mode_1d=gi_mode_1d,
             mode_2d=gi_mode_2d,
             npt_oop=None if npt_oop is None else int(npt_oop),
+            gi_exit_angle_convention=gi_exit_angle_convention,
         )
 
     integration_1d = None
@@ -905,6 +907,12 @@ def build_native_int_reduction_plan_from_scan(
         integrate_2d = not bool(getattr(scan, "skip_2d", False))
 
     gi_config = dict(getattr(scan, "gi_config", {}) or {})
+    if gi_config and "gi_exit_angle_convention" not in gi_config:
+        gi_convention = "legacy_xdart_2025_reflection"
+    else:
+        gi_convention = gi_config.get(
+            "gi_exit_angle_convention", "xdart_reflection_qoop_v1"
+        )
 
     def _gi_value(name: str, default: Any) -> Any:
         value = getattr(scan, name, None)
@@ -934,6 +942,7 @@ def build_native_int_reduction_plan_from_scan(
         incidence_motor=getattr(scan, "incidence_motor", None),
         tilt_angle=_gi_value("tilt_angle", 0.0),
         sample_orientation=_gi_value("sample_orientation", 4),
+        gi_exit_angle_convention=gi_convention,
         integrate_1d=integrate_1d,
         integrate_2d=bool(integrate_2d),
         threshold_min=threshold_min,

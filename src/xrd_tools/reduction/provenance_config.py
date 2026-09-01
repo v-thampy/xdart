@@ -204,6 +204,9 @@ def _gi_config_from_plan(plan: Any) -> dict[str, Any]:
         "th_val": float(getattr(gi, "incident_angle", 0.0) or 0.0),
         "tilt_angle": float(getattr(gi, "tilt_angle", 0.0) or 0.0),
         "sample_orientation": int(getattr(gi, "sample_orientation", 1) or 1),
+        "gi_exit_angle_convention": str(
+            getattr(gi, "gi_exit_angle_convention", "") or ""
+        ),
     }
 
 

@@ -20,6 +20,11 @@ def _header(Nch1=64, Nch2=80, cch1=30.0, cch2=40.0):
                           distance=500.0, Nch1=Nch1, Nch2=Nch2)
 
 
+def _wavelength_m():
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    return energy_eV_to_wavelength_m(10000.0)
+
+
 class TestHeaderToAiBridge:
     def test_solid_angle_peaks_at_beam_centre(self):
         """The convention check: the max-solid-angle pixel is the beam centre
@@ -107,7 +112,10 @@ class TestGiGridWeight:
         from xrd_tools.rsm.corrections import gi_grid_weight
         gi = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=False,
                                fresnel=False, absorption=False, refraction=False)
-        w = gi_grid_weight(_header(), gi, incident_angle_deg=0.3)
+        w = gi_grid_weight(
+            _header(), gi, incident_angle_deg=0.3,
+            wavelength_m=_wavelength_m(),
+        )
         np.testing.assert_allclose(w, 1.0)
 
     def test_footprint_only_is_inv_sin_alpha_i(self):
@@ -117,7 +125,10 @@ class TestGiGridWeight:
         from xrd_tools.rsm.corrections import gi_grid_weight
         gi = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=True,
                                fresnel=False, absorption=False, refraction=False)
-        w = gi_grid_weight(_header(), gi, incident_angle_deg=0.3)
+        w = gi_grid_weight(
+            _header(), gi, incident_angle_deg=0.3,
+            wavelength_m=_wavelength_m(),
+        )
         # footprint boost 1/sin αi enters the Σnorm weight
         np.testing.assert_allclose(w, 1.0 / np.sin(np.deg2rad(0.3)))
 
@@ -135,9 +146,14 @@ class TestGiGridWeight:
         gi = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=True,
                                fresnel=True, absorption=False, refraction=False)
         base = rsm_correction_weight(h, cs)
-        giw = gi_grid_weight(h, gi, incident_angle_deg=0.3)
+        giw = gi_grid_weight(
+            h, gi, incident_angle_deg=0.3,
+            wavelength_m=_wavelength_m(),
+        )
         combined = rsm_correction_weight(
-            h, cs, gi=GISettings(corrections=gi, incident_angle_deg=0.3))
+            h, cs, gi=GISettings(corrections=gi, incident_angle_deg=0.3),
+            wavelength_m=_wavelength_m(),
+        )
         np.testing.assert_allclose(combined, base * giw)
 
     def test_gi_requires_fixed_incident_angle(self):
@@ -147,7 +163,10 @@ class TestGiGridWeight:
         from xrd_tools.rsm.corrections import rsm_correction_weight
         gi = GICorrectionStack(material="Si", energy_eV=10000.0)
         with pytest.raises(ValueError, match="incident_angle_deg"):
-            rsm_correction_weight(_header(), None, gi=GISettings(corrections=gi))
+            rsm_correction_weight(
+                _header(), None, gi=GISettings(corrections=gi),
+                wavelength_m=_wavelength_m(),
+            )
 
     def test_gi_refraction_rejected_in_rsm(self):
         """RSM applies only the GI *intensity* weight, not the q-coordinate
@@ -162,11 +181,49 @@ class TestGiGridWeight:
         with pytest.raises(NotImplementedError, match="refraction"):
             rsm_correction_weight(
                 _header(), None,
-                gi=GISettings(corrections=on, incident_angle_deg=0.3))
+                gi=GISettings(corrections=on, incident_angle_deg=0.3),
+                wavelength_m=_wavelength_m(),
+            )
         off = GICorrectionStack(material="Si", energy_eV=10000.0, refraction=False)
         w = rsm_correction_weight(
-            _header(), None, gi=GISettings(corrections=off, incident_angle_deg=0.3))
+            _header(), None, gi=GISettings(corrections=off, incident_angle_deg=0.3),
+            wavelength_m=_wavelength_m(),
+        )
         assert w is not None and np.all(np.isfinite(w))
+
+    def test_gi_requires_exact_mapping_wavelength(self):
+        pytest.importorskip("xrayutilities")
+        pytest.importorskip("pyFAI")
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
+        from xrd_tools.rsm.corrections import rsm_correction_weight
+
+        settings = GISettings(
+            corrections=GICorrectionStack(
+                material="Si", energy_eV=10000.0, refraction=False,
+            ),
+            incident_angle_deg=0.3,
+        )
+        with pytest.raises(ValueError, match="exact mapping wavelength"):
+            rsm_correction_weight(_header(), None, gi=settings)
+
+    def test_gi_refuses_mapping_wavelength_that_differs_from_frozen_intent(self):
+        pytest.importorskip("xrayutilities")
+        pytest.importorskip("pyFAI")
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
+        from xrd_tools.rsm.corrections import rsm_correction_weight
+
+        settings = GISettings(
+            corrections=GICorrectionStack(
+                material="Si", energy_eV=10000.0, refraction=False,
+            ),
+            incident_angle_deg=0.3,
+            integrator_wavelength_m=_wavelength_m(),
+        )
+        with pytest.raises(ValueError, match="differs from persisted GI intent"):
+            rsm_correction_weight(
+                _header(), None, gi=settings,
+                wavelength_m=_wavelength_m() * 1.01,
+            )
 
 
 class TestRsmGridCorrectionsWiring:

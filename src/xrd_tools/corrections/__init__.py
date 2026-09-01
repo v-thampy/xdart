@@ -24,9 +24,13 @@ from xrd_tools.corrections.normalization import (
 from xrd_tools.corrections.stack import CorrectionStack
 from xrd_tools.corrections.grazing import (
     GICorrectionStack,
+    GI_EXIT_ANGLE_CONVENTION,
     GISettings,
+    LEGACY_GI_EXIT_ANGLE_CONVENTION,
     fresnel_transmission_sq,
+    physical_exit_angle_from_qoop,
     refracted_angle,
+    validate_gi_exit_angle_convention,
 )
 
 __all__ = [
@@ -34,9 +38,13 @@ __all__ = [
     "CorrectionStack",
     # grazing-incidence per-pixel corrections (GI mode)
     "GICorrectionStack",
+    "GI_EXIT_ANGLE_CONVENTION",
     "GISettings",
+    "LEGACY_GI_EXIT_ANGLE_CONVENTION",
     "fresnel_transmission_sq",
+    "physical_exit_angle_from_qoop",
     "refracted_angle",
+    "validate_gi_exit_angle_convention",
     # beam
     "absorption_correction",
     "polarization_correction",

@@ -478,10 +478,19 @@ class GIMode:
     mode_1d: GI1DMode | str = GI1DMode.Q_TOTAL
     mode_2d: GI2DMode | str = GI2DMode.QIP_QOOP
     npt_oop: int | None = None
+    gi_exit_angle_convention: str = "xdart_reflection_qoop_v1"
 
     def __post_init__(self) -> None:
+        from xrd_tools.corrections.grazing import (  # noqa: PLC0415
+            validate_gi_exit_angle_convention,
+        )
         object.__setattr__(self, "mode_1d", _coerce_gi_1d_mode(self.mode_1d))
         object.__setattr__(self, "mode_2d", _coerce_gi_2d_mode(self.mode_2d))
+        object.__setattr__(
+            self,
+            "gi_exit_angle_convention",
+            validate_gi_exit_angle_convention(self.gi_exit_angle_convention),
+        )
         if self.incident_angle is not None:
             object.__setattr__(self, "incident_angle", float(self.incident_angle))
         if self.npt_oop is not None and int(self.npt_oop) <= 0:
@@ -5099,6 +5108,7 @@ def _run_gi_1d(
         return integrate_gi_exitangles_1d(
             image,
             fi,
+            gi_exit_angle_convention=gi.gi_exit_angle_convention,
             **common,
             **extra,
         )
@@ -5168,6 +5178,7 @@ def _run_gi_2d(
         return integrate_gi_exitangles(
             image,
             fi,
+            gi_exit_angle_convention=gi.gi_exit_angle_convention,
             unit=plan.unit,
             radial_range=plan.radial_range,
             azimuth_range=plan.azimuth_range,

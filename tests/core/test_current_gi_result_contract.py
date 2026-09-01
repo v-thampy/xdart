@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import h5py
@@ -13,7 +14,12 @@ from tests.core._v2_record_fixture import (
     write_gi_reference_scan,
 )
 from xrd_tools.core import DEFAULT_MODE_KEY
-from xrd_tools.io import NexusRecordWriter, RecordWrite, WriterIncomplete
+from xrd_tools.io import (
+    NexusRecordWriter,
+    RecordWrite,
+    WriterFinalization,
+    WriterIncomplete,
+)
 from xrd_tools.io.append import (
     AppendIntent,
     AppendSource,
@@ -92,6 +98,55 @@ def test_current_admission_owns_the_exact_ordered_gi_inventory(tmp_path):
         )
         assert processed.mode_group("1d", "q_oop").name.endswith(
             "/integrated_1d/q_oop"
+        )
+
+
+def test_new_gi_record_persists_exact_current_identity_and_reloads(tmp_path):
+    from xrd_tools.corrections.grazing import GI_EXIT_ANGLE_CONVENTION
+    from xrd_tools.core.provenance import read_provenance
+    from xrd_tools.session.run_configuration import (
+        FrozenGIConfiguration,
+        GIIntent,
+        RunIntent,
+    )
+
+    frozen = RunIntent(
+        gi=GIIntent(enabled=True, incidence_motor="Manual", th_val=0.3),
+    ).freeze()
+    target = tmp_path / "new-current-gi.nexus"
+    writer = NexusRecordWriter(target, overwrite=True, flush_every=None)
+    writer.begin(primary_mode_1d="q_total")
+    writer.write(RecordWrite(
+        label=0,
+        result_1d=_result_1d(0, unit=_GI_1D_UNITS["q_total"]),
+        mode_1d="q_total",
+    ))
+    writer.finish(WriterFinalization(
+        frame_indices=(0,),
+        provenance_config={
+            "bai_1d_args": {"gi_mode_1d": "q_total"},
+            "bai_2d_args": {"gi_mode_2d": "qip_qoop"},
+            "gi": True,
+            "gi_config": frozen.gi.scan_config(),
+            "run_configuration": frozen.as_provenance(),
+        },
+    ))
+
+    provenance = read_provenance(target)
+    outer = provenance["config"]["run_configuration"]
+    assert len(outer["gi"]) == 9
+    assert outer["gi"]["gi_exit_angle_convention"] == GI_EXIT_ANGLE_CONVENTION
+    assert FrozenGIConfiguration.from_dict(outer["gi"]) == frozen.gi
+    assert provenance["config"]["gi_config"][
+        "gi_exit_angle_convention"
+    ] == GI_EXIT_ANGLE_CONVENTION
+
+    with h5py.File(target, "r") as handle:
+        raw = handle["entry/reduction/config/run_configuration"][()]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        assert json.loads(raw)["gi"]["gi_exit_angle_convention"] == (
+            GI_EXIT_ANGLE_CONVENTION
         )
 
 

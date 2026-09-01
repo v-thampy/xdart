@@ -57,6 +57,7 @@ def gi_grid_weight(
     gi: Any,
     *,
     incident_angle_deg: float,
+    wavelength_m: float,
     sample_orientation: int = 1,
     tilt_deg: float = 0.0,
     roi: tuple[int, int, int, int] | None = None,
@@ -65,11 +66,9 @@ def gi_grid_weight(
     absorption) for the RSM grid, from a
     :class:`~xrd_tools.corrections.grazing.GICorrectionStack`.
 
-    Reuses the P4 approach: the per-pixel exit angle αf comes from **pyFAI's own
-    fiber geometry** (a ``FiberIntegrator`` built from the header + the
-    ``exit_angle_vert`` unit after ``reset_integrator(incident_angle=…)``), and
-    ``gi.gi_normalization`` supplies the weight — so αf is convention-pinned by
-    ``q_oop ≡ k0·(sin αf + sin αi)``.
+    The per-pixel exit angle is reconstructed from pyFAI's q-oop map and the
+    supplied mapping wavelength.  The pyFAI exit-angle map is never an input to
+    xdart's Fresnel/absorption corrections.
 
     ⚠ **Refraction is NOT applied here** (it is a position correction that would
     rewrite qz in 3-D — deferred, real-data-gated), and the absolute composition
@@ -79,7 +78,13 @@ def gi_grid_weight(
     import pyFAI.units as U  # noqa: PLC0415
     from pyFAI.detectors import Detector  # noqa: PLC0415
     from pyFAI.integrator.fiber import FiberIntegrator  # noqa: PLC0415
+    from xrd_tools.corrections.grazing import (  # noqa: PLC0415
+        physical_exit_angle_from_qoop,
+    )
 
+    wavelength = float(wavelength_m)
+    if not np.isfinite(wavelength) or wavelength <= 0.0:
+        raise ValueError("GI RSM mapping wavelength must be positive and finite")
     h = header.with_roi(roi) if roi is not None else header
     shape = (int(h.Nch1), int(h.Nch2))
     p1 = float(h.pwidth1) * 1.0e-3
@@ -88,14 +93,23 @@ def gi_grid_weight(
         dist=float(h.distance) * 1.0e-3, poni1=float(h.cch1) * p1,
         poni2=float(h.cch2) * p2, rot1=0.0, rot2=0.0, rot3=0.0,
         detector=Detector(pixel1=p1, pixel2=p2, max_shape=shape),
-        wavelength=1.0e-10)
+        wavelength=wavelength)
     air = float(np.radians(incident_angle_deg))
     tilt = float(np.radians(tilt_deg))
     fi.reset_integrator(incident_angle=air, tilt_angle=tilt,
                         sample_orientation=int(sample_orientation))
-    af_u = U.get_unit_fiber("exit_angle_vert_rad", incident_angle=air,
-                            tilt_angle=tilt, sample_orientation=int(sample_orientation))
-    af = np.asarray(fi.array_from_unit(shape, "center", af_u), dtype=float)
+    qoop_u = U.get_unit_fiber(
+        "qoop_A^-1",
+        incident_angle=air,
+        tilt_angle=tilt,
+        sample_orientation=int(sample_orientation),
+    )
+    qoop = np.asarray(fi.array_from_unit(shape, "center", qoop_u), dtype=float)
+    af = physical_exit_angle_from_qoop(
+        qoop,
+        incident_angle_rad=air,
+        wavelength_m=fi.wavelength,
+    )
     return np.asarray(
         gi.gi_normalization(incident_angle_deg=float(incident_angle_deg),
                             alpha_f_rad=af), dtype=float)
@@ -106,6 +120,7 @@ def rsm_correction_weight(
     corrections: Any,
     *,
     gi: Any = None,
+    wavelength_m: float | None = None,
     roi: tuple[int, int, int, int] | None = None,
 ) -> np.ndarray | None:
     """Per-pixel ``Σnorm`` weight for the RSM grid, or ``None``.
@@ -129,6 +144,18 @@ def rsm_correction_weight(
         base = np.asarray(
             corrections.normalization(ai, (int(h.Nch1), int(h.Nch2))), dtype=float)
     if gi is not None and gi.corrections is not None:
+        from xrd_tools.corrections.grazing import (  # noqa: PLC0415
+            GI_EXIT_ANGLE_CONVENTION,
+            validate_gi_exit_angle_convention,
+        )
+        convention = validate_gi_exit_angle_convention(
+            gi.gi_exit_angle_convention
+        )
+        if convention != GI_EXIT_ANGLE_CONVENTION:
+            raise ValueError(
+                "legacy GI exit-angle science cannot be rerun under the current "
+                "pyFAI runtime; rerun raw science with xdart_reflection_qoop_v1"
+            )
         if gi.incident_angle_deg is None:
             raise ValueError(
                 "GI RSM (RSMPlan.gi) requires GISettings.incident_angle_deg (a "
@@ -148,8 +175,23 @@ def rsm_correction_weight(
                 "GICorrectionStack(refraction=False) for RSM until RSM q-refraction "
                 "lands (real-data-gated); the intensity weights "
                 "(footprint/Fresnel/absorption) still apply.")
+        recorded_wavelength = gi.integrator_wavelength_m
+        if wavelength_m is None:
+            wavelength_m = recorded_wavelength
+        if wavelength_m is None:
+            raise ValueError(
+                "GI RSM corrections require the exact mapping wavelength"
+            )
+        if recorded_wavelength is not None and not np.isclose(
+            float(wavelength_m), float(recorded_wavelength),
+            rtol=1.0e-12, atol=0.0,
+        ):
+            raise ValueError(
+                "GI RSM mapping wavelength differs from persisted GI intent"
+            )
         giw = gi_grid_weight(
             header, gi.corrections, incident_angle_deg=gi.incident_angle_deg,
+            wavelength_m=float(wavelength_m),
             sample_orientation=gi.sample_orientation, tilt_deg=gi.tilt_deg, roi=roi)
         base = giw if base is None else base * giw
     return base

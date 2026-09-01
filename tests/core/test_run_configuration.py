@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.corrections.grazing import GI_EXIT_ANGLE_CONVENTION
 from xrd_tools.session.readiness import processing_config_from_mapping
 from xrd_tools.session.run_configuration import (
     FrozenGIConfiguration,
@@ -196,6 +197,7 @@ def test_accessors_preserve_gi_motor_and_processing_signature():
         "th_val": 0.12,
         "sample_orientation": 3,
         "tilt_angle": 0.25,
+        "gi_exit_angle_convention": GI_EXIT_ANGLE_CONVENTION,
     }
     signature = processing_config_from_mapping(mapping)
     assert signature is not None

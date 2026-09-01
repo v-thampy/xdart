@@ -617,7 +617,14 @@ def process_scan_from_nexus(
     }
 
     from xrd_tools.rsm.corrections import rsm_correction_weight  # noqa: PLC0415
-    weight = rsm_correction_weight(mapper.header, corrections, gi=gi, roi=roi)
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m  # noqa: PLC0415
+    weight = rsm_correction_weight(
+        mapper.header,
+        corrections,
+        gi=gi,
+        wavelength_m=energy_eV_to_wavelength_m(energy),
+        roi=roi,
+    )
 
     sg = StreamingGridder(mapper, bins)
     if q_bounds is None:
@@ -721,7 +728,14 @@ def grid_scans_streaming(
     from xrd_tools.rsm.corrections import rsm_correction_weight  # noqa: PLC0415
     for si, energy, full_angles, angle_rows in resolved:
         # the weight is ROI-cropped to match this scan's chunk images
-        weight = rsm_correction_weight(mapper.header, corrections, gi=gi, roi=si.roi)
+        from xrd_tools.core.energy import energy_eV_to_wavelength_m  # noqa: PLC0415
+        weight = rsm_correction_weight(
+            mapper.header,
+            corrections,
+            gi=gi,
+            wavelength_m=energy_eV_to_wavelength_m(energy),
+            roi=si.roi,
+        )
         for img_chunk, chunk_indices in _iter_scan_chunks(si.scan, chunk_size):
             angles_chunk = _slice_angle_arrays(
                 full_angles, angle_rows, chunk_indices,

@@ -25,8 +25,68 @@ from typing import Any, Mapping
 
 import numpy as np
 
+
+GI_EXIT_ANGLE_CONVENTION = "xdart_reflection_qoop_v1"
+LEGACY_GI_EXIT_ANGLE_CONVENTION = "legacy_xdart_2025_reflection"
+_GI_EXIT_ANGLE_CONVENTIONS = frozenset({
+    GI_EXIT_ANGLE_CONVENTION,
+    LEGACY_GI_EXIT_ANGLE_CONVENTION,
+})
+# Only values beyond a small multiple of binary64 roundoff are rejected.  This
+# is deliberately not a scientific tolerance: a materially impossible ray must
+# never be projected back into the physical domain merely to keep a run green.
+_ASIN_ROUNDOFF_ATOL = 64.0 * np.finfo(np.float64).eps
+
 #: floor on αf before any 1/sin or transmission (the notebook's grazing guard).
 _AF_FLOOR_DEG = 0.01
+
+
+def validate_gi_exit_angle_convention(value: Any) -> str:
+    """Return one supported GI exit-axis identity, refusing unknown meanings."""
+    if type(value) is not str or value not in _GI_EXIT_ANGLE_CONVENTIONS:
+        raise ValueError(f"unsupported GI exit-angle convention {value!r}")
+    return value
+
+
+def physical_exit_angle_from_qoop(
+    q_oop_per_A: np.ndarray | float,
+    *,
+    incident_angle_rad: np.ndarray | float,
+    wavelength_m: float,
+) -> np.ndarray:
+    """Reconstruct xdart's reflected physical exit angle from q-oop.
+
+    ``q_oop = k0 * (sin(alpha_f) + sin(alpha_i))`` with ``k0`` in inverse
+    Angstrom.  The wavelength is the exact integrator/PONI wavelength used to
+    produce q-oop; it is intentionally independent of the optical-correction
+    energy.  Non-finite inputs and materially impossible asin arguments refuse.
+    Only last-bit roundoff at ``+/-1`` is clamped.
+    """
+    try:
+        wavelength = float(wavelength_m)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("GI exit-angle wavelength must be a positive finite value") from exc
+    if not np.isfinite(wavelength) or wavelength <= 0.0:
+        raise ValueError("GI exit-angle wavelength must be a positive finite value")
+    q_oop = np.asarray(q_oop_per_A, dtype=np.float64)
+    incidence = np.asarray(incident_angle_rad, dtype=np.float64)
+    if not np.all(np.isfinite(q_oop)) or not np.all(np.isfinite(incidence)):
+        raise ValueError("GI exit-angle q-oop and incidence must be finite")
+    k0_per_A = 2.0 * np.pi / (wavelength * 1.0e10)
+    if not np.isfinite(k0_per_A) or k0_per_A <= 0.0:
+        raise ValueError("GI exit-angle wavelength gives an invalid wavevector")
+    argument = q_oop / k0_per_A - np.sin(incidence)
+    outside = (argument < -1.0 - _ASIN_ROUNDOFF_ATOL) | (
+        argument > 1.0 + _ASIN_ROUNDOFF_ATOL
+    )
+    if np.any(outside):
+        lo = float(np.min(argument))
+        hi = float(np.max(argument))
+        raise ValueError(
+            "GI exit-angle asin argument is outside the physical domain "
+            f"(min={lo:.17g}, max={hi:.17g})"
+        )
+    return np.arcsin(np.clip(argument, -1.0, 1.0))
 
 
 def _floor_alpha(alpha_rad: np.ndarray | float) -> np.ndarray:
@@ -260,6 +320,16 @@ class GISettings:
     incident_angle_deg: float | None = None
     sample_orientation: int = 1
     tilt_deg: float = 0.0
+    gi_exit_angle_convention: str = GI_EXIT_ANGLE_CONVENTION
+    integrator_wavelength_m: float | None = None
+
+    def __post_init__(self) -> None:
+        validate_gi_exit_angle_convention(self.gi_exit_angle_convention)
+        if self.integrator_wavelength_m is not None:
+            wavelength = float(self.integrator_wavelength_m)
+            if not np.isfinite(wavelength) or wavelength <= 0.0:
+                raise ValueError("GISettings.integrator_wavelength_m must be positive and finite")
+            object.__setattr__(self, "integrator_wavelength_m", wavelength)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -268,25 +338,51 @@ class GISettings:
             "incident_angle_deg": self.incident_angle_deg,
             "sample_orientation": self.sample_orientation,
             "tilt_deg": self.tilt_deg,
+            "gi_exit_angle_convention": self.gi_exit_angle_convention,
+            "integrator_wavelength_m": self.integrator_wavelength_m,
         }
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "GISettings":
-        c = d.get("corrections")
+        data = dict(d)
+        legacy_keys = {
+            "corrections", "incident_angle_deg", "sample_orientation", "tilt_deg",
+        }
+        current_keys = legacy_keys | {
+            "gi_exit_angle_convention", "integrator_wavelength_m",
+        }
+        keys = set(data)
+        if keys == legacy_keys:
+            convention = LEGACY_GI_EXIT_ANGLE_CONVENTION
+            wavelength = None
+        elif keys == current_keys:
+            convention = validate_gi_exit_angle_convention(
+                data["gi_exit_angle_convention"]
+            )
+            wavelength = data["integrator_wavelength_m"]
+        else:
+            raise ValueError("GI settings have an unsupported keyset")
+        c = data.get("corrections")
         return cls(
             corrections=(GICorrectionStack.from_dict(c) if c is not None else None),
-            incident_angle_deg=d.get("incident_angle_deg"),
-            sample_orientation=int(d.get("sample_orientation", 1)),
-            tilt_deg=float(d.get("tilt_deg", 0.0)),
+            incident_angle_deg=data.get("incident_angle_deg"),
+            sample_orientation=int(data.get("sample_orientation", 1)),
+            tilt_deg=float(data.get("tilt_deg", 0.0)),
+            gi_exit_angle_convention=convention,
+            integrator_wavelength_m=wavelength,
         )
 
 
 __all__ = [
     "GICorrectionStack",
     "GISettings",
+    "GI_EXIT_ANGLE_CONVENTION",
+    "LEGACY_GI_EXIT_ANGLE_CONVENTION",
     "absorption_path",
     "film_absorption",
     "footprint_weight",
     "fresnel_transmission_sq",
+    "physical_exit_angle_from_qoop",
     "refracted_angle",
+    "validate_gi_exit_angle_convention",
 ]

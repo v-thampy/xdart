@@ -1,12 +1,4 @@
-"""P4 — the grazing-incidence stitch flag (StitchPlan.gi + pyfai_gi_q_frames).
-
-The GI per-pixel geometry (αf, q_oop) is delegated to pyFAI's fiber units, so the
-convention is pyFAI's own — gate-checked here via the textbook identity
-``q_oop == k0·(sin αf + sin αi)``.  The correction *application* reuses the
-already-gated P2b GICorrectionStack.  (The ABSOLUTE GI correctness — composition
-signs + sample_orientation/tilt — is pending real-data GIXSGUI validation; these
-tests pin the wiring + internal consistency, not the absolute physics.)
-"""
+"""GI Stitch wiring and the xdart-owned reflection exit-angle convention."""
 from __future__ import annotations
 
 import numpy as np
@@ -58,25 +50,67 @@ class TestGISettings:
     """The shared GI config object (StitchPlan.gi / RSMPlan.gi)."""
 
     def test_roundtrip_to_from_dict(self):
-        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
+        from xrd_tools.corrections.grazing import (
+            GICorrectionStack,
+            GI_EXIT_ANGLE_CONVENTION,
+            GISettings,
+        )
         gi = GISettings(
             corrections=GICorrectionStack(material="Si", energy_eV=10000.0,
                                           footprint=True, refraction=False),
-            incident_angle_deg=0.35, sample_orientation=3, tilt_deg=1.5)
+            incident_angle_deg=0.35, sample_orientation=3, tilt_deg=1.5,
+            integrator_wavelength_m=1.0e-10)
         back = GISettings.from_dict(gi.to_dict())
         assert back.incident_angle_deg == 0.35
         assert back.sample_orientation == 3 and back.tilt_deg == 1.5
         assert back.corrections.material == "Si"
         assert back.corrections.footprint is True and back.corrections.refraction is False
+        assert back.gi_exit_angle_convention == GI_EXIT_ANGLE_CONVENTION
+        assert back.integrator_wavelength_m == 1.0e-10
 
     def test_empty_settings_roundtrip(self):
         from xrd_tools.corrections.grazing import GISettings
         back = GISettings.from_dict(GISettings().to_dict())
         assert back.corrections is None and back.incident_angle_deg is None
 
+    def test_exact_legacy_and_current_keysets_only(self):
+        from xrd_tools.corrections.grazing import (
+            GI_EXIT_ANGLE_CONVENTION,
+            GISettings,
+            LEGACY_GI_EXIT_ANGLE_CONVENTION,
+        )
+
+        legacy = {
+            "corrections": None,
+            "incident_angle_deg": 0.3,
+            "sample_orientation": 4,
+            "tilt_deg": 0.0,
+        }
+        assert GISettings.from_dict(legacy).gi_exit_angle_convention == (
+            LEGACY_GI_EXIT_ANGLE_CONVENTION
+        )
+        current = {
+            **legacy,
+            "gi_exit_angle_convention": GI_EXIT_ANGLE_CONVENTION,
+            "integrator_wavelength_m": 1.0e-10,
+        }
+        assert GISettings.from_dict(current).integrator_wavelength_m == 1.0e-10
+        explicit_legacy = {
+            **current,
+            "gi_exit_angle_convention": LEGACY_GI_EXIT_ANGLE_CONVENTION,
+        }
+        assert GISettings.from_dict(explicit_legacy).to_dict() == explicit_legacy
+        with pytest.raises(ValueError, match="unsupported keyset"):
+            GISettings.from_dict({**current, "third_schema": True})
+        with pytest.raises(ValueError, match="unsupported GI exit-angle"):
+            GISettings.from_dict({
+                **current,
+                "gi_exit_angle_convention": "upstream_exit_map",
+            })
+
 
 class TestGIConvention:
-    """Pin the pyFAI fiber convention the GI provider delegates to."""
+    """Connect stable q-oop geometry to the independently pinned vector oracle."""
 
     def test_qoop_equals_k0_sin_af_plus_ai(self):
         pytest.importorskip("pyFAI")
@@ -87,16 +121,55 @@ class TestGIConvention:
                              detector="Pilatus100k", wavelength=1.0e-10)
         air = np.deg2rad(0.3)
         fi.reset_integrator(incident_angle=air, tilt_angle=0.0, sample_orientation=1)
-        af = fi.array_from_unit(_SHAPE, "center",
-                                U.get_unit_fiber("exit_angle_vert_rad", incident_angle=air))
         qoop = fi.array_from_unit(_SHAPE, "center",
                                   U.get_unit_fiber("qoop_A^-1", incident_angle=air))
+        from xrd_tools.corrections.grazing import physical_exit_angle_from_qoop
+        af = physical_exit_angle_from_qoop(
+            qoop,
+            incident_angle_rad=air,
+            wavelength_m=fi.wavelength,
+        )
         k0 = 2 * np.pi / 1.0   # λ = 1 Å
         np.testing.assert_allclose(qoop, k0 * (np.sin(af) + np.sin(air)),
                                    atol=1e-6)
 
+        # pyFAI 2026's generic exit map has a different incidence offset.  This
+        # inequality is intentional: xdart corrections are owned by q-oop.
+        upstream = fi.array_from_unit(
+            _SHAPE,
+            "center",
+            U.get_unit_fiber("exit_angle_vert_rad", incident_angle=air),
+        )
+        assert not np.allclose(upstream, af)
+
 
 class TestGIProvider:
+    def test_corrections_never_request_upstream_exit_angle_map(self, monkeypatch):
+        """Changing/removing pyFAI's exit-map sign cannot change corrections."""
+        pytest.importorskip("xrayutilities")
+        pytest.importorskip("pyFAI")
+        import pyFAI.units as U
+        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames
+
+        real_get = U.get_unit_fiber
+        requested = []
+
+        def guarded_get(name, *args, **kwargs):
+            requested.append(str(name))
+            if str(name).startswith("exit_angle"):
+                raise AssertionError("xdart correction consulted upstream exit map")
+            return real_get(name, *args, **kwargs)
+
+        monkeypatch.setattr(U, "get_unit_fiber", guarded_get)
+        gi = GICorrectionStack(
+            material="Si", energy_eV=10000.0, refraction=False,
+        )
+        frame = next(pyfai_gi_q_frames(
+            [_ring(0)], [_ai()], gi=gi, incident_angles_deg=[0.3],
+        ))
+        assert all(np.all(np.isfinite(value)) for value in frame)
+        assert "qoop_A^-1" in requested
     def test_gi_all_off_equals_plain_provider(self):
         """A GICorrectionStack with every factor off (incl. refraction) must yield a
         byte-equal frame to pyfai_q_frames — the GI path adds nothing when idle."""
@@ -199,6 +272,12 @@ class TestGIRunStitch:
                                    mode="1d", npt_1d=200, gi=GISettings(corrections=off)), src)
         np.testing.assert_allclose(gi.payload.intensity, plain.payload.intensity,
                                    equal_nan=True)
+        gi_provenance = gi.provenance["plan"]["gi"]
+        assert gi_provenance["gi_exit_angle_convention"] == (
+            "xdart_reflection_qoop_v1"
+        )
+        assert gi_provenance["integrator_wavelength_m"] == 1.0e-10
+        assert gi_provenance["corrections"]["energy_eV"] == 10000.0
 
     def test_gi_footprint_run_scales_intensity(self):
         """run_stitch GI footprint-only ⇒ I = I_nonGI · sin(αi) (αi=0.3° from eta):

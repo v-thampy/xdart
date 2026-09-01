@@ -102,6 +102,9 @@ def test_versioned_profile_round_trips_full_next_run_intent(tmp_path):
     assert "fingerprint" not in document["intent"]
     assert "generation" not in document["intent"]["source_spec"]
     assert "resolved_motor" not in document["intent"]["gi"]
+    assert document["intent"]["gi"]["gi_exit_angle_convention"] == (
+        "xdart_reflection_qoop_v1"
+    )
     assert original.generation == 17
 
     loaded = load_run_intent_profile(text)
@@ -140,6 +143,19 @@ def test_versioned_profile_round_trips_full_next_run_intent(tmp_path):
     original_frozen = original.clone_candidate().freeze()
     loaded_frozen = loaded.clone_candidate().freeze()
     assert loaded_frozen.fingerprint == original_frozen.fingerprint
+
+
+def test_historical_profile_gi_keyset_decodes_only_as_explicit_legacy(tmp_path):
+    from xrd_tools.corrections.grazing import LEGACY_GI_EXIT_ANGLE_CONVENTION
+
+    document = json.loads(dump_run_intent_profile(_full_intent(tmp_path)))
+    document["intent"]["gi"].pop("gi_exit_angle_convention")
+    loaded = load_run_intent_profile(json.dumps(document))
+    assert loaded.gi.gi_exit_angle_convention == LEGACY_GI_EXIT_ANGLE_CONVENTION
+
+    document["intent"]["gi"]["third_schema"] = True
+    with pytest.raises(RunIntentProfileError, match="invalid keyset"):
+        load_run_intent_profile(json.dumps(document))
 
 
 def test_directory_profile_drops_observer_and_intent_generations(tmp_path):

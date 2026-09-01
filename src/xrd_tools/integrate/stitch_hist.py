@@ -271,6 +271,7 @@ def pyfai_gi_q_frames(
     incident_angles_deg: Iterable[float],
     sample_orientation: int = 1,
     tilt_deg: float = 0.0,
+    gi_exit_angle_convention: str = "xdart_reflection_qoop_v1",
     corrections: Any = None,
     mask: np.ndarray | None = None,
     normalization: Iterable[float] | None = None,
@@ -281,10 +282,9 @@ def pyfai_gi_q_frames(
     Per pixel: the GI intensity factors (footprint·Fresnel·absorption) multiply into
     the ``Σnorm`` weight via ``gi.gi_normalization``; if ``gi.refraction`` the q-map
     is rewritten by ``gi.refract_q`` (a position correction).  The per-pixel exit
-    angle αf and out-of-plane q_z come from **pyFAI's own fiber geometry**
-    (``FiberIntegrator`` + the ``exit_angle_vert``/``qoop`` units, after
-    ``reset_integrator(incident_angle=…)``) — the SAME convention as the reduction
-    GI path, so q_oop ≡ k0·(sin αf + sin αi).  Per-frame αi (degrees) is
+    angle αf is reconstructed by xdart from pyFAI's q-oop map and the exact
+    frame-integrator wavelength.  pyFAI's version-specific exit-angle map is
+    deliberately not consulted.  Per-frame αi (degrees) is
     ``incident_angles_deg`` (one per frame, from
     ``Diffractometer.to_pyfai_per_frame(...)['incident_angle']``).
 
@@ -296,9 +296,20 @@ def pyfai_gi_q_frames(
     consume it fully and therefore enforce the checks.
     """
     import pyFAI.units as U  # noqa: PLC0415
+    from xrd_tools.corrections.grazing import (  # noqa: PLC0415
+        GI_EXIT_ANGLE_CONVENTION,
+        physical_exit_angle_from_qoop,
+        validate_gi_exit_angle_convention,
+    )
 
     if gi is None:
         raise ValueError("pyfai_gi_q_frames requires a GICorrectionStack (gi=)")
+    convention = validate_gi_exit_angle_convention(gi_exit_angle_convention)
+    if convention != GI_EXIT_ANGLE_CONVENTION:
+        raise ValueError(
+            "legacy GI exit-angle science cannot be rerun under the current "
+            "pyFAI runtime; rerun raw science with xdart_reflection_qoop_v1"
+        )
     inc = np.asarray(list(incident_angles_deg), dtype=float)
     if not np.all(np.isfinite(inc)):
         raise ValueError(
@@ -322,12 +333,14 @@ def pyfai_gi_q_frames(
         # populate the fiber geometry cache so the unit maps recompute for this αi
         fi.reset_integrator(incident_angle=air, tilt_angle=tilt_rad,
                             sample_orientation=so)
-        af_u = U.get_unit_fiber("exit_angle_vert_rad", incident_angle=air,
-                                tilt_angle=tilt_rad, sample_orientation=so)
         qoop_u = U.get_unit_fiber("qoop_A^-1", incident_angle=air,
                                   tilt_angle=tilt_rad, sample_orientation=so)
-        af = np.asarray(fi.array_from_unit(shape, "center", af_u), dtype=float)
         q_oop = np.asarray(fi.array_from_unit(shape, "center", qoop_u), dtype=float)
+        af = physical_exit_angle_from_qoop(
+            q_oop,
+            incident_angle_rad=air,
+            wavelength_m=fi.wavelength,
+        )
         q = np.asarray(fi.qArray(shape=shape), dtype=float) / 10.0
         chi = np.degrees(np.asarray(fi.chiArray(shape=shape), dtype=float))
         # base normalization (solid angle/polarization) × the GI intensity weight

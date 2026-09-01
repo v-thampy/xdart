@@ -163,6 +163,7 @@ def _configuration(
             tilt_angle=value.tilt_angle,
             mode_1d=value.mode_1d.value,
             mode_2d=value.mode_2d.value,
+            gi_exit_angle_convention=value.gi_exit_angle_convention,
         )
     intent = RunIntent(
         source_spec=source,
@@ -266,6 +267,40 @@ def test_frozen_configuration_has_one_independent_mask_free_reduction_policy(
 
     assert actual == expected
     assert actual.mask is None
+
+
+def test_average_recipe_identity_carries_current_marker_and_decodes_legacy(
+    tmp_path,
+) -> None:
+    from xrd_tools.corrections.grazing import (
+        GI_EXIT_ANGLE_CONVENTION,
+        LEGACY_GI_EXIT_ANGLE_CONVENTION,
+    )
+    from xrd_tools.reduction import average as average_module
+
+    reduction = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=17),
+        gi=GIMode(incident_angle=0.3, mode_1d="q_oop"),
+    )
+    recipe = AverageScanRecipe(
+        _source(tmp_path / "current-average-recipe"),
+        tmp_path / "current-average.nxs",
+        reduction,
+    )
+    assert len(recipe.integrator_gi) == 9
+    assert recipe.integrator_gi[-1] == GI_EXIT_ANGLE_CONVENTION
+    assert average_module._thaw_reduction(recipe).gi.gi_exit_angle_convention == (
+        GI_EXIT_ANGLE_CONVENTION
+    )
+
+    legacy = replace(recipe, integrator_gi=recipe.integrator_gi[:-1])
+    assert average_module._thaw_reduction(legacy).gi.gi_exit_angle_convention == (
+        LEGACY_GI_EXIT_ANGLE_CONVENTION
+    )
+    with pytest.raises(ValueError, match="unsupported keyset"):
+        average_module._thaw_reduction(
+            replace(recipe, integrator_gi=recipe.integrator_gi + ("third",))
+        )
 
 
 def _join(slot: OperationSlot, identity):

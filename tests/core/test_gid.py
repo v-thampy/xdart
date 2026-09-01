@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
 import pickle
 
@@ -232,6 +233,179 @@ def test_integrate_gi_exitangles(poni_fixture, synthetic_image):
     assert result.radial.shape == (200,)
     assert result.azimuthal.shape == (100,)
     assert result.intensity.shape == (200, 100)
+
+
+def test_xdart_exit_equations_match_independent_signed_orientation_matrices():
+    """Pin signs for orientation 1/default 4 plus rotated 3/6 and tilt.
+
+    The expected q vector is derived directly from the outgoing unit ray and
+    explicit sample-frame rotation matrices; it does not use a pyFAI exit map.
+    """
+    from xrd_tools.integrate.gid import (
+        _xdart_exit_angle_horz_equation,
+        _xdart_exit_angle_vert_equation,
+    )
+
+    x = np.array([-0.03, 0.01, 0.04])
+    y = np.array([0.02, -0.04, 0.01])
+    z = np.full(x.shape, 0.2)
+    ai = np.deg2rad(0.3)
+    wavelength_m = 1.0e-10
+    mappings = {
+        1: (x, y, 0.0),
+        4: (x, -y, 0.0),
+        3: (-x, -y, 0.0),
+        6: (-y, x, np.deg2rad(2.0)),
+    }
+
+    for orientation, (xo, yo, tilt) in mappings.items():
+        radius = np.sqrt(xo * xo + yo * yo + z * z)
+        q_beam_over_k0 = z / radius - 1.0
+        q_horz_over_k0 = xo / radius
+        q_vert_over_k0 = yo / radius
+        q_vert_after_incidence = (
+            -np.sin(ai) * q_beam_over_k0
+            + np.cos(ai) * q_vert_over_k0
+        )
+        qoop_over_k0 = (
+            -np.sin(tilt) * q_horz_over_k0
+            + np.cos(tilt) * q_vert_after_incidence
+        )
+        expected_vertical = np.arcsin(qoop_over_k0 - np.sin(ai))
+
+        pitched_y = np.cos(ai) * yo - np.sin(ai) * z
+        pitched_z = np.sin(ai) * yo + np.cos(ai) * z
+        expected_horizontal = np.arctan2(
+            np.cos(tilt) * xo - np.sin(tilt) * pitched_y,
+            pitched_z,
+        )
+
+        actual_vertical = _xdart_exit_angle_vert_equation(
+            x, y, z,
+            wavelength=wavelength_m,
+            incident_angle=ai,
+            tilt_angle=tilt,
+            sample_orientation=orientation,
+        )
+        actual_horizontal = _xdart_exit_angle_horz_equation(
+            x, y, z,
+            wavelength=wavelength_m,
+            incident_angle=ai,
+            tilt_angle=tilt,
+            sample_orientation=orientation,
+        )
+        np.testing.assert_allclose(actual_vertical, expected_vertical, atol=2e-15)
+        np.testing.assert_allclose(actual_horizontal, expected_horizontal, atol=2e-15)
+
+    # These are signed coordinates, not magnitudes.
+    positive_y = _xdart_exit_angle_vert_equation(
+        np.array([0.0]), np.array([0.02]), np.array([0.2]),
+        wavelength=wavelength_m, incident_angle=ai, tilt_angle=0.0,
+        sample_orientation=1,
+    )
+    flipped_y = _xdart_exit_angle_vert_equation(
+        np.array([0.0]), np.array([0.02]), np.array([0.2]),
+        wavelength=wavelength_m, incident_angle=ai, tilt_angle=0.0,
+        sample_orientation=4,
+    )
+    assert positive_y[0] > 0.0 > flipped_y[0]
+
+
+def test_public_exit_axes_keep_xdart_physical_names_and_signs():
+    shape = (195, 487)
+    poni = PONI(
+        dist=0.2,
+        poni1=shape[0] * 172e-6 / 2.0,
+        poni2=shape[1] * 172e-6 / 2.0,
+        wavelength=1.0e-10,
+        detector="Pilatus100k",
+    )
+    fi = create_fiber_integrator(poni, incident_angle=0.3, sample_orientation=4)
+    image = np.ones(shape, dtype=np.float64)
+    result = integrate_gi_exitangles(
+        image, fi, npt_rad=48, npt_azim=40,
+        incident_angle=0.3, sample_orientation=4,
+    )
+
+    assert result.unit == "exit_angle_horz_deg"
+    assert result.azimuthal_unit == "exit_angle_vert_deg"
+    assert result.radial[0] < 0.0 < result.radial[-1]
+    assert result.azimuthal[0] < -0.3 < result.azimuthal[-1]
+
+    with pytest.raises(ValueError, match="legacy GI exit-angle axes"):
+        integrate_gi_exitangles(
+            image, fi, npt_rad=16, npt_azim=12,
+            gi_exit_angle_convention="legacy_xdart_2025_reflection",
+        )
+
+
+def test_pyfai_2025_q_space_intensity_hashes_and_nan_occupancy_are_preserved():
+    """Synthetic frozen cross-version oracle captured on pyFAI 2025.3.0.
+
+    Axis endpoints are compared numerically because the upgrade probe found
+    last-bit axis drift; intensity bytes and NaN occupancy remain exact.
+    """
+    shape = (195, 487)
+    poni = PONI(
+        dist=0.2,
+        poni1=shape[0] * 172e-6 / 2.0,
+        poni2=shape[1] * 172e-6 / 2.0,
+        wavelength=1.0e-10,
+        detector="Pilatus100k",
+    )
+    image = (
+        np.arange(np.prod(shape), dtype=np.float64).reshape(shape) % 97.0
+    ) + 1.0
+    fi = create_fiber_integrator(poni, incident_angle=0.3, sample_orientation=4)
+    products = {
+        "qoop_1d": integrate_gi_1d(
+            image, fi, npt=96, npt_oop=64, method="cython",
+            sample_orientation=4,
+        ),
+        "qip_qoop_2d": integrate_gi_2d(
+            image, fi, npt_rad=48, npt_azim=40, method="cython",
+            sample_orientation=4,
+        ),
+        "polar": integrate_gi_polar(
+            image, fi, npt_rad=48, npt_azim=40, method="cython",
+            sample_orientation=4,
+        ),
+    }
+    expected = {
+        "qoop_1d": (
+            "b412ee1baf9f06741d39dcd74e9482988caa28399cd6cc1019cfe6db41905835",
+            0,
+            (-0.5140467375365425, 0.5142745493078682),
+            None,
+        ),
+        "qip_qoop_2d": (
+            "f9b9e44836f941340330fbc59ec7ed606c067d1b8ec2a8faf8c3223365a603e5",
+            0,
+            (-1.2652318611077744, 1.2652320151442593),
+            (-0.5091499695039502, 0.5093777812752758),
+        ),
+        "polar": (
+            "f9c0a66760d7a620f6e843c7878c769169a7051374d5661ae8a571431252c87b",
+            642,
+            (0.014456354043530887, 1.3733536341354342),
+            (-175.52373004171199, 173.62532670475272),
+        ),
+    }
+
+    for name, result in products.items():
+        digest, nan_count, radial_ends, azimuthal_ends = expected[name]
+        intensity = np.ascontiguousarray(result.intensity, dtype=np.float64)
+        assert hashlib.sha256(intensity.tobytes()).hexdigest() == digest
+        assert int(np.isnan(intensity).sum()) == nan_count
+        np.testing.assert_allclose(
+            [result.radial[0], result.radial[-1]], radial_ends,
+            rtol=0.0, atol=5.0e-15,
+        )
+        if azimuthal_ends is not None:
+            np.testing.assert_allclose(
+                [result.azimuthal[0], result.azimuthal[-1]], azimuthal_ends,
+                rtol=0.0, atol=5.0e-14,
+            )
 
 
 @pytest.mark.slow

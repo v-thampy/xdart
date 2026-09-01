@@ -13,6 +13,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D, PONI
+from xrd_tools.core.energy import energy_eV_to_wavelength_m
 from xrd_tools.core.roi import RoiSpec, invalid_pixel_mask, roi_reduce
 from xrd_tools.core.scan import FrameSource, MaskSpec
 from xrd_tools.sources import ensure_frame_source
@@ -181,7 +182,10 @@ class StitchPlan:
             "monitor_key": self.monitor_key,
             "streaming_multigeometry": self.streaming_multigeometry,
             "corrections": _ser(self.corrections),
-            "gi": _ser(self.gi),
+            "gi": _gi_settings_provenance(
+                self.gi,
+                wavelength_m=_stitch_plan_wavelength_m(self),
+            ),
         }
         diff = self.diffractometer
         if diff is not None:
@@ -265,6 +269,48 @@ def _member_wavelength_m(member: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return wl_f if np.isfinite(wl_f) and wl_f > 0.0 else None
+
+
+def _stitch_plan_wavelength_m(plan: Any, source: Any = None) -> float | None:
+    diffractometer = (
+        getattr(plan, "diffractometer", None)
+        or getattr(source, "diffractometer", None)
+    )
+    calibration = getattr(diffractometer, "calibration", None)
+    base_poni = (
+        getattr(plan, "base_poni", None)
+        or getattr(source, "poni", None)
+    )
+    # Match run_stitch's actual geometry precedence: a calibrated
+    # diffractometer owns the integrator, otherwise the resolved base PONI does.
+    for owner in (calibration, base_poni):
+        poni = getattr(owner, "poni", owner)
+        wavelength = getattr(poni, "wavelength", None)
+        if wavelength is None:
+            continue
+        try:
+            value = float(wavelength)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value) and value > 0.0:
+            return value
+    return None
+
+
+def _gi_settings_provenance(settings: Any, *, wavelength_m: float | None) -> Any:
+    if settings is None:
+        return None
+    values = settings.to_dict()
+    recorded = values.get("integrator_wavelength_m")
+    if wavelength_m is not None:
+        if recorded is not None and not np.isclose(
+            float(recorded), float(wavelength_m), rtol=1.0e-12, atol=0.0
+        ):
+            raise ValueError(
+                "GI integrator wavelength differs from the plan calibration"
+            )
+        values["integrator_wavelength_m"] = float(wavelength_m)
+    return values
 
 
 def _assert_members_same_wavelength(members: Sequence[Any], *, rtol: float = 1.0e-3) -> None:
@@ -532,7 +578,11 @@ def run_stitch(
                         _iter_images(), integrators, gi=plan.gi.corrections,
                         incident_angles_deg=inc,
                         sample_orientation=plan.gi.sample_orientation,
-                        tilt_deg=plan.gi.tilt_deg, corrections=plan.corrections,
+                        tilt_deg=plan.gi.tilt_deg,
+                        gi_exit_angle_convention=(
+                            plan.gi.gi_exit_angle_convention
+                        ),
+                        corrections=plan.corrections,
                         mask=plan.mask, normalization=normalization)
             else:
                 def frames_factory():
@@ -658,7 +708,13 @@ def run_stitch(
         kind="stitch",
         payload=payload,
         provenance={
-            "plan": _plan_dict(plan),
+            "plan": {
+                **_plan_dict(plan),
+                "gi": _gi_settings_provenance(
+                    plan.gi,
+                    wavelength_m=_stitch_plan_wavelength_m(plan, src),
+                ),
+            },
             "source": getattr(src, "name", type(src).__name__),
             "frame_indices": labels,
         },
@@ -726,7 +782,14 @@ class RSMPlan:
             "roi": list(self.roi) if self.roi is not None else None,
             "chunk_size": self.chunk_size,
             "corrections": _ser(self.corrections),
-            "gi": _ser(self.gi),
+            "gi": _gi_settings_provenance(
+                self.gi,
+                wavelength_m=(
+                    None
+                    if self.energy is None
+                    else energy_eV_to_wavelength_m(self.energy)
+                ),
+            ),
             "diffractometer": (getattr(diff, "preset", None)
                                or getattr(diff, "convention", None)),
         }
@@ -823,7 +886,20 @@ def run_rsm(
     return AnalysisResult(
         kind="rsm",
         payload=payload,
-        provenance={"plan": _plan_dict(plan), "n_sources": n_sources},
+        provenance={
+            "plan": {
+                **_plan_dict(plan),
+                "gi": _gi_settings_provenance(
+                    plan.gi,
+                    wavelength_m=(
+                        None
+                        if plan.energy is None
+                        else energy_eV_to_wavelength_m(plan.energy)
+                    ),
+                ),
+            },
+            "n_sources": n_sources,
+        },
         frame_records=_harvest_frame_records(_harvest, scan_labels),
     )
 

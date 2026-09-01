@@ -26,6 +26,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from xrd_tools.corrections.grazing import (
+    GI_EXIT_ANGLE_CONVENTION,
+    LEGACY_GI_EXIT_ANGLE_CONVENTION,
+    validate_gi_exit_angle_convention,
+)
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.gi_motor import pick_default_gi_motor
@@ -292,6 +297,7 @@ class GIIntent:
     tilt_angle: float = 0.0
     mode_1d: str = "q_total"
     mode_2d: str = "qip_qoop"
+    gi_exit_angle_convention: str = GI_EXIT_ANGLE_CONVENTION
 
     def freeze(
         self,
@@ -313,11 +319,25 @@ class GIIntent:
             tilt_angle=float(self.tilt_angle),
             mode_1d=str(self.mode_1d or "q_total"),
             mode_2d=str(self.mode_2d or "qip_qoop"),
+            gi_exit_angle_convention=validate_gi_exit_angle_convention(
+                self.gi_exit_angle_convention
+            ),
         )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "GIIntent":
         data = dict(value or {})
+        convention = data.get("gi_exit_angle_convention")
+        if convention is None:
+            historical_outer_keys = {
+                "enabled", "incidence_motor", "resolved_motor", "th_val",
+                "sample_orientation", "tilt_angle", "mode_1d", "mode_2d",
+            }
+            convention = (
+                LEGACY_GI_EXIT_ANGLE_CONVENTION
+                if set(data) == historical_outer_keys
+                else GI_EXIT_ANGLE_CONVENTION
+            )
         return cls(
             enabled=bool(data.get("enabled", data.get("gi", False))),
             incidence_motor=str(
@@ -334,6 +354,9 @@ class GIIntent:
             mode_2d=str(
                 data.get("mode_2d", data.get("gi_mode_2d", "qip_qoop"))
                 or "qip_qoop"
+            ),
+            gi_exit_angle_convention=validate_gi_exit_angle_convention(
+                convention
             ),
         )
 
@@ -356,6 +379,7 @@ class FrozenGIConfiguration:
     tilt_angle: float = 0.0
     mode_1d: str = "q_total"
     mode_2d: str = "qip_qoop"
+    gi_exit_angle_convention: str = GI_EXIT_ANGLE_CONVENTION
 
     def __post_init__(self) -> None:
         if (
@@ -369,6 +393,7 @@ class FrozenGIConfiguration:
             raise ValueError("th_val must be finite")
         if not math.isfinite(float(self.tilt_angle)):
             raise ValueError("tilt_angle must be finite")
+        validate_gi_exit_angle_convention(self.gi_exit_angle_convention)
         # Direct construction (tests, restore) may omit resolution; fall back to
         # the raw selection so the resolved value is always populated.
         if not str(self.resolved_motor or ""):
@@ -396,7 +421,7 @@ class FrozenGIConfiguration:
 
         if not self.enabled:
             return {}
-        return {
+        values = {
             "gi_mode_1d": self.mode_1d,
             "gi_mode_2d": self.mode_2d,
             "incidence_motor": self.effective_motor,
@@ -404,9 +429,12 @@ class FrozenGIConfiguration:
             "sample_orientation": int(self.sample_orientation),
             "tilt_angle": float(self.tilt_angle),
         }
+        if self.gi_exit_angle_convention == GI_EXIT_ANGLE_CONVENTION:
+            values["gi_exit_angle_convention"] = self.gi_exit_angle_convention
+        return values
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        values = {
             "enabled": bool(self.enabled),
             "incidence_motor": self.incidence_motor,
             "resolved_motor": self.effective_motor,
@@ -416,6 +444,40 @@ class FrozenGIConfiguration:
             "mode_1d": self.mode_1d,
             "mode_2d": self.mode_2d,
         }
+        if self.enabled and self.gi_exit_angle_convention == GI_EXIT_ANGLE_CONVENTION:
+            values["gi_exit_angle_convention"] = self.gi_exit_angle_convention
+        return values
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "FrozenGIConfiguration":
+        """Decode only the exact current-nine or historical-eight keysets."""
+        data = dict(value)
+        historical = {
+            "enabled", "incidence_motor", "resolved_motor", "th_val",
+            "sample_orientation", "tilt_angle", "mode_1d", "mode_2d",
+        }
+        current = historical | {"gi_exit_angle_convention"}
+        if set(data) == historical:
+            convention = LEGACY_GI_EXIT_ANGLE_CONVENTION
+        elif set(data) == current:
+            convention = validate_gi_exit_angle_convention(
+                data["gi_exit_angle_convention"]
+            )
+            if convention != GI_EXIT_ANGLE_CONVENTION:
+                raise ValueError("nine-key GI mapping must use the current convention")
+        else:
+            raise ValueError("persisted GI mapping has an unsupported keyset")
+        return cls(
+            enabled=data["enabled"],
+            incidence_motor=data["incidence_motor"],
+            resolved_motor=data["resolved_motor"],
+            th_val=data["th_val"],
+            sample_orientation=data["sample_orientation"],
+            tilt_angle=data["tilt_angle"],
+            mode_1d=data["mode_1d"],
+            mode_2d=data["mode_2d"],
+            gi_exit_angle_convention=convention,
+        )
 
 
 @dataclass(slots=True)
@@ -881,6 +943,21 @@ class FrozenRunConfiguration:
     def _content_fingerprint_value(self) -> tuple[Any, ...]:
         """Canonical content identity, deliberately excluding generation."""
 
+        gi_identity: tuple[Any, ...] = (
+            bool(self.gi.enabled),
+            str(self.gi.incidence_motor),
+            str(self.gi.effective_motor),
+            _float_token(self.gi.th_val),
+            int(self.gi.sample_orientation),
+            _float_token(self.gi.tilt_angle),
+            str(self.gi.mode_1d),
+            str(self.gi.mode_2d),
+        )
+        if (
+            self.gi.enabled
+            and self.gi.gi_exit_angle_convention == GI_EXIT_ANGLE_CONVENTION
+        ):
+            gi_identity += (self.gi.gi_exit_angle_convention,)
         value = (
             "xdart-frozen-run-configuration",
             _SCHEMA_VERSION,
@@ -894,16 +971,7 @@ class FrozenRunConfiguration:
             bool(self.live_mode),
             bool(self.batch_mode),
             int(self.max_cores),
-            (
-                bool(self.gi.enabled),
-                str(self.gi.incidence_motor),
-                str(self.gi.effective_motor),
-                _float_token(self.gi.th_val),
-                int(self.gi.sample_orientation),
-                _float_token(self.gi.tilt_angle),
-                str(self.gi.mode_1d),
-                str(self.gi.mode_2d),
-            ),
+            gi_identity,
             (
                 bool(self.threshold.apply_threshold),
                 (
@@ -1054,7 +1122,7 @@ class FrozenRunConfiguration:
         """Return a reduction snapshot dictionary derived from this frozen configuration."""
         gi_enabled = bool(self.gi.enabled)
         incidence = self.gi.scan_incidence_motor if gi_enabled else "Manual"
-        return {
+        values = {
             "bai_1d_args": copy.deepcopy(dict(self.bai_1d_args or {})),
             "bai_2d_args": copy.deepcopy(dict(self.bai_2d_args or {})),
             "gi": gi_enabled,
@@ -1063,6 +1131,11 @@ class FrozenRunConfiguration:
             "sample_orientation": int(self.gi.sample_orientation),
             "tilt_angle": float(self.gi.tilt_angle),
         }
+        if gi_enabled:
+            values["gi_exit_angle_convention"] = (
+                self.gi.gi_exit_angle_convention
+            )
+        return values
 
 
 @dataclass(slots=True)
@@ -1227,6 +1300,10 @@ class RunIntent:
                 mode_2d=_detached_scalar(
                     self.gi.mode_2d,
                     lambda value: str(value or "qip_qoop"),
+                ),
+                gi_exit_angle_convention=_detached_scalar(
+                    self.gi.gi_exit_angle_convention,
+                    str,
                 ),
             ),
             threshold=ThresholdIntent(

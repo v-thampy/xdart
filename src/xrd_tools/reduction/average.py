@@ -148,7 +148,17 @@ def _gi(value: GIMode | None):
     if value is None:
         return None
     _reject(type(value) is not GIMode, 'Average GI plan must be exact', TypeError)
-    return (value.incident_angle, value.incidence_motor, value.tilt_angle, value.sample_orientation, value.method, value.mode_1d.value, value.mode_2d.value, value.npt_oop)
+    return (value.incident_angle, value.incidence_motor, value.tilt_angle, value.sample_orientation, value.method, value.mode_1d.value, value.mode_2d.value, value.npt_oop, value.gi_exit_angle_convention)
+
+
+def _gi_convention(value: tuple) -> str:
+    from xrd_tools.corrections.grazing import (
+        LEGACY_GI_EXIT_ANGLE_CONVENTION,
+        validate_gi_exit_angle_convention,
+    )
+    _reject(type(value) is not tuple or len(value) not in {8, 9}, 'Average GI recipe has an unsupported keyset')
+    return (LEGACY_GI_EXIT_ANGLE_CONVENTION if len(value) == 8
+            else validate_gi_exit_angle_convention(value[8]))
 @dataclass(frozen=True, slots=True, init=False)
 class AverageScanRecipe:
     api_version: str; source: FrozenSourceSpec
@@ -197,7 +207,7 @@ def _thaw_reduction(recipe: AverageScanRecipe) -> ReductionPlan:
     one = recipe.integration_1d
     two = recipe.integration_2d
     gi = recipe.integrator_gi
-    return ReductionPlan(integration_1d=None if one is None else Integration1DPlan(npt=one[0], unit=one[1], method=one[2], radial_range=one[3], azimuth_range=one[4], monitor_key=one[5], error_model=one[6], polarization_factor=one[7], npt_rad=one[8], azimuth_offset=one[9], extra=_semantic_pairs(one[10])), integration_2d=None if two is None else Integration2DPlan(npt_rad=two[0], npt_azim=two[1], unit=two[2], method=two[3], radial_range=two[4], azimuth_range=two[5], azimuth_offset=two[6], monitor_key=two[7], error_model=two[8], polarization_factor=two[9], extra=_semantic_pairs(two[10])), gi=None if gi is None else GIMode(incident_angle=gi[0], incidence_motor=gi[1], tilt_angle=gi[2], sample_orientation=gi[3], method=gi[4], mode_1d=gi[5], mode_2d=gi[6], npt_oop=gi[7]), mask=None, threshold_min=recipe.threshold_min, threshold_max=recipe.threshold_max, mask_saturation=recipe.mask_saturation, extra=_semantic_pairs(recipe.reduction_extra))
+    return ReductionPlan(integration_1d=None if one is None else Integration1DPlan(npt=one[0], unit=one[1], method=one[2], radial_range=one[3], azimuth_range=one[4], monitor_key=one[5], error_model=one[6], polarization_factor=one[7], npt_rad=one[8], azimuth_offset=one[9], extra=_semantic_pairs(one[10])), integration_2d=None if two is None else Integration2DPlan(npt_rad=two[0], npt_azim=two[1], unit=two[2], method=two[3], radial_range=two[4], azimuth_range=two[5], azimuth_offset=two[6], monitor_key=two[7], error_model=two[8], polarization_factor=two[9], extra=_semantic_pairs(two[10])), gi=None if gi is None else GIMode(incident_angle=gi[0], incidence_motor=gi[1], tilt_angle=gi[2], sample_orientation=gi[3], method=gi[4], mode_1d=gi[5], mode_2d=gi[6], npt_oop=gi[7], gi_exit_angle_convention=_gi_convention(gi)), mask=None, threshold_min=recipe.threshold_min, threshold_max=recipe.threshold_max, mask_saturation=recipe.mask_saturation, extra=_semantic_pairs(recipe.reduction_extra))
 def _calibration_payload(value: CalibrationState) -> dict[str, Any]:
     poni = value.values
     payload = {'values': None if poni is None else {item.name: getattr(poni, item.name) for item in fields(PoniValues)}, 'detector_id': value.detector_id, 'detector_config': _plain_json(value.detector_config), 'value_fingerprint': value.value_fingerprint, 'source_sha256': value.source_sha256, 'source_uri': value.source_uri, 'mask': {item.name: getattr(value.mask, item.name).value if item.name == 'status' else getattr(value.mask, item.name) for item in fields(MaskState)}, 'status': value.status.value}

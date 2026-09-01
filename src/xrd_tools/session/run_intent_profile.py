@@ -52,7 +52,7 @@ _INTENT_KEYS = frozenset({
     "save_path",
     "run_options",
 })
-_GI_KEYS = frozenset({
+_LEGACY_GI_KEYS = frozenset({
     "enabled",
     "incidence_motor",
     "th_val",
@@ -60,6 +60,10 @@ _GI_KEYS = frozenset({
     "tilt_angle",
     "mode_1d",
     "mode_2d",
+})
+_GI_KEYS = frozenset({
+    *_LEGACY_GI_KEYS,
+    "gi_exit_angle_convention",
 })
 _THRESHOLD_KEYS = frozenset({
     "apply_threshold",
@@ -376,7 +380,21 @@ def _decode_source(value: object) -> SourceSpec | DirectorySourceSpec | None:
 
 def _decode_gi(value: object) -> GIIntent:
     data = _mapping(value, path="intent.gi")
-    _keyset(data, _GI_KEYS, path="intent.gi")
+    keys = frozenset(data)
+    if keys == _LEGACY_GI_KEYS:
+        from xrd_tools.corrections.grazing import (  # noqa: PLC0415
+            LEGACY_GI_EXIT_ANGLE_CONVENTION,
+        )
+        convention = LEGACY_GI_EXIT_ANGLE_CONVENTION
+    elif keys == _GI_KEYS:
+        convention = _text(
+            data["gi_exit_angle_convention"],
+            path="intent.gi.gi_exit_angle_convention",
+            empty=False,
+        )
+    else:
+        _keyset(data, _GI_KEYS, path="intent.gi")
+        raise AssertionError("unreachable")
     result = GIIntent(
         enabled=_boolean(data["enabled"], path="intent.gi.enabled"),
         incidence_motor=_text(
@@ -392,6 +410,7 @@ def _decode_gi(value: object) -> GIIntent:
         tilt_angle=_number(data["tilt_angle"], path="intent.gi.tilt_angle"),
         mode_1d=_text(data["mode_1d"], path="intent.gi.mode_1d", empty=False),
         mode_2d=_text(data["mode_2d"], path="intent.gi.mode_2d", empty=False),
+        gi_exit_angle_convention=convention,
     )
     try:
         result.freeze(choices=None)
@@ -579,6 +598,9 @@ def dump_run_intent_profile(intent: RunIntent) -> str:
                     "tilt_angle": float(frozen.gi.tilt_angle),
                     "mode_1d": frozen.gi.mode_1d,
                     "mode_2d": frozen.gi.mode_2d,
+                    "gi_exit_angle_convention": (
+                        frozen.gi.gi_exit_angle_convention
+                    ),
                 },
                 "threshold": frozen.threshold.as_dict(),
                 "poni_file": frozen.poni_file,
