@@ -200,7 +200,7 @@ def _accepted_admission(
         poni_bytes = Path(configuration.poni_file).read_bytes()
         mask_bytes = None if mask is None else mask.tobytes()
         assets = AcceptedScientificAssets(
-            (0.1, 0.01, 0.01, 0.0, 0.0, 0.0, 1e-10, "Tiny"),
+            (0.1, 0.01, 0.01, 0.0, 0.0, 0.0, 1e-10, "Detector"),
             None if mask is None else str(mask.dtype),
             None if mask is None else mask.shape,
             mask_bytes,

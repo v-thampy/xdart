@@ -38,6 +38,8 @@ PONI_V3_SENSOR_MATERIALS = (
     "CZT",
 )
 
+_DETECTOR_CONFIG_MAPPING_TYPES = {dict, MappingProxyType}
+
 
 def validate_sensor_parallax(
     material: object,
@@ -68,6 +70,171 @@ def validate_sensor_parallax(
         if not math.isfinite(wavelength) or wavelength <= 0.0:
             raise ValueError("enabled parallax requires a positive wavelength")
     return material, thickness, parallax
+
+
+def _plain_detector_config(value: object) -> object:
+    """Return one strict JSON-native detector-config value."""
+
+    if type(value) in _DETECTOR_CONFIG_MAPPING_TYPES:
+        if any(type(key) is not str for key in value):
+            raise ValueError("detector configuration keys must be strings")
+        return {
+            key: _plain_detector_config(item)
+            for key, item in value.items()
+        }
+    if type(value) in {tuple, list}:
+        return [_plain_detector_config(item) for item in value]
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    raise ValueError("detector configuration is not strict JSON data")
+
+
+def _exact_json_value(left: object, right: object) -> bool:
+    """Compare JSON values without Python's bool/int/float coercions."""
+
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return (
+            set(left) == set(right)
+            and all(_exact_json_value(left[key], right[key]) for key in left)
+        )
+    if type(left) is list:
+        return (
+            len(left) == len(right)
+            and all(
+                _exact_json_value(left_item, right_item)
+                for left_item, right_item in zip(left, right, strict=True)
+            )
+        )
+    return left == right
+
+
+def _detector_config_has_pathlike_value(value: object) -> bool:
+    if type(value) is str:
+        return True
+    if type(value) is dict:
+        return any(
+            _detector_config_has_pathlike_value(item)
+            for item in value.values()
+        )
+    if type(value) is list:
+        return any(_detector_config_has_pathlike_value(item) for item in value)
+    return False
+
+
+def _admit_detector_config(
+    detector_name: object,
+    detector_config: object,
+    *,
+    parallax: object | None = None,
+    wavelength_m: object | None = None,
+) -> tuple[dict[str, object], Detector]:
+    """Validate and construct one exact, non-path detector configuration.
+
+    The returned mapping is the supplied JSON projection, not pyFAI's expanded
+    defaults.  Every supplied key is nevertheless compared recursively against
+    ``Detector.get_config()`` after JSON normalization.  This preserves legacy
+    PONI-2 projection/fingerprint shape while refusing silent pyFAI coercions
+    such as ``pixel1=1`` (integer) becoming ``1.0`` (float).
+    """
+
+    from pyFAI.detectors import ALL_DETECTORS, detector_factory
+
+    if type(detector_config) not in _DETECTOR_CONFIG_MAPPING_TYPES:
+        raise ValueError("detector configuration must be a mapping")
+    config = _plain_detector_config(detector_config)
+    try:
+        config = json.loads(json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("detector configuration is not finite JSON") from exc
+
+    if type(detector_name) is not str:
+        raise ValueError("detector must be a simple registered name")
+    name = detector_name.strip()
+    unsafe_name = (
+        not name
+        or name != detector_name
+        or any(mark in name for mark in ("\0", "/", "\\", "://"))
+        or len(name) > 1 and name[0].isalpha() and name[1] == ":"
+        or os.path.exists(name)
+    )
+    folded = name.casefold()
+    detector_class = (
+        ALL_DETECTORS.get(folded)
+        or ALL_DETECTORS.get(folded.replace(" ", "_"))
+        or ALL_DETECTORS.get(folded.replace(" ", ""))
+    )
+    if unsafe_name or detector_class is None:
+        raise ValueError("detector must be a simple registered name")
+
+    try:
+        constructor_keys = (
+            set(inspect.getfullargspec(detector_class).args) - {"self"}
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("detector configuration schema is unavailable") from exc
+    if (
+        not set(config) <= constructor_keys | {"binning", "sensor"}
+        or any(
+            token in key.casefold()
+            for key in config
+            for token in ("spline", "file", "path", "uri", "url")
+        )
+    ):
+        raise ValueError("detector configuration contains an unsafe key")
+    non_sensor_config = {
+        key: value for key, value in config.items() if key != "sensor"
+    }
+    if _detector_config_has_pathlike_value(non_sensor_config):
+        raise ValueError("detector configuration contains a path-like value")
+
+    sensor = config.get("sensor")
+    if parallax is None:
+        if sensor is not None:
+            raise ValueError("legacy detector configuration contains a sensor")
+    else:
+        if (
+            type(parallax) is not bool
+            or type(sensor) is not dict
+            or set(sensor) != {"material", "thickness"}
+        ):
+            raise ValueError("PONI 3 detector sensor/parallax is malformed")
+        validate_sensor_parallax(
+            sensor["material"],
+            sensor["thickness"],
+            parallax,
+            wavelength_m=wavelength_m,
+        )
+
+    try:
+        detector = (
+            detector_factory(name, config=config)
+            if config
+            else detector_factory(name)
+        )
+        reported = json.loads(json.dumps(
+            detector.get_config(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ))
+    except (TypeError, ValueError, OverflowError, KeyError) as exc:
+        raise ValueError("detector configuration could not be constructed") from exc
+    if type(reported) is not dict or any(
+        key not in reported
+        or not _exact_json_value(value, reported[key])
+        for key, value in config.items()
+    ):
+        raise ValueError(
+            "supplied detector config differs from pyFAI canonical detector config"
+        )
+    return config, detector
 
 
 def apply_sensor_parallax(
@@ -139,7 +306,7 @@ def detector_calibration_from_projection(
         "dist", "poni1", "poni2", "rot1", "rot2", "rot3",
         "wavelength", "detector",
     }
-    mapping_types = {dict, MappingProxyType}
+    mapping_types = _DETECTOR_CONFIG_MAPPING_TYPES
     if type(projection) not in mapping_types:
         raise ValueError("accepted PONI projection has an invalid keyset")
     projection_keys = frozenset(projection)
@@ -151,17 +318,8 @@ def detector_calibration_from_projection(
     if type(detector_config) not in mapping_types:
         raise ValueError("accepted detector config must be a mapping")
 
-    def plain_json(value: object) -> object:
-        if type(value) in mapping_types:
-            if any(type(key) is not str for key in value):
-                raise ValueError("accepted detector config keys must be strings")
-            return {key: plain_json(item) for key, item in value.items()}
-        if type(value) in {tuple, list}:
-            return [plain_json(item) for item in value]
-        return value
-
     config = json.loads(json.dumps(
-        plain_json(detector_config),
+        _plain_detector_config(detector_config),
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -181,17 +339,29 @@ def detector_calibration_from_projection(
         *(float(value) for value in numeric),
         projection["detector"],
     )
+    projected_parallax = projection.get("parallax")
+    if "parallax" in projection:
+        projected_config = projection["detector_config"]
+        try:
+            plain_projected = _plain_detector_config(projected_config)
+        except ValueError as exc:
+            raise ValueError(
+                "accepted PONI detector projections differ"
+            ) from exc
+        if (
+            type(projected_config) not in mapping_types
+            or not _exact_json_value(plain_projected, config)
+        ):
+            raise ValueError("accepted PONI detector projections differ")
+    _admit_detector_config(
+        projection["detector"],
+        config,
+        parallax=projected_parallax,
+        wavelength_m=projection["wavelength"],
+    )
     calibration = DetectorCalibration(poni, config)
     if "parallax" not in projection:
-        if "sensor" in config:
-            raise ValueError("legacy PONI projection contains a sensor")
         return calibration
-    projected_config = projection["detector_config"]
-    if (
-        type(projected_config) not in mapping_types
-        or plain_json(projected_config) != config
-    ):
-        raise ValueError("accepted PONI detector projections differ")
     sensor = config.get("sensor")
     if type(sensor) is not dict:
         raise ValueError("accepted PONI sensor is missing")
@@ -281,7 +451,6 @@ def load_detector_calibration(
     path: Path | str, *, data: bytes | None = None,
 ) -> DetectorCalibration:
     """Strictly load bounded PONI 2.0/2.1/3.0 detector calibration."""
-    from pyFAI.detectors import ALL_DETECTORS
     from pyFAI.io.ponifile import PoniFile
     from xrd_tools.core.geometry.diffractometer import DetectorCalibration
 
@@ -340,25 +509,16 @@ def load_detector_calibration(
         raise ValueError("detector orientation must be an integer from 1 through 4")
     json.dumps(config, allow_nan=False)
     name = raw.get("detector", "").strip()
-    unsafe_name = (not name or any(mark in name for mark in ("\0", "/", "\\", "://"))
-                   or len(name) > 1 and name[0].isalpha() and name[1] == ":"
-                   or os.path.exists(name))
-    folded = name.casefold()
-    detector_class = (ALL_DETECTORS.get(folded) or ALL_DETECTORS.get(
-        folded.replace(" ", "_")) or ALL_DETECTORS.get(folded.replace(" ", "")))
-    if unsafe_name or detector_class is None: raise ValueError("detector must be a simple registered name")
-    constructor_keys = set(inspect.getfullargspec(detector_class).args) - {"self"}
-    if not set(config) <= constructor_keys | {"binning"} or any(
-        token in key.casefold() for key in config for token in
-        ("spline", "file", "path", "uri", "url")
-    ): raise ValueError("detector configuration contains an unsafe key")
-    def pathlike(value) -> bool:
-        if type(value) is str:
-            return True
-        items = value.values() if type(value) is dict else value if type(value) is list else ()
-        return any(pathlike(item) for item in items)
-    non_sensor_config = {key: value for key, value in config.items() if key != "sensor"}
-    if pathlike(non_sensor_config): raise ValueError("detector configuration contains a path-like value")
+    config, admitted_detector = _admit_detector_config(
+        name,
+        config,
+        parallax=None if sensor_values is None else sensor_values[2],
+        wavelength_m=(
+            raw.get("wavelength", "0")
+            if sensor_values is None
+            else float(raw.get("wavelength", "0"))
+        ),
+    )
     mapping = dict(raw, poni_version=version, detector=name, detector_config=config)
     if sensor_values is not None:
         mapping["parallax"] = sensor_values[2]
@@ -392,7 +552,10 @@ def load_detector_calibration(
         item.pixel2, int(item.orientation),
         DetectorCalibration(poni, item.get_config(),
                             parallax=calibration.parallax).to_json())
-    if identity(detector) != identity(rebuilt): raise ValueError("detector configuration did not survive reconstruction")
+    if (
+        identity(admitted_detector) != identity(detector)
+        or identity(detector) != identity(rebuilt)
+    ): raise ValueError("detector configuration did not survive reconstruction")
     if (rebuilt_integrator.parallax is not None) is not bool(calibration.parallax):
         raise ValueError("parallax state did not survive reconstruction")
     return calibration
@@ -484,16 +647,16 @@ def detector_calibration_to_integrator(
         Per-frame rotations (rad); ``None`` keeps the base ``poni`` value.
     """
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
-    from pyFAI.detectors import detector_factory  # noqa: PLC0415
-
     p = cal.poni
     cfg = dict(cal.detector_config or {})
     name = p.detector or ""
     if name or cfg:
         detector_name = name or "Detector"
-        det = (
-            detector_factory(detector_name, config=cfg)
-            if cfg else detector_factory(detector_name)
+        _accepted, det = _admit_detector_config(
+            detector_name,
+            cfg,
+            parallax=cal.parallax,
+            wavelength_m=p.wavelength,
         )
     else:
         det = None

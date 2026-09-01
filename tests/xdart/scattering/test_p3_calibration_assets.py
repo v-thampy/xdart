@@ -12,7 +12,10 @@ import pyFAI.detectors as detectors_module
 import pyFAI.io.ponifile as ponifile_module
 import numpy as np
 import pytest
-from xrd_tools.integrate.calibration import load_detector_calibration
+from xrd_tools.integrate.calibration import (
+    detector_calibration_from_projection,
+    load_detector_calibration,
+)
 from xrd_tools.io import science_fingerprint
 from xrd_tools.io.image import DetectorImageLayout
 from xrd_tools.session.intent_store import RunIntentStore
@@ -253,6 +256,81 @@ def test_p3_1a_v3_schema_rejects_hostile_sensor_parallax_before_construction(
             path.write_text(row, encoding="utf-8")
             with pytest.raises(ValueError):
                 load_detector_calibration(path)
+    assert upstream_calls == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        _poni('{"orientation":1,"pixel1":1}'),
+        _v3_poni(
+            '{"pixel1":1,"pixel2":0.0001,"max_shape":[32,40],'
+            '"orientation":3,"sensor":{"material":"Si",'
+            '"thickness":0.00045}}'
+        ),
+    ),
+)
+def test_detector_config_rejects_pyfai_numeric_type_coercion(tmp_path, text):
+    path = tmp_path / "coerced-detector-config.poni"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical detector config"):
+        load_detector_calibration(path)
+
+
+def test_persisted_projection_rejects_pyfai_numeric_type_coercion():
+    projection = {
+        "dist": 0.2,
+        "poni1": 0.01,
+        "poni2": 0.02,
+        "rot1": 0.0,
+        "rot2": 0.0,
+        "rot3": 0.0,
+        "wavelength": 1.0e-10,
+        "detector": "Detector",
+    }
+
+    with pytest.raises(ValueError, match="canonical detector config"):
+        detector_calibration_from_projection(
+            projection,
+            detector_config={"orientation": 3, "pixel1": 1},
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_config",
+    (
+        {"orientation": 3, "splineFile": "file:///tmp/hostile.spline"},
+        {"orientation": 3, "max_shape": "https://host.invalid/shape"},
+    ),
+)
+def test_persisted_projection_reuses_hostile_detector_config_boundary(
+    monkeypatch,
+    unsafe_config,
+):
+    projection = {
+        "dist": 0.2,
+        "poni1": 0.01,
+        "poni2": 0.02,
+        "rot1": 0.0,
+        "rot2": 0.0,
+        "rot3": 0.0,
+        "wavelength": 1.0e-10,
+        "detector": "Detector",
+    }
+    upstream_calls = []
+
+    def forbidden(*_args, **_kwargs):
+        upstream_calls.append(1)
+        raise AssertionError("unsafe persisted config reached pyFAI")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(detectors_module, "detector_factory", forbidden)
+        with pytest.raises(ValueError, match="unsafe|path-like"):
+            detector_calibration_from_projection(
+                projection,
+                detector_config=unsafe_config,
+            )
     assert upstream_calls == []
 
 

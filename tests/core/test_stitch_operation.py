@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -94,6 +95,22 @@ Rot1: 0.0
 Rot2: 0.0
 Rot3: 0.0
 Wavelength: 1e-10
+"""
+
+
+def _v3_poni_record() -> str:
+    return """\
+poni_version: 3.0
+Detector: Detector
+Detector_config: {"pixel1":0.000172,"pixel2":0.000172,"max_shape":[195,487],"orientation":3,"sensor":{"material":"Si","thickness":0.00045}}
+Distance: 0.2
+Poni1: 0.01677
+Poni2: 0.04188
+Rot1: 0.0
+Rot2: 0.0
+Rot3: 0.0
+Wavelength: 1e-10
+Parallax: True
 """
 
 
@@ -415,6 +432,104 @@ def test_prepare_binds_mode_source_selectors_and_provenance(tmp_path):
             project_root=tmp_path,
         )
     assert mismatch.value.code == "OUTPUT_KIND_MISMATCH"
+
+
+def test_poni_v3_stitch_persists_and_cross_checks_effective_calibration(
+    tmp_path,
+    monkeypatch,
+):
+    source = _source_receipt(tmp_path)
+    geometry_path = tmp_path / "geometry-v3.poni"
+    record = _v3_poni_record()
+    geometry_path.write_text(record, encoding="utf-8")
+    geometry = capture_stitch_geometry(
+        StitchGeometryInput(
+            geometry_path,
+            StitchGeometryKind.PONI,
+            source_motors=(("del", "del"), ("nu", "nu")),
+            reference_motor_positions=(("del", 0.0), ("nu", 0.0)),
+        )
+    )
+    plan = StitchOperationPlan(
+        geometry,
+        npt_1d=96,
+        radial_range=(0.1, 6.0),
+        monitor_selector=MetadataColumnSelector("I0"),
+        max_frame_bytes=64 * 1024 * 1024,
+    )
+    output_root = tmp_path / "output-v3"
+    output_root.mkdir()
+    output = ModuleOutputRequest(
+        output_root / "stitched.nexus",
+        AnalysisArtifactKind.STITCH_1D,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+    )
+    request = prepare_stitch_operation(
+        source,
+        output,
+        plan,
+        project_root=tmp_path,
+    )
+
+    geometry_provenance = request.provenance["geometry"]
+    effective = geometry_provenance["effective_calibration"]
+    assert geometry_provenance["sha256"] == hashlib.sha256(
+        record.encode()
+    ).hexdigest()
+    assert geometry_provenance["receipt_fingerprint"] == geometry.fingerprint
+    assert effective["detector_config"] == {
+        "pixel1": pytest.approx(0.000172),
+        "pixel2": pytest.approx(0.000172),
+        "max_shape": [195, 487],
+        "orientation": 3,
+        "sensor": {
+            "material": "Si",
+            "thickness": pytest.approx(0.00045),
+        },
+    }
+    assert effective["parallax"] is True
+
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert result.payload is not None
+    persisted = json.loads(result.payload.provenance_json)
+    assert persisted["geometry"]["effective_calibration"] == effective
+    assert persisted["geometry"]["sha256"] == geometry.sha256
+    assert persisted["geometry"]["receipt_fingerprint"] == geometry.fingerprint
+
+    forged = request.provenance
+    forged["geometry"]["effective_calibration"]["parallax"] = False
+    module = ModuleOperationRequest(
+        request.module.source,
+        request.module.output,
+        request.plan.fingerprint,
+        module_provenance_digest(ModuleKind.STITCH, forged),
+    )
+    canonical = module_artifact_request(module, forged).provenance_json
+    with pytest.raises(ValueError, match="exact request projection"):
+        stitch_operation.StitchOperationRequest(
+            module,
+            request.plan,
+            request.manifest,
+            canonical,
+            stitch_operation._REQUEST_FACTORY,
+        )
+
+    runtime_geometry = stitch_operation._runtime_geometry
+
+    def lose_effective_parallax(receipt, raw):
+        diffractometer, orientation = runtime_geometry(receipt, raw)
+        calibration = replace(diffractometer.calibration, parallax=False)
+        return replace(diffractometer, calibration=calibration), orientation
+
+    monkeypatch.setattr(
+        stitch_operation,
+        "_runtime_geometry",
+        lose_effective_parallax,
+    )
+    mismatch = run_stitch_operation(request)
+    assert mismatch.terminal.disposition is ModuleDisposition.REFUSED
+    assert mismatch.terminal.code == "GEOMETRY_EFFECTIVE_CALIBRATION_MISMATCH"
 
 
 def test_prepare_refuses_unsupported_source_kind_before_source_replay(tmp_path):

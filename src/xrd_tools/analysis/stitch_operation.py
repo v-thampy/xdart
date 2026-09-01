@@ -1291,6 +1291,42 @@ def _engine_version() -> str:
             return "unavailable"
 
 
+def _effective_poni_calibration(
+    geometry: StitchGeometryReceipt,
+    raw: bytes,
+) -> dict[str, object] | None:
+    """Return the strict effective PONI projection bound to one receipt."""
+
+    if geometry.request.kind is not StitchGeometryKind.PONI:
+        return None
+    from xrd_tools.integrate.calibration import (
+        detector_calibration_projection,
+        load_detector_calibration,
+    )
+
+    calibration = load_detector_calibration(
+        geometry.resolved_path,
+        data=raw,
+    )
+    projection = detector_calibration_projection(calibration)
+    # Force a finite JSON-native value at the provenance boundary.
+    return json.loads(json.dumps(
+        projection,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ))
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 def _provenance(
     source: ModuleSourceReceipt,
     output: ModuleOutputRequest,
@@ -1301,6 +1337,31 @@ def _provenance(
     geometry = plan.geometry
     geometry_request = geometry.request
     selector = plan.monitor_selector
+    geometry_projection: dict[str, object] = {
+        "kind": geometry_request.kind.value,
+        "relative_path": geometry_relative_path,
+        "byte_count": geometry.byte_count,
+        "sha256": geometry.sha256,
+        "receipt_fingerprint": geometry.fingerprint,
+        "source_motors": [list(item) for item in geometry_request.source_motors],
+        "reference_motor_positions": [
+            [name, value]
+            for name, value in geometry_request.reference_motor_positions
+        ],
+        "image_orientation": {
+            "rotation": geometry_request.image_rotation,
+            "flip_vertical": False,
+            "flip_horizontal": False,
+            "transpose": False,
+        },
+        "base_preset": geometry_request.base_preset,
+    }
+    effective_calibration = _effective_poni_calibration(
+        geometry,
+        geometry.content,
+    )
+    if effective_calibration is not None:
+        geometry_projection["effective_calibration"] = effective_calibration
     return {
         "schema_version": "stitch-operation-v1",
         "kind": "stitch",
@@ -1311,25 +1372,7 @@ def _provenance(
             "selected_labels": list(source.selected_labels),
             "input_manifest": manifest.to_provenance(),
         },
-        "geometry": {
-            "kind": geometry_request.kind.value,
-            "relative_path": geometry_relative_path,
-            "byte_count": geometry.byte_count,
-            "sha256": geometry.sha256,
-            "receipt_fingerprint": geometry.fingerprint,
-            "source_motors": [list(item) for item in geometry_request.source_motors],
-            "reference_motor_positions": [
-                [name, value]
-                for name, value in geometry_request.reference_motor_positions
-            ],
-            "image_orientation": {
-                "rotation": geometry_request.image_rotation,
-                "flip_vertical": False,
-                "flip_horizontal": False,
-                "transpose": False,
-            },
-            "base_preset": geometry_request.base_preset,
-        },
+        "geometry": geometry_projection,
         "plan": {
             "backend": plan.backend,
             "mode": plan.mode,
@@ -1846,6 +1889,34 @@ class StitchOperationExecution:
             diffractometer, orientation = _runtime_geometry(
                 self.request.plan.geometry, raw
             )
+            effective_calibration = None
+            if (
+                self.request.plan.geometry.request.kind
+                is StitchGeometryKind.PONI
+            ):
+                from xrd_tools.integrate.calibration import (
+                    detector_calibration_projection,
+                )
+
+                effective_calibration = detector_calibration_projection(
+                    diffractometer.calibration
+                )
+            expected_calibration = self.request.provenance["geometry"].get(
+                "effective_calibration"
+            )
+            if (
+                effective_calibration is None
+            ) != (
+                expected_calibration is None
+            ) or (
+                effective_calibration is not None
+                and _canonical_json(effective_calibration)
+                != _canonical_json(expected_calibration)
+            ):
+                raise StitchOperationRefused(
+                    "GEOMETRY_EFFECTIVE_CALIBRATION_MISMATCH",
+                    "runtime calibration differs from the receipt-bound projection",
+                )
             runtime_plan = _runtime_plan(self.request.plan, diffractometer)
             self._emit("geometry", 1, total)
             with requalified_analysis_source(

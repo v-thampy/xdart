@@ -224,7 +224,7 @@ def _accepted_admission(
     configuration = capture.intent_snapshot.thaw()
     poni_bytes = Path(configuration.poni_file).read_bytes()
     assets = AcceptedScientificAssets(
-        (0.1, 0.01, 0.01, 0.0, 0.0, 0.0, 1e-10, "Tiny"),
+        (0.1, 0.01, 0.01, 0.0, 0.0, 0.0, 1e-10, "Detector"),
         None,
         None,
         None,

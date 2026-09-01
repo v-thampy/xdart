@@ -249,10 +249,20 @@ class AcceptedScientificAssets:
 
     @property
     def detector_calibration(self) -> object | None:
-        from xrd_tools.core.geometry.diffractometer import DetectorCalibration
-        return None if self.poni_values is None else DetectorCalibration(
-            self.poni, json.loads(self.poni_detector_config_json),
-            parallax=self.poni_parallax,
+        if self.poni_values is None:
+            return None
+        from xrd_tools.integrate.calibration import (
+            detector_calibration_from_projection,
+        )
+
+        projection = dict(self.poni.to_dict())
+        config = json.loads(self.poni_detector_config_json)
+        if self.poni_parallax is not None:
+            projection["detector_config"] = config
+            projection["parallax"] = self.poni_parallax
+        return detector_calibration_from_projection(
+            projection,
+            detector_config=config,
         )
 
     @property
