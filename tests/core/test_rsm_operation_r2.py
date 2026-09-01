@@ -33,7 +33,7 @@ from xrd_tools.analysis.rsm_operation import (
     make_rsm_common_grid,
     prepare_rsm_operation_v2,
 )
-from xrd_tools.core.geometry import PixelQMap
+from xrd_tools.core.geometry import Diffractometer, PixelQMap
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.sources.spec import SpecSource
 
@@ -423,6 +423,45 @@ def test_xu_nthreads_restores_after_q_failure_and_cancellation(tmp_path, monkeyp
         prepare_rsm_tool_v2(_form(tmp_path, (member,)), cancel_token=cancelled)
     assert refused.value.code == "CANCELLED"
     assert xu.config.NTHREADS == before
+
+
+@pytest.mark.parametrize("failure_site", ("make_hxrd", "init_area", "area"))
+def test_q_backend_exceptions_are_stable_tool_refusals(
+    tmp_path,
+    monkeypatch,
+    failure_site,
+):
+    import xrayutilities as xu
+
+    member = _write_member(tmp_path, 0)
+    form = _form(tmp_path, (member,))
+    nthreads_before = xu.config.NTHREADS
+
+    class FailingAng2Q:
+        def init_area(self, *_args, **_kwargs):
+            if failure_site == "init_area":
+                raise RuntimeError("backend-private init detail")
+
+        def area(self, *_args, **_kwargs):
+            if failure_site == "area":
+                raise RuntimeError("backend-private area detail")
+            raise AssertionError("area must not run for this failure site")
+
+    class FailingHxrd:
+        Ang2Q = FailingAng2Q()
+
+    def failing_make_hxrd(*_args, **_kwargs):
+        if failure_site == "make_hxrd":
+            raise RuntimeError("backend-private construction detail")
+        return FailingHxrd()
+
+    monkeypatch.setattr(Diffractometer, "make_hxrd", failing_make_hxrd)
+    with pytest.raises(RSMToolPreflightRefused) as refused:
+        prepare_rsm_tool_v2(form)
+    assert refused.value.code == "RSM_MEMBER_Q_BOUNDS_INVALID"
+    assert "backend-private" not in str(refused.value)
+    assert xu.config.NTHREADS == nthreads_before
+    assert not Path(form.output_path).exists()
 
 
 def test_core_v2_rejects_duplicate_forms_and_limits_before_runtime(

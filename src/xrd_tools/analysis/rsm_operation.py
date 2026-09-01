@@ -2691,19 +2691,27 @@ def _resolve_exact_rsm_q_bounds_active(
             "RSM exact q preflight exceeds max_chunk_bytes",
         )
     session.require_active()
-    hxrd = mapper.diff_config.make_hxrd(energy)
+    try:
+        hxrd = mapper.diff_config.make_hxrd(energy)
+    except RSMOperationRefused:
+        raise
+    except Exception:
+        raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID") from None
     session.require_active()
-    hxrd.Ang2Q.init_area(
-        mapper.diff_config.init_area_detrot,
-        mapper.diff_config.init_area_tiltazimuth,
-        cch1=float(header.cch1),
-        cch2=float(header.cch2),
-        pwidth1=float(header.pwidth1),
-        pwidth2=float(header.pwidth2),
-        distance=float(header.distance),
-        Nch1=int(header.Nch1),
-        Nch2=int(header.Nch2),
-    )
+    try:
+        hxrd.Ang2Q.init_area(
+            mapper.diff_config.init_area_detrot,
+            mapper.diff_config.init_area_tiltazimuth,
+            cch1=float(header.cch1),
+            cch2=float(header.cch2),
+            pwidth1=float(header.pwidth1),
+            pwidth2=float(header.pwidth2),
+            distance=float(header.distance),
+            Nch1=int(header.Nch1),
+            Nch2=int(header.Nch2),
+        )
+    except Exception:
+        raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID") from None
     lows = np.full(3, np.inf, dtype=np.float64)
     highs = np.full(3, -np.inf, dtype=np.float64)
     for start in range(0, frame_count, chunk_size):
@@ -2711,22 +2719,27 @@ def _resolve_exact_rsm_q_bounds_active(
             raise RSMOperationRefused("CANCELLED")
         session.require_active()
         stop = min(start + chunk_size, frame_count)
-        q_values = hxrd.Ang2Q.area(
-            *(item[start:stop] for item in values),
-            UB=matrix,
-            **mapper.diff_config.ang2q_kwargs,
-        )
-        expected = (stop - start, header.Nch1, header.Nch2)
-        admitted: list[np.ndarray] = []
-        for value in q_values:
-            array = np.asarray(value)
-            if expected[0] == 1 and array.shape == expected[1:]:
-                array = array.reshape(expected)
-            if array.shape != expected or not np.all(np.isfinite(array)):
+        try:
+            q_values = hxrd.Ang2Q.area(
+                *(item[start:stop] for item in values),
+                UB=matrix,
+                **mapper.diff_config.ang2q_kwargs,
+            )
+            expected = (stop - start, header.Nch1, header.Nch2)
+            admitted: list[np.ndarray] = []
+            for value in q_values:
+                array = np.asarray(value)
+                if expected[0] == 1 and array.shape == expected[1:]:
+                    array = array.reshape(expected)
+                if array.shape != expected or not np.all(np.isfinite(array)):
+                    raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+                admitted.append(array)
+            if len(admitted) != 3:
                 raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
-            admitted.append(array)
-        if len(admitted) != 3:
-            raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
+        except RSMOperationRefused:
+            raise
+        except Exception:
+            raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID") from None
         for axis, item in enumerate(admitted):
             lows[axis] = min(lows[axis], float(np.min(item)))
             highs[axis] = max(highs[axis], float(np.max(item)))
