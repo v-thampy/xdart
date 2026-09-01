@@ -11,6 +11,7 @@ from typing import Any
 
 _EXPORTS = {
     "admit_analysis_artifact": ("xrd_tools.io.analysis_artifact", "admit_analysis_artifact"),
+    "analysis_execution_attestation_digest": ("xrd_tools.io.analysis_artifact", "analysis_execution_attestation_digest"),
     "AnalysisArtifactCleanupPending": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactCleanupPending"),
     "AnalysisArtifactError": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactError"),
     "AnalysisArtifactInspection": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactInspection"),
@@ -24,6 +25,7 @@ _EXPORTS = {
     "AnalysisArtifactReceipt": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactReceipt"),
     "AnalysisArtifactResultProjection": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactResultProjection"),
     "AnalysisArtifactRequest": ("xrd_tools.io.analysis_artifact", "AnalysisArtifactRequest"),
+    "canonical_analysis_execution_attestation": ("xrd_tools.io.analysis_artifact", "canonical_analysis_execution_attestation"),
     "canonical_analysis_provenance": ("xrd_tools.io.analysis_artifact", "canonical_analysis_provenance"),
     "inspect_analysis_artifact": ("xrd_tools.io.analysis_artifact", "inspect_analysis_artifact"),
     "project_analysis_artifact_result": ("xrd_tools.io.analysis_artifact", "project_analysis_artifact_result"),

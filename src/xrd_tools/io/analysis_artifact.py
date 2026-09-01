@@ -42,11 +42,16 @@ ANALYSIS_SCHEMA_ATTR = "ssrl_schema"
 ANALYSIS_SCHEMA_NAME = "xrd_tools.analysis_artifact"
 ANALYSIS_SCHEMA_VERSION_ATTR = "ssrl_schema_version"
 ANALYSIS_SCHEMA_VERSION = 1
+ANALYSIS_SCHEMA_VERSION_V2 = 2
 ANALYSIS_KIND_ATTR = "analysis_kind"
 _ENTRY = "entry"
 _PROVENANCE = "provenance_json"
+_EXECUTION_ATTESTATION = "execution_attestation_json"
+_EXECUTION_ATTESTATION_DIGEST_ATTR = "execution_attestation_digest"
 _MAX_PROVENANCE_BYTES = 1 << 20
 _MAX_PROVENANCE_NESTING = 64
+_MAX_EXECUTION_ATTESTATION_BYTES = 16_384
+_MAX_EXECUTION_ATTESTATION_NESTING = 4
 _MAX_ATTRIBUTE_BYTES = 4096
 _MAX_ATTRIBUTE_ITEMS = 16
 _MAX_AXIS_POINTS = 1_000_000
@@ -231,6 +236,204 @@ def canonical_analysis_provenance(value: Mapping[str, object]) -> str:
     return text
 
 
+def _execution_attestation_value(
+    value: object,
+    active: set[int],
+    depth: int,
+    budget: list[int],
+) -> object:
+    if type(value) in {dict, list, tuple} and depth > _MAX_EXECUTION_ATTESTATION_NESTING:
+        raise ValueError("analysis execution attestation exceeds the nesting bound")
+    recursive = type(value) in {dict, list, tuple}
+    marker = id(value)
+    if recursive:
+        if marker in active:
+            raise ValueError("analysis execution attestation is cyclic")
+        active.add(marker)
+
+    def charge(amount: int) -> None:
+        budget[0] += int(amount)
+        if budget[0] > _MAX_EXECUTION_ATTESTATION_BYTES:
+            raise ValueError("analysis execution attestation is oversized")
+
+    try:
+        if value is None:
+            charge(4)
+            return None
+        if type(value) is str:
+            charge(_json_string_size(value))
+            return value
+        if type(value) is bool:
+            charge(4 if value else 5)
+            return value
+        if type(value) is int:
+            if value.bit_length() > 65_536:
+                raise ValueError("analysis execution attestation is oversized")
+            charge(len(str(value)))
+            return value
+        if type(value) is float:
+            if not math.isfinite(value):
+                raise ValueError(
+                    "analysis execution attestation contains a nonfinite number"
+                )
+            charge(len(repr(value)))
+            return value
+        if type(value) in {list, tuple}:
+            charge(2)
+            frozen = []
+            for index, item in enumerate(value):
+                if index:
+                    charge(1)
+                frozen.append(
+                    _execution_attestation_value(
+                        item, active, depth + 1, budget
+                    )
+                )
+            return frozen
+        if type(value) is dict:
+            charge(2)
+            frozen = {}
+            for index, (key, item) in enumerate(value.items()):
+                if type(key) is not str:
+                    raise TypeError(
+                        "analysis execution attestation keys must be exact strings"
+                    )
+                if index:
+                    charge(1)
+                charge(_json_string_size(key) + 1)
+                frozen[key] = _execution_attestation_value(
+                    item, active, depth + 1, budget
+                )
+            return frozen
+        raise TypeError(
+            "analysis execution attestation contains unsupported "
+            f"{type(value).__name__}"
+        )
+    finally:
+        if recursive:
+            active.remove(marker)
+
+
+def canonical_analysis_execution_attestation(
+    value: Mapping[str, object],
+) -> str:
+    if type(value) is not dict:
+        raise TypeError("analysis execution attestation must be an exact dictionary")
+    frozen = _execution_attestation_value(value, set(), 1, [0])
+    text = json.dumps(
+        frozen,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    if len(text.encode("utf-8")) > _MAX_EXECUTION_ATTESTATION_BYTES:
+        raise ValueError("analysis execution attestation is oversized")
+    return text
+
+
+def _validated_execution_attestation(
+    value: Mapping[str, object],
+    *,
+    kind: AnalysisArtifactKind,
+    request_fingerprint: str,
+) -> tuple[str, dict[str, object]]:
+    text = canonical_analysis_execution_attestation(value)
+    parsed = json.loads(text)
+    top_keys = {
+        "schema_version",
+        "module_request_fingerprint",
+        "result_projection_policy",
+        "result_fingerprint",
+        "selected_frame_count",
+        "release_check_frame_count",
+        "release_check_passed",
+        "q_root_policy",
+        "xu_runtime",
+    }
+    runtime_keys = {
+        "lock_policy",
+        "xrayutilities_distribution_version",
+        "xrayutilities_module_version",
+        "numpy_version",
+        "config_epsilon",
+        "config_digits",
+        "nthreads_before",
+        "nthreads_effective",
+        "nthreads_restored",
+        "restore_passed",
+    }
+    runtime = parsed.get("xu_runtime")
+    selected = parsed.get("selected_frame_count")
+    released = parsed.get("release_check_frame_count")
+    before = runtime.get("nthreads_before") if type(runtime) is dict else None
+    restored = runtime.get("nthreads_restored") if type(runtime) is dict else None
+    if (
+        kind is not AnalysisArtifactKind.STITCH_1D
+        or set(parsed) != top_keys
+        or parsed.get("schema_version") != "analysis-execution-attestation-v1"
+        or parsed.get("module_request_fingerprint") != request_fingerprint
+        or parsed.get("result_projection_policy")
+        != _STORED_RESULT_PROJECTION_POLICY
+        or type(parsed.get("result_fingerprint")) is not str
+        or _SHA256.fullmatch(parsed["result_fingerprint"]) is None
+        or type(selected) is not int
+        or selected < 1
+        or type(released) is not int
+        or released != selected
+        or parsed.get("release_check_passed") is not True
+        or parsed.get("q_root_policy")
+        != "shared_ultimate_ndarray_root_weakref_v1"
+        or type(runtime) is not dict
+        or set(runtime) != runtime_keys
+        or runtime.get("lock_policy") != "shared_xrd_tools_xu_rlock_v1"
+        or runtime.get("xrayutilities_distribution_version") != "1.7.12"
+        or runtime.get("xrayutilities_module_version") != "1.7.12"
+        or runtime.get("numpy_version") != "2.5.1"
+        or type(runtime.get("config_epsilon")) is not float
+        or runtime.get("config_epsilon") != 1e-8
+        or type(runtime.get("config_digits")) is not int
+        or runtime.get("config_digits") != 8
+        or type(before) is not int
+        or before < 0
+        or type(runtime.get("nthreads_effective")) is not int
+        or runtime.get("nthreads_effective") != 1
+        or type(restored) is not int
+        or restored != before
+        or runtime.get("restore_passed") is not True
+    ):
+        raise ValueError("analysis execution attestation contract is invalid")
+    return text, parsed
+
+
+def analysis_execution_attestation_digest(
+    kind: AnalysisArtifactKind,
+    value: Mapping[str, object],
+    *,
+    request_fingerprint: str,
+) -> str:
+    """Return the exact v1 execution-attestation identity domain."""
+
+    if type(kind) is not AnalysisArtifactKind:
+        raise TypeError("analysis attestation kind must be exact")
+    _sha256(request_fingerprint, "request fingerprint")
+    _text, parsed = _validated_execution_attestation(
+        value,
+        kind=kind,
+        request_fingerprint=request_fingerprint,
+    )
+    # Importing the engine-light transaction enum lazily avoids the artifact /
+    # transaction import cycle while preserving the frozen Enum framing.
+    from xrd_tools.analysis.module_transaction import ModuleKind
+    from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
+
+    module_kind = ModuleKind.STITCH
+    return analysis_canonical_fingerprint(
+        "analysis-artifact-execution-attestation-v1",
+        (module_kind, parsed),
+    )
+
+
 @dataclass(eq=False, frozen=True, slots=True)
 class AnalysisArtifactRequest:
     target: str | Path
@@ -242,8 +445,16 @@ class AnalysisArtifactRequest:
     provenance_digest: str
     provenance: InitVar[Mapping[str, object]]
     provenance_json: str = field(init=False, repr=False)
+    schema_version: int = ANALYSIS_SCHEMA_VERSION
+    execution_attestation_digest: str | None = None
+    execution_attestation: InitVar[Mapping[str, object] | None] = None
+    execution_attestation_json: str | None = field(init=False, default=None, repr=False)
 
-    def __post_init__(self, provenance: Mapping[str, object]) -> None:
+    def __post_init__(
+        self,
+        provenance: Mapping[str, object],
+        execution_attestation: Mapping[str, object] | None,
+    ) -> None:
         if (
             type(self.kind) is not AnalysisArtifactKind
             or type(self.overwrite) is not AnalysisArtifactOverwrite
@@ -262,6 +473,40 @@ class AnalysisArtifactRequest:
             "provenance_json",
             canonical_analysis_provenance(provenance),
         )
+        if type(self.schema_version) is not int or self.schema_version not in {
+            ANALYSIS_SCHEMA_VERSION,
+            ANALYSIS_SCHEMA_VERSION_V2,
+        }:
+            raise TypeError("analysis artifact schema version is unsupported")
+        if self.schema_version == ANALYSIS_SCHEMA_VERSION:
+            if (
+                self.execution_attestation_digest is not None
+                or execution_attestation is not None
+            ):
+                raise ValueError("analysis artifact v1 cannot carry an attestation")
+            return
+        if (
+            type(self.execution_attestation_digest) is not str
+            or execution_attestation is None
+        ):
+            raise ValueError("analysis artifact v2 requires an execution attestation")
+        _sha256(
+            self.execution_attestation_digest,
+            "execution attestation digest",
+        )
+        text, parsed = _validated_execution_attestation(
+            execution_attestation,
+            kind=self.kind,
+            request_fingerprint=self.request_fingerprint,
+        )
+        observed = analysis_execution_attestation_digest(
+            self.kind,
+            parsed,
+            request_fingerprint=self.request_fingerprint,
+        )
+        if observed != self.execution_attestation_digest:
+            raise ValueError("analysis execution attestation digest changed")
+        object.__setattr__(self, "execution_attestation_json", text)
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +527,9 @@ class AnalysisArtifactInspection:
     provenance_json: str = field(repr=False)
     provenance_sha256: str
     result_fingerprint: str
+    schema_version: int = ANALYSIS_SCHEMA_VERSION
+    execution_attestation_digest: str | None = None
+    execution_attestation_json: str | None = field(default=None, repr=False)
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -331,6 +579,12 @@ class AnalysisArtifactResultProjection:
 
     def __deepcopy__(self, _memo):
         raise TypeError("analysis artifact result projection is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("analysis artifact result projection is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("analysis artifact result projection is not serializable")
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -470,6 +724,18 @@ class AnalysisArtifactPayload:
     def result_fingerprint(self) -> str:
         return self.inspection.result_fingerprint
 
+    @property
+    def schema_version(self) -> int:
+        return self.inspection.schema_version
+
+    @property
+    def execution_attestation_digest(self) -> str | None:
+        return self.inspection.execution_attestation_digest
+
+    @property
+    def execution_attestation_json(self) -> str | None:
+        return self.inspection.execution_attestation_json
+
     @staticmethod
     def _view(buffer: bytes, shape: tuple[int, ...]) -> np.ndarray:
         return np.frombuffer(buffer, dtype=np.float32).reshape(shape)
@@ -552,6 +818,11 @@ class AnalysisArtifactReceipt:
             or self.inspection.plan_fingerprint != self.request.plan_fingerprint
             or self.inspection.provenance_digest
             != self.request.provenance_digest
+            or self.inspection.schema_version != self.request.schema_version
+            or self.inspection.execution_attestation_digest
+            != self.request.execution_attestation_digest
+            or self.inspection.execution_attestation_json
+            != self.request.execution_attestation_json
         ):
             raise TypeError("analysis artifact receipt is invalid")
 
@@ -724,6 +995,96 @@ def _read_scalar_text(group: h5py.Group, name: str) -> str:
     return text
 
 
+def _require_execution_attestation_nesting_bound(text: str) -> None:
+    depth = 0
+    quoted = False
+    escaped = False
+    for character in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_EXECUTION_ATTESTATION_NESTING:
+                raise AnalysisArtifactInvalid(
+                    "analysis execution attestation exceeds the nesting bound"
+                )
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                break
+
+
+def _read_scalar_execution_attestation(
+    group: h5py.Group,
+    name: str,
+    *,
+    kind: AnalysisArtifactKind,
+    request_fingerprint: str,
+    expected_digest: str,
+) -> str:
+    dataset = _direct(group, name, h5py.Dataset)
+    if dataset.shape != () or len(dataset.attrs) != 0:
+        raise AnalysisArtifactInvalid(
+            "analysis execution attestation must be an attribute-free scalar"
+        )
+    if (
+        _hdf_type_class(dataset.id) != h5py.h5t.STRING
+        or dataset.dtype.kind != "S"
+        or dataset.dtype.itemsize < 1
+        or dataset.dtype.itemsize > _MAX_EXECUTION_ATTESTATION_BYTES
+        or dataset.id.get_storage_size() > _MAX_EXECUTION_ATTESTATION_BYTES
+    ):
+        raise AnalysisArtifactInvalid(
+            "analysis execution attestation must use bounded fixed-width storage"
+        )
+    raw = dataset[()]
+    if not isinstance(raw, bytes):
+        raise AnalysisArtifactInvalid(
+            "analysis execution attestation must be UTF-8 text"
+        )
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise AnalysisArtifactInvalid(
+            "analysis execution attestation must be UTF-8 text"
+        ) from error
+    if len(text.encode("utf-8")) > _MAX_EXECUTION_ATTESTATION_BYTES:
+        raise AnalysisArtifactInvalid("analysis execution attestation is oversized")
+    _require_execution_attestation_nesting_bound(text)
+    try:
+        parsed = json.loads(text)
+        canonical, frozen = _validated_execution_attestation(
+            parsed,
+            kind=kind,
+            request_fingerprint=request_fingerprint,
+        )
+    except (RecursionError, TypeError, ValueError) as error:
+        raise AnalysisArtifactInvalid(
+            "analysis execution attestation is invalid"
+        ) from error
+    if canonical != text:
+        raise AnalysisArtifactInvalid(
+            "analysis execution attestation is not canonical JSON"
+        )
+    if analysis_execution_attestation_digest(
+        kind,
+        frozen,
+        request_fingerprint=request_fingerprint,
+    ) != expected_digest:
+        raise AnalysisArtifactInvalid(
+            "analysis execution attestation digest changed"
+        )
+    return text
+
+
 def _require_json_nesting_bound(text: str) -> None:
     depth = 0
     quoted = False
@@ -870,8 +1231,10 @@ def _opened_hdf_revision(handle: h5py.File) -> tuple[int, int, int, int, int]:
 
 
 def _freeze_float32(values: np.ndarray) -> np.ndarray:
-    contiguous = np.ascontiguousarray(values, dtype=np.float32)
-    frozen = np.frombuffer(contiguous.tobytes(order="C"), dtype=np.float32)
+    contiguous = np.ascontiguousarray(values, dtype=np.dtype("<f4"))
+    frozen = np.frombuffer(
+        contiguous.tobytes(order="C"), dtype=np.dtype("<f4")
+    )
     return frozen.reshape(contiguous.shape)
 
 
@@ -881,6 +1244,7 @@ def _project_stored_float32(
     name: str,
     require_finite: bool,
     require_nonnegative: bool = False,
+    max_elements: int = _MAX_RESULT_ELEMENTS,
 ) -> np.ndarray:
     if (
         type(values) is not np.ndarray
@@ -888,12 +1252,18 @@ def _project_stored_float32(
         or values.dtype.fields is not None
         or values.ndim < 1
         or values.size < 1
-        or values.size > _MAX_RESULT_ELEMENTS
+        or values.size > max_elements
     ):
         raise AnalysisArtifactProjectionInvalid(
             f"{name} is not an exact bounded real ndarray"
         )
     source = np.asarray(values)
+    if source.dtype == np.dtype("<f4") and np.isnan(source).any():
+        nan_bits = source.view(np.uint32)[np.isnan(source)]
+        if np.any(nan_bits != _STORED_QNAN_F4_BITS):
+            raise AnalysisArtifactProjectionInvalid(
+                f"{name} contains a noncanonical stored NaN payload"
+            )
     if np.isinf(source).any() or (require_finite and not np.isfinite(source).all()):
         raise AnalysisArtifactProjectionInvalid(f"{name} contains a nonfinite value")
     if require_nonnegative and np.any(source < 0):
@@ -910,8 +1280,7 @@ def _project_stored_float32(
         if not np.isfinite(projected).any():
             raise AnalysisArtifactProjectionInvalid(f"{name} has no finite result")
         projected.view(np.uint32)[np.isnan(projected)] = _STORED_QNAN_F4_BITS
-    projected.setflags(write=False)
-    return projected
+    return _freeze_float32(projected)
 
 
 def project_analysis_artifact_result(
@@ -939,6 +1308,15 @@ def project_analysis_artifact_result(
         AnalysisArtifactKind.STITCH_2D: ("q", "chi"),
         AnalysisArtifactKind.RSM: ("h", "k", "l"),
     }[kind]
+
+    def bounded_unit(value: object) -> bool:
+        if type(value) is not str or not value:
+            return False
+        try:
+            return len(value.encode("utf-8")) <= _MAX_ATTRIBUTE_BYTES
+        except UnicodeEncodeError:
+            return False
+
     if (
         type(axes) is not tuple
         or len(axes) != len(expected_axis_names)
@@ -961,7 +1339,7 @@ def project_analysis_artifact_result(
                     AnalysisArtifactKind.STITCH_1D,
                     AnalysisArtifactKind.STITCH_2D,
                 }
-                and (type(item[1]) is not str or not item[1])
+                and not bounded_unit(item[1])
             )
             or (kind is AnalysisArtifactKind.RSM and item[1] is not None)
             for index, item in enumerate(axis_units)
@@ -981,6 +1359,7 @@ def project_analysis_artifact_result(
             values,
             name=name,
             require_finite=True,
+            max_elements=_MAX_AXIS_POINTS,
         )
         if projected.ndim != 1 or (
             projected.size > 1
@@ -1013,6 +1392,27 @@ def project_analysis_artifact_result(
             )
     projected_coverage = projected_normalization = None
     if coverage is not None:
+        if (
+            kind in {
+                AnalysisArtifactKind.STITCH_1D,
+                AnalysisArtifactKind.STITCH_2D,
+            }
+            and coverage.dtype == np.dtype(np.float64)
+        ):
+            if (
+                not np.isfinite(coverage).all()
+                or np.any(coverage < 0)
+                or np.any(coverage > 2**24)
+                or np.any(coverage != np.floor(coverage))
+            ):
+                raise AnalysisArtifactProjectionInvalid(
+                    "float64 Stitch coverage must be exact bounded integer counts"
+                )
+            coverage_f4 = np.asarray(coverage, dtype=np.dtype("<f4"))
+            if not np.array_equal(coverage_f4.astype(np.float64), coverage):
+                raise AnalysisArtifactProjectionInvalid(
+                    "Stitch coverage loses count identity in float32 storage"
+                )
         projected_coverage = _project_stored_float32(
             coverage,
             name="coverage",
@@ -1155,6 +1555,29 @@ def inspect_analysis_artifact(
             if len(handle.attrs) != 0 or len(handle) != 1 or _ENTRY not in handle:
                 raise AnalysisArtifactInvalid("analysis artifact must contain only /entry")
             entry = _direct(handle, _ENTRY, h5py.Group)
+            try:
+                version_id = entry.attrs.get_id(ANALYSIS_SCHEMA_VERSION_ATTR)
+            except KeyError as error:
+                raise AnalysisArtifactInvalid(
+                    "analysis artifact schema version is missing"
+                ) from error
+            if (
+                version_id.shape != ()
+                or _hdf_type_class(version_id) != h5py.h5t.INTEGER
+                or version_id.dtype.kind not in "iu"
+                or version_id.dtype.itemsize > 8
+            ):
+                raise AnalysisArtifactInvalid(
+                    "analysis artifact schema version is invalid"
+                )
+            version = int(entry.attrs[ANALYSIS_SCHEMA_VERSION_ATTR])
+            if version not in {
+                ANALYSIS_SCHEMA_VERSION,
+                ANALYSIS_SCHEMA_VERSION_V2,
+            }:
+                raise AnalysisArtifactInvalid(
+                    "analysis artifact schema version is unsupported"
+                )
             expected_entry_attrs = {
                 "NX_class",
                 ANALYSIS_SCHEMA_ATTR,
@@ -1166,6 +1589,8 @@ def inspect_analysis_artifact(
                 "provenance_digest",
                 "file_name",
             }
+            if version == ANALYSIS_SCHEMA_VERSION_V2:
+                expected_entry_attrs.add(_EXECUTION_ATTESTATION_DIGEST_ATTR)
             if len(entry.attrs) != len(expected_entry_attrs) or any(
                 name not in expected_entry_attrs for name in entry.attrs
             ):
@@ -1176,17 +1601,6 @@ def inspect_analysis_artifact(
                 raise AnalysisArtifactInvalid("analysis artifact entry is not NXentry")
             if _bounded_attr_text(entry, ANALYSIS_SCHEMA_ATTR) != ANALYSIS_SCHEMA_NAME:
                 raise AnalysisArtifactInvalid("analysis artifact schema marker is wrong")
-            version_id = entry.attrs.get_id(ANALYSIS_SCHEMA_VERSION_ATTR)
-            if (
-                version_id.shape != ()
-                or _hdf_type_class(version_id) != h5py.h5t.INTEGER
-                or version_id.dtype.kind not in "iu"
-                or version_id.dtype.itemsize > 8
-            ):
-                raise AnalysisArtifactInvalid("analysis artifact schema version is invalid")
-            version = entry.attrs[ANALYSIS_SCHEMA_VERSION_ATTR]
-            if int(version) != ANALYSIS_SCHEMA_VERSION:
-                raise AnalysisArtifactInvalid("analysis artifact schema version is unsupported")
             try:
                 kind = AnalysisArtifactKind(_bounded_attr_text(entry, ANALYSIS_KIND_ATTR))
             except ValueError as error:
@@ -1194,6 +1608,13 @@ def inspect_analysis_artifact(
             expected = expected_request.kind if expected_request is not None else expected_kind
             if expected is not None and kind is not expected:
                 raise AnalysisArtifactInvalid("analysis artifact kind does not match request")
+            if (
+                expected_request is not None
+                and version != expected_request.schema_version
+            ):
+                raise AnalysisArtifactInvalid(
+                    "analysis artifact schema version changed"
+                )
             required_attrs = (
                 ("request_fingerprint", "request_fingerprint"),
                 ("source_fingerprint", "source_fingerprint"),
@@ -1206,6 +1627,22 @@ def inspect_analysis_artifact(
                 identity_fingerprints[attr] = value
                 if expected_request is not None and value != getattr(expected_request, request_attr):
                     raise AnalysisArtifactInvalid(f"analysis artifact {attr} changed")
+            execution_attestation_digest = None
+            if version == ANALYSIS_SCHEMA_VERSION_V2:
+                execution_attestation_digest = _sha256(
+                    _bounded_attr_text(
+                        entry, _EXECUTION_ATTESTATION_DIGEST_ATTR
+                    ),
+                    "execution attestation digest",
+                )
+                if (
+                    expected_request is not None
+                    and execution_attestation_digest
+                    != expected_request.execution_attestation_digest
+                ):
+                    raise AnalysisArtifactInvalid(
+                        "analysis artifact execution attestation digest changed"
+                    )
             final_name = _bounded_attr_text(entry, "file_name")
             expected_name = (
                 expected_request.target
@@ -1214,7 +1651,10 @@ def inspect_analysis_artifact(
             )
             if final_name != expected_name:
                 raise AnalysisArtifactInvalid("analysis artifact records a private candidate path")
-            if len(entry) != 2:
+            expected_entry_children = 2 + int(
+                version == ANALYSIS_SCHEMA_VERSION_V2
+            )
+            if len(entry) != expected_entry_children:
                 raise AnalysisArtifactInvalid(
                     "analysis artifact contains an unknown entry graph"
                 )
@@ -1229,11 +1669,32 @@ def inspect_analysis_artifact(
             # source identity meanwhile; an unbound raw-popup graph must not
             # acquire artifact authority merely by being local-hard HDF5.
             allowed = {kind.group, _PROVENANCE}
+            if version == ANALYSIS_SCHEMA_VERSION_V2:
+                allowed.add(_EXECUTION_ATTESTATION)
             if any(name not in allowed for name in entry):
                 raise AnalysisArtifactInvalid("analysis artifact contains an unknown entry graph")
             provenance = _read_scalar_text(entry, _PROVENANCE)
             if expected_request is not None and provenance != expected_request.provenance_json:
                 raise AnalysisArtifactInvalid("analysis artifact provenance changed")
+            execution_attestation_json = None
+            if version == ANALYSIS_SCHEMA_VERSION_V2:
+                execution_attestation_json = _read_scalar_execution_attestation(
+                    entry,
+                    _EXECUTION_ATTESTATION,
+                    kind=kind,
+                    request_fingerprint=identity_fingerprints[
+                        "request_fingerprint"
+                    ],
+                    expected_digest=execution_attestation_digest,
+                )
+                if (
+                    expected_request is not None
+                    and execution_attestation_json
+                    != expected_request.execution_attestation_json
+                ):
+                    raise AnalysisArtifactInvalid(
+                        "analysis artifact execution attestation changed"
+                    )
             result = _direct(entry, kind.group, h5py.Group)
             expected_result_attrs = {"NX_class", "signal", "axes"}
             if len(result.attrs) != len(expected_result_attrs) or any(
@@ -1370,6 +1831,16 @@ def inspect_analysis_artifact(
                 )
             except AnalysisArtifactProjectionInvalid as error:
                 raise AnalysisArtifactInvalid(str(error)) from error
+            if (
+                execution_attestation_json is not None
+                and json.loads(execution_attestation_json).get(
+                    "result_fingerprint"
+                )
+                != projection.result_fingerprint
+            ):
+                raise AnalysisArtifactInvalid(
+                    "analysis execution attestation result changed"
+                )
             seen: set[int] = set()
             _require_local_graph(entry, seen)
             inspection = AnalysisArtifactInspection(
@@ -1391,6 +1862,9 @@ def inspect_analysis_artifact(
                     provenance.encode("utf-8")
                 ).hexdigest(),
                 result_fingerprint=projection.result_fingerprint,
+                schema_version=version,
+                execution_attestation_digest=execution_attestation_digest,
+                execution_attestation_json=execution_attestation_json,
             )
             if (
                 _opened_hdf_revision(handle) != admitted_revision
@@ -1684,7 +2158,7 @@ class AnalysisArtifactOutput:
                 ANALYSIS_SCHEMA_ATTR,
                 np.bytes_(ANALYSIS_SCHEMA_NAME.encode("utf-8")),
             )
-            entry.attrs[ANALYSIS_SCHEMA_VERSION_ATTR] = ANALYSIS_SCHEMA_VERSION
+            entry.attrs[ANALYSIS_SCHEMA_VERSION_ATTR] = self.request.schema_version
             for name, value in (
                 (ANALYSIS_KIND_ATTR, self.request.kind.value),
                 ("request_fingerprint", self.request.request_fingerprint),
@@ -1694,10 +2168,26 @@ class AnalysisArtifactOutput:
                 ("file_name", self.request.target),
             ):
                 entry.attrs.create(name, np.bytes_(value.encode("utf-8")))
+            if self.request.schema_version == ANALYSIS_SCHEMA_VERSION_V2:
+                entry.attrs.create(
+                    _EXECUTION_ATTESTATION_DIGEST_ATTR,
+                    np.bytes_(
+                        self.request.execution_attestation_digest.encode(
+                            "utf-8"
+                        )
+                    ),
+                )
             entry.create_dataset(
                 _PROVENANCE,
                 data=np.bytes_(self.request.provenance_json.encode("utf-8")),
             )
+            if self.request.schema_version == ANALYSIS_SCHEMA_VERSION_V2:
+                entry.create_dataset(
+                    _EXECUTION_ATTESTATION,
+                    data=np.bytes_(
+                        self.request.execution_attestation_json.encode("utf-8")
+                    ),
+                )
             write_result(entry)
             handle.flush()
         descriptor = os.open(candidate, os.O_RDONLY)
@@ -2029,6 +2519,7 @@ __all__ = [
     "ANALYSIS_SCHEMA_ATTR",
     "ANALYSIS_SCHEMA_NAME",
     "ANALYSIS_SCHEMA_VERSION",
+    "ANALYSIS_SCHEMA_VERSION_V2",
     "ANALYSIS_SCHEMA_VERSION_ATTR",
     "AnalysisArtifactCleanupPending",
     "AnalysisArtifactError",
@@ -2044,6 +2535,8 @@ __all__ = [
     "AnalysisArtifactResultProjection",
     "AnalysisArtifactRequest",
     "admit_analysis_artifact",
+    "analysis_execution_attestation_digest",
+    "canonical_analysis_execution_attestation",
     "canonical_analysis_provenance",
     "inspect_analysis_artifact",
     "project_analysis_artifact_result",

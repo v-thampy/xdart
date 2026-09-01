@@ -43,6 +43,8 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactOverwrite,
     AnalysisArtifactRequest,
     admit_analysis_artifact,
+    analysis_execution_attestation_digest,
+    project_analysis_artifact_result,
 )
 from xrd_tools.io.output_transaction import LeaseOwner, StreamTerminal, TargetChanged
 from xrd_tools.io.output_transaction import OutputTransactionCoordinator, TransactionPhase
@@ -121,6 +123,32 @@ def _provenance(request: ModuleOperationRequest) -> dict[str, object]:
     return {
         "kind": request.kind.value,
         "frames": list(request.source.selected_labels),
+    }
+
+
+def _attestation(request: ModuleOperationRequest, result_fingerprint: str):
+    count = len(request.source.selected_labels)
+    return {
+        "schema_version": "analysis-execution-attestation-v1",
+        "module_request_fingerprint": request.fingerprint,
+        "result_projection_policy": "analysis_artifact_stored_le_f4_v1",
+        "result_fingerprint": result_fingerprint,
+        "selected_frame_count": count,
+        "release_check_frame_count": count,
+        "release_check_passed": True,
+        "q_root_policy": "shared_ultimate_ndarray_root_weakref_v1",
+        "xu_runtime": {
+            "lock_policy": "shared_xrd_tools_xu_rlock_v1",
+            "xrayutilities_distribution_version": "1.7.12",
+            "xrayutilities_module_version": "1.7.12",
+            "numpy_version": "2.5.1",
+            "config_epsilon": 1e-8,
+            "config_digits": 8,
+            "nthreads_before": 0,
+            "nthreads_effective": 1,
+            "nthreads_restored": 0,
+            "restore_passed": True,
+        },
     }
 
 
@@ -501,6 +529,82 @@ def test_module_artifact_admission_and_commit_keep_exact_request(tmp_path):
         pickle.dumps(result.commit)
     assert output.snapshot.phase is TransactionPhase.COMMITTED
     assert output.snapshot.remaining_lease_owners == ()
+
+
+def test_module_v2_commit_binds_separate_attestation_and_same_request(tmp_path):
+    request = _request(tmp_path)
+    provenance = _provenance(request)
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.STITCH_1D,
+        axes=(("q", np.linspace(0.1, 1.0, 8)),),
+        axis_units=(("q", "q_A^-1"),),
+        intensity=np.linspace(2.0, 3.0, 8),
+        sigma=None,
+        coverage=np.arange(8, dtype=np.float64),
+        normalization=np.linspace(1.0, 2.0, 8),
+    )
+    attestation = _attestation(request, projection.result_fingerprint)
+    digest = analysis_execution_attestation_digest(
+        request.output.kind,
+        attestation,
+        request_fingerprint=request.fingerprint,
+    )
+    bound = module_artifact_request(
+        request,
+        provenance,
+        execution_attestation=attestation,
+        execution_attestation_digest=digest,
+    )
+    assert bound.schema_version == 2
+    output = admit_module_artifact(
+        request,
+        provenance,
+        execution_attestation=attestation,
+        execution_attestation_digest=digest,
+        coordinator=OutputTransactionCoordinator(),
+    )
+    result = output.publish(
+        lambda entry: write_stitched(
+            entry,
+            result_projection=projection,
+            provenance=bound.provenance_json,
+            bounded_artifact=True,
+        )
+    )
+    assert result.disposition is ModuleDisposition.COMMITTED
+    assert result.request is request
+    assert result.commit.request is request
+    assert result.commit.execution_attestation_digest == digest
+    expected = analysis_canonical_fingerprint(
+        "module-commit-v2",
+        (
+            request.fingerprint,
+            result.commit.terminal.target,
+            result.commit.terminal.size,
+            result.commit.terminal.digest,
+            result.commit.terminal.ordinal,
+            (
+                result.commit.terminal.device,
+                result.commit.terminal.inode,
+                result.commit.terminal.size,
+                result.commit.terminal.mtime_ns,
+                result.commit.terminal.ctime_ns,
+            ),
+            projection.result_fingerprint,
+            digest,
+        ),
+    )
+    assert result.commit.fingerprint == expected
+
+    forged = dict(attestation)
+    forged["release_check_frame_count"] = 2
+    with pytest.raises((TypeError, ValueError, ModuleArtifactRefused)):
+        module_artifact_request(
+            request,
+            provenance,
+            execution_attestation=forged,
+            execution_attestation_digest=digest,
+        )
 
 
 def test_module_commit_receipt_is_built_before_lower_lease_release(

@@ -27,6 +27,8 @@ from xrd_tools.analysis.scan_operations import (
     run_metadata_table_requalification,
 )
 from xrd_tools.io.analysis_artifact import (
+    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_VERSION_V2,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
     AnalysisArtifactOutput,
@@ -34,6 +36,7 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactOverwrite,
     AnalysisArtifactReceipt,
     AnalysisArtifactRequest,
+    analysis_execution_attestation_digest,
     admit_analysis_artifact as _admit_analysis_artifact,
     canonical_analysis_provenance,
     inspect_analysis_artifact,
@@ -376,6 +379,7 @@ class ModuleCommitReceipt:
     output: ModuleOutputRequest
     terminal: StreamTerminal
     result_fingerprint: str
+    execution_attestation_digest: str | None = field(default=None, kw_only=True)
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -390,20 +394,33 @@ class ModuleCommitReceipt:
         ):
             raise TypeError("module commit receipt lacks exact modern output authority")
         _require_sha256(self.result_fingerprint, "result fingerprint")
+        if self.execution_attestation_digest is not None:
+            _require_sha256(
+                self.execution_attestation_digest,
+                "execution attestation digest",
+            )
+        domain = (
+            "module-commit-v1"
+            if self.execution_attestation_digest is None
+            else "module-commit-v2"
+        )
+        identity = (
+            self.request.fingerprint,
+            self.terminal.target,
+            self.terminal.size,
+            self.terminal.digest,
+            self.terminal.ordinal,
+            stream_terminal_object_revision(self.terminal),
+            self.result_fingerprint,
+        )
+        if self.execution_attestation_digest is not None:
+            identity += (self.execution_attestation_digest,)
         object.__setattr__(
             self,
             "fingerprint",
             analysis_canonical_fingerprint(
-                "module-commit-v1",
-                (
-                    self.request.fingerprint,
-                    self.terminal.target,
-                    self.terminal.size,
-                    self.terminal.digest,
-                    self.terminal.ordinal,
-                    stream_terminal_object_revision(self.terminal),
-                    self.result_fingerprint,
-                ),
+                domain,
+                identity,
             ),
         )
 
@@ -434,6 +451,16 @@ class ModuleCommitReceipt:
             expected = module_artifact_request(
                 request,
                 json.loads(artifact.request.provenance_json),
+                execution_attestation=(
+                    None
+                    if artifact.request.execution_attestation_json is None
+                    else json.loads(
+                        artifact.request.execution_attestation_json
+                    )
+                ),
+                execution_attestation_digest=(
+                    artifact.request.execution_attestation_digest
+                ),
             )
         except (ModuleArtifactRefused, TypeError, ValueError) as error:
             raise TypeError(
@@ -448,6 +475,9 @@ class ModuleCommitReceipt:
             "plan_fingerprint",
             "provenance_digest",
             "provenance_json",
+            "schema_version",
+            "execution_attestation_digest",
+            "execution_attestation_json",
         )
         if any(
             getattr(artifact.request, name) != getattr(expected, name)
@@ -462,12 +492,24 @@ class ModuleCommitReceipt:
         revalidate_stream_terminal(artifact.request.target, artifact.terminal)
         if inspection != artifact.inspection:
             raise TypeError("artifact receipt no longer matches exact inspected result")
+        if (
+            inspection.execution_attestation_digest
+            != artifact.request.execution_attestation_digest
+            or inspection.execution_attestation_json
+            != artifact.request.execution_attestation_json
+        ):
+            raise TypeError(
+                "artifact execution attestation no longer matches its request"
+            )
         return cls(
             request,
             request.output,
             artifact.terminal,
             artifact.inspection.result_fingerprint,
-            _MODULE_RECEIPT_FACTORY,
+            _claim=_MODULE_RECEIPT_FACTORY,
+            execution_attestation_digest=(
+                artifact.inspection.execution_attestation_digest
+            ),
         )
 
 
@@ -560,11 +602,33 @@ def _source_requalification(
 def module_artifact_request(
     request: ModuleOperationRequest,
     provenance: Mapping[str, object],
+    *,
+    execution_attestation: Mapping[str, object] | None = None,
+    execution_attestation_digest: str | None = None,
 ) -> AnalysisArtifactRequest:
     if type(request) is not ModuleOperationRequest:
         raise TypeError("artifact binding requires exact ModuleOperationRequest")
     if type(provenance) is not dict:
         raise TypeError("module provenance must be an exact dictionary")
+    carries_attestation = (
+        execution_attestation is not None
+        or execution_attestation_digest is not None
+    )
+    if carries_attestation and (
+        execution_attestation is None
+        or type(execution_attestation_digest) is not str
+    ):
+        raise TypeError(
+            "module execution attestation and digest must be supplied together"
+        )
+    if carries_attestation:
+        observed = analysis_execution_attestation_digest(
+            request.output.kind,
+            execution_attestation,
+            request_fingerprint=request.fingerprint,
+        )
+        if observed != execution_attestation_digest:
+            raise ModuleArtifactRefused("EXECUTION_ATTESTATION_MISMATCH")
     artifact = AnalysisArtifactRequest(
         request.output.target,
         request.output.kind,
@@ -574,6 +638,13 @@ def module_artifact_request(
         request.plan_fingerprint,
         request.provenance_digest,
         provenance,
+        schema_version=(
+            ANALYSIS_SCHEMA_VERSION_V2
+            if carries_attestation
+            else ANALYSIS_SCHEMA_VERSION
+        ),
+        execution_attestation_digest=execution_attestation_digest,
+        execution_attestation=execution_attestation,
     )
     frozen_provenance = json.loads(artifact.provenance_json)
     if (
@@ -601,6 +672,12 @@ class ModuleArtifactOutput:
         expected = module_artifact_request(
             request,
             json.loads(foreign.provenance_json),
+            execution_attestation=(
+                None
+                if foreign.execution_attestation_json is None
+                else json.loads(foreign.execution_attestation_json)
+            ),
+            execution_attestation_digest=foreign.execution_attestation_digest,
         )
         fields = (
             "target",
@@ -611,6 +688,9 @@ class ModuleArtifactOutput:
             "plan_fingerprint",
             "provenance_digest",
             "provenance_json",
+            "schema_version",
+            "execution_attestation_digest",
+            "execution_attestation_json",
         )
         if any(getattr(foreign, name) != getattr(expected, name) for name in fields):
             raise TypeError("artifact output is foreign to the module request")
@@ -859,6 +939,8 @@ def admit_module_artifact(
     request: ModuleOperationRequest,
     provenance: Mapping[str, object],
     *,
+    execution_attestation: Mapping[str, object] | None = None,
+    execution_attestation_digest: str | None = None,
     cancel_token: threading.Event | None = None,
     coordinator: object | None = None,
 ) -> ModuleArtifactOutput:
@@ -874,7 +956,12 @@ def admit_module_artifact(
     )
     if result.disposition is not AnalysisDisposition.COMPLETED:
         raise ModuleArtifactRefused(result.code)
-    artifact_request = module_artifact_request(request, provenance)
+    artifact_request = module_artifact_request(
+        request,
+        provenance,
+        execution_attestation=execution_attestation,
+        execution_attestation_digest=execution_attestation_digest,
+    )
     output = _admit_analysis_artifact(
         artifact_request,
         coordinator=coordinator,
