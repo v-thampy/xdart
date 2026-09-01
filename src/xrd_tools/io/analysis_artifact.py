@@ -369,6 +369,167 @@ def _validated_execution_attestation(
     released = parsed.get("release_check_frame_count")
     before = runtime.get("nthreads_before") if type(runtime) is dict else None
     restored = runtime.get("nthreads_restored") if type(runtime) is dict else None
+    if kind is AnalysisArtifactKind.RSM:
+        from xrd_tools.core.geometry.xu_runtime import XuRuntimeExecutionRecord
+
+        rsm_top_keys = {
+            "schema_version",
+            "module_request_fingerprint",
+            "result_projection_policy",
+            "result_fingerprint",
+            "geometry_asset_receipt_fingerprint",
+            "effective_geometry_fingerprint",
+            "common_grid_fingerprint",
+            "selected_scan_count",
+            "selected_frame_count",
+            "science_chunk_count",
+            "q_release_check_chunk_count",
+            "frame_release_check_frame_count",
+            "release_check_passed",
+            "member_masks",
+            "xu_runtime",
+        }
+        mask_keys = {
+            "ordinal",
+            "member_preflight_fingerprint",
+            "mask_policy",
+            "full_shape",
+            "full_raw_digest",
+            "full_masked_pixel_count",
+            "cropped_shape",
+            "cropped_raw_digest",
+            "cropped_masked_pixel_count",
+            "mask_receipt_fingerprint",
+        }
+        selected_scans = parsed.get("selected_scan_count")
+        science_chunks = parsed.get("science_chunk_count")
+        q_released = parsed.get("q_release_check_chunk_count")
+        frame_released = parsed.get("frame_release_check_frame_count")
+        masks = parsed.get("member_masks")
+
+        def valid_runtime_projection(value: object) -> bool:
+            if type(value) is not dict:
+                return False
+            try:
+                record = XuRuntimeExecutionRecord(**value)
+            except TypeError:
+                return False
+            return record.to_attestation() == value
+
+        def valid_shape(value: object) -> bool:
+            return (
+                type(value) is list
+                and len(value) == 2
+                and all(type(item) is int and item >= 2 for item in value)
+            )
+
+        def valid_mask(item: object, ordinal: int) -> bool:
+            if type(item) is not dict or set(item) != mask_keys:
+                return False
+            policy = item.get("mask_policy")
+            full_shape = item.get("full_shape")
+            cropped_shape = item.get("cropped_shape")
+            full_count = item.get("full_masked_pixel_count")
+            cropped_count = item.get("cropped_masked_pixel_count")
+            if (
+                item.get("ordinal") != ordinal
+                or type(item.get("ordinal")) is not int
+                or type(item.get("member_preflight_fingerprint")) is not str
+                or _SHA256.fullmatch(
+                    item["member_preflight_fingerprint"]
+                )
+                is None
+                or type(policy) is not str
+                or policy
+                not in (
+                    "none",
+                    "exact-all-selected-frames-static-hot-v1",
+                )
+                or not valid_shape(full_shape)
+                or not valid_shape(cropped_shape)
+                or any(
+                    cropped > full
+                    for full, cropped in zip(
+                        full_shape,
+                        cropped_shape,
+                        strict=True,
+                    )
+                )
+                or type(full_count) is not int
+                or type(cropped_count) is not int
+                or not 0 <= full_count <= math.prod(full_shape)
+                or not 0 <= cropped_count <= math.prod(cropped_shape)
+                or cropped_count > full_count
+                or type(item.get("mask_receipt_fingerprint")) is not str
+                or _SHA256.fullmatch(item["mask_receipt_fingerprint"])
+                is None
+            ):
+                return False
+            if policy == "none":
+                return (
+                    item.get("full_raw_digest") is None
+                    and item.get("cropped_raw_digest") is None
+                    and full_count == 0
+                    and cropped_count == 0
+                )
+            return (
+                type(item.get("full_raw_digest")) is str
+                and _SHA256.fullmatch(item["full_raw_digest"]) is not None
+                and type(item.get("cropped_raw_digest")) is str
+                and _SHA256.fullmatch(item["cropped_raw_digest"]) is not None
+            )
+
+        if (
+            set(parsed) != rsm_top_keys
+            or parsed.get("schema_version")
+            != "rsm-execution-attestation-v1"
+            or parsed.get("module_request_fingerprint") != request_fingerprint
+            or parsed.get("result_projection_policy")
+            != _STORED_RESULT_PROJECTION_POLICY
+            or type(parsed.get("result_fingerprint")) is not str
+            or _SHA256.fullmatch(parsed["result_fingerprint"]) is None
+            or any(
+                type(parsed.get(name)) is not str
+                or _SHA256.fullmatch(parsed[name]) is None
+                for name in (
+                    "geometry_asset_receipt_fingerprint",
+                    "effective_geometry_fingerprint",
+                    "common_grid_fingerprint",
+                )
+            )
+            or type(selected_scans) is not int
+            or not 1 <= selected_scans <= 16
+            or type(selected) is not int
+            or not 1 <= selected <= 4096
+            or selected_scans > selected
+            or type(science_chunks) is not int
+            or not selected_scans <= science_chunks <= selected
+            or type(q_released) is not int
+            or q_released != science_chunks
+            or type(frame_released) is not int
+            or frame_released != selected
+            or parsed.get("release_check_passed") is not True
+            or type(masks) is not list
+            or len(masks) != selected_scans
+            or any(
+                not valid_mask(item, ordinal)
+                for ordinal, item in enumerate(masks)
+            )
+            or len(
+                {
+                    item["member_preflight_fingerprint"]
+                    for item in masks
+                }
+            )
+            != selected_scans
+            or len(
+                {item["mask_receipt_fingerprint"] for item in masks}
+            )
+            != selected_scans
+            or not valid_runtime_projection(runtime)
+        ):
+            raise ValueError("analysis execution attestation contract is invalid")
+        return text, parsed
     if (
         kind is not AnalysisArtifactKind.STITCH_1D
         or set(parsed) != top_keys
@@ -413,7 +574,7 @@ def analysis_execution_attestation_digest(
     *,
     request_fingerprint: str,
 ) -> str:
-    """Return the exact v1 execution-attestation identity domain."""
+    """Return the exact closed execution-attestation identity domain."""
 
     if type(kind) is not AnalysisArtifactKind:
         raise TypeError("analysis attestation kind must be exact")
@@ -428,9 +589,16 @@ def analysis_execution_attestation_digest(
     from xrd_tools.analysis.module_transaction import ModuleKind
     from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
 
-    module_kind = ModuleKind.STITCH
+    if kind is AnalysisArtifactKind.STITCH_1D:
+        module_kind = ModuleKind.STITCH
+        domain = "analysis-artifact-execution-attestation-v1"
+    elif kind is AnalysisArtifactKind.RSM:
+        module_kind = ModuleKind.RSM
+        domain = "analysis-artifact-rsm-execution-attestation-v1"
+    else:  # guarded by the exact validator above
+        raise ValueError("analysis execution attestation kind is unsupported")
     return analysis_canonical_fingerprint(
-        "analysis-artifact-execution-attestation-v1",
+        domain,
         (module_kind, parsed),
     )
 
@@ -1855,15 +2023,32 @@ def inspect_analysis_artifact(
                 if not chi_units:
                     raise AnalysisArtifactInvalid("stitched chi units are invalid")
                 axis_units[1] = ("chi", chi_units)
-            if version == ANALYSIS_SCHEMA_VERSION_V2 and (
-                kind is not AnalysisArtifactKind.STITCH_1D
-                or axis_units != [("q", "q_A^-1")]
-                or has_sigma
-                or not has_stitch_diagnostics
-            ):
-                raise AnalysisArtifactInvalid(
-                    "analysis artifact v2 requires the exact XU Stitch result schema"
-                )
+            if version == ANALYSIS_SCHEMA_VERSION_V2:
+                if kind is AnalysisArtifactKind.STITCH_1D:
+                    if (
+                        axis_units != [("q", "q_A^-1")]
+                        or has_sigma
+                        or not has_stitch_diagnostics
+                    ):
+                        raise AnalysisArtifactInvalid(
+                            "analysis artifact v2 requires the exact XU Stitch "
+                            "result schema"
+                        )
+                elif kind is AnalysisArtifactKind.RSM:
+                    if (
+                        axis_units
+                        != [("h", None), ("k", None), ("l", None)]
+                        or has_sigma
+                        or has_stitch_diagnostics
+                    ):
+                        raise AnalysisArtifactInvalid(
+                            "analysis artifact v2 requires the exact RSM result "
+                            "schema"
+                        )
+                else:
+                    raise AnalysisArtifactInvalid(
+                        "analysis artifact v2 kind is unsupported"
+                    )
             intensity = _direct(result, "intensity", h5py.Dataset)
             if len(intensity.attrs) != 0:
                 raise AnalysisArtifactInvalid(
@@ -1920,7 +2105,10 @@ def inspect_analysis_artifact(
                 )
             except AnalysisArtifactProjectionInvalid as error:
                 raise AnalysisArtifactInvalid(str(error)) from error
-            if version == ANALYSIS_SCHEMA_VERSION_V2:
+            if (
+                version == ANALYSIS_SCHEMA_VERSION_V2
+                and kind is AnalysisArtifactKind.STITCH_1D
+            ):
                 empty_coverage = projection.coverage == 0
                 empty_normalization = projection.normalization == 0
                 empty_intensity = np.isnan(projection.intensity)

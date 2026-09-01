@@ -13,13 +13,17 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import InitVar, dataclass, field
 from enum import Enum
+import gc
+import hashlib
 import importlib.metadata
 import json
 import math
 import os
 from pathlib import Path
 import stat
+import struct
 import threading
+import weakref
 
 import numpy as np
 
@@ -43,6 +47,7 @@ from xrd_tools.analysis.module_transaction import (
 )
 from xrd_tools.analysis.rsm_geometry_asset import (
     RSMEffectiveGeometry,
+    RSMGeometryAssetRefused,
     RSMGeometryAssetReceipt,
     RSMMemberGeometryBinding,
     bind_rsm_member_geometry,
@@ -72,12 +77,19 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
     AnalysisArtifactPayload,
     AnalysisArtifactProjectionInvalid,
+    analysis_execution_attestation_digest,
     canonical_analysis_provenance,
     project_analysis_artifact_result,
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import write_rsm
 from xrd_tools.io.spec import get_energy_and_UB
+from xrd_tools.rsm.gridding import (
+    RSMGridChunkLease,
+    RSMGridChunkReleaseError,
+    RSMGridChunkReleaseReceipt,
+    StreamingGridder,
+)
 from xrd_tools.rsm.volume import RSMVolume
 
 
@@ -91,6 +103,7 @@ _MAX_CONTRIBUTIONS = 4096
 _MAX_AXIS_POINTS = 1_000_000
 _MAX_PROVENANCE_BYTES = 1024 * 1024
 _MAX_JSON_DEPTH = 32
+_MAX_RSM_RESIDENT_BYTES = 1024 * 1024 * 1024
 _PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
 _REQUEST_FACTORY = object()
 _RSM_V2_FACTORY = object()
@@ -139,6 +152,25 @@ class RSMOperationCleanupPending(AnalysisArtifactCleanupPending):
         super().__init__(execution.output_snapshot)
 
     def retry_cleanup(self) -> "RSMOperationResult":
+        return self.execution.retry_cleanup()
+
+
+class RSMOperationVerificationErrorV2(RuntimeError):
+    """A committed grouped RSM output could not be strictly re-admitted."""
+
+    def __init__(self, execution: "RSMOperationExecutionV2", message: str):
+        self.execution = execution
+        super().__init__(message)
+
+
+class RSMOperationCleanupPendingV2(AnalysisArtifactCleanupPending):
+    """Retryable cleanup retaining the exact grouped RSM execution owner."""
+
+    def __init__(self, execution: "RSMOperationExecutionV2"):
+        self.execution = execution
+        super().__init__(execution.output_snapshot)
+
+    def retry_cleanup(self) -> "RSMOperationResultV2":
         return self.execution.retry_cleanup()
 
 
@@ -2604,6 +2636,652 @@ class RSMOperationRequestV2:
     ) = _rsm_v2_uncopyable("RSM v2 operation request")
 
 
+@dataclass(eq=False, frozen=True, slots=True, weakref_slot=True)
+class RSMStaticMaskReceipt:
+    """Scalar-only identity for one member's independently derived mask."""
+
+    member_preflight_fingerprint: str
+    mask_policy: str
+    conditioning_fingerprint: str
+    full_shape: tuple[int, int]
+    full_raw_digest: str | None
+    full_masked_pixel_count: int
+    cropped_shape: tuple[int, int]
+    cropped_raw_digest: str | None
+    cropped_masked_pixel_count: int
+    fingerprint: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _RSM_V2_FACTORY
+            or self.mask_policy
+            not in {"none", "exact-all-selected-frames-static-hot-v1"}
+            or type(self.full_shape) is not tuple
+            or type(self.cropped_shape) is not tuple
+            or len(self.full_shape) != 2
+            or len(self.cropped_shape) != 2
+            or any(
+                type(value) is not int or value < 2
+                for value in (*self.full_shape, *self.cropped_shape)
+            )
+            or any(
+                cropped > full
+                for cropped, full in zip(
+                    self.cropped_shape,
+                    self.full_shape,
+                    strict=True,
+                )
+            )
+            or type(self.full_masked_pixel_count) is not int
+            or not 0
+            <= self.full_masked_pixel_count
+            <= math.prod(self.full_shape)
+            or type(self.cropped_masked_pixel_count) is not int
+            or not 0
+            <= self.cropped_masked_pixel_count
+            <= math.prod(self.cropped_shape)
+            or self.cropped_masked_pixel_count
+            > self.full_masked_pixel_count
+        ):
+            raise TypeError("RSM static-mask receipt is not factory-owned")
+        _require_rsm_v2_digest(
+            self.member_preflight_fingerprint,
+            "RSM member preflight fingerprint",
+        )
+        _require_rsm_v2_digest(
+            self.conditioning_fingerprint,
+            "RSM conditioning fingerprint",
+        )
+        _require_rsm_v2_digest(
+            self.fingerprint,
+            "RSM static-mask receipt fingerprint",
+        )
+        if self.mask_policy == "none":
+            if (
+                self.full_raw_digest is not None
+                or self.cropped_raw_digest is not None
+                or self.full_masked_pixel_count != 0
+                or self.cropped_masked_pixel_count != 0
+            ):
+                raise ValueError("RSM none-mask receipt has unexpected facts")
+        else:
+            _require_rsm_v2_digest(
+                self.full_raw_digest,
+                "RSM full static-mask raw digest",
+            )
+            _require_rsm_v2_digest(
+                self.cropped_raw_digest,
+                "RSM cropped static-mask raw digest",
+            )
+        expected = analysis_canonical_fingerprint(
+            "rsm-static-mask-v1",
+            (
+                self.member_preflight_fingerprint,
+                self.mask_policy,
+                self.conditioning_fingerprint,
+                self.full_shape,
+                self.full_raw_digest,
+                self.full_masked_pixel_count,
+                self.cropped_shape,
+                self.cropped_raw_digest,
+                self.cropped_masked_pixel_count,
+            ),
+        )
+        if self.fingerprint != expected:
+            raise ValueError("RSM static-mask receipt fingerprint changed")
+
+    def to_attestation(self, ordinal: int) -> dict[str, object]:
+        if type(ordinal) is not int or not 0 <= ordinal < 16:
+            raise TypeError("RSM mask ordinal is invalid")
+        return {
+            "ordinal": ordinal,
+            "member_preflight_fingerprint": self.member_preflight_fingerprint,
+            "mask_policy": self.mask_policy,
+            "full_shape": list(self.full_shape),
+            "full_raw_digest": self.full_raw_digest,
+            "full_masked_pixel_count": self.full_masked_pixel_count,
+            "cropped_shape": list(self.cropped_shape),
+            "cropped_raw_digest": self.cropped_raw_digest,
+            "cropped_masked_pixel_count": self.cropped_masked_pixel_count,
+            "mask_receipt_fingerprint": self.fingerprint,
+        }
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _rsm_v2_uncopyable("RSM static-mask receipt")
+
+
+_RSM_V2_STATIC_MASK_ISSUANCE_LOCK = threading.RLock()
+_RSM_V2_STATIC_MASK_ISSUANCE: weakref.WeakKeyDictionary[
+    RSMStaticMaskReceipt, tuple[object, ...]
+] = weakref.WeakKeyDictionary()
+
+
+def _rsm_v2_static_mask_receipt_value(
+    receipt: RSMStaticMaskReceipt,
+) -> tuple[object, ...]:
+    try:
+        return (
+            receipt.member_preflight_fingerprint,
+            receipt.mask_policy,
+            receipt.conditioning_fingerprint,
+            receipt.full_shape,
+            receipt.full_raw_digest,
+            receipt.full_masked_pixel_count,
+            receipt.cropped_shape,
+            receipt.cropped_raw_digest,
+            receipt.cropped_masked_pixel_count,
+            receipt.fingerprint,
+        )
+    except AttributeError as error:
+        raise TypeError("RSM static-mask receipt was not issued") from error
+
+
+def _rsm_v2_static_mask_attestation(
+    receipt: object,
+    ordinal: int,
+    *,
+    expected_conditioning_fingerprint: str | None = None,
+) -> dict[str, object]:
+    """Revalidate one factory receipt before exposing its scalar projection."""
+
+    if type(receipt) is not RSMStaticMaskReceipt:
+        raise TypeError("RSM static-mask attestation requires an exact receipt")
+    if type(ordinal) is not int or not 0 <= ordinal < 16:
+        raise TypeError("RSM mask ordinal is invalid")
+    with _RSM_V2_STATIC_MASK_ISSUANCE_LOCK:
+        issued = _RSM_V2_STATIC_MASK_ISSUANCE.get(receipt)
+    if issued is None:
+        raise TypeError("RSM static-mask receipt was not issued")
+    if _rsm_v2_static_mask_receipt_value(receipt) != issued:
+        raise ValueError("RSM static-mask receipt changed after issuance")
+    if (
+        expected_conditioning_fingerprint is not None
+        and issued[2] != expected_conditioning_fingerprint
+    ):
+        raise ValueError("RSM static-mask receipt conditioning changed")
+    return {
+        "ordinal": ordinal,
+        "member_preflight_fingerprint": issued[0],
+        "mask_policy": issued[1],
+        "full_shape": list(issued[3]),
+        "full_raw_digest": issued[4],
+        "full_masked_pixel_count": issued[5],
+        "cropped_shape": list(issued[6]),
+        "cropped_raw_digest": issued[7],
+        "cropped_masked_pixel_count": issued[8],
+        "mask_receipt_fingerprint": issued[9],
+    }
+
+
+def _rsm_v2_static_mask_raw_digest(mask: np.ndarray) -> str:
+    if (
+        type(mask) is not np.ndarray
+        or mask.dtype != np.dtype(bool)
+        or mask.ndim != 2
+        or not mask.flags.c_contiguous
+    ):
+        raise TypeError("RSM static mask must be one contiguous bool array")
+    rows, columns = (int(value) for value in mask.shape)
+    bits = np.packbits(
+        mask.reshape(-1).astype(np.uint8, copy=False),
+        bitorder="little",
+    )
+    return hashlib.sha256(
+        b"xdart.rsm.static-mask.bits.v1\0"
+        + struct.pack("<QQ", rows, columns)
+        + bits.tobytes()
+    ).hexdigest()
+
+
+def _rsm_v2_cropped_static_mask(
+    mask: np.ndarray,
+    roi: tuple[int, int, int, int],
+    expected_shape: tuple[int, int],
+) -> np.ndarray:
+    if (
+        type(mask) is not np.ndarray
+        or mask.dtype != np.dtype(bool)
+        or mask.ndim != 2
+        or type(roi) is not tuple
+        or len(roi) != 4
+        or any(type(value) is not int for value in roi)
+    ):
+        raise RSMOperationRefused("RSM_STATIC_MASK_INVALID")
+    r0, r1, c0, c1 = roi
+    cropped = np.ascontiguousarray(mask[r0:r1, c0:c1], dtype=bool)
+    if cropped.shape != expected_shape:
+        raise RSMOperationRefused("RSM_STATIC_MASK_INVALID")
+    cropped.setflags(write=False)
+    return cropped
+
+
+def _make_rsm_static_mask_receipt(
+    member: RSMPreflightMemberV2,
+    conditioning: RSMImageConditioning,
+    full_mask: np.ndarray | None,
+    cropped_mask: np.ndarray | None,
+) -> RSMStaticMaskReceipt:
+    if (
+        type(member) is not RSMPreflightMemberV2
+        or type(conditioning) is not RSMImageConditioning
+    ):
+        raise TypeError("RSM static-mask receipt requires exact inputs")
+    conditioning_fingerprint = analysis_canonical_fingerprint(
+        "rsm-conditioning-v2",
+        conditioning._canonical_value(),
+    )
+    policy = member.mask_policy_intent[0]
+    if policy == "none":
+        if (
+            member.mask_policy_intent != ("none",)
+            or full_mask is not None
+            or cropped_mask is not None
+        ):
+            raise RSMOperationRefused("RSM_STATIC_MASK_IDENTITY_MISMATCH")
+        full_digest = cropped_digest = None
+        full_count = cropped_count = 0
+    else:
+        if (
+            member.mask_policy_intent
+            != (
+                "exact-all-selected-frames-static-hot-v1",
+                conditioning.static_hot_threshold,
+                conditioning_fingerprint,
+            )
+            or type(full_mask) is not np.ndarray
+            or type(cropped_mask) is not np.ndarray
+            or full_mask.shape != member.detector_shape
+            or cropped_mask.shape != member.cropped_shape
+            or full_mask.dtype != np.dtype(bool)
+            or cropped_mask.dtype != np.dtype(bool)
+            or full_mask.flags.writeable
+            or cropped_mask.flags.writeable
+        ):
+            raise RSMOperationRefused("RSM_STATIC_MASK_IDENTITY_MISMATCH")
+        full_digest = _rsm_v2_static_mask_raw_digest(full_mask)
+        cropped_digest = _rsm_v2_static_mask_raw_digest(cropped_mask)
+        full_count = int(np.count_nonzero(full_mask))
+        cropped_count = int(np.count_nonzero(cropped_mask))
+    canonical = (
+        member.fingerprint,
+        policy,
+        conditioning_fingerprint,
+        member.detector_shape,
+        full_digest,
+        full_count,
+        member.cropped_shape,
+        cropped_digest,
+        cropped_count,
+    )
+    fingerprint = analysis_canonical_fingerprint(
+        "rsm-static-mask-v1",
+        canonical,
+    )
+    receipt = RSMStaticMaskReceipt(
+        member.fingerprint,
+        policy,
+        conditioning_fingerprint,
+        member.detector_shape,
+        full_digest,
+        full_count,
+        member.cropped_shape,
+        cropped_digest,
+        cropped_count,
+        fingerprint,
+        _RSM_V2_FACTORY,
+    )
+    with _RSM_V2_STATIC_MASK_ISSUANCE_LOCK:
+        _RSM_V2_STATIC_MASK_ISSUANCE[receipt] = (
+            _rsm_v2_static_mask_receipt_value(receipt)
+        )
+    return receipt
+
+
+def _rsm_v2_chunk_owned_bytes(
+    *,
+    raw_bytes: int,
+    float_bytes: int,
+    pixel_count: int,
+    mask_state_bytes: int,
+    science: bool,
+) -> int:
+    if science:
+        # Decoded copies + stacked raw, conditioned numerator, three q roots,
+        # two feed payloads, the temporary finite mask, and the retained
+        # cropped static mask for this member.
+        return 2 * raw_bytes + 6 * float_bytes + pixel_count + mask_state_bytes
+    # Mask pass: decoded copies + stacked raw + conditioned chunk plus the
+    # retained first/same/above/cropped state for this member.
+    return 2 * raw_bytes + float_bytes + mask_state_bytes
+
+
+def _load_rsm_v2_raw_chunk(
+    source: object,
+    labels: tuple[int, ...],
+    member: RSMPreflightMemberV2,
+    plan: RSMOperationPlanV2,
+    *,
+    science: bool,
+    mask_state_bytes: int,
+    cancel_token: threading.Event | None,
+) -> np.ndarray:
+    if not labels or len(labels) > plan.chunk_size:
+        raise TypeError("RSM v2 chunk labels are invalid")
+    # SpecSource's admitted decoder contract returns owned float64 frames even
+    # when the authenticated on-disk raw encoding is an integer dtype.
+    expected_decoded_dtype = np.dtype(np.float64)
+    frames: list[np.ndarray] = []
+    raw_bytes = 0
+    pixels_per_frame = math.prod(member.detector_shape)
+    try:
+        for label in labels:
+            if cancel_token is not None and cancel_token.is_set():
+                raise RSMOperationRefused("CANCELLED")
+            observed = np.asarray(source.load_frame(label))
+            if (
+                observed.dtype.kind not in "biuf"
+                or observed.shape != member.detector_shape
+            ):
+                raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
+            owned = np.array(observed, copy=True, order="C")
+            observed = None
+            if owned.dtype != expected_decoded_dtype:
+                raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
+            float_frame_bytes = pixels_per_frame * np.dtype(np.float64).itemsize
+            if (
+                owned.nbytes > plan.max_frame_bytes
+                or float_frame_bytes > plan.max_frame_bytes
+            ):
+                raise RSMOperationRefused("FRAME_MEMORY_LIMIT_EXCEEDED")
+            frames.append(owned)
+            raw_bytes += owned.nbytes
+            float_bytes = len(frames) * float_frame_bytes
+            required = _rsm_v2_chunk_owned_bytes(
+                raw_bytes=raw_bytes,
+                float_bytes=float_bytes,
+                pixel_count=len(frames) * pixels_per_frame,
+                mask_state_bytes=mask_state_bytes,
+                science=science,
+            )
+            if required > plan.max_chunk_bytes:
+                raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMOperationRefused("CANCELLED")
+        stacked = np.stack(frames, axis=0)
+        if (
+            type(stacked) is not np.ndarray
+            or not stacked.flags.c_contiguous
+            or stacked.shape != (len(labels), *member.detector_shape)
+        ):
+            raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
+        return stacked
+    finally:
+        frames.clear()
+
+
+def _rsm_v2_contribution_angles(
+    member: RSMPreflightMemberV2,
+    contributions: tuple[RSMContribution, ...],
+) -> tuple[np.ndarray, ...]:
+    if (
+        type(contributions) is not tuple
+        or not contributions
+        or tuple(role for role, _selector in member.geometry_binding.motor_selectors)
+        != _PSIC_ROLES
+    ):
+        raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH")
+    values = []
+    for _role, selector in member.geometry_binding.motor_selectors:
+        key = (selector.name, selector.occurrence)
+        try:
+            series = [
+                _contribution_values(contribution)[key]
+                for contribution in contributions
+            ]
+        except KeyError as error:
+            raise RSMOperationRefused(
+                "RSM_MEMBER_IDENTITY_MISMATCH"
+            ) from error
+        array = np.ascontiguousarray(series, dtype=np.float64)
+        array.setflags(write=False)
+        values.append(array)
+    return tuple(values)
+
+
+def _make_rsm_v2_chunk_lease(
+    source: object,
+    member: RSMPreflightMemberV2,
+    plan: RSMOperationPlanV2,
+    contributions: tuple[RSMContribution, ...],
+    *,
+    cropped_static_mask: np.ndarray | None,
+    cancel_token: threading.Event | None,
+) -> RSMGridChunkLease:
+    """Build one non-generator chunk whose image roots are owned by its lease."""
+
+    labels = tuple(item.label for item in contributions)
+    raw = _load_rsm_v2_raw_chunk(
+        source,
+        labels,
+        member,
+        plan,
+        science=True,
+        mask_state_bytes=(
+            0 if cropped_static_mask is None else cropped_static_mask.nbytes
+        ),
+        cancel_token=cancel_token,
+    )
+    conditioned = condition_rsm_images(raw, plan.conditioning)
+    if cropped_static_mask is not None:
+        roi = plan.effective_geometry.roi
+        if (
+            type(cropped_static_mask) is not np.ndarray
+            or cropped_static_mask.dtype != np.dtype(bool)
+            or cropped_static_mask.shape != member.cropped_shape
+            or cropped_static_mask.flags.writeable
+            or type(roi) is not tuple
+            or len(roi) != 4
+        ):
+            raise RSMOperationRefused("RSM_STATIC_MASK_IDENTITY_MISMATCH")
+        r0, r1, c0, c1 = roi
+        cropped_view = conditioned[:, r0:r1, c0:c1]
+        if cropped_view.shape[1:] != cropped_static_mask.shape:
+            raise RSMOperationRefused("RSM_STATIC_MASK_IDENTITY_MISMATCH")
+        cropped_view[:, cropped_static_mask] = np.nan
+        cropped_view = None
+    divisors = np.ascontiguousarray(
+        [item.normalization_divisor for item in contributions],
+        dtype=np.float64,
+    )
+    with np.errstate(over="ignore", invalid="ignore"):
+        conditioned /= divisors[:, None, None]
+    divisors = None
+    if np.any(np.isinf(conditioned)):
+        raise RSMOperationRefused("NORMALIZATION_RESULT_INVALID")
+    lease = RSMGridChunkLease.from_arrays(raw, conditioned, len(labels))
+    raw = conditioned = None
+    return lease
+
+
+def _derive_rsm_v2_static_mask(
+    source: object,
+    member: RSMPreflightMemberV2,
+    plan: RSMOperationPlanV2,
+    *,
+    cancel_token: threading.Event | None,
+    frame_callback: Callable[[int], object] | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, RSMStaticMaskReceipt]:
+    threshold = plan.conditioning.static_hot_threshold
+    if threshold is None:
+        receipt = _make_rsm_static_mask_receipt(
+            member,
+            plan.conditioning,
+            None,
+            None,
+        )
+        return None, None, receipt
+    first: np.ndarray | None = None
+    same: np.ndarray | None = None
+    above: np.ndarray | None = None
+    completed = 0
+    full_pixels = math.prod(member.detector_shape)
+    cropped_pixels = math.prod(member.cropped_shape)
+    mask_state_bytes = max(
+        full_pixels
+        * (
+            np.dtype(np.float64).itemsize
+            + 3 * np.dtype(bool).itemsize
+        ),
+        full_pixels * np.dtype(bool).itemsize
+        + cropped_pixels * np.dtype(bool).itemsize,
+    )
+    contributions = member.contributions
+    for start in range(0, len(contributions), plan.chunk_size):
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMOperationRefused("CANCELLED")
+        selected = contributions[start : start + plan.chunk_size]
+        raw = _load_rsm_v2_raw_chunk(
+            source,
+            tuple(item.label for item in selected),
+            member,
+            plan,
+            science=False,
+            mask_state_bytes=mask_state_bytes,
+            cancel_token=cancel_token,
+        )
+        conditioned = condition_rsm_images(raw, plan.conditioning)
+        raw = None
+        for frame in conditioned:
+            if cancel_token is not None and cancel_token.is_set():
+                raise RSMOperationRefused("CANCELLED")
+            if first is None:
+                first = np.array(frame, dtype=np.float64, copy=True, order="C")
+                same = np.ones(member.detector_shape, dtype=bool)
+                above = first > threshold
+            else:
+                assert same is not None and above is not None
+                same &= frame == first
+                above &= frame > threshold
+            completed += 1
+            if frame_callback is not None:
+                try:
+                    frame_callback(completed)
+                except Exception:
+                    pass
+        conditioned = None
+    if (
+        completed != len(contributions)
+        or first is None
+        or same is None
+        or above is None
+    ):
+        raise RSMOperationRefused("RSM_STATIC_MASK_INVALID")
+    full_mask = np.ascontiguousarray(same & above, dtype=bool)
+    full_mask.setflags(write=False)
+    first = same = above = None
+    cropped_mask = _rsm_v2_cropped_static_mask(
+        full_mask,
+        plan.effective_geometry.roi,
+        member.cropped_shape,
+    )
+    receipt = _make_rsm_static_mask_receipt(
+        member,
+        plan.conditioning,
+        full_mask,
+        cropped_mask,
+    )
+    return full_mask, cropped_mask, receipt
+
+
+def _require_rsm_v2_memory_plan(request: RSMOperationRequestV2) -> None:
+    plan = request.plan
+    voxels = math.prod(plan.bins)
+    fixed_grid_bytes = 4 * voxels * np.dtype(np.float64).itemsize
+    stored_projection_bytes = (
+        fixed_grid_bytes
+        + voxels * np.dtype(np.float64).itemsize
+        + 2 * voxels * np.dtype(np.float32).itemsize
+    )
+    public_grid_finalization_bytes = (
+        fixed_grid_bytes
+        + 2 * voxels * np.dtype(np.float64).itemsize
+        + voxels * np.dtype(bool).itemsize
+    )
+    finalization_bytes = max(
+        stored_projection_bytes,
+        public_grid_finalization_bytes,
+    )
+    peak_chunk_bytes = 0
+    for member in request.preflight.members:
+        try:
+            options = json.loads(member.source_options_json)
+            declared_raw_dtype = np.dtype(
+                options["read_image_kwargs"]["raw_dtype"]
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
+        if declared_raw_dtype.kind not in "biuf":
+            raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH")
+        frame_count = min(plan.chunk_size, len(member.contributions))
+        pixels = frame_count * math.prod(member.detector_shape)
+        raw_bytes = pixels * np.dtype(np.float64).itemsize
+        float_bytes = pixels * np.dtype(np.float64).itemsize
+        if (
+            raw_bytes // frame_count > plan.max_frame_bytes
+            or float_bytes // frame_count > plan.max_frame_bytes
+        ):
+            raise RSMOperationRefused("FRAME_MEMORY_LIMIT_EXCEEDED")
+        full_pixels = math.prod(member.detector_shape)
+        cropped_pixels = math.prod(member.cropped_shape)
+        cropped_mask_bytes = (
+            cropped_pixels * np.dtype(bool).itemsize
+            if plan.conditioning.static_hot_threshold is not None
+            else 0
+        )
+        science_bytes = _rsm_v2_chunk_owned_bytes(
+            raw_bytes=raw_bytes,
+            float_bytes=float_bytes,
+            pixel_count=pixels,
+            mask_state_bytes=cropped_mask_bytes,
+            science=True,
+        )
+        mask_state_bytes = max(
+            full_pixels
+            * (
+                np.dtype(np.float64).itemsize
+                + 3 * np.dtype(bool).itemsize
+            ),
+            full_pixels * np.dtype(bool).itemsize
+            + cropped_pixels * np.dtype(bool).itemsize,
+        )
+        mask_bytes = _rsm_v2_chunk_owned_bytes(
+            raw_bytes=raw_bytes,
+            float_bytes=float_bytes,
+            pixel_count=pixels,
+            mask_state_bytes=mask_state_bytes,
+            science=False,
+        )
+        required = max(
+            science_bytes,
+            mask_bytes if plan.conditioning.static_hot_threshold is not None else 0,
+        )
+        if required > plan.max_chunk_bytes:
+            raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
+        peak_chunk_bytes = max(peak_chunk_bytes, required)
+    resident_bytes = max(
+        fixed_grid_bytes + peak_chunk_bytes,
+        finalization_bytes,
+    )
+    if resident_bytes >= _MAX_RSM_RESIDENT_BYTES:
+        raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
+
+
 def required_rsm_selectors_v2(
     motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...],
     normalization: RSMNormalizationPolicy,
@@ -2981,6 +3659,9 @@ def prepare_rsm_operation_v2(
         output,
         plan.fingerprint,
         module_provenance_digest(ModuleKind.RSM, provenance),
+        plan_owner=plan,
+        preflight_owner=preflight,
+        output_authority_owner=output_authority,
     )
     return RSMOperationRequestV2(
         module,
@@ -4174,6 +4855,681 @@ def run_rsm_operation(
     )
 
 
+def _revalidate_rsm_v2_geometry(request: RSMOperationRequestV2) -> None:
+    if type(request) is not RSMOperationRequestV2:
+        raise TypeError("RSM v2 revalidation requires an exact request")
+    try:
+        revalidate_rsm_geometry_asset(request.preflight.geometry_asset_receipt)
+        current_effective = lower_rsm_effective_geometry(
+            request.preflight.geometry_asset_receipt
+        )
+    except RSMGeometryAssetRefused as error:
+        raise RSMOperationRefused(error.code) from error
+    if (
+        current_effective.fingerprint
+        != request.plan.effective_geometry.fingerprint
+        or _effective_geometry_provenance(current_effective)
+        != _effective_geometry_provenance(request.plan.effective_geometry)
+    ):
+        raise RSMOperationRefused("RSM_EFFECTIVE_GEOMETRY_MISMATCH")
+
+
+def _revalidate_rsm_v2_authorities(
+    request: RSMOperationRequestV2,
+    *,
+    cancel_token: threading.Event | None,
+) -> None:
+    _revalidate_rsm_v2_geometry(request)
+    for source, member in zip(
+        request.module.source.members,
+        request.preflight.members,
+        strict=True,
+    ):
+        if (
+            source.fingerprint != member.module_source_fingerprint
+            or source.analysis.source_fingerprint != member.source_fingerprint
+            or source.table_fingerprint != member.table_fingerprint
+        ):
+            raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH")
+        _fresh_table(source, cancel_token=cancel_token)
+    _requalify_project_output(
+        request.module.output,
+        request.preflight.project_root,
+        request.output_authority,
+    )
+
+
+def _validate_rsm_v2_science_volume(
+    value: object,
+    request: RSMOperationRequestV2,
+) -> RSMVolume:
+    if type(value) is not RSMVolume:
+        raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    if value.intensity.shape != request.plan.bins:
+        raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    for axis, size, bounds in zip(
+        (value.h, value.k, value.l),
+        request.plan.bins,
+        request.plan.common_grid.bounds,
+        strict=True,
+    ):
+        observed = np.asarray(axis)
+        expected = np.linspace(bounds[0], bounds[1], size, dtype=np.float64)
+        if (
+            observed.shape != (size,)
+            or observed.dtype.kind not in "fiu"
+            or not np.all(np.isfinite(observed))
+            or not np.array_equal(observed, expected)
+        ):
+            raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    intensity = np.asarray(value.intensity)
+    if intensity.dtype.kind not in "fiu" or np.any(np.isinf(intensity)):
+        raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    return value
+
+
+def _rsm_v2_execution_attestation(
+    request: RSMOperationRequestV2,
+    *,
+    result_fingerprint: str,
+    mask_receipts: tuple[RSMStaticMaskReceipt, ...],
+    science_chunk_count: int,
+    q_release_check_chunk_count: int,
+    frame_release_check_frame_count: int,
+    runtime: object,
+) -> dict[str, object]:
+    from xrd_tools.core.geometry.xu_runtime import XuRuntimeExecutionRecord
+
+    selected_frames = request.module.source.selected_frame_count
+    if (
+        type(runtime) is not XuRuntimeExecutionRecord
+        or type(mask_receipts) is not tuple
+        or len(mask_receipts) != len(request.preflight.members)
+        or type(science_chunk_count) is not int
+        or type(q_release_check_chunk_count) is not int
+        or type(frame_release_check_frame_count) is not int
+        or not 1 <= science_chunk_count <= selected_frames
+        or q_release_check_chunk_count != science_chunk_count
+        or frame_release_check_frame_count != selected_frames
+    ):
+        raise RSMOperationRefused("RSM_EXECUTION_ATTESTATION_MISMATCH")
+    return {
+        "schema_version": "rsm-execution-attestation-v1",
+        "module_request_fingerprint": request.module.fingerprint,
+        "result_projection_policy": "analysis_artifact_stored_le_f4_v1",
+        "result_fingerprint": _require_rsm_v2_digest(
+            result_fingerprint,
+            "RSM stored-result fingerprint",
+        ),
+        "geometry_asset_receipt_fingerprint": (
+            request.preflight.geometry_asset_receipt.receipt_fingerprint
+        ),
+        "effective_geometry_fingerprint": request.plan.effective_geometry.fingerprint,
+        "common_grid_fingerprint": request.plan.common_grid.fingerprint,
+        "selected_scan_count": len(request.preflight.members),
+        "selected_frame_count": selected_frames,
+        "science_chunk_count": science_chunk_count,
+        "q_release_check_chunk_count": q_release_check_chunk_count,
+        "frame_release_check_frame_count": frame_release_check_frame_count,
+        "release_check_passed": True,
+        "member_masks": [
+            _rsm_v2_static_mask_attestation(receipt, ordinal)
+            for ordinal, receipt in enumerate(mask_receipts)
+        ],
+        "xu_runtime": runtime.to_attestation(),
+    }
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMOperationResultV2:
+    request: RSMOperationRequestV2
+    terminal: ModuleTerminalResult
+    payload: AnalysisArtifactPayload | None = None
+
+    def __post_init__(self) -> None:
+        committed = self.terminal.disposition is ModuleDisposition.COMMITTED
+        if (
+            type(self.request) is not RSMOperationRequestV2
+            or type(self.terminal) is not ModuleTerminalResult
+            or self.terminal.request is not self.request.module
+            or (committed and type(self.payload) is not AnalysisArtifactPayload)
+            or (not committed and self.payload is not None)
+            or (
+                committed
+                and (
+                    self.payload.kind is not AnalysisArtifactKind.RSM
+                    or self.payload.schema_version != 2
+                    or self.payload.result_fingerprint
+                    != self.terminal.commit.result_fingerprint
+                    or self.payload.execution_attestation_digest
+                    != self.terminal.commit.execution_attestation_digest
+                )
+            )
+        ):
+            raise TypeError("RSM v2 operation result is invalid")
+
+
+class RSMOperationExecutionV2:
+    """One-shot grouped owner retained across cleanup and reload retries."""
+
+    def __init__(self, request: RSMOperationRequestV2, *, coordinator=None):
+        if type(request) is not RSMOperationRequestV2:
+            raise TypeError("RSM v2 execution requires an exact request")
+        self.request = request
+        self.coordinator = coordinator
+        self._state = "new"
+        self._output: ModuleArtifactOutput | None = None
+        self._result: RSMOperationResultV2 | None = None
+        self._verification_terminal: ModuleTerminalResult | None = None
+        self._execution_attestation_json: str | None = None
+        self._execution_attestation_digest: str | None = None
+        self._mask_receipts: tuple[RSMStaticMaskReceipt, ...] = ()
+        self._progress_total = 1
+        self._revision = 0
+        self._progress_callback: Callable[[ModuleProgress], object] | None = None
+
+    def __copy__(self):
+        raise TypeError("RSM v2 operation execution is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM v2 operation execution is not copyable")
+
+    @property
+    def output_snapshot(self):
+        return None if self._output is None else self._output.snapshot
+
+    def _terminal(
+        self,
+        disposition: ModuleDisposition,
+        code: str,
+        diagnostic: str = "",
+    ) -> RSMOperationResultV2:
+        value = RSMOperationResultV2(
+            self.request,
+            ModuleTerminalResult(
+                self.request.module,
+                disposition,
+                code,
+                diagnostic=diagnostic,
+            ),
+        )
+        self._result = value
+        self._state = "done"
+        return value
+
+    def _emit(self, stage: str, completed: int) -> None:
+        callback = self._progress_callback
+        if callback is None:
+            return
+        self._revision += 1
+        value = ModuleProgress(
+            self.request.module,
+            self._revision,
+            stage,
+            min(completed, self._progress_total),
+            self._progress_total,
+        )
+        try:
+            callback(value)
+        except Exception:
+            pass
+
+    def _strict_result(
+        self,
+        terminal: ModuleTerminalResult,
+    ) -> RSMOperationResultV2:
+        if terminal.disposition is not ModuleDisposition.COMMITTED:
+            value = RSMOperationResultV2(self.request, terminal)
+            self._result = value
+            self._state = "done"
+            return value
+        if self._output is None or self._output.snapshot.receipt is None:
+            raise RSMOperationVerificationErrorV2(
+                self,
+                "committed RSM v2 output has no exact artifact receipt",
+            )
+        try:
+            payload = read_analysis_artifact(
+                self.request.module.output.target,
+                expected_receipt=self._output.snapshot.receipt,
+            )
+        except BaseException as error:
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationErrorV2(
+                self,
+                f"strict RSM v2 reload failed: {_failure_diagnostic(error)}",
+            ) from error
+        expected_axes = tuple(
+            np.ascontiguousarray(
+                np.linspace(bounds[0], bounds[1], count, dtype=np.float64),
+                dtype="<f4",
+            )
+            for bounds, count in zip(
+                self.request.plan.common_grid.bounds,
+                self.request.plan.bins,
+                strict=True,
+            )
+        )
+        invalid = (
+            payload.kind is not AnalysisArtifactKind.RSM
+            or payload.schema_version != 2
+            or payload.result_fingerprint != terminal.commit.result_fingerprint
+            or payload.provenance_json != self.request.provenance_json
+            or payload.execution_attestation_json
+            != self._execution_attestation_json
+            or payload.execution_attestation_digest
+            != self._execution_attestation_digest
+            or terminal.commit.execution_attestation_digest
+            != self._execution_attestation_digest
+            or payload.inspection.request_fingerprint
+            != self.request.module.fingerprint
+            or payload.inspection.source_fingerprint
+            != self.request.module.source.fingerprint
+            or payload.inspection.plan_fingerprint != self.request.plan.fingerprint
+            or payload.inspection.provenance_digest
+            != self.request.module.provenance_digest
+            or payload.inspection.shape != self.request.plan.bins
+            or payload.inspection.axis_units
+            != (("h", None), ("k", None), ("l", None))
+            or tuple(name for name, _axis in payload.axes) != ("h", "k", "l")
+            or any(
+                not np.array_equal(observed, expected)
+                for (_name, observed), expected in zip(
+                    payload.axes,
+                    expected_axes,
+                    strict=True,
+                )
+            )
+            or np.any(np.isinf(payload.intensity))
+            or payload.sigma is not None
+            or payload.coverage is not None
+            or payload.normalization is not None
+        )
+        if invalid:
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationErrorV2(
+                self,
+                "strict RSM v2 payload no longer matches its request",
+            )
+        try:
+            provenance = json.loads(payload.provenance_json)
+            attestation = json.loads(payload.execution_attestation_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationErrorV2(
+                self,
+                "strict RSM v2 intent or attestation is malformed",
+            ) from error
+        try:
+            expected_masks = [
+                _rsm_v2_static_mask_attestation(receipt, ordinal)
+                for ordinal, receipt in enumerate(self._mask_receipts)
+            ]
+        except (TypeError, ValueError) as error:
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationErrorV2(
+                self,
+                "strict RSM v2 identities changed after commit",
+            ) from error
+        if (
+            provenance != self.request.provenance
+            or attestation.get("member_masks") != expected_masks
+        ):
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationErrorV2(
+                self,
+                "strict RSM v2 identities changed after commit",
+            )
+        self._emit("reload", self._progress_total)
+        value = RSMOperationResultV2(self.request, terminal, payload)
+        self._result = value
+        self._verification_terminal = terminal
+        self._state = "done"
+        return value
+
+    def run(
+        self,
+        *,
+        cancel_token: threading.Event | None = None,
+        progress_callback: Callable[[ModuleProgress], object] | None = None,
+    ) -> RSMOperationResultV2:
+        if self._state != "new":
+            raise RuntimeError("RSM v2 execution is one-shot")
+        if cancel_token is not None and type(cancel_token) is not threading.Event:
+            raise TypeError("RSM v2 cancellation token must be threading.Event")
+        if progress_callback is not None and not callable(progress_callback):
+            raise TypeError("RSM v2 progress callback must be callable")
+        self._state = "running"
+        self._progress_callback = progress_callback
+        selected_frames = self.request.module.source.selected_frame_count
+        mask_frames = sum(
+            len(member.contributions)
+            for member in self.request.preflight.members
+            if member.mask_policy_intent[0]
+            == "exact-all-selected-frames-static-hot-v1"
+        )
+        self._progress_total = selected_frames + mask_frames + 4
+        self._emit("revalidate", 0)
+        if cancel_token is not None and cancel_token.is_set():
+            return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+        try:
+            _require_rsm_v2_memory_plan(self.request)
+            _revalidate_rsm_v2_authorities(
+                self.request,
+                cancel_token=cancel_token,
+            )
+        except RSMOperationRefused as error:
+            disposition = (
+                ModuleDisposition.CANCELLED
+                if error.code == "CANCELLED"
+                else ModuleDisposition.REFUSED
+            )
+            return self._terminal(disposition, error.code)
+        self._emit("revalidate", 1)
+
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+        runtime_owner = xu_runtime_session(
+            self.request.plan.effective_geometry.runtime_requirements
+        )
+        mapper = gridder = volume = None
+        mask_receipts: list[RSMStaticMaskReceipt] = []
+        science_chunk_count = 0
+        q_release_chunk_count = 0
+        frame_release_count = 0
+        progress_completed = 1
+        try:
+            with runtime_owner as session:
+                mapper = rsm_effective_pixel_q_map(
+                    self.request.plan.effective_geometry
+                )
+                gridder = StreamingGridder(
+                    mapper,
+                    self.request.plan.bins,
+                    runtime_session=session,
+                )
+                gridder.set_bounds(*self.request.plan.common_grid.bounds)
+                for source_receipt, member in zip(
+                    self.request.module.source.members,
+                    self.request.preflight.members,
+                    strict=True,
+                ):
+                    if cancel_token is not None and cancel_token.is_set():
+                        raise RSMOperationRefused("CANCELLED")
+                    with requalified_analysis_source(
+                        source_receipt.analysis,
+                        cancel_token=cancel_token,
+                    ) as source:
+                        mask_base = progress_completed
+
+                        def mask_progress(done: int) -> None:
+                            self._emit("static-mask", mask_base + done)
+
+                        full_mask, cropped_mask, mask_receipt = (
+                            _derive_rsm_v2_static_mask(
+                                source,
+                                member,
+                                self.request.plan,
+                                cancel_token=cancel_token,
+                                frame_callback=(
+                                    mask_progress
+                                    if member.mask_policy_intent[0]
+                                    != "none"
+                                    else None
+                                ),
+                            )
+                        )
+                        if member.mask_policy_intent[0] != "none":
+                            progress_completed += len(member.contributions)
+                        mask_receipts.append(mask_receipt)
+                        full_mask = None
+                        for start in range(
+                            0,
+                            len(member.contributions),
+                            self.request.plan.chunk_size,
+                        ):
+                            if cancel_token is not None and cancel_token.is_set():
+                                raise RSMOperationRefused("CANCELLED")
+                            contributions = member.contributions[
+                                start : start + self.request.plan.chunk_size
+                            ]
+                            angles = _rsm_v2_contribution_angles(
+                                member,
+                                contributions,
+                            )
+                            lease = _make_rsm_v2_chunk_lease(
+                                source,
+                                member,
+                                self.request.plan,
+                                contributions,
+                                cropped_static_mask=cropped_mask,
+                                cancel_token=cancel_token,
+                            )
+                            release = gridder.add_leased(
+                                lease,
+                                angles,
+                                member.energy_eV,
+                                UB=np.ascontiguousarray(
+                                    member.ub,
+                                    dtype=np.float64,
+                                ),
+                                roi=self.request.plan.effective_geometry.roi,
+                                weight=1.0,
+                            )
+                            if (
+                                type(release) is not RSMGridChunkReleaseReceipt
+                                or release.frame_count != len(contributions)
+                                or type(release.q_root_count) is not int
+                                or not 1 <= release.q_root_count <= 3
+                                or release.release_passed is not True
+                            ):
+                                raise RSMOperationRefused(
+                                    "RSM_CHUNK_RELEASE_FAILED"
+                                )
+                            science_chunk_count += 1
+                            q_release_chunk_count += 1
+                            frame_release_count += release.frame_count
+                            progress_completed += release.frame_count
+                            self._emit("science", progress_completed)
+                            if (
+                                cancel_token is not None
+                                and cancel_token.is_set()
+                            ):
+                                raise RSMOperationRefused("CANCELLED")
+                            lease = None
+                            angles = ()
+                        cropped_mask = None
+                    if cancel_token is not None and cancel_token.is_set():
+                        raise RSMOperationRefused("CANCELLED")
+                if gridder.n_frames_processed != selected_frames:
+                    raise RSMOperationRefused(
+                        "RSM_EXECUTION_ATTESTATION_MISMATCH"
+                    )
+                volume = _validate_rsm_v2_science_volume(
+                    gridder.to_volume(),
+                    self.request,
+                )
+        except AnalysisSourceLeaseRefused as error:
+            if error.code == "CANCELLED":
+                return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+            return self._terminal(ModuleDisposition.REFUSED, error.code)
+        except RSMGridChunkReleaseError:
+            return self._terminal(
+                ModuleDisposition.REFUSED,
+                "RSM_CHUNK_RELEASE_FAILED",
+            )
+        except XuRuntimeUnsupported as error:
+            return self._terminal(ModuleDisposition.REFUSED, error.code)
+        except RSMOperationRefused as error:
+            disposition = (
+                ModuleDisposition.CANCELLED
+                if error.code == "CANCELLED"
+                else ModuleDisposition.REFUSED
+            )
+            return self._terminal(disposition, error.code)
+        except BaseException as error:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "SCIENCE_FAILED",
+                _failure_diagnostic(error),
+            )
+        if cancel_token is not None and cancel_token.is_set():
+            return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+        if runtime_owner.execution_record is None or volume is None:
+            return self._terminal(
+                ModuleDisposition.REFUSED,
+                "RSM_EXECUTION_ATTESTATION_MISMATCH",
+            )
+        try:
+            result_projection = project_analysis_artifact_result(
+                kind=AnalysisArtifactKind.RSM,
+                axes=(("h", volume.h), ("k", volume.k), ("l", volume.l)),
+                axis_units=(("h", None), ("k", None), ("l", None)),
+                intensity=volume.intensity,
+                sigma=None,
+                coverage=None,
+                normalization=None,
+            )
+        except AnalysisArtifactProjectionInvalid:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "RSM_RESULT_STORAGE_PROJECTION_INVALID",
+            )
+        volume = gridder = mapper = None
+        gc.collect(0)
+        self._mask_receipts = tuple(mask_receipts)
+        try:
+            attestation = _rsm_v2_execution_attestation(
+                self.request,
+                result_fingerprint=result_projection.result_fingerprint,
+                mask_receipts=self._mask_receipts,
+                science_chunk_count=science_chunk_count,
+                q_release_check_chunk_count=q_release_chunk_count,
+                frame_release_check_frame_count=frame_release_count,
+                runtime=runtime_owner.execution_record,
+            )
+            attestation_digest = analysis_execution_attestation_digest(
+                AnalysisArtifactKind.RSM,
+                attestation,
+                request_fingerprint=self.request.module.fingerprint,
+            )
+            _revalidate_rsm_v2_authorities(
+                self.request,
+                cancel_token=cancel_token,
+            )
+            bound = module_artifact_request(
+                self.request.module,
+                self.request.provenance,
+                execution_attestation=attestation,
+                execution_attestation_digest=attestation_digest,
+                rsm_mask_receipts=self._mask_receipts,
+            )
+            self._execution_attestation_json = bound.execution_attestation_json
+            self._execution_attestation_digest = attestation_digest
+            self._emit("projection", self._progress_total - 2)
+            self._output = admit_module_artifact(
+                self.request.module,
+                self.request.provenance,
+                execution_attestation=attestation,
+                execution_attestation_digest=attestation_digest,
+                rsm_mask_receipts=self._mask_receipts,
+                cancel_token=cancel_token,
+                coordinator=self.coordinator,
+            )
+        except (RSMOperationRefused, ModuleArtifactRefused) as error:
+            code = error.code
+            disposition = (
+                ModuleDisposition.CANCELLED
+                if code == "CANCELLED"
+                else ModuleDisposition.REFUSED
+            )
+            return self._terminal(disposition, code)
+        except FileExistsError:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+        except BaseException as error:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "OUTPUT_ADMISSION_FAILED",
+                _failure_diagnostic(error),
+            )
+
+        def writer(entry: object) -> None:
+            write_rsm(
+                entry,
+                result_projection=result_projection,
+                provenance=bound.provenance_json,
+                bounded_artifact=True,
+            )
+
+        def prepublish_check() -> None:
+            try:
+                _revalidate_rsm_v2_authorities(
+                    self.request,
+                    cancel_token=cancel_token,
+                )
+            except RSMOperationRefused as error:
+                raise ModuleArtifactRefused(error.code) from error
+
+        try:
+            terminal = self._output.publish(
+                writer,
+                cancel_token=cancel_token,
+                prepublish_check=prepublish_check,
+            )
+        except AnalysisArtifactCleanupPending as error:
+            self._state = "cleanup_pending"
+            raise RSMOperationCleanupPendingV2(self) from error
+        self._emit("publish", self._progress_total - 1)
+        return self._strict_result(terminal)
+
+    def retry_cleanup(self) -> RSMOperationResultV2:
+        if self._result is not None:
+            return self._result
+        if self._state != "cleanup_pending" or self._output is None:
+            raise RuntimeError("RSM v2 execution has no retryable cleanup")
+        try:
+            terminal = self._output.retry_cleanup()
+        except AnalysisArtifactCleanupPending as error:
+            raise RSMOperationCleanupPendingV2(self) from error
+        self._emit("publish", self._progress_total - 1)
+        return self._strict_result(terminal)
+
+    def retry_verification(self) -> RSMOperationResultV2:
+        """Retry strict detached reload without replaying science or writing."""
+
+        if self._result is not None:
+            return self._result
+        if (
+            self._state != "verification_failed"
+            or self._verification_terminal is None
+            or self._verification_terminal.disposition
+            is not ModuleDisposition.COMMITTED
+        ):
+            raise RuntimeError("RSM v2 execution has no retryable verification")
+        return self._strict_result(self._verification_terminal)
+
+
+def run_rsm_operation_v2(
+    request: RSMOperationRequestV2,
+    *,
+    cancel_token: threading.Event | None = None,
+    progress_callback: Callable[[ModuleProgress], object] | None = None,
+    coordinator=None,
+) -> RSMOperationResultV2:
+    """Run one exact grouped RSM v2 request."""
+
+    execution = RSMOperationExecutionV2(request, coordinator=coordinator)
+    return execution.run(
+        cancel_token=cancel_token,
+        progress_callback=progress_callback,
+    )
+
+
 __all__ = [
     "RSMCommonGrid",
     "RSMContribution",
@@ -4183,17 +5539,22 @@ __all__ = [
     "RSMNormalizationMode",
     "RSMNormalizationPolicy",
     "RSMOperationCleanupPending",
+    "RSMOperationCleanupPendingV2",
     "RSMOperationExecution",
+    "RSMOperationExecutionV2",
     "RSMOperationPlan",
     "RSMOperationPlanV2",
     "RSMOperationRefused",
     "RSMOperationRequest",
     "RSMOperationRequestV2",
     "RSMOperationResult",
+    "RSMOperationResultV2",
     "RSMOperationVerificationError",
+    "RSMOperationVerificationErrorV2",
     "RSMOutputAuthorityReceipt",
     "RSMPreflightReceipt",
     "RSMPreflightMemberV2",
+    "RSMStaticMaskReceipt",
     "RSMGroupPreflightReceiptV2",
     "condition_rsm_images",
     "prepare_rsm_operation",
@@ -4203,6 +5564,7 @@ __all__ = [
     "make_rsm_common_grid",
     "resolve_exact_rsm_q_bounds",
     "run_rsm_operation",
+    "run_rsm_operation_v2",
     "rsm_normalization_divisors",
     "rsm_static_hot_mask",
 ]

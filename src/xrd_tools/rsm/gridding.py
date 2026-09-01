@@ -20,13 +20,17 @@ results saved across sessions) see :func:`combine_grids` /
 from __future__ import annotations
 
 from contextlib import contextmanager
+import gc
 import logging
-from dataclasses import dataclass, field
+import math
+import weakref
+from dataclasses import InitVar, dataclass, field
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
 from xrd_tools.core.geometry import DetectorHeader, PixelQMap
+from xrd_tools.core.physical_memory import physical_root_fact
 from xrd_tools.core.geometry.xu_runtime import (
     XuRuntimeSession,
     require_active_xu_runtime_session,
@@ -37,6 +41,8 @@ from xrd_tools.rsm.volume import RSMVolume
 # Private test seam. Production obtains Gridder3D only from an active shared
 # XuRuntimeSession; importing this module never imports xrayutilities.
 _GRIDDER3D_OVERRIDE = None
+_RSM_GRID_CHUNK_FACTORY = object()
+_RSM_GRID_RELEASE_FACTORY = object()
 
 
 logger = logging.getLogger(__name__)
@@ -121,11 +127,13 @@ def _feed_pair(grid_raw, grid_norm, qx, qy, qz, img, weight) -> None:
 
 def _pair_intensity(grid_raw, grid_norm) -> np.ndarray:
     """``Σraw / Σnorm``; NaN where the norm sum is non-positive (empty)."""
-    num = np.asarray(grid_raw.data, dtype=float)
+    out = np.asarray(grid_raw.data, dtype=float)
     den = np.asarray(grid_norm.data, dtype=float)
+    positive = den > 0
     with np.errstate(divide="ignore", invalid="ignore"):
-        out = num / den
-    out[~(den > 0)] = np.nan
+        np.divide(out, den, out=out, where=positive)
+    np.logical_not(positive, out=positive)
+    out[positive] = np.nan
     return out
 
 
@@ -133,6 +141,223 @@ def _qbounds(qx, qy, qz) -> tuple[float, float, float, float, float, float]:
     return (float(np.nanmin(qx)), float(np.nanmax(qx)),
             float(np.nanmin(qy)), float(np.nanmax(qy)),
             float(np.nanmin(qz)), float(np.nanmax(qz)))
+
+
+class RSMGridChunkReleaseError(RuntimeError):
+    """A consumed R2 chunk could not prove complete root release."""
+
+    code = "RSM_CHUNK_RELEASE_FAILED"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+def _uncopyable_chunk_value(kind: str):
+    def copy_value(self):
+        raise TypeError(f"{kind} is not copyable")
+
+    def deepcopy_value(self, _memo):
+        raise TypeError(f"{kind} is not copyable")
+
+    def reduce_value(self):
+        raise TypeError(f"{kind} is not serializable")
+
+    def reduce_ex_value(self, _protocol):
+        raise TypeError(f"{kind} is not serializable")
+
+    def replace_value(self, /, **_changes):
+        raise TypeError(f"{kind} is not replaceable")
+
+    return (
+        copy_value,
+        deepcopy_value,
+        reduce_value,
+        reduce_ex_value,
+        replace_value,
+    )
+
+
+def _ndarray_root(value: np.ndarray, name: str) -> np.ndarray:
+    try:
+        root = physical_root_fact(value).root
+    except ValueError as error:
+        raise TypeError(f"{name} has no exact ndarray root") from error
+    if type(root) is not np.ndarray:
+        raise TypeError(f"{name} must have an exact ndarray root")
+    return root
+
+
+class RSMGridChunkLease:
+    """One-shot owner of the two operation-owned R2 image roots."""
+
+    __slots__ = (
+        "_raw",
+        "_conditioned",
+        "_raw_root_ref",
+        "_conditioned_root_ref",
+        "_shape",
+        "frame_count",
+        "_consumed",
+    )
+
+    def __init__(
+        self,
+        raw_stack: np.ndarray,
+        conditioned_stack: np.ndarray,
+        frame_count: int,
+        _claim: object = None,
+    ) -> None:
+        if (
+            _claim is not _RSM_GRID_CHUNK_FACTORY
+            or type(raw_stack) is not np.ndarray
+            or raw_stack.dtype.kind not in "biuf"
+            or raw_stack.ndim != 3
+            or not raw_stack.flags.c_contiguous
+            or type(conditioned_stack) is not np.ndarray
+            or conditioned_stack.dtype != np.dtype(np.float64)
+            or conditioned_stack.ndim != 3
+            or not conditioned_stack.flags.c_contiguous
+            or conditioned_stack.shape != raw_stack.shape
+            or type(frame_count) is not int
+            or frame_count < 1
+            or frame_count != raw_stack.shape[0]
+        ):
+            raise TypeError("RSM grid chunk lease is not factory-owned")
+        raw_root = _ndarray_root(raw_stack, "RSM raw chunk")
+        conditioned_root = _ndarray_root(
+            conditioned_stack,
+            "RSM conditioned chunk",
+        )
+        if raw_root is conditioned_root:
+            raise ValueError("RSM raw and conditioned chunks must not alias")
+        object.__setattr__(self, "_raw", raw_stack)
+        object.__setattr__(self, "_conditioned", conditioned_stack)
+        object.__setattr__(self, "_raw_root_ref", weakref.ref(raw_root))
+        object.__setattr__(
+            self,
+            "_conditioned_root_ref",
+            weakref.ref(conditioned_root),
+        )
+        object.__setattr__(
+            self,
+            "_shape",
+            tuple(int(value) for value in raw_stack.shape),
+        )
+        object.__setattr__(self, "frame_count", frame_count)
+        object.__setattr__(self, "_consumed", False)
+
+    @classmethod
+    def from_arrays(
+        cls,
+        raw_stack: np.ndarray,
+        conditioned_stack: np.ndarray,
+        frame_count: int,
+    ) -> "RSMGridChunkLease":
+        if cls is not RSMGridChunkLease:
+            raise TypeError("RSM grid chunk lease factory requires the exact class")
+        return cls(
+            raw_stack,
+            conditioned_stack,
+            frame_count,
+            _RSM_GRID_CHUNK_FACTORY,
+        )
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return self._shape
+
+    @property
+    def consumed(self) -> bool:
+        return self._consumed
+
+    def _consume(self, claim: object):
+        if claim is not _RSM_GRID_CHUNK_FACTORY or self._consumed:
+            raise RuntimeError("RSM grid chunk lease is already consumed")
+        raw = self._raw
+        conditioned = self._conditioned
+        raw_ref = self._raw_root_ref
+        conditioned_ref = self._conditioned_root_ref
+        if (
+            type(raw) is not np.ndarray
+            or raw.dtype.kind not in "biuf"
+            or raw.ndim != 3
+            or not raw.flags.c_contiguous
+            or type(conditioned) is not np.ndarray
+            or conditioned.dtype != np.dtype(np.float64)
+            or conditioned.ndim != 3
+            or not conditioned.flags.c_contiguous
+            or type(self._shape) is not tuple
+            or raw.shape != self._shape
+            or conditioned.shape != self._shape
+            or type(self.frame_count) is not int
+            or self.frame_count != self._shape[0]
+            or type(raw_ref) is not weakref.ReferenceType
+            or type(conditioned_ref) is not weakref.ReferenceType
+        ):
+            raise TypeError("RSM grid chunk lease changed before consumption")
+        raw_root = _ndarray_root(raw, "RSM raw chunk")
+        conditioned_root = _ndarray_root(
+            conditioned,
+            "RSM conditioned chunk",
+        )
+        if (
+            raw_root is conditioned_root
+            or raw_ref() is not raw_root
+            or conditioned_ref() is not conditioned_root
+        ):
+            raise TypeError("RSM grid chunk roots changed before consumption")
+        object.__setattr__(self, "_consumed", True)
+        object.__setattr__(self, "_raw", None)
+        object.__setattr__(self, "_conditioned", None)
+        object.__setattr__(self, "_raw_root_ref", None)
+        object.__setattr__(self, "_conditioned_root_ref", None)
+        return raw, conditioned, raw_ref, conditioned_ref
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise TypeError("RSM grid chunk lease is immutable")
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _uncopyable_chunk_value("RSM grid chunk lease")
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMGridChunkReleaseReceipt:
+    """Positive scalar-only proof that one consumed R2 chunk was released."""
+
+    frame_count: int
+    q_root_count: int
+    release_passed: bool
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _RSM_GRID_RELEASE_FACTORY
+            or type(self.frame_count) is not int
+            or self.frame_count < 1
+            or type(self.q_root_count) is not int
+            or not 1 <= self.q_root_count <= 3
+            or self.release_passed is not True
+        ):
+            raise TypeError("RSM grid chunk release receipt is not factory-owned")
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _uncopyable_chunk_value("RSM grid chunk release receipt")
+
+
+def _bounded_release_collect() -> None:
+    """Perform the fixed CPython generation-zero release fence."""
+
+    gc.collect(0)
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +571,7 @@ class StreamingGridder:
         self._grid_norm: object | None = None
         self._bounds: tuple[float, float, float, float, float, float] | None = None
         self.n_frames_processed: int = 0
+        self._poisoned = False
 
     # ------------------------------------------------------------------
     # Bounds
@@ -362,6 +588,8 @@ class StreamingGridder:
         Must be called before :meth:`add`.  Bins outside the range are
         silently dropped by ``xu.Gridder3D``.
         """
+        if self._poisoned:
+            raise RSMGridChunkReleaseError()
         if self._grid_raw is not None:
             raise RuntimeError("bounds already set; create a fresh "
                                "StreamingGridder to re-bound")
@@ -417,6 +645,8 @@ class StreamingGridder:
         ((qx_lo, qx_hi), (qy_lo, qy_hi), (qz_lo, qz_hi))
             The bounds that were set.
         """
+        if self._poisoned:
+            raise RSMGridChunkReleaseError()
         if not scans:
             raise ValueError("scout: scans list must not be empty")
 
@@ -495,6 +725,8 @@ class StreamingGridder:
         The chunk-shape contract is ``(n_chunk, H, W)``; ``static_mask``
         must be ``(H, W)``.  Broadcast is applied along the frame axis.
         """
+        if self._poisoned:
+            raise RSMGridChunkReleaseError()
         if self._grid_raw is None:
             raise RuntimeError(
                 "StreamingGridder bounds not set; call set_bounds() or "
@@ -546,12 +778,206 @@ class StreamingGridder:
             )
         self.n_frames_processed += img.shape[0]
 
+    def add_leased(
+        self,
+        lease: RSMGridChunkLease,
+        angles: list[np.ndarray] | tuple[np.ndarray, ...],
+        energy: float,
+        *,
+        UB: np.ndarray,
+        roi: tuple[int, int, int, int] | None = None,
+        weight: float | np.ndarray | None = None,
+    ) -> RSMGridChunkReleaseReceipt:
+        """Consume one R2-owned chunk and prove every downstream root dead.
+
+        Unlike :meth:`add`, this path performs no hidden image copy and requires
+        one explicit already-active XU runtime owner.  Any failure after lease
+        consumption poisons the accumulator because one half of the raw/norm
+        pair may already have changed.
+        """
+
+        if self._poisoned:
+            raise RSMGridChunkReleaseError()
+        if self._grid_raw is None or self._grid_norm is None:
+            raise RuntimeError(
+                "StreamingGridder bounds not set; call set_bounds() before "
+                "add_leased()."
+            )
+        if type(lease) is not RSMGridChunkLease or lease.consumed:
+            raise TypeError("add_leased requires one unused exact RSM chunk lease")
+        if type(self.mapper) is not PixelQMap:
+            raise TypeError("RSM leased gridding requires exact PixelQMap")
+        if type(self._runtime_session) is not XuRuntimeSession:
+            raise TypeError("RSM leased gridding requires an explicit XU runtime")
+        session = require_active_xu_runtime_session(self._runtime_session)
+        if type(angles) not in {tuple, list} or len(angles) != 6:
+            raise ValueError("RSM leased gridding requires six angle arrays")
+        angle_values = tuple(np.asarray(value, dtype=np.float64) for value in angles)
+        if any(
+            value.ndim != 1
+            or len(value) != lease.frame_count
+            or not np.all(np.isfinite(value))
+            for value in angle_values
+        ):
+            raise ValueError("RSM leased angle arrays are not aligned and finite")
+        if type(energy) not in {int, float} or not math.isfinite(float(energy)) or energy <= 0:
+            raise ValueError("RSM leased energy must be finite and positive")
+        if type(UB) is not np.ndarray:
+            raise TypeError("RSM leased UB must be an exact ndarray")
+        matrix = np.asarray(UB, dtype=np.float64)
+        if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+            raise ValueError("RSM leased UB must be a finite 3 by 3 matrix")
+        if roi is not None and (
+            type(roi) is not tuple
+            or len(roi) != 4
+            or any(type(value) is not int for value in roi)
+        ):
+            raise TypeError("RSM leased ROI must be an exact integer tuple")
+        header = self.mapper.header if roi is None else self.mapper.header.with_roi(roi)
+        full_shape = (self.mapper.header.Nch1, self.mapper.header.Nch2)
+        expected_shape = (lease.frame_count, header.Nch1, header.Nch2)
+        if lease.shape[1:] != full_shape or any(value < 1 for value in expected_shape):
+            raise ValueError("RSM leased chunk does not match detector geometry")
+        if weight is not None:
+            if type(weight) in {int, float}:
+                if not math.isfinite(float(weight)) or float(weight) <= 0:
+                    raise ValueError("RSM leased scalar weight must be positive")
+            elif (
+                type(weight) is not np.ndarray
+                or weight.dtype.kind not in "biuf"
+                or weight.shape != expected_shape[1:]
+                or not weight.flags.c_contiguous
+                or weight.flags.writeable
+            ):
+                raise TypeError(
+                    "RSM leased weight must be a positive scalar or borrowed "
+                    "read-only detector array"
+                )
+
+        raw = conditioned = conditioned_view = None
+        qx = qy = qz = None
+        q_values = None
+        bad = norm_values = raw_payload = norm_payload = None
+        raw_ref = conditioned_ref = None
+        q_refs: tuple[weakref.ReferenceType, ...] = ()
+        payload_refs: tuple[weakref.ReferenceType, ...] = ()
+        q_root_count = 0
+        pending: BaseException | None = None
+        lease_consumed = False
+        release_failed = False
+        try:
+            raw, conditioned, raw_ref, conditioned_ref = lease._consume(
+                _RSM_GRID_CHUNK_FACTORY
+            )
+            lease_consumed = True
+            if raw.shape != lease.shape or conditioned.shape != lease.shape:
+                raise ValueError("RSM leased chunk changed shape before consumption")
+            if roi is None:
+                conditioned_view = conditioned
+            else:
+                r0, r1, c0, c1 = roi
+                conditioned_view = conditioned[:, r0:r1, c0:c1]
+            if conditioned_view.shape != expected_shape:
+                raise ValueError("RSM leased ROI does not match q geometry")
+            # The raw stack participates only in the ownership/release proof;
+            # science consumes the already-conditioned numerator.
+            raw = None
+            q_values = self.mapper.pixel_q(
+                angle_values,
+                float(energy),
+                UB=matrix,
+                roi=roi,
+                runtime_session=session,
+            )
+            qx, qy, qz = q_values
+            unique_q: dict[int, weakref.ReferenceType] = {}
+            for value in q_values:
+                root = _ndarray_root(value, "RSM q chunk")
+                unique_q.setdefault(id(root), weakref.ref(root))
+                root = None
+            value = None
+            q_refs = tuple(unique_q.values())
+            q_root_count = len(q_refs)
+            unique_q.clear()
+            if not 1 <= q_root_count <= 3:
+                raise ValueError("RSM q chunk has an invalid root count")
+            norm_values = np.broadcast_to(
+                np.asarray(1.0 if weight is None else weight, dtype=np.float64),
+                conditioned_view.shape,
+            )
+            bad = ~(
+                np.isfinite(qx)
+                & np.isfinite(qy)
+                & np.isfinite(qz)
+                & np.isfinite(conditioned_view)
+                & np.isfinite(norm_values)
+                & (norm_values > 0)
+            )
+            raw_payload = np.where(bad, np.nan, conditioned_view)
+            norm_payload = np.where(bad, np.nan, norm_values)
+            payload_refs = (
+                weakref.ref(_ndarray_root(raw_payload, "RSM raw feed payload")),
+                weakref.ref(_ndarray_root(norm_payload, "RSM norm feed payload")),
+            )
+            self._grid_raw(qx, qy, qz, raw_payload)
+            self._grid_norm(qx, qy, qz, norm_payload)
+        except BaseException as error:
+            try:
+                error.__traceback__ = None
+                error.__context__ = None
+                error.__cause__ = None
+            except BaseException:
+                pass
+            pending = error
+        finally:
+            raw = conditioned = conditioned_view = None
+            qx = qy = qz = None
+            q_values = None
+            bad = norm_values = raw_payload = norm_payload = None
+            angle_values = ()
+            matrix = None
+            session = None
+            try:
+                _bounded_release_collect()
+            except BaseException:
+                release_failed = True
+            references = tuple(
+                reference
+                for reference in (
+                    raw_ref,
+                    conditioned_ref,
+                    *q_refs,
+                    *payload_refs,
+                )
+                if reference is not None
+            )
+            if any(reference() is not None for reference in references):
+                release_failed = True
+            references = ()
+            q_refs = ()
+            payload_refs = ()
+        if release_failed or (pending is not None and lease_consumed):
+            self._poisoned = True
+        if release_failed:
+            raise RSMGridChunkReleaseError() from None
+        if pending is not None:
+            raise pending from None
+        self.n_frames_processed += lease.frame_count
+        return RSMGridChunkReleaseReceipt(
+            lease.frame_count,
+            q_root_count,
+            True,
+            _RSM_GRID_RELEASE_FACTORY,
+        )
+
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
 
     def to_volume(self) -> RSMVolume:
         """Build the final :class:`RSMVolume` from the accumulated grid."""
+        if self._poisoned:
+            raise RSMGridChunkReleaseError()
         if self._grid_raw is None:
             raise RuntimeError(
                 "bounds not set; call set_bounds() or scout() before to_volume()."

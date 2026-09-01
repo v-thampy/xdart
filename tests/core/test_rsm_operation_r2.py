@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+import json
+import os
 from pathlib import Path
 import pickle
+import stat
 import threading
+import weakref
 
 import numpy as np
 import pytest
@@ -19,6 +23,7 @@ from xdart.gui.tools.rsm_values import (
 )
 from xrd_tools.analysis.module_transaction import (
     MetadataColumnSelector,
+    ModuleDisposition,
     ModuleSourceGroupReceipt,
 )
 from xrd_tools.analysis.rsm_geometry_asset import (
@@ -29,9 +34,13 @@ from xrd_tools.analysis.rsm_geometry_asset import (
 from xrd_tools.analysis.rsm_operation import (
     RSMImageConditioning,
     RSMNormalizationPolicy,
+    RSMOperationCleanupPendingV2,
+    RSMOperationExecutionV2,
     RSMOperationRefused,
+    RSMOperationVerificationErrorV2,
     make_rsm_common_grid,
     prepare_rsm_operation_v2,
+    run_rsm_operation_v2,
 )
 from xrd_tools.core.geometry import Diffractometer, PixelQMap
 from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
@@ -596,3 +605,1069 @@ def test_group_dependency_and_canonical_byte_limits_fail_closed(
         prepare_rsm_tool_v2(form)
     assert refused.value.code == "RSM_SOURCE_GROUP_LIMIT_EXCEEDED"
     assert not Path(form.output_path).exists()
+
+
+def test_two_member_science_uses_one_grid_and_persists_exact_attestation(
+    tmp_path,
+    monkeypatch,
+):
+    from contextlib import contextmanager
+
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    import xrd_tools.rsm.gridding as rsm_gridding
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    first_ub = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    second_ub = (2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0)
+    members = (
+        _write_member(tmp_path, 0, energy_eV=12001.0, ub=first_ub),
+        _write_member(tmp_path, 1, energy_eV=14002.0, ub=second_ub),
+    )
+    prepared = prepare_rsm_tool_v2(_form(tmp_path, members)).request
+    for name in (
+        "combine_grids",
+        "get_common_grid",
+        "RegularGridInterpolator",
+    ):
+        monkeypatch.setattr(
+            rsm_gridding,
+            name,
+            lambda *_args, _name=name, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"forbidden RSM v2 grid path used: {_name}")
+            ),
+        )
+    real_source_lease = rsm_operation.requalified_analysis_source
+    source_lease_count = 0
+    max_source_leases = 0
+    source_lease_entries = 0
+
+    @contextmanager
+    def counted_source_lease(*args, **kwargs):
+        nonlocal source_lease_count, max_source_leases, source_lease_entries
+        with real_source_lease(*args, **kwargs) as source:
+            source_lease_count += 1
+            source_lease_entries += 1
+            max_source_leases = max(max_source_leases, source_lease_count)
+            try:
+                yield source
+            finally:
+                source_lease_count -= 1
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "requalified_analysis_source",
+        counted_source_lease,
+    )
+
+    def full_detector_frame(self, index):
+        ordinal = int(
+            str(self.name).split(" [", 1)[0].rsplit("_", 1)[-1]
+        )
+        return np.full(
+            (195, 487),
+            10 + ordinal + int(index),
+            dtype=np.float64,
+        )
+
+    monkeypatch.setattr(SpecSource, "load_frame", full_detector_frame)
+    real_gridder = rsm_operation.StreamingGridder
+    real_pixel_q = PixelQMap.pixel_q
+    instances = []
+    observed = []
+    mapped = []
+
+    def record_pixel_q(
+        self,
+        angles,
+        energy,
+        *,
+        UB=None,
+        roi=None,
+        image_shape=None,
+        runtime_session=None,
+    ):
+        assert runtime_session is not None and runtime_session.active
+        mapped.append(
+            (
+                float(energy),
+                tuple(float(value) for value in UB.flat),
+                len(angles[0]),
+            )
+        )
+        return real_pixel_q(
+            self,
+            angles,
+            energy,
+            UB=UB,
+            roi=roi,
+            image_shape=image_shape,
+            runtime_session=runtime_session,
+        )
+
+    monkeypatch.setattr(PixelQMap, "pixel_q", record_pixel_q)
+
+    class CountedGridder(real_gridder):
+        def __init__(self, *args, **kwargs):
+            instances.append(self)
+            super().__init__(*args, **kwargs)
+
+        def add_leased(self, lease, angles, energy, *, UB, **kwargs):
+            observed.append(
+                (
+                    float(energy),
+                    tuple(float(value) for value in UB.flat),
+                    lease.frame_count,
+                )
+            )
+            return super().add_leased(
+                lease,
+                angles,
+                energy,
+                UB=UB,
+                **kwargs,
+            )
+
+    monkeypatch.setattr(rsm_operation, "StreamingGridder", CountedGridder)
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert result.payload is not None
+    assert result.payload.schema_version == 2
+    assert len(instances) == 1
+    assert source_lease_entries == 2
+    assert max_source_leases == 1
+    assert source_lease_count == 0
+    assert len(observed) == 4
+    assert mapped == observed
+    assert [item[2] for item in observed] == [1, 1, 1, 1]
+    assert observed == [
+        (12001.0, first_ub, 1),
+        (12001.0, first_ub, 1),
+        (14002.0, second_ub, 1),
+        (14002.0, second_ub, 1),
+    ]
+    attestation = json.loads(result.payload.execution_attestation_json)
+    assert attestation["selected_scan_count"] == 2
+    assert attestation["selected_frame_count"] == 4
+    assert attestation["science_chunk_count"] == 4
+    assert attestation["q_release_check_chunk_count"] == 4
+    assert attestation["frame_release_check_frame_count"] == 4
+    assert [item["mask_policy"] for item in attestation["member_masks"]] == [
+        "none",
+        "none",
+    ]
+    assert result.payload.inspection.source_fingerprint == (
+        prepared.module.source.fingerprint
+    )
+    assert result.payload.provenance_json == prepared.provenance_json
+    assert result.payload.intensity.shape == prepared.plan.bins
+    assert not np.any(np.isinf(result.payload.intensity))
+    execution = RSMOperationExecutionV2(prepared)
+    with pytest.raises(TypeError):
+        copy.copy(execution)
+    with pytest.raises(TypeError):
+        copy.deepcopy(execution)
+
+
+def test_member_static_masks_are_independent_and_attested(tmp_path, monkeypatch):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    members = (_write_member(tmp_path, 0), _write_member(tmp_path, 1))
+    form = replace(
+        _form(tmp_path, members),
+        conditioning=RSMImageConditioning(0.0, None, 100.0),
+    )
+    prepared = prepare_rsm_tool_v2(form).request
+    r0, _r1, c0, _c1 = prepared.plan.effective_geometry.roi
+    real_derive = rsm_operation._derive_rsm_v2_static_mask
+    mask_roots = {}
+
+    def capture_mask_roots(*args, **kwargs):
+        full, cropped, receipt = real_derive(*args, **kwargs)
+        member = args[1]
+        mask_roots[member.fingerprint] = (
+            weakref.ref(full),
+            weakref.ref(cropped),
+        )
+        return full, cropped, receipt
+
+    real_lease = rsm_operation._make_rsm_v2_chunk_lease
+
+    def require_only_cropped_mask(*args, **kwargs):
+        member = args[1]
+        full_ref, cropped_ref = mask_roots[member.fingerprint]
+        assert full_ref() is None
+        assert cropped_ref() is kwargs["cropped_static_mask"]
+        lease = real_lease(*args, **kwargs)
+        masked_row = r0 + member.ordinal
+        masked_column = c0 + member.ordinal
+        assert np.isnan(
+            lease._conditioned[:, masked_row, masked_column]
+        ).all()
+        assert np.isfinite(
+            lease._conditioned[:, masked_row, masked_column + 2]
+        ).all()
+        return lease
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_derive_rsm_v2_static_mask",
+        capture_mask_roots,
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "_make_rsm_v2_chunk_lease",
+        require_only_cropped_mask,
+    )
+
+    def member_specific_hot_pixel(self, index):
+        ordinal = int(
+            str(self.name).split(" [", 1)[0].rsplit("_", 1)[-1]
+        )
+        frame = np.full(
+            (195, 487),
+            10 + ordinal + int(index),
+            dtype=np.float64,
+        )
+        frame[r0 + ordinal, c0 + ordinal] = 500
+        return frame
+
+    monkeypatch.setattr(SpecSource, "load_frame", member_specific_hot_pixel)
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    attestation = json.loads(result.payload.execution_attestation_json)
+    masks = attestation["member_masks"]
+    assert [item["mask_policy"] for item in masks] == [
+        "exact-all-selected-frames-static-hot-v1",
+        "exact-all-selected-frames-static-hot-v1",
+    ]
+    assert [item["full_masked_pixel_count"] for item in masks] == [1, 1]
+    assert [item["cropped_masked_pixel_count"] for item in masks] == [1, 1]
+    assert masks[0]["full_raw_digest"] != masks[1]["full_raw_digest"]
+    assert masks[0]["cropped_raw_digest"] != masks[1]["cropped_raw_digest"]
+    assert (
+        masks[0]["mask_receipt_fingerprint"]
+        != masks[1]["mask_receipt_fingerprint"]
+    )
+    assert all(
+        reference() is None
+        for pair in mask_roots.values()
+        for reference in pair
+    )
+
+
+def test_science_release_failure_never_admits_or_writes(tmp_path, monkeypatch):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    member = _write_member(tmp_path, 0)
+    prepared = prepare_rsm_tool_v2(_form(tmp_path, (member,))).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+
+    def release_failure(*_args, **_kwargs):
+        raise rsm_operation.RSMGridChunkReleaseError()
+
+    monkeypatch.setattr(
+        rsm_operation.StreamingGridder,
+        "add_leased",
+        release_failure,
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "admit_module_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("release failure must stop before admission")
+        ),
+    )
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "RSM_CHUNK_RELEASE_FAILED"
+    assert not Path(prepared.module.output.target).exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("frame_count", 2),
+        ("q_root_count", 0),
+        ("release_passed", False),
+    ),
+)
+def test_science_release_receipt_is_revalidated_at_operation_boundary(
+    tmp_path,
+    monkeypatch,
+    field,
+    value,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    real_add = rsm_operation.StreamingGridder.add_leased
+
+    def corrupt_release(*args, **kwargs):
+        receipt = real_add(*args, **kwargs)
+        object.__setattr__(receipt, field, value)
+        return receipt
+
+    monkeypatch.setattr(
+        rsm_operation.StreamingGridder,
+        "add_leased",
+        corrupt_release,
+    )
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "RSM_CHUNK_RELEASE_FAILED"
+    assert not Path(prepared.module.output.target).exists()
+
+
+def test_memory_plan_refuses_before_source_decode(tmp_path, monkeypatch):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    member = _write_member(tmp_path, 0)
+    prepared = prepare_rsm_tool_v2(_form(tmp_path, (member,))).request
+    monkeypatch.setattr(rsm_operation, "_MAX_RSM_RESIDENT_BYTES", 1)
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("memory refusal must precede detector decode")
+        ),
+    )
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "Q_MEMORY_LIMIT_EXCEEDED"
+    assert not Path(prepared.module.output.target).exists()
+
+
+def test_static_mask_science_charge_is_exact_before_decode(tmp_path, monkeypatch):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    member_form = _write_member(tmp_path, 0)
+    form = replace(
+        _form(tmp_path, (member_form,)),
+        conditioning=RSMImageConditioning(0.0, None, 100.0),
+    )
+    prepared = prepare_rsm_tool_v2(form).request
+    member = prepared.preflight.members[0]
+    frame_pixels = int(np.prod(member.detector_shape))
+    raw_bytes = frame_pixels * np.dtype(np.float64).itemsize
+    float_bytes = frame_pixels * np.dtype(np.float64).itemsize
+    old_science = rsm_operation._rsm_v2_chunk_owned_bytes(
+        raw_bytes=raw_bytes,
+        float_bytes=float_bytes,
+        pixel_count=frame_pixels,
+        mask_state_bytes=0,
+        science=True,
+    )
+    fixed_grid = 4 * int(np.prod(prepared.plan.bins)) * np.dtype(np.float64).itemsize
+    cropped_mask_bytes = int(np.prod(member.cropped_shape)) * np.dtype(bool).itemsize
+    monkeypatch.setattr(
+        rsm_operation,
+        "_MAX_RSM_RESIDENT_BYTES",
+        fixed_grid + old_science + cropped_mask_bytes,
+    )
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("static-mask accounting must precede detector decode")
+        ),
+    )
+
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "Q_MEMORY_LIMIT_EXCEEDED"
+    assert not Path(prepared.module.output.target).exists()
+
+
+def test_finalization_public_copies_and_projection_are_charged_before_decode(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    form = replace(
+        _form(tmp_path, (_write_member(tmp_path, 0),)),
+        bins=(100, 100, 100),
+    )
+    prepared = prepare_rsm_tool_v2(form).request
+    voxels = int(np.prod(prepared.plan.bins))
+    old_projection_only_charge = voxels * (
+        5 * np.dtype(np.float64).itemsize
+        + 2 * np.dtype(np.float32).itemsize
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "_MAX_RSM_RESIDENT_BYTES",
+        old_projection_only_charge + 1,
+    )
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("finalization accounting must precede detector decode")
+        ),
+    )
+
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "Q_MEMORY_LIMIT_EXCEEDED"
+    assert not Path(prepared.module.output.target).exists()
+
+
+def test_declared_raw_dtype_fences_cross_chunk_decoder_drift(tmp_path, monkeypatch):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+
+    def drifting_dtype(_self, index):
+        dtype = np.float64 if int(index) == 0 else np.float32
+        return np.full((195, 487), 10 + int(index), dtype=dtype)
+
+    monkeypatch.setattr(SpecSource, "load_frame", drifting_dtype)
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "FRAME_LAYOUT_INVALID"
+    assert not Path(prepared.module.output.target).exists()
+
+
+@pytest.mark.parametrize(
+    ("drift_kind", "expected_code"),
+    (
+        ("source", "SOURCE_REVISION_CHANGED"),
+        ("asset", "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"),
+        ("output-parent", "OUTPUT_IDENTITY_MISMATCH"),
+    ),
+)
+def test_v2_prepublish_drift_refuses_without_committing(
+    tmp_path,
+    monkeypatch,
+    drift_kind,
+    expected_code,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    member = _write_member(tmp_path, 0)
+    prepared = prepare_rsm_tool_v2(_form(tmp_path, (member,))).request
+    output = Path(prepared.module.output.target)
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    real_write = rsm_operation.write_rsm
+    if drift_kind == "source":
+        drift_path = Path(member.spec_path)
+        original = drift_path.stat()
+
+        def drift() -> None:
+            os.utime(
+                drift_path,
+                ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000),
+            )
+
+        def restore() -> None:
+            os.utime(
+                drift_path,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+
+    elif drift_kind == "asset":
+        drift_path = tmp_path / CANONICAL_RSM_GEOMETRY_LOCATOR
+        original = drift_path.stat()
+
+        def drift() -> None:
+            os.utime(
+                drift_path,
+                ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000),
+            )
+
+        def restore() -> None:
+            os.utime(
+                drift_path,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+
+    else:
+        drift_path = output.parent
+        original_mode = stat.S_IMODE(drift_path.stat().st_mode)
+        changed_mode = original_mode ^ stat.S_IXGRP
+
+        def drift() -> None:
+            os.chmod(drift_path, changed_mode)
+
+        def restore() -> None:
+            os.chmod(drift_path, original_mode)
+
+    writes = []
+
+    def write_then_drift(*args, **kwargs):
+        real_write(*args, **kwargs)
+        writes.append(True)
+        drift()
+
+    monkeypatch.setattr(rsm_operation, "write_rsm", write_then_drift)
+    try:
+        result = run_rsm_operation_v2(prepared)
+    finally:
+        restore()
+
+    assert writes == [True]
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == expected_code
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("cancel_after_chunks", (1, 2))
+def test_v2_cancellation_at_science_boundaries_restores_runtime(
+    tmp_path,
+    monkeypatch,
+    cancel_after_chunks,
+):
+    import xrayutilities as xu
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    member = _write_member(tmp_path, 0)
+    prepared = prepare_rsm_tool_v2(_form(tmp_path, (member,))).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    real_add = rsm_operation.StreamingGridder.add_leased
+    calls = []
+
+    def counted_add(*args, **kwargs):
+        result = real_add(*args, **kwargs)
+        calls.append(result.frame_count)
+        return result
+
+    monkeypatch.setattr(
+        rsm_operation.StreamingGridder,
+        "add_leased",
+        counted_add,
+    )
+    monkeypatch.setattr(
+        rsm_operation.StreamingGridder,
+        "to_volume",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cancelled science must not finalize the volume")
+        ),
+    )
+    cancelled = threading.Event()
+
+    def cancel_at_boundary(progress):
+        if (
+            progress.stage == "science"
+            and len(calls) == cancel_after_chunks
+            and not cancelled.is_set()
+        ):
+            cancelled.set()
+
+    before = xu.config.NTHREADS
+    result = run_rsm_operation_v2(
+        prepared,
+        cancel_token=cancelled,
+        progress_callback=cancel_at_boundary,
+    )
+
+    assert result.terminal.disposition is ModuleDisposition.CANCELLED
+    assert result.terminal.code == "CANCELLED"
+    assert calls == [1] * cancel_after_chunks
+    assert xu.config.NTHREADS == before
+    assert not Path(prepared.module.output.target).exists()
+
+
+@pytest.mark.parametrize("cancel_after_mask_frames", (1, 2))
+def test_v2_cancellation_at_static_mask_boundaries_prevents_science(
+    tmp_path,
+    monkeypatch,
+    cancel_after_mask_frames,
+):
+    import xrayutilities as xu
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    form = replace(
+        _form(tmp_path, (_write_member(tmp_path, 0),)),
+        conditioning=RSMImageConditioning(0.0, None, 100.0),
+    )
+    prepared = prepare_rsm_tool_v2(form).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    monkeypatch.setattr(
+        rsm_operation.StreamingGridder,
+        "add_leased",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cancelled static-mask pass must not start science")
+        ),
+    )
+    cancelled = threading.Event()
+    mask_callbacks = []
+
+    def cancel_at_mask_boundary(progress):
+        if progress.stage == "static-mask":
+            mask_callbacks.append(progress.completed)
+            if len(mask_callbacks) == cancel_after_mask_frames:
+                cancelled.set()
+
+    before = xu.config.NTHREADS
+    result = run_rsm_operation_v2(
+        prepared,
+        cancel_token=cancelled,
+        progress_callback=cancel_at_mask_boundary,
+    )
+
+    assert result.terminal.disposition is ModuleDisposition.CANCELLED
+    assert result.terminal.code == "CANCELLED"
+    assert len(mask_callbacks) == cancel_after_mask_frames
+    assert xu.config.NTHREADS == before
+    assert not Path(prepared.module.output.target).exists()
+
+
+def test_v2_cancellation_on_final_source_close_prevents_finalization(
+    tmp_path,
+    monkeypatch,
+):
+    from contextlib import contextmanager
+
+    import xrayutilities as xu
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    cancelled = threading.Event()
+    real_source_lease = rsm_operation.requalified_analysis_source
+
+    @contextmanager
+    def cancel_on_source_close(*args, **kwargs):
+        with real_source_lease(*args, **kwargs) as source:
+            yield source
+        cancelled.set()
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "requalified_analysis_source",
+        cancel_on_source_close,
+    )
+    monkeypatch.setattr(
+        rsm_operation.StreamingGridder,
+        "to_volume",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cancelled source close must not finalize the volume")
+        ),
+    )
+
+    before = xu.config.NTHREADS
+    result = run_rsm_operation_v2(prepared, cancel_token=cancelled)
+
+    assert result.terminal.disposition is ModuleDisposition.CANCELLED
+    assert result.terminal.code == "CANCELLED"
+    assert xu.config.NTHREADS == before
+    assert not Path(prepared.module.output.target).exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "mutated"),
+    (
+        ("EPSILON", 2e-8),
+        ("DIGITS", 7),
+        ("NTHREADS", 9),
+    ),
+)
+def test_v2_refuses_restores_and_never_attests_xu_global_mutation(
+    tmp_path,
+    monkeypatch,
+    name,
+    mutated,
+):
+    import xrayutilities as xu
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    before = (xu.config.EPSILON, xu.config.DIGITS, xu.config.NTHREADS)
+    changed = False
+
+    def mutate_after_science(progress):
+        nonlocal changed
+        if progress.stage == "science" and not changed:
+            setattr(xu.config, name, mutated)
+            changed = True
+
+    result = run_rsm_operation_v2(
+        prepared,
+        progress_callback=mutate_after_science,
+    )
+
+    assert changed is True
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "XU_RUNTIME_CONFIG_MUTATED"
+    assert (xu.config.EPSILON, xu.config.DIGITS, xu.config.NTHREADS) == before
+    assert not Path(prepared.module.output.target).exists()
+
+
+def test_transient_v2_reload_retry_never_replays_science_or_writer(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    member = _write_member(tmp_path, 0)
+    prepared = prepare_rsm_tool_v2(_form(tmp_path, (member,))).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    counts = {"science": 0, "writer": 0, "read": 0}
+    real_add = rsm_operation.StreamingGridder.add_leased
+    real_write = rsm_operation.write_rsm
+    real_read = rsm_operation.read_analysis_artifact
+
+    def counted_add(*args, **kwargs):
+        counts["science"] += 1
+        return real_add(*args, **kwargs)
+
+    def counted_write(*args, **kwargs):
+        counts["writer"] += 1
+        return real_write(*args, **kwargs)
+
+    def transient_read(*args, **kwargs):
+        counts["read"] += 1
+        if counts["read"] == 1:
+            raise OSError("transient detached reload fault")
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(rsm_operation.StreamingGridder, "add_leased", counted_add)
+    monkeypatch.setattr(rsm_operation, "write_rsm", counted_write)
+    monkeypatch.setattr(rsm_operation, "read_analysis_artifact", transient_read)
+    execution = RSMOperationExecutionV2(prepared)
+    with pytest.raises(RSMOperationVerificationErrorV2) as failed:
+        execution.run()
+    assert failed.value.execution is execution
+    recovered = execution.retry_verification()
+    assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
+    assert execution.retry_verification() is recovered
+    assert counts == {"science": 2, "writer": 1, "read": 2}
+
+
+def test_mutated_mask_receipt_reload_failure_retains_exact_execution(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    counts = {"science": 0, "writer": 0, "read": 0}
+    real_add = rsm_operation.StreamingGridder.add_leased
+    real_write = rsm_operation.write_rsm
+    real_read = rsm_operation.read_analysis_artifact
+    execution = RSMOperationExecutionV2(prepared)
+
+    def counted_add(*args, **kwargs):
+        counts["science"] += 1
+        return real_add(*args, **kwargs)
+
+    def counted_write(*args, **kwargs):
+        counts["writer"] += 1
+        return real_write(*args, **kwargs)
+
+    def mutate_after_read(*args, **kwargs):
+        counts["read"] += 1
+        payload = real_read(*args, **kwargs)
+        if counts["read"] == 1:
+            object.__setattr__(
+                execution._mask_receipts[0],
+                "fingerprint",
+                "0" * 64,
+            )
+        return payload
+
+    monkeypatch.setattr(rsm_operation.StreamingGridder, "add_leased", counted_add)
+    monkeypatch.setattr(rsm_operation, "write_rsm", counted_write)
+    monkeypatch.setattr(rsm_operation, "read_analysis_artifact", mutate_after_read)
+
+    with pytest.raises(RSMOperationVerificationErrorV2) as failed:
+        execution.run()
+    assert failed.value.execution is execution
+    assert Path(prepared.module.output.target).is_file()
+    with pytest.raises(RSMOperationVerificationErrorV2) as retried:
+        execution.retry_verification()
+    assert retried.value.execution is execution
+    assert counts == {"science": 2, "writer": 1, "read": 2}
+
+
+def test_v2_cleanup_retry_never_replays_science_or_writer(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    import xrd_tools.io.output_transaction as transaction_api
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    member = _write_member(tmp_path, 0)
+    initial = _form(tmp_path, (member,))
+    target = Path(initial.output_path)
+    target.write_bytes(b"prior operator output")
+    prepared = prepare_rsm_tool_v2(
+        replace(initial, overwrite=AnalysisArtifactOverwrite.REPLACE)
+    ).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    real_unlink = transaction_api._unlink
+    real_add = rsm_operation.StreamingGridder.add_leased
+    real_write = rsm_operation.write_rsm
+    failures = []
+    counts = {"science": 0, "writer": 0}
+
+    def fail_backup_once(path):
+        if ".xdart-replacing-" in Path(path).name and not failures:
+            failures.append("backup")
+            raise OSError("backup cleanup fault")
+        return real_unlink(path)
+
+    def counted_add(*args, **kwargs):
+        counts["science"] += 1
+        return real_add(*args, **kwargs)
+
+    def counted_write(*args, **kwargs):
+        counts["writer"] += 1
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(transaction_api, "_unlink", fail_backup_once)
+    monkeypatch.setattr(rsm_operation.StreamingGridder, "add_leased", counted_add)
+    monkeypatch.setattr(rsm_operation, "write_rsm", counted_write)
+    with pytest.raises(RSMOperationCleanupPendingV2) as pending:
+        run_rsm_operation_v2(prepared)
+    recovered = pending.value.retry_cleanup()
+    assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
+    assert recovered.payload is not None
+    assert pending.value.execution.retry_cleanup() is recovered
+    assert failures == ["backup"]
+    assert counts == {"science": 2, "writer": 1}

@@ -129,6 +129,65 @@ def _execution_attestation(
     }
 
 
+def _rsm_execution_attestation(
+    request_fingerprint: str,
+    result_fingerprint: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": "rsm-execution-attestation-v1",
+        "module_request_fingerprint": request_fingerprint,
+        "result_projection_policy": "analysis_artifact_stored_le_f4_v1",
+        "result_fingerprint": result_fingerprint,
+        "geometry_asset_receipt_fingerprint": _digest("rsm-asset"),
+        "effective_geometry_fingerprint": _digest("rsm-effective"),
+        "common_grid_fingerprint": _digest("rsm-grid"),
+        "selected_scan_count": 2,
+        "selected_frame_count": 7,
+        "science_chunk_count": 3,
+        "q_release_check_chunk_count": 3,
+        "frame_release_check_frame_count": 7,
+        "release_check_passed": True,
+        "member_masks": [
+            {
+                "ordinal": 0,
+                "member_preflight_fingerprint": _digest("rsm-member-0"),
+                "mask_policy": "none",
+                "full_shape": [4, 5],
+                "full_raw_digest": None,
+                "full_masked_pixel_count": 0,
+                "cropped_shape": [3, 4],
+                "cropped_raw_digest": None,
+                "cropped_masked_pixel_count": 0,
+                "mask_receipt_fingerprint": _digest("rsm-mask-0"),
+            },
+            {
+                "ordinal": 1,
+                "member_preflight_fingerprint": _digest("rsm-member-1"),
+                "mask_policy": "exact-all-selected-frames-static-hot-v1",
+                "full_shape": [4, 5],
+                "full_raw_digest": _digest("rsm-full-mask-1"),
+                "full_masked_pixel_count": 3,
+                "cropped_shape": [3, 4],
+                "cropped_raw_digest": _digest("rsm-cropped-mask-1"),
+                "cropped_masked_pixel_count": 2,
+                "mask_receipt_fingerprint": _digest("rsm-mask-1"),
+            },
+        ],
+        "xu_runtime": {
+            "lock_policy": "shared_xrd_tools_xu_rlock_v1",
+            "xrayutilities_distribution_version": "1.7.12",
+            "xrayutilities_module_version": "1.7.12",
+            "numpy_version": "2.5.1",
+            "config_epsilon": 1e-8,
+            "config_digits": 8,
+            "nthreads_before": 0,
+            "nthreads_effective": 1,
+            "nthreads_restored": 0,
+            "restore_passed": True,
+        },
+    }
+
+
 def _writer(request: AnalysisArtifactRequest):
     q = np.linspace(0.1, 2.0, 7)
     if request.kind is AnalysisArtifactKind.STITCH_1D:
@@ -618,6 +677,125 @@ def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
         assert (
             bytes(entry.attrs["execution_attestation_digest"]).decode()
             == attestation_digest
+        )
+
+
+def test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch(
+    tmp_path,
+):
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM,
+        axes=(
+            ("h", np.linspace(-1.0, 1.0, 3)),
+            ("k", np.linspace(-2.0, 2.0, 4)),
+            ("l", np.linspace(0.0, 3.0, 5)),
+        ),
+        axis_units=(("h", None), ("k", None), ("l", None)),
+        intensity=np.arange(60, dtype=np.float64).reshape(3, 4, 5),
+        sigma=None,
+        coverage=None,
+        normalization=None,
+    )
+    request_fingerprint = _digest("rsm-v2-request")
+    attestation = _rsm_execution_attestation(
+        request_fingerprint,
+        projection.result_fingerprint,
+    )
+    attestation_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        attestation,
+        request_fingerprint=request_fingerprint,
+    )
+    request = AnalysisArtifactRequest(
+        tmp_path / "rsm-artifact-v2.nexus",
+        AnalysisArtifactKind.RSM,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        request_fingerprint,
+        _digest("rsm-v2-source-group"),
+        _digest("rsm-v2-plan"),
+        _digest("rsm-v2-provenance"),
+        {"schema_version": "rsm-operation-v2-intent"},
+        schema_version=ANALYSIS_SCHEMA_VERSION_V2,
+        execution_attestation_digest=attestation_digest,
+        execution_attestation=attestation,
+    )
+    receipt = admit_analysis_artifact(
+        request,
+        coordinator=OutputTransactionCoordinator(),
+    ).publish(
+        lambda entry: write_rsm(
+            entry,
+            result_projection=projection,
+            provenance=request.provenance_json,
+            bounded_artifact=True,
+        )
+    )
+    payload = read_analysis_artifact(request.target, expected_receipt=receipt)
+    assert payload.kind is AnalysisArtifactKind.RSM
+    assert payload.schema_version == ANALYSIS_SCHEMA_VERSION_V2
+    assert payload.execution_attestation_digest == attestation_digest
+    assert payload.execution_attestation_json == request.execution_attestation_json
+    assert payload.result_fingerprint == projection.result_fingerprint
+    assert payload.inspection.axis_units == (
+        ("h", None),
+        ("k", None),
+        ("l", None),
+    )
+    assert payload.sigma is None
+    assert payload.coverage is None
+    assert payload.normalization is None
+    with h5py.File(request.target, "r") as handle:
+        entry = handle["entry"]
+        result = entry["rsm"]
+        assert set(entry) == {
+            "provenance_json",
+            "execution_attestation_json",
+            "rsm",
+        }
+        assert set(result) == {"h", "k", "l", "intensity", "provenance_json"}
+        assert all(len(result[name].attrs) == 0 for name in ("h", "k", "l"))
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "extra-key",
+        "bool-count",
+        "release-count",
+        "q-count",
+        "mask-order",
+        "none-digest",
+        "static-digest",
+        "cropped-shape",
+    ),
+)
+def test_rsm_execution_attestation_refuses_intrinsic_forgery(tamper):
+    request_fingerprint = _digest(f"rsm-attestation-{tamper}")
+    value = _rsm_execution_attestation(
+        request_fingerprint,
+        _digest("rsm-attested-result"),
+    )
+    if tamper == "extra-key":
+        value["foreign"] = True
+    elif tamper == "bool-count":
+        value["selected_scan_count"] = True
+    elif tamper == "release-count":
+        value["frame_release_check_frame_count"] = 6
+    elif tamper == "q-count":
+        value["q_release_check_chunk_count"] = 2
+    elif tamper == "mask-order":
+        value["member_masks"].reverse()
+    elif tamper == "none-digest":
+        value["member_masks"][0]["full_raw_digest"] = _digest("forged-none")
+    elif tamper == "static-digest":
+        value["member_masks"][1]["cropped_raw_digest"] = None
+    else:
+        value["member_masks"][1]["cropped_shape"] = [5, 4]
+    with pytest.raises(ValueError, match="attestation contract"):
+        analysis_execution_attestation_digest(
+            AnalysisArtifactKind.RSM,
+            value,
+            request_fingerprint=request_fingerprint,
         )
 
 

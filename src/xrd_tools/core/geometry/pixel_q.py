@@ -252,6 +252,7 @@ class PixelQMap:
         UB: np.ndarray | None = None,
         roi: tuple[int, int, int, int] | None = None,
         image_shape: tuple[int, ...] | None = None,
+        runtime_session: object | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute per-pixel ``(qx, qy, qz)`` arrays for a frame stack.
 
@@ -274,6 +275,9 @@ class PixelQMap:
             shape (``shape[-2:]``).  Applied *after* ``roi``.  Useful
             when feeding a stack whose dimensions might not match the
             configured header (e.g. detector binning).
+        runtime_session : XuRuntimeSession, optional
+            Exact already-active shared XU owner.  When omitted, this call
+            creates and restores its own one-shot owner as before.
 
         Returns
         -------
@@ -295,14 +299,20 @@ class PixelQMap:
                 f"DetectorHeader.Nch1/Nch2 explicitly."
             )
 
-        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+        from xrd_tools.core.geometry.xu_runtime import (
+            XuRuntimeSession,
+            require_active_xu_runtime_session,
+            xu_runtime_session,
+        )
 
         # make_hxrd, area initialization, mapping, and shape admission are one
         # indivisible use of xrayutilities global configuration.  Stitch and
         # every PixelQMap/RSM caller therefore share the exact same RLock and
         # NTHREADS=1/restore lifecycle.
-        with xu_runtime_session():
+        def map_active(active_session):
+            require_active_xu_runtime_session(active_session)
             hxrd = self.diff_config.make_hxrd(energy)
+            require_active_xu_runtime_session(active_session)
             hxrd.Ang2Q.init_area(
                 self.diff_config.init_area_detrot,
                 self.diff_config.init_area_tiltazimuth,
@@ -314,11 +324,13 @@ class PixelQMap:
                 Nch1=int(header.Nch1),
                 Nch2=int(header.Nch2),
             )
+            require_active_xu_runtime_session(active_session)
             qx, qy, qz = hxrd.Ang2Q.area(
                 *angles,
                 UB=UB,
                 **self.diff_config.ang2q_kwargs,
             )
+            require_active_xu_runtime_session(active_session)
             if not angles:
                 raise ValueError(
                     "pixel_q requires at least one per-frame angle array"
@@ -340,6 +352,13 @@ class PixelQMap:
                     )
                 values.append(array)
             return values[0], values[1], values[2]
+
+        if runtime_session is None:
+            with xu_runtime_session() as active_session:
+                return map_active(active_session)
+        if type(runtime_session) is not XuRuntimeSession:
+            raise TypeError("pixel_q runtime session must be exact")
+        return map_active(runtime_session)
 
 
 __all__ = [

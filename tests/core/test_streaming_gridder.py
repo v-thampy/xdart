@@ -13,9 +13,12 @@ Covers:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass, field, replace
+import pickle
 from threading import Thread
 from typing import Any
+import weakref
 
 import numpy as np
 import pytest
@@ -29,6 +32,8 @@ from xrd_tools.core.geometry import (
 # in pipeline → io.spec → silx (silx is not in the test sandbox).
 from xrd_tools.rsm import gridding as gridding_module
 from xrd_tools.rsm.gridding import (
+    RSMGridChunkLease,
+    RSMGridChunkReleaseError,
     StreamingGridder,
     StreamingScan,
     _corner_pixel_q,
@@ -269,6 +274,443 @@ def test_streaming_gridder_explicit_runtime_owns_every_xu_access(monkeypatch):
             runtime_session=runtime,
         )
     assert raised.value.code == "XU_RUNTIME_SESSION_INACTIVE"
+
+
+def _lease_with_root_refs(
+    *,
+    retain_raw: bool = False,
+    retain_conditioned: bool = False,
+):
+    if retain_raw and retain_conditioned:
+        raise ValueError("retain only one caller root per proof")
+    raw_root = np.arange(40, dtype=np.uint16).reshape(2, 4, 5)
+    conditioned_root = np.arange(40, dtype=np.float64).reshape(2, 4, 5)
+    raw = raw_root.view()
+    conditioned = conditioned_root.view()
+    raw_ref = weakref.ref(raw_root)
+    conditioned_ref = weakref.ref(conditioned_root)
+    retained = (
+        raw_root
+        if retain_raw
+        else conditioned_root
+        if retain_conditioned
+        else None
+    )
+    lease = RSMGridChunkLease.from_arrays(raw, conditioned, 2)
+    raw = conditioned = raw_root = conditioned_root = None
+    return lease, raw_ref, conditioned_ref, retained
+
+
+def _install_shared_q_backend(monkeypatch, q_refs, retained_q=None):
+    class SharedAng2Q(_FakeAng2Q):
+        def area(self, *args, **kwargs):
+            count = len(np.atleast_1d(args[0]))
+            rows = self.init_kwargs["Nch1"]
+            columns = self.init_kwargs["Nch2"]
+            root = np.empty((count, rows, columns, 3), dtype=np.float64)
+            root[..., 0] = 0.25
+            root[..., 1] = 0.50
+            root[..., 2] = 0.75
+            q_refs.append(weakref.ref(root))
+            if retained_q is not None:
+                retained_q.append(root)
+            return root[..., 0], root[..., 1], root[..., 2]
+
+    class SharedHxrd:
+        Ang2Q = SharedAng2Q()
+
+    monkeypatch.setattr(
+        DiffractometerConfig,
+        "make_hxrd",
+        lambda self, energy: SharedHxrd(),
+    )
+
+
+def _retaining_gridder_type(channel, retained, *, fail=False):
+    created = []
+
+    class RetainingGridder(_FakeGridder3D):
+        def __init__(self, *args):
+            self.channel = len(created)
+            created.append(self)
+            super().__init__(*args)
+
+        def __call__(self, qx, qy, qz, data):
+            if self.channel == channel:
+                retained.append(data)
+            super().__call__(qx, qy, qz, data)
+            if fail and self.channel == channel:
+                raise RuntimeError("private retained backend failure")
+
+    return RetainingGridder
+
+
+def _exercise_leased_release_failure(
+    monkeypatch,
+    *,
+    lease,
+    gridder_type=_FakeGridder3D,
+    retained_q=None,
+):
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+    q_refs = []
+    _install_shared_q_backend(monkeypatch, q_refs, retained_q)
+    runtime = xu_runtime_session()
+    with runtime:
+        monkeypatch.setattr(runtime.xu, "Gridder3D", gridder_type)
+        gridder = StreamingGridder(
+            _default_mapper(4, 5),
+            (3, 3, 3),
+            runtime_session=runtime,
+        )
+        gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(RSMGridChunkReleaseError) as refused:
+            gridder.add_leased(
+                lease,
+                tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+                12_000.0,
+                UB=np.eye(3, dtype=np.float64),
+            )
+        assert refused.value.code == "RSM_CHUNK_RELEASE_FAILED"
+        assert lease.consumed is True
+        assert gridder.n_frames_processed == 0
+        with pytest.raises(RSMGridChunkReleaseError):
+            gridder.to_volume()
+        second, *_rest = _lease_with_root_refs()
+        with pytest.raises(RSMGridChunkReleaseError):
+            gridder.add_leased(
+                second,
+                tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+                12_000.0,
+                UB=np.eye(3, dtype=np.float64),
+            )
+        assert second.consumed is False
+    return q_refs
+
+
+def test_rsm_chunk_lease_public_release_seam_and_factory_guards(monkeypatch):
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+    with pytest.raises(TypeError):
+        RSMGridChunkLease(
+            np.zeros((1, 4, 5), dtype=np.uint16),
+            np.zeros((1, 4, 5), dtype=np.float64),
+            1,
+        )
+    lease, raw_ref, conditioned_ref, retained = _lease_with_root_refs()
+    assert retained is None
+    for operation in (copy.copy, copy.deepcopy, pickle.dumps, replace):
+        with pytest.raises(TypeError):
+            operation(lease)
+    if hasattr(copy, "replace"):
+        with pytest.raises(TypeError):
+            copy.replace(lease)
+    for name, value in (
+        ("_raw", np.zeros((2, 4, 5), dtype=np.uint16)),
+        ("_conditioned", np.zeros((2, 4, 5), dtype=np.float64)),
+        ("frame_count", 1),
+        ("_consumed", True),
+    ):
+        with pytest.raises(TypeError, match="immutable"):
+            setattr(lease, name, value)
+
+    q_refs = []
+    _install_shared_q_backend(monkeypatch, q_refs)
+    runtime = xu_runtime_session()
+    with runtime:
+        monkeypatch.setattr(runtime.xu, "Gridder3D", _FakeGridder3D)
+        gridder = StreamingGridder(
+            _default_mapper(4, 5),
+            (3, 3, 3),
+            runtime_session=runtime,
+        )
+        gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        receipt = gridder.add_leased(
+            lease,
+            tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+            12_000.0,
+            UB=np.eye(3, dtype=np.float64),
+        )
+        assert receipt.frame_count == 2
+        assert receipt.q_root_count == 1
+        assert receipt.release_passed is True
+        assert gridder.n_frames_processed == 2
+        assert gridder.to_volume().shape == (3, 3, 3)
+
+    assert raw_ref() is None
+    assert conditioned_ref() is None
+    assert len(q_refs) == 1 and q_refs[0]() is None
+    for operation in (copy.copy, copy.deepcopy, pickle.dumps, replace):
+        with pytest.raises(TypeError):
+            operation(receipt)
+    if hasattr(copy, "replace"):
+        with pytest.raises(TypeError):
+            copy.replace(receipt)
+    with pytest.raises((TypeError, RuntimeError)):
+        gridder.add_leased(
+            lease,
+            tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+            12_000.0,
+            UB=np.eye(3, dtype=np.float64),
+        )
+
+
+def test_rsm_chunk_root_drift_is_refused_before_consumption(monkeypatch):
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+    lease, _raw_ref, _conditioned_ref, retained = _lease_with_root_refs()
+    assert retained is None
+    replacement_raw = np.ones((2, 4, 5), dtype=np.uint16)
+    replacement_conditioned = np.ones((2, 4, 5), dtype=np.float64)
+    object.__setattr__(lease, "_raw", replacement_raw)
+    object.__setattr__(lease, "_conditioned", replacement_conditioned)
+    q_refs = []
+    _install_shared_q_backend(monkeypatch, q_refs)
+    runtime = xu_runtime_session()
+    with runtime:
+        monkeypatch.setattr(runtime.xu, "Gridder3D", _FakeGridder3D)
+        gridder = StreamingGridder(
+            _default_mapper(4, 5),
+            (3, 3, 3),
+            runtime_session=runtime,
+        )
+        gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(TypeError, match="roots changed"):
+            gridder.add_leased(
+                lease,
+                tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+                12_000.0,
+                UB=np.eye(3, dtype=np.float64),
+            )
+        assert lease.consumed is False
+        assert gridder.n_frames_processed == 0
+        assert q_refs == []
+        gridder.add(
+            np.ones((1, 4, 5), dtype=np.float64),
+            [np.zeros(1, dtype=np.float64)],
+            12_000.0,
+        )
+        assert gridder.n_frames_processed == 1
+    assert len(q_refs) == 1 and q_refs[0]() is None
+
+
+def test_rsm_chunk_conditioned_root_retention_poisons_grid(monkeypatch):
+    lease, raw_ref, conditioned_ref, retained_conditioned = (
+        _lease_with_root_refs(retain_conditioned=True)
+    )
+    q_refs = _exercise_leased_release_failure(
+        monkeypatch,
+        lease=lease,
+    )
+    assert raw_ref() is None
+    assert conditioned_ref() is retained_conditioned
+    assert len(q_refs) == 1 and q_refs[0]() is None
+    retained_conditioned = None
+
+
+def test_rsm_chunk_q_root_retention_poisons_grid(monkeypatch):
+    lease, raw_ref, conditioned_ref, retained = _lease_with_root_refs()
+    assert retained is None
+    retained_q = []
+    q_refs = _exercise_leased_release_failure(
+        monkeypatch,
+        lease=lease,
+        retained_q=retained_q,
+    )
+    assert raw_ref() is None
+    assert conditioned_ref() is None
+    assert len(retained_q) == 1
+    assert len(q_refs) == 1 and q_refs[0]() is retained_q[0]
+    retained_q.clear()
+
+
+@pytest.mark.parametrize("channel", [0, 1], ids=["raw-payload", "norm-payload"])
+def test_rsm_chunk_feed_payload_retention_poisons_grid(monkeypatch, channel):
+    lease, raw_ref, conditioned_ref, retained = _lease_with_root_refs()
+    assert retained is None
+    retained_payload = []
+    gridder_type = _retaining_gridder_type(channel, retained_payload)
+    q_refs = _exercise_leased_release_failure(
+        monkeypatch,
+        lease=lease,
+        gridder_type=gridder_type,
+    )
+    assert raw_ref() is None
+    assert conditioned_ref() is None
+    assert len(q_refs) == 1 and q_refs[0]() is None
+    assert len(retained_payload) == 1
+    retained_payload.clear()
+
+
+def test_rsm_chunk_release_failure_precedes_private_backend_error(monkeypatch):
+    lease, raw_ref, conditioned_ref, retained = _lease_with_root_refs()
+    assert retained is None
+    retained_payload = []
+    gridder_type = _retaining_gridder_type(
+        0,
+        retained_payload,
+        fail=True,
+    )
+    q_refs = _exercise_leased_release_failure(
+        monkeypatch,
+        lease=lease,
+        gridder_type=gridder_type,
+    )
+    assert raw_ref() is None
+    assert conditioned_ref() is None
+    assert len(q_refs) == 1 and q_refs[0]() is None
+    assert len(retained_payload) == 1
+    retained_payload.clear()
+
+
+def test_rsm_chunk_release_failure_poisons_partial_grid(monkeypatch):
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+    lease, raw_ref, conditioned_ref, retained_raw = _lease_with_root_refs(
+        retain_raw=True
+    )
+    q_refs = []
+    _install_shared_q_backend(monkeypatch, q_refs)
+    runtime = xu_runtime_session()
+    with runtime:
+        monkeypatch.setattr(runtime.xu, "Gridder3D", _FakeGridder3D)
+        gridder = StreamingGridder(
+            _default_mapper(4, 5),
+            (3, 3, 3),
+            runtime_session=runtime,
+        )
+        gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(RSMGridChunkReleaseError) as refused:
+            gridder.add_leased(
+                lease,
+                tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+                12_000.0,
+                UB=np.eye(3, dtype=np.float64),
+            )
+        assert refused.value.code == "RSM_CHUNK_RELEASE_FAILED"
+        assert gridder.n_frames_processed == 0
+        with pytest.raises(RSMGridChunkReleaseError):
+            gridder.to_volume()
+        with pytest.raises(RSMGridChunkReleaseError):
+            gridder.add(
+                np.ones((1, 4, 5), dtype=np.float64),
+                [np.zeros(1)],
+                12_000.0,
+            )
+    assert raw_ref() is retained_raw
+    assert conditioned_ref() is None
+    assert len(q_refs) == 1 and q_refs[0]() is None
+    retained_raw = None
+
+
+def test_rsm_chunk_backend_failure_without_retention_still_poisons(monkeypatch):
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+    created = []
+
+    class FailingGridder(_FakeGridder3D):
+        def __init__(self, *args):
+            self.channel = len(created)
+            created.append(self)
+            super().__init__(*args)
+
+        def __call__(self, qx, qy, qz, data):
+            super().__call__(qx, qy, qz, data)
+            if self.channel == 0:
+                raise RuntimeError("backend failure without retention")
+
+    lease, raw_ref, conditioned_ref, retained = _lease_with_root_refs()
+    assert retained is None
+    q_refs = []
+    _install_shared_q_backend(monkeypatch, q_refs)
+    runtime = xu_runtime_session()
+    with runtime:
+        monkeypatch.setattr(runtime.xu, "Gridder3D", FailingGridder)
+        gridder = StreamingGridder(
+            _default_mapper(4, 5),
+            (3, 3, 3),
+            runtime_session=runtime,
+        )
+        gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(RuntimeError, match="without retention"):
+            gridder.add_leased(
+                lease,
+                tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+                12_000.0,
+                UB=np.eye(3, dtype=np.float64),
+            )
+        assert lease.consumed is True
+        assert gridder.n_frames_processed == 0
+        second, *_rest = _lease_with_root_refs()
+        with pytest.raises(RSMGridChunkReleaseError):
+            gridder.add_leased(
+                second,
+                tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+                12_000.0,
+                UB=np.eye(3, dtype=np.float64),
+            )
+        assert second.consumed is False
+        with pytest.raises(RSMGridChunkReleaseError):
+            gridder.to_volume()
+    assert raw_ref() is None
+    assert conditioned_ref() is None
+    assert len(q_refs) == 1 and q_refs[0]() is None
+
+
+def test_rsm_chunk_collection_failure_is_stable_and_scout_fails_fast(
+    monkeypatch,
+):
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+    lease, raw_ref, conditioned_ref, retained = _lease_with_root_refs()
+    assert retained is None
+    q_refs = []
+    _install_shared_q_backend(monkeypatch, q_refs)
+    runtime = xu_runtime_session()
+    with runtime:
+        monkeypatch.setattr(runtime.xu, "Gridder3D", _FakeGridder3D)
+        gridder = StreamingGridder(
+            _default_mapper(4, 5),
+            (3, 3, 3),
+            runtime_session=runtime,
+        )
+        gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        monkeypatch.setattr(
+            gridding_module,
+            "_bounded_release_collect",
+            lambda: (_ for _ in ()).throw(RuntimeError("collector failed")),
+        )
+        with pytest.raises(RSMGridChunkReleaseError) as refused:
+            gridder.add_leased(
+                lease,
+                tuple(np.zeros(2, dtype=np.float64) for _ in range(6)),
+                12_000.0,
+                UB=np.eye(3, dtype=np.float64),
+            )
+        assert refused.value.code == "RSM_CHUNK_RELEASE_FAILED"
+        assert gridder.n_frames_processed == 0
+        monkeypatch.setattr(
+            gridding_module,
+            "_corner_pixel_q",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("poisoned scout must not map q")
+            ),
+        )
+        with pytest.raises(RSMGridChunkReleaseError):
+            gridder.scout(
+                [
+                    (
+                        [np.zeros(1, dtype=np.float64)],
+                        12_000.0,
+                        np.eye(3, dtype=np.float64),
+                        (1, 4, 5),
+                    )
+                ]
+            )
+    assert raw_ref() is None
+    assert conditioned_ref() is None
+    assert len(q_refs) == 1 and q_refs[0]() is None
 
 
 # ---------------------------------------------------------------------------

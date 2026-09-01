@@ -388,10 +388,20 @@ class ModuleOperationRequest:
     provenance_digest: str
     fingerprint: str = field(init=False)
     _xu_stitch_claim: InitVar[object] = None
+    _rsm_v2_owner: InitVar[object] = None
     _xu_stitch_v2_bound: bool = field(init=False, default=False, repr=False)
     _rsm_v2_bound: bool = field(init=False, default=False, repr=False)
+    _rsm_v2_intent_owner: object = field(
+        init=False,
+        default=None,
+        repr=False,
+    )
 
-    def __post_init__(self, _xu_stitch_claim: object) -> None:
+    def __post_init__(
+        self,
+        _xu_stitch_claim: object,
+        _rsm_v2_owner: object,
+    ) -> None:
         single_source = type(self.source) is ModuleSourceReceipt
         group_source = type(self.source) is ModuleSourceGroupReceipt
         xu_bound = _xu_stitch_claim is _XU_STITCH_REQUEST_FACTORY
@@ -429,6 +439,16 @@ class ModuleOperationRequest:
             or self.output.kind is not AnalysisArtifactKind.RSM
         ):
             raise TypeError("RSM v2 request requires exact RSM artifact intent")
+        if rsm_v2_bound:
+            if type(_rsm_v2_owner) is not tuple or len(_rsm_v2_owner) != 3:
+                raise TypeError("RSM v2 request requires factory-owned intent")
+            object.__setattr__(
+                self,
+                "_rsm_v2_intent_owner",
+                _rsm_v2_owner,
+            )
+        elif _rsm_v2_owner is not None:
+            raise TypeError("only an RSM v2 request may carry grouped intent")
         object.__setattr__(self, "_xu_stitch_v2_bound", xu_bound)
         object.__setattr__(self, "_rsm_v2_bound", rsm_v2_bound)
         object.__setattr__(
@@ -509,8 +529,38 @@ def _rsm_v2_module_request(
     output: ModuleOutputRequest,
     plan_fingerprint: str,
     provenance_digest: str,
+    *,
+    plan_owner: object = None,
+    preflight_owner: object = None,
+    output_authority_owner: object = None,
 ) -> ModuleOperationRequest:
     """Construct the one private request branch authorized for RSM v2."""
+
+    if type(source) is not ModuleSourceGroupReceipt:
+        raise TypeError("RSM v2 request requires an exact source group")
+    if type(output) is not ModuleOutputRequest:
+        raise TypeError("RSM v2 request requires an exact output")
+    if output.kind is not AnalysisArtifactKind.RSM:
+        raise ValueError("module source and artifact kinds do not match")
+    from xrd_tools.analysis.rsm_operation import (
+        RSMGroupPreflightReceiptV2,
+        RSMOperationPlanV2,
+        RSMOutputAuthorityReceipt,
+    )
+
+    if (
+        type(plan_owner) is not RSMOperationPlanV2
+        or type(preflight_owner) is not RSMGroupPreflightReceiptV2
+        or type(output_authority_owner) is not RSMOutputAuthorityReceipt
+        or preflight_owner.group_source_fingerprint != source.fingerprint
+        or preflight_owner.plan_fingerprint != plan_fingerprint
+        or plan_owner.fingerprint != plan_fingerprint
+        or preflight_owner.effective_geometry is not plan_owner.effective_geometry
+        or preflight_owner.common_grid is not plan_owner.common_grid
+        or preflight_owner.ordered_geometry_bindings
+        != plan_owner.ordered_geometry_bindings
+    ):
+        raise TypeError("RSM v2 request requires factory-owned intent")
 
     return ModuleOperationRequest(
         source,
@@ -518,6 +568,7 @@ def _rsm_v2_module_request(
         plan_fingerprint,
         provenance_digest,
         _RSM_V2_REQUEST_FACTORY,
+        (plan_owner, preflight_owner, output_authority_owner),
     )
 
 
@@ -629,6 +680,55 @@ def _validate_xu_stitch_v2_intent(
         raise ModuleArtifactRefused("XU_INTENT_PROVENANCE_MISMATCH")
 
 
+def _validate_rsm_v2_intent(
+    request: ModuleOperationRequest,
+    provenance: Mapping[str, object],
+) -> None:
+    from xrd_tools.analysis.rsm_operation import (
+        RSMGroupPreflightReceiptV2,
+        RSMOperationPlanV2,
+        RSMOutputAuthorityReceipt,
+        _rsm_v2_provenance,
+    )
+
+    owner = request._rsm_v2_intent_owner
+    if type(owner) is not tuple or len(owner) != 3:
+        raise ModuleArtifactRefused("RSM_INTENT_PROVENANCE_MISMATCH")
+    plan_owner, preflight_owner, output_authority_owner = owner
+    if (
+        request._rsm_v2_bound is not True
+        or type(request.source) is not ModuleSourceGroupReceipt
+        or type(plan_owner) is not RSMOperationPlanV2
+        or type(preflight_owner) is not RSMGroupPreflightReceiptV2
+        or type(output_authority_owner) is not RSMOutputAuthorityReceipt
+        or plan_owner.fingerprint != request.plan_fingerprint
+        or preflight_owner.plan_fingerprint != request.plan_fingerprint
+        or preflight_owner.group_source_fingerprint
+        != request.source.fingerprint
+        or preflight_owner.effective_geometry is not plan_owner.effective_geometry
+        or preflight_owner.common_grid is not plan_owner.common_grid
+        or preflight_owner.ordered_geometry_bindings
+        != plan_owner.ordered_geometry_bindings
+    ):
+        raise ModuleArtifactRefused("RSM_INTENT_PROVENANCE_MISMATCH")
+    expected = _rsm_v2_provenance(
+        request.source,
+        request.output,
+        output_authority_owner,
+        preflight_owner.geometry_asset_receipt,
+        preflight_owner.effective_geometry,
+        plan_owner,
+        preflight_owner,
+    )
+    if (
+        type(provenance) is not dict
+        or provenance != expected
+        or module_provenance_digest(ModuleKind.RSM, expected)
+        != request.provenance_digest
+    ):
+        raise ModuleArtifactRefused("RSM_INTENT_PROVENANCE_MISMATCH")
+
+
 @dataclass(frozen=True, slots=True)
 class ModuleProgress:
     request: ModuleOperationRequest
@@ -721,6 +821,8 @@ class ModuleCommitReceipt:
         cls,
         request: ModuleOperationRequest,
         artifact: AnalysisArtifactReceipt,
+        *,
+        rsm_mask_receipts: tuple[object, ...] | None = None,
     ) -> "ModuleCommitReceipt":
         if (
             type(request) is not ModuleOperationRequest
@@ -742,6 +844,7 @@ class ModuleCommitReceipt:
                 execution_attestation_digest=(
                     artifact.request.execution_attestation_digest
                 ),
+                rsm_mask_receipts=rsm_mask_receipts,
             )
         except (ModuleArtifactRefused, TypeError, ValueError) as error:
             raise TypeError(
@@ -895,17 +998,23 @@ def module_artifact_request(
     *,
     execution_attestation: Mapping[str, object] | None = None,
     execution_attestation_digest: str | None = None,
+    rsm_mask_receipts: tuple[object, ...] | None = None,
 ) -> AnalysisArtifactRequest:
     if type(request) is not ModuleOperationRequest:
         raise TypeError("artifact binding requires exact ModuleOperationRequest")
-    if request._rsm_v2_bound:
-        raise ModuleArtifactRefused("RSM_V2_ARTIFACT_NOT_IMPLEMENTED")
     if type(provenance) is not dict:
         raise TypeError("module provenance must be an exact dictionary")
+    if not request._rsm_v2_bound and rsm_mask_receipts is not None:
+        raise TypeError("only an RSM v2 request may carry mask receipts")
     carries_attestation = (
         execution_attestation is not None
         or execution_attestation_digest is not None
     )
+    if request._rsm_v2_bound and (
+        execution_attestation is None
+        or type(execution_attestation_digest) is not str
+    ):
+        raise ModuleArtifactRefused("RSM_EXECUTION_ATTESTATION_MISMATCH")
     if carries_attestation and (
         execution_attestation is None
         or type(execution_attestation_digest) is not str
@@ -914,25 +1023,129 @@ def module_artifact_request(
             "module execution attestation and digest must be supplied together"
         )
     if carries_attestation:
-        _validate_xu_stitch_v2_intent(request, provenance)
-        observed = analysis_execution_attestation_digest(
-            request.output.kind,
-            execution_attestation,
-            request_fingerprint=request.fingerprint,
-        )
-        if observed != execution_attestation_digest:
-            raise ModuleArtifactRefused("EXECUTION_ATTESTATION_MISMATCH")
-        selected_count = execution_attestation.get("selected_frame_count")
-        release_count = execution_attestation.get("release_check_frame_count")
-        expected_count = len(request.source.selected_labels)
-        if selected_count != expected_count or release_count != expected_count:
-            raise ModuleArtifactRefused("EXECUTION_ATTESTATION_COUNT_MISMATCH")
+        if request._rsm_v2_bound:
+            _validate_rsm_v2_intent(request, provenance)
+            if type(rsm_mask_receipts) is not tuple:
+                raise ModuleArtifactRefused(
+                    "RSM_EXECUTION_ATTESTATION_MISMATCH"
+                )
+            try:
+                from xrd_tools.analysis.rsm_operation import (
+                    _rsm_v2_static_mask_attestation,
+                )
+
+                if type(execution_attestation) is not dict:
+                    raise TypeError("RSM execution attestation must be exact")
+                observed = analysis_execution_attestation_digest(
+                    request.output.kind,
+                    execution_attestation,
+                    request_fingerprint=request.fingerprint,
+                )
+            except (TypeError, ValueError):
+                raise ModuleArtifactRefused(
+                    "RSM_EXECUTION_ATTESTATION_MISMATCH"
+                ) from None
+            if observed != execution_attestation_digest:
+                raise ModuleArtifactRefused(
+                    "RSM_EXECUTION_ATTESTATION_MISMATCH"
+                )
+            members = provenance["members"]
+            masks = execution_attestation["member_masks"]
+            plan_owner = request._rsm_v2_intent_owner[0]
+            expected_conditioning_fingerprint = analysis_canonical_fingerprint(
+                "rsm-conditioning-v2",
+                plan_owner.conditioning._canonical_value(),
+            )
+            try:
+                expected_masks = [
+                    _rsm_v2_static_mask_attestation(
+                        receipt,
+                        ordinal,
+                        expected_conditioning_fingerprint=(
+                            expected_conditioning_fingerprint
+                        ),
+                    )
+                    for ordinal, receipt in enumerate(rsm_mask_receipts)
+                ]
+            except (TypeError, ValueError):
+                raise ModuleArtifactRefused(
+                    "RSM_EXECUTION_ATTESTATION_MISMATCH"
+                ) from None
+            chunk_size = provenance["plan"]["chunk_size"]
+            expected_chunks = sum(
+                (len(member["contributions"]) + chunk_size - 1)
+                // chunk_size
+                for member in members
+            )
+            expected_frames = request.source.selected_frame_count
+            if (
+                execution_attestation.get("selected_scan_count")
+                != len(request.source.members)
+                or masks != expected_masks
+                or execution_attestation.get("selected_frame_count")
+                != expected_frames
+                or execution_attestation.get(
+                    "frame_release_check_frame_count"
+                )
+                != expected_frames
+                or execution_attestation.get("science_chunk_count")
+                != expected_chunks
+                or execution_attestation.get(
+                    "q_release_check_chunk_count"
+                )
+                != expected_chunks
+                or execution_attestation.get(
+                    "geometry_asset_receipt_fingerprint"
+                )
+                != provenance["asset"]["receipt_fingerprint"]
+                or execution_attestation.get(
+                    "effective_geometry_fingerprint"
+                )
+                != provenance["effective_geometry"]["fingerprint"]
+                or execution_attestation.get("common_grid_fingerprint")
+                != provenance["common_grid"]["fingerprint"]
+                or [
+                    item["member_preflight_fingerprint"]
+                    for item in masks
+                ]
+                != [member["fingerprint"] for member in members]
+                or [item["mask_policy"] for item in masks]
+                != [
+                    member["mask_policy_intent"][0]
+                    for member in members
+                ]
+                or [item["full_shape"] for item in masks]
+                != [member["detector_shape"] for member in members]
+                or [item["cropped_shape"] for item in masks]
+                != [member["cropped_shape"] for member in members]
+            ):
+                raise ModuleArtifactRefused(
+                    "RSM_EXECUTION_ATTESTATION_MISMATCH"
+                )
+        else:
+            _validate_xu_stitch_v2_intent(request, provenance)
+            observed = analysis_execution_attestation_digest(
+                request.output.kind,
+                execution_attestation,
+                request_fingerprint=request.fingerprint,
+            )
+            if observed != execution_attestation_digest:
+                raise ModuleArtifactRefused("EXECUTION_ATTESTATION_MISMATCH")
+            selected_count = execution_attestation.get("selected_frame_count")
+            release_count = execution_attestation.get(
+                "release_check_frame_count"
+            )
+            expected_count = len(request.source.selected_labels)
+            if selected_count != expected_count or release_count != expected_count:
+                raise ModuleArtifactRefused(
+                    "EXECUTION_ATTESTATION_COUNT_MISMATCH"
+                )
     artifact = AnalysisArtifactRequest(
         request.output.target,
         request.output.kind,
         request.output.overwrite,
         request.fingerprint,
-        request.source.analysis.source_fingerprint,
+        request.artifact_source_fingerprint,
         request.plan_fingerprint,
         request.provenance_digest,
         provenance,
@@ -961,6 +1174,8 @@ class ModuleArtifactOutput:
         self,
         request: ModuleOperationRequest,
         output: AnalysisArtifactOutput,
+        *,
+        rsm_mask_receipts: tuple[object, ...] | None = None,
     ) -> None:
         if (
             type(request) is not ModuleOperationRequest
@@ -978,6 +1193,7 @@ class ModuleArtifactOutput:
                 else json.loads(foreign.execution_attestation_json)
             ),
             execution_attestation_digest=foreign.execution_attestation_digest,
+            rsm_mask_receipts=rsm_mask_receipts,
         )
         fields = (
             "target",
@@ -996,6 +1212,7 @@ class ModuleArtifactOutput:
             raise TypeError("artifact output is foreign to the module request")
         self.request = request
         self._output = output
+        self._rsm_mask_receipts = rsm_mask_receipts
         self._publish_started = False
         self._pending: tuple[ModuleDisposition, str, str] | None = None
         self._terminal: ModuleTerminalResult | None = None
@@ -1029,10 +1246,14 @@ class ModuleArtifactOutput:
     ) -> ModuleTerminalResult:
         if self._terminal is not None:
             return self._terminal
-        commit = ModuleCommitReceipt.from_artifact(
-            self.request,
-            artifact,
-        )
+        if self._rsm_mask_receipts is None:
+            commit = ModuleCommitReceipt.from_artifact(self.request, artifact)
+        else:
+            commit = ModuleCommitReceipt.from_artifact(
+                self.request,
+                artifact,
+                rsm_mask_receipts=self._rsm_mask_receipts,
+            )
         self._terminal = ModuleTerminalResult(
             self.request,
             ModuleDisposition.COMMITTED,
@@ -1241,6 +1462,7 @@ def admit_module_artifact(
     *,
     execution_attestation: Mapping[str, object] | None = None,
     execution_attestation_digest: str | None = None,
+    rsm_mask_receipts: tuple[object, ...] | None = None,
     cancel_token: threading.Event | None = None,
     coordinator: object | None = None,
 ) -> ModuleArtifactOutput:
@@ -1261,12 +1483,17 @@ def admit_module_artifact(
         provenance,
         execution_attestation=execution_attestation,
         execution_attestation_digest=execution_attestation_digest,
+        rsm_mask_receipts=rsm_mask_receipts,
     )
     output = _admit_analysis_artifact(
         artifact_request,
         coordinator=coordinator,
     )
-    return ModuleArtifactOutput(request, output)
+    return ModuleArtifactOutput(
+        request,
+        output,
+        rsm_mask_receipts=rsm_mask_receipts,
+    )
 
 
 __all__ = [

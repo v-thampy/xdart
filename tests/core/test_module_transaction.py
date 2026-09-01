@@ -227,6 +227,77 @@ def _attestation(request: ModuleOperationRequest, result_fingerprint: str):
     }
 
 
+def _rsm_attestation(
+    request: ModuleOperationRequest,
+    provenance: dict[str, object],
+    result_fingerprint: str,
+    *,
+    mask_receipts: tuple[object, ...] | None = None,
+):
+    members = provenance["members"]
+    frame_count = request.source.selected_frame_count
+    chunk_size = provenance["plan"]["chunk_size"]
+    chunk_count = sum(
+        (len(member["contributions"]) + chunk_size - 1) // chunk_size
+        for member in members
+    )
+    return {
+        "schema_version": "rsm-execution-attestation-v1",
+        "module_request_fingerprint": request.fingerprint,
+        "result_projection_policy": "analysis_artifact_stored_le_f4_v1",
+        "result_fingerprint": result_fingerprint,
+        "geometry_asset_receipt_fingerprint": provenance["asset"][
+            "receipt_fingerprint"
+        ],
+        "effective_geometry_fingerprint": provenance["effective_geometry"][
+            "fingerprint"
+        ],
+        "common_grid_fingerprint": provenance["common_grid"]["fingerprint"],
+        "selected_scan_count": len(request.source.members),
+        "selected_frame_count": frame_count,
+        "science_chunk_count": chunk_count,
+        "q_release_check_chunk_count": chunk_count,
+        "frame_release_check_frame_count": frame_count,
+        "release_check_passed": True,
+        "member_masks": (
+            [
+                {
+                    "ordinal": ordinal,
+                    "member_preflight_fingerprint": member["fingerprint"],
+                    "mask_policy": member["mask_policy_intent"][0],
+                    "full_shape": member["detector_shape"],
+                    "full_raw_digest": None,
+                    "full_masked_pixel_count": 0,
+                    "cropped_shape": member["cropped_shape"],
+                    "cropped_raw_digest": None,
+                    "cropped_masked_pixel_count": 0,
+                    "mask_receipt_fingerprint": _digest(
+                        f"rsm-mask-receipt-{ordinal}"
+                    ),
+                }
+                for ordinal, member in enumerate(members)
+            ]
+            if mask_receipts is None
+            else [
+                receipt.to_attestation(ordinal)
+                for ordinal, receipt in enumerate(mask_receipts)
+            ]
+        ),
+        "xu_runtime": {
+            "lock_policy": "shared_xrd_tools_xu_rlock_v1",
+            "xrayutilities_distribution_version": "1.7.12",
+            "xrayutilities_module_version": "1.7.12",
+            "numpy_version": "2.5.1",
+            "config_epsilon": 1e-8,
+            "config_digits": 8,
+            "nthreads_before": 0,
+            "nthreads_effective": 1,
+            "nthreads_restored": 0,
+            "restore_passed": True,
+        },
+    }
+
+
 def test_public_canonical_fingerprint_is_type_framed_and_domain_separated():
     assert analysis_canonical_fingerprint("x", {"b": 2, "a": 1}) == (
         analysis_canonical_fingerprint("x", {"a": 1, "b": 2})
@@ -551,26 +622,11 @@ def test_rsm_v2_module_request_is_private_tagged_and_fail_closed(tmp_path):
     )
     with pytest.raises(ValueError, match="do not match"):
         _rsm_v2_module_request(group, wrong_output, plan, provenance_digest)
-    request = _rsm_v2_module_request(group, output, plan, provenance_digest)
-    assert request.source is group
-    assert request.kind is ModuleKind.RSM
-    assert request._rsm_v2_bound is True
-    assert request._xu_stitch_v2_bound is False
-    assert request.artifact_source_fingerprint == group.fingerprint
-    assert request.fingerprint == analysis_canonical_fingerprint(
-        "module-request-v1",
-        (
-            "module-request-v2-rsm-bound",
-            group.fingerprint,
-            output.fingerprint,
-            plan,
-            provenance_digest,
-        ),
-    )
-    with pytest.raises(TypeError):
-        replace(request)
-    with pytest.raises(ModuleArtifactRefused, match="RSM_V2_ARTIFACT_NOT_IMPLEMENTED"):
-        module_artifact_request(request, provenance)
+    with pytest.raises(
+        TypeError,
+        match="factory-owned intent",
+    ):
+        _rsm_v2_module_request(group, output, plan, provenance_digest)
 
 
 def test_module_source_membership_is_nonempty_unique_subset_in_admitted_order(
@@ -967,6 +1023,453 @@ def test_module_v2_commit_binds_separate_attestation_and_same_request(tmp_path):
             execution_attestation=forged,
             execution_attestation_digest=digest,
         )
+
+
+def test_rsm_v2_module_commit_binds_group_and_exact_attestation(
+    tmp_path,
+    monkeypatch,
+):
+    from tests.core.test_rsm_operation_r2 import _form, _write_member
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-1.0, 1.0),
+            (-2.0, 2.0),
+            (-3.0, 3.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(
+            tmp_path,
+            (_write_member(tmp_path, 0), _write_member(tmp_path, 1)),
+        )
+    ).request
+    request = prepared.module
+    provenance = prepared.provenance
+    mask_receipts = tuple(
+        rsm_operation._make_rsm_static_mask_receipt(
+            member,
+            prepared.plan.conditioning,
+            None,
+            None,
+        )
+        for member in prepared.preflight.members
+    )
+    bounds = prepared.preflight.common_grid.bounds
+    bins = prepared.plan.bins
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM,
+        axes=tuple(
+            (
+                name,
+                np.linspace(axis_bounds[0], axis_bounds[1], count),
+            )
+            for name, axis_bounds, count in zip(
+                ("h", "k", "l"),
+                bounds,
+                bins,
+                strict=True,
+            )
+        ),
+        axis_units=(("h", None), ("k", None), ("l", None)),
+        intensity=np.arange(
+            np.prod(bins),
+            dtype=np.float64,
+        ).reshape(bins),
+        sigma=None,
+        coverage=None,
+        normalization=None,
+    )
+    attestation = _rsm_attestation(
+        request,
+        provenance,
+        projection.result_fingerprint,
+        mask_receipts=mask_receipts,
+    )
+    digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        attestation,
+        request_fingerprint=request.fingerprint,
+    )
+    bound = module_artifact_request(
+        request,
+        provenance,
+        execution_attestation=attestation,
+        execution_attestation_digest=digest,
+        rsm_mask_receipts=mask_receipts,
+    )
+    assert bound.schema_version == 2
+    assert bound.source_fingerprint == request.source.fingerprint
+    output = admit_module_artifact(
+        request,
+        provenance,
+        execution_attestation=attestation,
+        execution_attestation_digest=digest,
+        rsm_mask_receipts=mask_receipts,
+        coordinator=OutputTransactionCoordinator(),
+    )
+    result = output.publish(
+        lambda entry: write_rsm(
+            entry,
+            result_projection=projection,
+            provenance=bound.provenance_json,
+            bounded_artifact=True,
+        )
+    )
+    assert result.disposition is ModuleDisposition.COMMITTED
+    assert result.commit.request is request
+    assert result.commit.execution_attestation_digest == digest
+    assert output.snapshot.receipt.inspection.source_fingerprint == (
+        request.source.fingerprint
+    )
+
+    forged = copy.deepcopy(attestation)
+    forged["member_masks"][0]["mask_receipt_fingerprint"] = _digest(
+        "arbitrary-mask-receipt"
+    )
+    forged_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        forged,
+        request_fingerprint=request.fingerprint,
+    )
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="RSM_EXECUTION_ATTESTATION_MISMATCH",
+    ):
+        module_artifact_request(
+            request,
+            provenance,
+            execution_attestation=forged,
+            execution_attestation_digest=forged_digest,
+            rsm_mask_receipts=mask_receipts,
+        )
+
+    genuine = mask_receipts[0]
+    clone = object.__new__(rsm_operation.RSMStaticMaskReceipt)
+    for name in (
+        "member_preflight_fingerprint",
+        "mask_policy",
+        "conditioning_fingerprint",
+        "full_shape",
+        "full_raw_digest",
+        "full_masked_pixel_count",
+        "cropped_shape",
+        "cropped_raw_digest",
+        "cropped_masked_pixel_count",
+        "fingerprint",
+    ):
+        object.__setattr__(clone, name, getattr(genuine, name))
+    clone_receipts = (clone, *mask_receipts[1:])
+    clone_attestation = _rsm_attestation(
+        prepared.module,
+        prepared.provenance,
+        _digest("exact-class-clone-result"),
+        mask_receipts=clone_receipts,
+    )
+    clone_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        clone_attestation,
+        request_fingerprint=prepared.module.fingerprint,
+    )
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="RSM_EXECUTION_ATTESTATION_MISMATCH",
+    ):
+        module_artifact_request(
+            prepared.module,
+            prepared.provenance,
+            execution_attestation=clone_attestation,
+            execution_attestation_digest=clone_digest,
+            rsm_mask_receipts=clone_receipts,
+        )
+
+    object.__setattr__(
+        genuine,
+        "member_preflight_fingerprint",
+        _digest("mutated-issued-member"),
+    )
+    mutated_fingerprint = analysis_canonical_fingerprint(
+        "rsm-static-mask-v1",
+        (
+            genuine.member_preflight_fingerprint,
+            genuine.mask_policy,
+            genuine.conditioning_fingerprint,
+            genuine.full_shape,
+            genuine.full_raw_digest,
+            genuine.full_masked_pixel_count,
+            genuine.cropped_shape,
+            genuine.cropped_raw_digest,
+            genuine.cropped_masked_pixel_count,
+        ),
+    )
+    object.__setattr__(genuine, "fingerprint", mutated_fingerprint)
+    mutated_attestation = _rsm_attestation(
+        prepared.module,
+        prepared.provenance,
+        _digest("mutated-issued-result"),
+        mask_receipts=mask_receipts,
+    )
+    mutated_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        mutated_attestation,
+        request_fingerprint=prepared.module.fingerprint,
+    )
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="RSM_EXECUTION_ATTESTATION_MISMATCH",
+    ):
+        module_artifact_request(
+            prepared.module,
+            prepared.provenance,
+            execution_attestation=mutated_attestation,
+            execution_attestation_digest=mutated_digest,
+            rsm_mask_receipts=mask_receipts,
+        )
+
+    foreign_conditioning = rsm_operation.RSMImageConditioning(
+        99.0,
+        123.0,
+        None,
+    )
+    foreign_receipts = tuple(
+        rsm_operation._make_rsm_static_mask_receipt(
+            member,
+            foreign_conditioning,
+            None,
+            None,
+        )
+        for member in prepared.preflight.members
+    )
+    foreign_attestation = _rsm_attestation(
+        request,
+        provenance,
+        projection.result_fingerprint,
+        mask_receipts=foreign_receipts,
+    )
+    foreign_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        foreign_attestation,
+        request_fingerprint=request.fingerprint,
+    )
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="RSM_EXECUTION_ATTESTATION_MISMATCH",
+    ):
+        module_artifact_request(
+            request,
+            provenance,
+            execution_attestation=foreign_attestation,
+            execution_attestation_digest=foreign_digest,
+            rsm_mask_receipts=foreign_receipts,
+        )
+
+
+def test_rsm_v2_mask_facts_require_the_factory_execution_receipts(
+    tmp_path,
+    monkeypatch,
+):
+    from tests.core.test_rsm_operation_r2 import _form, _write_member
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    from xrd_tools.analysis.rsm_operation import RSMImageConditioning
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-1.0, 1.0),
+            (-2.0, 2.0),
+            (-3.0, 3.0),
+        ),
+    )
+    form = replace(
+        _form(tmp_path, (_write_member(tmp_path, 0),)),
+        conditioning=RSMImageConditioning(0.0, None, 100.0),
+    )
+    prepared = prepare_rsm_tool_v2(form).request
+    member = prepared.preflight.members[0]
+    full_mask = np.zeros(member.detector_shape, dtype=bool)
+    cropped_mask = np.zeros(member.cropped_shape, dtype=bool)
+    full_mask.setflags(write=False)
+    cropped_mask.setflags(write=False)
+    mask_receipts = (
+        rsm_operation._make_rsm_static_mask_receipt(
+            member,
+            prepared.plan.conditioning,
+            full_mask,
+            cropped_mask,
+        ),
+    )
+    attestation = _rsm_attestation(
+        prepared.module,
+        prepared.provenance,
+        _digest("static-mask-result"),
+        mask_receipts=mask_receipts,
+    )
+    digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        attestation,
+        request_fingerprint=prepared.module.fingerprint,
+    )
+    module_artifact_request(
+        prepared.module,
+        prepared.provenance,
+        execution_attestation=attestation,
+        execution_attestation_digest=digest,
+        rsm_mask_receipts=mask_receipts,
+    )
+
+    forged = copy.deepcopy(attestation)
+    mask = forged["member_masks"][0]
+    mask["full_raw_digest"] = _digest("self-consistent-forged-mask")
+    conditioning_fingerprint = analysis_canonical_fingerprint(
+        "rsm-conditioning-v2",
+        prepared.plan.conditioning._canonical_value(),
+    )
+    mask["mask_receipt_fingerprint"] = analysis_canonical_fingerprint(
+        "rsm-static-mask-v1",
+        (
+            mask["member_preflight_fingerprint"],
+            mask["mask_policy"],
+            conditioning_fingerprint,
+            tuple(mask["full_shape"]),
+            mask["full_raw_digest"],
+            mask["full_masked_pixel_count"],
+            tuple(mask["cropped_shape"]),
+            mask["cropped_raw_digest"],
+            mask["cropped_masked_pixel_count"],
+        ),
+    )
+    forged_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        forged,
+        request_fingerprint=prepared.module.fingerprint,
+    )
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="RSM_EXECUTION_ATTESTATION_MISMATCH",
+    ):
+        module_artifact_request(
+            prepared.module,
+            prepared.provenance,
+            execution_attestation=forged,
+            execution_attestation_digest=forged_digest,
+            rsm_mask_receipts=mask_receipts,
+        )
+
+
+def test_rsm_v2_factory_owner_refuses_retagged_nested_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    from tests.core.test_rsm_operation_r2 import _form, _write_member
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-1.0, 1.0),
+            (-2.0, 2.0),
+            (-3.0, 3.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(
+            tmp_path,
+            (_write_member(tmp_path, 0), _write_member(tmp_path, 1)),
+        )
+    ).request
+    base = prepared.provenance
+    forged_values = []
+
+    value = copy.deepcopy(base)
+    value["effective_geometry"]["diffractometer"]["preset"] = "evil"
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["members"][0]["geometry_binding"]["evil"] = True
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["members"][0]["contributions"][0]["values"] = []
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["members"][0]["dependency_files"] = [{"evil": True}]
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["common_grid"]["bounds"] = "evil"
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["plan"]["max_frame_bytes"] = -1
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["conditioning"]["additive_offset"] = "evil"
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["normalization"]["mode"] = "evil"
+    for member in value["members"]:
+        member["normalization_policy"] = copy.deepcopy(value["normalization"])
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["holds"] = ["everything-now-authorized"]
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["runtime_requirements"] = ["evil"]
+    value["effective_geometry"]["runtime_requirements"] = ["evil"]
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["members"][0]["source_options"]["evil"] = True
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["members"][0]["detector_shape"] = [2, 2]
+    value["members"][0]["cropped_shape"] = [2, 2]
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["members"][0]["mask_policy_intent"] = ["none", "extra"]
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    value["output"]["parent_relative_path"] = "../../evil"
+    forged_values.append(value)
+    value = copy.deepcopy(base)
+    semantic = _digest("forged-semantic")
+    value["asset"]["semantic_fingerprint"] = semantic
+    value["effective_geometry"]["asset_semantic_fingerprint"] = semantic
+    forged_values.append(value)
+
+    for forged in forged_values:
+        forged_request = _rsm_v2_module_request(
+            prepared.module.source,
+            prepared.module.output,
+            prepared.plan.fingerprint,
+            module_provenance_digest(ModuleKind.RSM, forged),
+            plan_owner=prepared.plan,
+            preflight_owner=prepared.preflight,
+            output_authority_owner=prepared.output_authority,
+        )
+        attestation = _rsm_attestation(
+            forged_request,
+            forged,
+            _digest("rsm-retagged-result"),
+        )
+        digest = analysis_execution_attestation_digest(
+            AnalysisArtifactKind.RSM,
+            attestation,
+            request_fingerprint=forged_request.fingerprint,
+        )
+        with pytest.raises(
+            ModuleArtifactRefused,
+            match="RSM_INTENT_PROVENANCE_MISMATCH",
+        ):
+            module_artifact_request(
+                forged_request,
+                forged,
+                execution_attestation=attestation,
+                execution_attestation_digest=digest,
+            )
 
 
 def test_module_commit_receipt_is_built_before_lower_lease_release(

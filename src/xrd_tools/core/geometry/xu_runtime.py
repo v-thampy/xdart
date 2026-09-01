@@ -183,7 +183,9 @@ class XuRuntimeSession:
         self.execution_record: XuRuntimeExecutionRecord | None = None
         self._config = None
         self._before: int | None = None
+        self._config_before: tuple[float, int, int] | None = None
         self._mutation_attempted = False
+        self._mutation_detected = False
         self._entered = False
         self._owner_thread_id: int | None = None
 
@@ -212,6 +214,12 @@ class XuRuntimeSession:
                 "XU_RUNTIME_SESSION_INACTIVE",
                 "XU runtime session is not active on the calling thread",
             )
+        if not self._effective_config_matches():
+            self._mutation_detected = True
+            raise XuRuntimeUnsupported(
+                "XU_RUNTIME_CONFIG_MUTATED",
+                "xrayutilities runtime globals changed during the active session",
+            )
         return self
 
     def active_modules(self) -> tuple[object, object]:
@@ -220,26 +228,65 @@ class XuRuntimeSession:
         self.require_active()
         return self.xu, self.numpy
 
+    def _effective_config_matches(self) -> bool:
+        if self._config is None:
+            return False
+        try:
+            observed = (
+                self._config.EPSILON,
+                self._config.DIGITS,
+                self._config.NTHREADS,
+            )
+        except BaseException:
+            return False
+        expected = (
+            self.requirements.config_epsilon,
+            self.requirements.config_digits,
+            XU_RUNTIME_EFFECTIVE_NTHREADS,
+        )
+        return all(
+            type(value) is type(required) and value == required
+            for value, required in zip(observed, expected, strict=True)
+        )
+
     def _restore_config(self) -> int:
-        if self._config is None or self._before is None:
+        if self._config is None or self._config_before is None:
             raise XuRuntimeUnsupported(
                 "XU_RUNTIME_CONFIG_RESTORE_FAILED",
                 "XU runtime owner has no captured global state",
             )
+        failures: list[BaseException] = []
+        for name, value in zip(
+            ("EPSILON", "DIGITS", "NTHREADS"),
+            self._config_before,
+            strict=True,
+        ):
+            try:
+                setattr(self._config, name, value)
+            except BaseException as error:
+                failures.append(error)
         try:
-            self._config.NTHREADS = self._before
-            restored = self._config.NTHREADS
-        except BaseException as error:
-            raise XuRuntimeUnsupported(
-                "XU_RUNTIME_CONFIG_RESTORE_FAILED",
-                "xrayutilities NTHREADS restoration failed",
-            ) from error
-        if type(restored) is not int or restored != self._before:
-            raise XuRuntimeUnsupported(
-                "XU_RUNTIME_CONFIG_RESTORE_FAILED",
-                "xrayutilities NTHREADS restoration did not hold",
+            restored = (
+                self._config.EPSILON,
+                self._config.DIGITS,
+                self._config.NTHREADS,
             )
-        return restored
+        except BaseException as error:
+            failures.append(error)
+            restored = ()
+        if failures or len(restored) != 3 or any(
+            type(value) is not type(required) or value != required
+            for value, required in zip(
+                restored,
+                self._config_before,
+                strict=True,
+            )
+        ):
+            raise XuRuntimeUnsupported(
+                "XU_RUNTIME_CONFIG_RESTORE_FAILED",
+                "xrayutilities runtime-global restoration failed",
+            )
+        return restored[2]
 
     def __enter__(self) -> "XuRuntimeSession":
         if self._entered:
@@ -271,15 +318,17 @@ class XuRuntimeSession:
                 )
             self._config = config
             self._before = config.NTHREADS
+            self._config_before = (
+                config.EPSILON,
+                config.DIGITS,
+                config.NTHREADS,
+            )
             self._mutation_attempted = True
             config.NTHREADS = XU_RUNTIME_EFFECTIVE_NTHREADS
-            if (
-                type(config.NTHREADS) is not int
-                or config.NTHREADS != XU_RUNTIME_EFFECTIVE_NTHREADS
-            ):
+            if not self._effective_config_matches():
                 raise XuRuntimeUnsupported(
                     "XU_RUNTIME_CONFIG_RESTORE_FAILED",
-                    "xrayutilities NTHREADS could not be set to one",
+                    "xrayutilities effective runtime globals could not be set",
                 )
             self.xu = xu
             self.numpy = np
@@ -312,6 +361,14 @@ class XuRuntimeSession:
                 "XU_RUNTIME_SESSION_INACTIVE",
                 "XU runtime session can only exit on its owning thread",
             )
+        mutation_error: XuRuntimeUnsupported | None = None
+        if not self._effective_config_matches():
+            self._mutation_detected = True
+        if self._mutation_detected:
+            mutation_error = XuRuntimeUnsupported(
+                "XU_RUNTIME_CONFIG_MUTATED",
+                "xrayutilities runtime globals changed during the active session",
+            )
         restore_error: BaseException | None = None
         try:
             try:
@@ -319,18 +376,20 @@ class XuRuntimeSession:
             except BaseException as error:
                 restore_error = error
             else:
-                self.execution_record = XuRuntimeExecutionRecord(
-                    XU_RUNTIME_LOCK_POLICY,
-                    self.requirements.distribution_version,
-                    self.requirements.module_version,
-                    self.requirements.numpy_version,
-                    self.requirements.config_epsilon,
-                    self.requirements.config_digits,
-                    self._before,
-                    XU_RUNTIME_EFFECTIVE_NTHREADS,
-                    restored,
-                    True,
-                )
+                assert self._before is not None
+                if mutation_error is None:
+                    self.execution_record = XuRuntimeExecutionRecord(
+                        XU_RUNTIME_LOCK_POLICY,
+                        self.requirements.distribution_version,
+                        self.requirements.module_version,
+                        self.requirements.numpy_version,
+                        self.requirements.config_epsilon,
+                        self.requirements.config_digits,
+                        self._before,
+                        XU_RUNTIME_EFFECTIVE_NTHREADS,
+                        restored,
+                        True,
+                    )
         finally:
             self.xu = None
             self.numpy = None
@@ -339,8 +398,10 @@ class XuRuntimeSession:
         if restore_error is not None:
             raise XuRuntimeUnsupported(
                 "XU_RUNTIME_CONFIG_RESTORE_FAILED",
-                "xrayutilities NTHREADS restoration failed",
+                "xrayutilities runtime-global restoration failed",
             ) from restore_error
+        if mutation_error is not None:
+            raise mutation_error from exc_value
         return False
 
 
