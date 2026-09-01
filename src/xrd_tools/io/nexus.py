@@ -3451,6 +3451,7 @@ def write_stitched(
     stitched_1d: IntegrationResult1D | None = None,
     stitched_2d: IntegrationResult2D | None = None,
     result_projection: object | None = None,
+    legacy_v1_unit_layout: bool = False,
     provenance: "Mapping[str, object] | str | None" = None,
     frame_records=None,
     source_base=None,
@@ -3476,10 +3477,16 @@ def write_stitched(
     oversized fixed-width provenance and schema attributes before allocating
     their contents.  The default retains the historical vlen-UTF8
     representation for ordinary scan files.
+
+    ``legacy_v1_unit_layout`` is reserved for bounded schema-v1 artifacts.  It
+    reproduces their accepted HDF5 object-header bytes while still writing only
+    the central stored-result projection.  Schema v2 must leave it false.
     """
     ck = _comp_kwargs(compression)
     if type(bounded_artifact) is not bool:
         raise TypeError("bounded_artifact must be an exact bool")
+    if type(legacy_v1_unit_layout) is not bool:
+        raise TypeError("legacy_v1_unit_layout must be an exact bool")
     if result_projection is not None:
         from xrd_tools.io.analysis_artifact import (
             AnalysisArtifactKind,
@@ -3534,6 +3541,12 @@ def write_stitched(
                 values,
                 ck=ck,
             )
+            if legacy_v1_unit_layout:
+                # Preserve the historical v1 HDF5 object-header sequence: the
+                # vlen attribute existed briefly before the bounded fixed-width
+                # replacement.  Its tombstone bytes are part of the accepted
+                # v1 terminal-file oracle even though the logical graph agrees.
+                dataset.attrs["units"] = units
             _bounded_text_attr(dataset, "units", units)
         if result_projection.sigma is not None:
             _schema_projected_dataset(
@@ -3619,9 +3632,14 @@ def write_stitched(
         return write_stitched(
             entry_grp,
             result_projection=projection,
+            legacy_v1_unit_layout=True,
             provenance=provenance,
             compression=compression,
             bounded_artifact=True,
+        )
+    if legacy_v1_unit_layout:
+        raise ValueError(
+            "legacy v1 unit layout requires a stored Stitch projection"
         )
     if (coverage is None) != (normalization is None):
         raise ValueError(

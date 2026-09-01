@@ -631,6 +631,7 @@ def test_xu_transient_reload_retry_never_replays_science_or_writer(
 
     def write_once(*args, **kwargs):
         writes.append("write")
+        assert kwargs.get("legacy_v1_unit_layout", False) is False
         return real_write(*args, **kwargs)
 
     def science_once(*args, **kwargs):
@@ -1145,6 +1146,7 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
 
     def write_once(*args, **kwargs):
         writes.append("write")
+        assert kwargs["legacy_v1_unit_layout"] is True
         return real_write(*args, **kwargs)
 
     def science_once(*args, **kwargs):

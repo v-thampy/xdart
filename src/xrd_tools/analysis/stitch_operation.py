@@ -2674,6 +2674,7 @@ class StitchOperationExecution:
             write_stitched(
                 entry,
                 result_projection=result_projection,
+                legacy_v1_unit_layout=True,
                 provenance=bound.provenance_json,
                 bounded_artifact=True,
             )

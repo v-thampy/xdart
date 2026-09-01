@@ -882,6 +882,104 @@ def test_bounded_writer_refuses_unbounded_inputs_before_hdf_mutation(tmp_path):
         assert tuple(entry) == ()
 
 
+def test_v1_stitch_writer_preserves_accepted_raw_bytes(tmp_path):
+    q = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7], dtype=np.float64)
+    provenance = '{"schema_version":"compat-v1","x":1}'
+
+    intensity_1d = np.array(
+        [1.0, np.nan, 3.00000006, 4.0, 5.0, 6.0, 7.0],
+        dtype=np.float64,
+    )
+    sigma_1d = np.array(
+        [0.1, 0.2, np.nan, 0.4, 0.5, 0.6, 0.7],
+        dtype=np.float64,
+    )
+    coverage_1d = np.arange(7, dtype=np.float64)
+    normalization_1d = np.linspace(1, 7, 7, dtype=np.float64)
+    value_1d = IntegrationResult1D(
+        q,
+        intensity_1d,
+        sigma_1d,
+        "q_A^-1",
+    )
+    projection_1d = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.STITCH_1D,
+        axes=(("q", q),),
+        axis_units=(("q", "q_A^-1"),),
+        intensity=intensity_1d,
+        sigma=sigma_1d,
+        coverage=coverage_1d,
+        normalization=normalization_1d,
+    )
+
+    chi = np.array([-20.0, -10.0, 0.0, 10.0, 20.0])
+    intensity_2d = np.arange(35, dtype=np.float64).reshape(7, 5)
+    intensity_2d[2, 3] = np.nan
+    sigma_2d = np.linspace(0.1, 3.5, 35).reshape(7, 5)
+    coverage_2d = np.arange(35, dtype=np.float64).reshape(7, 5)
+    normalization_2d = np.linspace(1.0, 35.0, 35).reshape(7, 5)
+    value_2d = IntegrationResult2D(
+        q,
+        chi,
+        intensity_2d,
+        sigma_2d,
+        "q_A^-1",
+        "chi_deg",
+    )
+    projection_2d = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.STITCH_2D,
+        axes=(("q", q), ("chi", chi)),
+        axis_units=(("q", "q_A^-1"), ("chi", "chi_deg")),
+        intensity=intensity_2d,
+        sigma=sigma_2d,
+        coverage=coverage_2d,
+        normalization=normalization_2d,
+    )
+
+    cases = (
+        (
+            "1d",
+            {"stitched_1d": value_1d},
+            projection_1d,
+            11_432,
+            "5be323286c0ffd69b0226f254f0c93e49592de2117e02c57e67788952c8c735e",
+        ),
+        (
+            "2d",
+            {"stitched_2d": value_2d},
+            projection_2d,
+            11_880,
+            "b671b55c5c81dc3df85ed2b676c9eead38ee0fc4fcbdbc516b35eee1ac0fdeae",
+        ),
+    )
+    for label, legacy_value, projection, expected_size, expected_sha in cases:
+        baseline = tmp_path / f"v1-{label}-baseline.h5"
+        projected = tmp_path / f"v1-{label}-projected.h5"
+        with h5py.File(baseline, "w") as handle:
+            write_stitched(
+                handle.create_group("entry"),
+                **legacy_value,
+                provenance=provenance,
+                coverage=(coverage_1d if label == "1d" else coverage_2d),
+                normalization=(
+                    normalization_1d if label == "1d" else normalization_2d
+                ),
+                bounded_artifact=True,
+            )
+        with h5py.File(projected, "w") as handle:
+            write_stitched(
+                handle.create_group("entry"),
+                result_projection=projection,
+                legacy_v1_unit_layout=True,
+                provenance=provenance,
+                bounded_artifact=True,
+            )
+        baseline_bytes = baseline.read_bytes()
+        assert projected.read_bytes() == baseline_bytes
+        assert len(baseline_bytes) == expected_size
+        assert hashlib.sha256(baseline_bytes).hexdigest() == expected_sha
+
+
 def test_canonical_provenance_stops_oversized_structure_during_freeze():
     with pytest.raises(ValueError, match="bounded input size"):
         canonical_analysis_provenance({"many": [None] * 300_000})
