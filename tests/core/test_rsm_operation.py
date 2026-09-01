@@ -1100,17 +1100,25 @@ def test_strict_reload_rejects_writer_corrupted_fixed_grid_without_replay(
         counts["science"] += 1
         return original_run(*args, **kwargs)
 
-    def corrupt_axis(entry, volume, **kwargs):
+    def corrupt_axis(entry, **kwargs):
         counts["writer"] += 1
-        shifted = np.array(volume.h, copy=True)
+        projection = kwargs.pop("result_projection")
+        shifted = np.array(projection.axes[0][1], dtype=np.float64, copy=True)
         shifted[1] += (shifted[2] - shifted[1]) * 0.1
-        corrupt = rsm_operation.RSMVolume(
-            shifted,
-            volume.k,
-            volume.l,
-            volume.intensity,
+        corrupt = rsm_operation.project_analysis_artifact_result(
+            kind=rsm_operation.AnalysisArtifactKind.RSM,
+            axes=(
+                ("h", shifted),
+                projection.axes[1],
+                projection.axes[2],
+            ),
+            axis_units=projection.axis_units,
+            intensity=projection.intensity,
+            sigma=None,
+            coverage=None,
+            normalization=None,
         )
-        return original_write(entry, corrupt, **kwargs)
+        return original_write(entry, result_projection=corrupt, **kwargs)
 
     monkeypatch.setattr(rsm_operation, "run_rsm", counted_run)
     monkeypatch.setattr(rsm_operation, "write_rsm", corrupt_axis)

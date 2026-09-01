@@ -140,7 +140,7 @@ def xu_runtime_availability(
     if observed_platform != required_platform:
         return XuRuntimeAvailability(
             False,
-            "XU_PLATFORM_UNSUPPORTED",
+            "XU_PLATFORM_UNVALIDATED",
             "xu_hist requires CPython 3.13.14 on Darwin arm64",
         )
     try:

@@ -28,6 +28,7 @@ from xrd_tools.analysis.module_transaction import (
     module_artifact_request,
     module_plan_fingerprint,
     module_provenance_digest,
+    xu_stitch_module_request,
 )
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
@@ -126,6 +127,65 @@ def _provenance(request: ModuleOperationRequest) -> dict[str, object]:
     }
 
 
+def _xu_request(tmp_path: Path):
+    base = _request(tmp_path)
+    asset_receipt = _digest("xu-asset-receipt")
+    effective = _digest("xu-effective-geometry")
+    provenance = {
+        "schema_version": "stitch-operation-v2-xu-intent",
+        "kind": "stitch",
+        "backend": "xu_hist",
+        "source": {
+            "source_fingerprint": base.source.analysis.source_fingerprint,
+            "module_source_fingerprint": base.source.fingerprint,
+            "metadata_table_fingerprint": base.source.table_fingerprint,
+            "selected_labels": list(base.source.selected_labels),
+            "input_manifest": {"fingerprint": _digest("xu-manifest")},
+        },
+        "asset": {
+            "lexical_relative_path": "calibration/xu/surface.json",
+            "resolved_relative_path": "calibration/xu/surface.json",
+            "byte_count": 4837,
+            "raw_sha256": _digest("xu-raw"),
+            "semantic_fingerprint": _digest("xu-semantic"),
+            "receipt_fingerprint": asset_receipt,
+        },
+        "effective_geometry": {"fingerprint": effective},
+        "detector": {"type": "Pilatus300kw"},
+        "corrections": {"policy": "surface-v1"},
+        "plan": {
+            "backend": "xu_hist",
+            "mode": "1d",
+            "unit": "q_A^-1",
+            "method": "numpy_histogram_center_v1",
+            "radial_range": [1.0, 5.2],
+            "npt_1d": 8,
+            "monitor_selector": None,
+            "use_detector_mask": True,
+            "max_frame_bytes": 4 * 1024 * 1024,
+            "asset_receipt_fingerprint": asset_receipt,
+            "effective_geometry_fingerprint": effective,
+            "plan_fingerprint": base.plan_fingerprint,
+        },
+        "observations": {"frame_count": len(base.source.selected_labels)},
+        "runtime_requirements": {"lock_policy": "shared_xu_lock_v1"},
+        "output": {
+            "target": base.output.target,
+            "kind": base.output.kind.value,
+            "overwrite": base.output.overwrite.value,
+            "output_fingerprint": base.output.fingerprint,
+        },
+        "holds": ["generic-xu-geometries"],
+    }
+    request = xu_stitch_module_request(
+        base.source,
+        base.output,
+        base.plan_fingerprint,
+        module_provenance_digest(ModuleKind.STITCH, provenance),
+    )
+    return request, provenance
+
+
 def _attestation(request: ModuleOperationRequest, result_fingerprint: str):
     count = len(request.source.selected_labels)
     return {
@@ -184,6 +244,12 @@ def test_module_values_freeze_content_but_keep_runtime_authority_exact(tmp_path)
     assert len(request.source.fingerprint) == len(request.fingerprint) == 64
     with pytest.raises(FrozenInstanceError):
         request.plan_fingerprint = _digest("changed")
+    with pytest.raises(TypeError, match="not copyable"):
+        copy.copy(request)
+    with pytest.raises(TypeError, match="not copyable"):
+        copy.deepcopy(request)
+    with pytest.raises(TypeError, match="not serializable"):
+        pickle.dumps(request)
 
     seconds_0 = MetadataColumnSelector("Seconds", 0)
     seconds_1 = MetadataColumnSelector("Seconds", 1)
@@ -532,15 +598,14 @@ def test_module_artifact_admission_and_commit_keep_exact_request(tmp_path):
 
 
 def test_module_v2_commit_binds_separate_attestation_and_same_request(tmp_path):
-    request = _request(tmp_path)
-    provenance = _provenance(request)
+    request, provenance = _xu_request(tmp_path)
     projection = project_analysis_artifact_result(
         kind=AnalysisArtifactKind.STITCH_1D,
         axes=(("q", np.linspace(0.1, 1.0, 8)),),
         axis_units=(("q", "q_A^-1"),),
         intensity=np.linspace(2.0, 3.0, 8),
         sigma=None,
-        coverage=np.arange(8, dtype=np.float64),
+        coverage=np.arange(1, 9, dtype=np.float64),
         normalization=np.linspace(1.0, 2.0, 8),
     )
     attestation = _attestation(request, projection.result_fingerprint)
@@ -595,6 +660,46 @@ def test_module_v2_commit_binds_separate_attestation_and_same_request(tmp_path):
         ),
     )
     assert result.commit.fingerprint == expected
+
+    clone = ModuleOperationRequest(
+        request.source,
+        request.output,
+        request.plan_fingerprint,
+        request.provenance_digest,
+    )
+    assert clone is not request
+    assert clone.fingerprint == request.fingerprint
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="XU_INTENT_PROVENANCE_MISMATCH",
+    ):
+        module_artifact_request(
+            clone,
+            provenance,
+            execution_attestation=attestation,
+            execution_attestation_digest=digest,
+        )
+    with pytest.raises(TypeError, match="exact module request"):
+        ModuleCommitReceipt.from_artifact(clone, output.snapshot.receipt)
+
+    count_forged = dict(attestation)
+    count_forged["selected_frame_count"] = 999
+    count_forged["release_check_frame_count"] = 999
+    count_digest = analysis_execution_attestation_digest(
+        request.output.kind,
+        count_forged,
+        request_fingerprint=request.fingerprint,
+    )
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="EXECUTION_ATTESTATION_COUNT_MISMATCH",
+    ):
+        module_artifact_request(
+            request,
+            provenance,
+            execution_attestation=count_forged,
+            execution_attestation_digest=count_digest,
+        )
 
     forged = dict(attestation)
     forged["release_check_frame_count"] = 2

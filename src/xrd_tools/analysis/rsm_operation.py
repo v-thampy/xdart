@@ -58,6 +58,8 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
     AnalysisArtifactPayload,
+    AnalysisArtifactProjectionInvalid,
+    project_analysis_artifact_result,
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import write_rsm
@@ -2422,6 +2424,21 @@ class RSMOperationExecution:
         except RSMOperationRefused as error:
             return self._terminal(ModuleDisposition.FAILED, error.code)
         try:
+            result_projection = project_analysis_artifact_result(
+                kind=AnalysisArtifactKind.RSM,
+                axes=(("h", volume.h), ("k", volume.k), ("l", volume.l)),
+                axis_units=(("h", None), ("k", None), ("l", None)),
+                intensity=volume.intensity,
+                sigma=None,
+                coverage=None,
+                normalization=None,
+            )
+        except AnalysisArtifactProjectionInvalid:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "RSM_RESULT_STORAGE_PROJECTION_INVALID",
+            )
+        try:
             _requalify_project_output(
                 self.request.module.output,
                 self.request.preflight.project_root,
@@ -2457,7 +2474,7 @@ class RSMOperationExecution:
         def writer(entry) -> None:
             write_rsm(
                 entry,
-                volume,
+                result_projection=result_projection,
                 provenance=bound.provenance_json,
                 bounded_artifact=True,
             )

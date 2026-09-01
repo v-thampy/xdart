@@ -7,7 +7,7 @@ loaded and retains exact lexical and physical file identity for later fences.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 import hashlib
 from importlib import resources
 import json
@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import stat
 from collections.abc import Mapping
+from types import MappingProxyType
 
 from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
 
@@ -31,6 +32,9 @@ _RESOURCE_SHA256 = (
 )
 _RESOURCE_SEMANTIC_FINGERPRINT = (
     "90f3bec535ed9a21be1b9d93491e774364df5849155b9b9c1707eace848e40f8"
+)
+_LEGACY_ORACLE_SHA256 = (
+    "9bb13babeb60475128dd9d14c833cdd8cd85af7510424c1b860b87231d8c0c25"
 )
 _TOP_LEVEL_KEYS = {
     "schema",
@@ -112,25 +116,41 @@ def _bounded_projection(value: object, *, depth: int, budget: list[int]) -> None
     )
 
 
+def _freeze_projection(value: object) -> object:
+    """Return a recursively immutable projection with no retained mutable root."""
+
+    if type(value) is dict:
+        frozen = {
+            key: _freeze_projection(item)
+            for key, item in value.items()
+        }
+        return MappingProxyType(frozen)
+    if type(value) is list:
+        return tuple(_freeze_projection(item) for item in value)
+    return value
+
+
 @dataclass(eq=False, frozen=True, slots=True)
 class XuStitchCalibrationProjection:
     canonical_json: str
     raw_sha256: str
     semantic_fingerprint: str
-    _claim: object = field(default=None, repr=False)
+    _value: Mapping[str, object] = field(repr=False)
+    _claim: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _claim: object) -> None:
         if (
-            self._claim is not _PROJECTION_FACTORY
+            _claim is not _PROJECTION_FACTORY
             or type(self.canonical_json) is not str
             or self.raw_sha256 != _RESOURCE_SHA256
             or self.semantic_fingerprint != _RESOURCE_SEMANTIC_FINGERPRINT
+            or not isinstance(self._value, MappingProxyType)
         ):
             raise TypeError("XU calibration projection is not factory-owned")
 
     @property
-    def value(self) -> dict[str, object]:
-        return json.loads(self.canonical_json)
+    def value(self) -> Mapping[str, object]:
+        return self._value
 
     @property
     def content(self) -> bytes:
@@ -156,6 +176,11 @@ def parse_xu_stitch_calibration_bytes(
         _refuse(
             "XU_CALIBRATION_PARSE_FAILED",
             "calibration must be nonempty bounded exact bytes",
+        )
+    if hashlib.sha256(raw).hexdigest() == _LEGACY_ORACLE_SHA256:
+        _refuse(
+            "XU_CALIBRATION_MIGRATION_REQUIRED",
+            "the exact historical XU geometry requires reviewed migration",
         )
     if raw.startswith(b"\xef\xbb\xbf") or b"\x00" in raw or raw.endswith(b"\n"):
         _refuse(
@@ -237,6 +262,7 @@ def parse_xu_stitch_calibration_bytes(
         text,
         raw_sha256,
         semantic,
+        _freeze_projection(value),
         _PROJECTION_FACTORY,
     )
 
@@ -246,12 +272,39 @@ def canonical_surface_resource_bytes() -> bytes:
         node = resources.files("xrd_tools")
         for part in _RESOURCE_PARTS:
             node = node.joinpath(part)
-        raw = node.read_bytes()
+        with resources.as_file(node) as resource_path:
+            shown = os.fspath(resource_path)
+            before = os.lstat(shown)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+                raise OSError("canonical resource is not a regular file")
+            descriptor = os.open(
+                shown,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise OSError("canonical resource changed type")
+                raw = os.read(descriptor, _MAX_ASSET_BYTES + 1)
+                trailing = os.read(descriptor, 1)
+                closed_state = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            after = os.lstat(shown)
+            if (
+                trailing
+                or _state(before)
+                != _state(opened)
+                or _state(opened)
+                != _state(closed_state)
+                or _state(closed_state) != _state(after)
+            ):
+                raise OSError("canonical resource changed during read")
         parse_xu_stitch_calibration_bytes(raw)
         return raw
-    except XuStitchCalibrationRefused:
-        raise
-    except (FileNotFoundError, OSError, TypeError) as error:
+    except (FileNotFoundError, OSError, TypeError, XuStitchCalibrationRefused) as error:
         raise XuStitchCalibrationRefused(
             "XU_CANONICAL_ASSET_UNAVAILABLE",
             "canonical SURFACE calibration resource is unavailable",
@@ -269,6 +322,7 @@ class XuStitchCalibrationInput:
             raise TypeError("XU calibration locator must be path-like") from error
         if type(shown) is not str or not shown or "\x00" in shown:
             raise TypeError("XU calibration locator must be a nonempty exact path")
+        object.__setattr__(self, "locator", shown)
 
 
 def _state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -291,6 +345,26 @@ def _lexical_target(
         shown = os.fspath(request.locator)
     except TypeError as error:
         raise TypeError("project and calibration locator must be path-like") from error
+    current = os.sep
+    try:
+        for part in Path(project).parts[1:]:
+            current = os.path.join(current, part)
+            state = os.lstat(current)
+            if stat.S_ISLNK(state.st_mode):
+                _refuse(
+                    "XU_CALIBRATION_SYMLINK_REFUSED",
+                    "Project ancestry traverses a symbolic link",
+                )
+    except FileNotFoundError:
+        _refuse(
+            "XU_CALIBRATION_PROJECT_INVALID",
+            "Project must be an existing real directory",
+        )
+    except OSError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_PROJECT_INVALID",
+            "Project ancestry cannot be inspected",
+        ) from error
     if not os.path.isdir(project) or os.path.islink(project):
         _refuse("XU_CALIBRATION_PROJECT_INVALID", "Project must be a real directory")
     target = os.path.normpath(
@@ -317,6 +391,11 @@ def _lexical_target(
             state = os.lstat(current)
         except FileNotFoundError:
             break
+        except OSError as error:
+            raise XuStitchCalibrationRefused(
+                "XU_CALIBRATION_UNAVAILABLE",
+                "calibration path cannot be inspected",
+            ) from error
         if stat.S_ISLNK(state.st_mode):
             _refuse(
                 "XU_CALIBRATION_SYMLINK_REFUSED",
@@ -332,6 +411,91 @@ def _lexical_target(
     return project, target, relative
 
 
+def _open_no_follow_chain(
+    project: str,
+    relative: str,
+) -> tuple[int, tuple[tuple[int, int, int, int, int, int], ...]]:
+    relative_parts = Path(relative).parts
+    project_parts = Path(project).parts
+    if (
+        not relative_parts
+        or not project_parts
+        or project_parts[0] != os.sep
+        or any(
+            part in {"", os.curdir, os.pardir}
+            for part in relative_parts
+        )
+    ):
+        _refuse(
+            "XU_CALIBRATION_OUTSIDE_PROJECT",
+            "calibration locator has an invalid lexical component",
+        )
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptors: list[int] = []
+    states: list[tuple[int, int, int, int, int, int]] = []
+    try:
+        current = os.open(os.sep, directory_flags)
+        descriptors.append(current)
+        states.append(_state(os.fstat(current)))
+        for part in project_parts[1:] + relative_parts[:-1]:
+            current = os.open(part, directory_flags, dir_fd=current)
+            descriptors.append(current)
+            states.append(_state(os.fstat(current)))
+        descriptor = os.open(relative_parts[-1], file_flags, dir_fd=current)
+        states.append(_state(os.fstat(descriptor)))
+    except FileNotFoundError as error:
+        for opened in reversed(descriptors):
+            try:
+                os.close(opened)
+            except OSError:
+                pass
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_UNAVAILABLE",
+            "calibration path is unavailable",
+        ) from error
+    except OSError as error:
+        for opened in reversed(descriptors):
+            try:
+                os.close(opened)
+            except OSError:
+                pass
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_SYMLINK_REFUSED",
+            "calibration path could not be opened without link traversal",
+        ) from error
+    for opened in reversed(descriptors):
+        os.close(opened)
+    return descriptor, tuple(states)
+
+
+def _lexical_chain_states(
+    project: str,
+    relative: str,
+) -> tuple[tuple[int, int, int, int, int, int], ...]:
+    states: list[tuple[int, int, int, int, int, int]] = []
+    current = os.sep
+    for part in Path(project).parts[1:] + Path(relative).parts:
+        current = os.path.join(current, part)
+        value = os.lstat(current)
+        if stat.S_ISLNK(value.st_mode):
+            _refuse(
+                "XU_CALIBRATION_SYMLINK_REFUSED",
+                "calibration path changed to a symbolic link",
+            )
+        states.append(_state(value))
+    states.insert(0, _state(os.lstat(os.sep)))
+    return tuple(states)
+
+
 @dataclass(eq=False, frozen=True, slots=True)
 class XuStitchCalibrationReceipt:
     request: XuStitchCalibrationInput
@@ -341,11 +505,11 @@ class XuStitchCalibrationReceipt:
     file_state: tuple[int, int, int, int, int, int]
     projection: XuStitchCalibrationProjection
     fingerprint: str
-    _claim: object = field(default=None, repr=False)
+    _claim: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _claim: object) -> None:
         if (
-            self._claim is not _RECEIPT_FACTORY
+            _claim is not _RECEIPT_FACTORY
             or type(self.request) is not XuStitchCalibrationInput
             or type(self.projection) is not XuStitchCalibrationProjection
             or type(self.file_state) is not tuple
@@ -393,44 +557,62 @@ def capture_xu_stitch_calibration(
         raise TypeError("XU calibration capture requires exact input")
     project, target, lexical_relative = _lexical_target(request, project_root)
     try:
-        before = os.lstat(target)
-    except OSError as error:
-        raise XuStitchCalibrationRefused(
-            "XU_CALIBRATION_UNAVAILABLE", "calibration file is unavailable"
-        ) from error
-    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
-        _refuse(
-            "XU_CALIBRATION_NOT_REGULAR",
-            "calibration must be a regular non-symlink file",
+        descriptor, opened_chain = _open_no_follow_chain(
+            project, lexical_relative
         )
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(target, flags)
         try:
             opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                _refuse(
+                    "XU_CALIBRATION_NOT_REGULAR",
+                    "calibration must be a regular non-symlink file",
+                )
             raw = os.read(descriptor, _MAX_ASSET_BYTES + 1)
             trailing = os.read(descriptor, 1)
             closed_state = os.fstat(descriptor)
         finally:
             os.close(descriptor)
-        after = os.lstat(target)
+        _project_again, target_again, relative_again = _lexical_target(
+            request, project
+        )
+        current_chain = _lexical_chain_states(project, lexical_relative)
     except OSError as error:
         raise XuStitchCalibrationRefused(
             "XU_CALIBRATION_UNAVAILABLE", "calibration file cannot be captured"
         ) from error
-    if trailing or not (
-        _state(before) == _state(opened) == _state(closed_state) == _state(after)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or trailing
+        or target_again != target
+        or relative_again != lexical_relative
+        or opened_chain != current_chain
+        or opened_chain[-1] != _state(opened)
+        or _state(opened) != _state(closed_state)
     ):
         _refuse(
             "XU_CALIBRATION_IDENTITY_MISMATCH",
             "calibration changed during capture",
         )
     projection = parse_xu_stitch_calibration_bytes(raw)
-    resolved_relative = os.path.relpath(os.path.realpath(target), os.path.realpath(project))
+    resolved_project = os.path.realpath(project)
+    resolved_target = os.path.realpath(target)
+    if os.path.commonpath((resolved_project, resolved_target)) != resolved_project:
+        _refuse(
+            "XU_CALIBRATION_OUTSIDE_PROJECT",
+            "calibration resolved outside Project after capture",
+        )
+    resolved_relative = os.path.relpath(resolved_target, resolved_project)
+    if resolved_relative == os.pardir or resolved_relative.startswith(
+        os.pardir + os.sep
+    ):
+        _refuse(
+            "XU_CALIBRATION_OUTSIDE_PROJECT",
+            "calibration resolved outside Project after capture",
+        )
     receipt_projection = (
         lexical_relative,
         resolved_relative,
-        _state(after),
+        _state(closed_state),
         projection.raw_sha256,
         projection.semantic_fingerprint,
     )
@@ -442,7 +624,7 @@ def capture_xu_stitch_calibration(
         project,
         lexical_relative,
         resolved_relative,
-        _state(after),
+        _state(closed_state),
         projection,
         fingerprint,
         _RECEIPT_FACTORY,

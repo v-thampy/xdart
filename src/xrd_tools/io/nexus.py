@@ -2692,6 +2692,48 @@ def _schema_dataset(g: h5py.Group, group_name: str, name: str, data,
     return g.create_dataset(spec.name, data=data, **kwargs)
 
 
+def _schema_projected_dataset(
+    group: h5py.Group,
+    group_name: str,
+    name: str,
+    data: np.ndarray,
+    *,
+    ck: dict,
+) -> h5py.Dataset:
+    """Write already-projected artifact bytes without a second conversion."""
+
+    spec = SCHEMA.groups[group_name].datasets[name]
+    if (
+        spec.dtype != "float32"
+        or type(data) is not np.ndarray
+        or data.dtype != np.dtype("<f4")
+        or not data.flags.c_contiguous
+        or data.flags.writeable
+    ):
+        raise TypeError("stored analysis projection is not exact frozen <f4")
+    kwargs = {}
+    if spec.compressed:
+        kwargs.update(ck)
+    return group.create_dataset(spec.name, data=data, **kwargs)
+
+
+def _projected_diagnostic_dataset(
+    group: h5py.Group,
+    name: str,
+    data: np.ndarray,
+    *,
+    ck: dict,
+) -> h5py.Dataset:
+    if (
+        type(data) is not np.ndarray
+        or data.dtype != np.dtype("<f4")
+        or not data.flags.c_contiguous
+        or data.flags.writeable
+    ):
+        raise TypeError("stored Stitch diagnostic is not exact frozen <f4")
+    return group.create_dataset(name, data=data, **ck)
+
+
 def _norm_attr(value):
     """Normalize an attr value (schema-declared or h5py-read) for comparison.
 
@@ -3343,7 +3385,7 @@ _MAX_BOUNDED_ARTIFACT_PROVENANCE_BYTES = 1 << 20
 
 
 def _bounded_artifact_text(value, name: str, *, max_bytes: int) -> bytes:
-    if type(value) is not str or not value:
+    if type(value) is not str or not value or "\x00" in value:
         raise TypeError(f"{name} must be an exact nonempty string")
     try:
         encoded = value.encode("utf-8")
@@ -3436,6 +3478,8 @@ def write_stitched(
     representation for ordinary scan files.
     """
     ck = _comp_kwargs(compression)
+    if type(bounded_artifact) is not bool:
+        raise TypeError("bounded_artifact must be an exact bool")
     if result_projection is not None:
         from xrd_tools.io.analysis_artifact import (
             AnalysisArtifactKind,
@@ -3471,7 +3515,7 @@ def write_stitched(
         group = _create_group_from_schema(entry_grp, group_name)
         axis_names = tuple(name for name, _values in result_projection.axes)
         _bound_analysis_nxdata(group, axis_names)
-        _schema_dataset(
+        _schema_projected_dataset(
             group,
             group_name,
             "intensity",
@@ -3483,10 +3527,16 @@ def write_stitched(
             result_projection.axis_units,
             strict=True,
         ):
-            dataset = _schema_dataset(group, group_name, name, values, ck=ck)
+            dataset = _schema_projected_dataset(
+                group,
+                group_name,
+                name,
+                values,
+                ck=ck,
+            )
             _bounded_text_attr(dataset, "units", units)
         if result_projection.sigma is not None:
-            _schema_dataset(
+            _schema_projected_dataset(
                 group,
                 group_name,
                 "sigma",
@@ -3494,17 +3544,85 @@ def write_stitched(
                 ck=ck,
             )
         if result_projection.coverage is not None:
-            group.create_dataset(
-                "coverage", data=result_projection.coverage, **ck
+            _projected_diagnostic_dataset(
+                group,
+                "coverage",
+                result_projection.coverage,
+                ck=ck,
             )
-            group.create_dataset(
-                "normalization", data=result_projection.normalization, **ck
+            _projected_diagnostic_dataset(
+                group,
+                "normalization",
+                result_projection.normalization,
+                ck=ck,
             )
         group.create_dataset(
             "provenance_json",
             data=np.bytes_(prov_json.encode("utf-8")),
         )
         return
+    if bounded_artifact:
+        from xrd_tools.io.analysis_artifact import (
+            AnalysisArtifactKind,
+            _project_analysis_artifact_result_v1_compat,
+        )
+
+        if (coverage is None) != (normalization is None):
+            raise ValueError(
+                "stitched coverage and normalization diagnostics must be paired"
+            )
+        if (stitched_1d is None) == (stitched_2d is None):
+            raise ValueError(
+                "bounded analysis artifact requires exactly one stitched result"
+            )
+        if frame_records is not None or source_base is not None:
+            raise ValueError(
+                "bounded analysis artifact does not accept unbound frame records"
+            )
+        value = stitched_1d if stitched_1d is not None else stitched_2d
+        _bounded_artifact_provenance(provenance)
+        if stitched_1d is not None:
+            _bounded_artifact_text(
+                value.unit,
+                "stitched radial units",
+                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
+            )
+            kind = AnalysisArtifactKind.STITCH_1D
+            axes = (("q", value.radial),)
+            axis_units = (("q", value.unit),)
+        else:
+            _bounded_artifact_text(
+                value.unit,
+                "stitched radial units",
+                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
+            )
+            _bounded_artifact_text(
+                value.azimuthal_unit,
+                "stitched azimuthal units",
+                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
+            )
+            kind = AnalysisArtifactKind.STITCH_2D
+            axes = (("q", value.radial), ("chi", value.azimuthal))
+            axis_units = (
+                ("q", value.unit),
+                ("chi", value.azimuthal_unit),
+            )
+        projection = _project_analysis_artifact_result_v1_compat(
+            kind=kind,
+            axes=axes,
+            axis_units=axis_units,
+            intensity=value.intensity,
+            sigma=value.sigma,
+            coverage=coverage,
+            normalization=normalization,
+        )
+        return write_stitched(
+            entry_grp,
+            result_projection=projection,
+            provenance=provenance,
+            compression=compression,
+            bounded_artifact=True,
+        )
     if (coverage is None) != (normalization is None):
         raise ValueError(
             "stitched coverage and normalization diagnostics must be paired"
@@ -3535,8 +3653,6 @@ def write_stitched(
                 "stitched diagnostics must be finite nonnegative result-shaped peers"
             )
         diagnostics = coverage_values, normalization_values
-    if type(bounded_artifact) is not bool:
-        raise TypeError("bounded_artifact must be an exact bool")
     prov_json: str | None = None
     if bounded_artifact:
         if (stitched_1d is None) == (stitched_2d is None):
@@ -3646,8 +3762,9 @@ def write_stitched(
 
 def write_rsm(
     entry_grp: h5py.Group,
-    volume: Any,
+    volume: Any | None = None,
     *,
+    result_projection: object | None = None,
     provenance: "Mapping[str, object] | str | None" = None,
     frame_records=None,
     source_base=None,
@@ -3662,6 +3779,81 @@ def write_rsm(
     """
     if type(bounded_artifact) is not bool:
         raise TypeError("bounded_artifact must be an exact bool")
+    ck = _comp_kwargs(compression)
+    if result_projection is not None:
+        from xrd_tools.io.analysis_artifact import (
+            AnalysisArtifactKind,
+            AnalysisArtifactResultProjection,
+        )
+
+        if (
+            type(result_projection) is not AnalysisArtifactResultProjection
+            or result_projection.kind is not AnalysisArtifactKind.RSM
+        ):
+            raise TypeError(
+                "result_projection must be an exact stored RSM projection"
+            )
+        if (
+            not bounded_artifact
+            or volume is not None
+            or frame_records is not None
+            or source_base is not None
+        ):
+            raise ValueError(
+                "stored RSM projection is exclusive to a bounded artifact"
+            )
+        prov = _bounded_artifact_provenance(provenance)
+        if "rsm" in entry_grp:
+            del entry_grp["rsm"]
+        group = _create_group_from_schema(entry_grp, "rsm")
+        axis_names = tuple(name for name, _values in result_projection.axes)
+        _bound_analysis_nxdata(group, axis_names)
+        _schema_projected_dataset(
+            group,
+            "rsm",
+            "intensity",
+            result_projection.intensity,
+            ck=ck,
+        )
+        for name, values in result_projection.axes:
+            _schema_projected_dataset(
+                group,
+                "rsm",
+                name,
+                values,
+                ck=ck,
+            )
+        group.create_dataset(
+            "provenance_json",
+            data=np.bytes_(prov.encode("utf-8")),
+        )
+        return
+    if bounded_artifact:
+        from xrd_tools.io.analysis_artifact import (
+            AnalysisArtifactKind,
+            project_analysis_artifact_result,
+        )
+
+        if volume is None or frame_records is not None or source_base is not None:
+            raise ValueError(
+                "bounded analysis artifact requires one unbound-free RSM volume"
+            )
+        projection = project_analysis_artifact_result(
+            kind=AnalysisArtifactKind.RSM,
+            axes=(("h", volume.h), ("k", volume.k), ("l", volume.l)),
+            axis_units=(("h", None), ("k", None), ("l", None)),
+            intensity=volume.intensity,
+            sigma=None,
+            coverage=None,
+            normalization=None,
+        )
+        return write_rsm(
+            entry_grp,
+            result_projection=projection,
+            provenance=provenance,
+            compression=compression,
+            bounded_artifact=True,
+        )
     if bounded_artifact:
         if frame_records is not None or source_base is not None:
             raise ValueError(
@@ -3673,7 +3865,8 @@ def write_rsm(
             provenance, default=str)
     else:
         prov = None
-    ck = _comp_kwargs(compression)
+    if volume is None:
+        raise TypeError("RSM writer requires one volume")
     intensity = np.asarray(volume.intensity, np.float32)
     expected = (len(volume.h), len(volume.k), len(volume.l))
     if intensity.shape != expected:

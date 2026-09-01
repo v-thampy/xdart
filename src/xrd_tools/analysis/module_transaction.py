@@ -52,6 +52,22 @@ from xrd_tools.io import (
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MODULE_SOURCE_FACTORY = object()
 _MODULE_RECEIPT_FACTORY = object()
+_XU_STITCH_REQUEST_FACTORY = object()
+_XU_INTENT_TOP_KEYS = {
+    "schema_version",
+    "kind",
+    "backend",
+    "source",
+    "asset",
+    "effective_geometry",
+    "detector",
+    "corrections",
+    "plan",
+    "observations",
+    "runtime_requirements",
+    "output",
+    "holds",
+}
 
 
 def _require_sha256(value: object, name: str) -> str:
@@ -309,8 +325,10 @@ class ModuleOperationRequest:
     plan_fingerprint: str
     provenance_digest: str
     fingerprint: str = field(init=False)
+    _xu_stitch_claim: InitVar[object] = None
+    _xu_stitch_v2_bound: bool = field(init=False, default=False, repr=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _xu_stitch_claim: object) -> None:
         if (
             type(self.source) is not ModuleSourceReceipt
             or type(self.output) is not ModuleOutputRequest
@@ -330,6 +348,13 @@ class ModuleOperationRequest:
         )
         if not compatible:
             raise ValueError("module source and artifact kinds do not match")
+        xu_bound = _xu_stitch_claim is _XU_STITCH_REQUEST_FACTORY
+        if xu_bound and (
+            self.source.kind is not ModuleKind.STITCH
+            or self.output.kind is not AnalysisArtifactKind.STITCH_1D
+        ):
+            raise TypeError("XU Stitch request requires exact Stitch 1-D intent")
+        object.__setattr__(self, "_xu_stitch_v2_bound", xu_bound)
         object.__setattr__(
             self,
             "fingerprint",
@@ -347,6 +372,143 @@ class ModuleOperationRequest:
     @property
     def kind(self) -> ModuleKind:
         return self.source.kind
+
+    def __copy__(self):
+        raise TypeError("module operation request is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("module operation request is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("module operation request is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("module operation request is not serializable")
+
+
+def xu_stitch_module_request(
+    source: ModuleSourceReceipt,
+    output: ModuleOutputRequest,
+    plan_fingerprint: str,
+    provenance_digest: str,
+) -> ModuleOperationRequest:
+    """Construct the one standard request authorized for XU artifact v2."""
+
+    return ModuleOperationRequest(
+        source,
+        output,
+        plan_fingerprint,
+        provenance_digest,
+        _XU_STITCH_REQUEST_FACTORY,
+    )
+
+
+def _validate_xu_stitch_v2_intent(
+    request: ModuleOperationRequest,
+    provenance: Mapping[str, object],
+) -> None:
+    source = provenance.get("source")
+    asset = provenance.get("asset")
+    effective = provenance.get("effective_geometry")
+    detector = provenance.get("detector")
+    corrections = provenance.get("corrections")
+    plan = provenance.get("plan")
+    observations = provenance.get("observations")
+    runtime = provenance.get("runtime_requirements")
+    output = provenance.get("output")
+    holds = provenance.get("holds")
+    if (
+        request._xu_stitch_v2_bound is not True
+        or set(provenance) != _XU_INTENT_TOP_KEYS
+        or provenance.get("schema_version")
+        != "stitch-operation-v2-xu-intent"
+        or provenance.get("kind") != "stitch"
+        or provenance.get("backend") != "xu_hist"
+        or type(source) is not dict
+        or set(source)
+        != {
+            "source_fingerprint",
+            "module_source_fingerprint",
+            "metadata_table_fingerprint",
+            "selected_labels",
+            "input_manifest",
+        }
+        or source.get("source_fingerprint")
+        != request.source.analysis.source_fingerprint
+        or source.get("module_source_fingerprint")
+        != request.source.fingerprint
+        or source.get("metadata_table_fingerprint")
+        != request.source.table_fingerprint
+        or source.get("selected_labels")
+        != list(request.source.selected_labels)
+        or type(source.get("input_manifest")) is not dict
+        or type(asset) is not dict
+        or set(asset)
+        != {
+            "lexical_relative_path",
+            "resolved_relative_path",
+            "byte_count",
+            "raw_sha256",
+            "semantic_fingerprint",
+            "receipt_fingerprint",
+        }
+        or any(
+            _SHA256.fullmatch(asset.get(name, "")) is None
+            for name in (
+                "raw_sha256",
+                "semantic_fingerprint",
+                "receipt_fingerprint",
+            )
+        )
+        or type(effective) is not dict
+        or _SHA256.fullmatch(effective.get("fingerprint", "")) is None
+        or type(detector) is not dict
+        or not detector
+        or type(corrections) is not dict
+        or not corrections
+        or type(plan) is not dict
+        or set(plan)
+        != {
+            "backend",
+            "mode",
+            "unit",
+            "method",
+            "radial_range",
+            "npt_1d",
+            "monitor_selector",
+            "use_detector_mask",
+            "max_frame_bytes",
+            "asset_receipt_fingerprint",
+            "effective_geometry_fingerprint",
+            "plan_fingerprint",
+        }
+        or plan.get("backend") != "xu_hist"
+        or plan.get("mode") != "1d"
+        or plan.get("unit") != "q_A^-1"
+        or plan.get("method") != "numpy_histogram_center_v1"
+        or plan.get("use_detector_mask") is not True
+        or plan.get("plan_fingerprint") != request.plan_fingerprint
+        or plan.get("asset_receipt_fingerprint")
+        != asset.get("receipt_fingerprint")
+        or plan.get("effective_geometry_fingerprint")
+        != effective.get("fingerprint")
+        or type(observations) is not dict
+        or not observations
+        or type(runtime) is not dict
+        or not runtime
+        or type(output) is not dict
+        or output
+        != {
+            "target": request.output.target,
+            "kind": request.output.kind.value,
+            "overwrite": request.output.overwrite.value,
+            "output_fingerprint": request.output.fingerprint,
+        }
+        or type(holds) is not list
+        or not holds
+        or any(type(item) is not str or not item for item in holds)
+    ):
+        raise ModuleArtifactRefused("XU_INTENT_PROVENANCE_MISMATCH")
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,6 +607,7 @@ class ModuleCommitReceipt:
         if (
             type(request) is not ModuleOperationRequest
             or type(artifact) is not AnalysisArtifactReceipt
+            or artifact.request._module_owner is not request
         ):
             raise TypeError("artifact receipt does not match the exact module request")
         try:
@@ -622,6 +785,7 @@ def module_artifact_request(
             "module execution attestation and digest must be supplied together"
         )
     if carries_attestation:
+        _validate_xu_stitch_v2_intent(request, provenance)
         observed = analysis_execution_attestation_digest(
             request.output.kind,
             execution_attestation,
@@ -629,6 +793,11 @@ def module_artifact_request(
         )
         if observed != execution_attestation_digest:
             raise ModuleArtifactRefused("EXECUTION_ATTESTATION_MISMATCH")
+        selected_count = execution_attestation.get("selected_frame_count")
+        release_count = execution_attestation.get("release_check_frame_count")
+        expected_count = len(request.source.selected_labels)
+        if selected_count != expected_count or release_count != expected_count:
+            raise ModuleArtifactRefused("EXECUTION_ATTESTATION_COUNT_MISMATCH")
     artifact = AnalysisArtifactRequest(
         request.output.target,
         request.output.kind,
@@ -645,6 +814,7 @@ def module_artifact_request(
         ),
         execution_attestation_digest=execution_attestation_digest,
         execution_attestation=execution_attestation,
+        module_owner=request,
     )
     frozen_provenance = json.loads(artifact.provenance_json)
     if (
@@ -666,6 +836,7 @@ class ModuleArtifactOutput:
         if (
             type(request) is not ModuleOperationRequest
             or type(output) is not AnalysisArtifactOutput
+            or output.request._module_owner is not request
         ):
             raise TypeError("module artifact owner requires exact values")
         foreign = output.request
@@ -986,4 +1157,5 @@ __all__ = [
     "module_artifact_request",
     "module_plan_fingerprint",
     "module_provenance_digest",
+    "xu_stitch_module_request",
 ]

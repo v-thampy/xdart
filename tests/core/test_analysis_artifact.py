@@ -470,9 +470,13 @@ def test_public_result_projection_refuses_unstorable_science(q, intensity):
     [
         np.array([0.0, 1.5], dtype=np.float64),
         np.array([0.0, float(2**24 + 1)], dtype=np.float64),
+        np.array([0.0, 0.5], dtype=np.float32),
+        np.array([0.0, float(2**24 + 2)], dtype=np.float32),
+        np.array([0, 2**24 + 1], dtype=np.int64),
+        np.array([0.0, 0.5], dtype=np.float16),
     ],
 )
-def test_public_result_projection_refuses_inexact_float64_stitch_counts(coverage):
+def test_public_result_projection_refuses_inexact_stitch_counts(coverage):
     with pytest.raises(AnalysisArtifactProjectionInvalid, match="coverage"):
         project_analysis_artifact_result(
             kind=AnalysisArtifactKind.STITCH_1D,
@@ -521,6 +525,16 @@ def test_public_result_projection_matches_axis_unit_and_nan_storage_bounds():
             coverage=None,
             normalization=None,
         )
+    with pytest.raises(AnalysisArtifactProjectionInvalid, match="axes, units"):
+        project_analysis_artifact_result(
+            kind=AnalysisArtifactKind.STITCH_1D,
+            axes=(("q", np.array([1.0, 2.0])),),
+            axis_units=(("q", "q_A^-1\x00"),),
+            intensity=np.ones(2),
+            sigma=None,
+            coverage=None,
+            normalization=None,
+        )
     noncanonical_nan = np.array(
         [np.uint32(0x7FC01234), np.uint32(0x3F800000)], dtype="<u4"
     ).view("<f4")
@@ -545,7 +559,7 @@ def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
         axis_units=(("q", "q_A^-1"),),
         intensity=np.linspace(1.0, 2.0, 7),
         sigma=None,
-        coverage=np.arange(7, dtype=np.float64),
+        coverage=np.arange(1, 8, dtype=np.float64),
         normalization=np.linspace(1.0, 7.0, 7),
     )
     request_fingerprint = _digest("v2-request")
@@ -607,6 +621,74 @@ def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
         )
 
 
+@pytest.mark.parametrize(
+    "unit,sigma,diagnostics",
+    [
+        ("not_q_A^-1", None, True),
+        ("q_A^-1", np.linspace(0.1, 0.2, 7), True),
+        ("q_A^-1", None, False),
+    ],
+)
+def test_analysis_artifact_v2_refuses_non_xu_result_schema(
+    tmp_path,
+    unit,
+    sigma,
+    diagnostics,
+):
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.STITCH_1D,
+        axes=(("q", np.linspace(0.1, 2.0, 7)),),
+        axis_units=(("q", unit),),
+        intensity=np.linspace(1.0, 2.0, 7),
+        sigma=sigma,
+        coverage=(np.arange(7, dtype=np.float64) if diagnostics else None),
+        normalization=(
+            np.linspace(1.0, 7.0, 7) if diagnostics else None
+        ),
+    )
+    request_fingerprint = _digest(
+        f"v2-invalid-result-{unit}-{sigma is not None}-{diagnostics}"
+    )
+    attestation = _execution_attestation(
+        request_fingerprint,
+        projection.result_fingerprint,
+    )
+    attestation_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.STITCH_1D,
+        attestation,
+        request_fingerprint=request_fingerprint,
+    )
+    target = tmp_path / (
+        f"v2-invalid-result-{sigma is not None}-{diagnostics}.nexus"
+    )
+    request = AnalysisArtifactRequest(
+        target,
+        AnalysisArtifactKind.STITCH_1D,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        request_fingerprint,
+        _digest("v2-invalid-source"),
+        _digest("v2-invalid-plan"),
+        _digest("v2-invalid-provenance"),
+        {"schema_version": "stitch-operation-v2-xu-intent"},
+        schema_version=ANALYSIS_SCHEMA_VERSION_V2,
+        execution_attestation_digest=attestation_digest,
+        execution_attestation=attestation,
+    )
+    with pytest.raises(AnalysisArtifactInvalid, match="exact XU Stitch"):
+        admit_analysis_artifact(
+            request,
+            coordinator=OutputTransactionCoordinator(),
+        ).publish(
+            lambda entry: write_stitched(
+                entry,
+                result_projection=projection,
+                provenance=request.provenance_json,
+                bounded_artifact=True,
+            )
+        )
+    assert not target.exists()
+
+
 def test_analysis_artifact_versions_refuse_cross_version_attestation_members(
     tmp_path,
 ):
@@ -636,6 +718,63 @@ def test_analysis_artifact_versions_refuse_cross_version_attestation_members(
             execution_attestation_digest=_digest("invalid-v1-attestation"),
             execution_attestation={},
         )
+
+
+def test_analysis_artifact_v2_refuses_padded_attestation_digest_attribute(
+    tmp_path,
+):
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.STITCH_1D,
+        axes=(("q", np.linspace(0.1, 2.0, 7)),),
+        axis_units=(("q", "q_A^-1"),),
+        intensity=np.linspace(1.0, 2.0, 7),
+        sigma=None,
+        coverage=np.arange(1, 8, dtype=np.float64),
+        normalization=np.linspace(1.0, 7.0, 7),
+    )
+    request_fingerprint = _digest("v2-padded-request")
+    attestation = _execution_attestation(
+        request_fingerprint,
+        projection.result_fingerprint,
+    )
+    attestation_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.STITCH_1D,
+        attestation,
+        request_fingerprint=request_fingerprint,
+    )
+    request = AnalysisArtifactRequest(
+        tmp_path / "artifact-v2-padded-digest.nexus",
+        AnalysisArtifactKind.STITCH_1D,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        request_fingerprint,
+        _digest("v2-padded-source"),
+        _digest("v2-padded-plan"),
+        _digest("v2-padded-provenance"),
+        {"schema_version": "stitch-operation-v2-xu-intent"},
+        schema_version=ANALYSIS_SCHEMA_VERSION_V2,
+        execution_attestation_digest=attestation_digest,
+        execution_attestation=attestation,
+    )
+    admit_analysis_artifact(
+        request,
+        coordinator=OutputTransactionCoordinator(),
+    ).publish(
+        lambda entry: write_stitched(
+            entry,
+            result_projection=projection,
+            provenance=request.provenance_json,
+            bounded_artifact=True,
+        )
+    )
+    with h5py.File(request.target, "r+") as handle:
+        entry = handle["entry"]
+        del entry.attrs["execution_attestation_digest"]
+        entry.attrs.create(
+            "execution_attestation_digest",
+            np.array(attestation_digest.encode("utf-8"), dtype="S65"),
+        )
+    with pytest.raises(AnalysisArtifactInvalid, match="exact digest text"):
+        inspect_analysis_artifact(request.target)
 
 
 def test_stitch_diagnostics_round_trip_and_bind_result_fingerprint(tmp_path):

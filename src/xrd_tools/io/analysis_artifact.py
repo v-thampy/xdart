@@ -66,6 +66,7 @@ _ANALYSIS_RECEIPT_FACTORY = object()
 _ANALYSIS_PAYLOAD_FACTORY = object()
 _ANALYSIS_CANDIDATE_INSPECTION = object()
 _ANALYSIS_PROJECTION_FACTORY = object()
+_ANALYSIS_V1_DECODE_PROJECTION = object()
 
 
 class AnalysisArtifactKind(str, Enum):
@@ -449,17 +450,21 @@ class AnalysisArtifactRequest:
     execution_attestation_digest: str | None = None
     execution_attestation: InitVar[Mapping[str, object] | None] = None
     execution_attestation_json: str | None = field(init=False, default=None, repr=False)
+    module_owner: InitVar[object | None] = None
+    _module_owner: object | None = field(init=False, default=None, repr=False)
 
     def __post_init__(
         self,
         provenance: Mapping[str, object],
         execution_attestation: Mapping[str, object] | None,
+        module_owner: object | None,
     ) -> None:
         if (
             type(self.kind) is not AnalysisArtifactKind
             or type(self.overwrite) is not AnalysisArtifactOverwrite
         ):
             raise TypeError("analysis artifact request enums must be exact")
+        object.__setattr__(self, "_module_owner", module_owner)
         object.__setattr__(self, "target", _normalize_target(self.target))
         for value, name in (
             (self.request_fingerprint, "request fingerprint"),
@@ -885,6 +890,33 @@ def _bounded_attr_text(owner, name: str) -> str:
     return _decode_fixed_text(owner.attrs[name])
 
 
+def _exact_sha256_attr_text(owner, name: str) -> str:
+    """Read one v2-only digest with no fixed-width NUL padding."""
+
+    try:
+        attribute = owner.attrs.get_id(name)
+    except KeyError as error:
+        raise AnalysisArtifactInvalid(
+            f"analysis artifact attribute {name} is missing"
+        ) from error
+    if (
+        attribute.shape != ()
+        or _hdf_type_class(attribute) != h5py.h5t.STRING
+        or attribute.dtype.kind != "S"
+        or attribute.dtype.itemsize != 64
+        or attribute.get_storage_size() != 64
+    ):
+        raise AnalysisArtifactInvalid(
+            f"analysis artifact attribute {name} is not exact digest text"
+        )
+    value = _decode_fixed_text(owner.attrs[name])
+    if len(value.encode("utf-8")) != 64:
+        raise AnalysisArtifactInvalid(
+            f"analysis artifact attribute {name} is padded digest text"
+        )
+    return value
+
+
 def _bounded_attr_texts(owner, name: str) -> tuple[str, ...]:
     try:
         attribute = owner.attrs.get_id(name)
@@ -1058,6 +1090,13 @@ def _read_scalar_execution_attestation(
         ) from error
     if len(text.encode("utf-8")) > _MAX_EXECUTION_ATTESTATION_BYTES:
         raise AnalysisArtifactInvalid("analysis execution attestation is oversized")
+    if (
+        dataset.dtype.itemsize != len(text.encode("utf-8"))
+        or dataset.id.get_storage_size() != len(text.encode("utf-8"))
+    ):
+        raise AnalysisArtifactInvalid(
+            "analysis execution attestation storage is not byte-exact"
+        )
     _require_execution_attestation_nesting_bound(text)
     try:
         parsed = json.loads(text)
@@ -1292,6 +1331,7 @@ def project_analysis_artifact_result(
     sigma: np.ndarray | None,
     coverage: np.ndarray | None,
     normalization: np.ndarray | None,
+    _stored_v1_claim: object = None,
 ) -> AnalysisArtifactResultProjection:
     """Project one result exactly once to the bytes stored by the artifact.
 
@@ -1310,7 +1350,7 @@ def project_analysis_artifact_result(
     }[kind]
 
     def bounded_unit(value: object) -> bool:
-        if type(value) is not str or not value:
+        if type(value) is not str or not value or "\x00" in value:
             return False
         try:
             return len(value.encode("utf-8")) <= _MAX_ATTRIBUTE_BYTES
@@ -1404,19 +1444,23 @@ def project_analysis_artifact_result(
                 AnalysisArtifactKind.STITCH_1D,
                 AnalysisArtifactKind.STITCH_2D,
             }
-            and coverage.dtype == np.dtype(np.float64)
+            and _stored_v1_claim is not _ANALYSIS_V1_DECODE_PROJECTION
         ):
-            if (
-                not np.isfinite(coverage).all()
-                or np.any(coverage < 0)
-                or np.any(coverage > 2**24)
-                or np.any(coverage != np.floor(coverage))
-            ):
+            with np.errstate(over="ignore", invalid="ignore"):
+                invalid_counts = (
+                    not np.isfinite(coverage).all()
+                    or np.any(coverage < 0)
+                    or np.any(coverage > 2**24)
+                    or np.any(coverage != np.floor(coverage))
+                )
+            if invalid_counts:
                 raise AnalysisArtifactProjectionInvalid(
-                    "float64 Stitch coverage must be exact bounded integer counts"
+                    "Stitch coverage must be exact bounded integer counts"
                 )
             coverage_f4 = np.asarray(coverage, dtype=np.dtype("<f4"))
-            if not np.array_equal(coverage_f4.astype(np.float64), coverage):
+            if not np.array_equal(
+                coverage_f4.astype(coverage.dtype), coverage
+            ):
                 raise AnalysisArtifactProjectionInvalid(
                     "Stitch coverage loses count identity in float32 storage"
                 )
@@ -1464,6 +1508,30 @@ def project_analysis_artifact_result(
         projected_normalization,
         digest.hexdigest(),
         _ANALYSIS_PROJECTION_FACTORY,
+    )
+
+
+def _project_analysis_artifact_result_v1_compat(
+    *,
+    kind: AnalysisArtifactKind,
+    axes: tuple[tuple[str, np.ndarray], ...],
+    axis_units: tuple[tuple[str, str | None], ...],
+    intensity: np.ndarray,
+    sigma: np.ndarray | None,
+    coverage: np.ndarray | None,
+    normalization: np.ndarray | None,
+) -> AnalysisArtifactResultProjection:
+    """Use the central projection for byte-compatible historical v1 Stitch."""
+
+    return project_analysis_artifact_result(
+        kind=kind,
+        axes=axes,
+        axis_units=axis_units,
+        intensity=intensity,
+        sigma=sigma,
+        coverage=coverage,
+        normalization=normalization,
+        _stored_v1_claim=_ANALYSIS_V1_DECODE_PROJECTION,
     )
 
 
@@ -1637,7 +1705,7 @@ def inspect_analysis_artifact(
             execution_attestation_digest = None
             if version == ANALYSIS_SCHEMA_VERSION_V2:
                 execution_attestation_digest = _sha256(
-                    _bounded_attr_text(
+                    _exact_sha256_attr_text(
                         entry, _EXECUTION_ATTESTATION_DIGEST_ATTR
                     ),
                     "execution attestation digest",
@@ -1787,6 +1855,15 @@ def inspect_analysis_artifact(
                 if not chi_units:
                     raise AnalysisArtifactInvalid("stitched chi units are invalid")
                 axis_units[1] = ("chi", chi_units)
+            if version == ANALYSIS_SCHEMA_VERSION_V2 and (
+                kind is not AnalysisArtifactKind.STITCH_1D
+                or axis_units != [("q", "q_A^-1")]
+                or has_sigma
+                or not has_stitch_diagnostics
+            ):
+                raise AnalysisArtifactInvalid(
+                    "analysis artifact v2 requires the exact XU Stitch result schema"
+                )
             intensity = _direct(result, "intensity", h5py.Dataset)
             if len(intensity.attrs) != 0:
                 raise AnalysisArtifactInvalid(
@@ -1835,9 +1912,32 @@ def inspect_analysis_artifact(
                     sigma=sigma_values,
                     coverage=coverage_values,
                     normalization=normalization_values,
+                    _stored_v1_claim=(
+                        _ANALYSIS_V1_DECODE_PROJECTION
+                        if version == ANALYSIS_SCHEMA_VERSION
+                        else None
+                    ),
                 )
             except AnalysisArtifactProjectionInvalid as error:
                 raise AnalysisArtifactInvalid(str(error)) from error
+            if version == ANALYSIS_SCHEMA_VERSION_V2:
+                empty_coverage = projection.coverage == 0
+                empty_normalization = projection.normalization == 0
+                empty_intensity = np.isnan(projection.intensity)
+                if (
+                    not np.array_equal(empty_coverage, empty_normalization)
+                    or not np.array_equal(empty_coverage, empty_intensity)
+                    or not np.isfinite(
+                        projection.intensity[~empty_coverage]
+                    ).all()
+                    or np.any(projection.coverage[~empty_coverage] <= 0)
+                    or np.any(
+                        projection.normalization[~empty_coverage] <= 0
+                    )
+                ):
+                    raise AnalysisArtifactInvalid(
+                        "analysis artifact v2 empty and occupied bins disagree"
+                    )
             if (
                 execution_attestation_json is not None
                 and json.loads(execution_attestation_json).get(
@@ -2029,6 +2129,12 @@ def read_analysis_artifact(
                     sigma=sigma,
                     coverage=coverage,
                     normalization=normalization,
+                    _stored_v1_claim=(
+                        _ANALYSIS_V1_DECODE_PROJECTION
+                        if inspection.schema_version
+                        == ANALYSIS_SCHEMA_VERSION
+                        else None
+                    ),
                 )
             except AnalysisArtifactProjectionInvalid as error:
                 raise AnalysisArtifactInvalid(str(error)) from error

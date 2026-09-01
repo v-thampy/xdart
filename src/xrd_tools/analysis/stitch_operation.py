@@ -51,6 +51,10 @@ from xrd_tools.analysis.scan_operations import (
     requalified_analysis_source,
     run_metadata_table,
 )
+from xrd_tools.analysis.xu_stitch_calibration import (
+    XuStitchCalibrationReceipt,
+    revalidate_xu_stitch_calibration,
+)
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.geometry import AngleMapping, Diffractometer, ImageOrientation
 from xrd_tools.core.scan import SourceKind
@@ -58,10 +62,22 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
     AnalysisArtifactPayload,
+    AnalysisArtifactProjectionInvalid,
+    _project_analysis_artifact_result_v1_compat,
+    analysis_execution_attestation_digest,
+    project_analysis_artifact_result,
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import write_stitched
 from xrd_tools.integrate.multi import StitchDiagnostics
+from xrd_tools.integrate.xu_stitch import (
+    XuStitchCancelled,
+    XuStitchEffectiveGeometryProjection,
+    XuStitchScienceRefused,
+    resolve_xu_stitch_effective_geometry,
+    run_xu_hist_stitch_1d,
+)
+from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 from xrd_tools.sources.base import BaseFrameSource
 
 
@@ -1216,6 +1232,7 @@ class StitchOperationPlan:
             "azimuth range",
             required=self.mode == "2d",
         )
+
         if self.mode == "1d" and azimuth is not None:
             raise ValueError("a 1-D Stitch plan cannot carry an azimuth range")
         if self.unit != "q_A^-1" or self.method != "full":
@@ -1259,6 +1276,76 @@ class StitchOperationPlan:
             "streaming-multigeometry-v1",
             self.max_frame_bytes,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class XuStitchOperationPlan:
+    calibration: XuStitchCalibrationReceipt
+    effective_geometry: XuStitchEffectiveGeometryProjection
+    q_min_A_inverse: float
+    q_max_A_inverse: float
+    npt_1d: int = 1500
+    monitor_selector: MetadataColumnSelector | None = None
+    max_frame_bytes: int = 256 * 1024 * 1024
+    backend: str = field(init=False, default="xu_hist")
+    mode: str = field(init=False, default="1d")
+    unit: str = field(init=False, default="q_A^-1")
+    method: str = field(init=False, default="numpy_histogram_center_v1")
+    use_detector_mask: bool = field(init=False, default=True)
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.calibration) is not XuStitchCalibrationReceipt
+            or type(self.effective_geometry)
+            is not XuStitchEffectiveGeometryProjection
+            or self.effective_geometry.asset_semantic_fingerprint
+            != self.calibration.semantic_fingerprint
+            or type(self.q_min_A_inverse) is not float
+            or type(self.q_max_A_inverse) is not float
+            or not math.isfinite(self.q_min_A_inverse)
+            or not math.isfinite(self.q_max_A_inverse)
+            or self.q_min_A_inverse >= self.q_max_A_inverse
+            or type(self.npt_1d) is not int
+            or not 1 <= self.npt_1d <= _MAX_AXIS_POINTS
+            or (
+                self.monitor_selector is not None
+                and type(self.monitor_selector) is not MetadataColumnSelector
+            )
+            or type(self.max_frame_bytes) is not int
+            or not 1 <= self.max_frame_bytes <= 4 * 1024 * 1024 * 1024
+        ):
+            raise TypeError("XU Stitch operation plan is invalid")
+        object.__setattr__(
+            self,
+            "fingerprint",
+            module_plan_fingerprint(
+                ModuleKind.STITCH,
+                (
+                    "stitch-operation-plan-v2-xu-hist",
+                    self.backend,
+                    self.mode,
+                    self.unit,
+                    self.method,
+                    (self.q_min_A_inverse, self.q_max_A_inverse),
+                    self.npt_1d,
+                    None
+                    if self.monitor_selector is None
+                    else (
+                        self.monitor_selector.name,
+                        self.monitor_selector.occurrence,
+                    ),
+                    self.use_detector_mask,
+                    self.max_frame_bytes,
+                    self.calibration.fingerprint,
+                    self.effective_geometry.fingerprint,
+                ),
+            ),
+        )
+
+    @property
+    def radial_range(self) -> tuple[float, float]:
+        return (self.q_min_A_inverse, self.q_max_A_inverse)
 
 
 def _required_stitch_selectors(
@@ -1969,6 +2056,35 @@ class StitchOperationExecution:
                 ModuleDisposition.FAILED,
                 "INVALID_STITCH_DIAGNOSTICS",
             )
+        try:
+            if self.request.plan.mode == "1d":
+                axes = (("q", payload.radial),)
+                axis_units = (("q", payload.unit),)
+                artifact_kind = AnalysisArtifactKind.STITCH_1D
+            else:
+                axes = (
+                    ("q", payload.radial),
+                    ("chi", payload.azimuthal),
+                )
+                axis_units = (
+                    ("q", payload.unit),
+                    ("chi", payload.azimuthal_unit),
+                )
+                artifact_kind = AnalysisArtifactKind.STITCH_2D
+            result_projection = _project_analysis_artifact_result_v1_compat(
+                kind=artifact_kind,
+                axes=axes,
+                axis_units=axis_units,
+                intensity=payload.intensity,
+                sigma=payload.sigma,
+                coverage=diagnostics.coverage,
+                normalization=diagnostics.normalization,
+            )
+        except AnalysisArtifactProjectionInvalid:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "STITCH_RESULT_STORAGE_PROJECTION_INVALID",
+            )
         provenance = self.request.provenance
         bound = module_artifact_request(self.request.module, provenance)
         try:
@@ -1998,11 +2114,8 @@ class StitchOperationExecution:
             _revalidate_geometry(self.request.plan.geometry)
             write_stitched(
                 entry,
-                stitched_1d=(payload if self.request.plan.mode == "1d" else None),
-                stitched_2d=(payload if self.request.plan.mode == "2d" else None),
+                result_projection=result_projection,
                 provenance=bound.provenance_json,
-                coverage=diagnostics.coverage,
-                normalization=diagnostics.normalization,
                 bounded_artifact=True,
             )
             _revalidate_geometry(self.request.plan.geometry)
