@@ -362,6 +362,7 @@ class XuPowderQFrameLease:
             )
         self._values = values
         self._root = roots[0]
+        self._root_ref = weakref.ref(self._root)
         self._released = False
 
     def q_magnitude(self) -> np.ndarray:
@@ -381,9 +382,10 @@ class XuPowderQFrameLease:
     def release(self) -> None:
         if self._released:
             return
-        root_ref = weakref.ref(self._root)
+        root_ref = self._root_ref
         self._values = None
         self._root = None
+        self._root_ref = None
         self._released = True
         if root_ref() is not None:
             raise XuStitchScienceRefused(

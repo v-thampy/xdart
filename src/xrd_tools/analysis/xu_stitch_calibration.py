@@ -272,42 +272,57 @@ def parse_xu_stitch_calibration_bytes(
 
 def canonical_surface_resource_bytes() -> bytes:
     try:
-        node = resources.files("xrd_tools")
-        for part in _RESOURCE_PARTS:
-            node = node.joinpath(part)
-        with resources.as_file(node) as resource_path:
-            shown = os.fspath(resource_path)
-            before = os.lstat(shown)
-            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-                raise OSError("canonical resource is not a regular file")
-            descriptor = os.open(
-                shown,
-                os.O_RDONLY
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_NONBLOCK", 0),
+        package_node = resources.files("xrd_tools")
+        package_shown = os.fspath(package_node)
+        if (
+            type(package_shown) is not str
+            or not package_shown
+            or "\x00" in package_shown
+        ):
+            raise OSError("canonical package root is not a filesystem path")
+        package_shown.encode("utf-8", errors="strict")
+        package_parts = Path(package_shown).parts
+        if (
+            not os.path.isabs(package_shown)
+            or not package_parts
+            or package_parts[0] != os.sep
+            or any(
+                part in {"", os.curdir, os.pardir}
+                for part in package_parts[1:]
             )
-            try:
-                opened = os.fstat(descriptor)
-                if not stat.S_ISREG(opened.st_mode):
-                    raise OSError("canonical resource changed type")
-                raw = os.read(descriptor, _MAX_ASSET_BYTES + 1)
-                trailing = os.read(descriptor, 1)
-                closed_state = os.fstat(descriptor)
-            finally:
-                os.close(descriptor)
-            after = os.lstat(shown)
-            if (
-                trailing
-                or _state(before)
-                != _state(opened)
-                or _state(opened)
-                != _state(closed_state)
-                or _state(closed_state) != _state(after)
-            ):
-                raise OSError("canonical resource changed during read")
+            or os.path.normpath(package_shown) != package_shown
+        ):
+            raise OSError("canonical package root is not an exact absolute path")
+        package = package_shown
+        relative = os.path.join(*_RESOURCE_PARTS)
+        descriptor, opened_chain = _open_no_follow_chain(package, relative)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError("canonical resource is not a regular file")
+            raw = os.read(descriptor, _MAX_ASSET_BYTES + 1)
+            trailing = os.read(descriptor, 1)
+            closed_state = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current_chain = _lexical_chain_states(package, relative)
+        if (
+            trailing
+            or opened_chain != current_chain
+            or opened_chain[-1] != _state(opened)
+            or _state(opened) != _state(closed_state)
+        ):
+            raise OSError("canonical resource changed during read")
         parse_xu_stitch_calibration_bytes(raw)
         return raw
-    except (FileNotFoundError, OSError, TypeError, XuStitchCalibrationRefused) as error:
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        UnicodeEncodeError,
+        ValueError,
+        XuStitchCalibrationRefused,
+    ) as error:
         raise XuStitchCalibrationRefused(
             "XU_CANONICAL_ASSET_UNAVAILABLE",
             "canonical SURFACE calibration resource is unavailable",
@@ -325,6 +340,12 @@ class XuStitchCalibrationInput:
             raise TypeError("XU calibration locator must be path-like") from error
         if type(shown) is not str or not shown or "\x00" in shown:
             raise TypeError("XU calibration locator must be a nonempty exact path")
+        try:
+            shown.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as error:
+            raise TypeError(
+                "XU calibration locator must be valid UTF-8 text"
+            ) from error
         object.__setattr__(self, "locator", shown)
 
 
@@ -344,10 +365,37 @@ def _lexical_target(
     project_root: str | Path,
 ) -> tuple[str, str, str]:
     try:
-        project = os.path.normpath(os.path.abspath(os.fspath(project_root)))
-        shown = os.fspath(request.locator)
+        project_shown = os.fspath(project_root)
     except TypeError as error:
-        raise TypeError("project and calibration locator must be path-like") from error
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_PROJECT_INVALID",
+            "Project must be a nonempty exact path",
+        ) from error
+    if (
+        type(project_shown) is not str
+        or not project_shown
+        or "\x00" in project_shown
+    ):
+        _refuse(
+            "XU_CALIBRATION_PROJECT_INVALID",
+            "Project must be a nonempty exact path",
+        )
+    try:
+        project_shown.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_PROJECT_INVALID",
+            "Project path must be valid UTF-8 text",
+        ) from error
+    try:
+        project = os.path.normpath(os.path.abspath(project_shown))
+        shown = os.fspath(request.locator)
+        shown.encode("utf-8", errors="strict")
+    except (OSError, ValueError, UnicodeEncodeError) as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_PROJECT_INVALID",
+            "Project and calibration paths cannot be normalized",
+        ) from error
     current = os.sep
     try:
         for part in Path(project).parts[1:]:

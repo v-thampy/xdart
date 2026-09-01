@@ -95,6 +95,22 @@ def test_surface_input_freezes_custom_pathlike_to_owned_text():
     assert type(request.locator) is str
 
 
+@pytest.mark.parametrize("locator", ["surface\x00.json", "surface-\udcff.json"])
+def test_surface_input_normalizes_hostile_locator_text(locator):
+    with pytest.raises(TypeError, match="XU calibration locator"):
+        XuStitchCalibrationInput(locator)
+
+
+@pytest.mark.parametrize("project_root", ["project\x00root", "project-\udcff-root"])
+def test_surface_capture_normalizes_hostile_project_text(project_root):
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        capture_xu_stitch_calibration(
+            XuStitchCalibrationInput("surface.json"),
+            project_root=project_root,
+        )
+    assert raised.value.code == "XU_CALIBRATION_PROJECT_INVALID"
+
+
 @pytest.mark.parametrize(
     "mutate,code",
     [
@@ -203,6 +219,75 @@ def test_canonical_resource_refuses_symlink_even_when_bytes_match(
     monkeypatch.setattr(
         "xrd_tools.analysis.xu_stitch_calibration.resources.files",
         lambda _package: package,
+    )
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        canonical_surface_resource_bytes()
+    assert raised.value.code == "XU_CANONICAL_ASSET_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("linked_component", ["package", "assets", "xu"])
+def test_canonical_resource_refuses_symlink_in_package_ancestry(
+    tmp_path,
+    monkeypatch,
+    linked_component,
+):
+    raw = canonical_surface_resource_bytes()
+    real_package = tmp_path / "real-package"
+    resource = (
+        real_package / "assets" / "xu" / "psic_powder_1d_surface_v1.json"
+    )
+    resource.parent.mkdir(parents=True)
+    resource.write_bytes(raw)
+    if linked_component == "package":
+        package = tmp_path / "package"
+        package.symlink_to(real_package, target_is_directory=True)
+    else:
+        package = tmp_path / "package"
+        package.mkdir()
+        if linked_component == "assets":
+            (package / "assets").symlink_to(
+                real_package / "assets", target_is_directory=True
+            )
+        else:
+            (package / "assets").mkdir()
+            (package / "assets" / "xu").symlink_to(
+                real_package / "assets" / "xu", target_is_directory=True
+            )
+    monkeypatch.setattr(
+        "xrd_tools.analysis.xu_stitch_calibration.resources.files",
+        lambda _package: package,
+    )
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        canonical_surface_resource_bytes()
+    assert raised.value.code == "XU_CANONICAL_ASSET_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("package_node", [object(), "package\x00root"])
+def test_canonical_resource_refuses_nonfilesystem_or_hostile_root(
+    monkeypatch,
+    package_node,
+):
+    monkeypatch.setattr(
+        "xrd_tools.analysis.xu_stitch_calibration.resources.files",
+        lambda _package: package_node,
+    )
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        canonical_surface_resource_bytes()
+    assert raised.value.code == "XU_CANONICAL_ASSET_UNAVAILABLE"
+
+
+def test_canonical_resource_refuses_noncanonical_package_root(
+    tmp_path,
+    monkeypatch,
+):
+    real_package = tmp_path / "package"
+    real_package.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_package, target_is_directory=True)
+    hostile = os.path.join(os.fspath(alias), os.pardir, real_package.name)
+    monkeypatch.setattr(
+        "xrd_tools.analysis.xu_stitch_calibration.resources.files",
+        lambda _package: hostile,
     )
     with pytest.raises(XuStitchCalibrationRefused) as raised:
         canonical_surface_resource_bytes()

@@ -66,6 +66,7 @@ def test_xu_effective_geometry_and_q_provider_use_one_shared_root(tmp_path):
             receipt.projection.value["acquisition"],
         )
         lease = provider.frame(nu=-10.0, del_=14.0)
+        assert lease._root_ref() is lease._root
         q = lease.q_magnitude()
         assert q.shape == (195, 1475)
         assert q.dtype == np.dtype(np.float64)
