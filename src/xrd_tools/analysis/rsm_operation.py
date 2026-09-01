@@ -65,6 +65,7 @@ from xrd_tools.core.geometry import (
     ImageOrientation,
     PixelQMap,
 )
+from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactCleanupPending,
@@ -2693,7 +2694,7 @@ def _resolve_exact_rsm_q_bounds_active(
     session.require_active()
     try:
         hxrd = mapper.diff_config.make_hxrd(energy)
-    except RSMOperationRefused:
+    except (RSMOperationRefused, XuRuntimeUnsupported):
         raise
     except Exception:
         raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID") from None
@@ -2710,6 +2711,8 @@ def _resolve_exact_rsm_q_bounds_active(
             Nch1=int(header.Nch1),
             Nch2=int(header.Nch2),
         )
+    except (RSMOperationRefused, XuRuntimeUnsupported):
+        raise
     except Exception:
         raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID") from None
     lows = np.full(3, np.inf, dtype=np.float64)
@@ -2736,7 +2739,7 @@ def _resolve_exact_rsm_q_bounds_active(
                 admitted.append(array)
             if len(admitted) != 3:
                 raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID")
-        except RSMOperationRefused:
+        except (RSMOperationRefused, XuRuntimeUnsupported):
             raise
         except Exception:
             raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID") from None

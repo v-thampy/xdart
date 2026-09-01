@@ -34,6 +34,7 @@ from xrd_tools.analysis.rsm_operation import (
     prepare_rsm_operation_v2,
 )
 from xrd_tools.core.geometry import Diffractometer, PixelQMap
+from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.sources.spec import SpecSource
 
@@ -460,6 +461,56 @@ def test_q_backend_exceptions_are_stable_tool_refusals(
         prepare_rsm_tool_v2(form)
     assert refused.value.code == "RSM_MEMBER_Q_BOUNDS_INVALID"
     assert "backend-private" not in str(refused.value)
+    assert xu.config.NTHREADS == nthreads_before
+    assert not Path(form.output_path).exists()
+
+
+@pytest.mark.parametrize("failure_site", ("make_hxrd", "init_area", "area"))
+@pytest.mark.parametrize(
+    ("error_type", "expected_code"),
+    (
+        (RSMOperationRefused, "CANCELLED"),
+        (XuRuntimeUnsupported, "XU_RUNTIME_TEST_REFUSAL"),
+    ),
+)
+def test_q_backend_preserves_typed_refusals(
+    tmp_path,
+    monkeypatch,
+    failure_site,
+    error_type,
+    expected_code,
+):
+    import xrayutilities as xu
+
+    member = _write_member(tmp_path, 0)
+    form = _form(tmp_path, (member,))
+    nthreads_before = xu.config.NTHREADS
+
+    def raise_typed():
+        raise error_type(expected_code)
+
+    class FailingAng2Q:
+        def init_area(self, *_args, **_kwargs):
+            if failure_site == "init_area":
+                raise_typed()
+
+        def area(self, *_args, **_kwargs):
+            if failure_site == "area":
+                raise_typed()
+            raise AssertionError("area must not run for this failure site")
+
+    class FailingHxrd:
+        Ang2Q = FailingAng2Q()
+
+    def failing_make_hxrd(*_args, **_kwargs):
+        if failure_site == "make_hxrd":
+            raise_typed()
+        return FailingHxrd()
+
+    monkeypatch.setattr(Diffractometer, "make_hxrd", failing_make_hxrd)
+    with pytest.raises(RSMToolPreflightRefused) as refused:
+        prepare_rsm_tool_v2(form)
+    assert refused.value.code == expected_code
     assert xu.config.NTHREADS == nthreads_before
     assert not Path(form.output_path).exists()
 
