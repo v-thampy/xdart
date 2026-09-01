@@ -279,6 +279,63 @@ def test_gi_reduction_preserves_v3_sensor_parallax_wavelength_and_convention(
     assert kwargs["gi_exit_angle_convention"] == GI_EXIT_ANGLE_CONVENTION
 
 
+def test_gi_refuses_mismatched_poni_and_integrator_before_resources(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.integrate.calibration import poni_to_integrator
+
+    poni = PONI(
+        dist=0.2,
+        poni1=0.0006,
+        poni2=0.0007,
+        wavelength=1.0e-10,
+        detector="Detector",
+    )
+    mismatched = PONI.from_dict({**poni.to_dict(), "wavelength": 1.1e-10})
+    resource_events = []
+
+    class Sink:
+        def _bind_run_saturation_mask(self, _mask):
+            resource_events.append("sink-bind")
+
+        def begin(self, scan, plan):
+            resource_events.append("sink")
+
+        def write(self, frame, reduction):
+            raise AssertionError("science must not start")
+
+        def finish(self, result):
+            return None
+
+    monkeypatch.setattr(
+        reduction_core,
+        "_coerce_executor",
+        lambda executor: resource_events.append("executor") or (None, False),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"scan\.integrator and scan\.poni calibration disagree: wavelength",
+    ):
+        run_reduction(
+            ReductionPlan(
+                integration_1d=Integration1DPlan(npt=3),
+                gi=GIMode(incident_angle=0.2),
+            ),
+            Scan(
+                "mismatched-gi-calibration",
+                [Frame(0, image=np.ones((12, 14)))],
+                poni=mismatched,
+                integrator=poni_to_integrator(poni),
+            ),
+            sink=Sink(),
+            executor=1,
+        )
+
+    assert resource_events == []
+
+
 @pytest.mark.parametrize("parallax", [False, True])
 def test_standard_worker_preserves_v3_sensor_parallax_and_wavelength(
     monkeypatch: pytest.MonkeyPatch,

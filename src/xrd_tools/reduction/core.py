@@ -284,6 +284,78 @@ def _accepted_reintegrate_fi(scan: Any) -> Any | None:
     return scan.integrator if scan.extra.get("_reintegrate_marker") is _REINTEGRATE_SCAN_MARKER and type(scan.integrator) is _xrd_fiber_integrator_type() else None
 
 
+def _validate_poni_integrator_identity(poni: PONI, integrator: Any) -> None:
+    """Refuse a split GI calibration authority before reduction starts.
+
+    A detector-config-backed integrator may carry state that a flat ``PONI``
+    cannot reconstruct (pixel geometry, sensor, and parallax), so GI is allowed
+    to use the supplied integrator.  Its common geometry and detector identity
+    must nevertheless be exactly the same as ``scan.poni``: the latter remains
+    a persisted calibration and metadata authority.
+    """
+
+    expected_geometry = {
+        name: float(getattr(poni, name))
+        for name in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3")
+    }
+    actual_geometry: dict[str, float] = {}
+    for name in expected_geometry:
+        try:
+            actual_geometry[name] = float(getattr(integrator, name))
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"scan.integrator has no valid {name} calibration value"
+            ) from exc
+    mismatches = [
+        name
+        for name, expected in expected_geometry.items()
+        if not np.isfinite(expected)
+        or not np.isfinite(actual_geometry[name])
+        or actual_geometry[name] != expected
+    ]
+
+    expected_wavelength = float(poni.wavelength)
+    expected_wavelength = (
+        None if expected_wavelength == 0.0 else expected_wavelength
+    )
+    try:
+        actual_wavelength = getattr(integrator, "wavelength")
+        actual_wavelength = (
+            None if actual_wavelength is None else float(actual_wavelength)
+        )
+        actual_wavelength = (
+            None if actual_wavelength == 0.0 else actual_wavelength
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "scan.integrator has no valid wavelength calibration value"
+        ) from exc
+    if (
+        expected_wavelength is not None
+        and not np.isfinite(expected_wavelength)
+    ) or (
+        actual_wavelength is not None
+        and not np.isfinite(actual_wavelength)
+    ) or actual_wavelength != expected_wavelength:
+        mismatches.append("wavelength")
+
+    try:
+        expected_detector = poni_to_integrator(poni).detector
+        actual_detector = integrator.detector
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "scan.integrator has no valid detector calibration identity"
+        ) from exc
+    if type(actual_detector) is not type(expected_detector):
+        mismatches.append("detector")
+
+    if mismatches:
+        raise ValueError(
+            "scan.integrator and scan.poni calibration disagree: "
+            + ", ".join(mismatches)
+        )
+
+
 def integrate_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
     from xrd_tools.integrate.single import integrate_1d as _impl
 
@@ -2864,6 +2936,14 @@ class ReductionSession:
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {self.chunk_size}")
         self.scan = _coerce_to_scan(self.source)
+        if self.plan.gi is not None:
+            if self.scan.poni is None:
+                raise ValueError("GI reduction requires scan.poni.")
+            if self.scan.integrator is not None:
+                _validate_poni_integrator_identity(
+                    self.scan.poni,
+                    self.scan.integrator,
+                )
         self._sink = _coerce_sink(self.sink)
         self._run_saturation_mask = _RunSaturationMask(self.plan.mask_saturation)
         bind_run_mask = getattr(self._sink, "_bind_run_saturation_mask", None)
@@ -2884,8 +2964,6 @@ class ReductionSession:
         ai = None
         fi = None
         if self.plan.gi is not None:
-            if self.scan.poni is None:
-                raise ValueError("GI reduction requires scan.poni.")
             # A strict detector-calibration-backed AI carries configuration,
             # sensor, and parallax state that the flat PONI cannot reconstruct.
             ai = self.scan.integrator
