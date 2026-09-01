@@ -312,7 +312,26 @@ class PixelQMap:
             UB=UB,
             **self.diff_config.ang2q_kwargs,
         )
-        return qx, qy, qz
+        if not angles:
+            raise ValueError("pixel_q requires at least one per-frame angle array")
+        frame_count = len(np.asarray(angles[0]))
+        expected = (frame_count, int(header.Nch1), int(header.Nch2))
+        values: list[np.ndarray] = []
+        for value in (qx, qy, qz):
+            array = np.asarray(value)
+            # xrayutilities squeezes the leading axis for a one-frame area
+            # call even though PixelQMap's public contract is always
+            # (N_frame, Nch1, Nch2).  Restore that axis at this boundary so a
+            # chunk_size of one (or a final one-frame remainder) is valid.
+            if frame_count == 1 and array.shape == expected[1:]:
+                array = array.reshape(expected)
+            if array.shape != expected:
+                raise ValueError(
+                    "pixel_q backend returned shape "
+                    f"{array.shape}; expected {expected}"
+                )
+            values.append(array)
+        return values[0], values[1], values[2]
 
 
 __all__ = [

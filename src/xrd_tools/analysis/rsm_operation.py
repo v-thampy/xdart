@@ -1,0 +1,2367 @@
+"""Typed, bounded scientific contract for the standalone RSM operation.
+
+This module deliberately separates notebook-equivalent scientific intent from
+the legacy convenience :class:`~xrd_tools.analysis.plans.RSMPlan`.  The R1
+operation requires an explicit normalization policy, records detector/image
+conditioning, resolves exact full-detector q bounds without reading detector
+images, and applies per-frame foil/exposure normalization to the numerator
+before data enter the shared ``sum(raw) / sum(norm)`` grid accumulator.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import InitVar, dataclass, field
+from enum import Enum
+import importlib.metadata
+import json
+import math
+import os
+from pathlib import Path
+import stat
+import threading
+
+import numpy as np
+
+from xrd_tools.analysis.module_transaction import (
+    MetadataColumnSelector,
+    ModuleArtifactOutput,
+    ModuleArtifactRefused,
+    ModuleDisposition,
+    ModuleKind,
+    ModuleOperationRequest,
+    ModuleOutputRequest,
+    ModuleProgress,
+    ModuleSourceReceipt,
+    ModuleTerminalResult,
+    admit_module_artifact,
+    module_artifact_request,
+    module_plan_fingerprint,
+    module_provenance_digest,
+)
+from xrd_tools.analysis.plans import RSMPlan, run_rsm
+from xrd_tools.analysis.scan_operations import (
+    AnalysisDisposition,
+    AnalysisSourceLeaseRefused,
+    MetadataTablePlan,
+    requalified_analysis_source,
+    run_metadata_table,
+)
+from xrd_tools.core.geometry import (
+    DetectorHeader,
+    Diffractometer,
+    ImageOrientation,
+    PixelQMap,
+)
+from xrd_tools.core.scan import SourceKind
+from xrd_tools.io.analysis_artifact import (
+    AnalysisArtifactCleanupPending,
+    AnalysisArtifactKind,
+    AnalysisArtifactPayload,
+    read_analysis_artifact,
+)
+from xrd_tools.io.nexus import write_rsm
+from xrd_tools.io.spec import get_energy_and_UB
+from xrd_tools.rsm.volume import RSMVolume
+
+
+_MAX_RSM_VOXELS = 8_000_000
+_MAX_CHUNK_SIZE = 1024
+_MAX_FRAME_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_CHUNK_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 512 * 1024
+_MAX_MANIFEST_FILES = 8192
+_MAX_CONTRIBUTIONS = 4096
+_MAX_JSON_DEPTH = 32
+_PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
+_REQUEST_FACTORY = object()
+
+
+class RSMNormalizationMode(str, Enum):
+    IDENTITY = "identity"
+    FOIL_TRANSMISSION_EXPOSURE = "foil-transmission-exposure"
+
+
+class RSMOperationRefused(ValueError):
+    """An RSM scientific input could not be admitted exactly."""
+
+    def __init__(self, code: str, message: str | None = None):
+        self.code = code
+        super().__init__(message or code)
+
+
+class RSMOperationVerificationError(RuntimeError):
+    """A committed RSM output could not be strictly re-admitted."""
+
+    def __init__(self, execution: "RSMOperationExecution", message: str):
+        self.execution = execution
+        super().__init__(message)
+
+
+class RSMOperationCleanupPending(AnalysisArtifactCleanupPending):
+    """Retryable cleanup retaining the exact RSM execution owner."""
+
+    def __init__(self, execution: "RSMOperationExecution"):
+        self.execution = execution
+        super().__init__(execution.output_snapshot)
+
+    def retry_cleanup(self) -> "RSMOperationResult":
+        return self.execution.retry_cleanup()
+
+
+def _failure_diagnostic(error: BaseException) -> str:
+    try:
+        message = str(error)
+    except BaseException:
+        message = "exception message unavailable"
+    kind = type(error)
+    return f"{kind.__module__}.{kind.__qualname__}: {message}"[:4096]
+
+
+def _finite_float(value: object, name: str, *, positive: bool = False) -> float:
+    if type(value) not in {int, float}:
+        raise TypeError(f"{name} must be an exact finite number")
+    result = float(value)
+    if not math.isfinite(result) or (positive and result <= 0):
+        qualifier = "positive " if positive else ""
+        raise ValueError(f"{name} must be a finite {qualifier}number")
+    return result
+
+
+def _selector_value(
+    selector: MetadataColumnSelector | None,
+) -> tuple[str, int] | None:
+    if selector is None:
+        return None
+    return selector.name, selector.occurrence
+
+
+def _canonical_roi(
+    value: object,
+    header: DetectorHeader,
+) -> tuple[int, int, int, int] | None:
+    if value is None:
+        return None
+    if (
+        type(value) is not tuple
+        or len(value) != 4
+        or any(type(item) is not int for item in value)
+    ):
+        raise TypeError("RSM ROI must be one exact four-integer tuple")
+    roi = tuple(value)
+    if roi[0] < 0 or roi[2] < 0:
+        raise ValueError("RSM ROI starts must be non-negative")
+    row_stop = header.Nch1 + roi[1] if roi[1] < 0 else roi[1]
+    column_stop = header.Nch2 + roi[3] if roi[3] < 0 else roi[3]
+    if (
+        not roi[0] < row_stop <= header.Nch1
+        or not roi[2] < column_stop <= header.Nch2
+    ):
+        raise ValueError("RSM ROI must be contained by the detector")
+    cropped = header.with_roi(roi)
+    if cropped.Nch1 < 2 or cropped.Nch2 < 2:
+        raise ValueError("RSM ROI must retain at least a 2 by 2 detector")
+    return roi
+
+
+@dataclass(frozen=True, slots=True)
+class RSMNormalizationPolicy:
+    """Mandatory per-frame numerator normalization for one RSM plan."""
+
+    mode: RSMNormalizationMode
+    foil_selector: MetadataColumnSelector | None
+    exposure_selector: MetadataColumnSelector | None
+    absorption_lengths: tuple[float, float, float, float]
+
+    def __post_init__(self) -> None:
+        if type(self.mode) is not RSMNormalizationMode:
+            raise TypeError("RSM normalization mode must be exact")
+        if (
+            type(self.absorption_lengths) is not tuple
+            or len(self.absorption_lengths) != 4
+        ):
+            raise TypeError("RSM absorption lengths must be an exact four-tuple")
+        lengths = tuple(
+            _finite_float(value, "RSM absorption length")
+            for value in self.absorption_lengths
+        )
+        if any(value < 0 for value in lengths):
+            raise ValueError("RSM absorption lengths must be non-negative")
+        if self.mode is RSMNormalizationMode.IDENTITY:
+            if (
+                self.foil_selector is not None
+                or self.exposure_selector is not None
+                or lengths != (0.0, 0.0, 0.0, 0.0)
+            ):
+                raise ValueError(
+                    "identity RSM normalization requires no selectors and zero lengths"
+                )
+        else:
+            if (
+                type(self.foil_selector) is not MetadataColumnSelector
+                or type(self.exposure_selector) is not MetadataColumnSelector
+            ):
+                raise TypeError(
+                    "foil/exposure RSM normalization requires exact selectors"
+                )
+            if self.foil_selector == self.exposure_selector:
+                raise ValueError("foil and exposure selectors must be distinct")
+            if not any(value > 0 for value in lengths):
+                raise ValueError("foil absorption lengths cannot all be zero")
+        object.__setattr__(self, "absorption_lengths", lengths)
+
+    @classmethod
+    def identity(cls) -> "RSMNormalizationPolicy":
+        return cls(
+            RSMNormalizationMode.IDENTITY,
+            None,
+            None,
+            (0.0, 0.0, 0.0, 0.0),
+        )
+
+    def _canonical_value(self) -> tuple[object, ...]:
+        return (
+            self.mode,
+            _selector_value(self.foil_selector),
+            _selector_value(self.exposure_selector),
+            self.absorption_lengths,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RSMImageConditioning:
+    """Image-domain conditioning applied before per-frame normalization."""
+
+    additive_offset: float
+    high_threshold: float | None
+    static_hot_threshold: float | None
+
+    def __post_init__(self) -> None:
+        offset = _finite_float(self.additive_offset, "RSM additive offset")
+        if offset < 0:
+            raise ValueError("RSM additive offset must be non-negative")
+        high = (
+            None
+            if self.high_threshold is None
+            else _finite_float(
+                self.high_threshold,
+                "RSM high threshold",
+                positive=True,
+            )
+        )
+        hot = (
+            None
+            if self.static_hot_threshold is None
+            else _finite_float(
+                self.static_hot_threshold,
+                "RSM static-hot threshold",
+                positive=True,
+            )
+        )
+        object.__setattr__(self, "additive_offset", offset)
+        object.__setattr__(self, "high_threshold", high)
+        object.__setattr__(self, "static_hot_threshold", hot)
+
+    def _canonical_value(self) -> tuple[object, ...]:
+        return (
+            self.additive_offset,
+            self.high_threshold,
+            self.static_hot_threshold,
+            "exact-all-frames-static-hot-v1",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RSMDetectorGeometry:
+    """The single canonical psic detector/angle description for R1."""
+
+    header: DetectorHeader
+    motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
+    image_orientation: ImageOrientation = field(default_factory=ImageOrientation)
+    roi: tuple[int, int, int, int] | None = None
+    preset: str = "psic"
+
+    def __post_init__(self) -> None:
+        if type(self.header) is not DetectorHeader:
+            raise TypeError("RSM detector header must be exact DetectorHeader")
+        header = self.header
+        for name in ("cch1", "cch2"):
+            _finite_float(getattr(header, name), f"detector {name}")
+        for name in ("pwidth1", "pwidth2", "distance"):
+            _finite_float(
+                getattr(header, name),
+                f"detector {name}",
+                positive=True,
+            )
+        if (
+            type(header.Nch1) is not int
+            or type(header.Nch2) is not int
+            or header.Nch1 < 2
+            or header.Nch2 < 2
+        ):
+            raise ValueError("RSM detector dimensions must be exact and at least 2")
+        if type(self.motor_selectors) is not tuple or len(self.motor_selectors) != 6:
+            raise TypeError("RSM psic motor selectors must be one exact six-tuple")
+        roles: list[str] = []
+        selectors: list[MetadataColumnSelector] = []
+        for item in self.motor_selectors:
+            if (
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                or type(item[1]) is not MetadataColumnSelector
+            ):
+                raise TypeError("RSM psic motor mapping entries are invalid")
+            roles.append(item[0])
+            selectors.append(item[1])
+        if tuple(roles) != _PSIC_ROLES:
+            raise ValueError(
+                "RSM psic motor roles must be ordered mu, eta, chi, phi, nu, del"
+            )
+        if len({(item.name, item.occurrence) for item in selectors}) != 6:
+            raise ValueError("RSM psic motor selectors must be unique")
+        if type(self.image_orientation) is not ImageOrientation:
+            raise TypeError("RSM image orientation must be exact ImageOrientation")
+        if any(
+            type(value) is not bool
+            for value in (
+                self.image_orientation.flip_vertical,
+                self.image_orientation.flip_horizontal,
+                self.image_orientation.transpose,
+            )
+        ):
+            raise TypeError("RSM image orientation flags must be exact booleans")
+        if not self.image_orientation.is_identity:
+            raise ValueError("R1 RSM supports only the notebook identity orientation")
+        if self.preset != "psic":
+            raise ValueError("R1 RSM supports only the canonical psic preset")
+        object.__setattr__(self, "roi", _canonical_roi(self.roi, header))
+
+    @property
+    def cropped_shape(self) -> tuple[int, int]:
+        header = self.header if self.roi is None else self.header.with_roi(self.roi)
+        return header.Nch1, header.Nch2
+
+    def _canonical_value(self) -> tuple[object, ...]:
+        return (
+            self.preset,
+            (
+                self.header.cch1,
+                self.header.cch2,
+                self.header.pwidth1,
+                self.header.pwidth2,
+                self.header.distance,
+                self.header.Nch1,
+                self.header.Nch2,
+            ),
+            tuple(
+                (role, selector.name, selector.occurrence)
+                for role, selector in self.motor_selectors
+            ),
+            (
+                self.image_orientation.rotation,
+                self.image_orientation.flip_vertical,
+                self.image_orientation.flip_horizontal,
+                self.image_orientation.transpose,
+            ),
+            self.roi,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RSMOperationPlan:
+    """Frozen R1 scientific intent; source facts are captured by preparation."""
+
+    geometry: RSMDetectorGeometry
+    conditioning: RSMImageConditioning
+    normalization: RSMNormalizationPolicy
+    bins: tuple[int, int, int] = (200, 200, 200)
+    chunk_size: int = 8
+    max_frame_bytes: int = 256 * 1024 * 1024
+    max_chunk_bytes: int = 256 * 1024 * 1024
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.geometry) is not RSMDetectorGeometry
+            or type(self.conditioning) is not RSMImageConditioning
+            or type(self.normalization) is not RSMNormalizationPolicy
+        ):
+            raise TypeError("RSM operation plan requires exact typed policies")
+        motor_keys = {
+            (selector.name, selector.occurrence)
+            for _role, selector in self.geometry.motor_selectors
+        }
+        normalization_keys = {
+            (selector.name, selector.occurrence)
+            for selector in (
+                self.normalization.foil_selector,
+                self.normalization.exposure_selector,
+            )
+            if selector is not None
+        }
+        if motor_keys & normalization_keys:
+            raise ValueError(
+                "RSM normalization selectors must be disjoint from motor selectors"
+            )
+        if (
+            type(self.bins) is not tuple
+            or len(self.bins) != 3
+            or any(type(value) is not int or value < 2 for value in self.bins)
+        ):
+            raise TypeError("RSM bins must be one exact positive integer triple")
+        if math.prod(self.bins) > _MAX_RSM_VOXELS:
+            raise ValueError("RSM grid exceeds the 8,000,000 voxel R1 bound")
+        if (
+            type(self.chunk_size) is not int
+            or not 1 <= self.chunk_size <= _MAX_CHUNK_SIZE
+        ):
+            raise ValueError("RSM chunk size is outside the R1 bound")
+        if (
+            type(self.max_frame_bytes) is not int
+            or not 1 <= self.max_frame_bytes <= _MAX_FRAME_BYTES
+        ):
+            raise ValueError("RSM frame byte limit is outside the R1 bound")
+        if (
+            type(self.max_chunk_bytes) is not int
+            or not 1 <= self.max_chunk_bytes <= _MAX_CHUNK_BYTES
+        ):
+            raise ValueError("RSM chunk byte limit is outside the R1 bound")
+        object.__setattr__(
+            self,
+            "fingerprint",
+            module_plan_fingerprint(ModuleKind.RSM, self._canonical_value()),
+        )
+
+    def _canonical_value(self) -> tuple[object, ...]:
+        return (
+            "rsm-operation-plan-v1",
+            self.geometry._canonical_value(),
+            self.conditioning._canonical_value(),
+            self.normalization._canonical_value(),
+            self.bins,
+            self.chunk_size,
+            self.max_frame_bytes,
+            self.max_chunk_bytes,
+            "exact-full-detector-q-bounds-v1",
+            "numerator-first-normalization-v1",
+            "bounded-chunk-working-set-v1",
+        )
+
+
+def required_rsm_selectors(
+    plan: RSMOperationPlan,
+) -> tuple[MetadataColumnSelector, ...]:
+    """Return the exact metadata projection required to execute ``plan``."""
+
+    if type(plan) is not RSMOperationPlan:
+        raise TypeError("RSM selector projection requires exact plan")
+    requested = [selector for _role, selector in plan.geometry.motor_selectors]
+    if plan.normalization.foil_selector is not None:
+        requested.append(plan.normalization.foil_selector)
+    if plan.normalization.exposure_selector is not None:
+        requested.append(plan.normalization.exposure_selector)
+    unique = {
+        (selector.name, selector.occurrence): selector for selector in requested
+    }
+    return tuple(
+        sorted(unique.values(), key=lambda item: (item.name, item.occurrence))
+    )
+
+
+def _file_state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_mode,
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _revision(value: object, name: str) -> tuple[int, int, int, int, int, int]:
+    if (
+        type(value) is not tuple
+        or len(value) != 6
+        or any(type(item) is not int for item in value)
+    ):
+        raise TypeError(f"{name} must be one exact file revision")
+    return value
+
+
+def _relative_locator(
+    path: str | Path,
+    project_root: Path,
+    name: str,
+    *,
+    must_exist: bool = True,
+) -> str:
+    try:
+        resolved = Path(path).expanduser().resolve(strict=must_exist)
+        relative = resolved.relative_to(project_root)
+    except (OSError, ValueError) as error:
+        raise RSMOperationRefused(
+            "INPUT_OUTSIDE_PROJECT",
+            f"{name} must resolve inside the selected Project root",
+        ) from error
+    value = relative.as_posix()
+    if not value or value == "." or len(value.encode("utf-8")) > 4096:
+        raise RSMOperationRefused(
+            "INPUT_LOCATOR_INVALID",
+            f"{name} has no bounded Project-relative locator",
+        )
+    return value
+
+
+def _manifest_relative_path(value: object, name: str) -> str:
+    if type(value) is not str or not value or len(value.encode("utf-8")) > 4096:
+        raise TypeError(f"{name} must be a bounded relative path")
+    path = Path(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"{name} must be a normalized relative path")
+    return path.as_posix()
+
+
+def _portable_json_value(value: object, *, depth: int = 0) -> object:
+    if depth > _MAX_JSON_DEPTH:
+        raise RSMOperationRefused(
+            "SOURCE_SPEC_INVALID",
+            "source options exceed the nesting bound",
+        )
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is not str or not key or len(key) > 4096:
+                raise RSMOperationRefused(
+                    "SOURCE_SPEC_INVALID",
+                    "source option key is invalid",
+                )
+            result[key] = _portable_json_value(item, depth=depth + 1)
+        return result
+    if type(value) in {tuple, list}:
+        return [_portable_json_value(item, depth=depth + 1) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return _portable_json_value(value.value, depth=depth + 1)
+    if isinstance(value, np.generic):
+        return _portable_json_value(value.item(), depth=depth + 1)
+    if type(value) in {str, bool, int} or value is None:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise RSMOperationRefused(
+        "SOURCE_SPEC_INVALID",
+        "source options contain an unsupported value",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RSMManifestFile:
+    relative_path: str
+    revision: tuple[int, int, int, int, int, int] | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "relative_path",
+            _manifest_relative_path(self.relative_path, "RSM manifest file path"),
+        )
+        if self.revision is not None:
+            _revision(self.revision, "RSM manifest file revision")
+
+
+@dataclass(frozen=True, slots=True)
+class RSMContribution:
+    label: int
+    file_ordinal: int
+    source_frame_index: int
+    values: tuple[tuple[str, int, float], ...]
+    normalization_divisor: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.label) is not int
+            or type(self.file_ordinal) is not int
+            or self.file_ordinal < 0
+            or type(self.source_frame_index) is not int
+            or self.source_frame_index < 0
+            or type(self.values) is not tuple
+        ):
+            raise TypeError("RSM contribution is invalid")
+        parsed: list[tuple[str, int, float]] = []
+        for item in self.values:
+            if (
+                type(item) is not tuple
+                or len(item) != 3
+                or type(item[0]) is not str
+                or not item[0]
+                or item[0].strip() != item[0]
+                or type(item[1]) is not int
+                or item[1] < 0
+                or type(item[2]) is not float
+                or not math.isfinite(item[2])
+            ):
+                raise TypeError("RSM contribution metadata value is invalid")
+            parsed.append(item)
+        if tuple(parsed) != tuple(
+            sorted(parsed, key=lambda item: (item[0], item[1]))
+        ):
+            raise ValueError("RSM contribution metadata values must be sorted")
+        if len({(name, occurrence) for name, occurrence, _value in parsed}) != len(
+            parsed
+        ):
+            raise ValueError("RSM contribution metadata values must be unique")
+        if type(self.normalization_divisor) is not float:
+            raise TypeError("RSM normalization divisor must be an exact float")
+        _finite_float(
+            self.normalization_divisor,
+            "RSM normalization divisor",
+            positive=True,
+        )
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMPreflightReceipt:
+    """Factory-owned, detector-image-free scientific preflight receipt."""
+
+    project_root: str
+    source_relative_path: str
+    source_scan: str
+    source_options_json: str = field(repr=False)
+    primary_revision: tuple[int, int, int, int, int, int]
+    files: tuple[RSMManifestFile, ...]
+    contributions: tuple[RSMContribution, ...]
+    energy_eV: float
+    ub: tuple[tuple[float, float, float], ...]
+    q_bounds: tuple[
+        tuple[float, float], tuple[float, float], tuple[float, float]
+    ]
+    detector_shape: tuple[int, int]
+    cropped_shape: tuple[int, int]
+    source_fingerprint: str
+    module_source_fingerprint: str
+    table_fingerprint: str
+    plan_fingerprint: str
+    fingerprint: str = field(init=False)
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        try:
+            root = Path(self.project_root)
+            options = json.loads(self.source_options_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise TypeError("RSM preflight receipt is invalid") from error
+        if (
+            _claim is not _REQUEST_FACTORY
+            or type(self.project_root) is not str
+            or not root.is_absolute()
+            or type(self.source_scan) is not str
+            or not self.source_scan
+            or type(options) is not dict
+            or type(self.files) is not tuple
+            or not self.files
+            or len(self.files) > _MAX_MANIFEST_FILES
+            or any(type(item) is not RSMManifestFile for item in self.files)
+            or len({item.relative_path for item in self.files}) != len(self.files)
+            or type(self.contributions) is not tuple
+            or not self.contributions
+            or len(self.contributions) > _MAX_CONTRIBUTIONS
+            or any(type(item) is not RSMContribution for item in self.contributions)
+            or any(item.file_ordinal >= len(self.files) for item in self.contributions)
+            or len({item.label for item in self.contributions})
+            != len(self.contributions)
+        ):
+            raise TypeError("RSM preflight receipt is invalid")
+        canonical_options = json.dumps(
+            options,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        if canonical_options != self.source_options_json:
+            raise ValueError("RSM preflight source options are not canonical")
+        object.__setattr__(
+            self,
+            "source_relative_path",
+            _manifest_relative_path(self.source_relative_path, "RSM source path"),
+        )
+        _revision(self.primary_revision, "RSM source primary revision")
+        energy = _finite_float(self.energy_eV, "RSM energy", positive=True)
+        if (
+            type(self.ub) is not tuple
+            or len(self.ub) != 3
+            or any(type(row) is not tuple or len(row) != 3 for row in self.ub)
+            or any(
+                type(value) is not float or not math.isfinite(value)
+                for row in self.ub
+                for value in row
+            )
+        ):
+            raise TypeError("RSM preflight UB must be an exact finite 3 by 3 tuple")
+        if (
+            type(self.q_bounds) is not tuple
+            or len(self.q_bounds) != 3
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or any(type(value) is not float for value in item)
+                or not all(math.isfinite(value) for value in item)
+                or not item[1] > item[0]
+                for item in self.q_bounds
+            )
+        ):
+            raise TypeError("RSM preflight q bounds are invalid")
+        for shape, name in (
+            (self.detector_shape, "detector shape"),
+            (self.cropped_shape, "cropped detector shape"),
+        ):
+            if (
+                type(shape) is not tuple
+                or len(shape) != 2
+                or any(type(value) is not int or value < 2 for value in shape)
+            ):
+                raise TypeError(f"RSM preflight {name} is invalid")
+        for digest, name in (
+            (self.source_fingerprint, "source fingerprint"),
+            (self.module_source_fingerprint, "module source fingerprint"),
+            (self.table_fingerprint, "table fingerprint"),
+            (self.plan_fingerprint, "plan fingerprint"),
+        ):
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise TypeError(f"RSM {name} must be lowercase SHA-256")
+        object.__setattr__(self, "energy_eV", energy)
+        object.__setattr__(
+            self,
+            "fingerprint",
+            module_plan_fingerprint(ModuleKind.RSM, self._canonical_value()),
+        )
+        encoded = json.dumps(
+            self.to_provenance(),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(encoded) > _MAX_MANIFEST_BYTES:
+            raise RSMOperationRefused(
+                "PREFLIGHT_BYTE_LIMIT_EXCEEDED",
+                "RSM persisted preflight exceeds 512 KiB",
+            )
+
+    def _canonical_value(self) -> tuple[object, ...]:
+        return (
+            "rsm-preflight-v1",
+            self.source_relative_path,
+            self.source_scan,
+            json.loads(self.source_options_json),
+            self.primary_revision,
+            tuple((item.relative_path, item.revision) for item in self.files),
+            tuple(
+                (
+                    item.label,
+                    item.file_ordinal,
+                    item.source_frame_index,
+                    item.values,
+                    item.normalization_divisor,
+                )
+                for item in self.contributions
+            ),
+            self.energy_eV,
+            self.ub,
+            self.q_bounds,
+            self.detector_shape,
+            self.cropped_shape,
+            self.source_fingerprint,
+            self.module_source_fingerprint,
+            self.table_fingerprint,
+            self.plan_fingerprint,
+        )
+
+    def to_provenance(self) -> dict[str, object]:
+        return {
+            "schema_version": "rsm-preflight-v1",
+            "source": {
+                "relative_path": self.source_relative_path,
+                "kind": "spec",
+                "scan": self.source_scan,
+                "options": json.loads(self.source_options_json),
+                "primary_revision": list(self.primary_revision),
+                "source_fingerprint": self.source_fingerprint,
+                "module_source_fingerprint": self.module_source_fingerprint,
+                "table_fingerprint": self.table_fingerprint,
+            },
+            "files": [
+                {
+                    "relative_path": item.relative_path,
+                    "revision": (
+                        None if item.revision is None else list(item.revision)
+                    ),
+                }
+                for item in self.files
+            ],
+            "contributions": [
+                {
+                    "label": item.label,
+                    "file_ordinal": item.file_ordinal,
+                    "source_frame_index": item.source_frame_index,
+                    "values": [
+                        {
+                            "name": name,
+                            "occurrence": occurrence,
+                            "value": value,
+                        }
+                        for name, occurrence, value in item.values
+                    ],
+                    "normalization_divisor": item.normalization_divisor,
+                }
+                for item in self.contributions
+            ],
+            "energy_eV": self.energy_eV,
+            "ub": [list(row) for row in self.ub],
+            "q_bounds": [list(item) for item in self.q_bounds],
+            "detector_shape": list(self.detector_shape),
+            "cropped_shape": list(self.cropped_shape),
+            "plan_fingerprint": self.plan_fingerprint,
+            "fingerprint": self.fingerprint,
+        }
+
+    def __copy__(self):
+        raise TypeError("RSM preflight receipt is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM preflight receipt is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM preflight receipt is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM preflight receipt is not serializable")
+
+
+def _fresh_table(
+    source: ModuleSourceReceipt,
+    *,
+    cancel_token: threading.Event | None = None,
+):
+    table = run_metadata_table(
+        MetadataTablePlan(source.analysis.source_spec),
+        cancel_token=cancel_token,
+    )
+    if table.disposition is AnalysisDisposition.CANCELLED:
+        raise RSMOperationRefused("CANCELLED")
+    if (
+        table.disposition is not AnalysisDisposition.COMPLETED
+        or table.receipt != source.analysis
+        or table.table_fingerprint != source.table_fingerprint
+        or table.labels != source.analysis.labels
+    ):
+        raise RSMOperationRefused(
+            "SOURCE_IDENTITY_MISMATCH",
+            "source metadata no longer matches its receipt",
+        )
+    return table
+
+
+def _project_source_options(
+    analysis,
+    root: Path,
+    selectors: tuple[MetadataColumnSelector, ...],
+) -> str:
+    """Return the closed, Project-relative R1 SPEC source projection."""
+
+    if analysis.source_spec.metadata_uri is not None:
+        raise RSMOperationRefused(
+            "SOURCE_SPEC_UNSUPPORTED",
+            "R1 RSM does not accept SourceSpec.metadata_uri",
+        )
+    if analysis.resolved_kind is not SourceKind.SPEC:
+        raise RSMOperationRefused("SOURCE_KIND_UNSUPPORTED")
+    options = dict(analysis.source_spec.options)
+    allowed = {
+        "scan",
+        "image_dir",
+        "image_stem",
+        "read_image_kwargs",
+        "metadata_column_projection",
+    }
+    if (
+        analysis.resolved_entry is not None
+        or not analysis.resolved_scan
+        or options.get("scan") != analysis.resolved_scan
+        or not options.get("image_dir")
+    ):
+        raise RSMOperationRefused(
+            "SOURCE_SPEC_UNSUPPORTED",
+            "R1 RSM requires one exact SPEC scan and image directory",
+        )
+    unexpected = set(options) - allowed
+    if unexpected:
+        raise RSMOperationRefused(
+            "SOURCE_SPEC_UNSUPPORTED",
+            f"R1 SPEC source has unsupported options {sorted(unexpected)}",
+        )
+    projection = options.get("metadata_column_projection")
+    expected_projection = tuple(
+        (selector.name, selector.occurrence) for selector in selectors
+    )
+    if type(projection) is not tuple or tuple(projection) != expected_projection:
+        raise RSMOperationRefused(
+            "SOURCE_PROJECTION_MISMATCH",
+            "R1 source projection must exactly match the RSM selectors",
+        )
+    projected = dict(options)
+    projected["image_dir"] = _relative_locator(
+        options["image_dir"], root, "SPEC image directory"
+    )
+    read_options = options.get("read_image_kwargs", {})
+    if type(read_options) is not dict:
+        read_options = dict(read_options)
+    allowed_read = {
+        "detector_shape",
+        "detector",
+        "raw_dtype",
+        "raw_header_skip",
+        "threshold",
+        "rotation",
+    }
+    unexpected_read = set(read_options) - allowed_read
+    if unexpected_read:
+        raise RSMOperationRefused(
+            "SOURCE_SPEC_UNSUPPORTED",
+            "R1 SPEC image reader has unsupported options "
+            f"{sorted(unexpected_read)}",
+        )
+    if read_options.get("rotation", 0) != 0:
+        raise RSMOperationRefused(
+            "SOURCE_ORIENTATION_CONFLICT",
+            "source rotation must be zero; RSM owns image orientation",
+        )
+    if read_options.get("threshold") is not None:
+        raise RSMOperationRefused(
+            "SOURCE_CONDITIONING_CONFLICT",
+            "source thresholding must be disabled; RSM owns conditioning",
+        )
+    projected["read_image_kwargs"] = read_options
+    portable = _portable_json_value(projected)
+    return json.dumps(
+        portable,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _numeric_lookup(
+    table,
+    selectors: tuple[MetadataColumnSelector, ...],
+) -> tuple[dict[int, int], tuple[tuple[MetadataColumnSelector, np.ndarray], ...]]:
+    positions: dict[int, int] = {}
+    for index, label in enumerate(table.labels):
+        if type(label) is not int or label in positions:
+            raise RSMOperationRefused(
+                "SOURCE_IDENTITY_MISMATCH",
+                "metadata labels are not exact and unique",
+            )
+        positions[label] = index
+    columns: dict[str, list[object]] = {}
+    for column in table.columns:
+        columns.setdefault(column.name, []).append(column)
+    selected: list[tuple[MetadataColumnSelector, np.ndarray]] = []
+    for selector in selectors:
+        matches = columns.get(selector.name, ())
+        if (
+            selector.occurrence >= len(matches)
+            or matches[selector.occurrence].numeric is None
+        ):
+            raise RSMOperationRefused(
+                "INVALID_METADATA_SELECTOR",
+                f"metadata column {selector.name!r} occurrence "
+                f"{selector.occurrence} is not numeric",
+            )
+        values = matches[selector.occurrence].numeric
+        if values.shape != (len(positions),):
+            raise RSMOperationRefused(
+                "SOURCE_IDENTITY_MISMATCH",
+                "metadata column length changed",
+            )
+        selected.append((selector, values))
+    return positions, tuple(selected)
+
+
+def _capture_preflight(
+    source: ModuleSourceReceipt,
+    plan: RSMOperationPlan,
+    table,
+    project_root: str | Path,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> RSMPreflightReceipt:
+    try:
+        root = Path(project_root).expanduser().resolve(strict=True)
+    except (OSError, TypeError) as error:
+        raise RSMOperationRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is unavailable"
+        ) from error
+    if not root.is_dir():
+        raise RSMOperationRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is not a directory"
+        )
+    analysis = source.analysis
+    selectors = required_rsm_selectors(plan)
+    if (
+        plan.conditioning.static_hot_threshold is not None
+        and len(source.selected_labels) < 2
+    ):
+        raise RSMOperationRefused(
+            "STATIC_MASK_REQUIRES_MULTIPLE_FRAMES",
+            "exact all-frame static-hot masking requires at least two frames",
+        )
+    source_relative = _relative_locator(analysis.resolved_root, root, "source")
+    source_options_json = _project_source_options(analysis, root, selectors)
+    if analysis.primary_post_state is None or not analysis.resolved_scan:
+        raise RSMOperationRefused(
+            "SOURCE_IDENTITY_MISMATCH",
+            "SPEC source has no exact primary revision or scan",
+        )
+    dependency_rows = (
+        (analysis.lexical_root, analysis.resolved_root, analysis.primary_post_state),
+        *analysis.dependency_revisions,
+    )
+    files: list[RSMManifestFile] = []
+    file_ordinals: dict[Path, int] = {}
+    dependency_by_resolved: dict[
+        Path, tuple[int, int, int, int, int, int] | None
+    ] = {}
+    charge = len(source_options_json.encode("utf-8")) + 2048
+
+    def charge_piece(value: object) -> None:
+        nonlocal charge
+        charge += len(
+            json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            )
+        ) + 1
+        if charge > _MAX_MANIFEST_BYTES:
+            raise RSMOperationRefused(
+                "PREFLIGHT_BYTE_LIMIT_EXCEEDED",
+                "RSM preflight exceeds 512 KiB while being captured",
+            )
+
+    for _lexical, raw_resolved, revision in dependency_rows:
+        resolved = Path(raw_resolved)
+        previous = dependency_by_resolved.get(resolved, ...)
+        if previous is not ...:
+            if previous != revision:
+                raise RSMOperationRefused(
+                    "SOURCE_IDENTITY_MISMATCH",
+                    "source dependency revisions disagree",
+                )
+            continue
+        if len(files) >= _MAX_MANIFEST_FILES:
+            raise RSMOperationRefused(
+                "PREFLIGHT_FILE_LIMIT_EXCEEDED",
+                "RSM preflight exceeds 8192 dependency files",
+            )
+        relative = _relative_locator(
+            resolved,
+            root,
+            "source dependency",
+            must_exist=revision is not None,
+        )
+        item = RSMManifestFile(relative, revision)
+        files.append(item)
+        file_ordinals[resolved] = len(files) - 1
+        dependency_by_resolved[resolved] = revision
+        charge_piece(
+            {
+                "relative_path": item.relative_path,
+                "revision": None if revision is None else list(revision),
+            }
+        )
+
+    label_positions, selected_columns = _numeric_lookup(table, selectors)
+    selected_by_key = {
+        (selector.name, selector.occurrence): values
+        for selector, values in selected_columns
+    }
+    try:
+        rows = np.asarray(
+            [label_positions[label] for label in source.selected_labels],
+            dtype=np.int64,
+        )
+    except KeyError as error:
+        raise RSMOperationRefused(
+            "SOURCE_IDENTITY_MISMATCH",
+            "selected RSM label is outside the exact metadata table",
+        ) from error
+    foil = exposure = None
+    if plan.normalization.foil_selector is not None:
+        selector = plan.normalization.foil_selector
+        foil = selected_by_key[(selector.name, selector.occurrence)][rows]
+    if plan.normalization.exposure_selector is not None:
+        selector = plan.normalization.exposure_selector
+        exposure = selected_by_key[(selector.name, selector.occurrence)][rows]
+    divisors = rsm_normalization_divisors(
+        plan.normalization,
+        len(source.selected_labels),
+        foil_status=foil,
+        exposure_seconds=exposure,
+    )
+    angles = tuple(
+        np.asarray(
+            selected_by_key[(selector.name, selector.occurrence)][rows],
+            dtype=np.float64,
+        )
+        for _role, selector in plan.geometry.motor_selectors
+    )
+    contributions: list[RSMContribution] = []
+    try:
+        with requalified_analysis_source(
+            analysis,
+            cancel_token=cancel_token,
+        ) as opened:
+            energy, ub_value = get_energy_and_UB(
+                analysis.resolved_root,
+                analysis.resolved_scan,
+            )
+            energy = _finite_float(energy, "RSM energy", positive=True)
+            ub = np.asarray(ub_value, dtype=np.float64)
+            if ub.shape != (3, 3) or not np.all(np.isfinite(ub)):
+                raise RSMOperationRefused("UB_INVALID")
+            for contribution_index, label in enumerate(source.selected_labels):
+                if cancel_token is not None and cancel_token.is_set():
+                    raise RSMOperationRefused("CANCELLED")
+                if len(contributions) >= _MAX_CONTRIBUTIONS:
+                    raise RSMOperationRefused(
+                        "PREFLIGHT_CONTRIBUTION_LIMIT_EXCEEDED",
+                        "RSM selection exceeds 4096 contributions",
+                    )
+                raw_locator = getattr(opened, "raw_locator_for", None)
+                if callable(raw_locator):
+                    path, frame_index = raw_locator(label)
+                else:
+                    frame = opened.frame_for(label)
+                    path, frame_index = frame.source_path, frame.source_frame_index
+                if path is None or type(frame_index) is not int or frame_index < 0:
+                    raise RSMOperationRefused(
+                        "RAW_LOCATOR_MISSING",
+                        f"selected frame {label} has no exact raw source locator",
+                    )
+                try:
+                    resolved = Path(path).expanduser().resolve(strict=True)
+                    state = _file_state(os.stat(resolved, follow_symlinks=False))
+                except OSError as error:
+                    raise RSMOperationRefused(
+                        "RAW_SOURCE_UNAVAILABLE",
+                        f"selected frame {label} raw source is unavailable",
+                    ) from error
+                if (
+                    not stat.S_ISREG(state[0])
+                    or dependency_by_resolved.get(resolved) != state
+                ):
+                    raise RSMOperationRefused(
+                        "SOURCE_IDENTITY_MISMATCH",
+                        f"selected frame {label} raw source is outside its receipt",
+                    )
+                try:
+                    ordinal = file_ordinals[resolved]
+                    position = label_positions[label]
+                except KeyError as error:
+                    raise RSMOperationRefused(
+                        "SOURCE_IDENTITY_MISMATCH",
+                        "selected raw source or label is outside its receipt",
+                    ) from error
+                values_list: list[tuple[str, int, float]] = []
+                for selector, column in selected_columns:
+                    value = float(column[position])
+                    if not math.isfinite(value):
+                        raise RSMOperationRefused(
+                            "INVALID_METADATA_VALUE",
+                            f"metadata column {selector.name!r} contains a "
+                            "non-finite value",
+                        )
+                    values_list.append((selector.name, selector.occurrence, value))
+                contribution = RSMContribution(
+                    label,
+                    ordinal,
+                    frame_index,
+                    tuple(sorted(values_list)),
+                    float(divisors[contribution_index]),
+                )
+                charge_piece(
+                    {
+                        "label": contribution.label,
+                        "file_ordinal": contribution.file_ordinal,
+                        "source_frame_index": contribution.source_frame_index,
+                        "values": contribution.values,
+                        "normalization_divisor": contribution.normalization_divisor,
+                    }
+                )
+                contributions.append(contribution)
+            bounds = resolve_exact_rsm_q_bounds(
+                PixelQMap(Diffractometer.psic(), plan.geometry.header),
+                angles,
+                energy,
+                ub,
+                roi=plan.geometry.roi,
+                chunk_size=plan.chunk_size,
+                max_frame_bytes=plan.max_frame_bytes,
+                max_chunk_bytes=plan.max_chunk_bytes,
+                cancel_token=cancel_token,
+            )
+    except AnalysisSourceLeaseRefused as error:
+        raise RSMOperationRefused(error.code) from error
+    return RSMPreflightReceipt(
+        str(root),
+        source_relative,
+        analysis.resolved_scan,
+        source_options_json,
+        analysis.primary_post_state,
+        tuple(files),
+        tuple(contributions),
+        float(energy),
+        tuple(tuple(float(value) for value in row) for row in ub),
+        bounds,
+        (plan.geometry.header.Nch1, plan.geometry.header.Nch2),
+        plan.geometry.cropped_shape,
+        analysis.source_fingerprint,
+        source.fingerprint,
+        source.table_fingerprint,
+        plan.fingerprint,
+        _REQUEST_FACTORY,
+    )
+
+
+def _engine_version() -> str:
+    try:
+        return importlib.metadata.version("xrayutilities")
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
+
+
+def _provenance(
+    source: ModuleSourceReceipt,
+    output: ModuleOutputRequest,
+    plan: RSMOperationPlan,
+    preflight: RSMPreflightReceipt,
+) -> dict[str, object]:
+    normalization = plan.normalization
+    return {
+        "schema_version": "rsm-operation-v1",
+        "kind": "rsm",
+        "source": {
+            "source_fingerprint": source.analysis.source_fingerprint,
+            "module_source_fingerprint": source.fingerprint,
+            "metadata_table_fingerprint": source.table_fingerprint,
+            "selected_labels": list(source.selected_labels),
+            "preflight": preflight.to_provenance(),
+        },
+        "geometry": {
+            "preset": plan.geometry.preset,
+            "header": {
+                name: getattr(plan.geometry.header, name)
+                for name in (
+                    "cch1",
+                    "cch2",
+                    "pwidth1",
+                    "pwidth2",
+                    "distance",
+                    "Nch1",
+                    "Nch2",
+                )
+            },
+            "motor_selectors": [
+                {
+                    "role": role,
+                    "name": selector.name,
+                    "occurrence": selector.occurrence,
+                }
+                for role, selector in plan.geometry.motor_selectors
+            ],
+            "image_orientation": {
+                "rotation": plan.geometry.image_orientation.rotation,
+                "flip_vertical": plan.geometry.image_orientation.flip_vertical,
+                "flip_horizontal": plan.geometry.image_orientation.flip_horizontal,
+                "transpose": plan.geometry.image_orientation.transpose,
+            },
+            "roi": None if plan.geometry.roi is None else list(plan.geometry.roi),
+            "q_bounds": [list(item) for item in preflight.q_bounds],
+            "energy_eV": preflight.energy_eV,
+            "ub": [list(row) for row in preflight.ub],
+        },
+        "conditioning": {
+            "additive_offset": plan.conditioning.additive_offset,
+            "high_threshold": plan.conditioning.high_threshold,
+            "static_hot_threshold": plan.conditioning.static_hot_threshold,
+            "static_rule": "exact-all-frames-static-hot-v1",
+        },
+        "normalization": {
+            "mode": normalization.mode.value,
+            "foil_selector": (
+                None
+                if normalization.foil_selector is None
+                else {
+                    "name": normalization.foil_selector.name,
+                    "occurrence": normalization.foil_selector.occurrence,
+                }
+            ),
+            "exposure_selector": (
+                None
+                if normalization.exposure_selector is None
+                else {
+                    "name": normalization.exposure_selector.name,
+                    "occurrence": normalization.exposure_selector.occurrence,
+                }
+            ),
+            "absorption_lengths": list(normalization.absorption_lengths),
+            "placement": "conditioned-numerator-before-grid",
+        },
+        "plan": {
+            "bins": list(plan.bins),
+            "chunk_size": plan.chunk_size,
+            "max_frame_bytes": plan.max_frame_bytes,
+            "max_chunk_bytes": plan.max_chunk_bytes,
+            "plan_fingerprint": plan.fingerprint,
+        },
+        "engine": {
+            "xrayutilities": _engine_version(),
+            "numpy": np.__version__,
+        },
+        "output": {"kind": output.kind.value},
+        "holds": [
+            "gi-and-refraction-corrections",
+            "multi-scan-rsm",
+            "volume-rendering",
+        ],
+    }
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMOperationRequest:
+    module: ModuleOperationRequest
+    plan: RSMOperationPlan
+    preflight: RSMPreflightReceipt
+    provenance_json: str
+    _claim: InitVar[object] = None
+    _cancel_token: InitVar[threading.Event | None] = None
+
+    def __post_init__(
+        self,
+        _claim: object,
+        _cancel_token: threading.Event | None,
+    ) -> None:
+        if (
+            _claim is not _REQUEST_FACTORY
+            or (
+                _cancel_token is not None
+                and type(_cancel_token) is not threading.Event
+            )
+            or type(self.module) is not ModuleOperationRequest
+            or self.module.kind is not ModuleKind.RSM
+            or self.module.output.kind is not AnalysisArtifactKind.RSM
+            or type(self.plan) is not RSMOperationPlan
+            or type(self.preflight) is not RSMPreflightReceipt
+            or type(self.provenance_json) is not str
+            or self.module.plan_fingerprint != self.plan.fingerprint
+            or self.preflight.plan_fingerprint != self.plan.fingerprint
+            or self.preflight.module_source_fingerprint
+            != self.module.source.fingerprint
+            or self.preflight.source_fingerprint
+            != self.module.source.analysis.source_fingerprint
+            or self.preflight.table_fingerprint
+            != self.module.source.table_fingerprint
+            or tuple(item.label for item in self.preflight.contributions)
+            != self.module.source.selected_labels
+        ):
+            raise TypeError("RSM operation request is invalid")
+        expected_preflight = _capture_preflight(
+            self.module.source,
+            self.plan,
+            _fresh_table(
+                self.module.source,
+                cancel_token=_cancel_token,
+            ),
+            self.preflight.project_root,
+            cancel_token=_cancel_token,
+        )
+        if expected_preflight.fingerprint != self.preflight.fingerprint:
+            raise ValueError(
+                "RSM preflight is not the exact bound source projection"
+            )
+        try:
+            provenance = json.loads(self.provenance_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise TypeError("RSM operation provenance is invalid") from error
+        if (
+            type(provenance) is not dict
+            or module_provenance_digest(ModuleKind.RSM, provenance)
+            != self.module.provenance_digest
+            or provenance
+            != _provenance(
+                self.module.source,
+                self.module.output,
+                self.plan,
+                self.preflight,
+            )
+        ):
+            raise ValueError("RSM provenance does not match its exact request")
+
+    @property
+    def provenance(self) -> dict[str, object]:
+        return json.loads(self.provenance_json)
+
+    def __copy__(self):
+        raise TypeError("RSM operation request is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM operation request is not copyable")
+
+
+def prepare_rsm_operation(
+    source: ModuleSourceReceipt,
+    output: ModuleOutputRequest,
+    plan: RSMOperationPlan,
+    *,
+    project_root: str | Path,
+    cancel_token: threading.Event | None = None,
+) -> RSMOperationRequest:
+    """Bind one exact SPEC scan, scientific preflight, plan, and output."""
+
+    if (
+        type(source) is not ModuleSourceReceipt
+        or source.kind is not ModuleKind.RSM
+        or type(output) is not ModuleOutputRequest
+        or type(plan) is not RSMOperationPlan
+    ):
+        raise TypeError("RSM preparation requires exact RSM module values")
+    if cancel_token is not None and type(cancel_token) is not threading.Event:
+        raise TypeError("RSM cancellation token must be exact threading.Event")
+    if source.analysis.resolved_kind is not SourceKind.SPEC:
+        raise RSMOperationRefused(
+            "SOURCE_KIND_UNSUPPORTED",
+            "R1 RSM accepts only one extensionless SPEC scan",
+        )
+    if output.kind is not AnalysisArtifactKind.RSM:
+        raise RSMOperationRefused(
+            "OUTPUT_KIND_MISMATCH",
+            "RSM requires an RSM analysis artifact output",
+        )
+    required = required_rsm_selectors(plan)
+    if tuple(source.resolved_selectors) != required:
+        raise RSMOperationRefused(
+            "SOURCE_PROJECTION_MISMATCH",
+            "module source selectors must exactly match the RSM plan",
+        )
+    table = _fresh_table(source, cancel_token=cancel_token)
+    preflight = _capture_preflight(
+        source,
+        plan,
+        table,
+        project_root,
+        cancel_token=cancel_token,
+    )
+    provenance = _provenance(source, output, plan, preflight)
+    module = ModuleOperationRequest(
+        source,
+        output,
+        plan.fingerprint,
+        module_provenance_digest(ModuleKind.RSM, provenance),
+    )
+    canonical = module_artifact_request(module, provenance).provenance_json
+    return RSMOperationRequest(
+        module,
+        plan,
+        preflight,
+        canonical,
+        _REQUEST_FACTORY,
+        cancel_token,
+    )
+
+
+def rsm_normalization_divisors(
+    policy: RSMNormalizationPolicy,
+    frame_count: int,
+    *,
+    foil_status: np.ndarray | None = None,
+    exposure_seconds: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute finite positive per-frame divisors for numerator normalization."""
+
+    if type(policy) is not RSMNormalizationPolicy:
+        raise TypeError("RSM normalization policy must be exact")
+    if type(frame_count) is not int or frame_count < 1:
+        raise ValueError("RSM normalization frame count must be positive")
+    if policy.mode is RSMNormalizationMode.IDENTITY:
+        if foil_status is not None or exposure_seconds is not None:
+            raise ValueError("identity normalization does not accept metadata arrays")
+        result = np.ones(frame_count, dtype=np.float64)
+        result.setflags(write=False)
+        return result
+    if foil_status is None or exposure_seconds is None:
+        raise RSMOperationRefused(
+            "NORMALIZATION_METADATA_MISSING",
+            "foil and exposure metadata are required",
+        )
+    foil = np.asarray(foil_status, dtype=np.float64)
+    exposure = np.asarray(exposure_seconds, dtype=np.float64)
+    expected = (frame_count,)
+    if foil.shape != expected or exposure.shape != expected:
+        raise RSMOperationRefused(
+            "NORMALIZATION_METADATA_SHAPE_INVALID",
+            "normalization metadata does not match frame membership",
+        )
+    if not np.all(np.isfinite(foil)) or not np.all(foil == np.floor(foil)):
+        raise RSMOperationRefused(
+            "FOIL_STATUS_INVALID",
+            "foil status must be finite integral values",
+        )
+    if np.any((foil < 0) | (foil > 9999)):
+        raise RSMOperationRefused(
+            "FOIL_STATUS_INVALID",
+            "foil status must be between 0 and 9999",
+        )
+    if not np.all(np.isfinite(exposure)) or np.any(exposure <= 0):
+        raise RSMOperationRefused(
+            "EXPOSURE_INVALID",
+            "exposure seconds must be finite and strictly positive",
+        )
+    codes = foil.astype(np.int64)
+    digits = np.column_stack(
+        (
+            codes // 1000,
+            (codes // 100) % 10,
+            (codes // 10) % 10,
+            codes % 10,
+        )
+    )
+    transmission = np.exp(
+        -(digits @ np.asarray(policy.absorption_lengths, dtype=np.float64))
+    )
+    divisors = transmission * exposure
+    if not np.all(np.isfinite(transmission)) or np.any(transmission <= 0):
+        raise RSMOperationRefused(
+            "TRANSMISSION_INVALID",
+            "foil transmission is non-finite or non-positive",
+        )
+    if not np.all(np.isfinite(divisors)) or np.any(divisors <= 0):
+        raise RSMOperationRefused(
+            "NORMALIZATION_DIVISOR_INVALID",
+            "foil/exposure divisor is non-finite or non-positive",
+        )
+    result = np.array(divisors, dtype=np.float64, copy=True, order="C")
+    result.setflags(write=False)
+    return result
+
+
+def condition_rsm_images(
+    images: np.ndarray,
+    conditioning: RSMImageConditioning,
+    *,
+    static_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return one owned float64 chunk after the recorded conditioning policy."""
+
+    if type(conditioning) is not RSMImageConditioning:
+        raise TypeError("RSM image conditioning must be exact")
+    source = np.asarray(images)
+    if source.dtype.kind not in "biuf" or source.ndim not in {2, 3}:
+        raise RSMOperationRefused(
+            "FRAME_LAYOUT_INVALID",
+            "RSM images must be numeric two- or three-dimensional arrays",
+        )
+    result = np.array(source, dtype=np.float64, copy=True, order="C")
+    if result.ndim == 2:
+        result = result[np.newaxis, :, :]
+    result += conditioning.additive_offset
+    if conditioning.high_threshold is not None:
+        result[result > conditioning.high_threshold] = np.nan
+    if static_mask is not None:
+        mask = np.asarray(static_mask)
+        if mask.dtype.kind != "b" or mask.shape != result.shape[1:]:
+            raise RSMOperationRefused(
+                "STATIC_MASK_LAYOUT_INVALID",
+                "RSM static mask must match the full detector frame",
+            )
+        result[:, mask] = np.nan
+    return result
+
+
+def rsm_static_hot_mask(
+    chunks: Iterable[np.ndarray],
+    conditioning: RSMImageConditioning,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> np.ndarray | None:
+    """Compute the notebook's exact all-frames, same-value hot-pixel mask."""
+
+    if cancel_token is not None and type(cancel_token) is not threading.Event:
+        raise TypeError("RSM cancellation token must be exact threading.Event")
+    threshold = conditioning.static_hot_threshold
+    if threshold is None:
+        return None
+    first: np.ndarray | None = None
+    same: np.ndarray | None = None
+    above: np.ndarray | None = None
+    frame_count = 0
+    for raw_chunk in chunks:
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMOperationRefused("CANCELLED")
+        chunk = condition_rsm_images(raw_chunk, conditioning)
+        for frame in chunk:
+            if cancel_token is not None and cancel_token.is_set():
+                raise RSMOperationRefused("CANCELLED")
+            if first is None:
+                first = np.array(frame, copy=True, order="C")
+                same = np.ones(first.shape, dtype=bool)
+                above = first > threshold
+            else:
+                assert same is not None and above is not None
+                same &= frame == first
+                above &= frame > threshold
+            frame_count += 1
+    if frame_count == 0 or first is None or same is None or above is None:
+        raise RSMOperationRefused("SOURCE_EMPTY")
+    result = np.ascontiguousarray(same & above)
+    result.setflags(write=False)
+    return result
+
+
+def resolve_exact_rsm_q_bounds(
+    mapper: PixelQMap,
+    angles: tuple[np.ndarray, ...] | list[np.ndarray],
+    energy_eV: float,
+    ub: np.ndarray,
+    *,
+    roi: tuple[int, int, int, int] | None,
+    chunk_size: int,
+    max_frame_bytes: int,
+    max_chunk_bytes: int,
+    cancel_token: threading.Event | None = None,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Resolve exact q extrema over every selected detector pixel, image-free."""
+
+    if type(mapper) is not PixelQMap:
+        raise TypeError("RSM q-bound resolution requires exact PixelQMap")
+    energy = _finite_float(energy_eV, "RSM energy", positive=True)
+    matrix = np.asarray(ub, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("RSM UB must be one finite 3 by 3 matrix")
+    if type(chunk_size) is not int or not 1 <= chunk_size <= _MAX_CHUNK_SIZE:
+        raise ValueError("RSM q-bound chunk size is outside the R1 bound")
+    if (
+        type(max_frame_bytes) is not int
+        or not 1 <= max_frame_bytes <= _MAX_FRAME_BYTES
+    ):
+        raise ValueError("RSM q-bound frame byte limit is outside the R1 bound")
+    if (
+        type(max_chunk_bytes) is not int
+        or not 1 <= max_chunk_bytes <= _MAX_CHUNK_BYTES
+    ):
+        raise ValueError("RSM q-bound chunk byte limit is outside the R1 bound")
+    if cancel_token is not None and type(cancel_token) is not threading.Event:
+        raise TypeError("RSM cancellation token must be exact threading.Event")
+    if type(angles) not in {tuple, list} or len(angles) != 6:
+        raise ValueError("RSM psic q-bound resolution requires six angle arrays")
+    values = tuple(np.asarray(item, dtype=np.float64) for item in angles)
+    if not values or values[0].ndim != 1 or len(values[0]) < 1:
+        raise ValueError("RSM angle arrays must be nonempty and one-dimensional")
+    frame_count = len(values[0])
+    if any(
+        item.ndim != 1
+        or len(item) != frame_count
+        or not np.all(np.isfinite(item))
+        for item in values
+    ):
+        raise ValueError("RSM angle arrays must be aligned and finite")
+    cropped = mapper.header if roi is None else mapper.header.with_roi(roi)
+    if cropped.Nch1 < 2 or cropped.Nch2 < 2:
+        raise ValueError("RSM q-bound ROI has an invalid detector shape")
+    if cancel_token is not None and cancel_token.is_set():
+        raise RSMOperationRefused("CANCELLED")
+    conditioned_frame_bytes = (
+        mapper.header.Nch1
+        * mapper.header.Nch2
+        * np.dtype(np.float64).itemsize
+    )
+    if conditioned_frame_bytes > max_frame_bytes:
+        raise RSMOperationRefused(
+            "FRAME_MEMORY_LIMIT_EXCEEDED",
+            "RSM full conditioned detector frame requires "
+            f"{conditioned_frame_bytes} bytes, exceeding "
+            f"max_frame_bytes={max_frame_bytes}",
+        )
+    q_plane_bytes = (
+        cropped.Nch1
+        * cropped.Nch2
+        * np.dtype(np.float64).itemsize
+    )
+    q_chunk_bytes = 3 * q_plane_bytes * min(frame_count, chunk_size)
+    if q_chunk_bytes > max_chunk_bytes:
+        raise RSMOperationRefused(
+            "Q_MEMORY_LIMIT_EXCEEDED",
+            "RSM exact q preflight requires "
+            f"{q_plane_bytes} bytes per coordinate plane and "
+            f"{q_chunk_bytes} bytes per coordinate chunk, exceeding "
+            f"max_chunk_bytes={max_chunk_bytes}",
+        )
+    lows = np.full(3, np.inf, dtype=np.float64)
+    highs = np.full(3, -np.inf, dtype=np.float64)
+    for start in range(0, frame_count, chunk_size):
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMOperationRefused("CANCELLED")
+        stop = min(start + chunk_size, frame_count)
+        q_values = mapper.pixel_q(
+            [item[start:stop] for item in values],
+            energy,
+            UB=matrix,
+            roi=roi,
+            image_shape=(stop - start, cropped.Nch1, cropped.Nch2),
+        )
+        expected = (stop - start, cropped.Nch1, cropped.Nch2)
+        if (
+            type(q_values) is not tuple
+            or len(q_values) != 3
+            or any(np.asarray(item).shape != expected for item in q_values)
+            or any(not np.all(np.isfinite(item)) for item in q_values)
+        ):
+            raise RSMOperationRefused(
+                "Q_COORDINATES_INVALID",
+                "RSM q-coordinate preflight returned an invalid detector grid",
+            )
+        for axis, item in enumerate(q_values):
+            lows[axis] = min(lows[axis], float(np.min(item)))
+            highs[axis] = max(highs[axis], float(np.max(item)))
+    if any(
+        not math.isfinite(float(lo))
+        or not math.isfinite(float(hi))
+        or not hi > lo
+        for lo, hi in zip(lows, highs)
+    ):
+        raise RSMOperationRefused("Q_BOUNDS_INVALID")
+    return tuple(
+        (float(lo), float(hi)) for lo, hi in zip(lows, highs)
+    )  # type: ignore[return-value]
+
+
+def _raw_chunks(
+    source,
+    labels: tuple[int, ...],
+    *,
+    chunk_size: int,
+    expected_shape: tuple[int, int],
+    max_frame_bytes: int,
+    max_chunk_bytes: int,
+    cancel_token: threading.Event | None,
+    frame_callback: Callable[[int], object] | None = None,
+):
+    completed = 0
+    for start in range(0, len(labels), chunk_size):
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMOperationRefused("CANCELLED")
+        chunk_labels = labels[start : start + chunk_size]
+        frames: list[np.ndarray] = []
+        working_bytes = 0
+        for label in chunk_labels:
+            if cancel_token is not None and cancel_token.is_set():
+                raise RSMOperationRefused("CANCELLED")
+            image = np.asarray(source.load_frame(label))
+            if image.dtype.kind not in "biuf" or image.shape != expected_shape:
+                raise RSMOperationRefused(
+                    "FRAME_LAYOUT_INVALID",
+                    f"RSM frame {label} does not match detector shape "
+                    f"{expected_shape}",
+                )
+            float_bytes = image.size * np.dtype(np.float64).itemsize
+            if image.nbytes > max_frame_bytes or float_bytes > max_frame_bytes:
+                raise MemoryError(
+                    f"RSM frame {label} requires {max(image.nbytes, float_bytes)} "
+                    f"bytes, exceeding max_frame_bytes={max_frame_bytes}"
+                )
+            # Bound arrays owned by this operation while the downstream
+            # gridder consumes the chunk: decoded frames, the stacked raw
+            # copy, conditioned input, the gridder's float copy, and its
+            # three per-pixel q-coordinate arrays. Backend-private temporary
+            # allocations remain outside this enforceable ownership boundary.
+            working_bytes += 2 * image.nbytes + 5 * float_bytes
+            if working_bytes > max_chunk_bytes:
+                raise MemoryError(
+                    f"RSM chunk through frame {label} requires at least "
+                    f"{working_bytes} bytes, exceeding "
+                    f"max_chunk_bytes={max_chunk_bytes}"
+                )
+            frames.append(image)
+            completed += 1
+            if frame_callback is not None:
+                try:
+                    frame_callback(completed)
+                except Exception:
+                    pass
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMOperationRefused("CANCELLED")
+        yield np.stack(frames, axis=0), list(chunk_labels)
+
+
+def _contribution_values(
+    contribution: RSMContribution,
+) -> dict[tuple[str, int], float]:
+    return {
+        (name, occurrence): value
+        for name, occurrence, value in contribution.values
+    }
+
+
+class _RSMSourceView:
+    """Selected, conditioned, numerator-normalized view of one source lease."""
+
+    def __init__(
+        self,
+        source,
+        request: RSMOperationRequest,
+        *,
+        cancel_token: threading.Event | None,
+        frame_callback: Callable[[int], object] | None,
+    ) -> None:
+        self._source = source
+        self._request = request
+        self._cancel_token = cancel_token
+        self._frame_callback = frame_callback
+        self.name = getattr(source, "name", type(source).__name__)
+        self.capabilities = source.capabilities
+        self._labels = request.module.source.selected_labels
+        self._contributions = request.preflight.contributions
+        self._by_label = {
+            item.label: item for item in self._contributions
+        }
+        geometry = request.plan.geometry
+        self._role_values = {
+            role: np.asarray(
+                [
+                    _contribution_values(item)[
+                        (selector.name, selector.occurrence)
+                    ]
+                    for item in self._contributions
+                ],
+                dtype=np.float64,
+            )
+            for role, selector in geometry.motor_selectors
+        }
+
+    @property
+    def frame_indices(self) -> list[int]:
+        return list(self._labels)
+
+    @property
+    def motors(self) -> dict[str, np.ndarray]:
+        return {
+            role: np.array(values, copy=True)
+            for role, values in self._role_values.items()
+        }
+
+    def motor_series(self, name: str) -> np.ndarray:
+        try:
+            return np.array(self._role_values[name], copy=True)
+        except KeyError as error:
+            raise KeyError(name) from error
+
+    def _condition(self, images: np.ndarray, labels: list[int]) -> np.ndarray:
+        conditioned = condition_rsm_images(images, self._request.plan.conditioning)
+        divisors = np.asarray(
+            [self._by_label[label].normalization_divisor for label in labels],
+            dtype=np.float64,
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            conditioned /= divisors[:, None, None]
+        if np.any(np.isinf(conditioned)):
+            raise RSMOperationRefused(
+                "NORMALIZATION_RESULT_INVALID",
+                "RSM normalization produced an infinite numerator",
+            )
+        return conditioned
+
+    def load_frame(self, index: int) -> np.ndarray:
+        label = int(index)
+        if label not in self._by_label:
+            raise KeyError(label)
+        chunks = _raw_chunks(
+            self._source,
+            (label,),
+            chunk_size=1,
+            expected_shape=self._request.preflight.detector_shape,
+            max_frame_bytes=self._request.plan.max_frame_bytes,
+            max_chunk_bytes=self._request.plan.max_chunk_bytes,
+            cancel_token=self._cancel_token,
+            frame_callback=self._frame_callback,
+        )
+        images, labels = next(chunks)
+        return self._condition(images, labels)[0]
+
+    def iter_chunks(self, chunk_size: int):
+        if type(chunk_size) is not int or chunk_size < 1:
+            raise ValueError("RSM chunk size must be positive")
+        for images, labels in _raw_chunks(
+            self._source,
+            self._labels,
+            chunk_size=chunk_size,
+            expected_shape=self._request.preflight.detector_shape,
+            max_frame_bytes=self._request.plan.max_frame_bytes,
+            max_chunk_bytes=self._request.plan.max_chunk_bytes,
+            cancel_token=self._cancel_token,
+            frame_callback=self._frame_callback,
+        ):
+            yield self._condition(images, labels), labels
+
+    def metadata_for(self, index: int) -> Mapping[str, object]:
+        method = getattr(self._source, "metadata_for", None)
+        return {} if not callable(method) else method(index)
+
+    def frame_for(self, index: int):
+        method = getattr(self._source, "frame_for", None)
+        if not callable(method):
+            raise AttributeError("source has no frame_for")
+        return method(index)
+
+
+def _crop_static_mask(
+    mask: np.ndarray | None,
+    roi: tuple[int, int, int, int] | None,
+    expected_shape: tuple[int, int],
+) -> np.ndarray | None:
+    if mask is None:
+        return None
+    result = np.asarray(mask, dtype=bool)
+    if roi is not None:
+        r0, r1, c0, c1 = roi
+        result = result[r0:r1, c0:c1]
+    if result.shape != expected_shape:
+        raise RSMOperationRefused(
+            "STATIC_MASK_LAYOUT_INVALID",
+            "RSM static mask does not match the cropped detector",
+        )
+    frozen = np.ascontiguousarray(result)
+    frozen.setflags(write=False)
+    return frozen
+
+
+def _runtime_plan(
+    request: RSMOperationRequest,
+    static_mask: np.ndarray | None,
+) -> RSMPlan:
+    plan = request.plan
+    preflight = request.preflight
+    return RSMPlan(
+        mapper=PixelQMap(Diffractometer.psic(), plan.geometry.header),
+        diff_motors=_PSIC_ROLES,
+        bins=plan.bins,
+        UB=np.asarray(preflight.ub, dtype=np.float64),
+        energy=preflight.energy_eV,
+        chunk_size=plan.chunk_size,
+        q_bounds=preflight.q_bounds,
+        roi=plan.geometry.roi,
+        static_mask=static_mask,
+        scout_pad=0.0,
+        corrections=None,
+        gi=None,
+    )
+
+
+def _validate_science_volume(
+    value: object,
+    request: RSMOperationRequest,
+) -> RSMVolume:
+    if type(value) is not RSMVolume:
+        raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    axes = (value.h, value.k, value.l)
+    if value.intensity.shape != request.plan.bins:
+        raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    for axis, size, bounds in zip(axes, request.plan.bins, request.preflight.q_bounds):
+        values = np.asarray(axis)
+        expected = np.linspace(bounds[0], bounds[1], size, dtype=np.float64)
+        if (
+            values.shape != (size,)
+            or values.dtype.kind not in "fiu"
+            or not np.all(np.isfinite(values))
+            or not np.array_equal(values, expected)
+        ):
+            raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    intensity = np.asarray(value.intensity)
+    if intensity.dtype.kind not in "fiu" or np.any(np.isinf(intensity)):
+        raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    return value
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMOperationResult:
+    request: RSMOperationRequest
+    terminal: ModuleTerminalResult
+    payload: AnalysisArtifactPayload | None = None
+
+    def __post_init__(self) -> None:
+        committed = self.terminal.disposition is ModuleDisposition.COMMITTED
+        if (
+            type(self.request) is not RSMOperationRequest
+            or type(self.terminal) is not ModuleTerminalResult
+            or self.terminal.request is not self.request.module
+            or (
+                committed
+                and type(self.payload) is not AnalysisArtifactPayload
+            )
+            or (not committed and self.payload is not None)
+            or (
+                committed
+                and self.payload.kind is not AnalysisArtifactKind.RSM
+            )
+            or (
+                committed
+                and self.payload.result_fingerprint
+                != self.terminal.commit.result_fingerprint
+            )
+        ):
+            raise TypeError("RSM operation result is invalid")
+
+
+class RSMOperationExecution:
+    """One-shot execution owner retained across cleanup and reload retries."""
+
+    def __init__(self, request: RSMOperationRequest, *, coordinator=None):
+        if type(request) is not RSMOperationRequest:
+            raise TypeError("RSM execution requires exact RSMOperationRequest")
+        self.request = request
+        self.coordinator = coordinator
+        self._state = "new"
+        self._output: ModuleArtifactOutput | None = None
+        self._result: RSMOperationResult | None = None
+        self._verification_terminal: ModuleTerminalResult | None = None
+        self._revision = 0
+        self._progress_callback: Callable[[ModuleProgress], object] | None = None
+
+    def __copy__(self):
+        raise TypeError("RSM operation execution is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM operation execution is not copyable")
+
+    @property
+    def output_snapshot(self):
+        return None if self._output is None else self._output.snapshot
+
+    def _terminal(
+        self,
+        disposition: ModuleDisposition,
+        code: str,
+        diagnostic: str = "",
+    ) -> RSMOperationResult:
+        value = RSMOperationResult(
+            self.request,
+            ModuleTerminalResult(
+                self.request.module,
+                disposition,
+                code,
+                diagnostic=diagnostic,
+            ),
+        )
+        self._result = value
+        self._state = "done"
+        return value
+
+    def _emit(self, stage: str, completed: int, total: int) -> None:
+        callback = self._progress_callback
+        if callback is None:
+            return
+        self._revision += 1
+        progress = ModuleProgress(
+            self.request.module,
+            self._revision,
+            stage,
+            completed,
+            total,
+        )
+        try:
+            callback(progress)
+        except Exception:
+            pass
+
+    def _strict_result(
+        self,
+        terminal: ModuleTerminalResult,
+        *,
+        total: int,
+    ) -> RSMOperationResult:
+        if terminal.disposition is not ModuleDisposition.COMMITTED:
+            value = RSMOperationResult(self.request, terminal)
+            self._result = value
+            self._state = "done"
+            return value
+        if self._output is None or self._output.snapshot.receipt is None:
+            raise RSMOperationVerificationError(
+                self, "committed RSM output has no exact artifact receipt"
+            )
+        try:
+            payload = read_analysis_artifact(
+                self.request.module.output.target,
+                expected_receipt=self._output.snapshot.receipt,
+            )
+        except BaseException as error:
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationError(
+                self, f"strict RSM reload failed: {_failure_diagnostic(error)}"
+            ) from error
+        if payload.result_fingerprint != terminal.commit.result_fingerprint:
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationError(
+                self, "strict RSM reload result fingerprint changed"
+            )
+        try:
+            provenance = json.loads(payload.provenance_json)
+            source_provenance = provenance["source"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationError(
+                self, "strict RSM provenance is malformed"
+            ) from error
+        if (
+            payload.kind is not AnalysisArtifactKind.RSM
+            or payload.inspection.shape != self.request.plan.bins
+            or tuple(name for name, _axis in payload.axes) != ("h", "k", "l")
+            or any(
+                not np.array_equal(
+                    np.asarray(axis),
+                    np.asarray(
+                        np.linspace(bounds[0], bounds[1], size),
+                        dtype=np.float32,
+                    ),
+                )
+                for (_name, axis), bounds, size in zip(
+                    payload.axes,
+                    self.request.preflight.q_bounds,
+                    self.request.plan.bins,
+                )
+            )
+            or payload.provenance_json != self.request.provenance_json
+            or source_provenance.get("preflight")
+            != self.request.preflight.to_provenance()
+            or source_provenance.get("selected_labels")
+            != list(self.request.module.source.selected_labels)
+        ):
+            self._verification_terminal = terminal
+            self._state = "verification_failed"
+            raise RSMOperationVerificationError(
+                self, "strict RSM payload no longer matches its request"
+            )
+        self._emit("reload", total, total)
+        value = RSMOperationResult(self.request, terminal, payload)
+        self._result = value
+        self._verification_terminal = terminal
+        self._state = "done"
+        return value
+
+    def run(
+        self,
+        *,
+        cancel_token: threading.Event | None = None,
+        progress_callback: Callable[[ModuleProgress], object] | None = None,
+    ) -> RSMOperationResult:
+        if self._state != "new":
+            raise RuntimeError("RSM execution is one-shot")
+        if cancel_token is not None and type(cancel_token) is not threading.Event:
+            raise TypeError("RSM cancellation token must be exact threading.Event")
+        if progress_callback is not None and not callable(progress_callback):
+            raise TypeError("RSM progress callback must be callable")
+        self._state = "running"
+        self._progress_callback = progress_callback
+        labels = self.request.module.source.selected_labels
+        hot_pass = self.request.plan.conditioning.static_hot_threshold is not None
+        science_steps = len(labels) * (2 if hot_pass else 1)
+        total = science_steps + 3
+        self._emit("preflight", 0, total)
+        if cancel_token is not None and cancel_token.is_set():
+            return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+        try:
+            with requalified_analysis_source(
+                self.request.module.source.analysis,
+                cancel_token=cancel_token,
+            ) as source:
+                static_mask = None
+                if hot_pass:
+                    static_mask = rsm_static_hot_mask(
+                        (
+                            images
+                            for images, _chunk_labels in _raw_chunks(
+                                source,
+                                labels,
+                                chunk_size=self.request.plan.chunk_size,
+                                expected_shape=self.request.preflight.detector_shape,
+                                max_frame_bytes=self.request.plan.max_frame_bytes,
+                                max_chunk_bytes=self.request.plan.max_chunk_bytes,
+                                cancel_token=cancel_token,
+                                frame_callback=lambda done: self._emit(
+                                    "static-mask", done, total
+                                ),
+                            )
+                        ),
+                        self.request.plan.conditioning,
+                        cancel_token=cancel_token,
+                    )
+                cropped_mask = _crop_static_mask(
+                    static_mask,
+                    self.request.plan.geometry.roi,
+                    self.request.preflight.cropped_shape,
+                )
+                base = len(labels) if hot_pass else 0
+                view = _RSMSourceView(
+                    source,
+                    self.request,
+                    cancel_token=cancel_token,
+                    frame_callback=lambda done: self._emit(
+                        "science", base + done, total
+                    ),
+                )
+                scientific = run_rsm(
+                    _runtime_plan(self.request, cropped_mask),
+                    view,
+                    scan_labels=[self.request.preflight.source_scan],
+                )
+        except AnalysisSourceLeaseRefused as error:
+            if error.code == "CANCELLED":
+                return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+            return self._terminal(ModuleDisposition.REFUSED, error.code)
+        except RSMOperationRefused as error:
+            disposition = (
+                ModuleDisposition.CANCELLED
+                if error.code == "CANCELLED"
+                else ModuleDisposition.REFUSED
+            )
+            return self._terminal(disposition, error.code)
+        except BaseException as error:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "SCIENCE_FAILED",
+                _failure_diagnostic(error),
+            )
+        if cancel_token is not None and cancel_token.is_set():
+            return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
+        try:
+            volume = _validate_science_volume(scientific.payload, self.request)
+        except RSMOperationRefused as error:
+            return self._terminal(ModuleDisposition.FAILED, error.code)
+        provenance = self.request.provenance
+        bound = module_artifact_request(self.request.module, provenance)
+        try:
+            self._output = admit_module_artifact(
+                self.request.module,
+                provenance,
+                cancel_token=cancel_token,
+                coordinator=self.coordinator,
+            )
+        except ModuleArtifactRefused as error:
+            disposition = (
+                ModuleDisposition.CANCELLED
+                if error.code == "CANCELLED"
+                else ModuleDisposition.REFUSED
+            )
+            return self._terminal(disposition, error.code)
+        except FileExistsError:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+        except BaseException as error:
+            return self._terminal(
+                ModuleDisposition.FAILED,
+                "OUTPUT_ADMISSION_FAILED",
+                _failure_diagnostic(error),
+            )
+
+        def writer(entry) -> None:
+            write_rsm(
+                entry,
+                volume,
+                provenance=bound.provenance_json,
+                bounded_artifact=True,
+            )
+
+        try:
+            terminal = self._output.publish(writer, cancel_token=cancel_token)
+        except AnalysisArtifactCleanupPending as error:
+            self._state = "cleanup_pending"
+            raise RSMOperationCleanupPending(self) from error
+        self._emit("publish", total - 1, total)
+        return self._strict_result(terminal, total=total)
+
+    def retry_cleanup(self) -> RSMOperationResult:
+        if self._result is not None:
+            return self._result
+        if self._state != "cleanup_pending" or self._output is None:
+            raise RuntimeError("RSM execution has no retryable cleanup")
+        try:
+            terminal = self._output.retry_cleanup()
+        except AnalysisArtifactCleanupPending as error:
+            raise RSMOperationCleanupPending(self) from error
+        hot_pass = self.request.plan.conditioning.static_hot_threshold is not None
+        total = len(self.request.module.source.selected_labels) * (
+            2 if hot_pass else 1
+        ) + 3
+        self._emit("publish", total - 1, total)
+        return self._strict_result(terminal, total=total)
+
+    def retry_verification(self) -> RSMOperationResult:
+        """Retry strict detached reload without replaying science or writing."""
+
+        if self._result is not None:
+            return self._result
+        if (
+            self._state != "verification_failed"
+            or self._verification_terminal is None
+            or self._verification_terminal.disposition
+            is not ModuleDisposition.COMMITTED
+        ):
+            raise RuntimeError("RSM execution has no retryable verification")
+        hot_pass = self.request.plan.conditioning.static_hot_threshold is not None
+        total = len(self.request.module.source.selected_labels) * (
+            2 if hot_pass else 1
+        ) + 3
+        return self._strict_result(self._verification_terminal, total=total)
+
+
+def run_rsm_operation(
+    request: RSMOperationRequest,
+    *,
+    cancel_token: threading.Event | None = None,
+    progress_callback: Callable[[ModuleProgress], object] | None = None,
+    coordinator=None,
+) -> RSMOperationResult:
+    """Run one prepared RSM operation, retaining cleanup in its exception."""
+
+    execution = RSMOperationExecution(request, coordinator=coordinator)
+    return execution.run(
+        cancel_token=cancel_token,
+        progress_callback=progress_callback,
+    )
+
+
+__all__ = [
+    "RSMContribution",
+    "RSMDetectorGeometry",
+    "RSMImageConditioning",
+    "RSMManifestFile",
+    "RSMNormalizationMode",
+    "RSMNormalizationPolicy",
+    "RSMOperationCleanupPending",
+    "RSMOperationExecution",
+    "RSMOperationPlan",
+    "RSMOperationRefused",
+    "RSMOperationRequest",
+    "RSMOperationResult",
+    "RSMOperationVerificationError",
+    "RSMPreflightReceipt",
+    "condition_rsm_images",
+    "prepare_rsm_operation",
+    "required_rsm_selectors",
+    "resolve_exact_rsm_q_bounds",
+    "run_rsm_operation",
+    "rsm_normalization_divisors",
+    "rsm_static_hot_mask",
+]

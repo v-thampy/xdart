@@ -348,6 +348,31 @@ class TestPixelQMap:
         assert qz.shape == (3, 128, 256)
         assert captured["energy"] == 11205.0
 
+    def test_single_frame_backend_squeeze_is_restored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _SqueezingArea(_FakeAng2Q):
+            def area(self, *args, **kwargs):
+                rows = self.init_area_kwargs["Nch1"]
+                columns = self.init_area_kwargs["Nch2"]
+                value = np.zeros((rows, columns), dtype=float)
+                return value, value + 1.0, value + 2.0
+
+        class _SqueezingHXRD:
+            Ang2Q = _SqueezingArea()
+
+        monkeypatch.setattr(
+            DiffractometerConfig,
+            "make_hxrd",
+            lambda self, energy: _SqueezingHXRD(),
+        )
+        header = DetectorHeader(2, 3, 0.1, 0.1, 100, 4, 5)
+        q_values = PixelQMap(DiffractometerConfig(), header).pixel_q(
+            [np.asarray([0.0])],
+            energy=12000.0,
+        )
+        assert [value.shape for value in q_values] == [(1, 4, 5)] * 3
+
     def test_init_area_receives_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured: dict = {}
         monkeypatch.setattr(
