@@ -1,0 +1,484 @@
+"""Engine-light custody for the canonical xrayutilities Stitch calibration.
+
+This module deliberately imports neither NumPy, pyFAI, nor xrayutilities.  It
+admits the small, canonical JSON authority before any scientific runtime is
+loaded and retains exact lexical and physical file identity for later fences.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import hashlib
+from importlib import resources
+import json
+import math
+import os
+from pathlib import Path
+import stat
+from collections.abc import Mapping
+
+from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
+
+
+_MAX_ASSET_BYTES = 65_536
+_MAX_DEPTH = 6
+_MAX_NODES = 256
+_MAX_STRING_LENGTH = 256
+_RESOURCE_PARTS = ("assets", "xu", "psic_powder_1d_surface_v1.json")
+_RESOURCE_BYTE_COUNT = 4_837
+_RESOURCE_SHA256 = (
+    "57857833c56eeed0db27ec9e3f64aa635d5cd1d1e74eaed0b957eb054b3356d3"
+)
+_RESOURCE_SEMANTIC_FINGERPRINT = (
+    "90f3bec535ed9a21be1b9d93491e774364df5849155b9b9c1707eace848e40f8"
+)
+_TOP_LEVEL_KEYS = {
+    "schema",
+    "version",
+    "preset",
+    "xrayutilities",
+    "detector",
+    "acquisition",
+    "corrections",
+    "validation",
+}
+_PROJECTION_FACTORY = object()
+_RECEIPT_FACTORY = object()
+
+
+class XuStitchCalibrationRefused(ValueError):
+    def __init__(self, code: str, message: str | None = None):
+        if type(code) is not str or not code:
+            raise TypeError("XU calibration refusal code must be nonempty")
+        self.code = code
+        super().__init__(message or code)
+
+
+def _refuse(code: str, message: str) -> None:
+    raise XuStitchCalibrationRefused(code, message)
+
+
+def _canonical_bytes(value: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _bounded_projection(value: object, *, depth: int, budget: list[int]) -> None:
+    if depth > _MAX_DEPTH:
+        _refuse("XU_CALIBRATION_PARSE_FAILED", "calibration exceeds depth 6")
+    if type(value) is str:
+        if len(value) > _MAX_STRING_LENGTH:
+            _refuse(
+                "XU_CALIBRATION_PARSE_FAILED",
+                "calibration string exceeds 256 Unicode scalars",
+            )
+        return
+    if value is None or type(value) is bool or type(value) is int:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            _refuse(
+                "XU_CALIBRATION_PARSE_FAILED",
+                "calibration contains a nonfinite number",
+            )
+        return
+    if type(value) is dict:
+        budget[0] += len(value)
+        if budget[0] > _MAX_NODES:
+            _refuse("XU_CALIBRATION_PARSE_FAILED", "calibration is oversized")
+        for key, item in value.items():
+            if type(key) is not str or len(key) > _MAX_STRING_LENGTH:
+                _refuse(
+                    "XU_CALIBRATION_PARSE_FAILED",
+                    "calibration object key is invalid",
+                )
+            _bounded_projection(item, depth=depth + 1, budget=budget)
+        return
+    if type(value) is list:
+        budget[0] += len(value)
+        if budget[0] > _MAX_NODES:
+            _refuse("XU_CALIBRATION_PARSE_FAILED", "calibration is oversized")
+        for item in value:
+            _bounded_projection(item, depth=depth + 1, budget=budget)
+        return
+    _refuse(
+        "XU_CALIBRATION_PARSE_FAILED",
+        f"calibration contains unsupported {type(value).__name__}",
+    )
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class XuStitchCalibrationProjection:
+    canonical_json: str
+    raw_sha256: str
+    semantic_fingerprint: str
+    _claim: object = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self._claim is not _PROJECTION_FACTORY
+            or type(self.canonical_json) is not str
+            or self.raw_sha256 != _RESOURCE_SHA256
+            or self.semantic_fingerprint != _RESOURCE_SEMANTIC_FINGERPRINT
+        ):
+            raise TypeError("XU calibration projection is not factory-owned")
+
+    @property
+    def value(self) -> dict[str, object]:
+        return json.loads(self.canonical_json)
+
+    @property
+    def content(self) -> bytes:
+        return self.canonical_json.encode("utf-8")
+
+    def __copy__(self):
+        raise TypeError("XU calibration projection is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("XU calibration projection is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("XU calibration projection is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("XU calibration projection is not serializable")
+
+
+def parse_xu_stitch_calibration_bytes(
+    raw: bytes,
+) -> XuStitchCalibrationProjection:
+    if type(raw) is not bytes or not 1 <= len(raw) <= _MAX_ASSET_BYTES:
+        _refuse(
+            "XU_CALIBRATION_PARSE_FAILED",
+            "calibration must be nonempty bounded exact bytes",
+        )
+    if raw.startswith(b"\xef\xbb\xbf") or b"\x00" in raw or raw.endswith(b"\n"):
+        _refuse(
+            "XU_CALIBRATION_PARSE_FAILED",
+            "calibration contains a BOM, NUL, or trailing newline",
+        )
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_PARSE_FAILED",
+            "calibration is not strict UTF-8",
+        ) from error
+
+    def object_pairs(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            _refuse(
+                "XU_CALIBRATION_PARSE_FAILED",
+                "calibration contains duplicate object keys",
+            )
+        return result
+
+    def invalid_constant(_value):
+        _refuse(
+            "XU_CALIBRATION_PARSE_FAILED",
+            "calibration contains a nonfinite JSON constant",
+        )
+
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=object_pairs,
+            parse_constant=invalid_constant,
+        )
+    except XuStitchCalibrationRefused:
+        raise
+    except (RecursionError, TypeError, ValueError) as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_PARSE_FAILED",
+            "calibration is not one exact JSON object",
+        ) from error
+    if type(value) is not dict or set(value) != _TOP_LEVEL_KEYS:
+        _refuse(
+            "XU_CALIBRATION_SCHEMA_UNSUPPORTED",
+            "calibration top-level schema is unsupported",
+        )
+    _bounded_projection(value, depth=1, budget=[0])
+    try:
+        canonical = _canonical_bytes(value)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_PARSE_FAILED",
+            "calibration cannot be encoded canonically",
+        ) from error
+    if canonical != raw:
+        _refuse(
+            "XU_CALIBRATION_NOT_CANONICAL",
+            "calibration bytes are not exact canonical JSON",
+        )
+    semantic = analysis_canonical_fingerprint(
+        "xu-stitch-calibration-asset-v1", value
+    )
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    if (
+        len(raw) != _RESOURCE_BYTE_COUNT
+        or raw_sha256 != _RESOURCE_SHA256
+        or semantic != _RESOURCE_SEMANTIC_FINGERPRINT
+        or value.get("schema") != "xdart.xu_stitch_calibration"
+        or type(value.get("version")) is not int
+        or value.get("version") != 1
+        or value.get("preset") != "psic_powder_1d"
+    ):
+        _refuse(
+            "XU_CALIBRATION_SCHEMA_UNSUPPORTED",
+            "calibration is not the authenticated SURFACE v1 projection",
+        )
+    return XuStitchCalibrationProjection(
+        text,
+        raw_sha256,
+        semantic,
+        _PROJECTION_FACTORY,
+    )
+
+
+def canonical_surface_resource_bytes() -> bytes:
+    try:
+        node = resources.files("xrd_tools")
+        for part in _RESOURCE_PARTS:
+            node = node.joinpath(part)
+        raw = node.read_bytes()
+        parse_xu_stitch_calibration_bytes(raw)
+        return raw
+    except XuStitchCalibrationRefused:
+        raise
+    except (FileNotFoundError, OSError, TypeError) as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CANONICAL_ASSET_UNAVAILABLE",
+            "canonical SURFACE calibration resource is unavailable",
+        ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class XuStitchCalibrationInput:
+    locator: str | Path
+
+    def __post_init__(self) -> None:
+        try:
+            shown = os.fspath(self.locator)
+        except TypeError as error:
+            raise TypeError("XU calibration locator must be path-like") from error
+        if type(shown) is not str or not shown or "\x00" in shown:
+            raise TypeError("XU calibration locator must be a nonempty exact path")
+
+
+def _state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(value.st_mode),
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _lexical_target(
+    request: XuStitchCalibrationInput,
+    project_root: str | Path,
+) -> tuple[str, str, str]:
+    try:
+        project = os.path.normpath(os.path.abspath(os.fspath(project_root)))
+        shown = os.fspath(request.locator)
+    except TypeError as error:
+        raise TypeError("project and calibration locator must be path-like") from error
+    if not os.path.isdir(project) or os.path.islink(project):
+        _refuse("XU_CALIBRATION_PROJECT_INVALID", "Project must be a real directory")
+    target = os.path.normpath(
+        shown if os.path.isabs(shown) else os.path.join(project, shown)
+    )
+    try:
+        if os.path.commonpath((project, target)) != project:
+            raise ValueError
+    except ValueError:
+        _refuse(
+            "XU_CALIBRATION_OUTSIDE_PROJECT",
+            "calibration locator is outside Project",
+        )
+    relative = os.path.relpath(target, project)
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        _refuse(
+            "XU_CALIBRATION_OUTSIDE_PROJECT",
+            "calibration locator is outside Project",
+        )
+    current = project
+    for part in Path(relative).parts:
+        current = os.path.join(current, part)
+        try:
+            state = os.lstat(current)
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(state.st_mode):
+            _refuse(
+                "XU_CALIBRATION_SYMLINK_REFUSED",
+                "calibration path traverses a symbolic link",
+            )
+    resolved_project = os.path.realpath(project)
+    resolved_target = os.path.realpath(target)
+    if os.path.commonpath((resolved_project, resolved_target)) != resolved_project:
+        _refuse(
+            "XU_CALIBRATION_OUTSIDE_PROJECT",
+            "resolved calibration locator is outside Project",
+        )
+    return project, target, relative
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class XuStitchCalibrationReceipt:
+    request: XuStitchCalibrationInput
+    project_root: str
+    lexical_relative_path: str
+    resolved_relative_path: str
+    file_state: tuple[int, int, int, int, int, int]
+    projection: XuStitchCalibrationProjection
+    fingerprint: str
+    _claim: object = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self._claim is not _RECEIPT_FACTORY
+            or type(self.request) is not XuStitchCalibrationInput
+            or type(self.projection) is not XuStitchCalibrationProjection
+            or type(self.file_state) is not tuple
+            or len(self.file_state) != 6
+            or type(self.fingerprint) is not str
+            or len(self.fingerprint) != 64
+        ):
+            raise TypeError("XU calibration receipt is not factory-owned")
+
+    @property
+    def byte_count(self) -> int:
+        return len(self.projection.content)
+
+    @property
+    def raw_sha256(self) -> str:
+        return self.projection.raw_sha256
+
+    @property
+    def semantic_fingerprint(self) -> str:
+        return self.projection.semantic_fingerprint
+
+    @property
+    def content(self) -> bytes:
+        return self.projection.content
+
+    def __copy__(self):
+        raise TypeError("XU calibration receipt is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("XU calibration receipt is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("XU calibration receipt is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("XU calibration receipt is not serializable")
+
+
+def capture_xu_stitch_calibration(
+    request: XuStitchCalibrationInput,
+    *,
+    project_root: str | Path,
+) -> XuStitchCalibrationReceipt:
+    if type(request) is not XuStitchCalibrationInput:
+        raise TypeError("XU calibration capture requires exact input")
+    project, target, lexical_relative = _lexical_target(request, project_root)
+    try:
+        before = os.lstat(target)
+    except OSError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_UNAVAILABLE", "calibration file is unavailable"
+        ) from error
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        _refuse(
+            "XU_CALIBRATION_NOT_REGULAR",
+            "calibration must be a regular non-symlink file",
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+        try:
+            opened = os.fstat(descriptor)
+            raw = os.read(descriptor, _MAX_ASSET_BYTES + 1)
+            trailing = os.read(descriptor, 1)
+            closed_state = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after = os.lstat(target)
+    except OSError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_UNAVAILABLE", "calibration file cannot be captured"
+        ) from error
+    if trailing or not (
+        _state(before) == _state(opened) == _state(closed_state) == _state(after)
+    ):
+        _refuse(
+            "XU_CALIBRATION_IDENTITY_MISMATCH",
+            "calibration changed during capture",
+        )
+    projection = parse_xu_stitch_calibration_bytes(raw)
+    resolved_relative = os.path.relpath(os.path.realpath(target), os.path.realpath(project))
+    receipt_projection = (
+        lexical_relative,
+        resolved_relative,
+        _state(after),
+        projection.raw_sha256,
+        projection.semantic_fingerprint,
+    )
+    fingerprint = analysis_canonical_fingerprint(
+        "xu-stitch-calibration-receipt-v1", receipt_projection
+    )
+    return XuStitchCalibrationReceipt(
+        request,
+        project,
+        lexical_relative,
+        resolved_relative,
+        _state(after),
+        projection,
+        fingerprint,
+        _RECEIPT_FACTORY,
+    )
+
+
+def revalidate_xu_stitch_calibration(
+    receipt: XuStitchCalibrationReceipt,
+) -> bytes:
+    if type(receipt) is not XuStitchCalibrationReceipt:
+        raise TypeError("XU calibration revalidation requires exact receipt")
+    current = capture_xu_stitch_calibration(
+        receipt.request,
+        project_root=receipt.project_root,
+    )
+    if (
+        current.lexical_relative_path != receipt.lexical_relative_path
+        or current.resolved_relative_path != receipt.resolved_relative_path
+        or current.file_state != receipt.file_state
+        or current.fingerprint != receipt.fingerprint
+        or current.content != receipt.content
+    ):
+        _refuse(
+            "XU_CALIBRATION_IDENTITY_MISMATCH",
+            "calibration no longer matches its receipt",
+        )
+    return current.content
+
+
+__all__ = [
+    "XuStitchCalibrationInput",
+    "XuStitchCalibrationProjection",
+    "XuStitchCalibrationReceipt",
+    "XuStitchCalibrationRefused",
+    "canonical_surface_resource_bytes",
+    "capture_xu_stitch_calibration",
+    "parse_xu_stitch_calibration_bytes",
+    "revalidate_xu_stitch_calibration",
+]
