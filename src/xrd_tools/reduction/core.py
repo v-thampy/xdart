@@ -2886,6 +2886,9 @@ class ReductionSession:
         if self.plan.gi is not None:
             if self.scan.poni is None:
                 raise ValueError("GI reduction requires scan.poni.")
+            # A strict detector-calibration-backed AI carries configuration,
+            # sensor, and parallax state that the flat PONI cannot reconstruct.
+            ai = self.scan.integrator
             self._initial_incident_angle = _resolve_gi_incident_angle(
                 self.scan.frames[0] if self.scan.frames else None,
                 self.plan.gi,
@@ -4324,7 +4327,7 @@ def _apply_gi_freeze_policy(
     scout_integrators = _ReductionIntegratorProvider(
         scan=scan,
         plan=plan,
-        ai=None,
+        ai=scan.integrator,
         fi=fi,
         initial_incident_angle=initial_incident_angle,
     )
@@ -4533,8 +4536,13 @@ class _ReductionIntegratorProvider:
             # geometrically identical to the owner thread's AI (strengthening
             # live==batch==reload equivalence).  Fall back to a poni rebuild
             # only when there is no base AI (pure-PONI, named-detector path).
-            ai = copy.deepcopy(self.ai) if self.ai is not None \
-                else poni_to_integrator(self.scan.poni)
+            if self.ai is not None:
+                from xrd_tools.integrate.calibration import (
+                    _clone_integrator_preserving_calibration,
+                )
+                ai = _clone_integrator_preserving_calibration(self.ai)
+            else:
+                ai = poni_to_integrator(self.scan.poni)
             self._local.ai = ai
         return ai
 
@@ -4545,15 +4553,23 @@ class _ReductionIntegratorProvider:
             return self.fi
         fi = getattr(self._local, "fi", None)
         if fi is None:
-            if self.fi is not None:
-                # Same reasoning as standard(): deepcopy the base
-                # FiberIntegrator to keep a generic detector's pixel size
-                # (a poni rebuild would drop it) and stay thread-isolated.
-                fi = copy.deepcopy(self.fi)
+            gi = self.plan.gi
+            if gi is None:
+                return None
+            accepted = self.fi if self.fi is not None else self.ai
+            if accepted is not None:
+                # pyFAI Geometry.promote/deepcopy does not copy _parallax.
+                # Use the checked project promotion so each worker preserves
+                # the accepted detector config, sensor, wavelength, and exact
+                # enabled/disabled parallax state.
+                from xrd_tools.integrate.gid import _fiber_from_integrator
+                fi = _fiber_from_integrator(
+                    accepted,
+                    incident_angle=float(self.initial_incident_angle or 0.0),
+                    tilt_angle=float(gi.tilt_angle),
+                    sample_orientation=int(gi.sample_orientation),
+                )
             else:
-                gi = self.plan.gi
-                if gi is None:
-                    return None
                 fi = poni_to_fiber_integrator(
                     self.scan.poni,
                     incident_angle=float(self.initial_incident_angle or 0.0),

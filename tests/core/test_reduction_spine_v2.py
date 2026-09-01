@@ -214,6 +214,128 @@ def test_run_reduction_gi_resolves_incidence_and_dispatches_modes(
     assert calls[3][1]["incident_angle"] == 0.20
 
 
+@pytest.mark.parametrize("parallax", [False, True])
+def test_gi_reduction_preserves_v3_sensor_parallax_wavelength_and_convention(
+    monkeypatch: pytest.MonkeyPatch,
+    parallax: bool,
+):
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.corrections.grazing import GI_EXIT_ANGLE_CONVENTION
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+
+    shape = (12, 14)
+    config = {
+        "pixel1": 1.0e-4,
+        "pixel2": 1.0e-4,
+        "max_shape": list(shape),
+        "orientation": 3,
+        "sensor": {"material": "Ge", "thickness": 0.00075},
+    }
+    poni = PONI(
+        dist=0.2,
+        poni1=0.0006,
+        poni2=0.0007,
+        wavelength=1.0e-10,
+        detector="Detector",
+    )
+    ai = detector_calibration_to_integrator(
+        DetectorCalibration(poni, config, parallax=parallax)
+    )
+    seen = []
+
+    def fake_exit_angle(image, fi, **kwargs):
+        seen.append((fi, kwargs))
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_gi_exitangles_1d",
+        fake_exit_angle,
+    )
+    result = run_reduction(
+        ReductionPlan(
+            integration_1d=Integration1DPlan(npt=3),
+            gi=GIMode(incident_angle=0.2, mode_1d=GI1DMode.EXIT_ANGLE),
+        ),
+        Scan(
+            "v3-gi",
+            [Frame(0, image=np.ones(shape))],
+            poni=poni,
+            integrator=ai,
+        ),
+        executor=1,
+    )
+
+    assert result.n_processed == 1
+    assert len(seen) == 1
+    fi, kwargs = seen[0]
+    assert (fi.parallax is not None) is parallax
+    assert fi.detector.get_config()["sensor"] == {
+        "material": "Ge",
+        "thickness": pytest.approx(0.00075),
+    }
+    assert fi.wavelength == poni.wavelength
+    assert kwargs["gi_exit_angle_convention"] == GI_EXIT_ANGLE_CONVENTION
+
+
+@pytest.mark.parametrize("parallax", [False, True])
+def test_standard_worker_preserves_v3_sensor_parallax_and_wavelength(
+    monkeypatch: pytest.MonkeyPatch,
+    parallax: bool,
+):
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+
+    shape = (12, 14)
+    config = {
+        "pixel1": 1.0e-4,
+        "pixel2": 1.0e-4,
+        "max_shape": list(shape),
+        "orientation": 3,
+        "sensor": {"material": "Ge", "thickness": 0.00075},
+    }
+    poni = PONI(
+        dist=0.2,
+        poni1=0.0006,
+        poni2=0.0007,
+        wavelength=1.0e-10,
+        detector="Detector",
+    )
+    ai = detector_calibration_to_integrator(
+        DetectorCalibration(poni, config, parallax=parallax)
+    )
+    seen = []
+
+    def fake_standard(image, worker_ai, **kwargs):
+        seen.append(worker_ai)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_standard)
+    result = run_reduction(
+        ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
+        Scan(
+            "v3-standard-worker",
+            [Frame(0, image=np.ones(shape))],
+            poni=poni,
+            integrator=ai,
+        ),
+        executor=1,
+    )
+
+    assert result.n_processed == 1
+    assert len(seen) == 1
+    worker_ai = seen[0]
+    assert worker_ai is not ai
+    assert (worker_ai.parallax is not None) is parallax
+    assert worker_ai.detector.get_config()["sensor"] == {
+        "material": "Ge",
+        "thickness": pytest.approx(0.00075),
+    }
+    assert worker_ai.wavelength == poni.wavelength
+
+
 def test_run_reduction_gi_dispatches_polar_and_exit_angle_modes(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -1644,7 +1644,18 @@ def _calibration(shared, incidence=None):
     except (TypeError, ValueError, json.JSONDecodeError) as error: raise ValueError("accepted PONI calibration is malformed") from error
     ai = detector_calibration_to_integrator(calibration); gi = shared["gi"]
     if not gi["enabled"]: return calibration, ai, None
-    from xrd_tools.integrate.gid import _ATTR_INC, _ATTR_ORIENT, _ATTR_TILT, _xrd_fiber_integrator_type; fi = __import__("copy").deepcopy(ai).promote(_xrd_fiber_integrator_type()); inc, tilt, orient = math.radians(incidence if incidence is not None else gi["th_val"] if gi["resolved_motor"] == "Manual" else 0.0), math.radians(gi["tilt_angle"]), gi["sample_orientation"]; fi.reset_integrator(inc, tilt, orient); fi.USE_LEGACY_MASK_NORMALIZATION = False; setattr(fi, _ATTR_INC, inc); setattr(fi, _ATTR_TILT, tilt); setattr(fi, _ATTR_ORIENT, orient); return calibration, ai, fi
+    from xrd_tools.integrate.gid import _fiber_from_integrator
+    fi = _fiber_from_integrator(
+        ai,
+        incident_angle=(
+            incidence
+            if incidence is not None
+            else gi["th_val"] if gi["resolved_motor"] == "Manual" else 0.0
+        ),
+        tilt_angle=gi["tilt_angle"],
+        sample_orientation=gi["sample_orientation"],
+    )
+    return calibration, ai, fi
 def _validated_shared_science(run: Mapping[str, Any], requested: Mapping[str, Any] | None = None, *, geometry=None):
     outer = dict(run); signed = outer.pop("scientific_signature", None); _reject(type(signed) is not dict, "persisted scientific signature is missing"); signed = dict(signed); assets = signed.pop("accepted_scientific_assets", None); _reject(signed != outer, "persisted duplicated scientific signature differs"); expected = {"schema_version", "generation", "fingerprint", "source", "processing_mode", "output_mode", "live_mode", "batch_mode", "max_cores", "gi", "threshold", "poni_file", "poni_values", "mask_file", "project_root", "save_path", "bai_1d_args", "bai_2d_args", "run_options"}; optional = ({"background"} if "background" in outer else set()) | ({"poni_v3_override"} if "poni_v3_override" in outer else set()); _reject(set(outer) != expected | optional, "persisted run configuration has a noncanonical keyset")
     if "poni_v3_override" in outer:

@@ -1871,9 +1871,10 @@ def test_private_request_prepares_plan_only_on_existing_operation_worker(monkeyp
     assert update.terminal.status is OperationTerminalStatus.RETURNED and seen[0][0].startswith("scattering-operation-") and seen[0][2]["source_root"] == "/" and "npt" not in seen[0][2]["preparation"]["selected_plan"]["bai_args"] and seen[1][0] is plan and seen[0][2]["cancel_token"] is seen[1][1]["cancel_token"]
 
 
-def test_persisted_v3_calibration_reconstructs_for_reintegration():
+def test_persisted_v3_gi_calibration_reconstructs_parallax_for_reintegration():
+    from xrd_tools.corrections.grazing import GI_EXIT_ANGLE_CONVENTION
     from xrd_tools.reduction import reintegrate as module
-    from xrd_tools.session.run_configuration import RunIntent
+    from xrd_tools.session.run_configuration import GIIntent, RunIntent
 
     config = {
         "pixel1": 1.0e-4,
@@ -1902,7 +1903,10 @@ def test_persisted_v3_calibration_reconstructs_for_reintegration():
         "poni_sha256": "a" * 64,
         "mask_sha256": None,
     }
-    frozen = RunIntent(poni_values=projection).freeze()
+    frozen = RunIntent(
+        poni_values=projection,
+        gi=GIIntent(enabled=True, incidence_motor="Manual", th_val=0.2),
+    ).freeze()
     outer = frozen.as_provenance()
     signed = copy.deepcopy(outer)
     signed["accepted_scientific_assets"] = copy.deepcopy(assets)
@@ -1911,7 +1915,9 @@ def test_persisted_v3_calibration_reconstructs_for_reintegration():
     shared = module._validated_shared_science(persisted)
     calibration, integrator, fiber = module._calibration(shared)
 
-    assert fiber is None
+    assert shared["gi"]["gi_exit_angle_convention"] == (
+        GI_EXIT_ANGLE_CONVENTION
+    )
     assert calibration.parallax is True
     assert calibration.detector_config["sensor"] == {
         "material": "Ge",
@@ -1919,6 +1925,23 @@ def test_persisted_v3_calibration_reconstructs_for_reintegration():
     }
     assert integrator.parallax is not None
     assert integrator.array_from_unit(unit="q_A^-1").shape == (12, 14)
+    assert fiber.parallax is not None
+    assert fiber.detector.get_config()["sensor"] == {
+        "material": "Ge",
+        "thickness": pytest.approx(0.00075),
+    }
+    assert fiber.wavelength == projection["wavelength"]
+    from xrd_tools.integrate.gid import _fiber_from_integrator
+    worker_fiber = _fiber_from_integrator(
+        fiber,
+        incident_angle=0.2,
+        tilt_angle=0.0,
+        sample_orientation=4,
+    )
+    assert worker_fiber is not fiber
+    assert worker_fiber.parallax is not None
+    assert worker_fiber.detector.get_config() == fiber.detector.get_config()
+    assert worker_fiber.wavelength == fiber.wavelength
 def test_expected_labels_are_rederived_and_exactly_compared(tmp_path):
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.reduction import ReintegratePlan

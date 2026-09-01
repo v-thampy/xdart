@@ -4,7 +4,7 @@ Calibration helpers bridging ``xrd_tools`` containers and pyFAI.
 
 from __future__ import annotations
 
-import inspect, json, logging, math, os
+import copy, inspect, json, logging, math, os
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -671,6 +671,35 @@ def detector_calibration_to_integrator(
     if cal.parallax is True:
         integrator.enable_parallax()
     return integrator
+
+
+def _clone_integrator_preserving_calibration(
+    integrator: AzimuthalIntegrator,
+) -> AzimuthalIntegrator:
+    """Return one worker-local AI with exact effective calibration state.
+
+    pyFAI 2026 ``deepcopy`` preserves the detector and scalar geometry but
+    omits ``Geometry._parallax``.  Re-enable it from the copied detector's
+    admitted sensor when necessary, then refuse any detector, wavelength, or
+    enabled-state drift before the worker can perform science.
+    """
+
+    source_config = integrator.detector.get_config()
+    source_wavelength = integrator.wavelength
+    source_parallax = integrator.parallax is not None
+    cloned = copy.deepcopy(integrator)
+    if source_parallax and cloned.parallax is None:
+        cloned.enable_parallax()
+    if (
+        cloned.detector.get_config() != source_config
+        or cloned.wavelength != source_wavelength
+        or (cloned.parallax is not None) is not source_parallax
+    ):
+        raise ValueError(
+            "detector, wavelength, or parallax state did not survive "
+            "integrator cloning"
+        )
+    return cloned
 
 
 def get_detector(name: str | Detector) -> Detector:

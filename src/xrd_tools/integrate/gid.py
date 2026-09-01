@@ -85,6 +85,57 @@ def _xrd_fiber_integrator_type() -> type[Any]:
     return _XrdToolsFiberIntegrator
 
 
+def _fiber_from_integrator(
+    integrator: Any,
+    *,
+    incident_angle: float,
+    tilt_angle: float = 0.0,
+    sample_orientation: int = 1,
+    angle_unit: str = "deg",
+) -> FiberIntegrator:
+    """Promote one accepted AI without dropping detector or parallax state.
+
+    pyFAI 2026 ``Geometry.promote`` deep-copies the detector and its immutable
+    geometry, but deliberately does not copy ``Geometry._parallax``.  Rebuild
+    the enabled parallax object from the copied detector sensor and the exact
+    promoted wavelength, then verify the complete effective projection before
+    returning the GI integrator.
+    """
+
+    if integrator is None or not hasattr(integrator, "promote"):
+        raise TypeError("GI promotion requires an accepted pyFAI integrator")
+    source_config = integrator.detector.get_config()
+    source_wavelength = integrator.wavelength
+    source_parallax = integrator.parallax is not None
+    try:
+        fi = integrator.promote(_xrd_fiber_integrator_type())
+    except Exception as exc:
+        raise ImportError(
+            "FiberIntegrator requires pyFAI >= 2025.01. "
+            "Upgrade with: pip install -U pyFAI"
+        ) from exc
+    if source_parallax:
+        fi.enable_parallax()
+    if (
+        fi.detector.get_config() != source_config
+        or fi.wavelength != source_wavelength
+        or (fi.parallax is not None) is not source_parallax
+    ):
+        raise ValueError(
+            "detector, wavelength, or parallax state did not survive GI promotion"
+        )
+
+    inc = _deg2rad_or_pass(incident_angle, angle_unit)
+    tilt = _deg2rad_or_pass(tilt_angle, angle_unit)
+    orient = int(sample_orientation)
+    fi.reset_integrator(inc, tilt, orient)
+    fi.USE_LEGACY_MASK_NORMALIZATION = False
+    setattr(fi, _ATTR_INC, inc)
+    setattr(fi, _ATTR_TILT, tilt)
+    setattr(fi, _ATTR_ORIENT, orient)
+    return fi
+
+
 def _effective_gi_params(
     fi: FiberIntegrator,
     incident_angle: float | None,
@@ -327,31 +378,17 @@ def create_fiber_integrator(
     ImportError
         If ``FiberIntegrator`` is unavailable (pyFAI < 2025.01).
     """
-    ai = poni_to_integrator(poni)
-    try:
-        fi = ai.promote(_xrd_fiber_integrator_type())
-    except (AttributeError, Exception) as exc:
-        raise ImportError(
-            "FiberIntegrator requires pyFAI >= 2025.01. "
-            "Upgrade with:  pip install -U pyFAI"
-        ) from exc
-
-    inc = _deg2rad_or_pass(incident_angle, angle_unit)
-    tilt = _deg2rad_or_pass(tilt_angle, angle_unit)
-    fi.reset_integrator(inc, tilt, int(sample_orientation))
-
-    # Disable pyFAI's legacy mask heuristic that auto-inverts masks
-    # with > 50% masked pixels (e.g. threshold masks).
-    fi.USE_LEGACY_MASK_NORMALIZATION = False
-
-    # Persist so integration helpers can re-inject them on every call
-    setattr(fi, _ATTR_INC, inc)
-    setattr(fi, _ATTR_TILT, tilt)
-    setattr(fi, _ATTR_ORIENT, int(sample_orientation))
+    fi = _fiber_from_integrator(
+        poni_to_integrator(poni),
+        incident_angle=incident_angle,
+        tilt_angle=tilt_angle,
+        sample_orientation=sample_orientation,
+        angle_unit=angle_unit,
+    )
 
     logger.debug(
         "FiberIntegrator created: incident=%.4f rad tilt=%.4f rad orientation=%d",
-        inc, tilt, sample_orientation,
+        getattr(fi, _ATTR_INC), getattr(fi, _ATTR_TILT), sample_orientation,
     )
     return fi
 
