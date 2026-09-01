@@ -1983,3 +1983,49 @@ def test_average_stale_committed_terminal_reports_without_auto_reload(
         assert page._workspace_operations.average_state is None
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_average_persists_sensor_and_parallax_detector_fields(
+    tmp_path, monkeypatch,
+) -> None:
+    from xrd_tools.session.experiment_state import (
+        CalibrationState,
+        FactStatus,
+        PoniValues,
+    )
+
+    _stub_integrators(monkeypatch)
+    source = _source(tmp_path / "v3-average-source")
+    target = tmp_path / "v3-average.nexus"
+    calibration = CalibrationState(
+        PoniValues(0.2, 0.0001, 0.0001, 0.0, 0.0, 0.0, 1.0e-10),
+        "Detector",
+        {
+            "pixel1": 1.0e-4,
+            "pixel2": 1.0e-4,
+            "max_shape": [2, 2],
+            "orientation": 3,
+            "sensor": {"material": "CdTe", "thickness": 0.001},
+        },
+        status=FactStatus.PRESENT,
+        parallax=True,
+    )
+    recipe = AverageScanRecipe(
+        source,
+        target,
+        ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+        calibration=calibration,
+    )
+
+    result = _run_terminal_average(recipe)
+
+    assert result.disposition == "COMMITTED"
+    assert recipe.calibration.parallax is True
+    with h5py.File(target, "r") as handle:
+        detector = handle["entry/instrument/detector"]
+        assert detector["sensor_material"].asstr()[()] == "CdTe"
+        assert float(detector["sensor_thickness"][()]) == pytest.approx(
+            0.001
+        )
+        assert detector["sensor_thickness"].attrs["units"] == "m"
+        assert bool(detector["parallax"][()]) is True

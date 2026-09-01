@@ -436,6 +436,42 @@ class TestDetectorCalibration:
         assert cal2.detector_config == cal.detector_config
         assert cal2.image_orientation == cal.image_orientation
 
+    def test_v3_json_roundtrip_omits_only_legacy_none(self):
+        poni = PONI(
+            dist=0.39,
+            poni1=0.03,
+            poni2=0.05,
+            wavelength=7.7e-11,
+            detector="Detector",
+        )
+        config = {
+            "pixel1": 1.0e-4,
+            "pixel2": 1.0e-4,
+            "max_shape": [8, 9],
+            "orientation": 3,
+            "sensor": {"material": "CdTe", "thickness": 0.001},
+        }
+        legacy = DetectorCalibration(poni, {"orientation": 3})
+        expected_legacy = (
+            '{"detector_config":{"orientation":3},'
+            '"image_orientation":{"flip_horizontal":false,'
+            '"flip_vertical":false,"rotation":0,"transpose":false},'
+            '"poni":{"detector":"Detector","dist":0.39,"poni1":0.03,'
+            '"poni2":0.05,"rot1":0.0,"rot2":0.0,"rot3":0.0,'
+            '"wavelength":7.7e-11}}'
+        )
+        assert legacy.to_json() == expected_legacy
+
+        for enabled in (False, True):
+            calibration = DetectorCalibration(
+                poni, config, parallax=enabled,
+            )
+            encoded = calibration.to_json()
+            assert json.loads(encoded)["parallax"] is enabled
+            assert DetectorCalibration.from_json(encoded) == calibration
+
+        assert "parallax" not in json.loads(legacy.to_json())
+
 
 # ---------------------------------------------------------------------------
 # from_pyfai_goniometer (real-data gate — closes stitching GAP D)

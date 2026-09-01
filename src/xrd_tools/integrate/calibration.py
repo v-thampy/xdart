@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect, json, logging, math, os
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -25,6 +26,210 @@ if TYPE_CHECKING:
     from xrd_tools.core.geometry.diffractometer import DetectorCalibration
 
 logger = logging.getLogger(__name__)
+
+PONI_V3_SENSOR_MATERIALS = (
+    "Si",
+    "Ge",
+    "CdTe",
+    "GaAs",
+    "Gd2O2S",
+    "BaFBr0.85I0.15",
+    "Se",
+    "CZT",
+)
+
+
+def validate_sensor_parallax(
+    material: object,
+    thickness_m: object,
+    parallax: object,
+    *,
+    wavelength_m: object | None = None,
+) -> tuple[str, float, bool]:
+    """Return one strict, JSON-native PONI-v3 sensor/parallax value."""
+
+    if type(material) is not str or material not in PONI_V3_SENSOR_MATERIALS:
+        raise ValueError("sensor material is unsupported")
+    if type(thickness_m) not in {int, float}:
+        raise TypeError("sensor thickness must be a finite number")
+    thickness = float(thickness_m)
+    if not math.isfinite(thickness):
+        raise ValueError("sensor thickness must be finite")
+    if thickness <= 0.0:
+        raise ValueError("sensor thickness must be greater than 0 m")
+    if thickness > 0.01:
+        raise ValueError("sensor thickness must be at most 0.01 m")
+    if type(parallax) is not bool:
+        raise TypeError("parallax must be true or false")
+    if parallax and wavelength_m is not None:
+        if type(wavelength_m) not in {int, float}:
+            raise ValueError("enabled parallax requires a positive wavelength")
+        wavelength = float(wavelength_m)
+        if not math.isfinite(wavelength) or wavelength <= 0.0:
+            raise ValueError("enabled parallax requires a positive wavelength")
+    return material, thickness, parallax
+
+
+def apply_sensor_parallax(
+    calibration: DetectorCalibration,
+    *,
+    material: object,
+    thickness_m: object,
+    parallax: object,
+) -> DetectorCalibration:
+    """Return one reconstructed effective calibration with strict sensor state."""
+
+    from xrd_tools.core.geometry.diffractometer import DetectorCalibration
+
+    if type(calibration) is not DetectorCalibration:
+        raise TypeError("calibration must be a DetectorCalibration")
+    material, thickness, enabled = validate_sensor_parallax(
+        material,
+        thickness_m,
+        parallax,
+        wavelength_m=calibration.poni.wavelength,
+    )
+    config = dict(calibration.detector_config)
+    config["sensor"] = {
+        "material": material,
+        "thickness": thickness,
+    }
+    effective = DetectorCalibration(
+        calibration.poni,
+        config,
+        calibration.image_orientation,
+        enabled,
+    )
+    integrator = detector_calibration_to_integrator(effective)
+    reported = integrator.detector.get_config().get("sensor")
+    if (
+        type(reported) is not dict
+        or set(reported) != {"material", "thickness"}
+        or reported["material"] != material
+        or type(reported["thickness"]) not in {int, float}
+        or float(reported["thickness"]) != thickness
+        or (integrator.parallax is not None) is not enabled
+    ):
+        raise ValueError("sensor/parallax did not survive reconstruction")
+    return effective
+
+
+def detector_calibration_projection(
+    calibration: DetectorCalibration,
+) -> dict[str, object]:
+    """Return the accepted flat science projection, preserving PONI-2 shape."""
+
+    values = dict(calibration.poni.to_dict())
+    if calibration.parallax is not None:
+        values["detector_config"] = dict(calibration.detector_config)
+        values["parallax"] = calibration.parallax
+    return values
+
+
+def detector_calibration_from_projection(
+    projection: object,
+    *,
+    detector_config: object,
+) -> DetectorCalibration:
+    """Reconstruct an exact accepted PONI-2 or PONI-3 science projection."""
+
+    from xrd_tools.core.geometry.diffractometer import DetectorCalibration
+
+    base_keys = {
+        "dist", "poni1", "poni2", "rot1", "rot2", "rot3",
+        "wavelength", "detector",
+    }
+    mapping_types = {dict, MappingProxyType}
+    if type(projection) not in mapping_types:
+        raise ValueError("accepted PONI projection has an invalid keyset")
+    projection_keys = frozenset(projection)
+    if projection_keys not in {
+        frozenset(base_keys),
+        frozenset(base_keys | {"detector_config", "parallax"}),
+    }:
+        raise ValueError("accepted PONI projection has an invalid keyset")
+    if type(detector_config) not in mapping_types:
+        raise ValueError("accepted detector config must be a mapping")
+
+    def plain_json(value: object) -> object:
+        if type(value) in mapping_types:
+            if any(type(key) is not str for key in value):
+                raise ValueError("accepted detector config keys must be strings")
+            return {key: plain_json(item) for key, item in value.items()}
+        if type(value) in {tuple, list}:
+            return [plain_json(item) for item in value]
+        return value
+
+    config = json.loads(json.dumps(
+        plain_json(detector_config),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ))
+    numeric = tuple(projection[key] for key in (
+        "dist", "poni1", "poni2", "rot1", "rot2", "rot3", "wavelength",
+    ))
+    if (
+        any(type(value) not in {int, float} for value in numeric)
+        or not all(math.isfinite(float(value)) for value in numeric)
+        or float(projection["dist"]) <= 0.0
+        or float(projection["wavelength"]) < 0.0
+        or type(projection["detector"]) is not str
+    ):
+        raise ValueError("accepted PONI projection is malformed")
+    poni = PONI(
+        *(float(value) for value in numeric),
+        projection["detector"],
+    )
+    calibration = DetectorCalibration(poni, config)
+    if "parallax" not in projection:
+        if "sensor" in config:
+            raise ValueError("legacy PONI projection contains a sensor")
+        return calibration
+    projected_config = projection["detector_config"]
+    if (
+        type(projected_config) not in mapping_types
+        or plain_json(projected_config) != config
+    ):
+        raise ValueError("accepted PONI detector projections differ")
+    sensor = config.get("sensor")
+    if type(sensor) is not dict:
+        raise ValueError("accepted PONI sensor is missing")
+    return apply_sensor_parallax(
+        calibration,
+        material=sensor.get("material"),
+        thickness_m=sensor.get("thickness"),
+        parallax=projection["parallax"],
+    )
+
+
+def detector_calibration_record(
+    calibration: DetectorCalibration,
+    *,
+    integrator: AzimuthalIntegrator | None = None,
+) -> dict[str, object]:
+    """Project one calibration into the NXdetector writer value mapping."""
+
+    if integrator is None:
+        integrator = detector_calibration_to_integrator(calibration)
+    values = dict(calibration.poni.to_dict())
+    values["detector_name"] = values.pop("detector", "")
+    values["x_pixel_size"] = integrator.detector.pixel2
+    values["y_pixel_size"] = integrator.detector.pixel1
+    if calibration.parallax is not None:
+        sensor = dict(calibration.detector_config.get("sensor", {}))
+        material, thickness, enabled = validate_sensor_parallax(
+            sensor.get("material"),
+            sensor.get("thickness"),
+            calibration.parallax,
+            wavelength_m=calibration.poni.wavelength,
+        )
+        values.update(
+            sensor_material=material,
+            sensor_thickness=thickness,
+            parallax=enabled,
+        )
+    return values
 
 
 def _as_path(path: Path | str) -> Path:
@@ -75,7 +280,7 @@ def load_poni(path: Path | str) -> PONI:
 def load_detector_calibration(
     path: Path | str, *, data: bytes | None = None,
 ) -> DetectorCalibration:
-    """Strictly load a bounded PONI 2.x file without losing detector config."""
+    """Strictly load bounded PONI 2.0/2.1/3.0 detector calibration."""
     from pyFAI.detectors import ALL_DETECTORS
     from pyFAI.io.ponifile import PoniFile
     from xrd_tools.core.geometry.diffractometer import DetectorCalibration
@@ -87,7 +292,7 @@ def load_detector_calibration(
         raise ValueError("PONI must be nonempty and no larger than 1 MiB")
     text = data.decode("utf-8", errors="strict")
     allowed = {"poni_version", "detector", "detector_config", "distance", "dist", "poni1",
-               "poni2", "rot1", "rot2", "rot3", "wavelength"}
+               "poni2", "rot1", "rot2", "rot3", "wavelength", "parallax"}
     raw: dict[str, str] = {}
     for line in text.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
@@ -108,8 +313,27 @@ def load_detector_calibration(
             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("invalid PONI version or detector config") from exc
-    if version not in {2.0, 2.1} or type(config) is not dict: raise ValueError(
-        "only configured PONI 2 and 2.1 are supported")
+    if version not in {2.0, 2.1, 3.0} or type(config) is not dict: raise ValueError(
+        "only configured PONI 2, 2.1, and 3 are supported")
+    if version < 3.0 and ("parallax" in raw or "sensor" in config):
+        raise ValueError("PONI 2 does not support sensor/parallax fields")
+    sensor_values = None
+    if version == 3.0:
+        token = raw.get("parallax")
+        if token not in {"True", "False"}:
+            raise ValueError("PONI 3 Parallax must be exactly True or False")
+        sensor = config.get("sensor")
+        if type(sensor) is not dict or set(sensor) != {"material", "thickness"}:
+            raise ValueError("PONI 3 sensor must contain material and thickness")
+        try:
+            sensor_values = validate_sensor_parallax(
+                sensor["material"],
+                sensor["thickness"],
+                token == "True",
+                wavelength_m=float(raw.get("wavelength", "0")),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid PONI 3 sensor/parallax") from exc
     if version == 2.1 and "orientation" not in config: raise ValueError("PONI 2.1 requires detector orientation")
     config.setdefault("orientation", 3)
     if type(config["orientation"]) is not int or config["orientation"] not in range(1, 5):
@@ -133,8 +357,11 @@ def load_detector_calibration(
             return True
         items = value.values() if type(value) is dict else value if type(value) is list else ()
         return any(pathlike(item) for item in items)
-    if pathlike(config): raise ValueError("detector configuration contains a path-like value")
+    non_sensor_config = {key: value for key, value in config.items() if key != "sensor"}
+    if pathlike(non_sensor_config): raise ValueError("detector configuration contains a path-like value")
     mapping = dict(raw, poni_version=version, detector=name, detector_config=config)
+    if sensor_values is not None:
+        mapping["parallax"] = sensor_values[2]
     pf = PoniFile(mapping)
     detector = pf.detector
     values = (pf.dist, pf.poni1, pf.poni2, pf.rot1, pf.rot2, pf.rot3)
@@ -144,16 +371,30 @@ def load_detector_calibration(
     if not all(map(math.isfinite, (*geometry, wavelength))) or geometry[0] <= 0 or wavelength < 0: raise ValueError(
         "PONI geometry is non-finite or out of range")
     poni = PONI(*geometry, wavelength, detector.__class__.__name__)
-    calibration = DetectorCalibration(poni, detector.get_config())
+    # Preserve the exact admitted configuration.  pyFAI 2026 expands omitted
+    # default pixel keys in ``get_config()``, which would otherwise change the
+    # accepted PONI 2 projection and fingerprint.
+    calibration = DetectorCalibration(poni, config)
+    if sensor_values is not None:
+        calibration = apply_sensor_parallax(
+            calibration,
+            material=sensor_values[0],
+            thickness_m=sensor_values[1],
+            parallax=sensor_values[2],
+        )
     normalized = dict(calibration.detector_config)
     json.dumps(normalized, sort_keys=True, separators=(",", ":"), allow_nan=False)
     if any(key not in normalized or json.dumps(normalized[key], sort_keys=True) != json.dumps(value, sort_keys=True) for key, value in config.items()): raise ValueError(
         "detector configuration did not survive construction")
-    rebuilt = detector_calibration_to_integrator(calibration).detector
+    rebuilt_integrator = detector_calibration_to_integrator(calibration)
+    rebuilt = rebuilt_integrator.detector
     identity = lambda item: (type(item), item.shape, item.max_shape, item.pixel1,
         item.pixel2, int(item.orientation),
-        DetectorCalibration(poni, item.get_config()).to_json())
+        DetectorCalibration(poni, item.get_config(),
+                            parallax=calibration.parallax).to_json())
     if identity(detector) != identity(rebuilt): raise ValueError("detector configuration did not survive reconstruction")
+    if (rebuilt_integrator.parallax is not None) is not bool(calibration.parallax):
+        raise ValueError("parallax state did not survive reconstruction")
     return calibration
 
 
@@ -248,11 +489,15 @@ def detector_calibration_to_integrator(
     p = cal.poni
     cfg = dict(cal.detector_config or {})
     name = p.detector or ""
-    if name and name.lower() != "detector":
-        det = detector_factory(name, config=cfg) if cfg else detector_factory(name)
+    if name or cfg:
+        detector_name = name or "Detector"
+        det = (
+            detector_factory(detector_name, config=cfg)
+            if cfg else detector_factory(detector_name)
+        )
     else:
         det = None
-    return AzimuthalIntegrator(
+    integrator = AzimuthalIntegrator(
         dist=float(p.dist), poni1=float(p.poni1), poni2=float(p.poni2),
         rot1=float(p.rot1 if rot1 is None else rot1),
         rot2=float(p.rot2 if rot2 is None else rot2),
@@ -260,6 +505,9 @@ def detector_calibration_to_integrator(
         wavelength=float(p.wavelength) if p.wavelength else None,
         detector=det,
     )
+    if cal.parallax is True:
+        integrator.enable_parallax()
+    return integrator
 
 
 def get_detector(name: str | Detector) -> Detector:

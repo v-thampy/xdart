@@ -196,13 +196,25 @@ def refine_goniometer(
 
     # --- base geometry -----------------------------------------------------
     base_poni: PONI
+    base_parallax: bool | None = None
     if isinstance(base_calibration, PONI):
         base_poni = base_calibration
     else:
-        from xrd_tools.integrate.calibration import load_poni  # noqa: PLC0415
-        base_poni = load_poni(base_calibration)
+        from xrd_tools.integrate.calibration import (  # noqa: PLC0415
+            load_detector_calibration,
+        )
+        strict_calibration = load_detector_calibration(base_calibration)
+        base_poni = strict_calibration.poni
         if detector_config is None:
-            detector_config = _detector_config_from_poni(base_calibration)
+            detector_config = dict(strict_calibration.detector_config)
+        elif (
+            strict_calibration.parallax is not None
+            and dict(detector_config) != dict(strict_calibration.detector_config)
+        ):
+            raise ValueError(
+                "PONI v3 refinement cannot replace its accepted detector config"
+            )
+        base_parallax = strict_calibration.parallax
     wl_m = float(wavelength if wavelength is not None else base_poni.wavelength)
     if not wl_m:
         raise ValueError("wavelength is required (give wavelength= or a base "
@@ -270,6 +282,8 @@ def refine_goniometer(
                 rot1=r1s * m1 + r1o, rot2=r2s * m2 + r2o, rot3=r3o,
                 detector=det, wavelength=wl_m,
             )
+            if base_parallax is True:
+                ai.enable_parallax()
             q_pred = ai.qArray()[f.rows, f.cols] / 10.0  # pyFAI q is nm⁻¹ → Å⁻¹
             out.append(q_pred - q_ring[f.rings])
         return np.concatenate(out)
@@ -335,6 +349,8 @@ def refine_goniometer(
             "constants": {"pi": float(np.pi)},
         },
     }
+    if base_parallax is not None:
+        gonio["parallax"] = base_parallax
     diff = Diffractometer.from_pyfai_goniometer(
         gonio, source_motors={"rot1_pos": rot1_motor, "rot2_pos": rot2_motor},
         base=base, preset=preset)

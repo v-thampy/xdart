@@ -39,6 +39,46 @@ _SCHEMA_VERSION = 1
 _FrozenValue = tuple[Any, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PoniV3OverrideIntent:
+    """Explicit operator override for selected-PONI sensor/parallax state."""
+
+    material: str
+    thickness_m: float
+    parallax: bool
+
+    def __post_init__(self) -> None:
+        from xrd_tools.integrate.calibration import validate_sensor_parallax
+
+        material, thickness, parallax = validate_sensor_parallax(
+            self.material,
+            self.thickness_m,
+            self.parallax,
+        )
+        object.__setattr__(self, "material", material)
+        object.__setattr__(self, "thickness_m", thickness)
+        object.__setattr__(self, "parallax", parallax)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "material": self.material,
+            "thickness_m": self.thickness_m,
+            "parallax": self.parallax,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "PoniV3OverrideIntent":
+        if type(value) is not dict or set(value) != {
+            "material", "thickness_m", "parallax",
+        }:
+            raise ValueError("PONI v3 override has an invalid keyset")
+        return cls(
+            value["material"],
+            value["thickness_m"],
+            value["parallax"],
+        )
+
+
 def _default_background():
     from xrd_tools.reduction.background import FrameBackgroundPlan
     return FrameBackgroundPlan()
@@ -783,6 +823,7 @@ class FrozenRunConfiguration:
     threshold: FrozenThresholdPolicy
     poni_file: str = ""
     mask_file: str = ""
+    poni_v3_override: PoniV3OverrideIntent | None = None
     background: Any = field(default_factory=_default_background)
     project_root: str = ""
     save_path: str = ""
@@ -816,6 +857,13 @@ class FrozenRunConfiguration:
             raise ValueError("max_cores must be at least 1")
         if bool(self.live_mode) and bool(self.batch_mode):
             raise ValueError("live_mode and batch_mode cannot both be enabled")
+        if (
+            self.poni_v3_override is not None
+            and type(self.poni_v3_override) is not PoniV3OverrideIntent
+        ):
+            raise TypeError(
+                "poni_v3_override must be PoniV3OverrideIntent or None"
+            )
         object.__setattr__(self, "generation", generation)
         object.__setattr__(self, "max_cores", max_cores)
         object.__setattr__(
@@ -881,6 +929,11 @@ class FrozenRunConfiguration:
         )
         if self.background.mode != "None":
             value += (("background", _freeze_value(self.background.to_mapping())),)
+        if self.poni_v3_override is not None:
+            value += ((
+                "poni_v3_override",
+                _freeze_value(self.poni_v3_override.as_dict()),
+            ),)
         return value
 
     @property
@@ -993,6 +1046,8 @@ class FrozenRunConfiguration:
         }
         if self.background.mode != "None":
             values["background"] = self.background.to_mapping()
+        if self.poni_v3_override is not None:
+            values["poni_v3_override"] = self.poni_v3_override.as_dict()
         return values
 
     def native_int_snapshot(self) -> dict[str, Any]:
@@ -1027,6 +1082,7 @@ class RunIntent:
     poni_file: str = ""
     poni_values: Mapping[Any, Any] | None = None
     mask_file: str = ""
+    poni_v3_override: PoniV3OverrideIntent | None = None
     background: Any = field(default_factory=_default_background)
     project_root: str = ""
     save_path: str = ""
@@ -1049,6 +1105,13 @@ class RunIntent:
             self.threshold = ThresholdIntent.from_mapping(self.threshold)
         if not isinstance(self.threshold, ThresholdIntent):
             raise TypeError("threshold must be ThresholdIntent or a mapping")
+        if (
+            self.poni_v3_override is not None
+            and type(self.poni_v3_override) is not PoniV3OverrideIntent
+        ):
+            raise TypeError(
+                "poni_v3_override must be PoniV3OverrideIntent or None"
+            )
         if self.source_spec is not None and not isinstance(
             self.source_spec,
             (SourceSpec, DirectorySourceSpec),
@@ -1104,6 +1167,7 @@ class RunIntent:
             threshold=self.threshold.freeze(),
             poni_file=str(self.poni_file or ""),
             mask_file=str(self.mask_file or ""),
+            poni_v3_override=self.poni_v3_override,
             background=self.background,
             project_root=str(self.project_root or ""),
             save_path=str(self.save_path or ""),
@@ -1191,6 +1255,7 @@ class RunIntent:
                 else _detached_value(dict(self.poni_values))
             ),
             mask_file=self.mask_file,
+            poni_v3_override=self.poni_v3_override,
             background=self.background,
             project_root=self.project_root,
             save_path=self.save_path,
@@ -1220,6 +1285,7 @@ class RunIntent:
             poni_file=value.poni_file,
             poni_values=value.poni_values,
             mask_file=value.mask_file,
+            poni_v3_override=value.poni_v3_override,
             background=value.background,
             project_root=value.project_root,
             save_path=value.save_path,

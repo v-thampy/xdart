@@ -20,6 +20,7 @@ from xrd_tools.session.run_configuration import (
     RunIntent,
     ThresholdIntent,
 )
+import xrd_tools.session.run_configuration as run_configuration_module
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 
@@ -220,3 +221,34 @@ def test_unversioned_static_scan_profile_is_refused():
     }
     with pytest.raises(RunIntentProfileError, match="profile.*keyset"):
         load_run_intent_profile(json.dumps(document))
+
+
+def test_versioned_profile_round_trips_enabled_poni_v3_override_and_omits_disabled_legacy_bytes():
+    override_type = getattr(
+        run_configuration_module, "PoniV3OverrideIntent"
+    )
+    legacy = RunIntent(poni_file="/calibration/legacy.poni")
+    legacy_text = dump_run_intent_profile(legacy)
+    assert "poni_v3_override" not in json.loads(legacy_text)["intent"]
+
+    enabled = RunIntent(
+        poni_file="/calibration/v3.poni",
+        poni_v3_override=override_type("BaFBr0.85I0.15", 0.01, True),
+    )
+    text = dump_run_intent_profile(enabled)
+    document = json.loads(text)
+    assert document["intent"]["poni_v3_override"] == {
+        "material": "BaFBr0.85I0.15",
+        "thickness_m": 0.01,
+        "parallax": True,
+    }
+    loaded = load_run_intent_profile(text)
+    assert loaded.poni_v3_override == enabled.poni_v3_override
+    assert loaded.clone_candidate().freeze().fingerprint == (
+        enabled.clone_candidate().freeze().fingerprint
+    )
+
+    malformed = copy.deepcopy(document)
+    malformed["intent"]["poni_v3_override"]["parallax"] = 1
+    with pytest.raises(RunIntentProfileError):
+        load_run_intent_profile(json.dumps(malformed))

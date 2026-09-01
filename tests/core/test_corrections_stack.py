@@ -126,3 +126,43 @@ class TestDetectorCalibrationToIntegrator:
         ai = detector_calibration_to_integrator(cal, rot2=0.31)
         assert ai.rot2 == pytest.approx(0.31)
         assert ai.rot1 == pytest.approx(0.0)  # base value kept
+
+    def test_honors_sensor_and_parallax(self):
+        pytest.importorskip("pyFAI")
+        from xrd_tools.core.containers import PONI
+        from xrd_tools.core.geometry import DetectorCalibration
+        from xrd_tools.integrate.calibration import (
+            detector_calibration_to_integrator,
+        )
+
+        config = {
+            "pixel1": 1.0e-4,
+            "pixel2": 1.0e-4,
+            "max_shape": [32, 40],
+            "orientation": 3,
+            "sensor": {"material": "Si", "thickness": 0.00045},
+        }
+        poni = PONI(
+            dist=0.15,
+            poni1=0.0016,
+            poni2=0.002,
+            wavelength=1.0e-10,
+            detector="Detector",
+        )
+        active = detector_calibration_to_integrator(
+            DetectorCalibration(poni, config, parallax=True)
+        )
+        inactive = detector_calibration_to_integrator(
+            DetectorCalibration(poni, config, parallax=False)
+        )
+
+        assert active.detector.get_config()["sensor"] == {
+            "material": "Si",
+            "thickness": pytest.approx(0.00045),
+        }
+        assert active.parallax is not None
+        assert inactive.parallax is None
+        active_q = active.array_from_unit(unit="q_A^-1")
+        inactive_q = inactive.array_from_unit(unit="q_A^-1")
+        assert active_q.shape == inactive_q.shape == (32, 40)
+        assert np.max(np.abs(active_q - inactive_q)) > 1.0e-8

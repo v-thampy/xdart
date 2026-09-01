@@ -35,6 +35,7 @@ from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.widgets.controls_panel import ActionButton
 from xrd_tools.session.intent_store import (
     IntentFreezeAccepted,
+    IntentRecaptureRequired,
     RunIntentStore,
 )
 from xrd_tools.session.readiness import (
@@ -505,3 +506,129 @@ def test_advanced_cas_does_not_overwrite_a_concurrent_intent_revision(
         assert "superseded" in page._shell.scientific.status.text()
     finally:
         _close(page)
+
+
+def test_advanced_poni_v3_controls_show_exact_allowlist_metres_and_enablement(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+) -> None:
+    dialog = AdvancedSettingsDialog()
+    try:
+        dialog.load_values(
+            advanced_settings_values(RunIntentStore(_intent(tmp_path)).snapshot())
+        )
+
+        assert dialog.poni_v3_group.title() == (
+            "Detector sensor / parallax (PONI v3)"
+        )
+        assert dialog.poni_v3_group.isHidden() is False
+        assert dialog.poni_v3_material.itemData(0) == "Si"
+        assert tuple(
+            dialog.poni_v3_material.itemData(index)
+            for index in range(dialog.poni_v3_material.count())
+        ) == (
+            "Si", "Ge", "CdTe", "GaAs", "Gd2O2S",
+            "BaFBr0.85I0.15", "Se", "CZT",
+        )
+        assert dialog.poni_v3_thickness_m.text() == "0.00045"
+        assert dialog.poni_v3_thickness_m.toolTip() == "450 µm = 0.00045 m"
+        assert dialog.poni_v3_override.isChecked() is False
+        assert dialog.poni_v3_material.isEnabled() is False
+        assert dialog.poni_v3_thickness_m.isEnabled() is False
+        assert dialog.poni_v3_parallax.isEnabled() is False
+        assert "selected PONI is authoritative" in (
+            dialog.poni_v3_authority.text()
+        )
+
+        dialog.poni_v3_override.setChecked(True)
+        assert dialog.poni_v3_material.isEnabled() is True
+        assert dialog.poni_v3_thickness_m.isEnabled() is True
+        assert dialog.poni_v3_parallax.isEnabled() is True
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    (
+        ({"poni_v3_override_enabled": 1}, "true or false"),
+        ({"poni_v3_material": "Silicon"}, "material"),
+        ({"poni_v3_thickness_m": True}, "thickness"),
+        ({"poni_v3_thickness_m": "nan"}, "finite"),
+        ({"poni_v3_thickness_m": "0"}, "greater than 0"),
+        ({"poni_v3_thickness_m": "0.0100001"}, "at most 0.01"),
+        ({"poni_v3_parallax": 1}, "true or false"),
+    ),
+)
+def test_advanced_poni_v3_override_reducer_rejects_nonboolean_unknown_nonfinite_and_out_of_bounds(
+    tmp_path: Path,
+    changes: dict[str, object],
+    reason: str,
+) -> None:
+    store = RunIntentStore(_intent(tmp_path))
+    snapshot = store.snapshot()
+    submission = replace(advanced_settings_values(snapshot), **changes)
+
+    result = reduce_advanced_settings(snapshot, submission)
+
+    assert isinstance(result, EditRefusal)
+    assert reason in result.reason
+    assert store.revision == 0
+    assert store.snapshot().thaw().poni_v3_override is None
+
+
+def test_advanced_poni_v3_override_commits_by_revision_and_freezes_for_start(
+    tmp_path: Path,
+) -> None:
+    store = RunIntentStore(_intent(tmp_path))
+    snapshot = store.snapshot()
+    values = replace(
+        advanced_settings_values(snapshot),
+        poni_v3_override_enabled=True,
+        poni_v3_material="GaAs",
+        poni_v3_thickness_m="0.0005",
+        poni_v3_parallax=True,
+    )
+    candidate = reduce_advanced_settings(snapshot, values)
+
+    assert isinstance(candidate, RunIntent)
+    committed = store.commit(candidate, expected_revision=snapshot.revision)
+    assert committed.revision == 1
+    frozen = store.freeze(expected_revision=1)
+    assert type(frozen) is IntentFreezeAccepted
+    assert frozen.configuration.poni_v3_override.as_dict() == {
+        "material": "GaAs",
+        "thickness_m": pytest.approx(0.0005),
+        "parallax": True,
+    }
+    assert frozen.configuration.as_provenance()["poni_v3_override"] == {
+        "material": "GaAs",
+        "thickness_m": pytest.approx(0.0005),
+        "parallax": True,
+    }
+
+
+def test_advanced_poni_v3_override_cas_does_not_overwrite_concurrent_revision(
+    tmp_path: Path,
+) -> None:
+    store = RunIntentStore(_intent(tmp_path))
+    snapshot = store.snapshot()
+    submission = replace(
+        advanced_settings_values(snapshot),
+        poni_v3_override_enabled=True,
+        poni_v3_material="CZT",
+        poni_v3_thickness_m="0.001",
+        poni_v3_parallax=False,
+    )
+    candidate = reduce_advanced_settings(snapshot, submission)
+    assert isinstance(candidate, RunIntent)
+
+    concurrent = store.snapshot().thaw()
+    concurrent.project_root = "/concurrent"
+    store.commit(concurrent, expected_revision=store.revision)
+    outcome = store.commit(candidate, expected_revision=snapshot.revision)
+
+    assert type(outcome) is IntentRecaptureRequired
+    current = store.snapshot().thaw()
+    assert current.project_root == "/concurrent"
+    assert current.poni_v3_override is None

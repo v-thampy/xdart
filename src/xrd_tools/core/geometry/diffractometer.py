@@ -382,23 +382,29 @@ class DetectorCalibration:
     poni: PONI
     detector_config: Mapping[str, Any] = field(default_factory=dict)
     image_orientation: ImageOrientation = field(default_factory=ImageOrientation)
+    parallax: bool | None = None
 
     def __post_init__(self) -> None:
         # store detector_config JSON-canonical so to_json never crashes on a
         # numpy scalar and the round-trip is idempotent (tuple -> list, etc.)
         object.__setattr__(self, "detector_config",
                            _json_canonical(dict(self.detector_config)))
+        if self.parallax is not None and type(self.parallax) is not bool:
+            raise TypeError("parallax must be bool or None")
 
     def to_json(self) -> str:
         return json.dumps(self._as_jsonable(), separators=(",", ":"),
                           sort_keys=True)
 
     def _as_jsonable(self) -> dict[str, Any]:
-        return {
+        values = {
             "poni": self.poni.to_dict(),
             "detector_config": dict(self.detector_config),
             "image_orientation": self.image_orientation.to_dict(),
         }
+        if self.parallax is not None:
+            values["parallax"] = self.parallax
+        return values
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "DetectorCalibration":
@@ -407,6 +413,7 @@ class DetectorCalibration:
             detector_config=dict(d.get("detector_config", {})),
             image_orientation=ImageOrientation.from_dict(
                 d.get("image_orientation", {})),
+            parallax=d.get("parallax"),
         )
 
     @classmethod
@@ -842,6 +849,7 @@ class Diffractometer:
             ),
             detector_config=dict(data.get("detector_config", {})),
             image_orientation=image_orientation or ImageOrientation(),
+            parallax=data.get("parallax"),
         )
 
         # The xu half is not in the pyFAI JSON — donate it from ``base``.

@@ -1770,6 +1770,56 @@ def test_private_request_prepares_plan_only_on_existing_operation_worker(monkeyp
     values = _persisted({"version": 1, "dimension": "1d", "bai_args": {}, "gi_mode": "q_total"}); slot = module.OperationSlot(); identity = slot.begin_reintegrate(target="/detached", entry="entry", source_root="/", expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64), expected_labels=(2,), dimension="1d", preparation_values=values, stamp=OperationContextStamp(0))
     assert entered.wait(2); values["selected_plan"]["bai_args"]["npt"] = 99; release.set(); update = _join(slot, identity)
     assert update.terminal.status is OperationTerminalStatus.RETURNED and seen[0][0].startswith("scattering-operation-") and seen[0][2]["source_root"] == "/" and "npt" not in seen[0][2]["preparation"]["selected_plan"]["bai_args"] and seen[1][0] is plan and seen[0][2]["cancel_token"] is seen[1][1]["cancel_token"]
+
+
+def test_persisted_v3_calibration_reconstructs_for_reintegration():
+    from xrd_tools.reduction import reintegrate as module
+    from xrd_tools.session.run_configuration import RunIntent
+
+    config = {
+        "pixel1": 1.0e-4,
+        "pixel2": 1.0e-4,
+        "max_shape": [12, 14],
+        "orientation": 3,
+        "sensor": {"material": "Ge", "thickness": 0.00075},
+    }
+    projection = {
+        "dist": 0.2,
+        "poni1": 0.0006,
+        "poni2": 0.0007,
+        "rot1": 0.0,
+        "rot2": 0.0,
+        "rot3": 0.0,
+        "wavelength": 1.0e-10,
+        "detector": "Detector",
+        "detector_config": config,
+        "parallax": True,
+    }
+    assets = {
+        "poni_values": projection,
+        "poni_detector_config_json": json.dumps(
+            config, sort_keys=True, separators=(",", ":"),
+        ),
+        "poni_sha256": "a" * 64,
+        "mask_sha256": None,
+    }
+    frozen = RunIntent(poni_values=projection).freeze()
+    outer = frozen.as_provenance()
+    signed = copy.deepcopy(outer)
+    signed["accepted_scientific_assets"] = copy.deepcopy(assets)
+    persisted = {**copy.deepcopy(outer), "scientific_signature": signed}
+
+    shared = module._validated_shared_science(persisted)
+    calibration, integrator, fiber = module._calibration(shared)
+
+    assert fiber is None
+    assert calibration.parallax is True
+    assert calibration.detector_config["sensor"] == {
+        "material": "Ge",
+        "thickness": pytest.approx(0.00075),
+    }
+    assert integrator.parallax is not None
+    assert integrator.array_from_unit(unit="q_A^-1").shape == (12, 14)
 def test_expected_labels_are_rederived_and_exactly_compared(tmp_path):
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.reduction import ReintegratePlan

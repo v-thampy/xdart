@@ -20,6 +20,7 @@ from xrd_tools.reduction.background import FrameBackgroundPlan
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.run_configuration import (
     GIIntent,
+    PoniV3OverrideIntent,
     RunIntent,
     ThresholdIntent,
 )
@@ -445,7 +446,17 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
     if type(document["version"]) is not int or document["version"] != PROFILE_VERSION:
         raise RunIntentProfileError("profile version is unsupported")
     data = _mapping(document["intent"], path="intent")
-    _keyset(data, _INTENT_KEYS, path="intent")
+    intent_keys = set(data)
+    if (
+        intent_keys != set(_INTENT_KEYS)
+        and intent_keys != set(_INTENT_KEYS) | {"poni_v3_override"}
+    ):
+        missing = sorted(_INTENT_KEYS - intent_keys)
+        extra = sorted(intent_keys - _INTENT_KEYS - {"poni_v3_override"})
+        raise RunIntentProfileError(
+            "intent has an invalid keyset "
+            f"(missing={missing}, extra={extra})"
+        )
     output_mode = _text(
         data["output_mode"], path="intent.output_mode", empty=False
     )
@@ -467,6 +478,19 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
         poni_values = _profile_mapping(
             poni_values, path="intent.poni_values"
         )
+    override = None
+    if "poni_v3_override" in data:
+        try:
+            override = PoniV3OverrideIntent.from_mapping(
+                _mapping(
+                    data["poni_v3_override"],
+                    path="intent.poni_v3_override",
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise RunIntentProfileError(
+                f"intent.poni_v3_override is invalid: {error}"
+            ) from error
     try:
         background = FrameBackgroundPlan.from_mapping(
             _mapping(data["background"], path="intent.background")
@@ -497,6 +521,7 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
         poni_file=_text(data["poni_file"], path="intent.poni_file"),
         poni_values=poni_values,
         mask_file=_text(data["mask_file"], path="intent.mask_file"),
+        poni_v3_override=override,
         background=background,
         project_root=_text(data["project_root"], path="intent.project_root"),
         save_path=_text(data["save_path"], path="intent.save_path"),
@@ -569,6 +594,10 @@ def dump_run_intent_profile(intent: RunIntent) -> str:
                 ),
             },
         }
+        if frozen.poni_v3_override is not None:
+            document["intent"]["poni_v3_override"] = (
+                frozen.poni_v3_override.as_dict()
+            )
         return json.dumps(
             document,
             ensure_ascii=False,

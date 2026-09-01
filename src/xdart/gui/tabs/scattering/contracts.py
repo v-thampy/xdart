@@ -185,6 +185,7 @@ class AcceptedScientificAssets:
     poni_sha256: str | None
     mask_sha256: str | None
     poni_detector_config_json: str | None = None
+    poni_parallax: bool | None = None
 
     def __post_init__(self) -> None:
         values = self.poni_values
@@ -205,6 +206,10 @@ class AcceptedScientificAssets:
         config_text = self.poni_detector_config_json
         if (values is None) != (config_text is None):
             raise TypeError("accepted PONI and detector config must be paired")
+        if self.poni_parallax is not None and type(self.poni_parallax) is not bool:
+            raise TypeError("accepted PONI parallax is invalid")
+        if values is None and self.poni_parallax is not None:
+            raise TypeError("accepted PONI parallax has no calibration")
         if config_text is not None:
             try:
                 config = json.loads(config_text)
@@ -217,6 +222,25 @@ class AcceptedScientificAssets:
             if (canonical != config_text or type(orientation) is not int
                     or orientation not in range(1, 5)):
                 raise TypeError("accepted detector config is not canonical")
+            sensor = config.get("sensor")
+            if self.poni_parallax is None:
+                if sensor is not None:
+                    raise TypeError("legacy accepted PONI cannot contain a sensor")
+            else:
+                try:
+                    from xrd_tools.integrate.calibration import (
+                        validate_sensor_parallax,
+                    )
+                    validate_sensor_parallax(
+                        sensor.get("material") if type(sensor) is dict else None,
+                        sensor.get("thickness") if type(sensor) is dict else None,
+                        self.poni_parallax,
+                        wavelength_m=values[6],
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise TypeError(
+                        "accepted PONI sensor/parallax is invalid"
+                    ) from exc
 
     @property
     def poni(self) -> object | None:
@@ -228,7 +252,17 @@ class AcceptedScientificAssets:
         from xrd_tools.core.geometry.diffractometer import DetectorCalibration
         return None if self.poni_values is None else DetectorCalibration(
             self.poni, json.loads(self.poni_detector_config_json),
+            parallax=self.poni_parallax,
         )
+
+    @property
+    def poni_projection(self) -> dict[str, object] | None:
+        if self.poni_values is None:
+            return None
+        from xrd_tools.integrate.calibration import (
+            detector_calibration_projection,
+        )
+        return detector_calibration_projection(self.detector_calibration)
 
     @property
     def mask(self) -> np.ndarray | None:

@@ -591,6 +591,21 @@ def _science_projection(
                 or type(config.get("orientation")) is not int
                 or config["orientation"] not in range(1, 5)):
             raise TypeError("accepted detector config is malformed")
+        try:
+            from xrd_tools.integrate.calibration import (
+                detector_calibration_from_projection,
+            )
+            calibration = detector_calibration_from_projection(
+                assets["poni_values"], detector_config=config,
+            )
+        except (TypeError, ValueError) as exc:
+            raise TypeError("accepted PONI projection is malformed") from exc
+        if calibration.parallax is not None and (
+            configuration.poni_values != assets["poni_values"]
+        ):
+            raise ValueError(
+                "accepted PONI projection differs from frozen calibration"
+            )
     for key in ("poni_sha256", "mask_sha256"):
         digest = assets[key]
         if digest is not None and (

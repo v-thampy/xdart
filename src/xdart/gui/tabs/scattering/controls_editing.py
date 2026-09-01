@@ -17,6 +17,8 @@ from xrd_tools.session.intent_store import (
 )
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import PoniV3OverrideIntent
+from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 from .contracts import SourceSelection
@@ -145,6 +147,10 @@ class AdvancedSettingsValues:
     two_d: AdvancedDimensionValues
     gi_enabled: object = False
     gi_method: object = DEFAULT_GI_HISTOGRAM_METHOD
+    poni_v3_override_enabled: object = False
+    poni_v3_material: object = "Si"
+    poni_v3_thickness_m: object = 0.00045
+    poni_v3_parallax: object = False
 
 
 def advanced_settings_values(
@@ -155,6 +161,7 @@ def advanced_settings_values(
     if not isinstance(snapshot, RunIntentSnapshot):
         raise TypeError("snapshot must be a RunIntentSnapshot")
     intent = snapshot.thaw()
+    override = intent.poni_v3_override
     return AdvancedSettingsValues(
         one_d=_advanced_dimension_values(
             intent.bai_1d_args,
@@ -166,6 +173,12 @@ def advanced_settings_values(
         ),
         gi_enabled=intent.gi.enabled,
         gi_method=_advanced_gi_method(intent),
+        poni_v3_override_enabled=override is not None,
+        poni_v3_material="Si" if override is None else override.material,
+        poni_v3_thickness_m=(
+            0.00045 if override is None else override.thickness_m
+        ),
+        poni_v3_parallax=False if override is None else override.parallax,
     )
 
 
@@ -212,11 +225,44 @@ def reduce_advanced_settings(
         return EditRefusal(
             "GI histogram backend is available only in Grazing mode."
         )
+    if type(values.poni_v3_override_enabled) is not bool:
+        return EditRefusal(
+            "PONI v3 override enablement requires true or false."
+        )
+    if (
+        type(values.poni_v3_material) is not str
+        or values.poni_v3_material not in PONI_V3_SENSOR_MATERIALS
+    ):
+        return EditRefusal("PONI v3 sensor material is unsupported.")
+    if type(values.poni_v3_thickness_m) is bool:
+        return EditRefusal(
+            "PONI v3 sensor thickness must be a finite number."
+        )
+    try:
+        thickness = float(values.poni_v3_thickness_m)
+    except (TypeError, ValueError, OverflowError):
+        return EditRefusal("PONI v3 sensor thickness must be finite.")
+    if not math.isfinite(thickness):
+        return EditRefusal("PONI v3 sensor thickness must be finite.")
+    if thickness <= 0.0:
+        return EditRefusal(
+            "PONI v3 sensor thickness must be greater than 0 m."
+        )
+    if thickness > 0.01:
+        return EditRefusal(
+            "PONI v3 sensor thickness must be at most 0.01 m."
+        )
+    if type(values.poni_v3_parallax) is not bool:
+        return EditRefusal("PONI v3 parallax requires true or false.")
     desired = AdvancedSettingsValues(
         one_d=one_d,
         two_d=two_d,
         gi_enabled=values.gi_enabled,
         gi_method=values.gi_method,
+        poni_v3_override_enabled=values.poni_v3_override_enabled,
+        poni_v3_material=values.poni_v3_material,
+        poni_v3_thickness_m=thickness,
+        poni_v3_parallax=values.poni_v3_parallax,
     )
     if desired == current:
         return EditNoChange()
@@ -239,6 +285,14 @@ def reduce_advanced_settings(
     ):
         candidate.bai_1d_args["gi_method_1d"] = desired.gi_method
         candidate.bai_2d_args["gi_method_2d"] = desired.gi_method
+    candidate.poni_v3_override = (
+        PoniV3OverrideIntent(
+            desired.poni_v3_material,
+            desired.poni_v3_thickness_m,
+            desired.poni_v3_parallax,
+        )
+        if desired.poni_v3_override_enabled else None
+    )
     return candidate
 
 

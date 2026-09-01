@@ -179,6 +179,7 @@ class CalibrationState:
     source_uri: str = ""
     mask: MaskState = field(default_factory=MaskState.absent)
     status: FactStatus = FactStatus.ABSENT
+    parallax: bool | None = None
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", FactStatus(self.status))
         for name in ("detector_id", "value_fingerprint", "source_sha256", "source_uri"):
@@ -192,6 +193,20 @@ class CalibrationState:
             raise TypeError("mask must be MaskState")
         if (self.status is FactStatus.PRESENT) != (self.values is not None):
             raise ValueError("calibration status and PONI values disagree")
+        sensor = self.detector_config.get("sensor")
+        if self.parallax is None:
+            if sensor is not None:
+                raise ValueError("legacy calibration cannot contain a sensor")
+        else:
+            if self.values is None or type(self.parallax) is not bool:
+                raise TypeError("v3 calibration parallax is invalid")
+            from xrd_tools.integrate.calibration import validate_sensor_parallax
+            validate_sensor_parallax(
+                sensor.get("material") if isinstance(sensor, Mapping) else None,
+                sensor.get("thickness") if isinstance(sensor, Mapping) else None,
+                self.parallax,
+                wavelength_m=self.imported_wavelength_m,
+            )
     @property
     def imported_wavelength_m(self) -> float | None:
         return None if self.values is None else self.values.wavelength_m
@@ -364,24 +379,27 @@ class ExperimentState:
         calibration, geometry = self.calibration, self.geometry
         energy, sample, provenance = self.energy, self.sample, self.provenance
         values, mask, incidence = calibration.values, calibration.mask, geometry.incidence
+        calibration_content = {
+            "values": None if values is None else {
+                "dist": values.dist, "poni1": values.poni1, "poni2": values.poni2,
+                "rot1": values.rot1, "rot2": values.rot2, "rot3": values.rot3,
+                "wavelength_m": values.wavelength_m,
+            },
+            "detector_id": calibration.detector_id,
+            "detector_config": _thaw_json(calibration.detector_config),
+            "value_fingerprint": calibration.value_fingerprint,
+            "source_sha256": calibration.source_sha256,
+            "source_uri": calibration.source_uri,
+            "mask": {"source_uri": mask.source_uri, "sha256": mask.sha256,
+                     "dtype": mask.dtype, "shape": list(mask.shape),
+                     "status": mask.status.value},
+            "status": calibration.status.value,
+        }
+        if calibration.parallax is not None:
+            calibration_content["parallax"] = calibration.parallax
         return {
             "schema_version": self.schema_version,
-            "calibration": {
-                "values": None if values is None else {
-                    "dist": values.dist, "poni1": values.poni1, "poni2": values.poni2,
-                    "rot1": values.rot1, "rot2": values.rot2, "rot3": values.rot3,
-                    "wavelength_m": values.wavelength_m,
-                },
-                "detector_id": calibration.detector_id,
-                "detector_config": _thaw_json(calibration.detector_config),
-                "value_fingerprint": calibration.value_fingerprint,
-                "source_sha256": calibration.source_sha256,
-                "source_uri": calibration.source_uri,
-                "mask": {"source_uri": mask.source_uri, "sha256": mask.sha256,
-                         "dtype": mask.dtype, "shape": list(mask.shape),
-                         "status": mask.status.value},
-                "status": calibration.status.value,
-            },
+            "calibration": calibration_content,
             "geometry": {
                 "gi_enabled": geometry.gi_enabled,
                 "incidence": {"kind": incidence.kind.value,

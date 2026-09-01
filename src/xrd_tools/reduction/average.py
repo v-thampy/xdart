@@ -90,7 +90,7 @@ def _copy_calibration(value: CalibrationState) -> CalibrationState:
     _reject(type(value) is not CalibrationState, 'Average calibration must be an exact CalibrationState', TypeError); poni = value.values
     copied_values = None if poni is None else PoniValues(*(getattr(poni, item.name) for item in fields(PoniValues)))
     mask = value.mask; copied_mask = MaskState(mask.source_uri, mask.sha256, mask.dtype, tuple(mask.shape), mask.status)
-    return CalibrationState(copied_values, value.detector_id, dict(value.detector_config), value.value_fingerprint, value.source_sha256, value.source_uri, copied_mask, value.status)
+    return CalibrationState(copied_values, value.detector_id, dict(value.detector_config), value.value_fingerprint, value.source_sha256, value.source_uri, copied_mask, value.status, value.parallax)
 def _copy_background(value: FrameBackgroundPlan | None) -> FrameBackgroundPlan | None:
     if value is None: return None
     _reject(type(value) is not FrameBackgroundPlan, 'Average background must be an exact FrameBackgroundPlan', TypeError)
@@ -200,7 +200,9 @@ def _thaw_reduction(recipe: AverageScanRecipe) -> ReductionPlan:
     return ReductionPlan(integration_1d=None if one is None else Integration1DPlan(npt=one[0], unit=one[1], method=one[2], radial_range=one[3], azimuth_range=one[4], monitor_key=one[5], error_model=one[6], polarization_factor=one[7], npt_rad=one[8], azimuth_offset=one[9], extra=_semantic_pairs(one[10])), integration_2d=None if two is None else Integration2DPlan(npt_rad=two[0], npt_azim=two[1], unit=two[2], method=two[3], radial_range=two[4], azimuth_range=two[5], azimuth_offset=two[6], monitor_key=two[7], error_model=two[8], polarization_factor=two[9], extra=_semantic_pairs(two[10])), gi=None if gi is None else GIMode(incident_angle=gi[0], incidence_motor=gi[1], tilt_angle=gi[2], sample_orientation=gi[3], method=gi[4], mode_1d=gi[5], mode_2d=gi[6], npt_oop=gi[7]), mask=None, threshold_min=recipe.threshold_min, threshold_max=recipe.threshold_max, mask_saturation=recipe.mask_saturation, extra=_semantic_pairs(recipe.reduction_extra))
 def _calibration_payload(value: CalibrationState) -> dict[str, Any]:
     poni = value.values
-    return {'values': None if poni is None else {item.name: getattr(poni, item.name) for item in fields(PoniValues)}, 'detector_id': value.detector_id, 'detector_config': _plain_json(value.detector_config), 'value_fingerprint': value.value_fingerprint, 'source_sha256': value.source_sha256, 'source_uri': value.source_uri, 'mask': {item.name: getattr(value.mask, item.name).value if item.name == 'status' else getattr(value.mask, item.name) for item in fields(MaskState)}, 'status': value.status.value}
+    payload = {'values': None if poni is None else {item.name: getattr(poni, item.name) for item in fields(PoniValues)}, 'detector_id': value.detector_id, 'detector_config': _plain_json(value.detector_config), 'value_fingerprint': value.value_fingerprint, 'source_sha256': value.source_sha256, 'source_uri': value.source_uri, 'mask': {item.name: getattr(value.mask, item.name).value if item.name == 'status' else getattr(value.mask, item.name) for item in fields(MaskState)}, 'status': value.status.value}
+    if value.parallax is not None: payload['parallax'] = value.parallax
+    return payload
 def _plain_json(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {key: _plain_json(item) for key, item in value.items()}
@@ -896,17 +898,23 @@ def _scan_calibration(recipe: AverageScanRecipe):
     from xrd_tools.core.geometry import DetectorCalibration
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
     poni = PONI(values.dist, values.poni1, values.poni2, values.rot1, values.rot2, values.rot3, values.wavelength_m, recipe.calibration.detector_id)
-    calibration = DetectorCalibration(poni, dict(recipe.calibration.detector_config))
+    calibration = DetectorCalibration(poni, dict(recipe.calibration.detector_config), parallax=recipe.calibration.parallax)
     return (poni, detector_calibration_to_integrator(calibration), calibration)
 def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threading.Event | None, progress: Callable[[str, int, int], None]):
     poni, integrator, calibration = _scan_calibration(plan.recipe)
     detector_values = None
     if calibration is not None:
-        detector_values = dict(calibration.poni.to_dict())
-        detector_values['detector_name'] = detector_values.pop('detector', '')
-        config = calibration.detector_config
-        detector_values['x_pixel_size'] = config.get('pixel2')
-        detector_values['y_pixel_size'] = config.get('pixel1')
+        if calibration.parallax is None:
+            detector_values = dict(calibration.poni.to_dict())
+            detector_values['detector_name'] = detector_values.pop('detector', '')
+            config = calibration.detector_config
+            detector_values['x_pixel_size'] = config.get('pixel2')
+            detector_values['y_pixel_size'] = config.get('pixel1')
+        else:
+            from xrd_tools.integrate.calibration import detector_calibration_record
+            detector_values = detector_calibration_record(
+                calibration, integrator=integrator,
+            )
     frame = ScanFrame(1, image=science['average'], metadata=dict(science['metadata']), source_path=None, source_frame_index=0, background=None, mask=science['zero'])
     provenance = {**_science_payload(plan), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
     scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.recipe.target, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})

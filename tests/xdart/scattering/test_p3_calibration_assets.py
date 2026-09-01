@@ -36,6 +36,18 @@ Rot2: 0.02
 Rot3: 0.03
 Wavelength: 1e-10
 """
+_V3_BASE = """poni_version: 3.0
+Detector: Detector
+Detector_config: {config}
+Distance: 0.15
+Poni1: 0.0016
+Poni2: 0.002
+Rot1: 0.0
+Rot2: 0.0
+Rot3: 0.0
+Wavelength: {wavelength}
+Parallax: {parallax}
+"""
 class _ProbeComplete(Exception):
     pass
 class _Bounded(BytesIO):
@@ -47,6 +59,19 @@ def _poni(config: str = '{"orientation":1}', **replacements: str) -> str:
     for old, new in replacements.items():
         text = text.replace(old.replace("_", ": "), new)
     return text
+def _v3_poni(
+    config: str = (
+        '{"pixel1":0.0001,"pixel2":0.0001,"max_shape":[32,40],'
+        '"orientation":3,"sensor":{"material":"Si",'
+        '"thickness":0.00045}}'
+    ),
+    *,
+    wavelength: str = "1e-10",
+    parallax: str = "True",
+) -> str:
+    return _V3_BASE.format(
+        config=config, wavelength=wavelength, parallax=parallax,
+    )
 def _intent(tmp_path: Path, text: str, name: str = "cal") -> tuple[RunIntent, Path]:
     path = tmp_path / f"{name}.poni"
     path.write_text(text, encoding="utf-8")
@@ -82,10 +107,11 @@ def test_p3_1a_admitted_orientation_reaches_standard_execution(tmp_path, monkeyp
     observed = [int(_execute(intent, assets, monkeypatch, index)[1].detector.orientation)
                 for index, assets in enumerate((accepted, None), 1)]
     assert observed == [1, 1]
-def test_p3_1a_real_pyfai_2025_3_preserves_canonical_detector_config(tmp_path, monkeypatch):
-    assert pyFAI.version == "2025.3.0"
+def test_p3_1a_real_pyfai_preserves_canonical_detector_config(tmp_path, monkeypatch):
+    assert tuple(int(value) for value in pyFAI.version.split(".")[:2]) >= (2026, 5)
     for index, config in enumerate(({"orientation": 1},
-                                    {"max_shape": [194, 1475], "orientation": 3})):
+                                    {"max_shape": [194, 1475], "orientation": 3},
+                                    {"orientation": 1, "pixel1": 0.000172})):
         canonical = json.dumps(config, sort_keys=True, separators=(",", ":"))
         intent, path = _intent(tmp_path, _poni(canonical), f"real-{index}")
         direct, accepted = load_detector_calibration(path), _load_scientific_assets(intent)
@@ -129,14 +155,231 @@ def test_p3_1a_rejection_order_and_postconstruction_validation(tmp_path, monkeyp
     def counted(*args, **kwargs):
         calls.append(1); return real(*args, **kwargs)
     monkeypatch.setattr(ponifile_module, "PoniFile", counted)
-    post = (_poni('{"orientation":1,"pixel1":0.000172}'),
-            base.replace("Distance: 0.1234", "Distance: 0"),
+    post = (base.replace("Distance: 0.1234", "Distance: 0"),
             base.replace("Rot1: 0.01", "Rot1: nan"),
             base.replace("Wavelength: 1e-10", "Wavelength: -1"))
     for index, text in enumerate(post, 1):
         path.write_text(text, encoding="utf-8")
         with pytest.raises(ValueError): load_detector_calibration(path)
         assert len(calls) == index
+
+
+def test_p3_1a_v3_sensor_parallax_reaches_frozen_execution_and_science_identity(
+    tmp_path, monkeypatch,
+):
+    intent, path = _intent(tmp_path, _v3_poni(), "v3-active")
+    accepted = _load_scientific_assets(intent)
+    configuration, signed = _signed(intent, accepted)
+    projection = signed["accepted_scientific_assets"]["poni_values"]
+
+    assert accepted.poni_parallax is True
+    assert accepted.detector_calibration.parallax is True
+    assert projection == configuration.poni_values
+    assert projection["detector_config"]["sensor"] == {
+        "material": "Si",
+        "thickness": pytest.approx(0.00045),
+    }
+    assert projection["parallax"] is True
+    assert signed["accepted_scientific_assets"]["poni_sha256"] == (
+        __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+    )
+    assert "poni_v3_override" not in configuration.as_provenance()
+
+    _poni_value, active = _execute(intent, accepted, monkeypatch, 70)
+    _poni_value, inactive = _execute(
+        intent, replace(accepted, poni_parallax=False), monkeypatch, 71,
+    )
+    assert active.parallax is not None
+    assert inactive.parallax is None
+    active_q = active.array_from_unit(unit="q_A^-1")
+    inactive_q = inactive.array_from_unit(unit="q_A^-1")
+    assert np.max(np.abs(active_q - inactive_q)) > 1.0e-8
+    assert dynamic_output._science_projection(configuration, signed)[
+        "poni_values"
+    ] == projection
+
+
+def test_p3_1a_v3_schema_rejects_hostile_sensor_parallax_before_construction(
+    tmp_path, monkeypatch,
+):
+    valid_sensor = {
+        "pixel1": 0.0001,
+        "pixel2": 0.0001,
+        "max_shape": [32, 40],
+        "orientation": 3,
+        "sensor": {"material": "Si", "thickness": 0.00045},
+    }
+    text = _v3_poni(json.dumps(valid_sensor, separators=(",", ":")))
+    rows = (
+        text.replace("Parallax: True\n", ""),
+        text + "PARALLAX: False\n",
+        text.replace("Parallax: True", "Parallax: true"),
+        text.replace("Parallax: True", 'Parallax: "True"'),
+        text.replace("Parallax: True", "Parallax: 1"),
+        text.replace('"sensor":{"material":"Si","thickness":0.00045}',
+                     '"sensor":{"material":"Si"}'),
+        text.replace('"thickness":0.00045',
+                     '"thickness":0.00045,"extra":1'),
+        text.replace('"material":"Si"', '"material":"../Si"'),
+        text.replace('"thickness":0.00045', '"thickness":true'),
+        text.replace('"thickness":0.00045', '"thickness":NaN'),
+        text.replace('"thickness":0.00045', '"thickness":0'),
+        text.replace('"thickness":0.00045', '"thickness":-0.1'),
+        text.replace('"thickness":0.00045', '"thickness":0.0100001'),
+        _v3_poni(
+            json.dumps(
+                {key: value for key, value in valid_sensor.items()
+                 if key != "sensor"},
+                separators=(",", ":"),
+            )
+        ),
+        _v3_poni(wavelength="0"),
+        _poni(
+            '{"orientation":1,"sensor":{"material":"Si",'
+            '"thickness":0.00045}}'
+        ) + "Parallax: False\n",
+    )
+    path = tmp_path / "hostile-v3.poni"
+    upstream_calls = []
+
+    def forbidden(*_args, **_kwargs):
+        upstream_calls.append(1)
+        raise AssertionError("hostile PONI reached upstream construction")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(ponifile_module, "PoniFile", forbidden)
+        guard.setattr(detectors_module, "detector_factory", forbidden)
+        for row in rows:
+            path.write_text(row, encoding="utf-8")
+            with pytest.raises(ValueError):
+                load_detector_calibration(path)
+    assert upstream_calls == []
+
+
+def test_p3_1a_v2_science_projection_and_fingerprint_remain_byte_identical(
+    tmp_path,
+):
+    intent, _path = _intent(tmp_path, _poni(), "v2-byte-stable")
+    accepted = _load_scientific_assets(intent)
+    assert accepted.poni_parallax is None
+    assert accepted.poni_detector_config_json == '{"orientation":1}'
+    assert json.dumps(
+        accepted.poni.to_dict(), sort_keys=True, separators=(",", ":"),
+    ) == (
+        '{"detector":"Pilatus300kw","dist":0.1234,"poni1":0.05,'
+        '"poni2":0.06,"rot1":0.01,"rot2":0.02,"rot3":0.03,'
+        '"wavelength":1e-10}'
+    )
+    deterministic = RunIntent(
+        source_spec=image_series_spec(Path("/data/frame_0001.tif")),
+        poni_file="/calibration/legacy.poni",
+        save_path="/processed/legacy.nxs",
+        output_mode="Overwrite",
+    ).freeze()
+    assert deterministic.fingerprint == (
+        "87231711104fc3a99080ca37802873989ff9cb6d6b1d62ea7ab769f94ea6a2fb"
+    )
+    assert "poni_v3_override" not in deterministic.as_provenance()
+
+
+def test_selected_poni_v3_remains_authoritative_when_advanced_override_is_disabled(
+    tmp_path,
+):
+    imported_config = (
+        '{"pixel1":0.0001,"pixel2":0.0001,"max_shape":[32,40],'
+        '"orientation":3,"sensor":{"material":"CdTe",'
+        '"thickness":0.001}}'
+    )
+    intent, _path = _intent(
+        tmp_path,
+        _v3_poni(imported_config, parallax="False"),
+        "v3-import-authority",
+    )
+
+    accepted = _load_scientific_assets(intent)
+
+    assert intent.poni_v3_override is None
+    assert accepted.poni_parallax is False
+    assert accepted.detector_calibration.detector_config["sensor"] == {
+        "material": "CdTe",
+        "thickness": pytest.approx(0.001),
+    }
+
+
+def test_explicit_advanced_override_replaces_only_sensor_parallax_and_records_provenance(
+    tmp_path,
+):
+    import xrd_tools.session.run_configuration as configuration_module
+
+    override_type = getattr(configuration_module, "PoniV3OverrideIntent")
+    imported_config = (
+        '{"pixel1":0.0001,"pixel2":0.0002,"max_shape":[32,40],'
+        '"orientation":2,"sensor":{"material":"CdTe",'
+        '"thickness":0.001}}'
+    )
+    intent, _path = _intent(
+        tmp_path,
+        _v3_poni(imported_config, parallax="False"),
+        "v3-explicit-override",
+    )
+    intent.poni_v3_override = override_type("Ge", 0.00075, True)
+
+    accepted = _load_scientific_assets(intent)
+    configuration, signed = _signed(intent, accepted)
+    effective = configuration.poni_values
+
+    assert effective["detector_config"] == {
+        "pixel1": pytest.approx(0.0001),
+        "pixel2": pytest.approx(0.0002),
+        "max_shape": [32, 40],
+        "orientation": 2,
+        "sensor": {
+            "material": "Ge",
+            "thickness": pytest.approx(0.00075),
+        },
+    }
+    assert effective["parallax"] is True
+    assert effective["dist"] == pytest.approx(0.15)
+    assert signed["poni_v3_override"] == {
+        "material": "Ge",
+        "thickness_m": pytest.approx(0.00075),
+        "parallax": True,
+    }
+    assert signed["accepted_scientific_assets"]["poni_values"] == effective
+    assert accepted.detector_calibration.parallax is True
+
+    missing = RunIntent(
+        source_spec=intent.source_spec,
+        poni_v3_override=override_type("Ge", 0.00075, False),
+    )
+    with pytest.raises(ValueError, match="selected.*PONI"):
+        _load_scientific_assets(missing)
+
+
+def test_poni_v3_capture_preserves_sensor_parallax_in_runtime_and_provenance(
+    tmp_path, monkeypatch,
+):
+    intent, _path = _intent(
+        tmp_path, _v3_poni(parallax="False"), "v3-capture",
+    )
+    accepted = _load_scientific_assets(intent)
+    configuration, signed = _signed(intent, accepted)
+    _poni_value, integrator = _execute(intent, accepted, monkeypatch, 72)
+
+    assert accepted.poni_parallax is False
+    assert accepted.detector_calibration.parallax is False
+    assert integrator.parallax is None
+    assert configuration.poni_values["parallax"] is False
+    assert signed["accepted_scientific_assets"]["poni_values"] == (
+        configuration.poni_values
+    )
+    assert signed["accepted_scientific_assets"][
+        "poni_detector_config_json"
+    ] == json.dumps(
+        configuration.poni_values["detector_config"],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 def test_p3_1a_poni_qualification_is_bounded_and_stable(tmp_path, monkeypatch):
     oversized = _poni().encode() + b"#" * (_LIMIT + 1)
     with monkeypatch.context() as guard:

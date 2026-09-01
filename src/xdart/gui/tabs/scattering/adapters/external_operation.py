@@ -97,7 +97,8 @@ def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
         except (TypeError, ValueError, OverflowError) as error: raise ValueError("AVERAGE_MASK_UNREPRESENTABLE") from error
     state = (CalibrationState(mask=mask_state) if values is None else
         CalibrationState(values, assets.poni_values[7], config, "",
-            assets.poni_sha256 or "", configuration.poni_file, mask_state, FactStatus.PRESENT))
+            assets.poni_sha256 or "", configuration.poni_file, mask_state,
+            FactStatus.PRESENT, assets.poni_parallax))
     if values is None: return state
     try:
         from xrd_tools.core import PONI
@@ -105,11 +106,13 @@ def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
         accepted = assets.detector_calibration
         reconstructed = DetectorCalibration(PONI(values.dist, values.poni1, values.poni2,
             values.rot1, values.rot2, values.rot3, values.wavelength_m, state.detector_id),
-            dict(state.detector_config))
+            dict(state.detector_config), parallax=state.parallax)
         def truth(calibration):
             detector = detector_calibration_to_integrator(calibration).detector
             reported = detector.get_config(); shape = tuple(detector.shape); maximum = tuple(detector.max_shape)
-            normalized = DetectorCalibration(calibration.poni, reported).to_json()
+            normalized = DetectorCalibration(
+                calibration.poni, reported, parallax=calibration.parallax,
+            ).to_json()
             return (type(detector), shape, maximum, float(detector.pixel1),
                 float(detector.pixel2), int(detector.orientation), normalized)
         accepted_truth = truth(accepted); reconstructed_truth = truth(reconstructed)

@@ -17,6 +17,8 @@ from xdart.modules.frame_publication import (
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.integrate.calibration import (
+    apply_sensor_parallax,
+    detector_calibration_record,
     detector_calibration_to_integrator,
     load_detector_calibration,
 )
@@ -1377,8 +1379,27 @@ class StandardRunExecutor:
             )
             if calibration is None:
                 raise ValueError('accepted PONI asset is unavailable')
+            if assets is None and configuration.poni_v3_override is not None:
+                override = configuration.poni_v3_override
+                calibration = apply_sensor_parallax(
+                    calibration,
+                    material=override.material,
+                    thickness_m=override.thickness_m,
+                    parallax=override.parallax,
+                )
             poni = getattr(calibration, "poni", calibration)
-            run.scan = run.source.to_scan(poni=poni, integrator=poni_to_integrator(calibration), output_path=artifact)
+            integrator = poni_to_integrator(calibration)
+            run.scan = run.source.to_scan(
+                poni=poni,
+                integrator=integrator,
+                output_path=artifact,
+            )
+            if calibration.parallax is not None:
+                extra = dict(getattr(run.scan, "extra", None) or {})
+                extra["detector_calibration"] = detector_calibration_record(
+                    calibration, integrator=integrator,
+                )
+                run.scan.extra = extra
         except SourceRevisionChanged:
             discard_source()
             raise

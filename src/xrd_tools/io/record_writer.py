@@ -3670,17 +3670,29 @@ class NexusRecordWriter:
         for name in (
             "dist", "poni1", "poni2", "rot1", "rot2", "rot3",
             "detector_name", "x_pixel_size", "y_pixel_size",
+            "sensor_material", "sensor_thickness", "parallax",
         ):
             if name in detector:
                 del detector[name]
             value = calibration.get(name)
-            if value is None or (name == "detector_name" and not str(value)):
+            if value is None or (
+                name in {"detector_name", "sensor_material"}
+                and not str(value)
+            ):
                 continue
+            if name == "parallax" and type(value) is not bool:
+                raise TypeError("detector parallax must be an exact boolean")
             dataset = detector.create_dataset(
                 name,
-                data=(str(value) if name == "detector_name" else float(value)),
+                data=(
+                    str(value)
+                    if name in {"detector_name", "sensor_material"}
+                    else bool(value) if name == "parallax" else float(value)
+                ),
             )
-            if name in {"x_pixel_size", "y_pixel_size"}:
+            if name in {
+                "x_pixel_size", "y_pixel_size", "sensor_thickness",
+            }:
                 dataset.attrs["units"] = "m"
         if "mask" in detector:
             del detector["mask"]

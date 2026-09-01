@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import copy
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from xrd_tools.session.run_configuration import (
     RunIntent,
     ThresholdIntent,
 )
+import xrd_tools.session.run_configuration as run_configuration_module
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 
@@ -115,6 +117,55 @@ def test_freeze_is_deeply_immutable_and_generation_is_content_independent():
     assert same_content.generation == 2
     assert same_content.fingerprint == frozen.fingerprint
     assert same_content.identity != frozen.identity
+
+
+def test_v3_calibration_changes_frozen_fingerprint_and_is_deeply_immutable():
+    override_type = getattr(
+        run_configuration_module, "PoniV3OverrideIntent"
+    )
+    projection = {
+        "dist": 0.2,
+        "poni1": 0.01,
+        "poni2": 0.02,
+        "rot1": 0.0,
+        "rot2": 0.0,
+        "rot3": 0.0,
+        "wavelength": 1.0e-10,
+        "detector": "Detector",
+        "detector_config": {
+            "orientation": 3,
+            "sensor": {"material": "Si", "thickness": 0.00045},
+        },
+        "parallax": True,
+    }
+    intent = RunIntent(
+        poni_values=copy.deepcopy(projection),
+        poni_v3_override=override_type("Si", 0.00045, True),
+    )
+    frozen = intent.freeze()
+    original_fingerprint = frozen.fingerprint
+
+    projection["detector_config"]["sensor"]["material"] = "Ge"
+    intent.poni_values["detector_config"]["sensor"]["thickness"] = 0.001
+    intent.poni_v3_override = override_type("Ge", 0.001, False)
+
+    assert frozen.poni_values["detector_config"]["sensor"] == {
+        "material": "Si",
+        "thickness": pytest.approx(0.00045),
+    }
+    assert frozen.poni_v3_override.as_dict() == {
+        "material": "Si",
+        "thickness_m": pytest.approx(0.00045),
+        "parallax": True,
+    }
+    detached = frozen.as_provenance()
+    detached["poni_v3_override"]["material"] = "Se"
+    assert frozen.as_provenance()["poni_v3_override"]["material"] == "Si"
+    assert frozen.fingerprint == original_fingerprint
+    assert RunIntent(
+        poni_values=copy.deepcopy(frozen.poni_values),
+        poni_v3_override=override_type("Ge", 0.001, False),
+    ).freeze().fingerprint != original_fingerprint
 
 
 def test_accessors_preserve_gi_motor_and_processing_signature():

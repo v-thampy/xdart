@@ -116,3 +116,63 @@ def test_headless_run_writes_complete_portable_record(project, tmp_path,
     moved_out = moved / "processed" / "scan.nexus"
     raw2 = get_raw_frame(moved_out, 2)
     np.testing.assert_allclose(np.asarray(raw2), expected_raw_2)
+
+
+def test_v3_standard_run_persists_sensor_parallax_and_reloads(
+    tmp_path,
+):
+    import h5py
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.integrate import calibration as calibration_module
+
+    shape = (12, 14)
+    config = {
+        "pixel1": 1.0e-4,
+        "pixel2": 2.0e-4,
+        "max_shape": list(shape),
+        "orientation": 3,
+        "sensor": {"material": "Si", "thickness": 0.00045},
+    }
+    calibration = DetectorCalibration(
+        PONI(
+            dist=0.2,
+            poni1=0.0006,
+            poni2=0.0014,
+            wavelength=1.0e-10,
+            detector="Detector",
+        ),
+        config,
+        parallax=True,
+    )
+    integrator = calibration_module.detector_calibration_to_integrator(
+        calibration
+    )
+    detector_record = getattr(
+        calibration_module, "detector_calibration_record"
+    )(calibration, integrator=integrator)
+    source = tmp_path / "v3-source.npy"
+    image = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    np.save(source, image)
+    output = tmp_path / "v3-standard.nexus"
+    scan = Scan(
+        "v3-standard",
+        [Frame(1, image=image, source_path=source)],
+        integrator=integrator,
+        extra={"detector_calibration": detector_record},
+    )
+    result = run_reduction(
+        ReductionPlan(integration_1d=Integration1DPlan(npt=20)),
+        scan,
+        sink=NexusSink(output, overwrite=True),
+    )
+    assert result.n_processed == 1
+
+    with h5py.File(output, "r") as handle:
+        detector = handle["entry/instrument/detector"]
+        assert detector["sensor_material"].asstr()[()] == "Si"
+        assert float(detector["sensor_thickness"][()]) == pytest.approx(
+            0.00045
+        )
+        assert detector["sensor_thickness"].attrs["units"] == "m"
+        assert bool(detector["parallax"][()]) is True

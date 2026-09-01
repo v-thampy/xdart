@@ -139,6 +139,7 @@ class CalibrationRequest:
 class CalibrationFileProof:
     state: SourceFileState; sha256: str; detector_config_json: str
     geometry: tuple[float, ...]
+    parallax: bool | None = None
     def __post_init__(self) -> None:
         if not _bounded_text(
                 self.detector_config_json, _CONFIG_BYTES_LIMIT):
@@ -158,7 +159,9 @@ class CalibrationFileProof:
                 or type(self.geometry) is not tuple
                 or len(self.geometry) != 7
                 or any(type(value) is not float or not np.isfinite(value)
-                       for value in self.geometry)):
+                       for value in self.geometry)
+                or self.parallax is not None
+                and type(self.parallax) is not bool):
             raise ValueError("calibration proof is invalid")
 @dataclass(frozen=True, slots=True)
 class CalibrationCandidate:
@@ -818,7 +821,9 @@ def _qualify(path: Path) -> CalibrationFileProof:
     poni = calibration.poni
     geometry = tuple(float(getattr(poni, name)) for name in (
         "dist", "poni1", "poni2", "rot1", "rot2", "rot3", "wavelength"))
-    return CalibrationFileProof(after, digest, config, geometry)
+    return CalibrationFileProof(
+        after, digest, config, geometry, calibration.parallax,
+    )
 def _matches(proof: CalibrationFileProof, path: Path) -> SourceFileState | None:
     try:
         state = _regular_state(path)

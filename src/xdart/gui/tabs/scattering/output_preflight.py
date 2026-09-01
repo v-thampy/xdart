@@ -11,7 +11,10 @@ from typing import Any, Callable
 import numpy as np
 from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.scan import SourceKind, SourceSpec
-from xrd_tools.integrate.calibration import load_detector_calibration
+from xrd_tools.integrate.calibration import (
+    apply_sensor_parallax,
+    load_detector_calibration,
+)
 from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
 from xrd_tools.io.image import read_detector_image_layout
 from xrd_tools.io.output_path import OVERWRITE_MODE, resolve_output_target
@@ -189,12 +192,12 @@ class OutputCandidate:
         if type(source) not in {SourceSpec, DirectorySourceSpec}:
             raise ValueError("output admission requires a supported source")
         accepted = assets or _load_scientific_assets(intent)
+        if accepted.poni_parallax is not None:
+            intent.poni_values = accepted.poni_projection
         frozen = intent.freeze(gi_motor_choices=gi_motor_choices)
         processing = frozen.as_provenance()
         processing["accepted_scientific_assets"] = {
-            "poni_values": (
-                None if accepted.poni is None else accepted.poni.to_dict()
-            ),
+            "poni_values": accepted.poni_projection,
             "poni_detector_config_json": accepted.poni_detector_config_json,
             "poni_sha256": accepted.poni_sha256,
             "mask_sha256": accepted.mask_sha256,
@@ -3268,6 +3271,20 @@ def _load_scientific_assets(
         if load_poni is load_detector_calibration else load_poni(path),
         max_bytes=1 << 20,
     )
+    # The optional v3 override is absent from legacy intent projections and
+    # helper-owned, RunIntent-compatible views.
+    override = getattr(intent, "poni_v3_override", None)
+    if override is not None:
+        if calibration is None:
+            raise ValueError(
+                "an enabled PONI v3 override requires a selected PONI"
+            )
+        calibration = apply_sensor_parallax(
+            calibration,
+            material=override.material,
+            thickness_m=override.thickness_m,
+            parallax=override.parallax,
+        )
     mask, mask_digest = _load_stable_mask_asset(
         intent.mask_file, calibration, cancelled=cancelled,
     )
@@ -3290,6 +3307,7 @@ def _load_scientific_assets(
         None if accepted is None else tuple(accepted.shape),
         None if accepted is None else accepted.tobytes(),
         poni_digest, mask_digest, config_json,
+        None if calibration is None else calibration.parallax,
     )
 def _scientific_mask_layout(path: Path) -> tuple[tuple[int, int], np.dtype]:
     if path.suffix.casefold() == ".npy":

@@ -16,6 +16,7 @@ from .controls_editing import (
     AdvancedSettingsValues,
     advanced_settings_values,
 )
+from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
 
 
 @dataclass(slots=True)
@@ -75,6 +76,40 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         gi_form.addRow("Histogram backend", self.gi_method)
         self.gi_group.setVisible(False)
         layout.addWidget(self.gi_group)
+        self.poni_v3_group = QtWidgets.QGroupBox(
+            "Detector sensor / parallax (PONI v3)"
+        )
+        self.poni_v3_group.setObjectName("vnextPoniV3AdvancedGroup")
+        poni_form = QtWidgets.QFormLayout(self.poni_v3_group)
+        self.poni_v3_override = QtWidgets.QCheckBox(
+            "Override selected PONI sensor settings"
+        )
+        self.poni_v3_override.setObjectName("vnextPoniV3Override")
+        self.poni_v3_material = QtWidgets.QComboBox()
+        self.poni_v3_material.setObjectName("vnextPoniV3Material")
+        for material in PONI_V3_SENSOR_MATERIALS:
+            self.poni_v3_material.addItem(material, material)
+        self.poni_v3_thickness_m = QtWidgets.QLineEdit("0.00045")
+        self.poni_v3_thickness_m.setObjectName("vnextPoniV3ThicknessM")
+        self.poni_v3_thickness_m.setToolTip("450 µm = 0.00045 m")
+        self.poni_v3_parallax = QtWidgets.QCheckBox("Enable parallax")
+        self.poni_v3_parallax.setObjectName("vnextPoniV3Parallax")
+        self.poni_v3_authority = QtWidgets.QLabel(
+            "Override off: the selected PONI is authoritative. "
+            "Override on: only sensor material, thickness, and parallax "
+            "change for the next run."
+        )
+        self.poni_v3_authority.setWordWrap(True)
+        poni_form.addRow(self.poni_v3_override)
+        poni_form.addRow("Sensor material", self.poni_v3_material)
+        poni_form.addRow("Sensor thickness (m)", self.poni_v3_thickness_m)
+        poni_form.addRow(self.poni_v3_parallax)
+        poni_form.addRow(self.poni_v3_authority)
+        self.poni_v3_override.toggled.connect(
+            self._set_poni_v3_enabled
+        )
+        self._set_poni_v3_enabled(False)
+        layout.addWidget(self.poni_v3_group)
         forms = QtWidgets.QHBoxLayout()
         forms.setSpacing(12)
         self.one_d = self._dimension_group(
@@ -95,7 +130,15 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        self.resize(700, 430)
+        self.resize(700, 590)
+
+    def _set_poni_v3_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.poni_v3_material,
+            self.poni_v3_thickness_m,
+            self.poni_v3_parallax,
+        ):
+            widget.setEnabled(bool(enabled))
 
     def _dimension_group(
         self,
@@ -175,6 +218,27 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         del blocker
         self.gi_group.setVisible(gi_enabled)
         self.gi_method.setEnabled(gi_enabled)
+        blockers = tuple(
+            QtCore.QSignalBlocker(widget)
+            for widget in (
+                self.poni_v3_override,
+                self.poni_v3_material,
+                self.poni_v3_thickness_m,
+                self.poni_v3_parallax,
+            )
+        )
+        self.poni_v3_override.setChecked(
+            bool(values.poni_v3_override_enabled)
+        )
+        material = str(values.poni_v3_material)
+        material_index = self.poni_v3_material.findData(material)
+        self.poni_v3_material.setCurrentIndex(max(0, material_index))
+        self.poni_v3_thickness_m.setText(str(values.poni_v3_thickness_m))
+        self.poni_v3_parallax.setChecked(bool(values.poni_v3_parallax))
+        del blockers
+        self._set_poni_v3_enabled(
+            bool(values.poni_v3_override_enabled)
+        )
         standard_method_tooltip = (
             "This standard integration method is not used by "
             "FiberIntegrator in Grazing mode."
@@ -236,6 +300,10 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             two_d=self._dimension_values(self.two_d),
             gi_enabled=self._gi_enabled,
             gi_method=self.gi_method.currentData(),
+            poni_v3_override_enabled=self.poni_v3_override.isChecked(),
+            poni_v3_material=self.poni_v3_material.currentData(),
+            poni_v3_thickness_m=self.poni_v3_thickness_m.text(),
+            poni_v3_parallax=self.poni_v3_parallax.isChecked(),
         )
 
     @staticmethod

@@ -85,6 +85,7 @@ _EXPORTS = {
     "normalization_value": "xrd_tools.session.frame_projection",
     "open_headless_scan_session": "xrd_tools.session.headless_scan",
     "pick_default_gi_motor": "xrd_tools.session.gi_motor",
+    "PoniV3OverrideIntent": "xrd_tools.session.run_configuration",
     "ProgressEvent": "xrd_tools.session.scan_session",
     "PROFILE_SCHEMA": "xrd_tools.session.run_intent_profile",
     "PROFILE_VERSION": "xrd_tools.session.run_intent_profile",

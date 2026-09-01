@@ -78,6 +78,37 @@ _FRAMES = [(6.0, 0.0), (15.0, 3.0), (25.0, 6.0), (40.0, 9.0)]
 
 
 class TestRefineGoniometer:
+    def test_v3_path_refuses_lossy_detector_config_replacement_before_fit(
+        self, tmp_path,
+    ):
+        from xrd_tools.integrate.refine import refine_goniometer
+
+        calibration = tmp_path / "sensor.poni"
+        calibration.write_text(
+            "poni_version: 3.0\n"
+            "Detector: Pilatus300kw\n"
+            'Detector_config: {"orientation":3,"sensor":'
+            '{"material":"Si","thickness":0.00045}}\n'
+            "Distance: 0.2\n"
+            "Poni1: 0.01\n"
+            "Poni2: 0.02\n"
+            "Rot1: 0.0\n"
+            "Rot2: 0.0\n"
+            "Rot3: 0.0\n"
+            "Wavelength: 1e-10\n"
+            "Parallax: True\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="cannot replace"):
+            refine_goniometer(
+                calibration,
+                [],
+                rot1_motor="nu",
+                rot2_motor="del",
+                detector_config={"orientation": 3},
+            )
+
     def test_synthetic_roundtrip_recovers_geometry(self):
         pytest.importorskip("pyFAI")
         pytest.importorskip("scipy")
