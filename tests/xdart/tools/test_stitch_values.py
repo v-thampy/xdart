@@ -13,10 +13,12 @@ from xdart.gui.tools.stitch_values import (
     prepare_stitch_tool,
 )
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector
+from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
 from xrd_tools.analysis.stitch_operation import (
     StitchGeometryKind,
     XuStitchOperationPlan,
+    run_stitch_operation,
 )
 from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_bytes
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
@@ -217,6 +219,19 @@ def test_xu_form_is_backend_tagged_and_preflight_binds_asset_runtime(tmp_path):
     assert preflight.request.provenance["observations"][
         "source_energy_range_eV"
     ] == [17000.018, 17000.018]
+
+
+def test_xu_form_runs_its_production_spec_raw_request_to_v2(tmp_path):
+    preflight = prepare_stitch_tool(_xu_form(tmp_path))
+    result = run_stitch_operation(preflight.request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert result.terminal.request is preflight.request.module
+    assert result.payload.schema_version == 2
+    assert result.payload.execution_attestation_digest == (
+        result.terminal.commit.execution_attestation_digest
+    )
+    assert result.payload.coverage is not None
+    assert np.any(result.payload.coverage > 0)
 
 
 @pytest.mark.parametrize(
