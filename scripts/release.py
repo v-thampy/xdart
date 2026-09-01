@@ -21,8 +21,7 @@ Checks (each prints PASS/FAIL; any FAIL exits 1):
              (tests/xdart/test_batch_finish_select_last.py); skipped where
              Qt is absent.  NOTE: this is a smoke, not the full GUI suite —
              the complete tests/xdart offscreen run is the CI gate (pr.yml).
-  deps       known ceilings intact (pyFAI<2025.12 — 2025.12 ships a
-             broken pyFAI-calib2 on Windows).
+  deps       pyFAI's audited project, Pixi, conda-recipe, and uv pins agree.
 
 There is intentionally NO publish subcommand: the maintainer uploads
 manually (see .github/workflows/release.yml, which runs `check` before
@@ -137,11 +136,24 @@ def check_gui_smoke() -> bool:
 
 
 def check_deps() -> bool:
-    text = (ROOT / "pyproject.toml").read_text()
+    project = (ROOT / "pyproject.toml").read_text()
+    recipe = (ROOT / "recipe" / "recipe.yaml").read_text()
+    uv_lock = (ROOT / "uv.lock").read_text()
     ok = True
-    # pyFAI ceiling: 2025.12 ships a broken pyFAI-calib2 on Windows.
-    ok &= (_ok if re.search(r'"pyFAI>=[\d.]+,<2025\.12"', text) else _fail)(
-        "pyFAI ceiling <2025.12 present")
+    window = r">=2026\.5,<2026\.6"
+    checks = (
+        (re.search(rf'"pyFAI{window}"', project), "project pyFAI window"),
+        (re.search(rf'^pyfai\s*=\s*"{window}"$', project, re.M),
+         "Pixi pyFAI window"),
+        (re.search(rf'^\s*- pyfai {window}(?:\s|$)', recipe, re.M),
+         "conda recipe pyFAI window"),
+        (re.search(rf'^\s*\{{ name = "pyfai", specifier = "{window}" \}},$',
+                   uv_lock, re.M), "uv requirement pyFAI window"),
+        (re.search(r'^name = "pyfai"\nversion = "2026\.5\.0"$',
+                   uv_lock, re.M), "uv resolves pyFAI 2026.5.0"),
+    )
+    for matched, label in checks:
+        ok &= (_ok if matched else _fail)(label)
     return ok
 
 

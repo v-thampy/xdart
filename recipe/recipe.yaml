@@ -72,7 +72,7 @@ requirements:
     - nexusformat
     - fabio
     - silx
-    - pyfai >=2025.3,<2025.12     # conda-forge lowercase; window selects 2025.3.0
+    - pyfai >=2026.5,<2026.6     # conda-forge lowercase; audited 2026.5 line
     - pyyaml
     - joblib
     - natsort

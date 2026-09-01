@@ -42,11 +42,10 @@ dependencies = [
     "nexusformat",
     "fabio",
     "silx",              # io.spec / io.metadata SPEC parsing
-    # pyFAI 2025.12 ships a broken pyFAI-calib2 on Windows (silx.gui import
-    # path / qt plugin issue); cap to <2025.12 until fixed upstream.
-    # There are no pyFAI releases between 2025.3.0 and 2025.12.0, so this
-    # range selects exactly 2025.3.0 (the tested version).
-    "pyFAI>=2025.3,<2025.12",
+    # Keep the audited 2026.5 API/serialization line bounded: PONI v3,
+    # MultiGeometry union, and GI convention compatibility are versioned xdart
+    # contracts rather than an unconstrained dependency upgrade.
+    "pyFAI>=2026.5,<2026.6",
     "pyyaml",            # core/hdf5.py imports yaml directly
     "joblib",
     "natsort",
@@ -136,7 +135,7 @@ numpy = "*"
 h5py = "*"
 hdf5plugin = "*"
 fabio = "*"
-pyfai = ">=2025.3,<2025.12"
+pyfai = ">=2026.5,<2026.6"
 silx = "*"
 # The Qt binding must come from the SAME provenance as the natives above: the
 # PySide6 wheel SIGABRTs when loaded into a process already holding

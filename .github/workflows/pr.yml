@@ -62,7 +62,7 @@ jobs:
           done
           exit 139
 
-  # Release-readiness preflight: version pins, the pyFAI ceiling, and the
+  # Release-readiness preflight: version pins, the audited pyFAI window, and the
   # schema/byte-compat gate must stay green on every PR.  No --strict-tree, so an
   # uncommitted tree only warns (a clean CI checkout passes the tree check anyway).
   release-preflight:
