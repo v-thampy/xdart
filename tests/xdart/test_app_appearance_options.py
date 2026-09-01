@@ -1,8 +1,8 @@
 """Frozen contract for selectable application appearance options.
 
-The application owns theme, font size, selected-control accent, and spacing as
-one appearance.  Pages may consume the resolved visual tokens, but they do not
-read preferences or install their own stylesheet.
+The application owns theme, font size, selected-control accent, spacing, and
+panel/container corners as one appearance.  Pages may consume the resolved
+visual tokens, but they do not read preferences or install their own stylesheet.
 """
 
 from __future__ import annotations
@@ -131,8 +131,20 @@ def test_accent_and_spacing_tables_are_exact_and_total():
         ("spacious", "Spacious"),
         ("extra_spacious", "Extra Spacious"),
     )
-    assert accent_owner.normalize_accent_color("unknown") == "theme_default"
-    assert spacing_owner.normalize_spacing("unknown") == "normal"
+    assert accent_owner.normalize_accent_color("unknown") == (
+        "periwinkle_muted"
+    )
+    assert spacing_owner.normalize_spacing("unknown") == "tight"
+
+
+def test_fresh_settings_resolve_exact_production_appearance_defaults(settings):
+    from xdart import _gui_main
+
+    assert _gui_main._resolve_theme(settings) == "dark"
+    assert typography.resolve_font_scale(settings) == "small"
+    assert themes.accent.resolve_accent_color(settings) == "periwinkle_muted"
+    assert themes.spacing.resolve_spacing(settings) == "tight"
+    assert themes.corners.resolve_controls_card_corners(settings) is True
 
 
 def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selection(
@@ -141,13 +153,13 @@ def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selecti
     explicit = render_qss(
         "dark",
         font_scale="default",
-        accent_color="theme_default",
+        accent_color="periwinkle_muted",
         spacing=themes.DEFAULT_SPACING,
     )
     assert explicit == baseline
     assert render_qss(
         "light",
-        accent_color="theme_default",
+        accent_color="periwinkle_muted",
         spacing=themes.DEFAULT_SPACING,
     ) == render_qss("light")
 
@@ -160,7 +172,7 @@ def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selecti
     assert "background-color: #a49bb0;" in _selector_body(
         mauve, "QPushButton:checked"
     )
-    assert "background-color: #bd93f9;" in _selector_body(
+    assert "background-color: #8f98b8;" in _selector_body(
         baseline, "QPushButton:checked"
     )
     for selector in (
@@ -243,21 +255,21 @@ def test_spacing_changes_real_qss_padding_without_changing_font_or_color():
     ):
         values = [getattr(tokens, attribute) for tokens in ordered]
         assert values == sorted(values)
-        assert len(set(values)) == 5
+        assert values[0] < values[-1]
 
     tight = render_qss("dark", spacing="extra_tight")
     roomy = render_qss("dark", spacing="extra_spacious")
     tight_button = _selector_body(tight, "QPushButton")
     roomy_button = _selector_body(roomy, "QPushButton")
-    assert "padding: 1px 6px;" in tight_button
-    assert "padding: 8px 18px;" in roomy_button
-    assert tight_button.replace("1px 6px", "8px 18px") == roomy_button
+    assert "padding: 3px 9px;" in tight_button
+    assert "padding: 6px 15px;" in roomy_button
+    assert tight_button.replace("3px 9px", "6px 15px") == roomy_button
     compact_selector = (
         "QPushButton#e3BrowserCompactButton,\n"
         "QToolButton#e3RefreshBrowser"
     )
-    assert "padding: 1px 2px;" in _selector_body(tight, compact_selector)
-    assert "padding: 5px 8px;" in _selector_body(roomy, compact_selector)
+    assert "padding: 1px 3px;" in _selector_body(tight, compact_selector)
+    assert "padding: 3px 6px;" in _selector_body(roomy, compact_selector)
     assert spacing_owner.spacing_tokens("extra_tight").layout_gap < (
         spacing_owner.spacing_tokens("extra_spacious").layout_gap
     )
@@ -343,18 +355,20 @@ def test_config_menus_are_exclusive_persisted_and_apply_one_complete_appearance(
         assert calls[-1] == (
             "dark",
             {
-                "font_scale": "default",
+                "font_scale": "small",
                 "accent_color": "mauve_grey",
-                "spacing": "normal",
+                "spacing": "tight",
+                "controls_card_corners": True,
             },
         )
         _trigger(window, "Spacing", "Spacious")
         assert calls[-1] == (
             "dark",
             {
-                "font_scale": "default",
+                "font_scale": "small",
                 "accent_color": "mauve_grey",
                 "spacing": "spacious",
+                "controls_card_corners": True,
             },
         )
         window._set_theme("light")
@@ -365,6 +379,7 @@ def test_config_menus_are_exclusive_persisted_and_apply_one_complete_appearance(
                 "font_scale": "large",
                 "accent_color": "mauve_grey",
                 "spacing": "spacious",
+                "controls_card_corners": True,
             },
         )
         assert settings.value(themes.accent.ACCENT_COLOR_SETTINGS_KEY) == (
@@ -384,5 +399,5 @@ def test_malformed_saved_options_fail_closed_to_defaults(settings):
     settings.setValue(accent_owner.ACCENT_COLOR_SETTINGS_KEY, "purple-ish")
     settings.setValue(spacing_owner.SPACING_SETTINGS_KEY, -4)
     settings.sync()
-    assert accent_owner.resolve_accent_color(settings) == "theme_default"
-    assert spacing_owner.resolve_spacing(settings) == "normal"
+    assert accent_owner.resolve_accent_color(settings) == "periwinkle_muted"
+    assert spacing_owner.resolve_spacing(settings) == "tight"

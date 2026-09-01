@@ -38,6 +38,14 @@ class _MenuHost(QtWidgets.QWidget):
         self.help_menu = QtWidgets.QMenu(self)
 
 
+class _MenuPort:
+    def __init__(self, host: _MenuHost) -> None:
+        self._host = host
+
+    def mount_points(self) -> AppMenuHosts:
+        return AppMenuHosts(self._host.config_menu, self._host.help_menu)
+
+
 def _main_window(monkeypatch):
     from xdart import _gui_main
 
@@ -51,7 +59,7 @@ def _main_window(monkeypatch):
             key=key,
             widget=widget,
             close=lambda: CloseReceipt(PageCleanup.CLEAN, "closed"),
-            app_menus=AppMenuHosts(widget.config_menu, widget.help_menu),
+            app_menus=_MenuPort(widget),
         )
 
     descriptor = PageDescriptor(

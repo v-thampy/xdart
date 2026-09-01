@@ -8,7 +8,7 @@ from __future__ import annotations
 
 
 ACCENT_COLOR_SETTINGS_KEY = "appearance/toggle_accent"
-DEFAULT_ACCENT_COLOR = "theme_default"
+DEFAULT_ACCENT_COLOR = "periwinkle_muted"
 
 ACCENT_COLOR_MENU = (
     ("theme_default", "Theme Default"),
@@ -29,7 +29,7 @@ ACCENT_COLOR_NAMES = tuple(key for key, _label in ACCENT_COLOR_MENU)
 
 
 def normalize_accent_color(value) -> str:
-    """Return an exact known choice; malformed settings fail to the theme."""
+    """Return an exact known choice; malformed settings use the app default."""
     return value if type(value) is str and value in ACCENT_COLOR_NAMES else (
         DEFAULT_ACCENT_COLOR
     )
@@ -43,7 +43,7 @@ def resolve_accent_color(settings) -> str:
 
 def selected_color(name: str, *, theme_default: str) -> str:
     normalized = normalize_accent_color(name)
-    if normalized == DEFAULT_ACCENT_COLOR:
+    if normalized == "theme_default":
         return theme_default
     return ACCENT_COLORS[normalized]
 

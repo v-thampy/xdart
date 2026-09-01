@@ -225,7 +225,7 @@ def test_menu_exposes_exactly_five_exclusive_tiers(qapp, settings, monkeypatch):
     assert group is not None and group.isExclusive()
 
     assert [a.isChecked() for a in actions] == [
-        False, False, True, False, False], "Default is the default selection"
+        False, True, False, False, False], "Small is the default selection"
 
     assert _submenu(window, "Control Panel Font Size")[1] is None, (
         "the superseded Controls-only submenu must be gone")
@@ -278,7 +278,7 @@ def test_only_exact_known_values_are_persisted(qapp, settings, monkeypatch):
 def test_the_five_tiers_are_the_whole_contract():
     assert typo.FONT_SCALES == (
         "extra_small", "small", "default", "large", "extra_large")
-    assert typo.DEFAULT_FONT_SCALE == "default"
+    assert typo.DEFAULT_FONT_SCALE == "small"
     assert [label for _key, label in typo.FONT_SCALE_MENU] == [
         "Extra Small", "Small", "Default", "Large", "Extra Large"]
     assert tuple(key for key, _label in typo.FONT_SCALE_MENU) == typo.FONT_SCALES
