@@ -496,6 +496,21 @@ def test_public_result_projection_matches_axis_unit_and_nan_storage_bounds():
             coverage=None,
             normalization=None,
         )
+
+    with pytest.raises(AnalysisArtifactProjectionInvalid, match="rows exceed"):
+        project_analysis_artifact_result(
+            kind=AnalysisArtifactKind.RSM,
+            axes=(
+                ("h", np.array([0.0])),
+                ("k", np.arange(2049, dtype=np.float64)),
+                ("l", np.arange(1024, dtype=np.float64)),
+            ),
+            axis_units=(("h", None), ("k", None), ("l", None)),
+            intensity=np.ones((1, 2049, 1024), dtype=np.float32),
+            sigma=None,
+            coverage=None,
+            normalization=None,
+        )
     with pytest.raises(AnalysisArtifactProjectionInvalid, match="axes, units"):
         project_analysis_artifact_result(
             kind=AnalysisArtifactKind.STITCH_1D,

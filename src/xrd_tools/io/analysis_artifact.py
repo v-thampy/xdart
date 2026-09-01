@@ -1370,6 +1370,13 @@ def project_analysis_artifact_result(
             )
         projected_axes.append((name, projected))
     expected_shape = tuple(values.size for _name, values in projected_axes)
+    if (
+        max(1, int(np.prod(expected_shape[1:], dtype=np.int64)) * 4)
+        > _MAX_READ_BLOCK_BYTES
+    ):
+        raise AnalysisArtifactProjectionInvalid(
+            "analysis result rows exceed the stored read bound"
+        )
     projected_intensity = _project_stored_float32(
         intensity,
         name="intensity",
