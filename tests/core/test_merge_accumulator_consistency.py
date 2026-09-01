@@ -40,13 +40,15 @@ def test_rsm_accumulator_recovers_true_from_multiplicative_correction():
     """Σraw/Σnorm (RSM gridder) recovers `true` from raw=true·C, norm=C — the SAME
     way stitch does (unified Jun 2026; was Σ(raw·w)/Σw, which could not)."""
     pytest.importorskip("xrayutilities")
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
     from xrd_tools.rsm.gridding import _feed_pair, _new_gridder, _pair_intensity
     n = _C.size
     qx = np.full(n, 0.5); qy = np.full(n, 0.5); qz = np.full(n, 0.5)
     bounds = (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
-    gr = _new_gridder((1, 1, 1), bounds)
-    gn = _new_gridder((1, 1, 1), bounds)
-    _feed_pair(gr, gn, qx, qy, qz, _RAW, _C)
-    vol = _pair_intensity(gr, gn)
+    with xu_runtime_session() as runtime:
+        gr = _new_gridder((1, 1, 1), bounds, runtime_session=runtime)
+        gn = _new_gridder((1, 1, 1), bounds, runtime_session=runtime)
+        _feed_pair(gr, gn, qx, qy, qz, _RAW, _C)
+        vol = _pair_intensity(gr, gn)
     got = float(np.asarray(vol).ravel()[0])
     assert got == pytest.approx(_TRUE, rel=1e-6)

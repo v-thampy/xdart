@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import copy
+import os
+from pathlib import Path
+import subprocess
+import sys
 from threading import Event, Thread
 
 import pytest
 
 from xrd_tools.core.geometry.xu_runtime import (
+    XU_RUNTIME_EFFECTIVE_NTHREADS,
     XU_RUNTIME_LOCK,
+    XU_RUNTIME_LOCK_POLICY,
     XuRuntimeExecutionRecord,
     XuRuntimeRequirements,
     XuRuntimeUnsupported,
+    require_active_xu_runtime_session,
     xu_runtime_availability,
+    xu_runtime_requirements_projection,
     xu_runtime_session,
 )
 
@@ -21,6 +29,26 @@ def test_xu_runtime_requirements_are_the_exact_validated_platform_contract():
         XuRuntimeRequirements(distribution_version="future")
     with pytest.raises(TypeError, match="requirements are invalid"):
         XuRuntimeRequirements(platform_machine="x86_64")
+
+
+def test_xu_runtime_requirements_projection_is_the_exact_effective_contract():
+    assert XU_RUNTIME_LOCK_POLICY == "shared_xrd_tools_xu_rlock_v1"
+    assert XU_RUNTIME_EFFECTIVE_NTHREADS == 1
+    assert xu_runtime_requirements_projection(XuRuntimeRequirements()) == (
+        "1.7.12",
+        "1.7.12",
+        "2.5.1",
+        1e-8,
+        8,
+        "CPython",
+        "3.13.14",
+        "Darwin",
+        "arm64",
+        XU_RUNTIME_LOCK_POLICY,
+        XU_RUNTIME_EFFECTIVE_NTHREADS,
+    )
+    with pytest.raises(TypeError, match="must be exact"):
+        xu_runtime_requirements_projection(object())
 
 
 def test_xu_runtime_availability_is_engine_light(monkeypatch):
@@ -142,3 +170,73 @@ def test_xu_runtime_is_reentrant_and_serializes_threads():
     assert config.NTHREADS == before
     assert XU_RUNTIME_LOCK.acquire(timeout=1)
     XU_RUNTIME_LOCK.release()
+
+
+def test_xu_runtime_active_modules_are_owner_thread_only_and_expire():
+    session = xu_runtime_session()
+    failures = []
+    with session:
+        assert session.active is True
+        xu_module, numpy_module = session.active_modules()
+        assert xu_module.__version__ == "1.7.12"
+        assert numpy_module.__version__ == "2.5.1"
+        assert require_active_xu_runtime_session(session) is session
+
+        def foreign_thread():
+            try:
+                session.active_modules()
+            except BaseException as error:
+                failures.append(error)
+
+        thread = Thread(target=foreign_thread)
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive()
+        exit_failures = []
+
+        def foreign_exit():
+            try:
+                session.__exit__(None, None, None)
+            except BaseException as error:
+                exit_failures.append(error)
+
+        exit_thread = Thread(target=foreign_exit)
+        exit_thread.start()
+        exit_thread.join(5)
+        assert not exit_thread.is_alive()
+        assert len(exit_failures) == 1
+        assert type(exit_failures[0]) is XuRuntimeUnsupported
+        assert exit_failures[0].code == "XU_RUNTIME_SESSION_INACTIVE"
+        assert session.active is True
+    assert session.active is False
+    assert len(failures) == 1
+    assert type(failures[0]) is XuRuntimeUnsupported
+    assert failures[0].code == "XU_RUNTIME_SESSION_INACTIVE"
+    with pytest.raises(XuRuntimeUnsupported) as raised:
+        session.active_modules()
+    assert raised.value.code == "XU_RUNTIME_SESSION_INACTIVE"
+    with pytest.raises(TypeError, match="must be exact"):
+        require_active_xu_runtime_session(object())
+
+
+def test_importing_rsm_gridding_does_not_import_xrayutilities():
+    repository = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.fspath(repository / "src")
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import xrd_tools.rsm.gridding; "
+                "assert 'xrayutilities' not in sys.modules"
+            ),
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

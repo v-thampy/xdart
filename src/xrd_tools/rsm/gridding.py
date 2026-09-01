@@ -19,24 +19,24 @@ results saved across sessions) see :func:`combine_grids` /
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
-import types
 from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
 from xrd_tools.core.geometry import DetectorHeader, PixelQMap
+from xrd_tools.core.geometry.xu_runtime import (
+    XuRuntimeSession,
+    require_active_xu_runtime_session,
+    xu_runtime_session,
+)
 from xrd_tools.rsm.volume import RSMVolume
 
-# xrayutilities is required for any real gridding call; the try/except
-# lets the module import in environments where xu isn't installed (e.g.
-# CI sandboxes), so tests can monkeypatch ``xu.Gridder3D`` and exercise
-# the chunk-handoff machinery without the full RSM stack.
-try:
-    import xrayutilities as xu
-except ModuleNotFoundError:  # pragma: no cover — exercised in sandbox only
-    xu = types.SimpleNamespace(Gridder3D=None)
+# Private test seam. Production obtains Gridder3D only from an active shared
+# XuRuntimeSession; importing this module never imports xrayutilities.
+_GRIDDER3D_OVERRIDE = None
 
 
 logger = logging.getLogger(__name__)
@@ -60,10 +60,35 @@ logger = logging.getLogger(__name__)
 # Unified onto ``Σraw/Σnorm`` per
 # docs/design/design_stitch_rsm_accumulator_jun2026.md.)
 
-def _new_gridder(bins: tuple[int, int, int],
-                 bounds: tuple[float, ...] | None = None):
+@contextmanager
+def _gridder_runtime(runtime_session: XuRuntimeSession | None):
+    if runtime_session is not None:
+        yield require_active_xu_runtime_session(runtime_session)
+        return
+    if _GRIDDER3D_OVERRIDE is not None:
+        yield None
+        return
+    with xu_runtime_session() as owned:
+        yield owned
+
+
+def _gridder_type(runtime_session: XuRuntimeSession | None):
+    if runtime_session is None:
+        if _GRIDDER3D_OVERRIDE is None:
+            raise RuntimeError("RSM gridder has no active XU runtime")
+        return _GRIDDER3D_OVERRIDE
+    xu_module, _numpy_module = runtime_session.active_modules()
+    return xu_module.Gridder3D
+
+
+def _new_gridder(
+    bins: tuple[int, int, int],
+    bounds: tuple[float, ...] | None = None,
+    *,
+    runtime_session: XuRuntimeSession | None,
+):
     """A KeepData(True) + Normalize(False) Gridder3D (bare-SUM accumulator)."""
-    g = xu.Gridder3D(*bins)
+    g = _gridder_type(runtime_session)(*bins)
     g.KeepData(True)
     g.Normalize(False)
     if bounds is not None:
@@ -125,6 +150,7 @@ def grid_img_data(
     roi: tuple[int, int, int, int] | None = None,
     mask_static_pixels: bool = True,
     weight: np.ndarray | None = None,
+    runtime_session: XuRuntimeSession | None = None,
 ) -> RSMVolume:
     """Map a 3D image stack to reciprocal space and bin onto a 3D grid.
 
@@ -162,6 +188,8 @@ def grid_img_data(
     RSMVolume
         Gridded H-K-L volume.
     """
+    if runtime_session is not None:
+        require_active_xu_runtime_session(runtime_session)
     img = np.array(img, dtype=float, copy=True)
     if img.ndim != 3:
         raise ValueError(
@@ -193,17 +221,28 @@ def grid_img_data(
     )
 
     bounds = _qbounds(qx, qy, qz)
-    grid_raw = _new_gridder(bins, bounds)
-    grid_norm = _new_gridder(bins, bounds)
-    _feed_pair(grid_raw, grid_norm, qx, qy, qz, img,
-               1.0 if weight is None else weight)
+    with _gridder_runtime(runtime_session) as active_runtime:
+        grid_raw = _new_gridder(
+            bins, bounds, runtime_session=active_runtime
+        )
+        grid_norm = _new_gridder(
+            bins, bounds, runtime_session=active_runtime
+        )
+        _feed_pair(
+            grid_raw,
+            grid_norm,
+            qx,
+            qy,
+            qz,
+            img,
+            1.0 if weight is None else weight,
+        )
+        h = np.array(grid_raw.xaxis, dtype=float, copy=True)
+        k = np.array(grid_raw.yaxis, dtype=float, copy=True)
+        l = np.array(grid_raw.zaxis, dtype=float, copy=True)
+        intensity = _pair_intensity(grid_raw, grid_norm)
 
-    return RSMVolume(
-        h=np.asarray(grid_raw.xaxis, dtype=float),
-        k=np.asarray(grid_raw.yaxis, dtype=float),
-        l=np.asarray(grid_raw.zaxis, dtype=float),
-        intensity=_pair_intensity(grid_raw, grid_norm),
-    )
+    return RSMVolume(h=h, k=k, l=l, intensity=intensity)
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +329,21 @@ class StreamingGridder:
     plus the gridder's bin buffer of ``bins[0] × bins[1] × bins[2] × 8``.
     """
 
-    def __init__(self, mapper: PixelQMap, bins: tuple[int, int, int]) -> None:
+    def __init__(
+        self,
+        mapper: PixelQMap,
+        bins: tuple[int, int, int],
+        *,
+        runtime_session: XuRuntimeSession | None = None,
+    ) -> None:
+        if runtime_session is not None:
+            require_active_xu_runtime_session(runtime_session)
         self.mapper = mapper
         self.bins = tuple(int(b) for b in bins)
+        self._runtime_session = runtime_session
         # the Σraw and Σnorm accumulators (P6) — both KeepData+Normalize(False)
-        self._grid_raw: xu.Gridder3D | None = None
-        self._grid_norm: xu.Gridder3D | None = None
+        self._grid_raw: object | None = None
+        self._grid_norm: object | None = None
         self._bounds: tuple[float, float, float, float, float, float] | None = None
         self.n_frames_processed: int = 0
 
@@ -328,8 +376,13 @@ class StreamingGridder:
                                  f"got ({lo}, {hi})")
 
         bounds = (qxmin, qxmax, qymin, qymax, qzmin, qzmax)
-        self._grid_raw = _new_gridder(self.bins, bounds)
-        self._grid_norm = _new_gridder(self.bins, bounds)
+        with _gridder_runtime(self._runtime_session) as active_runtime:
+            self._grid_raw = _new_gridder(
+                self.bins, bounds, runtime_session=active_runtime
+            )
+            self._grid_norm = _new_gridder(
+                self.bins, bounds, runtime_session=active_runtime
+            )
         self._bounds = bounds
 
     def scout(
@@ -469,20 +522,28 @@ class StreamingGridder:
                 )
             img[:, sm] = np.nan
 
-        qx, qy, qz = self.mapper.pixel_q(
-            angles,
-            energy,
-            UB=UB,
-            roi=roi,
-            image_shape=img.shape,
-        )
-        if qx.shape != img.shape:
-            raise ValueError(
-                f"per-pixel q shape {qx.shape} does not match chunk shape "
-                f"{img.shape}; check angle array lengths"
+        with _gridder_runtime(self._runtime_session):
+            qx, qy, qz = self.mapper.pixel_q(
+                angles,
+                energy,
+                UB=UB,
+                roi=roi,
+                image_shape=img.shape,
             )
-        _feed_pair(self._grid_raw, self._grid_norm, qx, qy, qz, img,
-                   1.0 if weight is None else weight)
+            if qx.shape != img.shape:
+                raise ValueError(
+                    f"per-pixel q shape {qx.shape} does not match chunk shape "
+                    f"{img.shape}; check angle array lengths"
+                )
+            _feed_pair(
+                self._grid_raw,
+                self._grid_norm,
+                qx,
+                qy,
+                qz,
+                img,
+                1.0 if weight is None else weight,
+            )
         self.n_frames_processed += img.shape[0]
 
     # ------------------------------------------------------------------
@@ -499,12 +560,12 @@ class StreamingGridder:
             raise RuntimeError(
                 "no chunks processed; call add() at least once before to_volume()."
             )
-        return RSMVolume(
-            h=np.asarray(self._grid_raw.xaxis, dtype=float),
-            k=np.asarray(self._grid_raw.yaxis, dtype=float),
-            l=np.asarray(self._grid_raw.zaxis, dtype=float),
-            intensity=_pair_intensity(self._grid_raw, self._grid_norm),
-        )
+        with _gridder_runtime(self._runtime_session):
+            h = np.array(self._grid_raw.xaxis, dtype=float, copy=True)
+            k = np.array(self._grid_raw.yaxis, dtype=float, copy=True)
+            l = np.array(self._grid_raw.zaxis, dtype=float, copy=True)
+            intensity = _pair_intensity(self._grid_raw, self._grid_norm)
+        return RSMVolume(h=h, k=k, l=l, intensity=intensity)
 
 
 def _pad_range(lo: float, hi: float, pad: float) -> tuple[float, float]:
@@ -532,6 +593,7 @@ def grid_img_data_streaming(
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
     weight: np.ndarray | None = None,
+    runtime_session: XuRuntimeSession | None = None,
 ) -> RSMVolume:
     """Stream a single in-memory image stack through :class:`StreamingGridder`.
 
@@ -581,7 +643,9 @@ def grid_img_data_streaming(
             f"per-frame weight has {weight_arr.shape[0]} frames but the stack has "
             f"{n_frames}; a 3D weight must be (N, H, W) with N == img.shape[0].")
 
-    sg = StreamingGridder(mapper, bins)
+    sg = StreamingGridder(
+        mapper, bins, runtime_session=runtime_session
+    )
     if q_bounds is None:
         sg.scout(
             [(list(angles), energy, UB, img.shape[-2:])],

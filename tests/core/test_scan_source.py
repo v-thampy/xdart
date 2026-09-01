@@ -113,7 +113,9 @@ def _reset_gridder_instances():
 
 @pytest.fixture
 def patched_xu(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
+    monkeypatch.setattr(
+        gridding_module, "_GRIDDER3D_OVERRIDE", _FakeGridder3D
+    )
     monkeypatch.setattr(
         DiffractometerConfig, "make_hxrd",
         lambda self, energy: _FakeHXRD(),

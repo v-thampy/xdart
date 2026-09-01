@@ -19,13 +19,18 @@ from xrd_tools.analysis.canonical_fingerprint import (
 import xrd_tools.analysis.rsm_geometry_asset as rsm_asset_module
 from xrd_tools.analysis.rsm_geometry_asset import (
     CANONICAL_RSM_GEOMETRY_LOCATOR,
+    RSMEffectiveGeometry,
     RSMGeometryAssetInput,
     RSMGeometryAssetRefused,
+    RSMMemberGeometryBinding,
+    bind_rsm_member_geometry,
     canonical_rsm_geometry_resource_bytes,
     capture_rsm_geometry_asset,
     install_canonical_rsm_geometry_asset,
+    lower_rsm_effective_geometry,
     parse_rsm_geometry_asset_bytes,
     revalidate_rsm_geometry_asset,
+    rsm_effective_pixel_q_map,
     rsm_geometry_asset_input,
 )
 
@@ -666,3 +671,327 @@ assert 'xrd_tools.analysis.scan_operations' not in sys.modules
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def _installed_effective_geometry(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    receipt = install_canonical_rsm_geometry_asset(project_root=project)
+    return receipt, lower_rsm_effective_geometry(receipt)
+
+
+def test_rsm_effective_geometry_lowers_every_exact_psic_and_runtime_fact(tmp_path):
+    from types import MappingProxyType
+
+    from xrd_tools.core.geometry import (
+        DetectorHeader,
+        Diffractometer,
+        ImageOrientation,
+        PixelQMap,
+    )
+    from xrd_tools.core.geometry.xu_runtime import (
+        XuRuntimeRequirements,
+        xu_runtime_requirements_projection,
+    )
+
+    receipt, effective = _installed_effective_geometry(tmp_path)
+    assert type(effective) is RSMEffectiveGeometry
+    assert type(effective.diffractometer_projection) is Diffractometer
+    assert effective.diffractometer_projection == Diffractometer.psic()
+    assert all(
+        isinstance(
+            getattr(effective.diffractometer_projection, name),
+            MappingProxyType,
+        )
+        for name in ("qconv_kwargs", "hxrd_kwargs", "ang2q_kwargs")
+    )
+    assert effective.detector_header == DetectorHeader(
+        cch1=97.0,
+        cch2=243.0,
+        pwidth1=0.172,
+        pwidth2=0.172,
+        distance=1014.7173,
+        Nch1=195,
+        Nch2=487,
+    )
+    assert effective.image_orientation == ImageOrientation()
+    assert effective.roi == (0, -1, 0, -1)
+    assert effective.runtime_requirements == XuRuntimeRequirements()
+    assert xu_runtime_requirements_projection(effective.runtime_requirements) == (
+        "1.7.12",
+        "1.7.12",
+        "2.5.1",
+        1e-8,
+        8,
+        "CPython",
+        "3.13.14",
+        "Darwin",
+        "arm64",
+        "shared_xrd_tools_xu_rlock_v1",
+        1,
+    )
+    psic_projection = (
+        "psic",
+        (
+            ("nu", 1.0, 0.0),
+            ("del", 1.0, 0.0),
+            ("", 1.0, 0.0),
+            ("eta", 1.0, 0.0),
+        ),
+        ("x+", "z-", "y+", "z-"),
+        ("x+", "z-"),
+        (0.0, 1.0, 0.0),
+        ("z-", "x-"),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        "real",
+        tuple((role, 1.0, 0.0) for role in ("mu", "eta", "chi", "phi", "nu", "del")),
+        ("eta", "chi", "phi", "mu"),
+        ("del", "nu"),
+        (),
+        (),
+        (),
+        None,
+    )
+    expected = analysis_canonical_fingerprint(
+        "rsm-effective-geometry-v1",
+        (
+            receipt.receipt_fingerprint,
+            EXPECTED_SEMANTIC,
+            psic_projection,
+            (97.0, 243.0, 0.172, 0.172, 1014.7173, 195, 487),
+            (0, False, False, False),
+            (0, -1, 0, -1),
+            xu_runtime_requirements_projection(XuRuntimeRequirements()),
+        ),
+    )
+    assert effective.fingerprint == expected
+    mapper = rsm_effective_pixel_q_map(effective)
+    assert type(mapper) is PixelQMap
+    assert mapper.diff_config is effective.diffractometer_projection
+    assert mapper.header is effective.detector_header
+
+
+def test_rsm_effective_geometry_is_owned_nested_immutable_and_revalidated(tmp_path):
+    receipt, effective = _installed_effective_geometry(tmp_path)
+    selectors = tuple(
+        (role, __import__(
+            "xrd_tools.analysis.module_transaction",
+            fromlist=["MetadataColumnSelector"],
+        ).MetadataColumnSelector(role, 0))
+        for role in ("mu", "eta", "chi", "phi", "nu", "del")
+    )
+    binding = bind_rsm_member_geometry(
+        effective, member_ordinal=0, motor_selectors=selectors
+    )
+    with pytest.raises(TypeError, match="factory-owned"):
+        RSMEffectiveGeometry(
+            effective.asset_receipt_fingerprint,
+            effective.asset_semantic_fingerprint,
+            effective.diffractometer_projection,
+            effective.detector_header,
+            effective.image_orientation,
+            effective.roi,
+            effective.runtime_requirements,
+            effective.fingerprint,
+        )
+    with pytest.raises(TypeError, match="factory-owned"):
+        RSMMemberGeometryBinding(
+            binding.member_ordinal,
+            binding.effective_geometry_fingerprint,
+            binding.motor_selectors,
+            binding.fingerprint,
+        )
+    for value in (effective, binding):
+        for operation in (
+            copy.copy,
+            copy.deepcopy,
+            lambda item: pickle.dumps(item),
+            lambda item: replace(item),
+            lambda item: copy.replace(item),
+        ):
+            with pytest.raises(TypeError):
+                operation(value)
+    for name in ("qconv_kwargs", "hxrd_kwargs", "ang2q_kwargs"):
+        with pytest.raises(TypeError):
+            getattr(effective.diffractometer_projection, name)["foreign"] = 1
+
+    target = Path(receipt.project_root) / receipt.lexical_relative_path
+    target.touch()
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        lower_rsm_effective_geometry(receipt)
+    assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
+
+
+def test_rsm_effective_geometry_binds_receipt_custody_separately_from_semantics(
+    tmp_path,
+):
+    first_project = tmp_path / "first"
+    second_project = tmp_path / "second"
+    first_project.mkdir()
+    second_project.mkdir()
+    first_receipt = install_canonical_rsm_geometry_asset(
+        project_root=first_project
+    )
+    second_receipt = install_canonical_rsm_geometry_asset(
+        project_root=second_project
+    )
+    assert first_receipt.semantic_fingerprint == second_receipt.semantic_fingerprint
+    assert first_receipt.receipt_fingerprint != second_receipt.receipt_fingerprint
+    first = lower_rsm_effective_geometry(first_receipt)
+    second = lower_rsm_effective_geometry(second_receipt)
+    assert first.asset_semantic_fingerprint == second.asset_semantic_fingerprint
+    assert first.asset_receipt_fingerprint != second.asset_receipt_fingerprint
+    assert first.fingerprint != second.fingerprint
+
+
+def test_rsm_effective_lowering_refuses_drift_in_every_psic_projection_group(
+    tmp_path, monkeypatch
+):
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.core.geometry.diffractometer import AngleMapping
+
+    project = tmp_path / "project"
+    project.mkdir()
+    receipt = install_canonical_rsm_geometry_asset(project_root=project)
+    base = Diffractometer.psic()
+    variants = (
+        replace(base, preset="foreign"),
+        replace(base, rot1=replace(base.rot1, offset=1.0)),
+        replace(base, rot2=replace(base.rot2, source_motor="foreign")),
+        replace(base, rot3=AngleMapping(source_motor="foreign")),
+        replace(base, incident_angle=replace(base.incident_angle, sign=-1.0)),
+        replace(base, sample_circles=tuple(reversed(base.sample_circles))),
+        replace(base, detector_circles=tuple(reversed(base.detector_circles))),
+        replace(base, r_i=(1.0, 0.0, 0.0)),
+        replace(base, camera=("x+", "z-")),
+        replace(base, hxrd_n=(1.0, 0.0, 0.0)),
+        replace(base, hxrd_q=(1.0, 0.0, 0.0)),
+        replace(base, hxrd_geometry="reciprocal"),
+        replace(
+            base,
+            circle_motors=(
+                replace(base.circle_motors[0], offset=1.0),
+                *base.circle_motors[1:],
+            ),
+        ),
+        replace(base, sample_motors=tuple(reversed(base.sample_motors))),
+        replace(base, detector_motors=tuple(reversed(base.detector_motors))),
+        replace(base, qconv_kwargs={"foreign": 1}),
+        replace(base, hxrd_kwargs={"foreign": 1}),
+        replace(base, ang2q_kwargs={"foreign": 1}),
+        replace(base, calibration=object()),
+    )
+    for variant in variants:
+        with monkeypatch.context() as isolated:
+            isolated.setattr(
+                Diffractometer,
+                "psic",
+                classmethod(lambda _cls, _variant=variant, **_kwargs: _variant),
+            )
+            with pytest.raises(RSMGeometryAssetRefused) as raised:
+                lower_rsm_effective_geometry(receipt)
+            assert raised.value.code == "RSM_GEOMETRY_LOWERING_MISMATCH"
+
+
+def test_rsm_member_geometry_binding_is_ordered_occurrence_sensitive_and_local(
+    tmp_path,
+):
+    from xrd_tools.analysis.module_transaction import MetadataColumnSelector
+
+    _receipt, effective = _installed_effective_geometry(tmp_path)
+    roles = ("mu", "eta", "chi", "phi", "nu", "del")
+
+    def selectors(*, eta_occurrence=0):
+        return tuple(
+            (
+                role,
+                MetadataColumnSelector(
+                    role, eta_occurrence if role == "eta" else 0
+                ),
+            )
+            for role in roles
+        )
+
+    member0 = bind_rsm_member_geometry(
+        effective, member_ordinal=0, motor_selectors=selectors()
+    )
+    member1 = bind_rsm_member_geometry(
+        effective, member_ordinal=1, motor_selectors=selectors()
+    )
+    member1_eta1 = bind_rsm_member_geometry(
+        effective, member_ordinal=1, motor_selectors=selectors(eta_occurrence=1)
+    )
+    repeated0 = bind_rsm_member_geometry(
+        effective, member_ordinal=0, motor_selectors=selectors()
+    )
+    assert type(member0) is RSMMemberGeometryBinding
+    assert member0.fingerprint == repeated0.fingerprint
+    assert member0.fingerprint != member1.fingerprint
+    assert member1.fingerprint != member1_eta1.fingerprint
+    assert member0.fingerprint == repeated0.fingerprint
+    assert MetadataColumnSelector("Seconds", 7) not in tuple(
+        selector for _role, selector in member0.motor_selectors
+    )
+
+    with pytest.raises(TypeError):
+        bind_rsm_member_geometry(
+            effective, member_ordinal=True, motor_selectors=selectors()
+        )
+    with pytest.raises(TypeError):
+        bind_rsm_member_geometry(
+            effective,
+            member_ordinal=16,
+            motor_selectors=selectors(),
+        )
+    with pytest.raises(TypeError):
+        bind_rsm_member_geometry(
+            effective,
+            member_ordinal=0,
+            motor_selectors=(selectors()[1], selectors()[0], *selectors()[2:]),
+        )
+    duplicate = list(selectors())
+    duplicate[1] = ("eta", duplicate[0][1])
+    with pytest.raises(ValueError):
+        bind_rsm_member_geometry(
+            effective,
+            member_ordinal=0,
+            motor_selectors=tuple(duplicate),
+        )
+
+
+def test_rsm_effective_mapper_is_exactly_q_equivalent_to_legacy_psic(tmp_path):
+    import numpy as np
+
+    from xrd_tools.core.geometry import Diffractometer, PixelQMap
+
+    _receipt, effective = _installed_effective_geometry(tmp_path)
+    effective_mapper = rsm_effective_pixel_q_map(effective)
+    legacy_mapper = PixelQMap(Diffractometer.psic(), effective.detector_header)
+    angles = tuple(
+        np.asarray(values, dtype=np.float64)
+        for values in (
+            (0.0, 0.1),
+            (10.0, 10.1),
+            (90.0, 90.0),
+            (0.0, 0.0),
+            (1.0, 1.1),
+            (20.0, 20.1),
+        )
+    )
+    effective_q = effective_mapper.pixel_q(
+        angles,
+        13_000.007,
+        UB=np.eye(3),
+        roi=effective.roi,
+    )
+    legacy_q = legacy_mapper.pixel_q(
+        angles,
+        13_000.007,
+        UB=np.eye(3),
+        roi=effective.roi,
+    )
+    assert all(
+        np.array_equal(effective_axis, legacy_axis)
+        for effective_axis, legacy_axis in zip(effective_q, legacy_q, strict=True)
+    )

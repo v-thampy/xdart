@@ -288,7 +288,9 @@ class TestGridImgData:
 
         import xrd_tools.rsm.gridding as gridding_module
 
-        monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
+        monkeypatch.setattr(
+            gridding_module, "_GRIDDER3D_OVERRIDE", _FakeGridder3D
+        )
         monkeypatch.setattr(DiffractometerConfig, "make_hxrd", lambda self, energy: _FakeHXRD())
 
         mapper = PixelQMap(
@@ -354,7 +356,9 @@ class TestGridImgData:
 
         import xrd_tools.rsm.gridding as gridding_module
 
-        monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
+        monkeypatch.setattr(
+            gridding_module, "_GRIDDER3D_OVERRIDE", _FakeGridder3D
+        )
         monkeypatch.setattr(
             DiffractometerConfig, "make_hxrd", lambda self, energy: _FakeHXRD())
 
@@ -428,7 +432,9 @@ class TestGridImgData:
 
         import xrd_tools.rsm.gridding as gridding_module
 
-        monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
+        monkeypatch.setattr(
+            gridding_module, "_GRIDDER3D_OVERRIDE", _FakeGridder3D
+        )
         monkeypatch.setattr(DiffractometerConfig, "make_hxrd", lambda self, energy: _FakeHXRD())
 
         mapper = PixelQMap(

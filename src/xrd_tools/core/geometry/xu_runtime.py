@@ -10,7 +10,8 @@ import threading
 
 
 XU_RUNTIME_LOCK = threading.RLock()
-_LOCK_POLICY = "shared_xrd_tools_xu_rlock_v1"
+XU_RUNTIME_LOCK_POLICY = "shared_xrd_tools_xu_rlock_v1"
+XU_RUNTIME_EFFECTIVE_NTHREADS = 1
 
 
 class XuRuntimeUnsupported(RuntimeError):
@@ -89,7 +90,7 @@ class XuRuntimeExecutionRecord:
 
     def __post_init__(self) -> None:
         if (
-            self.lock_policy != _LOCK_POLICY
+            self.lock_policy != XU_RUNTIME_LOCK_POLICY
             or self.xrayutilities_distribution_version != "1.7.12"
             or self.xrayutilities_module_version != "1.7.12"
             or self.numpy_version != "2.5.1"
@@ -100,7 +101,7 @@ class XuRuntimeExecutionRecord:
             or type(self.nthreads_before) is not int
             or self.nthreads_before < 0
             or type(self.nthreads_effective) is not int
-            or self.nthreads_effective != 1
+            or self.nthreads_effective != XU_RUNTIME_EFFECTIVE_NTHREADS
             or type(self.nthreads_restored) is not int
             or self.nthreads_restored != self.nthreads_before
             or self.restore_passed is not True
@@ -184,12 +185,40 @@ class XuRuntimeSession:
         self._before: int | None = None
         self._mutation_attempted = False
         self._entered = False
+        self._owner_thread_id: int | None = None
 
     def __copy__(self):
         raise TypeError("XU runtime session is not copyable")
 
     def __deepcopy__(self, _memo):
         raise TypeError("XU runtime session is not copyable")
+
+    @property
+    def active(self) -> bool:
+        """Whether this exact session is active on the calling thread."""
+
+        return (
+            self._entered
+            and self.xu is not None
+            and self.numpy is not None
+            and self._owner_thread_id == threading.get_ident()
+        )
+
+    def require_active(self) -> "XuRuntimeSession":
+        """Return this session only to its active owning thread."""
+
+        if not self.active:
+            raise XuRuntimeUnsupported(
+                "XU_RUNTIME_SESSION_INACTIVE",
+                "XU runtime session is not active on the calling thread",
+            )
+        return self
+
+    def active_modules(self) -> tuple[object, object]:
+        """Return ``(xrayutilities, numpy)`` only to the owning thread."""
+
+        self.require_active()
+        return self.xu, self.numpy
 
     def _restore_config(self) -> int:
         if self._config is None or self._before is None:
@@ -217,6 +246,7 @@ class XuRuntimeSession:
             raise RuntimeError("XU runtime session is one-shot")
         self._entered = True
         XU_RUNTIME_LOCK.acquire()
+        self._owner_thread_id = threading.get_ident()
         try:
             availability = xu_runtime_availability(self.requirements)
             if not availability.available:
@@ -242,8 +272,11 @@ class XuRuntimeSession:
             self._config = config
             self._before = config.NTHREADS
             self._mutation_attempted = True
-            config.NTHREADS = 1
-            if type(config.NTHREADS) is not int or config.NTHREADS != 1:
+            config.NTHREADS = XU_RUNTIME_EFFECTIVE_NTHREADS
+            if (
+                type(config.NTHREADS) is not int
+                or config.NTHREADS != XU_RUNTIME_EFFECTIVE_NTHREADS
+            ):
                 raise XuRuntimeUnsupported(
                     "XU_RUNTIME_CONFIG_RESTORE_FAILED",
                     "xrayutilities NTHREADS could not be set to one",
@@ -262,6 +295,7 @@ class XuRuntimeSession:
             finally:
                 self.xu = None
                 self.numpy = None
+                self._owner_thread_id = None
                 XU_RUNTIME_LOCK.release()
             if restore_error is not None:
                 raise restore_error from primary
@@ -273,6 +307,11 @@ class XuRuntimeSession:
             ) from primary
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        if self._owner_thread_id != threading.get_ident():
+            raise XuRuntimeUnsupported(
+                "XU_RUNTIME_SESSION_INACTIVE",
+                "XU runtime session can only exit on its owning thread",
+            )
         restore_error: BaseException | None = None
         try:
             try:
@@ -281,20 +320,21 @@ class XuRuntimeSession:
                 restore_error = error
             else:
                 self.execution_record = XuRuntimeExecutionRecord(
-                    _LOCK_POLICY,
+                    XU_RUNTIME_LOCK_POLICY,
                     self.requirements.distribution_version,
                     self.requirements.module_version,
                     self.requirements.numpy_version,
                     self.requirements.config_epsilon,
                     self.requirements.config_digits,
                     self._before,
-                    1,
+                    XU_RUNTIME_EFFECTIVE_NTHREADS,
                     restored,
                     True,
                 )
         finally:
             self.xu = None
             self.numpy = None
+            self._owner_thread_id = None
             XU_RUNTIME_LOCK.release()
         if restore_error is not None:
             raise XuRuntimeUnsupported(
@@ -310,13 +350,49 @@ def xu_runtime_session(
     return XuRuntimeSession(requirements)
 
 
+def xu_runtime_requirements_projection(
+    requirements: XuRuntimeRequirements,
+) -> tuple[object, ...]:
+    """Canonical stable runtime facts used by effective geometry."""
+
+    if type(requirements) is not XuRuntimeRequirements:
+        raise TypeError("XU runtime requirements must be exact")
+    return (
+        requirements.distribution_version,
+        requirements.module_version,
+        requirements.numpy_version,
+        requirements.config_epsilon,
+        requirements.config_digits,
+        requirements.python_implementation,
+        requirements.python_version,
+        requirements.platform_system,
+        requirements.platform_machine,
+        XU_RUNTIME_LOCK_POLICY,
+        XU_RUNTIME_EFFECTIVE_NTHREADS,
+    )
+
+
+def require_active_xu_runtime_session(
+    session: XuRuntimeSession,
+) -> XuRuntimeSession:
+    """Admit only one exact active session on its owning thread."""
+
+    if type(session) is not XuRuntimeSession:
+        raise TypeError("XU runtime session must be exact")
+    return session.require_active()
+
+
 __all__ = [
     "XU_RUNTIME_LOCK",
+    "XU_RUNTIME_LOCK_POLICY",
+    "XU_RUNTIME_EFFECTIVE_NTHREADS",
     "XuRuntimeAvailability",
     "XuRuntimeExecutionRecord",
     "XuRuntimeRequirements",
     "XuRuntimeSession",
     "XuRuntimeUnsupported",
+    "require_active_xu_runtime_session",
     "xu_runtime_availability",
+    "xu_runtime_requirements_projection",
     "xu_runtime_session",
 ]

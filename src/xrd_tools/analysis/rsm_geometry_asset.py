@@ -88,6 +88,10 @@ _EXPECTED_VALUE = {
 _PROJECTION_FACTORY = object()
 _INPUT_FACTORY = object()
 _RECEIPT_FACTORY = object()
+_EFFECTIVE_FACTORY = object()
+_MEMBER_BINDING_FACTORY = object()
+_PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
+_MAX_RSM_MEMBERS = 16
 
 
 class RSMGeometryAssetRefused(ValueError):
@@ -628,6 +632,335 @@ def revalidate_rsm_geometry_asset(receipt: RSMGeometryAssetReceipt) -> bytes:
     return current.content
 
 
+def _uncopyable_geometry_value(kind: str):
+    def copy_value(self):
+        raise TypeError(f"{kind} is not copyable")
+
+    def deepcopy_value(self, _memo):
+        raise TypeError(f"{kind} is not copyable")
+
+    def reduce_value(self):
+        raise TypeError(f"{kind} is not serializable")
+
+    def reduce_ex_value(self, _protocol):
+        raise TypeError(f"{kind} is not serializable")
+
+    def replace_value(self, /, **_changes):
+        raise TypeError(f"{kind} is not replaceable")
+
+    return (
+        copy_value,
+        deepcopy_value,
+        reduce_value,
+        reduce_ex_value,
+        replace_value,
+    )
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMEffectiveGeometry:
+    """One immutable lowering of the authenticated RSM geometry asset."""
+
+    asset_receipt_fingerprint: str
+    asset_semantic_fingerprint: str
+    diffractometer_projection: object = field(repr=False)
+    detector_header: object
+    image_orientation: object
+    roi: tuple[int, int, int, int]
+    runtime_requirements: object
+    fingerprint: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _EFFECTIVE_FACTORY
+            or type(self.asset_receipt_fingerprint) is not str
+            or len(self.asset_receipt_fingerprint) != 64
+            or self.asset_semantic_fingerprint
+            != _RESOURCE_SEMANTIC_FINGERPRINT
+            or type(self.roi) is not tuple
+            or self.roi != (0, -1, 0, -1)
+            or type(self.fingerprint) is not str
+            or len(self.fingerprint) != 64
+        ):
+            raise TypeError("RSM effective geometry is not factory-owned")
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _uncopyable_geometry_value("RSM effective geometry")
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMMemberGeometryBinding:
+    """One member ordinal's exact ordered motor-selector binding."""
+
+    member_ordinal: int
+    effective_geometry_fingerprint: str
+    motor_selectors: tuple[tuple[str, object], ...]
+    fingerprint: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _MEMBER_BINDING_FACTORY
+            or type(self.member_ordinal) is not int
+            or not 0 <= self.member_ordinal < _MAX_RSM_MEMBERS
+            or type(self.effective_geometry_fingerprint) is not str
+            or len(self.effective_geometry_fingerprint) != 64
+            or type(self.motor_selectors) is not tuple
+            or len(self.motor_selectors) != len(_PSIC_ROLES)
+            or tuple(item[0] for item in self.motor_selectors) != _PSIC_ROLES
+            or type(self.fingerprint) is not str
+            or len(self.fingerprint) != 64
+        ):
+            raise TypeError("RSM member geometry binding is not factory-owned")
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _uncopyable_geometry_value("RSM member geometry binding")
+
+
+def _effective_diffractometer_value(diffractometer: object) -> tuple[object, ...]:
+    def mapping(value: object) -> tuple[object, ...]:
+        return (value.source_motor, value.sign, value.offset)
+
+    return (
+        diffractometer.preset,
+        tuple(
+            mapping(getattr(diffractometer, name))
+            for name in ("rot1", "rot2", "rot3", "incident_angle")
+        ),
+        tuple(diffractometer.sample_circles),
+        tuple(diffractometer.detector_circles),
+        tuple(diffractometer.r_i),
+        tuple(diffractometer.camera),
+        tuple(diffractometer.hxrd_n),
+        tuple(diffractometer.hxrd_q),
+        diffractometer.hxrd_geometry,
+        tuple(mapping(item) for item in diffractometer.circle_motors),
+        tuple(diffractometer.sample_motors),
+        tuple(diffractometer.detector_motors),
+        tuple(sorted(dict(diffractometer.qconv_kwargs).items())),
+        tuple(sorted(dict(diffractometer.hxrd_kwargs).items())),
+        tuple(sorted(dict(diffractometer.ang2q_kwargs).items())),
+        diffractometer.calibration,
+    )
+
+
+def lower_rsm_effective_geometry(
+    receipt: RSMGeometryAssetReceipt,
+) -> RSMEffectiveGeometry:
+    """Revalidate and lower one exact asset to the pinned psic geometry."""
+
+    if type(receipt) is not RSMGeometryAssetReceipt:
+        raise TypeError("RSM effective geometry requires an exact asset receipt")
+    revalidate_rsm_geometry_asset(receipt)
+
+    # These imports are intentionally delayed: importing the custody/parser
+    # module itself remains stdlib-only and does not load NumPy or an engine.
+    from xrd_tools.core.geometry.diffractometer import (
+        Diffractometer,
+        ImageOrientation,
+    )
+    from xrd_tools.core.geometry.pixel_q import DetectorHeader
+    from xrd_tools.core.geometry.xu_runtime import (
+        XuRuntimeRequirements,
+        xu_runtime_requirements_projection,
+    )
+
+    value = receipt.projection.value
+    diffractometer_value = value["diffractometer"]
+    detector_value = value["detector"]
+    roles = tuple(diffractometer_value["motor_roles"])
+    if roles != _PSIC_ROLES:
+        _refuse(
+            "RSM_GEOMETRY_SCHEMA_UNSUPPORTED",
+            "RSM motor role order is not the authenticated psic order",
+        )
+    diffractometer = Diffractometer.psic(
+        mu=roles[0],
+        eta=roles[1],
+        chi=roles[2],
+        phi=roles[3],
+        nu=roles[4],
+        del_=roles[5],
+    )
+    expected_diffractometer = (
+        diffractometer_value["preset"],
+        (
+            (roles[4], 1.0, 0.0),
+            (roles[5], 1.0, 0.0),
+            ("", 1.0, 0.0),
+            (roles[1], 1.0, 0.0),
+        ),
+        tuple(diffractometer_value["sample_circles"]),
+        tuple(diffractometer_value["detector_circles"]),
+        tuple(diffractometer_value["r_i"]),
+        tuple(diffractometer_value["camera"]),
+        tuple(diffractometer_value["hxrd_n"]),
+        tuple(diffractometer_value["hxrd_q"]),
+        diffractometer_value["hxrd_geometry"],
+        tuple((role, 1.0, 0.0) for role in roles),
+        (roles[1], roles[2], roles[3], roles[0]),
+        (roles[5], roles[4]),
+        (),
+        (),
+        (),
+        None,
+    )
+    if _effective_diffractometer_value(diffractometer) != expected_diffractometer:
+        _refuse(
+            "RSM_GEOMETRY_LOWERING_MISMATCH",
+            "Diffractometer.psic() differs from the authenticated asset",
+        )
+    if (
+        diffractometer.calibration is not None
+        or any(
+            dict(getattr(diffractometer, name))
+            for name in ("qconv_kwargs", "hxrd_kwargs", "ang2q_kwargs")
+        )
+    ):
+        _refuse(
+            "RSM_GEOMETRY_LOWERING_MISMATCH",
+            "psic lowering contains undocumented calibration or kwargs",
+        )
+    # Diffractometer is frozen, but its three mapping fields are ordinary
+    # dictionaries. Freeze those nested leaves before exposing the projection.
+    for name in ("qconv_kwargs", "hxrd_kwargs", "ang2q_kwargs"):
+        object.__setattr__(
+            diffractometer,
+            name,
+            MappingProxyType(dict(getattr(diffractometer, name))),
+        )
+
+    header_value = detector_value["header"]
+    detector_header = DetectorHeader(
+        cch1=header_value["cch1"],
+        cch2=header_value["cch2"],
+        pwidth1=header_value["pwidth1"],
+        pwidth2=header_value["pwidth2"],
+        distance=header_value["distance"],
+        Nch1=header_value["Nch1"],
+        Nch2=header_value["Nch2"],
+    )
+    orientation_value = detector_value["image_orientation"]
+    image_orientation = ImageOrientation(
+        rotation=orientation_value["rotation"],
+        flip_vertical=orientation_value["flip_vertical"],
+        flip_horizontal=orientation_value["flip_horizontal"],
+        transpose=orientation_value["transpose"],
+    )
+    roi = tuple(detector_value["roi"])
+    requirements = XuRuntimeRequirements()
+    identity = (
+        receipt.receipt_fingerprint,
+        receipt.semantic_fingerprint,
+        expected_diffractometer,
+        (
+            detector_header.cch1,
+            detector_header.cch2,
+            detector_header.pwidth1,
+            detector_header.pwidth2,
+            detector_header.distance,
+            detector_header.Nch1,
+            detector_header.Nch2,
+        ),
+        (
+            image_orientation.rotation,
+            image_orientation.flip_vertical,
+            image_orientation.flip_horizontal,
+            image_orientation.transpose,
+        ),
+        roi,
+        xu_runtime_requirements_projection(requirements),
+    )
+    fingerprint = analysis_canonical_fingerprint(
+        "rsm-effective-geometry-v1", identity
+    )
+    return RSMEffectiveGeometry(
+        receipt.receipt_fingerprint,
+        receipt.semantic_fingerprint,
+        diffractometer,
+        detector_header,
+        image_orientation,
+        roi,
+        requirements,
+        fingerprint,
+        _EFFECTIVE_FACTORY,
+    )
+
+
+def bind_rsm_member_geometry(
+    effective_geometry: RSMEffectiveGeometry,
+    *,
+    member_ordinal: int,
+    motor_selectors: tuple[tuple[str, object], ...],
+) -> RSMMemberGeometryBinding:
+    """Bind one member's exact motor occurrences to effective geometry."""
+
+    if type(effective_geometry) is not RSMEffectiveGeometry:
+        raise TypeError("RSM member binding requires exact effective geometry")
+    if type(member_ordinal) is not int or not 0 <= member_ordinal < _MAX_RSM_MEMBERS:
+        raise TypeError("RSM member ordinal must be an exact integer from 0 to 15")
+    if type(motor_selectors) is not tuple or len(motor_selectors) != len(_PSIC_ROLES):
+        raise TypeError("RSM motor selectors must be one exact six-tuple")
+    from xrd_tools.analysis.module_transaction import MetadataColumnSelector
+
+    admitted: list[tuple[str, MetadataColumnSelector]] = []
+    for expected_role, item in zip(_PSIC_ROLES, motor_selectors, strict=True):
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or item[0] != expected_role
+            or type(item[1]) is not MetadataColumnSelector
+        ):
+            raise TypeError("RSM motor selector binding is invalid")
+        admitted.append((expected_role, item[1]))
+    keys = tuple((selector.name, selector.occurrence) for _role, selector in admitted)
+    if len(set(keys)) != len(keys):
+        raise ValueError("RSM motor selector occurrences must be unique")
+    frozen = tuple(admitted)
+    fingerprint = analysis_canonical_fingerprint(
+        "rsm-member-geometry-binding-v1",
+        (
+            member_ordinal,
+            effective_geometry.fingerprint,
+            tuple(
+                (role, selector.name, selector.occurrence)
+                for role, selector in frozen
+            ),
+        ),
+    )
+    return RSMMemberGeometryBinding(
+        member_ordinal,
+        effective_geometry.fingerprint,
+        frozen,
+        fingerprint,
+        _MEMBER_BINDING_FACTORY,
+    )
+
+
+def rsm_effective_pixel_q_map(effective_geometry: RSMEffectiveGeometry):
+    """Build the exact PixelQMap projection for one effective geometry."""
+
+    if type(effective_geometry) is not RSMEffectiveGeometry:
+        raise TypeError("RSM PixelQMap requires exact effective geometry")
+    from xrd_tools.core.geometry.pixel_q import PixelQMap
+
+    return PixelQMap(
+        effective_geometry.diffractometer_projection,
+        effective_geometry.detector_header,
+    )
+
+
 def install_canonical_rsm_geometry_asset(
     *, project_root: str | Path
 ) -> RSMGeometryAssetReceipt:
@@ -706,10 +1039,15 @@ __all__ = [
     "RSMGeometryAssetProjection",
     "RSMGeometryAssetReceipt",
     "RSMGeometryAssetRefused",
+    "RSMEffectiveGeometry",
+    "RSMMemberGeometryBinding",
+    "bind_rsm_member_geometry",
     "canonical_rsm_geometry_resource_bytes",
     "capture_rsm_geometry_asset",
     "install_canonical_rsm_geometry_asset",
+    "lower_rsm_effective_geometry",
     "parse_rsm_geometry_asset_bytes",
     "revalidate_rsm_geometry_asset",
+    "rsm_effective_pixel_q_map",
     "rsm_geometry_asset_input",
 ]

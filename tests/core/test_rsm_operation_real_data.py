@@ -15,6 +15,11 @@ from xrd_tools.analysis.module_transaction import (
     ModuleOutputRequest,
     ModuleSourceReceipt,
 )
+from xrd_tools.analysis.rsm_geometry_asset import (
+    install_canonical_rsm_geometry_asset,
+    lower_rsm_effective_geometry,
+    rsm_effective_pixel_q_map,
+)
 from xrd_tools.analysis.rsm_operation import (
     RSMDetectorGeometry,
     RSMImageConditioning,
@@ -23,6 +28,7 @@ from xrd_tools.analysis.rsm_operation import (
     RSMOperationPlan,
     prepare_rsm_operation,
     required_rsm_selectors,
+    resolve_exact_rsm_q_bounds,
     run_rsm_operation,
 )
 from xrd_tools.analysis.scan_operations import (
@@ -30,7 +36,12 @@ from xrd_tools.analysis.scan_operations import (
     MetadataTablePlan,
     run_metadata_table,
 )
-from xrd_tools.core.geometry import DetectorHeader, ImageOrientation
+from xrd_tools.core.geometry import (
+    DetectorHeader,
+    Diffractometer,
+    ImageOrientation,
+    PixelQMap,
+)
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
@@ -167,6 +178,87 @@ def _scan43_request(
 def _float32_sha256(values: np.ndarray) -> str:
     contiguous = np.ascontiguousarray(values, dtype=np.float32)
     return hashlib.sha256(contiguous.tobytes()).hexdigest()
+
+
+@pytest.mark.slow
+def test_scan43_effective_asset_preserves_every_exact_q_value_image_free(
+    tmp_path, monkeypatch
+):
+    from xrayutilities import config
+
+    from xrd_tools.sources.spec import SpecSource
+
+    root = _rsm_root()
+    output = root / f".xdart-rsm-a2-q-only-{os.getpid()}-{tmp_path.name}.nexus"
+    assert not output.exists()
+
+    def forbidden_decode(*_args, **_kwargs):
+        raise AssertionError("RSM A2 q equivalence must not decode detector data")
+
+    monkeypatch.setattr(SpecSource, "load_frame", forbidden_decode)
+    request = _scan43_request(root, output, (40, 40, 40))
+    asset_project = tmp_path / "asset-project"
+    asset_project.mkdir()
+    effective = lower_rsm_effective_geometry(
+        install_canonical_rsm_geometry_asset(project_root=asset_project)
+    )
+    effective_mapper = rsm_effective_pixel_q_map(effective)
+    legacy_mapper = PixelQMap(
+        Diffractometer.psic(), request.plan.geometry.header
+    )
+    contribution_values = tuple(
+        {
+            (name, occurrence): value
+            for name, occurrence, value in contribution.values
+        }
+        for contribution in request.preflight.contributions
+    )
+    angles = tuple(
+        np.asarray(
+            [
+                values[(selector.name, selector.occurrence)]
+                for values in contribution_values
+            ],
+            dtype=np.float64,
+        )
+        for _role, selector in request.plan.geometry.motor_selectors
+    )
+    ub = np.asarray(request.preflight.ub, dtype=np.float64)
+    before = config.NTHREADS
+    for start in range(0, len(angles[0]), request.plan.chunk_size):
+        stop = min(start + request.plan.chunk_size, len(angles[0]))
+        chunk = tuple(values[start:stop] for values in angles)
+        effective_q = effective_mapper.pixel_q(
+            chunk,
+            request.preflight.energy_eV,
+            UB=ub,
+            roi=effective.roi,
+        )
+        legacy_q = legacy_mapper.pixel_q(
+            chunk,
+            request.preflight.energy_eV,
+            UB=ub,
+            roi=request.plan.geometry.roi,
+        )
+        assert all(
+            np.array_equal(effective_axis, legacy_axis)
+            for effective_axis, legacy_axis in zip(
+                effective_q, legacy_q, strict=True
+            )
+        )
+    effective_bounds = resolve_exact_rsm_q_bounds(
+        effective_mapper,
+        angles,
+        request.preflight.energy_eV,
+        ub,
+        roi=effective.roi,
+        chunk_size=request.plan.chunk_size,
+        max_frame_bytes=request.plan.max_frame_bytes,
+        max_chunk_bytes=request.plan.max_chunk_bytes,
+    )
+    assert effective_bounds == request.preflight.q_bounds == _Q_BOUNDS
+    assert config.NTHREADS == before
+    assert not output.exists()
 
 
 @pytest.mark.slow

@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from threading import Thread
 from typing import Any
 
 import numpy as np
@@ -146,7 +147,9 @@ def _reset_gridder_instances():
 @pytest.fixture
 def patched_xu(monkeypatch: pytest.MonkeyPatch):
     """Patch the xu.Gridder3D used by gridding.py + DiffractometerConfig.make_hxrd."""
-    monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
+    monkeypatch.setattr(
+        gridding_module, "_GRIDDER3D_OVERRIDE", _FakeGridder3D
+    )
     monkeypatch.setattr(
         DiffractometerConfig, "make_hxrd",
         lambda self, energy: _FakeHXRD(),
@@ -163,6 +166,109 @@ def _default_mapper(Nch1: int = 64, Nch2: int = 64) -> PixelQMap:
             Nch1=Nch1, Nch2=Nch2,
         ),
     )
+
+
+def test_streaming_gridder_explicit_runtime_owns_every_xu_access(monkeypatch):
+    from xrayutilities import config
+
+    from xrd_tools.core.geometry.xu_runtime import (
+        XuRuntimeUnsupported,
+        xu_runtime_session,
+    )
+
+    before = config.NTHREADS
+    runtime = xu_runtime_session()
+
+    class GuardedGridder:
+        def __init__(self, nx, ny, nz):
+            assert runtime.active
+            self._xaxis = np.linspace(-1.0, 1.0, nx)
+            self._yaxis = np.linspace(-1.0, 1.0, ny)
+            self._zaxis = np.linspace(-1.0, 1.0, nz)
+            self._data = np.zeros((nx, ny, nz), dtype=float)
+
+        @property
+        def xaxis(self):
+            assert runtime.active
+            return self._xaxis
+
+        @property
+        def yaxis(self):
+            assert runtime.active
+            return self._yaxis
+
+        @property
+        def zaxis(self):
+            assert runtime.active
+            return self._zaxis
+
+        @property
+        def data(self):
+            assert runtime.active
+            return self._data
+
+        def KeepData(self, _flag):  # noqa: N802
+            assert runtime.active
+
+        def Normalize(self, _flag):  # noqa: N802
+            assert runtime.active
+
+        def dataRange(self, *bounds, **_kwargs):  # noqa: N802
+            assert runtime.active
+            self._xaxis = np.linspace(bounds[0], bounds[1], len(self._xaxis))
+            self._yaxis = np.linspace(bounds[2], bounds[3], len(self._yaxis))
+            self._zaxis = np.linspace(bounds[4], bounds[5], len(self._zaxis))
+
+        def __call__(self, _qx, _qy, _qz, data):
+            assert runtime.active
+            self._data += float(np.nansum(data))
+
+    monkeypatch.setattr(
+        DiffractometerConfig,
+        "make_hxrd",
+        lambda self, energy: _FakeHXRD(),
+    )
+    with runtime:
+        monkeypatch.setattr(runtime.xu, "Gridder3D", GuardedGridder)
+        gridder = StreamingGridder(
+            _default_mapper(4, 5),
+            (3, 3, 3),
+            runtime_session=runtime,
+        )
+        gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        image = np.ones((2, 4, 5), dtype=float)
+        angles = [np.zeros(2, dtype=float)]
+        gridder.add(image, angles, 12_000.0)
+        volume = gridder.to_volume()
+        assert volume.shape == (3, 3, 3)
+
+        failures = []
+
+        def foreign_thread():
+            try:
+                StreamingGridder(
+                    _default_mapper(4, 5),
+                    (3, 3, 3),
+                    runtime_session=runtime,
+                )
+            except BaseException as error:
+                failures.append(error)
+
+        thread = Thread(target=foreign_thread)
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert len(failures) == 1
+        assert type(failures[0]) is XuRuntimeUnsupported
+        assert failures[0].code == "XU_RUNTIME_SESSION_INACTIVE"
+    assert config.NTHREADS == before
+    with pytest.raises(XuRuntimeUnsupported) as raised:
+        StreamingGridder(
+            _default_mapper(4, 5),
+            (3, 3, 3),
+            runtime_session=runtime,
+        )
+    assert raised.value.code == "XU_RUNTIME_SESSION_INACTIVE"
 
 
 # ---------------------------------------------------------------------------
@@ -571,22 +677,26 @@ class TestTwoGridderAccumulator:
         from xrd_tools.rsm.gridding import (
             _feed_pair, _new_gridder, _pair_intensity,
         )
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
         bins, bounds = (4, 4, 4), (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
         # two pixels in the SAME bin: raw 10, 20 with per-pixel norm 1, 3
         q = np.array([0.5, 0.5])
         img = np.array([10.0, 20.0])
 
-        gr = _new_gridder(bins, bounds); gn = _new_gridder(bins, bounds)
-        _feed_pair(gr, gn, q, q, q, img, np.array([1.0, 3.0]))
-        out = _pair_intensity(gr, gn)
-        # Σraw/Σnorm = (10 + 20)/(1 + 3) = 7.5  (the stitch accumulator)
-        assert np.nanmax(out) == pytest.approx(7.5)
-        assert np.isnan(out).any()          # empty bins are NaN, not 0
+        with xu_runtime_session() as runtime:
+            gr = _new_gridder(bins, bounds, runtime_session=runtime)
+            gn = _new_gridder(bins, bounds, runtime_session=runtime)
+            _feed_pair(gr, gn, q, q, q, img, np.array([1.0, 3.0]))
+            out = _pair_intensity(gr, gn)
+            # Σraw/Σnorm = (10 + 20)/(1 + 3) = 7.5.
+            assert np.nanmax(out) == pytest.approx(7.5)
+            assert np.isnan(out).any()      # empty bins are NaN, not 0
 
-        gr2 = _new_gridder(bins, bounds); gn2 = _new_gridder(bins, bounds)
-        _feed_pair(gr2, gn2, q, q, q, img, 1.0)
-        # unit norm ⇒ the count-mean (10+20)/2 = 15
-        assert np.nanmax(_pair_intensity(gr2, gn2)) == pytest.approx(15.0)
+            gr2 = _new_gridder(bins, bounds, runtime_session=runtime)
+            gn2 = _new_gridder(bins, bounds, runtime_session=runtime)
+            _feed_pair(gr2, gn2, q, q, q, img, 1.0)
+            # unit norm ⇒ the count-mean (10+20)/2 = 15
+            assert np.nanmax(_pair_intensity(gr2, gn2)) == pytest.approx(15.0)
 
     def test_masked_pixel_does_not_bias_denominator(self) -> None:
         """A NaN-data (masked) pixel drops from BOTH sums — not just the
@@ -595,13 +705,16 @@ class TestTwoGridderAccumulator:
         from xrd_tools.rsm.gridding import (
             _feed_pair, _new_gridder, _pair_intensity,
         )
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
         bins, bounds = (4, 4, 4), (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
         q = np.array([0.5, 0.5])
         img = np.array([10.0, np.nan])      # 2nd pixel masked
-        gr = _new_gridder(bins, bounds); gn = _new_gridder(bins, bounds)
-        _feed_pair(gr, gn, q, q, q, img, np.array([1.0, 1.0]))
-        # only the finite pixel survives ⇒ mean 10, NOT 10/2 = 5
-        assert np.nanmax(_pair_intensity(gr, gn)) == pytest.approx(10.0)
+        with xu_runtime_session() as runtime:
+            gr = _new_gridder(bins, bounds, runtime_session=runtime)
+            gn = _new_gridder(bins, bounds, runtime_session=runtime)
+            _feed_pair(gr, gn, q, q, q, img, np.array([1.0, 1.0]))
+            # only the finite pixel survives ⇒ mean 10, NOT 10/2 = 5
+            assert np.nanmax(_pair_intensity(gr, gn)) == pytest.approx(10.0)
 
     def test_nan_coord_pixel_dropped_not_clamped(self) -> None:
         """A non-finite q coordinate is dropped (xu would otherwise clamp it
@@ -610,11 +723,14 @@ class TestTwoGridderAccumulator:
         from xrd_tools.rsm.gridding import (
             _feed_pair, _new_gridder, _pair_intensity,
         )
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
         bins, bounds = (4, 4, 4), (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
         qx = np.array([0.5, np.nan])        # 2nd pixel has a NaN coordinate
         q = np.array([0.5, 0.5])
         img = np.array([10.0, 99.0])
-        gr = _new_gridder(bins, bounds); gn = _new_gridder(bins, bounds)
-        _feed_pair(gr, gn, qx, q, q, img, 1.0)
-        # the 99 at the NaN coord is gone; only the clean 10 remains
-        assert np.nanmax(_pair_intensity(gr, gn)) == pytest.approx(10.0)
+        with xu_runtime_session() as runtime:
+            gr = _new_gridder(bins, bounds, runtime_session=runtime)
+            gn = _new_gridder(bins, bounds, runtime_session=runtime)
+            _feed_pair(gr, gn, qx, q, q, img, 1.0)
+            # the 99 at the NaN coord is gone; only the clean 10 remains
+            assert np.nanmax(_pair_intensity(gr, gn)) == pytest.approx(10.0)
