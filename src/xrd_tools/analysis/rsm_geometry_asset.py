@@ -13,13 +13,14 @@ from pathlib import Path
 import stat
 from types import MappingProxyType
 
-from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
+from xrd_tools.analysis.canonical_fingerprint import analysis_canonical_fingerprint
 
 
 _MAX_ASSET_BYTES = 65_536
 _MAX_DEPTH = 6
 _MAX_NODES = 256
 _MAX_STRING_LENGTH = 256
+_MAX_PATH_UTF8_BYTES = 4_096
 _RESOURCE_PARTS = (
     "assets",
     "rsm",
@@ -85,6 +86,7 @@ _EXPECTED_VALUE = {
     },
 }
 _PROJECTION_FACTORY = object()
+_INPUT_FACTORY = object()
 _RECEIPT_FACTORY = object()
 
 
@@ -288,26 +290,52 @@ def _validate_exact_relative(locator: str) -> tuple[str, ...]:
     ):
         raise TypeError("RSM geometry locator must be a normalized relative path")
     try:
-        locator.encode("utf-8", errors="strict")
+        encoded = locator.encode("utf-8", errors="strict")
     except UnicodeEncodeError as error:
         raise TypeError("RSM geometry locator must be valid UTF-8 text") from error
+    if len(encoded) > _MAX_PATH_UTF8_BYTES:
+        raise TypeError("RSM geometry locator exceeds 4096 UTF-8 bytes")
     parts = Path(locator).parts
     if not parts or any(part in {"", os.curdir, os.pardir} for part in parts):
         raise TypeError("RSM geometry locator has an invalid component")
     return parts
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(eq=False, frozen=True, slots=True)
 class RSMGeometryAssetInput:
     locator: str | Path
+    _claim: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _claim: object) -> None:
+        if _claim is not _INPUT_FACTORY:
+            raise TypeError("RSM geometry input is not factory-owned")
         try:
             shown = os.fspath(self.locator)
         except TypeError as error:
             raise TypeError("RSM geometry locator must be path-like") from error
         _validate_exact_relative(shown)
         object.__setattr__(self, "locator", shown)
+
+    def __copy__(self):
+        raise TypeError("RSM geometry input is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM geometry input is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM geometry input is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM geometry input is not serializable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("RSM geometry input is not replaceable")
+
+
+def rsm_geometry_asset_input(locator: str | Path) -> RSMGeometryAssetInput:
+    """Create one immutable, factory-owned RSM geometry locator request."""
+
+    return RSMGeometryAssetInput(locator, _INPUT_FACTORY)
 
 
 def _project_path(project_root: str | Path) -> str:
@@ -320,8 +348,12 @@ def _project_path(project_root: str | Path) -> str:
     if type(shown) is not str or not shown or "\x00" in shown:
         _refuse("RSM_GEOMETRY_PROJECT_INVALID", "Project path is invalid")
     try:
-        shown.encode("utf-8", errors="strict")
+        encoded = shown.encode("utf-8", errors="strict")
+        if len(encoded) > _MAX_PATH_UTF8_BYTES:
+            raise ValueError("Project path exceeds 4096 UTF-8 bytes")
         project = os.path.normpath(os.path.abspath(shown))
+        if len(project.encode("utf-8", errors="strict")) > _MAX_PATH_UTF8_BYTES:
+            raise ValueError("normalized Project path exceeds 4096 UTF-8 bytes")
     except (OSError, ValueError, UnicodeEncodeError) as error:
         raise RSMGeometryAssetRefused(
             "RSM_GEOMETRY_PROJECT_INVALID", "Project path cannot be normalized"
@@ -410,6 +442,7 @@ def _capture_exact(
     project: str, relative: str
 ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
     try:
+        before_chain = _lexical_chain_states(project, relative)
         descriptor, opened_chain = _open_no_follow_chain(project, relative)
         try:
             opened = os.fstat(descriptor)
@@ -430,6 +463,7 @@ def _capture_exact(
     if (
         trailing
         or len(raw) != int(opened.st_size)
+        or before_chain != opened_chain
         or opened_chain != current_chain
         or opened_chain[-1] != _state(opened)
         or _state(opened) != _state(closed)
@@ -597,7 +631,7 @@ def revalidate_rsm_geometry_asset(receipt: RSMGeometryAssetReceipt) -> bytes:
 def install_canonical_rsm_geometry_asset(
     *, project_root: str | Path
 ) -> RSMGeometryAssetReceipt:
-    request = RSMGeometryAssetInput(CANONICAL_RSM_GEOMETRY_LOCATOR)
+    request = rsm_geometry_asset_input(CANONICAL_RSM_GEOMETRY_LOCATOR)
     project = _project_path(project_root)
     relative = request.locator
     target = os.path.join(project, relative)
@@ -616,8 +650,6 @@ def install_canonical_rsm_geometry_asset(
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptors: list[int] = []
-    created = False
-    parent_descriptor: int | None = None
     filename = Path(relative).parts[-1]
     try:
         current = os.open(os.sep, directory_flags)
@@ -630,9 +662,7 @@ def install_canonical_rsm_geometry_asset(
                 opened = os.open(part, directory_flags, dir_fd=current)
             descriptors.append(opened)
             current = opened
-        parent_descriptor = current
         descriptor = os.open(filename, file_flags, 0o644, dir_fd=current)
-        created = True
         try:
             view = memoryview(raw)
             offset = 0
@@ -650,11 +680,6 @@ def install_canonical_rsm_geometry_asset(
             "RSM_GEOMETRY_INSTALL_CONFLICT", "geometry destination appeared"
         ) from error
     except OSError as error:
-        if created and parent_descriptor is not None:
-            try:
-                os.unlink(filename, dir_fd=parent_descriptor)
-            except OSError:
-                pass
         raise RSMGeometryAssetRefused(
             "RSM_GEOMETRY_INSTALL_FAILED", "geometry could not be installed"
         ) from error
@@ -686,4 +711,5 @@ __all__ = [
     "install_canonical_rsm_geometry_asset",
     "parse_rsm_geometry_asset_bytes",
     "revalidate_rsm_geometry_asset",
+    "rsm_geometry_asset_input",
 ]

@@ -63,7 +63,7 @@ _EXPORTS = {
     "AnalysisDisposition": ("xrd_tools.analysis.scan_operations", "AnalysisDisposition"),
     "AnalysisSourceLeaseRefused": ("xrd_tools.analysis.scan_operations", "AnalysisSourceLeaseRefused"),
     "AnalysisSourceReceipt": ("xrd_tools.analysis.scan_operations", "AnalysisSourceReceipt"),
-    "analysis_canonical_fingerprint": ("xrd_tools.analysis.scan_operations", "analysis_canonical_fingerprint"),
+    "analysis_canonical_fingerprint": ("xrd_tools.analysis.canonical_fingerprint", "analysis_canonical_fingerprint"),
     "MetadataColumn": ("xrd_tools.analysis.scan_operations", "MetadataColumn"),
     "MetadataTablePlan": ("xrd_tools.analysis.scan_operations", "MetadataTablePlan"),
     "MetadataTableResult": ("xrd_tools.analysis.scan_operations", "MetadataTableResult"),

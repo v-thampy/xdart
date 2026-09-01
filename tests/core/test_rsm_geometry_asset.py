@@ -8,9 +8,15 @@ import os
 from pathlib import Path
 import pickle
 import stat
+import subprocess
+import sys
 
 import pytest
 
+from xrd_tools.analysis.canonical_fingerprint import (
+    analysis_canonical_fingerprint,
+)
+import xrd_tools.analysis.rsm_geometry_asset as rsm_asset_module
 from xrd_tools.analysis.rsm_geometry_asset import (
     CANONICAL_RSM_GEOMETRY_LOCATOR,
     RSMGeometryAssetInput,
@@ -20,6 +26,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     install_canonical_rsm_geometry_asset,
     parse_rsm_geometry_asset_bytes,
     revalidate_rsm_geometry_asset,
+    rsm_geometry_asset_input,
 )
 
 
@@ -29,6 +36,9 @@ EXPECTED_SHA256 = (
 )
 EXPECTED_SEMANTIC = (
     "a5841542c58c5ff33899ef13a6f3883c6f6e356eefb11c41d1f24936eed9f0fa"
+)
+FROZEN_VIEW_DIAGNOSTIC = (
+    "036cff52be68a8c4aa3eb6e96be4b02d56e6f230a9e076353fabe96011927b5c"
 )
 
 
@@ -56,6 +66,13 @@ def test_canonical_rsm_resource_has_frozen_exact_identity_and_values():
     assert projection.semantic_fingerprint == EXPECTED_SEMANTIC
     assert projection.content == raw
     assert not raw.endswith(b"\n")
+    assert analysis_canonical_fingerprint(
+        "rsm-geometry-asset-v1", json.loads(raw)
+    ) == EXPECTED_SEMANTIC
+    assert analysis_canonical_fingerprint(
+        "rsm-geometry-asset-v1", projection.value
+    ) == FROZEN_VIEW_DIAGNOSTIC
+    assert FROZEN_VIEW_DIAGNOSTIC != projection.semantic_fingerprint
 
     value = projection.value
     assert value["schema"] == "xdart.rsm_geometry"
@@ -186,7 +203,7 @@ def test_rsm_projection_and_receipt_are_factory_owned_noncopyable(tmp_path):
     target = project / "geometry.json"
     target.write_bytes(canonical_rsm_geometry_resource_bytes())
     receipt = capture_rsm_geometry_asset(
-        RSMGeometryAssetInput("geometry.json"), project_root=project
+        rsm_geometry_asset_input("geometry.json"), project_root=project
     )
     for operation in (
         copy.copy,
@@ -196,6 +213,24 @@ def test_rsm_projection_and_receipt_are_factory_owned_noncopyable(tmp_path):
     ):
         with pytest.raises(TypeError):
             operation(receipt)
+
+
+def test_rsm_input_is_factory_owned_noncopyable_and_nonreplaceable():
+    with pytest.raises(TypeError, match="factory-owned"):
+        RSMGeometryAssetInput("geometry.json")
+
+    request = rsm_geometry_asset_input("geometry.json")
+    for operation in (
+        copy.copy,
+        copy.deepcopy,
+        lambda value: pickle.dumps(value),
+        lambda value: replace(value),
+        lambda value: replace(value, locator="other.json"),
+        lambda value: copy.replace(value),
+        lambda value: copy.replace(value, locator="other.json"),
+    ):
+        with pytest.raises(TypeError):
+            operation(request)
 
 
 @pytest.mark.parametrize(
@@ -210,11 +245,12 @@ def test_rsm_projection_and_receipt_are_factory_owned_noncopyable(tmp_path):
         "a//geometry.json",
         "geometry\x00.json",
         "geometry-\udcff.json",
+        "x" * 10_000,
     ],
 )
 def test_rsm_input_refuses_nonexact_locator(locator):
     with pytest.raises(TypeError, match="RSM geometry locator"):
-        RSMGeometryAssetInput(locator)
+        rsm_geometry_asset_input(locator)
 
 
 def test_rsm_input_owns_mutable_pathlike_text():
@@ -225,17 +261,28 @@ def test_rsm_input_owns_mutable_pathlike_text():
             return self.shown
 
     mutable = MutablePath()
-    request = RSMGeometryAssetInput(mutable)
+    request = rsm_geometry_asset_input(mutable)
     mutable.shown = "changed.json"
     assert request.locator == "calibration/rsm/geometry.json"
     assert type(request.locator) is str
 
 
-@pytest.mark.parametrize("project_root", ["project\x00root", "project-\udcff-root"])
+def test_rsm_input_enforces_exact_utf8_byte_bound():
+    exact = "a/" + "é" * 2_047
+    assert len(exact.encode("utf-8")) == 4_096
+    assert rsm_geometry_asset_input(exact).locator == exact
+    with pytest.raises(TypeError, match="4096 UTF-8 bytes"):
+        rsm_geometry_asset_input(exact + "x")
+
+
+@pytest.mark.parametrize(
+    "project_root",
+    ["project\x00root", "project-\udcff-root", "x" * 10_000],
+)
 def test_rsm_capture_normalizes_hostile_project_text(project_root):
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
-            RSMGeometryAssetInput("geometry.json"), project_root=project_root
+            rsm_geometry_asset_input("geometry.json"), project_root=project_root
         )
     assert raised.value.code == "RSM_GEOMETRY_PROJECT_INVALID"
 
@@ -246,7 +293,7 @@ def test_rsm_capture_binds_spelling_revision_and_revalidation(tmp_path):
     target.parent.mkdir(parents=True)
     target.write_bytes(canonical_rsm_geometry_resource_bytes())
     receipt = capture_rsm_geometry_asset(
-        RSMGeometryAssetInput("calibration/rsm/geometry.json"),
+        rsm_geometry_asset_input("calibration/rsm/geometry.json"),
         project_root=project,
     )
     assert receipt.lexical_relative_path == "calibration/rsm/geometry.json"
@@ -274,7 +321,7 @@ def test_rsm_capture_refuses_project_and_asset_symlink_ancestry(tmp_path):
     alias.symlink_to(real_parent, target_is_directory=True)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
-            RSMGeometryAssetInput("geometry.json"),
+            rsm_geometry_asset_input("geometry.json"),
             project_root=alias / "project",
         )
     assert raised.value.code == "RSM_GEOMETRY_SYMLINK_REFUSED"
@@ -287,14 +334,14 @@ def test_rsm_capture_refuses_project_and_asset_symlink_ancestry(tmp_path):
     (project / "linked").symlink_to(outside, target_is_directory=True)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
-            RSMGeometryAssetInput("linked/geometry.json"), project_root=project
+            rsm_geometry_asset_input("linked/geometry.json"), project_root=project
         )
     assert raised.value.code == "RSM_GEOMETRY_SYMLINK_REFUSED"
 
     (project / "final.json").symlink_to(outside / "geometry.json")
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
-            RSMGeometryAssetInput("final.json"), project_root=project
+            rsm_geometry_asset_input("final.json"), project_root=project
         )
     assert raised.value.code == "RSM_GEOMETRY_SYMLINK_REFUSED"
 
@@ -310,7 +357,7 @@ def test_rsm_capture_refuses_nonregular_final_node(tmp_path, kind):
         os.mkfifo(target)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
-            RSMGeometryAssetInput("geometry"), project_root=project
+            rsm_geometry_asset_input("geometry"), project_root=project
         )
     assert raised.value.code == "RSM_GEOMETRY_NOT_REGULAR"
 
@@ -322,7 +369,7 @@ def test_rsm_capture_refuses_oversize_and_short_read(tmp_path, monkeypatch):
     target.write_bytes(b"x" * 65_537)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
-            RSMGeometryAssetInput("geometry.json"), project_root=project
+            rsm_geometry_asset_input("geometry.json"), project_root=project
         )
     assert raised.value.code == "RSM_GEOMETRY_PARSE_FAILED"
 
@@ -340,7 +387,7 @@ def test_rsm_capture_refuses_oversize_and_short_read(tmp_path, monkeypatch):
     monkeypatch.setattr("xrd_tools.analysis.rsm_geometry_asset.os.read", short_read)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
-            RSMGeometryAssetInput("geometry.json"), project_root=project
+            rsm_geometry_asset_input("geometry.json"), project_root=project
         )
     assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
 
@@ -366,9 +413,38 @@ def test_rsm_capture_refuses_before_after_mutation(tmp_path, monkeypatch):
     )
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
-            RSMGeometryAssetInput("geometry.json"), project_root=project
+            rsm_geometry_asset_input("geometry.json"), project_root=project
         )
     assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
+
+
+def test_rsm_capture_refuses_exact_byte_inode_swap_before_open(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "geometry.json"
+    raw = canonical_rsm_geometry_resource_bytes()
+    target.write_bytes(raw)
+    real_open = rsm_asset_module._open_no_follow_chain
+    held = []
+
+    def swap_then_open(project_path, relative, **kwargs):
+        held.append(target.open("rb"))
+        target.unlink()
+        target.write_bytes(raw)
+        return real_open(project_path, relative, **kwargs)
+
+    monkeypatch.setattr(rsm_asset_module, "_open_no_follow_chain", swap_then_open)
+    try:
+        with pytest.raises(RSMGeometryAssetRefused) as raised:
+            capture_rsm_geometry_asset(
+                rsm_geometry_asset_input("geometry.json"), project_root=project
+            )
+        assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
+    finally:
+        for stream in held:
+            stream.close()
 
 
 def test_rsm_installer_is_create_only_idempotent_and_conflict_safe(tmp_path):
@@ -401,6 +477,31 @@ def test_rsm_installer_refuses_symlink_parent_without_outside_write(tmp_path):
         install_canonical_rsm_geometry_asset(project_root=project)
     assert raised.value.code == "RSM_GEOMETRY_INSTALL_FAILED"
     assert list(outside.iterdir()) == []
+
+
+def test_rsm_installer_never_unlinks_foreign_name_race_replacement(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / CANONICAL_RSM_GEOMETRY_LOCATOR
+    foreign = b"foreign replacement"
+    attacked = False
+
+    def replace_name_then_fail(_descriptor, _payload):
+        nonlocal attacked
+        assert not attacked
+        attacked = True
+        target.unlink()
+        target.write_bytes(foreign)
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(rsm_asset_module.os, "write", replace_name_then_fail)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        install_canonical_rsm_geometry_asset(project_root=project)
+    assert attacked
+    assert raised.value.code == "RSM_GEOMETRY_INSTALL_FAILED"
+    assert target.read_bytes() == foreign
 
 
 @pytest.mark.parametrize("linked_component", ["package", "assets", "rsm", "final"])
@@ -466,17 +567,102 @@ def test_canonical_rsm_resource_refuses_dotdot_package_spelling(tmp_path, monkey
     assert raised.value.code == "RSM_CANONICAL_ASSET_UNAVAILABLE"
 
 
-def test_rsm_parser_is_engine_light(monkeypatch):
-    imported = []
-    real_import = __import__
+def test_canonical_rsm_resource_refuses_exact_byte_inode_swap_before_open(
+    tmp_path, monkeypatch
+):
+    raw = canonical_rsm_geometry_resource_bytes()
+    package = tmp_path / "package"
+    target = package / "assets" / "rsm" / _RESOURCE_NAME
+    target.parent.mkdir(parents=True)
+    target.write_bytes(raw)
+    real_open = rsm_asset_module._open_no_follow_chain
+    held = []
 
-    def guarded(name, *args, **kwargs):
-        if name.split(".", 1)[0] in {"numpy", "pyFAI", "xrayutilities"}:
-            imported.append(name)
-            raise AssertionError(name)
-        return real_import(name, *args, **kwargs)
+    def swap_then_open(project_path, relative, **kwargs):
+        held.append(target.open("rb"))
+        target.unlink()
+        target.write_bytes(raw)
+        return real_open(project_path, relative, **kwargs)
 
-    monkeypatch.setattr("builtins.__import__", guarded)
-    projection = parse_rsm_geometry_asset_bytes(canonical_rsm_geometry_resource_bytes())
-    assert projection.semantic_fingerprint == EXPECTED_SEMANTIC
-    assert imported == []
+    monkeypatch.setattr(rsm_asset_module.resources, "files", lambda _name: package)
+    monkeypatch.setattr(rsm_asset_module, "_open_no_follow_chain", swap_then_open)
+    try:
+        with pytest.raises(RSMGeometryAssetRefused) as raised:
+            canonical_rsm_geometry_resource_bytes()
+        assert raised.value.code == "RSM_CANONICAL_ASSET_UNAVAILABLE"
+    finally:
+        for stream in held:
+            stream.close()
+
+
+def test_extracted_canonical_fingerprint_preserves_golden_identities():
+    import numpy as np
+    from xrd_tools.analysis import canonical_fingerprint as helper
+    from xrd_tools.analysis import scan_operations
+
+    assert scan_operations.analysis_canonical_fingerprint is (
+        helper.analysis_canonical_fingerprint
+    )
+    assert scan_operations._digest is helper._digest
+    assert scan_operations._canonical_charge is helper._canonical_charge
+    assert helper._PublicFingerprintContainer.__module__ == (
+        "xrd_tools.analysis.scan_operations"
+    )
+    values = {
+        "mapping": analysis_canonical_fingerprint("x", {"b": 2, "a": 1}),
+        "list": analysis_canonical_fingerprint("x", [1, 2]),
+        "tuple": analysis_canonical_fingerprint("x", (1, 2)),
+        "path": analysis_canonical_fingerprint("x", Path("a")),
+        "array": analysis_canonical_fingerprint(
+            "x", np.array([[1, 2], [3, 4]], dtype="<i4")
+        ),
+        "missing": analysis_canonical_fingerprint(
+            "x", np.array([float("nan")], dtype="<f8"), allow_missing=True
+        ),
+    }
+    assert values == {
+        "mapping": "dda8fa340049c735335394b4f838f45ce43dcd4f7651b05a757532ac15c2ecb4",
+        "list": "a186a2ee3e183472b4ae1b11a0015253535a0c372b94313fd4eccd701d025828",
+        "tuple": "3a196003d76aae95e8a175e33dbfc7ae685c7f4138b47363418da942b607a83e",
+        "path": "a7c34e84160463ddb5ee58213f7ea4a932523b2c73329e3d6e786c06af69f806",
+        "array": "79cddde133016cac593096fa33aa6850ee40521e5a8818fd77f524f27279b6b0",
+        "missing": "be58818851b8c9b474b8ce2e2fd27f0764b7fdd77ae5cddc2797e6dc1e955e23",
+    }
+
+
+def test_rsm_parser_and_public_fingerprint_are_fresh_import_engine_light():
+    repository = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    source_root = os.fspath(repository / "src")
+    inherited = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_root if not inherited else source_root + os.pathsep + inherited
+    )
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    program = f"""
+import sys
+from xrd_tools.analysis.rsm_geometry_asset import (
+    canonical_rsm_geometry_resource_bytes,
+    parse_rsm_geometry_asset_bytes,
+)
+projection = parse_rsm_geometry_asset_bytes(canonical_rsm_geometry_resource_bytes())
+assert projection.semantic_fingerprint == {EXPECTED_SEMANTIC!r}
+from xrd_tools.analysis import analysis_canonical_fingerprint
+assert analysis_canonical_fingerprint('x', {{'b': 2, 'a': 1}}) == \
+    'dda8fa340049c735335394b4f838f45ce43dcd4f7651b05a757532ac15c2ecb4'
+forbidden = sorted(
+    name for name in sys.modules
+    if name.split('.', 1)[0] in {{'numpy', 'pyFAI', 'xrayutilities'}}
+)
+assert forbidden == [], forbidden
+assert 'xrd_tools.analysis.scan_operations' not in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
