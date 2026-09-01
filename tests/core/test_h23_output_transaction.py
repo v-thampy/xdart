@@ -1451,7 +1451,7 @@ def test_canonical_stage_never_retries_failed_observation(
         replace_calls += 1
         raise PermissionError(13, "Access is denied", str(destination), 5)
 
-    def fail_first_resolution(path):
+    def fail_first_resolution(path, *, hash_content=True):
         nonlocal observation_failed
         if (
             replace_calls
@@ -1460,7 +1460,7 @@ def test_canonical_stage_never_retries_failed_observation(
         ):
             observation_failed = True
             raise OSError("staging observation unavailable")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_REPLACE_RETRIES", 3, raising=False)
     monkeypatch.setattr(api, "_REPLACE_RETRY_DELAY_S", 0.0, raising=False)
@@ -1568,13 +1568,13 @@ def test_empty_pending_without_terminal_proof_enters_integrity_hold(
     target_observations = 0
     writes: list[Path] = []
 
-    def fail_first_terminal_verification(path):
+    def fail_first_terminal_verification(path, *, hash_content=True):
         nonlocal target_observations
         if Path(path) == target:
             target_observations += 1
             if target_observations == 2:
                 raise OSError("terminal receipt observation transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_first_terminal_verification)
 
@@ -1693,9 +1693,9 @@ def test_absent_target_appearance_at_publication_is_not_clobbered(
     real_capture = api._capture_target
     target_captures = 0
 
-    def appear_after_last_validation(path):
+    def appear_after_last_validation(path, *, hash_content=True):
         nonlocal target_captures
-        snapshot = real_capture(path)
+        snapshot = real_capture(path, hash_content=hash_content)
         if Path(path) == target and not snapshot.exists:
             target_captures += 1
             if target_captures == 2:
@@ -1823,7 +1823,7 @@ def test_post_link_observation_resolves_owned_publication_without_writer_replay(
     failed: list[str] = []
     writes: list[Path] = []
 
-    def fail_first_post_link_capture(path):
+    def fail_first_post_link_capture(path, *, hash_content=True):
         candidate = transaction._candidate
         if (
             Path(path) == target
@@ -1834,7 +1834,7 @@ def test_post_link_observation_resolves_owned_publication_without_writer_replay(
         ):
             failed.append("post-link")
             raise OSError("final fingerprint transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_first_post_link_capture)
 
@@ -1975,7 +1975,7 @@ def test_publication_terminal_observation_retries_after_authorized_source_cleanu
     failed: list[str] = []
     writes: list[Path] = []
 
-    def fail_terminal_after_candidate_cleanup(path):
+    def fail_terminal_after_candidate_cleanup(path, *, hash_content=True):
         if (
             Path(path) == target
             and target.exists()
@@ -1985,7 +1985,7 @@ def test_publication_terminal_observation_retries_after_authorized_source_cleanu
         ):
             failed.append("terminal")
             raise OSError("publication terminal observation transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_terminal_after_candidate_cleanup)
 
@@ -2046,11 +2046,11 @@ def test_private_reservation_observation_failure_retains_exact_owner(
     failed: list[str] = []
     writes: list[Path] = []
 
-    def fail_first_private_observation(path):
+    def fail_first_private_observation(path, *, hash_content=True):
         if Path(path) == private_path and private_path.exists() and not failed:
             failed.append(reservation)
             raise OSError(f"{reservation} reservation fingerprint transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_first_private_observation)
 
@@ -2099,7 +2099,7 @@ def test_staged_prior_observation_failure_resolves_and_restores_exact_prior(
     failed: list[str] = []
     writes: list[Path] = []
 
-    def fail_first_post_move_observation(path):
+    def fail_first_post_move_observation(path, *, hash_content=True):
         if (
             Path(path) == transaction.backup
             and transaction.backup.exists()
@@ -2108,7 +2108,7 @@ def test_staged_prior_observation_failure_resolves_and_restores_exact_prior(
         ):
             failed.append("post-move")
             raise OSError("staged prior fingerprint transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_first_post_move_observation)
 
@@ -2153,7 +2153,7 @@ def test_writer_primary_survives_candidate_observation_and_cleanup_failure(
     failed: list[str] = []
     writes: list[Path] = []
 
-    def fail_first_post_writer_observation(path):
+    def fail_first_post_writer_observation(path, *, hash_content=True):
         candidate = transaction._candidate
         if (
             Path(path) == candidate
@@ -2163,7 +2163,7 @@ def test_writer_primary_survives_candidate_observation_and_cleanup_failure(
         ):
             failed.append("post-writer")
             raise OSError("candidate fingerprint transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_first_post_writer_observation)
 
@@ -2279,7 +2279,7 @@ def test_same_inode_staged_prior_corruption_holds_until_exact_bytes_return(
     failed: list[int] = []
     writes: list[Path] = []
 
-    def fail_two_post_move_observations(path):
+    def fail_two_post_move_observations(path, *, hash_content=True):
         if (
             Path(path) == transaction.backup
             and transaction.backup.exists()
@@ -2288,7 +2288,7 @@ def test_same_inode_staged_prior_corruption_holds_until_exact_bytes_return(
         ):
             failed.append(len(failed) + 1)
             raise OSError("staged prior observation transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_two_post_move_observations)
 
@@ -2384,7 +2384,7 @@ def test_replacement_inode_staged_prior_forgery_remains_foreign_hold(
     failed: list[int] = []
     writes: list[Path] = []
 
-    def fail_two_post_move_observations(path):
+    def fail_two_post_move_observations(path, *, hash_content=True):
         if (
             Path(path) == transaction.backup
             and transaction.backup.exists()
@@ -2393,7 +2393,7 @@ def test_replacement_inode_staged_prior_forgery_remains_foreign_hold(
         ):
             failed.append(len(failed) + 1)
             raise OSError("staged prior observation transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_two_post_move_observations)
 
@@ -2710,7 +2710,7 @@ def test_rollback_terminal_observation_retries_after_authorized_source_cleanup(
     writes: list[Path] = []
     writer_attempted: list[str] = []
 
-    def fail_terminal_after_backup_cleanup(path):
+    def fail_terminal_after_backup_cleanup(path, *, hash_content=True):
         if (
             Path(path) == target
             and writer_attempted
@@ -2720,7 +2720,7 @@ def test_rollback_terminal_observation_retries_after_authorized_source_cleanup(
         ):
             failed.append("terminal")
             raise OSError("rollback terminal observation transient")
-        return real_capture(path)
+        return real_capture(path, hash_content=hash_content)
 
     monkeypatch.setattr(api, "_capture_target", fail_terminal_after_backup_cleanup)
 
@@ -3688,9 +3688,22 @@ def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
         if any(name in text for name in public_names):
             offenders.append(str(path.relative_to(source_root)))
     assert sorted(offenders) == sorted([
+        "xdart/gui/tabs/scattering/adapters/browse_loader.py",
+        "xdart/gui/tabs/scattering/adapters/external_operation.py",
+        "xdart/gui/tabs/scattering/adapters/run_executor.py",
+        "xdart/gui/tabs/scattering/browse_1d_hydration.py",
+        "xdart/gui/tabs/scattering/browse_1d_projection.py",
+        "xdart/gui/tabs/scattering/browse_values.py",
+        "xdart/gui/tabs/scattering/context_controller.py",
+        "xdart/gui/tabs/scattering/display_values.py",
+        "xdart/gui/tabs/scattering/page.py",
+        "xdart/gui/tabs/scattering/processed_browser.py",
+        "xdart/gui/tabs/scattering/workspace_operations.py",
         "xrd_tools/io/append.py",
         "xrd_tools/io/record_writer.py",
+        "xrd_tools/reduction/average.py",
         "xrd_tools/reduction/core.py",
+        "xrd_tools/reduction/reintegrate.py",
     ])
 
 
@@ -3720,7 +3733,9 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
         "xrd_tools/io/analysis_artifact.py",
         "xrd_tools/io/append.py",
         "xrd_tools/io/record_writer.py",
+        "xrd_tools/reduction/average.py",
         "xrd_tools/reduction/core.py",
+        "xrd_tools/reduction/reintegrate.py",
     }
     observed: set[str] = set()
     for base in (source_root / "xrd_tools", source_root / "xdart/modules"):

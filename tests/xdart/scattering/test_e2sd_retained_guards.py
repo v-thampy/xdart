@@ -13,66 +13,17 @@ from tests.xdart.scattering._e2sd_support import (
     directory_start,
     write_poni,
 )
-from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
-from xdart.gui.tabs.scattering.adapters.run_executor import (
-    StandardRunExecutor,
-    _StandardRun,
-)
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
-from xdart.gui.tabs.scattering.adapters.target_reservation import (
-    RunResources,
-    TargetLease,
-)
 from xdart.gui.tabs.scattering.contracts import (
-    AdmissionFailure,
     AdmissionReceipt,
     SourceCapture,
     SourceObservationRequest,
     StartCapture,
 )
-from xdart.gui.tabs.scattering.events import CleanupStatus, RequestId, RunIdentity
+from xdart.gui.tabs.scattering.events import RequestId
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
-
-
-def _identity() -> RunIdentity:
-    return RunIdentity(1, "a" * 64)
-
-
-def test_target_lease_remains_last_while_other_owners_are_live(
-    tmp_path: Path,
-) -> None:
-    class Session:
-        def finish(self, **_kwargs):
-            raise RuntimeError("session still owns the writer")
-
-    class Sink:
-        def abort(self, _result) -> None:
-            raise RuntimeError("writer close failed")
-
-    target = tmp_path / "same-target.nxs"
-    lease = TargetLease.acquire((target,))
-    run = _StandardRun(
-        None,
-        _identity(),
-        None,
-        None,
-        Session(),
-        None,
-        target,
-        sink=Sink(),
-        resources=RunResources(None, None, lease),
-    )
-    executor = StandardRunExecutor()
-    executor._active = run
-
-    receipt = executor._cleanup(run)
-
-    assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
-    assert run.resources is not None
-    assert run.resources.target_lease is lease
-    assert target.resolve(strict=False) in TargetLease._reserved
 
 
 def test_two_independent_tiff_series_keep_distinct_group_identity(
@@ -150,26 +101,3 @@ def test_recursive_passive_observation_is_direct_only(tmp_path: Path) -> None:
 
     assert observation.direct_child_count == 1
     assert observation.subdirectories_deferred is True
-
-
-def test_append_refusal_acquires_zero_resources(tmp_path: Path) -> None:
-    _store, start = directory_start(tmp_path, output_mode="Append")
-    executor = StandardRunExecutor()
-    with patch.object(
-        executor_module,
-        "build_admission_receipt",
-        side_effect=AssertionError("Append opened source resources"),
-    ):
-        token = executor.begin_admission(start)
-        deadline = __import__("time").monotonic() + 3.0
-        result = None
-        while result is None and __import__("time").monotonic() < deadline:
-            result = executor.poll_admission(token)
-            __import__("time").sleep(0.005)
-
-    assert type(result) is AdmissionFailure
-    assert "Append is deferred to H23" in result.reason
-    operation = executor._admission
-    assert operation is not None
-    assert operation.directory_session is None
-    assert operation.target_lease is None

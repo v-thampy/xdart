@@ -75,7 +75,7 @@ def test_v2_reference_fixture_is_headless_and_xdart_independent(tmp_path):
     env = dict(os.environ)
     env["PYTHONPATH"] = str(repo / "src")
     proc = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path / "headless.nxs"),
+        [sys.executable, "-c", script, str(tmp_path / "headless.nexus"),
          str(tmp_path / "source")],
         cwd=repo,
         env=env,
@@ -92,7 +92,7 @@ def test_v2_record_content_matches_normalized_legacy_signature(tmp_path):
     from tests.core._v2_record_fixture import write_reference_scan
     from tests.core.h5sig import h5_content_signature
 
-    out = write_reference_scan(str(tmp_path / "ref.nxs"),
+    out = write_reference_scan(str(tmp_path / "ref.nexus"),
                                str(tmp_path / "proj"))
     now = h5_content_signature(out)
     ref = json.loads(FIXTURE.read_text())
@@ -158,7 +158,7 @@ def test_v2_record_storage_layout_frozen(tmp_path):
     import h5py
     from tests.core._v2_record_fixture import write_reference_scan
 
-    out = write_reference_scan(str(tmp_path / "ref.nxs"), str(tmp_path / "proj"))
+    out = write_reference_scan(str(tmp_path / "ref.nexus"), str(tmp_path / "proj"))
     with h5py.File(out, "r") as f:
         # appendable integrated stacks: chunked + resizable along frame axis
         for p in ("entry/integrated_1d/intensity", "entry/integrated_1d/sigma",
@@ -198,7 +198,7 @@ def test_v2_record_integrated_stacks_compress(tmp_path):
               "entry/integrated_2d/intensity")
     # portable gzip
     out = write_reference_scan(
-        str(tmp_path / "g.nxs"), str(tmp_path / "gp"), compression="gzip"
+        str(tmp_path / "g.nexus"), str(tmp_path / "gp"), compression="gzip"
     )
     with h5py.File(out, "r") as f:
         for p in stacks:
@@ -206,7 +206,7 @@ def test_v2_record_integrated_stacks_compress(tmp_path):
             assert f[p].chunks is not None and f[p].maxshape[0] is None
     # default: compressed (lz4, or gzip when hdf5plugin missing), never raw lzf
     out = write_reference_scan(
-        str(tmp_path / "d.nxs"), str(tmp_path / "dp"),
+        str(tmp_path / "d.nexus"), str(tmp_path / "dp"),
         compression=resolve_stack_compression("lz4"),
     )
     with h5py.File(out, "r") as f:
@@ -215,7 +215,7 @@ def test_v2_record_integrated_stacks_compress(tmp_path):
 
 
 def test_v2_record_gi_scan_writes_gi_provenance(tmp_path):
-    """S-7: a GI scan's written .nxs carries the data-derived GI provenance under
+    """S-7: a GI scan's written .nexus carries the data-derived GI provenance under
     /entry/reduction/config (gi=True, + gi_config for the freeze/mode).  The
     pre-6a parity fixture uses a NON-GI reference scan (gi=False), so it never
     exercised this branch and its "byte-identical to pre-6a" claim silently
@@ -235,7 +235,7 @@ def test_v2_record_gi_scan_writes_gi_provenance(tmp_path):
             v = v.decode()
         return str(v).strip().lower() in ("true", "1")
 
-    out = str(tmp_path / "gi.nxs")
+    out = str(tmp_path / "gi.nexus")
     write_gi_reference_scan(out, str(tmp_path / "gip"))
     with h5py.File(out, "r") as f:
         assert "entry/reduction/config/gi" in f, "GI scan lost /reduction/config/gi"
@@ -256,7 +256,7 @@ def test_v2_record_gi_scan_writes_gi_provenance(tmp_path):
 
     # the non-GI reference records gi=False (present, not absent) -> a reader can
     # always tell GI from standard.
-    ref = write_reference_scan(str(tmp_path / "std.nxs"), str(tmp_path / "sp"))
+    ref = write_reference_scan(str(tmp_path / "std.nexus"), str(tmp_path / "sp"))
     with h5py.File(ref, "r") as f:
         assert "entry/reduction/config/gi" in f
         assert _gi_flag(f) is False

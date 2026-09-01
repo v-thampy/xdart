@@ -1973,7 +1973,9 @@ def test_p34b_production_browse_reload_performance_probe(monkeypatch):
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest, BrowseLoadStatus
     from xrd_tools.io.output_transaction import capture_target_snapshot
-    target=Path(os.environ["P3_4B_BROWSE_ARTIFACT"]).resolve(); loads=int(os.environ["P3_4B_BROWSE_LOADS"]); warm=int(os.environ["P3_4B_BROWSE_WARMUPS"]); calls=[]; real=capture_target_snapshot
+    artifact=os.environ.get("P3_4B_BROWSE_ARTIFACT")
+    if not artifact: pytest.skip("requires P3_4B_BROWSE_ARTIFACT")
+    target=Path(artifact).resolve(); loads=int(os.environ["P3_4B_BROWSE_LOADS"]); warm=int(os.environ["P3_4B_BROWSE_WARMUPS"]); calls=[]; real=capture_target_snapshot
     monkeypatch.setattr(module,"capture_target_snapshot",lambda path: calls.append(threading.current_thread().name) or real(path),raising=False); walls=[]
     for index in range(loads):
         loader=module.BrowseLoader(max_items=512); request=BrowseLoadRequest(f"perf-{index}",1,str(target)); started=time.perf_counter(); outcome=_wait(lambda: loader.poll(loader.begin(request)),60); context=loader.consume(outcome); walls.append(time.perf_counter()-started)
