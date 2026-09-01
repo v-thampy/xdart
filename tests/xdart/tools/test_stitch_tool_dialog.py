@@ -138,6 +138,33 @@ def test_any_form_edit_invalidates_run_enablement(qapp, tmp_path):
         dialog.shutdown()
 
 
+def test_xu_backend_locks_asset_fields_and_installs_canonical_asset(qapp, tmp_path):
+    dialog, _owner, _status = _dialog(qapp)
+    try:
+        _fill_form(dialog, tmp_path)
+        dialog.backend_combo.setCurrentIndex(1)
+        qapp.processEvents()
+        assert dialog.backend_combo.currentData() == "xu_hist"
+        assert dialog.geometry_label.text() == "XU calibration asset"
+        assert not dialog.geometry_kind_combo.isEnabled()
+        assert not dialog.motor_mapping_edit.isEnabled()
+        assert not dialog.threshold_edit.isEnabled()
+        assert not dialog.install_xu_asset_button.isHidden()
+        dialog._install_xu_asset()
+        asset = Path(dialog.geometry_edit.text())
+        assert asset.is_file()
+        assert asset.name == "psic_powder_1d_surface_v1.json"
+        form = dialog._build_form()
+        assert form.backend == "xu_hist"
+        assert form.source_motors == (("del", "del"), ("nu", "nu"))
+        assert form.detector_shape == (195, 1475)
+        assert form.raw_dtype == np.dtype("int32").str
+        assert form.q_range == (1.0, 5.2)
+        assert form.use_detector_mask is True
+    finally:
+        dialog.shutdown()
+
+
 def test_preflight_presentation_lists_exact_controls_and_every_member(
     qapp, stitch_form
 ):

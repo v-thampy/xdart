@@ -19,6 +19,7 @@ import numpy as np
 
 from xrd_tools.analysis.module_transaction import (
     MetadataColumnSelector,
+    ModuleArtifactRefused,
     ModuleKind,
     ModuleOutputRequest,
     ModuleSourceReceipt,
@@ -33,9 +34,24 @@ from xrd_tools.analysis.stitch_operation import (
     StitchGeometryInput,
     StitchGeometryKind,
     StitchOperationPlan,
+    StitchOperationRefused,
     StitchOperationRequest,
+    XuStitchOperationPlan,
     capture_stitch_geometry,
     prepare_stitch_operation,
+)
+from xrd_tools.analysis.xu_stitch_calibration import (
+    XuStitchCalibrationInput,
+    XuStitchCalibrationRefused,
+    capture_xu_stitch_calibration,
+)
+from xrd_tools.core.geometry.xu_runtime import (
+    XuRuntimeUnsupported,
+    xu_runtime_session,
+)
+from xrd_tools.integrate.xu_stitch import (
+    XuStitchScienceRefused,
+    resolve_xu_stitch_effective_geometry,
 )
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.analysis_artifact import (
@@ -229,6 +245,7 @@ class StitchToolForm:
     overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
     max_frame_bytes: int = 256 * 1024 * 1024
     mode: str = "1d"
+    backend: str = "multigeometry"
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -237,6 +254,8 @@ class StitchToolForm:
         image_dir = _absolute_path(self.image_dir, "image directory")
         geometry = _absolute_path(self.geometry_path, "geometry path")
         output = _absolute_path(self.output_path, "output path")
+        if self.backend not in {"multigeometry", "xu_hist"}:
+            raise ValueError("Stitch backend must be multigeometry or xu_hist")
         if Path(spec).suffix:
             raise ValueError("Stitch SPEC path must be extensionless")
         if Path(output).suffix.casefold() != ".nexus":
@@ -330,6 +349,22 @@ class StitchToolForm:
             raise ValueError("float64 detector frame exceeds max frame bytes")
         if self.mode != "1d":
             raise ValueError("2-D Stitch remains held pending orientation parity")
+        if self.backend == "xu_hist" and (
+            self.geometry_kind is not StitchGeometryKind.PYFAI_GONIOMETER_JSON
+            or self.expected_geometry_sha256 is not None
+            or motors != (("del", "del"), ("nu", "nu"))
+            or references
+            or self.image_rotation != 0
+            or self.detector_shape != (195, 1475)
+            or dtype.str != "<i4"
+            or self.raw_header_skip != 0
+            or threshold != 800000.0
+            or self.use_detector_mask is not True
+        ):
+            raise ValueError(
+                "xu_hist requires the locked SURFACE detector, decoder, mapping, "
+                "orientation, threshold, and detector-mask contract"
+            )
         object.__setattr__(self, "project_root", project)
         object.__setattr__(self, "spec_path", spec)
         object.__setattr__(self, "image_dir", image_dir)
@@ -373,10 +408,36 @@ class StitchToolForm:
             self.max_frame_bytes,
             self.mode,
         )
+        domain = "stitch-tool-form-v1"
+        if self.backend == "xu_hist":
+            domain = "stitch-tool-form-v2-xu-hist"
+            canonical = (
+                domain,
+                self.backend,
+                project,
+                spec,
+                self.scan,
+                image_dir,
+                self.image_stem,
+                self.frame_selector.fingerprint_value,
+                self.detector_shape,
+                dtype.str,
+                self.raw_header_skip,
+                float(threshold),
+                geometry,
+                motors,
+                q_range,
+                self.npt_1d,
+                None if monitor is None else (monitor.name, monitor.occurrence),
+                output,
+                self.overwrite,
+                self.max_frame_bytes,
+                self.mode,
+            )
         object.__setattr__(
             self,
             "fingerprint",
-            analysis_canonical_fingerprint("stitch-tool-form-v1", canonical),
+            analysis_canonical_fingerprint(domain, canonical),
         )
 
 
@@ -454,6 +515,9 @@ class StitchPreflightSummary:
     overwrite: AnalysisArtifactOverwrite
     max_frame_bytes: int
     holds: tuple[str, ...]
+    backend: str = "multigeometry"
+    asset_semantic_fingerprint: str | None = None
+    effective_geometry_fingerprint: str | None = None
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -520,6 +584,23 @@ class StitchPreflightSummary:
             or type(self.overwrite) is not AnalysisArtifactOverwrite
             or type(self.holds) is not tuple
             or any(type(item) is not str or not item for item in self.holds)
+            or self.backend not in {"multigeometry", "xu_hist"}
+            or (
+                self.backend == "multigeometry"
+                and (
+                    self.asset_semantic_fingerprint is not None
+                    or self.effective_geometry_fingerprint is not None
+                )
+            )
+            or (
+                self.backend == "xu_hist"
+                and (
+                    type(self.asset_semantic_fingerprint) is not str
+                    or _SHA256.fullmatch(self.asset_semantic_fingerprint) is None
+                    or type(self.effective_geometry_fingerprint) is not str
+                    or _SHA256.fullmatch(self.effective_geometry_fingerprint) is None
+                )
+            )
         ):
             raise TypeError("Stitch preflight summary is invalid")
         canonical = (
@@ -570,12 +651,20 @@ class StitchPreflightSummary:
             self.max_frame_bytes,
             self.holds,
         )
+        domain = "stitch-preflight-summary-v1"
+        if self.backend == "xu_hist":
+            domain = "stitch-preflight-summary-v2-xu-hist"
+            canonical = (
+                domain,
+                canonical,
+                self.backend,
+                self.asset_semantic_fingerprint,
+                self.effective_geometry_fingerprint,
+            )
         object.__setattr__(
             self,
             "fingerprint",
-            analysis_canonical_fingerprint(
-                "stitch-preflight-summary-v1", canonical
-            ),
+            analysis_canonical_fingerprint(domain, canonical),
         )
 
 
@@ -598,7 +687,26 @@ class StitchToolPreflight:
             or self.summary.request_fingerprint != self.request.module.fingerprint
             or self.summary.manifest_fingerprint != self.request.manifest.fingerprint
             or self.summary.geometry_fingerprint
-            != self.request.plan.geometry.fingerprint
+            != (
+                self.request.plan.geometry.fingerprint
+                if type(self.request.plan) is StitchOperationPlan
+                else self.request.plan.calibration.fingerprint
+            )
+            or self.summary.backend != self.form.backend
+            or (
+                self.form.backend == "multigeometry"
+                and type(self.request.plan) is not StitchOperationPlan
+            )
+            or (
+                self.form.backend == "xu_hist"
+                and (
+                    type(self.request.plan) is not XuStitchOperationPlan
+                    or self.summary.asset_semantic_fingerprint
+                    != self.request.plan.calibration.semantic_fingerprint
+                    or self.summary.effective_geometry_fingerprint
+                    != self.request.plan.effective_geometry.fingerprint
+                )
+            )
             or self.summary.selected_labels
             != self.request.module.source.selected_labels
         ):
@@ -680,6 +788,16 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
     ) + (
         () if form.monitor_selector is None else (form.monitor_selector,)
     )
+    if form.backend == "xu_hist":
+        names = tuple(column.name for column in table.columns)
+        energy_count = names.count("energy")
+        if energy_count > 1:
+            raise StitchToolPreflightRefused(
+                "AMBIGUOUS_METADATA_SELECTOR",
+                "the optional XU source energy column must be unique",
+            )
+        if energy_count == 1:
+            requested_selectors += (MetadataColumnSelector("energy"),)
     selectors = tuple(
         sorted(
             {
@@ -696,25 +814,51 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
             selected_labels=selected_labels,
             resolved_selectors=selectors,
         )
-        geometry = capture_stitch_geometry(
-            StitchGeometryInput(
-                form.geometry_path,
-                form.geometry_kind,
-                expected_sha256=form.expected_geometry_sha256,
-                source_motors=form.source_motors,
-                reference_motor_positions=form.poni_references,
-                image_rotation=form.image_rotation,
+        if form.backend == "multigeometry":
+            geometry = capture_stitch_geometry(
+                StitchGeometryInput(
+                    form.geometry_path,
+                    form.geometry_kind,
+                    expected_sha256=form.expected_geometry_sha256,
+                    source_motors=form.source_motors,
+                    reference_motor_positions=form.poni_references,
+                    image_rotation=form.image_rotation,
+                )
             )
-        )
-        plan = StitchOperationPlan(
-            geometry,
-            mode="1d",
-            npt_1d=form.npt_1d,
-            radial_range=form.q_range,
-            monitor_selector=form.monitor_selector,
-            use_detector_mask=form.use_detector_mask,
-            max_frame_bytes=form.max_frame_bytes,
-        )
+            plan = StitchOperationPlan(
+                geometry,
+                mode="1d",
+                npt_1d=form.npt_1d,
+                radial_range=form.q_range,
+                monitor_selector=form.monitor_selector,
+                use_detector_mask=form.use_detector_mask,
+                max_frame_bytes=form.max_frame_bytes,
+            )
+        else:
+            calibration = capture_xu_stitch_calibration(
+                XuStitchCalibrationInput(form.geometry_path),
+                project_root=project,
+            )
+            runtime_owner = xu_runtime_session()
+            with runtime_owner as session:
+                effective = resolve_xu_stitch_effective_geometry(
+                    calibration,
+                    session,
+                ).projection
+            if runtime_owner.execution_record is None:
+                raise StitchToolPreflightRefused(
+                    "XU_RUNTIME_CONFIG_RESTORE_FAILED",
+                    "XU runtime restoration was not attested",
+                )
+            plan = XuStitchOperationPlan(
+                calibration,
+                effective,
+                float(form.q_range[0]),
+                float(form.q_range[1]),
+                npt_1d=form.npt_1d,
+                monitor_selector=form.monitor_selector,
+                max_frame_bytes=form.max_frame_bytes,
+            )
         output = ModuleOutputRequest(
             form.output_path,
             AnalysisArtifactKind.STITCH_1D,
@@ -728,6 +872,14 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
         )
     except StitchToolPreflightRefused:
         raise
+    except (
+        XuRuntimeUnsupported,
+        XuStitchCalibrationRefused,
+        XuStitchScienceRefused,
+        StitchOperationRefused,
+        ModuleArtifactRefused,
+    ) as error:
+        raise StitchToolPreflightRefused(error.code) from error
     manifest = request.manifest
     members = tuple(
         StitchPreflightMember(
@@ -738,9 +890,20 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
         )
         for contribution in manifest.contributions
     )
-    geometry_relative = _inside_project(
-        request.plan.geometry.resolved_path, project, "geometry"
-    )
+    if type(request.plan) is StitchOperationPlan:
+        geometry_relative = _inside_project(
+            request.plan.geometry.resolved_path, project, "geometry"
+        )
+        geometry_fingerprint = request.plan.geometry.fingerprint
+        geometry_sha256 = request.plan.geometry.sha256
+        asset_semantic_fingerprint = None
+        effective_geometry_fingerprint = None
+    else:
+        geometry_relative = request.plan.calibration.resolved_relative_path
+        geometry_fingerprint = request.plan.calibration.fingerprint
+        geometry_sha256 = request.plan.calibration.raw_sha256
+        asset_semantic_fingerprint = request.plan.calibration.semantic_fingerprint
+        effective_geometry_fingerprint = request.plan.effective_geometry.fingerprint
     summary = StitchPreflightSummary(
         form_fingerprint=form.fingerprint,
         request_fingerprint=request.module.fingerprint,
@@ -748,8 +911,8 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
         module_source_fingerprint=request.module.source.fingerprint,
         table_fingerprint=request.module.source.table_fingerprint,
         manifest_fingerprint=manifest.fingerprint,
-        geometry_fingerprint=request.plan.geometry.fingerprint,
-        geometry_sha256=request.plan.geometry.sha256,
+        geometry_fingerprint=geometry_fingerprint,
+        geometry_sha256=geometry_sha256,
         project_root=str(project),
         source_relative_path=manifest.source_relative_path,
         source_scan=manifest.source_scan or "",
@@ -775,7 +938,21 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
         use_detector_mask=form.use_detector_mask,
         overwrite=form.overwrite,
         max_frame_bytes=form.max_frame_bytes,
-        holds=("2d-orientation-parity", "gi-and-custom-corrections"),
+        holds=(
+            ("2d-orientation-parity", "gi-and-custom-corrections")
+            if form.backend == "multigeometry"
+            else (
+                "xu-2d-and-chi",
+                "gi-stitch-on-xu",
+                "sensor-parallax-xu-geometry",
+                "new-corrections-and-variance",
+                "mixed-energy-grouped-xu-stitch",
+                "unvalidated-platforms-and-live-gates",
+            )
+        ),
+        backend=form.backend,
+        asset_semantic_fingerprint=asset_semantic_fingerprint,
+        effective_geometry_fingerprint=effective_geometry_fingerprint,
         _claim=_PREFLIGHT_FACTORY,
     )
     return StitchToolPreflight(form, request, summary, _PREFLIGHT_FACTORY)

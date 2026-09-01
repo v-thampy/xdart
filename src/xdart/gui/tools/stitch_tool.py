@@ -21,6 +21,11 @@ from xrd_tools.analysis.stitch_operation import (
     StitchGeometryKind,
     StitchOperationResult,
 )
+from xrd_tools.analysis.xu_stitch_calibration import (
+    CANONICAL_XU_STITCH_CALIBRATION_LOCATOR,
+    XuStitchCalibrationRefused,
+    install_canonical_xu_stitch_calibration,
+)
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 
 from .stitch_owner import (
@@ -115,12 +120,36 @@ class StitchToolDialog(QtWidgets.QDialog):
         self.threshold_edit.setPlaceholderText("blank = no threshold")
         form.addRow("Hot-pixel threshold", self.threshold_edit)
 
+        self.backend_combo = QtWidgets.QComboBox()
+        self.backend_combo.setObjectName("stitchBackend")
+        self.backend_combo.addItem(
+            "pyFAI MultiGeometry",
+            "multigeometry",
+        )
+        self.backend_combo.addItem(
+            "xrayutilities histogram (calibrated multi-axis reference)",
+            "xu_hist",
+        )
+        self.backend_combo.setToolTip(
+            "Use xrayutilities histogram for the authenticated SURFACE calibrated "
+            "multi-axis path; use pyFAI MultiGeometry for validated pyFAI goniometers."
+        )
+        form.addRow("Backend", self.backend_combo)
+
         self.geometry_edit, geometry_row = self._path_row(
             caption="Choose Stitch geometry",
             file_filter="Geometry (*.json *.poni);;All files (*)",
         )
         self.geometry_edit.setObjectName("stitchGeometry")
-        form.addRow("Geometry", geometry_row)
+        self.install_xu_asset_button = QtWidgets.QPushButton("Install canonical")
+        self.install_xu_asset_button.setObjectName("stitchInstallXuAsset")
+        self.install_xu_asset_button.setToolTip(
+            "Create the exact bundled SURFACE v1 calibration inside this Project. "
+            "Existing different bytes are never replaced."
+        )
+        geometry_row.layout().addWidget(self.install_xu_asset_button)
+        self.geometry_label = QtWidgets.QLabel("Geometry")
+        form.addRow(self.geometry_label, geometry_row)
 
         self.geometry_kind_combo = QtWidgets.QComboBox()
         self.geometry_kind_combo.setObjectName("stitchGeometryKind")
@@ -249,6 +278,7 @@ class StitchToolDialog(QtWidgets.QDialog):
         hold = QtWidgets.QLabel(
             "Mode: 1-D only · 2-D held pending the scan-14 orientation parity oracle"
         )
+        self.parity_hold = hold
         hold.setObjectName("stitch2dHold")
         hold.setWordWrap(True)
         form.addRow("Parity boundary", hold)
@@ -330,6 +360,8 @@ class StitchToolDialog(QtWidgets.QDialog):
         self.geometry_kind_combo.currentIndexChanged.connect(
             self._sync_geometry_fields
         )
+        self.backend_combo.currentIndexChanged.connect(self._sync_backend_fields)
+        self.install_xu_asset_button.clicked.connect(self._install_xu_asset)
         self.preview_button.clicked.connect(self._begin_preflight)
         self.run_button.clicked.connect(self._begin_run)
         self.cancel_button.clicked.connect(self._cancel)
@@ -338,6 +370,7 @@ class StitchToolDialog(QtWidgets.QDialog):
             self._begin_retry_verification
         )
         self._sync_geometry_fields()
+        self._sync_backend_fields()
 
     def _path_row(self, *, directory=False, save=False, caption, file_filter=""):
         row = QtWidgets.QWidget()
@@ -410,6 +443,7 @@ class StitchToolDialog(QtWidgets.QDialog):
         ):
             spin.valueChanged.connect(self._form_changed)
         for combo in (
+            self.backend_combo,
             self.geometry_kind_combo,
             self.rotation_combo,
             self.overwrite_combo,
@@ -429,8 +463,84 @@ class StitchToolDialog(QtWidgets.QDialog):
         self.run_button.setEnabled(False)
 
     def _sync_geometry_fields(self, *_args):
+        if self.backend_combo.currentData() == "xu_hist":
+            self.poni_reference_edit.setEnabled(False)
+            return
         poni = self.geometry_kind_combo.currentIndex() == 1
         self.poni_reference_edit.setEnabled(poni)
+
+    def _sync_backend_fields(self, *_args):
+        xu = self.backend_combo.currentData() == "xu_hist"
+        self._suppress_form_changes = True
+        try:
+            if xu:
+                self.geometry_label.setText("XU calibration asset")
+                self.geometry_kind_combo.setCurrentIndex(0)
+                self.geometry_sha_edit.clear()
+                self.motor_mapping_edit.setText("del=del, nu=nu")
+                self.poni_reference_edit.clear()
+                self.rotation_combo.setCurrentIndex(0)
+                self.source_widget.det_rows.setText("195")
+                self.source_widget.det_cols.setText("1475")
+                dtype_index = self.source_widget.dtype_combo.findText("int32")
+                if dtype_index >= 0:
+                    self.source_widget.dtype_combo.setCurrentIndex(dtype_index)
+                self.source_widget.header_skip.setText("0")
+                self.threshold_edit.setText("800000")
+                self.detector_mask_check.setChecked(True)
+                self.q_min.setValue(1.0)
+                self.q_max.setValue(5.2)
+                self.parity_hold.setText(
+                    "Mode: XU 1-D only · GI, 2-D/chi, sensor/parallax, new "
+                    "corrections, and unvalidated platforms are held"
+                )
+            else:
+                self.geometry_label.setText("Geometry")
+                self.motor_mapping_edit.setText("del_angle=del, nu_angle=nu")
+                self.q_min.setValue(1.0)
+                self.q_max.setValue(6.2)
+                self.parity_hold.setText(
+                    "Mode: 1-D only · 2-D held pending the scan-14 orientation "
+                    "parity oracle"
+                )
+        finally:
+            self._suppress_form_changes = False
+        for widget in (
+            self.geometry_kind_combo,
+            self.geometry_sha_edit,
+            self.motor_mapping_edit,
+            self.poni_reference_edit,
+            self.rotation_combo,
+            self.source_widget.det_rows,
+            self.source_widget.det_cols,
+            self.source_widget.dtype_combo,
+            self.source_widget.header_skip,
+            self.threshold_edit,
+            self.detector_mask_check,
+        ):
+            widget.setEnabled(not xu)
+        self.install_xu_asset_button.setVisible(xu)
+        self._sync_geometry_fields()
+
+    def _install_xu_asset(self):
+        project = self.project_edit.text().strip()
+        if not project:
+            self._notice("Choose Project before installing the XU calibration")
+            return
+        try:
+            receipt = install_canonical_xu_stitch_calibration(
+                project_root=project,
+            )
+        except (TypeError, ValueError, XuStitchCalibrationRefused) as error:
+            code = getattr(error, "code", type(error).__name__)
+            self._notice(f"XU calibration install refused: {code}")
+            return
+        target = Path(receipt.project_root) / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+        self.geometry_edit.setText(str(target))
+        self._notice(
+            "Canonical XU calibration ready · "
+            f"{receipt.raw_sha256[:12]}… · {receipt.byte_count} bytes"
+        )
 
     @staticmethod
     def _parse_pairs(text):
@@ -512,6 +622,7 @@ class StitchToolDialog(QtWidgets.QDialog):
             )[self.overwrite_combo.currentIndex()],
             max_frame_bytes=self.max_frame_mib.value() * 1024 * 1024,
             mode="1d",
+            backend=self.backend_combo.currentData(),
         )
 
     def _current_form(self):
@@ -716,6 +827,7 @@ class StitchToolDialog(QtWidgets.QDialog):
         )
         threshold = "none" if summary.threshold is None else f"{summary.threshold:.10g}"
         lines = [
+            f"Backend: {summary.backend}",
             f"Project: {summary.project_root}",
             f"Source: {summary.source_relative_path} · scan {summary.source_scan}",
             f"Images: {summary.image_directory_relative_path} · stem {summary.image_stem}",
@@ -742,10 +854,17 @@ class StitchToolDialog(QtWidgets.QDialog):
             f"Request fingerprint: {summary.request_fingerprint}",
             f"Manifest fingerprint: {summary.manifest_fingerprint}",
             f"Geometry fingerprint: {summary.geometry_fingerprint}",
-            "Holds: " + ", ".join(summary.holds),
-            "",
-            "Exact raw membership:",
         ]
+        if summary.backend == "xu_hist":
+            lines.extend(
+                (
+                    "Asset semantic fingerprint: "
+                    f"{summary.asset_semantic_fingerprint}",
+                    "Effective geometry fingerprint: "
+                    f"{summary.effective_geometry_fingerprint}",
+                )
+            )
+        lines.extend(("Holds: " + ", ".join(summary.holds), "", "Exact raw membership:"))
         for member in summary.members:
             values = ", ".join(
                 f"{name}[{occurrence}]={value:.10g}"

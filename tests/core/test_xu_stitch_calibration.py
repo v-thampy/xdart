@@ -9,10 +9,12 @@ from pathlib import Path
 import pytest
 
 from xrd_tools.analysis.xu_stitch_calibration import (
+    CANONICAL_XU_STITCH_CALIBRATION_LOCATOR,
     XuStitchCalibrationInput,
     XuStitchCalibrationRefused,
     canonical_surface_resource_bytes,
     capture_xu_stitch_calibration,
+    install_canonical_xu_stitch_calibration,
     parse_xu_stitch_calibration_bytes,
     revalidate_xu_stitch_calibration,
 )
@@ -38,6 +40,26 @@ def test_canonical_surface_resource_has_authenticated_exact_bytes():
     with pytest.raises(TypeError):
         projection.value["xrayutilities"]["sample_axes"][0] = "changed"
     assert not raw.endswith(b"\n")
+
+
+def test_canonical_surface_installer_is_create_only_and_idempotent(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    first = install_canonical_xu_stitch_calibration(project_root=project)
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    assert target.read_bytes() == canonical_surface_resource_bytes()
+    second = install_canonical_xu_stitch_calibration(project_root=project)
+    assert second.fingerprint == first.fingerprint
+    assert second.file_state == first.file_state
+
+    conflict_project = tmp_path / "conflict"
+    conflict_target = conflict_project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    conflict_target.parent.mkdir(parents=True)
+    conflict_target.write_bytes(b"foreign")
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        install_canonical_xu_stitch_calibration(project_root=conflict_project)
+    assert raised.value.code == "XU_CALIBRATION_INSTALL_CONFLICT"
+    assert conflict_target.read_bytes() == b"foreign"
 
 
 def test_surface_projection_and_receipt_factory_claims_cannot_be_reused(tmp_path):

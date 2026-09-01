@@ -33,6 +33,9 @@ _RESOURCE_SHA256 = (
 _RESOURCE_SEMANTIC_FINGERPRINT = (
     "90f3bec535ed9a21be1b9d93491e774364df5849155b9b9c1707eace848e40f8"
 )
+CANONICAL_XU_STITCH_CALIBRATION_LOCATOR = (
+    "calibration/xu/psic_powder_1d_surface_v1.json"
+)
 _LEGACY_ORACLE_SHA256 = (
     "9bb13babeb60475128dd9d14c833cdd8cd85af7510424c1b860b87231d8c0c25"
 )
@@ -654,13 +657,128 @@ def revalidate_xu_stitch_calibration(
     return current.content
 
 
+def install_canonical_xu_stitch_calibration(
+    *,
+    project_root: str | Path,
+) -> XuStitchCalibrationReceipt:
+    """Create or re-admit the exact bundled SURFACE asset inside Project.
+
+    The installer is create-only: an existing byte-identical canonical asset is
+    re-admitted, while any conflicting path is refused without replacement.
+    """
+
+    request = XuStitchCalibrationInput(
+        CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    )
+    project, target, relative = _lexical_target(request, project_root)
+    raw = canonical_surface_resource_bytes()
+    if os.path.lexists(target):
+        try:
+            current = capture_xu_stitch_calibration(
+                request,
+                project_root=project,
+            )
+        except XuStitchCalibrationRefused as error:
+            raise XuStitchCalibrationRefused(
+                "XU_CALIBRATION_INSTALL_CONFLICT",
+                "canonical calibration destination already conflicts",
+            ) from error
+        if current.content != raw:
+            _refuse(
+                "XU_CALIBRATION_INSTALL_CONFLICT",
+                "canonical calibration destination has different bytes",
+            )
+        return current
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptors: list[int] = []
+    created = False
+    parent_descriptor: int | None = None
+    filename = Path(relative).parts[-1]
+    try:
+        current = os.open(os.sep, directory_flags)
+        descriptors.append(current)
+        for part in Path(project).parts[1:] + Path(relative).parts[:-1]:
+            try:
+                opened = os.open(part, directory_flags, dir_fd=current)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o755, dir_fd=current)
+                opened = os.open(part, directory_flags, dir_fd=current)
+            descriptors.append(opened)
+            current = opened
+        parent_descriptor = current
+        descriptor = os.open(filename, file_flags, 0o644, dir_fd=current)
+        created = True
+        try:
+            view = memoryview(raw)
+            offset = 0
+            while offset < len(view):
+                written = os.write(descriptor, view[offset:])
+                if written <= 0:
+                    raise OSError("canonical asset write made no progress")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(current)
+    except FileExistsError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_INSTALL_CONFLICT",
+            "canonical calibration destination appeared during install",
+        ) from error
+    except OSError as error:
+        if created and parent_descriptor is not None:
+            try:
+                os.unlink(filename, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_INSTALL_FAILED",
+            "canonical calibration could not be installed safely",
+        ) from error
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    try:
+        receipt = capture_xu_stitch_calibration(
+            request,
+            project_root=project,
+        )
+    except XuStitchCalibrationRefused as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_INSTALL_FAILED",
+            "installed calibration could not be re-admitted",
+        ) from error
+    if receipt.content != raw:
+        _refuse(
+            "XU_CALIBRATION_INSTALL_FAILED",
+            "installed calibration bytes changed",
+        )
+    return receipt
+
+
 __all__ = [
+    "CANONICAL_XU_STITCH_CALIBRATION_LOCATOR",
     "XuStitchCalibrationInput",
     "XuStitchCalibrationProjection",
     "XuStitchCalibrationReceipt",
     "XuStitchCalibrationRefused",
     "canonical_surface_resource_bytes",
     "capture_xu_stitch_calibration",
+    "install_canonical_xu_stitch_calibration",
     "parse_xu_stitch_calibration_bytes",
     "revalidate_xu_stitch_calibration",
 ]
