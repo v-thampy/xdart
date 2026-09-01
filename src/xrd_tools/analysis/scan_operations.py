@@ -43,6 +43,10 @@ __all__ = [
 # 159-motor #O/#P snapshot.  Keep that physical catalog admissible while the
 # independent 64 MiB canonical table budget remains the actual memory bound.
 _MAX_TABLE_ROWS, _MAX_TABLE_COLUMNS = 100_000, 256
+# An explicit projection is request authority, not a discovered physical
+# catalog.  Keep its accepted 127-selector boundary independent of the wider
+# full-table capacity required by Stitch geometry metadata.
+_MAX_METADATA_PROJECTION_COLUMNS = 128
 _MAX_CANDIDATES, _MAX_CANDIDATE_BYTES = 256, 1 << 20
 _MAX_TABLE_BYTES = _MAX_PLOT_BYTES = 64 << 20
 _MAX_PREVIEW_BYTES = _MAX_ROI_BYTES = 64 << 20
@@ -295,7 +299,7 @@ def _metadata_column_projection(
         raise InvalidCanonicalValue(
             "metadata column projection must be an exact tuple"
         )
-    if len(value) + 1 > _MAX_TABLE_COLUMNS:
+    if len(value) + 1 > _MAX_METADATA_PROJECTION_COLUMNS:
         raise InvalidCanonicalValue(
             "metadata column projection exceeds the table column bound"
         )

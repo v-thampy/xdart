@@ -594,6 +594,19 @@ class StitchToolOwner:
                         PageCleanup.PENDING, "stitch-cleanup-retry"
                     )
                 return CloseReceipt(PageCleanup.PENDING, "stitch-cleanup-retry")
+            if self._finalization is StitchOwnerFinalization.VERIFICATION_PENDING:
+                started = self._retry_command_locked(
+                    StitchOwnerAction.RETRY_VERIFICATION,
+                    StitchOwnerFinalization.VERIFICATION_PENDING,
+                    allow_closing=True,
+                )
+                if started is None:
+                    return CloseReceipt(
+                        PageCleanup.PENDING, "stitch-verification-retry"
+                    )
+                return CloseReceipt(
+                    PageCleanup.PENDING, "stitch-verification-retry"
+                )
         receipt = self._worker.close()
         if receipt.status is PageCleanup.PENDING:
             return receipt

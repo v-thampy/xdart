@@ -258,6 +258,45 @@ def test_close_drains_terminal_then_auto_retries_exact_cleanup(
     assert calls[0][1] is calls[1][1]
 
 
+def test_close_drains_terminal_then_auto_retries_exact_verification(
+    monkeypatch, preflight
+):
+    calls = []
+
+    def run(self, *, cancel_token=None, progress_callback=None):
+        calls.append(("run", self))
+        raise StitchOperationVerificationError(self, "held reload")
+
+    def retry_verification(self):
+        calls.append(("retry-verification", self))
+        return _refused_result(self)
+
+    monkeypatch.setattr(StitchOperationExecution, "run", run)
+    monkeypatch.setattr(
+        StitchOperationExecution, "retry_verification", retry_verification
+    )
+    owner = _prepare_owner(preflight)
+    assert owner.begin_run() is not None
+    pending = _poll_terminal(owner)
+    assert pending.outcome.kind is StitchOwnerOutcomeKind.VERIFICATION_PENDING
+    assert owner.close().status is PageCleanup.PENDING
+
+    deadline = time.monotonic() + 3
+    while True:
+        receipt = owner.close()
+        if receipt.status is PageCleanup.CLEAN:
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+
+    assert owner.close() is receipt
+    assert [name for name, _execution in calls] == [
+        "run",
+        "retry-verification",
+    ]
+    assert calls[0][1] is calls[1][1]
+
+
 def test_cancel_only_targets_active_science(monkeypatch, preflight):
     entered = Event()
 

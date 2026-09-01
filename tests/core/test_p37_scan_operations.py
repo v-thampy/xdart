@@ -262,6 +262,7 @@ def test_metadata_table_runner_is_qt_free_ordered_bounded_and_direct(
     ops = _scan_ops()
     assert ops._MAX_TABLE_ROWS == 100_000
     assert ops._MAX_TABLE_COLUMNS == 256
+    assert ops._MAX_METADATA_PROJECTION_COLUMNS == 128
     assert ops._MAX_TABLE_BYTES == 64 * 1024 * 1024
 
     before_qt = {name for name in sys.modules if name.startswith(("PyQt", "PySide"))}
