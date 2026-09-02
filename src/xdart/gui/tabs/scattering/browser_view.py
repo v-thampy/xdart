@@ -240,6 +240,9 @@ class BrowserView(QtWidgets.QFrame):
         self.setMinimumWidth(255)
         self._scans = ()
         self._current_artifact = ""
+        self._artifact_selection_contract = None
+        self._applied_artifact_selection: tuple[str, ...] = ()
+        self._applied_current_artifact: str | None = None
         self._selected_frames: tuple[DisplayFrameKey, ...] = ()
         self._trace_frames: tuple[DisplayFrameKey, ...] = ()
         self._plot_mode = "Single"
@@ -543,9 +546,11 @@ class BrowserView(QtWidgets.QFrame):
             if state.multi_artifact_selection
             else QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
-        if self.scans.selectionMode() != selection_mode:
+        selection_mode_changed = self.scans.selectionMode() != selection_mode
+        if selection_mode_changed:
             self.scans.setSelectionMode(selection_mode)
-        if state.scans != self._scans:
+        scans_changed = state.scans != self._scans
+        if scans_changed:
             self.scans.clear()
             for scan in state.scans:
                 item = QtWidgets.QListWidgetItem(scan.label)
@@ -558,16 +563,47 @@ class BrowserView(QtWidgets.QFrame):
             state.selected_artifacts
             or (() if not state.selected_scan else (state.selected_scan,))
         )
-        current_artifact_item = None
-        for index in range(self.scans.count()):
-            item = self.scans.item(index)
-            item.setSelected(item.data(_USER_ROLE) in selected_artifacts)
-            if item.data(_USER_ROLE) == state.selected_scan:
-                current_artifact_item = item
-        if current_artifact_item is not None:
-            self.scans.setCurrentItem(
-                current_artifact_item,
-                QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
+        selection_contract = (selected_artifacts, state.selected_scan)
+        current_item = self.scans.currentItem()
+        current_identifier = (
+            None if current_item is None else current_item.data(_USER_ROLE)
+        )
+        selected_identifiers = tuple(
+            item.data(_USER_ROLE) for item in self.scans.selectedItems()
+        )
+        reconcile_artifact_selection = (
+            scans_changed
+            or selection_mode_changed
+            or selection_contract != self._artifact_selection_contract
+            or selected_identifiers != self._applied_artifact_selection
+            or current_identifier != self._applied_current_artifact
+        )
+        if reconcile_artifact_selection:
+            current_artifact_item = None
+            for index in range(self.scans.count()):
+                item = self.scans.item(index)
+                item.setSelected(item.data(_USER_ROLE) in selected_artifacts)
+                if item.data(_USER_ROLE) == state.selected_scan:
+                    current_artifact_item = item
+            if current_artifact_item is not None:
+                self.scans.setCurrentItem(
+                    current_artifact_item,
+                    QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
+            else:
+                self.scans.setCurrentItem(
+                    None,
+                    QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
+            self._artifact_selection_contract = selection_contract
+            self._applied_artifact_selection = tuple(
+                item.data(_USER_ROLE) for item in self.scans.selectedItems()
+            )
+            current_item = self.scans.currentItem()
+            self._applied_current_artifact = (
+                None
+                if current_item is None
+                else current_item.data(_USER_ROLE)
             )
         self._current_artifact = state.selected_scan
 

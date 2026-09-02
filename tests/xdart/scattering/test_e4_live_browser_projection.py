@@ -15,6 +15,7 @@ from xdart.gui.tabs.scattering.adapters.source import (
 )
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering import browser_catalog as browser_catalog_module
+from xdart.gui.tabs.scattering import browser_view as browser_view_module
 from xdart.gui.tabs.scattering.browser_catalog import (
     BrowserCatalogEntry,
     DirectoryModifiedCache,
@@ -793,6 +794,96 @@ def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
                     else (projected.scans[row].identifier,)
                 ),
             )
+    finally:
+        browser.deleteLater()
+        app.processEvents()
+
+
+def test_unchanged_artifact_selection_reconcile_touches_no_scan_rows(
+    monkeypatch,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    touches: list[tuple[str, bool]] = []
+    item_type = QtWidgets.QListWidgetItem
+
+    class TrackedItem(item_type):
+        def setSelected(self, selected: bool) -> None:
+            touches.append((str(self.data(QtCore.Qt.ItemDataRole.UserRole)), selected))
+            super().setSelected(selected)
+
+    monkeypatch.setattr(
+        browser_view_module.QtWidgets, "QListWidgetItem", TrackedItem,
+    )
+    paths = tuple(
+        f"/out/scan-{index:04d}.nexus" for index in range(651)
+    )
+    catalog = tuple(
+        BrowserCatalogEntry(path, Path(path).name, index)
+        for index, path in enumerate(paths)
+    )
+    projected = build_browser_projection(
+        contexts=(),
+        selection=None,
+        navigation=FrameNavigationProjection(),
+        browser_directory="/out",
+        date_sorted=False,
+        auto_last=True,
+        catalog=catalog,
+        selected_artifacts=(paths[0],),
+        current_artifact=paths[0],
+        multi_artifact_selection=True,
+    )
+    browser = BrowserView()
+    navigation = FrameNavigationProjection()
+
+    def apply(state) -> int:
+        touches.clear()
+        browser.reconcile(state, navigation, plot_mode="Single")
+        return len(touches)
+
+    try:
+        assert apply(projected) == len(paths)
+        assert apply(projected) == 0
+
+        changed = replace(
+            projected,
+            selected_scan=paths[2],
+            selected_artifacts=(paths[0], paths[2]),
+        )
+        assert apply(changed) == len(paths)
+        assert apply(changed) == 0
+
+        cleared = replace(
+            changed, selected_scan="", selected_artifacts=(),
+        )
+        assert apply(cleared) == len(paths)
+        assert browser.scans.currentItem() is None
+        assert browser.scans.selectedItems() == []
+        assert apply(cleared) == 0
+
+        browser.scans.setCurrentItem(
+            browser.scans.item(1),
+            QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
+        )
+        assert apply(cleared) == len(paths)
+        assert browser.scans.currentItem() is None
+
+        # A real Qt-side selection drift is still repaired even when the
+        # authoritative projection value itself is unchanged.
+        apply(changed)
+        browser.scans.item(1).setSelected(True)
+        assert apply(changed) == len(paths)
+        assert tuple(
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for item in browser.scans.selectedItems()
+        ) == (paths[0], paths[2])
+
+        extended = replace(
+            changed,
+            scans=(*changed.scans, replace(changed.scans[-1],
+                identifier="/out/d.nexus", label="d.nexus")),
+        )
+        assert apply(extended) == len(paths) + 1
     finally:
         browser.deleteLater()
         app.processEvents()
