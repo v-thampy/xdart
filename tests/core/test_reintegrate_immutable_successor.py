@@ -2978,6 +2978,68 @@ def test_publication_drop_matrix_has_one_finite_outcome(
 
 
 @pytest.mark.parametrize(
+    ("dummy", "disposition"),
+    (
+        (-1.0, "ABORTED"),
+        (np.nextafter(-1.0, 0.0), "COMMITTED"),
+    ),
+    ids=("exact-default-dummy", "near-default-dummy"),
+)
+def test_2d_successor_uses_exact_dummy_publication_contract(
+    tmp_path, monkeypatch, dummy, disposition,
+):
+    from xrd_tools.core.containers import IntegrationResult2D
+    from xrd_tools.reduction import run_reintegrate_successor
+    import xrd_tools.reduction.core as reduction_core
+
+    seeded = _seed_existing(
+        tmp_path, labels=(2, 5), name=f"2d-dummy-{disposition.lower()}",
+    )
+    before = seeded.target.read_bytes()
+    preparation = _dimension_preparation(seeded, "2d")
+    preparation["selected_plan"]["bai_args"]["npt_azim"] = 5
+    plan = _plan(
+        seeded,
+        dimension="2d",
+        preparation=preparation,
+    )
+    intensity = np.full((4, 5), dummy, dtype=float)
+    intensity.flat[-1] = 12.0
+
+    def integrate_2d(_image, _integrator, **_kwargs):
+        return IntegrationResult2D(
+            np.linspace(0.1, 1.0, 4),
+            np.linspace(-1.0, 1.0, 5),
+            np.array(intensity, copy=True),
+            None,
+            "q_A^-1",
+            "chi_deg",
+        )
+
+    _stub_integrators(monkeypatch)
+    monkeypatch.setattr(reduction_core, "integrate_2d", integrate_2d)
+    result = run_reintegrate_successor(plan)
+
+    assert result.disposition == disposition
+    assert result.committed_labels == (
+        seeded.labels if disposition == "COMMITTED" else ()
+    )
+    assert result.publication_dropped_labels == (
+        () if disposition == "COMMITTED" else seeded.labels
+    )
+    assert seeded.target.read_bytes() == before
+    assert Path(plan.output_artifact).exists() is (
+        disposition == "COMMITTED"
+    )
+    if disposition == "COMMITTED":
+        with h5py.File(plan.output_artifact, "r") as document:
+            np.testing.assert_array_equal(
+                document["entry/integrated_2d/frame_index"][...],
+                np.asarray(seeded.labels),
+            )
+
+
+@pytest.mark.parametrize(
     "projection",
     (
         "source-graph-evidence",

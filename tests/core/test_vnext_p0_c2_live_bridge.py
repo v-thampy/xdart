@@ -2600,6 +2600,71 @@ def test_c2_nexus_preparation_classifies_each_result_array_once(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("case", "dropped"),
+    (
+        ("exact-default-dummy", True),
+        ("near-default-dummy", False),
+        ("nonfinite-intensity", True),
+        ("nonfinite-radial", True),
+        ("nonfinite-azimuthal", True),
+    ),
+)
+def test_c2_2d_publication_drop_uses_exact_minus_one_contract(case, dropped):
+    from xrd_tools.core.containers import IntegrationResult2D
+    from xrd_tools.reduction import Frame, FrameReduction, NexusSink
+    from xrd_tools.session import ResultMode
+
+    class Writer:
+        def __init__(self):
+            self.records = []
+            self.drops = []
+
+        def write_batch(self, records):
+            self.records.extend(records)
+
+        def drop_publication(self, label, mode):
+            self.drops.append((int(label), mode))
+
+    radial = np.linspace(0.1, 1.0, 4)
+    azimuthal = np.linspace(-1.0, 1.0, 5)
+    intensity = np.ones((4, 5), dtype=float)
+    if case == "exact-default-dummy":
+        intensity.flat[:19] = -1.0
+    elif case == "near-default-dummy":
+        intensity.flat[:19] = np.nextafter(-1.0, 0.0)
+    elif case == "nonfinite-intensity":
+        intensity.flat[:] = np.resize(
+            np.asarray([np.nan, np.inf, -np.inf]), intensity.size,
+        )
+    elif case == "nonfinite-radial":
+        radial[:] = np.nan
+    else:
+        azimuthal[:] = np.nan
+    result_2d = IntegrationResult2D(
+        radial,
+        azimuthal,
+        intensity,
+        None,
+        "q_A^-1",
+        "chi_deg",
+    )
+    writer = Writer()
+    sink = NexusSink("unused.nexus", write_thumbnails=False)
+    sink._writer = writer
+
+    sink.write(
+        Frame(11, image=None),
+        FrameReduction(11, result_2d=result_2d),
+    )
+
+    assert len(writer.records) == 1
+    assert (writer.records[0].result_2d is None) is dropped
+    assert writer.drops == (
+        [(11, ResultMode.two_d())] if dropped else []
+    )
+
+
 @pytest.mark.parametrize("failure_owner", ("sink", "accounting"))
 def test_c2_authority_and_sink_failures_never_publish_false_write(
     tmp_path, monkeypatch, failure_owner,

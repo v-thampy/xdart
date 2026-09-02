@@ -56,7 +56,7 @@ def _dummy_fraction(arr: np.ndarray | None, *, dummy_value: float = -1.0) -> flo
     data = np.asarray(arr, dtype=float)
     if data.size == 0:
         return 0.0
-    return float(np.isclose(data, dummy_value, equal_nan=False).sum() / data.size)
+    return float((data == dummy_value).sum() / data.size)
 
 
 def _axis_range(axis) -> tuple[float, float] | None:

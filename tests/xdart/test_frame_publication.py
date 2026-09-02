@@ -314,10 +314,12 @@ def test_publication_from_live_frame_can_publish_1d_light_rows():
 
 def test_gi_dummy_publication_is_flagged_before_display_or_save():
     frame = DuckFrame(idx=4, gi=True)
+    intensity = np.full((5, 4), -1.0)
+    intensity.flat[-1] = 12.0
     frame.int_2d = IntegrationResult2D(
         radial=np.linspace(-1.0, 1.0, 5),
         azimuthal=np.linspace(0.0, 3.0, 4),
-        intensity=np.full((5, 4), -1.0),
+        intensity=intensity,
         unit="qip_A^-1",
         azimuthal_unit="qoop_A^-1",
     )
@@ -326,6 +328,7 @@ def test_gi_dummy_publication_is_flagged_before_display_or_save():
 
     assert publication.view.two_d_kind is TwoDKind.QIP_QOOP
     assert not publication.diagnostics.ok
+    assert publication.diagnostics.dummy_fraction_2d == 0.95
     assert publication.diagnostics.errors_1d == ()
     assert publication.diagnostics.errors_2d
     assert publication_has_2d_errors(publication)
@@ -334,6 +337,25 @@ def test_gi_dummy_publication_is_flagged_before_display_or_save():
     assert any("dummy" in msg for msg in publication.diagnostics.errors)
     with pytest.raises(ValueError, match="dummy"):
         validate_publication(publication, raise_on_error=True)
+
+
+def test_gi_near_dummy_publication_is_not_flagged():
+    frame = DuckFrame(idx=4, gi=True)
+    intensity = np.full((5, 4), np.nextafter(-1.0, 0.0))
+    intensity.flat[-1] = 12.0
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(-1.0, 1.0, 5),
+        azimuthal=np.linspace(0.0, 3.0, 4),
+        intensity=intensity,
+        unit="qip_A^-1",
+        azimuthal_unit="qoop_A^-1",
+    )
+
+    publication = publication_from_live_frame(frame)
+
+    assert publication.diagnostics.dummy_fraction_2d == 0.0
+    assert publication.diagnostics.errors_2d == ()
+    assert publication.diagnostics.ok
 
 
 def test_publication_1d_error_classification_is_independent_from_2d():

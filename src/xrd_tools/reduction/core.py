@@ -2375,7 +2375,7 @@ class NexusSink:
         )
         drop_2d = result_2d is not None and (
             not np.isfinite(intensity_2d).any()
-            or np.isclose(intensity_2d, -1.0, equal_nan=False).mean() >= 0.95
+            or (intensity_2d == -1.0).mean() >= 0.95
             or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
             or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
         )
