@@ -310,11 +310,12 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
     monkeypatch.setattr(record_writer, "_decode_replacement_fact", lambda *_a, **_k: trace.append("detach") or fact)
     marker = object(); monkeypatch.setattr(module, "_load_fact", lambda *_a, **_k: trace.append("raw") or (Path("/raw"), marker, None, None))
     shared = {"background": {"version": 1, "mode": "None"}, "gi": {"enabled": False, "resolved_motor": "Manual"}, "geometry": None}
-    source_plan = SimpleNamespace(requested_shared_science=shared, labels=(7,), detector_shape=(2, 2), native_dtype="<u2", resource_allocation=None)
+    allocation = SimpleNamespace(reduction_inflight=1)
+    source_plan = SimpleNamespace(requested_shared_science=shared, labels=(7,), detector_shape=(2, 2), native_dtype="<u2", resource_allocation=allocation)
     topology = SimpleNamespace(
         execution=execution, lineage=None, source_base="/",
     )
-    frame = Frame(7); source = module._ReintegrateFrameSource(source_plan, topology=topology); source._frames = {7: frame}; source.bind_fact_reader(writer._detach_replacement_fact)
+    frame = Frame(7); source = module._ReintegrateFrameSource(source_plan, topology=topology); source._frames = {7: frame}; source.bind_allocation(allocation); source.bind_fact_reader(writer._detach_replacement_fact)
     assert source.prepare(frame)[0] is marker and trace == ["lock-enter", "detach", "lock-exit", "raw"]
     runtime_source = inspect.getsource(module._ExecutionRuntime.run)
     assert runtime_source.index("self.source.prepare(frame)") < runtime_source.index("self.session._session.drain()") and "with " not in runtime_source
@@ -335,6 +336,404 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
     source = (root / "src/xrd_tools/reduction/reintegrate.py").read_text()
     assert "import xdart" not in source and "from xdart" not in source
     assert "PyQt" not in source and "PySide" not in source and "qtpy" not in source
+
+
+def test_reintegrate_uses_bounded_inflight_chunks_and_settles_before_clear(
+    tmp_path, monkeypatch,
+):
+    import h5py
+    import numpy as np
+
+    from tests.core.test_vnext_p34_existing_replacement import _r1
+    from xrd_tools.io.record_writer import NexusRecordWriter
+    from xrd_tools.reduction import core
+    from xrd_tools.reduction import reintegrate as module
+
+    labels = tuple(range(12))
+    seeded = _seed_existing(tmp_path, labels=labels, name="chunked")
+    preparation = copy.deepcopy(seeded.preparation)
+    preparation["resource_policy"]["requests"] = {
+        "workers": 4,
+        "reduction_inflight": 8,
+    }
+    plan = module.ReintegratePlan.from_artifact(
+        seeded.target,
+        entry="entry",
+        dimension="1d",
+        preparation=preparation,
+    )
+    assert (
+        plan.resource_allocation.workers,
+        plan.resource_allocation.reduction_inflight,
+    ) == (4, 8)
+
+    sources = []
+    prepare_snapshots = []
+    drain_snapshots = []
+    cleared = []
+    batch_sizes = []
+    release = threading.Event()
+    source_init = module._ReintegrateFrameSource.__init__
+    source_prepare = module._ReintegrateFrameSource.prepare
+    source_clear = module._ReintegrateFrameSource.clear_label
+    engine_drain = core.ReductionSession.drain
+    writer_batch = NexusRecordWriter.write_batch
+
+    def initialize(owner, *args, **kwargs):
+        source_init(owner, *args, **kwargs)
+        sources.append(owner)
+
+    def prepare(owner, frame):
+        value = source_prepare(owner, frame)
+        prepare_snapshots.append(tuple(owner._jit))
+        return value
+
+    def clear(owner, label):
+        if int(label) in owner._jit:
+            cleared.append((int(label), tuple(owner._jit)))
+        return source_clear(owner, label)
+
+    def drain(session, *args, **kwargs):
+        active = tuple(session.source._jit)
+        if active:
+            release.set()
+        value = engine_drain(session, *args, **kwargs)
+        if active:
+            drain_snapshots.append((active, tuple(session.source._jit)))
+            release.clear()
+        return value
+
+    def write_batch(owner, records):
+        records = tuple(records)
+        batch_sizes.append(len(records))
+        return writer_batch(owner, records)
+
+    monkeypatch.setattr(module._ReintegrateFrameSource, "__init__", initialize)
+    monkeypatch.setattr(module._ReintegrateFrameSource, "prepare", prepare)
+    monkeypatch.setattr(module._ReintegrateFrameSource, "clear_label", clear)
+    monkeypatch.setattr(core.ReductionSession, "drain", drain)
+    monkeypatch.setattr(NexusRecordWriter, "write_batch", write_batch)
+    _stub_integrators(monkeypatch)
+    integrate_1d = core.integrate_1d
+
+    def gated_integrate(*args, **kwargs):
+        assert release.wait(10)
+        return integrate_1d(*args, **kwargs)
+
+    monkeypatch.setattr(core, "integrate_1d", gated_integrate)
+
+    result = module.run_reintegrate(plan)
+    assert result.disposition == "COMMITTED"
+    assert result.committed_labels == labels
+    assert prepare_snapshots == [
+        tuple(labels[start:label + 1])
+        for start in (0, 8)
+        for label in labels[start:start + 8]
+    ]
+    assert drain_snapshots == [
+        (labels[:8], labels[:8]),
+        (labels[8:], labels[8:]),
+    ]
+    assert tuple(label for label, _active in cleared) == labels
+    assert all(label in active for label, active in cleared)
+    assert batch_sizes == [8, 4]
+    assert len(sources) == 1
+    assert sources[0].jit_roots == ()
+    assert sources[0]._frames == {}
+    with h5py.File(seeded.target, "r") as handle:
+        group = handle["entry/integrated_1d"]
+        np.testing.assert_array_equal(group["frame_index"][()], labels)
+        np.testing.assert_allclose(
+            group["intensity"][()],
+            np.stack([_r1(label + 100).intensity for label in labels]),
+        )
+
+
+def test_direct_hdf_window_is_exact_two_handle_mask_bounded_and_retryable(
+    tmp_path, monkeypatch,
+):
+    import h5py
+    import hdf5plugin
+    import numpy as np
+
+    from xdart.gui.tabs.scattering.contracts import (
+        ExternalSourceState,
+        SourceExecutionStamp,
+        SourceFileState,
+    )
+    from xrd_tools.io.nexus import NexusImageStack
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+    from xrd_tools.reduction import reintegrate as module
+
+    shape = (17, 17)
+    members = []
+    expected = []
+    cursor = 0
+    for member_index in range(2):
+        path = tmp_path / f"member-{member_index}.h5"
+        frames = np.stack([
+            np.full(shape, member_index * 10 + offset, dtype=np.uint32)
+            for offset in range(2)
+        ])
+        with h5py.File(path, "w") as handle:
+            handle.create_group("entry/data").create_dataset(
+                "data", data=frames, chunks=(1, *shape),
+                **hdf5plugin.Bitshuffle(cname="lz4"),
+            )
+        members.append(ExternalSourceState(
+            SourceFileState.capture(path), "/entry/data/data",
+            cursor, cursor + len(frames), member_index,
+        ))
+        expected.extend(frames)
+        cursor += len(frames)
+    master = tmp_path / "master.h5"
+    with h5py.File(master, "w") as handle:
+        data = handle.create_group("entry/data")
+        for index, member in enumerate(members, 1):
+            data[f"data_{index:06d}"] = h5py.ExternalLink(
+                Path(member.file.path).name, member.dataset,
+            )
+    master_state = SourceFileState.capture(master)
+    execution = SourceExecutionStamp(
+        master_state, "nexus_hdf5", cursor, 0,
+        external_members=tuple(members),
+    ).as_dict()
+    fact = {
+        "label": 0,
+        "path": master_state.path,
+        "frame_index": 0,
+        "source_base": "",
+        "snapshot": {
+            "adapter_id": "nexus_hdf5",
+            "size": master_state.size,
+            "mtime_ns": master_state.mtime_ns,
+            "frame_count": cursor,
+            "dataset_path": "/entry/data/data_000001",
+            "self_contained": False,
+        },
+        "source_execution": execution,
+        "append_lineage": None,
+        "metadata": {},
+        "geometry": {},
+        "background_dependency": None,
+    }
+    topology = module._admit_source_topology(
+        fact, full_inventory=True, selected_labels=tuple(range(cursor)),
+    )
+    target = tmp_path / "processed.nexus"
+    target.write_bytes(b"distinct replacement target")
+    target_snapshot = capture_target_snapshot(target)
+    frame_bytes = int(np.prod(shape)) * np.dtype("<u4").itemsize
+    allocation = SimpleNamespace(owner_block_bytes=3 * frame_bytes)
+    file_count = lambda: h5py.h5f.get_obj_count(
+        h5py.h5f.OBJ_ALL, h5py.h5f.OBJ_FILE)
+    baseline = file_count()
+
+    owner = module._ReintegrateDirectHdfWindow(
+        topology, allocation, shape, "<u4", target_snapshot, 0,
+    )
+    owner.open()
+    assert file_count() == baseline + 1
+    for label in (0, 1, 2, 3):
+        route = topology.frame_routes[label].hdf
+        np.testing.assert_array_equal(owner.read(route, label), expected[label])
+        assert file_count() <= baseline + 2
+    errors = []
+    def cross_thread():
+        try:
+            owner.validate()
+        except BaseException as error:
+            errors.append(error)
+    thread = threading.Thread(target=cross_thread)
+    thread.start(); thread.join()
+    assert len(errors) == 1
+    assert "owner-thread-only" in str(errors[0])
+
+    real_close = NexusImageStack.close
+    close_calls = []
+    active_view = owner._active[2]
+    def flaky_close(view):
+        if view is active_view and not close_calls:
+            close_calls.append("failed")
+            raise OSError("injected direct-reader close failure")
+        return real_close(view)
+    monkeypatch.setattr(NexusImageStack, "close", flaky_close)
+    with pytest.raises(OSError, match="injected direct-reader close failure"):
+        owner.close(validate=True)
+    assert owner._active is not None and owner._master is not None
+    owner.close(validate=True)
+    assert owner._closed and owner._active is owner._master is None
+    assert file_count() == baseline
+
+    constrained = module._ReintegrateDirectHdfWindow(
+        topology, SimpleNamespace(owner_block_bytes=2 * frame_bytes),
+        shape, "<u4", target_snapshot, 1,
+    )
+    constrained.open()
+    np.testing.assert_array_equal(
+        constrained.read(topology.frame_routes[0].hdf, 0), expected[0],
+    )
+    assert constrained._active[-1] is None
+    constrained.close(validate=True)
+    assert file_count() == baseline
+
+    conflicting = replace(
+        topology,
+        frame_routes=__import__("types").MappingProxyType({
+            0: topology.frame_routes[0],
+            2: topology.frame_routes[2],
+            4: topology.frame_routes[0]._replace(
+                hdf=topology.frame_routes[0].hdf._replace(start=2, stop=4),
+            ),
+        }),
+    )
+    conflict_owner = module._ReintegrateDirectHdfWindow(
+        conflicting, allocation, shape, "<u4", target_snapshot, 0,
+    )
+    with pytest.raises(
+        ValueError,
+        match="REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+    ):
+        conflict_owner.open()
+    assert file_count() == baseline
+    conflict_owner.close(validate=False)
+
+    provisional_owner = module._ReintegrateDirectHdfWindow(
+        topology, SimpleNamespace(owner_block_bytes=frame_bytes),
+        shape, "<u4", target_snapshot, 1,
+    )
+    provisional_owner.open()
+    provisional_failures = []
+    def twice_failing_close(view):
+        if len(provisional_failures) < 2:
+            provisional_failures.append(view)
+            raise OSError("injected provisional close failure")
+        return real_close(view)
+    monkeypatch.setattr(NexusImageStack, "close", twice_failing_close)
+    with pytest.raises(OSError, match="injected provisional close failure"):
+        provisional_owner.read(topology.frame_routes[0].hdf, 0)
+    assert provisional_owner._provisional is not None
+    assert provisional_owner._master is not None
+    monkeypatch.setattr(NexusImageStack, "close", real_close)
+    provisional_owner.close(validate=False)
+    assert provisional_owner._closed and file_count() == baseline
+
+    same_inode = module._ReintegrateDirectHdfWindow(
+        topology, allocation, shape, "<u4",
+        capture_target_snapshot(master), 0,
+    )
+    with pytest.raises(
+        ValueError, match="REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
+    ):
+        same_inode.open()
+    assert file_count() == baseline
+    same_inode.close(validate=False)
+
+    raw_refusal = module._ReintegrateDirectHdfWindow(
+        topology, allocation, shape, "<u4", target_snapshot, 0,
+    )
+    raw_refusal.open()
+    real_direct_read = NexusImageStack.read_eiger_direct_chunk
+    monkeypatch.setattr(
+        NexusImageStack, "read_eiger_direct_chunk",
+        lambda *_args, **_kwargs: (None, "injected pre-read refusal"),
+    )
+    np.testing.assert_array_equal(
+        raw_refusal.read(topology.frame_routes[0].hdf, 0), expected[0],
+    )
+    assert file_count() <= baseline + 2
+    raw_refusal.close(validate=True)
+    assert file_count() == baseline
+    monkeypatch.setattr(
+        NexusImageStack, "read_eiger_direct_chunk", real_direct_read,
+    )
+
+    token = threading.Event()
+    cancelled = module._ReintegrateDirectHdfWindow(
+        topology, allocation, shape, "<u4", target_snapshot, 0, token,
+    )
+    cancelled.open()
+    def cancel_after_read(view, *args, **kwargs):
+        value = real_direct_read(view, *args, **kwargs)
+        token.set()
+        return value
+    monkeypatch.setattr(
+        NexusImageStack, "read_eiger_direct_chunk", cancel_after_read,
+    )
+    with pytest.raises(module.ReintegrateCancelled):
+        cancelled.read(topology.frame_routes[0].hdf, 0)
+    cancelled.close(validate=False)
+    assert file_count() == baseline
+    monkeypatch.setattr(
+        NexusImageStack, "read_eiger_direct_chunk", real_direct_read,
+    )
+
+    drifted = module._ReintegrateDirectHdfWindow(
+        topology, allocation, shape, "<u4", target_snapshot, 0,
+    )
+    drifted.open()
+    member_path = Path(members[0].file.path)
+    def drift_after_read(view, *args, **kwargs):
+        value = real_direct_read(view, *args, **kwargs)
+        observed = member_path.stat()
+        os.utime(member_path, ns=(
+            observed.st_atime_ns, observed.st_mtime_ns + 1_000_000,
+        ))
+        return value
+    monkeypatch.setattr(
+        NexusImageStack, "read_eiger_direct_chunk", drift_after_read,
+    )
+    with pytest.raises(
+        ValueError, match="REPLACEMENT_SOURCE_REVISION_CHANGED",
+    ):
+        drifted.read(topology.frame_routes[0].hdf, 0)
+    drifted.close(validate=False)
+    assert file_count() == baseline
+
+
+def test_direct_hdf_construction_preserves_primary_and_retry_custody(
+    monkeypatch,
+):
+    from xrd_tools.reduction import reintegrate as module
+
+    allocation = object()
+    plan = SimpleNamespace(
+        resource_allocation=allocation,
+        detector_shape=(2, 2),
+        native_dtype="<u2",
+        expected_target_snapshot=object(),
+        retained_mask_bytes=0,
+    )
+    source = object.__new__(module._ReintegrateFrameSource)
+    source.plan = plan
+    source.token = None
+    source.bound_allocation = allocation
+    source._topology = object()
+    source._direct_hdf = None
+    owners = []
+    class InjectedOwner:
+        def __init__(self, *args, **kwargs):
+            self.close_calls = 0
+            owners.append(self)
+        def open(self):
+            raise ValueError("injected direct admission primary")
+        def close(self, *, validate=False):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise OSError("injected direct cleanup failure")
+    monkeypatch.setattr(
+        module, "_ReintegrateDirectHdfWindow", InjectedOwner,
+    )
+    with pytest.raises(
+        ValueError, match="injected direct admission primary",
+    ) as caught:
+        source.open_direct_hdf()
+    assert "direct HDF construction cleanup" in "\n".join(
+        getattr(caught.value, "__notes__", ()))
+    assert source._direct_hdf is owners[0]
+    source.close_direct_hdf(validate=False)
+    assert source._direct_hdf is None and owners[0].close_calls == 2
+
 
 def test_parent_red_stable_loaded_browse_enables_reintegrate_1d_start(tmp_path, monkeypatch, qapp):
     from xrd_tools.session.readiness import ControlAction, SectionId

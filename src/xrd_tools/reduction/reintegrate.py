@@ -16,6 +16,7 @@ _MAX_HDF_EXTERNAL_ADDRESS = (1 << 63) - 1
 _REINTEGRATE_PLAN_API_VERSION = 3
 _REINTEGRATE_RECIPE_VERSION = 3
 _REINTEGRATE_SCIENCE_API_VERSION = 1
+_DIRECT_HDF_FALLBACK = object()
 class ReintegrateCancelled(RuntimeError): pass
 class _PersistedMaskSpec(NamedTuple): retained_bytes: int; decode_bytes: int
 class _ArtifactInspection(NamedTuple): labels: tuple[int, ...]; detector_shape: tuple[int, int]; native_dtype: str; persisted_shared_science: Mapping[str, Any]; persisted_selected_plan: Mapping[str, Any]; acquisition_fingerprint: str; source_base: str; append_lineage: bytes | None; gi_values: Mapping[int, float]; mask_spec: _PersistedMaskSpec; mask: Any | None; raw_options: Mapping[str, Any] | None; topology: _SourceTopology
@@ -1530,9 +1531,292 @@ def _decode_nonhdf_source(
         return decode(path)
     with _immutable_nonhdf_source(path, revisions, token) as stable:
         return decode(stable)
+
+
+class _ReintegrateDirectHdfWindow:
+    """Owner-thread direct-chunk reads over the already-admitted HDF graph.
+
+    The replacement topology remains the authority.  This window opens its
+    master/member objects directly from the pre-bound frame routes, fences the
+    resulting descriptors against that authority around every read, and hands
+    workers only detached native arrays.  Codec-ineligible datasets stay on a
+    high-level read through the same pinned member; a route that cannot retain
+    one native frame under the exact grant falls back to the legacy reader.  A
+    selected direct read never silently falls back after its bytes or codec
+    contract change.
+    """
+
+    def __init__(self, topology, allocation, shape, dtype, target_snapshot,
+                 retained_mask_bytes, token=None):
+        self._topology = topology
+        self._allocation = allocation
+        self._shape = tuple(shape)
+        self._dtype = str(dtype)
+        self._target_snapshot = target_snapshot
+        self._available_owner_bytes = (
+            int(allocation.owner_block_bytes) - int(retained_mask_bytes)
+        )
+        self._token = token
+        self._thread = None
+        self._master = None
+        self._active = None
+        self._provisional = None
+        self._bounds = {}
+        self._bypass = {}
+        self._opened = False
+        self._closed = False
+
+    @staticmethod
+    def _path_key(path):
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+    @classmethod
+    def _route_key(cls, route):
+        return cls._path_key(route.member_path), route.dataset_path
+
+    def open(self):
+        if self._closed or self._opened:
+            raise RuntimeError("replacement direct HDF window is one-shot")
+        self._thread = threading.get_ident()
+        self._opened = True
+        routes = tuple(
+            route.hdf for route in self._topology.frame_routes.values()
+            if route.hdf is not None and not route.hdf.storage_slices
+        )
+        if not routes:
+            return
+        for route in routes:
+            key = self._route_key(route)
+            bounds = (int(route.start), int(route.stop))
+            prior = self._bounds.get(key)
+            _reject(
+                prior is not None and prior != bounds,
+                "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+            )
+            self._bounds.setdefault(key, bounds)
+        paths = {
+            self._path_key(path): str(path) for path in (
+                self._topology.execution["path"],
+                *(route.member_path for route in routes),
+            )
+        }
+        target_identity = (
+            int(self._target_snapshot.device),
+            int(self._target_snapshot.inode),
+        )
+        for path in paths.values():
+            admitted = _admitted_revision(
+                path, self._topology.revision_lookup)
+            _reject(
+                tuple(int(value) for value in admitted[3][4:6])
+                == target_identity,
+                "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
+            )
+        import h5py
+        path = str(self._topology.execution["path"])
+        handle = h5py.File(path, "r")
+        self._master = (path, handle)
+        self.validate()
+
+    def _require_thread(self):
+        if self._thread is None or threading.get_ident() != self._thread:
+            raise RuntimeError(
+                "replacement direct HDF window is owner-thread-only")
+
+    def _close_active(self):
+        active = self._active
+        if active is None:
+            return
+        view = active[2]
+        view.close()
+        self._active = None
+
+    def _close_provisional(self):
+        provisional = self._provisional
+        if provisional is None:
+            return
+        _key, _path, handle, view, _start, _stop = provisional
+        (view.close() if view is not None else handle.close())
+        self._provisional = None
+
+    def _activate(self, route):
+        key = self._route_key(route)
+        bounds = (int(route.start), int(route.stop))
+        prior = self._bounds.get(key)
+        _reject(
+            prior is not None and prior != bounds,
+            "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+        )
+        self._bounds.setdefault(key, bounds)
+        if key in self._bypass:
+            _reject(
+                self._bypass[key] != bounds,
+                "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+            )
+            return None
+        active = self._active
+        if active is not None and active[0] == key:
+            _reject(
+                active[3:5] != bounds,
+                "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+            )
+            return active
+        self._close_active()
+        import h5py
+        import numpy as np
+        from xrd_tools.io.nexus import NexusImageStack
+        from xrd_tools.sources.eiger_direct_chunk import (
+            EigerDirectChunkPolicy,
+        )
+        path = str(route.member_path)
+        handle = h5py.File(path, "r")
+        self._provisional = (key, path, handle, None, *bounds)
+        view = None
+        try:
+            _hdf_handle_revision(
+                handle, path, self._topology.revision_lookup)
+            dataset = _local_hdf_dataset(handle, route.dataset_path)
+            _reject(
+                bool(dataset.is_virtual)
+                or dataset.ndim not in {2, 3}
+                or dataset.ndim == 2 and bounds != (0, 1)
+                or dataset.ndim == 3
+                and int(dataset.shape[0]) != bounds[1] - bounds[0],
+                "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+            )
+            frame_shape = tuple(int(value) for value in (
+                dataset.shape[1:] if dataset.ndim == 3
+                else dataset.shape))
+            _expected_source_schema(
+                frame_shape, np.dtype(dataset.dtype).str,
+                self._shape, self._dtype,
+            )
+            view = NexusImageStack._from_bound_datasets(
+                handle, [route.dataset_path], [dataset])
+            self._provisional = (key, path, handle, view, *bounds)
+            layout, _reason = view.eiger_direct_chunk_layout()
+            policy = None if layout is None else (
+                EigerDirectChunkPolicy.from_owner_grant(
+                    layout.frame_bytes, self._available_owner_bytes)
+                if self._available_owner_bytes > 0 else None
+            )
+            frame_bytes = _bounded_hdf_byte_count(
+                frame_shape, np.dtype(dataset.dtype).itemsize)
+            if self._available_owner_bytes < frame_bytes:
+                self._close_provisional()
+                self._bypass[key] = bounds
+                return None
+            selected_layout = (
+                layout if policy is not None and policy.enabled else None
+            )
+            self._active = (key, path, view, *bounds, selected_layout)
+            self._provisional = None
+            return self._active
+        except BaseException as primary:
+            try:
+                self._close_provisional()
+            except BaseException as cleanup:
+                try:
+                    primary.add_note(
+                        f"direct HDF provisional cleanup: {_diagnostic(cleanup)}")
+                except (AttributeError, TypeError):
+                    pass
+            raise
+
+    def validate(self):
+        self._require_thread()
+        if self._closed:
+            raise RuntimeError("replacement direct HDF window is closed")
+        _event(self._token)
+        owners = (() if self._master is None else (self._master,))
+        if self._active is not None:
+            owners += ((self._active[1], self._active[2]._h5),)
+        if self._provisional is not None:
+            owners += ((
+                self._provisional[1],
+                (self._provisional[2] if self._provisional[3] is None
+                 else self._provisional[3]._h5),
+            ),)
+        for path, handle in owners:
+            _hdf_handle_revision(
+                handle, path, self._topology.revision_lookup)
+        _event(self._token)
+
+    def read(self, route, index):
+        self._require_thread()
+        if not self._opened or self._closed:
+            return _DIRECT_HDF_FALLBACK
+        if route.storage_slices:
+            return _DIRECT_HDF_FALLBACK
+        bound = self._activate(route)
+        if bound is None:
+            return _DIRECT_HDF_FALLBACK
+        _key, _path, view, start, stop, layout = bound
+        local_index = int(index) - start
+        _reject(
+            (int(route.start), int(route.stop)) != (start, stop)
+            or not 0 <= local_index < stop - start,
+            "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+        )
+        self.validate()
+        try:
+            if layout is None:
+                import numpy as np
+                image = np.asarray(view[local_index])
+            else:
+                raw, _reason = view.read_eiger_direct_chunk(
+                    local_index, layout.frame_bytes)
+                if raw is None:
+                    import numpy as np
+                    image = np.asarray(view[local_index])
+                else:
+                    from xrd_tools.sources.eiger_direct_chunk import (
+                        decode_eiger_chunk,
+                    )
+                    image = decode_eiger_chunk(raw, layout)
+        finally:
+            self.validate()
+        return image
+
+    def close(self, *, validate=False):
+        if self._closed:
+            return
+        self._require_thread()
+        primary = None
+        if validate and (
+                self._master is not None or self._active is not None
+                or self._provisional is not None):
+            try:
+                self.validate()
+            except BaseException as error:
+                primary = error
+        try:
+            self._close_active()
+        except BaseException as error:
+            primary = primary or error
+        try:
+            self._close_provisional()
+        except BaseException as error:
+            primary = primary or error
+        master = self._master
+        if (self._active is None and self._provisional is None
+                and master is not None):
+            try:
+                master[1].close()
+            except BaseException as error:
+                primary = primary or error
+            else:
+                self._master = None
+        if (self._active is None and self._provisional is None
+                and self._master is None):
+            self._closed = True
+        if primary is not None:
+            raise primary
+
+
 def _source_fact_inner(fact, *, raw_options=None, read=False, token=None,
                        expected_shape=None, expected_dtype=None, topology=None,
-                       qualification=None):
+                       qualification=None, direct_hdf=None):
     import numpy as np
     topology = topology or _admit_source_topology(
         fact, full_inventory=False, token=token)
@@ -1549,38 +1833,50 @@ def _source_fact_inner(fact, *, raw_options=None, read=False, token=None,
         route = frame_route.hdf
         _reject(route is None,
                 "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED")
-        with h5py.File(path, "r") as handle:
-            _hdf_handle_revision(handle, path, before)
-            with _open_admitted_hdf_dataset(
-                handle, path, route.member_path, route.dataset_path, before,
-            ) as dataset:
-                local_index = index - route.start
-                _reject(
-                    bool(dataset.is_virtual)
-                    or dataset.ndim not in {2, 3}
-                    or dataset.ndim == 2 and (
-                        route.stop - route.start != 1 or local_index != 0)
-                    or dataset.ndim == 3 and (
-                        int(dataset.shape[0]) != route.stop - route.start
-                        or not 0 <= local_index < int(dataset.shape[0])),
-                    "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
-                )
-                shape = tuple(int(value) for value in (
-                    dataset.shape[1:] if dataset.ndim == 3
-                    else dataset.shape))
-                dtype = np.dtype(dataset.dtype).str
-                _expected_source_schema(
-                    shape, dtype, expected_shape, expected_dtype)
-                if read:
-                    if route.storage_slices:
-                        image = _read_external_hdf_frame(
-                            dataset, local_index, before,
-                            route.storage_slices)
-                    else:
-                        image = np.asarray(
-                            dataset[local_index]
-                            if dataset.ndim == 3 else dataset[()])
-            _hdf_handle_revision(handle, path, before)
+        direct = (
+            direct_hdf.read(route, index)
+            if read and direct_hdf is not None else _DIRECT_HDF_FALLBACK
+        )
+        if direct is not _DIRECT_HDF_FALLBACK:
+            _reject(
+                expected_shape is None or expected_dtype is None,
+                "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+            )
+            shape, dtype, image = (
+                tuple(expected_shape), str(expected_dtype), direct)
+        else:
+            with h5py.File(path, "r") as handle:
+                _hdf_handle_revision(handle, path, before)
+                with _open_admitted_hdf_dataset(
+                    handle, path, route.member_path, route.dataset_path, before,
+                ) as dataset:
+                    local_index = index - route.start
+                    _reject(
+                        bool(dataset.is_virtual)
+                        or dataset.ndim not in {2, 3}
+                        or dataset.ndim == 2 and (
+                            route.stop - route.start != 1 or local_index != 0)
+                        or dataset.ndim == 3 and (
+                            int(dataset.shape[0]) != route.stop - route.start
+                            or not 0 <= local_index < int(dataset.shape[0])),
+                        "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
+                    )
+                    shape = tuple(int(value) for value in (
+                        dataset.shape[1:] if dataset.ndim == 3
+                        else dataset.shape))
+                    dtype = np.dtype(dataset.dtype).str
+                    _expected_source_schema(
+                        shape, dtype, expected_shape, expected_dtype)
+                    if read:
+                        if route.storage_slices:
+                            image = _read_external_hdf_frame(
+                                dataset, local_index, before,
+                                route.storage_slices)
+                        else:
+                            image = np.asarray(
+                                dataset[local_index]
+                                if dataset.ndim == 3 else dataset[()])
+                _hdf_handle_revision(handle, path, before)
     else:
         shape, dtype, image = _decode_nonhdf_source(
             path, source_route, snapshot, index, raw_options, read, token,
@@ -1601,8 +1897,8 @@ def _source_fact_inner(fact, *, raw_options=None, read=False, token=None,
     return tuple(shape), dtype, path, image
 def _source_fact(fact, *, raw_options=None, read=False, token=None,
                  expected_shape=None, expected_dtype=None, topology=None,
-                 qualification=None):
-    try: return _source_fact_inner(fact, raw_options=raw_options, read=read, token=token, expected_shape=expected_shape, expected_dtype=expected_dtype, topology=topology, qualification=qualification)
+                 qualification=None, direct_hdf=None):
+    try: return _source_fact_inner(fact, raw_options=raw_options, read=read, token=token, expected_shape=expected_shape, expected_dtype=expected_dtype, topology=topology, qualification=qualification, direct_hdf=direct_hdf)
     except Exception as error: raise (error if isinstance(error, ReintegrateCancelled) or type(error) is ValueError and str(error).startswith("REPLACEMENT_") else ValueError("REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED" if Path(str(fact.get("path", ""))).suffix.lower() in {".h5", ".hdf5", ".nxs", ".cxi"} else "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"))
 def _background_fact(fact, shared, shape, path, token):
     from xrd_tools.reduction.background import FrameBackgroundPlan, _frame, _one, _tag, resolve_frame_background; plan = FrameBackgroundPlan.from_mapping(_plain(shared["background"])); pair = fact["background_dependency"]
@@ -1629,10 +1925,10 @@ def _fact_projection(selected, shared):
     }
     return tuple(sorted(key for key in keys if key)), shared["geometry"] is not None
 def _load_fact(fact, shape, dtype, shared, token, raw_options=None,
-               topology=None):
+               topology=None, direct_hdf=None):
     topology = topology or _admit_source_topology(
         fact, full_inventory=False, token=token)
-    _event(token); qualification = _qualified_fact(fact, topology); path = qualification[0]; _event(token); background, pair = _background_fact(fact, shared, shape, path, token); _event(token); final_shape, final_dtype, _path, image = _source_fact(fact, raw_options=raw_options, read=True, token=token, expected_shape=shape, expected_dtype=dtype, topology=topology, qualification=qualification); _event(token); _reject(final_shape != tuple(shape) or final_dtype != dtype, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); return path, image, background, pair
+    _event(token); qualification = _qualified_fact(fact, topology); path = qualification[0]; _event(token); background, pair = _background_fact(fact, shared, shape, path, token); _event(token); final_shape, final_dtype, _path, image = _source_fact(fact, raw_options=raw_options, read=True, token=token, expected_shape=shape, expected_dtype=dtype, topology=topology, qualification=qualification, direct_hdf=direct_hdf); _event(token); _reject(final_shape != tuple(shape) or final_dtype != dtype, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); return path, image, background, pair
 def _geometry_fact(fact, shared):
     value = dict(fact["geometry"]); active = shared["geometry"] is not None; _reject(active != bool(value) or active and (set(value) != {"rot1", "rot2", "rot3", "incident_angle"} or any(type(v) is not float or not math.isfinite(v) for v in value.values())), "replacement geometry differs"); return None if not active else __import__("xrd_tools.core.scan", fromlist=["FrameGeometry"]).FrameGeometry(**value)
 def _background_resource_terms(mode: str, shape: tuple[int, int]) -> tuple[int, int, int, int]: pixels = int(shape[0]) * int(shape[1]); _reject(mode not in {"None", "Series Average", "Single BG File", "BG Directory"}, "unsupported Background resource mode"); return (0, 0, 0, 0) if mode == "None" else (8*pixels, 25*pixels, 8*pixels, 64 << 20) if mode == "Series Average" else (8*pixels, 8*pixels, 8*pixels, 64 << 20)
@@ -2133,37 +2429,75 @@ class ReintegrateResult:
     disposition: str; input_labels: tuple[int, ...]; committed_labels: tuple[int, ...]; publication_dropped_labels: tuple[int, ...]; diagnostics: tuple[str, ...]; science_identity: str; operation_identity: str; audit_identity: str | None; commit_identity: Any | None
     def __new__(cls, *args, **kwargs): raise TypeError("ReintegrateResult is factory-constructed")
 class _ReintegrateFrameSource:
-    def __init__(self, plan, token=None, raw_options=None, topology=None): self.plan, self.token, self.raw_options, self.bound_allocation, self._jit, self._fact_reader, self._frames, self._topology = plan, token, raw_options, None, {}, None, {}, topology; self._metadata_keys, self._include_geometry = _fact_projection(getattr(plan, "selected_plan", None), plan.requested_shared_science)
+    def __init__(self, plan, token=None, raw_options=None, topology=None): self.plan, self.token, self.raw_options, self.bound_allocation, self._jit, self._fact_reader, self._frames, self._topology, self._direct_hdf = plan, token, raw_options, None, {}, None, {}, topology, None; self._metadata_keys, self._include_geometry = _fact_projection(getattr(plan, "selected_plan", None), plan.requested_shared_science)
     @property
     def frame_indices(self): return list(self.plan.labels)
     @property
-    def jit_roots(self): return tuple(v for v in self._jit.values() if v is not None)
+    def jit_roots(self): return tuple(root for roots in self._jit.values() for root in roots.values() if root is not None)
     def bind_allocation(self, allocation): _reject(allocation is not self.plan.resource_allocation, "RESOURCE_ALLOCATION_IDENTITY"); self.bound_allocation = allocation
     def bind_fact_reader(self, reader): self._fact_reader = reader
+    def open_direct_hdf(self):
+        if self._direct_hdf is not None:
+            raise RuntimeError("replacement direct HDF window is already bound")
+        _reject(
+            self._topology is None
+            or self.bound_allocation is not self.plan.resource_allocation,
+            "RESOURCE_ALLOCATION_IDENTITY",
+        )
+        owner = _ReintegrateDirectHdfWindow(
+            self._topology, self.bound_allocation,
+            self.plan.detector_shape, self.plan.native_dtype,
+            self.plan.expected_target_snapshot,
+            self.plan.retained_mask_bytes, self.token,
+        )
+        self._direct_hdf = owner
+        try:
+            owner.open()
+        except BaseException as primary:
+            try:
+                owner.close(validate=False)
+            except BaseException as cleanup:
+                try:
+                    primary.add_note(
+                        f"direct HDF construction cleanup: {_diagnostic(cleanup)}")
+                except (AttributeError, TypeError):
+                    pass
+            else:
+                self._direct_hdf = None
+            raise
+    def close_direct_hdf(self, *, validate=False):
+        owner = self._direct_hdf
+        if owner is not None:
+            owner.close(validate=validate)
+            self._direct_hdf = None
     def container_descriptor(self):
         import numpy as np; terms = _background_resource_terms(self.plan.requested_shared_science["background"]["mode"], self.plan.detector_shape); return SimpleNamespace(frame_shape=self.plan.detector_shape, dtype=np.dtype(self.plan.native_dtype), background_bytes=terms[0], resolver_background_bytes=terms[1], worker_background_bytes=terms[2], background_binding_bytes=terms[3])
     def to_scan(self, **kwargs):
         from xrd_tools.reduction.core import Frame, Scan, _REINTEGRATE_SCAN_MARKER; calibration, integrator, fi = _calibration(self.plan.requested_shared_science, self.plan.gi_bootstrap_incidence); gi = self.plan.requested_shared_science["gi"]; frames = [Frame(label, metadata=({gi["resolved_motor"]: self.plan.gi_bootstrap_incidence} if label == self.plan.labels[0] and gi["enabled"] and gi["resolved_motor"] != "Manual" else {})) for label in self.plan.labels]; self._frames = {frame.index: frame for frame in frames}
         scan = Scan("reintegrate", frames, poni=None if calibration is None else calibration.poni, integrator=fi or integrator, **kwargs); scan.extra["_reintegrate_marker"] = _REINTEGRATE_SCAN_MARKER; return scan
     def prepare(self, frame):
-        if self._fact_reader is None or self._jit: raise RuntimeError("replacement JIT fact ownership is invalid")
+        label = int(frame.index)
+        allocation = self.bound_allocation
+        if self._fact_reader is None or allocation is None or allocation is not self.plan.resource_allocation or label in self._jit or len(self._jit) >= allocation.reduction_inflight: raise RuntimeError("replacement JIT fact ownership is invalid")
+        roots = {}; self._jit[label] = roots
         try:
-            _event(self.token); fact = self._fact_reader(int(frame.index), metadata_keys=self._metadata_keys, include_geometry=self._include_geometry); self._jit.update({"source_identity": fact, "loader": frame.loader})
+            _event(self.token); fact = self._fact_reader(label, metadata_keys=self._metadata_keys, include_geometry=self._include_geometry); roots.update({"source_identity": fact, "loader": frame.loader})
             _reject(self._topology is None,
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
             _require_fact_topology(fact, self._topology)
-            path, image, background, pair = _load_fact(fact, self.plan.detector_shape, self.plan.native_dtype, self.plan.requested_shared_science, self.token, self.raw_options, self._topology)
+            path, image, background, pair = _load_fact(fact, self.plan.detector_shape, self.plan.native_dtype, self.plan.requested_shared_science, self.token, self.raw_options, self._topology, self._direct_hdf)
             revision = int(fact["snapshot"]["mtime_ns"]); gi = self.plan.requested_shared_science["gi"]; incidence = fact["metadata"].get(gi["resolved_motor"]); _reject(gi["enabled"] and gi["resolved_motor"] != "Manual" and (type(incidence) is not float or not math.isfinite(incidence) or frame.index == self.plan.labels[0] and incidence != self.plan.gi_bootstrap_incidence), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
             frame.source_path, frame.source_frame_index, frame.source_identity = path, fact["frame_index"], fact; frame.metadata.update(fact["metadata"]); frame.background = background
             frame.geometry = _geometry_fact(fact, self.plan.requested_shared_science)
             if pair is not None: frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
             geometry = None if frame.geometry is None else {key: getattr(frame.geometry, key) for key in ("rot1", "rot2", "rot3", "incident_angle")}; dependency = None if frame.background_dependency_bytes is None and frame.background_dependency_fingerprint is None else (frame.background_dependency_bytes, frame.background_dependency_fingerprint); _reject(frame.index != fact["label"] or frame.source_path != path or frame.source_frame_index != fact["frame_index"] or frame.source_identity is not fact or dict(frame.metadata) != dict(fact["metadata"]) or geometry != (None if not fact["geometry"] else dict(fact["geometry"])) or dependency != fact["background_dependency"], "replacement local JIT stub differs")
-            self._jit.update({"source_identity": fact, "image": image, "background": background, "metadata": frame.metadata, "geometry": frame.geometry, "normalization": frame.normalization_factor, "mask": frame.mask, "dependency": pair}); return image, revision
+            roots.update({"source_identity": fact, "image": image, "background": background, "metadata": frame.metadata, "geometry": frame.geometry, "normalization": frame.normalization_factor, "mask": frame.mask, "dependency": pair}); return image, revision
         except BaseException as error: self.clear_label(frame.index); (None if type(error).__name__ != "WriterStateError" or type(error).__module__ != "xrd_tools.io.record_writer" else (_ for _ in ()).throw(ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"))); raise
     def validate_terminal_topology(self):
         _reject(self._topology is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+        self.close_direct_hdf(validate=True)
         _validate_terminal_topology(self._topology, self.token)
-    def clear_label(self, label): frame = self._frames.get(int(label)); _scrub_frame(frame) if frame is not None else None; self._jit.clear()
+    def clear_label(self, label): frame = self._frames.get(int(label)); _scrub_frame(frame) if frame is not None else None; self._jit.pop(int(label), None)
     def clear_jit(self): [self.clear_label(label) for label in tuple(self._frames)]; self._jit.clear()
 class _ExecutionRuntime:
     def __init__(self, plan, cancel_token, progress_cb): self.plan, self.token, self.progress_cb, self.session, self.source, self.sink, self.result, self.audit, self.revision, self.diagnostics, self.accounting, self.primary, self.dropped = plan, cancel_token, progress_cb, None, None, None, None, None, 0, [], None, None, ()
@@ -2231,25 +2565,34 @@ class _ExecutionRuntime:
         inspected = inspected._replace(mask=mask)
         _event(self.token)
         audit = _dimension_audit(dimension=self.plan.dimension, operation_identity=self.plan.operation_identity, science_identity=self.plan.science_identity, acquisition_fingerprint=inspected.acquisition_fingerprint, requested_shared_science=self.plan.requested_shared_science, selected_plan=self.plan.selected_plan, append_lineage=inspected.append_lineage); self.audit = _audit_identity(audit); background = self.plan.requested_shared_science["background"]; run = {} if background["mode"] == "None" else {"background": _plain(background)}
-        lock = threading.RLock(); self.source = _ReintegrateFrameSource(self.plan, self.token, inspected.raw_options, inspected.topology); self.sink = NexusSink.for_existing_replacement(path, expected_target_snapshot=self.plan.expected_target_snapshot, dimension=self.plan.dimension, labels=self.plan.labels, audit_bytes=_canonical(audit), selected_plan=self.plan.selected_plan["bai_args"], selected_gi_mode=self.plan.selected_plan["gi_mode"], source_execution=dict(inspected.topology.execution), append_lineage=inspected.append_lineage, cancel_token=self.token, entry=self.plan.entry, source_base=inspected.source_base, run_configuration_provenance=run, write_thumbnails=False, flush_every=None, file_lock=lock)
+        lock = threading.RLock(); self.source = _ReintegrateFrameSource(self.plan, self.token, inspected.raw_options, inspected.topology); self.sink = NexusSink.for_existing_replacement(path, expected_target_snapshot=self.plan.expected_target_snapshot, dimension=self.plan.dimension, labels=self.plan.labels, audit_bytes=_canonical(audit), selected_plan=self.plan.selected_plan["bai_args"], selected_gi_mode=self.plan.selected_plan["gi_mode"], source_execution=dict(inspected.topology.execution), append_lineage=inspected.append_lineage, cancel_token=self.token, entry=self.plan.entry, source_base=inspected.source_base, run_configuration_provenance=run, write_thumbnails=False, flush_every=None, file_lock=lock); self.sink._configure_writer_batch_size(min(8, self.plan.resource_allocation.reduction_inflight))
         self.source.bind_fact_reader(lambda label, **kwargs: self.sink._writer._detach_replacement_fact(label, **kwargs)); core_plan = _core_plan(self.plan.selected_plan, self.plan.requested_shared_science, inspected.mask); modes = required_result_modes(core_plan); targets = {mode: (f"nexus:{path}",) for mode in modes}; ledger = StageLedger(required_modes=modes, targets_by_mode=targets); self.accounting = DynamicRunAccounting(ledger, run_generation=1, limits=DynamicAccountingLimits(1, 1, len(self.plan.labels)))
         try: self.session = ScanSession(core_plan, self.source, self.sink, policy=self.plan.session_policy, cancel_token=self.token, clear_frame_images=True, accounting=ledger, dynamic_accounting=self.accounting, targets_by_mode=targets)
         except BaseException as error: self.primary = error; return self._settle()
-        total = len(self.plan.labels)
+        total = len(self.plan.labels); chunk_size = min(8, self.plan.resource_allocation.reduction_inflight)
         try:
+            self.source.open_direct_hdf()
             self.session.start()
             self.sink._writer._replacement_read_context = (
                 inspected.source_base, inspected.topology.lineage,
                 inspected.topology.execution,
             )
-            for completed, frame in enumerate(self.session.scan.frames):
-                if self.token is not None and self.token.is_set(): self.session.stop(); break
+            frames = tuple(self.session.scan.frames)
+            for start in range(0, total, chunk_size):
+                chunk = frames[start:start + chunk_size]; prepared = []; submitted = []; stopped = False; drained = True
                 try:
-                    self._report("read", completed, total); image, revision = self.source.prepare(frame); key = DynamicFrameIdentity(self.plan.operation_identity, int(frame.index)); self.accounting.discover(key, group=self.plan.operation_identity, ordinal=completed, output_label=int(frame.index)); attempt = self.accounting.begin_attempt(key, source_revision=revision); self.accounting.record_enqueued(attempt)
-                    if not self.session.submit(frame, image, attempt_token=attempt): self.accounting.record_cancelled(attempt, reason="reintegration submission cancelled"); break
-                    if not self.session._session.drain(): break
-                    self._report("reduce", completed + 1, total); self._report("write", completed + 1, total)
-                finally: self.source.clear_label(frame.index)
+                    for completed, frame in enumerate(chunk, start):
+                        if self.token is not None and self.token.is_set(): self.session.stop(); stopped = True; break
+                        self._report("read", completed, total); image, revision = self.source.prepare(frame); prepared.append(frame); key = DynamicFrameIdentity(self.plan.operation_identity, int(frame.index)); self.accounting.discover(key, group=self.plan.operation_identity, ordinal=completed, output_label=int(frame.index)); attempt = self.accounting.begin_attempt(key, source_revision=revision); self.accounting.record_enqueued(attempt)
+                        if not self.session.submit(frame, image, attempt_token=attempt): self.accounting.record_cancelled(attempt, reason="reintegration submission cancelled"); stopped = True; break
+                        submitted.append(frame)
+                finally:
+                    try:
+                        if prepared: drained = self.session._session.drain()
+                    finally:
+                        [self.source.clear_label(frame.index) for frame in prepared]
+                for completed in range(start + 1, start + len(submitted) + 1): self._report("reduce", completed, total); self._report("write", completed, total)
+                if stopped or not drained: break
         except ReintegrateCancelled: self.session.stop()
         except BaseException as error: self._stop(error)
         try:
@@ -2260,7 +2603,7 @@ class _ExecutionRuntime:
         except BaseException as error: self._note(error); self._stop(error)
         return self._settle()
     def finish_current(self): self.session._mark_dynamic_failure(ReintegrateCancelled("reintegration cancelled before commit")) if self.token is not None and self.token.is_set() and self.session is not None and not self.sink._transaction.snapshot().writer_succeeded else None; return self._settle()
-    def close(self): source, sink = self.source, self.sink; writer = None if sink is None else sink._writer; source.clear_jit() if source is not None else None; source._frames.clear() if source is not None else None; setattr(source, "_fact_reader", None) if source is not None else None; setattr(source, "_topology", None) if source is not None else None; [setattr(writer, name, None) for name in ("_replacement_configuration", "_replacement_read_context", "_replacement_manifest", "_replacement_expected")] if writer is not None else None; writer._row_cursors.clear() if writer is not None else None; setattr(writer, "_replacement_labels", ()) if writer is not None else None; self.session = self.source = self.sink = self.result = self.accounting = None
+    def close(self): source, sink = self.source, self.sink; writer = None if sink is None else sink._writer; source.close_direct_hdf(validate=False) if source is not None else None; source.clear_jit() if source is not None else None; source._frames.clear() if source is not None else None; setattr(source, "_fact_reader", None) if source is not None else None; setattr(source, "_topology", None) if source is not None else None; [setattr(writer, name, None) for name in ("_replacement_configuration", "_replacement_read_context", "_replacement_manifest", "_replacement_expected")] if writer is not None else None; writer._row_cursors.clear() if writer is not None else None; setattr(writer, "_replacement_labels", ()) if writer is not None else None; self.session = self.source = self.sink = self.result = self.accounting = None
 def _open_runtime(plan, cancel_token, progress_cb): return _ExecutionRuntime(plan, cancel_token, progress_cb)
 class ReintegrateRunner:
     def __init__(self, plan: ReintegratePlan, *, cancel_token: threading.Event | None = None, progress_cb: Callable[[ReintegrateProgress], object] | None = None) -> None:
