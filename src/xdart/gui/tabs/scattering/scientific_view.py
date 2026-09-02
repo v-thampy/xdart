@@ -367,6 +367,14 @@ class ScientificView(QtWidgets.QFrame):
         layout.addLayout(self.footer)
         self._install_share_geometry_hooks()
 
+    def reconcile_operation_status(self, status: object) -> bool:
+        """Replace only the scalar scientific-footer status text."""
+
+        if type(status) is not str or not status:
+            return False
+        self.status.setText(status)
+        return True
+
     @property
     def rendered_image_axis(self) -> str | None:
         """Identity of the cake presentation actually accepted by the view."""

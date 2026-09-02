@@ -28,6 +28,7 @@ from .operation_values import (
     OperationContextStamp,
     OperationIdentity,
     OperationPending,
+    OperationProgress,
     OperationTerminalStatus,
     OperationUpdate,
 )
@@ -55,12 +56,23 @@ class WorkspaceOperationTransition:
     reintegrate_reload: ReintegrateReloadDirective | None = None
     average_reload: AverageReloadDirective | None = None
     request_catalog: bool = False
+    reintegrate_progress: OperationProgress | None = None
 
     def __post_init__(self) -> None:
         if (
             type(self.effect) is not WorkspaceRefreshEffect
             or type(self.notice) is not str
             or type(self.request_catalog) is not bool
+            or (
+                self.reintegrate_progress is not None
+                and (
+                    type(self.reintegrate_progress) is not OperationProgress
+                    or self.effect is not WorkspaceRefreshEffect.NONE
+                    or self.reintegrate_reload is not None
+                    or self.average_reload is not None
+                    or self.request_catalog
+                )
+            )
             or (
                 self.reintegrate_reload is not None
                 and type(self.reintegrate_reload)
@@ -85,12 +97,22 @@ class ReintegrateOperationState:
     identity: OperationIdentity
     capture: LoadedBrowseCapture
     dimension: str
+    progress: OperationProgress | None = None
+    cancel_accepted: bool = False
 
     def __post_init__(self) -> None:
         if (
             type(self.identity) is not OperationIdentity
             or type(self.capture) is not LoadedBrowseCapture
             or self.dimension not in {"1d", "2d"}
+            or (
+                self.progress is not None
+                and (
+                    type(self.progress) is not OperationProgress
+                    or self.progress.identity is not self.identity
+                )
+            )
+            or type(self.cancel_accepted) is not bool
         ):
             raise ValueError("Reintegrate operation state is invalid")
 
@@ -188,6 +210,11 @@ class WorkspaceOperationOwner:
     def reintegrate_capture(self) -> LoadedBrowseCapture | None:
         state = self._reintegrate
         return None if state is None else state.capture
+
+    @property
+    def reintegrate_cancel_accepted(self) -> bool:
+        state = self._reintegrate
+        return bool(state is not None and state.cancel_accepted)
 
     @property
     def average_identity(self) -> OperationIdentity | None:
@@ -308,11 +335,16 @@ class WorkspaceOperationOwner:
 
     def cancel_reintegrate(self, dimension: str) -> bool:
         state = self._reintegrate
-        return bool(
-            state is not None
-            and state.dimension == dimension
-            and self._slot.cancel(state.identity)
-        )
+        if (
+            state is None
+            or state.dimension != dimension
+            or state.cancel_accepted
+        ):
+            return False
+        accepted = self._slot.cancel(state.identity)
+        if accepted and self._reintegrate is state:
+            self._reintegrate = replace(state, cancel_accepted=True)
+        return bool(accepted)
 
     def retry_average(self) -> bool:
         state = self._average
@@ -355,14 +387,33 @@ class WorkspaceOperationOwner:
             state.dimension, "operation"
         )
         if update.terminal is None:
-            notice = ""
-            if update.progress is not None:
-                notice = (
-                    f"Reintegrate {shown}: {update.progress.stage} "
-                    f"{update.progress.completed}/{update.progress.total}…"
+            progress = update.progress
+            prior = state.progress
+            if (
+                update.stale
+                or state.cancel_accepted
+                or progress is None
+                or (
+                    prior is not None
+                    and (
+                        progress.revision <= prior.revision
+                        or progress.stage == prior.stage
+                        and progress.completed < prior.completed
+                    )
                 )
+            ):
+                return WorkspaceOperationTransition(
+                    WorkspaceRefreshEffect.NONE
+                )
+            self._reintegrate = replace(state, progress=progress)
+            notice = (
+                f"Reintegrate {shown}: {progress.stage} "
+                f"{progress.completed}/{progress.total}…"
+            )
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.CONTROLS, notice
+                WorkspaceRefreshEffect.NONE,
+                notice,
+                reintegrate_progress=progress,
             )
 
         terminal = update.terminal

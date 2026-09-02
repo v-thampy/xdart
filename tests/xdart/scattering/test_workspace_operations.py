@@ -16,6 +16,7 @@ from xdart.gui.tabs.scattering.operation_values import (
     OperationContextStamp,
     OperationIdentity,
     OperationPending,
+    OperationProgress,
     OperationTerminal,
     OperationTerminalStatus,
     OperationUpdate,
@@ -233,6 +234,65 @@ def test_reintegrate_begin_transfers_exact_capture_without_reload_custody(
     assert refused.reintegrate_state is None
     assert not refused.busy
     assert refused_slot.reintegrate_calls
+
+
+def test_reintegrate_progress_transition_is_exact_monotonic_and_cancel_fenced(
+) -> None:
+    owner, slot = _owner_with_slot()
+    capture = _capture()
+    identity = OperationIdentity(9)
+    slot.next_identity = identity
+    assert owner.begin_reintegrate(
+        capture,
+        dimension="1d",
+        preparation_values={"api_version": 1},
+        stamp=OperationContextStamp(1),
+    ) is identity
+
+    first = OperationProgress(identity, "integrate", 2, 5, 2)
+    transition = owner.consume_reintegrate_update(
+        OperationUpdate(identity, progress=first)
+    )
+    assert transition.effect is WorkspaceRefreshEffect.NONE
+    assert transition.reintegrate_progress is first
+    assert transition.notice == "Reintegrate 1-D: integrate 2/5…"
+    assert owner.reintegrate_state.progress is first
+
+    foreign_identity = OperationIdentity(identity.serial)
+    foreign = OperationProgress(foreign_identity, "integrate", 3, 5, 3)
+    reused = OperationProgress(identity, "write", 3, 5, 2)
+    regressed = OperationProgress(identity, "integrate", 1, 5, 3)
+    stale = OperationProgress(identity, "integrate", 3, 5, 4)
+    for update in (
+        OperationUpdate(foreign_identity, progress=foreign),
+        OperationUpdate(identity, progress=reused),
+        OperationUpdate(identity, progress=regressed),
+        OperationUpdate(identity, progress=stale, stale=True),
+    ):
+        ignored = owner.consume_reintegrate_update(update)
+        assert ignored.effect is WorkspaceRefreshEffect.NONE
+        assert ignored.reintegrate_progress is None
+        assert owner.reintegrate_state.progress is first
+
+    latest = OperationProgress(identity, "write", 3, 5, 5)
+    accepted = owner.consume_reintegrate_update(
+        OperationUpdate(identity, progress=latest)
+    )
+    assert accepted.reintegrate_progress is latest
+    assert owner.reintegrate_state.progress is latest
+
+    assert not owner.cancel_reintegrate("2d")
+    assert not owner.reintegrate_cancel_accepted
+    assert owner.cancel_reintegrate("1d")
+    assert owner.reintegrate_cancel_accepted
+    assert slot.cancel_calls == [identity]
+    assert not owner.cancel_reintegrate("1d")
+    late = owner.consume_reintegrate_update(OperationUpdate(
+        identity,
+        progress=OperationProgress(identity, "write", 4, 5, 6),
+    ))
+    assert late.reintegrate_progress is None
+    assert owner.reintegrate_state.progress is latest
 
 
 def test_reintegrate_terminal_and_lost_owner_always_require_full_reload() -> None:

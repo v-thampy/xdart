@@ -2145,14 +2145,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and operations.current_identity is active
             and operations.reintegrate_dimension != dimension
         ):
-            self._refresh_shell(); return
+            return
         if (
             active is not None
             and operations.current_identity is active
             and operations.reintegrate_dimension == dimension
         ):
+            if operations.reintegrate_cancel_accepted:
+                return
             accepted = operations.cancel_reintegrate(dimension)
-            self._notice(f"Cancelling Reintegrate {dimension[0]}-D…" if accepted else "Reintegrate cancellation was not accepted."); self._refresh_shell(); return
+            if not accepted:
+                return
+            notice = f"Cancelling Reintegrate {dimension[0]}-D…"
+            self._notice(notice)
+            if (
+                operations.current_identity is active
+                and operations.reintegrate_identity is active
+                and operations.reintegrate_cancel_accepted
+            ):
+                self._shell.scientific.reconcile_operation_status(notice)
+            return
         if self._authored_assets.busy:
             self._notice("Reintegrate is unavailable while authored-asset confirmation is pending.")
             self._refresh_shell(); return
@@ -2205,6 +2217,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if transition.notice:
             self._notice(transition.notice)
+        progress = transition.reintegrate_progress
+        state = self._workspace_operations.reintegrate_state
+        if (
+            progress is not None
+            and state is not None
+            and state.identity is progress.identity
+            and state.progress is progress
+            and not state.cancel_accepted
+            and self._workspace_operations.current_identity
+            is progress.identity
+        ):
+            self._shell.scientific.reconcile_operation_status(
+                transition.notice
+            )
         if transition.reintegrate_reload is not None:
             self._processed_browser.adopt_reload(
                 transition.reintegrate_reload

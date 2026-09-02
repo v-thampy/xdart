@@ -2648,6 +2648,116 @@ def test_reintegrate_progress_result_close_and_control_projection(monkeypatch):
     monkeypatch.setattr(module,"run_reintegrate",run); slot=module.OperationSlot(); identity=slot.begin_reintegrate(target="/progress",entry="entry",source_root="/",expected_target_snapshot=core.TargetSnapshot(True,1,2,3,4,"d"*64),expected_labels=(1,),dimension="1d",preparation_values=_persisted({"version":1,"dimension":"1d","bai_args":{},"gi_mode":"q_total"}),stamp=OperationContextStamp(0)); update=_join(slot,identity)
     assert update.terminal.status is OperationTerminalStatus.RETURNED and update.progress.identity is identity and (update.progress.stage,update.progress.revision)==("write",4) and all(getattr(slot,n) is None for n in ("_frozen","_worker","_cancel_event"))
 
+
+def test_reintegrate_progress_and_cancel_touch_only_current_scalar_footer(
+    tmp_path, monkeypatch, qapp,
+):
+    from xdart.gui.tabs.scattering.operation_values import (
+        OperationIdentity,
+        OperationProgress,
+        OperationUpdate,
+    )
+    page, _store, _seed, _context = _loaded_page(
+        tmp_path, monkeypatch, qapp,
+    )
+    operations = page._workspace_operations
+    slot = _reintegrate_slot(page)
+    identity = OperationIdentity(78)
+    capture = page._capture_current_loaded_browse()
+    assert capture is not None
+    slot._identity = identity
+    _set_reintegrate_state(page, identity, capture, "1d")
+    view = page._shell.scientific
+    original_progress = view.progress.text()
+    original_navigation = page._context_controller.navigation
+    original_shell_revision = page._shell_revision
+    original_selector = (
+        view.frame_selector.count(), view.frame_selector.currentIndex()
+    )
+    original_plots = (
+        view.raw._render_contract,
+        view.cake._render_contract,
+        tuple(view.curve.listDataItems()),
+    )
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Reintegrate scalar progress repainted scientific state")
+
+    monkeypatch.setattr(page, "_refresh_shell", forbidden)
+    monkeypatch.setattr(view, "reconcile", forbidden)
+    first = OperationProgress(identity, "integrate", 17, 651, 1)
+    pending = [OperationUpdate(identity, progress=first)]
+    polled = []
+    monkeypatch.setattr(
+        operations,
+        "poll",
+        lambda current: (
+            polled.append(current), pending.pop(0) if pending else None
+        )[1],
+    )
+    page._drain_executor()
+    assert polled == [identity]
+    assert view.status.text() == "Reintegrate 1-D: integrate 17/651…"
+    assert view.progress.text() == original_progress
+    assert page._shell_revision == original_shell_revision
+    assert page._context_controller.navigation is original_navigation
+    assert (
+        view.frame_selector.count(), view.frame_selector.currentIndex()
+    ) == original_selector
+    assert (
+        view.raw._render_contract,
+        view.cake._render_contract,
+        tuple(view.curve.listDataItems()),
+    ) == original_plots
+
+    foreign_identity = OperationIdentity(identity.serial)
+    for update in (
+        OperationUpdate(
+            identity,
+            progress=OperationProgress(identity, "integrate", 16, 651, 2),
+        ),
+        OperationUpdate(
+            identity,
+            progress=OperationProgress(identity, "integrate", 18, 651, 3),
+            stale=True,
+        ),
+        OperationUpdate(
+            foreign_identity,
+            progress=OperationProgress(
+                foreign_identity, "integrate", 19, 651, 4,
+            ),
+        ),
+    ):
+        page._consume_reintegrate_update(update)
+        assert view.status.text() == "Reintegrate 1-D: integrate 17/651…"
+
+    page._reintegrate_action("2d")
+    assert view.status.text() == "Reintegrate 1-D: integrate 17/651…"
+    cancelled = []
+    monkeypatch.setattr(
+        slot,
+        "cancel",
+        lambda current: cancelled.append(current) or current is identity,
+    )
+    page._reintegrate_action("1d")
+    assert cancelled == [identity]
+    assert operations.reintegrate_cancel_accepted
+    assert view.status.text() == "Cancelling Reintegrate 1-D…"
+    page._reintegrate_action("1d")
+    page._reintegrate_action("2d")
+    page._consume_reintegrate_update(OperationUpdate(
+        identity,
+        progress=OperationProgress(identity, "write", 651, 651, 5),
+    ))
+    assert cancelled == [identity]
+    assert view.status.text() == "Cancelling Reintegrate 1-D…"
+    assert page._run_timer.interval() == 125
+    assert page._shell_revision == original_shell_revision
+    operations._reintegrate = None
+    slot._identity = None
+    page.close_workspace()
+
+
 def test_reintegrate_gui_owner_import_writer_and_snapshot_frequency_census():
     root=Path(__file__).resolve().parents[3]; names=("src/xrd_tools/reduction/reintegrate.py","src/xdart/modules/display_context.py","src/xdart/gui/tabs/scattering/adapters/browse_loader.py","src/xdart/gui/tabs/scattering/context_controller.py","src/xdart/gui/tabs/scattering/adapters/external_operation.py","src/xdart/gui/tabs/scattering/page.py","src/xdart/gui/tabs/scattering/controls_projection.py","src/xdart/gui/tabs/scattering/workspace_operations.py")
     sources={name:(root/name).read_text() for name in names}; gui_text="\n".join(sources[name] for name in names[1:]); external_source=sources[names[4]]; page_source=sources[names[5]]
