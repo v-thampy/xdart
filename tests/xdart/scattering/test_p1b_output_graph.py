@@ -2462,6 +2462,131 @@ def test_live_gui_checkpoint_uses_the_exact_policy_bound(
         )
 
 
+def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.reduction import NexusTerminalDisposition
+    from xrd_tools.session import FrameRecordStore
+
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    poni = tmp_path / "bounded_live.poni"
+    for label in range(1, 9):
+        _write_tiff(raw_root / f"bounded_live_{label:04d}.tif", label)
+    write_poni(poni)
+    intent = _live_directory_intent(
+        raw_root,
+        tmp_path / "processed",
+        poni,
+        processing_mode="Int 1D",
+    )
+    intent.run_options["heavy_window"] = 16
+    open_session = dynamic_output.open_headless_scan_session
+    sessions = []
+    stores = []
+    checkpoints = []
+    clear_calls = []
+    clear_checkpoint_recoverable = (
+        FrameRecordStore.clear_checkpoint_recoverable
+    )
+
+    def observed_clear(owner):
+        clear_calls.append((
+            owner,
+            tuple(
+                owner.checkpoint_recoverable_modes(label)
+                for label in range(1, 9)
+            ),
+        ))
+        return clear_checkpoint_recoverable(owner)
+
+    def capture_session(*args, **kwargs):
+        session = open_session(*args, **kwargs)
+        session.on_checkpoint_recoverable(checkpoints.append)
+        sessions.append(session)
+        stores.append(kwargs["record_store"])
+        return session
+
+    monkeypatch.setattr(
+        dynamic_output, "open_headless_scan_session", capture_session,
+    )
+    monkeypatch.setattr(
+        FrameRecordStore,
+        "clear_checkpoint_recoverable",
+        observed_clear,
+    )
+    executor = StandardRunExecutor(join_timeout=2.0)
+    identity = _start(executor, intent, request_value=1716)
+    try:
+        _drain_until(
+            executor,
+            lambda values: (
+                sum(
+                    event.kind is StandardEventKind.FRAME_READY
+                    for event in values
+                ) >= 8
+                and bool(checkpoints)
+            ),
+        )
+        assert len(sessions) == len(stores) == 1
+        session, store = sessions[0], stores[0]
+        expected_rows = tuple(range(1, 9))
+        assert tuple(session.scan.frame_indices) == expected_rows
+        assert session._dynamic_nexus_checkpoint_threshold == 8
+        assert session._dynamic_nexus_checkpoint_count == 0
+        assert checkpoints[0].labels == expected_rows
+        target = session._dynamic_nexus_sink.path
+        assert _nexus_rows(target) == expected_rows
+
+        staged = session._dynamic_accounting.snapshot()
+        assert len(staged.pending_durable) == 8
+        assert staged.durable == frozenset()
+        expected_modes = frozenset({("1d", "default")})
+        assert all(
+            store.checkpoint_recoverable_modes(label) == expected_modes
+            for label in expected_rows
+        )
+
+        executor.stop(identity)
+        terminal_events = _drain_until(
+            executor,
+            lambda values: any(event.kind in _TERMINAL for event in values),
+        )
+        assert next(
+            event for event in terminal_events if event.kind in _TERMINAL
+        ).kind is StandardEventKind.STOPPED
+        assert (
+            session.terminal_result.disposition
+            is NexusTerminalDisposition.COMMITTED
+        )
+        settled = session._dynamic_accounting.snapshot()
+        assert settled.state.value == "stopped"
+        assert settled.pending_durable == frozenset()
+        ledger = session._dynamic_accounting.ledger
+        assert settled.durable == frozenset(
+            (key, mode, target_name)
+            for key in settled.discovered
+            for mode in ledger.required_modes
+            for target_name in ledger.targets_by_mode[mode]
+        )
+        assert _nexus_rows(target) == expected_rows
+        assert clear_calls == [
+            (store, tuple(expected_modes for _label in expected_rows)),
+            (store, tuple(frozenset() for _label in expected_rows)),
+        ]
+        assert all(
+            store.checkpoint_recoverable_modes(label) == frozenset()
+            for label in expected_rows
+        )
+    finally:
+        assert (
+            executor.close(identity).cleanup_status
+            is CleanupStatus.CLEANED
+        )
+
+
 def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
