@@ -976,6 +976,62 @@ def test_science_release_receipt_is_revalidated_at_operation_boundary(
     assert not Path(prepared.module.output.target).exists()
 
 
+def test_science_release_receipt_exact_class_clone_is_refused(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    real_add = rsm_operation.StreamingGridder.add_leased
+
+    def clone_release(*args, **kwargs):
+        receipt = real_add(*args, **kwargs)
+        clone = object.__new__(type(receipt))
+        for name in ("frame_count", "q_root_count", "release_passed"):
+            object.__setattr__(clone, name, getattr(receipt, name))
+        return clone
+
+    monkeypatch.setattr(
+        rsm_operation.StreamingGridder,
+        "add_leased",
+        clone_release,
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "admit_module_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cloned release receipt must stop before admission")
+        ),
+    )
+
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "RSM_CHUNK_RELEASE_FAILED"
+    assert not Path(prepared.module.output.target).exists()
+
+
 def test_memory_plan_refuses_before_source_decode(tmp_path, monkeypatch):
     import xrd_tools.analysis.rsm_operation as rsm_operation
 

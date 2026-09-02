@@ -23,6 +23,7 @@ from contextlib import contextmanager
 import gc
 import logging
 import math
+import threading
 import weakref
 from dataclasses import InitVar, dataclass, field
 
@@ -325,7 +326,7 @@ class RSMGridChunkLease:
     ) = _uncopyable_chunk_value("RSM grid chunk lease")
 
 
-@dataclass(eq=False, frozen=True, slots=True)
+@dataclass(eq=False, frozen=True, slots=True, weakref_slot=True)
 class RSMGridChunkReleaseReceipt:
     """Positive scalar-only proof that one consumed R2 chunk was released."""
 
@@ -352,6 +353,47 @@ class RSMGridChunkReleaseReceipt:
         __reduce_ex__,
         __replace__,
     ) = _uncopyable_chunk_value("RSM grid chunk release receipt")
+
+
+_RSM_GRID_RELEASE_ISSUANCE_LOCK = threading.RLock()
+_RSM_GRID_RELEASE_ISSUANCE: weakref.WeakKeyDictionary[
+    RSMGridChunkReleaseReceipt, tuple[int, int, bool]
+] = weakref.WeakKeyDictionary()
+
+
+def _rsm_grid_chunk_release_facts(
+    receipt: object,
+    *,
+    expected_frame_count: int,
+) -> tuple[int, int, bool]:
+    """Return immutable factory-issued facts for one exact release receipt."""
+
+    if (
+        type(receipt) is not RSMGridChunkReleaseReceipt
+        or type(expected_frame_count) is not int
+        or expected_frame_count < 1
+    ):
+        raise RSMGridChunkReleaseError()
+    with _RSM_GRID_RELEASE_ISSUANCE_LOCK:
+        issued = _RSM_GRID_RELEASE_ISSUANCE.get(receipt)
+    if issued is None:
+        raise RSMGridChunkReleaseError()
+    try:
+        observed = (
+            receipt.frame_count,
+            receipt.q_root_count,
+            receipt.release_passed,
+        )
+    except AttributeError:
+        raise RSMGridChunkReleaseError() from None
+    if (
+        observed != issued
+        or issued[0] != expected_frame_count
+        or not 1 <= issued[1] <= 3
+        or issued[2] is not True
+    ):
+        raise RSMGridChunkReleaseError()
+    return issued
 
 
 def _bounded_release_collect() -> None:
@@ -963,12 +1005,19 @@ class StreamingGridder:
         if pending is not None:
             raise pending from None
         self.n_frames_processed += lease.frame_count
-        return RSMGridChunkReleaseReceipt(
+        receipt = RSMGridChunkReleaseReceipt(
             lease.frame_count,
             q_root_count,
             True,
             _RSM_GRID_RELEASE_FACTORY,
         )
+        with _RSM_GRID_RELEASE_ISSUANCE_LOCK:
+            _RSM_GRID_RELEASE_ISSUANCE[receipt] = (
+                receipt.frame_count,
+                receipt.q_root_count,
+                receipt.release_passed,
+            )
+        return receipt
 
     # ------------------------------------------------------------------
     # Output

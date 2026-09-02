@@ -87,8 +87,8 @@ from xrd_tools.io.spec import get_energy_and_UB
 from xrd_tools.rsm.gridding import (
     RSMGridChunkLease,
     RSMGridChunkReleaseError,
-    RSMGridChunkReleaseReceipt,
     StreamingGridder,
+    _rsm_grid_chunk_release_facts,
 )
 from xrd_tools.rsm.volume import RSMVolume
 
@@ -5321,20 +5321,14 @@ class RSMOperationExecutionV2:
                                 roi=self.request.plan.effective_geometry.roi,
                                 weight=1.0,
                             )
-                            if (
-                                type(release) is not RSMGridChunkReleaseReceipt
-                                or release.frame_count != len(contributions)
-                                or type(release.q_root_count) is not int
-                                or not 1 <= release.q_root_count <= 3
-                                or release.release_passed is not True
-                            ):
-                                raise RSMOperationRefused(
-                                    "RSM_CHUNK_RELEASE_FAILED"
-                                )
+                            release_facts = _rsm_grid_chunk_release_facts(
+                                release,
+                                expected_frame_count=len(contributions),
+                            )
                             science_chunk_count += 1
                             q_release_chunk_count += 1
-                            frame_release_count += release.frame_count
-                            progress_completed += release.frame_count
+                            frame_release_count += release_facts[0]
+                            progress_completed += release_facts[0]
                             self._emit("science", progress_completed)
                             if (
                                 cancel_token is not None
