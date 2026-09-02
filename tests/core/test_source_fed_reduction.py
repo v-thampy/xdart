@@ -51,12 +51,17 @@ def _fake_gi_1d(image, fi, **kwargs):
     )
 
 
-def _write_stack(path, n, *, chunks=(2, 8, 8)):
+def _write_stack(
+        path, n, *, chunks=(2, 8, 8), dtype=np.uint16,
+        threshold_probe=False):
+    data = np.ones((n, 8, 8), dtype=dtype)
+    if threshold_probe:
+        data[:, 0, 0] = 3
     with h5py.File(path, "w") as f:
         e = f.create_group("entry")
         e.attrs["NX_class"] = "NXentry"
         e.create_group("instrument/detector").create_dataset(
-            "data", data=np.ones((n, 8, 8), np.uint16), chunks=chunks)
+            "data", data=data, chunks=chunks)
     return path
 
 
@@ -237,8 +242,9 @@ def test_huge_consumer_chunk_is_capped_by_source_read_plan(tmp_path, monkeypatch
     assert all(dtype == np.dtype(np.uint16) for _s, _e, _n, dtype in calls)
 
 
+@pytest.mark.parametrize("source_dtype", (np.uint16, np.float64))
 def test_public_submit_seam_receives_native_dtype_under_huge_chunk(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, source_dtype):
     """Native source arrays reach ``ReductionSession.submit`` before workers.
 
     This guards the real producer-to-session boundary; an upcast inside
@@ -249,18 +255,26 @@ def test_public_submit_seam_receives_native_dtype_under_huge_chunk(
     from xrd_tools.sources.cursor import ContainerCursor
     from xrd_tools.reduction.core import ReductionSession
 
-    p = _write_stack(tmp_path / "submit_00001.nxs", 5, chunks=(4, 8, 8))
-    frame_bytes = 8 * 8 * np.dtype(np.uint16).itemsize
+    p = _write_stack(
+        tmp_path / "submit_00001.nxs",
+        5,
+        chunks=(4, 8, 8),
+        dtype=source_dtype,
+        threshold_probe=True,
+    )
+    frame_bytes = 8 * 8 * np.dtype(source_dtype).itemsize
     monkeypatch.setattr(staging, "source_block_budget_bytes", lambda: 2 * frame_bytes)
     monkeypatch.setattr(reduction_core, "integrate_1d", _fake_1d)
     seen = []
     owner_blocks = []
+    owner_snapshots = []
     real_submit = ReductionSession.submit
     real_read_block = ContainerCursor.read_block
 
     def spy_read_block(self, start, stop):
         block = real_read_block(self, start, stop)
         owner_blocks.append(block.array)
+        owner_snapshots.append(block.array.copy())
         return block
 
     def spy_submit(self, frame, image=None):
@@ -277,13 +291,19 @@ def test_public_submit_seam_receives_native_dtype_under_huge_chunk(
     src = open_source(SourceSpec(p, SourceKind.NEXUS_STACK))
     src.integrator = object()
     result = run_reduction(
-        ReductionPlan(integration_1d=Integration1DPlan(npt=2)), src,
+        ReductionPlan(
+            integration_1d=Integration1DPlan(npt=2),
+            threshold_max=2.0,
+        ),
+        src,
         NexusSink(path=str(tmp_path / "submit_out.nexus"), overwrite=True),
         chunk_size=10_000, inflight_max=1, executor=1)
 
     assert result.n_processed == 5
     assert [index for index, _dtype in seen] == list(range(5))
-    assert {dtype for _index, dtype in seen} == {np.dtype(np.uint16)}
+    assert {dtype for _index, dtype in seen} == {np.dtype(source_dtype)}
+    for owner, before in zip(owner_blocks, owner_snapshots):
+        np.testing.assert_array_equal(owner, before)
 
 
 # ── H10-C2-B: the coordinated route binds one allocation before reading ──────

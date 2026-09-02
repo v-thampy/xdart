@@ -4929,7 +4929,7 @@ def _reduce_frame(
         if include_corrected_image
         else None
     )
-    image = _apply_thresholds(image, plan)
+    image = _apply_thresholds_owned(image, plan)
     image = _subtract_background(image, frame.background)
     plan_mask = _cached_mask_for_shape(
         plan.mask,
@@ -5102,6 +5102,40 @@ def _apply_thresholds(image: np.ndarray, plan: ReductionPlan) -> np.ndarray:
     if plan.threshold_min is None and plan.threshold_max is None:
         return image
     out = np.array(image, dtype=float, copy=True)
+    return _apply_threshold_bounds_in_place(out, plan)
+
+
+def _apply_thresholds_owned(
+    image: np.ndarray,
+    plan: ReductionPlan,
+) -> np.ndarray:
+    """Apply thresholds to the reduction worker's fresh float64 buffer.
+
+    Unlike :func:`_apply_thresholds`, this narrow seam mutates ``image``.  Its
+    only production caller has just created the array with
+    ``raw_image_arr.astype(float)``, so the raw detector values retained for
+    saturation masking and thumbnail correction cannot be changed.  Keeping
+    the ownership requirement explicit preserves the copy-based helper's
+    behavior for any diagnostic callers.
+    """
+    if (
+        not isinstance(image, np.ndarray)
+        or image.dtype != np.dtype(float)
+        or not image.flags.owndata
+        or not image.flags.writeable
+    ):
+        raise ValueError(
+            "owned threshold image must be a writable owning float64 ndarray"
+        )
+    if plan.threshold_min is None and plan.threshold_max is None:
+        return image
+    return _apply_threshold_bounds_in_place(image, plan)
+
+
+def _apply_threshold_bounds_in_place(
+    out: np.ndarray,
+    plan: ReductionPlan,
+) -> np.ndarray:
     bad = np.zeros(out.shape, dtype=bool)
     if plan.threshold_min is not None:
         bad |= out < float(plan.threshold_min)
