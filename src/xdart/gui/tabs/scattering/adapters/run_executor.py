@@ -1024,6 +1024,11 @@ class StandardRunExecutor:
         run = self._exact_run(run_identity)
         if run is None:
             return ExecutorClosed(run_identity, CleanupStatus.CLEANUP_PENDING)
+        deadline = monotonic() + max(0.0, self._join_timeout)
+
+        def remaining() -> float:
+            return max(0.0, deadline - monotonic())
+
         try:
             self.stop(run_identity)
         except Exception as error:
@@ -1033,20 +1038,20 @@ class StandardRunExecutor:
         if context_runtime is not None:
             context_runtime.retire()
         display_clean = run.display.retire(
-            join_timeout=self._join_timeout
+            join_timeout=remaining()
         )
         worker = run.worker
         worker_was_alive = worker is not None and worker is not current_thread() and worker.is_alive()
         if worker_was_alive:
-            worker.join(timeout=self._join_timeout)
+            worker.join(timeout=remaining())
         if worker is not None and worker.is_alive():
             return self._receipt(run)
         if not display_clean and worker_was_alive:
-            display_clean = run.display.retire(join_timeout=self._join_timeout)
+            display_clean = run.display.retire(join_timeout=remaining())
         if not run.closed:
             worker = self._start_cleanup_retry(run)
             if worker is not None and worker is not current_thread():
-                worker.join(timeout=self._join_timeout)
+                worker.join(timeout=remaining())
         if not display_clean:
             run.cleanup_status = CleanupStatus.CLEANUP_PENDING
         elif run.closed and all(value is None for value in (
