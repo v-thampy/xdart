@@ -72,9 +72,14 @@ from xrd_tools.reduction import (
     StrictPolicy,
     bind_dynamic_output_sink,
 )
-from xrd_tools.reduction.core import _cancel_requested, _request_cancel
+from xrd_tools.reduction.core import (
+    WriterBatchSettlementReceipt,
+    _cancel_requested,
+    _request_cancel,
+)
 from .dynamic_accounting import (
     DynamicAttemptState,
+    DynamicBatchSettlementReceipt,
     DynamicRunAccounting,
     DynamicRunState,
 )
@@ -373,6 +378,9 @@ class ScanSession:
         policy: SessionPolicy | None = None,
         envelope_bytes: int | None = None,
         executor_workers: int | None = None,
+        _dynamic_batch_settlement_authority_cb: (
+            Callable[[DynamicBatchSettlementReceipt], None] | None
+        ) = None,
         _accounting_only: bool = False,
     ) -> None:
         _cancel_requested(cancel_token)
@@ -403,6 +411,18 @@ class ScanSession:
                 raise ValueError("Nexus checkpoint threshold requires checkpointing")
         if dynamic_nexus_checkpoint and dynamic_accounting is None:
             raise ValueError("Nexus checkpointing requires dynamic accounting")
+        if _dynamic_batch_settlement_authority_cb is not None:
+            if not callable(_dynamic_batch_settlement_authority_cb):
+                raise TypeError(
+                    "dynamic batch settlement authority must be callable"
+                )
+            if dynamic_accounting is None:
+                raise ValueError(
+                    "dynamic batch settlement authority requires dynamic accounting"
+                )
+        self._dynamic_batch_settlement_authority_cb = (
+            _dynamic_batch_settlement_authority_cb
+        )
         if dynamic_accounting is not None and record_store_persisted_on_write:
             raise RuntimeError(
                 "dynamic durable truth is owned only by the writer boundary"
@@ -621,6 +641,11 @@ class ScanSession:
                 batch_settled_authority_cb=(
                     self._on_dynamic_nexus_batch_settled
                     if self._dynamic_nexus_checkpoint_threshold is not None
+                    else None
+                ),
+                batch_settlement_authority_cb=(
+                    self._on_dynamic_batch_settled
+                    if self._dynamic_batch_settlement_authority_cb is not None
                     else None
                 ),
             )
@@ -1684,6 +1709,24 @@ class ScanSession:
             return
         nexus.flush(force=True)
         self._dynamic_nexus_checkpoint_count = 0
+
+    def _on_dynamic_batch_settled(
+        self, receipt: WriterBatchSettlementReceipt,
+    ) -> None:
+        if type(receipt) is not WriterBatchSettlementReceipt:
+            raise TypeError(
+                "dynamic batch settlement requires an exact writer receipt"
+            )
+        dynamic = self._dynamic_accounting
+        authority = self._dynamic_batch_settlement_authority_cb
+        if dynamic is None or authority is None:
+            raise RuntimeError("dynamic batch settlement owner is absent")
+        authority(DynamicBatchSettlementReceipt(tuple(
+            dynamic.token_for_ledger_attempt(
+                item.frame_index, item.ledger_attempt,
+            )
+            for item in receipt.items
+        )))
 
     def _record_checkpoint_recoverable(
         self, owner_token, checkpoint, receipts, drops,

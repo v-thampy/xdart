@@ -318,7 +318,11 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
     frame = Frame(7); source = module._ReintegrateFrameSource(source_plan, topology=topology); source._frames = {7: frame}; source.bind_allocation(allocation); source.bind_fact_reader(writer._detach_replacement_fact)
     assert source.prepare(frame)[0] is marker and trace == ["lock-enter", "detach", "lock-exit", "raw"]
     runtime_source = inspect.getsource(module._ExecutionRuntime.run)
-    assert runtime_source.index("self.source.prepare(frame)") < runtime_source.index("self.session._session.drain()") and "with " not in runtime_source
+    assert (
+        runtime_source.index("self.source.prepare(frame)")
+        < runtime_source.index("_drain_reintegration_engine(")
+        and "with " not in runtime_source
+    )
     source.clear_jit()
 
     owners = {
@@ -338,7 +342,7 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
     assert "PyQt" not in source and "PySide" not in source and "qtpy" not in source
 
 
-def test_reintegrate_uses_bounded_inflight_chunks_and_settles_before_clear(
+def test_reintegrate_rolls_exact_settlement_before_one_terminal_drain(
     tmp_path, monkeypatch,
 ):
     import h5py
@@ -371,11 +375,15 @@ def test_reintegrate_uses_bounded_inflight_chunks_and_settles_before_clear(
     prepare_snapshots = []
     drain_snapshots = []
     cleared = []
+    receipt_sizes = []
+    receipt_threads = []
     batch_sizes = []
     release = threading.Event()
+    owner_ident = threading.get_ident()
     source_init = module._ReintegrateFrameSource.__init__
     source_prepare = module._ReintegrateFrameSource.prepare
-    source_clear = module._ReintegrateFrameSource.clear_label
+    source_clear = module._ReintegrateFrameSource._clear_label_locked
+    source_enqueue = module._ReintegrateFrameSource.enqueue_settled_batch
     engine_drain = core.ReductionSession.drain
     writer_batch = NexusRecordWriter.write_batch
 
@@ -385,22 +393,29 @@ def test_reintegrate_uses_bounded_inflight_chunks_and_settles_before_clear(
 
     def prepare(owner, frame):
         value = source_prepare(owner, frame)
-        prepare_snapshots.append(tuple(owner._jit))
+        active = owner.jit_labels
+        prepare_snapshots.append(active)
+        if len(active) == 8:
+            release.set()
         return value
 
     def clear(owner, label):
-        if int(label) in owner._jit:
-            cleared.append((int(label), tuple(owner._jit)))
+        active = owner.jit_labels
+        if int(label) in active:
+            cleared.append((int(label), active, threading.get_ident()))
         return source_clear(owner, label)
 
+    def enqueue(owner, receipt):
+        receipt_sizes.append(len(receipt.attempts))
+        receipt_threads.append(threading.get_ident())
+        return source_enqueue(owner, receipt)
+
     def drain(session, *args, **kwargs):
-        active = tuple(session.source._jit)
-        if active:
-            release.set()
+        assert release.is_set()
+        assert len(prepare_snapshots) == len(labels)
+        active = session.source.jit_labels
         value = engine_drain(session, *args, **kwargs)
-        if active:
-            drain_snapshots.append((active, tuple(session.source._jit)))
-            release.clear()
+        drain_snapshots.append((active, session.source.jit_labels))
         return value
 
     def write_batch(owner, records):
@@ -410,7 +425,10 @@ def test_reintegrate_uses_bounded_inflight_chunks_and_settles_before_clear(
 
     monkeypatch.setattr(module._ReintegrateFrameSource, "__init__", initialize)
     monkeypatch.setattr(module._ReintegrateFrameSource, "prepare", prepare)
-    monkeypatch.setattr(module._ReintegrateFrameSource, "clear_label", clear)
+    monkeypatch.setattr(module._ReintegrateFrameSource, "_clear_label_locked", clear)
+    monkeypatch.setattr(
+        module._ReintegrateFrameSource, "enqueue_settled_batch", enqueue,
+    )
     monkeypatch.setattr(core.ReductionSession, "drain", drain)
     monkeypatch.setattr(NexusRecordWriter, "write_batch", write_batch)
     _stub_integrators(monkeypatch)
@@ -425,19 +443,22 @@ def test_reintegrate_uses_bounded_inflight_chunks_and_settles_before_clear(
     result = module.run_reintegrate(plan)
     assert result.disposition == "COMMITTED"
     assert result.committed_labels == labels
-    assert prepare_snapshots == [
-        tuple(labels[start:label + 1])
-        for start in (0, 8)
-        for label in labels[start:start + 8]
-    ]
-    assert drain_snapshots == [
-        (labels[:8], labels[:8]),
-        (labels[8:], labels[8:]),
-    ]
-    assert tuple(label for label, _active in cleared) == labels
-    assert all(label in active for label, active in cleared)
-    assert batch_sizes == [8, 4]
+    assert len(prepare_snapshots) == len(labels)
+    assert max(map(len, prepare_snapshots)) == 8
+    assert all(len(active) <= 8 for active in prepare_snapshots)
+    assert len(drain_snapshots) == 1
+    assert tuple(label for label, _active, _thread in cleared) == labels
+    assert all(label in active for label, active, _thread in cleared)
+    assert {thread for _label, _active, thread in cleared} == {owner_ident}
+    assert batch_sizes[:2] == [4, 4]
+    assert sum(batch_sizes) == len(labels)
+    assert all(1 <= size <= 4 for size in batch_sizes)
+    assert receipt_sizes == batch_sizes
+    assert receipt_threads and set(receipt_threads) != {owner_ident}
     assert len(sources) == 1
+    assert sources[0]._jit_high_water == 8
+    assert sources[0]._receipt_high_water <= 8
+    assert sources[0]._receipt_attempt_high_water <= 8
     assert sources[0].jit_roots == ()
     assert sources[0]._frames == {}
     with h5py.File(seeded.target, "r") as handle:
@@ -447,6 +468,243 @@ def test_reintegrate_uses_bounded_inflight_chunks_and_settles_before_clear(
             group["intensity"][()],
             np.stack([_r1(label + 100).intensity for label in labels]),
         )
+
+
+def test_reintegrate_settlement_receipt_is_atomic_and_attempt_exact():
+    from xrd_tools.reduction import reintegrate as module
+    from xrd_tools.reduction.core import Frame
+    from xrd_tools.session import (
+        DynamicAttemptToken,
+        DynamicBatchSettlementReceipt,
+        DynamicFrameIdentity,
+    )
+
+    shared = {
+        "background": {"version": 1, "mode": "None"},
+        "gi": {"enabled": False, "resolved_motor": "Manual"},
+        "geometry": None,
+    }
+    allocation = SimpleNamespace(reduction_inflight=2)
+    plan = SimpleNamespace(
+        requested_shared_science=shared,
+        selected_plan=None,
+        labels=(1, 2),
+        resource_allocation=allocation,
+        operation_identity="operation",
+    )
+    source = module._ReintegrateFrameSource(plan)
+    source.bind_allocation(allocation)
+    frames = {1: Frame(1, metadata={"kept": 1}),
+              2: Frame(2, metadata={"kept": 2})}
+    first = DynamicAttemptToken(
+        DynamicFrameIdentity("operation", 1), 1, 1, 11,
+    )
+    second = DynamicAttemptToken(
+        DynamicFrameIdentity("operation", 2), 1, 1, 12,
+    )
+    foreign_second = DynamicAttemptToken(
+        DynamicFrameIdentity("operation", 2), 1, 2, 12,
+    )
+    source._frames = frames
+    with source._jit_condition:
+        source._jit.update({1: {"root": object()}, 2: {"root": object()}})
+        source._attempts.update({1: first, 2: second})
+    source.enqueue_settled_batch(DynamicBatchSettlementReceipt(
+        (first, foreign_second),
+    ))
+
+    with pytest.raises(RuntimeError, match="stale or foreign"):
+        source.consume_settled()
+    assert source.jit_labels == (1, 2)
+    assert source.pending_settlement_count == 1
+    assert frames[1].metadata == {"kept": 1}
+    assert frames[2].metadata == {"kept": 2}
+    source.clear_jit()
+    assert source.jit_labels == ()
+    assert source.pending_settlement_count == 0
+
+
+@pytest.mark.parametrize(
+    ("inflight", "batch"), ((1, 1), (2, 2), (3, 3), (4, 4), (8, 4)),
+)
+def test_reintegrate_writer_batch_tracks_low_inflight_grants(inflight, batch):
+    from xrd_tools.reduction import reintegrate as module
+
+    allocation = SimpleNamespace(reduction_inflight=inflight)
+    assert module._replacement_writer_batch_size(allocation) == batch
+
+
+def test_reintegrate_capacity_wait_surfaces_sticky_failure_and_cancel():
+    from xrd_tools.reduction import reintegrate as module
+
+    shared = {
+        "background": {"version": 1, "mode": "None"},
+        "gi": {"enabled": False, "resolved_motor": "Manual"},
+        "geometry": None,
+    }
+
+    def source_for(token=None):
+        allocation = SimpleNamespace(reduction_inflight=1)
+        plan = SimpleNamespace(
+            requested_shared_science=shared,
+            selected_plan=None,
+            labels=(1,),
+            resource_allocation=allocation,
+            operation_identity="operation",
+        )
+        source = module._ReintegrateFrameSource(plan, token=token)
+        source.bind_allocation(allocation)
+        with source._jit_condition:
+            source._jit[1] = {"root": object()}
+        return source
+
+    failure = RuntimeError("sticky writer failure")
+    failed = source_for()
+    failed.bind_failure_probe(lambda: failure)
+    with pytest.raises(RuntimeError, match="sticky writer failure") as caught:
+        failed.wait_for_capacity()
+    assert caught.value is failure
+
+    dead_writer = RuntimeError("writer died without recording a failure")
+    dead_engine = SimpleNamespace(
+        _current_failure=lambda: None,
+        _stream_started=True,
+        _writer_thread=SimpleNamespace(is_alive=lambda: False),
+        drain=lambda **_kwargs: pytest.fail("dead writer must precede drain"),
+    )
+    dead = source_for()
+    dead.bind_failure_probe(
+        lambda: module._replacement_engine_failure(dead_engine, dead_writer)
+    )
+    with pytest.raises(RuntimeError, match="writer died") as caught:
+        dead.wait_for_capacity()
+    assert caught.value is dead_writer
+    with pytest.raises(RuntimeError, match="writer died") as caught:
+        module._drain_reintegration_engine(dead_engine, dead, 0.1)
+    assert caught.value is dead_writer
+
+    drain_calls = []
+    alive_engine = SimpleNamespace(
+        drain=lambda **kwargs: drain_calls.append(kwargs) or False,
+    )
+    bounded = source_for()
+    bounded.bind_failure_probe(lambda: None)
+    with pytest.raises(TimeoutError, match="bounded timeout"):
+        module._drain_reintegration_engine(alive_engine, bounded, 0.02)
+    assert drain_calls
+
+    cancelled = threading.Event()
+    waiting = source_for(cancelled)
+    timer = threading.Timer(0.02, cancelled.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(module.ReintegrateCancelled):
+            waiting.wait_for_capacity()
+    finally:
+        timer.join()
+    assert time.monotonic() - started < 0.5
+
+
+def test_reintegrate_cancelled_stalled_worker_returns_pending_bounded(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+    from xrd_tools.reduction import core
+    from xrd_tools.reduction import reintegrate as module
+
+    labels = tuple(range(12))
+    seeded = _seed_existing(tmp_path, labels=labels, name="stalled-worker")
+    preparation = copy.deepcopy(seeded.preparation)
+    preparation["resource_policy"]["requests"] = {
+        "workers": 4,
+        "reduction_inflight": 8,
+    }
+    plan = module.ReintegratePlan.from_artifact(
+        seeded.target, entry="entry", dimension="1d", preparation=preparation,
+    )
+    expected = capture_target_snapshot(seeded.target)
+    _stub_integrators(monkeypatch)
+    integrate_1d = core.integrate_1d
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stalled(*args, **kwargs):
+        entered.set()
+        assert release.wait(5.0)
+        return integrate_1d(*args, **kwargs)
+
+    monkeypatch.setattr(core, "integrate_1d", stalled)
+    monkeypatch.setattr(module, "_TERMINAL_DRAIN_TIMEOUT_SECONDS", 0.1)
+    cancelled = threading.Event()
+    def cancel_stalled():
+        assert entered.wait(2.0)
+        time.sleep(0.02)
+        cancelled.set()
+    timer = threading.Thread(target=cancel_stalled)
+    runner = module.ReintegrateRunner(plan, cancel_token=cancelled)
+    timer.start()
+    started = time.monotonic()
+    try:
+        pending = runner.run()
+        assert pending.disposition == "SETTLEMENT_PENDING"
+        assert time.monotonic() - started < 1.0
+        assert runner._runtime._has_custody()
+    finally:
+        release.set()
+        timer.join()
+
+    engine = runner._runtime.session._session
+    deadline = time.monotonic() + 2.0
+    while engine._writer_thread is not None and engine._writer_thread.is_alive():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert engine.sink_terminal_safe
+    assert runner._runtime.session._session is engine
+    assert runner._runtime.session._dynamic_frozen_result is not None
+    with pytest.raises(TimeoutError, match="writer thread did not exit"):
+        runner.finish_current()
+    assert capture_target_snapshot(seeded.target) == expected
+    runner.close()
+
+
+def test_reintegrate_successful_drain_renews_join_budget_after_slow_validation(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.reduction import reintegrate as module
+    from xrd_tools.session.scan_session import ScanSession
+
+    seeded = _seed_existing(tmp_path, labels=(0, 1, 2), name="join-budget")
+    plan = module.ReintegratePlan.from_artifact(
+        seeded.target, entry="entry", dimension="1d",
+        preparation=seeded.preparation,
+    )
+    _stub_integrators(monkeypatch)
+    monkeypatch.setattr(module, "_TERMINAL_DRAIN_TIMEOUT_SECONDS", 0.05)
+    validate = module._ReintegrateFrameSource.validate_terminal_topology
+    finish = ScanSession.finish
+    observed = []
+
+    def slow_validate(owner):
+        value = validate(owner)
+        time.sleep(0.08)
+        return value
+
+    def capture_finish(owner, *args, **kwargs):
+        observed.append(kwargs.get("join_timeout"))
+        return finish(owner, *args, **kwargs)
+
+    monkeypatch.setattr(
+        module._ReintegrateFrameSource,
+        "validate_terminal_topology",
+        slow_validate,
+    )
+    monkeypatch.setattr(ScanSession, "finish", capture_finish)
+
+    result = module.run_reintegrate(plan)
+    assert result.disposition == "COMMITTED"
+    assert len(observed) == 1
+    assert type(observed[0]) is float and observed[0] > 0.02
 
 
 def test_direct_hdf_window_is_exact_two_handle_mask_bounded_and_retryable(
@@ -710,6 +968,7 @@ def test_direct_hdf_construction_preserves_primary_and_retry_custody(
     source.bound_allocation = allocation
     source._topology = object()
     source._direct_hdf = None
+    source._owner_ident = threading.get_ident()
     owners = []
     class InjectedOwner:
         def __init__(self, *args, **kwargs):

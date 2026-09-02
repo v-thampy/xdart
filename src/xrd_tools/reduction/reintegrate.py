@@ -1,4 +1,4 @@
-from __future__ import annotations; import hashlib, json, math, os, tempfile, threading; from bisect import bisect_right; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Callable, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
+from __future__ import annotations; import hashlib, json, math, os, tempfile, threading, time; from bisect import bisect_right; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Callable, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
 _REQUESTS = {"workers", "reduction_inflight", "queue_depth", "owner_block_bytes", "staging_items", "record_heavy_items", "publication_heavy_items", "thumbnail_items", "record_items", "publication_items"}; _STAGES = {"qualify", "read", "reduce", "write", "settle"}
 # Keep headless replacement admission aligned with the GUI's 256 MiB decoded
 # scientific-mask ceiling without importing GUI policy into xrd_tools.  Both
@@ -17,6 +17,7 @@ _REINTEGRATE_PLAN_API_VERSION = 3
 _REINTEGRATE_RECIPE_VERSION = 3
 _REINTEGRATE_SCIENCE_API_VERSION = 1
 _DIRECT_HDF_FALLBACK = object()
+_TERMINAL_DRAIN_TIMEOUT_SECONDS = 60.0
 class ReintegrateCancelled(RuntimeError): pass
 class _PersistedMaskSpec(NamedTuple): retained_bytes: int; decode_bytes: int
 class _ArtifactInspection(NamedTuple): labels: tuple[int, ...]; detector_shape: tuple[int, int]; native_dtype: str; persisted_shared_science: Mapping[str, Any]; persisted_selected_plan: Mapping[str, Any]; acquisition_fingerprint: str; source_base: str; append_lineage: bytes | None; gi_values: Mapping[int, float]; mask_spec: _PersistedMaskSpec; mask: Any | None; raw_options: Mapping[str, Any] | None; topology: _SourceTopology
@@ -2428,15 +2429,229 @@ def _progress(identity, stage, completed, total, revision): _reject(stage not in
 class ReintegrateResult:
     disposition: str; input_labels: tuple[int, ...]; committed_labels: tuple[int, ...]; publication_dropped_labels: tuple[int, ...]; diagnostics: tuple[str, ...]; science_identity: str; operation_identity: str; audit_identity: str | None; commit_identity: Any | None
     def __new__(cls, *args, **kwargs): raise TypeError("ReintegrateResult is factory-constructed")
+
+
+def _replacement_engine_failure(engine, dead_writer):
+    failure = engine._current_failure()
+    if failure is not None:
+        return failure
+    writer = engine._writer_thread
+    if engine._stream_started and (writer is None or not writer.is_alive()):
+        return dead_writer
+    return None
+
+
+def _replacement_writer_batch_size(allocation):
+    value = getattr(allocation, "reduction_inflight", None)
+    if type(value) is not int or value < 1:
+        raise ValueError("replacement writer batch grant must be a positive int")
+    return min(4, value)
+
+
 class _ReintegrateFrameSource:
-    def __init__(self, plan, token=None, raw_options=None, topology=None): self.plan, self.token, self.raw_options, self.bound_allocation, self._jit, self._fact_reader, self._frames, self._topology, self._direct_hdf = plan, token, raw_options, None, {}, None, {}, topology, None; self._metadata_keys, self._include_geometry = _fact_projection(getattr(plan, "selected_plan", None), plan.requested_shared_science)
+    """Thread-affine owner for bounded replacement source facts.
+
+    The writer may publish immutable settlement receipts, but only the runner
+    thread may release JIT roots or mutate the direct-HDF window.  A condition
+    lets the runner keep the reduction window full without weakening the exact
+    attempt ownership needed before an image can be scrubbed.
+    """
+
+    _WAIT_SECONDS = 0.1
+
+    def __init__(self, plan, token=None, raw_options=None, topology=None):
+        self.plan = plan
+        self.token = token
+        self.raw_options = raw_options
+        self.bound_allocation = None
+        self._jit = {}
+        self._attempts = {}
+        self._settled_receipts = []
+        self._fact_reader = None
+        self._failure_probe = None
+        self._frames = {}
+        self._topology = topology
+        self._direct_hdf = None
+        self._owner_ident = threading.get_ident()
+        self._jit_condition = threading.Condition()
+        self._jit_high_water = 0
+        self._receipt_high_water = 0
+        self._receipt_attempt_high_water = 0
+        self._metadata_keys, self._include_geometry = _fact_projection(
+            getattr(plan, "selected_plan", None),
+            plan.requested_shared_science,
+        )
+
+    def _require_owner(self):
+        if threading.get_ident() != self._owner_ident:
+            raise RuntimeError("replacement JIT ownership is runner-thread affine")
+
+    def _raise_terminal_state(self):
+        probe = self._failure_probe
+        if probe is not None:
+            failure = probe()
+            if failure is not None:
+                raise failure
+        _event(self.token)
+
     @property
-    def frame_indices(self): return list(self.plan.labels)
+    def frame_indices(self):
+        return list(self.plan.labels)
+
     @property
-    def jit_roots(self): return tuple(root for roots in self._jit.values() for root in roots.values() if root is not None)
-    def bind_allocation(self, allocation): _reject(allocation is not self.plan.resource_allocation, "RESOURCE_ALLOCATION_IDENTITY"); self.bound_allocation = allocation
-    def bind_fact_reader(self, reader): self._fact_reader = reader
+    def jit_roots(self):
+        with self._jit_condition:
+            return tuple(
+                root
+                for roots in self._jit.values()
+                if roots is not None
+                for root in roots.values()
+                if root is not None
+            )
+
+    @property
+    def jit_labels(self):
+        with self._jit_condition:
+            return tuple(self._jit)
+
+    @property
+    def pending_settlement_count(self):
+        with self._jit_condition:
+            return len(self._settled_receipts)
+
+    def bind_allocation(self, allocation):
+        self._require_owner()
+        _reject(
+            allocation is not self.plan.resource_allocation,
+            "RESOURCE_ALLOCATION_IDENTITY",
+        )
+        self.bound_allocation = allocation
+
+    def bind_fact_reader(self, reader):
+        self._require_owner()
+        self._fact_reader = reader
+
+    def bind_failure_probe(self, probe):
+        self._require_owner()
+        if not callable(probe) or self._failure_probe is not None:
+            raise RuntimeError("replacement failure authority is invalid")
+        self._failure_probe = probe
+
+    def bind_attempt(self, label, attempt):
+        from xrd_tools.session import DynamicAttemptToken
+
+        self._require_owner()
+        label = int(label)
+        if (
+            type(attempt) is not DynamicAttemptToken
+            or type(attempt.key.logical_frame_identity) is not int
+            or int(attempt.key.logical_frame_identity) != label
+            or attempt.key.source_identity != self.plan.operation_identity
+        ):
+            raise RuntimeError("replacement attempt identity is invalid")
+        with self._jit_condition:
+            if (
+                label not in self._jit
+                or self._jit[label] is None
+                or label in self._attempts
+            ):
+                raise RuntimeError("replacement attempt ownership is invalid")
+            self._attempts[label] = attempt
+
+    def enqueue_settled_batch(self, receipt):
+        from xrd_tools.session import DynamicBatchSettlementReceipt
+
+        if type(receipt) is not DynamicBatchSettlementReceipt:
+            raise TypeError("replacement settlement requires an exact receipt")
+        with self._jit_condition:
+            queued_attempts = sum(
+                len(value.attempts) for value in self._settled_receipts
+            )
+            allocation = self.bound_allocation
+            if (
+                allocation is None
+                or queued_attempts + len(receipt.attempts)
+                > allocation.reduction_inflight
+            ):
+                raise RuntimeError("replacement settlement queue exceeded its grant")
+            self._settled_receipts.append(receipt)
+            self._receipt_high_water = max(
+                self._receipt_high_water, len(self._settled_receipts),
+            )
+            self._receipt_attempt_high_water = max(
+                self._receipt_attempt_high_water,
+                queued_attempts + len(receipt.attempts),
+            )
+            self._jit_condition.notify_all()
+
+    def _receipt_labels_locked(self, receipt):
+        labels = []
+        seen = set()
+        for attempt in receipt.attempts:
+            label = attempt.key.logical_frame_identity
+            if (
+                type(label) is not int
+                or label in seen
+                or label not in self._jit
+                or self._jit[label] is None
+                or self._attempts.get(label) is not attempt
+            ):
+                raise RuntimeError("replacement settlement receipt is stale or foreign")
+            labels.append(label)
+            seen.add(label)
+        if not labels:
+            raise RuntimeError("replacement settlement receipt is empty")
+        return tuple(labels)
+
+    def _clear_label_locked(self, label):
+        label = int(label)
+        frame = self._frames.get(label)
+        if frame is not None:
+            _scrub_frame(frame)
+        self._attempts.pop(label, None)
+        self._jit.pop(label, None)
+
+    def consume_settled(self):
+        """Validate whole receipts, then release their exact attempts on owner."""
+        self._require_owner()
+        released = []
+        while True:
+            self._raise_terminal_state()
+            with self._jit_condition:
+                if not self._settled_receipts:
+                    return tuple(released)
+                receipt = self._settled_receipts[0]
+                labels = self._receipt_labels_locked(receipt)
+                # Remove the queue record only after whole-receipt validation.
+                # If a scrub then fails, exact remaining roots stay in _jit and
+                # terminal cleanup owns them; no partial progress is published.
+                self._settled_receipts.pop(0)
+                for label in labels:
+                    self._clear_label_locked(label)
+                released.extend(receipt.attempts)
+
+    def wait_for_capacity(self):
+        """Release settled roots or wait boundedly for failure/cancel/receipt."""
+        self._require_owner()
+        released = []
+        allocation = self.bound_allocation
+        if (
+            allocation is None
+            or allocation is not self.plan.resource_allocation
+            or type(allocation.reduction_inflight) is not int
+            or allocation.reduction_inflight < 1
+        ):
+            raise RuntimeError("replacement JIT allocation is invalid")
+        while True:
+            released.extend(self.consume_settled())
+            self._raise_terminal_state()
+            with self._jit_condition:
+                if len(self._jit) < allocation.reduction_inflight:
+                    return tuple(released)
+                self._jit_condition.wait(self._WAIT_SECONDS)
+
     def open_direct_hdf(self):
+        self._require_owner()
         if self._direct_hdf is not None:
             raise RuntimeError("replacement direct HDF window is already bound")
         _reject(
@@ -2466,6 +2681,7 @@ class _ReintegrateFrameSource:
                 self._direct_hdf = None
             raise
     def close_direct_hdf(self, *, validate=False):
+        self._require_owner()
         owner = self._direct_hdf
         if owner is not None:
             owner.close(validate=validate)
@@ -2476,12 +2692,24 @@ class _ReintegrateFrameSource:
         from xrd_tools.reduction.core import Frame, Scan, _REINTEGRATE_SCAN_MARKER; calibration, integrator, fi = _calibration(self.plan.requested_shared_science, self.plan.gi_bootstrap_incidence); gi = self.plan.requested_shared_science["gi"]; frames = [Frame(label, metadata=({gi["resolved_motor"]: self.plan.gi_bootstrap_incidence} if label == self.plan.labels[0] and gi["enabled"] and gi["resolved_motor"] != "Manual" else {})) for label in self.plan.labels]; self._frames = {frame.index: frame for frame in frames}
         scan = Scan("reintegrate", frames, poni=None if calibration is None else calibration.poni, integrator=fi or integrator, **kwargs); scan.extra["_reintegrate_marker"] = _REINTEGRATE_SCAN_MARKER; return scan
     def prepare(self, frame):
+        self._require_owner()
         label = int(frame.index)
         allocation = self.bound_allocation
-        if self._fact_reader is None or allocation is None or allocation is not self.plan.resource_allocation or label in self._jit or len(self._jit) >= allocation.reduction_inflight: raise RuntimeError("replacement JIT fact ownership is invalid")
-        roots = {}; self._jit[label] = roots
+        with self._jit_condition:
+            if (
+                self._fact_reader is None
+                or allocation is None
+                or allocation is not self.plan.resource_allocation
+                or label in self._jit
+                or len(self._jit) >= allocation.reduction_inflight
+            ):
+                raise RuntimeError("replacement JIT fact ownership is invalid")
+            # None is an owner-thread reservation while the potentially slow
+            # source read happens without blocking writer receipt publication.
+            self._jit[label] = None
+            self._jit_high_water = max(self._jit_high_water, len(self._jit))
         try:
-            _event(self.token); fact = self._fact_reader(label, metadata_keys=self._metadata_keys, include_geometry=self._include_geometry); roots.update({"source_identity": fact, "loader": frame.loader})
+            _event(self.token); fact = self._fact_reader(label, metadata_keys=self._metadata_keys, include_geometry=self._include_geometry); roots = {"source_identity": fact, "loader": frame.loader}
             _reject(self._topology is None,
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
             _require_fact_topology(fact, self._topology)
@@ -2491,16 +2719,50 @@ class _ReintegrateFrameSource:
             frame.geometry = _geometry_fact(fact, self.plan.requested_shared_science)
             if pair is not None: frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
             geometry = None if frame.geometry is None else {key: getattr(frame.geometry, key) for key in ("rot1", "rot2", "rot3", "incident_angle")}; dependency = None if frame.background_dependency_bytes is None and frame.background_dependency_fingerprint is None else (frame.background_dependency_bytes, frame.background_dependency_fingerprint); _reject(frame.index != fact["label"] or frame.source_path != path or frame.source_frame_index != fact["frame_index"] or frame.source_identity is not fact or dict(frame.metadata) != dict(fact["metadata"]) or geometry != (None if not fact["geometry"] else dict(fact["geometry"])) or dependency != fact["background_dependency"], "replacement local JIT stub differs")
-            roots.update({"source_identity": fact, "image": image, "background": background, "metadata": frame.metadata, "geometry": frame.geometry, "normalization": frame.normalization_factor, "mask": frame.mask, "dependency": pair}); return image, revision
+            roots.update({"source_identity": fact, "image": image, "background": background, "metadata": frame.metadata, "geometry": frame.geometry, "normalization": frame.normalization_factor, "mask": frame.mask, "dependency": pair})
+            with self._jit_condition:
+                if self._jit.get(label, object()) is not None:
+                    raise RuntimeError("replacement JIT reservation was lost")
+                self._jit[label] = roots
+            return image, revision
         except BaseException as error: self.clear_label(frame.index); (None if type(error).__name__ != "WriterStateError" or type(error).__module__ != "xrd_tools.io.record_writer" else (_ for _ in ()).throw(ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"))); raise
     def validate_terminal_topology(self):
         _reject(self._topology is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
         self.close_direct_hdf(validate=True)
         _validate_terminal_topology(self._topology, self.token)
-    def clear_label(self, label): frame = self._frames.get(int(label)); _scrub_frame(frame) if frame is not None else None; self._jit.pop(int(label), None)
-    def clear_jit(self): [self.clear_label(label) for label in tuple(self._frames)]; self._jit.clear()
+    def clear_label(self, label):
+        self._require_owner()
+        with self._jit_condition:
+            self._clear_label_locked(label)
+
+    def clear_jit(self):
+        self._require_owner()
+        with self._jit_condition:
+            for label in tuple(self._frames):
+                self._clear_label_locked(label)
+            self._jit.clear()
+            self._attempts.clear()
+            self._settled_receipts.clear()
+
+
+def _drain_reintegration_engine(engine, source, timeout):
+    if type(timeout) is not float or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("replacement drain timeout must be a positive float")
+    deadline = time.monotonic() + timeout
+    while True:
+        source._raise_terminal_state()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                "replacement terminal drain exceeded its bounded timeout"
+            )
+        if engine.drain(timeout=min(0.1, remaining), poll=0.05):
+            source._raise_terminal_state()
+            return
+
+
 class _ExecutionRuntime:
-    def __init__(self, plan, cancel_token, progress_cb): self.plan, self.token, self.progress_cb, self.session, self.source, self.sink, self.result, self.audit, self.revision, self.diagnostics, self.accounting, self.primary, self.dropped = plan, cancel_token, progress_cb, None, None, None, None, None, 0, [], None, None, ()
+    def __init__(self, plan, cancel_token, progress_cb): self.plan, self.token, self.progress_cb, self.session, self.source, self.sink, self.result, self.audit, self.revision, self.diagnostics, self.accounting, self.primary, self.dropped, self.terminal_deadline = plan, cancel_token, progress_cb, None, None, None, None, None, 0, [], None, None, (), None
     def _report(self, stage, completed, total):
         self.revision += 1; value = _progress(self.plan.operation_identity, stage, completed, total, self.revision)
         if self.progress_cb is not None:
@@ -2535,8 +2797,13 @@ class _ExecutionRuntime:
     def _settle(self):
         if self.session is None: return self._settle_construction()
         self._report("settle", 0, 1)
+        join_timeout = (
+            _TERMINAL_DRAIN_TIMEOUT_SECONDS
+            if self.terminal_deadline is None
+            else max(0.0, self.terminal_deadline - time.monotonic())
+        )
         try:
-            self.result = self.session.finish(raise_on_failure=False); terminal = self.session.terminal_result
+            self.result = self.session.finish(raise_on_failure=False, join_timeout=join_timeout); terminal = self.session.terminal_result
         except BaseException as error:
             terminal = self.session.terminal_result
             if terminal is not None and self.session._dynamic_terminal_settled: self.primary = self.primary or error; return self._terminal(terminal)
@@ -2565,11 +2832,28 @@ class _ExecutionRuntime:
         inspected = inspected._replace(mask=mask)
         _event(self.token)
         audit = _dimension_audit(dimension=self.plan.dimension, operation_identity=self.plan.operation_identity, science_identity=self.plan.science_identity, acquisition_fingerprint=inspected.acquisition_fingerprint, requested_shared_science=self.plan.requested_shared_science, selected_plan=self.plan.selected_plan, append_lineage=inspected.append_lineage); self.audit = _audit_identity(audit); background = self.plan.requested_shared_science["background"]; run = {} if background["mode"] == "None" else {"background": _plain(background)}
-        lock = threading.RLock(); self.source = _ReintegrateFrameSource(self.plan, self.token, inspected.raw_options, inspected.topology); self.sink = NexusSink.for_existing_replacement(path, expected_target_snapshot=self.plan.expected_target_snapshot, dimension=self.plan.dimension, labels=self.plan.labels, audit_bytes=_canonical(audit), selected_plan=self.plan.selected_plan["bai_args"], selected_gi_mode=self.plan.selected_plan["gi_mode"], source_execution=dict(inspected.topology.execution), append_lineage=inspected.append_lineage, cancel_token=self.token, entry=self.plan.entry, source_base=inspected.source_base, run_configuration_provenance=run, write_thumbnails=False, flush_every=None, file_lock=lock); self.sink._configure_writer_batch_size(min(8, self.plan.resource_allocation.reduction_inflight))
+        lock = threading.RLock(); self.source = _ReintegrateFrameSource(self.plan, self.token, inspected.raw_options, inspected.topology); self.sink = NexusSink.for_existing_replacement(path, expected_target_snapshot=self.plan.expected_target_snapshot, dimension=self.plan.dimension, labels=self.plan.labels, audit_bytes=_canonical(audit), selected_plan=self.plan.selected_plan["bai_args"], selected_gi_mode=self.plan.selected_plan["gi_mode"], source_execution=dict(inspected.topology.execution), append_lineage=inspected.append_lineage, cancel_token=self.token, entry=self.plan.entry, source_base=inspected.source_base, run_configuration_provenance=run, write_thumbnails=False, flush_every=None, file_lock=lock); self.sink._configure_writer_batch_size(_replacement_writer_batch_size(self.plan.resource_allocation))
         self.source.bind_fact_reader(lambda label, **kwargs: self.sink._writer._detach_replacement_fact(label, **kwargs)); core_plan = _core_plan(self.plan.selected_plan, self.plan.requested_shared_science, inspected.mask); modes = required_result_modes(core_plan); targets = {mode: (f"nexus:{path}",) for mode in modes}; ledger = StageLedger(required_modes=modes, targets_by_mode=targets); self.accounting = DynamicRunAccounting(ledger, run_generation=1, limits=DynamicAccountingLimits(1, 1, len(self.plan.labels)))
-        try: self.session = ScanSession(core_plan, self.source, self.sink, policy=self.plan.session_policy, cancel_token=self.token, clear_frame_images=True, accounting=ledger, dynamic_accounting=self.accounting, targets_by_mode=targets)
+        try: self.session = ScanSession(core_plan, self.source, self.sink, policy=self.plan.session_policy, cancel_token=self.token, clear_frame_images=True, accounting=ledger, dynamic_accounting=self.accounting, targets_by_mode=targets, _dynamic_batch_settlement_authority_cb=self.source.enqueue_settled_batch)
         except BaseException as error: self.primary = error; return self._settle()
-        total = len(self.plan.labels); chunk_size = min(8, self.plan.resource_allocation.reduction_inflight)
+        engine = self.session._session
+        dead_writer = RuntimeError(
+            "replacement writer exited before terminal settlement"
+        )
+
+        self.source.bind_failure_probe(
+            lambda: _replacement_engine_failure(engine, dead_writer)
+        )
+        total = len(self.plan.labels); submitted = settled = 0; stopped = False; terminal_drain_succeeded = False
+
+        def release_progress(attempts):
+            nonlocal settled
+            if not attempts:
+                return
+            settled += len(attempts)
+            self._report("reduce", settled, total)
+            self._report("write", settled, total)
+
         try:
             self.source.open_direct_hdf()
             self.session.start()
@@ -2578,29 +2862,73 @@ class _ExecutionRuntime:
                 inspected.topology.execution,
             )
             frames = tuple(self.session.scan.frames)
-            for start in range(0, total, chunk_size):
-                chunk = frames[start:start + chunk_size]; prepared = []; submitted = []; stopped = False; drained = True
-                try:
-                    for completed, frame in enumerate(chunk, start):
-                        if self.token is not None and self.token.is_set(): self.session.stop(); stopped = True; break
-                        self._report("read", completed, total); image, revision = self.source.prepare(frame); prepared.append(frame); key = DynamicFrameIdentity(self.plan.operation_identity, int(frame.index)); self.accounting.discover(key, group=self.plan.operation_identity, ordinal=completed, output_label=int(frame.index)); attempt = self.accounting.begin_attempt(key, source_revision=revision); self.accounting.record_enqueued(attempt)
-                        if not self.session.submit(frame, image, attempt_token=attempt): self.accounting.record_cancelled(attempt, reason="reintegration submission cancelled"); stopped = True; break
-                        submitted.append(frame)
-                finally:
-                    try:
-                        if prepared: drained = self.session._session.drain()
-                    finally:
-                        [self.source.clear_label(frame.index) for frame in prepared]
-                for completed in range(start + 1, start + len(submitted) + 1): self._report("reduce", completed, total); self._report("write", completed, total)
-                if stopped or not drained: break
+            for ordinal, frame in enumerate(frames):
+                if self.token is not None and self.token.is_set():
+                    self.session.stop(); stopped = True; break
+                release_progress(self.source.wait_for_capacity())
+                self._report("read", ordinal, total)
+                image, revision = self.source.prepare(frame)
+                key = DynamicFrameIdentity(
+                    self.plan.operation_identity, int(frame.index),
+                )
+                self.accounting.discover(
+                    key, group=self.plan.operation_identity, ordinal=ordinal,
+                    output_label=int(frame.index),
+                )
+                attempt = self.accounting.begin_attempt(
+                    key, source_revision=revision,
+                )
+                self.accounting.record_enqueued(attempt)
+                self.source.bind_attempt(frame.index, attempt)
+                if not self.session.submit(
+                    frame, image, attempt_token=attempt,
+                ):
+                    self.accounting.record_cancelled(
+                        attempt, reason="reintegration submission cancelled",
+                    )
+                    self.source.clear_label(frame.index)
+                    self.session.stop()
+                    stopped = True
+                    break
+                submitted += 1
+            self.terminal_deadline = (
+                time.monotonic() + _TERMINAL_DRAIN_TIMEOUT_SECONDS
+            )
+            _drain_reintegration_engine(
+                engine, self.source,
+                max(0.001, self.terminal_deadline - time.monotonic()),
+            )
+            terminal_drain_succeeded = True
+            if not stopped:
+                release_progress(self.source.consume_settled())
+                if (
+                    submitted != total
+                    or settled != total
+                    or self.source.jit_labels
+                    or self.source.pending_settlement_count
+                ):
+                    raise RuntimeError(
+                        "replacement rolling settlement lost exact custody"
+                    )
         except ReintegrateCancelled: self.session.stop()
         except BaseException as error: self._stop(error)
         try:
-            if self.session._session._current_failure() is None:
+            if (
+                not stopped
+                and self.session._session._current_failure() is None
+                and (self.token is None or not self.token.is_set())
+            ):
                 self.session.flush(force=True)
                 self.source.validate_terminal_topology()
             snapshot = self.accounting.snapshot(); pairs = snapshot.publication_dropped | snapshot.pending_publication_dropped; self.dropped = tuple(label for label in self.plan.labels if any(key.logical_frame_identity == label for key, _mode in pairs))
         except BaseException as error: self._note(error); self._stop(error)
+        if terminal_drain_succeeded:
+            # Draining proved the writer quiescent.  Qualification/flush/topology
+            # work after that boundary must not consume the separate finite join
+            # budget needed to publish the sentinel and settle the transaction.
+            self.terminal_deadline = (
+                time.monotonic() + _TERMINAL_DRAIN_TIMEOUT_SECONDS
+            )
         return self._settle()
     def finish_current(self): self.session._mark_dynamic_failure(ReintegrateCancelled("reintegration cancelled before commit")) if self.token is not None and self.token.is_set() and self.session is not None and not self.sink._transaction.snapshot().writer_succeeded else None; return self._settle()
     def close(self): source, sink = self.source, self.sink; writer = None if sink is None else sink._writer; source.close_direct_hdf(validate=False) if source is not None else None; source.clear_jit() if source is not None else None; source._frames.clear() if source is not None else None; setattr(source, "_fact_reader", None) if source is not None else None; setattr(source, "_topology", None) if source is not None else None; [setattr(writer, name, None) for name in ("_replacement_configuration", "_replacement_read_context", "_replacement_manifest", "_replacement_expected")] if writer is not None else None; writer._row_cursors.clear() if writer is not None else None; setattr(writer, "_replacement_labels", ()) if writer is not None else None; self.session = self.source = self.sink = self.result = self.accounting = None
@@ -2636,5 +2964,7 @@ class ReintegrateRunner:
 def run_reintegrate(plan: ReintegratePlan, *, cancel_token: threading.Event | None = None, progress_cb: Callable[[ReintegrateProgress], object] | None = None) -> ReintegrateResult:
     with ReintegrateRunner(plan, cancel_token=cancel_token, progress_cb=progress_cb) as runner:
         result = runner.run()
-        while result.disposition == "SETTLEMENT_PENDING": result = runner.finish_current()
+        while result.disposition == "SETTLEMENT_PENDING":
+            time.sleep(0.1)
+            result = runner.finish_current()
         return result

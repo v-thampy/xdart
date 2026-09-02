@@ -18,6 +18,7 @@ _EXPORTS = {
     "DynamicAccountingLimits": "xrd_tools.session.dynamic_accounting",
     "DynamicAttemptState": "xrd_tools.session.dynamic_accounting",
     "DynamicAttemptToken": "xrd_tools.session.dynamic_accounting",
+    "DynamicBatchSettlementReceipt": "xrd_tools.session.dynamic_accounting",
     "DynamicCleanupReceipt": "xrd_tools.session.dynamic_accounting",
     "DynamicFrameIdentity": "xrd_tools.session.dynamic_accounting",
     "DynamicGroupHighWater": "xrd_tools.session.dynamic_accounting",

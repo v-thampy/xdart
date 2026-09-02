@@ -696,6 +696,46 @@ class FrameOutcomeReceipt:
     attempt: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class WriterBatchItemIdentity:
+    """Exact accepted-attempt identity for one settled writer-batch item.
+
+    This is a package-owned authority value, not a public completion event.
+    The label and ledger attempt are captured from the exact streaming ticket
+    that crossed the sink/write settlement boundary.
+    """
+
+    frame_index: int
+    ledger_attempt: int
+
+    def __post_init__(self) -> None:
+        if type(self.frame_index) is not int:
+            raise TypeError("writer batch frame index must be an exact int")
+        if type(self.ledger_attempt) is not int or self.ledger_attempt < 1:
+            raise TypeError(
+                "writer batch ledger attempt must be a positive exact int"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class WriterBatchSettlementReceipt:
+    """Ordered exact identities for one fully settled writer batch."""
+
+    items: tuple[WriterBatchItemIdentity, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.items) is not tuple or not self.items:
+            raise TypeError("writer batch settlement items must be a non-empty tuple")
+        if any(type(item) is not WriterBatchItemIdentity for item in self.items):
+            raise TypeError(
+                "writer batch settlement items must be exact "
+                "WriterBatchItemIdentity values"
+            )
+        labels = tuple(item.frame_index for item in self.items)
+        if len(set(labels)) != len(labels):
+            raise ValueError("writer batch settlement frame labels must be unique")
+
+
 class ReductionSink(Protocol):
     """Destination for frame reduction products.
 
@@ -2806,6 +2846,12 @@ class ReductionSession:
     outcome_authority_cb: Callable[[FrameOutcomeReceipt], None] | None = None
     written_authority_cb: Callable[[Frame, FrameReduction, int | None], None] | None = None
     batch_settled_authority_cb: Callable[[int], None] | None = None
+    # Exact package-owned counterpart to the retained count authority above.
+    # It runs only after every per-item settlement authority AND the count
+    # authority (ScanSession's configured checkpoint owner) have succeeded.
+    batch_settlement_authority_cb: (
+        Callable[[WriterBatchSettlementReceipt], None] | None
+    ) = None
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -2995,6 +3041,17 @@ class ReductionSession:
             raise ValueError(
                 f"execution must be 'chunked' or 'streaming'; got {self.execution!r}"
             )
+        if self.batch_settlement_authority_cb is not None:
+            if not callable(self.batch_settlement_authority_cb):
+                raise TypeError("batch settlement authority must be callable")
+            if self.execution != "streaming":
+                raise ValueError(
+                    "batch settlement authority requires streaming execution"
+                )
+            if self.accept_cb is None:
+                raise ValueError(
+                    "batch settlement authority requires exact accepted attempts"
+                )
         try:
             self._worker, self._owns_worker = _coerce_executor(self.executor)
             self._sink.begin(self.scan, self.plan)
@@ -3529,12 +3586,30 @@ class ReductionSession:
                     except BaseException as exc:
                         self._record_failure(exc)
                         batch_settled = False
-            authority = self.batch_settled_authority_cb
-            if batch_settled and authority is not None:
+            count_authority = self.batch_settled_authority_cb
+            if batch_settled and count_authority is not None:
                 try:
-                    authority(len(batch))
+                    count_authority(len(batch))
                 except BaseException as exc:
                     self._record_failure(exc)
+                    batch_settled = False
+            receipt_authority = self.batch_settlement_authority_cb
+            if (
+                batch_settled
+                and receipt_authority is not None
+                and self._current_failure() is None
+            ):
+                try:
+                    receipt_authority(WriterBatchSettlementReceipt(tuple(
+                        WriterBatchItemIdentity(
+                            frame_index=int(ticket.frame.index),
+                            ledger_attempt=attempt,
+                        )
+                        for ticket, attempt, _reduction, _replacing in batch
+                    )))
+                except BaseException as exc:
+                    self._record_failure(exc)
+                    batch_settled = False
         finally:
             for ticket, _attempt, _reduction, _replacing in batch:
                 self._complete_stream_publication(ticket)

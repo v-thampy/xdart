@@ -448,13 +448,29 @@ def test_batch_settled_authority_follows_every_item_hook_before_release(monkeypa
         ))
         trace.append(("settled", count, held))
 
+    def accepted(frame, publish):
+        attempt = int(frame.index) + 11
+        publish(attempt)
+        return attempt
+
+    def exact_settlement(receipt):
+        session = session_box["session"]
+        held = tuple(sorted(
+            int(ticket.frame.index) for ticket in session._inflight._members
+        ))
+        trace.append(("receipt", tuple(
+            (item.frame_index, item.ledger_attempt) for item in receipt.items
+        ), held))
+
     session = ReductionSession(
         _plan(), Scan("settled-order", frames, integrator=object()),
         sink=SettledSink(), execution="streaming", executor=3, inflight_max=3,
+        accept_cb=accepted,
         written_authority_cb=lambda frame, reduction, attempt: trace.append(
             ("written", int(frame.index))
         ),
         batch_settled_authority_cb=settled,
+        batch_settlement_authority_cb=exact_settlement,
     )
     session_box["session"] = session
     for frame in frames:
@@ -468,6 +484,7 @@ def test_batch_settled_authority_follows_every_item_hook_before_release(monkeypa
         ("written", 1), ("drop", 1), ("post", 1),
         ("written", 2), ("drop", 2), ("post", 2),
         ("settled", 3, (0, 1, 2)),
+        ("receipt", ((0, 11), (1, 12), (2, 13)), (0, 1, 2)),
     ]
     assert session._inflight._members == {}
     assert result.failed is False
@@ -515,6 +532,170 @@ def test_batch_settled_authority_skips_an_incompletely_settled_batch(monkeypatch
     assert settled == []
     assert result.failed is True
     assert "injected post-write failure" in (result.error or "")
+
+
+def test_writer_batch_receipt_requires_successful_count_authority(monkeypatch):
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+
+    class BatchSink:
+        writer_batch_size = 2
+
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            raise AssertionError("two queued items must use write_batch")
+
+        def write_batch(self, items):
+            pass
+
+        def finish(self, result):
+            pass
+
+    def accepted(frame, publish):
+        attempt = int(frame.index) + 1
+        publish(attempt)
+        return attempt
+
+    receipts = []
+
+    def fail_checkpoint(_count):
+        raise RuntimeError("checkpoint authority failed")
+
+    frames = _frames(2)
+    session = ReductionSession(
+        _plan(), Scan("checkpoint-failure", frames, integrator=object()),
+        sink=BatchSink(), execution="streaming", executor=2, inflight_max=2,
+        accept_cb=accepted,
+        batch_settled_authority_cb=fail_checkpoint,
+        batch_settlement_authority_cb=receipts.append,
+    )
+    for frame in frames:
+        assert session.submit(frame)
+    gate.set()
+    result = session.finish(raise_on_failure=False)
+
+    assert receipts == []
+    assert result.failed is True
+    assert "checkpoint authority failed" in (result.error or "")
+
+
+def test_writer_batch_receipt_authority_failure_is_sticky_and_fails_closed(
+    monkeypatch,
+):
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+
+    class BatchSink:
+        writer_batch_size = 2
+
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            pass
+
+        def write_batch(self, items):
+            pass
+
+        def finish(self, result):
+            pass
+
+    def accepted(frame, publish):
+        attempt = int(frame.index) + 1
+        publish(attempt)
+        return attempt
+
+    calls = []
+
+    def fail_receipt(receipt):
+        calls.append(tuple(item.frame_index for item in receipt.items))
+        raise RuntimeError("settlement receipt authority failed")
+
+    frames = _frames(4)
+    session = ReductionSession(
+        _plan(), Scan("receipt-failure", frames, integrator=object()),
+        sink=BatchSink(), execution="streaming", executor=4, inflight_max=4,
+        accept_cb=accepted,
+        batch_settlement_authority_cb=fail_receipt,
+    )
+    for frame in frames:
+        assert session.submit(frame)
+    gate.set()
+    result = session.finish(raise_on_failure=False)
+
+    assert calls == [(0, 1)]
+    assert result.failed is True
+    assert "settlement receipt authority failed" in (result.error or "")
+
+
+def test_writer_batch_receipt_rejects_duplicate_frame_labels():
+    item = reduction_core.WriterBatchItemIdentity
+    receipt = reduction_core.WriterBatchSettlementReceipt
+
+    with pytest.raises(ValueError, match="frame labels must be unique"):
+        receipt((item(7, 1), item(7, 2)))
+
+
+@pytest.mark.parametrize("tail", (1, 2, 3))
+def test_writer_batch_receipt_preserves_terminal_tail(monkeypatch, tail):
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+
+    class BatchSink:
+        writer_batch_size = 4
+
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            pass
+
+        def write_batch(self, items):
+            pass
+
+        def finish(self, result):
+            pass
+
+    def accepted(frame, publish):
+        attempt = int(frame.index) + 1
+        publish(attempt)
+        return attempt
+
+    receipts = []
+    frames = _frames(4 + tail)
+    session = ReductionSession(
+        _plan(), Scan("receipt-tail", frames, integrator=object()),
+        sink=BatchSink(), execution="streaming", executor=4,
+        inflight_max=len(frames), accept_cb=accepted,
+        batch_settlement_authority_cb=receipts.append,
+    )
+    for frame in frames:
+        assert session.submit(frame)
+    gate.set()
+    result = session.finish()
+
+    assert result.failed is False
+    assert [
+        tuple(item.frame_index for item in receipt.items)
+        for receipt in receipts
+    ] == [tuple(range(4)), tuple(range(4, 4 + tail))]
 
 
 @pytest.mark.parametrize(

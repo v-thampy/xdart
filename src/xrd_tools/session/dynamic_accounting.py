@@ -28,6 +28,7 @@ __all__ = [
     "DynamicAccountingLimits",
     "DynamicAttemptState",
     "DynamicAttemptToken",
+    "DynamicBatchSettlementReceipt",
     "DynamicCleanupReceipt",
     "DynamicFrameIdentity",
     "DynamicGroupHighWater",
@@ -82,6 +83,33 @@ class DynamicAttemptToken:
     run_generation: int
     revision: int
     source_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicBatchSettlementReceipt:
+    """Ordered exact dynamic attempts in one fully settled writer batch."""
+
+    attempts: tuple[DynamicAttemptToken, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.attempts) is not tuple or not self.attempts:
+            raise TypeError(
+                "dynamic batch settlement attempts must be a non-empty tuple"
+            )
+        if any(type(token) is not DynamicAttemptToken for token in self.attempts):
+            raise TypeError(
+                "dynamic batch settlement attempts must be exact "
+                "DynamicAttemptToken values"
+            )
+        if len({id(token) for token in self.attempts}) != len(self.attempts):
+            raise ValueError("dynamic batch settlement attempts must be unique")
+        logical_labels = tuple(
+            token.key.logical_frame_identity for token in self.attempts
+        )
+        if len(set(logical_labels)) != len(logical_labels):
+            raise ValueError(
+                "dynamic batch settlement logical labels must be unique"
+            )
 
 
 class DynamicAttemptState(str, Enum):

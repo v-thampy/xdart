@@ -147,6 +147,89 @@ def test_h10_c4_external_ledger_is_exact_identity_and_validated_pre_engine():
     default.finish(raise_on_failure=False)
 
 
+def test_dynamic_writer_batch_settlement_converts_ordered_exact_attempts(
+    monkeypatch, tmp_path,
+):
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import (
+        DynamicAccountingLimits,
+        DynamicAttemptToken,
+        DynamicBatchSettlementReceipt,
+        DynamicFrameIdentity,
+        DynamicRunAccounting,
+        StageLedger,
+    )
+
+    gate = threading.Event()
+
+    def blocked(image, ai, **kw):
+        assert gate.wait(5.0)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocked)
+    plan = ReductionPlan(integration_2d=None)
+    mode = ResultMode.one_d()
+    output = (tmp_path / "dynamic-settlement.nexus").resolve()
+    targets = {mode: (f"nexus:{output}",)}
+    ledger = StageLedger(required_modes=(mode,), targets_by_mode=targets)
+    accounting = DynamicRunAccounting(
+        ledger,
+        run_generation=1,
+        limits=DynamicAccountingLimits(
+            max_groups=1, max_attempts_per_frame=1, max_outstanding=2,
+        ),
+    )
+    sink = NexusSink(
+        output, overwrite=True, atomic=False, flush_every=None,
+    )
+    sink._configure_writer_batch_size(2)
+    receipts = []
+    callback_threads = []
+
+    def settled(receipt):
+        receipts.append(receipt)
+        callback_threads.append(threading.get_ident())
+
+    frames = _frames(2)
+    session = ScanSession(
+        plan,
+        Scan("dynamic-settlement", frames, integrator=object()),
+        sink=sink,
+        executor=2,
+        inflight_max=2,
+        accounting=ledger,
+        dynamic_accounting=accounting,
+        targets_by_mode=targets,
+        _dynamic_batch_settlement_authority_cb=settled,
+    )
+    tokens = []
+    for label, frame in enumerate(frames):
+        key = DynamicFrameIdentity("dynamic-settlement-source", label)
+        accounting.discover(
+            key, group="scan", ordinal=label, output_label=label,
+        )
+        token = accounting.begin_attempt(key, source_revision=1)
+        accounting.record_enqueued(token)
+        tokens.append(token)
+        assert session.submit(frame, attempt_token=token)
+    gate.set()
+    result = session.finish()
+
+    assert result.failed is False
+    assert len(receipts) == 1
+    assert type(receipts[0]) is DynamicBatchSettlementReceipt
+    assert receipts[0].attempts == tuple(tokens)
+    assert callback_threads == [session._session._writer_ident]
+    assert callback_threads[0] != threading.get_ident()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        receipts[0].attempts = ()
+    duplicate_logical_label = DynamicAttemptToken(
+        DynamicFrameIdentity("foreign-source", 0), 1, 99, 1,
+    )
+    with pytest.raises(ValueError, match="logical labels must be unique"):
+        DynamicBatchSettlementReceipt((tokens[0], duplicate_logical_label))
+
+
 @pytest.fixture(autouse=True)
 def _fake_integrate(monkeypatch):
     monkeypatch.setattr(reduction_core, "integrate_1d",
