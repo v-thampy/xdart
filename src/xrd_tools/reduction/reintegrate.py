@@ -2944,7 +2944,26 @@ class ReintegrateRunner:
         if not (outcome.audit is None or type(outcome.audit) is str and len(outcome.audit) == 64 and all(c in "0123456789abcdef" for c in outcome.audit)) or outcome.disposition not in {"COMMITTED", "ROLLED_BACK", "SETTLEMENT_PENDING"} or outcome.disposition == "COMMITTED" and (not outcome.committed or type(outcome.terminal) is not StreamTerminal or outcome.audit is None or outcome.committed != tuple(v for v in self.plan.labels if v not in set(outcome.dropped))) or outcome.disposition != "COMMITTED" and (outcome.committed or outcome.terminal is not None) or outcome.disposition == "ROLLED_BACK" and outcome.audit is not None or set(outcome.committed) & set(outcome.dropped) or tuple(v for v in self.plan.labels if v in set(outcome.committed)) != outcome.committed or tuple(v for v in self.plan.labels if v in set(outcome.dropped)) != outcome.dropped: raise RuntimeError("replacement result contract is invalid")
         return _value(ReintegrateResult, outcome.disposition, self.plan.labels, outcome.committed, outcome.dropped, tuple(_diagnostic(x) for x in outcome.diagnostics[:16]), self.plan.science_identity, self.plan.operation_identity, outcome.audit, outcome.terminal)
     def _terminal_result(self, outcome):
-        self._state = "SETTLEMENT_PENDING" if outcome.disposition == "SETTLEMENT_PENDING" else "TERMINAL"; value = self._result(outcome); runtime = self._runtime; self._runtime = runtime if self._state == "SETTLEMENT_PENDING" else None; (None if self._state != "TERMINAL" or runtime.primary is None else (_ for _ in ()).throw(runtime.primary)); return value
+        self._state = (
+            "SETTLEMENT_PENDING"
+            if outcome.disposition == "SETTLEMENT_PENDING"
+            else "TERMINAL"
+        )
+        value = self._result(outcome)
+        runtime = self._runtime
+        self._runtime = runtime if self._state == "SETTLEMENT_PENDING" else None
+        primary = runtime.primary
+        cancelled_after_rollback = (
+            outcome.disposition == "ROLLED_BACK"
+            and type(primary) is ReintegrateCancelled
+        )
+        if (
+            self._state == "TERMINAL"
+            and primary is not None
+            and not cancelled_after_rollback
+        ):
+            raise primary
+        return value
     def run(self) -> ReintegrateResult:
         if threading.get_ident() != self._thread or self._state != "NEW": raise RuntimeError("runner is one-shot and thread-affine")
         self._runtime = _open_runtime(self.plan, self.cancel_token, self.progress_cb); self._state = "ACTIVE"
