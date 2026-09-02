@@ -863,6 +863,237 @@ def test_reduction_session_parallel_shares_frame_mask_cache(
     assert 0 < len(expansions) <= n_workers
 
 
+def test_reduce_frame_reuses_run_constant_mask_for_science_and_thumbnail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plan+saturation is frozen once; pyFAI receives true None after bind."""
+    captured_1d: list[dict] = []
+    captured_2d: list[dict] = []
+
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda _image, _ai, **kwargs: captured_1d.append(kwargs) or _r1d(1.0),
+    )
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_2d",
+        lambda _image, _ai, **kwargs: captured_2d.append(kwargs) or _r2d(1.0),
+    )
+
+    class Integrators:
+        def __init__(self) -> None:
+            self.bindings: list[np.ndarray | None] = []
+
+        def standard_with_run_mask(self, mask, _shape):
+            self.bindings.append(mask)
+            return object(), True
+
+        def standard(self):
+            raise AssertionError("bound AI should be used")
+
+    shape = (100, 100)
+    plan_mask = np.zeros(shape, dtype=bool)
+    plan_mask[2, 2] = True
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=2),
+        integration_2d=Integration2DPlan(npt_rad=2, npt_azim=2),
+        mask=plan_mask,
+        mask_saturation=True,
+    )
+    first = np.zeros(shape, dtype=np.uint16)
+    first[0, :2] = np.iinfo(np.uint16).max
+    later = np.zeros_like(first)
+    later[1, :3] = np.iinfo(np.uint16).max
+    integrators = Integrators()
+    run_mask = reduction_core._RunSaturationMask(True)
+    mask_cache: dict[tuple[int, int], np.ndarray | None] = {}
+
+    first_result = reduction_core._reduce_frame(
+        Frame(0, image=first),
+        None,
+        plan,
+        integrators,
+        mask_cache,
+        include_worker_thumbnail_prep=True,
+        run_saturation_mask=run_mask,
+    )
+    # The run owns a detached plan snapshot; caller mutation cannot change a
+    # later worker's bound mask or unmask a pixel mid-run.
+    plan_mask[2, 2] = False
+    later_result = reduction_core._reduce_frame(
+        Frame(1, image=later),
+        None,
+        plan,
+        integrators,
+        mask_cache,
+        include_worker_thumbnail_prep=True,
+        run_saturation_mask=run_mask,
+    )
+
+    assert len(integrators.bindings) == 2
+    assert integrators.bindings[0] is integrators.bindings[1]
+    admitted = integrators.bindings[0]
+    assert admitted is not None and admitted.flags.writeable is False
+    expected = np.zeros(shape, dtype=bool)
+    expected[2, 2] = True
+    expected[0, :2] = True
+    np.testing.assert_array_equal(admitted, expected)
+    np.testing.assert_array_equal(
+        first_result._worker_thumbnail_prep.resolved_mask,
+        expected,
+    )
+    np.testing.assert_array_equal(
+        later_result._worker_thumbnail_prep.resolved_mask,
+        expected,
+    )
+    for kwargs in captured_1d + captured_2d:
+        assert kwargs["mask"] is None
+        assert kwargs["_detector_mask_is_bound"] is True
+
+
+def test_reduce_frame_keeps_dynamic_and_chi_masks_on_explicit_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frame masks and chi integration retain their established semantics."""
+    calls: list[tuple[str, np.ndarray | None, bool]] = []
+
+    def capture_1d(_image, _ai, **kwargs):
+        calls.append((
+            "standard",
+            kwargs["mask"],
+            kwargs.get("_detector_mask_is_bound", False),
+        ))
+        return _r1d(1.0)
+
+    def capture_chi(_image, _ai, **kwargs):
+        calls.append(("chi", kwargs["mask"], False))
+        return _r1d(1.0, unit="chi_deg")
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", capture_1d)
+    monkeypatch.setattr(reduction_core, "integrate_radial", capture_chi)
+
+    class Integrators:
+        def standard_with_run_mask(self, _mask, _shape):
+            raise AssertionError("fallback cases must not bind a detector mask")
+
+        def standard(self):
+            return object()
+
+    shape = (4, 4)
+    plan_mask = np.zeros(shape, dtype=bool)
+    plan_mask[0, 0] = True
+    frame_mask = np.zeros(shape, dtype=bool)
+    frame_mask[1, 1] = True
+    run_mask = reduction_core._RunSaturationMask(False)
+    integrators = Integrators()
+    reduction_core._reduce_frame(
+        Frame(0, image=np.ones(shape), mask=frame_mask),
+        None,
+        ReductionPlan(
+            integration_1d=Integration1DPlan(npt=2),
+            integration_2d=None,
+            mask=plan_mask,
+        ),
+        integrators,
+        {},
+        run_saturation_mask=run_mask,
+    )
+    reduction_core._reduce_frame(
+        Frame(1, image=np.ones(shape)),
+        None,
+        ReductionPlan(
+            integration_1d=Integration1DPlan(npt=2, unit="chi_deg"),
+            integration_2d=None,
+            mask=plan_mask,
+        ),
+        integrators,
+        {},
+        run_saturation_mask=reduction_core._RunSaturationMask(False),
+    )
+    reduction_core._reduce_frame(
+        Frame(2, image=np.ones(shape)),
+        None,
+        ReductionPlan(
+            integration_1d=Integration1DPlan(
+                npt=2,
+                extra={"safe": np.bool_(False)},
+            ),
+            integration_2d=None,
+            mask=plan_mask,
+        ),
+        integrators,
+        {},
+        run_saturation_mask=reduction_core._RunSaturationMask(False),
+    )
+
+    assert [kind for kind, _mask, _bound in calls] == [
+        "standard",
+        "chi",
+        "standard",
+    ]
+    np.testing.assert_array_equal(calls[0][1], plan_mask | frame_mask)
+    assert calls[0][2] is False
+    np.testing.assert_array_equal(calls[1][1], plan_mask)
+    np.testing.assert_array_equal(calls[2][1], plan_mask)
+    assert calls[2][2] is False
+
+
+def test_integration_plan_reserves_detector_binding_control() -> None:
+    with pytest.raises(ValueError, match="reserves _detector_mask_is_bound"):
+        Integration1DPlan(extra={"_detector_mask_is_bound": True})
+    with pytest.raises(ValueError, match="reserves _detector_mask_is_bound"):
+        Integration2DPlan(extra={"_detector_mask_is_bound": True})
+
+
+def test_run_constant_mask_cache_retains_only_latest_shape() -> None:
+    owner = reduction_core._RunSaturationMask(False)
+    first_input = np.zeros((2, 2), dtype=bool)
+    first_input[0, 0] = True
+    first = owner.apply_run_constant(first_input, np.zeros((2, 2)))
+    second_input = np.zeros((3, 3), dtype=bool)
+    second_input[1, 1] = True
+    second = owner.apply_run_constant(second_input, np.zeros((3, 3)))
+
+    assert first is not None and first.flags.writeable is False
+    assert second is not None and second.flags.writeable is False
+    assert owner._constant_owner is second_input
+    assert owner._constant_shape == (3, 3)
+    assert owner._constant_mask is second
+
+
+def test_reduction_session_snapshots_plan_mask_before_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[np.ndarray] = []
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda _image, _ai, **kwargs: captured.append(kwargs["mask"]) or _r1d(1.0),
+    )
+    supplied = np.zeros((2, 2), dtype=bool)
+    supplied[0, 0] = True
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=2),
+        integration_2d=None,
+        mask=supplied,
+    )
+    scan = Scan("snapshot", [Frame(0, image=np.ones((2, 2)))], integrator=object())
+    session = ReductionSession(plan, scan, executor=False)
+    supplied[0, 0] = False
+    supplied[1, 1] = True
+    session.process()
+    session.finish()
+
+    assert session.plan is not plan
+    assert session.plan.mask.flags.writeable is False
+    assert captured[0] is session.plan.mask
+    np.testing.assert_array_equal(
+        captured[0],
+        np.array([[True, False], [False, False]]),
+    )
+
+
 def test_reduction_session_replace_refed_index_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

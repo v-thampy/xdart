@@ -35,6 +35,7 @@ def integrate_1d(
     error_model: str | None = None,
     polarization_factor: float | None = None,
     normalization_factor: float | None = None,
+    _detector_mask_is_bound: bool = False,
     **kwargs: Any,
 ) -> IntegrationResult1D:
     """
@@ -84,7 +85,14 @@ def integrate_1d(
         extra["normalization_factor"] = normalization_factor
     # Always-on geometric detector mask (module gaps are non-pixels) —
     # an explicit pyFAI mask otherwise REPLACES detector.calc_mask().
-    mask = mask_with_detector(ai, mask)
+    # The private reduction-engine opt-in preserves true ``None`` only after a
+    # private AI has admitted the complete run mask and reset its engines.
+    # Public/default behavior remains the established protective union.
+    if _detector_mask_is_bound:
+        if mask is not None:
+            raise ValueError("a bound detector mask requires mask=None")
+    else:
+        mask = mask_with_detector(ai, mask)
     result = ai.integrate1d(
         image,
         npt,
@@ -193,6 +201,7 @@ def integrate_2d(
     error_model: str | None = None,
     polarization_factor: float | None = None,
     normalization_factor: float | None = None,
+    _detector_mask_is_bound: bool = False,
     **kwargs: Any,
 ) -> IntegrationResult2D:
     """
@@ -249,7 +258,12 @@ def integrate_2d(
         extra["normalization_factor"] = normalization_factor
     # Always-on geometric detector mask (module gaps are non-pixels) —
     # an explicit pyFAI mask otherwise REPLACES detector.calc_mask().
-    mask = mask_with_detector(ai, mask)
+    # See integrate_1d: this bypass is private and only valid after admission.
+    if _detector_mask_is_bound:
+        if mask is not None:
+            raise ValueError("a bound detector mask requires mask=None")
+    else:
+        mask = mask_with_detector(ai, mask)
     result = ai.integrate2d(
         image,
         npt_rad,

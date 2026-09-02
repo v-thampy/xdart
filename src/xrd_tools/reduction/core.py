@@ -490,6 +490,10 @@ class Integration1DPlan:
         if self.npt_rad <= 0:
             raise ValueError(
                 f"Integration1DPlan.npt_rad must be > 0; got {self.npt_rad}")
+        if "_detector_mask_is_bound" in self.extra:
+            raise ValueError(
+                "Integration1DPlan.extra reserves _detector_mask_is_bound"
+            )
 
 
 @dataclass(slots=True)
@@ -513,6 +517,10 @@ class Integration2DPlan:
             raise ValueError(
                 "Integration2DPlan.npt_rad and npt_azim must both be > 0; "
                 f"got ({self.npt_rad}, {self.npt_azim})"
+            )
+        if "_detector_mask_is_bound" in self.extra:
+            raise ValueError(
+                "Integration2DPlan.extra reserves _detector_mask_is_bound"
             )
 
 
@@ -2983,12 +2991,23 @@ def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
 class _RunSaturationMask:
     """Session-owned, immutable detector-value mask seeded by frame one."""
 
-    __slots__ = ("enabled", "_seeded", "_mask", "_lock")
+    __slots__ = (
+        "enabled",
+        "_seeded",
+        "_mask",
+        "_constant_owner",
+        "_constant_shape",
+        "_constant_mask",
+        "_lock",
+    )
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
         self._seeded = False
         self._mask: np.ndarray | None = None
+        self._constant_owner: object | None = None
+        self._constant_shape: tuple[int, int] | None = None
+        self._constant_mask: np.ndarray | None = None
         self._lock = threading.Lock()
 
     @property
@@ -3026,6 +3045,39 @@ class _RunSaturationMask:
     def apply(self, mask: np.ndarray | None, raw_image: object) -> np.ndarray | None:
         self.seed(raw_image)
         return self.combine(mask, np.asarray(raw_image).shape)
+
+    def apply_run_constant(
+        self,
+        mask: np.ndarray | None,
+        raw_image: object,
+    ) -> np.ndarray | None:
+        """Return one immutable plan/value-mask union for this run and shape."""
+        raw = np.asarray(raw_image)
+        self.seed(raw)
+        image_shape = raw.shape
+        if len(image_shape) != 2:
+            raise ValueError(f"detector image must be 2D; got shape {image_shape}")
+        shape = (int(image_shape[0]), int(image_shape[1]))
+        with self._lock:
+            if self._constant_owner is mask and self._constant_shape == shape:
+                return self._constant_mask
+            resolved = combine_detector_masks(mask, self._mask, shape)
+            if resolved is not None:
+                if resolved is mask and isinstance(mask, np.ndarray) and (
+                    mask.dtype == np.dtype(bool)
+                    and mask.flags.c_contiguous
+                    and not mask.flags.writeable
+                ):
+                    resolved = mask
+                elif resolved is self._mask and self._mask is not None:
+                    resolved = self._mask
+                else:
+                    resolved = np.array(resolved, dtype=bool, order="C", copy=True)
+                resolved.setflags(write=False)
+            self._constant_owner = mask
+            self._constant_shape = shape
+            self._constant_mask = resolved
+            return resolved
 
     def combine(
         self,
@@ -3251,6 +3303,7 @@ class ReductionSession:
         )
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {self.chunk_size}")
+        self.plan = _snapshot_plan_mask(self.plan)
         self.scan = _coerce_to_scan(self.source)
         if self.plan.gi is not None:
             if self.scan.poni is None:
@@ -4948,32 +5001,117 @@ class _ReductionIntegratorProvider:
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
 
+    def _new_standard(self) -> Any:
+        """Build one private standard integrator from the accepted calibration."""
+        if self.ai is not None:
+            from xrd_tools.integrate.calibration import (
+                _clone_integrator_preserving_calibration,
+            )
+            return _clone_integrator_preserving_calibration(self.ai)
+        return poni_to_integrator(self.scan.poni)
+
     def standard(self) -> Any:
+        local_ai = getattr(self._local, "ai", None)
+        if local_ai is not None:
+            return local_ai
         if self.scan.poni is None:
             return self.ai
         if threading.get_ident() == self._owner_thread and self.ai is not None:
             return self.ai
-        ai = getattr(self._local, "ai", None)
-        if ai is None:
-            # Per-worker AI (pyFAI AIs aren't safe to share across threads).
-            # Deep-copy the base integrator instead of rebuilding from
-            # scan.poni: poni_to_integrator() cannot recover a GENERIC/unnamed
-            # detector's pixel size (PONI carries only a detector *name*), so a
-            # worker rebuild drops _pixel1/_pixel2 -> None and integrate1d
-            # crashes in calc_cartesian_positions.  A deepcopy keeps the
-            # detector (pixel sizes intact), stays thread-isolated, and is
-            # geometrically identical to the owner thread's AI (strengthening
-            # live==batch==reload equivalence).  Fall back to a poni rebuild
-            # only when there is no base AI (pure-PONI, named-detector path).
-            if self.ai is not None:
-                from xrd_tools.integrate.calibration import (
-                    _clone_integrator_preserving_calibration,
-                )
-                ai = _clone_integrator_preserving_calibration(self.ai)
-            else:
-                ai = poni_to_integrator(self.scan.poni)
-            self._local.ai = ai
+        # Per-worker AI (pyFAI AIs aren't safe to share across threads).
+        # Deep-copy the base integrator instead of rebuilding from scan.poni:
+        # a PONI cannot recover an unnamed detector's pixel size.
+        ai = self._new_standard()
+        self._local.ai = ai
         return ai
+
+    def _unbound_standard(self) -> Any:
+        """Discard an optional bound clone and return the established AI path."""
+        for name in ("ai", "run_mask_binding"):
+            try:
+                delattr(self._local, name)
+            except AttributeError:
+                pass
+        return self.standard()
+
+    def _retain_unbound_standard(
+        self,
+        ai: Any,
+        run_mask: np.ndarray | None,
+        shape: tuple[int, int],
+    ) -> tuple[Any, bool]:
+        """Cache a negative admission without rebuilding on every frame."""
+        self._local.ai = ai
+        self._local.run_mask_binding = (run_mask, shape, False)
+        return ai, False
+
+    def standard_with_run_mask(
+        self,
+        run_mask: np.ndarray | None,
+        image_shape: tuple[int, int],
+    ) -> tuple[Any, bool]:
+        """Return a private AI with a run-constant mask bound to its detector.
+
+        The boolean reports whether the caller may pass ``mask=None`` and let
+        pyFAI use the detector's cached mask checksum. Binding is deliberately
+        optional: unsupported/fake integrators and shape changes fall back to
+        the established explicit-mask path without mutating the accepted base
+        integrator owned by ``Scan``.
+        """
+        shape = (int(image_shape[0]), int(image_shape[1]))
+        cached = getattr(self._local, "run_mask_binding", None)
+        if (
+            cached is not None
+            and cached[0] is run_mask
+            and cached[1] == shape
+        ):
+            return self._local.ai, bool(cached[2])
+
+        # Rejected custom AIs keep the exact identity/state semantics of the
+        # established provider path (not an opportunistic clone on the owner).
+        if self.ai is not None and not _stock_pyfai_detector_mask_semantics(
+            self.ai,
+            shape,
+        ):
+            return self._retain_unbound_standard(
+                self._unbound_standard(),
+                run_mask,
+                shape,
+            )
+
+        try:
+            ai = self._new_standard()
+            if not _stock_pyfai_detector_mask_semantics(ai, shape):
+                unbound = ai if self.ai is None else self._unbound_standard()
+                return self._retain_unbound_standard(unbound, run_mask, shape)
+            detector = ai.detector
+            detector_mask = detector.mask
+            if detector_mask is not None:
+                detector_mask = np.asarray(detector_mask, dtype=bool)
+                bound_mask = (
+                    detector_mask
+                    if run_mask is None
+                    else np.logical_or(run_mask, detector_mask)
+                )
+            else:
+                bound_mask = (
+                    None if run_mask is None else np.asarray(run_mask, dtype=bool)
+                )
+            if run_mask is not None:
+                detector.mask = bound_mask
+            ai.reset_engines(collect_garbage=False)
+            if run_mask is not None:
+                admitted = np.asarray(detector.mask, dtype=bool)
+                if admitted.shape != shape or not np.array_equal(admitted, bound_mask):
+                    unbound = self._unbound_standard()
+                    return self._retain_unbound_standard(unbound, run_mask, shape)
+        except (AttributeError, TypeError, ValueError):
+            unbound = self._unbound_standard()
+            return self._retain_unbound_standard(unbound, run_mask, shape)
+
+        self._local.ai = ai
+        self._local.run_mask_binding = (run_mask, shape, True)
+        return ai, True
 
     def fiber(self) -> Any:
         if self.scan.poni is None:
@@ -5237,6 +5375,45 @@ def _stock_pyfai_float32_input_semantics(ai: Any) -> bool:
     )
 
 
+def _stock_pyfai_detector_mask_semantics(
+    ai: Any,
+    image_shape: tuple[int, int] | None = None,
+) -> bool:
+    """Whether ``mask=None`` is the exact stock cached-detector-mask path."""
+    try:
+        from pyFAI.detectors import Detector
+        from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    except ImportError:
+        return False
+    detector = getattr(ai, "detector", None)
+    admitted = (
+        type(ai) is AzimuthalIntegrator
+        and detector is not None
+        and not any(
+            name in getattr(ai, "__dict__", {})
+            for name in ("integrate1d", "integrate2d")
+        )
+        and getattr(type(detector), "mask", None) is Detector.mask
+        and getattr(type(detector), "get_mask_crc", None) is Detector.get_mask_crc
+        and callable(getattr(ai, "reset_engines", None))
+    )
+    if not admitted or image_shape is None:
+        return admitted
+    try:
+        detector_shape = getattr(detector, "shape", None)
+        detector_mask = detector.mask
+    except MemoryError:
+        raise
+    except Exception:
+        return False
+    if detector_shape is None or tuple(detector_shape) != tuple(image_shape):
+        return False
+    return (
+        detector_mask is None
+        or np.asarray(detector_mask).shape == tuple(image_shape)
+    )
+
+
 def _can_use_owned_float32_csr(
     raw_image: np.ndarray,
     background: np.ndarray | float | None,
@@ -5317,15 +5494,22 @@ def _reduce_frame(
         "ReductionPlan.mask",
         plan_masks,
     )
-    mask = _combined_mask(plan_mask, frame.mask, image.shape, frame_masks)
-    mask = _apply_saturation_mask(
-        mask,
-        raw_image_arr,
-        plan,
-        run_saturation_mask=run_saturation_mask,
-    )
+    frame_mask = _combined_mask(None, frame.mask, image.shape, frame_masks)
 
     if plan.gi is not None:
+        mask = (
+            frame_mask
+            if plan_mask is None
+            else plan_mask
+            if frame_mask is None
+            else plan_mask | frame_mask
+        )
+        mask = _apply_saturation_mask(
+            mask,
+            raw_image_arr,
+            plan,
+            run_saturation_mask=run_saturation_mask,
+        )
         fi = integrators.fiber()
         incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
         r1d = (
@@ -5355,9 +5539,57 @@ def _reduce_frame(
             if plan.integration_2d is not None else None
         )
     else:
-        ai = integrators.standard()
         p1 = plan.integration_1d
-        if p1 is not None and str(p1.unit or "").lower() == "chi_deg":
+        chi_mode = p1 is not None and str(p1.unit or "").lower() == "chi_deg"
+        unsafe_dynamic_mask_cache = any(
+            item is not None
+            and "safe" in item.extra
+            and item.extra["safe"] is not True
+            for item in (p1, plan.integration_2d)
+        )
+        ai = None
+        mask = None
+        integration_mask = None
+        detector_mask_is_bound = False
+        has_run_constant_mask = False
+        if frame_mask is None and not chi_mode and not unsafe_dynamic_mask_cache:
+            if run_saturation_mask is not None:
+                mask = run_saturation_mask.apply_run_constant(
+                    plan_mask,
+                    raw_image_arr,
+                )
+                has_run_constant_mask = True
+            elif not plan.mask_saturation:
+                mask = plan_mask
+                has_run_constant_mask = True
+            binder = getattr(integrators, "standard_with_run_mask", None)
+            if has_run_constant_mask and callable(binder):
+                ai, bound = binder(mask, image.shape)
+                if bound:
+                    integration_mask = None
+                    detector_mask_is_bound = True
+                else:
+                    integration_mask = mask
+        if not has_run_constant_mask:
+            mask = (
+                frame_mask
+                if plan_mask is None
+                else plan_mask
+                if frame_mask is None
+                else plan_mask | frame_mask
+            )
+            mask = _apply_saturation_mask(
+                mask,
+                raw_image_arr,
+                plan,
+                run_saturation_mask=run_saturation_mask,
+            )
+            integration_mask = mask
+        elif ai is None:
+            integration_mask = mask
+        if ai is None:
+            ai = integrators.standard()
+        if chi_mode:
             # Non-GI azimuthal profile (Mode A): the output axis is chi, while
             # radial_range is the q band to integrate over.  Mirror
             # xdart.LiveFrame.integrate_1d's legacy dispatch to
@@ -5382,7 +5614,7 @@ def _reduce_frame(
                 npt_rad=p1.npt_rad,
                 radial_unit="q_A^-1",
                 method=p1.method,
-                mask=mask,
+                mask=integration_mask,
                 radial_range=p1.radial_range,
                 polarization_factor=p1.polarization_factor,
                 normalization_factor=_normalization_for(
@@ -5397,13 +5629,14 @@ def _reduce_frame(
                     npt=p1.npt,
                     unit=p1.unit,
                     method=p1.method,
-                    mask=mask,
+                    mask=integration_mask,
                     radial_range=p1.radial_range,
                     azimuth_range=_integration_azimuth_range(p1),
                     error_model=p1.error_model,
                     polarization_factor=p1.polarization_factor,
                     normalization_factor=_normalization_for(
                         frame, p1, warned_monitor_keys, strict=strict),
+                    _detector_mask_is_bound=detector_mask_is_bound,
                     **p1.extra,
                 )
                 if p1 is not None else None
@@ -5425,13 +5658,14 @@ def _reduce_frame(
                 npt_azim=plan.integration_2d.npt_azim,
                 unit=plan.integration_2d.unit,
                 method=plan.integration_2d.method,
-                mask=mask,
+                mask=integration_mask,
                 radial_range=plan.integration_2d.radial_range,
                 azimuth_range=_integration_azimuth_range(plan.integration_2d),
                 error_model=plan.integration_2d.error_model,
                 polarization_factor=plan.integration_2d.polarization_factor,
                 normalization_factor=_normalization_for(
                     frame, plan.integration_2d, warned_monitor_keys, strict=strict),
+                _detector_mask_is_bound=detector_mask_is_bound,
                 **plan.integration_2d.extra,
             )
             if plan.integration_2d is not None else None
@@ -5798,6 +6032,18 @@ def _qip_qoop_unit(unit: str | None) -> str:
     return "qip_A^-1"
 
 
+def _snapshot_plan_mask(plan: ReductionPlan) -> ReductionPlan:
+    """Detach the static mask synchronously at session construction."""
+    mask = plan.mask
+    if mask is None:
+        return plan
+    values = mask.values if isinstance(mask, MaskSpec) else mask
+    owned = np.array(values, copy=True, order="K")
+    owned.setflags(write=False)
+    snapshot = MaskSpec(owned) if isinstance(mask, MaskSpec) else owned
+    return replace(plan, mask=snapshot)
+
+
 def _cached_mask_for_shape(
     mask: np.ndarray | MaskSpec | None,
     image_shape: tuple[int, int],
@@ -5807,7 +6053,19 @@ def _cached_mask_for_shape(
     if mask is None:
         return None
     if image_shape not in cache:
-        cache[image_shape] = _as_bool_mask(mask, name, image_shape=image_shape)
+        resolved = _as_bool_mask(mask, name, image_shape=image_shape)
+        # Session plans were detached synchronously; direct/private callers get
+        # the same first-resolved immutable ownership at this boundary.
+        if (
+            resolved.dtype == np.dtype(bool)
+            and resolved.flags.c_contiguous
+            and not resolved.flags.writeable
+        ):
+            owned = resolved
+        else:
+            owned = np.array(resolved, dtype=bool, order="C", copy=True)
+            owned.setflags(write=False)
+        cache[image_shape] = owned
     return cache[image_shape]
 
 

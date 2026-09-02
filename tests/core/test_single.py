@@ -9,6 +9,81 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.integrate.single import integrate_1d, integrate_2d, integrate_scan
 
 
+def test_private_bound_detector_mask_seam_preserves_public_default(monkeypatch):
+    """Only an admitted private AI may bypass the protective mask union."""
+    from types import SimpleNamespace
+
+    import xrd_tools.integrate.single as single_module
+
+    explicit = np.array([[True, False], [False, False]])
+    union_calls: list[object] = []
+
+    def union(_ai, mask):
+        union_calls.append(mask)
+        return explicit
+
+    class FakeAI:
+        def integrate1d(self, _image, _npt, **kwargs):
+            received.append(kwargs["mask"])
+            return SimpleNamespace(
+                radial=np.array([0.0, 1.0]),
+                intensity=np.array([1.0, 2.0]),
+                sigma=None,
+                unit="q_A^-1",
+                count=np.ones(2),
+            )
+
+        def integrate2d(self, _image, _npt_rad, _npt_azim, **kwargs):
+            received.append(kwargs["mask"])
+            return SimpleNamespace(
+                radial=np.array([0.0, 1.0]),
+                azimuthal=np.array([-1.0, 1.0]),
+                intensity=np.ones((2, 2)),
+                sigma=None,
+                unit="q_A^-1",
+                count=np.ones((2, 2)),
+            )
+
+    monkeypatch.setattr(single_module, "mask_with_detector", union)
+    ai = FakeAI()
+    image = np.ones((2, 2))
+    received: list[object] = []
+
+    integrate_1d(image, ai, npt=2, mask=None)
+    integrate_2d(image, ai, npt_rad=2, npt_azim=2, mask=None)
+    assert union_calls == [None, None]
+    assert received == [explicit, explicit]
+
+    union_calls.clear()
+    received.clear()
+    integrate_1d(
+        image,
+        ai,
+        npt=2,
+        mask=None,
+        _detector_mask_is_bound=True,
+    )
+    integrate_2d(
+        image,
+        ai,
+        npt_rad=2,
+        npt_azim=2,
+        mask=None,
+        _detector_mask_is_bound=True,
+    )
+    assert union_calls == []
+    assert received == [None, None]
+
+    with pytest.raises(ValueError, match="requires mask=None"):
+        integrate_1d(
+            image,
+            ai,
+            npt=2,
+            mask=explicit,
+            _detector_mask_is_bound=True,
+        )
+
+
 @pytest.mark.slow
 def test_integrate_1d_returns_correct_type(ai_fixture, synthetic_image):
     result = integrate_1d(
