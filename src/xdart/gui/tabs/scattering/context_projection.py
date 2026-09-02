@@ -41,7 +41,7 @@ from .shell_projection import (
     build_run_strip_projection, build_scientific_projection,
 )
 from .shell_values import (
-    AxisProjection, FrameNavigationProjection, HeavyProjection,
+    AxisProjection, BrowserScanIndex, FrameNavigationProjection, HeavyProjection,
     ProgressProjection, ScientificProjection, ShellProjection, TraceProjection,
 )
 from .state_machine import RunPhase
@@ -352,6 +352,7 @@ class ContextProjection:
         preferences: ScientificPreferences,
         browser_directory: str,
         browser_catalog: tuple[BrowserCatalogEntry, ...] = (),
+        browser_catalog_index: BrowserScanIndex | None = None,
         browser_transient_frame: DisplayFrameKey | None = None,
         viewer_1d_paths: tuple[str, ...] = (),
         date_sorted: bool,
@@ -485,6 +486,7 @@ class ContextProjection:
                 date_sorted=date_sorted,
                 auto_last=auto_last,
                 catalog=browser_catalog,
+                catalog_index=browser_catalog_index,
                 transient_frame=browser_transient_frame,
                 selected_artifacts=(
                     viewer_1d_selected_paths if viewer_1d_selected else ()

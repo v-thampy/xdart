@@ -11,7 +11,7 @@ from xdart.modules.display_context import (
     BrowseContext,
     DisplaySelection,
 )
-from .browser_catalog import BrowserCatalogEntry, natural_name_key
+from .browser_catalog import BrowserCatalogEntry
 from .display_values import (
     DisplayFrameKey,
     StandardDisplayPayload,
@@ -25,6 +25,8 @@ from .run_mode_projection import (
 from .shell_values import (
     BrowserProjection,
     BrowserScan,
+    BrowserScanIndex,
+    build_browser_scan_index,
     FrameNavigationProjection,
     PinnedTraceProjection,
     ScientificPlotOptions,
@@ -74,6 +76,7 @@ def build_browser_projection(
     date_sorted: bool,
     auto_last: bool,
     catalog: tuple[BrowserCatalogEntry, ...] = (),
+    catalog_index: BrowserScanIndex | None = None,
     transient_frame: DisplayFrameKey | None = None,
     selected_artifacts: tuple[str, ...] = (),
     current_artifact: str = "",
@@ -94,42 +97,23 @@ def build_browser_projection(
         or type(show_all_frames) is not bool
     ):
         raise TypeError("browser artifact selection must be exact")
+    if catalog_index is None:
+        catalog_index = build_browser_scan_index(catalog, date_sorted)
+    elif (
+        type(catalog_index) is not BrowserScanIndex
+        or type(catalog) is not tuple
+        or catalog != ()
+        or catalog_index.date_sorted != date_sorted
+    ):
+        raise TypeError("browser catalog index is inconsistent")
     transient_owner = (
         transient_frame
         if transient_frame is not None
         and any(frame is transient_frame for frame in navigation.frames)
         else None
     )
-    scans: list[BrowserScan] = []
-    seen_artifacts: set[str] = set()
-    entries = (
-        tuple(
-            sorted(
-                catalog,
-                key=lambda entry: (
-                    0 if entry.label == ".." else 1,
-                    0 if entry.label == ".." else -entry.modified_ns,
-                    natural_name_key(
-                        entry.label.removesuffix("/")
-                        if entry.is_directory
-                        else entry.label
-                    ),
-                ),
-            )
-        )
-        if date_sorted
-        else catalog
-    )
-    for entry in entries:
-        seen_artifacts.add(entry.artifact)
-        scans.append(
-            BrowserScan(
-                entry.artifact,
-                entry.label,
-                entry.artifact,
-                entry.is_directory,
-            )
-        )
+    scans = catalog_index.scans
+    seen_artifacts = catalog_index.identifiers
     for frame in navigation.frames:
         if (
             frame.artifact in seen_artifacts
@@ -143,14 +127,14 @@ def build_browser_projection(
             )
         ):
             continue
-        seen_artifacts.add(frame.artifact)
-        scans.append(
+        seen_artifacts = seen_artifacts | {frame.artifact}
+        scans = scans + (
             BrowserScan(
                 frame.artifact,
                 os.path.basename(frame.artifact) or frame.source_scan,
                 frame.artifact,
                 False,
-            )
+            ),
         )
     # Contexts and navigation are display-retention owners, not evidence that
     # an artifact still exists.  Only the exact latest in-flight artifact may
@@ -168,10 +152,7 @@ def build_browser_projection(
         selected_scan = navigation.current.artifact
     elif (not selected_scan and
         selection is not None
-        and any(
-            scan.identifier == selection.context_token
-            for scan in scans
-        )
+        and selection.context_token in seen_artifacts
     ):
         selected_scan = selection.context_token
     frames = (
@@ -185,7 +166,7 @@ def build_browser_projection(
     )
     return BrowserProjection(
         directory=browser_directory,
-        scans=tuple(scans),
+        scans=scans,
         selected_scan=selected_scan,
         date_sorted=date_sorted,
         auto_last=auto_last,
@@ -455,6 +436,7 @@ __all__ = [
     "RUN_MODE_CHOICES",
     "ScientificPreferences",
     "UNOWNED_RUN_MODE_REASONS",
+    "build_browser_scan_index",
     "build_browser_projection",
     "build_run_strip_projection",
     "build_scientific_projection",

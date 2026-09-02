@@ -6128,7 +6128,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             progress=projection_progress,
             preferences=self._preferences,
             browser_directory=browser.directory,
-            browser_catalog=browser.catalog,
+            browser_catalog_index=browser.scan_index,
             browser_transient_frame=browser.transient_frame,
             viewer_1d_paths=(
                 self._context_controller.viewer_1d_context.paths

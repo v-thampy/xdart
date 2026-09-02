@@ -212,6 +212,84 @@ def test_foreign_equal_wake_cannot_consume_the_owned_catalog() -> None:
         _wait(owner.retry_close)
 
 
+def test_projection_reuses_static_scan_index_and_rebuilds_for_date_policy() -> None:
+    wakes: list[BrowserCatalogWake] = []
+    catalog = (
+        BrowserCatalogEntry("/processed/b.nexus", "b.nexus", 1),
+        BrowserCatalogEntry("/processed/a.nexus", "a.nexus", 3),
+    )
+    catalogs = iter(
+        (
+            catalog,
+            tuple(list(catalog)),
+            catalog
+            + (BrowserCatalogEntry("/processed/c.nexus", "c.nexus", 2),),
+            catalog
+            + (BrowserCatalogEntry("/processed/c.nexus", "c.nexus", 2),),
+        )
+    )
+    owner = ProcessedBrowserOwner(
+        save_path="/processed",
+        processing_mode="Int 2D",
+        deliver=wakes.append,
+        catalog_reader=lambda _directory, **_kwargs: next(catalogs),
+    )
+    try:
+        assert owner.request_catalog() is not None
+        _wait(lambda: bool(wakes))
+        assert (
+            owner.consume_catalog(wakes.pop()).refresh
+            is BrowserRefreshEffect.CATALOG
+        )
+        first = owner.projection()
+        second = owner.projection()
+        assert second.scan_index is first.scan_index
+        assert tuple(scan.label for scan in first.scan_index.scans) == (
+            "b.nexus",
+            "a.nexus",
+        )
+        assert first.scan_index.identifiers == frozenset(
+            {"/processed/a.nexus", "/processed/b.nexus"}
+        )
+
+        assert owner.request_catalog() is not None
+        _wait(lambda: bool(wakes))
+        assert (
+            owner.consume_catalog(wakes.pop()).refresh
+            is BrowserRefreshEffect.NONE
+        )
+        assert owner.projection().scan_index is first.scan_index
+
+        assert owner.request_catalog() is not None
+        _wait(lambda: bool(wakes))
+        assert (
+            owner.consume_catalog(wakes.pop()).refresh
+            is BrowserRefreshEffect.CATALOG
+        )
+        changed_catalog = owner.projection()
+        assert changed_catalog.scan_index is not first.scan_index
+        assert tuple(
+            scan.label for scan in changed_catalog.scan_index.scans
+        ) == ("b.nexus", "a.nexus", "c.nexus")
+        assert owner.projection().scan_index is changed_catalog.scan_index
+
+        assert owner.set_date_sorted(True)
+        sorted_projection = owner.projection()
+        assert sorted_projection.scan_index is not changed_catalog.scan_index
+        assert tuple(
+            scan.label for scan in sorted_projection.scan_index.scans
+        ) == ("a.nexus", "c.nexus", "b.nexus")
+        assert owner.projection().scan_index is sorted_projection.scan_index
+    finally:
+        owner.begin_close()
+        assert owner._scan_index is None
+        assert owner._scan_index_catalog is None
+        owner.projection()
+        assert owner._scan_index is None
+        assert owner._scan_index_catalog is None
+        _wait(owner.retry_close)
+
+
 @pytest.mark.parametrize(
     ("reader", "notice"),
     (

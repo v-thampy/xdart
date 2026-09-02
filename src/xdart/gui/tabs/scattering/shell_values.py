@@ -9,6 +9,7 @@ import numpy as np
 
 from xrd_tools.session.readiness import ControlsProjection
 
+from .browser_catalog import BrowserCatalogEntry, natural_name_key
 from .controls_readiness import ControlsReadinessProjection
 from .display_values import DisplayFrameKey, StandardTerminalTiming
 from .external_tools import (
@@ -133,6 +134,76 @@ class BrowserScan:
             or type(self.is_directory) is not bool
         ):
             raise ValueError("browser scan identity and label are required")
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserScanIndex:
+    """Prevalidated static Browser rows and their membership index."""
+
+    scans: tuple[BrowserScan, ...] = ()
+    identifiers: frozenset[str] = frozenset()
+    date_sorted: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.scans) is not tuple
+            or not all(type(scan) is BrowserScan for scan in self.scans)
+            or type(self.identifiers) is not frozenset
+            or not all(
+                type(identifier) is str and identifier
+                for identifier in self.identifiers
+            )
+            or self.identifiers
+            != frozenset(scan.identifier for scan in self.scans)
+            or type(self.date_sorted) is not bool
+        ):
+            raise TypeError("browser scan index is invalid")
+
+
+def build_browser_scan_index(
+    catalog: tuple[BrowserCatalogEntry, ...],
+    date_sorted: bool,
+) -> BrowserScanIndex:
+    """Convert one immutable source catalog into reusable static rows."""
+
+    if (
+        type(catalog) is not tuple
+        or not all(type(entry) is BrowserCatalogEntry for entry in catalog)
+        or type(date_sorted) is not bool
+    ):
+        raise TypeError("browser source catalog is invalid")
+    entries = (
+        tuple(
+            sorted(
+                catalog,
+                key=lambda entry: (
+                    0 if entry.label == ".." else 1,
+                    0 if entry.label == ".." else -entry.modified_ns,
+                    natural_name_key(
+                        entry.label.removesuffix("/")
+                        if entry.is_directory
+                        else entry.label
+                    ),
+                ),
+            )
+        )
+        if date_sorted
+        else catalog
+    )
+    scans = tuple(
+        BrowserScan(
+            entry.artifact,
+            entry.label,
+            entry.artifact,
+            entry.is_directory,
+        )
+        for entry in entries
+    )
+    return BrowserScanIndex(
+        scans,
+        frozenset(scan.identifier for scan in scans),
+        date_sorted,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,6 +695,8 @@ __all__ = [
     "BrowserProjection",
     "DirectoryFileProgress",
     "BrowserScan",
+    "BrowserScanIndex",
+    "build_browser_scan_index",
     "FrameSelectionIntent",
     "FrameNavigationProjection",
     "HeavyProjection",

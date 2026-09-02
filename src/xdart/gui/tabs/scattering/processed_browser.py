@@ -38,6 +38,7 @@ from .browse_values import (
 from .display_values import DisplayFrameKey
 from .events import RunIdentity, detached_exception_strings
 from .operation_values import OperationContextStamp, OperationIdentity
+from .shell_values import BrowserScanIndex, build_browser_scan_index
 
 
 _LOG = logging.getLogger(__name__)
@@ -410,7 +411,7 @@ class ProcessedBrowserProjection:
     """Detached Browser values consumed by shell projection."""
 
     directory: str
-    catalog: tuple[BrowserCatalogEntry, ...]
+    scan_index: BrowserScanIndex
     transient_frame: DisplayFrameKey | None
     date_sorted: bool
     auto_last: bool
@@ -419,8 +420,8 @@ class ProcessedBrowserProjection:
     def __post_init__(self) -> None:
         if (
             type(self.directory) is not str
-            or type(self.catalog) is not tuple
-            or not all(type(entry) is BrowserCatalogEntry for entry in self.catalog)
+            or type(self.scan_index) is not BrowserScanIndex
+            or self.scan_index.date_sorted != self.date_sorted
             or (
                 self.transient_frame is not None
                 and type(self.transient_frame) is not DisplayFrameKey
@@ -500,6 +501,8 @@ class ProcessedBrowserOwner:
         self._directory = processed_directory(save_path)
         self._accepted_suffixes = browser_suffixes_for_mode(processing_mode)
         self._catalog: tuple[BrowserCatalogEntry, ...] = ()
+        self._scan_index: BrowserScanIndex | None = None
+        self._scan_index_catalog: tuple[BrowserCatalogEntry, ...] | None = None
         self._directory_time_cache = DirectoryModifiedCache()
         self._explicit_directory = False
         self._date_sorted = False
@@ -979,9 +982,22 @@ class ProcessedBrowserOwner:
         return owned is not None
 
     def projection(self) -> ProcessedBrowserProjection:
+        scan_index = self._scan_index
+        if (
+            scan_index is None
+            or self._scan_index_catalog is not self._catalog
+            or scan_index.date_sorted != self._date_sorted
+        ):
+            scan_index = build_browser_scan_index(
+                self._catalog,
+                self._date_sorted,
+            )
+            if not self._closing and not self._closed:
+                self._scan_index = scan_index
+                self._scan_index_catalog = self._catalog
         return ProcessedBrowserProjection(
             self._directory,
-            self._catalog,
+            scan_index,
             self._transient_frame,
             self._date_sorted,
             self._auto_last,
@@ -1321,6 +1337,8 @@ class ProcessedBrowserOwner:
             return True
         if not self._closing:
             self._closing = True
+            self._scan_index = None
+            self._scan_index_catalog = None
             self._terminal_timing_start = None
             self._reload = None
             self._reintegrate_successor = None

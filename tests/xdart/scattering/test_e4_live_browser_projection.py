@@ -29,9 +29,11 @@ from xdart.gui.tabs.scattering.processed_browser import (
     browser_suffixes_for_mode,
 )
 from xdart.gui.tabs.scattering.shell_projection import (
+    build_browser_scan_index,
     build_browser_projection,
 )
 from xdart.gui.tabs.scattering.shell_values import (
+    BrowserScanIndex,
     FrameNavigationProjection,
     ShellCommand,
     ShellCommandKind,
@@ -608,6 +610,56 @@ def test_browser_time_sort_interleaves_directories_and_artifacts() -> None:
     )
 
 
+def test_browser_projection_reuses_prevalidated_static_scan_tuple() -> None:
+    catalog = (
+        BrowserCatalogEntry("/out/old.nexus", "old.nexus", 10),
+        BrowserCatalogEntry("/out/new.nexus", "new.nexus", 20),
+    )
+    index = build_browser_scan_index(catalog, True)
+    projected = build_browser_projection(
+        contexts=(),
+        selection=None,
+        navigation=FrameNavigationProjection(),
+        browser_directory="/out",
+        date_sorted=True,
+        auto_last=True,
+        catalog_index=index,
+    )
+
+    assert projected.scans is index.scans
+    assert tuple(scan.label for scan in projected.scans) == (
+        "new.nexus",
+        "old.nexus",
+    )
+    with pytest.raises(TypeError, match="scan index"):
+        BrowserScanIndex(
+            index.scans,
+            frozenset({"/out/not-present.nexus"}),
+            True,
+        )
+    with pytest.raises(TypeError, match="inconsistent"):
+        build_browser_projection(
+            contexts=(),
+            selection=None,
+            navigation=FrameNavigationProjection(),
+            browser_directory="/out",
+            date_sorted=False,
+            auto_last=True,
+            catalog_index=index,
+        )
+    with pytest.raises(TypeError, match="inconsistent"):
+        build_browser_projection(
+            contexts=(),
+            selection=None,
+            navigation=FrameNavigationProjection(),
+            browser_directory="/out",
+            date_sorted=True,
+            auto_last=True,
+            catalog=catalog,
+            catalog_index=index,
+        )
+
+
 def test_browser_time_sort_derives_directory_time_from_immediate_children(
     tmp_path: Path,
 ) -> None:
@@ -713,6 +765,7 @@ def _keys() -> tuple[DisplayFrameKey, ...]:
 def test_browser_projection_borrows_only_inflight_artifact_keys() -> None:
     keys = _keys()
     navigation = FrameNavigationProjection(keys, keys[3], (keys[3],))
+    index = build_browser_scan_index((), False)
 
     projected = build_browser_projection(
         contexts=(),
@@ -721,6 +774,7 @@ def test_browser_projection_borrows_only_inflight_artifact_keys() -> None:
         browser_directory="/out",
         date_sorted=False,
         auto_last=True,
+        catalog_index=index,
         transient_frame=keys[3],
     )
 
@@ -739,6 +793,7 @@ def test_browser_projection_borrows_only_inflight_artifact_keys() -> None:
         )
     )
     assert navigation.frames is keys
+    assert index.scans == () and index.identifiers == frozenset()
 
 
 def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
