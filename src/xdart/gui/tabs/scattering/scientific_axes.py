@@ -184,6 +184,7 @@ def trace_projection(
             if divisor is None:
                 return None
             intensity = intensity / divisor
+            intensity.setflags(write=False)
         # Match the production accumulator presentation: scan name plus the
         # one-based frame number. The persisted frame key remains unchanged.
         source_name = os.path.basename(str(view.source_path or ""))

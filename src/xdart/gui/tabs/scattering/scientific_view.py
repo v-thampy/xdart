@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import time
 
 from matplotlib import colormaps as matplotlib_colormaps
@@ -112,6 +112,24 @@ _GI_IMAGE_AXIS_CHOICES = {
     "q_chi": (("Q-χ", "q_chi"),),
     "exit_angles": (("Exit angles", "exit_angles"),),
 }
+
+
+@dataclass(slots=True)
+class _TraceAggregateCache:
+    """Prepared immutable-prefix rows shared by Average and Sum renders."""
+
+    rows: tuple[tuple[tuple[object, ...], TraceProjection], ...]
+    intensity_scale: str
+    values: np.ndarray
+    projections: dict[str, TraceProjection]
+
+
+def _is_readonly_array(values: np.ndarray) -> bool:
+    # FrameView's repository-wide immutability contract freezes the exposed
+    # array object.  Producers that retain a mutable alias must pass a copy;
+    # walking hidden ndarray bases here would reject ordinary NumPy axes such
+    # as read-only views returned by np.linspace.
+    return not values.flags.writeable
 
 
 class _CompactMenuButton(QtWidgets.QPushButton):
@@ -239,6 +257,7 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_history_keys: tuple[DisplayFrameKey, ...] = ()
         self._trace_row_count = 0
         self._trace_history_by_identity: dict[int, TraceProjection] = {}
+        self._trace_aggregate_fold: _TraceAggregateCache | None = None
         self._pinned_trace_scope: tuple[object, ...] | None = None
         self._pinned_trace_by_id: dict[
             tuple[object, ...], TraceProjection
@@ -481,6 +500,7 @@ class ScientificView(QtWidgets.QFrame):
             self._rendered_trace_keys = (); self._rendered_plot_mode = ""
             self._waterfall_source_keys = (); self._waterfall_render_contract = None
             self._rendered_browse_science_contract = None
+            self._clear_trace_aggregate_fold()
         self._expected_background_key = key
 
     def release_display_background(self, active_key):
@@ -499,6 +519,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
                 self._curve_mounted_keys = ()
                 self._curve_items_by_key.clear(); self._curve_item_contracts.clear()
+                self._clear_trace_aggregate_fold()
                 self._rendered_axis_labels = None
                 self._trace_row_count = 0
                 self._rendered_browse_science_contract = None
@@ -1117,6 +1138,7 @@ class ScientificView(QtWidgets.QFrame):
             ("_rendered_detector_source", "none"),
             ("_selected_keys", ()),
             ("_trace_selection_keys", ()), ("_trace_history_keys", ()), ("_rendered_trace_keys", ()),
+            ("_trace_aggregate_fold", None),
             ("_curve_mounted_keys", ()), ("_curve_items_by_key", {}),
             ("_curve_item_contracts", {}), ("_rendered_axis_labels", None),
             ("_trace_row_count", 0),
@@ -1411,6 +1433,7 @@ class ScientificView(QtWidgets.QFrame):
         self._waterfall_source_keys = tuple(
             rekey(key) for key in self._waterfall_source_keys
         )
+        self._clear_trace_aggregate_fold()
         self._rebuild_frames(frames, current)
         current_index = next(
             (
@@ -1522,6 +1545,146 @@ class ScientificView(QtWidgets.QFrame):
         del blocker
         return self.plot_axis.currentData() == plot_choice
 
+    def _clear_trace_aggregate_fold(self) -> None:
+        self._trace_aggregate_fold = None
+
+    @staticmethod
+    def _aggregate_rows_are_an_exact_prefix(
+        prior: tuple[tuple[tuple[object, ...], TraceProjection], ...],
+        rows: tuple[tuple[tuple[object, ...], TraceProjection], ...],
+    ) -> bool:
+        return len(rows) >= len(prior) and all(
+            old_key == new_key and old_trace is new_trace
+            for (old_key, old_trace), (new_key, new_trace) in zip(
+                prior,
+                rows,
+            )
+        )
+
+    @staticmethod
+    def _aggregate_rows_are_cacheable(
+        rows: tuple[tuple[tuple[object, ...], TraceProjection], ...],
+        reference: np.ndarray,
+    ) -> bool:
+        return all(
+            _is_readonly_array(trace.axis.values)
+            and _is_readonly_array(trace.intensity)
+            and trace.axis.values.shape == reference.shape
+            and np.array_equal(trace.axis.values, reference)
+            for _key, trace in rows
+        )
+
+    @staticmethod
+    def _aggregate_projection(
+        fold: _TraceAggregateCache,
+        mode: str,
+    ) -> TraceProjection:
+        cached = fold.projections.get(mode)
+        if cached is not None:
+            return cached
+        # Preserve aggregate_traces exactly: the prepared prefix has the same
+        # C-contiguous shape, dtype, values, and row order as np.stack(rows),
+        # and is reduced with the same NumPy operation.  A carried running sum
+        # would change floating-point association for one-point traces.
+        values = fold.values[:len(fold.rows)]
+        if mode == "Sum":
+            intensity = np.nansum(values, axis=0)
+        elif mode == "Average":
+            intensity = np.nanmean(values, axis=0)
+        else:
+            raise ValueError(f"unsupported aggregate mode: {mode}")
+        intensity.setflags(write=False)
+        first = fold.rows[0][1]
+        projection = TraceProjection(
+            first.frame,
+            first.axis,
+            intensity,
+            mode,
+        )
+        fold.projections[mode] = projection
+        return projection
+
+    def _aggregate_trace_rows(
+        self,
+        rows: tuple[tuple[tuple[object, ...], TraceProjection], ...],
+        *,
+        intensity_scale: str,
+        mode: str,
+    ) -> tuple[TraceProjection, ...]:
+        """Fold one exact immutable append prefix without restacking history."""
+
+        if not rows:
+            self._clear_trace_aggregate_fold()
+            return ()
+        reference = rows[0][1].axis.values
+        prior = self._trace_aggregate_fold
+        if (
+            prior is not None
+            and prior.intensity_scale == intensity_scale
+            and self._aggregate_rows_are_an_exact_prefix(prior.rows, rows)
+        ):
+            suffix = rows[len(prior.rows):]
+            if not suffix:
+                return (self._aggregate_projection(prior, mode),)
+            if self._aggregate_rows_are_cacheable(suffix, reference):
+                scaled = tuple(
+                    _scaled_intensity(trace.intensity, intensity_scale)
+                    for _key, trace in suffix
+                )
+                result_dtype = np.result_type(
+                    prior.values.dtype,
+                    *(values.dtype for values in scaled),
+                )
+                if result_dtype == prior.values.dtype:
+                    size = len(rows)
+                    capacity = prior.values.shape[0]
+                    values = prior.values
+                    if size > capacity:
+                        capacity = 1 << (size - 1).bit_length()
+                        values = np.empty(
+                            (capacity, reference.size),
+                            dtype=prior.values.dtype,
+                        )
+                        values[:len(prior.rows)] = prior.values[
+                            :len(prior.rows)
+                        ]
+                    values[len(prior.rows):size] = scaled
+                    fold = _TraceAggregateCache(
+                        rows,
+                        intensity_scale,
+                        values,
+                        {},
+                    )
+                    projection = self._aggregate_projection(fold, mode)
+                    self._trace_aggregate_fold = fold
+                    return (projection,)
+
+        scaled_traces = tuple(
+            replace(
+                trace,
+                intensity=_scaled_intensity(
+                    trace.intensity,
+                    intensity_scale,
+                ),
+            )
+            for _key, trace in rows
+        )
+        if not self._aggregate_rows_are_cacheable(rows, reference):
+            self._clear_trace_aggregate_fold()
+            return aggregate_traces(scaled_traces, mode)
+        stacked = np.stack(tuple(
+            trace.intensity for trace in scaled_traces
+        ))
+        fold = _TraceAggregateCache(
+            rows,
+            intensity_scale,
+            stacked,
+            {},
+        )
+        projection = self._aggregate_projection(fold, mode)
+        self._trace_aggregate_fold = fold
+        return (projection,)
+
     def _render_traces(
         self,
         state: ScientificProjection,
@@ -1558,6 +1721,7 @@ class ScientificView(QtWidgets.QFrame):
             # receipt reseeds semantic history but retains its one mounted item
             # so the normal setData path can update it in place.
             self._trace_history_by_identity.clear()
+            self._trace_aggregate_fold = None
             if not compatible_single:
                 self._rendered_trace_keys = ()
                 self._rendered_plot_mode = ""
@@ -1571,6 +1735,14 @@ class ScientificView(QtWidgets.QFrame):
             *((("pin", *pin_id), trace) for pin_id, trace in pinned),
             *((("live", id(trace.frame)), trace) for trace in live_traces),
         )
+        fold = self._trace_aggregate_fold
+        if (
+            fold is not None
+            and not self._aggregate_rows_are_an_exact_prefix(fold.rows, rows)
+        ):
+            self._clear_trace_aggregate_fold()
+        if state.plot_mode not in {"Average", "Sum"}:
+            self._clear_trace_aggregate_fold()
         if browse_snapshot is None:
             self._trace_row_count = len(rows)
             presented_by_id = {
@@ -1630,29 +1802,29 @@ class ScientificView(QtWidgets.QFrame):
                 return
             if browse_snapshot is None:
                 rows = self._bounded_waterfall_rows(rows)
-        rows = tuple(
-            (
-                row_key,
-                replace(
-                    trace,
-                    intensity=_scaled_intensity(
-                        trace.intensity,
-                        state.plot_options.intensity_scale,
-                    ),
-                ),
-            )
-            for row_key, trace in rows
-        )
-        keys = tuple(row_key for row_key, _trace in rows)
-        traces = tuple(trace for _row_key, trace in rows)
         if state.plot_mode in {"Average", "Sum"}:
-            source_keys = keys
-            traces = aggregate_traces(traces, state.plot_mode)
-            keys = (
-                (("aggregate", state.plot_mode, *source_keys),)
-                if traces
-                else ()
+            traces = self._aggregate_trace_rows(
+                rows,
+                intensity_scale=state.plot_options.intensity_scale,
+                mode=state.plot_mode,
             )
+            keys = (("aggregate",),) if traces else ()
+        else:
+            rows = tuple(
+                (
+                    row_key,
+                    replace(
+                        trace,
+                        intensity=_scaled_intensity(
+                            trace.intensity,
+                            state.plot_options.intensity_scale,
+                        ),
+                    ),
+                )
+                for row_key, trace in rows
+            )
+            keys = tuple(row_key for row_key, _trace in rows)
+            traces = tuple(trace for _row_key, trace in rows)
         axis_keys = {
             self._axis_key(trace.axis)
             for trace in traces
@@ -1674,7 +1846,9 @@ class ScientificView(QtWidgets.QFrame):
             state.plot_options.intensity_scale,
         )
         position_by_key = (
-            {
+            {}
+            if not self._bottom_waterfall_active
+            else {
                 row_key: float(position)
                 for (row_key, _trace), position in zip(
                     rows,
@@ -1974,6 +2148,7 @@ class ScientificView(QtWidgets.QFrame):
         same_scope = scope == self._trace_history_scope
         if not same_scope:
             self._trace_history_by_identity.clear()
+            self._trace_aggregate_fold = None
             self._rendered_trace_keys = ()
             self._rendered_plot_mode = ""
             self._rendered_plot_options = None
@@ -1989,6 +2164,42 @@ class ScientificView(QtWidgets.QFrame):
         for trace in state.traces:
             frame = trace.frame
             if selected_by_id.get(id(frame)) is frame:
+                retained = self._trace_history_by_identity.get(id(frame))
+                if (
+                    same_scope
+                    and retained is not None
+                    and retained.frame is frame
+                    and (
+                        retained is trace
+                        or (
+                            retained.axis.label == trace.axis.label
+                            and retained.axis.unit == trace.axis.unit
+                            and retained.axis.values.dtype
+                            == trace.axis.values.dtype
+                            and np.array_equal(
+                                retained.axis.values,
+                                trace.axis.values,
+                                equal_nan=True,
+                            )
+                            and retained.intensity.dtype
+                            == trace.intensity.dtype
+                            and np.array_equal(
+                                retained.intensity,
+                                trace.intensity,
+                                equal_nan=True,
+                            )
+                            and retained.title == trace.title
+                            and retained.epoch == trace.epoch
+                        )
+                    )
+                ):
+                    # Projection may derive a fresh normalized ndarray for the
+                    # current frame on each repaint.  The exact frame and
+                    # numeric scope identify immutable per-frame science.  An
+                    # equal derived wrapper therefore keeps the already
+                    # detached identity; a real replacement still invalidates
+                    # the aggregate prefix below.
+                    continue
                 self._trace_history_by_identity[id(frame)] = trace
         self._trace_history_by_identity = {
             identity: trace

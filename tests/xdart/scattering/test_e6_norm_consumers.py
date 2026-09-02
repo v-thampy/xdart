@@ -599,6 +599,7 @@ def test_reserved_sentinel_channel_is_neither_offered_nor_effective():
         parts.payloads, parts.navigation, _prefs(norm_channel="mon"),
         parts.aggregate,
     )
+    assert all(not trace.intensity.flags.writeable for trace in state.traces)
     assert state.norm_channel == "mon"
     values = _trace_by_label(state)
     np.testing.assert_allclose(values[1], np.array([1.0, 2.0]) / 3.0)
