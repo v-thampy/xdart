@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import heapq
 import os
 from threading import Lock
 from types import MappingProxyType
@@ -830,45 +831,104 @@ class Browse1DCache(_LinearObject):
     ) -> tuple[tuple[_ResidentRow, ...], tuple[_ResidentRow, ...]]:
         incoming_keys = {row.key for row in pending}
         borrowed = self._borrowed_identities(state)
-        protected = {id(row) for row in protected_rows}
-        if len(protected) != len(protected_rows) or any(
-            not any(row is resident for resident in state.rows)
-            for row in protected_rows
-        ):
-            raise RuntimeError("protected Browse 1-D rows changed")
-        mandatory = tuple(row for row in state.rows if row.key in incoming_keys)
-        if any(id(row) in protected for row in mandatory):
+        protected: set[int] = set()
+        if protected_rows:
+            protected = {id(row) for row in protected_rows}
+            resident_identities = {id(row): row for row in state.rows}
+            if len(protected) != len(protected_rows) or any(
+                resident_identities.get(id(row)) is not row
+                for row in protected_rows
+            ):
+                raise RuntimeError("protected Browse 1-D rows changed")
+        mandatory_rows: list[_ResidentRow] = []
+        survivor_rows: list[_ResidentRow] = []
+        replaces_protected = False
+        replaces_borrowed = False
+        for row in state.rows:
+            if row.key not in incoming_keys:
+                survivor_rows.append(row)
+                continue
+            if id(row) in protected:
+                replaces_protected = True
+            if id(row.row_identity) in borrowed:
+                replaces_borrowed = True
+            mandatory_rows.append(row)
+        if replaces_protected:
             raise ValueError("protected Browse 1-D row cannot be replaced")
-        if any(id(row.row_identity) in borrowed for row in mandatory):
+        if replaces_borrowed:
             raise RuntimeError("borrowed Browse 1-D row cannot be replaced")
-        survivors = [row for row in state.rows if row.key not in incoming_keys]
-        victims = list(mandatory)
-        while (
-            len(survivors) + len(pending)
-            > _MAX_BROWSE_1D_RESIDENT_ROWS
-            or self._projected_unique_bytes(tuple(survivors), pending)
-            > self._budget
-        ):
-            row_limit_exceeded = (
-                len(survivors) + len(pending)
-                > _MAX_BROWSE_1D_RESIDENT_ROWS
-            )
+        mandatory = tuple(mandatory_rows)
+        survivors = tuple(survivor_rows)
+        row_count = len(survivors) + len(pending)
+        eligible: list[tuple[int, int, _ResidentRow]] | None = None
+        evicted: list[_ResidentRow] = []
+        evicted_identities: set[int] = set()
+        if row_count > _MAX_BROWSE_1D_RESIDENT_ROWS:
             eligible = [
-                row
-                for row in survivors
+                (row.touch, position, row)
+                for position, row in enumerate(survivors)
                 if id(row.row_identity) not in borrowed
                 and id(row) not in protected
             ]
-            if not eligible:
-                if row_limit_exceeded:
+            heapq.heapify(eligible)
+            while row_count > _MAX_BROWSE_1D_RESIDENT_ROWS:
+                if not eligible:
                     raise ValueError(
                         "Browse 1-D rows exceed the resident row limit"
                     )
+                _touch, _position, oldest = heapq.heappop(eligible)
+                evicted.append(oldest)
+                evicted_identities.add(id(oldest))
+                row_count -= 1
+
+        remaining = tuple(
+            row for row in survivors if id(row) not in evicted_identities
+        )
+        roots: dict[int, tuple[object, int, int]] = {}
+        projected_bytes = 0
+        for rows in (remaining, pending):
+            for row in rows:
+                identity = id(row.fact.root)
+                prior = roots.get(identity)
+                if prior is None:
+                    roots[identity] = (row.fact.root, row.fact.nbytes, 1)
+                    projected_bytes += row.fact.nbytes
+                else:
+                    root, nbytes, references = prior
+                    if root is not row.fact.root or nbytes != row.fact.nbytes:
+                        raise ValueError(
+                            "Browse 1-D physical-root identity changed"
+                        )
+                    roots[identity] = (root, nbytes, references + 1)
+
+        if projected_bytes <= self._budget:
+            return remaining, mandatory + tuple(evicted)
+
+        if eligible is None:
+            eligible = [
+                (row.touch, position, row)
+                for position, row in enumerate(survivors)
+                if id(row.row_identity) not in borrowed
+                and id(row) not in protected
+            ]
+            heapq.heapify(eligible)
+        while projected_bytes > self._budget:
+            if not eligible:
                 raise ValueError("Browse 1-D rows exceed the cache budget")
-            oldest = min(eligible, key=lambda item: item.touch)
-            survivors.remove(oldest)
-            victims.append(oldest)
-        return tuple(survivors), tuple(victims)
+            _touch, _position, oldest = heapq.heappop(eligible)
+            evicted.append(oldest)
+            evicted_identities.add(id(oldest))
+            identity = id(oldest.fact.root)
+            root, nbytes, references = roots[identity]
+            if references == 1:
+                del roots[identity]
+                projected_bytes -= nbytes
+            else:
+                roots[identity] = (root, nbytes, references - 1)
+        return (
+            tuple(row for row in remaining if id(row) not in evicted_identities),
+            mandatory + tuple(evicted),
+        )
 
     def begin_store(
         self,

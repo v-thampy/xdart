@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import gc
 import pickle
 import threading
@@ -40,6 +41,50 @@ def _operation(
     *rows: tuple[str, np.ndarray],
 ):
     return cache.begin_store(frame, label, tuple(rows))
+
+
+def _naive_plan_rows(cache, state, pending, protected_rows=()):
+    """The pre-H2-B planner retained as an exact ordering/error oracle."""
+
+    incoming_keys = {row.key for row in pending}
+    borrowed = cache._borrowed_identities(state)
+    protected = {id(row) for row in protected_rows}
+    if len(protected) != len(protected_rows) or any(
+        not any(row is resident for resident in state.rows)
+        for row in protected_rows
+    ):
+        raise RuntimeError("protected Browse 1-D rows changed")
+    mandatory = tuple(row for row in state.rows if row.key in incoming_keys)
+    if any(id(row) in protected for row in mandatory):
+        raise ValueError("protected Browse 1-D row cannot be replaced")
+    if any(id(row.row_identity) in borrowed for row in mandatory):
+        raise RuntimeError("borrowed Browse 1-D row cannot be replaced")
+    survivors = [row for row in state.rows if row.key not in incoming_keys]
+    victims = list(mandatory)
+    while (
+        len(survivors) + len(pending) > module._MAX_BROWSE_1D_RESIDENT_ROWS
+        or cache._projected_unique_bytes(tuple(survivors), pending)
+        > cache._budget
+    ):
+        row_limit_exceeded = (
+            len(survivors) + len(pending)
+            > module._MAX_BROWSE_1D_RESIDENT_ROWS
+        )
+        eligible = [
+            row for row in survivors
+            if id(row.row_identity) not in borrowed and id(row) not in protected
+        ]
+        if not eligible:
+            message = (
+                "Browse 1-D rows exceed the resident row limit"
+                if row_limit_exceeded
+                else "Browse 1-D rows exceed the cache budget"
+            )
+            raise ValueError(message)
+        oldest = min(eligible, key=lambda row: row.touch)
+        survivors.remove(oldest)
+        victims.append(oldest)
+    return tuple(survivors), tuple(victims)
 
 
 def _prepare_only(cache: Browse1DCache, operation) -> None:
@@ -366,6 +411,167 @@ def test_resident_row_limit_replacement_does_not_double_count(
     assert cache.resident_keys == (Browse1DRowKey(1, 1, "row"),)
     with cache.borrow(1, 1, "row") as borrowed:
         assert borrowed.array is replacement
+
+
+@pytest.mark.parametrize(
+    ("row_limit", "budget"),
+    ((16, 1 << 20), (16, 30), (6, 1 << 20), (5, 23), (5, 22)),
+)
+def test_one_pass_planner_matches_naive_shared_root_lru_oracle(
+    monkeypatch,
+    row_limit: int,
+    budget: int,
+) -> None:
+    shared = _readonly(np.arange(8), dtype=np.uint8)
+    cache = Browse1DCache(1 << 20)
+    _operation(
+        cache,
+        1,
+        1,
+        ("a", shared[:4]),
+        ("b", shared[4:]),
+        ("c", _readonly(np.arange(4), dtype=np.uint8)),
+        ("d", _readonly(np.arange(5), dtype=np.uint8)),
+        ("e", _readonly(np.arange(6), dtype=np.uint8)),
+        ("f", _readonly(np.arange(7), dtype=np.uint8)),
+    ).run()
+    first_borrow = cache.borrow(1, 1, "a")
+    last_borrow = cache.borrow(1, 1, "f")
+    try:
+        state = cache._snapshot_state()
+        # Equal touches prove the heap's original-position tie break matches
+        # repeated stable min/remove behavior.
+        state = replace(
+            state,
+            rows=tuple(
+                replace(row, touch=4)
+                if row.key.name in {"d", "e"}
+                else row
+                for row in state.rows
+            ),
+        )
+        protected = (
+            next(row for row in state.rows if row.key.name == "b"),
+        )
+        pending = cache._normalize_rows(
+            1,
+            1,
+            (
+                ("c", _readonly(np.arange(8), dtype=np.uint8)),
+                ("g", shared[:2]),
+            ),
+            state.clock,
+        )
+        monkeypatch.setattr(
+            module, "_MAX_BROWSE_1D_RESIDENT_ROWS", row_limit,
+        )
+        cache._budget = budget
+
+        def outcome(planner):
+            try:
+                survivors, victims = planner(
+                    cache, state, pending, protected,
+                )
+            except Exception as error:
+                return type(error), str(error)
+            return (
+                tuple(id(row) for row in survivors),
+                tuple(id(row) for row in victims),
+            )
+
+        expected = outcome(
+            lambda owner, exact, incoming, pinned:
+                _naive_plan_rows(owner, exact, incoming, pinned)
+        )
+        actual = outcome(
+            lambda owner, exact, incoming, pinned:
+                owner._plan_rows(exact, incoming, pinned)
+        )
+        assert actual == expected
+    finally:
+        first_borrow.release()
+        last_borrow.release()
+
+
+def test_one_pass_planner_preserves_mixed_replacement_error_precedence() -> None:
+    cache = Browse1DCache(1 << 20)
+    _operation(
+        cache,
+        1,
+        1,
+        ("borrowed", _readonly([1], dtype=np.uint8)),
+        ("protected", _readonly([2], dtype=np.uint8)),
+    ).run()
+    borrowed = cache.borrow(1, 1, "borrowed")
+    try:
+        state = cache._snapshot_state()
+        protected = (
+            next(row for row in state.rows if row.key.name == "protected"),
+        )
+        pending = cache._normalize_rows(
+            1,
+            1,
+            (
+                ("borrowed", _readonly([3], dtype=np.uint8)),
+                ("protected", _readonly([4], dtype=np.uint8)),
+            ),
+            state.clock,
+        )
+
+        with pytest.raises(
+            ValueError, match="protected Browse 1-D row cannot be replaced",
+        ):
+            _naive_plan_rows(cache, state, pending, protected)
+        with pytest.raises(
+            ValueError, match="protected Browse 1-D row cannot be replaced",
+        ):
+            cache._plan_rows(state, pending, protected)
+    finally:
+        borrowed.release()
+
+
+def test_one_pass_planner_preserves_row_cap_before_private_fact_validation(
+    monkeypatch,
+) -> None:
+    shared = _readonly(np.arange(8), dtype=np.uint8)
+    cache = Browse1DCache(1 << 20)
+    _operation(
+        cache,
+        1,
+        1,
+        ("oldest", shared[:4]),
+        ("retained", shared[4:]),
+    ).run()
+    state = cache._snapshot_state()
+    state = replace(
+        state,
+        rows=(
+            replace(
+                state.rows[0],
+                fact=replace(
+                    state.rows[0].fact,
+                    nbytes=state.rows[0].fact.nbytes + 1,
+                ),
+            ),
+            state.rows[1],
+        ),
+    )
+    pending = cache._normalize_rows(
+        2,
+        2,
+        (("incoming", _readonly([9], dtype=np.uint8)),),
+        state.clock,
+    )
+    monkeypatch.setattr(module, "_MAX_BROWSE_1D_RESIDENT_ROWS", 2)
+
+    expected = _naive_plan_rows(cache, state, pending)
+    actual = cache._plan_rows(state, pending)
+    assert tuple(id(row) for row in actual[0]) == tuple(
+        id(row) for row in expected[0]
+    )
+    assert tuple(id(row) for row in actual[1]) == tuple(
+        id(row) for row in expected[1]
+    )
 
 
 def test_preparing_snapshot_retains_exact_prior_rows_until_accept() -> None:
