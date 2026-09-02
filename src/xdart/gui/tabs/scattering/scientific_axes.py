@@ -195,10 +195,11 @@ def trace_projection(
                  or is_readable_output_path(source_name))
             else frame.local_frame_label
         )
+        member_label = "[averaged]" if payload.averaged else str(frame_label)
         title = (
-            f"{frame.source_scan}_{frame_label}"
+            f"{frame.source_scan}_{member_label}"
             if frame.source_scan and frame.source_scan != "null_main"
-            else str(frame_label)
+            else member_label
         )
         if (
             selected_from_cake

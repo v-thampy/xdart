@@ -232,6 +232,7 @@ class StandardDisplayPayload:
     gi_mode_1d: str = ""
     gi_mode_2d: str = ""
     wavelength_m: float | None = None
+    averaged: bool = False
 
 def standard_event_is_valid(value: object, identity: RunIdentity) -> bool:
     try:
@@ -318,6 +319,7 @@ def display_payload_is_valid(
                 and value.selection_generation == selection_generation
                 and value.frame_key is frame
                 and type(value.title) is str and type(value.status) is str
+                and type(value.averaged) is bool
                 and value.measurement_mode in {"Standard", "GI"}
                 and type(value.gi_incidence_motor) is str
                 and type(value.gi_resolved_motor) is str

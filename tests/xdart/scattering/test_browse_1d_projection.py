@@ -347,6 +347,27 @@ def test_average_row_projects_averaged_title_without_relabeling_other_rows(
         "Browse · scan · [averaged]",
         "Browse · scan · frame 2",
     )
+    assert tuple(payload.averaged for payload in outcome.payloads) == (
+        True,
+        False,
+    )
+
+    from xdart.gui.tabs.scattering.shell_projection import (
+        ScientificPreferences,
+        build_scientific_projection,
+    )
+
+    scientific = build_scientific_projection(
+        outcome.payloads,
+        scope[2],
+        frozenset(scope[3]),
+        ScientificPreferences(plot_mode="Overlay"),
+        "",
+    )
+    assert tuple(trace.title for trace in scientific.traces) == (
+        "scan_[averaged]",
+        "scan_2",
+    )
 
     outcome.borrow_bundle.release()
     _close(scope)

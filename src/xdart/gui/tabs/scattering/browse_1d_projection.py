@@ -591,6 +591,7 @@ def _payload(
         gi_resolved_motor="Manual" if gi else "",
         gi_mode_1d=(scalar_row.active_mode_1d or "") if gi else "",
         gi_mode_2d=(scalar_row.active_mode_2d or "") if gi else "",
+        averaged=scalar_row.averaged,
     )
 
 
