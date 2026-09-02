@@ -40,6 +40,27 @@ def _snapshot(authority: PhysicalRootAuthority) -> tuple[int, int, int, tuple]:
     )
 
 
+def _assert_indexed_state(authority: PhysicalRootAuthority) -> None:
+    state = authority._snapshot_state()
+    assert state.retained_bytes == sum(entry.nbytes for entry in state.roots)
+    assert tuple(state.root_index.values()) == state.roots
+    assert all(
+        state.root_index[entry.identity] is entry for entry in state.roots
+    )
+    assert {id(binding.token): binding for binding in state.bindings} == dict(
+        state.token_index
+    )
+    indexed = tuple(
+        binding
+        for semantic_hash, bucket in state.semantic_index.items()
+        for binding in bucket
+        if binding.semantic_hash == semantic_hash
+    )
+    assert {id(binding) for binding in indexed} == {
+        id(binding) for binding in state.bindings
+    }
+
+
 def _open_journal(exchange) -> module._ExchangeJournal:
     journal = exchange._journal
     assert type(journal) is module._ExchangeJournal
@@ -91,6 +112,7 @@ def test_exchange_projects_survivors_incoming_and_shared_roots_at_final_cap(
     accepted = exchange.accept()
     assert exchange.phase is PhysicalRootExchangePhase.ACCEPTED
     assert _snapshot(authority)[:3] == (16, 2, 3)
+    _assert_indexed_state(authority)
     assert set(map(id, authority.retained_roots)) == {id(shared), id(new)}
     assert accepted["victim"] is incoming["victim"]
     assert accepted["shared-alias"] is incoming["shared-alias"]
@@ -106,6 +128,123 @@ def test_exchange_projects_survivors_incoming_and_shared_roots_at_final_cap(
     accepted["shared-alias"].release()
     leases["survivor"].release()
     assert _snapshot(authority)[:3] == (0, 0, 0)
+    _assert_indexed_state(authority)
+
+
+def test_indexed_gate_shells_share_the_exact_graph_and_running_total() -> None:
+    shared = np.arange(8, dtype=np.uint8)
+    replacement = np.arange(8, dtype=np.uint8)
+    authority = PhysicalRootAuthority(16)
+    leases = _retain(
+        authority, ("victim", shared), ("survivor", shared[:4]),
+    )
+    base = authority._snapshot_state()
+    _assert_indexed_state(authority)
+    assert base.retained_bytes == shared.nbytes
+
+    exchange = authority.exchange((leases["victim"],))
+    exchange.reserve(replacement, "victim")
+    exchange.prepare()
+    staged = authority._snapshot_state()
+    assert staged.root_index is base.root_index
+    assert staged.token_index is base.token_index
+    assert staged.semantic_index is base.semantic_index
+    assert staged.retained_bytes == base.retained_bytes
+
+    exchange.commit()
+    pending = authority._snapshot_state()
+    assert pending is not staged
+    assert pending.retained_bytes == shared.nbytes + replacement.nbytes
+    _assert_indexed_state(authority)
+    accepted = exchange.accept()
+    final = authority._snapshot_state()
+    assert final.root_index is pending.root_index
+    assert final.token_index is pending.token_index
+    assert final.semantic_index is pending.semantic_index
+    assert final.retained_bytes == pending.retained_bytes
+
+    accepted["victim"].release()
+    leases["survivor"].release()
+    leases["victim"].release()
+    _assert_indexed_state(authority)
+
+
+def test_release_never_calls_retained_semantic_hash_or_equality() -> None:
+    armed = False
+    callbacks: list[str] = []
+
+    class Semantic:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def __hash__(self) -> int:
+            callbacks.append("hash")
+            if armed:
+                raise _InjectedCut("retained semantic hash")
+            return 19
+
+        def __eq__(self, other: object) -> bool:
+            callbacks.append("eq")
+            if armed:
+                raise _InjectedCut("retained semantic equality")
+            return isinstance(other, Semantic) and self.value == other.value
+
+    authority = PhysicalRootAuthority(16)
+    reservation = authority.reserve()
+    reservation.reserve(np.arange(4, dtype=np.uint8), Semantic(1))
+    reservation.reserve(np.arange(4, dtype=np.uint8), Semantic(2))
+    leases = tuple(reservation.commit().values())
+    callbacks.clear()
+    armed = True
+
+    leases[0].release()
+    leases[1].release()
+    assert callbacks == []
+    assert _snapshot(authority)[:3] == (0, 0, 0)
+    _assert_indexed_state(authority)
+
+
+def test_unrelated_projection_and_prepare_never_call_retained_semantics() -> None:
+    armed = False
+    callbacks: list[str] = []
+
+    class Semantic:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def __hash__(self) -> int:
+            callbacks.append("hash")
+            if armed:
+                raise _InjectedCut("retained semantic hash")
+            return self.value + 100
+
+        def __eq__(self, other: object) -> bool:
+            callbacks.append("eq")
+            if armed:
+                raise _InjectedCut("retained semantic equality")
+            return isinstance(other, Semantic) and self.value == other.value
+
+    authority = PhysicalRootAuthority(256)
+    retained = _retain(
+        authority,
+        *((Semantic(i), np.arange(4, dtype=np.uint8)) for i in range(32)),
+    )
+    retained_leases = tuple(retained.values())
+    callbacks.clear()
+    armed = True
+
+    exchange = authority.exchange(())
+    exchange.reserve(np.arange(4, dtype=np.uint8), "incoming")
+    exchange.prepare()
+    exchange.commit()
+    incoming = exchange.accept()["incoming"]
+    assert callbacks == []
+    _assert_indexed_state(authority)
+
+    armed = False
+    incoming.release()
+    for lease in retained_leases:
+        lease.release()
 
 
 def test_exchange_final_capacity_excludes_replaced_root_staging_overlap() -> None:
@@ -298,6 +437,10 @@ def test_exchange_rollback_refuses_to_overwrite_unknown_third_state() -> None:
     third = module._AuthorityState(
         receipt.staged.roots,
         receipt.staged.bindings,
+        receipt.staged.root_index,
+        receipt.staged.token_index,
+        receipt.staged.semantic_index,
+        receipt.staged.retained_bytes,
         receipt.staged.gate,
         receipt.staged.phase,
         receipt.staged.closed,
@@ -503,6 +646,10 @@ def test_failed_early_accept_never_claims_terminal_intent(
             third = module._AuthorityState(
                 staged_state.roots,
                 staged_state.bindings,
+                staged_state.root_index,
+                staged_state.token_index,
+                staged_state.semantic_index,
+                staged_state.retained_bytes,
                 object(),
                 module._GatePhase.STAGED,
                 staged_state.closed,

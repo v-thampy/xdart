@@ -102,6 +102,7 @@ class _RootEntry:
 @dataclass(frozen=True, slots=True, eq=False)
 class _SemanticBinding:
     semantic: Hashable
+    semantic_hash: int
     root_identity: int
     token: _LeaseToken
 
@@ -110,10 +111,92 @@ class _SemanticBinding:
 class _AuthorityState:
     roots: tuple[_RootEntry, ...]
     bindings: tuple[_SemanticBinding, ...]
+    root_index: Mapping[int, _RootEntry]
+    token_index: Mapping[int, _SemanticBinding]
+    semantic_index: Mapping[int, tuple[_SemanticBinding, ...]]
+    retained_bytes: int
     gate: object | None
     phase: _GatePhase
     closed: bool
     terminal_evidence: tuple[ReferenceType[_TerminalMarker], ...]
+
+
+def _indexed_state(
+    roots: tuple[_RootEntry, ...],
+    bindings: tuple[_SemanticBinding, ...],
+    gate: object | None,
+    phase: _GatePhase,
+    closed: bool,
+    terminal_evidence: tuple[ReferenceType[_TerminalMarker], ...],
+) -> _AuthorityState:
+    """Build one callback-free immutable index for an authority graph."""
+
+    root_index: dict[int, _RootEntry] = {}
+    retained_bytes = 0
+    for entry in roots:
+        if entry.identity != id(entry.root) or entry.identity in root_index:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        root_index[entry.identity] = entry
+        retained_bytes += entry.nbytes
+    token_index: dict[int, _SemanticBinding] = {}
+    semantic_index: dict[int, list[_SemanticBinding]] = {}
+    references: dict[int, int] = {}
+    for binding in bindings:
+        token_identity = id(binding.token)
+        if token_identity in token_index:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        token_index[token_identity] = binding
+        semantic_index.setdefault(binding.semantic_hash, []).append(binding)
+        references[binding.root_identity] = (
+            references.get(binding.root_identity, 0) + 1
+        )
+    if any(
+        references.get(entry.identity, 0) != entry.references
+        for entry in roots
+    ) or any(identity not in root_index for identity in references):
+        raise RuntimeError("physical-root authority state is inconsistent")
+    return _AuthorityState(
+        roots,
+        bindings,
+        MappingProxyType(root_index),
+        MappingProxyType(token_index),
+        MappingProxyType({
+            value: tuple(bucket) for value, bucket in semantic_index.items()
+        }),
+        retained_bytes,
+        gate,
+        phase,
+        closed,
+        terminal_evidence,
+    )
+
+
+def _state_with_graph(
+    state: _AuthorityState,
+    *,
+    gate: object | None,
+    phase: _GatePhase,
+    closed: bool | None = None,
+    terminal_evidence: tuple[ReferenceType[_TerminalMarker], ...] | None = None,
+) -> _AuthorityState:
+    """Reuse one exact immutable graph while changing only shell state."""
+
+    return _AuthorityState(
+        state.roots,
+        state.bindings,
+        state.root_index,
+        state.token_index,
+        state.semantic_index,
+        state.retained_bytes,
+        gate,
+        phase,
+        state.closed if closed is None else closed,
+        (
+            state.terminal_evidence
+            if terminal_evidence is None
+            else terminal_evidence
+        ),
+    )
 
 
 def _is_exchange_gate(state: _AuthorityState) -> bool:
@@ -152,26 +235,37 @@ def _terminal_evidence_with(
 def _root_entry(
     state: _AuthorityState, identity: int,
 ) -> _RootEntry | None:
-    for entry in state.roots:
-        if entry.identity == identity:
-            return entry
+    entry = state.root_index.get(identity)
+    if entry is not None and entry.identity == identity:
+        return entry
     return None
 
 
 def _binding_for_token(
     state: _AuthorityState, token: _LeaseToken,
 ) -> _SemanticBinding | None:
-    for binding in state.bindings:
-        if binding.token is token:
-            return binding
+    binding = state.token_index.get(id(token))
+    if binding is not None and binding.token is token:
+        return binding
     return None
 
 
-def _validate_semantic(semantic: Hashable) -> None:
+def _validate_semantic(semantic: Hashable) -> int:
     try:
-        hash(semantic)
+        return hash(semantic)
     except TypeError as error:
         raise TypeError("physical-root semantic must be hashable") from error
+
+
+def _binding_for_semantic(
+    state: _AuthorityState,
+    semantic: Hashable,
+) -> _SemanticBinding | None:
+    semantic_hash = _validate_semantic(semantic)
+    for binding in state.semantic_index.get(semantic_hash, ()):
+        if binding.semantic is semantic or binding.semantic == semantic:
+            return binding
+    return None
 
 
 def _validate_projection(
@@ -183,28 +277,34 @@ def _validate_projection(
 ) -> int:
     """Validate a final projection outside the authority swap lock."""
 
-    victim_ids = {id(token) for token in victim_tokens}
-    survivors = tuple(
-        binding
-        for binding in state.bindings
-        if id(binding.token) not in victim_ids
-    )
-    semantics = {binding.semantic: binding for binding in survivors}
-    unique: dict[int, tuple[object, int]] = {}
-    for binding in survivors:
-        entry = _root_entry(state, binding.root_identity)
-        if entry is None:
+    victim_ids: set[int] = set()
+    victim_roots: dict[int, int] = {}
+    for token in victim_tokens:
+        token_identity = id(token)
+        if token_identity in victim_ids:
             raise RuntimeError("physical-root authority state is inconsistent")
-        prior = unique.get(entry.identity)
-        if prior is not None and (
-            prior[0] is not entry.root or prior[1] != entry.nbytes
-        ):
+        victim_ids.add(token_identity)
+        binding = _binding_for_token(state, token)
+        if binding is None:
             raise RuntimeError("physical-root authority state is inconsistent")
-        unique[entry.identity] = (entry.root, entry.nbytes)
+        victim_roots[binding.root_identity] = (
+            victim_roots.get(binding.root_identity, 0) + 1
+        )
+    projected = state.retained_bytes
+    for identity, count in victim_roots.items():
+        entry = _root_entry(state, identity)
+        if entry is None or count > entry.references:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        if count == entry.references:
+            projected -= entry.nbytes
+    unique: dict[int, PhysicalRootFact] = {}
     for semantic, fact in incoming.items():
-        if semantic in semantics:
+        existing_binding = _binding_for_semantic(state, semantic)
+        if (
+            existing_binding is not None
+            and id(existing_binding.token) not in victim_ids
+        ):
             raise ValueError("physical-root semantic is already retained")
-        semantics[semantic] = None
         identity = id(fact.root)
         existing = _root_entry(state, identity)
         if existing is not None and (
@@ -213,11 +313,17 @@ def _validate_projection(
             raise ValueError("physical-root identity changed")
         prior = unique.get(identity)
         if prior is not None and (
-            prior[0] is not fact.root or prior[1] != fact.nbytes
+            prior.root is not fact.root or prior.nbytes != fact.nbytes
         ):
             raise ValueError("physical-root byte size changed")
-        unique[identity] = (fact.root, fact.nbytes)
-    projected = sum(item[1] for item in unique.values()) + sum(claims.values())
+        if prior is None:
+            unique[identity] = fact
+            if (
+                existing is None
+                or victim_roots.get(identity, 0) == existing.references
+            ):
+                projected += fact.nbytes
+    projected += sum(claims.values())
     if projected > limit:
         raise ValueError("retained physical-root bytes exceed limit")
     return projected
@@ -227,44 +333,141 @@ def _replacement_state(
     state: _AuthorityState,
     victim_tokens: tuple[_LeaseToken, ...],
     incoming: tuple[tuple[Hashable, PhysicalRootFact, "PhysicalRootLease"], ...],
+    projected_bytes: int,
     *,
     gate: object | None,
     phase: _GatePhase,
 ) -> _AuthorityState:
-    """Build an immutable replacement projection outside the swap lock."""
+    """Apply one validated graph delta without re-walking retained bindings."""
 
-    victim_ids = {id(token) for token in victim_tokens}
-    bindings = [
-        binding
-        for binding in state.bindings
-        if id(binding.token) not in victim_ids
-    ]
+    victim_ids: set[int] = set()
+    root_deltas: dict[int, int] = {}
+    for token in victim_tokens:
+        token_identity = id(token)
+        if token_identity in victim_ids:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        victim_ids.add(token_identity)
+        binding = _binding_for_token(state, token)
+        if binding is None:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        root_deltas[binding.root_identity] = (
+            root_deltas.get(binding.root_identity, 0) - 1
+        )
+
+    incoming_bindings: list[_SemanticBinding] = []
+    incoming_facts: dict[int, PhysicalRootFact] = {}
     for semantic, fact, lease in incoming:
-        bindings.append(
-            _SemanticBinding(semantic, id(fact.root), lease._token)
-        )
-    counts: dict[int, int] = {}
-    for binding in bindings:
-        counts[binding.root_identity] = counts.get(binding.root_identity, 0) + 1
-    roots: list[_RootEntry] = []
-    emitted: set[int] = set()
-    for entry in state.roots:
-        count = counts.get(entry.identity, 0)
-        if count:
-            roots.append(
-                _RootEntry(entry.identity, entry.root, entry.nbytes, count)
-            )
-            emitted.add(entry.identity)
-    for _semantic, fact, _lease in incoming:
         identity = id(fact.root)
-        if identity in emitted:
-            continue
-        roots.append(
-            _RootEntry(identity, fact.root, fact.nbytes, counts[identity])
+        prior = incoming_facts.get(identity)
+        if prior is not None and (
+            prior.root is not fact.root or prior.nbytes != fact.nbytes
+        ):
+            raise RuntimeError("physical-root authority state is inconsistent")
+        incoming_facts[identity] = fact
+        root_deltas[identity] = root_deltas.get(identity, 0) + 1
+        incoming_bindings.append(
+            _SemanticBinding(
+                semantic,
+                _validate_semantic(semantic),
+                identity,
+                lease._token,
+            )
         )
-        emitted.add(identity)
+
+    root_replacements: dict[int, _RootEntry | None] = {}
+    new_roots: list[_RootEntry] = []
+    retained_bytes = state.retained_bytes
+    for identity, delta in root_deltas.items():
+        existing = _root_entry(state, identity)
+        if existing is None:
+            fact = incoming_facts.get(identity)
+            if fact is None or delta <= 0:
+                raise RuntimeError("physical-root authority state is inconsistent")
+            entry = _RootEntry(identity, fact.root, fact.nbytes, delta)
+            root_replacements[identity] = entry
+            new_roots.append(entry)
+            retained_bytes += fact.nbytes
+            continue
+        fact = incoming_facts.get(identity)
+        if fact is not None and (
+            existing.root is not fact.root or existing.nbytes != fact.nbytes
+        ):
+            raise RuntimeError("physical-root authority state is inconsistent")
+        references = existing.references + delta
+        if references < 0:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        if references == 0:
+            root_replacements[identity] = None
+            retained_bytes -= existing.nbytes
+        elif references != existing.references:
+            root_replacements[identity] = _RootEntry(
+                identity, existing.root, existing.nbytes, references,
+            )
+
+    if retained_bytes != projected_bytes:
+        raise RuntimeError("physical-root authority projection is inconsistent")
+    if root_replacements:
+        roots = tuple(
+            replacement
+            for entry in state.roots
+            if (
+                replacement := root_replacements.get(entry.identity, entry)
+            ) is not None
+        ) + tuple(new_roots)
+    else:
+        roots = state.roots
+    bindings = (
+        tuple(
+            binding
+            for binding in state.bindings
+            if id(binding.token) not in victim_ids
+        )
+        if victim_ids
+        else state.bindings
+    ) + tuple(incoming_bindings)
+
+    root_index = dict(state.root_index)
+    for identity, replacement in root_replacements.items():
+        if replacement is None:
+            root_index.pop(identity, None)
+        else:
+            root_index[identity] = replacement
+    token_index = dict(state.token_index)
+    semantic_index = dict(state.semantic_index)
+    for token in victim_tokens:
+        binding = token_index.pop(id(token), None)
+        if binding is None or binding.token is not token:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        bucket = semantic_index.get(binding.semantic_hash)
+        if bucket is None:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        replacement_bucket = tuple(
+            item for item in bucket if item.token is not token
+        )
+        if len(replacement_bucket) + 1 != len(bucket):
+            raise RuntimeError("physical-root authority state is inconsistent")
+        if replacement_bucket:
+            semantic_index[binding.semantic_hash] = replacement_bucket
+        else:
+            del semantic_index[binding.semantic_hash]
+    for binding in incoming_bindings:
+        token_identity = id(binding.token)
+        if token_identity in token_index:
+            raise RuntimeError("physical-root authority state is inconsistent")
+        token_index[token_identity] = binding
+        semantic_index[binding.semantic_hash] = (
+            semantic_index.get(binding.semantic_hash, ()) + (binding,)
+        )
     return _AuthorityState(
-        tuple(roots), tuple(bindings), gate, phase, state.closed,
+        roots,
+        bindings,
+        MappingProxyType(root_index),
+        MappingProxyType(token_index),
+        MappingProxyType(semantic_index),
+        retained_bytes,
+        gate,
+        phase,
+        state.closed,
         state.terminal_evidence,
     )
 
@@ -770,22 +973,19 @@ class PhysicalRootExchange:
         """Build terminal evidence from the exact current gated state."""
 
         if direction is PhysicalRootExchangePhase.ACCEPTED:
-            roots = state.roots
-            bindings = state.bindings
+            graph = state
             marker = receipt.accepted_marker
         elif direction is PhysicalRootExchangePhase.ROLLED_BACK:
-            roots = journal.base.roots
-            bindings = journal.base.bindings
+            graph = journal.base
             marker = receipt.rolled_back_marker
         else:  # pragma: no cover - internal exact-enum contract
             raise RuntimeError("physical-root terminal direction is invalid")
-        return _AuthorityState(
-            roots,
-            bindings,
-            None,
-            _GatePhase.BASE,
-            state.closed,
-            _terminal_evidence_with(state, marker),
+        return _state_with_graph(
+            graph,
+            gate=None,
+            phase=_GatePhase.BASE,
+            closed=state.closed,
+            terminal_evidence=_terminal_evidence_with(state, marker),
         )
 
     def _compact_accepted(
@@ -1116,6 +1316,7 @@ class PhysicalRootExchange:
                     journal.base,
                     journal.victim_tokens,
                     incoming,
+                    projected_bytes,
                     gate=journal.operation,
                     phase=_GatePhase.COMMIT_PENDING,
                 )
@@ -1125,13 +1326,10 @@ class PhysicalRootExchange:
                 rolled_back_marker = _TerminalMarker(
                     PhysicalRootExchangePhase.ROLLED_BACK,
                 )
-                staged = _AuthorityState(
-                    journal.base.roots,
-                    journal.base.bindings,
-                    journal.operation,
-                    _GatePhase.STAGED,
-                    journal.base.closed,
-                    journal.base.terminal_evidence,
+                staged = _state_with_graph(
+                    journal.base,
+                    gate=journal.operation,
+                    phase=_GatePhase.STAGED,
                 )
                 lease_dict = {
                     semantic: lease
@@ -1339,7 +1537,7 @@ class PhysicalRootAuthority:
         if type(limit_bytes) is not int or limit_bytes < 0:
             raise TypeError("physical-root limit must be a nonnegative integer")
         self._limit = limit_bytes
-        self._state = _AuthorityState(
+        self._state = _indexed_state(
             (), (), None, _GatePhase.BASE, False, (),
         )
         self._lock = RLock()
@@ -1351,7 +1549,7 @@ class PhysicalRootAuthority:
     @property
     def retained_bytes(self) -> int:
         state = self._accounting_state()
-        return sum(entry.nbytes for entry in state.roots)
+        return state.retained_bytes
 
     @property
     def retained_roots(self) -> tuple[object, ...]:
@@ -1396,9 +1594,8 @@ class PhysicalRootAuthority:
                 raise RuntimeError("physical-root authority is closed")
             if state.gate is not None:
                 raise RuntimeError("physical-root reservation is already active")
-            self._state = _AuthorityState(
-                state.roots, state.bindings, operation,
-                _GatePhase.LEGACY, state.closed, state.terminal_evidence,
+            self._state = _state_with_graph(
+                state, gate=operation, phase=_GatePhase.LEGACY,
             )
         return reservation
 
@@ -1471,9 +1668,8 @@ class PhysicalRootAuthority:
                 raise RuntimeError("physical-root authority is busy")
             if operation is not None and state.gate is not operation:
                 raise RuntimeError("physical-root reservation is not active")
-            self._state = _AuthorityState(
-                state.roots, state.bindings, None,
-                _GatePhase.BASE, state.closed, state.terminal_evidence,
+            self._state = _state_with_graph(
+                state, gate=None, phase=_GatePhase.BASE,
             )
 
     def _qualify(
@@ -1517,13 +1713,20 @@ class PhysicalRootAuthority:
                     raise RuntimeError("physical-root reservation is not active")
             if receipt:
                 raise RuntimeError("physical-root commit receipt is not empty")
-            _validate_projection(state, (), {}, roots, self._limit)
+            projected_bytes = _validate_projection(
+                state, (), {}, roots, self._limit,
+            )
             incoming = tuple(
                 (semantic, fact, PhysicalRootLease(self, semantic))
                 for semantic, fact in roots.items()
             )
             target = _replacement_state(
-                state, (), incoming, gate=None, phase=_GatePhase.BASE,
+                state,
+                (),
+                incoming,
+                projected_bytes,
+                gate=None,
+                phase=_GatePhase.BASE,
             )
             leases = {
                 semantic: lease for semantic, _fact, lease in incoming
@@ -1571,7 +1774,7 @@ class PhysicalRootAuthority:
                             item.references - 1,
                         )
                     )
-            replacement = _AuthorityState(
+            replacement = _indexed_state(
                 tuple(roots), bindings, state.gate, state.phase, state.closed,
                 state.terminal_evidence,
             )
@@ -1588,7 +1791,7 @@ class PhysicalRootAuthority:
                 raise RuntimeError("physical-root authority is busy")
             if old_state.closed:
                 return
-            self._state = _AuthorityState(
+            self._state = _indexed_state(
                 (), (), None, _GatePhase.BASE, True,
                 old_state.terminal_evidence,
             )
