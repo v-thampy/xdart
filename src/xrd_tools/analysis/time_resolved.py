@@ -70,11 +70,10 @@ def discover_processed_scans(
     processed results.  Inspect only their lightweight metadata here; the 1-D
     stacks remain untouched until :func:`load_time_resolved_series` is called.
 
-    By default every readable output suffix is discovered (``.nexus`` and
-    ``.nxs``), case-insensitively, so a directory holding both new and legacy
-    results — including a case-preserving share's ``SCAN.NXS`` — is ordered as
-    one natural series.  An explicitly passed ``pattern`` keeps its exact
-    meaning and narrows discovery to that glob alone.
+    By default current ``.nexus`` outputs are discovered case-insensitively.
+    An explicitly passed ``pattern`` narrows the candidate filenames, but it
+    never bypasses strict current processed-record admission; legacy ``.nxs``
+    belongs to the explicit importer/raw-source boundary.
     """
     root = Path(directory).expanduser()
     if not root.is_dir():

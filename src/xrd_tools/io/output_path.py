@@ -26,14 +26,16 @@ touches is a name and an existence test:
 NeXus-family suffixes are raw candidates too: content probing, not a filename,
 separates raw detector containers from current processed output.
 
-Pure: depends only on :mod:`os` and :mod:`pathlib` — no h5py, no numpy, no Qt,
-no ``xdart``, no writer and no schema import.
+Pure: depends only on small standard-library path/hash helpers — no h5py, no
+numpy, no Qt, no ``xdart``, no writer and no schema import.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
+import re
 
 #: Suffix for every newly generated output file.
 NEW_OUTPUT_SUFFIX = ".nexus"
@@ -58,7 +60,14 @@ __all__ = [
     "default_output_path",
     "resolve_output_target",
     "is_readable_output_path",
+    "artifact_family_from_source",
+    "resolve_finite_output_target",
 ]
+
+
+_ARTIFACT_FAMILY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
+_FINITE_OPERATION_TOKEN = re.compile(r"[a-z0-9][a-z0-9-]{0,39}\Z")
+_LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def is_readable_output_path(path: "os.PathLike[str] | str") -> bool:
@@ -124,6 +133,81 @@ def default_output_path(directory: "os.PathLike[str] | str",
     headless layer), never a filename with a suffix.  Nothing is created here.
     """
     return Path(os.fspath(directory)) / f"{scan_name}{NEW_OUTPUT_SUFFIX}"
+
+
+def artifact_family_from_source(
+    source: "os.PathLike[str] | str",
+    persisted_family: str | None = None,
+) -> str:
+    """Return the bounded lineage family for an immutable successor.
+
+    A valid persisted family is authoritative.  Without one, the complete
+    source stem is retained verbatim when safe; generated-looking suffixes are
+    deliberately *not* guessed or stripped.  Unsafe basenames receive a stable
+    hash family without placing arbitrary text in a public pathname.
+    """
+
+    if persisted_family is not None:
+        if type(persisted_family) is not str or not _ARTIFACT_FAMILY.fullmatch(
+            persisted_family
+        ):
+            raise ValueError("artifact family is not canonical")
+        return persisted_family
+    try:
+        basename = os.path.basename(os.fspath(source))
+    except TypeError as error:
+        raise TypeError("artifact source must be path-like") from error
+    if type(basename) is not str or not basename or "\x00" in basename:
+        raise ValueError("artifact source basename is invalid")
+    stem = Path(basename).stem
+    if _ARTIFACT_FAMILY.fullmatch(stem):
+        return stem
+    return "artifact-" + hashlib.sha256(os.fsencode(basename)).hexdigest()[:24]
+
+
+def resolve_finite_output_target(
+    directory: "os.PathLike[str] | str",
+    artifact_family: str,
+    *,
+    operation_token: str,
+    version_identity: str,
+    explicit_target: "os.PathLike[str] | str | None" = None,
+) -> Path:
+    """Resolve one absent-path or deterministic immutable successor name.
+
+    An absent explicit destination is honored after strict ``.nexus`` suffix
+    normalization.  An occupied explicit destination is never replaced; the
+    deterministic family/operation/version name is selected instead.  An
+    occupied deterministic name remains selected so the publisher can perform
+    exact-version reuse or typed collision admission without a counter suffix.
+    """
+
+    if type(artifact_family) is not str or not _ARTIFACT_FAMILY.fullmatch(
+        artifact_family
+    ):
+        raise ValueError("artifact family is not canonical")
+    if type(operation_token) is not str or not _FINITE_OPERATION_TOKEN.fullmatch(
+        operation_token
+    ):
+        raise ValueError("finite operation token is not canonical")
+    if type(version_identity) is not str or not _LOWER_HEX_64.fullmatch(
+        version_identity
+    ):
+        raise ValueError("finite version identity is not canonical")
+    try:
+        root = Path(os.fspath(directory))
+    except TypeError as error:
+        raise TypeError("finite output directory must be path-like") from error
+    if explicit_target is not None and os.fspath(explicit_target) != "":
+        requested = Path(os.fspath(explicit_target)).with_suffix(
+            NEW_OUTPUT_SUFFIX
+        )
+        if not os.path.lexists(requested):
+            return requested
+    return root / (
+        f"{artifact_family}.{operation_token}-{version_identity[:32]}"
+        f"{NEW_OUTPUT_SUFFIX}"
+    )
 
 
 def resolve_output_target(

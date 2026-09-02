@@ -1,0 +1,1283 @@
+from __future__ import annotations
+
+import copy
+from contextlib import nullcontext
+from dataclasses import replace
+import hashlib
+import json
+import os
+from pathlib import Path
+import pickle
+import stat
+import threading
+
+import pytest
+
+import xrd_tools.io.finite_artifact as finite_module
+from xrd_tools.io.finite_artifact import (
+    FINITE_LINEAGE_MAX_BYTES,
+    FiniteArtifactCollision,
+    FiniteArtifactDisposition,
+    FiniteArtifactIntegrityError,
+    FiniteArtifactPublisher,
+    FiniteArtifactRequest,
+    FiniteCandidateBinding,
+    FiniteCandidateValidation,
+    FiniteCommittedInspection,
+    FiniteDocumentAdapter,
+    FiniteOperationContext,
+    FinitePredecessorReceipt,
+    FiniteSourceAdmission,
+    admit_finite_artifact_lineage,
+    capture_finite_predecessor,
+    capture_finite_source,
+    finite_artifact_request,
+    finite_lineage_hdf_path,
+    finite_operation_context,
+    require_finite_artifact_lineage,
+    write_finite_artifact_lineage,
+)
+from xrd_tools.io.output_path import (
+    artifact_family_from_source,
+    resolve_finite_output_target,
+)
+from xrd_tools.io.output_transaction import (
+    StreamTerminal,
+    capture_target_snapshot,
+)
+from xrd_tools.io.processed_scan_id import require_current_output_path
+
+
+def _digest(label: str) -> str:
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _request(
+    root: Path,
+    source: Path,
+    *,
+    explicit_target: Path | None = None,
+    family: str | None = "scan",
+    operation_kind: str = "reintegrate-1d",
+    admission: FiniteSourceAdmission | None = None,
+    operation_context: FiniteOperationContext | None = None,
+    predecessor: FinitePredecessorReceipt | None = None,
+    entry: str = "entry",
+) -> FiniteArtifactRequest:
+    source_admission = admission or capture_finite_source(source)
+    selected_context = operation_context or finite_operation_context(
+        source_admission,
+        request_generation_identity=_digest("request-generation"),
+        resource_allocation_identity=_digest("resource-allocation"),
+        route_identity=_digest("route"),
+        custody_identity=_digest("custody"),
+    )
+    return finite_artifact_request(
+        source_admission=source_admission,
+        operation_context=selected_context,
+        predecessor=predecessor or capture_finite_predecessor(source_admission),
+        destination_directory=root,
+        explicit_target=explicit_target,
+        artifact_family=family,
+        operation_kind=operation_kind,
+        source_graph_identity=_digest("source-graph"),
+        entry=entry,
+        scientific_identity=_digest("science"),
+        output_schema="xdart-current-v4",
+        algorithm_identity=_digest("algorithm"),
+        preservation_identity=_digest("preservation"),
+    )
+
+
+def _payload(request: FiniteArtifactRequest, value: str = "result") -> bytes:
+    return json.dumps(
+        {
+            "value": value,
+            "version_identity": request.version_identity,
+            "publication_identity": request.publication_identity,
+            "operation_kind": request.operation_kind,
+            "source_graph_identity": request.source_graph_identity,
+            "scientific_identity": request.scientific_identity,
+            "preservation_identity": request.preservation_identity,
+            "lineage_json": request.lineage.canonical_json,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _write_payload(request: FiniteArtifactRequest, value: str = "result"):
+    def write(binding: FiniteCandidateBinding) -> None:
+        binding.seek(0)
+        binding.truncate(0)
+        binding.write(_payload(request, value))
+
+    return write
+
+
+def _validate_payload(request: FiniteArtifactRequest, value: str = "result"):
+    def validate(binding: FiniteCandidateBinding) -> FiniteCandidateValidation:
+        binding.seek(0)
+        assert binding.read(len(_payload(request, value)) + 1) == _payload(
+            request,
+            value,
+        )
+        return FiniteCandidateValidation(request.lineage)
+
+    return validate
+
+
+def _inspect_payload(
+    path: Path,
+    request: FiniteArtifactRequest,
+) -> FiniteCommittedInspection:
+    raw = path.read_bytes()
+    assert raw == _payload(request)
+    lineage = admit_finite_artifact_lineage(json.loads(raw)["lineage_json"])
+    snapshot = capture_target_snapshot(path)
+    assert snapshot.exists
+    state = os.stat(path)
+    return FiniteCommittedInspection(
+        StreamTerminal(
+            str(path),
+            int(snapshot.size),
+            str(snapshot.digest),
+            1,
+            int(state.st_dev),
+            int(state.st_ino),
+            int(state.st_mtime_ns),
+            int(state.st_ctime_ns),
+        ),
+        lineage,
+    )
+
+
+def _publish(
+    request: FiniteArtifactRequest,
+    *,
+    publisher: FiniteArtifactPublisher | None = None,
+    seed=None,
+    writer=None,
+    validate=None,
+    prepublish=None,
+):
+    selected = publisher or FiniteArtifactPublisher(request)
+    adapter = FiniteDocumentAdapter(
+        lambda binding: nullcontext(binding),
+        writer or _write_payload(request),
+        lambda binding: nullcontext(binding),
+        validate or _validate_payload(request),
+    )
+    return selected.publish(
+        adapter,
+        inspect_committed=_inspect_payload,
+        seed=seed,
+        prepublish=prepublish,
+    )
+
+
+def test_trusted_adapter_authority_boundary_is_explicit() -> None:
+    adapter_contract = FiniteDocumentAdapter.__doc__ or ""
+    publisher_contract = FiniteArtifactPublisher.publish.__doc__ or ""
+
+    assert "Trusted" in adapter_contract
+    assert "duplicate" in adapter_contract
+    assert "a sandbox" in publisher_contract
+    assert "hostile same-process Python" in publisher_contract
+
+
+@pytest.mark.parametrize(
+    ("shown", "persisted", "expected"),
+    (
+        ("scan.nexus", None, "scan"),
+        ("scan.reintegrate-1d-deadbeef.nexus", None,
+         "scan.reintegrate-1d-deadbeef"),
+        ("ignored.nexus", "beamline-scan_7", "beamline-scan_7"),
+        (" space name.nexus", None,
+         "artifact-" + hashlib.sha256(b" space name.nexus").hexdigest()[:24]),
+        ("x" * 82 + ".nexus", None,
+         "artifact-" + hashlib.sha256(("x" * 82 + ".nexus").encode()).hexdigest()[:24]),
+    ),
+)
+def test_family_policy_never_guesses_generated_suffixes(
+    tmp_path: Path,
+    shown: str,
+    persisted: str | None,
+    expected: str,
+) -> None:
+    assert artifact_family_from_source(tmp_path / shown, persisted) == expected
+
+
+def test_request_identities_are_deterministic_and_path_roles_are_separate(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    first = _request(tmp_path, source)
+    second = _request(tmp_path, source)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    third = _request(elsewhere, source)
+
+    assert first == second
+    assert first.version_identity == third.version_identity
+    assert first.publication_identity != third.publication_identity
+    assert first.source_artifact == str(source.resolve())
+    assert first.output_artifact != first.source_artifact
+    assert Path(first.output_artifact).name == (
+        f"scan.reintegrate-1d-{first.version_identity[:32]}.nexus"
+    )
+    assert first.canonical_version_json.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    (
+        "request_generation_identity",
+        "resource_allocation_identity",
+        "route_identity",
+        "custody_identity",
+    ),
+)
+def test_operation_context_is_required_canonical_and_attempt_only(
+    tmp_path: Path,
+    changed_field: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    admission = capture_finite_source(source)
+    values = {
+        "request_generation_identity": _digest("request-generation"),
+        "resource_allocation_identity": _digest("resource-allocation"),
+        "route_identity": _digest("route"),
+        "custody_identity": _digest("custody"),
+    }
+    first_context = finite_operation_context(admission, **values)
+    first = _request(
+        tmp_path,
+        source,
+        admission=admission,
+        operation_context=first_context,
+    )
+    values[changed_field] = _digest(f"changed-{changed_field}")
+    changed_context = finite_operation_context(admission, **values)
+    changed = _request(
+        tmp_path,
+        source,
+        admission=admission,
+        operation_context=changed_context,
+    )
+
+    context_payload = json.loads(first_context.canonical_json)
+    assert set(context_payload) == {
+        "custody_identity",
+        "domain",
+        "request_generation_identity",
+        "resource_allocation_identity",
+        "route_identity",
+        "source_snapshot",
+    }
+    assert set(context_payload["source_snapshot"]) == {
+        "ctime_ns",
+        "device",
+        "digest",
+        "inode",
+        "mode",
+        "mtime_ns",
+        "size",
+    }
+    assert first_context.context_identity != changed_context.context_identity
+    assert first.operation_identity != changed.operation_identity
+    assert first.version_identity == changed.version_identity
+    assert first.publication_identity == changed.publication_identity
+    assert first.lineage == changed.lineage
+
+
+def test_lineage_is_canonical_acyclic_and_excludes_attempt_facts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source, entry="entrée")
+    payload = json.loads(request.lineage.canonical_json)
+
+    assert set(payload) == {
+        "algorithm_identity",
+        "artifact_family_v1",
+        "entry",
+        "operation_kind",
+        "output_schema",
+        "predecessor",
+        "preservation_identity",
+        "publication_identity",
+        "publication_policy",
+        "schema",
+        "scientific_identity",
+        "source_graph_identity",
+        "version_identity",
+    }
+    assert set(payload["predecessor"]) == {
+        "artifact_family_v1",
+        "lineage_identity",
+        "publication_identity",
+        "source_artifact",
+        "source_digest",
+        "source_size",
+        "terminal",
+        "version_identity",
+    }
+    assert "entrée" in request.canonical_version_json
+    assert "\\u00e9" not in request.canonical_version_json
+    assert not {
+        "operation_identity",
+        "operation_context_identity",
+        "route_identity",
+        "custody_identity",
+    } & set(payload)
+    assert admit_finite_artifact_lineage(
+        request.lineage.canonical_json.encode("utf-8")
+    ) == request.lineage
+    tampered = dict(payload)
+    tampered["operation_identity"] = request.operation_identity
+    with pytest.raises(ValueError, match="schema or canonical"):
+        admit_finite_artifact_lineage(json.dumps(
+            tampered,
+            sort_keys=True,
+            separators=(",", ":"),
+        ))
+    with pytest.raises(ValueError, match="encoded ceiling"):
+        admit_finite_artifact_lineage(b"x" * (FINITE_LINEAGE_MAX_BYTES + 1))
+
+
+def test_finite_predecessor_lineage_is_one_level_not_recursive(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    first_request = _request(tmp_path, source)
+    first_result = _publish(first_request)
+    assert first_result.terminal is not None
+    successor_source = Path(first_request.output_artifact)
+    admission = capture_finite_source(successor_source)
+    predecessor = capture_finite_predecessor(
+        admission,
+        terminal=first_result.terminal,
+        artifact_family_v1=first_request.artifact_family,
+        version_identity=first_request.version_identity,
+        publication_identity=first_request.publication_identity,
+        lineage_identity=first_request.lineage.lineage_identity,
+    )
+    second = _request(
+        tmp_path,
+        successor_source,
+        family=first_request.artifact_family,
+        operation_kind="reintegrate-2d",
+        admission=admission,
+        predecessor=predecessor,
+    )
+    parent = json.loads(second.lineage.canonical_json)["predecessor"]
+    assert parent["version_identity"] == first_request.version_identity
+    assert parent["publication_identity"] == first_request.publication_identity
+    assert parent["lineage_identity"] == first_request.lineage.lineage_identity
+    assert "predecessor" not in parent
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("version_identity", "publication_identity", "operation_identity"),
+)
+def test_request_recomputes_and_refuses_tampered_derived_identities(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    with pytest.raises(ValueError, match="identities are not canonical"):
+        replace(request, **{field: _digest(f"tampered-{field}")})
+
+
+def test_explicit_absent_target_is_honored_and_occupied_target_derives_version(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    explicit = tmp_path / "chosen.h5"
+    first = _request(tmp_path, source, explicit_target=explicit)
+    assert first.output_artifact == str((tmp_path / "chosen.nexus").resolve())
+
+    Path(first.output_artifact).write_bytes(b"foreign")
+    second = _request(tmp_path, source, explicit_target=explicit)
+    assert second.output_artifact == str(
+        resolve_finite_output_target(
+            tmp_path,
+            "scan",
+            operation_token="reintegrate-1d",
+            version_identity=second.version_identity,
+            explicit_target=explicit,
+        ).resolve()
+    )
+    assert second.output_artifact != first.output_artifact
+    assert Path(first.output_artifact).read_bytes() == b"foreign"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"operation_kind": "Bad Kind"},
+        {"source_graph_identity": "0" * 63},
+        {"entry": ""},
+        {"output_schema": ""},
+        {"artifact_family": "bad family"},
+    ),
+)
+def test_request_refuses_noncanonical_or_unbounded_identity_inputs(
+    tmp_path: Path,
+    mutation: dict[str, str],
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    admission = capture_finite_source(source)
+    values = {
+        "source_admission": admission,
+        "operation_context": finite_operation_context(
+            admission,
+            request_generation_identity=_digest("request-generation"),
+            resource_allocation_identity=_digest("resource-allocation"),
+            route_identity=_digest("route"),
+            custody_identity=_digest("custody"),
+        ),
+        "predecessor": capture_finite_predecessor(admission),
+        "destination_directory": tmp_path,
+        "artifact_family": "scan",
+        "operation_kind": "reintegrate-1d",
+        "source_graph_identity": _digest("source-graph"),
+        "entry": "entry",
+        "scientific_identity": _digest("science"),
+        "output_schema": "xdart-current-v4",
+        "algorithm_identity": _digest("algorithm"),
+        "preservation_identity": _digest("preservation"),
+    }
+    values.update(mutation)
+    with pytest.raises((TypeError, ValueError)):
+        finite_artifact_request(**values)
+
+
+def test_private_candidate_is_factory_owned_mode_0600_and_not_public_nexus(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    observed: dict[str, object] = {}
+
+    def writer(binding: FiniteCandidateBinding) -> None:
+        observed["binding"] = binding
+        assert not binding.closed
+        assert not hasattr(binding, "path")
+        assert not hasattr(binding, "name")
+        assert not hasattr(binding, "fileno")
+        binding.truncate(0)
+        binding.write(_payload(request))
+
+    def prepublish() -> None:
+        candidates = tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        observed["path"] = candidate
+        observed["mode"] = stat.S_IMODE(candidate.stat().st_mode)
+        assert candidate.name.startswith(
+            f".xdart-finite-{request.version_identity}-"
+        )
+        with pytest.raises(ValueError, match="must end in .nexus"):
+            require_current_output_path(candidate)
+
+    result = _publish(request, writer=writer, prepublish=prepublish)
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert observed["mode"] == 0o600
+    assert not Path(observed["path"]).exists()
+    binding = observed["binding"]
+    assert binding.closed
+    with pytest.raises(ValueError, match="revoked"):
+        binding.write(b"late")
+    for action in (copy.copy, copy.deepcopy, pickle.dumps):
+        with pytest.raises(TypeError):
+            action(binding)
+
+
+def test_seed_receipt_proves_exact_copy_and_source_immutability(tmp_path: Path) -> None:
+    source = tmp_path / "source.nexus"
+    original = os.urandom(65_537)
+    source.write_bytes(original)
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source)
+
+    def writer(binding: FiniteCandidateBinding) -> None:
+        binding.seek(0)
+        assert binding.read(len(original) + 1) == original
+        binding.seek(0)
+        binding.truncate(0)
+        binding.write(_payload(request))
+
+    result = _publish(request, seed=admitted, writer=writer)
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert result.seed_receipt is not None
+    assert result.seed_receipt.copy_strategy == "bounded-copy-v1"
+    assert result.seed_receipt.source_digest == hashlib.sha256(original).hexdigest()
+    assert result.seed_receipt.candidate_digest == result.seed_receipt.source_digest
+    assert result.seed_receipt.byte_count == len(original)
+    assert source.read_bytes() == original
+    assert capture_finite_source(source) == admitted
+    with pytest.raises(TypeError, match="capture-owned"):
+        type(admitted)(admitted.snapshot)
+
+
+def test_seed_publication_does_not_rehash_the_admitted_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(os.urandom(32_769))
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source)
+    real_snapshot = finite_module._snapshot_at
+    captures: list[str] = []
+
+    def spy(parent_descriptor, name, path):
+        captures.append(str(Path(path)))
+        return real_snapshot(parent_descriptor, name, path)
+
+    monkeypatch.setattr(finite_module, "_snapshot_at", spy)
+    result = _publish(request, seed=admitted)
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert str(source) not in captures
+    assert len(captures) == 3
+
+
+def test_seed_substitution_is_detected_before_foreign_file_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source seed")
+    admission = capture_finite_source(source)
+    request = _request(tmp_path, source, admission=admission)
+    real_open = finite_module.os.open
+    swapped: list[Path] = []
+
+    def fault(path, flags, *args, **kwargs):
+        dir_fd = kwargs.get("dir_fd")
+        if (
+            not swapped
+            and dir_fd is not None
+            and type(path) is str
+            and path.endswith(".candidate")
+            and flags & os.O_ACCMODE == os.O_WRONLY
+        ):
+            candidate = tmp_path / path
+            candidate.unlink()
+            candidate.write_bytes(b"foreign must survive")
+            swapped.append(candidate)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(finite_module.os, "open", fault)
+    with pytest.raises(FiniteArtifactIntegrityError, match="descriptor identity"):
+        _publish(request, seed=admission)
+    assert swapped[0].read_bytes() == b"foreign must survive"
+    assert not Path(request.output_artifact).exists()
+
+
+@pytest.mark.parametrize("cancel_seam", ("before", "after-writer", "prepublish"))
+def test_cancellation_before_publication_aborts_without_mutating_input(
+    tmp_path: Path,
+    cancel_seam: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    original = b"immutable source"
+    source.write_bytes(original)
+    request = _request(tmp_path, source)
+    token = threading.Event()
+    calls: list[str] = []
+    if cancel_seam == "before":
+        token.set()
+
+    def writer(binding: FiniteCandidateBinding) -> None:
+        calls.append("writer")
+        binding.truncate(0)
+        binding.write(_payload(request))
+        if cancel_seam == "after-writer":
+            token.set()
+
+    def prepublish() -> None:
+        calls.append("prepublish")
+        if cancel_seam == "prepublish":
+            token.set()
+
+    result = _publish(
+        request,
+        publisher=FiniteArtifactPublisher(request, cancel_token=token),
+        writer=writer,
+        prepublish=prepublish,
+    )
+    assert result.disposition is FiniteArtifactDisposition.ABORTED
+    assert result.terminal is None
+    assert not Path(request.output_artifact).exists()
+    assert source.read_bytes() == original
+    assert calls == ([] if cancel_seam == "before" else ["writer"] + (
+        ["prepublish"] if cancel_seam == "prepublish" else []
+    ))
+
+
+@pytest.mark.parametrize("seam", ("writer", "validator", "prepublish", "source-drift"))
+def test_prepublish_failures_preserve_primary_source_and_absent_final(
+    tmp_path: Path,
+    seam: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    original = b"source"
+    source.write_bytes(original)
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source)
+
+    def writer(binding: FiniteCandidateBinding) -> None:
+        if seam == "writer":
+            raise LookupError("writer-primary")
+        binding.truncate(0)
+        binding.write(_payload(request))
+
+    def validate(binding: FiniteCandidateBinding) -> FiniteCandidateValidation:
+        if seam == "validator":
+            raise LookupError("validator-primary")
+        binding.seek(0)
+        assert binding.read(len(_payload(request)) + 1) == _payload(request)
+        return FiniteCandidateValidation(request.lineage)
+
+    def prepublish() -> None:
+        if seam == "prepublish":
+            raise LookupError("prepublish-primary")
+        if seam == "source-drift":
+            source.write_bytes(b"changed")
+
+    expected = FiniteArtifactIntegrityError if seam == "source-drift" else LookupError
+    with pytest.raises(expected):
+        _publish(
+            request,
+            seed=admitted,
+            writer=writer,
+            validate=validate,
+            prepublish=prepublish,
+        )
+    assert not Path(request.output_artifact).exists()
+    assert source.read_bytes() == (b"changed" if seam == "source-drift" else original)
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+@pytest.mark.parametrize(
+    "seam",
+    ("changed-before-publish", "changed-without-seed-before-link"),
+)
+def test_request_source_snapshot_is_revalidated_without_rehashing(
+    tmp_path: Path,
+    seam: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"admitted source")
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source, admission=admitted)
+    calls: list[str] = []
+    seed = None
+
+    if seam == "changed-before-publish":
+        source.write_bytes(b"later source")
+        seed = capture_finite_source(source)
+
+    def writer(binding: FiniteCandidateBinding) -> None:
+        calls.append("writer")
+        binding.truncate(0)
+        binding.write(_payload(request))
+
+    def prepublish() -> None:
+        calls.append("prepublish")
+        if seam == "changed-without-seed-before-link":
+            source.write_bytes(b"changed before link")
+
+    with pytest.raises(
+        FiniteArtifactIntegrityError,
+        match="request source changed|seed admission does not match",
+    ):
+        _publish(
+            request,
+            seed=seed,
+            writer=writer,
+            prepublish=prepublish,
+        )
+
+    assert calls == (
+        []
+        if seam == "changed-before-publish"
+        else ["writer", "prepublish"]
+    )
+    assert not Path(request.output_artifact).exists()
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+def test_existing_exact_result_is_reused_without_writer_or_validation_work(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    first = _publish(request)
+    before = Path(request.output_artifact).stat()
+    calls: list[str] = []
+
+    def forbidden(_binding) -> None:
+        calls.append("work")
+        raise AssertionError("writer/validator replayed")
+
+    second = FiniteArtifactPublisher(request).publish(
+        FiniteDocumentAdapter(
+            lambda binding: nullcontext(binding),
+            forbidden,
+            lambda binding: nullcontext(binding),
+            forbidden,
+        ),
+        inspect_committed=_inspect_payload,
+    )
+    after = Path(request.output_artifact).stat()
+    assert first.disposition is FiniteArtifactDisposition.COMMITTED
+    assert second.disposition is FiniteArtifactDisposition.ALREADY_COMMITTED
+    assert calls == []
+    assert (before.st_dev, before.st_ino, before.st_mtime_ns) == (
+        after.st_dev, after.st_ino, after.st_mtime_ns
+    )
+
+
+@pytest.mark.parametrize("occupant", ("foreign", "symlink", "short-tag-collision"))
+def test_existing_foreign_or_mismatched_occupant_is_preserved(
+    tmp_path: Path,
+    occupant: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    target = Path(request.output_artifact)
+    foreign = tmp_path / "foreign"
+    foreign.write_bytes(b"foreign")
+    if occupant == "symlink":
+        target.symlink_to(foreign)
+    elif occupant == "short-tag-collision":
+        target.write_bytes(_payload(request).replace(
+            request.version_identity.encode(), _digest("other-version").encode()
+        ))
+    else:
+        target.write_bytes(b"foreign")
+
+    with pytest.raises(FiniteArtifactCollision):
+        _publish(request)
+    assert foreign.read_bytes() == b"foreign"
+    assert os.path.lexists(target)
+
+
+@pytest.mark.parametrize(
+    "link_fault", ("before", "after", "exact-winner", "foreign", "symlink")
+)
+def test_no_clobber_link_resolution_never_deletes_a_public_occupant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_fault: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    target = Path(request.output_artifact)
+    real_link = finite_module._link
+
+    def fault(source_path, destination_path, **kwargs):
+        if link_fault == "after":
+            real_link(source_path, destination_path, **kwargs)
+            raise OSError("uncertain after link")
+        if link_fault == "exact-winner":
+            target.write_bytes(_payload(request))
+            raise FileExistsError(target)
+        if link_fault == "foreign":
+            target.write_bytes(b"foreign winner")
+            raise FileExistsError(target)
+        if link_fault == "symlink":
+            target.symlink_to(source)
+            raise FileExistsError(target)
+        raise OSError("known before link")
+
+    monkeypatch.setattr(finite_module, "_link", fault)
+    if link_fault == "after":
+        result = _publish(request)
+        assert result.disposition is FiniteArtifactDisposition.COMMITTED
+        assert target.read_bytes() == _payload(request)
+    elif link_fault == "exact-winner":
+        result = _publish(request)
+        assert result.disposition is FiniteArtifactDisposition.ALREADY_COMMITTED
+        assert target.read_bytes() == _payload(request)
+    elif link_fault in {"foreign", "symlink"}:
+        with pytest.raises(FiniteArtifactCollision):
+            _publish(request)
+        assert os.path.lexists(target)
+        if link_fault == "foreign":
+            assert target.read_bytes() == b"foreign winner"
+        else:
+            assert target.is_symlink()
+    else:
+        with pytest.raises(OSError, match="known before"):
+            _publish(request)
+        assert not target.exists()
+
+
+def test_own_link_commits_and_fsyncs_if_private_alias_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    real_link = finite_module._link
+    real_parent_fsync = finite_module._fsync_parent
+    fsync_calls: list[int] = []
+
+    def link_then_remove(source_name, target_name, **kwargs):
+        real_link(source_name, target_name, **kwargs)
+        os.unlink(source_name, dir_fd=kwargs["src_dir_fd"])
+
+    def observed_fsync(descriptor: int) -> None:
+        fsync_calls.append(descriptor)
+        real_parent_fsync(descriptor)
+
+    monkeypatch.setattr(finite_module, "_link", link_then_remove)
+    monkeypatch.setattr(finite_module, "_fsync_parent", observed_fsync)
+    result = _publish(request)
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert len(fsync_calls) == 1
+    assert result.hidden_orphan is None
+    assert Path(request.output_artifact).read_bytes() == _payload(request)
+
+
+@pytest.mark.parametrize("seam", ("existing", "prepublish"))
+def test_output_parent_symlink_substitution_is_refused(
+    tmp_path: Path,
+    seam: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    request = _request(destination, source)
+    if seam == "existing":
+        _publish(request)
+    moved = tmp_path / "moved-destination"
+
+    def substitute() -> None:
+        destination.rename(moved)
+        destination.symlink_to(moved, target_is_directory=True)
+
+    if seam == "existing":
+        substitute()
+        with pytest.raises(FiniteArtifactIntegrityError, match="parent"):
+            _publish(request)
+    else:
+        with pytest.raises(FiniteArtifactIntegrityError, match="parent"):
+            _publish(request, prepublish=substitute)
+        assert not (moved / Path(request.output_artifact).name).exists()
+    destination.unlink()
+    moved.rename(destination)
+
+
+def test_delayed_writer_capability_cannot_mutate_published_final(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    release = threading.Event()
+    attempted = threading.Event()
+    errors: list[BaseException] = []
+    threads: list[threading.Thread] = []
+
+    def writer(binding: FiniteCandidateBinding) -> None:
+        binding.truncate(0)
+        binding.write(_payload(request))
+
+        def late_write() -> None:
+            release.wait()
+            try:
+                binding.seek(0)
+                binding.write(b"late corruption")
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                attempted.set()
+
+        thread = threading.Thread(target=late_write)
+        thread.start()
+        threads.append(thread)
+
+    result = _publish(request, writer=writer)
+    assert result.terminal is not None
+    release.set()
+    assert attempted.wait(2.0)
+    threads[0].join(timeout=2.0)
+    assert not threads[0].is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert Path(request.output_artifact).read_bytes() == _payload(request)
+    assert capture_target_snapshot(request.output_artifact).digest == result.terminal.digest
+
+
+def test_postpublication_parent_fsync_failure_commits_with_bounded_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+
+    def fail_parent(_descriptor: int) -> None:
+        assert Path(request.output_artifact).exists()
+        raise OSError("directory durability unavailable")
+
+    monkeypatch.setattr(finite_module, "_fsync_parent", fail_parent)
+    result = _publish(request)
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert result.terminal is not None
+    assert result.diagnostics == (
+        "FINITE_PARENT_DIRECTORY_FSYNC_UNCONFIRMED:OSError:directory durability unavailable",
+    )
+    assert Path(request.output_artifact).read_bytes() == _payload(request)
+
+
+def test_candidate_file_fsync_failure_is_prepublish_and_leaves_no_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+
+    def fail_file(_descriptor: int) -> None:
+        raise OSError("file durability unavailable")
+
+    monkeypatch.setattr(finite_module, "_fsync", fail_file)
+    with pytest.raises(OSError, match="file durability unavailable"):
+        _publish(request)
+    assert not Path(request.output_artifact).exists()
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+def test_postlink_semantic_failure_preserves_public_object_and_never_replays(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    calls: list[str] = []
+
+    def inspect(
+        _path: Path,
+        _request: FiniteArtifactRequest,
+    ) -> FiniteCommittedInspection:
+        calls.append("inspect")
+        raise ValueError("terminal semantic mismatch")
+
+    with pytest.raises(FiniteArtifactIntegrityError):
+        FiniteArtifactPublisher(request).publish(
+            FiniteDocumentAdapter(
+                lambda binding: nullcontext(binding),
+                _write_payload(request),
+                lambda binding: nullcontext(binding),
+                _validate_payload(request),
+            ),
+            inspect_committed=inspect,
+        )
+    assert calls == ["inspect"]
+    assert Path(request.output_artifact).read_bytes() == _payload(request)
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+def test_candidate_capabilities_are_pathless_revoked_and_validator_read_only(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    retained: list[FiniteCandidateBinding] = []
+
+    def writer(binding: FiniteCandidateBinding) -> None:
+        retained.append(binding)
+        binding.truncate(0)
+        binding.write(_payload(request))
+
+    def validate(binding: FiniteCandidateBinding) -> FiniteCandidateValidation:
+        retained.append(binding)
+        with pytest.raises(OSError, match="read-only"):
+            binding.write(b"forbidden")
+        binding.seek(0)
+        assert binding.read(len(_payload(request)) + 1) == _payload(request)
+        return FiniteCandidateValidation(request.lineage)
+
+    result = _publish(request, writer=writer, validate=validate)
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert len(retained) == 2
+    assert all(binding.closed for binding in retained)
+    for binding in retained:
+        with pytest.raises(ValueError, match="revoked"):
+            binding.read(1)
+        with pytest.raises(ValueError, match="revoked"):
+            binding.write(b"late")
+    assert Path(request.output_artifact).read_bytes() == _payload(request)
+
+
+def test_real_hdf5_session_is_closed_and_lineage_is_exact_before_publication(
+    tmp_path: Path,
+) -> None:
+    import h5py
+
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    retained = []
+
+    def open_writer(binding: FiniteCandidateBinding):
+        handle = h5py.File(binding, "w")
+        retained.append(handle)
+        return handle
+
+    def write(handle) -> None:
+        entry = handle.create_group(request.entry)
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("result", data=[1.0, 2.0, 3.0])
+        write_finite_artifact_lineage(handle, request)
+
+    def open_reader(binding: FiniteCandidateBinding):
+        handle = h5py.File(binding, "r")
+        retained.append(handle)
+        return handle
+
+    def validate(handle) -> FiniteCandidateValidation:
+        assert handle[f"/{request.entry}/result"][...].tolist() == [1.0, 2.0, 3.0]
+        return FiniteCandidateValidation(
+            require_finite_artifact_lineage(handle, request)
+        )
+
+    def inspect(
+        path: Path,
+        expected: FiniteArtifactRequest,
+    ) -> FiniteCommittedInspection:
+        with h5py.File(path, "r") as handle:
+            lineage = require_finite_artifact_lineage(handle, expected)
+            node = handle[finite_lineage_hdf_path(expected.entry)]
+            assert node.shape == (
+                len(expected.lineage.canonical_json.encode("utf-8")),
+            )
+            assert node.maxshape == node.shape
+            assert node.dtype.kind == "u"
+            assert node.dtype.itemsize == 1
+            assert node.chunks is None
+            assert len(node.attrs) == 0
+        snapshot = capture_target_snapshot(path)
+        state = path.stat()
+        return FiniteCommittedInspection(
+            StreamTerminal(
+                str(path),
+                snapshot.size,
+                snapshot.digest,
+                1,
+                state.st_dev,
+                state.st_ino,
+                state.st_mtime_ns,
+                state.st_ctime_ns,
+            ),
+            lineage,
+        )
+
+    result = FiniteArtifactPublisher(request).publish(
+        FiniteDocumentAdapter(open_writer, write, open_reader, validate),
+        inspect_committed=inspect,
+    )
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert len(retained) == 2
+    assert all(handle.id.valid == 0 for handle in retained)
+    with pytest.raises(ValueError):
+        retained[0].create_group("late")
+
+
+@pytest.mark.parametrize("foreign_kind", ("regular", "symlink", "fifo", "directory"))
+def test_visible_foreign_private_occupants_are_preserved_before_cleanup(
+    tmp_path: Path,
+    foreign_kind: str,
+) -> None:
+    candidate = tmp_path / ".xdart-finite-visible.candidate"
+    candidate.write_bytes(b"owned")
+    expected = finite_module._snapshot_path(candidate)
+    candidate.unlink()
+    foreign_target = tmp_path / "foreign-target"
+    foreign_target.write_bytes(b"foreign target")
+    if foreign_kind == "regular":
+        candidate.write_bytes(b"foreign")
+    elif foreign_kind == "symlink":
+        candidate.symlink_to(foreign_target)
+    elif foreign_kind == "fifo":
+        os.mkfifo(candidate)
+    else:
+        candidate.mkdir()
+    parent_descriptor = os.open(
+        tmp_path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        with pytest.raises(FiniteArtifactIntegrityError, match="foreign object"):
+            finite_module._unlink_candidate(
+                parent_descriptor,
+                candidate,
+                expected,
+            )
+    finally:
+        os.close(parent_descriptor)
+    assert os.path.lexists(candidate)
+    if foreign_kind == "regular":
+        assert candidate.read_bytes() == b"foreign"
+        candidate.unlink()
+    elif foreign_kind == "symlink":
+        assert candidate.is_symlink()
+        candidate.unlink()
+    elif foreign_kind == "fifo":
+        assert stat.S_ISFIFO(candidate.lstat().st_mode)
+        candidate.unlink()
+    else:
+        candidate.rmdir()
+
+
+def test_publisher_is_one_shot_even_after_abort(tmp_path: Path) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    token = threading.Event()
+    token.set()
+    publisher = FiniteArtifactPublisher(request, cancel_token=token)
+    assert _publish(request, publisher=publisher).disposition is FiniteArtifactDisposition.ABORTED
+    with pytest.raises(RuntimeError, match="one-shot"):
+        _publish(request, publisher=publisher)
+
+
+@pytest.mark.parametrize("published", (False, True))
+def test_candidate_cleanup_failure_reports_exact_hidden_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    published: bool,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    real_unlink = finite_module._unlink_candidate
+    paths: list[Path] = []
+
+    def fail_cleanup(_parent_descriptor: int, path: Path, *args, **kwargs) -> None:
+        paths.append(path)
+        raise PermissionError("candidate cleanup denied")
+
+    monkeypatch.setattr(finite_module, "_unlink_candidate", fail_cleanup)
+    if published:
+        result = _publish(request)
+        assert result.disposition is FiniteArtifactDisposition.COMMITTED
+        assert Path(request.output_artifact).exists()
+        assert result.hidden_orphan == str(paths[0])
+    else:
+        token = threading.Event()
+
+        def writer(binding: FiniteCandidateBinding) -> None:
+            binding.truncate(0)
+            binding.write(_payload(request))
+            token.set()
+
+        result = _publish(
+            request,
+            publisher=FiniteArtifactPublisher(request, cancel_token=token),
+            writer=writer,
+        )
+        assert result.disposition is FiniteArtifactDisposition.ABORTED
+        assert not Path(request.output_artifact).exists()
+        assert result.hidden_orphan == str(paths[0])
+    assert Path(result.hidden_orphan).exists()
+    monkeypatch.setattr(finite_module, "_unlink_candidate", real_unlink)
+    Path(result.hidden_orphan).unlink()
+
+
+def test_writer_failure_remains_primary_when_private_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    candidate_paths: list[Path] = []
+
+    def writer(_binding: FiniteCandidateBinding) -> None:
+        raise LookupError("writer remains primary")
+
+    def fail_cleanup(
+        _parent_descriptor: int,
+        path: Path,
+        *_args,
+        **_kwargs,
+    ) -> None:
+        candidate_paths.append(path)
+        raise PermissionError("cleanup is secondary")
+
+    monkeypatch.setattr(finite_module, "_unlink_candidate", fail_cleanup)
+    with pytest.raises(LookupError, match="writer remains primary") as captured:
+        _publish(request, writer=writer)
+    assert any("CLEANUP_INCOMPLETE" in note for note in captured.value.__notes__)
+    assert candidate_paths[0].exists()
+    assert not Path(request.output_artifact).exists()
+    candidate_paths[0].unlink()
+
+
+def test_foreign_private_candidate_collision_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    monkeypatch.setattr(finite_module.secrets, "token_hex", lambda _n: "a" * 32)
+    candidate = tmp_path / (
+        f".xdart-finite-{request.version_identity}-{'a' * 32}.candidate"
+    )
+    candidate.write_bytes(b"foreign candidate")
+    with pytest.raises(FiniteArtifactCollision):
+        _publish(request)
+    assert candidate.read_bytes() == b"foreign candidate"
+    assert not Path(request.output_artifact).exists()
+
+
+def test_types_are_public_lazy_exports() -> None:
+    import xrd_tools.io as io_api
+
+    assert io_api.FiniteArtifactPublisher is FiniteArtifactPublisher
+    assert io_api.FiniteArtifactRequest is FiniteArtifactRequest
+    assert io_api.FiniteArtifactDisposition is FiniteArtifactDisposition
+    assert io_api.FiniteDocumentAdapter is FiniteDocumentAdapter
+    assert io_api.FiniteOperationContext is FiniteOperationContext
+    assert io_api.FiniteCandidateValidation is FiniteCandidateValidation
+    assert io_api.FiniteCommittedInspection is FiniteCommittedInspection
+    assert io_api.capture_finite_source is capture_finite_source
+    assert io_api.finite_artifact_request is finite_artifact_request
+    assert io_api.finite_operation_context is finite_operation_context
+    assert io_api.capture_finite_predecessor is capture_finite_predecessor
+    assert io_api.write_finite_artifact_lineage is write_finite_artifact_lineage
+    assert io_api.require_finite_artifact_lineage is require_finite_artifact_lineage
+    assert io_api.artifact_family_from_source is artifact_family_from_source
+    assert io_api.resolve_finite_output_target is resolve_finite_output_target
+    assert io_api.FINITE_LINEAGE_NODE_NAME == "finite_artifact"
+    assert io_api.FINITE_LINEAGE_SCHEMA == "xdart.finite-artifact-lineage.v1"
+    assert io_api.FINITE_PUBLICATION_POLICY == "IMMUTABLE_SUCCESSOR_V1"
+    assert io_api.FINITE_PARENT_DIRECTORY_FSYNC_WARNING == (
+        "FINITE_PARENT_DIRECTORY_FSYNC_UNCONFIRMED"
+    )
+    assert "FiniteArtifactPublisher" in io_api.__all__

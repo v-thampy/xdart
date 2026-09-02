@@ -4,8 +4,9 @@
 This file is the headless (PP-C0) half of the finite oracle frozen before
 implementation.  It pins the sole Qt-free path owner
 (:mod:`xrd_tools.io.output_path`), its public ``xrd_tools.io`` surface, and the
-headless consumers that must generate ``.nexus`` while still reading ``.nxs``
-forever.  The canonical GUI consumers are pinned in
+headless consumers that must generate and ordinarily read only current
+``.nexus`` output.  Historical ``.nxs`` remains raw/importer territory.  The
+canonical GUI consumers are pinned in
 ``tests/xdart/test_output_path_policy_gui.py`` (PP-C1).
 
 Row numbers below are the handoff §5 oracle rows.  Parent polarity is recorded
@@ -50,12 +51,19 @@ def _write_processed(path: Path, *, q_len: int = 9, n_frames: int = 2) -> Path:
         g.attrs["NX_class"] = "NXdata"
         g.attrs["signal"] = "intensity"
         g.attrs["axes"] = ("frame_index", "q")
-        g.create_dataset("frame_index", data=frames)
+        g.create_dataset(
+            "frame_index",
+            data=frames,
+            maxshape=(None,),
+            chunks=(max(1, min(n_frames, 64)),),
+        )
         q_ds = g.create_dataset("q", data=q)
         q_ds.attrs["units"] = "q_A^-1"
         g.create_dataset(
             "intensity",
             data=np.ones((n_frames, q_len), dtype=np.float32),
+            maxshape=(None, q_len),
+            chunks=(max(1, min(n_frames, 8)), q_len),
         )
         frame_group = entry.create_group("frames")
         for frame in frames:
@@ -231,15 +239,15 @@ def test_row5_time_resolved_discovery_orders_mixed_suffixes(tmp_path):
     assert [p.name for p in found] == ["scan_2.nexus"]
 
 
-def test_row5_explicit_pattern_still_narrows_discovery(tmp_path):
-    """An explicitly passed pattern keeps its exact meaning."""
+def test_row5_explicit_pattern_does_not_bypass_current_admission(tmp_path):
+    """An explicit legacy glob cannot bypass strict processed admission."""
     from xrd_tools.analysis.time_resolved import discover_processed_scans
 
     _write_processed(tmp_path / "scan_2.nexus")
     _write_processed(tmp_path / "scan_10.nxs")
 
     found = discover_processed_scans(tmp_path, pattern="*.nxs")
-    assert [p.name for p in found] == ["scan_10.nxs"]
+    assert found == []
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +536,9 @@ def test_row14_owner_imports_no_writer_or_schema_code():
     offenders = [m for m in imported
                  if any(bad.lower() in m.lower() for bad in forbidden)]
     assert offenders == [], offenders
-    assert set(imported) <= {"os", "pathlib", "__future__", "typing"}, imported
+    assert set(imported) <= {
+        "hashlib", "os", "pathlib", "re", "__future__", "typing",
+    }, imported
 
 
 # ---------------------------------------------------------------------------
@@ -645,15 +655,14 @@ def test_c2row3_default_discovery_finds_only_nexus_records(tmp_path):
     assert [p.name for p in found] == ["scan_1.NEXUS", "scan_3.nexus"]
 
 
-def test_c2row3_explicit_pattern_narrowing_stays_exact(tmp_path):
-    """C2 row 3b — an explicit glob keeps its exact, case-sensitive meaning."""
+def test_c2row3_explicit_pattern_never_bypasses_strict_admission(tmp_path):
+    """C2 row 3b — a glob narrows candidates, not reader admission."""
     from xrd_tools.analysis.time_resolved import discover_processed_scans
 
     _write_processed(tmp_path / "scan_1.NEXUS")
     _write_processed(tmp_path / "scan_2.nxs")
 
-    assert [p.name for p in discover_processed_scans(tmp_path, pattern="*.nxs")
-            ] == ["scan_2.nxs"]
+    assert discover_processed_scans(tmp_path, pattern="*.nxs") == []
     assert discover_processed_scans(tmp_path, pattern="*.nexus") == []
 
 
