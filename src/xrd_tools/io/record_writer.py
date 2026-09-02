@@ -35,10 +35,11 @@ from xrd_tools.io.nexus import (
     write_stitched,
 )
 from xrd_tools.io.nexus_record import (
+    _PreparedThumbnail,
     _average_count_chunks,
     _background_pair,
+    _prepare_thumbnail,
     ensure_frames_container,
-    quantize_thumbnail,
     read_background_dependency,
     replace_frame_record,
     stamp_source_base,
@@ -2419,28 +2420,29 @@ class NexusRecordWriter:
         self._dirty_absent_modes.discard((group_name, label))
         self._durable_absence_proofs.pop((group_name, label), None)
 
-    def _expected_frame_row(self, record: RecordWrite) -> _ExpectedFrameRow:
+    def _expected_frame_row(
+        self,
+        record: RecordWrite,
+        prepared_thumbnail: _PreparedThumbnail | None = None,
+    ) -> _ExpectedFrameRow:
         thumbnail = None
         lut = None
         if record.thumbnail is not None:
-            thumbnail, lut = quantize_thumbnail(np.asarray(record.thumbnail))
-            thumbnail = np.asarray(thumbnail).copy()
-            lut = (float(lut[0]), float(lut[1]), str(lut[2]))
+            prepared_thumbnail = prepared_thumbnail or _prepare_thumbnail(
+                record.thumbnail,
+                thumbnail_mask=record.thumbnail_mask,
+            )
+            thumbnail = prepared_thumbnail.array
+            lut = prepared_thumbnail.lut
         source_path = None
         source_frame_index = None
         if record.source_path is not None:
             source_path = str(record.source_path) if self._replacement_configuration is not None else relative_source_path(record.source_path, self.source_base)
             source_frame_index = int(record.source_frame_index)
         timestamp = None if record.timestamp is None else str(record.timestamp)
-        thumbnail_mask = None
-        if record.thumbnail is not None:
-            thumbnail_mask = (
-                np.asarray(record.thumbnail_mask, dtype=bool).copy()
-                if record.thumbnail_mask is not None
-                else ~np.isfinite(np.asarray(record.thumbnail))
-            )
-            if not thumbnail_mask.any() and record.thumbnail_mask is None:
-                thumbnail_mask = None
+        thumbnail_mask = (
+            None if prepared_thumbnail is None else prepared_thumbnail.mask
+        )
         return _ExpectedFrameRow(
             int(record.label),
             thumbnail,
@@ -2456,13 +2458,24 @@ class NexusRecordWriter:
              (record.background_dependency_bytes, record.background_dependency_fingerprint)),
         )
 
-    def _remember_frame_row(self, record: RecordWrite) -> None:
+    def _remember_frame_row(
+        self,
+        record: RecordWrite,
+        prepared_thumbnail: _PreparedThumbnail | None = None,
+    ) -> None:
         if not self.complete_record:
             return
-        self._dirty_frames[int(record.label)] = self._expected_frame_row(record)
+        self._dirty_frames[int(record.label)] = self._expected_frame_row(
+            record,
+            prepared_thumbnail,
+        )
 
-    def _expected_source_fact(self, record: RecordWrite) -> _PersistedSourceFact:
-        expected = self._expected_frame_row(record)
+    def _expected_source_fact(
+        self,
+        record: RecordWrite,
+        prepared_thumbnail: _PreparedThumbnail | None = None,
+    ) -> _PersistedSourceFact:
+        expected = self._expected_frame_row(record, prepared_thumbnail)
         return self._source_fact_for_expected_frame(expected)
 
     @staticmethod
@@ -2586,9 +2599,13 @@ class NexusRecordWriter:
         self._require_active()
         with self._boundary():
             return _decode_replacement_fact(self._h5, int(label), entry=self.entry, rows=self._row_cursors, context=self._replacement_read_context, metadata_keys=metadata_keys, include_geometry=include_geometry)
-    def _verify_supplied_source_identity(self, record: RecordWrite) -> None:
+    def _verify_supplied_source_identity(
+        self,
+        record: RecordWrite,
+        prepared_thumbnail: _PreparedThumbnail | None = None,
+    ) -> None:
         """Require complete source-fact equality for a mode-only sibling."""
-        expected = self._expected_source_fact(record)
+        expected = self._expected_source_fact(record, prepared_thumbnail)
         observed = self._authoritative_source_fact(int(record.label))
         if observed != expected:
             raise WriterStateError(
@@ -2596,15 +2613,22 @@ class NexusRecordWriter:
                 "does not match the mode-only write"
             )
         frame = _replacement_hard_group(self._entry_group(), f"frames/frame_{int(record.label):04d}") if self._replacement_configuration is not None else self._entry_group().get(f"frames/frame_{int(record.label):04d}")
-        if not isinstance(frame, h5py.Group) or read_background_dependency(frame) != self._expected_frame_row(record).background_dependency:
+        if not isinstance(frame, h5py.Group) or read_background_dependency(frame) != self._expected_frame_row(record, prepared_thumbnail).background_dependency:
             raise WriterStateError("existing frame background dependency does not match the mode-only write")
 
-    def _remember_written_rows(self, records: tuple[RecordWrite, ...]) -> None:
+    def _remember_written_rows(
+        self,
+        records: tuple[RecordWrite, ...],
+        prepared_thumbnails: Mapping[int, _PreparedThumbnail],
+    ) -> None:
         for record in records:
             self._remember_mode_row(record, dimension="1d")
             self._remember_mode_row(record, dimension="2d")
             if record.write_frame_record:
-                self._remember_frame_row(record)
+                self._remember_frame_row(
+                    record,
+                    prepared_thumbnails.get(int(record.label)),
+                )
             self._append_written_labels.add(int(record.label))
 
     def _verify_mode_row(
@@ -4104,8 +4128,12 @@ class NexusRecordWriter:
             raise ValueError(f"unknown {dimension} mode {mode!r}")
         return f"{top}/{mode_subgroup_name(mode)}"
 
-    def _validate_records(self, records: tuple[RecordWrite, ...]) -> None:
+    def _validate_records(
+        self,
+        records: tuple[RecordWrite, ...],
+    ) -> dict[int, _PreparedThumbnail]:
         labels = [int(record.label) for record in records]
+        prepared_thumbnails: dict[int, _PreparedThumbnail] = {}
         if len(labels) != len(set(labels)):
             raise ValueError(f"dirty batch contains duplicate labels: {labels}")
         if self._replacement_labels and (any(label not in self._replacement_labels for label in labels) or any(record.write_frame_record or self._replacement_configuration[0] == "1d" and record.result_2d is not None or self._replacement_configuration[0] == "2d" and record.result_1d is not None for record in records)):
@@ -4192,6 +4220,16 @@ class NexusRecordWriter:
             if record.source_path is not None and self._replacement_configuration is None:
                 relative_source_path(record.source_path, self.source_base)
             frame = _replacement_hard_group(entry, f"frames/frame_{int(record.label):04d}") if self._replacement_configuration is not None else entry.get(f"frames/frame_{int(record.label):04d}")
+            prepared_thumbnail = None
+            if thumb is not None and (
+                (self.complete_record and record.write_frame_record)
+                or isinstance(frame, h5py.Group)
+            ):
+                prepared_thumbnail = _prepare_thumbnail(
+                    thumb,
+                    thumbnail_mask=record.thumbnail_mask,
+                )
+                prepared_thumbnails[int(record.label)] = prepared_thumbnail
             expected_background = (None if record.background_dependency_bytes is None else
                 (record.background_dependency_bytes, record.background_dependency_fingerprint))
             if isinstance(frame, h5py.Group) and read_background_dependency(frame) != expected_background:
@@ -4212,16 +4250,21 @@ class NexusRecordWriter:
                 # assertion, including child presence/absence, source selector,
                 # snapshot fields, thumbnail mask flags, shape, dtype and bytes.
                 self._verify_frame_row(
-                    _EvidenceBuilder(), self._expected_frame_row(record),
+                    _EvidenceBuilder(),
+                    self._expected_frame_row(record, prepared_thumbnail),
                 )
             elif isinstance(frame, h5py.Group) and not record.write_frame_record:
-                self._verify_supplied_source_identity(record)
+                self._verify_supplied_source_identity(
+                    record,
+                    prepared_thumbnail,
+                )
             if existing_columns is not None:
                 unexpected = set(map(str, record.metadata)) - existing_columns
                 if unexpected:
                     raise ValueError(
                         f"dirty metadata adds columns absent on disk: {sorted(unexpected)}"
                     )
+        return prepared_thumbnails
 
     @staticmethod
     def _modes(record: RecordWrite) -> tuple[ResultMode, ...]:
@@ -4295,7 +4338,7 @@ class NexusRecordWriter:
         validation_complete = False
         try:
             with self._boundary():
-                self._validate_records(batch)
+                prepared_thumbnails = self._validate_records(batch)
                 validation_complete = True
                 self._authorize_transaction_mutation()
                 labels_1d = [int(r.label) for r in primary_1d]
@@ -4385,8 +4428,11 @@ class NexusRecordWriter:
                             source_snapshot=record.source_snapshot,
                             background_dependency_bytes=record.background_dependency_bytes,
                             background_dependency_fingerprint=record.background_dependency_fingerprint,
+                            _prepared_thumbnail=prepared_thumbnails.get(
+                                int(record.label),
+                            ),
                         )
-                self._remember_written_rows(batch)
+                self._remember_written_rows(batch, prepared_thumbnails)
             self._bump("prepare_rows", len(batch))
             self._bump("stacked_1d_rows", len(one_d))
             self._bump("stacked_2d_rows", len(two_d))

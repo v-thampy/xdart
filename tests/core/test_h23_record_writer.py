@@ -1161,6 +1161,53 @@ def test_frame_provenance_corruption_is_read_back_before_durability(tmp_path):
     writer.abort()
 
 
+def test_thumbnail_quantization_is_shared_by_write_and_durability(monkeypatch, tmp_path):
+    rw = _api()
+    nexus_record = importlib.import_module("xrd_tools.io.nexus_record")
+    original_quantize = nexus_record.quantize_thumbnail
+    calls = []
+
+    def counted_quantize(array, dtype="uint8"):
+        calls.append(None)
+        return original_quantize(array, dtype=dtype)
+
+    monkeypatch.setattr(nexus_record, "quantize_thumbnail", counted_quantize)
+    target = tmp_path / "one-thumbnail-quantization.nexus"
+    finite = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    masked = np.array([[1.0, np.nan], [3.0, np.inf]], dtype=np.float32)
+    record = rw.RecordWrite(
+        label=0,
+        result_1d=_r1(1),
+        thumbnail=finite,
+        thumbnail_mask=np.zeros(finite.shape, dtype=bool),
+    )
+    writer = rw.NexusRecordWriter(target, atomic=False, flush_every=None)
+    writer.begin()
+    writer.write_batch((
+        record,
+        rw.RecordWrite(label=1, result_1d=_r1(2), thumbnail=masked),
+        rw.RecordWrite(label=2, result_1d=_r1(3)),
+    ))
+    writer.flush(force=True)
+    assert len(calls) == 2
+    assert "thumbnail_mask" in writer._h5["entry/frames/frame_0000"]
+    np.testing.assert_array_equal(
+        writer._h5["entry/frames/frame_0000/thumbnail_mask"][()],
+        np.zeros(finite.shape, dtype=bool),
+    )
+    np.testing.assert_array_equal(
+        writer._h5["entry/frames/frame_0001/thumbnail_mask"][()],
+        ~np.isfinite(masked),
+    )
+    assert "thumbnail" not in writer._h5["entry/frames/frame_0002"]
+
+    calls.clear()
+    writer.write(record)
+    writer.flush(force=True)
+    assert len(calls) == 1
+    writer.abort()
+
+
 def test_finish_replace_failure_preserves_typed_partial_artifact(monkeypatch, tmp_path):
     rw = _api()
     target = tmp_path / "partial.nexus"

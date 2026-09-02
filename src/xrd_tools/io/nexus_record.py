@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging, hashlib, json, re, struct
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 import uuid
 
@@ -411,6 +412,63 @@ def quantize_thumbnail(arr, dtype: str = "uint8"):
     return (norm * 255).astype(np.uint8), (float(vmin), float(vmax), "uint8")
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedThumbnail:
+    """Owned immutable thumbnail bytes shared by write and verification."""
+
+    array: np.ndarray
+    lut: tuple[float, float, str]
+    mask: np.ndarray | None
+
+
+def _prepare_thumbnail(
+    thumbnail,
+    dtype: str = "uint8",
+    *,
+    thumbnail_mask=None,
+) -> _PreparedThumbnail:
+    source = np.asarray(thumbnail)
+    array, raw_lut = quantize_thumbnail(source, dtype=dtype)
+    array = np.asarray(array)
+    if not array.flags.owndata:
+        array = np.array(array, copy=True)
+    array.setflags(write=False)
+    invalid = (
+        np.asarray(thumbnail_mask, dtype=bool)
+        if thumbnail_mask is not None
+        else ~np.isfinite(source)
+    )
+    if thumbnail_mask is not None and invalid.shape != source.shape:
+        raise ValueError("thumbnail_mask shape must equal thumbnail shape")
+    mask = None
+    if invalid.any() or thumbnail_mask is not None:
+        mask = np.array(invalid, dtype=bool, copy=True)
+        mask.setflags(write=False)
+    return _PreparedThumbnail(
+        array=array,
+        lut=(float(raw_lut[0]), float(raw_lut[1]), str(raw_lut[2])),
+        mask=mask,
+    )
+
+
+def _write_prepared_thumbnail(
+    frame_grp: h5py.Group,
+    prepared: _PreparedThumbnail,
+    *,
+    mask_baked: bool,
+) -> None:
+    ds = frame_grp.create_dataset("thumbnail", data=prepared.array)
+    for key, value in zip(THUMBNAIL_LUT_ATTRS, prepared.lut):
+        ds.attrs[key] = value
+    ds.attrs["mask_baked"] = bool(mask_baked)
+    if prepared.mask is not None:
+        frame_grp.create_dataset(
+            "thumbnail_mask",
+            data=prepared.mask,
+            compression="gzip",
+        )
+
+
 # ---------------------------------------------------------------------------
 # @source_base (N1 portability root)
 # ---------------------------------------------------------------------------
@@ -526,25 +584,12 @@ def write_thumbnail(
     thumbnail_mask=None,
 ) -> None:
     """Quantize + store ``thumbnail`` with its inversion LUT attributes."""
-    source = np.asarray(thumbnail)
-    arr, lut = quantize_thumbnail(source, dtype=dtype)
-    ds = frame_grp.create_dataset("thumbnail", data=arr)
-    for key, value in zip(THUMBNAIL_LUT_ATTRS, lut):
-        ds.attrs[key] = value
-    ds.attrs["mask_baked"] = bool(mask_baked)
-    invalid = (
-        np.asarray(thumbnail_mask, dtype=bool)
-        if thumbnail_mask is not None
-        else ~np.isfinite(source)
+    prepared = _prepare_thumbnail(
+        thumbnail,
+        dtype=dtype,
+        thumbnail_mask=thumbnail_mask,
     )
-    if thumbnail_mask is not None and invalid.shape != source.shape:
-        raise ValueError("thumbnail_mask shape must equal thumbnail shape")
-    if invalid.any() or thumbnail_mask is not None:
-        frame_grp.create_dataset(
-            "thumbnail_mask",
-            data=invalid,
-            compression="gzip",
-        )
+    _write_prepared_thumbnail(frame_grp, prepared, mask_baked=mask_baked)
 
 
 def write_frame_source_ref(
@@ -639,7 +684,9 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                          source_path=None, source_frame_index: int = 0,
                          timestamp=None, source_base=None,
                          source_snapshot=None, background_dependency_bytes=None,
-                         background_dependency_fingerprint=None) -> h5py.Group:
+                         background_dependency_fingerprint=None,
+                         _prepared_thumbnail: _PreparedThumbnail | None = None,
+                         ) -> h5py.Group:
     """Replace one direct per-frame record through an atomic sibling stage."""
     if not frame_key or "/" in frame_key:
         raise ValueError(
@@ -651,10 +698,10 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
     installed = False
     prior_moved = False
     try:
-        write_frame_record(
+        frame = write_frame_record(
             frames_grp,
             staged,
-            thumbnail=thumbnail,
+            thumbnail=(thumbnail if _prepared_thumbnail is None else None),
             thumbnail_dtype=thumbnail_dtype,
             thumbnail_mask_baked=thumbnail_mask_baked,
             mask_baked=mask_baked,
@@ -667,6 +714,14 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
             background_dependency_bytes=background_dependency_bytes,
             background_dependency_fingerprint=background_dependency_fingerprint,
         )
+        if _prepared_thumbnail is not None:
+            if _prepared_thumbnail.lut[2] != thumbnail_dtype:
+                raise ValueError("prepared thumbnail dtype differs")
+            _write_prepared_thumbnail(
+                frame,
+                _prepared_thumbnail,
+                mask_baked=thumbnail_mask_baked,
+            )
         if frame_key in frames_grp:
             frames_grp.move(frame_key, backup)
             prior_moved = True
