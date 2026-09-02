@@ -35,6 +35,7 @@ from xrd_tools.core.physical_memory import (
 
 _GIB = 1 << 30
 _MAX_ROW_NAME_BYTES = 1 << 10
+_MAX_BROWSE_1D_RESIDENT_ROWS = 4096
 _ROW_NAME_PREFIX = "browse-1d-row-v1:"
 _ROW_COMPONENTS = frozenset({"axis", "intensity", "sigma"})
 
@@ -842,7 +843,16 @@ class Browse1DCache(_LinearObject):
             raise RuntimeError("borrowed Browse 1-D row cannot be replaced")
         survivors = [row for row in state.rows if row.key not in incoming_keys]
         victims = list(mandatory)
-        while self._projected_unique_bytes(tuple(survivors), pending) > self._budget:
+        while (
+            len(survivors) + len(pending)
+            > _MAX_BROWSE_1D_RESIDENT_ROWS
+            or self._projected_unique_bytes(tuple(survivors), pending)
+            > self._budget
+        ):
+            row_limit_exceeded = (
+                len(survivors) + len(pending)
+                > _MAX_BROWSE_1D_RESIDENT_ROWS
+            )
             eligible = [
                 row
                 for row in survivors
@@ -850,6 +860,10 @@ class Browse1DCache(_LinearObject):
                 and id(row) not in protected
             ]
             if not eligible:
+                if row_limit_exceeded:
+                    raise ValueError(
+                        "Browse 1-D rows exceed the resident row limit"
+                    )
                 raise ValueError("Browse 1-D rows exceed the cache budget")
             oldest = min(eligible, key=lambda item: item.touch)
             survivors.remove(oldest)

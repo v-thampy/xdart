@@ -276,6 +276,98 @@ def test_whole_readonly_rows_share_one_root_and_catalog_survives_eviction(
     assert dict(cache.scalars(1, 7)) == {"temperature": 300.0}
 
 
+def test_resident_row_limit_uses_lru_and_counts_shared_roots(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(module, "_MAX_BROWSE_1D_RESIDENT_ROWS", 2)
+    shared = _readonly(np.arange(8), dtype=np.uint8)
+    cache = Browse1DCache(1 << 20)
+    _operation(
+        cache,
+        1,
+        1,
+        ("first", shared[:4]),
+        ("second", shared[4:]),
+    ).run()
+    assert cache.resident_root_count == 1
+    recent = cache.borrow(1, 1, "first")
+    recent.release()
+
+    _operation(
+        cache, 2, 2, ("third", _readonly([8], dtype=np.uint8)),
+    ).run()
+
+    assert cache.resident_keys == (
+        Browse1DRowKey(1, 1, "first"),
+        Browse1DRowKey(2, 2, "third"),
+    )
+
+
+def test_resident_row_limit_refuses_before_journal_when_rows_are_pinned(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(module, "_MAX_BROWSE_1D_RESIDENT_ROWS", 2)
+    cache = Browse1DCache(1 << 20)
+    _operation(
+        cache,
+        1,
+        1,
+        ("borrowed", _readonly([1], dtype=np.uint8)),
+        ("protected", _readonly([2], dtype=np.uint8)),
+    ).run()
+    borrowed = cache.borrow(1, 1, "borrowed")
+    before = cache._snapshot_state()
+    roots = cache._authority.retained_roots
+    try:
+        with pytest.raises(ValueError, match="resident row limit"):
+            cache.begin_store(
+                2,
+                2,
+                (("incoming", _readonly([3], dtype=np.uint8)),),
+                _expected_state=before,
+                _protected_rows=(before.rows[1],),
+            )
+        assert cache._snapshot_state() is before
+        assert cache._authority.retained_roots == roots
+        assert cache.phase is Browse1DCachePhase.OPEN
+    finally:
+        borrowed.release()
+
+
+def test_resident_row_limit_refuses_oversized_batch_atomically(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(module, "_MAX_BROWSE_1D_RESIDENT_ROWS", 2)
+    cache = Browse1DCache(1 << 20)
+    before = cache._snapshot_state()
+    with pytest.raises(ValueError, match="resident row limit"):
+        _operation(
+            cache,
+            1,
+            1,
+            ("first", _readonly([1], dtype=np.uint8)),
+            ("second", _readonly([2], dtype=np.uint8)),
+            ("third", _readonly([3], dtype=np.uint8)),
+        )
+    assert cache._snapshot_state() is before
+    assert cache.resident_keys == ()
+
+
+def test_resident_row_limit_replacement_does_not_double_count(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(module, "_MAX_BROWSE_1D_RESIDENT_ROWS", 1)
+    cache = Browse1DCache(1 << 20)
+    _operation(
+        cache, 1, 1, ("row", _readonly([1], dtype=np.uint8)),
+    ).run()
+    replacement = _readonly([2], dtype=np.uint8)
+    assert _operation(cache, 1, 1, ("row", replacement)).run() == "accepted"
+    assert cache.resident_keys == (Browse1DRowKey(1, 1, "row"),)
+    with cache.borrow(1, 1, "row") as borrowed:
+        assert borrowed.array is replacement
+
+
 def test_preparing_snapshot_retains_exact_prior_rows_until_accept() -> None:
     first = _readonly(np.arange(4), dtype=np.uint8)
     second = _readonly(np.arange(4, 8), dtype=np.uint8)
